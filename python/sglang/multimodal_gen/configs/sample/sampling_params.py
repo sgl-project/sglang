@@ -272,7 +272,7 @@ class SamplingParams:
                         [f"{w}x{h}" for w, h in self.supported_resolutions]
                     )
                     error_msg = (
-                        f"Unsupported resolution: {self.width}x{self.height}, output quality may suffer."
+                        f"Unsupported resolution: {self.width}x{self.height}, output quality may suffer. "
                         f"Supported resolutions: {supported_str}"
                     )
                     logger.warning(error_msg)
