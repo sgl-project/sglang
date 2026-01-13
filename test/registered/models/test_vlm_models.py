@@ -1,8 +1,6 @@
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 # VLM (Vision Language Model) tests
-register_cuda_ci(est_time=228, suite="stage-b-test-large-1-gpu")
-register_amd_ci(est_time=420, suite="stage-b-test-small-1-gpu-amd")
 
 import argparse
 import random
@@ -16,6 +14,9 @@ from sglang.test.kits.mmmu_vlm_kit import (
     MMMUMultiModelTestBase,
 )
 from sglang.test.test_utils import is_in_ci
+
+register_cuda_ci(est_time=228, suite="stage-b-test-large-1-gpu")
+register_amd_ci(est_time=420, suite="stage-b-test-small-1-gpu-amd")
 
 _is_hip = is_hip()
 # VLM models for testing

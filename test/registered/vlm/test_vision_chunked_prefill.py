@@ -1,6 +1,5 @@
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=150, suite="stage-b-test-large-1-gpu")
 
 """
 Usage:
@@ -45,6 +44,8 @@ class TestVisionChunkedPrefill(CustomTestCase):
         # import decord
         # from transformers import AutoTokenizer
         from decord import VideoReader, cpu
+
+register_cuda_ci(est_time=150, suite="stage-b-test-large-1-gpu")
 
         vr = VideoReader(video_path, ctx=cpu(0))
         total_frame_num = len(vr)

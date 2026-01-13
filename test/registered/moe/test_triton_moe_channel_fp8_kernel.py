@@ -1,6 +1,5 @@
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=16, suite="stage-b-test-large-1-gpu")
 
 import itertools
 import unittest
@@ -14,6 +13,7 @@ from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.test_utils import CustomTestCase
 
+register_cuda_ci(est_time=16, suite="stage-b-test-large-1-gpu")
 
 def native_w8a8_per_token_matmul(A, B, As, Bs, output_dtype=torch.float16):
     """Matrix multiplication function that supports per-token input quantization and per-column weight quantization"""

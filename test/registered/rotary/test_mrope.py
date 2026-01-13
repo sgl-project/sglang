@@ -1,8 +1,6 @@
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 # Rotary Embedding - MRoPE tests (1-GPU)
-register_cuda_ci(est_time=10, suite="stage-b-test-large-1-gpu")
-register_amd_ci(est_time=15, suite="stage-b-test-small-1-gpu-amd")
 
 from typing import NamedTuple
 
@@ -15,6 +13,10 @@ from transformers import __version__ as TRANSFORMERS_VERSION
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.srt.utils import (
+
+register_cuda_ci(est_time=10, suite="stage-b-test-large-1-gpu")
+register_amd_ci(est_time=15, suite="stage-b-test-small-1-gpu-amd")
+
     cpu_has_amx_support,
     is_cpu,
     is_cuda,

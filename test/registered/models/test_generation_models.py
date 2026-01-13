@@ -1,7 +1,6 @@
 from sglang.test.ci.ci_register import register_cuda_ci
 
 # Generation model tests (CUDA only)
-register_cuda_ci(est_time=103, suite="stage-b-test-large-1-gpu")
 
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -40,6 +39,7 @@ from sglang.test.runners import (
 )
 from sglang.test.test_utils import CustomTestCase, is_in_ci
 
+register_cuda_ci(est_time=103, suite="stage-b-test-large-1-gpu")
 
 @dataclasses.dataclass
 class ModelCase:

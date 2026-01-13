@@ -1,6 +1,5 @@
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=180, suite="stage-c-test-large-4-gpu")
 
 import asyncio
 import logging
@@ -17,6 +16,9 @@ from sglang.srt.layers.moe.routed_experts_capturer import (
 )
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
+
+register_cuda_ci(est_time=180, suite="stage-c-test-large-4-gpu")
+
     DEFAULT_ENABLE_ROUTED_EXPERTS_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,

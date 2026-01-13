@@ -1,6 +1,5 @@
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=195, suite="stage-b-test-small-1-gpu")
 
 import gc
 import json
@@ -158,6 +157,8 @@ class TestUpdateWeightsFromTensor(CustomTestCase):
 
         # Serialize the bucket data
         from sglang.srt.utils import MultiprocessingSerializer
+
+register_cuda_ci(est_time=195, suite="stage-b-test-small-1-gpu")
 
         serialized_bucket = MultiprocessingSerializer.serialize(
             bucket_dict, output_str=True

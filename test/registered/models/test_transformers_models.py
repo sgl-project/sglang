@@ -1,8 +1,6 @@
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 # Transformers fallback model tests
-register_cuda_ci(est_time=245, suite="stage-b-test-small-1-gpu")
-register_amd_ci(est_time=320, suite="stage-b-test-small-1-gpu-amd")
 
 import dataclasses
 import multiprocessing as mp
@@ -66,6 +64,9 @@ class TestTransformersFallbackEndpoint(CustomTestCase):
             port=int(self.base_url.split(":")[-1]),
         )
         from sglang.test.few_shot_gsm8k import run_eval
+
+register_cuda_ci(est_time=245, suite="stage-b-test-small-1-gpu")
+register_amd_ci(est_time=320, suite="stage-b-test-small-1-gpu-amd")
 
         metrics = run_eval(args)
         print(f"{metrics=}")

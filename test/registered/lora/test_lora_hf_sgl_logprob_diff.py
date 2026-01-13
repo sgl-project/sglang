@@ -36,6 +36,7 @@ import torch
 
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.runners import HFRunner, SRTRunner
+from sglang.test.test_utils import DEFAULT_PORT_FOR_SRT_TEST_RUNNER, CustomTestCase
 
 register_cuda_ci(
     est_time=150,
@@ -44,8 +45,6 @@ register_cuda_ci(
 register_cuda_ci(
     est_time=76,
 )
-
-from sglang.test.test_utils import DEFAULT_PORT_FOR_SRT_TEST_RUNNER, CustomTestCase
 
 # Test configuration constants
 LORA_BACKEND = "triton"

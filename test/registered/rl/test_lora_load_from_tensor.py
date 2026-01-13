@@ -1,7 +1,5 @@
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=90, suite="stage-b-test-small-1-gpu")
-register_amd_ci(est_time=90, suite="stage-b-test-small-1-gpu")
 
 import json
 import os
@@ -226,6 +224,9 @@ class TestLoRALoadFromTensor(CustomTestCase):
 
         from sglang.test.runners import HFRunner, SRTRunner
         from sglang.test.test_utils import DEFAULT_PORT_FOR_SRT_TEST_RUNNER
+
+register_cuda_ci(est_time=90, suite="stage-b-test-small-1-gpu")
+register_amd_ci(est_time=90, suite="stage-b-test-small-1-gpu")
 
         print("[Test]Testing LoRA logprob difference with HuggingFace...")
 

@@ -1,6 +1,5 @@
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=524, suite="stage-b-test-large-1-gpu")
 
 """
 Consolidated HiCache variant tests.
@@ -16,6 +15,9 @@ from sglang.bench_serving import get_tokenizer
 from sglang.srt.utils import is_hip, kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
+
+register_cuda_ci(est_time=524, suite="stage-b-test-large-1-gpu")
+
     DEFAULT_DRAFT_MODEL_EAGLE3,
     DEFAULT_MLA_MODEL_NAME_FOR_TEST,
     DEFAULT_MODEL_NAME_FOR_TEST,

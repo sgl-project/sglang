@@ -1,6 +1,5 @@
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=100, suite="stage-b-test-large-2-gpu")
 
 import unittest
 from types import SimpleNamespace
@@ -8,6 +7,9 @@ from types import SimpleNamespace
 from sglang.srt.utils import kill_process_tree
 from sglang.test.few_shot_gsm8k import run_eval
 from sglang.test.test_utils import (
+
+register_cuda_ci(est_time=100, suite="stage-b-test-large-2-gpu")
+
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,

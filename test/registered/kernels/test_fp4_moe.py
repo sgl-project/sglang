@@ -7,7 +7,6 @@ from flashinfer import fp4_quantize, scaled_fp4_grouped_quantize
 
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=300, suite="nightly-4-gpu-b200", nightly=True)
 from flashinfer.fused_moe import cutlass_fused_moe as flashinfer_cutlass_fused_moe
 from sgl_kernel import scaled_fp4_quant, silu_and_mul
 from torch.nn import functional as F
@@ -190,6 +189,8 @@ def flashinfer_cutedsl_grouped_gemm_nt_masked(
     masked_m: torch.Tensor,
 ):
     from flashinfer.cute_dsl.blockscaled_gemm import grouped_gemm_nt_masked
+
+register_cuda_ci(est_time=300, suite="nightly-4-gpu-b200", nightly=True)
 
     # hidden_states: [l, m, k]
     # weights: [l, n, k]

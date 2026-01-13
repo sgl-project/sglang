@@ -579,7 +579,6 @@ jobs:
           fi
           python3 run_suite.py --hw cpu --suite stage-a-cpu-only $CONTINUE_ON_ERROR_FLAG
 
-  # Runs on RTX 5090 (32GB, SM120 Blackwell) - 67 tests that pass on 5090
   stage-b-test-small-1-gpu:
     needs: [check-changes, call-gate, stage-a-test-1, sgl-kernel-build-wheels]
     if: |

@@ -1,6 +1,5 @@
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=957, suite="stage-b-test-large-1-gpu")
 
 """
 Usage:
@@ -183,6 +182,8 @@ class TestDeepseekOCRServer(TestOpenAIMLLMServerBase):
 
         # Verify coordinate format [[x1, y1, x2, y2]]
         import re
+
+register_cuda_ci(est_time=957, suite="stage-b-test-large-1-gpu")
 
         coord_pattern = r"\[\[[\d\s,]+\]\]"
         assert re.search(

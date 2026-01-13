@@ -1,8 +1,6 @@
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 # Qwen model tests
-register_cuda_ci(est_time=90, suite="stage-b-test-small-1-gpu")
-register_amd_ci(est_time=130, suite="stage-b-test-small-1-gpu-amd")
 
 import unittest
 from types import SimpleNamespace
@@ -10,6 +8,10 @@ from types import SimpleNamespace
 from sglang.srt.utils import kill_process_tree
 from sglang.test.few_shot_gsm8k import run_eval
 from sglang.test.test_utils import (
+
+register_cuda_ci(est_time=90, suite="stage-b-test-small-1-gpu")
+register_amd_ci(est_time=130, suite="stage-b-test-small-1-gpu-amd")
+
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
