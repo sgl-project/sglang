@@ -1,21 +1,18 @@
-from sglang.test.ci.ci_register import register_cuda_ci
-
-
 import unittest
 from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
-
-register_cuda_ci(est_time=140, suite="stage-b-test-large-2-gpu")
-
     DEFAULT_MLA_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
 )
+
+register_cuda_ci(est_time=140, suite="stage-b-test-large-2-gpu")
 
 
 class TestEp(CustomTestCase):

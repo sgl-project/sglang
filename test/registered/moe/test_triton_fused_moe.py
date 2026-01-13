@@ -1,6 +1,3 @@
-from sglang.test.ci.ci_register import register_cuda_ci
-
-
 import unittest
 
 import torch
@@ -12,9 +9,11 @@ from sglang.srt.layers.moe.moe_runner.triton_kernels import TritonKernelsQuantIn
 from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
 from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=89, suite="stage-b-test-large-1-gpu")
+
 
 class TestFusedMOE(CustomTestCase):
     NUM_EXPERTS = [8, 64]

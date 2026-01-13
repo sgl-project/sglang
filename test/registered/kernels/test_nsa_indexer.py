@@ -4,10 +4,8 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.test.ci.ci_register import register_cuda_ci
-
-
 from sglang.srt.layers import dp_attention as _dp_attn
+from sglang.test.ci.ci_register import register_cuda_ci
 
 # Patch DP-attention globals before importing backends
 _dp_attn.get_attention_tp_size = lambda: 1  # TP size = 1 for unit test

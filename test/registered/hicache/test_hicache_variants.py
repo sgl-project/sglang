@@ -1,6 +1,3 @@
-from sglang.test.ci.ci_register import register_cuda_ci
-
-
 """
 Consolidated HiCache variant tests.
 Tests HiCache with different configurations: standard, MLA, EAGLE, and page size variants.
@@ -13,11 +10,9 @@ import requests
 
 from sglang.bench_serving import get_tokenizer
 from sglang.srt.utils import is_hip, kill_process_tree
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
-
-register_cuda_ci(est_time=524, suite="stage-b-test-large-1-gpu")
-
     DEFAULT_DRAFT_MODEL_EAGLE3,
     DEFAULT_MLA_MODEL_NAME_FOR_TEST,
     DEFAULT_MODEL_NAME_FOR_TEST,
@@ -27,6 +22,8 @@ register_cuda_ci(est_time=524, suite="stage-b-test-large-1-gpu")
     CustomTestCase,
     popen_launch_server,
 )
+
+register_cuda_ci(est_time=524, suite="stage-b-test-large-1-gpu")
 
 _is_hip = is_hip()
 

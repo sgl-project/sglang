@@ -1,5 +1,3 @@
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-
 # Transformers fallback model tests
 
 import dataclasses
@@ -11,6 +9,7 @@ from typing import List
 import torch
 
 from sglang.srt.utils import is_hip, kill_process_tree
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.runners import DEFAULT_PROMPTS, SRTRunner, check_close_model_outputs
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
@@ -20,6 +19,9 @@ from sglang.test.test_utils import (
     is_in_ci,
     popen_launch_server,
 )
+
+register_cuda_ci(est_time=245, suite="stage-b-test-small-1-gpu")
+register_amd_ci(est_time=320, suite="stage-b-test-small-1-gpu-amd")
 
 
 class TestTransformersFallbackEndpoint(CustomTestCase):
@@ -64,9 +66,6 @@ class TestTransformersFallbackEndpoint(CustomTestCase):
             port=int(self.base_url.split(":")[-1]),
         )
         from sglang.test.few_shot_gsm8k import run_eval
-
-register_cuda_ci(est_time=245, suite="stage-b-test-small-1-gpu")
-register_amd_ci(est_time=320, suite="stage-b-test-small-1-gpu-amd")
 
         metrics = run_eval(args)
         print(f"{metrics=}")

@@ -1,6 +1,3 @@
-from sglang.test.ci.ci_register import register_cuda_ci
-
-
 # Adapted from https://github.com/vllm-project/vllm/blob/633f943e30a4444d890d26b81850f7217736f840/tests/kernels/mamba/test_mamba_ssm_ssd.py
 
 
@@ -11,7 +8,10 @@ from einops import rearrange, repeat
 
 from sglang.srt.layers.attention.mamba.mamba2_metadata import Mamba2Metadata
 from sglang.srt.layers.attention.mamba.ops import mamba_chunk_scan_combined
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.utils import is_in_ci
+
+register_cuda_ci(est_time=13, suite="stage-b-test-small-1-gpu")
 
 # Added by the IBM Team, 2024
 
@@ -607,7 +607,5 @@ def test_mamba_chunk_scan_cont_batch_prefill_chunking(chunk_size, seqlens):
 
 if __name__ == "__main__":
     import sys
-
-register_cuda_ci(est_time=13, suite="stage-b-test-small-1-gpu")
 
     sys.exit(pytest.main([__file__]))

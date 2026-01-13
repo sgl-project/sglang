@@ -1,7 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
-from sglang.test.ci.ci_register import register_cuda_ci
-
-
 import unittest
 from typing import Callable
 
@@ -13,6 +10,7 @@ from torch.nn import functional as F
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.moe.flashinfer_cutedsl_moe import flashinfer_cutedsl_moe_masked
 from sglang.srt.layers.moe.topk import TopKConfig, select_experts
+from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=300, suite="stage-c-test-large-4-gpu-b200")
 

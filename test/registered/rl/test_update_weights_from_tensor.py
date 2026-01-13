@@ -1,6 +1,3 @@
-from sglang.test.ci.ci_register import register_cuda_ci
-
-
 import gc
 import json
 import random
@@ -14,6 +11,7 @@ import torch
 import sglang as sgl
 from sglang.srt.utils import MultiprocessingSerializer, kill_process_tree
 from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -21,6 +19,8 @@ from sglang.test.test_utils import (
     CustomTestCase,
     popen_launch_server,
 )
+
+register_cuda_ci(est_time=195, suite="stage-b-test-small-1-gpu")
 
 
 def test_update_weights_from_tensor(tp_size):
@@ -157,8 +157,6 @@ class TestUpdateWeightsFromTensor(CustomTestCase):
 
         # Serialize the bucket data
         from sglang.srt.utils import MultiprocessingSerializer
-
-register_cuda_ci(est_time=195, suite="stage-b-test-small-1-gpu")
 
         serialized_bucket = MultiprocessingSerializer.serialize(
             bucket_dict, output_str=True

@@ -1,6 +1,3 @@
-from sglang.test.ci.ci_register import register_cuda_ci
-
-
 # Adapted from https://github.com/vllm-project/vllm/blob/main/tests/kernels/mamba/test_causal_conv1d.py
 
 
@@ -16,6 +13,9 @@ from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
     causal_conv1d_fn,
     causal_conv1d_update,
 )
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=25, suite="stage-b-test-small-1-gpu")
 
 
 def causal_conv1d_ref(
@@ -386,7 +386,5 @@ def test_causal_conv1d_varlen(
 
 if __name__ == "__main__":
     import sys
-
-register_cuda_ci(est_time=25, suite="stage-b-test-small-1-gpu")
 
     sys.exit(pytest.main([__file__]))

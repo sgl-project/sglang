@@ -17,10 +17,6 @@ Usage:
     python -m pytest test_radix_cache_unit.py::TestRadixCache::test_insert_basic
 """
 
-from sglang.test.ci.ci_register import register_cuda_ci
-
-# CPU-based unit test, runs quickly on any GPU runner
-
 import time
 import unittest
 import unittest.mock
@@ -29,6 +25,10 @@ import torch
 
 from sglang.srt.disaggregation.kv_events import BlockRemoved, BlockStored
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
+from sglang.test.ci.ci_register import register_cuda_ci
+
+# CPU-based unit test, runs quickly on any GPU runner
+
 
 register_cuda_ci(est_time=5, suite="stage-b-test-small-1-gpu")
 

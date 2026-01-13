@@ -1,6 +1,5 @@
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-
 """Test distributed weight updates.
 
 This test suite simulates a distributed training environment to ensure

@@ -1,6 +1,3 @@
-from sglang.test.ci.ci_register import register_cuda_ci
-
-
 import json
 import unittest
 from io import BytesIO
@@ -20,6 +17,8 @@ from transformers import (
     Gemma3ForConditionalGeneration,
     Qwen2_5_VLForConditionalGeneration,
 )
+
+from sglang.test.ci.ci_register import register_cuda_ci
 
 if not hasattr(_hf_activations, "PytorchGELUTanh"):
 

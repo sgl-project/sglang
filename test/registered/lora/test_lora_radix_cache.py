@@ -19,8 +19,6 @@ import torch
 
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.lora_utils import CI_MULTI_LORA_MODELS, run_lora_test_one_by_one
-
-
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=200, suite="nightly-1-gpu", nightly=True)

@@ -1,4 +1,11 @@
+import multiprocessing as mp
+import unittest
+
+import torch
+
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.runners import HFRunner, SRTRunner
+from sglang.test.test_utils import CustomTestCase
 
 # Reward model tests
 
@@ -16,13 +23,6 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 # limitations under the License.
 # ==============================================================================
 
-import multiprocessing as mp
-import unittest
-
-import torch
-
-from sglang.test.runners import HFRunner, SRTRunner
-from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=103, suite="stage-b-test-small-1-gpu")
 register_amd_ci(est_time=132, suite="stage-b-test-small-1-gpu-amd")

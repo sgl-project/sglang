@@ -41,6 +41,7 @@ from sglang.test.test_utils import CustomTestCase, is_in_ci
 
 register_cuda_ci(est_time=103, suite="stage-b-test-large-1-gpu")
 
+
 @dataclasses.dataclass
 class ModelCase:
     model_path: str
