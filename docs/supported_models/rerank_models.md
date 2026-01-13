@@ -71,7 +71,7 @@ for item in response_json:
 - `documents` (required): List of documents to be ranked
 - `model` (required): Model to use for reranking
 - `top_n` (optional): Maximum number of documents to return. Defaults to returning all documents. If specified value is greater than the total number of documents, all documents will be returned.
-- `return_documents` (optional): Whether to return documents in the response. Defaults to `false`. Only included when set to `true`.
+- `return_documents` (optional): Whether to return documents in the response. Defaults to `True`.
 
 ## Qwen3-Reranker (decoder-only yes/no rerank)
 
@@ -117,7 +117,7 @@ curl -X POST http://127.0.0.1:8001/v1/rerank \
 - `model` (required): Model to use for reranking
 - `instruct` (optional): Instruction text for the reranker
 - `top_n` (optional): Maximum number of documents to return. Defaults to returning all documents. If specified value is greater than the total number of documents, all documents will be returned.
-- `return_documents` (optional): Whether to return documents in the response. Defaults to `false`. Only included when set to `true`.
+- `return_documents` (optional): Whether to return documents in the response. Defaults to `True`.
 
 ### Response Format
 
