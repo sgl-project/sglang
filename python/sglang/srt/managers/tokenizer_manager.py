@@ -2246,6 +2246,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         """Convert attributes to span attributes."""
         span_attrs = {}
 
+        if not self.enable_trace:
+            return span_attrs
+
         # Token usage attributes
         span_attrs[SpanAttributes.GEN_AI_USAGE_COMPLETION_TOKENS] = (
             recv_obj.completion_tokens[i]
