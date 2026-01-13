@@ -254,9 +254,6 @@ class ComponentLoader(ABC):
         Args:
             module_type: Type of module (e.g., "vae", "text_encoder", "transformer", "scheduler")
             transformers_or_diffusers: Whether the module is from transformers or diffusers
-
-        Returns:
-            A component loader for the specified module type
         """
         # Map of module types to their loader classes and expected library
         module_type = _normalize_module_type(module_type)
@@ -803,8 +800,6 @@ class PipelineComponentLoader:
             component_model_path: Path to the component model
             transformers_or_diffusers: Whether the module is from transformers or diffusers
 
-        Returns:
-            The loaded module
         """
 
         # Get the appropriate loader for this module type
