@@ -25,7 +25,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import dict_to_3d_list
 
 try:
-    from st_attn import sliding_tile_attention
+    from fastvideo_kernel import sliding_tile_attention
 
     st_attn_backend_available = True
 except Exception:

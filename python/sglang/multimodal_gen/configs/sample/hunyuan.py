@@ -33,6 +33,8 @@ class HunyuanSamplingParams(SamplingParams):
             (832, 1104),  # 4:3
             (1104, 832),  # 3:4
             (960, 960),  # 1:1
+            # STA resolution
+            (1280, 768),
         ]
     )
 
