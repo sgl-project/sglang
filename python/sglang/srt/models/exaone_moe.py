@@ -84,11 +84,19 @@ class ExaoneMoEMLP(nn.Module):
         tp_size: Optional[int] = None,
     ) -> None:
         super().__init__()
+        gateup_quant_config = quant_config
+        down_quant_config = quant_config
+        if quant_config and hasattr(quant_config, "ignore") and quant_config.ignore:
+            if add_prefix("gate_proj", prefix) in quant_config.ignore:
+                gateup_quant_config = None
+            if add_prefix("down_proj", prefix) in quant_config.ignore:
+                down_quant_config = None
+
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
             bias=False,
-            quant_config=quant_config,
+            quant_config=gateup_quant_config,
             prefix=add_prefix("gate_up_proj", prefix),
             tp_rank=tp_rank,
             tp_size=tp_size,
@@ -97,7 +105,7 @@ class ExaoneMoEMLP(nn.Module):
             intermediate_size,
             hidden_size,
             bias=False,
-            quant_config=quant_config,
+            quant_config=down_quant_config,
             reduce_results=reduce_results,
             prefix=add_prefix("down_proj", prefix),
             tp_rank=tp_rank,
@@ -181,7 +189,6 @@ class ExaoneMoESparseMoEBlock(nn.Module):
             num_expert_group=config.n_group,
             topk_group=config.topk_group,
             correction_bias=self.e_score_correction_bias,
-            quant_config=quant_config,
             routed_scaling_factor=self.routed_scaling_factor,
             apply_routed_scaling_factor_on_output=True,
             scoring_func="sigmoid",
@@ -342,13 +349,21 @@ class ExaoneMoEAttention(nn.Module):
         self.scaling = self.head_dim**-0.5
         self.max_position_embeddings = max_position_embeddings
 
+        qkv_quant_config = quant_config
+        o_quant_config = quant_config
+        if quant_config and hasattr(quant_config, "ignore") and quant_config.ignore:
+            if add_prefix("q_proj", prefix) in quant_config.ignore:
+                qkv_quant_config = None
+            if add_prefix("o_proj", prefix) in quant_config.ignore:
+                o_quant_config = None
+
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
             self.head_dim,
             self.total_num_heads,
             self.total_num_kv_heads,
             bias=bias,
-            quant_config=quant_config,
+            quant_config=qkv_quant_config,
             prefix=add_prefix("qkv_proj", prefix),
             tp_rank=attn_tp_rank,
             tp_size=attn_tp_size,
@@ -357,7 +372,7 @@ class ExaoneMoEAttention(nn.Module):
             self.total_num_heads * self.head_dim,
             hidden_size,
             bias=bias,
-            quant_config=quant_config,
+            quant_config=o_quant_config,
             prefix=add_prefix("o_proj", prefix),
             tp_rank=attn_tp_rank,
             tp_size=attn_tp_size,
