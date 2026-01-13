@@ -671,12 +671,12 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
                             profile_output_dir=bench_args.profile_output_dir,
                         )
                     )
-
-                # Replace the profile link
-                for res, profile_res in zip(results, profile_results):
-                    res.profile_link = profile_res.profile_link
             except Exception as e:
-                print(f"Error profiling, there will be no profile trace dump: {e}")
+                print(f"Error profiling, some profile traces may not be dumped: {e}")
+
+            # Replace the profile link for any successful profile results
+            for res, profile_res in zip(results, profile_results, strict=False):
+                res.profile_link = profile_res.profile_link
     finally:
         if proc:
             kill_process_tree(proc.pid)
