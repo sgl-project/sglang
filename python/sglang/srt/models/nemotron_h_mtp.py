@@ -12,9 +12,6 @@
 # limitations under the License.
 # ==============================================================================
 
-"""Inference-only NemotronH MTP (Multi-Token Prediction) model."""
-
-import logging
 from collections.abc import Iterable
 from typing import Optional
 
@@ -40,17 +37,13 @@ from sglang.srt.models.nemotron_h import (
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix
 
-logger = logging.getLogger(__name__)
-
 
 class NemotronHMTPAttentionDecoderLayer(NemotronHAttentionDecoderLayer):
-    """MTP Attention decoder layer with start projections and end norm."""
-
     def __init__(
         self,
         config: NemotronHConfig,
         layer_idx: int,
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         has_start_projections: bool = False,
         has_end_norm: bool = False,
@@ -92,34 +85,28 @@ class NemotronHMTPAttentionDecoderLayer(NemotronHAttentionDecoderLayer):
         *,
         inputs_embeds: torch.Tensor,
         hidden_states: torch.Tensor,
-        residual: Optional[torch.Tensor],
+        residual: torch.Tensor | None = None,
         forward_batch: ForwardBatch,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # Start projections (Fusion)
         if self.has_start_projections:
-            # Normalize both inputs before fusion
             inputs_embeds_normed = self.enorm(inputs_embeds)
             previous_hidden_states_normed = self.hnorm(hidden_states)
 
-            # Fuse via concatenation and linear projection
             fused = torch.cat(
                 [inputs_embeds_normed, previous_hidden_states_normed], dim=-1
             )
             hidden_states, _ = self.eh_proj(fused)
 
-        # Call parent forward (Attention)
-        # Parent forward expects: hidden_states, residual, forward_batch
         hidden_states, residual = super().forward(
             hidden_states=hidden_states,
             residual=residual,
             forward_batch=forward_batch,
         )
 
-        # End norm
         if self.has_end_norm:
             if residual is not None:
                 hidden_states = hidden_states + residual
-                residual = None  # Consumed residual
+                residual = None
 
             hidden_states = self.final_layernorm(hidden_states)
 
@@ -127,13 +114,11 @@ class NemotronHMTPAttentionDecoderLayer(NemotronHAttentionDecoderLayer):
 
 
 class NemotronHMTPMoEDecoderLayer(NemotronHMoEDecoderLayer):
-    """MTP MoE decoder layer with start projections and end norm."""
-
     def __init__(
         self,
         config: NemotronHConfig,
         layer_idx: int,
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         has_start_projections: bool = False,
         has_end_norm: bool = False,
@@ -151,7 +136,6 @@ class NemotronHMTPMoEDecoderLayer(NemotronHMoEDecoderLayer):
             self.enorm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
             self.hnorm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
 
-            # Fusion layer to combine embeddings with target hidden states
             self.eh_proj = ColumnParallelLinear(
                 input_size=config.hidden_size * 2,
                 output_size=config.hidden_size,
@@ -175,33 +159,28 @@ class NemotronHMTPMoEDecoderLayer(NemotronHMoEDecoderLayer):
         *,
         inputs_embeds: torch.Tensor,
         hidden_states: torch.Tensor,
-        residual: Optional[torch.Tensor],
+        residual: torch.Tensor | None = None,
         forward_batch: ForwardBatch,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # Start projections (Fusion)
         if self.has_start_projections:
-            # Normalize both inputs before fusion
             inputs_embeds_normed = self.enorm(inputs_embeds)
             previous_hidden_states_normed = self.hnorm(hidden_states)
 
-            # Fuse via concatenation and linear projection
             fused = torch.cat(
                 [inputs_embeds_normed, previous_hidden_states_normed], dim=-1
             )
             hidden_states, _ = self.eh_proj(fused)
 
-        # Call parent forward (MoE)
         hidden_states, residual = super().forward(
             hidden_states=hidden_states,
             residual=residual,
             forward_batch=forward_batch,
         )
 
-        # End norm
         if self.has_end_norm:
             if residual is not None:
                 hidden_states = hidden_states + residual
-                residual = None  # Consumed residual
+                residual = None
 
             hidden_states = self.final_layernorm(hidden_states)
 
@@ -209,12 +188,10 @@ class NemotronHMTPMoEDecoderLayer(NemotronHMoEDecoderLayer):
 
 
 class NemotronHMultiTokenPredictor(nn.Module):
-    """MTP predictor with NemotronH layers."""
-
     def __init__(
         self,
         config: NemotronHConfig,
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -280,7 +257,6 @@ class NemotronHMultiTokenPredictor(nn.Module):
     def forward(
         self,
         input_ids: torch.Tensor,
-        positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         inputs_embeds: torch.Tensor | None = None,
@@ -301,12 +277,10 @@ class NemotronHMultiTokenPredictor(nn.Module):
 
 
 class NemotronHForCausalLMMTP(NemotronHForCausalLM):
-    """NemotronH MTP model."""
-
     def __init__(
         self,
         config: NemotronHConfig,
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ):
         nn.Module.__init__(self)
@@ -321,14 +295,12 @@ class NemotronHForCausalLMMTP(NemotronHForCausalLM):
         # doesn't use Mamba2AttnBackend (MTP has no Mamba layers)
         config.hybrid_override_pattern = config.mtp_hybrid_override_pattern
 
-        # MTP predictor
         self.model = NemotronHMultiTokenPredictor(
             config=config,
             quant_config=quant_config,
             prefix=add_prefix("model", prefix),
         )
 
-        # LM head for generating logits
         self.lm_head = ParallelLMHead(
             self.config.vocab_size,
             self.config.hidden_size,
@@ -348,13 +320,10 @@ class NemotronHForCausalLMMTP(NemotronHForCausalLM):
         input_embeds: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
-        """Forward - applies attention-based MTP."""
-        # TODO smor- check if this is correct
         hidden_states = forward_batch.spec_info.hidden_states
 
         hidden_states = self.model(
             input_ids,
-            positions,
             hidden_states,
             forward_batch,
             input_embeds,
