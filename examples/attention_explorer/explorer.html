@@ -208,6 +208,111 @@
 
         .btn-primary:disabled { opacity: 0.4; cursor: not-allowed; }
 
+        .btn-small {
+            padding: 6px 10px;
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            background: var(--surface);
+            color: var(--text);
+            font-size: 12px;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .btn-small:hover {
+            background: var(--hover);
+            border-color: var(--cyan);
+        }
+
+        /* Layer Heatmap Modal */
+        .modal-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0, 0, 0, 0.8);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            z-index: 1000;
+        }
+
+        .modal-content {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 24px;
+            max-width: 800px;
+            max-height: 80vh;
+            overflow: auto;
+        }
+
+        .modal-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+        }
+
+        .modal-title {
+            font-size: 16px;
+            font-weight: 600;
+            color: var(--text);
+        }
+
+        .modal-close {
+            background: none;
+            border: none;
+            font-size: 24px;
+            color: var(--text-dim);
+            cursor: pointer;
+        }
+
+        .layer-heatmap {
+            display: grid;
+            gap: 4px;
+        }
+
+        .layer-row {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .layer-label {
+            width: 80px;
+            font-size: 11px;
+            color: var(--text-dim);
+            text-align: right;
+        }
+
+        .layer-bar {
+            flex: 1;
+            height: 24px;
+            background: var(--void);
+            border-radius: 4px;
+            overflow: hidden;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .layer-bar:hover {
+            transform: scaleY(1.2);
+        }
+
+        .layer-fill {
+            height: 100%;
+            background: linear-gradient(90deg, var(--cyan), var(--magenta));
+            transition: width 0.3s;
+        }
+
+        .layer-value {
+            width: 60px;
+            font-size: 11px;
+            color: var(--text);
+        }
+
         .btn-ghost {
             background: transparent;
             color: var(--text-dim);
@@ -689,6 +794,15 @@
                         <div class="toggle" id="wordModeToggle"></div>
                         <span class="toggle-label">Aggregate to word-level</span>
                     </div>
+                    <div class="setting full" id="layerControlSection" style="display: none;">
+                        <label>Layer Filter</label>
+                        <div style="display: flex; align-items: center; gap: 10px;">
+                            <select id="layerSelect" onchange="filterByLayer()">
+                                <option value="all">All Layers</option>
+                            </select>
+                            <button class="btn-small" onclick="showLayerHeatmap()" title="Show layer heatmap">📊</button>
+                        </div>
+                    </div>
                 </div>
             </div>
 
@@ -981,6 +1095,7 @@
 
                 hideLoading();
                 updateStats();
+                updateLayerControls();
 
             } catch (error) {
                 console.error('Analysis error:', error);
@@ -1242,7 +1357,10 @@
             if (!srcPos) return;
 
             // Draw edges this token attends to (cyan)
-            const outEdges = state.adjacencyOut[state.selectedToken] || [];
+            // Apply layer filter if set
+            const layerFilter = state.selectedLayer === 'all' ? null : parseInt(state.selectedLayer);
+            const outEdges = (state.adjacencyOut[state.selectedToken] || [])
+                .filter(e => layerFilter === null || e.layer === layerFilter);
             outEdges.filter(e => e.weight >= threshold).forEach(edge => {
                 const dstPos = getTokenPos(edge.dst);
                 if (!dstPos) return;
@@ -1263,7 +1381,9 @@
             });
 
             // Draw edges that attend to this token (lime)
-            const inEdges = state.adjacencyIn[state.selectedToken] || [];
+            // Apply layer filter to incoming edges as well
+            const inEdges = (state.adjacencyIn[state.selectedToken] || [])
+                .filter(e => layerFilter === null || e.layer === layerFilter);
             inEdges.filter(e => e.weight >= threshold).forEach(edge => {
                 const dstPos = getTokenPos(edge.src);
                 if (!dstPos) return;
@@ -1301,11 +1421,17 @@
             if (selectedEl) selectedEl.classList.add('selected');
 
             // Aggregate edges for all tokens in the word (if in word mode)
+            // Apply layer filter if set
+            const layerFilter = state.selectedLayer === 'all' ? null : parseInt(state.selectedLayer);
             let outEdges = [];
             let inEdges = [];
             state.selectedTokenIndices.forEach(tokenIdx => {
-                outEdges = outEdges.concat(state.adjacencyOut[tokenIdx] || []);
-                inEdges = inEdges.concat(state.adjacencyIn[tokenIdx] || []);
+                const out = (state.adjacencyOut[tokenIdx] || [])
+                    .filter(e => layerFilter === null || e.layer === layerFilter);
+                const inn = (state.adjacencyIn[tokenIdx] || [])
+                    .filter(e => layerFilter === null || e.layer === layerFilter);
+                outEdges = outEdges.concat(out);
+                inEdges = inEdges.concat(inn);
             });
 
             // Deduplicate and aggregate by destination/source
@@ -1374,9 +1500,15 @@
             }
 
             const token = state.tokens.find(t => t.idx === state.selectedToken);
-            const edges = state.detailTab === 'attends'
+
+            // Apply layer filter if set
+            const layerFilter = state.selectedLayer === 'all' ? null : parseInt(state.selectedLayer);
+            const rawEdges = state.detailTab === 'attends'
                 ? (state.adjacencyOut[state.selectedToken] || [])
                 : (state.adjacencyIn[state.selectedToken] || []);
+            const edges = layerFilter === null
+                ? rawEdges
+                : rawEdges.filter(e => e.layer === layerFilter);
 
             const sorted = [...edges].sort((a, b) => b.weight - a.weight);
 
@@ -1654,6 +1786,129 @@
             return words;
         }
 
+        // Layer filtering and visualization
+        state.selectedLayer = 'all';
+        state.layerStats = {};
+
+        function updateLayerControls() {
+            const layers = new Set(state.edges.map(e => e.layer));
+            const select = document.getElementById('layerSelect');
+            const section = document.getElementById('layerControlSection');
+
+            if (layers.size <= 1) {
+                section.style.display = 'none';
+                return;
+            }
+
+            section.style.display = 'block';
+
+            // Build layer options
+            const sortedLayers = Array.from(layers).sort((a, b) => a - b);
+            select.innerHTML = '<option value="all">All Layers (' + layers.size + ')</option>';
+            sortedLayers.forEach(layer => {
+                const edgeCount = state.edges.filter(e => e.layer === layer).length;
+                select.innerHTML += `<option value="${layer}">Layer ${layer} (${edgeCount} edges)</option>`;
+            });
+
+            // Compute layer statistics
+            state.layerStats = {};
+            sortedLayers.forEach(layer => {
+                const layerEdges = state.edges.filter(e => e.layer === layer);
+                const totalWeight = layerEdges.reduce((sum, e) => sum + e.weight, 0);
+                const avgWeight = layerEdges.length > 0 ? totalWeight / layerEdges.length : 0;
+                state.layerStats[layer] = {
+                    edgeCount: layerEdges.length,
+                    totalWeight: totalWeight,
+                    avgWeight: avgWeight,
+                    maxWeight: Math.max(...layerEdges.map(e => e.weight), 0)
+                };
+            });
+        }
+
+        function filterByLayer() {
+            const select = document.getElementById('layerSelect');
+            state.selectedLayer = select.value;
+
+            // Re-render with layer filter
+            renderEdges();
+
+            // Update token highlighting based on filtered edges
+            document.querySelectorAll('.token').forEach(el => {
+                el.classList.remove('attended-to', 'attends-from');
+            });
+
+            if (state.selectedToken !== null) {
+                selectToken(state.selectedToken, state.selectedTokenIndices);
+            }
+        }
+
+        function getFilteredEdges() {
+            if (state.selectedLayer === 'all') {
+                return state.edges;
+            }
+            return state.edges.filter(e => e.layer === parseInt(state.selectedLayer));
+        }
+
+        function showLayerHeatmap() {
+            const layers = Object.keys(state.layerStats).sort((a, b) => a - b);
+            if (layers.length === 0) {
+                alert('No layer data available. Generate some attention first.');
+                return;
+            }
+
+            const maxEdges = Math.max(...layers.map(l => state.layerStats[l].edgeCount));
+            const maxWeight = Math.max(...layers.map(l => state.layerStats[l].totalWeight));
+
+            const modal = document.createElement('div');
+            modal.className = 'modal-overlay';
+            modal.onclick = (e) => { if (e.target === modal) modal.remove(); };
+
+            let heatmapHtml = '';
+            layers.forEach(layer => {
+                const stats = state.layerStats[layer];
+                const edgePct = (stats.edgeCount / maxEdges * 100).toFixed(0);
+                const weightPct = (stats.totalWeight / maxWeight * 100).toFixed(0);
+
+                heatmapHtml += `
+                    <div class="layer-row" onclick="selectLayerFromHeatmap(${layer})">
+                        <div class="layer-label">Layer ${layer}</div>
+                        <div class="layer-bar" title="Click to filter">
+                            <div class="layer-fill" style="width: ${weightPct}%"></div>
+                        </div>
+                        <div class="layer-value">${stats.edgeCount} edges</div>
+                    </div>
+                `;
+            });
+
+            modal.innerHTML = `
+                <div class="modal-content">
+                    <div class="modal-header">
+                        <div class="modal-title">Layer-by-Layer Attention Distribution</div>
+                        <button class="modal-close" onclick="this.closest('.modal-overlay').remove()">&times;</button>
+                    </div>
+                    <div style="margin-bottom: 16px; color: var(--text-dim); font-size: 12px;">
+                        Bar width shows relative attention weight per layer. Click a layer to filter.
+                    </div>
+                    <div class="layer-heatmap">
+                        ${heatmapHtml}
+                    </div>
+                    <div style="margin-top: 20px; display: flex; gap: 10px;">
+                        <button class="btn-small" onclick="document.getElementById('layerSelect').value='all'; filterByLayer(); this.closest('.modal-overlay').remove();">
+                            Show All Layers
+                        </button>
+                    </div>
+                </div>
+            `;
+
+            document.body.appendChild(modal);
+        }
+
+        function selectLayerFromHeatmap(layer) {
+            document.getElementById('layerSelect').value = layer.toString();
+            filterByLayer();
+            document.querySelector('.modal-overlay')?.remove();
+        }
+
         // UI Helpers
         function showLoading(text) {
             document.getElementById('emptyState').style.display = 'none';
@@ -1690,12 +1945,15 @@
             state.adjacencyOut = {};
             state.adjacencyIn = {};
             state.selectedToken = null;
+            state.selectedLayer = 'all';
+            state.layerStats = {};
 
             document.getElementById('canvasContainer').style.display = 'none';
             document.getElementById('emptyState').style.display = 'flex';
             document.getElementById('selectedTokenText').textContent = 'Select a token';
             document.getElementById('selectedTokenMeta').textContent = 'Click any token to see its attention patterns';
             document.getElementById('attentionList').innerHTML = '';
+            document.getElementById('layerControlSection').style.display = 'none';
             updateStats();
         }
 
