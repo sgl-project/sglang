@@ -200,9 +200,10 @@ class CohereAttention(nn.Module):
         )
 
         self.v1 = isinstance(config, CohereConfig)
+        self.v2 = isinstance(config, Cohere2Config)
 
         # Model v2 has interleaved sliding windows, v1 does not
-        if isinstance(config, Cohere2Config) and config.layer_types[layer_id] == "sliding_attention":
+        if self.v2 and config.layer_types[layer_id] == "sliding_attention":
             self.sliding_window_size = config.sliding_window
         else:
             self.sliding_window_size = -1
