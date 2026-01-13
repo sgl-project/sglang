@@ -3,13 +3,15 @@ use std::{
     sync::OnceLock,
     time::Duration,
 };
+
 use redis::RedisError;
 use tracing::{info, warn};
 
 static SHARED_SERVER: OnceLock<RedisTestServer> = OnceLock::new();
 
 pub fn get_shared_server() -> &'static RedisTestServer {
-    let server = SHARED_SERVER.get_or_init(|| RedisTestServer::start().expect("Failed to start shared Redis server"));
+    let server = SHARED_SERVER
+        .get_or_init(|| RedisTestServer::start().expect("Failed to start shared Redis server"));
     server.wait_ready();
     server
 }
@@ -110,10 +112,7 @@ mod tests {
             .query(&mut conn)
             .unwrap();
 
-        let value: String = redis::cmd("GET")
-            .arg("test_key")
-            .query(&mut conn)
-            .unwrap();
+        let value: String = redis::cmd("GET").arg("test_key").query(&mut conn).unwrap();
         assert_eq!(value, "test_value");
     }
 }
