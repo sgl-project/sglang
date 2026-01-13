@@ -58,9 +58,9 @@ pub fn create_test_app(
         router_config.worker_startup_check_interval_secs,
     )));
 
-    // Create empty OnceLock for worker job queue and workflow engine
+    // Create empty OnceLock for worker job queue and workflow engines
     let worker_job_queue = Arc::new(OnceLock::new());
-    let workflow_engine = Arc::new(OnceLock::new());
+    let workflow_engines = Arc::new(OnceLock::new());
 
     // Create AppContext using builder pattern
     let app_context = Arc::new(
@@ -78,7 +78,7 @@ pub fn create_test_app(
             .conversation_item_storage(conversation_item_storage)
             .load_monitor(load_monitor)
             .worker_job_queue(worker_job_queue)
-            .workflow_engine(workflow_engine)
+            .workflow_engines(workflow_engines)
             .build()
             .unwrap(),
     );
@@ -168,7 +168,7 @@ pub async fn create_test_app_context() -> Arc<AppContext> {
 
     // Initialize empty OnceLocks
     let worker_job_queue = Arc::new(OnceLock::new());
-    let workflow_engine = Arc::new(OnceLock::new());
+    let workflow_engines = Arc::new(OnceLock::new());
 
     // Initialize MCP manager with empty config
     let mcp_manager_lock = Arc::new(OnceLock::new());
@@ -208,7 +208,7 @@ pub async fn create_test_app_context() -> Arc<AppContext> {
             .conversation_item_storage(conversation_item_storage)
             .load_monitor(None)
             .worker_job_queue(worker_job_queue)
-            .workflow_engine(workflow_engine)
+            .workflow_engines(workflow_engines)
             .mcp_manager(mcp_manager_lock)
             .build()
             .unwrap(),
