@@ -1,15 +1,16 @@
 /* Copyright 2025 SGLang Team. */
-#include <sgl_kernel/tensor.h>   // For TensorMatcher, SymbolicSize, SymbolicDevice
-#include <sgl_kernel/utils.cuh>  // For LaunchKernel
-#include <sgl_kernel/utils.h>    // For div_ceil, RuntimeCheck
-#include <sgl_kernel/vec.cuh>    // For aligned_vector
+#include <sgl_kernel/tensor.h>
+#include <sgl_kernel/utils.h>
 
-#include <cuda_fp16.h>
+#include <sgl_kernel/utils.cuh>
+#include <sgl_kernel/vec.cuh>
+
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
 #include <tvm/ffi/optional.h>
 
 #include "cutlass/numeric_types.h"
+#include <cuda_fp16.h>
 
 namespace {
 
