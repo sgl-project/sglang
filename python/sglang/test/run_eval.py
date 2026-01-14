@@ -282,6 +282,12 @@ if __name__ == "__main__":
         default=5,
         help="Number of few-shot examples for GSM8K (default: 5)",
     )
+    parser.add_argument(
+        "--gsm8k-data-path",
+        type=str,
+        default=None,
+        help="Path to GSM8K data file (e.g., test.jsonl)",
+    )
 
     args = parser.parse_args()
 

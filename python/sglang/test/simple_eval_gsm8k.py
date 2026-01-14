@@ -19,27 +19,24 @@ INVALID = -9999999
 
 
 def get_one_example(lines, i, include_answer):
-    ret = "Question: " + lines[i]["question"] + "\nAnswer:"
+    ret = f"Question: {lines[i]['question']}\nAnswer:"
     if include_answer:
-        ret += " " + lines[i]["answer"]
+        ret += f" {lines[i]['answer']}"
     return ret
 
 
 def get_few_shot_examples(lines, k):
-    ret = ""
-    for i in range(k):
-        ret += get_one_example(lines, i, True) + "\n\n"
-    return ret
+    return "".join(get_one_example(lines, i, True) + "\n\n" for i in range(k))
 
 
 def get_answer_value(answer_str):
     answer_str = answer_str.replace(",", "")
-    numbers = re.findall(r"\d+", answer_str)
+    numbers = re.findall(r"-?\d+\.?\d*", answer_str)
     if len(numbers) < 1:
         return INVALID
     try:
         return ast.literal_eval(numbers[-1])
-    except SyntaxError:
+    except (SyntaxError, ValueError):
         return INVALID
 
 
@@ -49,15 +46,21 @@ class GSM8KEval(Eval):
         num_examples: Optional[int] = None,
         num_threads: int = 64,
         num_shots: int = 5,
+        data_path: Optional[str] = None,
     ):
         self._num_threads = num_threads
         self._num_shots = num_shots
 
-        filename = download_and_cache_file(GSM8K_URL)
+        if data_path:
+            filename = data_path
+        else:
+            filename = download_and_cache_file(GSM8K_URL)
 
         self._lines = list(read_jsonl(filename))
         self._few_shot_prompt = get_few_shot_examples(self._lines, num_shots)
 
+        # The evaluation data should not include the few-shot examples to prevent data leakage.
+        self._lines = self._lines[num_shots:]
         if num_examples is not None:
             self._lines = self._lines[:num_examples]
 
