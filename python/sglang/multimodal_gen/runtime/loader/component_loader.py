@@ -735,6 +735,7 @@ class TransformerLoader(ComponentLoader):
             reduce_dtype=torch.float32,
             output_dtype=None,
             strict=False,
+            layerwise_offload=server_args.dit_layerwise_offload,
         )
 
         total_params = sum(p.numel() for p in model.parameters())

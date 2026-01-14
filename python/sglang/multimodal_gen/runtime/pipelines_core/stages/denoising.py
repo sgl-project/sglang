@@ -705,16 +705,12 @@ class DenoisingStage(PipelineStage):
             latents, batch
         )
 
-        offload_mgr = getattr(self.transformer, "_layerwise_offload_manager", None)
-        if offload_mgr is not None and getattr(offload_mgr, "enabled", False):
-            offload_mgr.release_all()
-
-        if self.transformer_2 is not None:
-            offload_mgr_2 = getattr(
-                self.transformer_2, "_layerwise_offload_manager", None
-            )
-            if offload_mgr_2 is not None and getattr(offload_mgr_2, "enabled", False):
-                offload_mgr_2.release_all()
+        # release all layerwise offloaded layers
+        for dit in filter(None, [self.transformer, self.transformer_2]):
+            if isinstance(dit, OffloadableDiTMixin) and dit.layerwise_offload_managers:
+                for manager in dit.layerwise_offload_managers:
+                    if manager.enabled:
+                        manager.release_all()
 
         # Save STA mask search results if needed
         if (

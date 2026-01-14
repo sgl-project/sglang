@@ -80,6 +80,7 @@ def maybe_load_fsdp_model(
     output_dtype: torch.dtype | None = None,
     pin_cpu_memory: bool = True,
     strict: bool = True,
+    layerwise_offload: bool = False,
 ) -> torch.nn.Module:
     """
     Load the model with FSDP if is training, else load the model without FSDP.
@@ -109,6 +110,11 @@ def maybe_load_fsdp_model(
     if current_platform.is_mps():
         use_fsdp = False
         logger.info("Disabling FSDP for MPS platform as it's not compatible")
+
+    if layerwise_offload:
+        cpu_offload = True
+        logger.info("Layerwise offload enabled, loading model to CPU first")
+        device = torch.device("cpu")
 
     if use_fsdp:
         world_size = hsdp_replicate_dim * hsdp_shard_dim

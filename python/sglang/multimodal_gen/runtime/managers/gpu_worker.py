@@ -107,6 +107,10 @@ class GPUWorker:
                         f"Module {type(dit).__name__} does not support layerwise offload. Skipping."
                     )
 
+            # Clear GPU cache to release memory from offloaded layers
+            torch.cuda.empty_cache()
+            logger.info("Cleared GPU cache after layerwise offload initialization")
+
         logger.info(
             f"Worker {self.rank}: Initialized device, model, and distributed environment."
         )
