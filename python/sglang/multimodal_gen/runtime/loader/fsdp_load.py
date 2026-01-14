@@ -181,8 +181,6 @@ def shard_model(
             which modules to shard with FSDP.
         pin_cpu_memory (bool): If set to True, FSDP will pin the CPU memory of the offloaded parameters.
 
-    Raises:
-        ValueError: If no layer modules were sharded, indicating that no shard_condition was triggered.
     """
     if fsdp_shard_conditions is None or len(fsdp_shard_conditions) == 0:
         logger.warning(
@@ -244,8 +242,6 @@ def load_model_from_full_model_state_dict(
             * **missing_keys** is a list of str containing the missing keys
             * **unexpected_keys** is a list of str containing the unexpected keys
 
-    Raises:
-        NotImplementedError: If got FSDP with more than 1D.
     """
     meta_sd = model.state_dict()
     param_dict = dict(model.named_parameters())
