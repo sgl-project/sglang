@@ -109,6 +109,7 @@ QUANTIZATION_CHOICES = [
     "auto-round",
     "compressed-tensors",  # for Ktransformers
     "modelslim",  # for NPU
+    "quark_int4fp8_moe",
 ]
 
 SPECULATIVE_DRAFT_MODEL_QUANTIZATION_CHOICES = [*QUANTIZATION_CHOICES, "unquant"]
@@ -370,6 +371,7 @@ class ServerArgs:
 
     # API related
     api_key: Optional[str] = None
+    admin_api_key: Optional[str] = None
     served_model_name: Optional[str] = None
     weight_version: str = "default"
     chat_template: Optional[str] = None
@@ -3249,6 +3251,15 @@ class ServerArgs:
             type=str,
             default=ServerArgs.api_key,
             help="Set API key of the server. It is also used in the OpenAI API compatible server.",
+        )
+        parser.add_argument(
+            "--admin-api-key",
+            type=str,
+            default=ServerArgs.admin_api_key,
+            help=(
+                "Set admin API key for sensitive management endpoints (e.g. /clear_hicache_storage_backend). "
+                "When set, admin endpoints require this key and do NOT accept --api-key."
+            ),
         )
         parser.add_argument(
             "--served-model-name",
