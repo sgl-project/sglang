@@ -1005,22 +1005,76 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         image_noise_mask: Optional[List[List[int]]] = None,
         **kwargs,
     ):
+
         assert patch_size in self.all_patch_size
         assert f_patch_size in self.all_f_patch_size
 
+        # TODO: hard code bsz1
+        assert len(hidden_states) == 1, f"{len(hidden_states)=}"
+        assert len(encoder_hidden_states) == 1, f"{len(encoder_hidden_states)=}"
+        assert siglip_feats is None or len(siglip_feats) == 1, f"{len(siglip_feats)=}"
+
         x = hidden_states
+
+        # omni_mode = isinstance(x[0], list)
+        # TODO: test base mode only for now.
+        omni_mode = False
+        device = x[0][-1].device if omni_mode else x[0].device
+
         cap_feats = encoder_hidden_states
         timestep = 1000.0 - timestep
         t = timestep
-        bsz = 1
-        device = x[0].device
-        t = self.t_embedder(t)
-        adaln_input = t.type_as(x)
-        (
-            x,
-            cap_feats,
-            x_size,
-        ) = self.patchify_and_embed(x, cap_feats, patch_size, f_patch_size)
+
+        if omni_mode:
+            # Dual embeddings: noisy (t) and clean (t=1)
+            t_noisy = self.t_embedder(t).type_as(x[0][-1])
+            t_clean = self.t_embedder(torch.ones_like(t) * self.t_scale).type_as(
+                x[0][-1]
+            )
+            adaln_input = None
+        else:
+            # Single embedding for all tokens
+            adaln_input = self.t_embedder(t).type_as(x[0])
+            t_noisy = t_clean = None
+
+        # TODO: only freq compute test.
+
+        # Patchify
+        if omni_mode:
+            (
+                x,
+                cap_feats,
+                x_size,
+                siglip_feats,
+                x_pos_offsets,
+                x_noise_mask,
+                cap_noise_mask,
+                siglip_noise_mask,
+            ) = self.patchify_and_embed_omni(
+                x,
+                cap_feats,
+                patch_size,
+                f_patch_size,
+                siglip_feats,
+                image_noise_mask,
+            )
+        else:
+            (
+                x,
+                cap_feats,
+                x_size,
+            ) = self.patchify_and_embed(x, cap_feats, patch_size, f_patch_size)
+            x_pos_offsets = x_noise_mask = cap_noise_mask = siglip_noise_mask = None
+
+        # TODO: debug assert
+        assert isinstance(x, list) and isinstance(x[0], torch.Tensor), f"{type(x)=}"
+        assert isinstance(cap_feats, list) and isinstance(
+            cap_feats[0], torch.Tensor
+        ), f"{type(cap_feats)=}"
+        assert siglip_feats is None or (
+            isinstance(siglip_feats, list) and isinstance(siglip_feats[0], torch.Tensor)
+        ), f"{type(siglip_feats)=}"
+        assert len(x_size) == 1, f"bsz should be 1. got {len(x_size)=}"
 
         x = torch.cat(x, dim=0)
         x, _ = self.all_x_embedder[f"{patch_size}-{f_patch_size}"](x)
