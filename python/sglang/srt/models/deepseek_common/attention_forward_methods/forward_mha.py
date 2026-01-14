@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from typing import TYPE_CHECKING
 
 import torch
@@ -79,7 +81,7 @@ if _use_aiter_gfx95:
 
 class DeepseekMHAForwardMixin:
 
-    def init_mha_forward(self: "DeepseekV2AttentionMLA"):
+    def init_mha_forward(self: DeepseekV2AttentionMLA):
         self.disable_chunked_prefix_cache = (
             get_global_server_args().disable_chunked_prefix_cache
         )
@@ -90,7 +92,7 @@ class DeepseekMHAForwardMixin:
         )
 
     def forward_normal_prepare(
-        self: "DeepseekV2AttentionMLA",
+        self: DeepseekV2AttentionMLA,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
@@ -213,7 +215,7 @@ class DeepseekMHAForwardMixin:
         return q, k, v, forward_batch
 
     def forward_normal_core(
-        self: "DeepseekV2AttentionMLA",
+        self: DeepseekV2AttentionMLA,
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
@@ -225,7 +227,7 @@ class DeepseekMHAForwardMixin:
         return output
 
     def forward_normal_chunked_kv_prepare(
-        self: "DeepseekV2AttentionMLA",
+        self: DeepseekV2AttentionMLA,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
@@ -243,7 +245,7 @@ class DeepseekMHAForwardMixin:
         )
 
     def forward_normal_chunked_kv_core(
-        self: "DeepseekV2AttentionMLA",
+        self: DeepseekV2AttentionMLA,
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
@@ -279,7 +281,7 @@ class DeepseekMHAForwardMixin:
         return output
 
     def forward_normal_one_shot_prepare(
-        self: "DeepseekV2AttentionMLA",
+        self: DeepseekV2AttentionMLA,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
@@ -291,7 +293,7 @@ class DeepseekMHAForwardMixin:
         )
 
     def forward_normal_one_shot_core(
-        self: "DeepseekV2AttentionMLA",
+        self: DeepseekV2AttentionMLA,
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
@@ -309,7 +311,7 @@ class DeepseekMHAForwardMixin:
         return self.forward_normal_core(q, k, v, forward_batch)
 
     def _chunked_prefix_attn_mha(
-        self: "DeepseekV2AttentionMLA",
+        self: DeepseekV2AttentionMLA,
         q: torch.Tensor,
         accum_output: torch.Tensor,
         accum_lse: torch.Tensor,
@@ -354,7 +356,7 @@ class DeepseekMHAForwardMixin:
         return accum_output
 
     def _set_mla_kv_buffer(
-        self: "DeepseekV2AttentionMLA",
+        self: DeepseekV2AttentionMLA,
         latent_cache: torch.Tensor,
         kv_a: torch.Tensor,
         k_pe: torch.Tensor,
@@ -380,7 +382,7 @@ class DeepseekMHAForwardMixin:
             )
 
     def _get_mla_kv_buffer(
-        self: "DeepseekV2AttentionMLA",
+        self: DeepseekV2AttentionMLA,
         kv_indices: torch.Tensor,
         dst_dtype: torch.dtype,
         forward_batch: ForwardBatch,
@@ -403,7 +405,7 @@ class DeepseekMHAForwardMixin:
         return kv_a, k_pe
 
     def _get_mla_kv_buffer_from_fp8_for_nsa(
-        self: "DeepseekV2AttentionMLA",
+        self: DeepseekV2AttentionMLA,
         forward_batch: ForwardBatch,
     ):
         """
@@ -431,7 +433,7 @@ class DeepseekMHAForwardMixin:
         return kv_a, k_pe
 
     def _concat_and_cast_mha_k(
-        self: "DeepseekV2AttentionMLA",
+        self: DeepseekV2AttentionMLA,
         k_nope: torch.Tensor,
         k_pe: torch.Tensor,
         forward_batch: ForwardBatch,
