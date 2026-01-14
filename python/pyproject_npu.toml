@@ -78,7 +78,6 @@ diffusion = [
     "moviepy>=2.0.0",
     "opencv-python==4.10.0.84",
     "remote-pdb",
-    #"yunchang==0.6.3.post1", # for now need to install yunchang from sources
     "cache-dit==1.1.8"
 ]
 

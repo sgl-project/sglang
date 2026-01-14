@@ -63,9 +63,6 @@ chmod a+x ./CANN-custom_ops-8.2.0.0-$DEVICE_TYPE-linux.aarch64.run
 wget https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/ops/custom_ops-1.0.$DEVICE_TYPE-cp311-cp311-linux_aarch64.whl
 pip install ./custom_ops-1.0.$DEVICE_TYPE-cp311-cp311-linux_aarch64.whl
 
-git clone https://github.com/feifeibear/long-context-attention.git long-context-attention
-(cd long-context-attention && git checkout 7a52abd669efb35e550680a239e1745b620b2bae && ${PIP_INSTALL} .)
-
 ### Install SGLang
 rm -rf python/pyproject.toml && mv python/pyproject_npu.toml python/pyproject.toml
 ${PIP_INSTALL} -v -e "python[dev_npu]"

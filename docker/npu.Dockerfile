@@ -74,11 +74,6 @@ RUN (${PIP_INSTALL} torch==${PYTORCH_VERSION} torchvision==${TORCHVISION_VERSION
 RUN (${PIP_INSTALL} pybind11) \
     && (${PIP_INSTALL} ${TRITON_ASCEND_URL})
 
-RUN git clone https://github.com/feifeibear/long-context-attention.git long-context-attention \
-    && cd long-context-attention \
-    && git checkout 7a52abd669efb35e550680a239e1745b620b2bae \
-    && pip install .
-
 # Install SGLang
 RUN git clone ${SGLANG_REPO} --branch ${VER_SGLANG} sglang && \
     cd sglang/python && \
