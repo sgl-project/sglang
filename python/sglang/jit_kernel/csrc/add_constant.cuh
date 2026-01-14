@@ -1,6 +1,7 @@
-#include <sgl_kernel/tensor.h>   // For TensorMatcher, SymbolicSize, SymbolicDevice
+#include <sgl_kernel/tensor.h>  // For TensorMatcher, SymbolicSize, SymbolicDevice
+#include <sgl_kernel/utils.h>   // For div_ceil, RuntimeCheck
+
 #include <sgl_kernel/utils.cuh>  // For LaunchKernel
-#include <sgl_kernel/utils.h>    // For div_ceil, RuntimeCheck
 
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>

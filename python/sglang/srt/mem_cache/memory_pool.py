@@ -56,6 +56,7 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
     is_cuda,
+    is_hip,
     is_npu,
     next_power_of_2,
 )
@@ -76,6 +77,7 @@ _is_cuda = is_cuda()
 _is_npu = is_npu()
 _is_cpu = is_cpu()
 _cpu_has_amx_support = cpu_has_amx_support()
+_is_hip = is_hip()
 
 
 def get_tensor_size_bytes(t: Union[torch.Tensor, List[torch.Tensor]]):
@@ -1748,7 +1750,10 @@ class NSATokenToKVPool(MLATokenToKVPool):
         # num head == 1 and head dim == 128 for index_k in NSA
         assert index_head_dim == 128
 
-        assert self.page_size == 64
+        if _is_hip:
+            assert self.page_size == 1
+        else:
+            assert self.page_size == 64
         with (
             torch.cuda.use_mem_pool(self.custom_mem_pool)
             if self.custom_mem_pool
