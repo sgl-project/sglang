@@ -18,7 +18,8 @@ def register_image_processor(
     import inspect
 
     params_to_pass = {
-        # Before https://github.com/huggingface/transformers/pull/43195/changes, this parameter is required.
+        # Before https://github.com/huggingface/transformers/pull/43195/changes,
+        # 'image_processor_class' parameter is required.
         # Now it is deprecated.
         "image_processor_class": None,
         "slow_image_processor_class": image_processor,
