@@ -24,7 +24,8 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=89, suite="stage-b-test-small-1-gpu")
-register_amd_ci(est_time=89, suite="stage-b-test-small-1-gpu")
+register_cuda_ci(est_time=77, suite="stage-b-test-small-1-gpu-5090")
+register_amd_ci(est_time=89, suite="stage-b-test-small-1-gpu-amd")
 
 
 class TestReasoningContentAPI(CustomTestCase):

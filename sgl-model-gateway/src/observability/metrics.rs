@@ -329,6 +329,9 @@ pub(crate) fn init_metrics() {
         "Active database connections by storage_type"
     );
     describe_counter!("smg_db_items_stored", "Total items stored by storage_type");
+
+    // Initialize mesh metrics
+    crate::mesh::metrics::init_mesh_metrics();
 }
 
 pub fn start_prometheus(config: PrometheusConfig) {
@@ -495,15 +498,6 @@ impl Metrics {
             "path" => path_interned
         )
         .record(duration.as_secs_f64());
-    }
-
-    pub fn set_inflight_request_age_count(gt: &'static str, le: &'static str, count: usize) {
-        gauge!(
-            "smg_http_inflight_request_age_count",
-            "gt" => gt,
-            "le" => le
-        )
-        .set(count as f64);
     }
 
     /// Set active HTTP connections count
@@ -920,6 +914,16 @@ impl Metrics {
         let worker_interned = intern_string(worker);
         gauge!(
             "smg_worker_requests_active",
+            "worker" => worker_interned
+        )
+        .set(count as f64);
+    }
+
+    /// Set active routing keys per worker
+    pub fn set_worker_routing_keys_active(worker: &str, count: usize) {
+        let worker_interned = intern_string(worker);
+        gauge!(
+            "smg_worker_routing_keys_active",
             "worker" => worker_interned
         )
         .set(count as f64);
