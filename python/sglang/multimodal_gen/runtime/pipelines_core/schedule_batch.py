@@ -139,6 +139,16 @@ class Req:
     # results
     output: torch.Tensor | None = None
 
+    #
+    ## TODO: debug member
+    #
+
+    # for prepare_siglip_embeds
+    resized_images = None
+    condition_latents = None
+    negative_condition_latents = None
+
+
     def __init__(self, **kwargs):
         # Initialize dataclass fields
         for name, field in self.__class__.__dataclass_fields__.items():
