@@ -48,7 +48,9 @@ def _get_qkv_projections(
         # Use fused QKV projection for nunchaku quantization
         img_qkv, _ = attn.to_qkv(hidden_states)
         # Make tensors contiguous after chunk to ensure compatibility with .view() operations
-        img_query, img_key, img_value = [x.contiguous() for x in img_qkv.chunk(3, dim=-1)]
+        img_query, img_key, img_value = [
+            x.contiguous() for x in img_qkv.chunk(3, dim=-1)
+        ]
     else:
         # Use separate Q/K/V projections for non-quantized models
         img_query, _ = attn.to_q(hidden_states)
@@ -61,7 +63,9 @@ def _get_qkv_projections(
             # Use fused QKV projection for nunchaku quantization
             txt_qkv, _ = attn.to_added_qkv(encoder_hidden_states)
             # Make tensors contiguous after chunk to ensure compatibility with .view() operations
-            txt_query, txt_key, txt_value = [x.contiguous() for x in txt_qkv.chunk(3, dim=-1)]
+            txt_query, txt_key, txt_value = [
+                x.contiguous() for x in txt_qkv.chunk(3, dim=-1)
+            ]
         else:
             # Use separate Q/K/V projections for non-quantized models
             txt_query, _ = attn.add_q_proj(encoder_hidden_states)
@@ -496,20 +500,47 @@ class QwenImageCrossAttention(nn.Module):
         self.prefix = prefix
 
         # Check if using nunchaku quantization for main QKV
-        from sglang.multimodal_gen.runtime.layers.quantization.nunchaku_config import NunchakuConfig
+        from sglang.multimodal_gen.runtime.layers.quantization.nunchaku_config import (
+            NunchakuConfig,
+        )
+
         self.use_fused_qkv = isinstance(quant_config, NunchakuConfig)
-        
+
         self.inner_dim = out_dim if out_dim is not None else head_dim * num_heads
         self.inner_kv_dim = self.inner_dim
-        
+
         if self.use_fused_qkv:
             # Use fused QKV projection for nunchaku quantization
-            self.to_qkv = ReplicatedLinear(dim, self.inner_dim * 3, bias=True, quant_config=quant_config, prefix=f"{prefix}.to_qkv")
+            self.to_qkv = ReplicatedLinear(
+                dim,
+                self.inner_dim * 3,
+                bias=True,
+                quant_config=quant_config,
+                prefix=f"{prefix}.to_qkv",
+            )
         else:
             # Use separate Q/K/V projections for non-quantized models
-            self.to_q = ReplicatedLinear(dim, self.inner_dim, bias=True, quant_config=quant_config, prefix=f"{prefix}.to_q")
-            self.to_k = ReplicatedLinear(dim, self.inner_dim, bias=True, quant_config=quant_config, prefix=f"{prefix}.to_k")
-            self.to_v = ReplicatedLinear(dim, self.inner_dim, bias=True, quant_config=quant_config, prefix=f"{prefix}.to_v")
+            self.to_q = ReplicatedLinear(
+                dim,
+                self.inner_dim,
+                bias=True,
+                quant_config=quant_config,
+                prefix=f"{prefix}.to_q",
+            )
+            self.to_k = ReplicatedLinear(
+                dim,
+                self.inner_dim,
+                bias=True,
+                quant_config=quant_config,
+                prefix=f"{prefix}.to_k",
+            )
+            self.to_v = ReplicatedLinear(
+                dim,
+                self.inner_dim,
+                bias=True,
+                quant_config=quant_config,
+                prefix=f"{prefix}.to_v",
+            )
 
         if self.qk_norm:
             self.norm_q = RMSNorm(head_dim, eps=eps) if qk_norm else nn.Identity()
@@ -517,24 +548,43 @@ class QwenImageCrossAttention(nn.Module):
 
         if added_kv_proj_dim is not None:
             # Check if using nunchaku quantization
-            from sglang.multimodal_gen.runtime.layers.quantization.nunchaku_config import NunchakuConfig
+            from sglang.multimodal_gen.runtime.layers.quantization.nunchaku_config import (
+                NunchakuConfig,
+            )
+
             self.use_fused_added_qkv = isinstance(quant_config, NunchakuConfig)
-            
+
             if self.use_fused_added_qkv:
                 # Use fused QKV projection for nunchaku quantization
                 self.to_added_qkv = ReplicatedLinear(
-                    added_kv_proj_dim, self.inner_dim * 3, bias=True, quant_config=quant_config, prefix=f"{prefix}.to_added_qkv"
+                    added_kv_proj_dim,
+                    self.inner_dim * 3,
+                    bias=True,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.to_added_qkv",
                 )
             else:
                 # Use separate Q/K/V projections for non-quantized models
                 self.add_q_proj = ReplicatedLinear(
-                    added_kv_proj_dim, self.inner_dim, bias=True, quant_config=quant_config, prefix=f"{prefix}.add_q_proj"
+                    added_kv_proj_dim,
+                    self.inner_dim,
+                    bias=True,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.add_q_proj",
                 )
                 self.add_k_proj = ReplicatedLinear(
-                    added_kv_proj_dim, self.inner_dim, bias=True, quant_config=quant_config, prefix=f"{prefix}.add_k_proj"
+                    added_kv_proj_dim,
+                    self.inner_dim,
+                    bias=True,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.add_k_proj",
                 )
                 self.add_v_proj = ReplicatedLinear(
-                    added_kv_proj_dim, self.inner_dim, bias=True, quant_config=quant_config, prefix=f"{prefix}.add_v_proj"
+                    added_kv_proj_dim,
+                    self.inner_dim,
+                    bias=True,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.add_v_proj",
                 )
 
         if context_pre_only is not None and not context_pre_only:
