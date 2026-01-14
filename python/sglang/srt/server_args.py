@@ -812,15 +812,13 @@ class ServerArgs:
                 from modelscope import snapshot_download
 
                 self.model_path = snapshot_download(
-                    self.model_path,
-                    cache_dir=self.download_dir,
-                    revision=self.revision
+                    self.model_path, cache_dir=self.download_dir, revision=self.revision
                 )
                 self.tokenizer_path = snapshot_download(
-                    self.tokenizer_path, 
+                    self.tokenizer_path,
                     cache_dir=self.download_dir,
                     revision=self.revision,
-                    ignore_patterns=["*.bin", "*.safetensors"]
+                    ignore_patterns=["*.bin", "*.safetensors"],
                 )
 
         # Mamba scheduler strategy
