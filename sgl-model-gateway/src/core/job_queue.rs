@@ -590,6 +590,9 @@ impl JobQueue {
                                 health_failure_threshold: router_config
                                     .health_check
                                     .failure_threshold,
+                                disable_health_check: router_config
+                                    .health_check
+                                    .disable_health_check,
                                 max_connection_attempts: router_config
                                     .health_check
                                     .success_threshold
@@ -652,6 +655,7 @@ impl JobQueue {
                         health_check_interval_secs: router_config.health_check.check_interval_secs,
                         health_success_threshold: router_config.health_check.success_threshold,
                         health_failure_threshold: router_config.health_check.failure_threshold,
+                        disable_health_check: router_config.health_check.disable_health_check,
                         max_connection_attempts: router_config.health_check.success_threshold * 10,
                         dp_aware: router_config.dp_aware,
                     };
