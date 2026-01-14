@@ -1471,12 +1471,18 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 recv_obj = await self.recv_from_detokenizer.recv_pyobj()
 
             # If batch size limit is set and batch exceeds limit, process in chunks
-            if max_batch_size > 0 and hasattr(recv_obj, 'rids') and len(recv_obj.rids) > max_batch_size:
+            if (
+                max_batch_size > 0
+                and hasattr(recv_obj, "rids")
+                and len(recv_obj.rids) > max_batch_size
+            ):
                 batch_size = len(recv_obj.rids)
                 # Process in chunks to reduce latency for first token
                 for start_idx in range(0, batch_size, max_batch_size):
                     end_idx = min(start_idx + max_batch_size, batch_size)
-                    chunk_recv_obj = self._create_batch_chunk(recv_obj, start_idx, end_idx)
+                    chunk_recv_obj = self._create_batch_chunk(
+                        recv_obj, start_idx, end_idx
+                    )
                     self._result_dispatcher(chunk_recv_obj)
                     # Feed watchdog between chunks to prevent timeout
                     self.soft_watchdog.feed()
@@ -1548,7 +1554,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         spec_algorithm_enabled = self.server_args.speculative_algorithm
         stream_output_enabled = self.server_args.stream_output
         has_hidden_states = getattr(recv_obj, "output_hidden_states", None) is not None
-        has_routed_experts = getattr(recv_obj, "output_routed_experts", None) is not None
+        has_routed_experts = (
+            getattr(recv_obj, "output_routed_experts", None) is not None
+        )
         has_customized_info = getattr(recv_obj, "customized_info", None) is not None
         lora_enabled = self.server_args.enable_lora
         has_dump_folder = bool(self.dump_requests_folder)
@@ -1646,7 +1654,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 }
             elif is_multimodal_output:
                 raise NotImplementedError("BatchMultimodalOut not implemented")
-            
+
             else:
                 assert is_embedding, "Only BatchEmbeddingOutput is supported for now."
                 # BatchEmbeddingOutput
