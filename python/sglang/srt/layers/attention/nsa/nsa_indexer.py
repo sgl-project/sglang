@@ -429,9 +429,14 @@ class Indexer(MultiPlatformOp):
         # NOTE(dark): logits should be cleaned in topk_transform
         topk_result = metadata.topk_transform(logits, self.index_topk)
         if not _is_hip and q_offset < q_fp8.shape[0]:
-            topk_result = torch.cat(
-                [topk_result, -1 * torch.ones_like(topk_result)], dim=0
+            pad_len = q_fp8.shape[0] - q_offset
+            padding = torch.full(
+                (pad_len, topk_result.shape[1]),
+                -1,
+                dtype=topk_result.dtype,
+                device=topk_result.device,
             )
+            topk_result = torch.cat([topk_result, padding], dim=0)
         return topk_result
 
     def _should_chunk_mqa_logits(
