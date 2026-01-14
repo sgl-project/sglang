@@ -69,10 +69,68 @@ if _is_hip:
         except ImportError:
             raise ImportError("aiter is required when SGLANG_USE_AITER is set to True")
     else:
-        try:
-            import vllm._C  # noqa: F401
-        except ImportError:
-            raise ImportError("vllm is required when SGLANG_USE_AITER is set to False")
+        # When SGLANG_USE_AITER=0, use pure PyTorch implementations
+        # instead of vLLM to avoid external dependency
+
+        def _dynamic_per_token_scaled_fp8_quant_pytorch(
+            output: torch.Tensor,
+            input: torch.Tensor,
+            scale: torch.Tensor,
+        ):
+            """Pure PyTorch implementation of per-token dynamic FP8 quantization."""
+            input_contig = input.contiguous()
+            num_tokens = input_contig.shape[0]
+            # Find max absolute value per token (row)
+            max_vals = torch.abs(input_contig).max(dim=1, keepdim=True)[
+                0
+            ]  # [num_tokens, 1]
+            # Calculate scale per token: scale = max_value / fp8_max
+            # Avoid division by zero
+            max_vals = torch.clamp(max_vals, min=1e-10)
+            # Only write scales for actual input tokens (handle padding)
+            scale[:num_tokens].copy_((max_vals / fp8_max).to(scale.dtype))
+            # Quantize: input * (fp8_max / max_vals)
+            scale_inv = fp8_max / max_vals
+            quantized_float = input_contig * scale_inv
+            quantized_float = torch.clamp(quantized_float, fp8_min, fp8_max)
+            # Only copy quantized values for actual input tokens (handle padding)
+            output[:num_tokens].copy_(quantized_float.to(output.dtype))
+
+        def _dynamic_scaled_fp8_quant_pytorch(
+            output: torch.Tensor,
+            input: torch.Tensor,
+            scale: torch.Tensor,
+        ):
+            """Pure PyTorch implementation of per-tensor dynamic FP8 quantization."""
+            num_tokens = input.shape[0]
+            # Find max absolute value of entire tensor
+            max_val = torch.abs(input).max().item()
+            # Calculate scale: scale = max_value / fp8_max
+            max_val = max(max_val, 1e-10)  # Avoid division by zero
+            scale_val = max_val / fp8_max
+            scale.fill_(scale_val)
+            # Quantize: input * (fp8_max / max_val)
+            scale_inv = fp8_max / max_val
+            quantized_float = input * scale_inv
+            quantized_float = torch.clamp(quantized_float, fp8_min, fp8_max)
+            # Only copy quantized values for actual input tokens (handle padding)
+            output[:num_tokens].copy_(quantized_float.to(output.dtype))
+
+        def _static_scaled_fp8_quant_pytorch(
+            output: torch.Tensor,
+            input: torch.Tensor,
+            scale: torch.Tensor,
+        ):
+            """Pure PyTorch implementation of per-tensor static FP8 quantization."""
+            num_tokens = input.shape[0]
+            # Use provided scale to quantize
+            scale_val = scale.item()
+            scale_inv = 1.0 / scale_val if scale_val != 0 else 0.0
+            quantized_float = input * scale_inv
+            quantized_float = torch.clamp(quantized_float, fp8_min, fp8_max)
+            # Only copy quantized values for actual input tokens (handle padding)
+            output[:num_tokens].copy_(quantized_float.to(output.dtype))
+
 
 logger = logging.getLogger(__name__)
 
@@ -1414,15 +1472,13 @@ if _is_hip:
                 if _use_aiter:
                     dynamic_per_token_scaled_quant(output, input, scale)
                 else:
-                    torch.ops._C.dynamic_per_token_scaled_fp8_quant(
-                        output, input.contiguous(), scale, None
-                    )
+                    _dynamic_per_token_scaled_fp8_quant_pytorch(output, input, scale)
             else:
                 scale = torch.zeros(1, device=input.device, dtype=torch.float32)
                 if _use_aiter:
                     dynamic_per_tensor_quant(output, input, scale)
                 else:
-                    torch.ops._C.dynamic_scaled_fp8_quant(output, input, scale)
+                    _dynamic_scaled_fp8_quant_pytorch(output, input, scale)
         else:
             # Static scaling
             assert (
@@ -1431,7 +1487,7 @@ if _is_hip:
             if _use_aiter:
                 static_per_tensor_quant(output, input, scale)
             else:
-                torch.ops._C.static_scaled_fp8_quant(output, input, scale)
+                _static_scaled_fp8_quant_pytorch(output, input, scale)
 
         return output, scale
 
