@@ -116,6 +116,10 @@ class WeightChecker:
             )
 
     def _snapshot(self):
+        """
+        Snapshot the model state from GPU to CPU. Keep the tensors with
+        `self._snapshot_tensors` for later comparison.
+        """
         named_tensors = [
             (name, param.data.detach().cpu()) for name, param in self._model_state()
         ]
@@ -125,10 +129,17 @@ class WeightChecker:
         ), f"should not have duplicated tensor name"
 
     def _reset_tensors(self):
+        """
+        Reset the model state to random values, to simulate situations like silent
+        data corruption. Only use this for verification purpose.
+        """
         for name, param in self._model_state():
             param.copy_(_random_like(param))
 
     def _compare(self):
+        """
+        Compare the model state between the snapshot and the current model state.
+        """
         assert self._snapshot_tensors is not None
 
         _check_tensors(
