@@ -359,6 +359,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Include routers
+from sglang.srt.entrypoints.v1_loads import router as v1_loads_router
+
+app.include_router(v1_loads_router)
+
 
 @app.exception_handler(HTTPException)
 async def validation_exception_handler(request: Request, exc: HTTPException):
@@ -601,6 +606,11 @@ async def server_info():
 
 @app.get("/get_load")
 async def get_load():
+    """Get load metrics (deprecated - use /v1/loads instead)."""
+    logger.warning(
+        "Endpoint '/get_load' is deprecated and will be removed in a future version. "
+        "Please use '/v1/loads' instead."
+    )
     return await _global_state.tokenizer_manager.get_load()
 
 
