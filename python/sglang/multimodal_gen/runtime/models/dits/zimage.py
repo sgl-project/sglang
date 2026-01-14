@@ -992,6 +992,115 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         )
         return image, (F, H, W), (F_tokens, H_tokens, W_tokens)
 
+    def _build_unified_sequence(
+        self,
+        x: torch.Tensor,
+        x_freqs: torch.Tensor,
+        x_seqlens: List[int],
+        x_noise_mask: Optional[List[List[int]]],
+        cap: torch.Tensor,
+        cap_freqs: torch.Tensor,
+        cap_seqlens: List[int],
+        cap_noise_mask: Optional[List[List[int]]],
+        siglip: Optional[torch.Tensor],
+        siglip_freqs: Optional[torch.Tensor],
+        siglip_seqlens: Optional[List[int]],
+        siglip_noise_mask: Optional[List[List[int]]],
+        omni_mode: bool,
+        device: torch.device,
+    ):
+        """
+        Concat feats into a single.
+
+        Build unified sequence: x, cap, and optionally siglip.
+        - Basic mode order: [x, cap]
+        - Omni mode order: [cap, x, siglip]
+        """
+
+        # TODO: single batch only for now.
+        bsz = len(x_seqlens)
+        unified = []
+        unified_freqs_cos = []
+        unified_freqs_sin = []
+        unified_noise_mask = []
+
+        for i in range(bsz):
+            x_len, cap_len = x_seqlens[i], cap_seqlens[i]
+
+            if omni_mode:
+                # Omni: [cap, x, siglip]
+                if siglip is not None and siglip_seqlens is not None:
+                    sig_len = siglip_seqlens[i]
+                    unified.append(
+                        torch.cat([cap[i][:cap_len], x[i][:x_len], siglip[i][:sig_len]])
+                    )
+                    # TODO: review, hack
+                    unified_freqs_cos.append(
+                        torch.cat(
+                            [
+                                cap_freqs[0][:cap_len],
+                                x_freqs[0][:x_len],
+                                siglip_freqs[0][:sig_len],
+                            ]
+                        )
+                    )
+                    unified_freqs_sin.append(
+                        torch.cat(
+                            [
+                                cap_freqs[1][:cap_len],
+                                x_freqs[1][:x_len],
+                                siglip_freqs[1][:sig_len],
+                            ]
+                        )
+                    )
+                    unified_noise_mask.append(
+                        torch.tensor(
+                            cap_noise_mask[i] + x_noise_mask[i] + siglip_noise_mask[i],
+                            dtype=torch.long,
+                            device=device,
+                        )
+                    )
+                else:
+                    unified.append(torch.cat([cap[i][:cap_len], x[i][:x_len]]))
+                    unified_freqs_cos.append(
+                        torch.cat([cap_freqs[0][:cap_len], x_freqs[0][:x_len]])
+                    )
+                    unified_freqs_sin.append(
+                        torch.cat([cap_freqs[1][:cap_len], x_freqs[1][:x_len]])
+                    )
+                    unified_noise_mask.append(
+                        torch.tensor(
+                            cap_noise_mask[i] + x_noise_mask[i],
+                            dtype=torch.long,
+                            device=device,
+                        )
+                    )
+            else:
+                # Basic: [x, cap]
+                unified.append(torch.cat([x[i][:x_len], cap[i][:cap_len]]))
+                unified_freqs_cos.append(
+                    torch.cat([x_freqs[0][:x_len], cap_freqs[0][:cap_len]])
+                )
+                unified_freqs_sin.append(
+                    torch.cat([x_freqs[1][:x_len], cap_freqs[1][:cap_len]])
+                )
+
+        # TODO: single batch only
+        # no batch pad
+        assert len(unified) == 1, "Single batch only for now."
+        assert len(unified_freqs_cos) == 1, "Single batch only for now."
+        unified = unified[0].unsqueeze(0)
+        # unified_freqs = unified_freqs[0].unsqueeze(0)
+        unified_freqs = (unified_freqs_cos[0], unified_freqs_sin[0])
+
+        # Noise mask
+        noise_mask_tensor = None
+        if omni_mode:
+            assert len(unified_noise_mask) == 1, "Single batch only for now."
+            noise_mask_tensor = unified_noise_mask[0][: unified.shape[1]].unsqueeze(0)
+
+        return unified, unified_freqs, noise_mask_tensor
+
     # TODO: copy to configs/zimage.py later
     def get_freqs_cis(
         self,
@@ -1249,6 +1358,31 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         cap_feats = cap_feats.unsqueeze(0)
         for layer in self.context_refiner:
             cap_feats = layer(cap_feats, cap_freqs_cis)
+
+        if (
+            omni_mode
+            and siglip_feats[0] is not None
+            and self.siglip_embedder is not None
+        ):
+            # TODO: debug ignore
+            # review
+            # siglip_freqs_cis = torch.stack(freqs_cis[2])
+            siglip_freqs_cis = None
+
+            # process siglip
+            siglip_seqlens = siglip_freqs = None
+            siglip_feats = torch.cat(siglip_feats, dim=0)
+            siglip_feats = siglip_feats.unsqueeze(0)
+
+            siglip_seqlens = [len(si) for si in siglip_feats]
+            # embed
+            siglip_feats = self.siglip_embedder(siglip_feats)
+            # TODO:
+            # single batch
+            # no pad
+
+            for layer in self.siglip_refiner:
+                siglip_feats = layer(siglip_feats, siglip_freqs_cis)
 
         unified = torch.cat([x, cap_feats], dim=1)
         unified_freqs_cis = (
