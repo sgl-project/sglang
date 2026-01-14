@@ -11,7 +11,7 @@ use crate::{
     tool_parser::{
         errors::ParserResult,
         traits::ToolParser,
-        types::{StreamingParseResult, ToolCall, ToolCallItem},
+        types::{FormatInfo, StreamingParseResult, ToolCall, ToolCallItem},
     },
 };
 
@@ -50,6 +50,12 @@ impl ToolParser for PassthroughParser {
     }
 
     fn get_unstreamed_tool_args(&self) -> Option<Vec<ToolCallItem>> {
+        None
+    }
+
+    fn get_format_info(&self) -> Option<FormatInfo> {
+        // Passthrough parser is a fallback that doesn't parse tool calls
+        // It does not support structural tags
         None
     }
 }

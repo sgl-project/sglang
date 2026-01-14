@@ -8,7 +8,7 @@ use crate::{
         errors::ParserResult,
         parsers::helpers,
         traits::ToolParser,
-        types::{FunctionCall, StreamingParseResult, ToolCall, ToolCallItem},
+        types::{FormatInfo, FunctionCall, StreamingParseResult, ToolCall, ToolCallItem},
     },
 };
 
@@ -344,5 +344,27 @@ impl ToolParser for KimiK2Parser {
         self.current_tool_name_sent = false;
         self.streamed_args_for_tool.clear();
         self.last_arguments.clear();
+    }
+
+    fn get_format_info(&self) -> Option<FormatInfo> {
+        Some(FormatInfo {
+            // First tool call: includes outer section wrapper
+            begin_pattern: Box::new(|name, index| {
+                format!(
+                    "<|tool_calls_section_begin|><|tool_call_begin|>functions.{}:{}<|tool_call_argument_begin|>",
+                    name, index
+                )
+            }),
+            end_pattern: "<|tool_call_end|>".to_string(),
+            trigger: "<|tool_calls_section_begin|>".to_string(),
+            // Subsequent tool calls: no outer section wrapper
+            begin_pattern_subsequent: Some(Box::new(|name, index| {
+                format!(
+                    "<|tool_call_begin|>functions.{}:{}<|tool_call_argument_begin|>",
+                    name, index
+                )
+            })),
+            trigger_subsequent: Some("<|tool_call_begin|>".to_string()),
+        })
     }
 }
