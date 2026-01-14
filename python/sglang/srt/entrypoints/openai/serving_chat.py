@@ -186,6 +186,11 @@ class OpenAIServingChat(OpenAIServingBase):
             request.reasoning_effort = reasoning_effort
 
         """Convert OpenAI chat completion request to internal format"""
+
+        # Auto-enable separate_reasoning for gpt-oss models
+        if self.is_gpt_oss and request.separate_reasoning is None:
+            request.separate_reasoning = True
+
         is_multimodal = self.tokenizer_manager.model_config.is_multimodal
 
         # Process messages and apply chat template
@@ -601,8 +606,14 @@ class OpenAIServingChat(OpenAIServingBase):
 
                 # Handle reasoning content
                 if self.reasoning_parser and request.separate_reasoning:
+                    logger.debug(
+                        f"[DEBUG] Before _process_reasoning_stream: delta={repr(delta)}"
+                    )
                     reasoning_text, delta = self._process_reasoning_stream(
                         index, delta, reasoning_parser_dict, content, request
+                    )
+                    logger.debug(
+                        f"[DEBUG] After _process_reasoning_stream: reasoning_text={repr(reasoning_text)}, delta={repr(delta)}"
                     )
                     if reasoning_text:
                         choice_data = ChatCompletionResponseStreamChoice(
@@ -950,7 +961,7 @@ class OpenAIServingChat(OpenAIServingBase):
             # Align with Kimi-K2 format: functions.{name}:{index}
             # Kimi-K2 allows multiple tool_calls in one message; SGLang sets call_item.tool_index to the *local* position inside that message.
             # Therefore, the index must be corrected by using `history_tool_calls_cnt + call_item.tool_index` to ensure globally unique and properly ordered.
-            tool_call_id = f"functions.{call_item.name}:{history_tool_calls_cnt+call_item.tool_index}"
+            tool_call_id = f"functions.{call_item.name}:{history_tool_calls_cnt + call_item.tool_index}"
             logger.debug(
                 f"Process tool call idx, parser: {self.tool_call_parser}, tool_call_id: {tool_call_id}, history_cnt: {history_tool_calls_cnt}"
             )
@@ -1071,6 +1082,10 @@ class OpenAIServingChat(OpenAIServingBase):
                 is_force_reasoning,
             )
         reasoning_parser = reasoning_parser_dict[index]
+        # Note: GptOssDetector returns tool calls in StreamingParseResult,
+        # but ReasoningParser only returns (reasoning_text, normal_text).
+        # For gpt-oss, tool calls need to be extracted from normal_text (which contains raw markers)
+        # by the tool call parser, so we just pass through normal_text.
         return reasoning_parser.parse_stream_chunk(delta)
 
     def _get_history_tool_calls_cnt(self, request: ChatCompletionRequest) -> int:
@@ -1140,9 +1155,15 @@ class OpenAIServingChat(OpenAIServingBase):
             normal_text, calls = result.normal_text, result.calls
         else:
             normal_text, calls = parser.parse_stream_chunk(delta)
+        logger.debug(
+            f"[DEBUG] After parse_stream_chunk: delta_input={repr(delta)}, normal_text={repr(normal_text)}, calls={len(calls)}"
+        )
 
         # Yield normal text
         if normal_text:
+            logger.debug(
+                f"[DEBUG] Yielding normal text: index={index}, content={repr(normal_text)}"
+            )
             choice_data = ChatCompletionResponseStreamChoice(
                 index=index,
                 delta=DeltaMessage(content=normal_text),
