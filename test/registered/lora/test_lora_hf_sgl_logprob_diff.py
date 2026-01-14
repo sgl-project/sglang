@@ -41,6 +41,10 @@ register_cuda_ci(
     est_time=150,
     suite="stage-b-test-small-1-gpu",
 )
+register_cuda_ci(
+    est_time=76,
+    suite="stage-b-test-small-1-gpu-5090",
+)
 
 from sglang.test.test_utils import DEFAULT_PORT_FOR_SRT_TEST_RUNNER, CustomTestCase
 
