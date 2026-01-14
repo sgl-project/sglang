@@ -1,6 +1,8 @@
 name: CI Coverage Overview
 
 on:
+  schedule:
+    - cron: '0 6 * * *'  # Daily at 6 AM UTC
   pull_request:
     paths:
       - '.github/workflows/ci-coverage-overview.yml'

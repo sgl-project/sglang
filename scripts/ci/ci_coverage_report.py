@@ -66,10 +66,18 @@ def organize_test_data(tests: list[CIRegistry]) -> dict:
         if t.disabled:
             disabled_tests.append(t)
 
+    # Count unique test files (a file may be registered for multiple backends)
+    unique_files = set(t.filename for t in tests)
+    unique_enabled_files = set(t.filename for t in tests if not t.disabled)
+    unique_disabled_files = set(t.filename for t in tests if t.disabled)
+
     return {
         "total": len(tests),
+        "total_unique_files": len(unique_files),
         "enabled": len(tests) - len(disabled_tests),
+        "enabled_unique_files": len(unique_enabled_files),
         "disabled_count": len(disabled_tests),
+        "disabled_unique_files": len(unique_disabled_files),
         "by_backend": by_backend,
         "by_folder": by_folder,
         "disabled_tests": disabled_tests,
@@ -81,15 +89,22 @@ def generate_summary_section(data: dict) -> str:
     lines = []
     lines.append("# CI Coverage Overview\n")
     lines.append(
-        f"**Total Tests:** {data['total']} ({data['enabled']} enabled, {data['disabled_count']} disabled)\n"
+        f"**Unique Test Files:** {data['total_unique_files']} ({data['enabled_unique_files']} enabled, {data['disabled_unique_files']} disabled)\n"
+    )
+    lines.append(
+        f"**Total Registrations:** {data['total']} ({data['enabled']} enabled, {data['disabled_count']} disabled)\n"
+    )
+    lines.append(
+        "*Note: A test file may be registered for multiple backends (e.g., CUDA + AMD), so total registrations > unique files.*\n"
     )
 
     by_backend = data["by_backend"]
     by_folder = data["by_folder"]
     disabled_tests = data["disabled_tests"]
 
-    # Backend summary
-    lines.append("## Backend Summary\n")
+    # Backend summary (collapsible)
+    lines.append("<details>")
+    lines.append("<summary><h2>Backend Summary</h2></summary>\n")
     lines.append("| Backend | Total | Enabled | Disabled | Per-Commit | Nightly |")
     lines.append("|---------|-------|---------|----------|------------|---------|")
 
@@ -106,10 +121,11 @@ def generate_summary_section(data: dict) -> str:
             f"| {backend} | {b_total} | {b_enabled} | {b_disabled} | {b_per_commit} | {b_nightly} |"
         )
 
-    lines.append("")
+    lines.append("\n</details>\n")
 
-    # Folder summary
-    lines.append("## Folder Summary\n")
+    # Folder summary (collapsible)
+    lines.append("<details>")
+    lines.append("<summary><h2>Folder Summary</h2></summary>\n")
     lines.append("| Folder | CUDA | AMD | NPU | CPU | Total |")
     lines.append("|--------|------|-----|-----|-----|-------|")
 
@@ -123,18 +139,19 @@ def generate_summary_section(data: dict) -> str:
             f"| {folder} | {cuda} | {amd} | {npu} | {cpu} | {len(folder_tests)} |"
         )
 
-    lines.append("")
+    lines.append("\n</details>\n")
 
-    # Disabled tests section
+    # Disabled tests section (collapsible)
     if disabled_tests:
-        lines.append("## Disabled Tests\n")
+        lines.append("<details>")
+        lines.append("<summary><h2>Disabled Tests</h2></summary>\n")
         lines.append("| File | Backend | Suite | Reason |")
         lines.append("|------|---------|-------|--------|")
         for t in sorted(disabled_tests, key=lambda x: (x.backend.name, x.filename)):
             test_name = get_test_basename(t.filename)
             reason = t.disabled[:50] + "..." if len(t.disabled) > 50 else t.disabled
             lines.append(f"| `{test_name}` | {t.backend.name} | {t.suite} | {reason} |")
-        lines.append("")
+        lines.append("\n</details>\n")
 
     return "\n".join(lines)
 
@@ -148,7 +165,8 @@ def generate_by_folder_section(data: dict) -> str:
 
     for folder in sorted(by_folder.keys()):
         folder_tests = by_folder[folder]
-        lines.append(f"## {folder}/ ({len(folder_tests)} tests)\n")
+        lines.append("<details>")
+        lines.append(f"<summary><h2>{folder}/ ({len(folder_tests)} tests)</h2></summary>\n")
 
         # Group by backend within folder
         folder_by_backend = defaultdict(list)
@@ -177,6 +195,8 @@ def generate_by_folder_section(data: dict) -> str:
 
             lines.append("")
 
+        lines.append("</details>\n")
+
     return "\n".join(lines)
 
 
@@ -196,8 +216,9 @@ def generate_by_suite_section(data: dict) -> str:
         b_disabled = sum(1 for t in backend_tests if t.disabled)
         b_enabled = b_total - b_disabled
 
+        lines.append("<details>")
         lines.append(
-            f"## {backend} Backend ({b_enabled} enabled, {b_disabled} disabled)\n"
+            f"<summary><h2>{backend} Backend ({b_enabled} enabled, {b_disabled} disabled)</h2></summary>\n"
         )
 
         # Group by suite within backend
@@ -213,8 +234,9 @@ def generate_by_suite_section(data: dict) -> str:
             is_nightly = any(t.nightly for t in suite_tests if not t.disabled)
 
             suite_type = "Nightly" if is_nightly else "Per-Commit"
+            lines.append("<details>")
             lines.append(
-                f"### {suite} ({s_enabled} enabled, {s_disabled} disabled) - {suite_type}\n"
+                f"<summary><h3>{suite} ({s_enabled} enabled, {s_disabled} disabled) - {suite_type}</h3></summary>\n"
             )
             lines.append(f"*Estimated total time: {s_est_time:.0f}s*\n")
 
@@ -236,7 +258,9 @@ def generate_by_suite_section(data: dict) -> str:
                     f"| `{test_name}` | {folder} | {t.est_time:.0f}s | {status} |"
                 )
 
-            lines.append("")
+            lines.append("\n</details>\n")
+
+        lines.append("</details>\n")
 
     return "\n".join(lines)
 
