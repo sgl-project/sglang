@@ -8,6 +8,7 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    is_in_amd_ci,
     is_in_ci,
     popen_launch_server,
     write_github_step_summary,
@@ -31,6 +32,14 @@ class TestDeepseekV32DP(CustomTestCase):
             "--model-loader-extra-config",
             '{"enable_multithread_load": true, "num_threads": 64}',
         ]
+        if is_in_amd_ci():
+            other_args += [
+                "--nsa-prefill-backend",
+                "tilelang",
+                "--nsa-decode-backend",
+                "tilelang",
+            ]
+
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
@@ -73,7 +82,10 @@ class TestDeepseekV32DP(CustomTestCase):
             write_github_step_summary(
                 f"### test_bs_1_speed (deepseek-v32)\n" f"{speed=:.2f} token/s\n"
             )
-            self.assertGreater(speed, 50)
+            if is_in_amd_ci():
+                self.assertGreater(speed, 10)
+            else:
+                self.assertGreater(speed, 50)
 
 
 class TestDeepseekV32TP(CustomTestCase):
@@ -88,6 +100,14 @@ class TestDeepseekV32TP(CustomTestCase):
             "--model-loader-extra-config",
             '{"enable_multithread_load": true, "num_threads": 64}',
         ]
+        if is_in_amd_ci():
+            other_args += [
+                "--nsa-prefill-backend",
+                "tilelang",
+                "--nsa-decode-backend",
+                "tilelang",
+            ]
+
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
@@ -130,7 +150,10 @@ class TestDeepseekV32TP(CustomTestCase):
             write_github_step_summary(
                 f"### test_bs_1_speed (deepseek-v32)\n" f"{speed=:.2f} token/s\n"
             )
-            self.assertGreater(speed, 70)
+            if is_in_amd_ci():
+                self.assertGreater(speed, 20)
+            else:
+                self.assertGreater(speed, 70)
 
 
 if __name__ == "__main__":
