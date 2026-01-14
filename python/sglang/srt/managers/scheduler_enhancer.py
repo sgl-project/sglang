@@ -1,4 +1,5 @@
 import torch
+from sglang.srt.environ import envs
 
 
 class SchedulerEnhancer:
@@ -16,7 +17,7 @@ class SchedulerEnhancer:
             self.device = "cpu"
 
         self.global_batch_size = torch.empty(
-            (self.dp_size, self.attn_tp_size, 1),
+            (self.dp_size, self.attn_tp_size, 2),
             dtype=torch.int64,
             device=self.device,
         )
@@ -33,7 +34,7 @@ class SchedulerEnhancer:
             server_args.disaggregation_mode == "null"
         ), f"To use SCHEDULER_DECREASE_PREFILL_IDLE, disaggregation_mode must be null."
 
-    def get_schedule_info(self, running_batch):
+    def get_schedule_info(self, running_batch, max_prefill_bs):
         if self.group is None:
             if self.disable_overlap_schedule:
                 self.group = self.tp_worker.get_tp_group().device_group
@@ -42,6 +43,7 @@ class SchedulerEnhancer:
         local_batch_size = torch.tensor(
             [
                 running_batch.batch_size(),
+                max_prefill_bs,
             ],
             device=self.device,
             dtype=torch.int64,
@@ -56,11 +58,18 @@ class SchedulerEnhancer:
 
     def get_schedule_decision(self, running_batch, max_prefill_bs):
         if self.server_args.enable_dp_attention:
-            tp0_info = self.get_schedule_info(running_batch)
-            if (
-                self.max_running_requests - int(tp0_info[:, 0].max().item())
-                < max_prefill_bs
-            ):
+            tp0_info = self.get_schedule_info(running_batch, max_prefill_bs)
+            prefill_delay_level1 = (
+                envs.SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE.get() == 1
+                and self.max_running_requests - int(tp0_info[:, 0].max().item())
+                < int(tp0_info[:, 1].max().item())
+            )
+            prefill_delay_level2 = (
+                envs.SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE.get() == 2
+                and int(tp0_info[:, 0].min().item()) < self.max_running_requests
+                and int(tp0_info[:, 0].max().item()) == self.max_running_requests
+            )
+            if prefill_delay_level1 or prefill_delay_level2:
                 self.stable_count += 1
                 if self.stable_count < self.max_stable_count:
                     return False
