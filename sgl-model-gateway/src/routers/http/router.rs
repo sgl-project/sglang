@@ -16,7 +16,7 @@ use crate::{
     app_context::AppContext,
     config::types::RetryConfig,
     core::{
-        is_retryable_status, ConnectionMode, RetryExecutor, Worker, WorkerLoadGuard,
+        is_retryable_status, AttachedBody, ConnectionMode, RetryExecutor, Worker, WorkerLoadGuard,
         WorkerRegistry, WorkerType, UNKNOWN_MODEL_ID,
     },
     observability::{
@@ -286,15 +286,14 @@ impl Router {
             }
         };
 
-        // Optional load tracking for cache-aware policy
-        // Get the policy for this model to check if it's cache-aware
         let policy = match model_id {
             Some(model) => self.policy_registry.get_policy_or_default(model),
             None => self.policy_registry.get_default_policy(),
         };
 
-        let load_guard =
-            (policy.name() == "cache_aware").then(|| WorkerLoadGuard::new(worker.clone()));
+        let load_guard = ["cache_aware", "manual"]
+            .contains(&policy.name())
+            .then(|| WorkerLoadGuard::new(worker.clone(), headers));
 
         // Note: Using borrowed reference avoids heap allocation
         events::RequestSentEvent { url: worker.url() }.emit();
@@ -629,7 +628,7 @@ impl Router {
             // Attach load guard to response body for proper RAII lifecycle
             // Guard is dropped when response body is consumed or client disconnects
             if let Some(guard) = load_guard {
-                response = guard.attach_to_response(response);
+                response = AttachedBody::wrap_response(response, guard);
             }
             response
         }
