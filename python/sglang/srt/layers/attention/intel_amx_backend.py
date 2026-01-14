@@ -23,7 +23,14 @@ class IntelAMXAttnBackend(AttentionBackend):
         self.num_head = (
             model_runner.model_config.num_attention_heads // model_runner.tp_size
         )
-        v_buffer = model_runner.token_to_kv_pool.get_value_buffer(0)
+        # [NB]: `layer_id` set to 0 for qwen3-next models, as not all attn layers require kv pool
+        # using "full_attention_layer_id_mapping" to map which layer needs kv pool
+        layer_id = 0
+        if hasattr(model_runner.token_to_kv_pool, "full_attention_layer_id_mapping"):
+            layer_id = [*model_runner.token_to_kv_pool.full_attention_layer_id_mapping][
+                0
+            ]
+        v_buffer = model_runner.token_to_kv_pool.get_value_buffer(layer_id)
         if isinstance(v_buffer, tuple):
             self.v_head_dim = v_buffer[0].shape[-1]
         else:
