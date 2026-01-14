@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
 from sglang.srt.custom_op import CustomOp
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.utils import npu_format_cast
 from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
 from sglang.srt.layers.moe import (
@@ -122,6 +123,8 @@ class UnquantizedLinearMethod(LinearMethodBase):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if _is_cpu and _is_cpu_amx_available:
             _amx_process_weight_after_loading(layer, ["weight"])
+        if _is_npu and envs.SGLANG_UNQUANT_LINEAR_NZ.get():
+            layer.weight.data = npu_format_cast(layer.weight.data)
 
     def apply(
         self,
