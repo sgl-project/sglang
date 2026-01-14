@@ -137,7 +137,7 @@ class DenoisingStage(PipelineStage):
         setattr(module, "forward", compiled_forward)
         return module
 
-    def _maybe_enable_cache_dit(self, num_inference_steps: int) -> None:
+    def _maybe_enable_cache_dit(self, num_inference_steps: int, batch: Req) -> None:
         """Enable cache-dit on the transformers if configured (idempotent).
 
         This method should be called after the transformer is fully loaded
@@ -158,7 +158,7 @@ class DenoisingStage(PipelineStage):
                 )
             return
         # check if cache-dit is enabled in config
-        if not envs.SGLANG_CACHE_DIT_ENABLED:
+        if not envs.SGLANG_CACHE_DIT_ENABLED or batch.is_warmup:
             return
 
         from sglang.multimodal_gen.runtime.distributed import (
@@ -478,10 +478,6 @@ class DenoisingStage(PipelineStage):
         """
         Prepare all necessary invariant variables for the denoising loop.
 
-        Args:
-            batch: The current batch information.
-            server_args: The inference arguments.
-
         Returns:
             A dictionary containing all the prepared variables for the denoising loop.
         """
@@ -500,13 +496,13 @@ class DenoisingStage(PipelineStage):
                 server_args.model_paths["transformer"], server_args, "transformer"
             )
             # enable cache-dit before torch.compile (delayed mounting)
-            self._maybe_enable_cache_dit(cache_dit_num_inference_steps)
+            self._maybe_enable_cache_dit(cache_dit_num_inference_steps, batch)
             self.compile_module_with_torch_compile(self.transformer)
             if pipeline:
                 pipeline.add_module("transformer", self.transformer)
             server_args.model_loaded["transformer"] = True
         else:
-            self._maybe_enable_cache_dit(cache_dit_num_inference_steps)
+            self._maybe_enable_cache_dit(cache_dit_num_inference_steps, batch)
 
         # Prepare extra step kwargs for scheduler
         extra_step_kwargs = self.prepare_extra_func_kwargs(
@@ -940,13 +936,6 @@ class DenoisingStage(PipelineStage):
     ) -> Req:
         """
         Run the denoising loop.
-
-        Args:
-            batch: The current batch information.
-            server_args: The inference arguments.
-
-        Returns:
-            The batch with denoised latents.
         """
         # Prepare variables for the denoising loop
 
@@ -1127,13 +1116,6 @@ class DenoisingStage(PipelineStage):
     ) -> tqdm:
         """
         Create a progress bar for the denoising process.
-
-        Args:
-            iterable: The iterable to iterate over.
-            total: The total number of items.
-
-        Returns:
-            A tqdm progress bar.
         """
         local_rank = get_world_group().local_rank
         disable = local_rank != 0
@@ -1176,11 +1158,6 @@ class DenoisingStage(PipelineStage):
 
         Args:
             i: The current timestep index.
-            batch: The current batch information.
-            server_args: The inference arguments.
-
-        Returns:
-            The attention metadata, or None if not applicable.
         """
         attn_metadata = None
         self.attn_metadata_builder = None
@@ -1375,10 +1352,6 @@ class DenoisingStage(PipelineStage):
     def prepare_sta_param(self, batch: Req, server_args: ServerArgs):
         """
         Prepare Sliding Tile Attention (STA) parameters and settings.
-
-        Args:
-            batch: The current batch information.
-            server_args: The inference arguments.
         """
         # TODO(kevin): STA mask search, currently only support Wan2.1 with 69x768x1280
         STA_mode = server_args.STA_mode
