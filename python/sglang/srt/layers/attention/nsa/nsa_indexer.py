@@ -85,6 +85,11 @@ class BaseIndexerMetadata(ABC):
         Return: seq lens for each batch.
         """
 
+    def get_nsa_extend_len_cpu(self) -> List[int]:
+        """
+        Return: extend seq lens for each batch.
+        """
+
     def get_token_to_batch_idx(self) -> torch.Tensor:
         """
         Return: batch idx for each token.
@@ -384,6 +389,7 @@ class Indexer(MultiPlatformOp):
         assert len(weights.shape) == 3
         weights = weights.squeeze(2)
 
+        q_offset = sum(metadata.get_nsa_extend_len_cpu())
         if _is_hip:
             from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
 
@@ -410,9 +416,9 @@ class Indexer(MultiPlatformOp):
             )
         else:
             logits = deep_gemm.fp8_paged_mqa_logits(
-                q_fp8,
+                q_fp8[:q_offset],
                 kv_cache_fp8,
-                weights,
+                weights[:q_offset],
                 seqlens_32,
                 block_tables,
                 schedule_metadata,
@@ -422,6 +428,10 @@ class Indexer(MultiPlatformOp):
 
         # NOTE(dark): logits should be cleaned in topk_transform
         topk_result = metadata.topk_transform(logits, self.index_topk)
+        if not _is_hip and q_offset < q_fp8.shape[0]:
+            topk_result = torch.cat(
+                [topk_result, -1 * torch.ones_like(topk_result)], dim=0
+            )
         return topk_result
 
     def _should_chunk_mqa_logits(

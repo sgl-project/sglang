@@ -12,6 +12,7 @@ from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_extend_npu_graph_r
 from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_npu_graph_runner import (
     EAGLEDraftNpuGraphRunner,
 )
+from sglang.srt.layers.attention.nsa_backend import NativeSparseAttnMultiStepBackend
 from sglang.srt.layers.attention.triton_backend import TritonMultiStepDraftBackend
 from sglang.srt.layers.dp_attention import get_attention_tp_group
 from sglang.srt.layers.moe.utils import (
@@ -275,7 +276,10 @@ class EagleDraftWorker(BaseDraftWorker):
             _is_npu
             or (
                 _is_cuda
-                and isinstance(self.draft_attn_backend, TritonMultiStepDraftBackend)
+                and isinstance(
+                    self.draft_attn_backend,
+                    (TritonMultiStepDraftBackend, NativeSparseAttnMultiStepBackend),
+                )
             )
         ):
             tic = time.perf_counter()

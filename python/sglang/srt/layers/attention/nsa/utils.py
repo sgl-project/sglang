@@ -15,6 +15,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_size,
 )
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.utils.common import ceil_align, ceil_div
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -83,10 +84,17 @@ def nsa_cp_round_robin_split_data(input_: Union[torch.Tensor, List]):
 
 def pad_nsa_cache_seqlens(forward_batch: "ForwardBatch", nsa_cache_seqlens):
     attn_tp_size = get_attention_tp_size()
-    if attn_tp_size == 1 or not can_nsa_prefill_cp_round_robin_split(forward_batch):
+    if attn_tp_size == 1 or forward_batch.global_num_tokens_cpu is None:
         return nsa_cache_seqlens
-    tokens = sum(forward_batch.extend_seq_lens_cpu)
-    pad_len = (tokens - 1) // attn_tp_size + 1 - nsa_cache_seqlens.shape[0]
+    if forward_batch.forward_mode.is_decode_or_idle():
+        tokens = forward_batch.batch_size
+    else:
+        tokens = sum(forward_batch.extend_seq_lens_cpu)
+    if can_nsa_prefill_cp_round_robin_split(forward_batch):
+        padded_tokens = ceil_div(tokens, attn_tp_size)
+    else:
+        padded_tokens = ceil_align(tokens, attn_tp_size)
+    pad_len = padded_tokens - nsa_cache_seqlens.shape[0]
     if pad_len > 0:
         nsa_cache_seqlens = torch.cat(
             [
