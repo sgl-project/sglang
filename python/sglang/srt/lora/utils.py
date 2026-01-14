@@ -4,6 +4,7 @@ from typing import Iterable, Optional, Set, Tuple
 
 import torch
 
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils.hf_transformers_utils import AutoConfig
 
 
@@ -46,7 +47,11 @@ class LoRAType(Enum):
 
 
 def get_hidden_dim(
-    module_name: str, config: AutoConfig, base_model: torch.nn.Module, layer_idx: int
+    module_name: str,
+    config: AutoConfig,
+    base_model: torch.nn.Module,
+    layer_idx: int,
+    lora_added_vocab_size: int = 0,
 ) -> Tuple[int]:
     """
     Given a module_name (might be a stacked name), return the hidden dims of modules' input and output.
@@ -78,8 +83,18 @@ def get_hidden_dim(
             return config.hidden_size, config.intermediate_size * 2
         elif module_name == "down_proj":
             return config.intermediate_size, config.hidden_size
+        elif module_name == "embed_tokens":
+            # For embedding: input is vocab_size (as embedding lookup), output is hidden_size
+            # if contain extra tokens will be added; otherwise is 0.
+            return config.vocab_size + lora_added_vocab_size, config.hidden_size
+        elif module_name == "lm_head":
+            # For lm_head: input is hidden_size, output is vocab_size
+            # if contain extra tokens will be added; otherwise is 0.
+            return config.hidden_size, config.vocab_size + lora_added_vocab_size
         else:
-            raise NotImplementedError()
+            raise NotImplementedError(
+                "get_hidden_dim not implemented for " + module_name
+            )
 
 
 def get_normalized_target_modules(
@@ -95,6 +110,12 @@ def get_normalized_target_modules(
         "v_proj": "qkv_proj",
         "gate_proj": "gate_up_proj",
         "up_proj": "gate_up_proj",
+        "embed_tokens": "embed_tokens",
+        "vocab_emb": "embed_tokens",
+        "embeddings": "embed_tokens",
+        "word_embeddings": "embed_tokens",
+        "lm_head": "lm_head",
+        "output": "lm_head",
     }
 
     result = set()
@@ -131,4 +152,33 @@ def get_target_module_name(full_module_name: str, target_modules: Set[str]) -> s
     )
 
 
+EMBEDDING_NAMES = ["embed_tokens", "lm_head"]
 ROW_PARALLELISM_LINEAR_LORA_NAMES = ["o_proj", "down_proj"]
+
+
+def generate_sequence_lengths(
+    forward_batch: ForwardBatch, device: Optional[torch.device] = None
+) -> torch.Tensor:
+
+    device = torch.get_default_device() if device is None else device
+    with torch.device(device):
+        if forward_batch.forward_mode.is_decode():
+            seg_lens = torch.ones(forward_batch.batch_size, dtype=torch.int32)
+        elif forward_batch.forward_mode.is_target_verify():
+            seg_lens = torch.full(
+                size=(forward_batch.batch_size,),
+                fill_value=forward_batch.spec_info.draft_token_num,
+                dtype=torch.int32,
+            )
+        elif forward_batch.forward_mode.is_extend():
+            seg_lens = (
+                forward_batch.extend_seq_lens
+                if forward_batch.extend_seq_lens.device == device
+                else torch.tensor(
+                    forward_batch.extend_seq_lens_cpu,
+                    dtype=torch.int32,
+                )
+            )
+        else:
+            raise ValueError(f"Unsupported forward mode: {forward_batch.forward_mode}")
+    return seg_lens

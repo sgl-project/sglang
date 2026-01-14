@@ -401,7 +401,8 @@ void fused_qk_norm_rope(
     double factor,
     double low,
     double high,
-    double attention_factor);
+    double attention_factor,
+    int64_t rotary_dim);
 
 void cutlass_fp4_group_mm(
     torch::Tensor& output,
@@ -1005,3 +1006,15 @@ std::vector<at::Tensor> fwd_kvcache_mla_fp8(
 
 std::vector<at::Tensor> get_mla_decoding_metadata_dense_fp8(
     at::Tensor& seqlens_k, const int64_t num_heads_per_head_k, const int64_t num_heads_k);
+
+/*
+ * From csrc/sgl_diffusion/elementwise
+ */
+torch::Tensor timestep_embedding(
+    const torch::Tensor& t,
+    torch::Tensor& output,
+    int64_t dim,
+    bool flip_sin_to_cos,
+    double downscale_freq_shift,
+    double scale,
+    int64_t max_period);

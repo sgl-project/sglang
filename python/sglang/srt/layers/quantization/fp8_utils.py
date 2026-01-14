@@ -1,4 +1,9 @@
-from typing import Callable, List, Optional, Tuple
+from __future__ import annotations
+
+import logging
+from enum import Enum
+from functools import lru_cache
+from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
 
 import torch
 
@@ -6,14 +11,9 @@ from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
 from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
-from sglang.srt.utils import ceil_div, is_blackwell_supported, offloader
 
-try:
-    from vllm import _custom_ops as ops
-
-    VLLM_AVAILABLE = True
-except ImportError:
-    VLLM_AVAILABLE = False
+if TYPE_CHECKING:
+    from sglang.srt.server_args import ServerArgs
 
 from sglang.srt.layers.quantization.fp8_kernel import (
     fp8_dtype,
@@ -29,13 +29,19 @@ from sglang.srt.layers.quantization.fp8_kernel import (
 )
 from sglang.srt.utils import (
     ceil_align,
+    ceil_div,
     get_bool_env_var,
     get_cuda_version,
     get_device_capability,
+    is_blackwell_supported,
     is_cuda,
     is_flashinfer_available,
     is_hip,
+    is_sm90_supported,
+    offloader,
 )
+
+logger = logging.getLogger(__name__)
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
@@ -89,6 +95,7 @@ def use_rowwise_torch_scaled_mm():
 USE_ROWWISE_TORCH_SCALED_MM = use_rowwise_torch_scaled_mm()
 
 
+@lru_cache(maxsize=1)
 def cutlass_fp8_supported():
     if not _is_cuda:
         return False
@@ -125,43 +132,167 @@ def normalize_e4m3fn_to_e4m3fnuz(
     return weight, weight_scale, input_scale
 
 
-# TODO(ch-wan): define these backends in --moe-runner-backend
-def cutlass_block_fp8_supported() -> bool:
-    if not get_bool_env_var("SGLANG_SUPPORT_CUTLASS_BLOCK_FP8"):
-        return False
-    if _is_cuda:
-        major, minor = torch.cuda.get_device_capability()
-        sm_version = major * 10 + minor
-        cuda_version = tuple(map(int, torch.version.cuda.split(".")))
-        if cuda_version >= (12, 0) and sm_version >= 90:
-            return True
-    return False
+class Fp8GemmRunnerBackend(Enum):
+    """Enum for FP8 GEMM runner backend selection."""
+
+    AUTO = "auto"
+    FLASHINFER = "flashinfer_trtllm"
+    CUTLASS = "cutlass"
+    DEEP_GEMM = "deep_gemm"
+    TRITON = "triton"
+    AITER = "aiter"
+
+    def is_auto(self) -> bool:
+        return self == Fp8GemmRunnerBackend.AUTO
+
+    def is_flashinfer(self) -> bool:
+        return self == Fp8GemmRunnerBackend.FLASHINFER
+
+    def is_cutlass(self) -> bool:
+        return self == Fp8GemmRunnerBackend.CUTLASS
+
+    def is_deep_gemm(self) -> bool:
+        return self == Fp8GemmRunnerBackend.DEEP_GEMM
+
+    def is_triton(self) -> bool:
+        return self == Fp8GemmRunnerBackend.TRITON
+
+    def is_aiter(self) -> bool:
+        return self == Fp8GemmRunnerBackend.AITER
 
 
-CUTLASS_BLOCK_FP8_SUPPORTED = cutlass_block_fp8_supported()
-ENABLE_FLASHINFER_FP8_GEMM = (
-    envs.SGLANG_ENABLE_FLASHINFER_FP8_GEMM.get()
-    and is_blackwell_supported()
-    and is_flashinfer_available()
-)
-if ENABLE_FLASHINFER_FP8_GEMM:
+FP8_GEMM_RUNNER_BACKEND: Fp8GemmRunnerBackend | None = None
+
+
+def _check_cutlass_block_fp8_hardware_support() -> bool:
+    """Return True if CUTLASS block FP8 is supported (Hopper or newer with CUDA 12.0+)."""
+    return is_sm90_supported() or is_blackwell_supported()
+
+
+if is_blackwell_supported() and is_flashinfer_available():
     from flashinfer.gemm import gemm_fp8_nt_groupwise
 
 
 def dispatch_w8a8_block_fp8_linear() -> Callable:
-    if ENABLE_FLASHINFER_FP8_GEMM:
-        return flashinfer_gemm_w8a8_block_fp8_linear
-    elif CUTLASS_BLOCK_FP8_SUPPORTED:
+    """
+    Dispatch to the appropriate FP8 block linear implementation.
+
+    This function selects the backend based on:
+    1. The --fp8-gemm-backend server argument (preferred)
+    2. Auto-detection based on hardware capabilities
+    """
+    backend = get_fp8_gemm_runner_backend()
+
+    # Handle explicit backend selection via --fp8-gemm-backend
+    if not backend.is_auto():
+        return _dispatch_explicit_backend(backend)
+
+    # Auto mode: Select based purely on hardware/backend availability
+    return _dispatch_auto_backend()
+
+
+def _dispatch_explicit_backend(backend: Fp8GemmRunnerBackend) -> Callable:
+    """Dispatch based on explicitly selected backend."""
+    if backend.is_flashinfer():
+        if not (is_blackwell_supported() and is_flashinfer_available()):
+            raise RuntimeError(
+                "FlashInfer FP8 GEMM requested via --fp8-gemm-backend=flashinfer_trtllm, "
+                "but FlashInfer is not available or not supported on this hardware. "
+                "FlashInfer FP8 GEMM requires Blackwell GPUs and FlashInfer to be installed."
+            )
+        return flashinfer_gemm_w8a8_block_fp8_linear_with_fallback
+
+    elif backend.is_cutlass():
+        if not _check_cutlass_block_fp8_hardware_support():
+            raise RuntimeError(
+                "CUTLASS block FP8 requested via --fp8-gemm-backend=cutlass, "
+                "but hardware does not support it. CUTLASS block FP8 requires "
+                "Hopper (SM90+) GPUs with CUDA 12.0+."
+            )
+        return cutlass_w8a8_block_fp8_linear_with_fallback
+
+    elif backend.is_aiter():
+        if not _use_aiter:
+            raise RuntimeError(
+                "AITER backend requested via --fp8-gemm-backend=aiter, "
+                "but AITER is not available. AITER requires AMD GPUs with "
+                "SGLANG_USE_AITER=1 environment variable set."
+            )
+        return aiter_w8a8_block_fp8_linear
+
+    elif backend.is_deep_gemm():
+        if not deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
+            raise RuntimeError(
+                "DeepGEMM backend requested via --fp8-gemm-backend=deep_gemm, "
+                "but DeepGEMM is not available. This usually means the deep_gemm package "
+                "is not installed or has been disabled via SGLANG_ENABLE_JIT_DEEPGEMM=0."
+            )
+        return deepgemm_w8a8_block_fp8_linear_with_fallback
+
+    elif backend.is_triton():
+        return triton_w8a8_block_fp8_linear
+
+    else:
+        raise ValueError(f"Unknown FP8 GEMM backend: {backend}")
+
+
+def _dispatch_auto_backend() -> Callable:
+    """Auto-select the best backend based on hardware capabilities."""
+    # Priority order for auto selection:
+    # 1. DeepGEMM (if enabled and available)
+    # 2. FlashInfer TRTLLM (if Blackwell GPU and FlashInfer available)
+    # 3. CUTLASS (if Hopper+ GPU and CUDA 12.0+)
+    # 4. AITER (if AMD GPU with AITER enabled)
+    # 5. Triton (fallback)
+
+    if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
+        return deepgemm_w8a8_block_fp8_linear_with_fallback
+    elif is_blackwell_supported() and is_flashinfer_available():
+        return flashinfer_gemm_w8a8_block_fp8_linear_with_fallback
+    elif _check_cutlass_block_fp8_hardware_support():
         return cutlass_w8a8_block_fp8_linear_with_fallback
     elif _use_aiter:
         return aiter_w8a8_block_fp8_linear
-    elif deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
-        return deepgemm_w8a8_block_fp8_linear_with_fallback
     else:
         return triton_w8a8_block_fp8_linear
 
 
-def flashinfer_gemm_w8a8_block_fp8_linear(
+def initialize_fp8_gemm_config(server_args: ServerArgs) -> None:
+    """Initialize FP8 GEMM configuration."""
+    global FP8_GEMM_RUNNER_BACKEND
+
+    backend = server_args.fp8_gemm_runner_backend
+
+    # TODO(brayden): Remove env-based overrides in v0.5.7, they will be fully removed in v0.5.7.
+    # Only check environment variables when the server args is not set, server args should take priority.
+    if backend == "auto":
+        if envs.SGLANG_ENABLE_FLASHINFER_FP8_GEMM.get():
+            backend = "flashinfer_trtllm"
+        elif envs.SGLANG_SUPPORT_CUTLASS_BLOCK_FP8.get():
+            backend = "cutlass"
+    else:
+        if (
+            envs.SGLANG_ENABLE_FLASHINFER_FP8_GEMM.get()
+            or envs.SGLANG_SUPPORT_CUTLASS_BLOCK_FP8.get()
+        ):
+            logger.warning(
+                f"FP8 GEMM backend set to '{backend}' via --fp8-gemm-backend overrides "
+                "environment variables SGLANG_ENABLE_FLASHINFER_FP8_GEMM and "
+                "SGLANG_SUPPORT_CUTLASS_BLOCK_FP8. Using server argument value."
+            )
+
+    FP8_GEMM_RUNNER_BACKEND = Fp8GemmRunnerBackend(backend)
+
+
+def get_fp8_gemm_runner_backend() -> Fp8GemmRunnerBackend:
+    """Get the current FP8 GEMM runner backend."""
+    global FP8_GEMM_RUNNER_BACKEND
+    if FP8_GEMM_RUNNER_BACKEND is None:
+        FP8_GEMM_RUNNER_BACKEND = Fp8GemmRunnerBackend.AUTO
+    return FP8_GEMM_RUNNER_BACKEND
+
+
+def flashinfer_gemm_w8a8_block_fp8_linear_with_fallback(
     input: torch.Tensor,
     weight: torch.Tensor,
     block_size: List[int],
@@ -171,7 +302,18 @@ def flashinfer_gemm_w8a8_block_fp8_linear(
 ) -> torch.Tensor:
     assert input_scale is None
 
+    # FlashInfer TRTLLM backend requires K dimension >= 256
+    # Check shape before quantizing, otherwise we run into Flashinfer assertion.
+    # TODO(brayden): make a better fallback here, maybe to cutlass backend?
     input_2d = input.view(-1, input.shape[-1])
+    k_dim = input_2d.shape[1]  # K dimension
+
+    if k_dim < 256:
+        # Fallback to Triton for shapes that don't meet TRTLLM constraint.
+        return triton_w8a8_block_fp8_linear(
+            input, weight, block_size, weight_scale, input_scale, bias
+        )
+
     output_shape = [*input.shape[:-1], weight.shape[0]]
 
     q_input, x_scale = sglang_per_token_group_quant_fp8(
@@ -760,9 +902,8 @@ def apply_fp8_linear(
     # We also don't pad when using torch.compile,
     # as it breaks with dynamic shapes.
     if pad_output is None:
-        pad_output = (
-            not get_bool_env_var("SGLANG_ENABLE_TORCH_COMPILE")
-            and not cutlass_fp8_supported
+        pad_output = not cutlass_fp8_supported and not get_bool_env_var(
+            "SGLANG_ENABLE_TORCH_COMPILE"
         )
     output_padding = 17 if pad_output else None
 
@@ -809,43 +950,30 @@ def apply_fp8_linear(
                     )
 
     if cutlass_fp8_supported and weight_scale.numel() == weight.shape[1]:
-        # cutlass_scaled_mm supports per tensor/channel W and per tensor/token A
-        # for sgl-kernel fp8_scaled_mm, it support per channel W now
-        if VLLM_AVAILABLE and use_vllm_cutlass_w8a8_fp8_kernel:
-            # Fall back to vllm cutlass w8a8 fp8 kernel
-            output = ops.cutlass_scaled_mm(
-                qinput,
-                weight,
-                out_dtype=input.dtype,
-                scale_a=x_scale,
-                scale_b=weight_scale,
-                bias=bias,
+        cutlass_compatible_b = weight.shape[0] % 16 == 0 and weight.shape[1] % 16 == 0
+        if not cutlass_compatible_b or use_triton_w8a8_fp8_kernel:
+            # Massage the input to be 2D
+            qinput = qinput.view(-1, qinput.shape[-1])
+            output = triton_scaled_mm(
+                qinput, weight, x_scale, weight_scale, input.dtype, bias
             )
         else:
-            cutlass_compatible_b = (
-                weight.shape[0] % 16 == 0 and weight.shape[1] % 16 == 0
+            output = fp8_scaled_mm(
+                qinput,
+                weight,
+                x_scale,
+                weight_scale,
+                out_dtype=input.dtype,
+                bias=bias,
             )
-            if not cutlass_compatible_b or use_triton_w8a8_fp8_kernel:
-                # Massage the input to be 2D
-                qinput = qinput.view(-1, qinput.shape[-1])
-                output = triton_scaled_mm(
-                    qinput, weight, x_scale, weight_scale, input.dtype, bias
-                )
-            else:
-                output = fp8_scaled_mm(
-                    qinput,
-                    weight,
-                    x_scale,
-                    weight_scale,
-                    out_dtype=input.dtype,
-                    bias=bias,
-                )
         return output.view(*output_shape)
 
     # torch.scaled_mm supports per tensor weights + activations only
     # so fallback to naive if per channel or per token
     per_tensor_weights = weight_scale.numel() == 1
-    per_tensor_activations = x_scale.numel() == 1
+    # When the number of token is 1,
+    # per-token scale has shape (1, 1), per-tensor scale has shape (1) or ().
+    per_tensor_activations = (x_scale.numel() == 1) and x_scale.dim() < 2
 
     if (
         use_per_token_if_dynamic
@@ -892,7 +1020,9 @@ def apply_fp8_linear(
             return _process_scaled_mm_output(output, input_2d.shape, output_shape)
 
     if per_tensor_weights and per_tensor_activations:
-        # Fused GEMM_DQ
+        # Fused GEMM_DQ; _scaled_mm with torch.compile requires len(weight_scale.shape) == len(x_scale.shape)
+        if weight_scale.ndim == 0 and x_scale.ndim == 1:
+            weight_scale = weight_scale.unsqueeze(0)
         output = torch._scaled_mm(
             qinput,
             weight,

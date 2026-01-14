@@ -1146,7 +1146,7 @@ def chunk_kda_fwd(
     beta: torch.Tensor,
     scale: float,
     initial_state: torch.Tensor,
-    output_final_state: bool,
+    initial_state_indices: torch.Tensor,
     cu_seqlens: torch.LongTensor | None = None,
 ):
     chunk_size = 64
@@ -1172,13 +1172,13 @@ def chunk_kda_fwd(
         cu_seqlens=cu_seqlens,
     )
     del A
-    h, v_new, final_state = chunk_gated_delta_rule_fwd_h(
+    h, v_new = chunk_gated_delta_rule_fwd_h(
         k=kg,
         w=w,
         u=u,
         gk=g,
         initial_state=initial_state,
-        output_final_state=output_final_state,
+        initial_state_indices=initial_state_indices,
         cu_seqlens=cu_seqlens,
     )
     del w, u, kg
@@ -1194,7 +1194,7 @@ def chunk_kda_fwd(
         chunk_size=chunk_size,
     )
     del Aqk, v_new, h
-    return o, final_state
+    return o
 
 
 def chunk_kda(
@@ -1205,7 +1205,7 @@ def chunk_kda(
     beta: torch.Tensor,
     scale: float = None,
     initial_state: torch.Tensor = None,
-    output_final_state: bool = False,
+    initial_state_indices: torch.Tensor = None,
     use_qk_l2norm_in_kernel: bool = False,
     cu_seqlens: torch.LongTensor | None = None,
     **kwargs,
@@ -1217,18 +1217,18 @@ def chunk_kda(
         q = l2norm_fwd(q.contiguous())
         k = l2norm_fwd(k.contiguous())
 
-    o, final_state = chunk_kda_fwd(
+    o = chunk_kda_fwd(
         q=q,
         k=k,
         v=v.contiguous(),
         g=g.contiguous(),
         beta=beta.contiguous(),
         scale=scale,
-        initial_state=initial_state.contiguous(),
-        output_final_state=output_final_state,
+        initial_state=initial_state,
+        initial_state_indices=initial_state_indices,
         cu_seqlens=cu_seqlens,
     )
-    return o, final_state
+    return o
 
 
 @triton.autotune(

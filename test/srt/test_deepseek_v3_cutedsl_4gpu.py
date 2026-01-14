@@ -23,7 +23,7 @@ class TestDeepseekR1Nvfp4CuteDSLDeepEP(CustomTestCase):
             "--trust-remote-code",
             "--disable-radix-cache",
             "--mem-fraction-static",
-            "0.89",
+            "0.8",
             "--max-prefill-tokens",
             "16384",
             "--max-running-requests",

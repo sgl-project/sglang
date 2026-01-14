@@ -15,7 +15,7 @@ from sglang.srt.managers.data_parallel_controller import (
 )
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.utils import configure_logger, numa_utils, prepare_model_and_tokenizer
+from sglang.srt.utils import configure_logger, numa_utils
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = logging.getLogger(__name__)
@@ -76,11 +76,6 @@ def launch_scheduler_process_only(
     if port_args is None:
         port_args = PortArgs.init_new(server_args)
         logger.info(f"{server_args=}")
-
-    # Prepare model and tokenizer paths
-    server_args.model_path, server_args.tokenizer_path = prepare_model_and_tokenizer(
-        server_args.model_path, server_args.tokenizer_path
-    )
 
     scheduler_procs = []
 

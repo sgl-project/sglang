@@ -531,23 +531,3 @@ impl<'a> Parser<'a> {
         }
     }
 }
-
-/// Utility function to check if a string contains complete JSON
-pub fn is_complete_json(input: &str) -> bool {
-    serde_json::from_str::<Value>(input).is_ok()
-}
-
-/// Utility function to find common prefix between two strings
-pub fn find_common_prefix(s1: &str, s2: &str) -> usize {
-    s1.chars()
-        .zip(s2.chars())
-        .take_while(|(a, b)| a == b)
-        .count()
-}
-
-/// Utility function to compute diff between old and new strings
-pub fn compute_diff(old: &str, new: &str) -> String {
-    let common_len = find_common_prefix(old, new);
-    // Convert character count to byte offset
-    new.chars().skip(common_len).collect()
-}

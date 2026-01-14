@@ -55,7 +55,7 @@ jobs:
         run: |
           labels='${{ steps.pr.outputs.labels }}'
           if [[ "${{ contains(fromJson(steps.pr.outputs.labels), 'run-ci') }}" == "false" ]]; then
-            echo "Missing required label 'run-ci'."
+            echo "Missing required label 'run-ci'. See https://docs.sglang.io/developer_guide/contribution_guide.html#how-to-trigger-ci-tests for more details."
             exit 1
           fi
 
@@ -155,11 +155,92 @@ jobs:
             });
 
             const runs = data.workflow_runs || [];
-            const recentFound = runs.find((run) => {
-              if (String(run.id) === String(context.runId)) return false;
-              if (new Date(run.created_at) < cutoff) return false;
-              return (run.actor?.login === triggeringActor) || (run.triggering_actor?.login === triggeringActor);
-            });
+
+            // Rate Limiting Logic:
+            // We only count workflow runs that actually consumed CI resources (i.e., passed the gate).
+            // A run "passes the gate" if any jobs beyond the gate jobs (check-changes, pr-gate, call-gate)
+            // actually executed (not skipped/cancelled). This prevents scenarios where:
+            // - User has PR A with missing 'run-ci' label (fails at gate)
+            // - User opens PR B with 'run-ci' label
+            // - PR B should be able to run even though PR A triggered a run recently
+
+            // Helper function to check if a run passed the gate (i.e., actually consumed CI resources)
+            async function didRunPassGate(run) {
+              try {
+                // Note: Fetching up to 100 jobs (API maximum). If a workflow has >100 jobs,
+                // we may miss some, but this is unlikely in practice.
+                const { data: jobsData } = await github.rest.actions.listJobsForWorkflowRun({
+                  owner, repo, run_id: run.id, per_page: 100
+                });
+                const jobs = jobsData.jobs || [];
+
+                // If no jobs exist yet, the run hasn't started consuming resources
+                if (jobs.length === 0) {
+                  core.info(`Run ${run.id} has no jobs yet; not counting against rate limit.`);
+                  return false;
+                }
+
+                // Gate jobs that don't consume significant CI resources
+                const gateJobs = ['check-changes', 'pr-gate', 'call-gate', 'pr-test-finish'];
+                const jobsBeyondGate = jobs.filter(j => !gateJobs.some(g => j.name === g || j.name.startsWith(g + ' ')));
+
+                // A job "ran" if it reached a terminal conclusion state that indicates actual execution
+                const ranStates = ['success', 'failure', 'timed_out', 'action_required'];
+                const hasJobsThatRan = jobsBeyondGate.some(j => j.conclusion && ranStates.includes(j.conclusion));
+                return hasJobsThatRan;
+              } catch (e) {
+                core.warning(`Could not check jobs for run ${run.id}: ${e.message}`);
+
+                // If it's a rate limit error, count it conservatively to prevent abuse
+                if (e.status === 429) {
+                  core.warning(`Hit rate limit checking run ${run.id}; counting it to be safe.`);
+                  return true;
+                }
+
+                // For cancelled/skipped runs, they likely didn't consume resources
+                if (run.conclusion === 'cancelled' || run.conclusion === 'skipped') {
+                  return false;
+                }
+
+                // Default to counting it to prevent abuse
+                return true;
+              }
+            }
+
+            // Limit the number of runs we'll check in detail to avoid API rate limits
+            const MAX_RUNS_TO_CHECK = 5;
+            let runsChecked = 0;
+            let runsSkippedAtGate = 0;
+            let recentFound = null;
+
+            for (const run of runs) {
+              if (String(run.id) === String(context.runId)) continue;
+              if (new Date(run.created_at) < cutoff) continue;
+              const isUserRun = (run.actor?.login === triggeringActor) || (run.triggering_actor?.login === triggeringActor);
+              if (!isUserRun) continue;
+
+              runsChecked++;
+              core.info(`Checking run ${run.id} (created: ${run.created_at}, conclusion: ${run.conclusion})`);
+
+              // Safety limit: if we've checked too many runs, assume the next one passed to be conservative
+              if (runsChecked > MAX_RUNS_TO_CHECK) {
+                core.warning(`Checked ${MAX_RUNS_TO_CHECK} runs; assuming this one passed gate to avoid API limits.`);
+                recentFound = run;
+                break;
+              }
+
+              // Only count runs that actually passed the gate and consumed CI resources
+              if (await didRunPassGate(run)) {
+                recentFound = run;
+                core.info(`Found recent run ${run.id} that passed gate.`);
+                break;
+              } else {
+                runsSkippedAtGate++;
+                core.info(`Run ${run.id} failed at gate; not counting against rate limit.`);
+              }
+            }
+
+            core.info(`Rate limit check summary: checked ${runsChecked} runs, ${runsSkippedAtGate} failed at gate.`);
 
             if (recentFound) {
               core.setFailed(

@@ -1,4 +1,4 @@
-//! Conversation CRUD handlers - shared across routers
+//! Conversation CRUD handlers for the /v1/conversations API - shared across routers
 
 use std::sync::Arc;
 
@@ -9,11 +9,15 @@ use axum::{
 };
 use chrono::Utc;
 use serde_json::{json, Value};
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
-use crate::data_connector::{
-    Conversation, ConversationId, ConversationItem, ConversationItemId, ConversationItemStorage,
-    ConversationStorage, ListParams, NewConversation, NewConversationItem, SortOrder,
+use crate::{
+    data_connector::{
+        Conversation, ConversationId, ConversationItem, ConversationItemId,
+        ConversationItemStorage, ConversationStorage, ListParams, NewConversation,
+        NewConversationItem, SortOrder,
+    },
+    routers::persistence_utils::item_to_json,
 };
 
 // ============================================================================
@@ -552,47 +556,6 @@ pub async fn delete_conversation_item(
 }
 
 // ============================================================================
-// Item Creation Helper
-// ============================================================================
-
-pub async fn create_and_link_item(
-    item_storage: &Arc<dyn ConversationItemStorage>,
-    conv_id_opt: Option<&ConversationId>,
-    mut new_item: NewConversationItem,
-) -> Result<(), String> {
-    if new_item.status.is_none() {
-        new_item.status = Some("completed".to_string());
-    }
-
-    let created = item_storage
-        .create_item(new_item)
-        .await
-        .map_err(|e| format!("Failed to create item: {e}"))?;
-
-    if let Some(conv_id) = conv_id_opt {
-        item_storage
-            .link_item(conv_id, &created.id, Utc::now())
-            .await
-            .map_err(|e| format!("Failed to link item: {e}"))?;
-
-        debug!(
-            conversation_id = %conv_id.0,
-            item_id = %created.id.0,
-            item_type = %created.item_type,
-            "Persisted conversation item and link"
-        );
-    } else {
-        debug!(
-            item_id = %created.id.0,
-            item_type = %created.item_type,
-            "Persisted conversation item (no conversation link)"
-        );
-    }
-
-    Ok(())
-}
-
-// ============================================================================
 // Parsing and Serialization
 // ============================================================================
 
@@ -654,60 +617,6 @@ fn parse_item_from_value(
         },
         warning,
     ))
-}
-
-/// Field mappings for item types that store data in content
-const ITEM_TYPE_FIELDS: &[(&str, &[&str])] = &[
-    (
-        "mcp_call",
-        &[
-            "name",
-            "arguments",
-            "output",
-            "server_label",
-            "approval_request_id",
-            "error",
-        ],
-    ),
-    ("mcp_list_tools", &["tools", "server_label"]),
-    ("function_call", &["call_id", "name", "arguments", "output"]),
-    ("function_call_output", &["call_id", "output"]),
-];
-
-pub fn item_to_json(item: &ConversationItem) -> Value {
-    let mut obj = serde_json::Map::new();
-    obj.insert("id".to_string(), json!(item.id.0));
-    obj.insert("type".to_string(), json!(item.item_type));
-
-    if let Some(role) = &item.role {
-        obj.insert("role".to_string(), json!(role));
-    }
-
-    // Find field mappings for this item type
-    let fields = ITEM_TYPE_FIELDS
-        .iter()
-        .find(|(t, _)| *t == item.item_type)
-        .map(|(_, fields)| *fields);
-
-    if let Some(fields) = fields {
-        // Extract specific fields from content
-        if let Some(content_obj) = item.content.as_object() {
-            for field in fields {
-                if let Some(value) = content_obj.get(*field) {
-                    obj.insert((*field).to_string(), value.clone());
-                }
-            }
-        }
-    } else {
-        // Default: include content as-is
-        obj.insert("content".to_string(), item.content.clone());
-    }
-
-    if let Some(status) = &item.status {
-        obj.insert("status".to_string(), json!(status));
-    }
-
-    Value::Object(obj)
 }
 
 pub fn conversation_to_json(conversation: &Conversation) -> Value {

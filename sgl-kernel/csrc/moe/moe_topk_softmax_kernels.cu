@@ -44,6 +44,8 @@ using MaxReduceOp = cub::Max;
 using MinReduceOp = cub::Min;
 #endif
 
+using cub_kvp = cub::KeyValuePair<int, float>;
+
 /// Aligned array type
 template <
     typename T,
@@ -143,9 +145,122 @@ __launch_bounds__(TPB) __global__ void moeSoftmax(
   }
 }
 
+namespace moe {
+struct TopKPair {
+  static const int PAIR = 2;
+  static const int MAX_INDEX = 0;
+  cub_kvp max;
+  cub_kvp secondMax;
+
+  __device__ TopKPair() {}
+  __device__ TopKPair(cub_kvp max, cub_kvp secondMax) : max(max), secondMax(secondMax) {}
+};
+
+struct TopKPairArgMax {
+  __device__ TopKPairArgMax() {}
+  __device__ __forceinline__ TopKPair operator()(const TopKPair& candidate1, const TopKPair& candidate2) const {
+    cub_kvp globalMax, globalSecondMax;
+
+    // Determine the global maximum
+    if (candidate1.max.value > candidate2.max.value) {
+      globalMax = candidate1.max;
+    } else {
+      globalMax = candidate2.max;
+    }
+
+    // Determine the global second maximum
+    if (globalMax.key == candidate1.max.key) {
+      // If candidate1 contributed the max, compare its secondMax with candidate2's max
+      globalSecondMax = (candidate1.secondMax.value > candidate2.max.value) ? candidate1.secondMax : candidate2.max;
+    } else {
+      // If candidate2 contributed the max, compare its secondMax with candidate1's max
+      globalSecondMax = (candidate2.secondMax.value > candidate1.max.value) ? candidate2.secondMax : candidate1.max;
+    }
+    return TopKPair(globalMax, globalSecondMax);
+  }
+};
+}  // namespace moe
+
+template <int TPB>
+__launch_bounds__(TPB) __global__ void moeTopKFast(
+    float* inputs_after_softmax,
+    const bool* finished,
+    float* output,
+    int* indices,
+    const int num_experts,
+    const int k,
+    const int start_expert,
+    const int end_expert,
+    const bool renormalize) {
+  using namespace moe;
+  using BlockReduce = cub::BlockReduce<TopKPair, TPB>;
+  __shared__ typename BlockReduce::TempStorage tmpStorage;
+  TopKPair thread_pair;
+
+  const int block_row = blockIdx.x;
+
+  const bool row_is_active = finished ? !finished[block_row] : true;
+  const int thread_read_offset = blockIdx.x * num_experts;
+  float row_sum_for_renormalize = 0;
+  // Each loop finds the top 2 elements,
+  // thus requiring only ⌈k/2⌉ loops (calculated as (k + 1) / 2).
+  for (int k_idx = 0; k_idx < (k + TopKPair::PAIR - 1) / TopKPair::PAIR; ++k_idx) {
+    // Initializing the top 2 elements by the minimum value.
+    thread_pair.max.key = 0;
+    thread_pair.max.value = -1.f;
+    thread_pair.secondMax.key = 0;
+    thread_pair.secondMax.value = -1.f;
+
+    cub_kvp inp_kvp;
+    for (int expert = threadIdx.x; expert < num_experts; expert += TPB) {
+      const int idx = thread_read_offset + expert;
+      inp_kvp.key = expert;
+      inp_kvp.value = inputs_after_softmax[idx];
+      // updating the thread_pair according to inp_kvp's value
+      if (inp_kvp.value > thread_pair.max.value) {
+        thread_pair.secondMax = thread_pair.max;
+        thread_pair.max = inp_kvp;
+      } else if (inp_kvp.value > thread_pair.secondMax.value) {
+        thread_pair.secondMax = inp_kvp;
+      }
+    }
+
+    TopKPairArgMax reducer;
+    const TopKPair result_pair = BlockReduce(tmpStorage).Reduce(thread_pair, reducer);
+    if (threadIdx.x == 0) {
+#pragma unroll
+      // updating 2 elements to the result.
+      for (int i = 0; i < TopKPair::PAIR; i++) {
+        if (k_idx * 2 + i >= k) break;
+        cub_kvp result = (i == TopKPair::MAX_INDEX) ? result_pair.max : result_pair.secondMax;
+        int expert = result.key;
+        bool node_uses_expert = expert >= start_expert && expert < end_expert;
+        bool should_process_row = row_is_active && node_uses_expert;
+        // The inputs_after_softmax is modified in-place to avoid unnecessary loops for finding the top k-1 value.
+        // 1.f represents the minimum value.
+        inputs_after_softmax[thread_read_offset + expert] = -1.f;
+        int idx = k * block_row + k_idx * 2 + i;
+        output[idx] = result.value;
+        indices[idx] = should_process_row ? (expert - start_expert) : num_experts;
+        assert(indices[idx] >= 0);
+        row_sum_for_renormalize += result.value;
+      }
+    }
+    __syncthreads();
+  }
+
+  if (renormalize && threadIdx.x == 0) {
+    float row_sum_for_renormalize_inv = 1.f / row_sum_for_renormalize;
+    for (int k_idx = 0; k_idx < k; ++k_idx) {
+      const int idx = k * block_row + k_idx;
+      output[idx] = output[idx] * row_sum_for_renormalize_inv;
+    }
+  }
+}
+
 template <int TPB>
 __launch_bounds__(TPB) __global__ void moeTopK(
-    const float* inputs_after_softmax,
+    float* inputs_after_softmax,
     const bool* finished,
     float* output,
     int* indices,
@@ -175,15 +290,6 @@ __launch_bounds__(TPB) __global__ void moeTopK(
       const int idx = thread_read_offset + expert;
       inp_kvp.key = expert;
       inp_kvp.value = inputs_after_softmax[idx];
-
-      for (int prior_k = 0; prior_k < k_idx; ++prior_k) {
-        const int prior_winning_expert = indices[k * block_row + prior_k];
-
-        if (prior_winning_expert == expert) {
-          inp_kvp = thread_kvp;
-        }
-      }
-
       thread_kvp = arg_max(inp_kvp, thread_kvp);
     }
 
@@ -199,6 +305,9 @@ __launch_bounds__(TPB) __global__ void moeTopK(
       indices[idx] = should_process_row ? (expert - start_expert) : num_experts;
       assert(indices[idx] >= 0);
       row_sum_for_renormalize += result_kvp.value;
+      // The inputs_after_softmax is modified in-place to avoid unnecessary loops for finding the top k-1 value.
+      // 1.f represents the minimum value.
+      inputs_after_softmax[thread_read_offset + expert] = -1.f;
     }
     __syncthreads();
   }
@@ -592,8 +701,15 @@ void topkGatingSoftmaxKernelLauncher(
       static constexpr int TPB = 256;
       moeSoftmax<T, TPB><<<num_tokens, TPB, 0, stream>>>(
           gating_output, nullptr, softmax_workspace, num_experts, moe_softcapping, correction_bias);
-      moeTopK<TPB><<<num_tokens, TPB, 0, stream>>>(
-          softmax_workspace, nullptr, topk_weights, topk_indices, num_experts, topk, 0, num_experts, renormalize);
+      if (topk == 1) {
+        // Note: As an optimization for better performance,
+        // the softmax_workspace is overwritten in-place by both moeTopK and moeTopKFast.
+        moeTopK<TPB><<<num_tokens, TPB, 0, stream>>>(
+            softmax_workspace, nullptr, topk_weights, topk_indices, num_experts, topk, 0, num_experts, renormalize);
+      } else {
+        moeTopKFast<TPB><<<num_tokens, TPB, 0, stream>>>(
+            softmax_workspace, nullptr, topk_weights, topk_indices, num_experts, topk, 0, num_experts, renormalize);
+      }
     }
   }
 }

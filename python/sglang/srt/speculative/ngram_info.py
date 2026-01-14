@@ -155,7 +155,7 @@ class NgramVerifyInput(SpecInput):
         batch: ScheduleBatch,
         logits_output: torch.Tensor,
     ):
-        accept_index_cpu = self.accept_index.tolist()
+        accept_index_cpu = self.accepted_indices.tolist()
         predict_cpu = self.predict.tolist()
         has_finished = False
 
@@ -171,7 +171,7 @@ class NgramVerifyInput(SpecInput):
                 if req.finished():
                     has_finished = True
                     # set all tokens after finished token to -1 and break
-                    self.accept_index[i, j + 1 :] = -1
+                    self.accepted_indices[i, j + 1 :] = -1
                     break
                 else:
                     if req.grammar is not None:
@@ -180,7 +180,7 @@ class NgramVerifyInput(SpecInput):
                         except ValueError as e:
                             logger.info(
                                 f"{i=}, {req=}\n"
-                                f"{self.accept_index=}\n"
+                                f"{self.accepted_indices=}\n"
                                 f"{self.predict=}\n"
                             )
                             raise e
@@ -190,15 +190,17 @@ class NgramVerifyInput(SpecInput):
             )
 
         if has_finished:
-            self.accept_length = (self.accept_index != -1).sum(dim=1) - 1
-        self.accept_index = self.accept_index[self.accept_index != -1]
+            self.accept_length = (self.accepted_indices != -1).sum(dim=1) - 1
+        self.accepted_indices = self.accepted_indices[self.accepted_indices != -1]
 
         logits_output.next_token_logits = logits_output.next_token_logits[
-            self.accept_index
+            self.accepted_indices
         ]
         if logits_output.hidden_states:
-            logits_output.hidden_states = logits_output.hidden_states[self.accept_index]
-        self.verified_id = self.predict[self.accept_index]
+            logits_output.hidden_states = logits_output.hidden_states[
+                self.accepted_indices
+            ]
+        self.verified_id = self.predict[self.accepted_indices]
 
     def _free_cache(
         self, batch: ScheduleBatch, page_size: int, accept_length_cpu: torch.Tensor
@@ -208,16 +210,16 @@ class NgramVerifyInput(SpecInput):
         if page_size == 1:
             # TODO: boolean array index leads to a device sync. Remove it.
             evict_mask = torch.full_like(self.draft_token, True, dtype=torch.bool)
-            evict_mask[self.accept_index] = False
+            evict_mask[self.accepted_indices] = False
             batch.token_to_kv_pool_allocator.free(batch.out_cache_loc[evict_mask])
-            batch.out_cache_loc = batch.out_cache_loc[self.accept_index]
+            batch.out_cache_loc = batch.out_cache_loc[self.accepted_indices]
         else:
             # Shift the accepted tokens to the beginning.
             # Only evict the last part
             src_cache_loc, tgt_cache_loc, to_free_num_slots = get_src_tgt_cache_loc(
                 batch.seq_lens,
                 batch.out_cache_loc,
-                self.accept_index,
+                self.accepted_indices,
                 self.accept_length,
                 self.draft_token_num,
                 page_size,
@@ -285,14 +287,14 @@ class NgramVerifyInput(SpecInput):
         predict_shape = list(logits_output.next_token_logits.shape)[:-1]
         predict_shape[-1] += 1
         self.predict = torch.empty(predict_shape, dtype=torch.int32, device=self.device)
-        self.accept_index = torch.full(
+        self.accepted_indices = torch.full(
             (bs, self.draft_token_num), -1, dtype=torch.int32, device=self.device
         )
         self.accept_length = torch.empty((bs,), dtype=torch.int32, device=self.device)
 
         verify_tree_greedy(
             predicts=self.predict,  # mutable
-            accept_index=self.accept_index,  # mutable
+            accept_index=self.accepted_indices,  # mutable
             accept_token_num=self.accept_length,  # mutable
             candidates=candidates,
             retrive_index=self.retrive_index,
@@ -312,7 +314,7 @@ class NgramVerifyInput(SpecInput):
         predict_shape = list(logits_output.next_token_logits.shape)[:-1]
         predict_shape[-1] += 1
         self.predict = torch.empty(predict_shape, dtype=torch.int32, device=self.device)
-        self.accept_index = torch.full(
+        self.accepted_indices = torch.full(
             (bs, self.draft_token_num), -1, dtype=torch.int32, device=self.device
         )
         self.accept_length = torch.empty((bs,), dtype=torch.int32, device=self.device)
@@ -354,7 +356,7 @@ class NgramVerifyInput(SpecInput):
         )
         tree_speculative_sampling_target_only(
             predicts=self.predict,  # mutable
-            accept_index=self.accept_index,  # mutable
+            accept_index=self.accepted_indices,  # mutable
             accept_token_num=self.accept_length,  # mutable
             candidates=candidates.to(torch.int64),
             retrive_index=self.retrive_index.to(torch.int64),

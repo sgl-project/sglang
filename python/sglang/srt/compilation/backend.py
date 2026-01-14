@@ -19,20 +19,11 @@ from sglang.srt.compilation.compilation_config import CompilationConfig
 from sglang.srt.compilation.compilation_counter import compilation_counter
 from sglang.srt.compilation.compiler_interface import EagerAdapter, InductorAdaptor
 from sglang.srt.compilation.cuda_piecewise_backend import CUDAPiecewiseBackend
+from sglang.srt.compilation.npu_piecewise_backend import NPUPiecewiseBackend
 from sglang.srt.compilation.pass_manager import PostGradPassManager
-from sglang.srt.utils.common import rank0_log
+from sglang.srt.utils.common import is_npu, rank0_log
 
 logger = logging.getLogger(__name__)
-
-
-SPLIT_OPS = [
-    "sglang.unified_attention_with_output",
-    "sglang.gdn_with_output",
-]
-
-
-def add_split_ops(ops):
-    SPLIT_OPS.extend(ops)
 
 
 def make_compiler(config: CompilationConfig):
@@ -42,6 +33,32 @@ def make_compiler(config: CompilationConfig):
         return InductorAdaptor()
     else:
         raise ValueError(f"Unknown compiler: {config.compiler}")
+
+
+def make_backend(
+    graph: fx.GraphModule,
+    compile_config: CompilationConfig,
+    inductor_config: dict[str, Any],
+    graph_pool: Any,
+    piecewise_compile_index: int,
+    total_piecewise_compiles: int,
+    sym_shape_indices: list[int],
+    compiled_graph_for_general_shape: Callable,
+    sglang_backend,
+):
+
+    backend_cls = CUDAPiecewiseBackend if not is_npu() else NPUPiecewiseBackend
+    return backend_cls(
+        graph,
+        compile_config,
+        inductor_config,
+        graph_pool,
+        piecewise_compile_index,
+        total_piecewise_compiles,
+        sym_shape_indices,
+        compiled_graph_for_general_shape,
+        sglang_backend,
+    )
 
 
 class CompilerManager:
@@ -302,7 +319,7 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):
                 )
             )
 
-            self.module.__dict__[target] = CUDAPiecewiseBackend(
+            self.module.__dict__[target] = make_backend(
                 submod,
                 self.compile_config,
                 self.inductor_config,
@@ -406,7 +423,7 @@ class SGLangBackend:
 
         self.split_gm, self.piecewise_graphs = split_graph(
             graph,
-            SPLIT_OPS,
+            self.compile_config.split_ops,
         )
         from torch._dynamo.utils import lazy_format_graph_code
 

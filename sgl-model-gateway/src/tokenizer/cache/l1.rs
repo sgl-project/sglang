@@ -80,10 +80,11 @@ fn find_special_token_boundaries(text: &str, special_tokens: &[&str]) -> Vec<usi
 }
 
 /// A cached prefix entry
+/// Uses Arc<[TokenIdType]> for zero-copy access to tokens
 #[derive(Debug, Clone)]
 struct CachedPrefix {
-    /// The pre-computed token IDs for this prefix
-    tokens: Vec<TokenIdType>,
+    /// The pre-computed token IDs for this prefix (Arc for zero-copy cloning)
+    tokens: Arc<[TokenIdType]>,
     /// Last access timestamp (for LRU eviction)
     last_accessed: Arc<AtomicU64>,
     /// Size in bytes (for memory tracking during eviction)
@@ -127,6 +128,7 @@ impl L1Cache {
     /// Returns (cached_tokens, byte_offset) if found
     ///
     /// Uses pre-computed tokens cached during insertion.
+    /// Returns Vec<TokenIdType> as the caller needs to extend it with suffix tokens.
     pub fn longest_prefix_match(
         &self,
         input: &str,
@@ -139,13 +141,19 @@ impl L1Cache {
             return None;
         }
 
-        // Search backwards from the longest boundary to find the best match
-        for &boundary_pos in boundaries.iter().rev() {
-            let prefix = &input[0..boundary_pos];
-            let prefix_bytes = prefix.as_bytes();
-            let hash = blake3::hash(prefix_bytes);
-            let hash_bytes: Blake3Hash = *hash.as_bytes();
+        // Build all prefix hashes incrementally O(N)
+        let mut hasher = blake3::Hasher::new();
+        let mut prefix_hashes = Vec::with_capacity(boundaries.len());
+        let mut last_pos = 0;
+        let bytes = input.as_bytes();
+        for &boundary_pos in &boundaries {
+            hasher.update(&bytes[last_pos..boundary_pos]);
+            prefix_hashes.push((boundary_pos, *hasher.clone().finalize().as_bytes()));
+            last_pos = boundary_pos;
+        }
 
+        // Search from the longest boundary to find the best match
+        for (boundary_pos, hash_bytes) in prefix_hashes.into_iter().rev() {
             let shard_idx = hash_bytes[0] as usize % NUM_SHARDS;
 
             if let Some(entry) = self.shards[shard_idx].get(&hash_bytes) {
@@ -154,7 +162,8 @@ impl L1Cache {
                 entry.last_accessed.store(timestamp, Ordering::Relaxed);
 
                 self.hits.fetch_add(1, Ordering::Relaxed);
-                return Some((entry.tokens.clone(), boundary_pos));
+                // Convert Arc<[T]> to Vec<T> - caller will extend with suffix tokens
+                return Some((entry.tokens.to_vec(), boundary_pos));
             }
         }
 
@@ -164,8 +173,7 @@ impl L1Cache {
 
     /// Insert prefix entries at ALL special token boundaries
     ///
-    /// Re-tokenizes each prefix to ensure correctness (BPE tokenization is not prefix-stable).
-    /// This is more expensive on cache misses but provides correct tokens for cache hits.
+    /// Uses incremental hashing and tokenization for O(N) performance.
     ///
     /// Optimized for workloads with high prefix reuse (e.g., chat templates with repeated system prompts).
     pub fn insert_at_boundaries<E: super::super::traits::Encoder + ?Sized>(
@@ -173,6 +181,7 @@ impl L1Cache {
         input: &str,
         tokenizer: &E,
         special_tokens: &[&str],
+        add_special_tokens: bool,
     ) -> anyhow::Result<()> {
         let boundaries = find_special_token_boundaries(input, special_tokens);
 
@@ -180,24 +189,33 @@ impl L1Cache {
             return Ok(());
         }
 
-        // Calculate how much memory we need and tokenize each prefix
-        let mut entries_to_insert = Vec::new();
-        for &boundary_pos in &boundaries {
-            // Extract prefix up to this special token boundary
-            let prefix = &input[0..boundary_pos];
-            let prefix_bytes = prefix.as_bytes();
-            let hash = blake3::hash(prefix_bytes);
-            let hash_bytes: Blake3Hash = *hash.as_bytes();
+        let mut hasher = blake3::Hasher::new();
+        let mut running_tokens = Vec::new();
+        let mut last_pos = 0;
+        let mut entries_to_insert = Vec::with_capacity(boundaries.len());
+        let bytes = input.as_bytes();
+        for (i, &boundary_pos) in boundaries.iter().enumerate() {
+            let delta_text = &input[last_pos..boundary_pos];
 
-            // Re-tokenize the prefix for guaranteed correctness
-            // This is the only way to know the exact token boundaries
-            let prefix_encoding = tokenizer.encode(prefix)?;
-            let prefix_tokens = prefix_encoding.token_ids().to_vec();
+            // 1. Incremental Hash update
+            hasher.update(&bytes[last_pos..boundary_pos]);
+            let hash_bytes: Blake3Hash = *hasher.clone().finalize().as_bytes();
+
+            // 2. Incremental Tokenization
+            // Only add special tokens (like BOS) for the very first segment to avoid duplicates
+            let segment_encoding = tokenizer.encode(delta_text, (i == 0) && add_special_tokens)?;
+            running_tokens.extend_from_slice(segment_encoding.token_ids());
+
+            // 3. Prepare entry
+            // Convert current tokens to Arc<[TokenIdType]> for sharing
+            let prefix_tokens: Arc<[TokenIdType]> = running_tokens.as_slice().into();
 
             // Size = text bytes + token storage
             let size_bytes = boundary_pos + prefix_tokens.len() * size_of::<TokenIdType>();
 
             entries_to_insert.push((hash_bytes, prefix_tokens, size_bytes));
+
+            last_pos = boundary_pos;
         }
 
         if entries_to_insert.is_empty() {
@@ -213,14 +231,13 @@ impl L1Cache {
         }
 
         // Insert all entries
+        let current_timestamp = self.access_counter.load(Ordering::Relaxed);
         for (hash_bytes, prefix_tokens, size_bytes) in entries_to_insert {
             let shard_idx = hash_bytes[0] as usize % NUM_SHARDS;
 
             let cached = CachedPrefix {
-                tokens: prefix_tokens,
-                last_accessed: Arc::new(AtomicU64::new(
-                    self.access_counter.load(Ordering::Relaxed),
-                )),
+                tokens: prefix_tokens, // Already Arc<[TokenIdType]>
+                last_accessed: Arc::new(AtomicU64::new(current_timestamp)),
                 size_bytes,
             };
 
@@ -354,7 +371,7 @@ mod tests {
 
         // Insert at special token boundaries (re-tokenizes prefixes)
         cache
-            .insert_at_boundaries(input1, &tokenizer, special_tokens)
+            .insert_at_boundaries(input1, &tokenizer, special_tokens, false)
             .unwrap();
 
         // Should have cached at special token boundaries
@@ -381,7 +398,7 @@ mod tests {
         let input = "<|im_start|>user\nHi<|im_end|>";
 
         cache
-            .insert_at_boundaries(input, &tokenizer, special_tokens)
+            .insert_at_boundaries(input, &tokenizer, special_tokens, false)
             .unwrap();
 
         // Should cache at <|im_start|> boundary (has suffix left)
@@ -402,7 +419,7 @@ mod tests {
         let input = "<|im_start|>system\nYou are a helpful AI assistant that provides detailed and accurate responses.<|im_end|><|im_start|>user\nHello there! How are you today? Can you help me understand how tokenization works in language models?<|im_end|><|im_start|>assistant\nI'm doing well, thank you! I'd be happy to explain tokenization. Tokenization is the process of breaking text into smaller units called tokens.<|im_end|>";
 
         cache
-            .insert_at_boundaries(input, &tokenizer, special_tokens)
+            .insert_at_boundaries(input, &tokenizer, special_tokens, false)
             .unwrap();
 
         // Should have multiple entries at special token boundaries
@@ -429,7 +446,7 @@ mod tests {
         let input = "<|im_start|>system\nYou are a helpful assistant that provides detailed answers.<|im_end|><|im_start|>user\nHello there! How are you today?<|im_end|>";
 
         cache
-            .insert_at_boundaries(input, &tokenizer, special_tokens)
+            .insert_at_boundaries(input, &tokenizer, special_tokens, false)
             .unwrap();
 
         // Try to find match
@@ -451,7 +468,7 @@ mod tests {
         let input = "<|im_start|>system\nYou are a helpful assistant that provides clear and detailed responses.<|im_end|><|im_start|>user\nHello there!<|im_end|>";
 
         cache
-            .insert_at_boundaries(input, &tokenizer, special_tokens)
+            .insert_at_boundaries(input, &tokenizer, special_tokens, false)
             .unwrap();
         assert!(!cache.is_empty());
 
@@ -473,7 +490,7 @@ mod tests {
         // Insert first conversation
         let input1 = "<|im_start|>system\nYou are a helpful assistant specialized in mathematics.<|im_end|><|im_start|>user\nCan you explain calculus to me?<|im_end|><|im_start|>assistant\nCertainly! Calculus is a branch of mathematics that studies continuous change.<|im_end|><|eot_id|>";
         cache
-            .insert_at_boundaries(input1, &tokenizer, special_tokens)
+            .insert_at_boundaries(input1, &tokenizer, special_tokens, false)
             .unwrap();
 
         // Access the first entry to update its timestamp
@@ -483,7 +500,7 @@ mod tests {
         // Insert second conversation
         let input2 = "<|im_start|>system\nYou are a helpful assistant specialized in physics.<|im_end|><|im_start|>user\nWhat is quantum mechanics?<|im_end|><|im_start|>assistant\nQuantum mechanics is the fundamental theory describing nature at atomic and subatomic scales.<|im_end|><|eot_id|>";
         cache
-            .insert_at_boundaries(input2, &tokenizer, special_tokens)
+            .insert_at_boundaries(input2, &tokenizer, special_tokens, false)
             .unwrap();
 
         // Access the second entry to make it more recent
@@ -493,7 +510,7 @@ mod tests {
         // Insert third conversation (should trigger eviction of oldest)
         let input3 = "<|im_start|>system\nYou are a helpful assistant specialized in chemistry.<|im_end|><|im_start|>user\nExplain the periodic table to me please.<|im_end|><|im_start|>assistant\nThe periodic table is a tabular arrangement of chemical elements organized by atomic number and electron configuration.<|im_end|><|eot_id|>";
         cache
-            .insert_at_boundaries(input3, &tokenizer, special_tokens)
+            .insert_at_boundaries(input3, &tokenizer, special_tokens, false)
             .unwrap();
 
         // Verify cache didn't exceed max memory

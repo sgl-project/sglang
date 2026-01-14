@@ -2,11 +2,8 @@
 
 use std::sync::Arc;
 
-use axum::{
-    http::StatusCode,
-    response::{IntoResponse, Response},
-};
-use serde_json::{json, to_value};
+use axum::response::Response;
+use serde_json::to_value;
 use tracing::{debug, error, warn};
 
 use crate::{
@@ -18,19 +15,19 @@ use crate::{
         responses::{ResponseTool, ResponseToolType, ResponsesRequest, ResponsesResponse},
     },
     routers::{
-        grpc::error,
-        openai::{conversations::persist_conversation_items, mcp::ensure_request_mcp_client},
+        error, mcp_utils::ensure_request_mcp_client, persistence_utils::persist_conversation_items,
     },
 };
 
 /// Ensure MCP connection succeeds if MCP tools are declared
 ///
 /// Checks if request declares MCP tools, and if so, validates that
-/// the MCP client can be created and connected.
-pub async fn ensure_mcp_connection(
+/// the MCP clients can be created and connected.
+/// Returns Ok((has_mcp_tools, server_keys)) on success.
+pub(crate) async fn ensure_mcp_connection(
     mcp_manager: &Arc<McpManager>,
     tools: Option<&[ResponseTool]>,
-) -> Result<bool, Response> {
+) -> Result<(bool, Vec<String>), Response> {
     let has_mcp_tools = tools
         .map(|t| {
             t.iter()
@@ -40,50 +37,43 @@ pub async fn ensure_mcp_connection(
 
     if has_mcp_tools {
         if let Some(tools) = tools {
-            if ensure_request_mcp_client(mcp_manager, tools)
-                .await
-                .is_none()
-            {
-                error!(
-                    function = "ensure_mcp_connection",
-                    "Failed to connect to MCP server"
-                );
-                return Err(error::failed_dependency(
-                    "Failed to connect to MCP server. Check server_url and authorization.",
-                ));
+            match ensure_request_mcp_client(mcp_manager, tools).await {
+                Some((_manager, server_keys)) => {
+                    return Ok((true, server_keys));
+                }
+                None => {
+                    error!(
+                        function = "ensure_mcp_connection",
+                        "Failed to connect to MCP servers"
+                    );
+                    return Err(error::failed_dependency(
+                        "connect_mcp_server_failed",
+                        "Failed to connect to MCP servers. Check server_url and authorization.",
+                    ));
+                }
             }
         }
     }
 
-    Ok(has_mcp_tools)
+    Ok((false, Vec::new()))
 }
 
 /// Validate that workers are available for the requested model
-pub fn validate_worker_availability(
+pub(crate) fn validate_worker_availability(
     worker_registry: &Arc<WorkerRegistry>,
     model: &str,
 ) -> Option<Response> {
     let available_models = worker_registry.get_models();
 
     if !available_models.contains(&model.to_string()) {
-        return Some(
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                axum::Json(json!({
-                    "error": {
-                        "message": format!(
-                            "No workers available for model '{}'. Available models: {}",
-                            model,
-                            available_models.join(", ")
-                        ),
-                        "type": "service_unavailable",
-                        "param": "model",
-                        "code": "no_available_workers"
-                    }
-                })),
-            )
-                .into_response(),
-        );
+        return Some(error::service_unavailable(
+            "no_available_workers",
+            format!(
+                "No workers available for model '{}'. Available models: {}",
+                model,
+                available_models.join(", ")
+            ),
+        ));
     }
 
     None
@@ -103,7 +93,7 @@ pub fn validate_worker_availability(
 ///   the initial conversion from ResponsesRequest to ChatCompletionRequest. MCP tools
 ///   are merged later by the tool loop before being sent to the chat pipeline, where
 ///   tool_choice constraints are generated for ALL tools (function + MCP combined).
-pub fn extract_tools_from_response_tools(
+pub(crate) fn extract_tools_from_response_tools(
     response_tools: Option<&[ResponseTool]>,
     include_mcp: bool,
 ) -> Vec<Tool> {
@@ -137,7 +127,7 @@ pub fn extract_tools_from_response_tools(
 ///
 /// Common helper function to avoid duplication across sync and streaming paths
 /// in both harmony and regular responses implementations.
-pub async fn persist_response_if_needed(
+pub(crate) async fn persist_response_if_needed(
     conversation_storage: Arc<dyn ConversationStorage>,
     conversation_item_storage: Arc<dyn ConversationItemStorage>,
     response_storage: Arc<dyn ResponseStorage>,

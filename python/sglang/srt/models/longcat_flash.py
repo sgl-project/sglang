@@ -63,6 +63,7 @@ from sglang.srt.layers.moe.ep_moe.kernels import zero_experts_compute_triton
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import StandardTopKOutput, TopK
+from sglang.srt.layers.moe.utils import filter_moe_weight_param_global_expert
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.quantization.fp8_utils import (
@@ -245,6 +246,7 @@ class LongcatFlashMoE(nn.Module):
             renormalize=False,
             use_grouped_topk=False,
             correction_bias=self.router.e_score_correction_bias.data,
+            layer_id=layer_id,
         )
         self.topk.forward = self.topk.forward_native
 
@@ -294,6 +296,9 @@ class LongcatFlashMoE(nn.Module):
             x.data
             for name, x in self.experts.named_parameters()
             if name not in ["correction_bias"]
+            and filter_moe_weight_param_global_expert(
+                name, x, self.experts.num_local_experts
+            )
         ]
 
 
@@ -380,6 +385,8 @@ class LongcatFlashDecoderLayer(nn.Module):
                 num_layers=config.num_hidden_layers,
                 is_layer_sparse=False,
                 is_previous_layer_sparse=False,
+                # TODO: Check if the following is correct.
+                is_next_layer_sparse=False,
             )
             for i in range(2)
         ]
@@ -398,6 +405,8 @@ class LongcatFlashDecoderLayer(nn.Module):
             num_layers=config.num_hidden_layers,
             is_layer_sparse=True,
             is_previous_layer_sparse=True,
+            # TODO: Check if the following is correct.
+            is_next_layer_sparse=True,
         )
         self.moe_layer_communicator = LayerCommunicator(
             layer_scatter_modes=self.moe_layer_scatter_modes,

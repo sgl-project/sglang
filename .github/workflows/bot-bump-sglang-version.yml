@@ -53,9 +53,37 @@ jobs:
         run: |
           bash scripts/release/commit_and_pr.sh "SGLang" "${{ github.event.inputs.new_version }}" "$BRANCH_NAME"
 
-  run-nightly-tests:
+  run-nightly-tests-nvidia:
     needs: bump-sglang-version
     uses: ./.github/workflows/nightly-test-nvidia.yml
+    with:
+      ref: ${{ needs.bump-sglang-version.outputs.branch_name }}
+    secrets: inherit
+
+  run-nightly-tests-amd:
+    needs: bump-sglang-version
+    uses: ./.github/workflows/nightly-test-amd.yml
+    with:
+      ref: ${{ needs.bump-sglang-version.outputs.branch_name }}
+    secrets: inherit
+
+  run-nightly-tests-npu:
+    needs: bump-sglang-version
+    uses: ./.github/workflows/nightly-test-npu.yml
+    with:
+      ref: ${{ needs.bump-sglang-version.outputs.branch_name }}
+    secrets: inherit
+
+  run-pr-tests-xeon:
+    needs: bump-sglang-version
+    uses: ./.github/workflows/pr-test-xeon.yml
+    with:
+      ref: ${{ needs.bump-sglang-version.outputs.branch_name }}
+    secrets: inherit
+
+  run-pr-tests-xpu:
+    needs: bump-sglang-version
+    uses: ./.github/workflows/pr-test-xpu.yml
     with:
       ref: ${{ needs.bump-sglang-version.outputs.branch_name }}
     secrets: inherit

@@ -153,7 +153,7 @@ impl ToolParser for DeepSeekParser {
             match self.parse_tool_call(mat.as_str()) {
                 Ok(tool) => tools.push(tool),
                 Err(e) => {
-                    tracing::warn!("Failed to parse tool call: {}", e);
+                    tracing::debug!("Failed to parse tool call: {}", e);
                     continue;
                 }
             }
@@ -205,7 +205,7 @@ impl ToolParser for DeepSeekParser {
             // Validate tool name
             if !tool_indices.contains_key(func_name) {
                 // Invalid tool name - skip this tool, preserve indexing for next tool
-                tracing::warn!("Invalid tool name '{}' - skipping", func_name);
+                tracing::debug!("Invalid tool name '{}' - skipping", func_name);
                 helpers::reset_current_tool_state(
                     &mut self.buffer,
                     &mut self.current_tool_name_sent,

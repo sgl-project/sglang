@@ -6,6 +6,7 @@ pub mod cache;
 pub mod factory;
 pub mod hub;
 pub mod mock;
+pub mod registry;
 pub mod sequence;
 pub mod stop;
 pub mod stream;
@@ -22,19 +23,14 @@ pub mod tiktoken;
 #[cfg(test)]
 mod tests;
 
-// Re-exports
-pub use cache::{CacheConfig, CacheStats, CachedTokenizer, TokenizerFingerprint};
-pub use factory::{
-    create_tokenizer, create_tokenizer_async, create_tokenizer_async_with_chat_template,
-    create_tokenizer_from_file, create_tokenizer_with_chat_template,
-    create_tokenizer_with_chat_template_blocking, TokenizerType,
-};
+// Internal imports for Tokenizer struct
+use factory::{create_tokenizer_from_file, create_tokenizer_with_chat_template};
+// Re-export types used outside this module
 pub use huggingface::HuggingFaceTokenizer;
-pub use sequence::Sequence;
-pub use stop::{SequenceDecoderOutput, StopSequenceConfig, StopSequenceDecoder};
+pub use registry::TokenizerRegistry;
+pub use stop::StopSequenceDecoder;
 pub use stream::DecodeStream;
-pub use tiktoken::{TiktokenModel, TiktokenTokenizer};
-pub use traits::{Decoder, Encoder, Encoding, SpecialTokens, Tokenizer as TokenizerTrait};
+pub use traits::{Decoder, Encoder, Encoding, SpecialTokens};
 
 /// Main tokenizer wrapper that provides a unified interface for different tokenizer implementations
 #[derive(Clone)]
@@ -72,13 +68,19 @@ impl Tokenizer {
     }
 
     /// Direct encode method
-    pub fn encode(&self, input: &str) -> Result<Encoding> {
-        self.0.encode(input)
+    ///
+    /// Set `add_special_tokens` to `true` for embeddings (to add BOS/EOS tokens configured in tokenizer_config.json),
+    /// or `false` for chat completion (where the chat template handles special tokens).
+    pub fn encode(&self, input: &str, add_special_tokens: bool) -> Result<Encoding> {
+        self.0.encode(input, add_special_tokens)
     }
 
     /// Direct batch encode method
-    pub fn encode_batch(&self, inputs: &[&str]) -> Result<Vec<Encoding>> {
-        self.0.encode_batch(inputs)
+    ///
+    /// Set `add_special_tokens` to `true` for embeddings (to add BOS/EOS tokens configured in tokenizer_config.json),
+    /// or `false` for chat completion (where the chat template handles special tokens).
+    pub fn encode_batch(&self, inputs: &[&str], add_special_tokens: bool) -> Result<Vec<Encoding>> {
+        self.0.encode_batch(inputs, add_special_tokens)
     }
 
     /// Direct decode method

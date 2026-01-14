@@ -2,7 +2,7 @@
 
 ### Running DeepSeek-V3
 
-#### Running DeepSeek on 1 x Atlas 800I A3.
+#### Running DeepSeek in PD mixed mode on 1 x Atlas 800I A3.
 
 W4A8 Model weights could be found [here](https://modelers.cn/models/Modelers_Park/DeepSeek-R1-0528-w4a8).
 
@@ -32,15 +32,13 @@ python3 -m sglang.launch_server \
     --device npu \
     --quantization modelslim \
     --watchdog-timeout 9000 \
-    --host 127.0.0.1 \
-    --port 6688 \
     --cuda-graph-bs 8 16 24 28 32 \
     --mem-fraction-static 0.68 \
     --max-running-requests 128 \
     --context-length 8188 \
     --disable-radix-cache \
     --chunked-prefill-size -1 \
-    --max-prefill-tokens 6000 \
+    --max-prefill-tokens 16384 \
     --moe-a2a-backend deepep \
     --deepep-mode auto \
     --enable-dp-attention \
@@ -53,17 +51,17 @@ python3 -m sglang.launch_server \
     --dtype bfloat16
 ```
 
-#### Running DeepSeek with PD disaggregation on 2 x Atlas 800I A3.
+#### Running DeepSeek with PD disaggregation mode on 2 x Atlas 800I A3.
 
 W4A8 Model weights could be found [here](https://modelers.cn/models/Modelers_Park/DeepSeek-R1-0528-w4a8).
 
-
-Prefill:
+1. Prefill:
 
 ```shell
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export STREAMS_PER_DEVICE=32
-#PD
+
+#memfabric config store
 export ASCEND_MF_STORE_URL="tcp://<PREFILL_HOST_IP>:<PORT>"
 
 #Deepep communication settings
@@ -78,10 +76,11 @@ export TASK_QUEUE_ENABLE=2
 
 python -m sglang.launch_server \
     --model-path ${MODEL_PATH} \
-    --disaggregation-mode prefill \
     --host $PREFILL_HOST_IP \
     --port 8000 \
+    --disaggregation-mode prefill \
     --disaggregation-bootstrap-port 8996 \
+    --disaggregation-transfer-backend ascend \
     --trust-remote-code \
     --nnodes 1 \
     --node-rank 0 \
@@ -90,7 +89,6 @@ python -m sglang.launch_server \
     --attention-backend ascend \
     --device npu \
     --quantization modelslim \
-    --disaggregation-transfer-backend ascend \
     --max-running-requests 8 \
     --context-length 8192 \
     --disable-radix-cache \
@@ -108,12 +106,13 @@ python -m sglang.launch_server \
     --dtype bfloat16
 ```
 
-Decode:
+2. Decode:
 
 ```shell
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export STREAMS_PER_DEVICE=32
-#PD
+
+#memfabric config store
 export ASCEND_MF_STORE_URL="tcp://<PREFILL_HOST_IP>:<PORT>"
 
 #Deepep communication settings
@@ -158,13 +157,12 @@ python -m sglang.launch_server \
     --speculative-num-steps 3 \
     --speculative-eagle-topk 1 \
     --speculative-num-draft-tokens 4 \
-    --prefill-round-robin-balance \
     --disable-shared-experts-fusion \
     --dtype bfloat16 \
     --tokenizer-worker-num 4
 ```
 
-sglang router:
+3. SGLang Router
 
 ```shell
 python -m sglang_router.launch_router \
@@ -180,13 +178,13 @@ python -m sglang_router.launch_router \
 
 W8A8 Model weights could be found [here](https://modelers.cn/models/State_Cloud/Deepseek-R1-bf16-hfd-w8a8).
 
-Prefill:
+1. Prefill:
 
 ```shell
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export STREAMS_PER_DEVICE=32
-#PD
-P_HOST_IP=('xx,xx,xx,xx' 'xx,xx,xx,xx')
+
+#memfabric config store
 export ASCEND_MF_STORE_URL="tcp://<P_HOST_IP[0]>:<PORT>"
 
 #Deepep communication settings
@@ -199,14 +197,18 @@ export SGLANG_USE_FIA_NZ=1
 export ENABLE_MOE_NZ=1
 export TASK_QUEUE_ENABLE=2
 
+#Please list all host ips of Prefill instance
+P_HOST_IP=('xx,xx,xx,xx' 'xx,xx,xx,xx')
+
 for i in "${!P_HOST_IP[@]}";
 do
   python -m sglang.launch_server \
       --model-path ${MODEL_PATH} \
-      --disaggregation-mode prefill \
       --host ${P_HOST_IP[$i]} \
       --port 8000 \
+      --disaggregation-mode prefill \
       --disaggregation-bootstrap-port $((8996+$i)) \
+      --disaggregation-transfer-backend ascend \
       --trust-remote-code \
       --nnodes 1 \
       --node-rank 0 \
@@ -215,7 +217,6 @@ do
       --attention-backend ascend \
       --device npu \
       --quantization modelslim \
-      --disaggregation-transfer-backend ascend \
       --max-running-requests 8 \
       --context-length 8192 \
       --disable-radix-cache \
@@ -234,12 +235,13 @@ do
 done
 ```
 
-Decode:
+2. Decode:
 
 ```shell
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export STREAMS_PER_DEVICE=32
-#PD
+
+#memfabric config store
 export ASCEND_MF_STORE_URL="tcp://<P_HOST_IP[0]>:<PORT>"
 
 #Deepep communication settings
@@ -256,6 +258,7 @@ export SGLANG_NPU_USE_MLAPO=1
 export SGLANG_USE_FIA_NZ=1
 export ENABLE_MOE_NZ=1
 
+#please list all host ips of Prefill instance
 D_HOST_IP=('xx,xx,xx,xx' 'xx,xx,xx,xx')
 
 for i in "${!D_HOST_IP[@]}";
@@ -263,6 +266,7 @@ do
   python -m sglang.launch_server
       --model-path ${MODEL_PATH} \
       --disaggregation-mode decode \
+      --disaggregation-transfer-backend ascend \
       --host ${D_HOST_IP[$i]} \
       --port 8001 \
       --trust-remote-code \
@@ -281,7 +285,6 @@ do
       --deepep-mode low_latency \
       --enable-dp-lm-head \
       --cuda-graph-bs  8 10 12 14 16 18 20 22 24 26 \
-      --disaggregation-transfer-backend ascend \
       --watchdog-timeout 9000 \
       --context-length 8192 \
       --speculative-algorithm NEXTN \
@@ -289,13 +292,12 @@ do
       --speculative-eagle-topk 1 \
       --speculative-num-draft-tokens 3  \
       --tokenizer-worker-num 4 \
-      --prefill-round-robin-balance \
       --disable-shared-experts-fusion \
       --dtype bfloat16
 done
 ```
 
-sglang router:
+3. SGLang Router:
 
 ```shell
 python -m sglang_router.launch_router \

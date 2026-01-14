@@ -1,8 +1,6 @@
 // factory.rs
 //
 // Factory function to create storage backends based on configuration.
-// This centralizes storage initialization logic and fixes the bug where
-// conversation_item_storage was missing/incorrect in server.rs.
 
 use std::sync::Arc;
 
@@ -16,10 +14,16 @@ use super::{
     oracle::{OracleConversationItemStorage, OracleConversationStorage, OracleResponseStorage},
 };
 use crate::{
-    config::{HistoryBackend, OracleConfig, PostgresConfig, RouterConfig},
-    data_connector::postgres::{
-        PostgresConversationItemStorage, PostgresConversationStorage, PostgresResponseStorage,
-        PostgresStore,
+    config::{HistoryBackend, OracleConfig, PostgresConfig, RedisConfig, RouterConfig},
+    data_connector::{
+        postgres::{
+            PostgresConversationItemStorage, PostgresConversationStorage, PostgresResponseStorage,
+            PostgresStore,
+        },
+        redis::{
+            RedisConversationItemStorage, RedisConversationStorage, RedisResponseStorage,
+            RedisStore,
+        },
     },
 };
 
@@ -102,6 +106,33 @@ pub fn create_storage(config: &RouterConfig) -> Result<StorageTuple, String> {
 
             Ok(storages)
         }
+        HistoryBackend::Redis => {
+            let redis_cfg = config
+                .redis
+                .clone()
+                .ok_or("Redis configuration is required when history_backend=redis")?;
+
+            let log_redis_url = match Url::parse(&redis_cfg.url) {
+                Ok(mut url) => {
+                    if url.password().is_some() {
+                        let _ = url.set_password(Some("****"));
+                    }
+                    url.to_string()
+                }
+                Err(_) => "<redacted>".to_string(),
+            };
+
+            info!(
+                "Initializing data connector: Redis (url: {}, pool_max: {})",
+                log_redis_url, redis_cfg.pool_max
+            );
+
+            let storages = create_redis_storage(&redis_cfg)?;
+
+            info!("Data connector initialized successfully: Redis");
+
+            Ok(storages)
+        }
     }
 }
 
@@ -136,5 +167,18 @@ fn create_postgres_storage(postgres_cfg: &PostgresConfig) -> Result<StorageTuple
         Arc::new(postgres_resp),
         Arc::new(postgres_conv),
         Arc::new(postgres_item),
+    ))
+}
+
+fn create_redis_storage(redis_cfg: &RedisConfig) -> Result<StorageTuple, String> {
+    let store = RedisStore::new(redis_cfg.clone())?;
+    let redis_resp = RedisResponseStorage::new(store.clone());
+    let redis_conv = RedisConversationStorage::new(store.clone());
+    let redis_item = RedisConversationItemStorage::new(store.clone());
+
+    Ok((
+        Arc::new(redis_resp),
+        Arc::new(redis_conv),
+        Arc::new(redis_item),
     ))
 }

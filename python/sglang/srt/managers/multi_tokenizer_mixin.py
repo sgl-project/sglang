@@ -104,6 +104,14 @@ def _extract_field_by_index(
     if field is None:
         return None
 
+    if isinstance(field, dict):
+        new_field = {}
+        for k, v in field.items():
+            if len(v) <= index:
+                new_field[k] = None
+            new_field[k] = v[index]
+        return new_field
+
     if check_length:
         if len(field) <= index:
             return None
@@ -127,6 +135,9 @@ def _handle_output_by_index(output, i):
             ),
             prefill_launch_latency=_extract_field_by_index(
                 output, "prefill_launch_latency", i
+            ),
+            prefill_finished_ts=_extract_field_by_index(
+                output, "prefill_finished_ts", i
             ),
             finished_reasons=_extract_field_by_index(output, "finished_reasons", i),
             decoded_texts=_extract_field_by_index(output, "decoded_texts", i),
@@ -216,6 +227,9 @@ def _handle_output_by_index(output, i):
             prefill_launch_latency=_extract_field_by_index(
                 output, "prefill_launch_latency", i
             ),
+            prefill_finished_ts=_extract_field_by_index(
+                output, "prefill_finished_ts", i
+            ),
             finished_reasons=_extract_field_by_index(output, "finished_reasons", i),
             output_strs=_extract_field_by_index(output, "output_strs", i),
             output_ids=_extract_field_by_index(output, "output_ids", i),
@@ -263,6 +277,12 @@ def _handle_output_by_index(output, i):
             ),
             output_hidden_states=_extract_field_by_index(
                 output, "output_hidden_states", i, check_length=False
+            ),
+            output_routed_experts=_extract_field_by_index(
+                output, "output_routed_experts", i, check_length=False
+            ),
+            customized_info=_extract_field_by_index(
+                output, "customized_info", i, check_length=False
             ),
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,

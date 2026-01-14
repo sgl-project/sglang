@@ -6,18 +6,26 @@ use async_trait::async_trait;
 use axum::response::Response;
 use tracing::error;
 
-use super::{chat::ChatResponseProcessingStage, generate::GenerateResponseProcessingStage};
-use crate::routers::grpc::{
-    common::stages::PipelineStage,
-    context::{RequestContext, RequestType},
+use super::{
+    chat::ChatResponseProcessingStage, classify::ClassifyResponseProcessingStage,
+    embedding::response_processing::EmbeddingResponseProcessingStage,
+    generate::GenerateResponseProcessingStage,
+};
+use crate::routers::{
     error,
-    regular::{processor, streaming},
+    grpc::{
+        common::stages::PipelineStage,
+        context::{RequestContext, RequestType},
+        regular::{processor, streaming},
+    },
 };
 
 /// Response processing stage (delegates to endpoint-specific implementations)
-pub struct ResponseProcessingStage {
+pub(crate) struct ResponseProcessingStage {
     chat_stage: ChatResponseProcessingStage,
     generate_stage: GenerateResponseProcessingStage,
+    embedding_stage: EmbeddingResponseProcessingStage,
+    classify_stage: ClassifyResponseProcessingStage,
 }
 
 impl ResponseProcessingStage {
@@ -31,6 +39,8 @@ impl ResponseProcessingStage {
                 streaming_processor.clone(),
             ),
             generate_stage: GenerateResponseProcessingStage::new(processor, streaming_processor),
+            embedding_stage: EmbeddingResponseProcessingStage::new(),
+            classify_stage: ClassifyResponseProcessingStage::new(),
         }
     }
 }
@@ -41,12 +51,15 @@ impl PipelineStage for ResponseProcessingStage {
         match &ctx.input.request_type {
             RequestType::Chat(_) => self.chat_stage.execute(ctx).await,
             RequestType::Generate(_) => self.generate_stage.execute(ctx).await,
+            RequestType::Embedding(_) => self.embedding_stage.execute(ctx).await,
+            RequestType::Classify(_) => self.classify_stage.execute(ctx).await,
             RequestType::Responses(_) => {
                 error!(
                     function = "ResponseProcessingStage::execute",
                     "RequestType::Responses reached regular response processing stage"
                 );
                 Err(error::internal_error(
+                    "responses_in_wrong_pipeline",
                     "RequestType::Responses reached regular response processing stage",
                 ))
             }
