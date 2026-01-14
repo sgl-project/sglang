@@ -18,7 +18,9 @@ from collections import defaultdict
 from pathlib import Path
 
 # Add the ci_register module path directly to avoid heavy sglang imports
-sys.path.insert(0, str(Path(__file__).parent.parent.parent / "python" / "sglang" / "test" / "ci"))
+sys.path.insert(
+    0, str(Path(__file__).parent.parent.parent / "python" / "sglang" / "test" / "ci")
+)
 
 from ci_register import CIRegistry, HWBackend, ut_parse_one_file
 
@@ -166,7 +168,9 @@ def generate_by_folder_section(data: dict) -> str:
     for folder in sorted(by_folder.keys()):
         folder_tests = by_folder[folder]
         lines.append("<details>")
-        lines.append(f"<summary><h2>{folder}/ ({len(folder_tests)} tests)</h2></summary>\n")
+        lines.append(
+            f"<summary><h2>{folder}/ ({len(folder_tests)} tests)</h2></summary>\n"
+        )
 
         # Group by backend within folder
         folder_by_backend = defaultdict(list)
