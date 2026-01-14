@@ -146,6 +146,7 @@ async def generations(
     )
 
     resp_format = (request.response_format or "b64_json").lower()
+
     if resp_format == "b64_json":
         with open(save_file_path, "rb") as f:
             b64 = base64.b64encode(f.read()).decode("utf-8")
@@ -154,6 +155,7 @@ async def generations(
                 ImageResponseData(
                     b64_json=b64,
                     revised_prompt=request.prompt,
+                    file_path=os.path.abspath(save_file_path),
                 )
             ],
         }
@@ -264,14 +266,24 @@ async def edits(
             with open(save_file_path, "rb") as f:
                 b64 = base64.b64encode(f.read()).decode("utf-8")
                 response_kwargs["data"].append(
-                    ImageResponseData(b64_json=b64, revised_prompt=prompt)
+                    ImageResponseData(
+                        b64_json=b64,
+                        revised_prompt=prompt,
+                        file_path=os.path.abspath(save_file_path),
+                    )
                 )
         if result.peak_memory_mb and result.peak_memory_mb > 0:
             response_kwargs["peak_memory_mb"] = result.peak_memory_mb
     else:
         url = f"/v1/images/{request_id}/content"
         response_kwargs = {
-            "data": [ImageResponseData(url=url, revised_prompt=prompt)],
+            "data": [
+                ImageResponseData(
+                    url=url,
+                    revised_prompt=prompt,
+                    file_path=os.path.abspath(save_file_path),
+                )
+            ],
         }
 
     response_kwargs = add_common_data_to_response(

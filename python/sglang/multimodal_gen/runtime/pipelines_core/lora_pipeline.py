@@ -435,6 +435,33 @@ class LoRAPipeline(ComposedPipelineBase):
                     lora_A_name in self.lora_adapters[nickname]
                     and lora_B_name in self.lora_adapters[nickname]
                 ):
+                    # Some LoRA checkpoints (e.g. Lightning distill) store per-layer alpha as "<layer>.alpha".
+                    # If present, we must apply the standard LoRA scaling: scale = alpha / rank.
+                    try:
+                        inferred_rank = int(
+                            self.lora_adapters[nickname][lora_A_name].shape[0]
+                        )
+                    except Exception:
+                        inferred_rank = None
+                    # Default to None for some checkpoints without "<layer>.alpha"
+                    inferred_alpha: int | None = None
+                    alpha_key = name + ".alpha"
+                    if alpha_key in self.lora_adapters[nickname]:
+                        try:
+                            inferred_alpha = int(
+                                self.lora_adapters[nickname][alpha_key].item()
+                            )
+                        except Exception:
+                            inferred_alpha = None
+
+                    if inferred_rank is not None:
+                        layer.lora_rank = inferred_rank
+                        layer.lora_alpha = (
+                            inferred_alpha
+                            if inferred_alpha is not None
+                            else inferred_rank
+                        )
+
                     layer.set_lora_weights(
                         self.lora_adapters[nickname][lora_A_name],
                         self.lora_adapters[nickname][lora_B_name],
