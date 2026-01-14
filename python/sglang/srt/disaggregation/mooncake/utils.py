@@ -14,6 +14,7 @@
 """Mooncake-specific utilities for custom memory pool management."""
 
 import logging
+import os
 from typing import Any, Optional, Tuple
 
 import torch
@@ -46,45 +47,55 @@ def init_mooncake_custom_mem_pool(
 
     if enable_custom_mem_pool:
         try:
-            # TODO(shangming): abstract custom allocator class for more backends
             if custom_mem_pool_type == "NVLINK":
                 from mooncake.allocator import NVLinkAllocator
+                from mooncake.allocator import MemoryBackend
+                mem_backend = NVLinkAllocator.detect_mem_backend()
+                if mem_backend == MemoryBackend.USE_CUMEMCREATE:
+                    logger.info("I support fabric mem, using NVLink memory pool")
+                    allocator = NVLinkAllocator.get_allocator(device)
+                    custom_mem_pool = torch.cuda.MemPool(allocator.allocator())
+                    logger.debug(
+                        f"Initialized NVLink memory pool on device {device}"
+                    )
+                    return True, custom_mem_pool, custom_mem_pool_type
+                elif  mem_backend == MemoryBackend.USE_CUDAMALLOC:
+                    logger.info("Fabric memory not supported, falling back to default cudaMalloc")
+                    return False, None, None
+                else:
+                    logger.info("Memory Backend Unknown or UnSupported")
+                    return False, None, None
 
-                allocator = NVLinkAllocator.get_allocator(device)
             elif custom_mem_pool_type == "BAREX":
                 from mooncake.allocator import BarexAllocator
-
                 allocator = BarexAllocator.get_allocator(device)
-            else:
-                # This should not happen due to the enable_custom_mem_pool check above
-                raise ValueError(
-                    f"Unsupported custom mem pool type: {custom_mem_pool_type}"
+                custom_mem_pool = torch.cuda.MemPool(allocator.allocator())
+                logger.debug(
+                    f"Initialized BAREX memory pool on device {device}"
                 )
+                return True, custom_mem_pool, custom_mem_pool_type
 
-            custom_mem_pool = torch.cuda.MemPool(allocator.allocator())
-            logger.debug(
-                f"Initialized custom memory pool: {custom_mem_pool_type} on device {device}"
-            )
+            else:
+                logger.error(f"Unsupported custom mem pool type: {custom_mem_pool_type}")
+                return False, None, None
+
         except ImportError as e:
             logger.warning(
                 f"Failed to import mooncake allocator for {custom_mem_pool_type}: {e}. "
                 f"Falling back to default memory pool."
             )
-            enable_custom_mem_pool = False
-            custom_mem_pool = None
-            custom_mem_pool_type = None
+            return False, None, None
+
         except Exception as e:
             logger.error(
                 f"Failed to initialize custom memory pool {custom_mem_pool_type}: {e}. "
                 f"Falling back to default memory pool."
             )
-            enable_custom_mem_pool = False
-            custom_mem_pool = None
-            custom_mem_pool_type = None
+            return False, None, None
     else:
+        logger.debug("Custom memory pool is disabled; using default allocator (cudaMalloc).")
         return False, None, None
 
-    return enable_custom_mem_pool, custom_mem_pool, custom_mem_pool_type
 
 
 def check_mooncake_custom_mem_pool_enabled() -> Tuple[bool, Optional[str]]:
