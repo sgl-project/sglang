@@ -43,7 +43,7 @@ import torch
 import torch.utils.checkpoint
 from torch import nn
 from torch.nn.parameter import Parameter
-from transformers import PretrainedConfig, CohereConfig, Cohere2Config
+from transformers import Cohere2Config, CohereConfig, PretrainedConfig
 
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
