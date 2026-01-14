@@ -20,56 +20,6 @@ from sglang.srt.layers.attention.fla.fused_recurrent import (
 _cutedsl_gdn_verify_available = None
 _cutedsl_gdn_verify_k_last = None
 
-# DEBUG: Global step counters for logging
-_debug_extend_step = 0
-_debug_verify_step = 0
-# Set to False for CUDA Graph compatibility; use env var SGLANG_GDN_DEBUG=1 to enable
-import os
-_debug_enabled = os.environ.get("SGLANG_GDN_DEBUG", "0") == "1"
-
-def reset_debug_counters():
-    """Reset debug counters - call after warmup to start fresh."""
-    global _debug_extend_step, _debug_verify_step
-    _debug_extend_step = 0
-    _debug_verify_step = 0
-
-def enable_debug_logging(enabled=True):
-    """Enable or disable debug logging."""
-    global _debug_enabled
-    _debug_enabled = enabled
-
-def _log_tensor(phase, step, layer, name, t, k_last, transpose_to_vlast=False):
-    """Log tensor values in a structured way.
-    
-    Args:
-        phase: "extend" or "verify"
-        step: step number (0 for extend, 0/1/2... for verify steps)
-        layer: layer index
-        name: tensor name
-        t: tensor
-        k_last: whether using K-last layout
-        transpose_to_vlast: whether to transpose for V-last comparison
-    """
-    if not _debug_enabled or t is None:
-        return
-    
-    # Only log on TP rank 0 to avoid log ordering issues
-    try:
-        import torch.distributed as dist
-        if dist.is_initialized() and dist.get_rank() != 0:
-            return
-    except:
-        pass
-    
-    import json
-    t_cmp = t.transpose(-1, -2) if transpose_to_vlast else t
-    vals = t_cmp.flatten()[:8].tolist()
-    open('/lustre/raplab/client/xutingz/workspace/gdn_log/sglang_debug.log', 'a').write(json.dumps({
-        "phase": phase, "step": step, "layer": layer, 
-        "name": name, "k_last": k_last,
-        "shape": list(t.shape), "vals": vals
-    }) + '\n')
-
 
 def _get_cutedsl_gdn_verify():
     """Lazy import for CuTe DSL GDN verify kernel."""
@@ -249,6 +199,7 @@ class MambaAttnBackendBase(AttentionBackend):
         self.retrieve_next_token_list = []
         self.retrieve_next_sibling_list = []
         self.retrieve_parent_token_list = []
+        self.intermediate_state_indices_list = []  # Pre-allocated for CUDA graph
         self.cached_cuda_graph_decode_query_start_loc: torch.Tensor = None
         self.cached_cuda_graph_verify_query_start_loc: torch.Tensor = None
         self.conv_states_shape: tuple[int, int] = None
@@ -511,6 +462,10 @@ class MambaAttnBackendBase(AttentionBackend):
                     (i + 1, draft_token_num), dtype=torch.int32, device=self.device
                 )
             )
+            # Pre-allocate intermediate_state_indices: [0, 1, 2, ..., i]
+            self.intermediate_state_indices_list.append(
+                torch.arange(i + 1, dtype=torch.int32, device=self.device)
+            )
         self.cached_cuda_graph_decode_query_start_loc = torch.arange(
             0, max_bs + 1, dtype=torch.int32, device=self.device
         )
@@ -553,6 +508,14 @@ class MambaAttnBackendBase(AttentionBackend):
                 retrieve_next_token=self.retrieve_next_token_list[bs - 1],
                 retrieve_next_sibling=self.retrieve_next_sibling_list[bs - 1],
                 retrieve_parent_token=self.retrieve_parent_token_list[bs - 1],
+                intermediate_state_indices=self.intermediate_state_indices_list[bs - 1],
+            )
+        elif forward_mode.is_target_verify():
+            # topk == 1, still need intermediate_state_indices for speculative decoding
+            return ForwardMetadata(
+                query_start_loc=self.query_start_loc_list[bs - 1],
+                mamba_cache_indices=self.state_indices_list[bs - 1],
+                intermediate_state_indices=self.intermediate_state_indices_list[bs - 1],
             )
         else:
             return ForwardMetadata(
@@ -618,6 +581,14 @@ class MambaAttnBackendBase(AttentionBackend):
                 retrieve_next_token=self.retrieve_next_token_list[bs - 1],
                 retrieve_next_sibling=self.retrieve_next_sibling_list[bs - 1],
                 retrieve_parent_token=self.retrieve_parent_token_list[bs - 1],
+                intermediate_state_indices=self.intermediate_state_indices_list[bs - 1],
+            )
+        elif forward_mode.is_target_verify():
+            # topk == 1, still need intermediate_state_indices for speculative decoding
+            return ForwardMetadata(
+                query_start_loc=self.query_start_loc_list[bs - 1],
+                mamba_cache_indices=self.state_indices_list[bs - 1],
+                intermediate_state_indices=self.intermediate_state_indices_list[bs - 1],
             )
         else:
             return ForwardMetadata(
@@ -927,6 +898,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
         # Check if SSM states use K-last layout (HV, V, K) for MTP kernel optimization
         # Priority: server_args > model config
         self.ssm_k_last = get_global_server_args().mamba_ssm_k_last
+        # Cache for has_prefix_cache to avoid repeated GPU->CPU sync
+        self._cached_has_prefix_cache = False
         
         # Warn if K-last is enabled without speculative decoding
         if self.ssm_k_last and not GDNAttnBackend._k_last_decode_warning_shown:
@@ -997,37 +970,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
         key = key.view(1, seq_len, num_heads, head_k_dim)
         value = value.view(1, seq_len, value.shape[1] // head_v_dim, head_v_dim)
 
-        # Decode kernel expects V-last layout
-        # DEBUG: Compare K-last vs V-last tensor values (all tensors logged in V-last format)
-        def _debug_tensor(name, t, transpose_to_vlast=False):
-            if not _debug_enabled:  # Skip during CUDA Graph capture
-                return
-            import json
-            if t is None:
-                return
-            try:
-                import torch.distributed as dist
-                if dist.is_initialized() and dist.get_rank() != 0:
-                    return
-            except:
-                pass
-            t_cmp = t.transpose(-1, -2) if transpose_to_vlast else t
-            # Sample first batch, first head, corner values
-            if t_cmp.dim() >= 3:
-                vals = t_cmp[0, 0, :4, :4].flatten()[:8].tolist() if t_cmp.dim() == 4 else t_cmp[0, :4, :4].flatten()[:8].tolist()
-            else:
-                vals = t_cmp.flatten()[:8].tolist()
-            open('/lustre/raplab/client/xutingz/workspace/gdn_log/sglang_debug.log', 'a').write(json.dumps({
-                "loc": "decode", "name": name, "k_last": self.ssm_k_last, 
-                "shape": list(t.shape), "vals": vals
-            }) + '\n')
-        
         if self.ssm_k_last:
             # K-last -> V-last: transpose for kernel
             # ssm_states shape: (pool_size+1, HV, V, K) for K-last
             ssm_input = ssm_states[cache_indices]  # [batch, HV, V, K]
-            # Log as V-last for comparison: transpose K-last to V-last
-            _debug_tensor("ssm_input", ssm_input, transpose_to_vlast=True)
             ssm_states_v_last = ssm_input.transpose(-1, -2).contiguous()  # [batch, HV, K, V]
             
             core_attn_out = fused_sigmoid_gating_delta_rule_update(
@@ -1045,19 +991,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 softplus_beta=1.0,
                 softplus_threshold=20.0,
             )
-            _debug_tensor("core_attn_out", core_attn_out)
-            # Log updated state as V-last
-            _debug_tensor("ssm_updated", ssm_states_v_last)
-            
             # V-last -> K-last: transpose back and write to pool
             ssm_states[cache_indices] = ssm_states_v_last.transpose(-1, -2)
-            # Log writeback as V-last for comparison
-            _debug_tensor("ssm_writeback", ssm_states[cache_indices], transpose_to_vlast=True)
         else:
             # V-last mode: ssm_states shape is (pool_size+1, HV, K, V)
-            ssm_input = ssm_states[cache_indices] if ssm_states.dim() > 3 else ssm_states
-            _debug_tensor("ssm_input", ssm_input)
-            
             core_attn_out = fused_sigmoid_gating_delta_rule_update(
                 A_log=A_log,
                 dt_bias=dt_bias,
@@ -1073,9 +1010,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 softplus_beta=1.0,
                 softplus_threshold=20.0,
             )
-            _debug_tensor("core_attn_out", core_attn_out)
-            _debug_tensor("ssm_updated", ssm_states[cache_indices])
-            _debug_tensor("ssm_writeback", ssm_states[cache_indices])
 
         self._track_mamba_state_decode(
             forward_batch, conv_states, ssm_states, cache_indices
@@ -1132,9 +1066,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 dtype=torch.bool,
                 device=forward_batch.input_ids.device,
             )
-            intermediate_state_indices = torch.arange(
-                cache_indices.shape[0], dtype=torch.int32, device=cache_indices.device
-            )
+            # Use pre-allocated indices from CUDA graph state to avoid sync
+            intermediate_state_indices = forward_metadata.intermediate_state_indices
+            if intermediate_state_indices is None:
+                # Fallback for non-CUDA-graph path
+                intermediate_state_indices = torch.arange(
+                    cache_indices.shape[0], dtype=torch.int32, device=cache_indices.device
+                )
         else:
             has_initial_states = forward_batch.extend_prefix_lens > 0
 
@@ -1210,12 +1148,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 available, cutedsl_gdn_verify_k_last = _get_cutedsl_gdn_verify()
                 use_k_last_gdn = available
 
-            # DEBUG: Log verify tensors with step counter
-            global _debug_verify_step
-            if layer_id == 0:
-                _debug_verify_step += 1  # Increment at layer 0
-            cur_verify_step = _debug_verify_step
-            
             if use_k_last_gdn:
                 # Use K-last CuTe DSL GDN verify kernel (no transpose needed)
                 batch_size = seq_len // forward_batch.spec_info.draft_token_num
@@ -1226,26 +1158,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 a_mtp = a.view(batch_size, draft_token_num, num_value_heads)
                 b_mtp = b.view(batch_size, draft_token_num, num_value_heads)
 
-                # Log input tensors (K-last transposed to V-last for comparison)
-                _log_tensor("verify", cur_verify_step, layer_id, "query", query_mtp, use_k_last_gdn)
-                _log_tensor("verify", cur_verify_step, layer_id, "value", value_mtp, use_k_last_gdn)
-                # DEBUG: Log cache_indices info (only on rank 0)
-                if _debug_enabled and layer_id == 0:
-                    try:
-                        import torch.distributed as dist
-                        if not dist.is_initialized() or dist.get_rank() == 0:
-                            import json
-                            open('/lustre/raplab/client/xutingz/workspace/gdn_log/sglang_debug.log', 'a').write(json.dumps({
-                                "phase": "verify", "step": cur_verify_step, "layer": layer_id,
-                                "name": "cache_indices_info", "k_last": True,
-                                "cache_indices": cache_indices[:min(5, len(cache_indices))].tolist(),
-                                "batch_size": batch_size, "used_indices": cache_indices[:batch_size].tolist(),
-                            }) + '\n')
-                    except:
-                        pass
-                ssm_input = ssm_states[cache_indices[:batch_size]]
-                _log_tensor("verify", cur_verify_step, layer_id, "ssm_input", ssm_input, use_k_last_gdn, transpose_to_vlast=True)
-
                 core_attn_out = cutedsl_gdn_verify_k_last(
                     A_log=A_log,
                     a=a_mtp,
@@ -1255,7 +1167,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     v=value_mtp,
                     b=b_mtp,
                     initial_state_source=ssm_states,
-                    initial_state_indices=cache_indices[:batch_size],
+                    initial_state_indices=cache_indices,
                     intermediate_states_buffer=intermediate_state_cache,
                     use_qk_l2norm_in_kernel=True,
                     disable_state_update=True,
@@ -1263,31 +1175,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     cache_steps=draft_token_num,
                 )
                 # Reshape output: [B, T, HV, V] -> [1, seq_len, HV, V]
-                core_attn_out_reshaped = core_attn_out.view(1, seq_len, num_value_heads, head_v_dim)
-                _log_tensor("verify", cur_verify_step, layer_id, "core_attn_out", core_attn_out_reshaped, use_k_last_gdn)
-                core_attn_out = core_attn_out_reshaped
+                core_attn_out = core_attn_out.view(1, seq_len, num_value_heads, head_v_dim)
             else:
                 # Use original V-last kernel with pre-computed gates
                 g, beta = fused_gdn_gating(A_log, a, b, dt_bias)
-                
-                # Log input tensors
-                _log_tensor("verify", cur_verify_step, layer_id, "query", query, use_k_last_gdn)
-                _log_tensor("verify", cur_verify_step, layer_id, "value", value, use_k_last_gdn)
-                # DEBUG: Log cache_indices info (only on rank 0)
-                if _debug_enabled and layer_id == 0:
-                    try:
-                        import torch.distributed as dist
-                        if not dist.is_initialized() or dist.get_rank() == 0:
-                            import json
-                            open('/lustre/raplab/client/xutingz/workspace/gdn_log/sglang_debug.log', 'a').write(json.dumps({
-                                "phase": "verify", "step": cur_verify_step, "layer": layer_id,
-                                "name": "cache_indices_info", "k_last": False,
-                                "cache_indices": cache_indices[:min(5, len(cache_indices))].tolist(),
-                            }) + '\n')
-                    except:
-                        pass
-                ssm_input = ssm_states[cache_indices] if ssm_states.dim() > 3 else ssm_states
-                _log_tensor("verify", cur_verify_step, layer_id, "ssm_input", ssm_input, use_k_last_gdn)
                 
                 core_attn_out = fused_recurrent_gated_delta_rule_update(
                     q=query,
@@ -1305,28 +1196,23 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     cache_steps=forward_batch.spec_info.draft_token_num,
                     retrieve_parent_token=retrieve_parent_token,
                 )
-                _log_tensor("verify", cur_verify_step, layer_id, "core_attn_out", core_attn_out, use_k_last_gdn)
         else:
             # Prefill/Extend path
             g, beta = fused_gdn_gating(A_log, a, b, dt_bias)
-            
-            # DEBUG: Log extend tensors with step counter
-            global _debug_extend_step
-            if layer_id == 0:
-                _debug_extend_step += 1  # Increment at layer 0
-            cur_extend_step = _debug_extend_step
             
             # Only cuda env uses fuse ssm_states update
             # For K-last layout, we need to handle V-last kernel with K-last pool
             if self.ssm_k_last:
                 batch_size = cache_indices.shape[0]
                 # Check if any request has prefix cache (non-zero initial state)
-                has_prefix_cache = (forward_batch.extend_prefix_lens > 0).any()
+                # Only sync on layer 0, reuse cached result for subsequent layers
+                if layer_id == 0:
+                    self._cached_has_prefix_cache = (forward_batch.extend_prefix_lens > 0).any().item()
+                has_prefix_cache = self._cached_has_prefix_cache
                 
                 if has_prefix_cache:
                     # Has prefix cache: need to read and transpose existing state
                     ssm_input = ssm_states[cache_indices]  # [batch, HV, V, K]
-                    _log_tensor("extend", cur_extend_step, layer_id, "ssm_input", ssm_input, self.ssm_k_last, transpose_to_vlast=True)
                     recurrent_state = ssm_input.transpose(-1, -2).contiguous()  # [batch, HV, K, V]
                     sequential_indices = torch.arange(batch_size, device=cache_indices.device, dtype=cache_indices.dtype)
                     recurrent_state_indices_args = {"initial_state_indices": sequential_indices}
@@ -1336,35 +1222,15 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     # Since initial is 0, reading with wrong stride is fine (0 == 0)
                     # After kernel, transpose the modified slots to fix semantics
                     # Note: This works because K == V (stride values are identical)
-                    _log_tensor("extend", cur_extend_step, layer_id, "ssm_input", ssm_states[cache_indices], self.ssm_k_last, transpose_to_vlast=True)
                     recurrent_state = ssm_states  # Direct reference, no copy
                     recurrent_state_indices_args = {"initial_state_indices": cache_indices}
             else:
-                ssm_input = ssm_states[cache_indices] if ssm_states.dim() > 3 else ssm_states
-                _log_tensor("extend", cur_extend_step, layer_id, "ssm_input", ssm_input, self.ssm_k_last)
                 recurrent_state = ssm_states
                 recurrent_state_indices_args = {"initial_state_indices": cache_indices}
                 if is_npu():
                     recurrent_state = ssm_states[cache_indices]
                     recurrent_state_indices_args = {}
 
-            _log_tensor("extend", cur_extend_step, layer_id, "query", query, self.ssm_k_last)
-            _log_tensor("extend", cur_extend_step, layer_id, "value", value, self.ssm_k_last)
-            
-            # DEBUG: Log cache_indices for extend (only on rank 0)
-            if _debug_enabled and layer_id == 0:
-                try:
-                    import torch.distributed as dist
-                    if not dist.is_initialized() or dist.get_rank() == 0:
-                        import json
-                        open('/lustre/raplab/client/xutingz/workspace/gdn_log/sglang_debug.log', 'a').write(json.dumps({
-                            "phase": "extend", "step": cur_extend_step, "layer": layer_id,
-                            "name": "cache_indices_info", "k_last": self.ssm_k_last,
-                            "cache_indices": cache_indices[:min(5, len(cache_indices))].tolist(),
-                        }) + '\n')
-                except:
-                    pass
-            
             core_attn_out, last_recurrent_state, h = chunk_gated_delta_rule(
                 q=query,
                 k=key,
@@ -1377,13 +1243,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 use_qk_l2norm_in_kernel=True,
                 **recurrent_state_indices_args,
             )
-            
-            _log_tensor("extend", cur_extend_step, layer_id, "core_attn_out", core_attn_out, self.ssm_k_last)
 
             if self.ssm_k_last:
                 # V-last -> K-last: transpose kernel output back to pool layout
                 # Note: INPLACE_UPDATE=True in kernel, so recurrent_state is updated in-place
-                _log_tensor("extend", cur_extend_step, layer_id, "ssm_updated", recurrent_state, self.ssm_k_last)
                 if recurrent_state is ssm_states:
                     # Optimization path: kernel wrote directly to ssm_states with V-last semantics
                     # Need to fix by reading, transposing, and writing back
@@ -1392,18 +1255,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 else:
                     # Standard path: recurrent_state is a separate V-last buffer
                     ssm_states[cache_indices] = recurrent_state.to(ssm_states.dtype, copy=False).transpose(-1, -2)
-                _log_tensor("extend", cur_extend_step, layer_id, "ssm_writeback", ssm_states[cache_indices], self.ssm_k_last, transpose_to_vlast=True)
             elif is_npu():
                 last_recurrent_state = last_recurrent_state.to(
                     ssm_states.dtype, copy=False
                 )
                 ssm_states[cache_indices] = last_recurrent_state
-                _log_tensor("extend", cur_extend_step, layer_id, "ssm_updated", last_recurrent_state, self.ssm_k_last)
-                _log_tensor("extend", cur_extend_step, layer_id, "ssm_writeback", ssm_states[cache_indices], self.ssm_k_last)
-            else:
-                # CUDA V-last mode: kernel updates in-place via cache_indices
-                _log_tensor("extend", cur_extend_step, layer_id, "ssm_updated", ssm_states[cache_indices], self.ssm_k_last)
-                _log_tensor("extend", cur_extend_step, layer_id, "ssm_writeback", ssm_states[cache_indices], self.ssm_k_last)
 
             self._track_mamba_state_extend(
                 forward_batch, h, ssm_states, forward_metadata
