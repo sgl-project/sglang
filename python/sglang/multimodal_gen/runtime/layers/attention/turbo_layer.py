@@ -12,14 +12,19 @@ from torch.nn import Module
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionImpl,
 )
+from sglang.multimodal_gen.runtime.layers.attention.backends.sparse_linear_attn import (
+    SparseLinearAttentionBackend,
+)
 from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
 from sglang.multimodal_gen.runtime.managers.forward_context import (
     ForwardContext,
     get_forward_context,
 )
 from sglang.multimodal_gen.runtime.platforms.interface import AttentionBackendEnum
-from sglang.multimodal_gen.runtime.server_args import get_global_server_args
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import get_compute_dtype
+
+logger = init_logger(__name__)
 
 
 def post_all2all(local_seq_2_local_head, seq_world_size):
@@ -230,11 +235,15 @@ class MinimalA2AAttnOp(DistributedAttention):
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
     ):
         dtype = get_compute_dtype()
-        if attention_type == "sla":
-            get_global_server_args().attention_backend = "SLA_ATTN"
         attn_backend = get_attn_backend(
             head_size, dtype, supported_attention_backends=supported_attention_backends
         )
+        # Maintained for compatibility purposes; can be removed when CI allows setting Attention_backend or when TurboWan supports FA.
+        if attn_backend is not SparseLinearAttentionBackend:
+            logger.warning(
+                "TurboWan now only supports `sla_attn` and has been automatically set to `sla_attn`. Please set --attention-backend to `sla_attn`."
+            )
+            attn_backend = SparseLinearAttentionBackend
         impl_cls: Type["AttentionImpl"] = attn_backend.get_impl_cls()
         local_attn = impl_cls(
             num_heads=num_heads,
