@@ -1485,6 +1485,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     @property
     def mamba2_config(self):
         config = self.model_config.hf_config
+        if isinstance(config, NemotronHConfig) and self.is_draft_worker:
+            # NemotronH MTP draft models have no Mamba layers (pattern like "*E")
+            # so they shouldn't use HybridLinearAttnBackend
+            pattern = getattr(config, "mtp_hybrid_override_pattern", None)
+            if pattern is not None and "M" not in pattern:
+                return None
         if isinstance(config, FalconH1Config | NemotronHConfig):
             return config
         if isinstance(config, NemotronH_Nano_VL_V2_Config):

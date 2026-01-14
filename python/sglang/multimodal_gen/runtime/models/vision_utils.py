@@ -101,10 +101,6 @@ def load_image(
         convert_method (Callable[[PIL.Image.Image], PIL.Image.Image], *optional*):
             A conversion method to apply to the image after loading it. When set to `None` the image will be converted
             "RGB".
-
-    Returns:
-        `PIL.Image.Image`:
-            A PIL Image.
     """
     if isinstance(image, str):
         if image.startswith("http://") or image.startswith("https://"):
