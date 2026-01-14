@@ -679,31 +679,6 @@ class Ernie4_5_VLMoeForConditionalGeneration(nn.Module):
                     "multimodal section rotary embedding requires "
                     f"(3, seq_len) positions, but got {positions.size()}"
                 )
-        if input_ids.numel() != positions.shape[-1]:
-            true_seq_len = input_ids.shape[-1]
-            pos_len = positions.shape[-1]
-            if pos_len < true_seq_len:
-                logger.warning(
-                    f"input_ids({input_ids.shape}) != positions({positions.shape}). Token count mismatch. Positions will be padded."
-                )
-                if positions.dim() == 2:  # mRoPE: (3, seq_len)
-                    last_pos = positions[:, -1:]  # (3, 1)
-                    delta = torch.arange(
-                        1,
-                        true_seq_len - pos_len + 1,
-                        device=positions.device,
-                    )
-                    delta = delta.unsqueeze(0).expand(3, -1)
-                    pad_pos = last_pos + delta
-                    positions = torch.cat([positions, pad_pos], dim=1)
-                else:  # 1D RoPE
-                    last_pos = positions[-1]
-                    pad_pos = last_pos + torch.arange(
-                        1,
-                        true_seq_len - pos_len + 1,
-                        device=positions.device,
-                    )
-                    positions = torch.cat([positions, pad_pos], dim=0)
 
         self._set_visual_token_mask(input_ids, forward_batch)
 
