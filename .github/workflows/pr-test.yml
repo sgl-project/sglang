@@ -53,6 +53,8 @@ concurrency:
 
 env:
   SGLANG_IS_IN_CI: true
+  METRICS_DIR: ${{ github.workspace }}/.ci_metrics
+  SGLANG_TEST_METRICS_OUTPUT: ${{ github.workspace }}/.ci_metrics/test_metrics
 
 jobs:
   # =============================================== check changes ====================================================
@@ -605,6 +607,12 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
+      - name: Collect test metrics
+        uses: ./.github/actions/collect-test-metrics
+        with:
+          metrics_dir: ${{ env.METRICS_DIR }}
+          artifact_name: regression-metrics-${{ github.run_id }}-${{ github.job }}-partition-${{ matrix.partition }}
+
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
         uses: actions/download-artifact@v4
@@ -648,6 +656,12 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
+
+      - name: Collect test metrics
+        uses: ./.github/actions/collect-test-metrics
+        with:
+          metrics_dir: ${{ env.METRICS_DIR }}
+          artifact_name: regression-metrics-${{ github.run_id }}-${{ github.job }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -748,6 +762,12 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
+
+      - name: Collect test metrics
+        uses: ./.github/actions/collect-test-metrics
+        with:
+          metrics_dir: ${{ env.METRICS_DIR }}
+          artifact_name: regression-metrics-${{ github.run_id }}-${{ github.job }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -1026,6 +1046,12 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
+      - name: Collect test metrics
+        uses: ./.github/actions/collect-test-metrics
+        with:
+          metrics_dir: ${{ env.METRICS_DIR }}
+          artifact_name: regression-metrics-${{ github.run_id }}-${{ github.job }}
+
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
         uses: actions/download-artifact@v6
@@ -1048,6 +1074,7 @@ jobs:
             CONTINUE_ON_ERROR_FLAG="--continue-on-error"
           fi
           IS_BLACKWELL=1 python3 run_suite.py --hw cuda --suite stage-b-test-4-gpu-b200 $CONTINUE_ON_ERROR_FLAG
+
 
   unit-test-backend-4-gpu:
     needs: [check-changes, call-gate, stage-b-test-small-1-gpu, stage-b-test-large-1-gpu, stage-b-test-large-2-gpu, stage-b-test-4-gpu-b200]
