@@ -44,17 +44,15 @@ def initialize_fp4_gemm_config(server_args: ServerArgs) -> None:
 
     # Handle deprecated env var for backward compatibility
     # TODO: Remove this in a future version
-    if backend == "auto":
+    if envs.SGLANG_FLASHINFER_FP4_GEMM_BACKEND.is_set():
         env_backend = envs.SGLANG_FLASHINFER_FP4_GEMM_BACKEND.get()
-        if env_backend:
+        if backend == "auto":
             logger.warning(
                 "SGLANG_FLASHINFER_FP4_GEMM_BACKEND is deprecated. "
                 f"Please use '--fp4-gemm-backend={env_backend}' instead."
             )
             backend = env_backend
-    else:
-        env_backend = envs.SGLANG_FLASHINFER_FP4_GEMM_BACKEND.get()
-        if env_backend:
+        else:
             logger.warning(
                 f"FP4 GEMM backend set to '{backend}' via --fp4-gemm-backend overrides "
                 "environment variable SGLANG_FLASHINFER_FP4_GEMM_BACKEND. "
