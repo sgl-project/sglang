@@ -191,7 +191,8 @@ fn bench_concurrent(c: &mut Criterion) {
                                             headers: Some(&headers),
                                             ..Default::default()
                                         };
-                                        let _ = black_box(policy.select_worker(&workers, &info).await);
+                                        let _ =
+                                            black_box(policy.select_worker(&workers, &info).await);
                                     }
                                 })
                             })
