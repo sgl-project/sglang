@@ -163,7 +163,9 @@ class TestIGWMode:
 class TestDisableHealthCheck:
     """Tests for --disable-health-check CLI option."""
 
-    def test_disable_health_check_workers_immediately_healthy(self, model_pool: ModelPool):
+    def test_disable_health_check_workers_immediately_healthy(
+        self, model_pool: ModelPool
+    ):
         """Test that workers are immediately healthy when health checks are disabled."""
         http_instance = model_pool.get("llama-8b", ConnectionMode.HTTP)
 
@@ -195,7 +197,9 @@ class TestDisableHealthCheck:
                     worker.metadata.get("disable_health_check"),
                 )
                 # Worker should be healthy immediately
-                assert worker.status == "healthy", "Worker should be healthy when health checks disabled"
+                assert (
+                    worker.status == "healthy"
+                ), "Worker should be healthy when health checks disabled"
         finally:
             gateway.shutdown()
 
