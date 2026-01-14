@@ -186,11 +186,6 @@ class OpenAIServingChat(OpenAIServingBase):
             request.reasoning_effort = reasoning_effort
 
         """Convert OpenAI chat completion request to internal format"""
-
-        # Auto-enable separate_reasoning for gpt-oss models
-        if self.is_gpt_oss and request.separate_reasoning is None:
-            request.separate_reasoning = True
-
         is_multimodal = self.tokenizer_manager.model_config.is_multimodal
 
         # Process messages and apply chat template
