@@ -70,6 +70,7 @@ Its core features include:
 
    supported_models/generative_models.md
    supported_models/multimodal_language_models.md
+   supported_models/vision_language_action_models.md
    supported_models/diffusion_language_models.md
    supported_models/diffusion_models.md
    supported_models/embedding_models.md
