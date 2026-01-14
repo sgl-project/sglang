@@ -73,5 +73,10 @@ class TestSoftWatchdogTokenizer(BaseTestSoftWatchdog, CustomTestCase):
     expected_message = "TokenizerManager watchdog timeout"
 
 
+class TestSoftWatchdogSchedulerInit(BaseTestSoftWatchdog, CustomTestCase):
+    env_override = lambda: envs.SGLANG_TEST_STUCK_SCHEDULER_INIT.override(30)
+    expected_message = "Scheduler watchdog timeout"
+
+
 if __name__ == "__main__":
     unittest.main()

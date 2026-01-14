@@ -82,7 +82,6 @@ import torch.distributed
 import torch.distributed as dist
 import triton
 import zmq
-from fastapi.responses import ORJSONResponse
 from packaging import version as pkg_version
 from PIL import Image
 from starlette.routing import Mount
@@ -165,9 +164,19 @@ def is_host_cpu_x86() -> bool:
     )
 
 
+def is_host_cpu_arm64() -> bool:
+    machine = platform.machine().lower()
+    return (
+        machine in ("aarch64", "arm64")
+        and hasattr(torch, "cpu")
+        and torch.cpu.is_available()
+    )
+
+
 @lru_cache(maxsize=1)
 def is_cpu() -> bool:
-    return os.getenv("SGLANG_USE_CPU_ENGINE", "0") == "1" and is_host_cpu_x86()
+    is_host_cpu_supported = is_host_cpu_x86() or is_host_cpu_arm64()
+    return os.getenv("SGLANG_USE_CPU_ENGINE", "0") == "1" and is_host_cpu_supported
 
 
 def is_float4_e2m1fn_x2(dtype) -> bool:
@@ -1121,20 +1130,6 @@ def rank0_log(msg: str):
         logger.info(msg)
 
 
-def add_api_key_middleware(app, api_key: str):
-    @app.middleware("http")
-    async def authentication(request, call_next):
-        if request.method == "OPTIONS":
-            return await call_next(request)
-        if request.url.path.startswith("/health") or request.url.path.startswith(
-            "/metrics"
-        ):
-            return await call_next(request)
-        if request.headers.get("Authorization") != "Bearer " + api_key:
-            return ORJSONResponse(content={"error": "Unauthorized"}, status_code=401)
-        return await call_next(request)
-
-
 def configure_logger(server_args, prefix: str = ""):
     if SGLANG_LOGGING_CONFIG_PATH := os.getenv("SGLANG_LOGGING_CONFIG_PATH"):
         if not os.path.exists(SGLANG_LOGGING_CONFIG_PATH):
@@ -1859,9 +1854,10 @@ def crash_on_warnings():
     return get_bool_env_var("SGLANG_IS_IN_CI")
 
 
+@functools.lru_cache(None)
 def print_warning_once(msg: str) -> None:
     # Set the stacklevel to 2 to print the caller's line info
-    logger.warning(msg, stacklevel=2)
+    logger.warning(msg)
 
 
 @functools.lru_cache(None)
@@ -2465,6 +2461,11 @@ def set_cuda_arch():
         os.environ["FLASHINFER_CUDA_ARCH_LIST"] = (
             f"{arch}{'a' if capability[0] >= 9 else ''}"
         )
+
+
+def cdiv(a: int, b: int) -> int:
+    """Ceiling division."""
+    return -(a // -b)
 
 
 def next_power_of_2(n: int):
@@ -3161,7 +3162,7 @@ def get_cpu_ids_by_node():
 
 def is_shm_available(dtype, world_size, local_size):
     return (
-        cpu_has_amx_support()
+        (cpu_has_amx_support() or is_host_cpu_arm64())
         and dtype in [torch.bfloat16, torch.float16, torch.float]
         and world_size >= 1
         and world_size == local_size
@@ -3757,6 +3758,20 @@ def calc_diff(x, y):
     denominator = (x * x + y * y).sum()
     sim = 2 * (x * y).sum() / denominator
     return 1 - sim
+
+
+@contextmanager
+def temp_attr_context(obj, attr, value):
+    if obj is None:
+        yield
+        return
+
+    original_value = getattr(obj, attr)
+    setattr(obj, attr, value)
+    try:
+        yield
+    finally:
+        setattr(obj, attr, original_value)
 
 
 cached_device_index = -1
