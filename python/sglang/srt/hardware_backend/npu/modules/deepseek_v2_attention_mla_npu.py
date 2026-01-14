@@ -10,7 +10,7 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
 )
 from sglang.srt.layers.attention.nsa.utils import (
     cp_split_and_rebuild_position,
-    enable_prefill_cp,
+    nsa_use_prefill_cp,
 )
 from sglang.srt.layers.communicator import get_attn_tp_context
 
@@ -192,12 +192,12 @@ def forward_mla_prepare_npu(
 
         q_nope_out = q_nope_out.transpose(0, 1)
 
-        if enable_prefill_cp(forward_batch, m.nsa_enable_prefill_cp):
+        if nsa_use_prefill_cp(forward_batch, m.nsa_enable_prefill_cp):
             positions = cp_split_and_rebuild_position(forward_batch, positions)
 
         q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
 
-        if enable_prefill_cp(forward_batch, m.nsa_enable_prefill_cp):
+        if nsa_use_prefill_cp(forward_batch, m.nsa_enable_prefill_cp):
             # support allgather+rerrange
             k_nope, k_pe = m.rebuild_cp_kv_cache(
                 latent_cache, forward_batch, k_nope, k_pe
@@ -338,12 +338,12 @@ def forward_dsa_prepare_npu(
 
         q_nope_out = q_nope_out.transpose(0, 1)
 
-        if enable_prefill_cp(forward_batch, m.nsa_enable_prefill_cp):
+        if nsa_use_prefill_cp(forward_batch, m.nsa_enable_prefill_cp):
             positions = cp_split_and_rebuild_position(forward_batch, positions)
 
         q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
 
-        if enable_prefill_cp(forward_batch, m.nsa_enable_prefill_cp):
+        if nsa_use_prefill_cp(forward_batch, m.nsa_enable_prefill_cp):
             # support allgather+rerrange
             k_nope, k_pe = m.rebuild_cp_kv_cache(
                 latent_cache, forward_batch, k_nope, k_pe

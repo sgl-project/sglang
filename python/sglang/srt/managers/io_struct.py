@@ -243,6 +243,9 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
     # Extra key for classifying the request (e.g. cache_salt)
     extra_key: Optional[Union[List[str], str]] = None
 
+    # Routing key for routing-key schedule policy
+    routing_key: Optional[str] = None
+
     # Whether to disallow logging for this request (e.g. due to ZDR)
     no_logs: bool = False
 
@@ -255,9 +258,18 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
     # Whether to return entropy
     return_entropy: bool = False
 
+    # Propagates trace context via Engine.generate/async_generate
+    external_trace_header: Optional[Dict] = None
+
     # For EPD-disaggregated inference
     need_wait_for_image: Optional[bool] = None
     num_items_assigned: Optional[List] = None
+
+    # Multimodal tiling controls (extensions)
+    max_dynamic_patch: Optional[int] = None
+    min_dynamic_patch: Optional[int] = None
+    image_max_dynamic_patch: Optional[int] = None
+    video_max_dynamic_patch: Optional[int] = None
 
     def contains_mm_input(self) -> bool:
         return (
@@ -662,6 +674,7 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
             custom_labels=self.custom_labels,
             return_bytes=self.return_bytes,
             return_entropy=self.return_entropy,
+            external_trace_header=self.external_trace_header,
             http_worker_ipc=self.http_worker_ipc,
             **{
                 field: getattr(self, field)
@@ -730,6 +743,9 @@ class TokenizedGenerateReqInput(BaseReq):
     # Extra key for classifying the request (e.g. cache_salt)
     extra_key: Optional[str] = None
 
+    # Routing key for routing-key schedule policy
+    routing_key: Optional[str] = None
+
     # Whether to disallow logging for this request (e.g. due to ZDR)
     no_logs: bool = False
 
@@ -792,12 +808,14 @@ class EmbeddingReqInput(BaseReq, APIServingTimingMixin):
     is_cross_encoder_request: bool = False
     # Priority for the request
     priority: Optional[int] = None
+    # Routing key for routing-key schedule policy
+    routing_key: Optional[str] = None
 
     # For background responses (OpenAI responses API)
     background: bool = False
 
-    # tracing context
-    trace_context: Optional[Dict] = None
+    # Propagates trace context via Engine.encode/async_encode
+    external_trace_header: Optional[Dict] = None
 
     # The number of dimensions the resulting output embeddings should have. It is applicable for Matryoshka Embeddings.
     dimensions: Optional[int] = None
@@ -878,6 +896,7 @@ class EmbeddingReqInput(BaseReq, APIServingTimingMixin):
             video_data=self.video_data[i] if self.video_data is not None else None,
             sampling_params=self.sampling_params[i],
             rid=self.rid[i],
+            external_trace_header=self.external_trace_header,
             dimensions=self.dimensions,
             http_worker_ipc=self.http_worker_ipc,
             **{
@@ -979,6 +998,8 @@ class BatchTokenIDOutput(
 
     # Load for DP balance
     load: GetLoadReqOutput = None
+    # Customized info
+    customized_info: Optional[Dict[str, List[Any]]] = None
 
 
 @dataclass
@@ -1064,6 +1085,9 @@ class BatchStrOutput(
 
     # Load for DP balance
     load: GetLoadReqOutput = None
+
+    # Customized info
+    customized_info: Optional[Dict[str, List[Any]]] = None
 
 
 @dataclass
@@ -1620,13 +1644,33 @@ class UnloadLoRAAdapterReqInput(BaseReq):
 
 
 @dataclass
+class LoadLoRAAdapterFromTensorsReqInput(BaseReq):
+    lora_name: str
+    config_dict: Dict[str, Any]
+    serialized_tensors: str
+    pinned: bool = False
+    added_tokens_config: Optional[Dict[str, Any]] = None
+    lora_id: Optional[str] = None
+
+    def to_ref(self) -> LoRARef:
+        return LoRARef(
+            lora_id=self.lora_id,
+            lora_name=self.lora_name,
+            lora_path="__tensor__",
+            pinned=self.pinned,
+        )
+
+
+@dataclass
 class LoRAUpdateOutput(BaseReq):
     success: bool
     error_message: Optional[str] = None
     loaded_adapters: Optional[Dict[str, LoRARef]] = None
 
 
-LoadLoRAAdapterReqOutput = UnloadLoRAAdapterReqOutput = LoRAUpdateOutput
+LoadLoRAAdapterReqOutput = UnloadLoRAAdapterReqOutput = (
+    LoadLoRAAdapterFromTensorsReqOutput
+) = LoRAUpdateOutput
 
 
 class BlockReqType(Enum):

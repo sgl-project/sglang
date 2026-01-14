@@ -11,13 +11,18 @@
 //! The ring is rebuilt only when workers are added/removed, not per-request.
 //! Uses virtual nodes (150 per worker) for even distribution and blake3 for stable hashing.
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use dashmap::DashMap;
 use uuid::Uuid;
 
 use crate::{
-    core::{CircuitState, ConnectionMode, RuntimeType, Worker, WorkerType},
+    core::{
+        circuit_breaker::CircuitState,
+        worker::{HealthChecker, RuntimeType, WorkerType},
+        ConnectionMode, Worker,
+    },
+    mesh::OptionalMeshSyncManager,
     observability::metrics::Metrics,
 };
 
@@ -187,6 +192,10 @@ pub struct WorkerRegistry {
 
     /// URL to worker ID mapping
     url_to_id: Arc<DashMap<String, WorkerId>>,
+    /// Optional mesh sync manager for state synchronization
+    /// When None, the registry works independently without mesh synchronization
+    /// Uses RwLock for thread-safe access when setting mesh_sync after initialization
+    mesh_sync: Arc<RwLock<OptionalMeshSyncManager>>,
 }
 
 impl WorkerRegistry {
@@ -199,6 +208,7 @@ impl WorkerRegistry {
             type_workers: Arc::new(DashMap::new()),
             connection_workers: Arc::new(DashMap::new()),
             url_to_id: Arc::new(DashMap::new()),
+            mesh_sync: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -216,6 +226,11 @@ impl WorkerRegistry {
     /// Get the hash ring for a model (O(1) lookup)
     pub fn get_hash_ring(&self, model_id: &str) -> Option<Arc<HashRing>> {
         self.hash_rings.get(model_id).map(|r| Arc::clone(&r))
+    }
+
+    /// Set mesh sync manager (thread-safe, can be called after initialization)
+    pub fn set_mesh_sync(&self, mesh_sync: OptionalMeshSyncManager) {
+        *self.mesh_sync.write().unwrap() = mesh_sync;
     }
 
     /// Register a new worker
@@ -261,6 +276,17 @@ impl WorkerRegistry {
             .entry(worker.connection_mode().clone())
             .or_default()
             .push(worker_id.clone());
+
+        // Sync to mesh if enabled (no-op if mesh is not enabled)
+        if let Some(ref mesh_sync) = *self.mesh_sync.read().unwrap() {
+            mesh_sync.sync_worker_state(
+                worker_id.as_str().to_string(),
+                worker.model_id().to_string(),
+                worker.url().to_string(),
+                worker.is_healthy(),
+                0.0, // TODO: Get actual load
+            );
+        }
 
         worker_id
     }
@@ -318,6 +344,11 @@ impl WorkerRegistry {
             worker.set_healthy(false);
             Metrics::remove_worker_metrics(worker.url());
 
+            // Sync removal to mesh if enabled (no-op if mesh is not enabled)
+            if let Some(ref mesh_sync) = *self.mesh_sync.read().unwrap() {
+                mesh_sync.remove_worker_state(worker_id.as_str());
+            }
+
             Some(worker)
         } else {
             None
@@ -356,18 +387,31 @@ impl WorkerRegistry {
             .unwrap_or_else(|| Arc::from(Self::EMPTY_WORKERS))
     }
 
-    /// Alias for get_by_model for backwards compatibility
-    #[inline]
-    pub fn get_by_model_fast(&self, model_id: &str) -> Arc<[Arc<dyn Worker>]> {
-        self.get_by_model(model_id)
-    }
-
     /// Get all workers by worker type
     pub fn get_by_type(&self, worker_type: &WorkerType) -> Vec<Arc<dyn Worker>> {
         self.type_workers
             .get(worker_type)
             .map(|ids| ids.iter().filter_map(|id| self.get(id)).collect())
             .unwrap_or_default()
+    }
+
+    /// Update worker health status and sync to mesh
+    pub fn update_worker_health(&self, worker_id: &WorkerId, is_healthy: bool) {
+        if let Some(worker) = self.workers.get(worker_id) {
+            // Update worker health (if Worker trait has a method for this)
+            // For now, we'll just sync to mesh
+
+            // Sync to mesh if enabled (no-op if mesh is not enabled)
+            if let Some(ref mesh_sync) = *self.mesh_sync.read().unwrap() {
+                mesh_sync.sync_worker_state(
+                    worker_id.as_str().to_string(),
+                    worker.model_id().to_string(),
+                    worker.url().to_string(),
+                    is_healthy,
+                    0.0, // TODO: Get actual load
+                );
+            }
+        }
     }
 
     /// Get all prefill workers (regardless of bootstrap_port)
@@ -471,7 +515,7 @@ impl WorkerRegistry {
         // Start with the most efficient collection based on filters
         // Use model index when possible as it's O(1) lookup
         let workers: Vec<Arc<dyn Worker>> = if let Some(model) = model_id {
-            self.get_by_model_fast(model).to_vec()
+            self.get_by_model(model).to_vec()
         } else {
             self.get_all()
         };
@@ -594,7 +638,7 @@ impl WorkerRegistry {
 
     /// Start a health checker for all workers in the registry
     /// This should be called once after the registry is populated with workers
-    pub fn start_health_checker(&self, check_interval_secs: u64) -> crate::core::HealthChecker {
+    pub(crate) fn start_health_checker(&self, check_interval_secs: u64) -> HealthChecker {
         use std::sync::{
             atomic::{AtomicBool, Ordering},
             Arc,
@@ -627,6 +671,7 @@ impl WorkerRegistry {
                 // This is especially important when there are many workers
                 let health_futures: Vec<_> = workers
                     .iter()
+                    .filter(|worker| !worker.metadata().health_config.disable_health_check)
                     .map(|worker| {
                         let worker = worker.clone();
                         async move {
@@ -638,7 +683,7 @@ impl WorkerRegistry {
             }
         });
 
-        crate::core::HealthChecker::new(handle, shutdown)
+        HealthChecker::new(handle, shutdown)
     }
 }
 
@@ -682,7 +727,7 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
-    use crate::core::{BasicWorkerBuilder, CircuitBreakerConfig};
+    use crate::core::{circuit_breaker::CircuitBreakerConfig, BasicWorkerBuilder};
 
     #[test]
     fn test_worker_registry() {
@@ -703,7 +748,7 @@ mod tests {
                 .build(),
         );
 
-        // Register worker (WorkerFactory returns Box<dyn Worker>, convert to Arc)
+        // Register worker
         let worker_id = registry.register(Arc::from(worker));
 
         assert!(registry.get(&worker_id).is_some());
@@ -764,24 +809,21 @@ mod tests {
         registry.register(Arc::from(worker2));
         registry.register(Arc::from(worker3));
 
-        let llama_workers = registry.get_by_model_fast("llama-3");
+        let llama_workers = registry.get_by_model("llama-3");
         assert_eq!(llama_workers.len(), 2);
         let urls: Vec<String> = llama_workers.iter().map(|w| w.url().to_string()).collect();
         assert!(urls.contains(&"http://worker1:8080".to_string()));
         assert!(urls.contains(&"http://worker2:8080".to_string()));
 
-        let gpt_workers = registry.get_by_model_fast("gpt-4");
+        let gpt_workers = registry.get_by_model("gpt-4");
         assert_eq!(gpt_workers.len(), 1);
         assert_eq!(gpt_workers[0].url(), "http://worker3:8080");
 
-        let unknown_workers = registry.get_by_model_fast("unknown-model");
+        let unknown_workers = registry.get_by_model("unknown-model");
         assert_eq!(unknown_workers.len(), 0);
 
-        let llama_workers_slow = registry.get_by_model("llama-3");
-        assert_eq!(llama_workers.len(), llama_workers_slow.len());
-
         registry.remove_by_url("http://worker1:8080");
-        let llama_workers_after = registry.get_by_model_fast("llama-3");
+        let llama_workers_after = registry.get_by_model("llama-3");
         assert_eq!(llama_workers_after.len(), 1);
         assert_eq!(llama_workers_after[0].url(), "http://worker2:8080");
     }
