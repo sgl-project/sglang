@@ -36,6 +36,7 @@ class RouterArgs:
     eviction_interval_secs: int = 60
     max_tree_size: int = 2**26
     max_idle_secs: int = 4 * 3600
+    assignment_mode: str = "random"  # Mode for manual policy new routing key assignment
     max_payload_size: int = 512 * 1024 * 1024  # 512MB default for large batches
     bucket_adjust_interval_secs: int = 5
     dp_aware: bool = False
@@ -85,6 +86,7 @@ class RouterArgs:
     health_check_timeout_secs: int = 5
     health_check_interval_secs: int = 60
     health_check_endpoint: str = "/health"
+    disable_health_check: bool = False
     # Circuit breaker configuration
     cb_failure_threshold: int = 10
     cb_success_threshold: int = 3
@@ -309,6 +311,13 @@ class RouterArgs:
             type=int,
             default=RouterArgs.max_idle_secs,
             help="Maximum idle time in seconds before eviction (for manual policy)",
+        )
+        routing_group.add_argument(
+            f"--{prefix}assignment-mode",
+            type=str,
+            default=RouterArgs.assignment_mode,
+            choices=["random", "min_load", "min_group"],
+            help="Mode for assigning new routing keys in manual policy: random (default), min_load (worker with fewest requests), min_group (worker with fewest routing keys)",
         )
         routing_group.add_argument(
             f"--{prefix}max-payload-size",
@@ -590,6 +599,12 @@ class RouterArgs:
             type=str,
             default=RouterArgs.health_check_endpoint,
             help="Health check endpoint path",
+        )
+        health_group.add_argument(
+            f"--{prefix}disable-health-check",
+            action="store_true",
+            default=RouterArgs.disable_health_check,
+            help="Disable all worker health checks at startup",
         )
         # Tokenizer configuration
         tokenizer_group.add_argument(
