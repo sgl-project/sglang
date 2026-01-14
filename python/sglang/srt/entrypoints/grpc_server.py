@@ -5,15 +5,20 @@ Uses GrpcRequestManager for orchestration without tokenization.
 
 import asyncio
 import dataclasses
+import hashlib
+import io
 import json
 import logging
+import mimetypes
 import os
 import signal
 import threading
 import time
+import zipfile
 from concurrent import futures
 from datetime import datetime, timezone
-from typing import AsyncIterator, Dict, Optional
+from pathlib import Path
+from typing import AsyncIterator, Dict, List, Optional, Tuple
 
 import grpc
 from google.protobuf.json_format import MessageToDict
@@ -531,6 +536,154 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             dp_rank_count=len(loads),
             loads=loads,
             aggregate=_compute_aggregate_protobuf(loads),
+        )
+
+    async def GetTokenizer(
+        self,
+        _request: sglang_scheduler_pb2.GetTokenizerRequest,
+        context: grpc.aio.ServicerContext,
+    ) -> AsyncIterator[sglang_scheduler_pb2.GetTokenizerChunk]:
+        """Stream tokenizer artifacts to remote routers."""
+
+        logger.info("Receive tokenizer fetch request")
+
+        try:
+            metadata, bundle_name, bundle_bytes = self._prepare_tokenizer_bundle()
+        except FileNotFoundError as exc:
+            logger.error(f"Tokenizer bundle not available: {exc}")
+            context.set_code(grpc.StatusCode.NOT_FOUND)
+            context.set_details(str(exc))
+            return
+        except Exception as exc:  # pragma: no cover - defensive catch
+            logger.error(
+                "Failed to prepare tokenizer bundle: %s\n%s",
+                exc,
+                get_exception_traceback(),
+            )
+            context.set_code(grpc.StatusCode.INTERNAL)
+            context.set_details(str(exc))
+            return
+
+        yield sglang_scheduler_pb2.GetTokenizerChunk(metadata=metadata)
+
+        chunk_size = 2 * 1024 * 1024  # 2MB chunks to balance memory and throughput
+        total_size = len(bundle_bytes)
+        for index, start in enumerate(range(0, total_size, chunk_size)):
+            chunk = bundle_bytes[start : start + chunk_size]
+            yield sglang_scheduler_pb2.GetTokenizerChunk(
+                file_chunk=sglang_scheduler_pb2.TokenizerFileChunk(
+                    file_name=bundle_name,
+                    data=chunk,
+                    chunk_index=index,
+                    is_last_chunk=start + len(chunk) >= total_size,
+                    compression="zip",
+                )
+            )
+
+    # Helper methods for tokenizer bundle preparation
+    def _prepare_tokenizer_bundle(
+        self,
+    ) -> Tuple[sglang_scheduler_pb2.TokenizerMetadata, str, bytes]:
+        base_path = self.server_args.tokenizer_path or self.server_args.model_path
+        if not base_path:
+            raise FileNotFoundError("Tokenizer path is not configured on the scheduler")
+
+        tokenizer_path = Path(base_path)
+        if tokenizer_path.is_dir():
+            tokenizer_path = tokenizer_path / "tokenizer.json"
+
+        if not tokenizer_path.exists():
+            raise FileNotFoundError(
+                f"Tokenizer file not found at {tokenizer_path}. Ensure tokenizer.json is available."
+            )
+
+        base_dir = tokenizer_path.parent
+        file_entries: List[Tuple[str, bytes, bool, str]] = []
+
+        def add_file(path: Optional[Path], optional: bool) -> None:
+            if path is None:
+                return
+            if not path.exists():
+                if optional:
+                    return
+                raise FileNotFoundError(f"Required tokenizer artifact missing: {path}")
+            file_entries.append(
+                (
+                    path.name,
+                    path.read_bytes(),
+                    optional,
+                    self._guess_mime_type(path),
+                )
+            )
+
+        add_file(tokenizer_path, optional=False)
+        add_file(base_dir / "tokenizer_config.json", optional=True)
+        add_file(self._resolve_chat_template_file(base_dir), optional=True)
+
+        # Configuration for special tokenizer files. tokenizer.model or gguf is not supported.
+        add_file(base_dir / "special_tokens_map.json", optional=True)
+        add_file(base_dir / "added_tokens.json", optional=True)
+        add_file(base_dir / "vocab.json", optional=True)
+
+        if not file_entries:
+            raise FileNotFoundError("No tokenizer artifacts discovered on scheduler")
+
+        bundle_buffer = io.BytesIO()
+        with zipfile.ZipFile(
+            bundle_buffer, "w", compression=zipfile.ZIP_DEFLATED
+        ) as archive:
+            for name, content, _optional, _mime in file_entries:
+                archive.writestr(name, content)
+
+        bundle_bytes = bundle_buffer.getvalue()
+        fingerprint = hashlib.sha256(bundle_bytes).hexdigest()
+
+        metadata = sglang_scheduler_pb2.TokenizerMetadata(
+            model_identifier=self._model_identifier(),
+            fingerprint=fingerprint,
+            bundle_format="zip",
+            files=[
+                sglang_scheduler_pb2.TokenizerFileDescriptor(
+                    file_name=name,
+                    mime_type=mime,
+                    optional=optional,
+                )
+                for name, _content, optional, mime in file_entries
+            ],
+        )
+
+        return metadata, "tokenizer_bundle.zip", bundle_bytes
+
+    def _resolve_chat_template_file(self, base_dir: Path) -> Optional[Path]:
+        explicit = self.server_args.chat_template
+        if explicit:
+            explicit_path = Path(explicit)
+            if explicit_path.exists():
+                return explicit_path
+
+        preferred_names = ["chat_template.json", "chat_template.jinja"]
+        for name in preferred_names:
+            candidate = base_dir / name
+            if candidate.exists():
+                return candidate
+
+        for candidate in base_dir.glob("*.jinja"):
+            if candidate.name != "chat_template.jinja":
+                return candidate
+
+        return None
+
+    @staticmethod
+    def _guess_mime_type(path: Path) -> str:
+        mime, _ = mimetypes.guess_type(str(path))
+        return mime or "application/octet-stream"
+
+    def _model_identifier(self) -> str:
+        return (
+            self.server_args.served_model_name
+            or self.server_args.model_path
+            or self.server_args.tokenizer_path
+            or "unknown"
         )
 
     # Helper methods for request/response conversion

@@ -109,6 +109,8 @@ base64 = "0.22"
 openai-harmony = { git = "https://github.com/openai/harmony", tag = "v0.0.4" }
 openmetrics-parser = "0.4.4"
 arc-swap = "1.7.1"
+zip = "7.0.0"
+tempfile = "3.8"
 
 # gRPC and Protobuf dependencies
 tonic = { version = "0.14.2", features = ["gzip", "transport"] }
@@ -145,7 +147,6 @@ criterion = { version = "0.5", features = ["html_reports"] }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 portpicker = "0.1"
-tempfile = "3.8"
 lazy_static = "1.4"
 wasm-encoder = "0.242"
 npyz = { version = "0.8", features = ["npz"] }  # For reading numpy .npz files in golden tests
