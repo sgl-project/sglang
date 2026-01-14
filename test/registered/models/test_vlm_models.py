@@ -7,6 +7,7 @@ register_amd_ci(est_time=420, suite="stage-b-test-small-1-gpu-amd")
 import argparse
 import random
 import sys
+import tempfile
 import unittest
 from types import SimpleNamespace
 
@@ -38,7 +39,11 @@ class TestVLMModels(MMMUMultiModelTestBase):
             models_to_test = [random.choice(MODELS)]
 
         for model in models_to_test:
-            self._run_vlm_mmmu_test(model, "./logs")
+            # Use a unique temporary directory for each model to avoid cached results
+            with tempfile.TemporaryDirectory(
+                prefix=f"test_vlm_mmmu_{model.model.replace('/', '_')}_"
+            ) as temp_dir:
+                self._run_vlm_mmmu_test(model, temp_dir)
 
 
 if __name__ == "__main__":
