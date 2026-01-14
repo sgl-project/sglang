@@ -1,0 +1,236 @@
+name: Release Gateway Crate to crates.io
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - sgl-model-gateway/Cargo.toml
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # --- Linux x86_64 ---
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            linker: ""
+            is_cross: false
+
+          # --- Linux ARM64 (原生 Cargo + 交叉工具链) ---
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            linker: "aarch64-linux-gnu-gcc"
+            is_cross: true
+
+          # --- macOS x86_64 ---
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            linker: ""
+            is_cross: false
+
+          # --- macOS ARM64 ---
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            linker: ""
+            is_cross: false
+
+          # --- Windows x86_64 ---
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            linker: ""
+            is_cross: false
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: sglang-repo
+
+      - name: Prepare source code
+        shell: bash
+        run: |
+          mv sglang-repo/sgl-model-gateway/* .
+          rm -rf sglang-repo
+          ls -alt
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # -------------------------------------------------------------
+      # 1. 安装 Linux 编译依赖 (移植自你的脚本)
+      # 包括: perl, make, gcc (基础), gcc-aarch64 (交叉), protoc
+      # -------------------------------------------------------------
+      - name: Install Linux Dependencies
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -e
+          echo "Installing base dependencies..."
+          sudo apt-get update
+          # 安装基础构建工具 (OpenSSL 需要 perl/make, 通用编译需要 gcc/g++)
+          sudo apt-get install -y wget unzip gcc g++ perl make
+
+          # 如果是 ARM64 目标，安装交叉编译器
+          if [ "${{ matrix.is_cross }}" == "true" ]; then
+            echo "Installing ARM64 cross-compilation toolchain..."
+            sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+          fi
+
+          # --- 手动安装 Proto
+          echo "Downloading and installing Protoc v32.0..."
+
+          (cd /tmp && \
+           wget https://github.com/protocolbuffers/protobuf/releases/download/v32.0/protoc-32.0-linux-x86_64.zip && \
+           sudo unzip -o protoc-32.0-linux-x86_64.zip -d /usr/local && \
+           rm protoc-32.0-linux-x86_64.zip)
+
+          protoc --version
+
+      # -------------------------------------------------------------
+      # 2. 安装 macOS/Windows 依赖
+      # -------------------------------------------------------------
+      - name: Install Dependencies (Mac/Win)
+        if: runner.os != 'Linux'
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" == "macOS" ]; then
+            brew install protobuf
+          elif [ "$RUNNER_OS" == "Windows" ]; then
+            choco install protoc
+            if [ ! -f "C:/Strawberry/perl/bin/perl.exe" ]; then
+              echo "Warning: Strawberry Perl not found!"
+            fi
+          fi
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+
+      # -------------------------------------------------------------
+      # 3. 编译 (Cargo Build)
+      # -------------------------------------------------------------
+      - name: Build Binary
+        shell: bash
+        env:
+          # 将 LTO 从 "fat" 降级为 "thin" (内存占用大幅降低，性能几乎无损)
+          CARGO_PROFILE_RELEASE_LTO: "thin"
+          # 增加代码生成单元 (允许并行处理，降低单个单元的内存峰值)
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: 16
+        # -----------------------------------------------
+        run: |
+          # 1. 针对 Linux ARM64: 设置链接器
+          if [ -n "${{ matrix.linker }}" ]; then
+            if [ "${{ matrix.target }}" == "aarch64-unknown-linux-gnu" ]; then
+              export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=${{ matrix.linker }}
+            fi
+            echo "Set linker to ${{ matrix.linker }}"
+          fi
+
+          # 2. 针对 Windows: 强制使用 Strawberry Perl
+          if [ "$RUNNER_OS" == "Windows" ]; then
+             export PERL="C:/Strawberry/perl/bin/perl.exe"
+          fi
+
+          echo "🏗️ Building with CARGO for ${{ matrix.target }}..."
+
+          # 执行编译:
+          # 强制开启 vendored-openssl 以生成静态链接的二进制文件
+          cargo build --release --target ${{ matrix.target }} --features vendored-openssl
+
+      # -------------------------------------------------------------
+      # 4. 打包与上传
+      # -------------------------------------------------------------
+      - name: Package binaries
+        shell: bash
+        run: |
+          set -e
+          ARTIFACT_NAME="${{ matrix.target }}"
+          OUT_DIR="${{ github.workspace }}/artifacts/$ARTIFACT_NAME"
+          mkdir -p "$OUT_DIR"
+          BIN_DIR="target/${{ matrix.target }}/release"
+
+          if [[ "${{ matrix.target }}" == *"windows"* ]]; then EXT=".exe"; else EXT=""; fi
+
+          for bin in sgl-model-gateway smg amg; do
+            if [ -f "$BIN_DIR/$bin$EXT" ]; then
+              cp "$BIN_DIR/$bin$EXT" "$OUT_DIR/"
+            else
+               echo "Warning: $bin binary not found in $BIN_DIR"
+            fi
+          done
+
+          cp LICENSE "$OUT_DIR/" 2>/dev/null || true
+          cp README.md "$OUT_DIR/" 2>/dev/null || true
+
+          cd "${{ github.workspace }}/artifacts"
+          tar -czf "$ARTIFACT_NAME.tar.gz" "$ARTIFACT_NAME"
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sgl-model-gateway-${{ matrix.os }}-${{ matrix.target }}
+          path: artifacts/*.tar.gz
+
+  # Publish Job
+  publish:
+    name: Publish to crates.io
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' || (github.ref == 'refs/heads/main' && github.event_name == 'push')
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: sglang-repo
+
+      # 1. 修复文件结构 & 修复 LICENSE 软链接
+      - name: Move sgl-model-gateway folder and Fix LICENSE
+        run: |
+          mv sglang-repo/sgl-model-gateway/* .
+          # 删除断掉的软链接，复制真实文件
+          rm LICENSE
+          cp sglang-repo/LICENSE .
+          rm -rf sglang-repo
+          ls -al
+
+      # 2. 安装依赖 & 手动安装 Protoc v32.0 (保持与 Build 一致)
+      - name: Install Dependencies & Protoc
+        shell: bash
+        run: |
+          set -e
+          echo "Installing base dependencies..."
+          sudo apt-get update
+          # 安装基础构建工具
+          sudo apt-get install -y wget unzip gcc g++ perl make
+
+          # --- 手动安装 Protoc v32.0
+          echo "Downloading and installing Protoc v32.0..."
+          (cd /tmp && \
+           wget https://github.com/protocolbuffers/protobuf/releases/download/v32.0/protoc-32.0-linux-x86_64.zip && \
+           sudo unzip -o protoc-32.0-linux-x86_64.zip -d /usr/local && \
+           rm protoc-32.0-linux-x86_64.zip)
+
+          protoc --version
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # 3. 发布
+      - name: Publish crate (Dry Run)
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          # 调试用 --dry-run，正式发布请去掉
+          cargo publish --dry-run --token "$CARGO_REGISTRY_TOKEN"

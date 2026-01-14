@@ -2,6 +2,12 @@
 name = "sgl-model-gateway"
 version = "0.3.2"
 edition = "2021"
+description = "High-performance model routing control and data plane for large-scale LLM deployments."
+license = "Apache-2.0"
+documentation = "https://docs.sglang.io/advanced_features/sgl_model_gateway.html"
+homepage = "https://docs.sglang.io/advanced_features/sgl_model_gateway.html"
+repository = "https://github.com/sgl-project/sglang"
+readme = "README.md"
 
 [features]
 default = ["grpc-client"]
@@ -106,7 +112,7 @@ num-bigint = "0.4"
 image = { version = "0.25.4", default-features = false, features = ["png", "jpeg", "gif", "bmp", "ico", "tiff", "webp"] }
 ndarray = "0.16"
 base64 = "0.22"
-openai-harmony = { git = "https://github.com/openai/harmony", tag = "v0.0.4" }
+openai-harmony = "0.0.8"
 openmetrics-parser = "0.4.4"
 arc-swap = "1.7.1"
 
