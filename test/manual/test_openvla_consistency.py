@@ -187,16 +187,9 @@ class SGLangRunner:
         latency_ms = (end_time - start_time) * 1000
 
         # Extract action tokens from output
-        # SGLang returns text, we need to get the token IDs
-        # For OpenVLA, action tokens are in range [32000, 32255]
-        meta = output.get("meta_info", {})
-        output_ids = meta.get("output_ids", [])
-
-        # If output_ids not available, try to decode from text
-        if not output_ids:
-            # Fallback: the output text contains action tokens
-            # This is model-specific handling
-            output_ids = []
+        # SGLang returns output_ids at the top level
+        # For OpenVLA, action tokens are in range [31744, 31999] (vocab_size - 256 to vocab_size - 1)
+        output_ids = output.get("output_ids", [])
 
         return BenchmarkResult(
             action_tokens=output_ids[:7] if output_ids else [],
@@ -335,28 +328,48 @@ def run_benchmark(
     return results, summary
 
 
+def decode_action_tokens(tokens: List[int], vocab_size: int = 32000) -> Tuple[List[int], List[float]]:
+    """Decode action tokens to bins and normalized actions.
+
+    OpenVLA uses the formula: bin = vocab_size - token - 1
+
+    Args:
+        tokens: List of action token IDs.
+        vocab_size: Base vocabulary size (32000 for OpenVLA).
+
+    Returns:
+        Tuple of (bin_indices, normalized_actions).
+    """
+    bins = [max(0, min(255, vocab_size - t - 1)) for t in tokens]
+    actions = [(2.0 * b + 1.0) / 256.0 - 1.0 for b in bins]
+    return bins, actions
+
+
 def compare_outputs(
     ref_results: List[BenchmarkResult],
     test_results: List[BenchmarkResult],
     tolerance: int = 0,
 ) -> Tuple[int, int, float]:
-    """Compare action tokens between reference and test results."""
+    """Compare action tokens between reference and test results.
+
+    Compares using bin indices (derived from tokens via HF formula).
+    """
     total_tokens = 0
     matching_tokens = 0
 
     for ref, test in zip(ref_results, test_results):
-        ref_tokens = ref.action_tokens
-        test_tokens = test.action_tokens
+        ref_bins, _ = decode_action_tokens(ref.action_tokens)
+        test_bins, _ = decode_action_tokens(test.action_tokens)
 
-        # Compare token by token
-        for i in range(min(len(ref_tokens), len(test_tokens))):
+        # Compare bin by bin
+        for i in range(min(len(ref_bins), len(test_bins))):
             total_tokens += 1
-            diff = abs(ref_tokens[i] - test_tokens[i])
+            diff = abs(ref_bins[i] - test_bins[i])
             if diff <= tolerance:
                 matching_tokens += 1
 
         # Account for length differences
-        total_tokens += abs(len(ref_tokens) - len(test_tokens))
+        total_tokens += abs(len(ref_bins) - len(test_bins))
 
     accuracy = matching_tokens / total_tokens if total_tokens > 0 else 0
     return matching_tokens, total_tokens, accuracy

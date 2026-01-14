@@ -58,20 +58,29 @@ class OpenVLAImageProcessor(BaseMultimodalProcessor):
                 image, _ = load_image(url)
                 image_hash = hash(url)
 
-            # NOTE: Do NOT use HuggingFace processor here.
-            # The HF processor outputs 6 channels (for both DINOv2 and SigLIP),
-            # but SGLang's vision backbone processes each encoder separately
-            # with 3-channel input. Always use manual preprocessing.
+            # Precompute BOTH DINOv2 and SigLIP normalized pixels (6 channels total)
+            # This matches HF's preprocessing and avoids bfloat16 precision loss
+            # during runtime conversion.
             image = image.convert("RGB").resize(
                 (image_size, image_size), Image.BILINEAR
             )
-            pixel_values = np.array(image, dtype=np.float32) / 255.0
-            # Normalize with ImageNet stats
-            mean = np.array([0.485, 0.456, 0.406])
-            std = np.array([0.229, 0.224, 0.225])
-            pixel_values = (pixel_values - mean) / std
-            # Convert to CHW format
-            pixel_values = pixel_values.transpose(2, 0, 1).astype(np.float16)
+            raw = np.array(image, dtype=np.float32) / 255.0
+
+            # DINOv2 normalization (HF's exact quantized ImageNet stats)
+            dinov2_mean = np.array([0.484375, 0.455078125, 0.40625])
+            dinov2_std = np.array([0.228515625, 0.2236328125, 0.224609375])
+            dinov2_pixels = (raw - dinov2_mean) / dinov2_std
+            dinov2_pixels = dinov2_pixels.transpose(2, 0, 1)  # HWC -> CHW
+
+            # SigLIP normalization
+            siglip_mean = np.array([0.5, 0.5, 0.5])
+            siglip_std = np.array([0.5, 0.5, 0.5])
+            siglip_pixels = (raw - siglip_mean) / siglip_std
+            siglip_pixels = siglip_pixels.transpose(2, 0, 1)  # HWC -> CHW
+
+            # Stack into 6-channel tensor: [DINOv2(3), SigLIP(3)]
+            # Use float32 to preserve precision - will be converted to model dtype later
+            pixel_values = np.concatenate([dinov2_pixels, siglip_pixels], axis=0).astype(np.float32)
 
             return pixel_values, image_hash, (image_size, image_size)
 

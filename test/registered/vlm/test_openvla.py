@@ -67,20 +67,28 @@ class TestOpenVLAActionDecoding(CustomTestCase):
     """Test OpenVLA action token decoding logic."""
 
     def test_action_token_to_continuous(self):
-        """Test conversion from action tokens to continuous values."""
-        # OpenVLA uses 256-bin discretization per action dimension
-        # Tokens are in range [action_token_offset, action_token_offset + 255]
-        # Values are mapped to [-1, 1]
-        action_token_offset = 32000
+        """Test conversion from action tokens to continuous values.
 
-        # Test tokens: min, mid, max for different action dimensions
+        OpenVLA uses an inverted token mapping:
+        - Tokens are in range [vocab_size - 256, vocab_size - 1] = [31744, 31999]
+        - Formula: bin = vocab_size - token - 1
+        - Action value uses bin centers: action = (2 * bin + 1) / 256 - 1
+        """
+        vocab_size = 32000
+
+        # Test tokens corresponding to specific bins:
+        # bin 0 (action -0.996): token = 31999
+        # bin 127 (action -0.004): token = 31872
+        # bin 255 (action 0.996): token = 31744
         action_tokens = torch.tensor(
-            [[32000, 32128, 32255, 32064, 32192, 32032, 32000]]
+            [[31999, 31872, 31744, 31935, 31807, 31967, 31999]]
         )
 
-        # Replicate the decoding logic from OpenVLA
-        bin_indices = action_tokens - action_token_offset
-        actions = (bin_indices.float() / 255.0) * 2.0 - 1.0
+        # Replicate the HF decoding logic
+        bin_indices = vocab_size - action_tokens - 1
+        bin_indices = bin_indices.clamp(min=0, max=255)
+        # Use bin centers: (2 * bin + 1) / 256 - 1
+        actions = ((2.0 * bin_indices.float() + 1.0) / 256.0) - 1.0
 
         # Verify output shape (batch=1, action_dim=7)
         self.assertEqual(actions.shape, (1, 7))
@@ -89,26 +97,29 @@ class TestOpenVLAActionDecoding(CustomTestCase):
         self.assertTrue(torch.all(actions >= -1.0))
         self.assertTrue(torch.all(actions <= 1.0))
 
-        # Verify specific values
-        # Token 32000 -> bin 0 -> action -1.0
-        self.assertAlmostEqual(actions[0, 0].item(), -1.0, places=5)
-        # Token 32128 -> bin 128 -> action ~0.003922
-        self.assertAlmostEqual(actions[0, 1].item(), 0.003922, places=3)
-        # Token 32255 -> bin 255 -> action 1.0
-        self.assertAlmostEqual(actions[0, 2].item(), 1.0, places=5)
+        # Verify specific values using bin centers
+        # Token 31999 -> bin 0 -> action = (2*0 + 1)/256 - 1 = -0.99609
+        self.assertAlmostEqual(actions[0, 0].item(), -0.99609, places=3)
+        # Token 31872 -> bin 127 -> action = (2*127 + 1)/256 - 1 = -0.00391
+        self.assertAlmostEqual(actions[0, 1].item(), -0.00391, places=3)
+        # Token 31744 -> bin 255 -> action = (2*255 + 1)/256 - 1 = 0.99609
+        self.assertAlmostEqual(actions[0, 2].item(), 0.99609, places=3)
 
     def test_action_bins_coverage(self):
         """Test that action bins cover the full [-1, 1] range uniformly."""
         n_bins = 256
         bin_indices = torch.arange(n_bins)
-        actions = (bin_indices.float() / 255.0) * 2.0 - 1.0
+        # Use bin centers: (2 * bin + 1) / 256 - 1
+        actions = ((2.0 * bin_indices.float() + 1.0) / 256.0) - 1.0
 
-        # First bin should be -1.0
-        self.assertAlmostEqual(actions[0].item(), -1.0, places=5)
-        # Last bin should be 1.0
-        self.assertAlmostEqual(actions[-1].item(), 1.0, places=5)
-        # Middle bin should be close to 0
-        self.assertAlmostEqual(actions[128].item(), 0.003922, places=3)
+        # First bin (0) should map to action near -1
+        self.assertAlmostEqual(actions[0].item(), -0.99609, places=3)
+        # Last bin (255) should map to action near 1
+        self.assertAlmostEqual(actions[-1].item(), 0.99609, places=3)
+        # Middle bin (127) should be near 0
+        self.assertAlmostEqual(actions[127].item(), -0.00391, places=3)
+        # Bin 128 should be just above 0
+        self.assertAlmostEqual(actions[128].item(), 0.00391, places=3)
 
 
 class TestOpenVLAImageProcessor(CustomTestCase):
@@ -122,9 +133,9 @@ class TestOpenVLAImageProcessor(CustomTestCase):
         img = Image.new("RGB", (224, 224), color=(128, 128, 128))
         pixel_values = np.array(img, dtype=np.float32) / 255.0
 
-        # Normalize with ImageNet stats (same as OpenVLA)
-        mean = np.array([0.485, 0.456, 0.406])
-        std = np.array([0.229, 0.224, 0.225])
+        # Normalize with HF's exact quantized ImageNet stats (for OpenVLA)
+        mean = np.array([0.484375, 0.455078125, 0.40625])
+        std = np.array([0.228515625, 0.2236328125, 0.224609375])
         pixel_values = (pixel_values - mean) / std
 
         # Convert to CHW format

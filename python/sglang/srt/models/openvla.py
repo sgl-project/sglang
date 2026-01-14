@@ -42,7 +42,21 @@ class PrismaticVisionBackbone(nn.Module):
     OpenVLA uses a fused dual-encoder vision backbone that concatenates
     features from DINOv2 (structural/geometric) and SigLIP (semantic).
     Both are ViT models loaded via TIMM.
+
+    IMPORTANT: DINOv2 and SigLIP use different normalization:
+    - DINOv2: HF's quantized ImageNet (mean=[0.484375, 0.455078125, 0.40625], std=[0.228515625, 0.2236328125, 0.224609375])
+    - SigLIP: Simple scaling (mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+
+    The input is expected to be ImageNet-normalized. This class handles the
+    conversion to SigLIP normalization internally for the fused encoder.
     """
+
+    # Normalization constants (HF's exact quantized values for OpenVLA)
+    # These are slightly different from standard ImageNet to match HF's PrismaticImageProcessor
+    IMAGENET_MEAN = [0.484375, 0.455078125, 0.40625]
+    IMAGENET_STD = [0.228515625, 0.2236328125, 0.224609375]
+    SIGLIP_MEAN = [0.5, 0.5, 0.5]
+    SIGLIP_STD = [0.5, 0.5, 0.5]
 
     def __init__(
         self,
@@ -59,6 +73,58 @@ class PrismaticVisionBackbone(nn.Module):
         self.featurizer = None
         self.fused_featurizer = None
         self.embed_dim = None
+
+        # Precompute normalization conversion parameters (ImageNet -> SigLIP)
+        # Formula: x_siglip = scale * x_imagenet + bias
+        # where: scale = imagenet_std / siglip_std
+        #        bias = (imagenet_mean - siglip_mean) / siglip_std
+        self._init_norm_conversion()
+
+    def _init_norm_conversion(self):
+        """Initialize normalization conversion parameters.
+
+        Precomputes scale and bias tensors for converting from ImageNet
+        normalization to SigLIP normalization.
+        """
+        import torch
+
+        # Convert to numpy arrays for computation
+        imagenet_mean = np.array(self.IMAGENET_MEAN)
+        imagenet_std = np.array(self.IMAGENET_STD)
+        siglip_mean = np.array(self.SIGLIP_MEAN)
+        siglip_std = np.array(self.SIGLIP_STD)
+
+        # Compute conversion parameters
+        # x_siglip = (x_imagenet * imagenet_std + imagenet_mean - siglip_mean) / siglip_std
+        #          = x_imagenet * (imagenet_std / siglip_std) + (imagenet_mean - siglip_mean) / siglip_std
+        scale = imagenet_std / siglip_std
+        bias = (imagenet_mean - siglip_mean) / siglip_std
+
+        # Register as buffers (not parameters, but move with model)
+        self.register_buffer(
+            "norm_scale",
+            torch.tensor(scale, dtype=torch.float32).view(1, 3, 1, 1),
+            persistent=False,
+        )
+        self.register_buffer(
+            "norm_bias",
+            torch.tensor(bias, dtype=torch.float32).view(1, 3, 1, 1),
+            persistent=False,
+        )
+
+    def _convert_imagenet_to_siglip(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        """Convert ImageNet-normalized input to SigLIP normalization.
+
+        Args:
+            pixel_values: ImageNet-normalized images (batch, 3, H, W).
+
+        Returns:
+            SigLIP-normalized images (batch, 3, H, W).
+        """
+        # Ensure scale/bias are on same device and dtype as input
+        scale = self.norm_scale.to(pixel_values.device, pixel_values.dtype)
+        bias = self.norm_bias.to(pixel_values.device, pixel_values.dtype)
+        return pixel_values * scale + bias
 
     def _init_timm_models(self):
         """Initialize TIMM models. Called after config is loaded.
@@ -102,31 +168,44 @@ class PrismaticVisionBackbone(nn.Module):
     ) -> torch.Tensor:
         """Extract and fuse features from both vision encoders.
 
+        IMPORTANT: HF's OpenVLA uses the SECOND-TO-LAST transformer layer output,
+        not the final layer. We use TIMM's get_intermediate_layers to match this.
+
         Args:
-            pixel_values: Images of shape (batch, channels, height, width).
+            pixel_values: Images of shape (batch, 6, height, width) with:
+                - channels 0-2: DINOv2 normalized (ImageNet stats)
+                - channels 3-5: SigLIP normalized (0.5 mean/std)
+                OR shape (batch, 3, height, width) for backwards compatibility
+                (will use runtime conversion, less precise).
 
         Returns:
             Patch features of shape (batch, num_patches, embed_dim).
         """
-        # Expected number of patch tokens: (H/14) * (W/14)
-        num_patches = (pixel_values.shape[-1] // 14) ** 2
+        # Handle both 6-channel (pre-normalized) and 3-channel (needs conversion) input
+        if pixel_values.shape[1] == 6:
+            # 6-channel input: split into DINOv2 and SigLIP portions
+            dinov2_pixels = pixel_values[:, 0:3, :, :]
+            siglip_pixels = pixel_values[:, 3:6, :, :]
+            logger.info(f"[OpenVLA DEBUG] Using 6-channel preprocessed input")
+        else:
+            # 3-channel input: DINOv2 normalized, convert for SigLIP
+            dinov2_pixels = pixel_values
+            siglip_pixels = self._convert_imagenet_to_siglip(pixel_values)
+            logger.info(f"[OpenVLA DEBUG] Using 3-channel input with runtime conversion")
 
         # Get features from primary encoder (DINOv2-reg)
-        # DINOv2 with registers outputs: [CLS, patches..., registers...]
-        # We need to extract just the patch tokens
-        features = self.featurizer.forward_features(pixel_values)
-
-        # Extract only the patch tokens (skip CLS, exclude registers)
-        # Position 0 is CLS, positions 1:num_patches+1 are patches
-        if features.shape[1] > num_patches:
-            features = features[:, 1 : num_patches + 1, :]
+        # Use second-to-last layer to match HF's behavior
+        n_blocks = len(self.featurizer.blocks)
+        features = self.featurizer.get_intermediate_layers(
+            dinov2_pixels, n={n_blocks - 2}
+        )[0]  # Returns tuple, take first (and only) element
 
         # Fuse with secondary encoder (SigLIP)
         if self.use_fused and self.fused_featurizer is not None:
-            fused_features = self.fused_featurizer.forward_features(pixel_values)
-            # SigLIP: [CLS, patches...] - skip CLS, keep patches
-            if fused_features.shape[1] > num_patches:
-                fused_features = fused_features[:, 1 : num_patches + 1, :]
+            n_fused_blocks = len(self.fused_featurizer.blocks)
+            fused_features = self.fused_featurizer.get_intermediate_layers(
+                siglip_pixels, n={n_fused_blocks - 2}
+            )[0]
             features = torch.cat([features, fused_features], dim=-1)
 
         return features
@@ -227,9 +306,11 @@ class OpenVLAForActionPrediction(nn.Module):
         # Projector (initialized after vision backbone loads)
         self.projector = None
 
-        # Language model
+        # Language model - use text_config which contains the LLM configuration
+        # OpenVLA uses a nested config structure where text_config has Llama params
+        llm_config = getattr(config, "text_config", config)
         self.language_model = LlamaForCausalLM(
-            config,
+            llm_config,
             quant_config=quant_config,
             prefix=add_prefix("language_model", prefix),
         )
@@ -250,45 +331,52 @@ class OpenVLAForActionPrediction(nn.Module):
         input_ids: List[int],
         image_inputs: MultimodalInputs,
     ) -> List[int]:
-        """Replace image placeholder tokens with appropriate padding.
+        """Insert vision token placeholders AFTER BOS to match HF's structure.
 
-        OpenVLA inserts vision features after the BOS token. The number of
-        image tokens equals num_patches (256 for 224x224 images).
+        IMPORTANT: HF's OpenVLA/Prismatic inserts vision features AFTER the BOS token:
+        - Position 0: BOS token
+        - Positions 1-256: Vision patches (256 tokens)
+        - Positions 257+: Remaining text tokens
+
+        This matches the training-time structure and is critical for correct outputs.
 
         Args:
-            input_ids: Token IDs with image placeholders.
+            input_ids: Token IDs (text only, starting with BOS).
             image_inputs: Multimodal input data.
 
         Returns:
-            Padded input IDs with expanded image positions.
+            Input IDs with vision placeholders inserted after BOS.
         """
         if not image_inputs or not image_inputs.mm_items:
             return input_ids
 
+        logger.info(f"[OpenVLA DEBUG] Original input_ids (first 10): {input_ids[:10]}")
+        logger.info(f"[OpenVLA DEBUG] Original input_ids length: {len(input_ids)}")
         pad_values = [item.pad_value for item in image_inputs.mm_items]
+        logger.info(f"[OpenVLA DEBUG] pad_values: {pad_values}")
         image_inputs.image_pad_len = []
         image_inputs.image_offsets = []
 
         for idx, item in enumerate(image_inputs.mm_items):
-            # Find image token position
-            try:
-                offset = input_ids.index(self.image_token_id)
-            except ValueError:
-                # No image token found, assume after BOS (position 1)
-                offset = 1
-
             # Number of patches for this image
             num_patches = self.num_patches
 
-            # Replace single image token with num_patches padding tokens
+            # INSERT vision tokens AFTER BOS (position 1)
+            # Structure: [BOS] + [vision x 256] + [remaining text]
             pad_value = pad_values[idx % len(pad_values)]
-            input_ids = (
-                input_ids[:offset] + [pad_value] * num_patches + input_ids[offset + 1 :]
-            )
 
-            image_inputs.image_offsets.append(offset)
+            # Keep BOS at position 0, insert vision at position 1
+            bos_token = input_ids[0]  # BOS is first token
+            remaining_text = input_ids[1:]  # Everything after BOS
+            input_ids = [bos_token] + [pad_value] * num_patches + remaining_text
+
+            # Vision starts at position 1 (after BOS), pad_len is num_patches
+            image_inputs.image_offsets.append(1)  # Vision at position 1
             image_inputs.image_pad_len.append(num_patches)
+            logger.info(f"[OpenVLA DEBUG] Inserted {num_patches} vision tokens at position 1 (after BOS)")
 
+        logger.info(f"[OpenVLA DEBUG] Final padded input_ids length: {len(input_ids)}")
+        logger.info(f"[OpenVLA DEBUG] Structure: BOS at 0, vision at 1-{self.num_patches}, text at {self.num_patches+1}+")
         return input_ids
 
     def encode_images(self, pixel_values: torch.Tensor) -> torch.Tensor:
@@ -333,7 +421,9 @@ class OpenVLAForActionPrediction(nn.Module):
 
         if forward_batch.forward_mode.is_extend():
             # Prefill: embed text and insert vision features
-            input_ids.clamp_(min=0, max=self.config.vocab_size - 1)
+            # Use text_config for vocab_size since OpenVLA has nested config
+            llm_config = getattr(self.config, "text_config", self.config)
+            input_ids.clamp_(min=0, max=llm_config.vocab_size - 1)
             input_embeds = self.language_model.model.embed_tokens(input_ids)
 
             # Check if we need to process images
@@ -361,12 +451,22 @@ class OpenVLAForActionPrediction(nn.Module):
 
                 if pixel_values:
                     # Stack and encode images
+                    # DEBUG: Log pixel value shapes
+                    logger.info(f"[OpenVLA DEBUG] pixel_values[0] shape: {pixel_values[0].shape}")
+                    logger.info(f"[OpenVLA DEBUG] pixel_values[0] dtype: {pixel_values[0].dtype}")
                     pixel_values = torch.tensor(
                         np.stack(pixel_values, axis=0),
                         device=input_embeds.device,
                         dtype=input_embeds.dtype,
                     )
+                    logger.info(f"[OpenVLA DEBUG] stacked pixel_values shape: {pixel_values.shape}")
+                    logger.info(f"[OpenVLA DEBUG] pixel_values[0,0,0,:5]: {pixel_values[0,0,0,:5]}")  # DINOv2 first row
+                    logger.info(f"[OpenVLA DEBUG] pixel_values[0,3,0,:5]: {pixel_values[0,3,0,:5]}")  # SigLIP first row
                     image_features = self.encode_images(pixel_values)
+                    logger.info(f"[OpenVLA DEBUG] image_features shape: {image_features.shape}")
+                    logger.info(f"[OpenVLA DEBUG] image_features mean: {image_features.float().mean().item():.6f}")
+                    logger.info(f"[OpenVLA DEBUG] input_embeds shape before insertion: {input_embeds.shape}")
+                    logger.info(f"[OpenVLA DEBUG] input_ids first 10: {input_ids[:10].tolist()}")
 
                     # Insert image features into embeddings
                     extend_start_loc_cpu = forward_batch.extend_start_loc.cpu().numpy()
@@ -411,9 +511,13 @@ class OpenVLAForActionPrediction(nn.Module):
 
                             try:
                                 input_embeds[left_idx:right_idx] = img_feature
+                                logger.info(f"[OpenVLA DEBUG] Inserted image at {left_idx}:{right_idx}")
                             except RuntimeError as e:
                                 logger.warning(f"Error inserting image features: {e}")
 
+            logger.info(f"[OpenVLA DEBUG] Final input_embeds mean: {input_embeds.float().mean().item():.6f}")
+            logger.info(f"[OpenVLA DEBUG] positions first 10: {positions[:10].tolist()}")
+            logger.info(f"[OpenVLA DEBUG] positions last 10: {positions[-10:].tolist()}")
             return self.language_model(
                 input_ids, positions, forward_batch, input_embeds=input_embeds
             )
@@ -436,7 +540,8 @@ class OpenVLAForActionPrediction(nn.Module):
 
         # Initialize projector after we know vision dimensions
         vision_dim = self.vision_backbone.embed_dim
-        llm_dim = self.config.hidden_size
+        llm_config = getattr(self.config, "text_config", self.config)
+        llm_dim = llm_config.hidden_size
         self.projector = PrismaticProjector(
             vision_dim=vision_dim,
             llm_dim=llm_dim,
@@ -462,11 +567,20 @@ class OpenVLAForActionPrediction(nn.Module):
                 self.language_model.load_weights([(lm_name, loaded_weight)])
                 continue
 
+            # Handle LayerScale weight naming difference between HF checkpoint and TIMM
+            # HF checkpoint uses: ls1.scale_factor, ls2.scale_factor
+            # TIMM uses: ls1.gamma, ls2.gamma
+            if ".ls1.scale_factor" in name or ".ls2.scale_factor" in name:
+                name = name.replace(".scale_factor", ".gamma")
+
             # Handle vision and projector weights
             matched = False
             for src_prefix, tgt_prefix in weight_mappings.items():
                 if name.startswith(src_prefix):
                     tgt_name = name.replace(src_prefix, tgt_prefix)
+                    # Also apply the gamma fix to target name
+                    if ".scale_factor" in tgt_name:
+                        tgt_name = tgt_name.replace(".scale_factor", ".gamma")
                     if tgt_name in params_dict:
                         param = params_dict[tgt_name]
 
@@ -564,26 +678,35 @@ class OpenVLAForActionPrediction(nn.Module):
     def decode_action_tokens(
         self,
         action_tokens: torch.Tensor,
-        action_token_offset: int = 32000,
+        vocab_size: int = 32000,
     ) -> torch.Tensor:
         """Convert action tokens to continuous action values.
 
         OpenVLA uses 256-bin discretization per action dimension.
-        Tokens are in range [action_token_offset, action_token_offset + 255].
-        Values are mapped to [-1, 1].
+        Tokens are in range [vocab_size - 256, vocab_size - 1] where
+        vocab_size = text_config.vocab_size - pad_to_multiple_of = 32064 - 64 = 32000.
+
+        The formula to convert token to bin is: bin = vocab_size - token - 1
+        (This is inverted: lower tokens = higher bins)
+
+        Values are then mapped to [-1, 1] using bin centers.
 
         Args:
             action_tokens: Token IDs of shape (batch, 7).
-            action_token_offset: Starting token ID for action tokens.
+            vocab_size: Base vocabulary size for action decoding (default 32000).
 
         Returns:
             Continuous actions of shape (batch, 7) in [-1, 1].
         """
-        # Convert token IDs to bin indices
-        bin_indices = action_tokens - action_token_offset
+        # Convert token IDs to bin indices using HF formula
+        # bin = vocab_size - token - 1, clamped to [0, 255]
+        bin_indices = vocab_size - action_tokens - 1
+        bin_indices = bin_indices.clamp(min=0, max=255)
 
-        # Map to continuous values: bin / 255 * 2 - 1
-        actions = (bin_indices.float() / 255.0) * 2.0 - 1.0
+        # Map to continuous values using bin centers
+        # bin_centers = linspace(-1, 1, 257)[:-1] + 0.5/256
+        # Simplified: action = (2 * bin + 1) / 256 - 1
+        actions = ((2.0 * bin_indices.float() + 1.0) / 256.0) - 1.0
 
         return actions
 
