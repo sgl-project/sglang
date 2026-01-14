@@ -1348,6 +1348,8 @@ class StorageMetrics:
     backup_pgs: List[int] = field(default_factory=list)
     prefetch_bandwidth: List[float] = field(default_factory=list)
     backup_bandwidth: List[float] = field(default_factory=list)
+    prefetch_failure_rate: float = 0.0
+    backup_failure_rate: float = 0.0
 
 
 class StorageMetricsCollector:
@@ -1355,7 +1357,7 @@ class StorageMetricsCollector:
         self,
         labels: Dict[str, str],
     ):
-        from prometheus_client import Counter, Histogram
+        from prometheus_client import Counter, Gauge, Histogram
 
         self.labels = labels
 
@@ -1417,6 +1419,20 @@ class StorageMetricsCollector:
             buckets=bucket_bandwidth,
         )
 
+        self.gauge_prefetch_failure_rate = Gauge(
+            name="sglang:prefetch_failure_rate",
+            documentation="Failure rate of prefetch operations.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+
+        self.gauge_backup_failure_rate = Gauge(
+            name="sglang:backup_failure_rate",
+            documentation="Failure rate of backup operations.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+
     def log_prefetched_tokens(self, prefetched_tokens: int):
         if prefetched_tokens > 0:
             self.prefetched_tokens_total.labels(**self.labels).inc(prefetched_tokens)
@@ -1427,6 +1443,9 @@ class StorageMetricsCollector:
 
     def _log_histogram(self, histogram, data: Union[int, float]):
         histogram.labels(**self.labels).observe(data)
+
+    def _log_gauge(self, gauge, data: Union[int, float]):
+        gauge.labels(**self.labels).set(data)
 
     def log_storage_metrics(self, storage_metrics: Optional[StorageMetrics] = None):
         if storage_metrics is None:
@@ -1442,6 +1461,13 @@ class StorageMetricsCollector:
             self._log_histogram(self.histogram_prefetch_bandwidth, v)
         for v in storage_metrics.backup_bandwidth:
             self._log_histogram(self.histogram_backup_bandwidth, v)
+
+        self._log_gauge(
+            self.gauge_prefetch_failure_rate, storage_metrics.prefetch_failure_rate
+        )
+        self._log_gauge(
+            self.gauge_backup_failure_rate, storage_metrics.backup_failure_rate
+        )
 
 
 class ExpertDispatchCollector:
