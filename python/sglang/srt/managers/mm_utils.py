@@ -22,6 +22,7 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
     MultimodalInputs,
 )
+from sglang.srt.managers.tokenizer_manager import _determine_tensor_transport_mode
 from sglang.srt.mem_cache.multimodal_cache import MultiModalStaticCache
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import get_global_server_args
@@ -1511,10 +1512,17 @@ def wrap_shm_features(obj):
     """
     Scan the object for multimodal tensors and wrap them in SHM pointers.
     """
+    if _determine_tensor_transport_mode(get_global_server_args()) == "default":
+        return obj
+
     if hasattr(obj, "mm_inputs") and obj.mm_inputs:
         mm_items = obj.mm_inputs.get("mm_items", [])
         for item in mm_items:
-            if hasattr(item, "feature") and isinstance(item.feature, torch.Tensor):
+            if (
+                hasattr(item, "feature")
+                and isinstance(item.feature, torch.Tensor)
+                and item.feature.is_cpu
+            ):
                 item.feature = ShmPointerMMData(item.feature)
     return obj
 
@@ -1523,6 +1531,8 @@ def unwrap_shm_features(obj):
     """
     Restore ShmPointerMMData wrappers back into standard torch.Tensors.
     """
+    if _determine_tensor_transport_mode(get_global_server_args()) == "default":
+        return obj
     if hasattr(obj, "mm_inputs") and obj.mm_inputs:
         mm_items = obj.mm_inputs.get("mm_items", [])
         for item in mm_items:
