@@ -1965,14 +1965,6 @@ class ServerArgs:
                 f"MoRI MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
 
-            mori_token_per_rank = get_int_env_var(
-                "SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 4096
-            )
-
-            logger.info(
-                f"kkkkkkkkkkkkkkkkkkkkkk {mori_token_per_rank=} {self.chunked_prefill_size=}"
-            )
-
             assert (self.chunked_prefill_size) <= get_int_env_var(
                 "SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 4096
             ), "SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK (default 4096) must be larger or equal to chunked_prefill_size//dp_size"
