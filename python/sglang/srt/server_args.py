@@ -1932,9 +1932,19 @@ class ServerArgs:
             logger.warning(
                 "SGLANG_CUTLASS_MOE is deprecated, use --moe-runner-backend=cutlass and/or --speculative-moe-runner-backend=cutlass instead"
             )
+            quantization_config = getattr(
+                self.get_hf_config(), "quantization_config", None
+            )
+            quant_method = (
+                quantization_config.get("quant_method")
+                if quantization_config is not None
+                else None
+            )
+            if self.quantization is None and quant_method is not None:
+                self.quantization = quant_method
             assert (
-                self.quantization == "fp8"
-            ), "cutlass MoE is only supported with fp8 quantization"
+                self.quantization == "fp8" or self.quantization == "compressed-tensors"
+            ), "cutlass MoE is only supported with fp8 or compressed-tensors quantization"
             self.moe_runner_backend = "cutlass"
         if self.moe_runner_backend == "cutlass" and self.quantization == "fp8":
             assert (

@@ -751,7 +751,14 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         assert loaded_shard_id < len(self.output_sizes)
 
         if isinstance(param, BlockQuantScaleParameter):
-            weight_block_size = self.quant_method.quant_config.weight_block_size
+            if hasattr(self.quant_method, "quant_config"):
+                weight_block_size = self.quant_method.quant_config.weight_block_size
+            elif hasattr(self, "weight_block_size"):  # llm-compressor quant model
+                weight_block_size = self.weight_block_size
+            else:
+                raise ValueError(
+                    "BlockQuantScaleParameter requires weight_block_size to be set."
+                )
             raw_block_n, _ = weight_block_size[0], weight_block_size[1]
             block_n = 1 if getattr(param, "format_ue8m0", False) else raw_block_n
             shard_offset = (
