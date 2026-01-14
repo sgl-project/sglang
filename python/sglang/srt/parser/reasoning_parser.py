@@ -1,7 +1,7 @@
 from typing import Dict, Optional, Tuple, Type
 
-from sglang.srt.parser.harmony_parser import HarmonyParser
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
+from sglang.srt.parser.harmony_parser import HarmonyParser
 
 
 class StreamingParseResult:
@@ -62,7 +62,10 @@ class BaseReasoningFormatDetector:
         # The text is considered to be in a reasoning block.
         processed_text = text.replace(self.think_start_token, "").strip()
 
-        if self.think_end_token not in processed_text and self.think_end_token not in self.previous_content:
+        if (
+            self.think_end_token not in processed_text
+            and self.think_end_token not in self.previous_content
+        ):
             # Assume reasoning was truncated before `</think>` token
             return StreamingParseResult(reasoning_text=processed_text)
 
@@ -77,9 +80,7 @@ class BaseReasoningFormatDetector:
             )
         else:
             # think_end_token is in self.previous_content for continue_final_message=True case
-            return StreamingParseResult(
-                normal_text=processed_text
-            )
+            return StreamingParseResult(normal_text=processed_text)
 
     def parse_streaming_increment(self, new_text: str) -> StreamingParseResult:
         """
@@ -159,7 +160,9 @@ class DeepSeekR1Detector(BaseReasoningFormatDetector):
             If True, streams reasoning content as it arrives.
     """
 
-    def __init__(self, stream_reasoning: bool = True, force_reasoning: bool = True, **kwargs):
+    def __init__(
+        self, stream_reasoning: bool = True, force_reasoning: bool = True, **kwargs
+    ):
         # DeepSeek-R1 is assumed to be reasoning until `</think>` token
         super().__init__(
             "<think>",
@@ -187,7 +190,9 @@ class Qwen3Detector(BaseReasoningFormatDetector):
             If True, streams reasoning content as it arrives.
     """
 
-    def __init__(self, stream_reasoning: bool = True, force_reasoning: bool = False, **kwargs):
+    def __init__(
+        self, stream_reasoning: bool = True, force_reasoning: bool = False, **kwargs
+    ):
         super().__init__(
             "<think>",
             "</think>",
@@ -206,7 +211,9 @@ class KimiDetector(BaseReasoningFormatDetector):
     and the rest of the text as `normal_text`.
     """
 
-    def __init__(self, stream_reasoning: bool = True, force_reasoning: bool = False, **kwargs):
+    def __init__(
+        self, stream_reasoning: bool = True, force_reasoning: bool = False, **kwargs
+    ):
         super().__init__(
             "◁think▷",
             "◁/think▷",
@@ -221,7 +228,9 @@ class GptOssDetector(BaseReasoningFormatDetector):
     Detector for T4-style reasoning format (GPT-OSS), using the HarmonyParser.
     """
 
-    def __init__(self, stream_reasoning: bool = True, force_reasoning: bool = True, **kwargs):
+    def __init__(
+        self, stream_reasoning: bool = True, force_reasoning: bool = True, **kwargs
+    ):
         super().__init__(
             "<|channel|>analysis<|message|>",
             "<|end|>",
@@ -280,7 +289,9 @@ class MiniMaxAppendThinkDetector(BaseReasoningFormatDetector):
     Append `<think>` token to the beginning of the text.
     """
 
-    def __init__(self, stream_reasoning: bool = True, force_reasoning: bool = False, **kwargs):
+    def __init__(
+        self, stream_reasoning: bool = True, force_reasoning: bool = False, **kwargs
+    ):
         # scheduler.py need `reasoning_parser.detector.think_end_token`
         super().__init__(
             "<think>",
@@ -308,7 +319,9 @@ class NanoV3Detector(BaseReasoningFormatDetector):
 
     """
 
-    def __init__(self, stream_reasoning: bool = True, force_reasoning: bool = False, **kwargs):
+    def __init__(
+        self, stream_reasoning: bool = True, force_reasoning: bool = False, **kwargs
+    ):
         super().__init__(
             "<think>",
             "</think>",
@@ -350,7 +363,7 @@ class ReasoningParser:
         model_type: Optional[str] = None,
         stream_reasoning: bool = True,
         force_reasoning: Optional[bool] = None,
-        request: ChatCompletionRequest = None
+        request: ChatCompletionRequest = None,
     ):
         if not model_type:
             raise ValueError("Model type must be specified")
