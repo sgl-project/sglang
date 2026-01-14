@@ -1251,6 +1251,19 @@ ResponseInputOutputItem: TypeAlias = Union[
 # ================== Transcription API Protocol Definitions ==================
 
 
+class TranscriptionRequest(BaseModel):
+    """Request model for audio transcription (OpenAI-compatible)."""
+
+    model: str = DEFAULT_MODEL_NAME
+    language: Optional[str] = None
+    response_format: str = "json"
+    temperature: float = 0.0
+    stream: bool = False
+    # Internal fields (not from API)
+    audio_data: Optional[bytes] = None
+    audio_duration_s: float = 0.0
+
+
 class TranscriptionUsage(BaseModel):
     """Usage info for transcription response (duration-based)."""
 

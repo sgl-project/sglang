@@ -29,6 +29,7 @@ from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 from sglang.srt.entrypoints.openai.protocol import (
     DeltaMessage,
     ErrorResponse,
+    TranscriptionRequest,
     TranscriptionResponse,
     TranscriptionStreamChoice,
     TranscriptionStreamResponse,
@@ -52,38 +53,30 @@ class OpenAIServingTranscription(OpenAIServingBase):
     def _request_id_prefix(self) -> str:
         return "trsc-"
 
-    def _validate_request(self, request) -> Optional[str]:
+    def _validate_request(self, request: TranscriptionRequest) -> Optional[str]:
         """Validate transcription request."""
         # Validation is done in the route handler for form data
         return None
 
     def _convert_to_internal_request(
         self,
-        request,
+        request: TranscriptionRequest,
         raw_request: Request = None,
-    ) -> tuple[GenerateReqInput, dict]:
-        """Convert transcription request to internal format.
-
-        Note: For transcription, we use a dict instead of a Pydantic model
-        since the request comes from form data, not JSON.
-        """
-        audio_data = request.get("audio_data")
-        temperature = request.get("temperature", 0.0)
-        language = request.get("language")
-
+    ) -> tuple[GenerateReqInput, TranscriptionRequest]:
+        """Convert transcription request to internal format."""
         # Build sampling params - include language for WhisperProcessor
         sampling_params = {
-            "temperature": temperature,
+            "temperature": request.temperature,
             "max_new_tokens": 448,  # Whisper default max tokens
-            "language": language,  # Pass to WhisperProcessor for language-specific decoding
+            "language": request.language,  # Pass to WhisperProcessor for language-specific decoding
         }
 
         # For Whisper, we pass audio_data and let the processor handle it
         adapted_request = GenerateReqInput(
             text="",  # Empty text - Whisper processor will set proper decoder tokens
-            audio_data=audio_data,
+            audio_data=request.audio_data,
             sampling_params=sampling_params,
-            stream=request.get("stream", False),
+            stream=request.stream,
             modalities=["audio"],
             routing_key=self.extract_routing_key(raw_request),
         )
@@ -120,16 +113,16 @@ class OpenAIServingTranscription(OpenAIServingBase):
         # Calculate audio duration for usage reporting
         audio_duration_s = self._get_audio_duration(audio_data)
 
-        # Build request dict
-        request = {
-            "audio_data": audio_data,
-            "model": model,
-            "language": language,
-            "response_format": response_format,
-            "temperature": temperature,
-            "stream": stream,
-            "audio_duration_s": audio_duration_s,
-        }
+        # Build request
+        request = TranscriptionRequest(
+            audio_data=audio_data,
+            model=model,
+            language=language,
+            response_format=response_format,
+            temperature=temperature,
+            stream=stream,
+            audio_duration_s=audio_duration_s,
+        )
 
         # Use the base class handle_request pattern
         return await self.handle_request(request, raw_request)
@@ -137,7 +130,7 @@ class OpenAIServingTranscription(OpenAIServingBase):
     async def _handle_non_streaming_request(
         self,
         adapted_request: GenerateReqInput,
-        request: dict,
+        request: TranscriptionRequest,
         raw_request: Request,
     ) -> Union[TranscriptionResponse, ErrorResponse, ORJSONResponse, Response]:
         """Handle non-streaming transcription request."""
@@ -149,22 +142,20 @@ class OpenAIServingTranscription(OpenAIServingBase):
             return self.create_error_response(str(e))
 
         text = ret.get("text", "")
-        audio_duration_s = request.get("audio_duration_s", 0.0)
-        response_format = request.get("response_format", "json")
 
         # Build response based on format
-        if response_format == "text":
+        if request.response_format == "text":
             return Response(content=text, media_type="text/plain")
 
         # JSON format
-        usage = TranscriptionUsage(seconds=int(math.ceil(audio_duration_s)))
+        usage = TranscriptionUsage(seconds=int(math.ceil(request.audio_duration_s)))
 
         return TranscriptionResponse(text=text, usage=usage)
 
     async def _handle_streaming_request(
         self,
         adapted_request: GenerateReqInput,
-        request: dict,
+        request: TranscriptionRequest,
         raw_request: Request,
     ) -> StreamingResponse:
         """Handle streaming transcription request."""
@@ -177,13 +168,13 @@ class OpenAIServingTranscription(OpenAIServingBase):
     async def _generate_transcription_stream(
         self,
         adapted_request: GenerateReqInput,
-        request: dict,
+        request: TranscriptionRequest,
         raw_request: Request,
     ) -> AsyncGenerator[str, None]:
         """Generate streaming transcription response."""
         created_time = int(time.time())
         request_id = f"{self._request_id_prefix()}{uuid.uuid4().hex}"
-        model = request.get("model", "default")
+        model = request.model
         stream_buffer = ""
 
         try:
