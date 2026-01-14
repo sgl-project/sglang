@@ -29,10 +29,11 @@ DEFAULT_PORT_FOR_SRT_TEST_RUNNER = (
 DEFAULT_URL_FOR_TEST = f"http://127.0.0.1:{DEFAULT_PORT_FOR_SRT_TEST_RUNNER + 1000}"
 
 
-class TestAscendW8A8(CustomTestCase):
+class TestAscendW8A8CompressedTensors(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = "vllm-ascend/Qwen2.5-0.5B-Instruct-w8a8"
+        # TODO: Move model to CI or Modelscope
+        cls.model = "RedHatAI/Qwen2.5-0.5B-Instruct-quantized.w8a8"
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -67,8 +68,8 @@ class TestAscendW8A8(CustomTestCase):
         metrics = run_eval(args)
         print(metrics)
 
-        self.assertGreaterEqual(metrics["accuracy"], 0.25)
-        self.assertGreaterEqual(metrics["output_throughput"], 1000)
+        self.assertGreaterEqual(metrics["accuracy"], 0.3)
+        self.assertGreaterEqual(metrics["output_throughput"], 700)
 
     def run_decode(self, max_new_tokens):
         response = requests.post(
