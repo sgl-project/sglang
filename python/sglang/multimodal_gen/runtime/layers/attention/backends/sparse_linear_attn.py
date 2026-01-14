@@ -135,17 +135,6 @@ class SparseLinearAttentionImpl(AttentionImpl, nn.Module):
             nn.init.zeros_(self.proj_l.weight)
             nn.init.zeros_(self.proj_l.bias)  # type: ignore[arg-type]
 
-    def _get_feature_map(self, feature_map_type: str):
-        """Get feature map function based on type."""
-        if feature_map_type == "elu":
-            return self._elu_feature_map
-        elif feature_map_type == "relu":
-            return torch.nn.ReLU()
-        elif feature_map_type == "softmax":
-            return self._softmax_feature_map
-        else:
-            raise NotImplementedError(f"Not supported feature map {feature_map_type}.")
-
     def _calc_linear_attention_with_torch(self, q, k, v):
         kv = torch.matmul(k.transpose(-1, -2), v)
         k_sum = torch.sum(k, dim=-2, keepdim=True)
