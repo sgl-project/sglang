@@ -92,6 +92,31 @@
             letter-spacing: 1px;
         }
 
+        .header-actions {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+        }
+
+        .help-btn {
+            padding: 8px 16px;
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            color: var(--text-dim);
+            font-size: 12px;
+            cursor: pointer;
+            transition: all 0.2s;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .help-btn:hover {
+            border-color: var(--cyan);
+            color: var(--cyan);
+        }
+
         .server-status {
             display: flex;
             align-items: center;
@@ -145,10 +170,91 @@
             text-transform: uppercase;
             letter-spacing: 1px;
             color: var(--text-dim);
+            display: flex;
+            align-items: center;
+            gap: 8px;
         }
 
         .card-body {
             padding: 20px;
+        }
+
+        /* Info Icons & Tooltips */
+        .info-icon {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 16px;
+            height: 16px;
+            border-radius: 50%;
+            background: var(--border);
+            color: var(--text-dim);
+            font-size: 10px;
+            cursor: help;
+            transition: all 0.2s;
+        }
+
+        .info-icon:hover {
+            background: var(--cyan);
+            color: var(--void);
+        }
+
+        .tooltip-container {
+            position: relative;
+            display: inline-flex;
+        }
+
+        .tooltip {
+            position: absolute;
+            bottom: calc(100% + 8px);
+            left: 50%;
+            transform: translateX(-50%);
+            padding: 12px 16px;
+            background: var(--elevated);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            font-size: 11px;
+            line-height: 1.5;
+            color: var(--text);
+            white-space: normal;
+            width: 280px;
+            z-index: 1000;
+            opacity: 0;
+            visibility: hidden;
+            transition: all 0.2s;
+            box-shadow: 0 8px 32px rgba(0,0,0,0.5);
+        }
+
+        .tooltip::after {
+            content: '';
+            position: absolute;
+            top: 100%;
+            left: 50%;
+            transform: translateX(-50%);
+            border: 6px solid transparent;
+            border-top-color: var(--border);
+        }
+
+        .tooltip-container:hover .tooltip {
+            opacity: 1;
+            visibility: visible;
+        }
+
+        .tooltip-title {
+            font-weight: 600;
+            color: var(--cyan);
+            margin-bottom: 6px;
+            display: block;
+        }
+
+        .tooltip-formula {
+            font-family: 'IBM Plex Mono', monospace;
+            background: var(--deep);
+            padding: 6px 8px;
+            border-radius: 4px;
+            margin-top: 8px;
+            font-size: 10px;
+            color: var(--lime);
         }
 
         /* Query Section */
@@ -215,10 +321,17 @@
             border-radius: 8px;
         }
 
-        .meter-label {
+        .meter-header {
             display: flex;
             justify-content: space-between;
+            align-items: center;
             margin-bottom: 8px;
+        }
+
+        .meter-label {
+            display: flex;
+            align-items: center;
+            gap: 8px;
             font-size: 12px;
             color: var(--text-dim);
         }
@@ -228,6 +341,7 @@
             background: var(--border);
             border-radius: 4px;
             overflow: hidden;
+            position: relative;
         }
 
         .meter-fill {
@@ -235,6 +349,14 @@
             background: linear-gradient(90deg, var(--lime), var(--amber), var(--magenta));
             border-radius: 4px;
             transition: width 0.3s ease;
+        }
+
+        .meter-scale {
+            display: flex;
+            justify-content: space-between;
+            margin-top: 4px;
+            font-size: 9px;
+            color: var(--text-muted);
         }
 
         .retrieval-decision {
@@ -262,6 +384,20 @@
             margin-top: 20px;
         }
 
+        .section-header {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-bottom: 12px;
+        }
+
+        .section-title {
+            font-size: 12px;
+            color: var(--text-dim);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
         .token-list {
             display: flex;
             flex-wrap: wrap;
@@ -276,6 +412,7 @@
             border-radius: 4px;
             font-size: 12px;
             transition: all 0.2s;
+            cursor: help;
         }
 
         .token.anchor {
@@ -347,17 +484,24 @@
             color: var(--text);
         }
 
-        .score-bar {
+        .score-bars {
             margin-top: 12px;
+        }
+
+        .score-bar {
             display: flex;
             gap: 8px;
             align-items: center;
+            margin-top: 6px;
         }
 
         .score-bar-label {
             font-size: 10px;
             color: var(--text-muted);
-            width: 80px;
+            width: 90px;
+            display: flex;
+            align-items: center;
+            gap: 4px;
         }
 
         .score-bar-track {
@@ -377,6 +521,13 @@
         .score-bar-fill.fp { background: var(--cyan); }
         .score-bar-fill.quality { background: var(--magenta); }
         .score-bar-fill.semantic { background: var(--lime); }
+
+        .score-bar-value {
+            font-size: 10px;
+            color: var(--text-dim);
+            width: 35px;
+            text-align: right;
+        }
 
         /* Answer Section */
         .answer-card {
@@ -422,12 +573,25 @@
             border-radius: 8px;
         }
 
+        .fingerprint-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 12px;
+        }
+
         .fingerprint-title {
             font-size: 11px;
             color: var(--text-muted);
-            margin-bottom: 12px;
             text-transform: uppercase;
             letter-spacing: 1px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .fingerprint-chart {
+            position: relative;
         }
 
         .fingerprint-bars {
@@ -443,11 +607,46 @@
             border-radius: 2px 2px 0 0;
             min-width: 3px;
             transition: height 0.3s;
+            position: relative;
+        }
+
+        .fp-bar:hover::after {
+            content: attr(data-value);
+            position: absolute;
+            bottom: calc(100% + 4px);
+            left: 50%;
+            transform: translateX(-50%);
+            font-size: 9px;
+            color: var(--cyan);
+            background: var(--surface);
+            padding: 2px 4px;
+            border-radius: 2px;
+        }
+
+        .fp-axis-labels {
+            display: flex;
+            justify-content: space-between;
+            margin-top: 8px;
+            font-size: 9px;
+            color: var(--text-muted);
+        }
+
+        .fp-y-axis {
+            position: absolute;
+            left: -30px;
+            top: 0;
+            bottom: 0;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+            font-size: 9px;
+            color: var(--text-muted);
         }
 
         /* Legend */
         .legend {
             display: flex;
+            flex-wrap: wrap;
             gap: 16px;
             margin-top: 16px;
             padding-top: 16px;
@@ -460,6 +659,7 @@
             gap: 8px;
             font-size: 11px;
             color: var(--text-dim);
+            cursor: help;
         }
 
         .legend-dot {
@@ -503,6 +703,153 @@
             margin-bottom: 16px;
             opacity: 0.5;
         }
+
+        /* Help Modal */
+        .modal-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0, 0, 0, 0.8);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            z-index: 2000;
+            opacity: 0;
+            visibility: hidden;
+            transition: all 0.3s;
+        }
+
+        .modal-overlay.active {
+            opacity: 1;
+            visibility: visible;
+        }
+
+        .modal {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            width: 90%;
+            max-width: 800px;
+            max-height: 90vh;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .modal-header {
+            padding: 20px 24px;
+            background: var(--elevated);
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .modal-title {
+            font-family: 'Outfit', sans-serif;
+            font-size: 18px;
+            font-weight: 600;
+        }
+
+        .modal-close {
+            width: 32px;
+            height: 32px;
+            background: var(--deep);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            color: var(--text-dim);
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 18px;
+        }
+
+        .modal-close:hover {
+            border-color: var(--magenta);
+            color: var(--magenta);
+        }
+
+        .modal-body {
+            padding: 24px;
+            overflow-y: auto;
+        }
+
+        .help-section {
+            margin-bottom: 32px;
+        }
+
+        .help-section:last-child {
+            margin-bottom: 0;
+        }
+
+        .help-section-title {
+            font-family: 'Outfit', sans-serif;
+            font-size: 16px;
+            font-weight: 600;
+            color: var(--cyan);
+            margin-bottom: 16px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .help-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 16px;
+        }
+
+        .help-item {
+            padding: 16px;
+            background: var(--deep);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+        }
+
+        .help-item-title {
+            font-weight: 600;
+            color: var(--text);
+            margin-bottom: 8px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .help-item-badge {
+            font-size: 10px;
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-weight: 500;
+        }
+
+        .help-item-badge.metric { background: var(--cyan); color: var(--void); }
+        .help-item-badge.zone { background: var(--violet); color: var(--text); }
+        .help-item-badge.score { background: var(--lime); color: var(--void); }
+
+        .help-item-desc {
+            font-size: 12px;
+            line-height: 1.6;
+            color: var(--text-dim);
+        }
+
+        .help-item-formula {
+            margin-top: 8px;
+            padding: 8px 12px;
+            background: var(--surface);
+            border-radius: 4px;
+            font-family: 'IBM Plex Mono', monospace;
+            font-size: 11px;
+            color: var(--lime);
+        }
+
+        .help-item-range {
+            margin-top: 8px;
+            font-size: 11px;
+            color: var(--amber);
+        }
     </style>
 </head>
 <body>
@@ -515,9 +862,14 @@
                     <span>Fingerprint-based Retrieval</span>
                 </div>
             </div>
-            <div class="server-status">
-                <div class="status-dot" id="statusDot"></div>
-                <span id="statusText">Connecting...</span>
+            <div class="header-actions">
+                <button class="help-btn" onclick="toggleHelp()">
+                    <span>?</span> Glossary & Help
+                </button>
+                <div class="server-status">
+                    <div class="status-dot" id="statusDot"></div>
+                    <span id="statusText">Connecting...</span>
+                </div>
             </div>
         </header>
 
@@ -525,7 +877,16 @@
             <!-- Query Analysis -->
             <div class="card">
                 <div class="card-header">
-                    <div class="card-title">Query Analysis</div>
+                    <div class="card-title">
+                        Query Analysis
+                        <div class="tooltip-container">
+                            <span class="info-icon">?</span>
+                            <div class="tooltip">
+                                <span class="tooltip-title">Query Analysis</span>
+                                Analyzes your query using attention fingerprints to determine if external knowledge retrieval is needed. Identifies "anchor tokens" that signal information-seeking behavior.
+                            </div>
+                        </div>
+                    </div>
                 </div>
                 <div class="card-body">
                     <textarea class="query-input" id="queryInput" placeholder="Enter your question...">What are the health benefits of green tea?</textarea>
@@ -543,31 +904,71 @@
                     </div>
 
                     <div class="retrieval-meter" id="retrievalMeter" style="display: none;">
-                        <div class="meter-label">
-                            <span>Retrieval Need</span>
+                        <div class="meter-header">
+                            <div class="meter-label">
+                                <span>Retrieval Need</span>
+                                <div class="tooltip-container">
+                                    <span class="info-icon">?</span>
+                                    <div class="tooltip">
+                                        <span class="tooltip-title">Retrieval Need Score</span>
+                                        Measures how much the query requires external information. Higher scores indicate the model's attention patterns show information-seeking behavior (semantic bridges).
+                                        <div class="tooltip-formula">Score = 0.15 * semantic_bridges + 0.1 * long_range + 0.2</div>
+                                    </div>
+                                </div>
+                            </div>
                             <span id="retrievalScore">0%</span>
                         </div>
                         <div class="meter-bar">
                             <div class="meter-fill" id="meterFill" style="width: 0%"></div>
                         </div>
+                        <div class="meter-scale">
+                            <span>0% Self-contained</span>
+                            <span>40% Threshold</span>
+                            <span>100% Needs retrieval</span>
+                        </div>
                         <div class="retrieval-decision" id="retrievalDecision"></div>
                     </div>
 
                     <div class="token-analysis" id="tokenAnalysis" style="display: none;">
-                        <div class="card-title" style="font-size: 12px; margin-bottom: 8px;">Token Classification</div>
+                        <div class="section-header">
+                            <span class="section-title">Token Classification</span>
+                            <div class="tooltip-container">
+                                <span class="info-icon">?</span>
+                                <div class="tooltip">
+                                    <span class="tooltip-title">Token Classification</span>
+                                    Each token is classified into an "attention zone" based on its fingerprint. Zones indicate how the model processes that token:
+                                    <br><br>
+                                    <strong style="color: var(--cyan);">Semantic Bridge:</strong> Token seeks information (high retrieval need)<br>
+                                    <strong style="color: var(--violet);">Long Range:</strong> Token connects to distant context<br>
+                                    <strong style="color: var(--text-muted);">Syntax:</strong> Local grammatical token (low importance)
+                                </div>
+                            </div>
+                        </div>
                         <div class="token-list" id="tokenList"></div>
                         <div class="legend">
-                            <div class="legend-item">
+                            <div class="legend-item tooltip-container">
                                 <div class="legend-dot" style="background: var(--cyan)"></div>
                                 Retrieval Anchor
+                                <div class="tooltip" style="width: 220px;">
+                                    <span class="tooltip-title">Retrieval Anchor</span>
+                                    Tokens that signal information-seeking. High mid-range attention mass (>0.4) and elevated entropy indicate the model is "searching" for information.
+                                </div>
                             </div>
-                            <div class="legend-item">
+                            <div class="legend-item tooltip-container">
                                 <div class="legend-dot" style="background: var(--violet)"></div>
                                 Long Range
+                                <div class="tooltip" style="width: 220px;">
+                                    <span class="tooltip-title">Long Range Zone</span>
+                                    Tokens that attend to distant context (>50 tokens away). Long-range attention mass >0.4 indicates connecting disparate concepts.
+                                </div>
                             </div>
-                            <div class="legend-item">
+                            <div class="legend-item tooltip-container">
                                 <div class="legend-dot" style="background: var(--text-muted)"></div>
                                 Syntax
+                                <div class="tooltip" style="width: 220px;">
+                                    <span class="tooltip-title">Syntax Floor Zone</span>
+                                    Local grammatical tokens (articles, prepositions). High local attention mass (>0.6), low entropy. Can be reconstructed from context - low importance.
+                                </div>
                             </div>
                         </div>
                     </div>
@@ -577,7 +978,17 @@
             <!-- Document Ranking -->
             <div class="card">
                 <div class="card-header">
-                    <div class="card-title">Document Ranking</div>
+                    <div class="card-title">
+                        Document Ranking
+                        <div class="tooltip-container">
+                            <span class="info-icon">?</span>
+                            <div class="tooltip">
+                                <span class="tooltip-title">Document Ranking</span>
+                                Documents are scored and ranked by how well they match the query's attention fingerprint. Higher scores indicate better retrieval targets.
+                                <div class="tooltip-formula">Final Score = 0.35*FP + 0.25*TQ + 0.4*Semantic</div>
+                            </div>
+                        </div>
+                    </div>
                     <span style="font-size: 11px; color: var(--text-muted);" id="docCount">5 documents</span>
                 </div>
                 <div class="card-body">
@@ -590,7 +1001,16 @@
             <!-- Answer -->
             <div class="card answer-card">
                 <div class="card-header">
-                    <div class="card-title">Generated Answer</div>
+                    <div class="card-title">
+                        Generated Answer
+                        <div class="tooltip-container">
+                            <span class="info-icon">?</span>
+                            <div class="tooltip">
+                                <span class="tooltip-title">Generated Answer</span>
+                                The model generates an answer using the top-ranked documents as context. The fingerprint visualization shows the attention distribution during generation.
+                            </div>
+                        </div>
+                    </div>
                     <span style="font-size: 11px; color: var(--text-muted);" id="answerMeta"></span>
                 </div>
                 <div class="card-body">
@@ -602,12 +1022,338 @@
                     </div>
 
                     <div class="fingerprint-viz" id="fingerprintViz" style="display: none;">
-                        <div class="fingerprint-title">Generation Attention Fingerprint</div>
-                        <div class="fingerprint-bars" id="fingerprintBars"></div>
+                        <div class="fingerprint-header">
+                            <div class="fingerprint-title">
+                                Generation Attention Fingerprint
+                                <div class="tooltip-container">
+                                    <span class="info-icon">?</span>
+                                    <div class="tooltip">
+                                        <span class="tooltip-title">Attention Fingerprint</span>
+                                        A 20-dimensional vector capturing attention distribution characteristics:
+                                        <br><br>
+                                        <strong>Bars 1-3:</strong> Distance mass (local, mid, long)<br>
+                                        <strong>Bar 4:</strong> Entropy (attention spread)<br>
+                                        <strong>Bars 5-20:</strong> Distance histogram buckets<br>
+                                        <br>
+                                        Taller bars = more attention in that range
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="fingerprint-chart">
+                            <div class="fingerprint-bars" id="fingerprintBars"></div>
+                            <div class="fp-axis-labels">
+                                <span>Local (0-10)</span>
+                                <span>Mid (10-50)</span>
+                                <span>Long (50+)</span>
+                                <span>Entropy</span>
+                            </div>
+                        </div>
                     </div>
                 </div>
             </div>
         </main>
+    </div>
+
+    <!-- Help Modal -->
+    <div class="modal-overlay" id="helpModal">
+        <div class="modal">
+            <div class="modal-header">
+                <div class="modal-title">Glossary & How It Works</div>
+                <button class="modal-close" onclick="toggleHelp()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <!-- Attention Zones Section -->
+                <div class="help-section">
+                    <div class="help-section-title">
+                        <span style="color: var(--violet);">&#9679;</span>
+                        Attention Zones (Token Classification)
+                    </div>
+                    <div style="background: var(--deep); border-left: 3px solid var(--violet); padding: 12px 16px; margin-bottom: 16px; border-radius: 0 6px 6px 0;">
+                        <div style="font-size: 11px; font-weight: 600; color: var(--violet); text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px;">Transformer Architecture Source</div>
+                        <div style="font-size: 12px; color: var(--text-dim); line-height: 1.6;">
+                            Attention zones are derived from the <strong style="color: var(--text);">self-attention mechanism</strong>:
+                            <code style="background: var(--void); padding: 2px 6px; border-radius: 3px; font-size: 11px;">Attention = softmax(QK<sup>T</sup>/√d) · V</code><br>
+                            We analyze the attention weight matrix from the <strong style="color: var(--text);">final transformer layer</strong>,
+                            averaged across all attention heads. The "zone" tells us which part of the context the model is retrieving information from.
+                        </div>
+                    </div>
+                    <div class="help-grid">
+                        <div class="help-item">
+                            <div class="help-item-title">
+                                <span style="color: var(--cyan);">&#9632;</span>
+                                Semantic Bridge
+                                <span class="help-item-badge zone">ZONE</span>
+                            </div>
+                            <div class="help-item-desc">
+                                Tokens that actively seek information by attending to mid-range context. These are "retrieval anchors" - words that indicate the model needs external knowledge.
+                            </div>
+                            <div class="help-item-formula">
+                                Condition: mid_mass > 0.4 AND entropy > 0.5
+                            </div>
+                            <div class="help-item-range">
+                                Importance: 0.9 (high) | Examples: "What", "explain", "capital"
+                            </div>
+                            <div style="margin-top: 8px; padding: 8px; background: var(--void); border-radius: 4px; font-size: 11px; color: var(--text-muted);">
+                                <strong style="color: var(--violet);">Architecture:</strong> Later transformer layers learn semantic key-value representations.
+                                When query vectors match keys across sentence boundaries, attention flows to semantically related tokens regardless of position.
+                            </div>
+                        </div>
+                        <div class="help-item">
+                            <div class="help-item-title">
+                                <span style="color: var(--violet);">&#9632;</span>
+                                Long Range
+                                <span class="help-item-badge zone">ZONE</span>
+                            </div>
+                            <div class="help-item-desc">
+                                Tokens that connect to distant context (>50 tokens away). Important for maintaining coherence across long documents and connecting related concepts.
+                            </div>
+                            <div class="help-item-formula">
+                                Condition: long_mass > 0.4
+                            </div>
+                            <div class="help-item-range">
+                                Importance: 0.8 | Examples: pronouns referring back, topic words
+                            </div>
+                            <div style="margin-top: 8px; padding: 8px; background: var(--void); border-radius: 4px; font-size: 11px; color: var(--text-muted);">
+                                <strong style="color: var(--violet);">Architecture:</strong> "Attention sinks" (BOS/instruction tokens) receive persistent attention.
+                                Specialized "global" attention heads maintain connection to system prompts throughout generation.
+                            </div>
+                        </div>
+                        <div class="help-item">
+                            <div class="help-item-title">
+                                <span style="color: var(--text-muted);">&#9632;</span>
+                                Syntax Floor
+                                <span class="help-item-badge zone">ZONE</span>
+                            </div>
+                            <div class="help-item-desc">
+                                Local grammatical tokens with focused attention on nearby words. These can be reconstructed from context and have low semantic importance.
+                            </div>
+                            <div class="help-item-formula">
+                                Condition: local_mass > 0.6 AND entropy < 2.5
+                            </div>
+                            <div class="help-item-range">
+                                Importance: 0.3 (low) | Examples: "the", "is", "of", ","
+                            </div>
+                            <div style="margin-top: 8px; padding: 8px; background: var(--void); border-radius: 4px; font-size: 11px; color: var(--text-muted);">
+                                <strong style="color: var(--violet);">Architecture:</strong> RoPE (Rotary Position Embeddings) creates natural distance decay.
+                                Early transformer layers specialize in syntax and naturally attend locally. This is the "baseline" attention pattern.
+                            </div>
+                        </div>
+                        <div class="help-item">
+                            <div class="help-item-title">
+                                <span style="color: var(--amber);">&#9632;</span>
+                                Diffuse
+                                <span class="help-item-badge zone">ZONE</span>
+                            </div>
+                            <div class="help-item-desc">
+                                Tokens with scattered, unfocused attention. High entropy but no dominant attention pattern. Often indicates uncertainty or transition points.
+                            </div>
+                            <div class="help-item-formula">
+                                Condition: total_mass < 0.5 AND entropy > 3.0
+                            </div>
+                            <div class="help-item-range">
+                                Importance: 0.2 (low) | May indicate model confusion
+                            </div>
+                            <div style="margin-top: 8px; padding: 8px; background: var(--void); border-radius: 4px; font-size: 11px; color: var(--text-muted);">
+                                <strong style="color: var(--violet);">Architecture:</strong> When no key vectors strongly match the query,
+                                softmax produces near-uniform distribution. This happens at decision points where multiple continuations are equally plausible.
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Fingerprint Metrics Section -->
+                <div class="help-section">
+                    <div class="help-section-title">
+                        <span style="color: var(--cyan);">&#9679;</span>
+                        Fingerprint Components
+                    </div>
+                    <div style="background: var(--deep); border-left: 3px solid var(--cyan); padding: 12px 16px; margin-bottom: 16px; border-radius: 0 6px 6px 0;">
+                        <div style="font-size: 11px; font-weight: 600; color: var(--cyan); text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px;">How Fingerprints Are Computed</div>
+                        <div style="font-size: 12px; color: var(--text-dim); line-height: 1.6;">
+                            <strong style="color: var(--text);">1.</strong> Extract attention weights <code style="background: var(--void); padding: 2px 6px; border-radius: 3px; font-size: 11px;">A[i,j]</code> from the final transformer layer<br>
+                            <strong style="color: var(--text);">2.</strong> Bin weights by distance: how many tokens back each attended position is<br>
+                            <strong style="color: var(--text);">3.</strong> Aggregate into local/mid/long mass and compute entropy<br>
+                            <strong style="color: var(--text);">4.</strong> Normalize to create a 20-dimensional fingerprint vector
+                        </div>
+                    </div>
+                    <div class="help-grid">
+                        <div class="help-item">
+                            <div class="help-item-title">
+                                Local Mass
+                                <span class="help-item-badge metric">METRIC</span>
+                            </div>
+                            <div class="help-item-desc">
+                                Fraction of attention going to nearby tokens (within 10 positions). High values indicate local/syntactic processing.
+                            </div>
+                            <div class="help-item-formula">
+                                local_mass = sum(attention[i-10:i]) / sum(attention)
+                            </div>
+                            <div class="help-item-range">
+                                Range: 0.0 - 1.0 | High (>0.6) = syntax processing
+                            </div>
+                            <div style="margin-top: 6px; font-size: 10px; color: var(--text-muted);">
+                                <strong style="color: var(--cyan);">Source:</strong> RoPE position encoding creates natural distance decay in dot products
+                            </div>
+                        </div>
+                        <div class="help-item">
+                            <div class="help-item-title">
+                                Mid-Range Mass
+                                <span class="help-item-badge metric">METRIC</span>
+                            </div>
+                            <div class="help-item-desc">
+                                Fraction of attention going to tokens 10-50 positions away. High values indicate semantic/conceptual connections.
+                            </div>
+                            <div class="help-item-formula">
+                                mid_mass = sum(attention[i-50:i-10]) / sum(attention)
+                            </div>
+                            <div class="help-item-range">
+                                Range: 0.0 - 1.0 | High (>0.4) = semantic bridge
+                            </div>
+                            <div style="margin-top: 6px; font-size: 10px; color: var(--text-muted);">
+                                <strong style="color: var(--cyan);">Source:</strong> Semantic attention heads learn key-value pairs that match concepts
+                            </div>
+                        </div>
+                        <div class="help-item">
+                            <div class="help-item-title">
+                                Long-Range Mass
+                                <span class="help-item-badge metric">METRIC</span>
+                            </div>
+                            <div class="help-item-desc">
+                                Fraction of attention going to distant tokens (>50 positions). High values indicate cross-document connections.
+                            </div>
+                            <div class="help-item-formula">
+                                long_mass = sum(attention[0:i-50]) / sum(attention)
+                            </div>
+                            <div class="help-item-range">
+                                Range: 0.0 - 1.0 | High (>0.4) = long-range zone
+                            </div>
+                            <div style="margin-top: 6px; font-size: 10px; color: var(--text-muted);">
+                                <strong style="color: var(--cyan);">Source:</strong> Global/instruction-following heads attend to system prompts
+                            </div>
+                        </div>
+                        <div class="help-item">
+                            <div class="help-item-title">
+                                Attention Entropy
+                                <span class="help-item-badge metric">METRIC</span>
+                            </div>
+                            <div class="help-item-desc">
+                                Measures how spread out the attention is. Low entropy = focused on few tokens. High entropy = distributed across many.
+                            </div>
+                            <div class="help-item-formula">
+                                entropy = -sum(p * log(p)) where p = attention probs
+                            </div>
+                            <div class="help-item-range">
+                                Range: 0.0 - 4.0+ | Low (<2.0) = focused, High (>3.0) = diffuse
+                            </div>
+                            <div style="margin-top: 6px; font-size: 10px; color: var(--text-muted);">
+                                <strong style="color: var(--cyan);">Source:</strong> Softmax temperature controls entropy. High logit variance → sharp attention.
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Scoring Metrics Section -->
+                <div class="help-section">
+                    <div class="help-section-title">
+                        <span style="color: var(--lime);">&#9679;</span>
+                        Document Scoring
+                    </div>
+                    <div style="background: var(--deep); border-left: 3px solid var(--lime); padding: 12px 16px; margin-bottom: 16px; border-radius: 0 6px 6px 0;">
+                        <div style="font-size: 11px; font-weight: 600; color: var(--lime); text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px;">Attention-Guided Document Ranking</div>
+                        <div style="font-size: 12px; color: var(--text-dim); line-height: 1.6;">
+                            Unlike traditional RAG (keyword/embedding similarity), we use <strong style="color: var(--text);">attention fingerprints</strong>
+                            to match documents. This captures <em>how the model would attend</em> to the document, not just lexical overlap.
+                            Documents whose fingerprints align with query "semantic bridge" tokens are likely to satisfy the information need.
+                        </div>
+                    </div>
+                    <div class="help-grid">
+                        <div class="help-item">
+                            <div class="help-item-title">
+                                FP Similarity
+                                <span class="help-item-badge score">SCORE</span>
+                            </div>
+                            <div class="help-item-desc">
+                                <strong>Fingerprint Similarity</strong> - How well the document's attention fingerprint matches the query's anchor tokens. Documents with similar fingerprint patterns to the query anchors score higher.
+                            </div>
+                            <div class="help-item-formula">
+                                fp_sim = cosine_similarity(query_fp, doc_fp)
+                            </div>
+                            <div class="help-item-range">
+                                Range: 0.0 - 1.0 | Weight in final: 35%
+                            </div>
+                        </div>
+                        <div class="help-item">
+                            <div class="help-item-title">
+                                Target Quality
+                                <span class="help-item-badge score">SCORE</span>
+                            </div>
+                            <div class="help-item-desc">
+                                <strong>TQ = Target Quality</strong> - How good the document is as a retrieval target. Documents with focused, low-entropy attention patterns make better targets (more coherent information).
+                            </div>
+                            <div class="help-item-formula">
+                                target_quality = 1 - avg_entropy(doc_fingerprint)
+                            </div>
+                            <div class="help-item-range">
+                                Range: 0.0 - 1.0 | Weight in final: 25%
+                            </div>
+                        </div>
+                        <div class="help-item">
+                            <div class="help-item-title">
+                                Semantic Score
+                                <span class="help-item-badge score">SCORE</span>
+                            </div>
+                            <div class="help-item-desc">
+                                Traditional text matching score. Measures keyword overlap between query tokens and document text. Complements attention-based scoring.
+                            </div>
+                            <div class="help-item-formula">
+                                semantic = matching_tokens / total_query_tokens
+                            </div>
+                            <div class="help-item-range">
+                                Range: 0.0 - 1.0 | Weight in final: 40%
+                            </div>
+                        </div>
+                        <div class="help-item">
+                            <div class="help-item-title">
+                                Final Score
+                                <span class="help-item-badge score">SCORE</span>
+                            </div>
+                            <div class="help-item-desc">
+                                Combined ranking score used to order documents. Balances attention-based metrics with traditional semantic matching.
+                            </div>
+                            <div class="help-item-formula">
+                                final = 0.35*FP_sim + 0.25*TQ + 0.40*semantic
+                            </div>
+                            <div class="help-item-range">
+                                Range: 0.0 - 1.0 | Documents sorted by this score
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- How It Works Section -->
+                <div class="help-section">
+                    <div class="help-section-title">
+                        <span style="color: var(--magenta);">&#9679;</span>
+                        How Attention-Guided RAG Works
+                    </div>
+                    <div class="help-item" style="margin-bottom: 16px;">
+                        <div class="help-item-desc" style="font-size: 13px; line-height: 1.8;">
+                            <strong>1. Query Analysis:</strong> When you enter a query, we analyze its tokens using attention fingerprints. Tokens are classified into zones (semantic_bridge, long_range, syntax_floor) based on their attention patterns.<br><br>
+
+                            <strong>2. Retrieval Need Detection:</strong> If many tokens are "semantic bridges" (actively seeking information), the query has high retrieval need. Simple greetings or self-contained questions have low retrieval need.<br><br>
+
+                            <strong>3. Document Scoring:</strong> Each candidate document is scored by:<br>
+                            &nbsp;&nbsp;&bull; <strong>FP Similarity:</strong> How well its fingerprint matches query anchors<br>
+                            &nbsp;&nbsp;&bull; <strong>Target Quality:</strong> How focused/coherent the document is<br>
+                            &nbsp;&nbsp;&bull; <strong>Semantic Match:</strong> Traditional keyword overlap<br><br>
+
+                            <strong>4. Answer Generation:</strong> Top-ranked documents are used as context for generating the answer. The fingerprint visualization shows how attention was distributed during generation.
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
     </div>
 
     <script>
@@ -656,6 +1402,25 @@
         document.addEventListener('DOMContentLoaded', () => {
             checkServerConnection();
             renderDocuments(sampleDocuments.map((d, i) => ({...d, score: 0, rank: i + 1})));
+        });
+
+        function toggleHelp() {
+            const modal = document.getElementById('helpModal');
+            modal.classList.toggle('active');
+        }
+
+        // Close modal on escape key
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape') {
+                document.getElementById('helpModal').classList.remove('active');
+            }
+        });
+
+        // Close modal on overlay click
+        document.getElementById('helpModal').addEventListener('click', (e) => {
+            if (e.target.id === 'helpModal') {
+                toggleHelp();
+            }
         });
 
         async function checkServerConnection() {
@@ -765,7 +1530,8 @@
             list.innerHTML = tokens.map((token, i) => {
                 const isAnchor = anchors.includes(i);
                 const zone = zones[i];
-                return `<span class="token ${zone} ${isAnchor ? 'anchor' : ''}">${token}</span>`;
+                const zoneLabel = zone.replace('_', ' ');
+                return `<span class="token ${zone} ${isAnchor ? 'anchor' : ''}" title="Zone: ${zoneLabel}">${token}</span>`;
             }).join('');
         }
 
@@ -827,22 +1593,36 @@
                     </div>
                     <div class="document-text">${doc.text}</div>
                     ${doc.score ? `
-                    <div class="score-bar">
-                        <span class="score-bar-label">FP Similarity</span>
-                        <div class="score-bar-track">
-                            <div class="score-bar-fill fp" style="width: ${(doc.fpSimilarity || 0) * 100}%"></div>
+                    <div class="score-bars">
+                        <div class="score-bar">
+                            <span class="score-bar-label">
+                                FP Similarity
+                                <span class="info-icon" style="width:12px;height:12px;font-size:8px;" title="Fingerprint Similarity: How well document matches query attention patterns">?</span>
+                            </span>
+                            <div class="score-bar-track">
+                                <div class="score-bar-fill fp" style="width: ${(doc.fpSimilarity || 0) * 100}%"></div>
+                            </div>
+                            <span class="score-bar-value">${((doc.fpSimilarity || 0) * 100).toFixed(0)}%</span>
                         </div>
-                    </div>
-                    <div class="score-bar">
-                        <span class="score-bar-label">Target Quality</span>
-                        <div class="score-bar-track">
-                            <div class="score-bar-fill quality" style="width: ${(doc.targetQuality || 0) * 100}%"></div>
+                        <div class="score-bar">
+                            <span class="score-bar-label">
+                                Target Quality
+                                <span class="info-icon" style="width:12px;height:12px;font-size:8px;" title="Target Quality: How focused/coherent the document is (1 - entropy)">?</span>
+                            </span>
+                            <div class="score-bar-track">
+                                <div class="score-bar-fill quality" style="width: ${(doc.targetQuality || 0) * 100}%"></div>
+                            </div>
+                            <span class="score-bar-value">${((doc.targetQuality || 0) * 100).toFixed(0)}%</span>
                         </div>
-                    </div>
-                    <div class="score-bar">
-                        <span class="score-bar-label">Semantic</span>
-                        <div class="score-bar-track">
-                            <div class="score-bar-fill semantic" style="width: ${(doc.semanticScore || 0) * 100}%"></div>
+                        <div class="score-bar">
+                            <span class="score-bar-label">
+                                Semantic
+                                <span class="info-icon" style="width:12px;height:12px;font-size:8px;" title="Semantic Match: Keyword overlap between query and document">?</span>
+                            </span>
+                            <div class="score-bar-track">
+                                <div class="score-bar-fill semantic" style="width: ${(doc.semanticScore || 0) * 100}%"></div>
+                            </div>
+                            <span class="score-bar-value">${((doc.semanticScore || 0) * 100).toFixed(0)}%</span>
                         </div>
                     </div>
                     ` : ''}
@@ -946,8 +1726,8 @@
                 return docs.reduce((sum, d) => sum + (d.fingerprint[i] || 0), 0) / docs.length;
             });
 
-            bars.innerHTML = aggregated.map(val =>
-                `<div class="fp-bar" style="height: ${val * 100}%"></div>`
+            bars.innerHTML = aggregated.map((val, i) =>
+                `<div class="fp-bar" style="height: ${val * 100}%" data-value="${(val * 100).toFixed(0)}%" title="Bucket ${i+1}: ${(val * 100).toFixed(1)}%"></div>`
             ).join('');
         }
     </script>

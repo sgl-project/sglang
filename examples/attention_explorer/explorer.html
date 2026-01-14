@@ -741,6 +741,194 @@
         .toggle.active::after { left: 19px; }
 
         .toggle-label { font-size: 11px; }
+
+        /* Tooltip System */
+        .tooltip-container {
+            position: relative;
+            display: inline-flex;
+            align-items: center;
+        }
+
+        .info-icon {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 14px;
+            height: 14px;
+            background: var(--border);
+            border-radius: 50%;
+            font-size: 9px;
+            color: var(--text-dim);
+            cursor: help;
+            margin-left: 4px;
+            flex-shrink: 0;
+        }
+
+        .info-icon:hover {
+            background: var(--cyan);
+            color: var(--void);
+        }
+
+        .tooltip {
+            position: absolute;
+            bottom: 100%;
+            left: 50%;
+            transform: translateX(-50%);
+            background: var(--elevated);
+            border: 1px solid var(--border-glow);
+            border-radius: 8px;
+            padding: 10px 12px;
+            font-size: 11px;
+            color: var(--text);
+            white-space: normal;
+            width: 240px;
+            z-index: 1000;
+            opacity: 0;
+            visibility: hidden;
+            transition: all 0.2s;
+            pointer-events: none;
+            line-height: 1.5;
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4);
+            margin-bottom: 8px;
+        }
+
+        .tooltip::after {
+            content: '';
+            position: absolute;
+            top: 100%;
+            left: 50%;
+            transform: translateX(-50%);
+            border: 6px solid transparent;
+            border-top-color: var(--border-glow);
+        }
+
+        .tooltip-container:hover .tooltip {
+            opacity: 1;
+            visibility: visible;
+        }
+
+        .tooltip strong {
+            color: var(--cyan);
+        }
+
+        .tooltip code {
+            background: var(--deep);
+            padding: 1px 4px;
+            border-radius: 3px;
+            font-size: 10px;
+        }
+
+        /* Help Modal Styles */
+        .help-modal .modal-content {
+            max-width: 900px;
+            max-height: 85vh;
+        }
+
+        .help-section {
+            margin-bottom: 28px;
+        }
+
+        .help-section:last-child {
+            margin-bottom: 0;
+        }
+
+        .help-section-title {
+            font-family: 'Outfit', sans-serif;
+            font-size: 14px;
+            font-weight: 600;
+            color: var(--cyan);
+            margin-bottom: 14px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .help-section-title::before {
+            content: '';
+            width: 3px;
+            height: 16px;
+            background: var(--cyan);
+            border-radius: 2px;
+        }
+
+        .help-grid {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 12px;
+        }
+
+        @media (max-width: 600px) {
+            .help-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        .help-item {
+            background: var(--deep);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 14px;
+        }
+
+        .help-item-header {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 8px;
+        }
+
+        .help-item-icon {
+            width: 24px;
+            height: 24px;
+            border-radius: 6px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 12px;
+            flex-shrink: 0;
+        }
+
+        .help-item-name {
+            font-weight: 600;
+            font-size: 12px;
+            color: var(--text);
+        }
+
+        .help-item-desc {
+            font-size: 11px;
+            color: var(--text-dim);
+            line-height: 1.5;
+        }
+
+        .help-item-formula {
+            margin-top: 8px;
+            padding: 6px 10px;
+            background: var(--void);
+            border-radius: 4px;
+            font-family: 'IBM Plex Mono', monospace;
+            font-size: 10px;
+            color: var(--lime);
+        }
+
+        .help-btn {
+            padding: 8px 14px;
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            color: var(--text-dim);
+            font-family: inherit;
+            font-size: 11px;
+            cursor: pointer;
+            transition: all 0.2s;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .help-btn:hover {
+            border-color: var(--cyan);
+            color: var(--cyan);
+        }
     </style>
 </head>
 <body>
@@ -754,6 +942,10 @@
                 </div>
             </div>
             <div class="header-actions">
+                <button class="help-btn" onclick="showHelpModal()">
+                    <span>?</span>
+                    <span>Glossary & Help</span>
+                </button>
                 <div class="status-badge">
                     <div class="status-dot" id="statusDot"></div>
                     <span id="statusText">Connecting...</span>
@@ -763,7 +955,13 @@
 
         <aside class="panel-left">
             <div class="panel-section">
-                <div class="section-title">Input Text</div>
+                <div class="section-title">
+                    Input Text
+                    <span class="tooltip-container">
+                        <span class="info-icon">?</span>
+                        <span class="tooltip">Enter your prompt or question. The model will generate a response and we'll capture the <strong>attention patterns</strong> - which tokens the model looked at while generating each output token.</span>
+                    </span>
+                </div>
                 <textarea id="inputText" placeholder="Enter text to analyze attention patterns...">What is the capital of France?</textarea>
                 <div class="btn-row">
                     <button class="btn btn-primary" id="analyzeBtn" onclick="analyze()">Analyze</button>
@@ -772,76 +970,127 @@
             </div>
 
             <div class="panel-section">
-                <div class="section-title">Configuration</div>
+                <div class="section-title">
+                    Configuration
+                    <span class="tooltip-container">
+                        <span class="info-icon">?</span>
+                        <span class="tooltip">Configure how attention patterns are captured and displayed. These settings control both the model generation and the visualization.</span>
+                    </span>
+                </div>
                 <div class="settings-grid">
                     <div class="setting">
-                        <label>Max Tokens</label>
+                        <label class="tooltip-container">
+                            Max Tokens
+                            <span class="info-icon">?</span>
+                            <span class="tooltip">Maximum number of tokens the model will generate. Higher values = longer responses but more computation. <strong>Range: 1-4096</strong></span>
+                        </label>
                         <input type="number" id="maxTokens" value="100" min="1" max="4096">
                     </div>
                     <div class="setting">
-                        <label>Attention Top-K</label>
+                        <label class="tooltip-container">
+                            Attention Top-K
+                            <span class="info-icon">?</span>
+                            <span class="tooltip">Number of top attention targets to capture per token. Higher = more detail but more data. <strong>Recommended: 5-10</strong></span>
+                        </label>
                         <input type="number" id="attentionTopK" value="5" min="1" max="64">
                     </div>
                     <div class="setting">
-                        <label>Temperature</label>
+                        <label class="tooltip-container">
+                            Temperature
+                            <span class="info-icon">?</span>
+                            <span class="tooltip">Controls randomness in generation. <strong>0.0</strong> = deterministic, <strong>1.0</strong> = creative, <strong>2.0</strong> = very random. Default 0.6 balances coherence and variety.</span>
+                        </label>
                         <input type="number" id="temperature" value="0.6" min="0" max="2" step="0.1">
                     </div>
                     <div class="setting">
-                        <label>Edge Threshold</label>
+                        <label class="tooltip-container">
+                            Edge Threshold
+                            <span class="info-icon">?</span>
+                            <span class="tooltip">Minimum attention weight to display edges. <strong>0.05</strong> shows all significant connections. Increase to <strong>0.2+</strong> to see only strong attention.</span>
+                        </label>
                         <input type="number" id="edgeThreshold" value="0.05" min="0" max="1" step="0.01">
                     </div>
-                    <div class="toggle-row setting full" onclick="toggleWordMode()">
+                    <div class="toggle-row setting full tooltip-container" onclick="toggleWordMode()">
                         <div class="toggle" id="wordModeToggle"></div>
                         <span class="toggle-label">Aggregate to word-level</span>
+                        <span class="tooltip" style="bottom: auto; top: 100%; margin-top: 8px; left: 0; transform: none;">
+                            Combine subword tokens into readable words. Attention from all subtokens is aggregated. Useful for longer texts.
+                        </span>
                     </div>
                     <div class="setting full" id="layerControlSection" style="display: none;">
-                        <label>Layer Filter</label>
+                        <label class="tooltip-container">
+                            Layer Filter
+                            <span class="info-icon">?</span>
+                            <span class="tooltip">Transformer layers process different information. <strong>Early layers</strong> = syntax/structure. <strong>Later layers</strong> = semantics/meaning. Filter to explore each.</span>
+                        </label>
                         <div style="display: flex; align-items: center; gap: 10px;">
                             <select id="layerSelect" onchange="filterByLayer()">
                                 <option value="all">All Layers</option>
                             </select>
-                            <button class="btn-small" onclick="showLayerHeatmap()" title="Show layer heatmap">📊</button>
+                            <button class="btn-small tooltip-container" onclick="showLayerHeatmap()" title="Show layer heatmap">
+                                📊
+                                <span class="tooltip" style="width: 160px;">View attention distribution across all layers</span>
+                            </button>
                         </div>
                     </div>
                 </div>
             </div>
 
             <div class="panel-section">
-                <div class="section-title">Statistics</div>
+                <div class="section-title">
+                    Statistics
+                    <span class="tooltip-container">
+                        <span class="info-icon">?</span>
+                        <span class="tooltip">Summary of the captured attention data. <strong>Tokens</strong> = total prompt + generated. <strong>Edges</strong> = attention connections or fingerprints. <strong>Layers</strong> = transformer layers with data.</span>
+                    </span>
+                </div>
                 <div class="stats-row">
-                    <div class="stat">
+                    <div class="stat tooltip-container">
                         <div class="stat-value" id="statTokens">0</div>
                         <div class="stat-label">Tokens</div>
+                        <span class="tooltip" style="bottom: auto; top: 100%; margin-top: 8px;">Total tokens in the sequence: prompt tokens (input) + generated tokens (output). Each token has attention data.</span>
                     </div>
-                    <div class="stat">
+                    <div class="stat tooltip-container">
                         <div class="stat-value" id="statEdges">0</div>
                         <div class="stat-label">Edges</div>
+                        <span class="tooltip" style="bottom: auto; top: 100%; margin-top: 8px;">Attention connections captured. In fingerprint mode, shows count of fingerprints. In raw mode, shows attention edges.</span>
                     </div>
-                    <div class="stat">
+                    <div class="stat tooltip-container">
                         <div class="stat-value" id="statLayers">0</div>
                         <div class="stat-label">Layers</div>
+                        <span class="tooltip" style="bottom: auto; top: 100%; margin-top: 8px;">Transformer layers with attention data. Different layers capture different pattern types (syntax vs. semantics).</span>
                     </div>
                 </div>
             </div>
 
             <div class="panel-section" id="manifoldLegend" style="display: none;">
-                <div class="section-title">Attention Zones</div>
+                <div class="section-title">
+                    Attention Zones
+                    <span class="tooltip-container">
+                        <span class="info-icon">?</span>
+                        <span class="tooltip">Tokens are classified into attention zones based on their <strong>fingerprint</strong> - a 20-dimensional vector capturing the attention distribution pattern.</span>
+                    </span>
+                </div>
                 <div style="display: flex; flex-direction: column; gap: 8px;">
-                    <div style="display: flex; align-items: center; gap: 10px;">
+                    <div class="tooltip-container" style="display: flex; align-items: center; gap: 10px;">
                         <div style="width: 12px; height: 12px; border-radius: 3px; background: var(--cyan);"></div>
                         <span style="font-size: 11px; color: var(--text-dim);">Semantic Bridge</span>
+                        <span class="tooltip">Mid-range attention (17-48 tokens back) with high entropy. Model connecting concepts across context. <code>mid_mass > 0.4 && entropy > 0.5</code></span>
                     </div>
-                    <div style="display: flex; align-items: center; gap: 10px;">
+                    <div class="tooltip-container" style="display: flex; align-items: center; gap: 10px;">
                         <div style="width: 12px; height: 12px; border-radius: 3px; background: var(--amber);"></div>
                         <span style="font-size: 11px; color: var(--text-dim);">Syntax Floor</span>
+                        <span class="tooltip">Local attention (1-16 tokens) with low entropy. Focused on recent context for syntax/structure. <code>local_mass > 0.6 && entropy < 2.5</code></span>
                     </div>
-                    <div style="display: flex; align-items: center; gap: 10px;">
+                    <div class="tooltip-container" style="display: flex; align-items: center; gap: 10px;">
                         <div style="width: 12px; height: 12px; border-radius: 3px; background: var(--magenta);"></div>
                         <span style="font-size: 11px; color: var(--text-dim);">Exploration</span>
+                        <span class="tooltip">Diffuse attention with high entropy. Model uncertain, exploring multiple possibilities. <code>total_mass < 0.5 && entropy > 3.0</code></span>
                     </div>
-                    <div style="display: flex; align-items: center; gap: 10px;">
+                    <div class="tooltip-container" style="display: flex; align-items: center; gap: 10px;">
                         <div style="width: 12px; height: 12px; border-radius: 3px; background: var(--lime);"></div>
                         <span style="font-size: 11px; color: var(--text-dim);">Steering</span>
+                        <span class="tooltip">Long-range attention (49+ tokens back). Model looking at instructions or early context. <code>long_mass > 0.4</code></span>
                     </div>
                 </div>
             </div>
@@ -875,11 +1124,13 @@
             </div>
 
             <div class="detail-tabs">
-                <button class="detail-tab active" data-tab="attends" onclick="switchDetailTab('attends')">
+                <button class="detail-tab active tooltip-container" data-tab="attends" onclick="switchDetailTab('attends')">
                     Attends To
+                    <span class="tooltip" style="width: 200px;">Shows which earlier tokens this token "looked at" during generation. High scores = strong influence.</span>
                 </button>
-                <button class="detail-tab" data-tab="attendedBy" onclick="switchDetailTab('attendedBy')">
+                <button class="detail-tab tooltip-container" data-tab="attendedBy" onclick="switchDetailTab('attendedBy')">
                     Attended By
+                    <span class="tooltip" style="width: 200px;">Shows which later tokens "looked at" this token. Reveals which tokens were influenced by this one.</span>
                 </button>
             </div>
 
@@ -1963,6 +2214,287 @@
         document.getElementById('tokenViewport').addEventListener('scroll', () => {
             if (state.selectedToken !== null) renderEdges();
         });
+
+        // Help Modal
+        function showHelpModal() {
+            const modal = document.createElement('div');
+            modal.className = 'modal-overlay help-modal';
+            modal.onclick = (e) => { if (e.target === modal) modal.remove(); };
+
+            modal.innerHTML = `
+                <div class="modal-content">
+                    <div class="modal-header">
+                        <div class="modal-title">Attention Explorer - Glossary & Help</div>
+                        <button class="modal-close" onclick="this.closest('.modal-overlay').remove()">&times;</button>
+                    </div>
+
+                    <div class="help-section">
+                        <div class="help-section-title">Attention Zones</div>
+                        <p style="font-size: 11px; color: var(--text-dim); margin-bottom: 14px; line-height: 1.5;">
+                            Each generated token is classified into an <strong style="color: var(--cyan);">Attention Zone</strong> based on where
+                            the model focused its attention. This classification uses a 20-dimensional fingerprint derived from attention weights.
+                        </p>
+                        <div style="background: var(--deep); border-left: 3px solid var(--violet); padding: 12px; margin-bottom: 14px; border-radius: 0 6px 6px 0;">
+                            <div style="font-size: 10px; color: var(--violet); font-weight: 600; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 6px;">Transformer Architecture Source</div>
+                            <div style="font-size: 11px; color: var(--text-dim); line-height: 1.6;">
+                                Attention weights come from the <strong style="color: var(--text);">softmax(QK<sup>T</sup>/√d)</strong> operation in
+                                multi-head attention. We capture the final layer's attention, averaged across all heads.
+                                The "zone" reflects where in the sequence the model retrieves information to predict the next token.
+                            </div>
+                        </div>
+                        <div class="help-grid">
+                            <div class="help-item">
+                                <div class="help-item-header">
+                                    <div class="help-item-icon" style="background: rgba(0, 229, 255, 0.2); color: var(--cyan);">SB</div>
+                                    <span class="help-item-name">Semantic Bridge</span>
+                                </div>
+                                <div class="help-item-desc">
+                                    Model attending to mid-range context (17-48 tokens back) with distributed attention.
+                                    Indicates concept retrieval, reasoning, or connecting ideas across the context.
+                                </div>
+                                <div class="help-item-formula">mid_mass > 0.4 && entropy > 0.5</div>
+                                <div style="margin-top: 8px; font-size: 10px; color: var(--text-muted); line-height: 1.4;">
+                                    <strong style="color: var(--violet);">Architecture:</strong> Later transformer layers develop semantic representations.
+                                    Mid-range attention emerges when the model's learned key-value vectors match across semantically related tokens,
+                                    regardless of position.
+                                </div>
+                            </div>
+                            <div class="help-item">
+                                <div class="help-item-header">
+                                    <div class="help-item-icon" style="background: rgba(255, 170, 0, 0.2); color: var(--amber);">SF</div>
+                                    <span class="help-item-name">Syntax Floor</span>
+                                </div>
+                                <div class="help-item-desc">
+                                    Focused attention on recent tokens (1-16 back) with low entropy.
+                                    Indicates local syntax processing, completing phrases, or structured output.
+                                </div>
+                                <div class="help-item-formula">local_mass > 0.6 && entropy < 2.5</div>
+                                <div style="margin-top: 8px; font-size: 10px; color: var(--text-muted); line-height: 1.4;">
+                                    <strong style="color: var(--violet);">Architecture:</strong> Early layers learn positional/syntactic patterns.
+                                    The attention mechanism with RoPE (rotary position embeddings) naturally decays attention to distant tokens,
+                                    creating a "floor" of local context.
+                                </div>
+                            </div>
+                            <div class="help-item">
+                                <div class="help-item-header">
+                                    <div class="help-item-icon" style="background: rgba(255, 0, 153, 0.2); color: var(--magenta);">EX</div>
+                                    <span class="help-item-name">Exploration</span>
+                                </div>
+                                <div class="help-item-desc">
+                                    Diffuse attention spread across context with high entropy.
+                                    Model is uncertain, exploring multiple possibilities for the next token.
+                                </div>
+                                <div class="help-item-formula">total_mass < 0.5 && entropy > 3.0</div>
+                                <div style="margin-top: 8px; font-size: 10px; color: var(--text-muted); line-height: 1.4;">
+                                    <strong style="color: var(--violet);">Architecture:</strong> When no key vectors strongly match the query,
+                                    the softmax produces a near-uniform distribution. This happens at decision points where multiple continuations
+                                    are equally plausible (high temperature amplifies this).
+                                </div>
+                            </div>
+                            <div class="help-item">
+                                <div class="help-item-header">
+                                    <div class="help-item-icon" style="background: rgba(180, 255, 0, 0.2); color: var(--lime);">ST</div>
+                                    <span class="help-item-name">Steering</span>
+                                </div>
+                                <div class="help-item-desc">
+                                    Long-range attention reaching 49+ tokens back.
+                                    Model following instructions, referencing early context, or guided behavior.
+                                </div>
+                                <div class="help-item-formula">long_mass > 0.4</div>
+                                <div style="margin-top: 8px; font-size: 10px; color: var(--text-muted); line-height: 1.4;">
+                                    <strong style="color: var(--violet);">Architecture:</strong> Instruction-tuned models learn to attend to system prompts
+                                    and user instructions. Specific attention heads become "instruction followers" that maintain connection
+                                    to directive tokens throughout generation.
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="help-section">
+                        <div class="help-section-title">Fingerprint Components</div>
+                        <p style="font-size: 11px; color: var(--text-dim); margin-bottom: 14px; line-height: 1.5;">
+                            The fingerprint is a 20-dimensional vector capturing the attention distribution.
+                            The first 8 values are distance bins; derived features characterize the pattern.
+                        </p>
+                        <div style="background: var(--deep); border-left: 3px solid var(--violet); padding: 12px; margin-bottom: 14px; border-radius: 0 6px 6px 0;">
+                            <div style="font-size: 10px; color: var(--violet); font-weight: 600; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 6px;">How We Compute Fingerprints</div>
+                            <div style="font-size: 11px; color: var(--text-dim); line-height: 1.6;">
+                                <strong style="color: var(--text);">1. Capture:</strong> Extract attention weights <code style="background: var(--void); padding: 1px 4px; border-radius: 3px;">A[i,j]</code> from final layer<br>
+                                <strong style="color: var(--text);">2. Bin:</strong> Sum weights into 8 distance bins (1-8, 9-16, ..., 57-64+)<br>
+                                <strong style="color: var(--text);">3. Derive:</strong> Compute local/mid/long mass + entropy from bins<br>
+                                <strong style="color: var(--text);">4. Classify:</strong> Apply zone rules to determine attention pattern type
+                            </div>
+                        </div>
+                        <div class="help-grid">
+                            <div class="help-item">
+                                <div class="help-item-header">
+                                    <div class="help-item-icon" style="background: var(--deep);">L</div>
+                                    <span class="help-item-name">Local Mass</span>
+                                </div>
+                                <div class="help-item-desc">
+                                    Sum of attention to tokens 1-16 positions back. High = recent context focus.
+                                </div>
+                                <div class="help-item-formula">local_mass = sum(bins[0:2]) | Range: 0.0-1.0</div>
+                                <div style="margin-top: 6px; font-size: 10px; color: var(--text-muted);">
+                                    <strong style="color: var(--violet);">Source:</strong> RoPE position encoding naturally creates distance decay.
+                                    Early layers especially show high local mass.
+                                </div>
+                            </div>
+                            <div class="help-item">
+                                <div class="help-item-header">
+                                    <div class="help-item-icon" style="background: var(--deep);">M</div>
+                                    <span class="help-item-name">Mid-Range Mass</span>
+                                </div>
+                                <div class="help-item-desc">
+                                    Sum of attention to tokens 17-48 positions back. High = semantic retrieval.
+                                </div>
+                                <div class="help-item-formula">mid_mass = sum(bins[2:6]) | Range: 0.0-1.0</div>
+                                <div style="margin-top: 6px; font-size: 10px; color: var(--text-muted);">
+                                    <strong style="color: var(--violet);">Source:</strong> Later layers learn semantic key-value patterns that match
+                                    across sentence boundaries. "Semantic heads" specialize in this.
+                                </div>
+                            </div>
+                            <div class="help-item">
+                                <div class="help-item-header">
+                                    <div class="help-item-icon" style="background: var(--deep);">R</div>
+                                    <span class="help-item-name">Long-Range Mass</span>
+                                </div>
+                                <div class="help-item-desc">
+                                    Sum of attention to tokens 49+ positions back. High = instruction following.
+                                </div>
+                                <div class="help-item-formula">long_mass = sum(bins[6:8]) | Range: 0.0-1.0</div>
+                                <div style="margin-top: 6px; font-size: 10px; color: var(--text-muted);">
+                                    <strong style="color: var(--violet);">Source:</strong> "Attention sinks" (BOS token) and instruction tokens
+                                    receive persistent attention via specialized heads.
+                                </div>
+                            </div>
+                            <div class="help-item">
+                                <div class="help-item-header">
+                                    <div class="help-item-icon" style="background: var(--deep);">E</div>
+                                    <span class="help-item-name">Entropy</span>
+                                </div>
+                                <div class="help-item-desc">
+                                    Shannon entropy of attention distribution. Low = focused, High = diffuse.
+                                </div>
+                                <div class="help-item-formula">-sum(p * log(p)) | Range: 0.0-4.0+</div>
+                                <div style="margin-top: 6px; font-size: 10px; color: var(--text-muted);">
+                                    <strong style="color: var(--violet);">Source:</strong> Entropy reflects softmax temperature internally.
+                                    High logit variance → low entropy. Uniform logits → high entropy.
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="help-section">
+                        <div class="help-section-title">Attention Edges</div>
+                        <p style="font-size: 11px; color: var(--text-dim); margin-bottom: 14px; line-height: 1.5;">
+                            In raw token mode (when available), attention edges show which tokens influenced the generation of each token.
+                        </p>
+                        <div style="background: var(--deep); border-left: 3px solid var(--violet); padding: 12px; margin-bottom: 14px; border-radius: 0 6px 6px 0;">
+                            <div style="font-size: 10px; color: var(--violet); font-weight: 600; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 6px;">Causal Attention Mask</div>
+                            <div style="font-size: 11px; color: var(--text-dim); line-height: 1.6;">
+                                Transformers use <strong style="color: var(--text);">causal (autoregressive) attention</strong>: each token can only
+                                attend to itself and <em>previous</em> tokens. The attention matrix is lower-triangular. "Attends To" shows the
+                                weighted sum of values that produce this token's representation.
+                            </div>
+                        </div>
+                        <div class="help-grid">
+                            <div class="help-item">
+                                <div class="help-item-header">
+                                    <div class="help-item-icon" style="background: rgba(0, 229, 255, 0.2); color: var(--cyan);">→</div>
+                                    <span class="help-item-name">Attends To</span>
+                                </div>
+                                <div class="help-item-desc">
+                                    <strong>Cyan edges/highlights</strong>: Tokens the selected token looked at during generation.
+                                    Higher weight = stronger influence on this token's generation.
+                                </div>
+                                <div style="margin-top: 6px; font-size: 10px; color: var(--text-muted);">
+                                    <strong style="color: var(--violet);">Source:</strong> Row <code style="background: var(--void); padding: 1px 4px; border-radius: 3px;">A[i, :]</code>
+                                    of the attention matrix. These values sum to 1.0 (softmax normalization).
+                                </div>
+                            </div>
+                            <div class="help-item">
+                                <div class="help-item-header">
+                                    <div class="help-item-icon" style="background: rgba(180, 255, 0, 0.2); color: var(--lime);">←</div>
+                                    <span class="help-item-name">Attended By</span>
+                                </div>
+                                <div class="help-item-desc">
+                                    <strong>Lime edges/highlights</strong>: Later tokens that looked at the selected token.
+                                    Shows how this token influenced subsequent generation.
+                                </div>
+                                <div style="margin-top: 6px; font-size: 10px; color: var(--text-muted);">
+                                    <strong style="color: var(--violet);">Source:</strong> Column <code style="background: var(--void); padding: 1px 4px; border-radius: 3px;">A[:, j]</code>
+                                    of the attention matrix. High-influence tokens are "attention sinks."
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="help-section">
+                        <div class="help-section-title">Configuration Settings</div>
+                        <div class="help-grid">
+                            <div class="help-item">
+                                <div class="help-item-header">
+                                    <span class="help-item-name">Max Tokens</span>
+                                </div>
+                                <div class="help-item-desc">
+                                    Maximum tokens to generate. More tokens = longer response but more computation.
+                                    <strong>Range: 1-4096</strong>
+                                </div>
+                            </div>
+                            <div class="help-item">
+                                <div class="help-item-header">
+                                    <span class="help-item-name">Attention Top-K</span>
+                                </div>
+                                <div class="help-item-desc">
+                                    Top attention targets captured per token. <strong>5-10</strong> for visualization.
+                                    Higher = more edges but more data.
+                                </div>
+                            </div>
+                            <div class="help-item">
+                                <div class="help-item-header">
+                                    <span class="help-item-name">Temperature</span>
+                                </div>
+                                <div class="help-item-desc">
+                                    Randomness in generation. <strong>0.0</strong> = deterministic, <strong>1.0+</strong> = creative.
+                                    Affects both output and attention patterns.
+                                </div>
+                            </div>
+                            <div class="help-item">
+                                <div class="help-item-header">
+                                    <span class="help-item-name">Edge Threshold</span>
+                                </div>
+                                <div class="help-item-desc">
+                                    Minimum attention weight to display. <strong>0.05</strong> shows significant connections.
+                                    <strong>0.2+</strong> shows only strong attention.
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="help-section">
+                        <div class="help-section-title">How to Use</div>
+                        <div style="font-size: 12px; color: var(--text-dim); line-height: 1.8;">
+                            <ol style="padding-left: 20px; margin: 0;">
+                                <li><strong style="color: var(--text);">Enter text</strong> in the input area (question, prompt, or text to analyze)</li>
+                                <li><strong style="color: var(--text);">Click Analyze</strong> to generate a response with attention capture</li>
+                                <li><strong style="color: var(--text);">View segments</strong>: Prompt (cyan), Thinking (amber), Output (lime)</li>
+                                <li><strong style="color: var(--text);">Click any token</strong> to see its attention pattern and zone classification</li>
+                                <li><strong style="color: var(--text);">Use layer filter</strong> (if available) to explore attention at different depths</li>
+                                <li><strong style="color: var(--text);">Toggle word mode</strong> to aggregate subword tokens into readable words</li>
+                            </ol>
+                        </div>
+                    </div>
+
+                    <div style="margin-top: 20px; padding-top: 16px; border-top: 1px solid var(--border); font-size: 11px; color: var(--text-muted);">
+                        <strong>SGLang Attention Explorer</strong> visualizes real attention patterns from transformer language models.
+                        Fingerprints are computed from the attention weights during generation.
+                    </div>
+                </div>
+            `;
+
+            document.body.appendChild(modal);
+        }
     </script>
 </body>
 </html>
