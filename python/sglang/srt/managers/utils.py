@@ -1,18 +1,97 @@
 from __future__ import annotations
 
+import dataclasses
 import logging
-import multiprocessing as mp
-from http import HTTPStatus
-from typing import TYPE_CHECKING, Dict, List, Optional
+from typing import TYPE_CHECKING, List, Optional
 
+import torch
+
+from sglang.srt.eplb.expert_distribution import ExpertDistributionMetrics
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req
+from sglang.srt.managers.overlap_utils import FutureIndices
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import GenerationBatchResult
+    from sglang.srt.speculative.eagle_info import EagleDraftInput
+
 
 logger = logging.getLogger(__name__)
+
+
+@dataclasses.dataclass
+class GenerationBatchResult:
+    logits_output: Optional[LogitsProcessorOutput] = None
+    pp_hidden_states_proxy_tensors: Optional[PPProxyTensors] = None
+    next_token_ids: Optional[torch.Tensor] = None
+    num_accepted_tokens: int = 0
+    accept_length_per_req_cpu: Optional[List[int]] = None
+    can_run_cuda_graph: bool = False
+
+    # For output processing
+    extend_input_len_per_req: Optional[List[int]] = None
+    extend_logprob_start_len_per_req: Optional[List[int]] = None
+
+    # For overlap scheduling
+    copy_done: Optional[torch.cuda.Event] = None
+    delay_sample_func: Optional[callable] = None
+    future_indices: Optional[FutureIndices] = None
+
+    # FIXME(lsyin): maybe move to a better place?
+    # sync path: forward stream -> output processor
+    accept_lens: Optional[torch.Tensor] = None
+
+    # relay path: forward stream -> next step forward
+    next_draft_input: Optional[EagleDraftInput] = None
+
+    # metrics
+    expert_distribution_metrics: Optional[ExpertDistributionMetrics] = None
+
+    def copy_to_cpu(self, return_logprob: bool):
+        """Copy tensors to CPU in overlap scheduling.
+        Only the tensors which are needed for processing results are copied,
+        e.g., next_token_ids, logits outputs
+        """
+        if return_logprob:
+            if self.logits_output.next_token_logprobs is not None:
+                self.logits_output.next_token_logprobs = (
+                    self.logits_output.next_token_logprobs.to("cpu", non_blocking=True)
+                )
+            if self.logits_output.input_token_logprobs is not None:
+                self.logits_output.input_token_logprobs = (
+                    self.logits_output.input_token_logprobs.to("cpu", non_blocking=True)
+                )
+        if self.logits_output.hidden_states is not None:
+            self.logits_output.hidden_states = self.logits_output.hidden_states.to(
+                "cpu", non_blocking=True
+            )
+        self.next_token_ids = self.next_token_ids.to("cpu", non_blocking=True)
+
+        if self.accept_lens is not None:
+            self.accept_lens = self.accept_lens.to("cpu", non_blocking=True)
+
+        if (x := self.expert_distribution_metrics) is not None:
+            x.copy_to_cpu()
+
+        self.copy_done.record()
+
+    @classmethod
+    def from_pp_proxy(
+        cls, logits_output, next_pp_outputs: PPProxyTensors, can_run_cuda_graph
+    ):
+        # TODO(lsyin): refactor PP and avoid using dict
+        proxy_dict = next_pp_outputs.tensors
+        return cls(
+            logits_output=logits_output,
+            pp_hidden_states_proxy_tensors=None,
+            next_token_ids=next_pp_outputs["next_token_ids"],
+            extend_input_len_per_req=proxy_dict.get("extend_input_len_per_req", None),
+            extend_logprob_start_len_per_req=proxy_dict.get(
+                "extend_logprob_start_len_per_req", None
+            ),
+            can_run_cuda_graph=can_run_cuda_graph,
+        )
 
 
 def validate_input_length(
@@ -97,46 +176,3 @@ def get_logprob_from_pp_outputs(
     ]
 
     return logits_output, extend_input_len_per_req, extend_logprob_start_len_per_req
-
-
-class DPBalanceMeta:
-    """
-    This class will be use in scheduler and dp controller
-    """
-
-    def __init__(self, num_workers: int):
-        self.num_workers = num_workers
-        self._manager = mp.Manager()
-        self.mutex = self._manager.Lock()
-
-        init_local_tokens = [0] * self.num_workers
-        init_onfly_info = [self._manager.dict() for _ in range(self.num_workers)]
-
-        self.shared_state = self._manager.Namespace()
-        self.shared_state.local_tokens = self._manager.list(init_local_tokens)
-        self.shared_state.onfly_info = self._manager.list(init_onfly_info)
-
-    def destructor(self):
-        # we must destructor this class manually
-        self._manager.shutdown()
-
-    def get_shared_onfly(self) -> List[Dict[int, int]]:
-        return [dict(d) for d in self.shared_state.onfly_info]
-
-    def set_shared_onfly_info(self, data: List[Dict[int, int]]):
-        self.shared_state.onfly_info = data
-
-    def get_shared_local_tokens(self) -> List[int]:
-        return list(self.shared_state.local_tokens)
-
-    def set_shared_local_tokens(self, data: List[int]):
-        self.shared_state.local_tokens = data
-
-    def __getstate__(self):
-        state = self.__dict__.copy()
-        del state["_manager"]
-        return state
-
-    def __setstate__(self, state):
-        self.__dict__.update(state)
-        self._manager = None

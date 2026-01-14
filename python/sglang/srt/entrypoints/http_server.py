@@ -19,23 +19,27 @@ This file implements HTTP APIs for the inference engine via fastapi.
 
 import asyncio
 import dataclasses
-import json
 import logging
-import multiprocessing as multiprocessing
 import os
 import tempfile
 import threading
 import time
+from contextlib import asynccontextmanager
 from http import HTTPStatus
-from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Union
-
-from sglang.srt.tracing.trace import process_tracing_init, trace_set_thread_info
+from typing import (
+    Any,
+    AsyncGenerator,
+    AsyncIterator,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Union,
+)
 
 # Fix a bug of Python threading
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
 
-from contextlib import asynccontextmanager
-from typing import AsyncGenerator
 
 import numpy as np
 import orjson
@@ -48,36 +52,62 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
-from sglang.srt.entrypoints.engine import _launch_subprocesses
+from sglang.srt.entrypoints.engine import (
+    _launch_subprocesses,
+    init_tokenizer_manager,
+    run_detokenizer_process,
+    run_scheduler_process,
+)
+from sglang.srt.entrypoints.ollama.protocol import (
+    OllamaChatRequest,
+    OllamaGenerateRequest,
+    OllamaShowRequest,
+)
+from sglang.srt.entrypoints.ollama.serving import OllamaServing
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
+    ClassifyRequest,
     CompletionRequest,
+    DetokenizeRequest,
     EmbeddingRequest,
     ErrorResponse,
     ModelCard,
     ModelList,
     ResponsesRequest,
     ScoringRequest,
+    TokenizeRequest,
     V1RerankReqInput,
 )
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
+from sglang.srt.entrypoints.openai.serving_classify import OpenAIServingClassify
 from sglang.srt.entrypoints.openai.serving_completions import OpenAIServingCompletion
 from sglang.srt.entrypoints.openai.serving_embedding import OpenAIServingEmbedding
 from sglang.srt.entrypoints.openai.serving_rerank import OpenAIServingRerank
 from sglang.srt.entrypoints.openai.serving_score import OpenAIServingScore
+from sglang.srt.entrypoints.openai.serving_tokenize import (
+    OpenAIServingDetokenize,
+    OpenAIServingTokenize,
+)
+from sglang.srt.entrypoints.warmup import execute_warmups
+from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.managers.io_struct import (
     AbortReq,
+    CheckWeightsReqInput,
     CloseSessionReqInput,
     ConfigureLoggingReq,
+    ContinueGenerationReqInput,
+    DestroyWeightsUpdateGroupReqInput,
     EmbeddingReqInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsUpdateGroupReqInput,
+    LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterReqInput,
     OpenSessionReqInput,
     ParseFunctionCallReq,
+    PauseGenerationReqInput,
     ProfileReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
@@ -88,13 +118,14 @@ from sglang.srt.managers.io_struct import (
     UnloadLoRAAdapterReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
+    UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightVersionReqInput,
     VertexGenerateReqInput,
 )
 from sglang.srt.managers.multi_tokenizer_mixin import (
-    MultiTokenizerManager,
     MultiTokenizerRouter,
+    TokenizerWorker,
     get_main_process_id,
     monkey_patch_uvicorn_multiprocessing,
     read_from_shared_memory,
@@ -103,34 +134,47 @@ from sglang.srt.managers.multi_tokenizer_mixin import (
 from sglang.srt.managers.template_manager import TemplateManager
 from sglang.srt.managers.tokenizer_manager import ServerStatus, TokenizerManager
 from sglang.srt.metrics.func_timer import enable_func_timer
+from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
+    parse_remote_instance_transfer_engine_info_from_scheduler_infos,
+)
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.tracing.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.utils import (
-    add_api_key_middleware,
     add_prometheus_middleware,
+    add_prometheus_track_response_middleware,
     delete_directory,
     get_bool_env_var,
     kill_process_tree,
     set_uvicorn_logging_configs,
 )
-from sglang.srt.warmup import execute_warmups
+from sglang.srt.utils.auth import AuthLevel, app_has_admin_force_endpoints, auth_level
 from sglang.utils import get_exception_traceback
 from sglang.version import __version__
 
 logger = logging.getLogger(__name__)
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
+# Global constants
 HEALTH_CHECK_TIMEOUT = int(os.getenv("SGLANG_HEALTH_CHECK_TIMEOUT", 20))
+WAIT_WEIGHTS_READY_TIMEOUT = int(os.getenv("SGLANG_WAIT_WEIGHTS_READY_TIMEOUT", 120))
 
 
 # Store global states
 @dataclasses.dataclass
 class _GlobalState:
-    tokenizer_manager: Union[
-        TokenizerManager, MultiTokenizerRouter, MultiTokenizerManager
-    ]
+    tokenizer_manager: Union[TokenizerManager, MultiTokenizerRouter, TokenizerWorker]
     template_manager: TemplateManager
     scheduler_info: Dict
+    # Dict{
+    #   rank: Tuple(
+    #           session_id,
+    #           Dict{
+    #               name: Tuple (d_ptr, numel, element_size)
+    #           }
+    #         )
+    # }
+    remote_instance_transfer_engine_info: Optional[Dict] = None
 
 
 _global_state: Optional[_GlobalState] = None
@@ -141,29 +185,40 @@ def set_global_state(global_state: _GlobalState):
     _global_state = global_state
 
 
+def get_global_state() -> _GlobalState:
+    return _global_state
+
+
 async def init_multi_tokenizer() -> ServerArgs:
-    """Read args information from shm and init tokenizer manager for current process"""
-    pid = os.getpid()
-    main_pid = get_main_process_id()
-    logger.info(f"current worker_id: {pid}, main processID: {main_pid}")
+    """
+    Initialization function for multi-process tokenizer mode.
+    It read args information from shm and inits tokenizer manager for current process.
+    """
 
     # Read configuration from shared memory
+    main_pid = get_main_process_id()
     port_args, server_args, scheduler_info = read_from_shared_memory(
         f"multi_tokenizer_args_{main_pid}"
     )
     server_args: ServerArgs
+    port_args: PortArgs
 
     # API key authentication is not supported in multi-tokenizer mode
     assert (
         server_args.api_key is None
     ), "API key is not supported in multi-tokenizer mode"
 
+    # Create a new ipc name for the current process
     port_args.tokenizer_ipc_name = (
         f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
     )
+    logger.info(
+        f"Start multi-tokenizer worker process {os.getpid()}, "
+        f"ipc_name={port_args.tokenizer_ipc_name}"
+    )
 
     # Launch multi-tokenizer manager process
-    tokenizer_manager = MultiTokenizerManager(server_args, port_args)
+    tokenizer_manager = TokenizerWorker(server_args, port_args)
     template_manager = TemplateManager()
     template_manager.initialize_templates(
         tokenizer_manager=tokenizer_manager,
@@ -171,10 +226,9 @@ async def init_multi_tokenizer() -> ServerArgs:
         chat_template=server_args.chat_template,
         completion_template=server_args.completion_template,
     )
-    # Register this tokenizer with the main tokenizer manager
-    await tokenizer_manager.register_to_main_tokenizer_manager()
 
     tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
+
     set_global_state(
         _GlobalState(
             tokenizer_manager=tokenizer_manager,
@@ -183,36 +237,34 @@ async def init_multi_tokenizer() -> ServerArgs:
         )
     )
 
-    if server_args.enable_trace:
-        process_tracing_init(server_args.oltp_traces_endpoint, "sglang")
-        if server_args.disaggregation_mode == "null":
-            thread_label = f"MultiTokenizer-{tokenizer_manager.worker_id}"
-            trace_set_thread_info(thread_label)
-
     return server_args
 
 
 @asynccontextmanager
 async def lifespan(fast_api_app: FastAPI):
-    if not getattr(fast_api_app, "is_single_tokenizer_mode", False):
+    if getattr(fast_api_app, "is_single_tokenizer_mode", False):
+        server_args = fast_api_app.server_args
+        warmup_thread_kwargs = fast_api_app.warmup_thread_kwargs
+        thread_label = "Tokenizer"
+    else:
         # Initialize multi-tokenizer support for worker processes
-        fast_api_app.server_args: ServerArgs = await init_multi_tokenizer()
+        server_args = await init_multi_tokenizer()
+        warmup_thread_kwargs = dict(server_args=server_args)
+        thread_label = f"MultiTokenizer-{_global_state.tokenizer_manager.worker_id}"
 
-        # only metrics middleware is supported in multi-tokenizer mode
-        worker_pid = os.getpid()
-        if fast_api_app.server_args.enable_metrics:
-            add_prometheus_middleware(app)
-            enable_func_timer()
+    # Add prometheus middleware
+    if server_args.enable_metrics:
+        add_prometheus_middleware(app)
+        enable_func_timer()
 
-        logger.info(f"Worker {worker_pid} added prometheus middleware")
-        fast_api_app.warmup_thread = threading.Thread(
-            target=_wait_and_warmup,
-            args=(
-                fast_api_app.server_args,
-                None,  # pipe_finish_writer not needed in worker
-                None,  # launch_callback not needed in worker
-            ),
-        )
+    # Init tracing
+    if server_args.enable_trace:
+        process_tracing_init(server_args.otlp_traces_endpoint, "sglang")
+        if server_args.disaggregation_mode == "prefill":
+            thread_label = "Prefill" + thread_label
+        elif server_args.disaggregation_mode == "decode":
+            thread_label = "Decode" + thread_label
+        trace_set_thread_info(thread_label)
 
     # Initialize OpenAI serving handlers
     fast_api_app.state.openai_serving_completion = OpenAIServingCompletion(
@@ -224,15 +276,26 @@ async def lifespan(fast_api_app: FastAPI):
     fast_api_app.state.openai_serving_embedding = OpenAIServingEmbedding(
         _global_state.tokenizer_manager, _global_state.template_manager
     )
+    fast_api_app.state.openai_serving_classify = OpenAIServingClassify(
+        _global_state.tokenizer_manager, _global_state.template_manager
+    )
     fast_api_app.state.openai_serving_score = OpenAIServingScore(
         _global_state.tokenizer_manager
     )
     fast_api_app.state.openai_serving_rerank = OpenAIServingRerank(
         _global_state.tokenizer_manager
     )
+    fast_api_app.state.openai_serving_tokenize = OpenAIServingTokenize(
+        _global_state.tokenizer_manager
+    )
+    fast_api_app.state.openai_serving_detokenize = OpenAIServingDetokenize(
+        _global_state.tokenizer_manager
+    )
 
-    server_args: ServerArgs = fast_api_app.server_args
+    # Initialize Ollama-compatible serving handler
+    fast_api_app.state.ollama_serving = OllamaServing(_global_state.tokenizer_manager)
 
+    # Launch tool server
     tool_server = None
     if server_args.tool_server == "demo":
         from sglang.srt.entrypoints.openai.tool_server import DemoToolServer
@@ -256,12 +319,11 @@ async def lifespan(fast_api_app: FastAPI):
             enable_force_include_usage=True,
             tool_server=tool_server,
         )
-    except Exception as e:
-        import traceback
+    except Exception:
+        traceback = get_exception_traceback()
+        logger.warning(f"Can not initialize OpenAIServingResponses, error: {traceback}")
 
-        traceback.print_exc()
-        logger.warning(f"Can not initialize OpenAIServingResponses, error: {e}")
-
+    # Execute custom warmups
     if server_args.warmups is not None:
         await execute_warmups(
             server_args.disaggregation_mode,
@@ -270,18 +332,18 @@ async def lifespan(fast_api_app: FastAPI):
         )
         logger.info("Warmup ended")
 
-    warmup_thread = getattr(fast_api_app, "warmup_thread", None)
-    if warmup_thread is not None:
-        warmup_thread.start()
+    # Execute the general warmup
+    warmup_thread = threading.Thread(
+        target=_wait_and_warmup,
+        kwargs=warmup_thread_kwargs,
+    )
+    warmup_thread.start()
 
+    # Start the HTTP server
     try:
         yield
     finally:
-        if server_args.tokenizer_worker_num > 1:
-            pid = os.getpid()
-            logger.info(f"uvicorn worker {pid} ending...")
-            warmup_thread.join()
-            logger.info(f"uvicorn worker {pid} ended.")
+        warmup_thread.join()
 
 
 # Fast API
@@ -300,7 +362,23 @@ app.add_middleware(
 
 @app.exception_handler(HTTPException)
 async def validation_exception_handler(request: Request, exc: HTTPException):
-    """Enrich HTTP exception with status code and other details"""
+    """Enrich HTTP exception with status code and other details.
+
+    For /v1/responses, emit OpenAI-style nested error envelope:
+    {"error": {"message": "...", "type": "...", "param": null, "code": <status>}}
+    """
+    # adjust fmt for responses api
+    if request.url.path.startswith("/v1/responses"):
+        nested_error = {
+            "message": exc.detail,
+            "type": HTTPStatus(exc.status_code).phrase,
+            "param": None,
+            "code": exc.status_code,
+        }
+        return ORJSONResponse(
+            content={"error": nested_error}, status_code=exc.status_code
+        )
+
     error = ErrorResponse(
         object="error",
         message=exc.detail,
@@ -313,7 +391,10 @@ async def validation_exception_handler(request: Request, exc: HTTPException):
 # Custom exception handlers to change validation error status codes
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
-    """Override FastAPI's default 422 validation error with 400"""
+    """Override FastAPI's default 422 validation error with 400.
+
+    For /v1/responses, emit OpenAI-style nested error envelope; for other endpoints keep legacy format.
+    """
     exc_str = str(exc)
     errors_str = str(exc.errors())
 
@@ -321,6 +402,16 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
         message = f"{exc_str} {errors_str}"
     else:
         message = exc_str
+
+    if request.url.path.startswith("/v1/responses"):
+        # adapt specially, for v1/responses API only (notice the error key is different)
+        nested_error = {
+            "message": message,
+            "type": HTTPStatus.BAD_REQUEST.phrase,
+            "param": None,
+            "code": HTTPStatus.BAD_REQUEST.value,
+        }
+        return ORJSONResponse(status_code=400, content={"error": nested_error})
 
     err = ErrorResponse(
         message=message,
@@ -370,12 +461,19 @@ async def health_generate(request: Request) -> Response:
     if _global_state.tokenizer_manager.server_status == ServerStatus.Starting:
         return Response(status_code=503)
 
+    if (
+        not envs.SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION.get()
+        and request.url.path == "/health"
+    ):
+        return Response(status_code=200)
+
     sampling_params = {"max_new_tokens": 1, "temperature": 0.0}
     rid = f"HEALTH_CHECK_{time.time()}"
 
     if _global_state.tokenizer_manager.is_image_gen:
-        # Keep this branch for some internal use cases.
-        raise NotImplementedError("Image generation is not supported yet.")
+        gri = _global_state.tokenizer_manager.get_image_gen_health_check_request(
+            rid, sampling_params
+        )
     elif _global_state.tokenizer_manager.is_generation:
         gri = GenerateReqInput(
             rid=rid,
@@ -427,19 +525,44 @@ async def health_generate(request: Request) -> Response:
 
 @app.get("/get_model_info")
 async def get_model_info():
+    """Get the model information (deprecated - use /model_info instead)."""
+    logger.warning(
+        "Endpoint '/get_model_info' is deprecated and will be removed in a future version. "
+        "Please use '/model_info' instead."
+    )
+    return await model_info()
+
+
+@app.get("/model_info")
+async def model_info():
     """Get the model information."""
+    model_config = _global_state.tokenizer_manager.model_config
     result = {
         "model_path": _global_state.tokenizer_manager.model_path,
         "tokenizer_path": _global_state.tokenizer_manager.server_args.tokenizer_path,
         "is_generation": _global_state.tokenizer_manager.is_generation,
         "preferred_sampling_params": _global_state.tokenizer_manager.server_args.preferred_sampling_params,
         "weight_version": _global_state.tokenizer_manager.server_args.weight_version,
+        "has_image_understanding": model_config.is_image_understandable_model,
+        "has_audio_understanding": model_config.is_audio_understandable_model,
+        "model_type": getattr(model_config.hf_config, "model_type", None),
+        "architectures": getattr(model_config.hf_config, "architectures", None),
     }
     return result
 
 
 @app.get("/get_weight_version")
 async def get_weight_version():
+    """Get the current weight version (deprecated - use /weight_version instead)."""
+    logger.warning(
+        "Endpoint '/get_weight_version' is deprecated and will be removed in a future version. "
+        "Please use '/weight_version' instead."
+    )
+    return await weight_version()
+
+
+@app.get("/weight_version")
+async def weight_version():
     """Get the current weight version."""
     return {
         "weight_version": _global_state.tokenizer_manager.server_args.weight_version
@@ -448,10 +571,26 @@ async def get_weight_version():
 
 @app.get("/get_server_info")
 async def get_server_info():
-    # Returns interna states per DP.
+    """Get the server information (deprecated - use /server_info instead)."""
+    logger.warning(
+        "Endpoint '/get_server_info' is deprecated and will be removed in a future version. "
+        "Please use '/server_info' instead."
+    )
+    return await server_info()
+
+
+@app.get("/server_info")
+async def server_info():
+    """Get the server information."""
+    # Returns internal states per DP.
     internal_states: List[Dict[Any, Any]] = (
         await _global_state.tokenizer_manager.get_internal_state()
     )
+
+    # This field is not serializable.
+    if hasattr(_global_state.tokenizer_manager.server_args, "model_config"):
+        del _global_state.tokenizer_manager.server_args.model_config
+
     return {
         **dataclasses.asdict(_global_state.tokenizer_manager.server_args),
         **_global_state.scheduler_info,
@@ -466,8 +605,9 @@ async def get_load():
 
 
 # example usage:
-# curl -s -X POST http://localhost:30000/set_internal_state -H "Content-Type: application/json" -d '{"server_args": {"max_micro_batch_size": 8}}'
+# curl -s -X POST http://localhost:30000/set_internal_state -H "Content-Type: application/json" -d '{"server_args": {"pp_max_micro_batch_size": 8}}'
 @app.api_route("/set_internal_state", methods=["POST", "PUT"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def set_internal_state(obj: SetInternalStateReq, request: Request):
     res = await _global_state.tokenizer_manager.set_internal_state(obj)
     return res
@@ -515,7 +655,7 @@ async def generate_request(obj: GenerateReqInput, request: Request):
 async def generate_from_file_request(file: UploadFile, request: Request):
     """Handle a generate request, this is purely to work with input_embeds."""
     content = await file.read()
-    input_embeds = json.loads(content.decode("utf-8"))
+    input_embeds = orjson.loads(content.decode("utf-8"))
 
     obj = GenerateReqInput(
         input_embeds=input_embeds,
@@ -560,6 +700,7 @@ async def classify_request(obj: EmbeddingReqInput, request: Request):
 
 
 @app.api_route("/flush_cache", methods=["GET", "POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def flush_cache():
     """Flush the radix cache."""
     ret = await _global_state.tokenizer_manager.flush_cache()
@@ -571,6 +712,7 @@ async def flush_cache():
 
 
 @app.api_route("/clear_hicache_storage_backend", methods=["GET", "POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def clear_hicache_storage_backend():
     """Clear the hierarchical cache storage backend."""
     ret = await _global_state.tokenizer_manager.clear_hicache_storage()
@@ -581,6 +723,7 @@ async def clear_hicache_storage_backend():
 
 
 @app.api_route("/start_profile", methods=["GET", "POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def start_profile_async(obj: Optional[ProfileReqInput] = None):
     """Start profiling."""
     if obj is None:
@@ -594,6 +737,9 @@ async def start_profile_async(obj: Optional[ProfileReqInput] = None):
         with_stack=obj.with_stack,
         record_shapes=obj.record_shapes,
         profile_by_stage=obj.profile_by_stage,
+        merge_profiles=obj.merge_profiles,
+        profile_prefix=obj.profile_prefix,
+        profile_stages=obj.profile_stages,
     )
     return Response(
         content="Start profiling.\n",
@@ -602,6 +748,7 @@ async def start_profile_async(obj: Optional[ProfileReqInput] = None):
 
 
 @app.api_route("/stop_profile", methods=["GET", "POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def stop_profile_async():
     """Stop profiling."""
     await _global_state.tokenizer_manager.stop_profile()
@@ -612,6 +759,7 @@ async def stop_profile_async():
 
 
 @app.api_route("/freeze_gc", methods=["GET", "POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def freeze_gc_async():
     """
     See engine.freeze_gc for more details.
@@ -624,6 +772,7 @@ async def freeze_gc_async():
 
 
 @app.api_route("/start_expert_distribution_record", methods=["GET", "POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def start_expert_distribution_record_async():
     """Start recording the expert distribution. Clear the previous record if any."""
     await _global_state.tokenizer_manager.start_expert_distribution_record()
@@ -634,6 +783,7 @@ async def start_expert_distribution_record_async():
 
 
 @app.api_route("/stop_expert_distribution_record", methods=["GET", "POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def stop_expert_distribution_record_async():
     """Stop recording the expert distribution."""
     await _global_state.tokenizer_manager.stop_expert_distribution_record()
@@ -644,6 +794,7 @@ async def stop_expert_distribution_record_async():
 
 
 @app.api_route("/dump_expert_distribution_record", methods=["GET", "POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def dump_expert_distribution_record_async():
     """Dump expert distribution record."""
     await _global_state.tokenizer_manager.dump_expert_distribution_record()
@@ -654,16 +805,12 @@ async def dump_expert_distribution_record_async():
 
 
 @app.post("/update_weights_from_disk")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def update_weights_from_disk(obj: UpdateWeightFromDiskReqInput, request: Request):
     """Update the weights from disk inplace without re-launching the server."""
     success, message, num_paused_requests = (
         await _global_state.tokenizer_manager.update_weights_from_disk(obj, request)
     )
-
-    # Update weight version if provided and weights update was successful
-    if success and obj.weight_version is not None:
-        _update_weight_version_if_provided(obj.weight_version)
-        message += f" Weight version updated to {obj.weight_version}."
 
     content = {
         "success": success,
@@ -683,6 +830,7 @@ async def update_weights_from_disk(obj: UpdateWeightFromDiskReqInput, request: R
 
 
 @app.post("/init_weights_send_group_for_remote_instance")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def init_weights_send_group_for_remote_instance(
     obj: InitWeightsSendGroupForRemoteInstanceReqInput, request: Request
 ):
@@ -699,6 +847,7 @@ async def init_weights_send_group_for_remote_instance(
 
 
 @app.post("/send_weights_to_remote_instance")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def send_weights_to_remote_instance(
     obj: SendWeightsToRemoteInstanceReqInput, request: Request
 ):
@@ -714,7 +863,33 @@ async def send_weights_to_remote_instance(
         return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
 
 
+@app.get("/get_remote_instance_transfer_engine_info")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def get_remote_instance_transfer_engine_info(rank: int = None):
+    if rank is None or rank < 0:
+        return Response(status_code=HTTPStatus.BAD_REQUEST)
+
+    if (
+        _global_state.remote_instance_transfer_engine_info is None
+        or len(_global_state.remote_instance_transfer_engine_info) == 0
+    ):
+        return Response(status_code=HTTPStatus.BAD_REQUEST)
+
+    try:
+        result = {
+            "rank": rank,
+            "remote_instance_transfer_engine_info": _global_state.remote_instance_transfer_engine_info[
+                rank
+            ],
+        }
+        return result
+    except Exception as e:
+        logger.error(f"Exception: {e}")
+        return Response(status_code=HTTPStatus.BAD_REQUEST)
+
+
 @app.post("/init_weights_update_group")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def init_weights_update_group(
     obj: InitWeightsUpdateGroupReqInput, request: Request
 ):
@@ -729,7 +904,23 @@ async def init_weights_update_group(
         return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
 
 
+@app.post("/destroy_weights_update_group")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def destroy_weights_update_group(
+    obj: DestroyWeightsUpdateGroupReqInput, request: Request
+):
+    """Destroy the parameter update group."""
+    success, message = (
+        await _global_state.tokenizer_manager.destroy_weights_update_group(obj, request)
+    )
+    content = {"success": success, "message": message}
+    return ORJSONResponse(
+        content, status_code=200 if success else HTTPStatus.BAD_REQUEST
+    )
+
+
 @app.post("/update_weights_from_tensor")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def update_weights_from_tensor(
     obj: UpdateWeightsFromTensorReqInput, request: Request
 ):
@@ -744,11 +935,6 @@ async def update_weights_from_tensor(
         obj, request
     )
 
-    # Update weight version if provided and weights update was successful
-    if success and obj.weight_version is not None:
-        _update_weight_version_if_provided(obj.weight_version)
-        message += f" Weight version updated to {obj.weight_version}."
-
     content = {"success": success, "message": message}
     return ORJSONResponse(
         content, status_code=200 if success else HTTPStatus.BAD_REQUEST
@@ -756,6 +942,7 @@ async def update_weights_from_tensor(
 
 
 @app.post("/update_weights_from_distributed")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def update_weights_from_distributed(
     obj: UpdateWeightsFromDistributedReqInput, request: Request
 ):
@@ -766,11 +953,6 @@ async def update_weights_from_distributed(
         )
     )
 
-    # Update weight version if provided and weights update was successful
-    if success and obj.weight_version is not None:
-        _update_weight_version_if_provided(obj.weight_version)
-        message += f" Weight version updated to {obj.weight_version}."
-
     content = {"success": success, "message": message}
     if success:
         return ORJSONResponse(content, status_code=200)
@@ -778,7 +960,25 @@ async def update_weights_from_distributed(
         return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
 
 
+@app.post("/update_weights_from_ipc")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def update_weights_from_ipc(obj: UpdateWeightsFromIPCReqInput, request: Request):
+    """Update the weights from IPC (Inter-Process Communication) for checkpoint-engine integration."""
+    success, message = await _global_state.tokenizer_manager.update_weights_from_ipc(
+        obj, request
+    )
+
+    content = {"success": success, "message": message}
+    if success:
+        if _global_state.tokenizer_manager.initial_weights_loaded is False:
+            _global_state.tokenizer_manager.initial_weights_loaded = True
+        return ORJSONResponse(content)
+    else:
+        return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
+
+
 @app.post("/update_weight_version")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def update_weight_version(obj: UpdateWeightVersionReqInput, request: Request):
     """Update the weight version. This operation requires no active requests."""
     if obj.abort_all_requests:
@@ -809,6 +1009,7 @@ async def update_weight_version(obj: UpdateWeightVersionReqInput, request: Reque
 
 
 @app.api_route("/get_weights_by_name", methods=["GET", "POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def get_weights_by_name(obj: GetWeightsByNameReqInput, request: Request):
     """Get model parameter by name."""
     try:
@@ -822,6 +1023,7 @@ async def get_weights_by_name(obj: GetWeightsByNameReqInput, request: Request):
 
 
 @app.api_route("/release_memory_occupation", methods=["GET", "POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def release_memory_occupation(
     obj: ReleaseMemoryOccupationReqInput, request: Request
 ):
@@ -833,6 +1035,7 @@ async def release_memory_occupation(
 
 
 @app.api_route("/resume_memory_occupation", methods=["GET", "POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def resume_memory_occupation(
     obj: ResumeMemoryOccupationReqInput, request: Request
 ):
@@ -843,7 +1046,18 @@ async def resume_memory_occupation(
         return _create_error_response(e)
 
 
+@app.post("/weights_checker")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def check_weights(obj: CheckWeightsReqInput, request: Request):
+    success, message = await _global_state.tokenizer_manager.check_weights(obj, request)
+    return ORJSONResponse(
+        {"success": success, "message": message},
+        status_code=200 if success else HTTPStatus.BAD_REQUEST,
+    )
+
+
 @app.api_route("/slow_down", methods=["GET", "POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def slow_down(obj: SlowDownReqInput, request: Request):
     """Slow down the system deliberately. Only for testing. Example scenario:
     when we want to test performance of D in large-scale PD disaggregation and have no enough nodes for P,
@@ -857,6 +1071,7 @@ async def slow_down(obj: SlowDownReqInput, request: Request):
 
 
 @app.api_route("/load_lora_adapter", methods=["POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def load_lora_adapter(obj: LoadLoRAAdapterReqInput, request: Request):
     """Load a new LoRA adapter without re-launching the server."""
     result = await _global_state.tokenizer_manager.load_lora_adapter(obj, request)
@@ -873,7 +1088,23 @@ async def load_lora_adapter(obj: LoadLoRAAdapterReqInput, request: Request):
         )
 
 
+@app.api_route("/load_lora_adapter_from_tensors", methods=["POST"])
+async def load_lora_adapter_from_tensors(
+    obj: LoadLoRAAdapterFromTensorsReqInput, request: Request
+):
+    """Load a new LoRA adapter from tensors without re-launching the server."""
+    result = await _global_state.tokenizer_manager.load_lora_adapter_from_tensors(
+        obj, request
+    )
+
+    if result.success:
+        return ORJSONResponse(result, status_code=HTTPStatus.OK)
+    else:
+        return ORJSONResponse(result, status_code=HTTPStatus.BAD_REQUEST)
+
+
 @app.api_route("/unload_lora_adapter", methods=["POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def unload_lora_adapter(obj: UnloadLoRAAdapterReqInput, request: Request):
     """Load a new LoRA adapter without re-launching the server."""
     result = await _global_state.tokenizer_manager.unload_lora_adapter(obj, request)
@@ -915,6 +1146,7 @@ async def close_session(obj: CloseSessionReqInput, request: Request):
 
 
 @app.api_route("/configure_logging", methods=["GET", "POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def configure_logging(obj: ConfigureLoggingReq, request: Request):
     """Configure the request logging options."""
     _global_state.tokenizer_manager.configure_logging(obj)
@@ -922,6 +1154,7 @@ async def configure_logging(obj: ConfigureLoggingReq, request: Request):
 
 
 @app.post("/abort_request")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def abort_request(obj: AbortReq, request: Request):
     """Abort a request."""
     try:
@@ -976,9 +1209,10 @@ async def separate_reasoning_request(obj: SeparateReasoningReqInput, request: Re
 
 
 @app.post("/pause_generation")
-async def pause_generation(request: Request):
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def pause_generation(obj: PauseGenerationReqInput, request: Request):
     """Pause generation."""
-    await _global_state.tokenizer_manager.pause_generation()
+    await _global_state.tokenizer_manager.pause_generation(obj)
     return ORJSONResponse(
         content={"message": "Generation paused successfully.", "status": "ok"},
         status_code=200,
@@ -986,9 +1220,10 @@ async def pause_generation(request: Request):
 
 
 @app.post("/continue_generation")
-async def continue_generation(request: Request):
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def continue_generation(obj: ContinueGenerationReqInput, request: Request):
     """Continue generation."""
-    await _global_state.tokenizer_manager.continue_generation()
+    await _global_state.tokenizer_manager.continue_generation(obj)
     return ORJSONResponse(
         content={"message": "Generation continued successfully.", "status": "ok"},
         status_code=200,
@@ -1028,11 +1263,61 @@ async def openai_v1_embeddings(request: EmbeddingRequest, raw_request: Request):
     )
 
 
+@app.post(
+    "/v1/classify",
+    response_class=ORJSONResponse,
+    dependencies=[Depends(validate_json_request)],
+)
+async def openai_v1_classify(request: ClassifyRequest, raw_request: Request):
+    """OpenAI-compatible classification endpoint."""
+    return await raw_request.app.state.openai_serving_classify.handle_request(
+        request, raw_request
+    )
+
+
+@app.post(
+    "/v1/tokenize",
+    response_class=ORJSONResponse,
+    dependencies=[Depends(validate_json_request)],
+)
+@app.post(
+    "/tokenize",
+    response_class=ORJSONResponse,
+    dependencies=[Depends(validate_json_request)],
+    include_in_schema=False,
+)
+async def openai_v1_tokenize(request: TokenizeRequest, raw_request: Request):
+    """OpenAI-compatible tokenization endpoint."""
+    return await raw_request.app.state.openai_serving_tokenize.handle_request(
+        request, raw_request
+    )
+
+
+@app.post(
+    "/v1/detokenize",
+    response_class=ORJSONResponse,
+    dependencies=[Depends(validate_json_request)],
+)
+@app.post(
+    "/detokenize",
+    response_class=ORJSONResponse,
+    dependencies=[Depends(validate_json_request)],
+    include_in_schema=False,
+)
+async def openai_v1_detokenize(request: DetokenizeRequest, raw_request: Request):
+    """OpenAI-compatible detokenization endpoint."""
+    return await raw_request.app.state.openai_serving_detokenize.handle_request(
+        request, raw_request
+    )
+
+
 @app.get("/v1/models", response_class=ORJSONResponse)
 async def available_models():
     """Show available models. OpenAI-compatible endpoint."""
     served_model_names = [_global_state.tokenizer_manager.served_model_name]
     model_cards = []
+
+    # Add base model
     for served_model_name in served_model_names:
         model_cards.append(
             ModelCard(
@@ -1041,6 +1326,20 @@ async def available_models():
                 max_model_len=_global_state.tokenizer_manager.model_config.context_len,
             )
         )
+
+    # Add loaded LoRA adapters
+    if _global_state.tokenizer_manager.server_args.enable_lora:
+        lora_registry = _global_state.tokenizer_manager.lora_registry
+        for _, lora_ref in lora_registry.get_all_adapters().items():
+            model_cards.append(
+                ModelCard(
+                    id=lora_ref.lora_name,
+                    root=lora_ref.lora_path,
+                    parent=served_model_names[0],
+                    max_model_len=None,
+                )
+            )
+
     return ModelList(data=model_cards)
 
 
@@ -1123,6 +1422,42 @@ async def v1_rerank_request(request: V1RerankReqInput, raw_request: Request):
     )
 
 
+##### Ollama-compatible API endpoints #####
+
+
+@app.get(os.environ.get("SGLANG_OLLAMA_ROOT_ROUTE", "/"))
+@app.head(os.environ.get("SGLANG_OLLAMA_ROOT_ROUTE", "/"))
+async def ollama_root():
+    """Ollama-compatible root endpoint for health check."""
+    return "Ollama is running"
+
+
+@app.post(os.environ.get("SGLANG_OLLAMA_CHAT_ROUTE", "/api/chat"))
+async def ollama_chat(request: OllamaChatRequest, raw_request: Request):
+    """Ollama-compatible chat endpoint."""
+    return await raw_request.app.state.ollama_serving.handle_chat(request, raw_request)
+
+
+@app.post(os.environ.get("SGLANG_OLLAMA_GENERATE_ROUTE", "/api/generate"))
+async def ollama_generate(request: OllamaGenerateRequest, raw_request: Request):
+    """Ollama-compatible generate endpoint."""
+    return await raw_request.app.state.ollama_serving.handle_generate(
+        request, raw_request
+    )
+
+
+@app.get(os.environ.get("SGLANG_OLLAMA_TAGS_ROUTE", "/api/tags"))
+async def ollama_tags(raw_request: Request):
+    """Ollama-compatible list models endpoint."""
+    return raw_request.app.state.ollama_serving.get_tags()
+
+
+@app.post(os.environ.get("SGLANG_OLLAMA_SHOW_ROUTE", "/api/show"))
+async def ollama_show(request: OllamaShowRequest, raw_request: Request):
+    """Ollama-compatible show model info endpoint."""
+    return raw_request.app.state.ollama_serving.get_show(request.model)
+
+
 ## SageMaker API
 @app.get("/ping")
 async def sagemaker_health() -> Response:
@@ -1168,140 +1503,17 @@ async def vertex_generate(vertex_req: VertexGenerateReqInput, raw_request: Reque
     return ORJSONResponse({"predictions": ret})
 
 
-def _update_weight_version_if_provided(weight_version: Optional[str]) -> None:
-    """Update weight version if provided."""
-    if weight_version is not None:
-        _global_state.tokenizer_manager.server_args.weight_version = weight_version
-
-
 def _create_error_response(e):
     return ORJSONResponse(
         {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
     )
 
 
-def launch_server(
-    server_args: ServerArgs,
-    pipe_finish_writer: Optional[multiprocessing.connection.Connection] = None,
-    launch_callback: Optional[Callable[[], None]] = None,
-):
-    """
-    Launch SRT (SGLang Runtime) Server.
-
-    The SRT server consists of an HTTP server and an SRT engine.
-
-    - HTTP server: A FastAPI server that routes requests to the engine.
-    - The engine consists of three components:
-        1. TokenizerManager: Tokenizes the requests and sends them to the scheduler.
-        2. Scheduler (subprocess): Receives requests from the Tokenizer Manager, schedules batches, forwards them, and sends the output tokens to the Detokenizer Manager.
-        3. DetokenizerManager (subprocess): Detokenizes the output tokens and sends the result back to the Tokenizer Manager.
-
-    Note:
-    1. The HTTP server, Engine, and TokenizerManager both run in the main process.
-    2. Inter-process communication is done through IPC (each process uses a different port) via the ZMQ library.
-    """
-    if server_args.tokenizer_worker_num > 1:
-        port_args = PortArgs.init_new(server_args)
-        port_args.tokenizer_worker_ipc_name = (
-            f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
-        )
-        tokenizer_manager, template_manager, scheduler_info = _launch_subprocesses(
-            server_args=server_args, port_args=port_args
-        )
-    else:
-        tokenizer_manager, template_manager, scheduler_info = _launch_subprocesses(
-            server_args=server_args,
-        )
-
-        if server_args.enable_trace:
-            process_tracing_init(server_args.oltp_traces_endpoint, "sglang")
-            if server_args.disaggregation_mode == "null":
-                thread_label = "Tokenizer"
-                trace_set_thread_info(thread_label)
-
-    set_global_state(
-        _GlobalState(
-            tokenizer_manager=tokenizer_manager,
-            template_manager=template_manager,
-            scheduler_info=scheduler_info,
-        )
-    )
-
-    if server_args.tokenizer_worker_num > 1:
-        multi_tokenizer_args_shm = write_data_for_multi_tokenizer(
-            port_args,
-            server_args,
-            scheduler_info,
-        )
-    else:
-        # Add api key authorization
-        if server_args.api_key:
-            add_api_key_middleware(app, server_args.api_key)
-
-        # Add prometheus middleware
-        if server_args.enable_metrics:
-            add_prometheus_middleware(app)
-            enable_func_timer()
-
-        # Send a warmup request - we will create the thread launch it
-        # in the lifespan after all other warmups have fired.
-        warmup_thread = threading.Thread(
-            target=_wait_and_warmup,
-            args=(
-                server_args,
-                pipe_finish_writer,
-                launch_callback,
-            ),
-        )
-        app.warmup_thread = warmup_thread
-
-    try:
-        # Update logging configs
-        set_uvicorn_logging_configs()
-        app.server_args = server_args
-        # Listen for HTTP requests
-        if server_args.tokenizer_worker_num > 1:
-            from uvicorn.config import LOGGING_CONFIG
-
-            LOGGING_CONFIG["loggers"]["sglang.srt.entrypoints.http_server"] = {
-                "handlers": ["default"],
-                "level": "INFO",
-                "propagate": False,
-            }
-
-            monkey_patch_uvicorn_multiprocessing()
-
-            uvicorn.run(
-                "sglang.srt.entrypoints.http_server:app",
-                host=server_args.host,
-                port=server_args.port,
-                log_level=server_args.log_level_http or server_args.log_level,
-                timeout_keep_alive=5,
-                loop="uvloop",
-                workers=server_args.tokenizer_worker_num,
-            )
-        else:
-            app.is_single_tokenizer_mode = True
-            uvicorn.run(
-                app,
-                host=server_args.host,
-                port=server_args.port,
-                log_level=server_args.log_level_http or server_args.log_level,
-                timeout_keep_alive=5,
-                loop="uvloop",
-            )
-    finally:
-        if server_args.tokenizer_worker_num > 1:
-            multi_tokenizer_args_shm.unlink()
-            _global_state.tokenizer_manager.socket_mapping.clear_all_sockets()
-        else:
-            warmup_thread.join()
+# Minimal 32x32 black PNG (base64, GLM4v requires at least 32x32 sized image)
+MINIMUM_PNG_PICTURE_BASE64 = "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAACXBIWXMAAA7EAAAOxAGVKw4bAAAAbUlEQVRYhe3VsQ2AMAxE0Y/lIgNQULD/OqyCMgCihCKSG4yRuKuiNH6JLsoEbMACOGBcua9HOR7Y6w6swBwMy0qLTpkeI77qdEBpBFAHBBDAGH8WrwJKI4AAegUCfAKgEgpQDvh3CR3oQCuav58qlAw73kKCSgAAAABJRU5ErkJggg=="
 
 
-def _execute_server_warmup(
-    server_args: ServerArgs,
-    pipe_finish_writer: Optional[multiprocessing.connection.Connection],
-):
+def _execute_server_warmup(server_args: ServerArgs):
     headers = {}
     url = server_args.url()
     if server_args.api_key:
@@ -1312,7 +1524,7 @@ def _execute_server_warmup(
     for _ in range(120):
         time.sleep(1)
         try:
-            res = requests.get(url + "/get_model_info", timeout=5, headers=headers)
+            res = requests.get(url + "/model_info", timeout=5, headers=headers)
             assert res.status_code == 200, f"{res=}, {res.text=}"
             success = True
             break
@@ -1321,16 +1533,21 @@ def _execute_server_warmup(
             pass
 
     if not success:
-        if pipe_finish_writer is not None:
-            pipe_finish_writer.send(last_traceback)
         logger.error(f"Initialization failed. warmup error: {last_traceback}")
         kill_process_tree(os.getpid())
         return success
 
     model_info = res.json()
 
-    # Send a warmup request
-    request_name = "/generate" if model_info["is_generation"] else "/encode"
+    # Construct a warmup request
+    is_vlm = bool(model_info.get("has_image_understanding", False))
+    if model_info["is_generation"]:
+        if is_vlm and not server_args.skip_tokenizer_init:
+            request_name = "/v1/chat/completions"
+        else:
+            request_name = "/generate"
+    else:
+        request_name = "/encode"
     max_new_tokens = 8 if model_info["is_generation"] else 1
     json_data = {
         "sampling_params": {
@@ -1343,13 +1560,43 @@ def _execute_server_warmup(
         # TODO Workaround the bug that embedding errors for list of size 1
         if server_args.dp_size == 1:
             json_data["input_ids"] = json_data["input_ids"][0]
+    elif (
+        is_vlm
+        and server_args.disaggregation_mode == "null"
+        and model_info["is_generation"]
+    ):
+        # TODO: ChatCompletionRequest does not have bootstrap info required by disaggregation mode, disable image-warmup for now
+        # Only use chat completions format for generation models, not embedding models
+        json_data = {
+            "model": _global_state.tokenizer_manager.served_model_name,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/png;base64,{MINIMUM_PNG_PICTURE_BASE64}"
+                            },
+                        },
+                        {
+                            "type": "text",
+                            "text": "Describe the image.",
+                        },
+                    ],
+                }
+            ],
+            "max_tokens": max_new_tokens,
+            "stream": False,
+            "temperature": 0.0,
+        }
     else:
         json_data["text"] = ["The capital city of France is"] * server_args.dp_size
         # TODO Workaround the bug that embedding errors for list of size 1
         if server_args.dp_size == 1:
             json_data["text"] = json_data["text"][0]
 
-    # Debug dumping
+    # Config debug dumping
     if server_args.debug_tensor_dump_input_file:
         json_data.pop("text", None)
         json_data["input_ids"] = np.load(
@@ -1357,15 +1604,17 @@ def _execute_server_warmup(
         ).tolist()
         json_data["sampling_params"]["max_new_tokens"] = 0
 
+    # Send a warmup request
+    warmup_timeout = envs.SGLANG_WARMUP_TIMEOUT.get()
     try:
         if server_args.disaggregation_mode == "null":
             res = requests.post(
                 url + request_name,
                 json=json_data,
                 headers=headers,
-                timeout=600,
+                timeout=warmup_timeout if warmup_timeout > 0 else 600,
             )
-            assert res.status_code == 200, f"{res}"
+            assert res.status_code == 200, f"{res.text}"
             _global_state.tokenizer_manager.server_status = ServerStatus.Up
 
         else:
@@ -1383,13 +1632,15 @@ def _execute_server_warmup(
                     i * (2**63 // server_args.dp_size) + (i % server_args.tp_size)
                     for i in range(server_args.dp_size)
                 ],
-                "input_ids": [[0, 1, 2, 3]] * server_args.dp_size,
+                "input_ids": [[10, 11, 12, 13]] * server_args.dp_size,
             }
             res = requests.post(
                 url + request_name,
                 json=json_data,
                 headers=headers,
-                timeout=1800,  # because of deep gemm precache is very long if not precache.
+                timeout=(
+                    warmup_timeout if warmup_timeout > 0 else 1800
+                ),  # because of deep gemm precache is very long if not precache.
             )
             if res.status_code == 200:
                 logger.info(
@@ -1406,8 +1657,6 @@ def _execute_server_warmup(
 
     except Exception:
         last_traceback = get_exception_traceback()
-        if pipe_finish_writer is not None:
-            pipe_finish_writer.send(last_traceback)
         logger.error(f"Initialization failed. warmup error: {last_traceback}")
         kill_process_tree(os.getpid())
         return False
@@ -1419,22 +1668,21 @@ def _execute_server_warmup(
 
 def _wait_and_warmup(
     server_args: ServerArgs,
-    pipe_finish_writer: Optional[multiprocessing.connection.Connection],
     launch_callback: Optional[Callable[[], None]] = None,
+    execute_warmup_func: Callable = _execute_server_warmup,
 ):
+    if server_args.checkpoint_engine_wait_weights_before_ready:
+        _wait_weights_ready()
+
+    # Send a warmup request
     if not server_args.skip_server_warmup:
-        if not _execute_server_warmup(
-            server_args,
-            pipe_finish_writer,
-        ):
+        if not execute_warmup_func(server_args):
             return
     else:
         _global_state.tokenizer_manager.server_status = ServerStatus.Up
 
+    # The server is ready for requests
     logger.info("The server is fired up and ready to roll!")
-
-    if pipe_finish_writer is not None:
-        pipe_finish_writer.send("ready")
 
     if server_args.delete_ckpt_after_loading:
         delete_directory(server_args.model_path)
@@ -1444,3 +1692,157 @@ def _wait_and_warmup(
 
     if launch_callback is not None:
         launch_callback()
+
+
+def _wait_weights_ready():
+    """Wait for weights to be ready within the specified timeout."""
+    timeout = WAIT_WEIGHTS_READY_TIMEOUT
+    start_time = time.time()
+
+    for _ in range(timeout):
+        if _global_state.tokenizer_manager.initial_weights_loaded:
+            logger.info(
+                f"Weights are ready after {time.time() - start_time:.2f} seconds"
+            )
+            return
+        time.sleep(1)
+
+    # Timeout reached without weights being ready
+    logger.error(
+        f"Weights are not ready after waiting {timeout} seconds. "
+        f"Consider increasing SGLANG_WAIT_WEIGHTS_READY_TIMEOUT environment variable. "
+        f"Current status: initial_weights_loaded={_global_state.tokenizer_manager.initial_weights_loaded}"
+    )
+
+
+def launch_server(
+    server_args: ServerArgs,
+    init_tokenizer_manager_func: Callable = init_tokenizer_manager,
+    run_scheduler_process_func: Callable = run_scheduler_process,
+    run_detokenizer_process_func: Callable = run_detokenizer_process,
+    execute_warmup_func: Callable = _execute_server_warmup,
+    launch_callback: Optional[Callable[[], None]] = None,
+):
+    """
+    Launch SRT (SGLang Runtime) Server.
+
+    The SRT server consists of an HTTP server and an SRT engine.
+
+    - HTTP server: A FastAPI server that routes requests to the engine.
+    - The engine consists of three components:
+        1. TokenizerManager: Tokenizes the requests and sends them to the scheduler.
+        2. Scheduler (subprocess): Receives requests from the Tokenizer Manager, schedules batches, forwards them, and sends the output tokens to the Detokenizer Manager.
+        3. DetokenizerManager (subprocess): Detokenizes the output tokens and sends the result back to the Tokenizer Manager.
+
+    Note:
+    1. The HTTP server, Engine, and TokenizerManager all run in the main process.
+    2. Inter-process communication is done through IPC (each process uses a different port) via the ZMQ library.
+    """
+    # Launch subprocesses
+    tokenizer_manager, template_manager, scheduler_infos, port_args = (
+        _launch_subprocesses(
+            server_args=server_args,
+            init_tokenizer_manager_func=init_tokenizer_manager_func,
+            run_scheduler_process_func=run_scheduler_process_func,
+            run_detokenizer_process_func=run_detokenizer_process_func,
+        )
+    )
+
+    # Parse info got from the schedulers
+    remote_instance_transfer_engine_info = (
+        parse_remote_instance_transfer_engine_info_from_scheduler_infos(scheduler_infos)
+    )
+
+    # Set global states
+    set_global_state(
+        _GlobalState(
+            tokenizer_manager=tokenizer_manager,
+            template_manager=template_manager,
+            scheduler_info=scheduler_infos[0],
+            remote_instance_transfer_engine_info=remote_instance_transfer_engine_info,
+        )
+    )
+
+    if server_args.enable_metrics:
+        add_prometheus_track_response_middleware(app)
+
+    # Pass additional arguments to the lifespan function.
+    # They will be used for additional initialization setups.
+    if server_args.tokenizer_worker_num == 1:
+        # If it is single tokenizer mode, we can pass the arguments by attributes of the app object.
+        app.is_single_tokenizer_mode = True
+        app.server_args = server_args
+        app.warmup_thread_kwargs = dict(
+            server_args=server_args,
+            launch_callback=launch_callback,
+            execute_warmup_func=execute_warmup_func,
+        )
+
+        # Add api key authorization
+        # This is only supported in single tokenizer mode.
+        #
+        # Backward compatibility:
+        # - api_key only: behavior matches legacy (all endpoints require api_key)
+        # - no keys: legacy had no restriction; ADMIN_FORCE endpoints must still be rejected when
+        #   admin_api_key is not configured.
+        if (
+            server_args.api_key
+            or server_args.admin_api_key
+            or app_has_admin_force_endpoints(app)
+        ):
+            from sglang.srt.utils.auth import add_api_key_middleware
+
+            add_api_key_middleware(
+                app,
+                api_key=server_args.api_key,
+                admin_api_key=server_args.admin_api_key,
+            )
+    else:
+        # If it is multi-tokenizer mode, we need to write the arguments to shared memory
+        # for other worker processes to read.
+        app.is_single_tokenizer_mode = False
+        multi_tokenizer_args_shm = write_data_for_multi_tokenizer(
+            port_args, server_args, scheduler_infos[0]
+        )
+
+    try:
+        # Update logging configs
+        set_uvicorn_logging_configs()
+
+        # Listen for HTTP requests
+        if server_args.tokenizer_worker_num == 1:
+            # Default case, one tokenizer process
+            uvicorn.run(
+                app,
+                host=server_args.host,
+                port=server_args.port,
+                root_path=server_args.fastapi_root_path,
+                log_level=server_args.log_level_http or server_args.log_level,
+                timeout_keep_alive=5,
+                loop="uvloop",
+            )
+        else:
+            # Multiple tokenizer and http processes
+            from uvicorn.config import LOGGING_CONFIG
+
+            LOGGING_CONFIG["loggers"]["sglang.srt.entrypoints.http_server"] = {
+                "handlers": ["default"],
+                "level": "INFO",
+                "propagate": False,
+            }
+            monkey_patch_uvicorn_multiprocessing()
+
+            uvicorn.run(
+                "sglang.srt.entrypoints.http_server:app",
+                host=server_args.host,
+                port=server_args.port,
+                root_path=server_args.fastapi_root_path,
+                log_level=server_args.log_level_http or server_args.log_level,
+                timeout_keep_alive=5,
+                loop="uvloop",
+                workers=server_args.tokenizer_worker_num,
+            )
+    finally:
+        if server_args.tokenizer_worker_num > 1:
+            multi_tokenizer_args_shm.unlink()
+            _global_state.tokenizer_manager.socket_mapping.clear_all_sockets()

@@ -15,26 +15,18 @@
 """Qwen3Hybrid model configuration"""
 
 import enum
-import os
 
-import numpy as np
-import torch
 from transformers.configuration_utils import PretrainedConfig
-from transformers.modeling_rope_utils import rope_config_validation
 from transformers.utils import logging
 
-from sglang.srt.distributed.utils import divide
-from sglang.srt.layers.dp_attention import get_attention_tp_size
+from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
 
 logger = logging.get_logger(__name__)
 
 
-# NOTE: HybridLayerType
 class HybridLayerType(enum.Enum):
     full_attention = "attention"
-    swa_attention = "swa_attention"
     linear_attention = "linear_attention"
-    mamba2 = "mamba"
 
 
 class Qwen3NextConfig(PretrainedConfig):
@@ -233,7 +225,6 @@ class Qwen3NextConfig(PretrainedConfig):
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
         self.head_dim = head_dim
-        rope_config_validation(self)
 
         # linear attention (gdn now part)
         self.linear_conv_kernel_dim = linear_conv_kernel_dim
@@ -282,45 +273,17 @@ class Qwen3NextConfig(PretrainedConfig):
         ]
 
     @property
-    def hybrid_gdn_params(self):
-        world_size = get_attention_tp_size()
-        conv_dim = (
-            self.linear_key_head_dim * self.linear_num_key_heads * 2
-            + self.linear_value_head_dim * self.linear_num_value_heads
-        )
-        conv_state_shape = (
-            divide(conv_dim, world_size),
-            self.linear_conv_kernel_dim - 1,
+    def mamba2_cache_params(self) -> Mamba2CacheParams:
+        from sglang.srt.layers.dp_attention import get_attention_tp_size
+
+        shape = Mamba2StateShape.create(
+            tp_world_size=get_attention_tp_size(),
+            intermediate_size=self.linear_value_head_dim * self.linear_num_value_heads,
+            n_groups=self.linear_num_key_heads,
+            num_heads=self.linear_num_value_heads,
+            head_dim=self.linear_value_head_dim,
+            state_size=self.linear_key_head_dim,
+            conv_kernel=self.linear_conv_kernel_dim,
         )
 
-        temporal_state_shape = (
-            divide(self.linear_num_value_heads, world_size),
-            self.linear_key_head_dim,
-            self.linear_value_head_dim,
-        )
-        conv_dtype = torch.bfloat16
-        dtype_map = {
-            "float32": torch.float32,
-            "bfloat16": torch.bfloat16,
-        }
-        ssm_dtype = dtype_map[os.environ["SGLANG_MAMBA_SSM_DTYPE"]]
-        mamba_layers = self.linear_layer_ids
-        return (
-            conv_state_shape,
-            temporal_state_shape,
-            conv_dtype,
-            ssm_dtype,
-            mamba_layers,
-        )
-
-    @property
-    def mamba_cache_per_req(self):
-        conv_state_shape, temporal_state_shape, conv_dtype, ssm_dtype, mamba_layers = (
-            self.hybrid_gdn_params
-        )
-        mamba_layers_len = len(mamba_layers)
-
-        return (
-            int(np.prod(conv_state_shape)) * conv_dtype.itemsize
-            + int(np.prod(temporal_state_shape)) * ssm_dtype.itemsize
-        ) * mamba_layers_len
+        return Mamba2CacheParams(shape=shape, layers=self.linear_layer_ids)

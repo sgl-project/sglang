@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from typing import List, Optional
 
 import torch
-from sgl_kernel.utils import get_cuda_stream, is_arch_support_pdl
+from sgl_kernel.utils import is_arch_support_pdl
 
 
 # These implementations extensively draw from and build upon the FlashInfer project https://github.com/flashinfer-ai/flashinfer
@@ -263,6 +263,10 @@ class FusedSetKVBufferArg:
     cache_loc: torch.Tensor
 
 
+def _view_3d(x, head_size):
+    return x.view(x.shape[0], -1, head_size)
+
+
 def apply_rope_with_cos_sin_cache_inplace(
     positions: torch.Tensor,
     query: torch.Tensor,
@@ -317,31 +321,27 @@ def apply_rope_with_cos_sin_cache_inplace(
         assert a.v_scale is None, "v_scale is not yet supported"
         assert a.cache_loc.dtype == torch.int64, f"{a.cache_loc.dtype=}"
 
-    def _view_3d(x):
-        return x.view(x.shape[0], -1, head_size)
-
     torch.ops.sgl_kernel.apply_rope_pos_ids_cos_sin_cache.default(
-        _view_3d(query),
-        _view_3d(key),
-        _view_3d(query),
-        _view_3d(key),
+        _view_3d(query, head_size),
+        _view_3d(key, head_size),
+        _view_3d(query, head_size),
+        _view_3d(key, head_size),
         cos_sin_cache,
         positions.long(),
         (not is_neox),
         enable_pdl,
-        get_cuda_stream(),
         (
-            _view_3d(fused_set_kv_buffer_arg.value)
+            _view_3d(fused_set_kv_buffer_arg.value, head_size)
             if fused_set_kv_buffer_arg is not None
             else None
         ),
         (
-            _view_3d(fused_set_kv_buffer_arg.k_buffer)
+            _view_3d(fused_set_kv_buffer_arg.k_buffer, head_size)
             if fused_set_kv_buffer_arg is not None
             else None
         ),
         (
-            _view_3d(fused_set_kv_buffer_arg.v_buffer)
+            _view_3d(fused_set_kv_buffer_arg.v_buffer, head_size)
             if fused_set_kv_buffer_arg is not None
             else None
         ),
@@ -350,6 +350,19 @@ def apply_rope_with_cos_sin_cache_inplace(
             if fused_set_kv_buffer_arg is not None
             else None
         ),
+    )
+
+
+def rotary_embedding(
+    positions: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    head_size: int,
+    cos_sin_cache: torch.Tensor,
+    is_neox: bool = True,
+):
+    torch.ops.sgl_kernel.rotary_embedding.default(
+        positions, query, key, head_size, cos_sin_cache, is_neox
     )
 
 
@@ -365,11 +378,11 @@ def downcast_fp8(
     offset: int = 0,
 ) -> None:
     torch.ops.sgl_kernel.downcast_fp8(
-        k, v, k_out, v_out, k_scale, v_scale, loc, mult, offset, get_cuda_stream()
+        k, v, k_out, v_out, k_scale, v_scale, loc, mult, offset
     )
 
 
-def copy_to_gpu_no_ce(input: List[int], output: torch.Tensor):
+def copy_to_gpu_no_ce(input: torch.Tensor, output: torch.Tensor):
     torch.ops.sgl_kernel.copy_to_gpu_no_ce(input, output)
 
 
@@ -391,3 +404,35 @@ def concat_mla_absorb_q(
     )
     torch.ops.sgl_kernel.concat_mla_absorb_q(a, b, out)
     return out
+
+
+def timestep_embedding(
+    t: torch.Tensor,
+    dim: int,
+    flip_sin_to_cos: bool = False,
+    downscale_freq_shift: float = 0.0,
+    scale: float = 1,
+    max_period: int = 10000,
+    dtype: torch.dtype = torch.float32,
+):
+    """
+    Create sinusoidal timestep embeddings.
+
+    # TODO: review, output dtype always be float32. According to python code:
+    #  sglang/python/sglang/multimodal_gen/runtime/layers/visual_embedding.py
+
+    Args:
+        t: Tensor of shape [B] with timesteps
+        dim: Embedding dimension
+        max_period: Controls the minimum frequency of the embeddings
+
+    Returns:
+        Tensor of shape [B, dim] with embeddings
+    """
+    dtype = torch.float32
+
+    batch_size = t.shape[0]
+    output = torch.empty((batch_size, dim), dtype=dtype, device=t.device)
+    return torch.ops.sgl_kernel.timestep_embedding(
+        t, output, dim, flip_sin_to_cos, downscale_freq_shift, scale, max_period
+    )

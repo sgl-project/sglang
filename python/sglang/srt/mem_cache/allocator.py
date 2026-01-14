@@ -26,8 +26,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.mem_cache.memory_pool import SWAKVPool
-from sglang.srt.utils import get_bool_env_var, next_power_of_2
+from sglang.srt.utils import get_bool_env_var, get_num_new_pages, next_power_of_2
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
@@ -172,121 +171,6 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return self._kvcache.load_cpu_copy(kv_cache_cpu, indices)
 
 
-class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
-    """Allocator for SWA hybrid KV cache."""
-
-    def __init__(
-        self,
-        size: int,
-        size_swa: int,
-        dtype: torch.dtype,
-        device: str,
-        kvcache: SWAKVPool,
-        need_sort: bool,
-    ):
-        super().__init__(size, 1, dtype, device, kvcache, need_sort)
-        assert isinstance(kvcache, SWAKVPool)
-        self._size_full = size
-        self._size_swa = size_swa
-        self.full_attn_allocator = TokenToKVPoolAllocator(
-            size,
-            dtype,
-            device,
-            kvcache.full_kv_pool,
-            need_sort,
-        )
-        self.swa_attn_allocator = TokenToKVPoolAllocator(
-            size_swa,
-            dtype,
-            device,
-            kvcache.swa_kv_pool,
-            need_sort,
-        )
-        self.full_to_swa_index_mapping = torch.empty(
-            size + size_swa + 1,
-            dtype=torch.int64,
-            device=device,
-        )
-        self.clear()
-
-        self._kvcache.full_to_swa_index_mapping = self.full_to_swa_index_mapping
-
-    def available_size(self):
-        raise NotImplementedError()
-
-    def full_available_size(self):
-        return self.full_attn_allocator.available_size()
-
-    def swa_available_size(self):
-        return self.swa_attn_allocator.available_size()
-
-    @property
-    def size_full(self):
-        return self._size_full
-
-    @property
-    def size_swa(self):
-        return self._size_swa
-
-    def debug_print(self) -> str:
-        msg = ""
-        msg += f"#swa-available-size: {self.swa_attn_allocator.available_size()}, "
-        msg += (
-            f"#full-attn-available-size: {self.full_attn_allocator.available_size()}, "
-        )
-        return msg
-
-    def get_kvcache(self):
-        return self._kvcache
-
-    def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor):
-        assert self.full_to_swa_index_mapping is not None
-        return self.full_to_swa_index_mapping[kv_indices].to(torch.int32)
-
-    def alloc(self, need_size: int):
-        if need_size > self.full_attn_allocator.available_size():
-            return None
-        if need_size > self.swa_attn_allocator.available_size():
-            return None
-
-        alloc_full_indices = self.full_attn_allocator.alloc(need_size)
-        alloc_swa_indices = self.swa_attn_allocator.alloc(need_size)
-        self.full_to_swa_index_mapping[alloc_full_indices] = alloc_swa_indices
-        return alloc_full_indices
-
-    def free(self, free_index: torch.Tensor):
-        if free_index.numel() == 0:
-            return
-        if self.is_not_in_free_group:
-            self.full_attn_allocator.free(free_index)
-            self.free_swa(free_index)
-        else:
-            self.free_group.append(free_index)
-        assert (
-            self.full_attn_allocator.available_size() <= self.full_attn_allocator.size
-        )
-        assert self.swa_attn_allocator.available_size() <= self.swa_attn_allocator.size
-
-    def free_swa(self, free_index: torch.Tensor):
-        swa_indices = self.full_to_swa_index_mapping[free_index]
-        swa_indices = swa_indices[swa_indices > 0]
-        self.swa_attn_allocator.free(swa_indices)
-        self.full_to_swa_index_mapping[free_index] = 0
-
-    def backup_state(self):
-        raise NotImplementedError
-
-    def restore_state(self, state):
-        raise NotImplementedError
-
-    def clear(self):
-        self.swa_attn_allocator.clear()
-        self.full_attn_allocator.clear()
-        self.full_to_swa_index_mapping.fill_(0)
-        self.is_not_in_free_group = True
-        self.free_group = []
-
-
 @triton.jit
 def alloc_extend_kernel(
     pre_lens_ptr,
@@ -294,7 +178,6 @@ def alloc_extend_kernel(
     last_loc_ptr,
     free_page_ptr,
     out_indices,
-    ret_values,
     bs_upper: tl.constexpr,
     page_size: tl.constexpr,
     max_num_extend_tokens: tl.constexpr,
@@ -322,13 +205,6 @@ def alloc_extend_kernel(
     ) // page_size
     sum_num_new_pages = tl.sum(num_new_pages)
     new_page_start_loc = sum_num_new_pages - num_page_start_loc_self
-
-    # Return value
-    if pid == tl.num_programs(0) - 1:
-        merged_value = (sum_num_new_pages.to(tl.int64)) << 32 | sum_extend_lens.to(
-            tl.int64
-        )
-        tl.store(ret_values, merged_value)
 
     # Part 1: fill the old partial page
     last_loc = tl.load(last_loc_ptr + pid)
@@ -381,7 +257,6 @@ def alloc_decode_kernel(
     last_loc_ptr,
     free_page_ptr,
     out_indices,
-    ret_values,
     bs_upper: tl.constexpr,
     page_size: tl.constexpr,
 ):
@@ -403,10 +278,6 @@ def alloc_decode_kernel(
     ) // page_size
     sum_num_new_pages = tl.sum(num_new_pages)
     new_page_start_loc = sum_num_new_pages - num_page_start_loc_self
-
-    # Return value
-    if pid == tl.num_programs(0) - 1:
-        tl.store(ret_values, sum_num_new_pages)
 
     if num_page_start_loc_self == 0:
         last_loc = tl.load(last_loc_ptr + pid)
@@ -438,7 +309,6 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         super().__init__(size, page_size, dtype, device, kvcache, need_sort)
         self.num_pages = size // page_size
         self.debug_mode = get_bool_env_var("SGLANG_DEBUG_MEMORY_POOL")
-        self.ret_values = torch.empty((), dtype=torch.int64, device=self.device)
         self.seen_max_num_extend_tokens_next_power_of_2 = 1
         self.clear()
 
@@ -468,7 +338,9 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def alloc_extend(
         self,
         prefix_lens: torch.Tensor,
+        prefix_lens_cpu: torch.Tensor,
         seq_lens: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
         last_loc: torch.Tensor,
         extend_num_tokens: int,
     ):
@@ -497,7 +369,6 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             last_loc,
             self.free_pages,
             out_indices,
-            self.ret_values,
             next_power_of_2(bs),
             self.page_size,
             self.seen_max_num_extend_tokens_next_power_of_2,
@@ -506,8 +377,11 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if self.debug_mode:
             assert len(torch.unique(out_indices)) == len(out_indices)
 
-        merged_value = self.ret_values.item()
-        num_new_pages = merged_value >> 32
+        num_new_pages = get_num_new_pages(
+            seq_lens=seq_lens_cpu,
+            page_size=self.page_size,
+            prefix_lens=prefix_lens_cpu,
+        )
         if num_new_pages > len(self.free_pages):
             return None
 
@@ -517,6 +391,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def alloc_decode(
         self,
         seq_lens: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
         last_loc: torch.Tensor,
     ):
         if self.debug_mode:
@@ -534,7 +409,6 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             last_loc,
             self.free_pages,
             out_indices,
-            self.ret_values,
             next_power_of_2(bs),
             self.page_size,
         )
@@ -542,7 +416,11 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if self.debug_mode:
             assert len(torch.unique(out_indices)) == len(out_indices)
 
-        num_new_pages = self.ret_values.item()
+        num_new_pages = get_num_new_pages(
+            seq_lens=seq_lens_cpu,
+            page_size=self.page_size,
+            decode=True,
+        )
         if num_new_pages > len(self.free_pages):
             return None
 

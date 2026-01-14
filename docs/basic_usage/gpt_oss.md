@@ -43,7 +43,12 @@ export PYTHON_EXECUTION_BACKEND=UV
 
 Launch the server with the demo tool server:
 
-`python3 -m sglang.launch_server --model-path openai/gpt-oss-120b --tool-server demo --tp 2`
+```bash
+python3 -m sglang.launch_server \
+  --model-path openai/gpt-oss-120b \
+  --tool-server demo \
+  --tp 2
+```
 
 For production usage, sglang can act as an MCP client for multiple services. An [example tool server](https://github.com/openai/gpt-oss/tree/main/gpt-oss-mcp-server) is provided. Start the servers and point sglang to them:
 ```bash

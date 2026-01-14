@@ -36,6 +36,8 @@ class EvalArgs:
     profile: bool = False
     profile_number: int = 5
     concurrency: int = 1
+    max_new_tokens: Optional[int] = None
+    temperature: Optional[float] = None
     response_answer_regex: str = "(.*)"
     lora_path: Optional[str] = None
 
@@ -93,6 +95,18 @@ class EvalArgs:
             type=int,
             default=EvalArgs.concurrency,
             help="Number of concurrent requests to make during evaluation. Default is 1, which means no concurrency.",
+        )
+        parser.add_argument(
+            "--max-new-tokens",
+            type=int,
+            default=EvalArgs.max_new_tokens,
+            help="Maximum number of new tokens to generate per sample.",
+        )
+        parser.add_argument(
+            "--temperature",
+            type=float,
+            default=EvalArgs.temperature,
+            help="Sampling temperature for generation.",
         )
         parser.add_argument(
             "--response-answer-regex",
@@ -234,18 +248,20 @@ def prepare_samples(eval_args: EvalArgs):
 
 
 def get_sampling_params(eval_args):
-    max_new_tokens = 30
-    temperature = 0.001
-
     extra_request_body = {}
     if eval_args.extra_request_body:
         extra_request_body = json.loads(eval_args.extra_request_body)
-
-    return {
-        "temperature": temperature,
-        "max_new_tokens": max_new_tokens,
+    sampling_params = {
         **extra_request_body,
     }
+
+    if eval_args.max_new_tokens is not None and eval_args.max_new_tokens > 0:
+        sampling_params.update({"max_completion_tokens": eval_args.max_new_tokens})
+
+    if eval_args.temperature is not None:
+        sampling_params.update({"temperature": eval_args.temperature})
+
+    return sampling_params
 
 
 # ----------- Process Multi-choice -------------
