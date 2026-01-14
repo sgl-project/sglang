@@ -109,7 +109,7 @@ class RocmPlatform(Platform):
             logger.info("Using AITer backend on ROCm.")
             return "sglang.multimodal_gen.runtime.layers.attention.backends.aiter.AITerBackend"
 
-        if selected_backend == AttentionBackendEnum.SLIDING_TILE_ATTN:
+        elif selected_backend == AttentionBackendEnum.SLIDING_TILE_ATTN:
             try:
                 from fastvideo_kernel import sliding_tile_attention  # noqa: F401
 
