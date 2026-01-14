@@ -38,6 +38,5 @@ class TestQwen3Next(GSM8KMixin, MambaSchedulerStrategyMixin, DefaultServerBase):
         self._test_prefix_cache_branching_helper(64)
 
 
-
 if __name__ == "__main__":
     unittest.main()

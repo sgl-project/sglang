@@ -280,7 +280,9 @@ class MambaAttnBackendBase(AttentionBackend):
                      flattened positions into the packed input tensor.
         """
         conv_state_len = self.conv_states_shape[-1]
-        chunk_size = getattr(self, "mamba_chunk_size", get_global_server_args().mamba_cache_chunk_size)
+        chunk_size = getattr(
+            self, "mamba_chunk_size", get_global_server_args().mamba_cache_chunk_size
+        )
 
         # Calculate the end position of the last aligned chunk
         lens_to_track = (
@@ -340,7 +342,9 @@ class MambaAttnBackendBase(AttentionBackend):
             track_ssm_final_src: Source indices into last_recurrent_state buffer (for aligned seqs)
             track_ssm_final_dst: Destination cache slot indices (for aligned seqs)
         """
-        chunk_size = getattr(self, "mamba_chunk_size", get_global_server_args().mamba_cache_chunk_size)
+        chunk_size = getattr(
+            self, "mamba_chunk_size", get_global_server_args().mamba_cache_chunk_size
+        )
         # Move to CPU to avoid kernel launches for masking operations
         mamba_track_mask = forward_batch.mamba_track_mask.cpu()
         extend_seq_lens = forward_batch.extend_seq_lens.cpu()
