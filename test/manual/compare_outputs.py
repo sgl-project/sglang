@@ -8,7 +8,6 @@ os.environ["SGLANG_DISABLE_CUDNN_CHECK"] = "1"
 import gc
 from io import BytesIO
 
-import numpy as np
 import requests
 import torch
 from PIL import Image

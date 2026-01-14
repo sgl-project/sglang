@@ -19,14 +19,12 @@ Requirements:
 
 import argparse
 import gc
-import os
 import statistics
 import time
 from dataclasses import dataclass
 from io import BytesIO
 from typing import List, Optional, Tuple
 
-import numpy as np
 import requests
 import torch
 from PIL import Image
