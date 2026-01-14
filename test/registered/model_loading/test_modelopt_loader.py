@@ -26,6 +26,7 @@ CALIBRATION_NUM_SAMPLES = 512
 DEFAULT_DEVICE = "cuda:0"
 
 register_cuda_ci(est_time=11, suite="stage-b-test-small-1-gpu")
+register_cuda_ci(est_time=8, suite="stage-b-test-small-1-gpu-5090")
 
 
 class TestModelOptModelLoader(CustomTestCase):

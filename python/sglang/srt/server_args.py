@@ -370,6 +370,7 @@ class ServerArgs:
 
     # API related
     api_key: Optional[str] = None
+    admin_api_key: Optional[str] = None
     served_model_name: Optional[str] = None
     weight_version: str = "default"
     chat_template: Optional[str] = None
@@ -1090,7 +1091,7 @@ class ServerArgs:
                     self.attention_backend = "nsa"
                     logger.info("Use nsa attention backend for DeepSeek with DSA.")
 
-                if not is_npu():  # CUDA GPU
+                if not is_npu():  # CUDA or ROCm GPU
                     if self.enable_nsa_prefill_context_parallel:
                         logger.warning(
                             f"Context parallel feature is still under experiment. It has only been verified on Hopper platform."
@@ -1126,8 +1127,15 @@ class ServerArgs:
                                 f"attn_tp_size={self.tp_size}, attention weights will be sharded across {self.tp_size} ranks."
                             )
 
-                    self.page_size = 64
-                    logger.warning("Setting page size to 64 for DeepSeek DSA.")
+                    if is_hip():
+                        self.page_size = 1
+                        logger.warning(
+                            "Setting page size to 1 for DeepSeek DSA on ROCm."
+                        )
+                    else:
+                        # For CUDA GPU
+                        self.page_size = 64
+                        logger.warning("Setting page size to 64 for DeepSeek DSA.")
 
                     # For Hopper, we support both bf16 and fp8 kv cache; for Blackwell, we support fp8 only currently
                     import torch
@@ -3242,6 +3250,15 @@ class ServerArgs:
             type=str,
             default=ServerArgs.api_key,
             help="Set API key of the server. It is also used in the OpenAI API compatible server.",
+        )
+        parser.add_argument(
+            "--admin-api-key",
+            type=str,
+            default=ServerArgs.admin_api_key,
+            help=(
+                "Set admin API key for sensitive management endpoints (e.g. /clear_hicache_storage_backend). "
+                "When set, admin endpoints require this key and do NOT accept --api-key."
+            ),
         )
         parser.add_argument(
             "--served-model-name",
