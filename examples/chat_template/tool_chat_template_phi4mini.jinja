@@ -1,0 +1,74 @@
+{% if not add_generation_prompt is defined %}
+  {% set add_generation_prompt = false %}
+{% endif %}
+
+{%- set ns = namespace(system_prompt='', has_system=false) -%}
+
+{#- Collect system messages -#}
+{%- for message in messages %}
+  {%- if message['role'] == 'system' %}
+    {%- if ns.has_system %}
+      {%- set ns.system_prompt = ns.system_prompt + '\n\n' + message['content'] %}
+    {%- else %}
+      {%- set ns.system_prompt = message['content'] %}
+      {%- set ns.has_system = true %}
+    {%- endif %}
+  {%- endif %}
+{%- endfor %}
+
+{#- Add tools to system prompt if provided (following Microsoft Phi-4 official format) -#}
+{% if tools is defined and tools is not none and tools|length > 0 %}
+  {%- if not ns.has_system %}
+    {%- set ns.system_prompt = 'You are a helpful assistant with access to the following functions:' %}
+    {%- set ns.has_system = true %}
+  {%- else %}
+    {%- set ns.system_prompt = ns.system_prompt + '\n\nYou have access to the following functions:' %}
+  {%- endif %}
+  {%- for tool in tools %}
+    {%- set ns.system_prompt = ns.system_prompt + '\n\n' + (tool.function | tojson) %}
+  {%- endfor %}
+  {%- set ns.system_prompt = ns.system_prompt + '\n\nTo use a function, respond with:\nfunctools[{"name": "function_name", "arguments": {...}}]\n\nFor multiple function calls:\nfunctools[{"name": "func1", "arguments": {...}}, {"name": "func2", "arguments": {...}}]' %}
+{%- endif %}
+
+{#- Start building the prompt -#}
+{%- if ns.system_prompt %}
+<|system|>
+{{ ns.system_prompt }}<|end|>
+{%- endif %}
+
+{#- Process conversation messages -#}
+{%- for message in messages %}
+  {%- if message['role'] == 'user' %}
+<|user|>
+{{ message['content'] }}<|end|>
+  {%- elif message['role'] == 'assistant' %}
+    {%- if message.get('tool_calls') %}
+      {#- Assistant message with tool calls -#}
+<|assistant|>
+      {%- if message.get('content') %}
+{{ message['content'] }}
+      {%- endif %}
+functools[
+      {%- for tool_call in message['tool_calls'] %}
+        {%- set formatted_args = tool_call['function']['arguments'] if tool_call['function']['arguments'] is string else tool_call['function']['arguments']|tojson %}
+{"name": "{{ tool_call['function']['name'] }}", "arguments": {{ formatted_args }}}
+        {%- if not loop.last %}, {% endif %}
+      {%- endfor %}
+]<|end|>
+    {%- else %}
+      {#- Normal assistant message -#}
+<|assistant|>
+{{ message['content'] }}<|end|>
+    {%- endif %}
+  {%- elif message['role'] == 'tool' %}
+    {#- Tool response message -#}
+<|user|>
+Tool response for {{ message.get('name', 'function') }}:
+{{ message['content'] }}<|end|>
+  {%- endif %}
+{%- endfor %}
+
+{#- Add generation prompt if requested -#}
+{%- if add_generation_prompt %}
+<|assistant|>
+{%- endif %}
