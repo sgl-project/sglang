@@ -130,4 +130,3 @@ Sample 5:
 **Out of memory errors**
 - Reduce `--concurrency` to lower GPU memory usage
 - Use a smaller Whisper model variant
-

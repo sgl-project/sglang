@@ -473,7 +473,9 @@ class ModelConfig:
             # - Decoder cross-attention: encoder_layers+decoder_layers to encoder_layers+2*decoder_layers-1
             # Even though cross-attention doesn't save KV cache, attention backend needs buffer to exist
             encoder_layers = getattr(self.hf_text_config, "encoder_layers", 0)
-            decoder_layers = getattr(self.hf_text_config, "decoder_layers", self.num_hidden_layers)
+            decoder_layers = getattr(
+                self.hf_text_config, "decoder_layers", self.num_hidden_layers
+            )
             self.num_attention_layers = encoder_layers + 2 * decoder_layers
         self.num_nextn_predict_layers = getattr(
             self.hf_text_config, "num_nextn_predict_layers", None

@@ -3,6 +3,7 @@ from typing import Any, Iterable, List, Optional, Tuple
 import torch
 from transformers import WhisperConfig
 
+from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.activation import get_act_fn
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -13,7 +14,6 @@ from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorO
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
-from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.managers.schedule_batch import MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
@@ -40,7 +40,9 @@ class WhisperAttention(torch.nn.Module):
 
         # Get tensor parallel size for head partitioning
         tp_size = get_tensor_model_parallel_world_size()
-        assert num_heads % tp_size == 0, f"num_heads ({num_heads}) must be divisible by tp_size ({tp_size})"
+        assert (
+            num_heads % tp_size == 0
+        ), f"num_heads ({num_heads}) must be divisible by tp_size ({tp_size})"
         self.num_heads = num_heads // tp_size  # TP-divided num_heads for RadixAttention
 
         if (head_dim * num_heads) != embed_dim:
@@ -53,7 +55,7 @@ class WhisperAttention(torch.nn.Module):
         # Store head_dim and kv_size for cross-attention forward pass
         self.head_dim = head_dim
         self.kv_size = self.num_heads * head_dim  # TP-divided kv_size
-        
+
         if is_cross_attention:
             # For cross-attention: Q comes from decoder, K/V come from encoder
             self.q_proj = ColumnParallelLinear(
@@ -153,19 +155,25 @@ class WhisperAttention(torch.nn.Module):
                     if is_decode:
                         # Decode: each request contributes 1 decoder token
                         # q[i] should attend to k[i*enc_len:(i+1)*enc_len]
-                        mask = torch.zeros((q_len, kv_len), device=q.device, dtype=torch.bool)
+                        mask = torch.zeros(
+                            (q_len, kv_len), device=q.device, dtype=torch.bool
+                        )
                         for i in range(batch_size):
                             enc_start = i * encoder_len_per_request
                             enc_end = (i + 1) * encoder_len_per_request
                             mask[i, enc_start:enc_end] = True
                         # Apply mask: positions with False get -inf
-                        attn_weights = attn_weights.masked_fill(~mask.unsqueeze(0), float('-inf'))
+                        attn_weights = attn_weights.masked_fill(
+                            ~mask.unsqueeze(0), float("-inf")
+                        )
                     else:
                         # Prefill: need seq_lens to determine decoder token boundaries
                         seq_lens = forward_batch.seq_lens
                         if seq_lens is not None and len(seq_lens) == batch_size:
                             seq_lens_list = seq_lens.tolist()
-                            mask = torch.zeros((q_len, kv_len), device=q.device, dtype=torch.bool)
+                            mask = torch.zeros(
+                                (q_len, kv_len), device=q.device, dtype=torch.bool
+                            )
                             q_start = 0
                             for i, dec_len in enumerate(seq_lens_list):
                                 enc_start = i * encoder_len_per_request
@@ -173,7 +181,9 @@ class WhisperAttention(torch.nn.Module):
                                 q_end = q_start + dec_len
                                 mask[q_start:q_end, enc_start:enc_end] = True
                                 q_start = q_end
-                            attn_weights = attn_weights.masked_fill(~mask.unsqueeze(0), float('-inf'))
+                            attn_weights = attn_weights.masked_fill(
+                                ~mask.unsqueeze(0), float("-inf")
+                            )
 
             attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1)
 
@@ -197,20 +207,24 @@ class WhisperAttention(torch.nn.Module):
 
                 batch_size, seq_len, _ = hidden_states.shape
                 # Reshape: [batch, seq_len, embed_dim] -> [batch, seq_len, num_heads, head_dim]
-                q = q.view(batch_size, seq_len, num_heads, head_dim).permute(0, 2, 1, 3)  # [batch, num_heads, seq_len, head_dim]
+                q = q.view(batch_size, seq_len, num_heads, head_dim).permute(
+                    0, 2, 1, 3
+                )  # [batch, num_heads, seq_len, head_dim]
                 k = k.view(batch_size, seq_len, num_heads, head_dim).permute(0, 2, 1, 3)
                 v = v.view(batch_size, seq_len, num_heads, head_dim).permute(0, 2, 1, 3)
 
                 # Use PyTorch's scaled_dot_product_attention for efficiency
-                attn_output = torch.nn.functional.scaled_dot_product_attention(q, k, v, scale=1.0)  # scaling already applied to q
+                attn_output = torch.nn.functional.scaled_dot_product_attention(
+                    q, k, v, scale=1.0
+                )  # scaling already applied to q
 
                 # [batch, num_heads, seq_len, head_dim] -> [batch, seq_len, embed_dim]
-                attn_output = attn_output.permute(0, 2, 1, 3).reshape(batch_size, seq_len, num_heads * head_dim)
+                attn_output = attn_output.permute(0, 2, 1, 3).reshape(
+                    batch_size, seq_len, num_heads * head_dim
+                )
             else:
                 # For decoder self-attention: use RadixAttention with KV cache
-                attn_output = self.attn(
-                    q, k, v, forward_batch, save_kv_cache=True
-                )
+                attn_output = self.attn(q, k, v, forward_batch, save_kv_cache=True)
 
         attn_output, _ = self.out_proj(attn_output)
 
@@ -288,7 +302,9 @@ class WhisperDecoderLayer(torch.nn.Module):
         # Decoder self-attention uses encoder_layers to encoder_layers + decoder_layers - 1
         # Decoder cross-attention uses encoder_layers + decoder_layers to encoder_layers + 2*decoder_layers - 1
         decoder_self_attn_layer_id = config.encoder_layers + layer_id
-        decoder_cross_attn_layer_id = config.encoder_layers + config.decoder_layers + layer_id
+        decoder_cross_attn_layer_id = (
+            config.encoder_layers + config.decoder_layers + layer_id
+        )
 
         self.self_attn = WhisperAttention(
             embed_dim=self.embed_dim,
@@ -489,7 +505,7 @@ class WhisperForConditionalGeneration(torch.nn.Module):
         params_dict = dict(self.named_parameters())
 
         weights_dict = dict(weights)
-        
+
         # Create fake zeros bias for k_proj in cross-attention (Whisper has no k_proj bias)
         for layer_idx in range(self.config.decoder_layers):
             layer_prefix = f"model.decoder.layers.{layer_idx}.encoder_attn."
@@ -499,7 +515,7 @@ class WhisperForConditionalGeneration(torch.nn.Module):
                 bias_key = layer_prefix + "k_proj.bias"
                 if bias_key not in weights_dict:
                     weights_dict[bias_key] = torch.zeros(k_proj_weight.size(0))
-        
+
         # Tie proj_out weights to embed_tokens
         weights_dict["proj_out.weight"] = weights_dict[
             "model.decoder.embed_tokens.weight"
@@ -507,7 +523,7 @@ class WhisperForConditionalGeneration(torch.nn.Module):
 
         for name, loaded_weight in weights_dict.items():
             name = name.replace("model.", "")
-            
+
             # Handle stacked params (qkv_proj and kv_proj)
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
@@ -564,7 +580,11 @@ class WhisperForConditionalGeneration(torch.nn.Module):
 
             # Access per-request multimodal inputs instead of merged
             mm_inputs_list = forward_batch.mm_inputs if forward_batch.mm_inputs else []
-            req_indices = forward_batch.req_pool_indices.tolist() if forward_batch.req_pool_indices is not None else []
+            req_indices = (
+                forward_batch.req_pool_indices.tolist()
+                if forward_batch.req_pool_indices is not None
+                else []
+            )
 
             # Process each request's audio separately and cache
             for req_idx, mm_input in zip(req_indices, mm_inputs_list):
