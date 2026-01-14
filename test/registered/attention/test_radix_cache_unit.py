@@ -21,6 +21,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 
 # CPU-based unit test, runs quickly on any GPU runner
 register_cuda_ci(est_time=5, suite="stage-b-test-small-1-gpu")
+register_cuda_ci(est_time=7, suite="stage-b-test-small-1-gpu-5090")
 
 import time
 import unittest
