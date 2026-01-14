@@ -278,7 +278,16 @@ impl WasmThreadPool {
                 return;
             }
         };
-
+        let mut linker = Linker::<WasiState>::new(&engine);
+        if let Err(e) = wasmtime_wasi::p2::add_to_linker_async(&mut linker) {
+            error!(
+                target: "smg::wasm::runtime",
+                worker_id = worker_id,
+                "Failed to add WASI to linker: {}",
+                e
+            );
+            return;
+        }
         let cache_capacity =
             NonZeroUsize::new(config.module_cache_size).unwrap_or(NonZeroUsize::new(10).unwrap());
         let mut component_cache: LruCache<Vec<u8>, Component> = LruCache::new(cache_capacity);
@@ -326,6 +335,7 @@ impl WasmThreadPool {
                 } => {
                     let result = Self::execute_component_in_worker(
                         &engine,
+                        &linker,
                         &mut component_cache, // Pass the cache
                         wasm_bytes,
                         attach_point,
@@ -342,6 +352,7 @@ impl WasmThreadPool {
 
     async fn execute_component_in_worker(
         engine: &Engine,
+        linker: &Linker<WasiState>,
         cache: &mut LruCache<Vec<u8>, Component>, //  cache argument
         wasm_bytes: Vec<u8>,
         attach_point: WasmModuleAttachPoint,
@@ -367,8 +378,6 @@ impl WasmThreadPool {
             comp
         };
 
-        let mut linker = Linker::<WasiState>::new(engine);
-        wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
         let mut builder = WasiCtx::builder();
 
         // Create memory limits from config.
@@ -420,7 +429,7 @@ impl WasmThreadPool {
                 };
 
                 // Instantiate component (must use async instantiation when async support is enabled)
-                let bindings = SglModelGateway::instantiate_async(&mut store, &component, &linker)
+                let bindings = SglModelGateway::instantiate_async(&mut store, &component, linker)
                     .await
                     .map_err(|e| {
                         WasmError::from(WasmRuntimeError::InstanceCreateFailed(e.to_string()))
@@ -448,7 +457,7 @@ impl WasmThreadPool {
                 };
 
                 // Instantiate component (must use async instantiation when async support is enabled)
-                let bindings = SglModelGateway::instantiate_async(&mut store, &component, &linker)
+                let bindings = SglModelGateway::instantiate_async(&mut store, &component, linker)
                     .await
                     .map_err(|e| {
                         WasmError::from(WasmRuntimeError::InstanceCreateFailed(e.to_string()))
