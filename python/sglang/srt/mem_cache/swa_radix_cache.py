@@ -358,6 +358,7 @@ class SWARadixCache(BasePrefixCache):
             self.init_metrics_collector()
 
         self.sliding_window_size = sliding_window_size
+        self.window_size = self.sliding_window_size
         self.reset()
 
     ##### Public API #####
@@ -415,7 +416,13 @@ class SWARadixCache(BasePrefixCache):
             last_host_node=last_node,
         )
 
-    def insert(self, key: RadixKey, value=None, prev_prefix_len: int = 0) -> int:
+    def insert(
+        self,
+        key: RadixKey,
+        value=None,
+        prev_prefix_len: int = 0,
+        evicted_seqlen: int = 0,
+    ) -> int:
         if self.disable:
             return 0
 
@@ -428,7 +435,9 @@ class SWARadixCache(BasePrefixCache):
             # Make sure the value len equal to the EAGLE bigram key len
             value = value[: len(key)]
 
-        return self._insert_helper(self.root_node, key, value, prev_prefix_len)
+        return self._insert_helper(
+            self.root_node, key, value, prev_prefix_len, evicted_seqlen
+        )
 
     def cache_finished_req(self, req: Req, is_insert: bool = True) -> None:
         """Cache request when it finishes."""
@@ -478,6 +487,7 @@ class SWARadixCache(BasePrefixCache):
                 RadixKey(token_ids[:page_aligned_token_len], req.extra_key),
                 page_aligned_kv_indices,
                 old_prefix_len,
+                req.evicted_seqlen_local,
             )
         else:
             self.token_to_kv_pool_allocator.free(
@@ -672,6 +682,27 @@ class SWARadixCache(BasePrefixCache):
                 x = x_next
 
         self.update_eviction_metrics(full_num_evicted + swa_num_evicted, start_time)
+
+    def evict_swa(self, req: Req, pre_len: int) -> None:
+        # evict the swa tokens that not in the tree cache and also not in the sliding window
+        req.evicted_seqlen_local = max(
+            req.evicted_seqlen_local, req.cache_protected_len
+        )
+        new_evicted_seqlen_local = max(
+            req.evicted_seqlen_local, pre_len - self.sliding_window_size
+        )
+
+        if self.page_size > 1:
+            new_evicted_seqlen_local = (
+                new_evicted_seqlen_local // self.page_size
+            ) * self.page_size
+
+        if new_evicted_seqlen_local > req.evicted_seqlen_local:
+            free_slots = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, req.evicted_seqlen_local : new_evicted_seqlen_local
+            ]
+            self.token_to_kv_pool_allocator.free_swa(free_slots)
+            req.evicted_seqlen_local = new_evicted_seqlen_local
 
     def inc_lock_ref(self, node: TreeNode) -> Optional[int]:
         """
@@ -902,7 +933,12 @@ class SWARadixCache(BasePrefixCache):
         return new_node
 
     def _insert_helper(
-        self, node: TreeNode, key: RadixKey, value, update_kv_after_len: int
+        self,
+        node: TreeNode,
+        key: RadixKey,
+        value,
+        update_kv_after_len: int,
+        evicted_seqlen: int = 0,
     ) -> int:
         # Update the last access time from root to leaf, so that
         # swa will tombstone the node closer to root first
@@ -935,7 +971,7 @@ class SWARadixCache(BasePrefixCache):
             # the prefill prefix matching will stuck.
             if update_kv_after_len < total_prefix_length + prefix_len:
                 first_diff_idx = max(0, update_kv_after_len - total_prefix_length)
-                if node.swa_tombstone:
+                if node.swa_tombstone and evicted_seqlen < total_prefix_length:
                     assert (
                         node.swa_lock_ref == 0
                     ), f"tombstone swa_lock_ref should always be 0, {node.full_lock_ref=}, {node.swa_lock_ref=}, {node.id=}"
@@ -960,16 +996,39 @@ class SWARadixCache(BasePrefixCache):
                 child_key = self.get_child_key_fn(key)
 
         if len(key):
-            new_node = TreeNode()
-            new_node.parent = node
-            new_node.key = key
-            new_node.value = value
-            self.full_lru_list.insert_mru(new_node)
-            self.swa_lru_list.insert_mru(new_node)
-            node.children[child_key] = new_node
-            self.full_evictable_size_ += len(value)
-            self.swa_evictable_size_ += len(value)
+            if (
+                evicted_seqlen > total_prefix_length
+                and evicted_seqlen < total_prefix_length + len(key)
+            ):
+                swa_evicted_len = evicted_seqlen - total_prefix_length
+                node = self._add_new_node(
+                    node, key[:swa_evicted_len], value[:swa_evicted_len], True
+                )
+                key = key[swa_evicted_len:]
+                value = value[swa_evicted_len:]
+
+            self._add_new_node(node, key, value, False)
         return total_prefix_length
+
+    def _add_new_node(
+        self,
+        node: TreeNode,
+        key: RadixKey,
+        value: torch.Tensor,
+        swa_tombstone: bool = False,
+    ) -> TreeNode:
+        new_node = TreeNode()
+        new_node.parent = node
+        new_node.key = key
+        new_node.value = value
+        new_node.swa_tombstone = swa_tombstone
+        node.children[self.get_child_key_fn(key)] = new_node
+        self.full_lru_list.insert_mru(new_node)
+        self.full_evictable_size_ += len(value)
+        if not swa_tombstone:
+            self.swa_lru_list.insert_mru(new_node)
+            self.swa_evictable_size_ += len(value)
+        return new_node
 
     def _iteratively_delete_tombstone_leaf(
         self, node: TreeNode

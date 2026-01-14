@@ -12,6 +12,7 @@ from sglang.srt.mem_cache.chunk_cache import ChunkCache, SWAChunkCache
 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
+from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import support_triton
 from sglang.srt.utils.common import ceil_align
@@ -442,7 +443,9 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     Returns:
         out_cache_loc: allocated cache locations
     """
-    if isinstance(batch.tree_cache, SWAChunkCache):
+    if isinstance(batch.tree_cache, SWAChunkCache) or isinstance(
+        batch.tree_cache, SWARadixCache
+    ):
         for req in batch.reqs:
             # We set evict_swa condition here with two reasons:
             # 1. In overlap scheduler, we cannot evict swa when req.decode_batch_idx == 0 since the prev extend batch is still running.
