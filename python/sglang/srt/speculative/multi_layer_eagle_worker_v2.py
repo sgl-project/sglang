@@ -412,7 +412,7 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
         draft_input = EagleDraftInput(
             hidden_states=batch_result.logits_output.hidden_states,
             num_tokens_per_batch=self.speculative_num_steps + 1,
-            num_tokens_for_logprob_per_batch=self.speculative_num_steps + 1,
+            num_tokens_for_logprob_per_batch=1,
         )
 
         # Prepare for draft extend in a separate stream
