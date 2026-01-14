@@ -39,6 +39,7 @@ from sglang.srt.utils import (
     is_xpu,
     set_weight_attrs,
 )
+from sglang.srt.utils.common import get_bool_env_var
 from sglang.utils import resolve_obj_by_qualname
 
 _is_cuda = is_cuda()
