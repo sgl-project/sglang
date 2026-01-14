@@ -18,6 +18,9 @@ pip install -e "python"
 
 Before running evaluations, you need to launch the SGLang server. The command below shows a general usage pattern. You should adjust flags based on your specific model and hardware requirements.
 
+> [!NOTE]
+> Below is a minimal example. Please change the install and launch commands to your own.
+
 ```bash
 python -m sglang.launch_server \
   --model-path <model-path> \
@@ -25,25 +28,16 @@ python -m sglang.launch_server \
   --port 30000 \
 ```
 
-**Common Flags:**
-- `--model-path`: Path to the model weights or Hugging Face model ID.
-- `--tp-size`: Tensor parallelism size (number of GPUs).
-- `--ep-size`: Expert parallelism size (for MoE models).
-- `--tool-call-parser`: Specify parser for tool use (e.g., `minimax-m2`).
-- `--reasoning-parser`: Specify parser for reasoning models (e.g., `minimax-append-think`).
-- `--trust-remote-code`: Required for some custom models.
-
 > [!NOTE]
-> Record the exact GPU type, count, and any specific flags used for reproducibility.
+> Record the exact GPU type, count, and any specific flags used for reproducibility, submit them when you are making the PR.
 
 ## Accuracy Evaluation
 
-### Large Language Models (LLMs)
+### LLMs
 
 SGLang provides built-in scripts to evaluate common benchmarks.
 
-#### MMLU
-[Massive Multitask Language Understanding](https://arxiv.org/abs/2009.03300).
+**MMLU**
 
 ```bash
 python -m sglang.test.run_eval \
@@ -52,8 +46,7 @@ python -m sglang.test.run_eval \
   --num-examples 1000
 ```
 
-#### GSM8K
-[Grade School Math 8K](https://arxiv.org/abs/2110.14168).
+**GSM8K**
 
 ```bash
 python -m sglang.test.few_shot_gsm8k \
@@ -63,8 +56,7 @@ python -m sglang.test.few_shot_gsm8k \
   --num-shots 5
 ```
 
-#### HellaSwag
-[HellaSwag](https://arxiv.org/abs/1905.07830) Common sense reasoning.
+**HellaSwag**
 
 ```bash
 python benchmark/hellaswag/bench_sglang.py \
@@ -74,8 +66,7 @@ python benchmark/hellaswag/bench_sglang.py \
   --num-shots 20
 ```
 
-#### GPQA
-[Graduate-Level Google-Proof Q&A Benchmark](https://arxiv.org/abs/2311.12022).
+**GPQA**
 
 ```bash
 python -m sglang.test.run_eval \
@@ -88,8 +79,7 @@ python -m sglang.test.run_eval \
 > [!TIP]
 > For reasoning models, add `--thinking-mode <mode>` (e.g., `qwen3`, `deepseek-r1`, `deepseek-v3`). You may skip it if the model has forced thinking enabled.
 
-#### HumanEval
-HumanEval problem solving dataset described in the paper "[Evaluating Large Language Models Trained on Code](https://arxiv.org/abs/2107.03374)".
+**HumanEval**
 
 ```bash
 # Install human-eval if it is not installed yet
@@ -101,10 +91,9 @@ python -m sglang.test.run_eval \
   --port 30000
 ```
 
-### Multimodal Language Models
+### VLMs
 
-#### MMMU
-[Massive Multi-discipline Multimodal Understanding and Reasoning Benchmark](https://arxiv.org/abs/2311.16502).
+**MMMU**
 
 ```bash
 python benchmark/mmmu/bench_sglang.py \
