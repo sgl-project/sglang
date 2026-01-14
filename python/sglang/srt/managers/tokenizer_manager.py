@@ -1481,20 +1481,18 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 recv_obj = await self.recv_from_detokenizer.recv_pyobj()
 
             # If batch size limit is set and batch exceeds limit, process in chunks
-            if max_batch_size > 0 and hasattr(recv_obj, 'rids'):
+            if max_batch_size > 0 and hasattr(recv_obj, 'rids') and len(recv_obj.rids) > max_batch_size:
                 batch_size = len(recv_obj.rids)
-                if batch_size > max_batch_size:
-                    # Process in chunks to reduce latency for first token
-                    for start_idx in range(0, batch_size, max_batch_size):
-                        end_idx = min(start_idx + max_batch_size, batch_size)
-                        chunk_recv_obj = self._create_batch_chunk(recv_obj, start_idx, end_idx)
-                        self._result_dispatcher(chunk_recv_obj)
-                        # Feed watchdog between chunks to prevent timeout
-                        self.soft_watchdog.feed()
-                else:
-                    self._result_dispatcher(recv_obj)
+                # Process in chunks to reduce latency for first token
+                for start_idx in range(0, batch_size, max_batch_size):
+                    end_idx = min(start_idx + max_batch_size, batch_size)
+                    chunk_recv_obj = self._create_batch_chunk(recv_obj, start_idx, end_idx)
+                    self._result_dispatcher(chunk_recv_obj)
+                    # Feed watchdog between chunks to prevent timeout
+                    self.soft_watchdog.feed()
             else:
                 self._result_dispatcher(recv_obj)
+
             self.last_receive_tstamp = time.time()
             self.soft_watchdog.feed()
 
@@ -1528,16 +1526,15 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             if field_value is None:
                 continue
 
+            # Handle dict with list values (e.g., customized_info)
+            if isinstance(field_value, dict):
+                chunk_dict[field_name] = {
+                    k: v[start_idx:end_idx] for k, v in field_value.items()
+                }
             # Handle list/tuple types with slicing
-            if isinstance(field_value, (list, tuple)):
-                # Special handling for dict with list values (e.g., customized_info)
-                if isinstance(field_value, dict):
-                    chunk_dict[field_name] = {
-                        k: v[start_idx:end_idx] for k, v in field_value.items()
-                    }
-                else:
-                    chunk_dict[field_name] = field_value[start_idx:end_idx]
-            # For non-list types (e.g., load object), copy as-is
+            elif isinstance(field_value, (list, tuple)):
+                chunk_dict[field_name] = field_value[start_idx:end_idx]
+            # For other types (e.g., load object), copy as-is
             else:
                 chunk_dict[field_name] = field_value
 
