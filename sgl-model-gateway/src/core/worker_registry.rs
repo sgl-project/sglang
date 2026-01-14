@@ -671,6 +671,7 @@ impl WorkerRegistry {
                 // This is especially important when there are many workers
                 let health_futures: Vec<_> = workers
                     .iter()
+                    .filter(|worker| !worker.metadata().health_config.disable_health_check)
                     .map(|worker| {
                         let worker = worker.clone();
                         async move {

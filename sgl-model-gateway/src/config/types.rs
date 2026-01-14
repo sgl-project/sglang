@@ -554,6 +554,7 @@ pub struct HealthCheckConfig {
     pub timeout_secs: u64,
     pub check_interval_secs: u64,
     pub endpoint: String,
+    pub disable_health_check: bool,
 }
 
 impl Default for HealthCheckConfig {
@@ -564,6 +565,7 @@ impl Default for HealthCheckConfig {
             timeout_secs: 5,
             check_interval_secs: 60,
             endpoint: "/health".to_string(),
+            disable_health_check: false,
         }
     }
 }

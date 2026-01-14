@@ -378,6 +378,10 @@ struct CliArgs {
     #[arg(long, default_value = "/health", help_heading = "Health Checks")]
     health_check_endpoint: String,
 
+    /// Disable all worker health checks at startup
+    #[arg(long, default_value_t = false, help_heading = "Health Checks")]
+    disable_health_check: bool,
+
     // ==================== Tokenizer ====================
     /// Model path for loading tokenizer (HuggingFace ID or local path)
     #[arg(long, help_heading = "Tokenizer")]
@@ -987,6 +991,7 @@ impl CliArgs {
                 timeout_secs: self.health_check_timeout_secs,
                 check_interval_secs: self.health_check_interval_secs,
                 endpoint: self.health_check_endpoint.clone(),
+                disable_health_check: self.disable_health_check,
             })
             .tokenizer_cache(TokenizerCacheConfig {
                 enable_l0: self.tokenizer_cache_enable_l0,
