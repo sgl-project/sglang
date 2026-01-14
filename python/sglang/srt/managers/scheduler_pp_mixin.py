@@ -860,6 +860,10 @@ class SchedulerPPMixin:
     def _pp_send_pyobj_to_next_stage(self: Scheduler, data, async_send: bool = False):
         p2p_work = []
         if self.attn_tp_rank == 0:
+            # Send wake signal before reqs
+            if self.pp_idle_wakeup_notifier_socket:
+                self.pp_idle_wakeup_notifier_socket.send(b"WAKE")
+
             dp_offset = self.attn_dp_rank * self.attn_tp_size
             p2p_work = point_to_point_pyobj(
                 data,
