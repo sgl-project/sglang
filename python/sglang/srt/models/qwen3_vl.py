@@ -24,6 +24,8 @@ import torch.nn as nn
 from einops import rearrange
 from transformers.activations import ACT2FN
 
+import numpy as np
+
 from sglang.srt.configs.qwen3_vl import Qwen3VLConfig, Qwen3VLVisionConfig
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
@@ -397,89 +399,90 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         return cos_combined, sin_combined
 
     def fast_pos_embed_interpolate(self, grid_thw):
-        """优化版：确保第一个for循环完全在CPU上执行"""
-        # 1. 先将所有数据移到CPU（一次性同步）
-        grid_thw_cpu = grid_thw.cpu() if grid_thw.is_cuda else grid_thw
+        """使用NumPy进行CPU计算，更高效"""
+        grid_thw_cpu = grid_thw.cpu().numpy() if grid_thw.is_cuda else grid_thw.numpy()
 
-        grid_ts = grid_thw_cpu[:, 0].tolist()  # 转为Python列表
+        batch_size = len(grid_thw_cpu)
+        grid_ts = grid_thw_cpu[:, 0].tolist()
         grid_hs = grid_thw_cpu[:, 1].tolist()
         grid_ws = grid_thw_cpu[:, 2].tolist()
 
         device = self.pos_embed.weight.device
         dtype = self.pos_embed.weight.dtype
 
-        idx_list = [[] for _ in range(4)]
-        weight_list = [[] for _ in range(4)]
+        # 预计算总大小
+        total_patches = sum(h * w for h, w in zip(grid_hs, grid_ws))
 
-        # 2. 现在循环的是Python整数，确保所有计算在CPU上进行
+        # 预分配NumPy数组（更高效）
+        all_indices_np = np.zeros((4, total_patches), dtype=np.int64)
+        all_weights_np = np.zeros((4, total_patches), dtype=np.float32)
+
+        current_idx = 0
+
         for t, h, w in zip(grid_ts, grid_hs, grid_ws):
-            # 使用CPU设备进行计算
-            cpu_device = torch.device('cpu')
+            n_patches = h * w
 
+            # 使用NumPy生成坐标（比PyTorch CPU更快）
             if self.align_corners:
-                # 在CPU上创建张量
-                h_idxs = torch.linspace(0, self.num_grid_per_side - 1, h, device=cpu_device)
-                w_idxs = torch.linspace(0, self.num_grid_per_side - 1, w, device=cpu_device)
+                h_idxs = np.linspace(0, self.num_grid_per_side - 1, h, dtype=np.float32)
+                w_idxs = np.linspace(0, self.num_grid_per_side - 1, w, dtype=np.float32)
             else:
-                # 在CPU上创建张量
-                h_idxs = (torch.arange(h, device=cpu_device) + 0.5) * (
-                    self.num_grid_per_side / h
-                ) - 0.5
-                w_idxs = (torch.arange(w, device=cpu_device) + 0.5) * (
-                    self.num_grid_per_side / w
-                ) - 0.5
-                h_idxs = h_idxs.clamp(0, self.num_grid_per_side - 1)
-                w_idxs = w_idxs.clamp(0, self.num_grid_per_side - 1)
+                h_idxs = (np.arange(h, dtype=np.float32) + 0.5) * (self.num_grid_per_side / h) - 0.5
+                w_idxs = (np.arange(w, dtype=np.float32) + 0.5) * (self.num_grid_per_side / w) - 0.5
+                h_idxs = np.clip(h_idxs, 0, self.num_grid_per_side - 1)
+                w_idxs = np.clip(w_idxs, 0, self.num_grid_per_side - 1)
 
-            h_idxs_floor = h_idxs.floor().long()
-            w_idxs_floor = w_idxs.floor().long()
-            h_idxs_ceil = (h_idxs_floor + 1).clamp(max=self.num_grid_per_side - 1)
-            w_idxs_ceil = (w_idxs_floor + 1).clamp(max=self.num_grid_per_side - 1)
+            # NumPy meshgrid
+            h_grid, w_grid = np.meshgrid(h_idxs, w_idxs, indexing='ij')
+            h_flat = h_grid.reshape(-1)
+            w_flat = w_grid.reshape(-1)
 
-            dh = h_idxs - h_idxs_floor
-            dw = w_idxs - w_idxs_floor
+            # NumPy floor和clamp
+            h_floor = np.floor(h_flat).astype(np.int64)
+            w_floor = np.floor(w_flat).astype(np.int64)
+            h_ceil = np.clip(h_floor + 1, 0, self.num_grid_per_side - 1)
+            w_ceil = np.clip(w_floor + 1, 0, self.num_grid_per_side - 1)
 
-            base_h = h_idxs_floor * self.num_grid_per_side
-            base_h_ceil = h_idxs_ceil * self.num_grid_per_side
+            dh = h_flat - h_floor
+            dw = w_flat - w_floor
 
-            indices = [
-                (base_h.unsqueeze(1) + w_idxs_floor.unsqueeze(0)).flatten(),
-                (base_h.unsqueeze(1) + w_idxs_ceil.unsqueeze(0)).flatten(),
-                (base_h_ceil.unsqueeze(1) + w_idxs_floor.unsqueeze(0)).flatten(),
-                (base_h_ceil.unsqueeze(1) + w_idxs_ceil.unsqueeze(0)).flatten(),
-            ]
+            # 计算索引和权重
+            indices_00 = h_floor * self.num_grid_per_side + w_floor
+            indices_01 = h_floor * self.num_grid_per_side + w_ceil
+            indices_10 = h_ceil * self.num_grid_per_side + w_floor
+            indices_11 = h_ceil * self.num_grid_per_side + w_ceil
 
-            weights = [
-                ((1 - dh).unsqueeze(1) * (1 - dw).unsqueeze(0)).flatten(),
-                ((1 - dh).unsqueeze(1) * dw.unsqueeze(0)).flatten(),
-                (dh.unsqueeze(1) * (1 - dw).unsqueeze(0)).flatten(),
-                (dh.unsqueeze(1) * dw.unsqueeze(0)).flatten(),
-            ]
+            w00 = (1 - dh) * (1 - dw)
+            w01 = (1 - dh) * dw
+            w10 = dh * (1 - dw)
+            w11 = dh * dw
 
-            for i in range(4):
-                idx_list[i].append(indices[i])
-                weight_list[i].append(weights[i])
+            # 填充
+            end_idx = current_idx + n_patches
+            all_indices_np[0, current_idx:end_idx] = indices_00
+            all_indices_np[1, current_idx:end_idx] = indices_01
+            all_indices_np[2, current_idx:end_idx] = indices_10
+            all_indices_np[3, current_idx:end_idx] = indices_11
 
-        # 3. 合并所有张量（先在CPU上合并，然后一次性移到GPU）
-        # 在CPU上合并
-        idx_tensor_cpu = torch.stack([torch.cat(l) for l in idx_list]).long()
-        weight_tensor_cpu = torch.stack([torch.cat(l) for l in weight_list])
+            all_weights_np[0, current_idx:end_idx] = w00
+            all_weights_np[1, current_idx:end_idx] = w01
+            all_weights_np[2, current_idx:end_idx] = w10
+            all_weights_np[3, current_idx:end_idx] = w11
 
-        # 一次性移到GPU
-        idx_tensor = idx_tensor_cpu.to(device=device)
-        weight_tensor = weight_tensor_cpu.to(dtype=dtype, device=device)
+            current_idx = end_idx
 
-        # 4. 批量获取位置编码（在GPU上）
-        pos_embeds = self.pos_embed(idx_tensor) * weight_tensor.unsqueeze(-1)
-        patch_pos_embeds = pos_embeds.sum(dim=0)  # 更高效的求和
+        # 转换为PyTorch张量（一次性）
+        idx_tensor = torch.from_numpy(all_indices_np).to(device)
+        weight_tensor = torch.from_numpy(all_weights_np).to(dtype=dtype, device=device)
 
-        # 5. 分割结果
-        patch_pos_embeds = patch_pos_embeds.split(
-            [h * w for h, w in zip(grid_hs, grid_ws)]
-        )
+        # 后续相同...
+        pos_embeds = self.pos_embed(idx_tensor.view(-1))
+        pos_embeds = pos_embeds.view(4, total_patches, -1)
+        patch_pos_embeds = (pos_embeds * weight_tensor.unsqueeze(-1)).sum(dim=0)
 
-        # 6. 时间重复和空间重排
-        patch_pos_embeds_permute = []
+        patch_pos_embeds = patch_pos_embeds.split([h * w for h, w in zip(grid_hs, grid_ws)])
+
+        result_parts = []
         merge_size = self.spatial_merge_size
 
         for pos_embed, t, h, w in zip(patch_pos_embeds, grid_ts, grid_hs, grid_ws):
@@ -492,10 +495,9 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
                 t, h_merge, merge_size, w_merge, merge_size, -1
             ).permute(0, 1, 3, 2, 4, 5).flatten(0, 4)
 
-            patch_pos_embeds_permute.append(pos_embed)
+            result_parts.append(pos_embed)
 
-        return torch.cat(patch_pos_embeds_permute, dim=0)
-
+        return torch.cat(result_parts, dim=0)
     def forward(
         self,
         x: torch.Tensor,
