@@ -159,11 +159,12 @@ class MarkerType(Enum):
 class StateMachineContext:
     """Context for the finite state machine.
 
-    Maintains the current parsing state and any buffered content.
+    Maintains current parsing state and any buffered content.
     """
 
     state: ParserState = ParserState.IDLE
     current_buffer: str = ""  # Buffer for buffering states (COMMENTARY, JSON)
+    tool_call_start: int = -1  # Start position of tool call for raw_text extraction
 
 
 # ============================================================================
@@ -381,9 +382,13 @@ class HarmonyStateMachine:
                 if base_channel_type in ("analysis", "commentary", "final"):
                     if is_tool_call:
                         # Built-in tool call (e.g., "analysis to=browser.search" or "commentary to=functions.get_weather")
-                        # Use COMMENTARY state to buffer the tool info and wait for MESSAGE and CALL markers
+                        # Use COMMENTARY state to buffer the tool info and wait for CONSTRAIN marker
                         self.context.state = ParserState.IN_COMMENTARY
-                        return [], self._skip_to_after_message(tokens, pos)
+                        # Record tool call start position for raw_text extraction
+                        self.context.tool_call_start = token.start
+                        # Skip CHANNEL and TEXT tokens (channel name + tool name)
+                        # Let CONSTRAIN marker trigger the transition to IN_JSON state
+                        return [], pos + 2  # Skip CHANNEL and following TEXT
                     elif base_channel_type == "analysis":
                         # Regular analysis block
                         self.context.state = ParserState.IN_ANALYSIS
@@ -453,8 +458,13 @@ class HarmonyStateMachine:
             # Built-in tool (no args)
             # Content is in current_buffer (may need to handle this)
             tool_content = self.context.current_buffer.strip()
-            raw_text = full_text[: token.end]
+            # Use tool_call_start if available, otherwise fall back to full text
+            if self.context.tool_call_start >= 0:
+                raw_text = full_text[self.context.tool_call_start : token.end]
+            else:
+                raw_text = full_text[: token.end]
             self.context.current_buffer = ""
+            self.context.tool_call_start = -1
             self.context.state = ParserState.IDLE
             return [Event("tool_call", tool_content, raw_text)], pos + 1
 
@@ -474,6 +484,9 @@ class HarmonyStateMachine:
         if marker_type == MarkerType.CONSTRAIN:
             # Transition to JSON state
             self.context.state = ParserState.IN_JSON
+            # Skip constraint type (e.g., "json") that follows CONSTRAIN
+            if pos + 1 < len(tokens) and tokens[pos + 1].type == "TEXT":
+                return [], pos + 2  # Skip CONSTRAIN and constraint type
             return [], pos + 1
 
         elif marker_type == MarkerType.END:
@@ -488,8 +501,13 @@ class HarmonyStateMachine:
         elif marker_type == MarkerType.CALL:
             # Tool call without params
             tool_content = self.context.current_buffer.strip()
-            raw_text = full_text[: token.end]
+            # Use tool_call_start if available, otherwise fall back to full text
+            if self.context.tool_call_start >= 0:
+                raw_text = full_text[self.context.tool_call_start : token.end]
+            else:
+                raw_text = full_text[: token.end]
             self.context.current_buffer = ""
+            self.context.tool_call_start = -1
             self.context.state = ParserState.IDLE
             return [Event("tool_call", tool_content, raw_text)], pos + 1
 
@@ -509,8 +527,13 @@ class HarmonyStateMachine:
         if marker_type == MarkerType.CALL:
             # Parse JSON and emit tool_call
             json_content = self.context.current_buffer.strip()
-            raw_text = full_text[: token.end]
+            # Use tool_call_start if available, otherwise fall back to full text
+            if self.context.tool_call_start >= 0:
+                raw_text = full_text[self.context.tool_call_start : token.end]
+            else:
+                raw_text = full_text[: token.end]
             self.context.current_buffer = ""
+            self.context.tool_call_start = -1
             self.context.state = ParserState.IDLE
             return [Event("tool_call", json_content, raw_text)], pos + 1
 
