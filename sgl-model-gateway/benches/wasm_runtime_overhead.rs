@@ -8,7 +8,7 @@ use smg::wasm::{
 };
 use tokio::runtime::Runtime;
 
-// Path relative to the benches/ directory
+
 const AUTH_WASM: &[u8] = include_bytes!(
     "../examples/wasm/wasm-guest-auth/target/wasm32-wasip2/release/wasm_guest_auth.component.wasm"
 );
@@ -32,7 +32,7 @@ fn bench_wasm_runtime_overhead(c: &mut Criterion) {
     let attach_point = WasmModuleAttachPoint::Middleware(MiddlewareAttachPoint::OnRequest);
 
     c.bench_function("wasm_runtime_overhead_pre_fix", |b| {
-        // Use block_on inside the loop to avoid requiring Criterion's async feature
+
         b.iter(|| {
             rt.block_on(async {
                 runtime
