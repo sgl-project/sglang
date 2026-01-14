@@ -962,6 +962,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             if (
                 not is_visual
                 and layer_id is not None
+                and hasattr(self, "model")
                 and hasattr(self.model, "start_layer")
                 and (
                     layer_id < self.model.start_layer

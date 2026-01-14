@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, NamedTuple, Optional
+from enum import Enum, auto
+from typing import NamedTuple, Optional
+
+import torch
+import torch.distributed as dist
 
 from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -17,14 +21,6 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
 from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.moe.utils import DeepEPMode
 from sglang.srt.utils import get_int_env_var
-
-if TYPE_CHECKING:
-    from sglang.srt.batch_overlap.single_batch_overlap import CombineOverlapArgs
-
-from enum import Enum, auto
-
-import torch
-import torch.distributed as dist
 
 logger = logging.getLogger(__name__)
 
@@ -147,8 +143,6 @@ class _MooncakeEPDispatcherImpl:
         self.first_execution = True
         self.timeout_us = 10000000
 
-        self.active_ranks = ElasticEPStateManager.instance().active_ranks
-
         self.handle = None
 
     def dispatch_a(
@@ -215,11 +209,12 @@ class _MooncakeEPDispatcherImpl:
         use_fp8: bool = False,
     ):
         buffer = self._get_buffer()
+        active_ranks = ElasticEPStateManager.instance().active_ranks
         packed_recv_hidden, packed_recv_count, self.handle, event, hook = (
             buffer.dispatch(
                 hidden_states,
                 topk_ids,
-                self.active_ranks,
+                active_ranks,
                 self.num_max_dispatch_tokens_per_rank,
                 self.num_experts,
                 -1 if self.first_execution else self.timeout_us,
@@ -235,14 +230,13 @@ class _MooncakeEPDispatcherImpl:
         hidden_states: torch.Tensor,
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
-        overlap_args: Optional[CombineOverlapArgs] = None,
     ):
         hidden_states, event, hook = self._combine_core(
             hidden_states,
             topk_ids,
             topk_weights,
         )
-        return hidden_states, event, hook, overlap_args
+        return hidden_states, event, hook
 
     def combine_b(self, hidden_states, event, hook):
         hook() if self.return_recv_hook else event.current_stream_wait()
@@ -255,11 +249,12 @@ class _MooncakeEPDispatcherImpl:
         topk_weights: torch.Tensor,
     ):
         buffer = self._get_buffer()
+        active_ranks = ElasticEPStateManager.instance().active_ranks
         combined_hidden_states, event, hook = buffer.combine(
             hidden_states,
             topk_ids,
             topk_weights,
-            self.active_ranks,
+            active_ranks,
             -1 if self.first_execution else self.timeout_us,
             self.handle,
             async_finish=not self.return_recv_hook,
@@ -368,7 +363,6 @@ class MooncakeEPDispatcher(BaseDispatcher):
             hidden_states=hidden_states,
             topk_ids=topk_ids,
             topk_weights=topk_weights,
-            overlap_args=self.overlap_args,
         )
         self._combine_intermediate_state = inner_state
 
