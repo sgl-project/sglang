@@ -2,13 +2,15 @@
 """Compare SGLang vs Transformers outputs for OpenVLA."""
 
 import os
+
 os.environ["SGLANG_DISABLE_CUDNN_CHECK"] = "1"
 
 import gc
+from io import BytesIO
+
 import numpy as np
 import requests
 import torch
-from io import BytesIO
 from PIL import Image
 
 # Test image and prompt
@@ -30,13 +32,15 @@ def decode_tokens_to_actions(tokens, vocab_size=32000):
 
 def run_transformers(image):
     """Run Transformers inference."""
-    from transformers import AutoProcessor, AutoModelForVision2Seq
+    from transformers import AutoModelForVision2Seq, AutoProcessor
 
     print("=" * 70)
     print("Transformers Inference")
     print("=" * 70)
 
-    processor = AutoProcessor.from_pretrained("openvla/openvla-7b", trust_remote_code=True)
+    processor = AutoProcessor.from_pretrained(
+        "openvla/openvla-7b", trust_remote_code=True
+    )
 
     model = AutoModelForVision2Seq.from_pretrained(
         "openvla/openvla-7b",
@@ -125,7 +129,9 @@ def compare_results(hf_results, sglang_results):
     print("=" * 70)
 
     print("\nToken-by-token comparison:")
-    print(f"{'Dim':<5} {'HF Token':<15} {'SGLang Token':<15} {'Match':<8} {'Bin Diff':<10}")
+    print(
+        f"{'Dim':<5} {'HF Token':<15} {'SGLang Token':<15} {'Match':<8} {'Bin Diff':<10}"
+    )
     print("-" * 60)
 
     total_match = 0

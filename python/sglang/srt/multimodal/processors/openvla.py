@@ -54,7 +54,9 @@ class OpenVLAImageProcessor(BaseMultimodalProcessor):
                 image = image_data
                 image_hash = id(image)  # Use object id as hash for PIL images
             else:
-                url = image_data.url if isinstance(image_data, ImageData) else image_data
+                url = (
+                    image_data.url if isinstance(image_data, ImageData) else image_data
+                )
                 image, _ = load_image(url)
                 image_hash = hash(url)
 
@@ -80,7 +82,9 @@ class OpenVLAImageProcessor(BaseMultimodalProcessor):
 
             # Stack into 6-channel tensor: [DINOv2(3), SigLIP(3)]
             # Use float32 to preserve precision - will be converted to model dtype later
-            pixel_values = np.concatenate([dinov2_pixels, siglip_pixels], axis=0).astype(np.float32)
+            pixel_values = np.concatenate(
+                [dinov2_pixels, siglip_pixels], axis=0
+            ).astype(np.float32)
 
             return pixel_values, image_hash, (image_size, image_size)
 

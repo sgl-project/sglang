@@ -328,7 +328,9 @@ def run_benchmark(
     return results, summary
 
 
-def decode_action_tokens(tokens: List[int], vocab_size: int = 32000) -> Tuple[List[int], List[float]]:
+def decode_action_tokens(
+    tokens: List[int], vocab_size: int = 32000
+) -> Tuple[List[int], List[float]]:
     """Decode action tokens to bins and normalized actions.
 
     OpenVLA uses the formula: bin = vocab_size - token - 1

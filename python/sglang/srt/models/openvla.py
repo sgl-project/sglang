@@ -191,14 +191,18 @@ class PrismaticVisionBackbone(nn.Module):
             # 3-channel input: DINOv2 normalized, convert for SigLIP
             dinov2_pixels = pixel_values
             siglip_pixels = self._convert_imagenet_to_siglip(pixel_values)
-            logger.info(f"[OpenVLA DEBUG] Using 3-channel input with runtime conversion")
+            logger.info(
+                f"[OpenVLA DEBUG] Using 3-channel input with runtime conversion"
+            )
 
         # Get features from primary encoder (DINOv2-reg)
         # Use second-to-last layer to match HF's behavior
         n_blocks = len(self.featurizer.blocks)
         features = self.featurizer.get_intermediate_layers(
             dinov2_pixels, n={n_blocks - 2}
-        )[0]  # Returns tuple, take first (and only) element
+        )[
+            0
+        ]  # Returns tuple, take first (and only) element
 
         # Fuse with secondary encoder (SigLIP)
         if self.use_fused and self.fused_featurizer is not None:
@@ -373,10 +377,14 @@ class OpenVLAForActionPrediction(nn.Module):
             # Vision starts at position 1 (after BOS), pad_len is num_patches
             image_inputs.image_offsets.append(1)  # Vision at position 1
             image_inputs.image_pad_len.append(num_patches)
-            logger.info(f"[OpenVLA DEBUG] Inserted {num_patches} vision tokens at position 1 (after BOS)")
+            logger.info(
+                f"[OpenVLA DEBUG] Inserted {num_patches} vision tokens at position 1 (after BOS)"
+            )
 
         logger.info(f"[OpenVLA DEBUG] Final padded input_ids length: {len(input_ids)}")
-        logger.info(f"[OpenVLA DEBUG] Structure: BOS at 0, vision at 1-{self.num_patches}, text at {self.num_patches+1}+")
+        logger.info(
+            f"[OpenVLA DEBUG] Structure: BOS at 0, vision at 1-{self.num_patches}, text at {self.num_patches+1}+"
+        )
         return input_ids
 
     def encode_images(self, pixel_values: torch.Tensor) -> torch.Tensor:
@@ -452,21 +460,39 @@ class OpenVLAForActionPrediction(nn.Module):
                 if pixel_values:
                     # Stack and encode images
                     # DEBUG: Log pixel value shapes
-                    logger.info(f"[OpenVLA DEBUG] pixel_values[0] shape: {pixel_values[0].shape}")
-                    logger.info(f"[OpenVLA DEBUG] pixel_values[0] dtype: {pixel_values[0].dtype}")
+                    logger.info(
+                        f"[OpenVLA DEBUG] pixel_values[0] shape: {pixel_values[0].shape}"
+                    )
+                    logger.info(
+                        f"[OpenVLA DEBUG] pixel_values[0] dtype: {pixel_values[0].dtype}"
+                    )
                     pixel_values = torch.tensor(
                         np.stack(pixel_values, axis=0),
                         device=input_embeds.device,
                         dtype=input_embeds.dtype,
                     )
-                    logger.info(f"[OpenVLA DEBUG] stacked pixel_values shape: {pixel_values.shape}")
-                    logger.info(f"[OpenVLA DEBUG] pixel_values[0,0,0,:5]: {pixel_values[0,0,0,:5]}")  # DINOv2 first row
-                    logger.info(f"[OpenVLA DEBUG] pixel_values[0,3,0,:5]: {pixel_values[0,3,0,:5]}")  # SigLIP first row
+                    logger.info(
+                        f"[OpenVLA DEBUG] stacked pixel_values shape: {pixel_values.shape}"
+                    )
+                    logger.info(
+                        f"[OpenVLA DEBUG] pixel_values[0,0,0,:5]: {pixel_values[0,0,0,:5]}"
+                    )  # DINOv2 first row
+                    logger.info(
+                        f"[OpenVLA DEBUG] pixel_values[0,3,0,:5]: {pixel_values[0,3,0,:5]}"
+                    )  # SigLIP first row
                     image_features = self.encode_images(pixel_values)
-                    logger.info(f"[OpenVLA DEBUG] image_features shape: {image_features.shape}")
-                    logger.info(f"[OpenVLA DEBUG] image_features mean: {image_features.float().mean().item():.6f}")
-                    logger.info(f"[OpenVLA DEBUG] input_embeds shape before insertion: {input_embeds.shape}")
-                    logger.info(f"[OpenVLA DEBUG] input_ids first 10: {input_ids[:10].tolist()}")
+                    logger.info(
+                        f"[OpenVLA DEBUG] image_features shape: {image_features.shape}"
+                    )
+                    logger.info(
+                        f"[OpenVLA DEBUG] image_features mean: {image_features.float().mean().item():.6f}"
+                    )
+                    logger.info(
+                        f"[OpenVLA DEBUG] input_embeds shape before insertion: {input_embeds.shape}"
+                    )
+                    logger.info(
+                        f"[OpenVLA DEBUG] input_ids first 10: {input_ids[:10].tolist()}"
+                    )
 
                     # Insert image features into embeddings
                     extend_start_loc_cpu = forward_batch.extend_start_loc.cpu().numpy()
@@ -511,13 +537,21 @@ class OpenVLAForActionPrediction(nn.Module):
 
                             try:
                                 input_embeds[left_idx:right_idx] = img_feature
-                                logger.info(f"[OpenVLA DEBUG] Inserted image at {left_idx}:{right_idx}")
+                                logger.info(
+                                    f"[OpenVLA DEBUG] Inserted image at {left_idx}:{right_idx}"
+                                )
                             except RuntimeError as e:
                                 logger.warning(f"Error inserting image features: {e}")
 
-            logger.info(f"[OpenVLA DEBUG] Final input_embeds mean: {input_embeds.float().mean().item():.6f}")
-            logger.info(f"[OpenVLA DEBUG] positions first 10: {positions[:10].tolist()}")
-            logger.info(f"[OpenVLA DEBUG] positions last 10: {positions[-10:].tolist()}")
+            logger.info(
+                f"[OpenVLA DEBUG] Final input_embeds mean: {input_embeds.float().mean().item():.6f}"
+            )
+            logger.info(
+                f"[OpenVLA DEBUG] positions first 10: {positions[:10].tolist()}"
+            )
+            logger.info(
+                f"[OpenVLA DEBUG] positions last 10: {positions[-10:].tolist()}"
+            )
             return self.language_model(
                 input_ids, positions, forward_batch, input_embeds=input_embeds
             )
