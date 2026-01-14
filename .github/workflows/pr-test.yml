@@ -912,14 +912,15 @@ jobs:
           python3 run_suite.py --hw cuda --suite stage-b-test-large-2-gpu --auto-partition-id ${{ matrix.partition }} --auto-partition-size 2 $CONTINUE_ON_ERROR_FLAG
 
   stage-b-test-4-gpu-b200:
-    needs: [check-changes, call-gate, stage-a-test-1, sgl-kernel-build-wheels]
+    needs: [check-changes, call-gate, wait-for-stage-a, sgl-kernel-build-wheels]
     if: |
       always() &&
       (
         (inputs.target_stage == 'stage-b-test-4-gpu-b200') ||
         (
           !inputs.target_stage &&
-          (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
+          (!failure() && !cancelled()) &&
+          (needs.wait-for-stage-a.result == 'success' || needs.wait-for-stage-a.result == 'skipped') &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
