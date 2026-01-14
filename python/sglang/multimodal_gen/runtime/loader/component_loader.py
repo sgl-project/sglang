@@ -770,10 +770,10 @@ class TransformerLoader(ComponentLoader):
 
     def _get_quant_config(self, server_args: ServerArgs) -> Any:
         """Get quantization config from server args."""
-        if not getattr(server_args, "enable_svdquant", False):
+        if not server_args.nunchaku_config.enable_svdquant:
             return None
 
-        if not getattr(server_args, "quantized_model_path", None):
+        if not server_args.nunchaku_config.quantized_model_path:
             return None
 
         from sglang.multimodal_gen.runtime.loader.nunchaku_loader import (

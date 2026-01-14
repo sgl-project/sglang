@@ -19,6 +19,7 @@ from typing import Any, Optional
 
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig, STA_Mode
+from sglang.multimodal_gen.configs.quantization import NunchakuSVDQuantArgs
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
@@ -314,19 +315,10 @@ class ServerArgs:
     moba_config_path: str | None = None
     moba_config: dict[str, Any] = field(default_factory=dict)
 
-    # Quantization / Nunchaku SVDQuant parameters
-    # NOTE: Currently used to enable Nunchaku-based quantized models (e.g., FLUX).
-    enable_svdquant: bool = False
-    # Path or HF repo ID of the quantized model weights (.safetensors) for the
-    # main transformer (e.g., DiT / UNet). Example:
-    #   - "nunchaku-tech/nunchaku-flux.1-dev/svdq-int4_r32-flux.1-dev.safetensors"
-    quantized_model_path: str | None = None
-    # Precision of Nunchaku quantization.
-    quantization_precision: str = "int4"  # "int4" or "nvfp4"
-    # Low-rank dimension used by SVDQuant.
-    quantization_rank: int = 32
-    # Whether to use unsigned activations for INT4.
-    quantization_act_unsigned: bool = False
+    # Quantization / Nunchaku SVDQuant configuration
+    nunchaku_config: NunchakuSVDQuantArgs = field(
+        default_factory=NunchakuSVDQuantArgs, repr=False
+    )
 
     # Master port for distributed inference
     # TODO: do not hard code
@@ -433,6 +425,9 @@ class ServerArgs:
                     "Failed to load V-MoBA config from %s: %s", self.moba_config_path, e
                 )
                 raise
+
+        # Validate Nunchaku configuration
+        self.nunchaku_config.validate()
 
         self.check_server_args()
 
@@ -658,45 +653,8 @@ class ServerArgs:
             help="Validation sparsity for VSA",
         )
 
-        # Quantization / Nunchaku SVDQuant parameters
-        parser.add_argument(
-            "--enable-svdquant",
-            action=StoreBoolean,
-            default=ServerArgs.enable_svdquant,
-            help=(
-                "Enable Nunchaku (SVDQuant) quantization for supported components "
-                "(e.g., FLUX / QwenImage transformer)."
-            ),
-        )
-        parser.add_argument(
-            "--quantized-model-path",
-            type=str,
-            default=ServerArgs.quantized_model_path,
-            help=(
-                "Path or Hugging Face repo ID of the Nunchaku-quantized model weights "
-                "(.safetensors). For example: "
-                '"nunchaku-tech/nunchaku-flux.1-dev/svdq-int4_r32-flux.1-dev.safetensors".'
-            ),
-        )
-        parser.add_argument(
-            "--quantization-precision",
-            type=str,
-            default=ServerArgs.quantization_precision,
-            choices=["int4", "nvfp4"],
-            help="int4, nvfp4 for Nunchaku SVDQuant quantization precision to use for weights/activations.",
-        )
-        parser.add_argument(
-            "--quantization-rank",
-            type=int,
-            default=ServerArgs.quantization_rank,
-            help="Low-rank dimension used by SVDQuant (larger rank = better quality).",
-        )
-        parser.add_argument(
-            "--quantization-act-unsigned",
-            action=StoreBoolean,
-            default=ServerArgs.quantization_act_unsigned,
-            help="Use unsigned activation quantization for INT4 (recommended for many models) in Nunchaku SVDQuant.",
-        )
+        # Nunchaku SVDQuant quantization parameters
+        NunchakuSVDQuantArgs.add_cli_args(parser)
 
         # Master port for distributed inference
         parser.add_argument(
@@ -848,6 +806,9 @@ class ServerArgs:
                 pipeline_config = PipelineConfig.from_kwargs(kwargs)
                 logger.debug(f"Using PipelineConfig: {type(pipeline_config)}")
                 server_args_kwargs["pipeline_config"] = pipeline_config
+            elif attr == "nunchaku_config":
+                nunchaku_config = NunchakuSVDQuantArgs.from_dict(kwargs)
+                server_args_kwargs["nunchaku_config"] = nunchaku_config
             elif attr in kwargs:
                 server_args_kwargs[attr] = kwargs[attr]
 

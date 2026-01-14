@@ -18,8 +18,8 @@ def create_nunchaku_config_from_server_args(server_args) -> NunchakuConfig:
         NunchakuConfig instance
     """
     return NunchakuConfig(
-        precision=getattr(server_args, "quantization_precision", "int4"),
-        rank=getattr(server_args, "quantization_rank", 32),
-        act_unsigned=getattr(server_args, "quantization_act_unsigned", False),
-        quantized_model_path=getattr(server_args, "quantized_model_path", None),
+        precision=server_args.nunchaku_config.quantization_precision,
+        rank=server_args.nunchaku_config.quantization_rank,
+        act_unsigned=server_args.nunchaku_config.quantization_act_unsigned,
+        quantized_model_path=server_args.nunchaku_config.quantized_model_path,
     )

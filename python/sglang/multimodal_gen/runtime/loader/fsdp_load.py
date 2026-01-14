@@ -203,7 +203,7 @@ def shard_model(
     # TODO(will): don't reshard after forward for the last layer to save on the
     # all-gather that will immediately happen Shard the model with FSDP,
     for n, m in reversed(list(model.named_modules())):
-        if any(shard_condition(n, m) for shard_condition in fsdp_shard_conditions):
+        if any([shard_condition(n, m) for shard_condition in fsdp_shard_conditions]):  # type: ignore
             fully_shard(m, **fsdp_kwargs)
             num_layers_sharded += 1
 
