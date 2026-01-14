@@ -12,6 +12,7 @@ use super::{
     memory::{MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage},
     noop::{NoOpConversationItemStorage, NoOpConversationStorage, NoOpResponseStorage},
     oracle::{OracleConversationItemStorage, OracleConversationStorage, OracleResponseStorage},
+    genai_oci_oracle::{GenaiOciOracleConversationItemStorage, GenaiOciOracleConversationStorage, GenaiOciOracleResponseStorage},
 };
 use crate::{
     config::{HistoryBackend, OracleConfig, PostgresConfig, RouterConfig},
@@ -100,6 +101,26 @@ pub fn create_storage(config: &RouterConfig) -> Result<StorageTuple, String> {
 
             Ok(storages)
         }
+        HistoryBackend::GenaiOciOracle => {
+            let mut genai_oci_oracle_cfg = config
+                .genai_oci_oracle
+                .clone()
+                .unwrap_or_default();
+
+            // Apply environment variable defaults
+            genai_oci_oracle_cfg = genai_oci_oracle_cfg.with_env_defaults()
+                .map_err(|e| format!("Failed to configure GenaiOciOracle from environment: {e}"))?;
+
+            info!(
+                "Initializing data connector: GenaiOciOracle ATP (pool_max: {})",
+                genai_oci_oracle_cfg.pool_max
+            );
+
+            let storages = create_genai_oci_oracle_storage(&genai_oci_oracle_cfg)?;
+
+            info!("Data connector initialized successfully: GenaiOciOracle ATP");
+            Ok(storages)
+        }
     }
 }
 
@@ -134,5 +155,22 @@ fn create_postgres_storage(postgres_cfg: &PostgresConfig) -> Result<StorageTuple
         Arc::new(postgres_resp),
         Arc::new(postgres_conv),
         Arc::new(postgres_item),
+    ))
+}
+
+fn create_genai_oci_oracle_storage(genai_oci_oracle_cfg: &OracleConfig) -> Result<StorageTuple, String> {
+    let response_storage = GenaiOciOracleResponseStorage::new(genai_oci_oracle_cfg.clone())
+        .map_err(|err| format!("failed to initialize GenaiOciOracle response storage: {err}"))?;
+
+    let conversation_storage = GenaiOciOracleConversationStorage::new(genai_oci_oracle_cfg.clone())
+        .map_err(|err| format!("failed to initialize GenaiOciOracle conversation storage: {err}"))?;
+
+    let conversation_item_storage = GenaiOciOracleConversationItemStorage::new(genai_oci_oracle_cfg.clone())
+        .map_err(|err| format!("failed to initialize GenaiOciOracle conversation item storage: {err}"))?;
+
+    Ok((
+        Arc::new(response_storage),
+        Arc::new(conversation_storage),
+        Arc::new(conversation_item_storage),
     ))
 }

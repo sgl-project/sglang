@@ -419,7 +419,7 @@ struct CliArgs {
     backend: Backend,
 
     /// History storage backend
-    #[arg(long, default_value = "memory", value_parser = ["memory", "none", "oracle","postgres"], help_heading = "Backend")]
+    #[arg(long, default_value = "memory", value_parser = ["memory", "none", "oracle","postgres","genai_oci_oracle"], help_heading = "Backend")]
     history_backend: String,
 
     /// Enable WebAssembly support
@@ -869,6 +869,7 @@ impl CliArgs {
             "none" => HistoryBackend::None,
             "oracle" => HistoryBackend::Oracle,
             "postgres" => HistoryBackend::Postgres,
+            "genai_oci_oracle" => HistoryBackend::GenaiOciOracle,
             _ => HistoryBackend::Memory,
         };
 

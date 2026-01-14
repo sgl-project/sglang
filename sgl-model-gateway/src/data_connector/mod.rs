@@ -10,6 +10,7 @@
 mod common;
 mod core;
 mod factory;
+mod genai_oci_oracle;
 mod memory;
 mod noop;
 mod oracle;

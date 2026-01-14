@@ -58,6 +58,9 @@ pub struct RouterConfig {
     /// Required when history_backend = "postgres"
     #[serde(skip_serializing_if = "Option::is_none")]
     pub postgres: Option<PostgresConfig>,
+    /// Required when history_backend = "genai_oci_oracle"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub genai_oci_oracle: Option<OracleConfig>,
     /// For reasoning models (e.g., deepseek-r1, qwen3)
     pub reasoning_parser: Option<String>,
     /// For tool-call interactions
@@ -138,10 +141,11 @@ pub enum HistoryBackend {
     None,
     Oracle,
     Postgres,
+    GenaiOciOracle,
 }
 
 /// Oracle history backend configuration
-#[derive(Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct OracleConfig {
     /// ATP wallet or TLS config files directory
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -169,6 +173,39 @@ impl OracleConfig {
 
     pub fn default_pool_timeout_secs() -> u64 {
         default_pool_timeout_secs()
+    }
+
+    /// Build config using environment variables for OCI Autonomous DB
+    /// - DB_USER (required) -> username
+    /// - DB_PASSWORD (required) -> password
+    /// - DB_CONNECT_STRING (required) -> connect_descriptor
+    /// - TNS_ADMIN (required) -> wallet_path
+    pub fn with_env_defaults(mut self) -> Result<Self, String> {
+        if self.username.is_empty() {
+            self.username = std::env::var("DB_USER")
+                .map_err(|e| format!("DB_USER is not set: {e}"))?;
+        }
+
+        if self.password.is_empty() {
+            self.password = std::env::var("DB_PASSWORD")
+                .map_err(|e| format!("DB_PASSWORD is not set: {e}"))?;
+        }
+
+        if self.connect_descriptor.is_empty() {
+            self.connect_descriptor = std::env::var("DB_CONNECT_STRING")
+                .map_err(|e| format!("DB_CONNECT_STRING is not set: {e}"))?;
+        }
+
+        if self.wallet_path.is_none() {
+            self.wallet_path = Some(std::env::var("TNS_ADMIN")
+                .map_err(|e| format!("TNS_ADMIN is not set: {e}"))?);
+        }
+
+        if self.pool_max == 0 {
+            self.pool_max = 10;
+        }
+
+        Ok(self)
     }
 }
 
@@ -579,6 +616,7 @@ impl Default for RouterConfig {
             history_backend: default_history_backend(),
             oracle: None,
             postgres: None,
+            genai_oci_oracle: None,
             reasoning_parser: None,
             tool_call_parser: None,
             tokenizer_cache: TokenizerCacheConfig::default(),
