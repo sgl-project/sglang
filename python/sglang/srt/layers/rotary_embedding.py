@@ -296,7 +296,9 @@ class RotaryEmbedding(CustomOp):
             fused_set_kv_buffer_arg is None
         ), "fused_set_kv_buffer_arg is not supported for npu implementation"
 
-        if (query.dtype == torch.bfloat16 and self.cos_sin_cache.dtype == torch.float) or get_bool_env_var("SGLANG_ENABLE_TORCH_COMPILE"):
+        if (
+            query.dtype == torch.bfloat16 and self.cos_sin_cache.dtype == torch.float
+        ) or get_bool_env_var("SGLANG_ENABLE_TORCH_COMPILE"):
             return self.forward_native(positions, query, key, offsets)
 
         rotary_mode = "half"

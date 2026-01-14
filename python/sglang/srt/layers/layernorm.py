@@ -430,6 +430,8 @@ class GemmaRMSNorm(CustomOp):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if get_bool_env_var("SGLANG_ENABLE_TORCH_COMPILE"):
+            return self.forward_native(x, residual)
         if residual is not None:
             norm_out, residual = add_gemma_rms_norm(x, self.weight, residual, self.variance_epsilon)
             return norm_out, residual

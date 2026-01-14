@@ -243,6 +243,8 @@ class AscendAttnBackend(AttentionBackend):
             if hasattr(model_runner.model_config, "not_use_fused_infer_attention_score"):
                 self.not_use_fused_infer_attention_score = True
         else:
+            if hasattr(model_runner.model_config, "use_sdpa"):
+                self.use_sdpa = True
             self.use_alibi = hasattr(model_runner.model_config, "use_alibi") and model_runner.model_config.use_alibi
         self.native_attn = TorchNativeAttnBackend(model_runner)
         self.graph_metadata = {}
@@ -848,9 +850,34 @@ class AscendAttnBackend(AttentionBackend):
                             scale_value=layer.scaling,
                             num_heads=layer.tp_q_head_num,
                             slopes=slopes,
-                            is_extend=True
+                            is_extend=True,
                         )
                 else:
+                    if hasattr(self, "use_sdpa"):
+                        use_gqa = layer.tp_q_head_num != layer.tp_k_head_num
+                        attn_output = torch.nn.functional.scaled_dot_product_attention(
+                            q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+                            .unsqueeze(0)
+                            .transpose(1, 2),
+                            k.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
+                            .unsqueeze(0)
+                            .transpose(1, 2),
+                            v.view(-1, layer.tp_k_head_num, layer.v_head_dim)
+                            .unsqueeze(0)
+                            .transpose(1, 2),
+                            attn_mask=None,
+                            dropout_p=0.0,
+                            enable_gqa=use_gqa,
+                            scale=layer.scaling,
+                            is_causal=True,
+                        )
+                        attn_output = attn_output.transpose(1, 2).contiguous()
+                        attn_output = (
+                            attn_output.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
+                            .contiguous()
+                            .squeeze(0)
+                        )
+                        return attn_output
                     if layer.qk_head_dim != layer.v_head_dim:
                         attn_output = q.new_empty(
                             (q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
