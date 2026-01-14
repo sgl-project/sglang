@@ -164,6 +164,7 @@ class DiffusionServerArgs:
 
     dit_layerwise_offload: bool = False
     enable_cache_dit: bool = False
+    text_encoder_cpu_offload: bool = False
 
 
 @dataclass(frozen=True)
@@ -429,6 +430,19 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
             modality="video",
             warmup=0,
             custom_validator="video",
+        ),
+        DiffusionSamplingParams(
+            prompt=T2V_PROMPT,
+        ),
+    ),
+    DiffusionTestCase(
+        "wan2_1_t2v_1.3b_text_encoder_cpu_offload",
+        DiffusionServerArgs(
+            model_path="Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+            modality="video",
+            warmup=0,
+            custom_validator="video",
+            text_encoder_cpu_offload=True,
         ),
         DiffusionSamplingParams(
             prompt=T2V_PROMPT,
