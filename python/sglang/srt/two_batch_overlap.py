@@ -23,6 +23,7 @@ from sglang.srt.layers.moe import (
 from sglang.srt.layers.moe.token_dispatcher import (
     DeepEPDispatcher,
     MooncakeEPDispatcher,
+    NixlEPDispatcher,
 )
 from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -978,6 +979,10 @@ class MaybeTboDeepEPDispatcher:
         elif get_moe_a2a_backend().is_mooncake():
             self._inners = [
                 MooncakeEPDispatcher(**kwargs) for _ in range(num_inner_dispatchers)
+            ]
+        elif get_moe_a2a_backend().is_nixl():
+            self._inners = [
+                NixlEPDispatcher(**kwargs) for _ in range(num_inner_dispatchers)
             ]
 
     def _execute(self, name, tbo_subbatch_index: Optional[int] = None, **kwargs):

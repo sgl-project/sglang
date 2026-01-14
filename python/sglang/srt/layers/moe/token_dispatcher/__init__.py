@@ -21,6 +21,11 @@ from sglang.srt.layers.moe.token_dispatcher.mooncake import (
     MooncakeDispatchOutput,
     MooncakeEPDispatcher,
 )
+from sglang.srt.layers.moe.token_dispatcher.nixl import (
+    NixlEPCombineInput,
+    NixlEPDispatcher,
+    NixlEPDispatchOutput,
+)
 from sglang.srt.layers.moe.token_dispatcher.standard import (
     StandardCombineInput,
     StandardDispatchOutput,
@@ -38,6 +43,9 @@ __all__ = [
     "MooncakeCombineInput",
     "MooncakeDispatchOutput",
     "MooncakeEPDispatcher",
+    "NixlEPCombineInput",
+    "NixlEPDispatchOutput",
+    "NixlEPDispatcher",
     "StandardDispatchOutput",
     "StandardCombineInput",
     "DeepEPConfig",
