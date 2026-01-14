@@ -1251,7 +1251,7 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         image_noise_mask: Optional[List[List[int]]] = None,
         **kwargs,
     ):
-
+        # TODO: ignore control net for now.
         assert patch_size in self.all_patch_size
         assert f_patch_size in self.all_f_patch_size
 
@@ -1365,18 +1365,19 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         for layer in self.context_refiner:
             cap_feats = layer(cap_feats, cap_freqs_cis)
 
+        # TODO: debug ignore
+        # review
+        # siglip_freqs_cis = torch.stack(freqs_cis[2])
+        siglip_freqs_cis = None
+        siglip_seqlens = siglip_freqs = None
+
         if (
             omni_mode
             and siglip_feats[0] is not None
             and self.siglip_embedder is not None
         ):
-            # TODO: debug ignore
-            # review
-            # siglip_freqs_cis = torch.stack(freqs_cis[2])
-            siglip_freqs_cis = None
-
             # process siglip
-            siglip_seqlens = siglip_freqs = None
+            # TODO: review shape
             siglip_feats = torch.cat(siglip_feats, dim=0)
             siglip_feats = siglip_feats.unsqueeze(0)
 
@@ -1390,20 +1391,46 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
             for layer in self.siglip_refiner:
                 siglip_feats = layer(siglip_feats, siglip_freqs_cis)
 
-        unified = torch.cat([x, cap_feats], dim=1)
-        unified_freqs_cis = (
-            torch.cat([x_freqs_cis[0], cap_freqs_cis[0]], dim=0),
-            torch.cat([x_freqs_cis[1], cap_freqs_cis[1]], dim=0),
+        x_seqlens = [len(xi) for xi in x]
+        cap_seqlens = [len(ci) for ci in cap_feats]
+        unified, unified_freqs_cis, unified_noise_tensor = self._build_unified_sequence(
+            x=x,
+            x_freqs=x_freqs_cis,
+            x_seqlens=x_seqlens,
+            x_noise_mask=x_noise_mask,
+            cap=cap_feats,
+            cap_freqs=cap_freqs_cis,
+            cap_seqlens=cap_seqlens,
+            cap_noise_mask=cap_noise_mask,
+            siglip=siglip_feats,
+            siglip_freqs=siglip_freqs_cis,
+            siglip_seqlens=siglip_seqlens,
+            siglip_noise_mask=siglip_noise_mask,
+            omni_mode=omni_mode,
+            device=device,
         )
 
         for layer in self.layers:
-            unified = layer(unified, unified_freqs_cis, adaln_input)
+            unified = layer(
+                unified,
+                unified_freqs_cis,
+                adaln_input,
+                unified_noise_tensor,
+                t_noisy,
+                t_clean,
+            )
+            # TODO: controlnet is ignore for now.
+            # if controlnet ...
 
         unified = self.all_final_layer[f"{patch_size}-{f_patch_size}"](
-            unified, adaln_input
+            unified,
+            adaln_input,
+            noise_mask=unified_noise_tensor,
+            c_noisy=t_noisy,
+            c_clean=t_clean,
         )
         unified = list(unified.unbind(dim=0))
-        x = self.unpatchify(unified, x_size, patch_size, f_patch_size)
+        x = self.unpatchify(unified, x_size, patch_size, f_patch_size, x_pos_offsets)
 
         return -x[0]
 
