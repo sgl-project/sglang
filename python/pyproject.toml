@@ -93,7 +93,6 @@ diffusion = [
   "remote-pdb",
   "st_attn ==0.0.7",
   "vsa==0.0.4",
-  "yunchang==0.6.3.post1",
   "runai_model_streamer",
   "cache-dit==1.1.8",
   "boto3",
