@@ -7,6 +7,7 @@ import time
 from typing import Any, List, Optional, Union
 
 import httpx
+import torch
 from fastapi import UploadFile
 
 from sglang.multimodal_gen.configs.sample.sampling_params import DataType
@@ -196,8 +197,16 @@ async def process_generation_batch(
                 save_file_path = str(
                     os.path.join(batch.output_path, batch.output_file_name)
                 )
+                sample = result.output[idx]
+                audio = getattr(result, "audio", None)
+                if isinstance(audio, torch.Tensor) and audio.ndim >= 2:
+                    audio = audio[idx] if audio.shape[0] > idx else None
+                if audio is not None and not (
+                    isinstance(sample, (tuple, list)) and len(sample) == 2
+                ):
+                    sample = (sample, audio)
                 post_process_sample(
-                    result.output[idx],
+                    sample,
                     batch.data_type,
                     batch.fps,
                     batch.save_output,

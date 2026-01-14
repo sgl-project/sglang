@@ -15,6 +15,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.hunyuan import (
     FastHunyuanConfig,
     HunyuanConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import LTX2PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     SelfForcingWanT2V480PConfig,
     WanI2V480PConfig,
@@ -38,4 +39,5 @@ __all__ = [
     "WanI2V720PConfig",
     "SelfForcingWanT2V480PConfig",
     "ZImagePipelineConfig",
+    "LTX2PipelineConfig",
 ]

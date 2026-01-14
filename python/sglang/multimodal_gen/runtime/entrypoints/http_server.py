@@ -116,8 +116,16 @@ async def forward_to_scheduler(req_obj, sp):
             raise RuntimeError("Model generation returned no output.")
 
         output_file_path = sp.output_file_path()
+        sample = response.output[0]
+        audio = getattr(response, "audio", None)
+        if isinstance(audio, torch.Tensor) and audio.ndim >= 2:
+            audio = audio[0]
+        if audio is not None and not (
+            isinstance(sample, (tuple, list)) and len(sample) == 2
+        ):
+            sample = (sample, audio)
         post_process_sample(
-            sample=response.output[0],
+            sample=sample,
             data_type=sp.data_type,
             fps=sp.fps or 24,
             save_output=True,
