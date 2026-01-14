@@ -6,6 +6,8 @@ import torch
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
+from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.npu.utils import npu_format_cast
 from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
 from sglang.srt.layers.moe import (
     MoeRunner,
@@ -25,6 +27,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_cpu,
     is_hip,
+    is_npu,
     next_power_of_2,
     set_weight_attrs,
     use_intel_amx_backend,
@@ -40,6 +43,7 @@ if TYPE_CHECKING:
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_hip = is_hip()
 _is_cpu = is_cpu()
+_is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _use_aiter:
@@ -119,6 +123,8 @@ class UnquantizedLinearMethod(LinearMethodBase):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if _is_cpu and _is_cpu_amx_available:
             _amx_process_weight_after_loading(layer, ["weight"])
+        if _is_npu and envs.SGLANG_UNQUANT_LINEAR_NZ.get():
+            layer.weight.data = npu_format_cast(layer.weight.data)
 
     def apply(
         self,
