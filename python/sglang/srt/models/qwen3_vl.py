@@ -397,30 +397,44 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         return cos_combined, sin_combined
 
     def fast_pos_embed_interpolate(self, grid_thw):
-        grid_ts, grid_hs, grid_ws = grid_thw[:, 0], grid_thw[:, 1], grid_thw[:, 2]
+        """优化版：确保第一个for循环完全在CPU上执行"""
+        # 1. 先将所有数据移到CPU（一次性同步）
+        grid_thw_cpu = grid_thw.cpu() if grid_thw.is_cuda else grid_thw
+
+        grid_ts = grid_thw_cpu[:, 0].tolist()  # 转为Python列表
+        grid_hs = grid_thw_cpu[:, 1].tolist()
+        grid_ws = grid_thw_cpu[:, 2].tolist()
+
         device = self.pos_embed.weight.device
+        dtype = self.pos_embed.weight.dtype
 
         idx_list = [[] for _ in range(4)]
         weight_list = [[] for _ in range(4)]
 
+        # 2. 现在循环的是Python整数，确保所有计算在CPU上进行
         for t, h, w in zip(grid_ts, grid_hs, grid_ws):
+            # 使用CPU设备进行计算
+            cpu_device = torch.device('cpu')
+
             if self.align_corners:
-                h_idxs = torch.linspace(0, self.num_grid_per_side - 1, h, device=device)
-                w_idxs = torch.linspace(0, self.num_grid_per_side - 1, w, device=device)
+                # 在CPU上创建张量
+                h_idxs = torch.linspace(0, self.num_grid_per_side - 1, h, device=cpu_device)
+                w_idxs = torch.linspace(0, self.num_grid_per_side - 1, w, device=cpu_device)
             else:
-                h_idxs = (torch.arange(h, device=device) + 0.5) * (
+                # 在CPU上创建张量
+                h_idxs = (torch.arange(h, device=cpu_device) + 0.5) * (
                     self.num_grid_per_side / h
                 ) - 0.5
-                w_idxs = (torch.arange(w, device=device) + 0.5) * (
+                w_idxs = (torch.arange(w, device=cpu_device) + 0.5) * (
                     self.num_grid_per_side / w
                 ) - 0.5
                 h_idxs = h_idxs.clamp(0, self.num_grid_per_side - 1)
                 w_idxs = w_idxs.clamp(0, self.num_grid_per_side - 1)
 
-            h_idxs_floor = h_idxs.int()
-            w_idxs_floor = w_idxs.int()
-            h_idxs_ceil = (h_idxs_floor + 1).clip(max=self.num_grid_per_side - 1)
-            w_idxs_ceil = (w_idxs_floor + 1).clip(max=self.num_grid_per_side - 1)
+            h_idxs_floor = h_idxs.floor().long()
+            w_idxs_floor = w_idxs.floor().long()
+            h_idxs_ceil = (h_idxs_floor + 1).clamp(max=self.num_grid_per_side - 1)
+            w_idxs_ceil = (w_idxs_floor + 1).clamp(max=self.num_grid_per_side - 1)
 
             dh = h_idxs - h_idxs_floor
             dw = w_idxs - w_idxs_floor
@@ -429,47 +443,58 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             base_h_ceil = h_idxs_ceil * self.num_grid_per_side
 
             indices = [
-                (base_h[None].T + w_idxs_floor[None]).flatten(),
-                (base_h[None].T + w_idxs_ceil[None]).flatten(),
-                (base_h_ceil[None].T + w_idxs_floor[None]).flatten(),
-                (base_h_ceil[None].T + w_idxs_ceil[None]).flatten(),
+                (base_h.unsqueeze(1) + w_idxs_floor.unsqueeze(0)).flatten(),
+                (base_h.unsqueeze(1) + w_idxs_ceil.unsqueeze(0)).flatten(),
+                (base_h_ceil.unsqueeze(1) + w_idxs_floor.unsqueeze(0)).flatten(),
+                (base_h_ceil.unsqueeze(1) + w_idxs_ceil.unsqueeze(0)).flatten(),
             ]
 
             weights = [
-                ((1 - dh)[None].T * (1 - dw)[None]).flatten(),
-                ((1 - dh)[None].T * dw[None]).flatten(),
-                (dh[None].T * (1 - dw)[None]).flatten(),
-                (dh[None].T * dw[None]).flatten(),
+                ((1 - dh).unsqueeze(1) * (1 - dw).unsqueeze(0)).flatten(),
+                ((1 - dh).unsqueeze(1) * dw.unsqueeze(0)).flatten(),
+                (dh.unsqueeze(1) * (1 - dw).unsqueeze(0)).flatten(),
+                (dh.unsqueeze(1) * dw.unsqueeze(0)).flatten(),
             ]
 
             for i in range(4):
                 idx_list[i].append(indices[i])
                 weight_list[i].append(weights[i])
 
-        idx_tensor = torch.stack([torch.cat(l) for l in idx_list]).long()
-        weight_tensor = torch.stack([torch.cat(l) for l in weight_list]).to(
-            self.pos_embed.weight.dtype
-        )
-        pos_embeds = self.pos_embed(idx_tensor).to(device) * weight_tensor[:, :, None]
-        patch_pos_embeds = pos_embeds[0] + pos_embeds[1] + pos_embeds[2] + pos_embeds[3]
+        # 3. 合并所有张量（先在CPU上合并，然后一次性移到GPU）
+        # 在CPU上合并
+        idx_tensor_cpu = torch.stack([torch.cat(l) for l in idx_list]).long()
+        weight_tensor_cpu = torch.stack([torch.cat(l) for l in weight_list])
 
+        # 一次性移到GPU
+        idx_tensor = idx_tensor_cpu.to(device=device)
+        weight_tensor = weight_tensor_cpu.to(dtype=dtype, device=device)
+
+        # 4. 批量获取位置编码（在GPU上）
+        pos_embeds = self.pos_embed(idx_tensor) * weight_tensor.unsqueeze(-1)
+        patch_pos_embeds = pos_embeds.sum(dim=0)  # 更高效的求和
+
+        # 5. 分割结果
         patch_pos_embeds = patch_pos_embeds.split(
             [h * w for h, w in zip(grid_hs, grid_ws)]
         )
 
+        # 6. 时间重复和空间重排
         patch_pos_embeds_permute = []
         merge_size = self.spatial_merge_size
+
         for pos_embed, t, h, w in zip(patch_pos_embeds, grid_ts, grid_hs, grid_ws):
             pos_embed = pos_embed.repeat(t, 1)
-            pos_embed = (
-                pos_embed.view(
-                    t, h // merge_size, merge_size, w // merge_size, merge_size, -1
-                )
-                .permute(0, 1, 3, 2, 4, 5)
-                .flatten(0, 4)
-            )
+
+            h_merge = h // merge_size
+            w_merge = w // merge_size
+
+            pos_embed = pos_embed.view(
+                t, h_merge, merge_size, w_merge, merge_size, -1
+            ).permute(0, 1, 3, 2, 4, 5).flatten(0, 4)
+
             patch_pos_embeds_permute.append(pos_embed)
-        return torch.cat(patch_pos_embeds_permute)
+
+        return torch.cat(patch_pos_embeds_permute, dim=0)
 
     def forward(
         self,
