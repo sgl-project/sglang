@@ -58,6 +58,7 @@ jobs:
   # =============================================== check changes ====================================================
   check-changes:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     outputs:
       main_package: ${{ steps.filter.outputs.main_package || steps.run-mode.outputs.run_all_tests }}
       sgl_kernel: ${{ steps.filter.outputs.sgl_kernel }} # sgl-kernel tests only run when kernels are rebuilt
@@ -182,6 +183,7 @@ jobs:
     needs: [check-changes, call-gate]
     if: needs.check-changes.outputs.sgl_kernel == 'true'
     runs-on: x64-kernel-build-node
+    timeout-minutes: 60
     strategy:
       matrix:
         include:
@@ -229,6 +231,7 @@ jobs:
     needs: [check-changes, call-gate]
     if: needs.check-changes.outputs.sgl_kernel == 'true'
     runs-on: arm-kernel-build-node
+    timeout-minutes: 60
     strategy:
       matrix:
         include:
@@ -279,6 +282,7 @@ jobs:
       !inputs.target_stage &&
       needs.check-changes.outputs.sgl_kernel == 'true'
     runs-on: 1-gpu-runner
+    timeout-minutes: 60
     env:
       RUNNER_LABELS: 1-gpu-runner
     steps:
@@ -315,6 +319,7 @@ jobs:
       !inputs.target_stage &&
       needs.check-changes.outputs.sgl_kernel == 'true'
     runs-on: 1-gpu-runner
+    timeout-minutes: 60
     env:
       RUNNER_LABELS: 1-gpu-runner
     steps:
@@ -351,6 +356,7 @@ jobs:
       !inputs.target_stage &&
       needs.check-changes.outputs.sgl_kernel == 'true'
     runs-on: 1-gpu-runner
+    timeout-minutes: 60
     env:
       CI: true
       RUNNER_LABELS: 1-gpu-runner
@@ -400,6 +406,7 @@ jobs:
       !inputs.target_stage &&
       needs.check-changes.outputs.sgl_kernel == 'true'
     runs-on: ${{ needs.check-changes.outputs.b200_runner }}
+    timeout-minutes: 60
     env:
       RUNNER_LABELS: ${{ needs.check-changes.outputs.b200_runner }}
     steps:
@@ -469,6 +476,7 @@ jobs:
       !inputs.target_stage &&
       needs.check-changes.outputs.jit_kernel == 'true'
     runs-on: 1-gpu-runner
+    timeout-minutes: 60
     env:
       RUNNER_LABELS: 1-gpu-runner
     steps:
@@ -502,6 +510,7 @@ jobs:
         )
       )
     runs-on: 1-gpu-runner
+    timeout-minutes: 60
     env:
       RUNNER_LABELS: 1-gpu-runner
     steps:
@@ -548,6 +557,7 @@ jobs:
         )
       )
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - name: Free disk space
         run: |
@@ -592,6 +602,7 @@ jobs:
         )
       )
     runs-on: 1-gpu-runner
+    timeout-minutes: 60
     env:
       RUNNER_LABELS: 1-gpu-runner
     strategy:
@@ -641,6 +652,7 @@ jobs:
         )
       )
     runs-on: 1-gpu-runner
+    timeout-minutes: 60
     env:
       RUNNER_LABELS: 1-gpu-runner
     steps:
@@ -737,6 +749,7 @@ jobs:
         )
       )
     runs-on: 2-gpu-runner
+    timeout-minutes: 60
     env:
       RUNNER_LABELS: 2-gpu-runner
     strategy:
@@ -785,6 +798,7 @@ jobs:
         )
       )
     runs-on: 4-gpu-h100
+    timeout-minutes: 60
     env:
       RUNNER_LABELS: 4-gpu-h100
     steps:
@@ -829,6 +843,7 @@ jobs:
         )
       )
     runs-on: ${{ needs.check-changes.outputs.b200_runner }}
+    timeout-minutes: 60
     env:
       RUNNER_LABELS: ${{ needs.check-changes.outputs.b200_runner }}
     steps:
@@ -869,6 +884,7 @@ jobs:
         )
       )
     runs-on: 1-gpu-runner
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -919,6 +935,7 @@ jobs:
         )
       )
     runs-on: 2-gpu-runner
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -1015,6 +1032,7 @@ jobs:
         )
       )
     runs-on: ${{ needs.check-changes.outputs.b200_runner }}
+    timeout-minutes: 60
     env:
       RUNNER_LABELS: ${{ needs.check-changes.outputs.b200_runner }}
     strategy:
@@ -1062,6 +1080,7 @@ jobs:
         )
       )
     runs-on: 4-gpu-h100
+    timeout-minutes: 60
     env:
       RUNNER_LABELS: 4-gpu-h100
     strategy:
@@ -1114,6 +1133,7 @@ jobs:
         )
       )
     runs-on: 8-gpu-h200
+    timeout-minutes: 60
     env:
       RUNNER_LABELS: 8-gpu-h200
     strategy:
@@ -1172,6 +1192,7 @@ jobs:
         )
       )
     runs-on: 8-gpu-h20
+    timeout-minutes: 60
     env:
       SGLANG_CI_RDMA_ALL_DEVICES: "mlx5_1,mlx5_2,mlx5_3,mlx5_4"
       RUNNER_LABELS: 8-gpu-h20
@@ -1225,6 +1246,7 @@ jobs:
         )
       )
     runs-on: 1-gpu-runner
+    timeout-minutes: 60
     env:
       RUNNER_LABELS: 1-gpu-runner
     steps:
@@ -1297,6 +1319,7 @@ jobs:
         )
       )
     runs-on: 1-gpu-runner
+    timeout-minutes: 60
     env:
       RUNNER_LABELS: 1-gpu-runner
     steps:
@@ -1361,6 +1384,7 @@ jobs:
         )
       )
     runs-on: 1-gpu-runner
+    timeout-minutes: 60
     env:
       RUNNER_LABELS: 1-gpu-runner
     steps:
@@ -1419,6 +1443,7 @@ jobs:
         )
       )
     runs-on: 2-gpu-runner
+    timeout-minutes: 60
     env:
       RUNNER_LABELS: 2-gpu-runner
     steps:
@@ -1489,6 +1514,7 @@ jobs:
         )
       )
     runs-on: 1-gpu-runner
+    timeout-minutes: 60
     env:
       RUNNER_LABELS: 1-gpu-runner
     steps:
@@ -1532,6 +1558,7 @@ jobs:
         )
       )
     runs-on: 2-gpu-runner
+    timeout-minutes: 60
     env:
       RUNNER_LABELS: 2-gpu-runner
     steps:
@@ -1575,6 +1602,7 @@ jobs:
         )
       )
     runs-on: 4-gpu-h100
+    timeout-minutes: 60
     env:
       RUNNER_LABELS: 4-gpu-h100
     steps:
@@ -1623,6 +1651,7 @@ jobs:
         )
       )
     runs-on: 8-gpu-h200
+    timeout-minutes: 60
     env:
       RUNNER_LABELS: 8-gpu-h200
     steps:
@@ -1671,6 +1700,7 @@ jobs:
         )
       )
     runs-on: ${{ needs.check-changes.outputs.b200_runner }}
+    timeout-minutes: 60
     env:
       RUNNER_LABELS: ${{ needs.check-changes.outputs.b200_runner }}
     strategy:
@@ -1724,6 +1754,7 @@ jobs:
         )
       )
     runs-on: 4-gpu-gb200
+    timeout-minutes: 60
     env:
       RUNNER_LABELS: 4-gpu-gb200
     strategy:
@@ -1802,6 +1833,7 @@ jobs:
       ]
     if: always()
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - name: Check all dependent job statuses
         run: |
