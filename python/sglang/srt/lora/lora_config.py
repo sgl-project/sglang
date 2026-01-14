@@ -88,3 +88,26 @@ class LoRAConfig:
             logger = logging.getLogger(__name__)
             logger.warning(f"Failed to parse added_tokens.json: {e}")
             return None
+
+
+def is_valid_lora_adapter_path(adapter_path: str) -> bool:
+    """
+    Check if the specified path is a valid LoRA adapter directory.
+
+    Args:
+        adapter_path: Path to check
+
+    Returns:
+        True if the path is a valid LoRA adapter, False otherwise
+    """
+    config_file = os.path.join(adapter_path, "adapter_config.json")
+    if not os.path.exists(config_file):
+        return False
+
+    with open(config_file, "r") as f:
+        config = json.load(f)
+        return (
+            config.get("peft_type", "").lower() == "lora"
+            and "r" in config
+            and "target_modules" in config
+        )
