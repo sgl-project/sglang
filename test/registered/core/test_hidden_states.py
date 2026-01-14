@@ -10,6 +10,7 @@ from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST, CustomTest
 
 register_cuda_ci(est_time=55, suite="stage-b-test-small-1-gpu")
 register_amd_ci(est_time=55, suite="stage-b-test-small-1-gpu-amd")
+register_cuda_ci(est_time=31, suite="stage-b-test-small-1-gpu-5090")
 
 _is_hip = is_hip()
 if _is_hip:

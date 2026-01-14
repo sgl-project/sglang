@@ -146,6 +146,7 @@ async def generations(
     )
 
     resp_format = (request.response_format or "b64_json").lower()
+
     if resp_format == "b64_json":
         with open(save_file_path, "rb") as f:
             b64 = base64.b64encode(f.read()).decode("utf-8")
