@@ -25,6 +25,7 @@ import multiprocessing as mp
 import os
 import random
 import signal
+import tempfile
 import threading
 import time
 from typing import AsyncIterator, Callable, Dict, Iterator, List, Optional, Tuple, Union
@@ -891,6 +892,20 @@ def _launch_scheduler_processes(
 
         for pp_rank in pp_rank_range:
             for tp_rank in tp_rank_range:
+                # Compute mappings needed so PP stages may sleep on idle
+                if server_args.enable_pp_sleep_on_idle and tp_rank == tp_rank_range[0]:
+                    # Add notifier-listener pair if this rank precedes another on the same node
+                    if (pp_rank // pp_size_per_node) == (
+                        (pp_rank + 1) // pp_size_per_node
+                    ):
+                        notifier_listener_ipc_name = port_args.pp_idle_wakeup_listeners_ipc_names.setdefault(
+                            (None, pp_rank + 1),
+                            f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
+                        )
+                        port_args.pp_idle_wakeup_notifiers_ipc_names[None, pp_rank] = (
+                            notifier_listener_ipc_name
+                        )
+
                 reader, writer = mp.Pipe(duplex=False)
                 gpu_id = (
                     server_args.base_gpu_id
