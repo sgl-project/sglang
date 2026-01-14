@@ -269,7 +269,7 @@ python -m sglang.launch_server \
 Use ascend backend with [memfabric_hybrid](https://gitcode.com/Ascend/memfabric_hybrid) and ASCEND_MF_STORE_URL being set
 
 ```bash
-pip install memfabric-hybrid==1.0.0
+pip install memfabric-hybrid==1.0.4
 export ASCEND_MF_STORE_URL="tcp://xxx.xx.xxx.xxx:xxxx"
 ```
 Use mooncake backend, more details can be found in mooncake section.

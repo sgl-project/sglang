@@ -46,7 +46,7 @@ Prior to start work with SGLang on Ascend you need to install CANN Toolkit, Kern
 If you want to use PD disaggregation mode, you need to install MemFabric-Hybrid. MemFabric-Hybrid is a drop-in replacement of Mooncake Transfer Engine that enables KV cache transfer on Ascend NPU clusters.
 
 ```shell
-pip install memfabric-hybrid==1.0.0
+pip install memfabric-hybrid==1.0.4
 ```
 
 #### Pytorch and Pytorch Framework Adaptor on Ascend
