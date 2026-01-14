@@ -9,7 +9,8 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=8, suite="stage-b-test-small-1-gpu")
-register_amd_ci(est_time=12, suite="stage-a-test-1")
+register_cuda_ci(est_time=9, suite="stage-b-test-small-1-gpu-5090")
+register_amd_ci(est_time=12, suite="stage-b-test-small-1-gpu-amd")
 
 
 def torch_scaled_mm(
