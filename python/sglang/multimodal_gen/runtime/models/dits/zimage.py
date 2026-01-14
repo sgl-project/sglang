@@ -1,5 +1,5 @@
 import math
-from typing import Any, List, Optional, Tuple
+from typing import Any, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -992,10 +992,147 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         )
         return image, (F, H, W), (F_tokens, H_tokens, W_tokens)
 
+    # TODO: copy to configs/zimage.py later
+    def get_freqs_cis(
+        self,
+        prompt_embeds: List[torch.Tensor],
+        images: List[torch.Tensor],
+        siglips: List[torch.Tensor],
+        device,
+        rotary_emb,
+    ):
+        def _get_pos_ids(
+            ori_len: int,
+            pos_grid_size: Tuple,
+            pos_start: Tuple,
+            device: torch.device,
+        ):
+            pad_len = (-ori_len) % SEQ_MULTI_OF
+            total_len = ori_len + pad_len
+
+            # Pos IDs
+            ori_pos_ids = self.create_coordinate_grid(
+                size=pos_grid_size, start=pos_start, device=device
+            ).flatten(0, 2)
+            if pad_len > 0:
+                pad_pos_ids = (
+                    self.create_coordinate_grid(
+                        size=(1, 1, 1), start=(0, 0, 0), device=device
+                    )
+                    .flatten(0, 2)
+                    .repeat(pad_len, 1)
+                )
+                pos_ids = torch.cat([ori_pos_ids, pad_pos_ids], dim=0)
+            else:
+                pos_ids = ori_pos_ids
+
+            return pos_ids
+
+        # TODO: assert batch size == 1
+
+        # TODO: hard code....
+        PATCH_SIZE = 2
+        F_PATCH_SIZE = 1
+        SEQ_MULTI_OF = 32
+
+        # cap_start_pos for cap pos ids
+        cap_cu_len = 1
+        # cap_end_pos + 0 for image pos ids
+        # cap_end_pos + 1 for image siglip ids
+        cap_end_pos = []
+
+        image_size = []
+
+        cap_pos_ids_list = []
+        image_pos_ids_list = []
+        siglip_pos_ids_list = []
+
+        for cap_item in prompt_embeds:
+            cap_padded_pos_ids = _get_pos_ids(
+                len(cap_item),
+                (len(cap_item) + (-len(cap_item)) % SEQ_MULTI_OF, 1, 1),
+                (cap_cu_len, 0, 0),
+                device,
+            )
+            cap_cu_len += len(cap_item)
+            cap_end_pos.append(cap_cu_len)
+            cap_cu_len += 2  # for image vae and siglip tokens
+            cap_pos_ids_list.append(cap_padded_pos_ids)
+
+        for j, image in enumerate(images):
+            if image is not None:
+                pH, pW, pF = PATCH_SIZE, PATCH_SIZE, F_PATCH_SIZE
+                C, F, H, W = image.size()
+                F_t, H_t, W_t = F // pF, H // pH, W // pW
+                image = image.view(C, F_t, pF, H_t, pH, W_t, pW)
+                image = image.permute(1, 3, 5, 2, 4, 6, 0).reshape(
+                    F_t * H_t * W_t, pF * pH * pW * C
+                )
+                image_pos = _get_pos_ids(
+                    F_t * H_t * W_t, (F_t, H_t, W_t), (cap_end_pos[j], 0, 0), device
+                )
+                image_size.append((F, H, W))
+            else:
+                # TODO: review
+                # when will this happen?
+                image_len = SEQ_MULTI_OF
+                image_pos = (
+                    self.create_coordinate_grid((1, 1, 1), (0, 0, 0), device)
+                    .flatten(0, 2)
+                    .repeat(image_len, 1)
+                )
+                image_size.append(None)
+
+            image_pos_ids_list.append(image_pos)
+
+        # TODO: ugly hack
+        for j, sig_item in enumerate(siglips if siglips is not None else []):
+            if sig_item is not None:
+                # TODO: review
+                # diff
+                # shape = (1, xx , xx)???
+                sig_H, sig_W, sig_C = sig_item.size()
+                sig_flat = sig_item.permute(2, 0, 1).reshape(sig_H * sig_W, sig_C)
+                sig_pos = _get_pos_ids(
+                    len(sig_flat),
+                    (1, sig_H, sig_W),
+                    (cap_end_pos[j] + 1, 0, 0),
+                    device,
+                )
+                # Scale position IDs to match x resolution
+                if image_size[j] is not None:
+                    sig_pos = sig_pos.float()
+                    sig_pos[..., 1] = (
+                        sig_pos[..., 1] / max(sig_H - 1, 1) * (image_size[j][1] - 1)
+                    )
+                    sig_pos[..., 2] = (
+                        sig_pos[..., 2] / max(sig_W - 1, 1) * (image_size[j][2] - 1)
+                    )
+                    sig_pos = sig_pos.to(torch.int32)
+            else:
+                # TODO: review
+                # when will this happen?
+                sig_len = SEQ_MULTI_OF
+                sig_pos = (
+                    self.create_coordinate_grid((1, 1, 1), (0, 0, 0), device)
+                    .flatten(0, 2)
+                    .repeat(sig_len, 1)
+                )
+            siglip_pos_ids_list.append(sig_pos)
+
+        cap_freqs_cis = rotary_emb(torch.cat(cap_pos_ids_list, dim=0))
+        x_freqs_cis = rotary_emb(torch.cat(image_pos_ids_list, dim=0))
+        siglip_freqs_cis = (
+            rotary_emb(torch.cat(siglip_pos_ids_list, dim=0))
+            if len(siglip_pos_ids_list) != 0
+            else None
+        )
+        return (cap_freqs_cis, x_freqs_cis, siglip_freqs_cis)
+
     def forward(
         self,
-        hidden_states: List[torch.Tensor],
-        encoder_hidden_states: List[torch.Tensor],
+        hidden_states: Union[List[torch.Tensor], List[List[torch.Tensor]]],
+        encoder_hidden_states: Union[List[torch.Tensor], List[List[torch.Tensor]]],
         timestep,
         guidance=0,
         patch_size=2,
@@ -1037,7 +1174,25 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
             adaln_input = self.t_embedder(t).type_as(x[0])
             t_noisy = t_clean = None
 
-        # TODO: only freq compute test.
+        # TODO: overwrite freqs_cis for debug
+        # TODO: single batch only
+        # compute freqs before patchify
+        # TODO: ugly
+        freqs_cis = self.get_freqs_cis(
+            prompt_embeds=(
+                encoder_hidden_states[0]
+                if isinstance(encoder_hidden_states[0], list)
+                else encoder_hidden_states
+            ),
+            images=(
+                hidden_states[0]
+                if isinstance(hidden_states[0], list)
+                else hidden_states
+            ),
+            siglips=siglip_feats[0] if siglip_feats is not None else None,
+            device=device,
+            rotary_emb=getattr(self, "rotary_emb", None),
+        )
 
         # Patchify
         if omni_mode:
