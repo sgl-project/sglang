@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from enum import Enum
+from functools import lru_cache
 from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
 
 import torch
@@ -13,13 +14,6 @@ from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
-
-try:
-    from vllm import _custom_ops as ops
-
-    VLLM_AVAILABLE = True
-except ImportError:
-    VLLM_AVAILABLE = False
 
 from sglang.srt.layers.quantization.fp8_kernel import (
     fp8_dtype,
@@ -101,6 +95,7 @@ def use_rowwise_torch_scaled_mm():
 USE_ROWWISE_TORCH_SCALED_MM = use_rowwise_torch_scaled_mm()
 
 
+@lru_cache(maxsize=1)
 def cutlass_fp8_supported():
     if not _is_cuda:
         return False
@@ -907,9 +902,8 @@ def apply_fp8_linear(
     # We also don't pad when using torch.compile,
     # as it breaks with dynamic shapes.
     if pad_output is None:
-        pad_output = (
-            not get_bool_env_var("SGLANG_ENABLE_TORCH_COMPILE")
-            and not cutlass_fp8_supported
+        pad_output = not cutlass_fp8_supported and not get_bool_env_var(
+            "SGLANG_ENABLE_TORCH_COMPILE"
         )
     output_padding = 17 if pad_output else None
 
@@ -956,37 +950,22 @@ def apply_fp8_linear(
                     )
 
     if cutlass_fp8_supported and weight_scale.numel() == weight.shape[1]:
-        # cutlass_scaled_mm supports per tensor/channel W and per tensor/token A
-        # for sgl-kernel fp8_scaled_mm, it support per channel W now
-        if VLLM_AVAILABLE and use_vllm_cutlass_w8a8_fp8_kernel:
-            # Fall back to vllm cutlass w8a8 fp8 kernel
-            output = ops.cutlass_scaled_mm(
-                qinput,
-                weight,
-                out_dtype=input.dtype,
-                scale_a=x_scale,
-                scale_b=weight_scale,
-                bias=bias,
+        cutlass_compatible_b = weight.shape[0] % 16 == 0 and weight.shape[1] % 16 == 0
+        if not cutlass_compatible_b or use_triton_w8a8_fp8_kernel:
+            # Massage the input to be 2D
+            qinput = qinput.view(-1, qinput.shape[-1])
+            output = triton_scaled_mm(
+                qinput, weight, x_scale, weight_scale, input.dtype, bias
             )
         else:
-            cutlass_compatible_b = (
-                weight.shape[0] % 16 == 0 and weight.shape[1] % 16 == 0
+            output = fp8_scaled_mm(
+                qinput,
+                weight,
+                x_scale,
+                weight_scale,
+                out_dtype=input.dtype,
+                bias=bias,
             )
-            if not cutlass_compatible_b or use_triton_w8a8_fp8_kernel:
-                # Massage the input to be 2D
-                qinput = qinput.view(-1, qinput.shape[-1])
-                output = triton_scaled_mm(
-                    qinput, weight, x_scale, weight_scale, input.dtype, bias
-                )
-            else:
-                output = fp8_scaled_mm(
-                    qinput,
-                    weight,
-                    x_scale,
-                    weight_scale,
-                    out_dtype=input.dtype,
-                    bias=bias,
-                )
         return output.view(*output_shape)
 
     # torch.scaled_mm supports per tensor weights + activations only
@@ -1041,7 +1020,9 @@ def apply_fp8_linear(
             return _process_scaled_mm_output(output, input_2d.shape, output_shape)
 
     if per_tensor_weights and per_tensor_activations:
-        # Fused GEMM_DQ
+        # Fused GEMM_DQ; _scaled_mm with torch.compile requires len(weight_scale.shape) == len(x_scale.shape)
+        if weight_scale.ndim == 0 and x_scale.ndim == 1:
+            weight_scale = weight_scale.unsqueeze(0)
         output = torch._scaled_mm(
             qinput,
             weight,

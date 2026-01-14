@@ -10,11 +10,8 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
-from sglang.srt.utils.common import (
-    ceil_align,
-    disable_request_logging,
-    raise_error_or_warn,
-)
+from sglang.srt.utils.common import ceil_align, raise_error_or_warn
+from sglang.srt.utils.request_logger import disable_request_logging
 from sglang.srt.utils.watchdog import WatchdogRaw
 
 if TYPE_CHECKING:
@@ -291,7 +288,7 @@ class SchedulerRuntimeCheckerMixin:
             self.stats.token_usage = round(token_usage, 2)
             self.stats.gen_throughput = 0
             self.stats.num_queue_reqs = len(self.waiting_queue)
-            self.stats.num_grammar_queue_reqs = len(self.grammar_queue)
+            self.stats.num_grammar_queue_reqs = len(self.grammar_manager)
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 self.stats.num_prefill_prealloc_queue_reqs = len(
                     self.disagg_prefill_bootstrap_queue.queue
@@ -340,7 +337,7 @@ def create_scheduler_watchdog(
     scheduler: Scheduler, watchdog_timeout: float, soft: bool = False
 ) -> WatchdogRaw:
     def dump_info() -> str:
-        if disable_request_logging():
+        if scheduler.is_initializing or disable_request_logging():
             return ""
         if scheduler.is_hybrid_swa:
             _, info_msg = scheduler._check_hybrid_memory()
@@ -358,8 +355,9 @@ def create_scheduler_watchdog(
 
     return WatchdogRaw(
         debug_name="Scheduler",
-        get_counter=lambda: scheduler.forward_ct,
-        is_active=lambda: scheduler.cur_batch is not None,
+        get_counter=lambda: getattr(scheduler, "forward_ct", 0),
+        is_active=lambda: scheduler.is_initializing
+        or getattr(scheduler, "cur_batch", None) is not None,
         watchdog_timeout=watchdog_timeout,
         soft=soft,
         dump_info=dump_info,
