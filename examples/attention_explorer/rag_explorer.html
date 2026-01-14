@@ -881,9 +881,12 @@
                         Query Analysis
                         <div class="tooltip-container">
                             <span class="info-icon">?</span>
-                            <div class="tooltip">
-                                <span class="tooltip-title">Query Analysis</span>
-                                Analyzes your query using attention fingerprints to determine if external knowledge retrieval is needed. Identifies "anchor tokens" that signal information-seeking behavior.
+                            <div class="tooltip" style="width: 280px;">
+                                <span class="tooltip-title">What is Query Analysis?</span>
+                                <strong style="color: var(--lime);">This analyzes YOUR question to see if the AI needs to look up information.</strong><br><br>
+                                Some questions are simple ("Hi, how are you?") - the AI can answer from memory.<br><br>
+                                Other questions need facts ("What is the capital of France?") - the AI should look things up.<br><br>
+                                <strong style="color: var(--cyan);">We detect this by looking at attention patterns!</strong>
                             </div>
                         </div>
                     </div>
@@ -909,10 +912,15 @@
                                 <span>Retrieval Need</span>
                                 <div class="tooltip-container">
                                     <span class="info-icon">?</span>
-                                    <div class="tooltip">
-                                        <span class="tooltip-title">Retrieval Need Score</span>
-                                        Measures how much the query requires external information. Higher scores indicate the model's attention patterns show information-seeking behavior (semantic bridges).
-                                        <div class="tooltip-formula">Score = 0.15 * semantic_bridges + 0.1 * long_range + 0.2</div>
+                                    <div class="tooltip" style="width: 300px;">
+                                        <span class="tooltip-title">Does this question need external info?</span>
+                                        <strong style="color: var(--lime);">This meter shows if the AI should look up information to answer your question.</strong><br><br>
+
+                                        <strong style="color: var(--cyan);">Low (0-40%):</strong> Simple question. The AI can answer from what it knows. Example: "Hello!" or "What is 2+2?"<br><br>
+
+                                        <strong style="color: var(--amber);">High (40-100%):</strong> Fact-seeking question. The AI is "searching" for information. Example: "What are the health benefits of green tea?"<br><br>
+
+                                        <em>We detect this by looking at attention patterns - when the AI's attention is scattered and searching, it needs help!</em>
                                     </div>
                                 </div>
                             </div>
@@ -934,13 +942,18 @@
                             <span class="section-title">Token Classification</span>
                             <div class="tooltip-container">
                                 <span class="info-icon">?</span>
-                                <div class="tooltip">
-                                    <span class="tooltip-title">Token Classification</span>
-                                    Each token is classified into an "attention zone" based on its fingerprint. Zones indicate how the model processes that token:
-                                    <br><br>
-                                    <strong style="color: var(--cyan);">Semantic Bridge:</strong> Token seeks information (high retrieval need)<br>
-                                    <strong style="color: var(--violet);">Long Range:</strong> Token connects to distant context<br>
-                                    <strong style="color: var(--text-muted);">Syntax:</strong> Local grammatical token (low importance)
+                                <div class="tooltip" style="width: 300px;">
+                                    <span class="tooltip-title">What are these colored tokens?</span>
+                                    <strong style="color: var(--lime);">Each word piece (token) gets a color based on what the AI was "thinking" when processing it.</strong><br><br>
+
+                                    <strong style="color: var(--cyan);">🔗 Cyan = "I need information"</strong><br>
+                                    These tokens are searching for facts. Words like "capital", "explain", "how" trigger information-seeking.<br><br>
+
+                                    <strong style="color: var(--violet);">🔭 Purple = "Connecting to earlier context"</strong><br>
+                                    These tokens link to something mentioned way earlier.<br><br>
+
+                                    <strong style="color: var(--text-muted);">📝 Gray = "Just grammar"</strong><br>
+                                    Words like "the", "is", "a" - not important for understanding.
                                 </div>
                             </div>
                         </div>
@@ -949,25 +962,31 @@
                             <div class="legend-item tooltip-container">
                                 <div class="legend-dot" style="background: var(--cyan)"></div>
                                 Retrieval Anchor
-                                <div class="tooltip" style="width: 220px;">
-                                    <span class="tooltip-title">Retrieval Anchor</span>
-                                    Tokens that signal information-seeking. High mid-range attention mass (>0.4) and elevated entropy indicate the model is "searching" for information.
+                                <div class="tooltip" style="width: 260px;">
+                                    <span class="tooltip-title">🔗 Retrieval Anchor</span>
+                                    <strong style="color: var(--lime);">Words that say "I need information!"</strong><br><br>
+                                    These tokens triggered the AI to search for facts. When you see cyan, the AI was actively looking for something to answer the question.<br><br>
+                                    <em>Examples:</em> "capital", "explain", "benefits", "how does"
                                 </div>
                             </div>
                             <div class="legend-item tooltip-container">
                                 <div class="legend-dot" style="background: var(--violet)"></div>
                                 Long Range
-                                <div class="tooltip" style="width: 220px;">
-                                    <span class="tooltip-title">Long Range Zone</span>
-                                    Tokens that attend to distant context (>50 tokens away). Long-range attention mass >0.4 indicates connecting disparate concepts.
+                                <div class="tooltip" style="width: 260px;">
+                                    <span class="tooltip-title">🔭 Long Range</span>
+                                    <strong style="color: var(--lime);">Words connecting to earlier context.</strong><br><br>
+                                    These tokens are linking back to something mentioned way earlier in the text (50+ words back).<br><br>
+                                    <em>Example:</em> Referring back to instructions or the original question.
                                 </div>
                             </div>
                             <div class="legend-item tooltip-container">
                                 <div class="legend-dot" style="background: var(--text-muted)"></div>
                                 Syntax
-                                <div class="tooltip" style="width: 220px;">
-                                    <span class="tooltip-title">Syntax Floor Zone</span>
-                                    Local grammatical tokens (articles, prepositions). High local attention mass (>0.6), low entropy. Can be reconstructed from context - low importance.
+                                <div class="tooltip" style="width: 260px;">
+                                    <span class="tooltip-title">📝 Syntax (Grammar)</span>
+                                    <strong style="color: var(--lime);">Just grammar words - not important for meaning.</strong><br><br>
+                                    Words like "the", "is", "a", "of" - they help sentences flow but don't carry the main meaning.<br><br>
+                                    <em>These are filtered out when ranking documents.</em>
                                 </div>
                             </div>
                         </div>
@@ -982,10 +1001,18 @@
                         Document Ranking
                         <div class="tooltip-container">
                             <span class="info-icon">?</span>
-                            <div class="tooltip">
-                                <span class="tooltip-title">Document Ranking</span>
-                                Documents are scored and ranked by how well they match the query's attention fingerprint. Higher scores indicate better retrieval targets.
-                                <div class="tooltip-formula">Final Score = 0.35*FP + 0.25*TQ + 0.4*Semantic</div>
+                            <div class="tooltip" style="width: 300px;">
+                                <span class="tooltip-title">How are documents ranked?</span>
+                                <strong style="color: var(--lime);">We find documents that best match your question.</strong><br><br>
+
+                                Traditional search just matches keywords. We go deeper - we find documents that the AI would naturally "attend to" when answering.<br><br>
+
+                                <strong style="color: var(--cyan);">Score breakdown:</strong><br>
+                                • <strong>35%</strong> - Fingerprint match (attention similarity)<br>
+                                • <strong>25%</strong> - Document quality (focused, coherent)<br>
+                                • <strong>40%</strong> - Keyword overlap (traditional match)<br><br>
+
+                                <em>Higher score = better answer!</em>
                             </div>
                         </div>
                     </div>
@@ -1005,9 +1032,13 @@
                         Generated Answer
                         <div class="tooltip-container">
                             <span class="info-icon">?</span>
-                            <div class="tooltip">
-                                <span class="tooltip-title">Generated Answer</span>
-                                The model generates an answer using the top-ranked documents as context. The fingerprint visualization shows the attention distribution during generation.
+                            <div class="tooltip" style="width: 280px;">
+                                <span class="tooltip-title">The AI's Answer</span>
+                                <strong style="color: var(--lime);">This is the AI's response to your question.</strong><br><br>
+
+                                The AI uses the top-ranked documents as "context" - like giving it reference material to read before answering.<br><br>
+
+                                <strong style="color: var(--cyan);">The bar chart below</strong> shows what the AI was "looking at" while writing the answer - you can see if it focused on nearby words (grammar) or distant context (facts).
                             </div>
                         </div>
                     </div>
@@ -1027,15 +1058,19 @@
                                 Generation Attention Fingerprint
                                 <div class="tooltip-container">
                                     <span class="info-icon">?</span>
-                                    <div class="tooltip">
-                                        <span class="tooltip-title">Attention Fingerprint</span>
-                                        A 20-dimensional vector capturing attention distribution characteristics:
-                                        <br><br>
-                                        <strong>Bars 1-3:</strong> Distance mass (local, mid, long)<br>
-                                        <strong>Bar 4:</strong> Entropy (attention spread)<br>
-                                        <strong>Bars 5-20:</strong> Distance histogram buckets<br>
-                                        <br>
-                                        Taller bars = more attention in that range
+                                    <div class="tooltip" style="width: 300px;">
+                                        <span class="tooltip-title">What is this bar chart?</span>
+                                        <strong style="color: var(--lime);">This shows WHERE the AI was looking when it wrote the answer.</strong><br><br>
+
+                                        <strong style="color: var(--cyan);">Reading the bars (left to right):</strong><br>
+                                        • <strong>Local (0-10)</strong> - Recent words (grammar)<br>
+                                        • <strong>Mid (10-50)</strong> - Earlier in sentence (meaning)<br>
+                                        • <strong>Long (50+)</strong> - Way back (instructions/facts)<br>
+                                        • <strong>Entropy</strong> - How spread out attention is<br><br>
+
+                                        <strong>Taller bar = more attention there</strong><br>
+                                        High "Mid" bars = AI was connecting concepts<br>
+                                        High "Local" bars = AI was doing grammar
                                     </div>
                                 </div>
                             </div>
@@ -1063,6 +1098,94 @@
                 <button class="modal-close" onclick="toggleHelp()">&times;</button>
             </div>
             <div class="modal-body">
+                <!-- Beginner Introduction -->
+                <div class="help-section">
+                    <div class="help-section-title">
+                        <span style="color: var(--lime);">&#9679;</span>
+                        What is RAG? (Plain English)
+                    </div>
+                    <div style="background: linear-gradient(135deg, rgba(0,229,255,0.1), rgba(180,255,0,0.1)); padding: 16px; border-radius: 8px; margin-bottom: 16px;">
+                        <div style="font-size: 13px; color: var(--text); line-height: 1.8;">
+                            <strong style="color: var(--cyan);">RAG = Retrieval-Augmented Generation</strong><br><br>
+                            Think of it like this: when you ask the AI a fact question, it's like asking someone who hasn't studied for an exam. They might guess wrong!<br><br>
+                            <strong style="color: var(--lime);">RAG gives the AI a "cheat sheet"</strong> - it finds relevant documents first, then lets the AI read them before answering. Much more accurate!<br><br>
+                            <strong style="color: var(--amber);">This tool shows you:</strong><br>
+                            1. Does your question need a cheat sheet? (Retrieval Need)<br>
+                            2. Which documents are most relevant? (Document Ranking)<br>
+                            3. How did the AI use them? (Attention Fingerprint)
+                        </div>
+                    </div>
+                </div>
+
+                <!-- LLM Interpretation Guide -->
+                <div class="help-section">
+                    <div class="help-section-title">
+                        <span style="color: var(--magenta);">&#9679;</span>
+                        💡 Ask the AI to Explain Results!
+                    </div>
+                    <div style="background: linear-gradient(135deg, rgba(180,255,0,0.15), rgba(255,0,153,0.15)); padding: 16px; border-radius: 8px; margin-bottom: 16px; border: 1px solid var(--border);">
+                        <div style="font-size: 12px; color: var(--text); line-height: 1.8;">
+                            <strong style="color: var(--lime);">You can ask the same AI to interpret what you see!</strong><br><br>
+                            <strong>Try these prompts:</strong><br><br>
+                            <div style="background: var(--void); padding: 10px; border-radius: 6px; margin: 8px 0; font-family: monospace; font-size: 11px;">
+                            "My query 'What are the health benefits of green tea?' got a retrieval need score of 72%. The word 'benefits' was classified as a Semantic Bridge. What does this tell us?"
+                            </div>
+                            <div style="background: var(--void); padding: 10px; border-radius: 6px; margin: 8px 0; font-family: monospace; font-size: 11px;">
+                            "Document A scored 0.85 and Document B scored 0.45. A was about tea health benefits, B was about tea history. Why did A rank higher for a health question?"
+                            </div>
+                            <div style="background: var(--void); padding: 10px; border-radius: 6px; margin: 8px 0; font-family: monospace; font-size: 11px;">
+                            "The attention fingerprint shows high 'mid-range' bars. What does that mean about how the AI generated its answer?"
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Basic Concepts -->
+                <div class="help-section">
+                    <div class="help-section-title">
+                        <span style="color: var(--cyan);">&#9679;</span>
+                        Key Concepts (No Jargon)
+                    </div>
+                    <div class="help-grid">
+                        <div class="help-item">
+                            <div class="help-item-title">
+                                <span style="color: var(--cyan);">T</span>
+                                Token
+                            </div>
+                            <div class="help-item-desc">
+                                A piece of text - usually a word or part of a word. "Hello" = 1 token. "unhappiness" = 3 tokens.
+                            </div>
+                        </div>
+                        <div class="help-item">
+                            <div class="help-item-title">
+                                <span style="color: var(--magenta);">A</span>
+                                Attention
+                            </div>
+                            <div class="help-item-desc">
+                                Where the AI "looks" when processing each word. Like highlighting which parts of your question matter most.
+                            </div>
+                        </div>
+                        <div class="help-item">
+                            <div class="help-item-title">
+                                <span style="color: var(--lime);">F</span>
+                                Fingerprint
+                            </div>
+                            <div class="help-item-desc">
+                                A summary of the AI's attention pattern - like a unique signature showing what it was thinking.
+                            </div>
+                        </div>
+                        <div class="help-item">
+                            <div class="help-item-title">
+                                <span style="color: var(--amber);">R</span>
+                                Retrieval Need
+                            </div>
+                            <div class="help-item-desc">
+                                How much your question needs external info. "Hi!" = low. "What is quantum physics?" = high.
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
                 <!-- Attention Zones Section -->
                 <div class="help-section">
                     <div class="help-section-title">
@@ -1070,12 +1193,10 @@
                         Attention Zones (Token Classification)
                     </div>
                     <div style="background: var(--deep); border-left: 3px solid var(--violet); padding: 12px 16px; margin-bottom: 16px; border-radius: 0 6px 6px 0;">
-                        <div style="font-size: 11px; font-weight: 600; color: var(--violet); text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px;">Transformer Architecture Source</div>
+                        <div style="font-size: 11px; font-weight: 600; color: var(--violet); text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px;">What are these colors?</div>
                         <div style="font-size: 12px; color: var(--text-dim); line-height: 1.6;">
-                            Attention zones are derived from the <strong style="color: var(--text);">self-attention mechanism</strong>:
-                            <code style="background: var(--void); padding: 2px 6px; border-radius: 3px; font-size: 11px;">Attention = softmax(QK<sup>T</sup>/√d) · V</code><br>
-                            We analyze the attention weight matrix from the <strong style="color: var(--text);">final transformer layer</strong>,
-                            averaged across all attention heads. The "zone" tells us which part of the context the model is retrieving information from.
+                            Each word gets a color based on <strong style="color: var(--text);">where the AI was looking</strong> when it processed that word.
+                            Colors reveal the AI's "focus" - is it doing grammar (local) or retrieving facts (semantic bridge)?
                         </div>
                     </div>
                     <div class="help-grid">

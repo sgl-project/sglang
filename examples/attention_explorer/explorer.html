@@ -946,9 +946,17 @@
                     <span>?</span>
                     <span>Glossary & Help</span>
                 </button>
-                <div class="status-badge">
+                <div class="status-badge tooltip-container">
                     <div class="status-dot" id="statusDot"></div>
                     <span id="statusText">Connecting...</span>
+                    <span class="tooltip" style="width: 280px; right: 0; left: auto; transform: none;">
+                        <strong style="color: var(--lime);">What is this?</strong><br>
+                        Shows if we can talk to the AI server.<br><br>
+                        <strong style="color: var(--cyan);">Status colors:</strong><br>
+                        • <strong style="color: var(--lime);">Green</strong> = Connected, ready to use<br>
+                        • <strong style="color: var(--amber);">Yellow</strong> = Connecting...<br>
+                        • <strong style="color: var(--magenta);">Red</strong> = Can't connect (server may be offline)
+                    </span>
                 </div>
             </div>
         </header>
@@ -959,7 +967,12 @@
                     Input Text
                     <span class="tooltip-container">
                         <span class="info-icon">?</span>
-                        <span class="tooltip">Enter your prompt or question. The model will generate a response and we'll capture the <strong>attention patterns</strong> - which tokens the model looked at while generating each output token.</span>
+                        <span class="tooltip" style="width: 300px;">
+                            <strong style="color: var(--lime);">What to enter here:</strong><br>
+                            Type any question or text you want the AI to respond to. For example: "What is the capital of France?" or "Explain how cars work."<br><br>
+                            <strong style="color: var(--cyan);">What happens next:</strong><br>
+                            The AI will answer your question, and we'll show you <em>which words it looked at</em> while writing each word of its answer. This is called "attention" - it's literally where the AI pays attention.
+                        </span>
                     </span>
                 </div>
                 <textarea id="inputText" placeholder="Enter text to analyze attention patterns...">What is the capital of France?</textarea>
@@ -982,7 +995,12 @@
                         <label class="tooltip-container">
                             Max Tokens
                             <span class="info-icon">?</span>
-                            <span class="tooltip">Maximum number of tokens the model will generate. Higher values = longer responses but more computation. <strong>Range: 1-4096</strong></span>
+                            <span class="tooltip" style="width: 280px;">
+                                <strong style="color: var(--lime);">What is a Token?</strong><br>
+                                A token is a piece of text - usually a word or part of a word. "Hello" is 1 token, "unhappiness" might be 3 tokens (un-happi-ness).<br><br>
+                                <strong style="color: var(--cyan);">What this setting does:</strong><br>
+                                Controls how long the AI's response can be. Set to 100 = response up to ~75 words. Set to 500 = longer responses.
+                            </span>
                         </label>
                         <input type="number" id="maxTokens" value="100" min="1" max="4096">
                     </div>
@@ -990,7 +1008,12 @@
                         <label class="tooltip-container">
                             Attention Top-K
                             <span class="info-icon">?</span>
-                            <span class="tooltip">Number of top attention targets to capture per token. Higher = more detail but more data. <strong>Recommended: 5-10</strong></span>
+                            <span class="tooltip" style="width: 280px;">
+                                <strong style="color: var(--lime);">What is Top-K?</strong><br>
+                                "K" means a number you choose. "Top-K" means "show me the top K most important items."<br><br>
+                                <strong style="color: var(--cyan);">What this setting does:</strong><br>
+                                When the AI generates a word, it looks at previous words. This setting says "show me the top 5 (or 10, etc.) words it looked at most." Higher = more detail, but messier visualization.
+                            </span>
                         </label>
                         <input type="number" id="attentionTopK" value="5" min="1" max="64">
                     </div>
@@ -998,7 +1021,15 @@
                         <label class="tooltip-container">
                             Temperature
                             <span class="info-icon">?</span>
-                            <span class="tooltip">Controls randomness in generation. <strong>0.0</strong> = deterministic, <strong>1.0</strong> = creative, <strong>2.0</strong> = very random. Default 0.6 balances coherence and variety.</span>
+                            <span class="tooltip" style="width: 280px;">
+                                <strong style="color: var(--lime);">What is Temperature?</strong><br>
+                                Think of it like creativity level. Like how "hot" or "cold" the AI's imagination is.<br><br>
+                                <strong style="color: var(--cyan);">What the values mean:</strong><br>
+                                • <strong>0.0</strong> = Very predictable, always picks the "safest" word<br>
+                                • <strong>0.6</strong> = Balanced (recommended)<br>
+                                • <strong>1.0+</strong> = Creative, sometimes surprising<br>
+                                • <strong>2.0</strong> = Wild, may be nonsensical
+                            </span>
                         </label>
                         <input type="number" id="temperature" value="0.6" min="0" max="2" step="0.1">
                     </div>
@@ -1006,22 +1037,41 @@
                         <label class="tooltip-container">
                             Edge Threshold
                             <span class="info-icon">?</span>
-                            <span class="tooltip">Minimum attention weight to display edges. <strong>0.05</strong> shows all significant connections. Increase to <strong>0.2+</strong> to see only strong attention.</span>
+                            <span class="tooltip" style="width: 280px;">
+                                <strong style="color: var(--lime);">What is an Edge?</strong><br>
+                                An "edge" is a line connecting two tokens, showing the AI looked from one word to another.<br><br>
+                                <strong style="color: var(--lime);">What is a Threshold?</strong><br>
+                                A minimum cutoff. "Only show me connections stronger than this."<br><br>
+                                <strong style="color: var(--cyan);">What this setting does:</strong><br>
+                                • <strong>0.05</strong> = Show all connections (busy but complete)<br>
+                                • <strong>0.2+</strong> = Show only strong connections (cleaner)
+                            </span>
                         </label>
                         <input type="number" id="edgeThreshold" value="0.05" min="0" max="1" step="0.01">
                     </div>
                     <div class="toggle-row setting full tooltip-container" onclick="toggleWordMode()">
                         <div class="toggle" id="wordModeToggle"></div>
                         <span class="toggle-label">Aggregate to word-level</span>
-                        <span class="tooltip" style="bottom: auto; top: 100%; margin-top: 8px; left: 0; transform: none;">
-                            Combine subword tokens into readable words. Attention from all subtokens is aggregated. Useful for longer texts.
+                        <span class="tooltip" style="bottom: auto; top: 100%; margin-top: 8px; left: 0; transform: none; width: 280px;">
+                            <strong style="color: var(--lime);">What does this do?</strong><br>
+                            AI breaks words into pieces: "unhappiness" → "un" + "happi" + "ness". This toggle combines them back into readable words.<br><br>
+                            <strong style="color: var(--cyan);">When to use:</strong><br>
+                            Turn ON for easier reading. Turn OFF to see exactly what the AI sees internally.
                         </span>
                     </div>
                     <div class="setting full" id="layerControlSection" style="display: none;">
                         <label class="tooltip-container">
                             Layer Filter
                             <span class="info-icon">?</span>
-                            <span class="tooltip">Transformer layers process different information. <strong>Early layers</strong> = syntax/structure. <strong>Later layers</strong> = semantics/meaning. Filter to explore each.</span>
+                            <span class="tooltip" style="width: 300px;">
+                                <strong style="color: var(--lime);">What are Layers?</strong><br>
+                                The AI processes text through multiple "layers" - like an assembly line. Each layer transforms the understanding.<br><br>
+                                <strong style="color: var(--cyan);">What different layers do:</strong><br>
+                                • <strong>Early layers (1-8)</strong>: Handle basic stuff - grammar, word shapes<br>
+                                • <strong>Middle layers</strong>: Build phrases, local meaning<br>
+                                • <strong>Later layers (24-32)</strong>: Deep understanding, reasoning<br><br>
+                                <strong>Tip:</strong> Filter to see how attention changes at different depths!
+                            </span>
                         </label>
                         <div style="display: flex; align-items: center; gap: 10px;">
                             <select id="layerSelect" onchange="filterByLayer()">
@@ -1029,7 +1079,10 @@
                             </select>
                             <button class="btn-small tooltip-container" onclick="showLayerHeatmap()" title="Show layer heatmap">
                                 📊
-                                <span class="tooltip" style="width: 160px;">View attention distribution across all layers</span>
+                                <span class="tooltip" style="width: 200px;">
+                                    <strong style="color: var(--lime);">Layer Heatmap</strong><br>
+                                    See a bar chart of attention across all layers. Find which layers are most active!
+                                </span>
                             </button>
                         </div>
                     </div>
@@ -1041,24 +1094,36 @@
                     Statistics
                     <span class="tooltip-container">
                         <span class="info-icon">?</span>
-                        <span class="tooltip">Summary of the captured attention data. <strong>Tokens</strong> = total prompt + generated. <strong>Edges</strong> = attention connections or fingerprints. <strong>Layers</strong> = transformer layers with data.</span>
+                        <span class="tooltip" style="width: 260px;">
+                            <strong style="color: var(--lime);">What are these numbers?</strong><br>
+                            A quick summary of what was analyzed. Think of it like a receipt showing how much data we captured.
+                        </span>
                     </span>
                 </div>
                 <div class="stats-row">
                     <div class="stat tooltip-container">
                         <div class="stat-value" id="statTokens">0</div>
                         <div class="stat-label">Tokens</div>
-                        <span class="tooltip" style="bottom: auto; top: 100%; margin-top: 8px;">Total tokens in the sequence: prompt tokens (input) + generated tokens (output). Each token has attention data.</span>
+                        <span class="tooltip" style="bottom: auto; top: 100%; margin-top: 8px; width: 240px;">
+                            <strong style="color: var(--lime);">Total word pieces</strong><br>
+                            Your input + AI's response, broken into tokens. "Hello world" = 2 tokens. A paragraph might be 50+ tokens.
+                        </span>
                     </div>
                     <div class="stat tooltip-container">
                         <div class="stat-value" id="statEdges">0</div>
                         <div class="stat-label">Edges</div>
-                        <span class="tooltip" style="bottom: auto; top: 100%; margin-top: 8px;">Attention connections captured. In fingerprint mode, shows count of fingerprints. In raw mode, shows attention edges.</span>
+                        <span class="tooltip" style="bottom: auto; top: 100%; margin-top: 8px; width: 240px;">
+                            <strong style="color: var(--lime);">Connection lines</strong><br>
+                            How many "looked at" connections we found. More edges = the AI referenced more context while writing.
+                        </span>
                     </div>
                     <div class="stat tooltip-container">
                         <div class="stat-value" id="statLayers">0</div>
                         <div class="stat-label">Layers</div>
-                        <span class="tooltip" style="bottom: auto; top: 100%; margin-top: 8px;">Transformer layers with attention data. Different layers capture different pattern types (syntax vs. semantics).</span>
+                        <span class="tooltip" style="bottom: auto; top: 100%; margin-top: 8px; width: 260px;">
+                            <strong style="color: var(--lime);">Processing stages</strong><br>
+                            The AI has multiple "layers" like floors in a building. Early layers handle grammar, later layers handle meaning. We show attention from the final layer (most meaningful).
+                        </span>
                     </div>
                 </div>
             </div>
@@ -1068,29 +1133,50 @@
                     Attention Zones
                     <span class="tooltip-container">
                         <span class="info-icon">?</span>
-                        <span class="tooltip">Tokens are classified into attention zones based on their <strong>fingerprint</strong> - a 20-dimensional vector capturing the attention distribution pattern.</span>
+                        <span class="tooltip" style="width: 280px;">
+                            <strong style="color: var(--lime);">What are Attention Zones?</strong><br>
+                            We color-code each token based on <em>where</em> the AI was looking when it wrote that word. It's like a heat map of the AI's focus.<br><br>
+                            <strong style="color: var(--cyan);">Why does this matter?</strong><br>
+                            It reveals what the AI was "thinking about" - was it focused on nearby words (grammar) or looking far back (recalling information)?
+                        </span>
                     </span>
                 </div>
                 <div style="display: flex; flex-direction: column; gap: 8px;">
                     <div class="tooltip-container" style="display: flex; align-items: center; gap: 10px;">
                         <div style="width: 12px; height: 12px; border-radius: 3px; background: var(--cyan);"></div>
                         <span style="font-size: 11px; color: var(--text-dim);">Semantic Bridge</span>
-                        <span class="tooltip">Mid-range attention (17-48 tokens back) with high entropy. Model connecting concepts across context. <code>mid_mass > 0.4 && entropy > 0.5</code></span>
+                        <span class="tooltip" style="width: 280px;">
+                            <strong style="color: var(--cyan);">Meaning: "Connecting ideas"</strong><br>
+                            The AI is linking concepts from different parts of the text. Like when answering "What is the capital?" it connects "capital" to the country mentioned earlier.<br><br>
+                            <strong>When you see this:</strong> The AI is doing reasoning or retrieving related information.
+                        </span>
                     </div>
                     <div class="tooltip-container" style="display: flex; align-items: center; gap: 10px;">
                         <div style="width: 12px; height: 12px; border-radius: 3px; background: var(--amber);"></div>
                         <span style="font-size: 11px; color: var(--text-dim);">Syntax Floor</span>
-                        <span class="tooltip">Local attention (1-16 tokens) with low entropy. Focused on recent context for syntax/structure. <code>local_mass > 0.6 && entropy < 2.5</code></span>
+                        <span class="tooltip" style="width: 280px;">
+                            <strong style="color: var(--amber);">Meaning: "Following grammar"</strong><br>
+                            The AI is focused on nearby words to get grammar right. Like making sure "the cat" is followed by "is" not "are".<br><br>
+                            <strong>When you see this:</strong> The AI is doing routine language construction, not deep thinking.
+                        </span>
                     </div>
                     <div class="tooltip-container" style="display: flex; align-items: center; gap: 10px;">
                         <div style="width: 12px; height: 12px; border-radius: 3px; background: var(--magenta);"></div>
                         <span style="font-size: 11px; color: var(--text-dim);">Exploration</span>
-                        <span class="tooltip">Diffuse attention with high entropy. Model uncertain, exploring multiple possibilities. <code>total_mass < 0.5 && entropy > 3.0</code></span>
+                        <span class="tooltip" style="width: 280px;">
+                            <strong style="color: var(--magenta);">Meaning: "Unsure, exploring options"</strong><br>
+                            The AI's attention is scattered - it's not sure what to write next and is considering multiple possibilities.<br><br>
+                            <strong>When you see this:</strong> Decision points, creative moments, or potential confusion.
+                        </span>
                     </div>
                     <div class="tooltip-container" style="display: flex; align-items: center; gap: 10px;">
                         <div style="width: 12px; height: 12px; border-radius: 3px; background: var(--lime);"></div>
                         <span style="font-size: 11px; color: var(--text-dim);">Steering</span>
-                        <span class="tooltip">Long-range attention (49+ tokens back). Model looking at instructions or early context. <code>long_mass > 0.4</code></span>
+                        <span class="tooltip" style="width: 280px;">
+                            <strong style="color: var(--lime);">Meaning: "Following instructions"</strong><br>
+                            The AI is looking way back at the original instructions or system prompt. It's checking what it was asked to do.<br><br>
+                            <strong>When you see this:</strong> The AI is staying on task, following your request.
+                        </span>
                     </div>
                 </div>
             </div>
@@ -1126,11 +1212,19 @@
             <div class="detail-tabs">
                 <button class="detail-tab active tooltip-container" data-tab="attends" onclick="switchDetailTab('attends')">
                     Attends To
-                    <span class="tooltip" style="width: 200px;">Shows which earlier tokens this token "looked at" during generation. High scores = strong influence.</span>
+                    <span class="tooltip" style="width: 260px;">
+                        <strong style="color: var(--cyan);">← What did THIS word look at?</strong><br><br>
+                        When the AI wrote this word, which earlier words did it reference? Like when writing "Paris", it looked at "France" and "capital".<br><br>
+                        <strong>The bars show:</strong> Strength of connection (100% = looked at this word a lot)
+                    </span>
                 </button>
                 <button class="detail-tab tooltip-container" data-tab="attendedBy" onclick="switchDetailTab('attendedBy')">
                     Attended By
-                    <span class="tooltip" style="width: 200px;">Shows which later tokens "looked at" this token. Reveals which tokens were influenced by this one.</span>
+                    <span class="tooltip" style="width: 260px;">
+                        <strong style="color: var(--lime);">→ What words looked at THIS word?</strong><br><br>
+                        Which later words referenced this one? Shows the "influence" of this word on what came after.<br><br>
+                        <strong>High influence:</strong> Important words that shaped the rest of the response.
+                    </span>
                 </button>
             </div>
 
@@ -2224,231 +2318,100 @@
             modal.innerHTML = `
                 <div class="modal-content">
                     <div class="modal-header">
-                        <div class="modal-title">Attention Explorer - Glossary & Help</div>
+                        <div class="modal-title">Attention Explorer - Complete Guide</div>
                         <button class="modal-close" onclick="this.closest('.modal-overlay').remove()">&times;</button>
                     </div>
 
+                    <!-- BEGINNER INTRO -->
                     <div class="help-section">
-                        <div class="help-section-title">Attention Zones</div>
-                        <p style="font-size: 11px; color: var(--text-dim); margin-bottom: 14px; line-height: 1.5;">
-                            Each generated token is classified into an <strong style="color: var(--cyan);">Attention Zone</strong> based on where
-                            the model focused its attention. This classification uses a 20-dimensional fingerprint derived from attention weights.
-                        </p>
-                        <div style="background: var(--deep); border-left: 3px solid var(--violet); padding: 12px; margin-bottom: 14px; border-radius: 0 6px 6px 0;">
-                            <div style="font-size: 10px; color: var(--violet); font-weight: 600; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 6px;">Transformer Architecture Source</div>
-                            <div style="font-size: 11px; color: var(--text-dim); line-height: 1.6;">
-                                Attention weights come from the <strong style="color: var(--text);">softmax(QK<sup>T</sup>/√d)</strong> operation in
-                                multi-head attention. We capture the final layer's attention, averaged across all heads.
-                                The "zone" reflects where in the sequence the model retrieves information to predict the next token.
+                        <div class="help-section-title">What is This Tool?</div>
+                        <div style="background: linear-gradient(135deg, rgba(0,229,255,0.1), rgba(255,0,153,0.1)); padding: 16px; border-radius: 8px; margin-bottom: 16px;">
+                            <div style="font-size: 13px; color: var(--text); line-height: 1.8;">
+                                <strong style="color: var(--cyan);">This tool lets you see inside an AI's "brain" while it writes.</strong><br><br>
+                                When you ask an AI a question, it doesn't think like a human. Instead, it reads your words, then writes its answer
+                                <em>one word at a time</em>. For each word it writes, it "looks back" at previous words to decide what to write next.<br><br>
+                                <strong style="color: var(--lime);">This tool shows you exactly which words it looked at.</strong>
+                                That's called "attention" - literally where the AI pays attention.
                             </div>
                         </div>
+                    </div>
+
+                    <!-- BASIC CONCEPTS -->
+                    <div class="help-section">
+                        <div class="help-section-title">Basic Concepts (No Jargon)</div>
                         <div class="help-grid">
                             <div class="help-item">
                                 <div class="help-item-header">
-                                    <div class="help-item-icon" style="background: rgba(0, 229, 255, 0.2); color: var(--cyan);">SB</div>
-                                    <span class="help-item-name">Semantic Bridge</span>
+                                    <div class="help-item-icon" style="background: var(--cyan); color: var(--void);">T</div>
+                                    <span class="help-item-name">Token</span>
                                 </div>
                                 <div class="help-item-desc">
-                                    Model attending to mid-range context (17-48 tokens back) with distributed attention.
-                                    Indicates concept retrieval, reasoning, or connecting ideas across the context.
-                                </div>
-                                <div class="help-item-formula">mid_mass > 0.4 && entropy > 0.5</div>
-                                <div style="margin-top: 8px; font-size: 10px; color: var(--text-muted); line-height: 1.4;">
-                                    <strong style="color: var(--violet);">Architecture:</strong> Later transformer layers develop semantic representations.
-                                    Mid-range attention emerges when the model's learned key-value vectors match across semantically related tokens,
-                                    regardless of position.
+                                    <strong>A piece of text.</strong> Usually a word, but sometimes part of a word.<br><br>
+                                    <em>Example:</em> "Hello" = 1 token. "unhappiness" = 3 tokens: "un" + "happi" + "ness"<br><br>
+                                    <strong>Why?</strong> AI doesn't read letters - it reads these chunks called tokens.
                                 </div>
                             </div>
                             <div class="help-item">
                                 <div class="help-item-header">
-                                    <div class="help-item-icon" style="background: rgba(255, 170, 0, 0.2); color: var(--amber);">SF</div>
-                                    <span class="help-item-name">Syntax Floor</span>
+                                    <div class="help-item-icon" style="background: var(--magenta); color: var(--void);">A</div>
+                                    <span class="help-item-name">Attention</span>
                                 </div>
                                 <div class="help-item-desc">
-                                    Focused attention on recent tokens (1-16 back) with low entropy.
-                                    Indicates local syntax processing, completing phrases, or structured output.
-                                </div>
-                                <div class="help-item-formula">local_mass > 0.6 && entropy < 2.5</div>
-                                <div style="margin-top: 8px; font-size: 10px; color: var(--text-muted); line-height: 1.4;">
-                                    <strong style="color: var(--violet);">Architecture:</strong> Early layers learn positional/syntactic patterns.
-                                    The attention mechanism with RoPE (rotary position embeddings) naturally decays attention to distant tokens,
-                                    creating a "floor" of local context.
+                                    <strong>Where the AI "looks" when writing each word.</strong><br><br>
+                                    <em>Example:</em> When writing "Paris" after "What is the capital of France?", the AI looks strongly at "France" and "capital".<br><br>
+                                    <strong>Why?</strong> This reveals what information the AI used to make its decision.
                                 </div>
                             </div>
                             <div class="help-item">
                                 <div class="help-item-header">
-                                    <div class="help-item-icon" style="background: rgba(255, 0, 153, 0.2); color: var(--magenta);">EX</div>
-                                    <span class="help-item-name">Exploration</span>
+                                    <div class="help-item-icon" style="background: var(--amber); color: var(--void);">E</div>
+                                    <span class="help-item-name">Edge</span>
                                 </div>
                                 <div class="help-item-desc">
-                                    Diffuse attention spread across context with high entropy.
-                                    Model is uncertain, exploring multiple possibilities for the next token.
-                                </div>
-                                <div class="help-item-formula">total_mass < 0.5 && entropy > 3.0</div>
-                                <div style="margin-top: 8px; font-size: 10px; color: var(--text-muted); line-height: 1.4;">
-                                    <strong style="color: var(--violet);">Architecture:</strong> When no key vectors strongly match the query,
-                                    the softmax produces a near-uniform distribution. This happens at decision points where multiple continuations
-                                    are equally plausible (high temperature amplifies this).
+                                    <strong>A line connecting two tokens.</strong><br><br>
+                                    If you see a line from word A to word B, it means "when writing A, the AI looked at B".<br><br>
+                                    <strong>Thicker line = stronger attention</strong> (looked at it more).
                                 </div>
                             </div>
                             <div class="help-item">
                                 <div class="help-item-header">
-                                    <div class="help-item-icon" style="background: rgba(180, 255, 0, 0.2); color: var(--lime);">ST</div>
-                                    <span class="help-item-name">Steering</span>
+                                    <div class="help-item-icon" style="background: var(--lime); color: var(--void);">L</div>
+                                    <span class="help-item-name">Layer</span>
                                 </div>
                                 <div class="help-item-desc">
-                                    Long-range attention reaching 49+ tokens back.
-                                    Model following instructions, referencing early context, or guided behavior.
-                                </div>
-                                <div class="help-item-formula">long_mass > 0.4</div>
-                                <div style="margin-top: 8px; font-size: 10px; color: var(--text-muted); line-height: 1.4;">
-                                    <strong style="color: var(--violet);">Architecture:</strong> Instruction-tuned models learn to attend to system prompts
-                                    and user instructions. Specific attention heads become "instruction followers" that maintain connection
-                                    to directive tokens throughout generation.
+                                    <strong>A processing stage inside the AI.</strong><br><br>
+                                    Like floors in a factory: early layers (ground floor) handle simple stuff like grammar. Later layers (top floor) handle meaning and reasoning.<br><br>
+                                    <strong>We show the final layer</strong> - the deepest understanding.
                                 </div>
                             </div>
                         </div>
                     </div>
 
+                    <!-- SETTINGS EXPLAINED -->
                     <div class="help-section">
-                        <div class="help-section-title">Fingerprint Components</div>
-                        <p style="font-size: 11px; color: var(--text-dim); margin-bottom: 14px; line-height: 1.5;">
-                            The fingerprint is a 20-dimensional vector capturing the attention distribution.
-                            The first 8 values are distance bins; derived features characterize the pattern.
-                        </p>
-                        <div style="background: var(--deep); border-left: 3px solid var(--violet); padding: 12px; margin-bottom: 14px; border-radius: 0 6px 6px 0;">
-                            <div style="font-size: 10px; color: var(--violet); font-weight: 600; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 6px;">How We Compute Fingerprints</div>
-                            <div style="font-size: 11px; color: var(--text-dim); line-height: 1.6;">
-                                <strong style="color: var(--text);">1. Capture:</strong> Extract attention weights <code style="background: var(--void); padding: 1px 4px; border-radius: 3px;">A[i,j]</code> from final layer<br>
-                                <strong style="color: var(--text);">2. Bin:</strong> Sum weights into 8 distance bins (1-8, 9-16, ..., 57-64+)<br>
-                                <strong style="color: var(--text);">3. Derive:</strong> Compute local/mid/long mass + entropy from bins<br>
-                                <strong style="color: var(--text);">4. Classify:</strong> Apply zone rules to determine attention pattern type
-                            </div>
-                        </div>
-                        <div class="help-grid">
-                            <div class="help-item">
-                                <div class="help-item-header">
-                                    <div class="help-item-icon" style="background: var(--deep);">L</div>
-                                    <span class="help-item-name">Local Mass</span>
-                                </div>
-                                <div class="help-item-desc">
-                                    Sum of attention to tokens 1-16 positions back. High = recent context focus.
-                                </div>
-                                <div class="help-item-formula">local_mass = sum(bins[0:2]) | Range: 0.0-1.0</div>
-                                <div style="margin-top: 6px; font-size: 10px; color: var(--text-muted);">
-                                    <strong style="color: var(--violet);">Source:</strong> RoPE position encoding naturally creates distance decay.
-                                    Early layers especially show high local mass.
-                                </div>
-                            </div>
-                            <div class="help-item">
-                                <div class="help-item-header">
-                                    <div class="help-item-icon" style="background: var(--deep);">M</div>
-                                    <span class="help-item-name">Mid-Range Mass</span>
-                                </div>
-                                <div class="help-item-desc">
-                                    Sum of attention to tokens 17-48 positions back. High = semantic retrieval.
-                                </div>
-                                <div class="help-item-formula">mid_mass = sum(bins[2:6]) | Range: 0.0-1.0</div>
-                                <div style="margin-top: 6px; font-size: 10px; color: var(--text-muted);">
-                                    <strong style="color: var(--violet);">Source:</strong> Later layers learn semantic key-value patterns that match
-                                    across sentence boundaries. "Semantic heads" specialize in this.
-                                </div>
-                            </div>
-                            <div class="help-item">
-                                <div class="help-item-header">
-                                    <div class="help-item-icon" style="background: var(--deep);">R</div>
-                                    <span class="help-item-name">Long-Range Mass</span>
-                                </div>
-                                <div class="help-item-desc">
-                                    Sum of attention to tokens 49+ positions back. High = instruction following.
-                                </div>
-                                <div class="help-item-formula">long_mass = sum(bins[6:8]) | Range: 0.0-1.0</div>
-                                <div style="margin-top: 6px; font-size: 10px; color: var(--text-muted);">
-                                    <strong style="color: var(--violet);">Source:</strong> "Attention sinks" (BOS token) and instruction tokens
-                                    receive persistent attention via specialized heads.
-                                </div>
-                            </div>
-                            <div class="help-item">
-                                <div class="help-item-header">
-                                    <div class="help-item-icon" style="background: var(--deep);">E</div>
-                                    <span class="help-item-name">Entropy</span>
-                                </div>
-                                <div class="help-item-desc">
-                                    Shannon entropy of attention distribution. Low = focused, High = diffuse.
-                                </div>
-                                <div class="help-item-formula">-sum(p * log(p)) | Range: 0.0-4.0+</div>
-                                <div style="margin-top: 6px; font-size: 10px; color: var(--text-muted);">
-                                    <strong style="color: var(--violet);">Source:</strong> Entropy reflects softmax temperature internally.
-                                    High logit variance → low entropy. Uniform logits → high entropy.
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-
-                    <div class="help-section">
-                        <div class="help-section-title">Attention Edges</div>
-                        <p style="font-size: 11px; color: var(--text-dim); margin-bottom: 14px; line-height: 1.5;">
-                            In raw token mode (when available), attention edges show which tokens influenced the generation of each token.
-                        </p>
-                        <div style="background: var(--deep); border-left: 3px solid var(--violet); padding: 12px; margin-bottom: 14px; border-radius: 0 6px 6px 0;">
-                            <div style="font-size: 10px; color: var(--violet); font-weight: 600; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 6px;">Causal Attention Mask</div>
-                            <div style="font-size: 11px; color: var(--text-dim); line-height: 1.6;">
-                                Transformers use <strong style="color: var(--text);">causal (autoregressive) attention</strong>: each token can only
-                                attend to itself and <em>previous</em> tokens. The attention matrix is lower-triangular. "Attends To" shows the
-                                weighted sum of values that produce this token's representation.
-                            </div>
-                        </div>
-                        <div class="help-grid">
-                            <div class="help-item">
-                                <div class="help-item-header">
-                                    <div class="help-item-icon" style="background: rgba(0, 229, 255, 0.2); color: var(--cyan);">→</div>
-                                    <span class="help-item-name">Attends To</span>
-                                </div>
-                                <div class="help-item-desc">
-                                    <strong>Cyan edges/highlights</strong>: Tokens the selected token looked at during generation.
-                                    Higher weight = stronger influence on this token's generation.
-                                </div>
-                                <div style="margin-top: 6px; font-size: 10px; color: var(--text-muted);">
-                                    <strong style="color: var(--violet);">Source:</strong> Row <code style="background: var(--void); padding: 1px 4px; border-radius: 3px;">A[i, :]</code>
-                                    of the attention matrix. These values sum to 1.0 (softmax normalization).
-                                </div>
-                            </div>
-                            <div class="help-item">
-                                <div class="help-item-header">
-                                    <div class="help-item-icon" style="background: rgba(180, 255, 0, 0.2); color: var(--lime);">←</div>
-                                    <span class="help-item-name">Attended By</span>
-                                </div>
-                                <div class="help-item-desc">
-                                    <strong>Lime edges/highlights</strong>: Later tokens that looked at the selected token.
-                                    Shows how this token influenced subsequent generation.
-                                </div>
-                                <div style="margin-top: 6px; font-size: 10px; color: var(--text-muted);">
-                                    <strong style="color: var(--violet);">Source:</strong> Column <code style="background: var(--void); padding: 1px 4px; border-radius: 3px;">A[:, j]</code>
-                                    of the attention matrix. High-influence tokens are "attention sinks."
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-
-                    <div class="help-section">
-                        <div class="help-section-title">Configuration Settings</div>
+                        <div class="help-section-title">What Do the Settings Mean?</div>
                         <div class="help-grid">
                             <div class="help-item">
                                 <div class="help-item-header">
                                     <span class="help-item-name">Max Tokens</span>
                                 </div>
                                 <div class="help-item-desc">
-                                    Maximum tokens to generate. More tokens = longer response but more computation.
-                                    <strong>Range: 1-4096</strong>
+                                    <strong>How long can the AI's response be?</strong><br><br>
+                                    100 tokens ≈ 75 words (short answer)<br>
+                                    500 tokens ≈ 375 words (paragraph)<br>
+                                    2000 tokens ≈ 1500 words (essay)<br><br>
+                                    <em>Tip:</em> Start small (100) to see patterns quickly.
                                 </div>
                             </div>
                             <div class="help-item">
                                 <div class="help-item-header">
-                                    <span class="help-item-name">Attention Top-K</span>
+                                    <span class="help-item-name">Top-K</span>
                                 </div>
                                 <div class="help-item-desc">
-                                    Top attention targets captured per token. <strong>5-10</strong> for visualization.
-                                    Higher = more edges but more data.
+                                    <strong>"K" = a number. "Top-K" = show me the top K things.</strong><br><br>
+                                    Top-5 = For each word the AI writes, show the 5 words it looked at most.<br><br>
+                                    <em>Higher K</em> = more detail, but messier visualization.<br>
+                                    <em>Recommendation:</em> 5-10 is usually best.
                                 </div>
                             </div>
                             <div class="help-item">
@@ -2456,8 +2419,12 @@
                                     <span class="help-item-name">Temperature</span>
                                 </div>
                                 <div class="help-item-desc">
-                                    Randomness in generation. <strong>0.0</strong> = deterministic, <strong>1.0+</strong> = creative.
-                                    Affects both output and attention patterns.
+                                    <strong>How creative/random is the AI?</strong><br><br>
+                                    Think of it like a dial from "boring but safe" to "creative but risky":<br><br>
+                                    <span style="color: var(--cyan);">0.0</span> = Always picks the "safest" word (predictable)<br>
+                                    <span style="color: var(--lime);">0.6</span> = Balanced (recommended)<br>
+                                    <span style="color: var(--amber);">1.0</span> = Creative, varied responses<br>
+                                    <span style="color: var(--magenta);">2.0</span> = Very random (may be weird)
                                 </div>
                             </div>
                             <div class="help-item">
@@ -2465,30 +2432,152 @@
                                     <span class="help-item-name">Edge Threshold</span>
                                 </div>
                                 <div class="help-item-desc">
-                                    Minimum attention weight to display. <strong>0.05</strong> shows significant connections.
-                                    <strong>0.2+</strong> shows only strong attention.
+                                    <strong>Filter out weak connections.</strong><br><br>
+                                    "Only show me connections stronger than X%"<br><br>
+                                    <span style="color: var(--cyan);">0.05 (5%)</span> = Show all significant connections<br>
+                                    <span style="color: var(--lime);">0.10 (10%)</span> = Cleaner view<br>
+                                    <span style="color: var(--amber);">0.20 (20%)</span> = Only strong connections<br><br>
+                                    <em>Tip:</em> Increase if visualization looks too busy.
                                 </div>
                             </div>
                         </div>
                     </div>
 
+                    <!-- ATTENTION ZONES -->
                     <div class="help-section">
-                        <div class="help-section-title">How to Use</div>
-                        <div style="font-size: 12px; color: var(--text-dim); line-height: 1.8;">
-                            <ol style="padding-left: 20px; margin: 0;">
-                                <li><strong style="color: var(--text);">Enter text</strong> in the input area (question, prompt, or text to analyze)</li>
-                                <li><strong style="color: var(--text);">Click Analyze</strong> to generate a response with attention capture</li>
-                                <li><strong style="color: var(--text);">View segments</strong>: Prompt (cyan), Thinking (amber), Output (lime)</li>
-                                <li><strong style="color: var(--text);">Click any token</strong> to see its attention pattern and zone classification</li>
-                                <li><strong style="color: var(--text);">Use layer filter</strong> (if available) to explore attention at different depths</li>
-                                <li><strong style="color: var(--text);">Toggle word mode</strong> to aggregate subword tokens into readable words</li>
+                        <div class="help-section-title">What Do the Colors Mean? (Attention Zones)</div>
+                        <p style="font-size: 12px; color: var(--text-dim); margin-bottom: 14px; line-height: 1.6;">
+                            We color-code each token based on <em>how far back</em> the AI was looking when it wrote that word.
+                            This reveals what the AI was "thinking about."
+                        </p>
+                        <div class="help-grid">
+                            <div class="help-item">
+                                <div class="help-item-header">
+                                    <div class="help-item-icon" style="background: rgba(0, 229, 255, 0.3); color: var(--cyan);">🔗</div>
+                                    <span class="help-item-name" style="color: var(--cyan);">Semantic Bridge</span>
+                                </div>
+                                <div class="help-item-desc">
+                                    <strong>The AI is connecting ideas.</strong><br><br>
+                                    Looking at words 2-4 sentences back to link concepts together. Like when answering "What is the capital?" by connecting "capital" → "France" → "Paris".<br><br>
+                                    <em>When you see this:</em> The AI is doing reasoning or retrieval.
+                                </div>
+                            </div>
+                            <div class="help-item">
+                                <div class="help-item-header">
+                                    <div class="help-item-icon" style="background: rgba(255, 170, 0, 0.3); color: var(--amber);">📝</div>
+                                    <span class="help-item-name" style="color: var(--amber);">Syntax Floor</span>
+                                </div>
+                                <div class="help-item-desc">
+                                    <strong>The AI is handling grammar.</strong><br><br>
+                                    Looking at very recent words (last 1-2 sentences) to get grammar right. Like making sure "the cat" → "is" (not "are").<br><br>
+                                    <em>When you see this:</em> Routine language construction, not deep thinking.
+                                </div>
+                            </div>
+                            <div class="help-item">
+                                <div class="help-item-header">
+                                    <div class="help-item-icon" style="background: rgba(255, 0, 153, 0.3); color: var(--magenta);">❓</div>
+                                    <span class="help-item-name" style="color: var(--magenta);">Exploration</span>
+                                </div>
+                                <div class="help-item-desc">
+                                    <strong>The AI is uncertain.</strong><br><br>
+                                    Attention is scattered everywhere - the AI isn't sure what to write next and is considering many options.<br><br>
+                                    <em>When you see this:</em> Decision points, creative moments, or confusion.
+                                </div>
+                            </div>
+                            <div class="help-item">
+                                <div class="help-item-header">
+                                    <div class="help-item-icon" style="background: rgba(180, 255, 0, 0.3); color: var(--lime);">📋</div>
+                                    <span class="help-item-name" style="color: var(--lime);">Steering</span>
+                                </div>
+                                <div class="help-item-desc">
+                                    <strong>The AI is following instructions.</strong><br><br>
+                                    Looking way back at your original question or instructions to stay on task.<br><br>
+                                    <em>When you see this:</em> The AI is checking what you asked for.
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- INTERPRET WITH LLM -->
+                    <div class="help-section">
+                        <div class="help-section-title">💡 Pro Tip: Ask the AI to Explain Its Own Attention!</div>
+                        <div style="background: linear-gradient(135deg, rgba(180,255,0,0.15), rgba(0,229,255,0.15)); padding: 16px; border-radius: 8px; border: 1px solid var(--border);">
+                            <div style="font-size: 12px; color: var(--text); line-height: 1.8;">
+                                <strong style="color: var(--lime);">You can copy attention patterns and ask the same AI to interpret them!</strong><br><br>
+
+                                <strong>Example prompts you can use:</strong><br><br>
+
+                                <div style="background: var(--void); padding: 12px; border-radius: 6px; margin: 8px 0; font-family: monospace; font-size: 11px;">
+                                "When generating the word 'Paris', the AI looked at these words with these weights:<br>
+                                - 'France' (45%)<br>
+                                - 'capital' (32%)<br>
+                                - 'the' (12%)<br>
+                                What does this tell us about how the AI reasoned?"
+                                </div>
+
+                                <div style="background: var(--void); padding: 12px; border-radius: 6px; margin: 8px 0; font-family: monospace; font-size: 11px;">
+                                "I see tokens colored as 'Semantic Bridge' in this response. What does that suggest about the AI's reasoning process?"
+                                </div>
+
+                                <div style="background: var(--void); padding: 12px; border-radius: 6px; margin: 8px 0; font-family: monospace; font-size: 11px;">
+                                "The entropy for this token was 3.2 (high) - attention was scattered. Why might the model be uncertain at this point?"
+                                </div>
+
+                                <br><strong style="color: var(--cyan);">The AI can help you understand what you're seeing!</strong>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- HOW IT WORKS TECHNICALLY -->
+                    <div class="help-section">
+                        <div class="help-section-title">🔬 Technical Deep Dive (Optional)</div>
+                        <details style="cursor: pointer;">
+                            <summary style="color: var(--cyan); font-weight: 500; padding: 8px 0;">Click to expand technical details...</summary>
+                            <div style="margin-top: 12px; padding: 16px; background: var(--deep); border-radius: 8px;">
+                                <div style="font-size: 12px; color: var(--text-dim); line-height: 1.7;">
+                                    <strong style="color: var(--violet);">How Attention Works in Transformers:</strong><br><br>
+
+                                    1. Each token gets converted to three vectors: <strong>Query (Q)</strong>, <strong>Key (K)</strong>, <strong>Value (V)</strong><br><br>
+
+                                    2. To decide what token X should "look at", we compute:<br>
+                                    <code style="background: var(--void); padding: 4px 8px; border-radius: 4px; margin: 4px 0; display: inline-block;">
+                                    Attention = softmax(Q<sub>x</sub> · K<sub>all</sub><sup>T</sup> / √d)
+                                    </code><br><br>
+
+                                    3. This gives us a probability distribution: "how much should X look at each previous token?"<br><br>
+
+                                    4. We capture these attention weights and display them as edges.<br><br>
+
+                                    <strong style="color: var(--violet);">Where Zones Come From:</strong><br>
+                                    • <strong>Local Mass</strong>: Sum of attention to tokens 1-16 back<br>
+                                    • <strong>Mid Mass</strong>: Sum of attention to tokens 17-48 back<br>
+                                    • <strong>Long Mass</strong>: Sum of attention to tokens 49+ back<br>
+                                    • <strong>Entropy</strong>: How spread out the attention is (-Σp·log(p))<br><br>
+
+                                    Zones are classified by combining these metrics with rules like:<br>
+                                    • Semantic Bridge: mid_mass > 0.4 AND entropy > 0.5<br>
+                                    • Syntax Floor: local_mass > 0.6 AND entropy < 2.5
+                                </div>
+                            </div>
+                        </details>
+                    </div>
+
+                    <!-- QUICK START -->
+                    <div class="help-section">
+                        <div class="help-section-title">Quick Start Guide</div>
+                        <div style="font-size: 13px; color: var(--text-dim); line-height: 2;">
+                            <ol style="padding-left: 24px; margin: 0;">
+                                <li>Type a question in the text box (e.g., "What is the capital of France?")</li>
+                                <li>Click <strong style="color: var(--cyan);">Analyze</strong> and wait for the AI to respond</li>
+                                <li>Look at the <strong style="color: var(--text);">colored tokens</strong> - each color tells you what the AI was "thinking"</li>
+                                <li><strong style="color: var(--text);">Click any token</strong> to see exactly which words it looked at</li>
+                                <li>Use the <strong style="color: var(--text);">Attends To / Attended By</strong> tabs to explore connections</li>
                             </ol>
                         </div>
                     </div>
 
-                    <div style="margin-top: 20px; padding-top: 16px; border-top: 1px solid var(--border); font-size: 11px; color: var(--text-muted);">
-                        <strong>SGLang Attention Explorer</strong> visualizes real attention patterns from transformer language models.
-                        Fingerprints are computed from the attention weights during generation.
+                    <div style="margin-top: 20px; padding-top: 16px; border-top: 1px solid var(--border); font-size: 11px; color: var(--text-muted); text-align: center;">
+                        <strong>SGLang Attention Explorer</strong> - See inside the AI's decision-making process
                     </div>
                 </div>
             `;
