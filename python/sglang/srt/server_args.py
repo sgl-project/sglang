@@ -338,6 +338,10 @@ class ServerArgs:
     disable_hybrid_swa_memory: bool = False
     radix_eviction_policy: str = "lru"
     enable_prefill_delayer: bool = False
+    # Limit the batch size for detokenizer output processing in tokenizer_manager.
+    # This helps reduce first-token latency under high concurrency by processing
+    # smaller batches more frequently. Set to 0 to disable batching limits.
+    max_detokenizer_batch_size: int = 0
     prefill_delayer_max_delay_passes: int = 30
     prefill_delayer_token_usage_low_watermark: Optional[float] = None
     prefill_delayer_forward_passes_buckets: Optional[List[float]] = None
@@ -3043,6 +3047,14 @@ class ServerArgs:
             type=int,
             default=ServerArgs.max_running_requests,
             help="The maximum number of running requests.",
+        )
+        parser.add_argument(
+            "--max-detokenizer-batch-size",
+            type=int,
+            default=ServerArgs.max_detokenizer_batch_size,
+            help="The maximum batch size for detokenizer output processing in tokenizer_manager. "
+            "This helps reduce first-token latency under high concurrency by processing smaller batches more frequently. "
+            "Set to 0 to disable batching limits (default).",
         )
         parser.add_argument(
             "--max-queued-requests",

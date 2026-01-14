@@ -1472,12 +1472,76 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
     async def handle_loop(self):
         """The event loop that handles requests"""
+
+        # Batch size limit for detokenizer output processing
+        max_batch_size = self.server_args.max_detokenizer_batch_size
+
         while True:
             with self.soft_watchdog.disable():
                 recv_obj = await self.recv_from_detokenizer.recv_pyobj()
-            self._result_dispatcher(recv_obj)
+
+            # If batch size limit is set and batch exceeds limit, process in chunks
+            if max_batch_size > 0 and hasattr(recv_obj, 'rids'):
+                batch_size = len(recv_obj.rids)
+                if batch_size > max_batch_size:
+                    # Process in chunks to reduce latency for first token
+                    for start_idx in range(0, batch_size, max_batch_size):
+                        end_idx = min(start_idx + max_batch_size, batch_size)
+                        chunk_recv_obj = self._create_batch_chunk(recv_obj, start_idx, end_idx)
+                        self._result_dispatcher(chunk_recv_obj)
+                        # Feed watchdog between chunks to prevent timeout
+                        self.soft_watchdog.feed()
+                else:
+                    self._result_dispatcher(recv_obj)
+            else:
+                self._result_dispatcher(recv_obj)
             self.last_receive_tstamp = time.time()
             self.soft_watchdog.feed()
+
+    def _create_batch_chunk(
+        self,
+        recv_obj: Union[
+            BatchStrOutput,
+            BatchEmbeddingOutput,
+            BatchMultimodalOutput,
+            BatchTokenIDOutput,
+        ],
+        start_idx: int,
+        end_idx: int,
+    ) -> Union[
+        BatchStrOutput,
+        BatchEmbeddingOutput,
+        BatchMultimodalOutput,
+        BatchTokenIDOutput,
+    ]:
+        """Create a chunk of the batch output for processing in smaller pieces.
+
+        This method automatically handles all dataclass fields by introspection,
+        so it will automatically pick up new fields added to the batch output classes.
+        """
+        chunk_dict = {}
+        for field in dataclasses.fields(recv_obj):
+            field_name = field.name
+            field_value = getattr(recv_obj, field_name, None)
+
+            # Skip None values
+            if field_value is None:
+                continue
+
+            # Handle list/tuple types with slicing
+            if isinstance(field_value, (list, tuple)):
+                # Special handling for dict with list values (e.g., customized_info)
+                if isinstance(field_value, dict):
+                    chunk_dict[field_name] = {
+                        k: v[start_idx:end_idx] for k, v in field_value.items()
+                    }
+                else:
+                    chunk_dict[field_name] = field_value[start_idx:end_idx]
+            # For non-list types (e.g., load object), copy as-is
+            else:
+                chunk_dict[field_name] = field_value
+
+        return recv_obj.__class__(**chunk_dict)
 
     def _handle_batch_output(
         self,
@@ -1488,6 +1552,23 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             BatchTokenIDOutput,
         ],
     ):
+        # Optimization: Pre-compute batch-level conditions to avoid repeated checks in loop
+        enable_metrics = self.enable_metrics
+        is_embedding = isinstance(recv_obj, BatchEmbeddingOutput)
+        is_str_output = isinstance(recv_obj, BatchStrOutput)
+        is_multimodal_output = isinstance(recv_obj, BatchMultimodalOutput)
+        is_token_id_output = isinstance(recv_obj, BatchTokenIDOutput)
+        spec_algorithm_enabled = self.server_args.speculative_algorithm
+        stream_output_enabled = self.server_args.stream_output
+        # These optional attributes only exist in specific output types
+        has_hidden_states = is_str_output or is_token_id_output
+        has_routed_experts = is_str_output or is_token_id_output
+        has_customized_info = is_str_output or is_token_id_output
+        has_cached_tokens_details = recv_obj.cached_tokens_details is not None
+        lora_enabled = self.server_args.enable_lora
+        has_dump_folder = bool(self.dump_requests_folder)
+        has_crash_dump_folder = bool(self.crash_dump_folder)
+
         for i, rid in enumerate(recv_obj.rids):
             state = self.rid_to_state.get(rid, None)
             if state is None:
@@ -1496,7 +1577,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 )
                 continue
 
-            # Build meta_info and return value
+            # Optimization: Build meta_info dict once, pre-allocating when possible
             meta_info = {
                 "id": rid,
                 "finish_reason": recv_obj.finished_reasons[i],
@@ -1505,7 +1586,8 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 "total_retractions": recv_obj.retraction_counts[i],
             }
 
-            if self.enable_metrics:
+            # Add metrics (batch-level check)
+            if enable_metrics:
                 self._add_metric_if_present(recv_obj, "queue_time", meta_info, i)
                 self._add_metric_if_present(
                     recv_obj, "prefill_launch_delay", meta_info, i
@@ -1517,6 +1599,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     recv_obj, "prefill_finished_ts", meta_info, i
                 )
 
+            # Convert logprob style if needed (request-level check)
             if getattr(state.obj, "return_logprob", False):
                 self.convert_logprob_style(
                     meta_info,
@@ -1529,35 +1612,29 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     i,
                 )
 
-            if not isinstance(recv_obj, BatchEmbeddingOutput):
-                meta_info.update(
-                    {
-                        "completion_tokens": recv_obj.completion_tokens[i],
-                        "cached_tokens": recv_obj.cached_tokens[i],
-                    }
-                )
+            # Add completion tokens for non-embedding outputs
+            if not is_embedding:
+                meta_info["completion_tokens"] = recv_obj.completion_tokens[i]
+                meta_info["cached_tokens"] = recv_obj.cached_tokens[i]
                 # Add detailed cache breakdown if available
-                if (
-                    hasattr(recv_obj, "cached_tokens_details")
-                    and recv_obj.cached_tokens_details
-                ):
-                    meta_info["cached_tokens_details"] = recv_obj.cached_tokens_details[
-                        i
-                    ]
+                if has_cached_tokens_details:
+                    meta_info["cached_tokens_details"] = recv_obj.cached_tokens_details[i]
 
-            if getattr(recv_obj, "output_hidden_states", None):
+            # Add optional outputs (batch-level checks)
+            if has_hidden_states:
                 meta_info["hidden_states"] = recv_obj.output_hidden_states[i]
-            if getattr(recv_obj, "routed_experts", None):
+            if has_routed_experts:
                 meta_info["routed_experts"] = recv_obj.routed_experts[i]
-            if getattr(recv_obj, "customized_info", None):
-                for k, v in recv_obj.customized_info.items():
-                    meta_info[k] = v[i]
+            if has_customized_info:
+                customized_info = recv_obj.customized_info
+                for k in customized_info:
+                    meta_info[k] = customized_info[k][i]
 
-            if isinstance(recv_obj, BatchStrOutput):
+            # Handle different output types (batch-level check, no isinstance in loop)
+            if is_str_output:
                 state.text += recv_obj.output_strs[i]
-                # Not all request types have `stream` (e.g., EmbeddingReqInput). Default to non-streaming.
                 is_stream = getattr(state.obj, "stream", False)
-                if self.server_args.stream_output and is_stream:
+                if stream_output_enabled and is_stream:
                     state.output_ids.extend(recv_obj.output_ids[i])
                     output_token_ids = state.output_ids[state.last_output_offset :]
                     state.last_output_offset = len(state.output_ids)
@@ -1571,9 +1648,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     "meta_info": meta_info,
                 }
 
-            elif isinstance(recv_obj, BatchTokenIDOutput):
+            elif is_token_id_output:
                 is_stream = getattr(state.obj, "stream", False)
-                if self.server_args.stream_output and is_stream:
+                if stream_output_enabled and is_stream:
                     state.output_ids.extend(recv_obj.output_ids[i])
                     output_token_ids = state.output_ids[state.last_output_offset :]
                     state.last_output_offset = len(state.output_ids)
@@ -1585,10 +1662,12 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     "output_ids": output_token_ids,
                     "meta_info": meta_info,
                 }
-            elif isinstance(recv_obj, BatchMultimodalOutput):
+            elif is_multimodal_output:
                 raise NotImplementedError("BatchMultimodalOut not implemented")
+            
             else:
-                assert isinstance(recv_obj, BatchEmbeddingOutput)
+                assert is_embedding, "Only BatchEmbeddingOutput is supported for now."
+                # BatchEmbeddingOutput
                 out_dict = {
                     "embedding": recv_obj.embeddings[i],
                     "meta_info": meta_info,
@@ -1600,9 +1679,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 state.finished_time_perf = time.perf_counter()
                 meta_info["e2e_latency"] = state.finished_time - state.created_time
 
-                if self.server_args.speculative_algorithm:
+                if spec_algorithm_enabled:
                     self._calculate_spec_decoding_metrics(meta_info, recv_obj, i)
-                if self.enable_metrics:
+                if enable_metrics:
                     self._calculate_timing_metrics(meta_info, state, recv_obj, i)
 
                 trace_req_finish(
@@ -1613,19 +1692,18 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
                 del self.rid_to_state[rid]
 
-                # Mark ongoing LoRA request as finished.
-                if self.server_args.enable_lora and state.obj.lora_path:
+                if lora_enabled and state.obj.lora_path:
                     asyncio.create_task(self.lora_registry.release(state.obj.lora_id))
 
             state.out_list.append(out_dict)
             state.event.set()
 
-            # Log metrics and dump
-            if self.enable_metrics and state.obj.log_metrics:
+            # Log metrics and dump (request-level checks)
+            if enable_metrics and state.obj.log_metrics:
                 self.collect_metrics(state, recv_obj, i)
-            if self.dump_requests_folder and state.finished and state.obj.log_metrics:
+            if has_dump_folder and state.finished and state.obj.log_metrics:
                 self.dump_requests(state, out_dict)
-            if self.crash_dump_folder and state.finished and state.obj.log_metrics:
+            if has_crash_dump_folder and state.finished and state.obj.log_metrics:
                 self.record_request_for_crash_dump(state, out_dict)
 
         # When skip_tokenizer_init is enabled, tokensizer_manager receives
