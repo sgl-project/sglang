@@ -36,6 +36,27 @@ from sglang.multimodal_gen.utils import set_mixed_precision_policy
 logger = init_logger(__name__)
 
 
+def _make_param_like(
+    actual_param: torch.nn.Parameter | None, tensor: torch.Tensor
+) -> torch.nn.Parameter:
+    if actual_param is None:
+        return nn.Parameter(tensor, requires_grad=False)
+
+    cls = actual_param.__class__
+    try:
+        new_param = cls.__new__(cls, tensor)
+    except Exception:
+        new_param = nn.Parameter(tensor, requires_grad=False)
+
+    actual_dict = getattr(actual_param, "__dict__", None)
+    if actual_dict:
+        for k, v in actual_dict.items():
+            setattr(new_param, k, v)
+
+    new_param.requires_grad = False
+    return new_param
+
+
 # TODO(PY): move this to utils elsewhere
 @contextlib.contextmanager
 def set_default_dtype(dtype: torch.dtype) -> Generator[None, None, None]:
@@ -273,10 +294,7 @@ def load_model_from_full_model_state_dict(
                 sharded_tensor = torch.empty_like(
                     meta_sharded_param, device=device, dtype=param_dtype
                 )
-                temp_param = nn.Parameter(sharded_tensor)
-                for attr in ["output_dim", "input_dim", "is_sharded_weight"]:
-                    if hasattr(actual_param, attr):
-                        setattr(temp_param, attr, getattr(actual_param, attr))
+                temp_param = _make_param_like(actual_param, sharded_tensor)
                 weight_loader(temp_param, full_tensor)
                 sharded_tensor = temp_param.data
             else:
@@ -290,7 +308,7 @@ def load_model_from_full_model_state_dict(
             )
             if cpu_offload:
                 sharded_tensor = sharded_tensor.to("cpu")
-        sharded_sd[target_param_name] = nn.Parameter(sharded_tensor)
+        sharded_sd[target_param_name] = _make_param_like(actual_param, sharded_tensor)
 
     model.reverse_param_names_mapping = reverse_param_names_mapping
     unused_keys = set(meta_sd.keys()) - set(sharded_sd.keys())
@@ -311,6 +329,7 @@ def load_model_from_full_model_state_dict(
                 f"Currently only parameters containing {ALLOWED_NEW_PARAM_PATTERNS} are allowed."
             )
         meta_sharded_param = meta_sd.get(new_param_name)
+        actual_param = param_dict.get(new_param_name)
         if not hasattr(meta_sharded_param, "device_mesh"):
             # Initialize with zeros
             sharded_tensor = torch.zeros_like(
@@ -328,7 +347,7 @@ def load_model_from_full_model_state_dict(
             )
             if cpu_offload:
                 sharded_tensor = sharded_tensor.cpu()
-        sharded_sd[new_param_name] = nn.Parameter(sharded_tensor)
+        sharded_sd[new_param_name] = _make_param_like(actual_param, sharded_tensor)
 
     # choose `assign=True` since we cannot call `copy_` on meta tensor
     return model.load_state_dict(sharded_sd, strict=strict, assign=True)
