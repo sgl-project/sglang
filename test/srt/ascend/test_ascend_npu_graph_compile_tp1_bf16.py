@@ -30,10 +30,6 @@ class TestAscendNpuGraphCompile(CustomTestCase):
                 "--mem-fraction-static",
                 0.7,
                 "--enable-torch-compile",
-                "--cuda-graph-bs",
-                "128",
-                "--tp-size",
-                "1",
             ],
         )
 

@@ -82,11 +82,6 @@ def set_default_server_args(args: "ServerArgs"):
         else:
             args.hicache_mem_layout = "page_first_direct"
 
-    if args.enable_npu_torchair_compile and args.enable_torch_compile:
-        raise ValueError(
-            "Cannot enable both --enable-npu-torchair-compile and --enable-torch-compile"
-        )
-
     if args.disable_cuda_graph and (
         args.enable_torch_compile or args.enable_npu_torchair_compile
     ):
