@@ -67,8 +67,6 @@ _DP: Optional[GroupCoordinator] = None
 _DIT: Optional[GroupCoordinator] = None
 _VAE: Optional[GroupCoordinator] = None
 
-logger = init_logger(__name__)
-
 TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 
 
@@ -342,7 +340,9 @@ def initialize_model_parallel(
     """
 
     if backend is None:
-        backend = envs.get_torch_distributed_backend()
+        from sglang.multimodal_gen.runtime.platforms import current_platform
+
+        backend = current_platform.get_torch_distributed_backend_str()
     # Get world size and rank. Ensure some consistencies.
     assert torch.distributed.is_initialized()
     world_size: int = torch.distributed.get_world_size()
@@ -405,10 +405,12 @@ def initialize_model_parallel(
     assert _SP is None, "sequence parallel group is already initialized"
 
     try:
-        from .yunchang import PROCESS_GROUP as _YC_PROCESS_GROUP
-        from .yunchang import set_seq_parallel_pg as _set_seq_parallel_pg
+        from .parallel_groups import PROCESS_GROUP as _YC_PROCESS_GROUP
+        from .parallel_groups import (
+            set_seq_parallel_pg_by_sp_groups as _set_seq_parallel_pg_by_sp_groups,
+        )
     except ImportError:
-        _set_seq_parallel_pg = None
+        _set_seq_parallel_pg_by_sp_groups = None
 
         class _DummyProcessGroup:
             ULYSSES_PG = torch.distributed.group.WORLD
@@ -416,11 +418,15 @@ def initialize_model_parallel(
 
         PROCESS_GROUP = _DummyProcessGroup()
     else:
-        _set_seq_parallel_pg(
+        # Build SGLang Diffusion SP sub-groups based on the true SP groups. This is
+        # critical when TP>1, because SP groups may be strided in global ranks
+        # (e.g., tp-sp order).
+        sp_groups = rank_generator.get_ranks("sp")
+        _set_seq_parallel_pg_by_sp_groups(
             sp_ulysses_degree=ulysses_degree,
             sp_ring_degree=ring_degree,
-            rank=get_world_group().rank_in_group,
-            world_size=dit_parallel_size,
+            rank=get_world_group().rank,
+            sp_groups=sp_groups,
         )
         PROCESS_GROUP = _YC_PROCESS_GROUP
 
@@ -627,8 +633,6 @@ def patch_tensor_parallel_group(tp_group: GroupCoordinator):
     This method is for draft workers of speculative decoding to run draft model
     with different tp degree from that of target model workers.
 
-    Args:
-        tp_group (GroupCoordinator): the tp group coordinator
     """
     global _TP_STATE_PATCHED
     assert not _TP_STATE_PATCHED, "Should not call when it's already patched"
