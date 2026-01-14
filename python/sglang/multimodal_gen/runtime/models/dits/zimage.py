@@ -1346,8 +1346,14 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
 
         x = x.unsqueeze(0)
         x_freqs_cis = x_freqs_cis
+        x_noise_tensor = None
+        # TODO: ugly hack
+        if x_noise_mask is not None:
+            x_noise_tensor = torch.stack(
+                [torch.tensor(m, dtype=torch.long, device=device) for m in x_noise_mask]
+            )
         for layer in self.noise_refiner:
-            x = layer(x, x_freqs_cis, adaln_input)
+            x = layer(x, x_freqs_cis, adaln_input, x_noise_tensor, t_noisy, t_clean)
 
         cap_feats = torch.cat(cap_feats, dim=0)
 
