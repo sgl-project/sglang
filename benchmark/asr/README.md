@@ -6,10 +6,6 @@ This benchmark evaluates the performance and accuracy (Word Error Rate - WER) of
 
 - `openai/whisper-large-v3`
 - `openai/whisper-large-v3-turbo`
-- `openai/whisper-medium`
-- `openai/whisper-small`
-- `openai/whisper-base`
-- `openai/whisper-tiny`
 
 ## Setup
 
