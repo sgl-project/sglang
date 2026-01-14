@@ -358,7 +358,12 @@ class TokenizerCommunicatorMixin:
         )
 
         # Start host profiler with the same profile_id and output_dir
-        if include_host and hasattr(self, "start_host_profile"):
+        if (
+            include_host
+            and hasattr(self, "start_host_profile")
+            and num_steps is None
+            and start_step is None
+        ):
             # Include both CPU and GPU for host since multimodal preprocessing uses GPU
             host_activities = ["CPU", "GPU"]
             host_result = self.start_host_profile(

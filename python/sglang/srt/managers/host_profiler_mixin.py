@@ -141,25 +141,38 @@ class HostProfilerMixin:
         logger.info("Stopping host profiling...")
 
         if self.host_profiler is not None:
-            self.host_profiler.stop()
+            try:
+                self.host_profiler.stop()
 
-            # Build filename
-            filename = f"{self.host_profile_id}-host.trace.json.gz"
-            trace_path = os.path.join(self.host_profiler_output_dir, filename)
+                # Build filename
+                filename = f"{self.host_profile_id}-host.trace.json.gz"
 
-            self.host_profiler.export_chrome_trace(trace_path)
+                # Ensure output directory exists
+                if self.host_profiler_output_dir is not None:
+                    self.host_profiler_output_dir.mkdir(parents=True, exist_ok=True)
+                    trace_path = os.path.join(self.host_profiler_output_dir, filename)
+                else:
+                    trace_path = os.path.join("/tmp", filename)
 
-            logger.info(f"Host profiling done. Trace saved to: {trace_path}")
+                self.host_profiler.export_chrome_trace(trace_path)
 
-            self.host_profiler = None
-            self.host_profile_in_progress = False
-            self.host_profile_request_count = 0
-            self.host_profile_target_request_count = None
+                logger.info(f"Host profiling done. Trace saved to: {trace_path}")
 
-            return {
-                "success": True,
-                "message": f"Host profiling stopped. Trace saved to: {trace_path}",
-            }
+                return {
+                    "success": True,
+                    "message": f"Host profiling stopped. Trace saved to: {trace_path}",
+                }
+            except Exception as e:
+                logger.warning(f"Error stopping host profiler: {e}")
+                return {
+                    "success": False,
+                    "message": f"Error stopping host profiler: {e}",
+                }
+            finally:
+                self.host_profiler = None
+                self.host_profile_in_progress = False
+                self.host_profile_request_count = 0
+                self.host_profile_target_request_count = None
 
         self.host_profile_in_progress = False
         return {"success": False, "message": "No active profiler to stop."}
