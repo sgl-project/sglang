@@ -473,7 +473,7 @@ void sm90_fp8_blockwise_group_mm_dispatch_shape(
 
   struct MmaConfigH20LargeK {
     using ElementA = cutlass::float_e4m3_t;
-    using MmaTileShape = Shape<_64, _128, _128>;
+    using MmaTileShape = Shape<_128, _128, _128>;
     using ClusterShape = Shape<_2, _1, _1>;
     using KernelSchedule = cutlass::gemm::KernelPtrArrayTmaWarpSpecializedPingpongFP8Blockwise;
     using EpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecializedPingpong;
