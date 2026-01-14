@@ -680,7 +680,6 @@ class Flux2Transformer2DModel(CachableDiT, OffloadableDiTMixin):
         self,
         config: FluxConfig,
         hf_config: dict[str, Any],
-        quant_config: QuantizationConfig = None,
     ):
         super().__init__(config=config, hf_config=hf_config)
         patch_size: int = config.patch_size
@@ -698,6 +697,7 @@ class Flux2Transformer2DModel(CachableDiT, OffloadableDiTMixin):
         eps: float = config.eps
         self.out_channels = out_channels or in_channels
         self.inner_dim = num_attention_heads * attention_head_dim
+        quant_config = config.quant_config
 
         # 1. Sinusoidal positional embedding for RoPE on image and text tokens
         self.rotary_emb = Flux2PosEmbed(theta=rope_theta, axes_dim=axes_dims_rope)

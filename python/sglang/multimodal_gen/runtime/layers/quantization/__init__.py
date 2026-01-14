@@ -9,7 +9,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
 )
 
-QuantizationMethods = Literal[None]
+QuantizationMethods = Literal["modelopt_fp4"]
 
 QUANTIZATION_METHODS: list[str] = list(get_args(QuantizationMethods))
 
