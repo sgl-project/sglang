@@ -634,6 +634,7 @@ class ServerArgs:
     disaggregation_decode_dp: Optional[int] = None
     disaggregation_prefill_pp: Optional[int] = 1
     disaggregation_ib_device: Optional[str] = None
+    disaggregation_nixl_backend: Optional[str] = None
     disaggregation_decode_enable_offload_kvcache: bool = False
     # Enable auto FAKE mode for decode node testing, no need to pass bootstrap_host in request
     disaggregation_decode_enable_fake_auto: bool = False
@@ -4584,6 +4585,13 @@ class ServerArgs:
             help="The InfiniBand devices for disaggregation transfer, accepts single device (e.g., --disaggregation-ib-device mlx5_0) "
             "or multiple comma-separated devices (e.g., --disaggregation-ib-device mlx5_0,mlx5_1). "
             "Default is None, which triggers automatic device detection when mooncake backend is enabled.",
+        )
+        parser.add_argument(
+            "--disaggregation-nixl-backend",
+            type=str,
+            default=ServerArgs.disaggregation_nixl_backend,
+            help="The NIXL plugin backend for KV cache transfer. "
+            "Available options depend on NIXL installation: UCX (default), LIBFABRIC, etc."
         )
         parser.add_argument(
             "--disaggregation-decode-enable-offload-kvcache",
