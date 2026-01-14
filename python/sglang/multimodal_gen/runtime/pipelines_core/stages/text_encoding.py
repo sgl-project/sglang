@@ -68,6 +68,9 @@ class TextEncodingStage(PipelineStage):
         num_condition_images: int = (
             len(batch.image_path) if batch.image_path is not None else 0
         )
+        # TODO: hard code debug
+        # ignore text encode for now.
+        num_condition_images = 0
         assert num_condition_images == 0, f"Unimpl {num_condition_images=}."
 
         all_indices: list[int] = list(range(len(self.text_encoders)))
@@ -115,12 +118,12 @@ class TextEncodingStage(PipelineStage):
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         """Verify text encoding stage inputs."""
         result = VerificationResult()
-        result.add_check("prompt", batch.prompt, V.string_or_list_strings)
-        result.add_check(
-            "negative_prompt",
-            batch.negative_prompt,
-            lambda x: not batch.do_classifier_free_guidance or V.string_not_none(x),
-        )
+        # result.add_check("prompt", batch.prompt, V.string_or_list_strings)
+        # result.add_check(
+        #     "negative_prompt",
+        #     batch.negative_prompt,
+        #     lambda x: not batch.do_classifier_free_guidance or V.string_not_none(x),
+        # )
         result.add_check(
             "do_classifier_free_guidance",
             batch.do_classifier_free_guidance,
@@ -243,9 +246,28 @@ class TextEncodingStage(PipelineStage):
             )
 
             processed_text_list: list[str] = []
+            # TODO: hard code
+            # preprocess_func need more arguments like num_condition_images
             for prompt_str in texts:
-                preprocessed = preprocess_func(prompt_str)
-                processed_text_list.append(preprocessed)
+                if num_condition_images == 0:
+                    preprocessed = preprocess_func(prompt_str)
+                    processed_text_list.append(preprocessed)
+                else:
+                    # TODO: refactor, hard code for z-image-omni only for now.
+                    # which create a batch of placeholder
+                    prompt_list = ["<|im_start|>user\n<|vision_start|>"]
+                    prompt_list += ["<|vision_end|><|vision_start|>"] * (
+                        num_condition_images - 1
+                    )
+                    prompt_list += [
+                        "<|vision_end|>"
+                        + prompt_str
+                        + "<|im_end|>\n<|im_start|>assistant\n<|vision_start|>"
+                    ]
+                    prompt_list += ["<|vision_end|><|im_end|>"]
+                    # TODO: note review, a list where split by vision block like
+                    # ['<|im_start|>user\n<|vision_start|>', '<|vision_end|><|vision_start|>', '<|vision_end|> USER PROMPT <|im_end|>\n<|im_start|>assistant\n<|vision_start|>', '<|vision_end|><|im_end|> ']
+                    processed_text_list.append(prompt_list)
 
             # Prepare tokenizer args
             tok_kwargs = self.prepare_tokenizer_kwargs(

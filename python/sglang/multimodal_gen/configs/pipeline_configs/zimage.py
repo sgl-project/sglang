@@ -168,32 +168,76 @@ def zimage_omni_preprocess_text(prompt: str):
     return "<|im_start|>user\n" + prompt + "<|im_end|>\n<|im_start|>assistant\n"
 
 
+def zimage_omni_postprocess_text(
+    outputs: BaseEncoderOutput, _text_inputs
+) -> torch.Tensor:
+    """
+    # TODO: debug note, remove later
+    Omni mode:
+        Omni mode text embedding require a fregment pattern
+        which break a single text into fregments(split by <|vision_start|>).
+        number of fregments is num_image + 2
+        mask flatten embeds and reconstruct batch into
+        List[List[torch.Tensor]]
+    Returns:
+        (torch.tensor | List[List[torch.Tensor]])
+            torch.tensor: single batch embed
+            List[List[torch.Tensor]]: single batch fregs of embeds.
+            where len(d) == batch size. len(d[bid]) == num_image + 2
+    """
+    device = outputs.hidden_states[-2].device
+    prompt_mask = _text_inputs.attention_mask.to(device).bool()
+    return outputs.hidden_states[-2][0][prompt_mask[0]]
+
+
 @dataclass
 class ZImageOmniPipelineConfig(ZImagePipelineConfig):
     preprocess_text_funcs: tuple[Callable, ...] = field(
         default_factory=lambda: (zimage_omni_preprocess_text,)
     )
 
-    def tokenize_prompt(self, prompts: list[str], tokenizer, tok_kwargs) -> dict:
-        # # flatten to 1-d list
-        # inputs = tokenizer(
-        #     prompts,
-        #     tokenize=True,
-        #     add_generation_prompt=True,
-        #     enable_thinking=True,
-        #     padding="max_length",
-        #     max_length=512,  # TODO (yhyang201): set max length according to config
-        #     truncation=True,
-        #     return_tensors="pt",
-        #     return_dict=True,
-        # )
+    postprocess_text_funcs: tuple[Callable, ...] = field(
+        default_factory=lambda: (zimage_omni_postprocess_text,)
+    )
+
+    def tokenize_prompt(self, prompts, tokenizer, tok_kwargs) -> dict:
+        """
+        template was inject in preprocess, no apply_chat_template now.
+        """
+
+        # TODO: 2d list for omni mode
+        # where
+        # dim0 = batch size
+        # dim1 = sequence-item len
+        if isinstance(prompts, str):
+            prompts = [[prompts]]
+        elif isinstance(prompts, list) and isinstance(prompts[0], str):
+            prompts = [prompts]
+        else:
+            raise NotImplementedError
+
+        # all batch flattened
+        flattened_prompt = []
+        prompt_list_lengths = []
+
+        # do flatten and record metadata
+        for i in range(len(prompts)):
+            # record freg numbers
+            prompt_list_lengths.append(len(prompts[i]))
+            # NOTE: all batch flattened
+            flattened_prompt.extend(prompts[i])
 
         inputs = tokenizer(
-            prompts,
+            flattened_prompt,
             padding="max_length",
+            # TODO: review ?
             max_length=512,  # TODO (yhyang201): set max length according to config
             truncation=True,
             return_tensors="pt",
         )
+
+        # TODO: hack
+        # prompt_list_lengths is used to reconstruct flattened_prompt into batching
+        inputs.prompt_list_lengths = prompt_list_lengths
 
         return inputs
