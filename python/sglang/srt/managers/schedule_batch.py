@@ -1580,7 +1580,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     # The reference by CudaIpcTensorTransportProxy was cut off,
                     # proactively delete to avoid slow gc.
                     del pixel_values
-                if pixel_values is None:
+                if get_global_server_args().language_only:
                     precomputed_embeddings = getattr(
                         mm_item, "precomputed_embeddings", None
                     )
