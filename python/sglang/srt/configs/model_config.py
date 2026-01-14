@@ -300,6 +300,10 @@ class ModelConfig:
             self.hf_config.architectures[0] = "Qwen3NextForCausalLMMTP"
             self.hf_config.num_nextn_predict_layers = 1
 
+        if is_draft_model and self.hf_config.architectures[0] == "NemotronHForCausalLM":
+            self.hf_config.architectures[0] = "NemotronHForCausalLMMTP"
+            self.hf_config.num_nextn_predict_layers = 1
+
     def _derive_hybrid_model(self):
         # Use self.context_len after it has been initialized to prevent using context_len which may be None.
         self.is_hybrid_swa = is_hybrid_swa_model(self.hf_config.architectures)
@@ -463,6 +467,9 @@ class ModelConfig:
         self.num_attention_layers = self.num_hidden_layers
         if "LongcatFlashForCausalLM" in self.hf_config.architectures:
             self.num_attention_layers = self.num_hidden_layers * 2
+        if "IQuestLoopCoderForCausalLM" in self.hf_config.architectures:
+            loop_num = getattr(self.hf_text_config, "loop_num", 1)
+            self.num_attention_layers = int(self.num_hidden_layers * int(loop_num))
         self.num_nextn_predict_layers = getattr(
             self.hf_text_config, "num_nextn_predict_layers", None
         )
@@ -716,6 +723,7 @@ class ModelConfig:
             "quark",
             "mxfp4",
             "auto-round",
+            "quark_int4fp8_moe",
         ]
         optimized_quantization_methods = [
             "fp8",

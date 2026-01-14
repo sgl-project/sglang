@@ -1527,10 +1527,34 @@ class DeepseekV2AttentionMLA(nn.Module):
             # NSA Indexer: cache quantized keys, auto-skip topk for sequences <= nsa_index_topk
 
             if self.use_nsa:
-                q_lora = self.q_a_layernorm(q)
-                q = self.q_b_proj(q_lora)[0].view(
-                    -1, self.num_local_heads, self.qk_head_dim
-                )
+                # NSA requires unquantized q_lora for the indexer. When q_b_proj is FP8
+                # on gfx95, we can still use fused RMSNorm+FP8 quant, but MUST request
+                # the unquantized output for q_lora; otherwise q_lora becomes the (fp8,scale)
+                # tuple.
+                if (
+                    _use_aiter_gfx95
+                    and self.q_b_proj.weight.dtype == torch.float8_e4m3fn
+                ):
+                    q_quanted, q_lora, _, _ = fused_rms_fp8_group_quant(
+                        q,
+                        self.q_a_layernorm.weight,
+                        self.q_a_layernorm.variance_epsilon,
+                        None,
+                        None,
+                        None,
+                        group_size=128,
+                        dtype_quant=torch.float8_e4m3fn,
+                        res1=None,
+                        output_unquantized_inp1=True,
+                    )
+                    q = self.q_b_proj(q_quanted)[0].view(
+                        -1, self.num_local_heads, self.qk_head_dim
+                    )
+                else:
+                    q_lora = self.q_a_layernorm(q)
+                    q = self.q_b_proj(q_lora)[0].view(
+                        -1, self.num_local_heads, self.qk_head_dim
+                    )
                 _ = self.indexer(
                     x=hidden_states,
                     q_lora=q_lora,
@@ -1707,23 +1731,38 @@ class DeepseekV2AttentionMLA(nn.Module):
                         self.kv_a_layernorm.variance_epsilon,
                     )
                 else:
+                    q_lora = None
                     if (
                         _use_aiter_gfx95
                         and self.q_b_proj.weight.dtype == torch.float8_e4m3fn
                     ):
-
-                        q, _, k_nope, _ = fused_rms_fp8_group_quant(
-                            q,
-                            self.q_a_layernorm.weight,
-                            self.q_a_layernorm.variance_epsilon,
-                            k_nope,
-                            self.kv_a_layernorm.weight,
-                            self.kv_a_layernorm.variance_epsilon,
-                            group_size=128,
-                            dtype_quant=torch.float8_e4m3fn,
-                            res1=None,
-                            output_unquantized_inp1=False,
-                        )
+                        if self.use_nsa:
+                            q_quanted, q_lora, k_nope, _ = fused_rms_fp8_group_quant(
+                                q,
+                                self.q_a_layernorm.weight,
+                                self.q_a_layernorm.variance_epsilon,
+                                k_nope,
+                                self.kv_a_layernorm.weight,
+                                self.kv_a_layernorm.variance_epsilon,
+                                group_size=128,
+                                dtype_quant=torch.float8_e4m3fn,
+                                res1=None,
+                                output_unquantized_inp1=True,
+                            )
+                            q = q_quanted
+                        else:
+                            q, _, k_nope, _ = fused_rms_fp8_group_quant(
+                                q,
+                                self.q_a_layernorm.weight,
+                                self.q_a_layernorm.variance_epsilon,
+                                k_nope,
+                                self.kv_a_layernorm.weight,
+                                self.kv_a_layernorm.variance_epsilon,
+                                group_size=128,
+                                dtype_quant=torch.float8_e4m3fn,
+                                res1=None,
+                                output_unquantized_inp1=False,
+                            )
 
                     else:
                         q = self.q_a_layernorm(q)
@@ -1731,7 +1770,8 @@ class DeepseekV2AttentionMLA(nn.Module):
 
             # q_lora needed by indexer
             if self.use_nsa:
-                q_lora = q
+                if q_lora is None:
+                    q_lora = q
 
             # overlap q_b_proj and indexer during decode
             if (
