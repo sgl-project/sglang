@@ -256,9 +256,6 @@ class ComponentLoader(ABC):
         Args:
             module_type: Type of module (e.g., "vae", "text_encoder", "transformer", "scheduler")
             transformers_or_diffusers: Whether the module is from transformers or diffusers
-
-        Returns:
-            A component loader for the specified module type
         """
         # Map of module types to their loader classes and expected library
         module_type = _normalize_module_type(module_type)
@@ -271,6 +268,7 @@ class ComponentLoader(ABC):
             "image_processor": (ImageProcessorLoader, "transformers"),
             "image_encoder": (ImageEncoderLoader, "transformers"),
             "processor": (AutoProcessorLoader, "transformers"),
+            "vision_language_encoder": (VisionLanguageEncoderLoader, "transformers"),
         }
 
         if module_type in module_loaders:
@@ -784,6 +782,36 @@ class GenericComponentLoader(ComponentLoader):
         self.library = library
 
 
+class VisionLanguageEncoderLoader(ComponentLoader):
+    """Loader for vision language encoder (typically Causal LM or Vision2Seq)."""
+
+    def load_customized(
+        self,
+        component_model_path: str,
+        server_args: ServerArgs,
+        transformers_or_diffusers: str = "vision_language_encoder",
+    ) -> Any:
+        if transformers_or_diffusers == "vision_language_encoder":
+            from transformers import GlmImageForConditionalGeneration
+
+            config = get_hf_config(
+                component_model_path,
+                trust_remote_code=server_args.trust_remote_code,
+                revision=server_args.revision,
+            )
+            model = GlmImageForConditionalGeneration.from_pretrained(
+                component_model_path,
+                config=config,
+                trust_remote_code=server_args.trust_remote_code,
+                revision=server_args.revision,
+            ).to(get_local_torch_device())
+            return model
+        else:
+            raise ValueError(
+                f"Unsupported library for VisionLanguageEncoder: {transformers_or_diffusers}"
+            )
+
+
 class PipelineComponentLoader:
     """
     Utility class for loading pipeline components.
@@ -805,8 +833,6 @@ class PipelineComponentLoader:
             component_model_path: Path to the component model
             transformers_or_diffusers: Whether the module is from transformers or diffusers
 
-        Returns:
-            The loaded module
         """
 
         # Get the appropriate loader for this module type

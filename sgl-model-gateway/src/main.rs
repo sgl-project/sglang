@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
+use rand::{distr::Alphanumeric, Rng};
 use smg::{
     auth::{ApiKeyEntry, ControlPlaneAuthConfig, JwtConfig, Role},
     config::{
@@ -10,6 +11,7 @@ use smg::{
         TraceConfig,
     },
     core::ConnectionMode,
+    mesh::service::MeshServerConfig,
     observability::{
         metrics::PrometheusConfig,
         otel_trace::{is_otel_enabled, shutdown_otel},
@@ -376,6 +378,10 @@ struct CliArgs {
     #[arg(long, default_value = "/health", help_heading = "Health Checks")]
     health_check_endpoint: String,
 
+    /// Disable all worker health checks at startup
+    #[arg(long, default_value_t = false, help_heading = "Health Checks")]
+    disable_health_check: bool,
+
     // ==================== Tokenizer ====================
     /// Model path for loading tokenizer (HuggingFace ID or local path)
     #[arg(long, help_heading = "Tokenizer")]
@@ -564,6 +570,22 @@ struct CliArgs {
         help_heading = "Control Plane Authentication"
     )]
     disable_audit_logging: bool,
+
+    // ==================== Mesh Server ====================
+    #[arg(long, default_value_t = false)]
+    enable_mesh: bool,
+
+    #[arg(long)]
+    mesh_server_name: Option<String>,
+
+    #[arg(long, default_value = "0.0.0.0")]
+    mesh_host: String,
+
+    #[arg(long, default_value_t = 39527)]
+    mesh_port: u16,
+
+    #[arg(long, num_args = 0..)]
+    mesh_peer_urls: Vec<String>,
 }
 
 enum OracleConnectSource {
@@ -873,6 +895,8 @@ impl CliArgs {
                 prefill_selector: Self::parse_selector(&self.prefill_selector),
                 decode_selector: Self::parse_selector(&self.decode_selector),
                 bootstrap_port_annotation: "sglang.ai/bootstrap-port".to_string(),
+                router_selector: HashMap::new(), // Can be set via config file
+                router_mesh_port_annotation: "sglang.ai/ha-port".to_string(),
             })
         } else {
             None
@@ -967,6 +991,7 @@ impl CliArgs {
                 timeout_secs: self.health_check_timeout_secs,
                 check_interval_secs: self.health_check_interval_secs,
                 endpoint: self.health_check_endpoint.clone(),
+                disable_health_check: self.disable_health_check,
             })
             .tokenizer_cache(TokenizerCacheConfig {
                 enable_l0: self.tokenizer_cache_enable_l0,
@@ -1006,6 +1031,18 @@ impl CliArgs {
 
     fn to_server_config(&self, router_config: RouterConfig) -> ServerConfig {
         let service_discovery_config = if self.service_discovery {
+            // Get router discovery config from router_config.discovery if available
+            let (router_selector, router_mesh_port_annotation) = router_config
+                .discovery
+                .as_ref()
+                .map(|d| {
+                    (
+                        d.router_selector.clone(),
+                        d.router_mesh_port_annotation.clone(),
+                    )
+                })
+                .unwrap_or_else(|| (HashMap::new(), "sglang.ai/mesh-port".to_string()));
+
             Some(ServiceDiscoveryConfig {
                 enabled: true,
                 selector: Self::parse_selector(&self.selector),
@@ -1016,6 +1053,8 @@ impl CliArgs {
                 prefill_selector: Self::parse_selector(&self.prefill_selector),
                 decode_selector: Self::parse_selector(&self.decode_selector),
                 bootstrap_port_annotation: "sglang.ai/bootstrap-port".to_string(),
+                router_selector,
+                router_mesh_port_annotation,
             })
         } else {
             None
@@ -1041,6 +1080,38 @@ impl CliArgs {
             }
         };
 
+        // ==================== Mesh Server ====================
+        let mesh_server_config = if self.enable_mesh {
+            let self_name = if let Some(name) = &self.mesh_server_name {
+                name.to_string()
+            } else {
+                // If name is not set, use a random name
+                let mut rng = rand::rng();
+                let random_string: String =
+                    (0..4).map(|_| rng.sample(Alphanumeric) as char).collect();
+                format!("Mesh_{}", random_string)
+            };
+
+            let peer = self
+                .mesh_peer_urls
+                .first()
+                .and_then(|url| url.parse::<std::net::SocketAddr>().ok());
+            if let Ok(addr) =
+                format!("{}:{}", self.mesh_host, self.mesh_port).parse::<std::net::SocketAddr>()
+            {
+                Some(MeshServerConfig {
+                    self_name,
+                    self_addr: addr,
+                    init_peer: peer,
+                })
+            } else {
+                tracing::warn!("Invalid mesh server address, so mesh server will not be started");
+                None
+            }
+        } else {
+            None
+        };
+
         ServerConfig {
             host: self.host.clone(),
             port: self.port,
@@ -1058,6 +1129,7 @@ impl CliArgs {
             },
             shutdown_grace_period_secs: self.shutdown_grace_period_secs,
             control_plane_auth,
+            mesh_server_config,
         }
     }
 }
