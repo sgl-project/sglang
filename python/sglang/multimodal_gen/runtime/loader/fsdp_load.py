@@ -319,7 +319,6 @@ def load_model_from_full_model_state_dict(
                 f"Currently only parameters containing {ALLOWED_NEW_PARAM_PATTERNS} are allowed."
             )
         meta_sharded_param = meta_sd.get(new_param_name)
-        actual_param = param_dict.get(new_param_name)
         if not hasattr(meta_sharded_param, "device_mesh"):
             # Initialize with zeros
             sharded_tensor = torch.zeros_like(
