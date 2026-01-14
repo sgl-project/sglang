@@ -213,6 +213,9 @@ class NPUW8A8Int8DynamicMoEMethod(FusedMoEMethodBase):
         set_weight_attrs(w2_weight_offset, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        layer.w13_weight.data = npu_format_cast(layer.w13_weight.data.transpose(1, 2).contiguous())
+        layer.w2_weight.data = npu_format_cast(layer.w2_weight.data.transpose(1, 2).contiguous())
+        
         layer.w13_weight_scale = torch.nn.Parameter(
             layer.w13_weight_scale.data.squeeze(-1).contiguous().to(torch.float32),
             requires_grad=False,
@@ -226,9 +229,6 @@ class NPUW8A8Int8DynamicMoEMethod(FusedMoEMethodBase):
         layer.w2_weight_offset = torch.nn.Parameter(
             layer.w2_weight_offset.data.squeeze(-1).contiguous(), requires_grad=False
         )
-
-        layer.w13_weight.data = npu_format_cast(layer.w13_weight.data.transpose(1, 2))
-        layer.w2_weight.data = npu_format_cast(layer.w2_weight.data.transpose(1, 2))
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: "MoeRunnerConfig"
