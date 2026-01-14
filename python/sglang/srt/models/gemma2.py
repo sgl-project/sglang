@@ -15,8 +15,6 @@
 # Adapted from:
 # https://github.com/vllm-project/vllm/blob/56b325e977435af744f8b3dca7af0ca209663558/vllm/model_executor/models/gemma2.py
 
-import functools
-import math
 from typing import Iterable, Optional, Set, Tuple
 
 import torch
@@ -84,9 +82,7 @@ class Gemma2MLP(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate_up, _ = self.gate_up_proj(x)
-        d = gate_up.shape[-1] // 2
-        gate, up = gate_up[..., :d], gate_up[..., d:]
-        x = self.act_fn(gate) * up
+        x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         return x
 
