@@ -13,25 +13,28 @@ from __future__ import annotations
 
 import os
 import pprint
-from dataclasses import asdict, dataclass, field
-from typing import TYPE_CHECKING, Any, Optional
+from dataclasses import MISSING, asdict, dataclass, field, fields
+from typing import Any, Optional
 
 import PIL.Image
 import torch
 
-from sglang.multimodal_gen.configs.sample.sampling_params import DataType
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.configs.sample.teacache import (
     TeaCacheParams,
     WanTeaCacheParams,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.perf_logger import RequestTimings
+from sglang.multimodal_gen.utils import align_to
 
-if TYPE_CHECKING:
+logger = init_logger(__name__)
 
-    from sglang.multimodal_gen.runtime.utils.perf_logger import RequestTimings
+SAMPLING_PARAMS_FIELDS = {f.name for f in fields(SamplingParams)}
 
 
-@dataclass
+@dataclass(init=False)
 class Req:
     """
     Complete state passed through the pipeline execution.
@@ -39,34 +42,24 @@ class Req:
     This dataclass contains all information needed during the diffusion pipeline
     execution, allowing methods to update specific components without needing
     to manage numerous individual parameters.
+
+    [IMPORTANT] Fields that overlap with SamplingParams are automatically delegated to the
+    sampling_params member via __getattr__ and __setattr__.
     """
 
-    # TODO(will): double check that args are separate from server_args
-    # properly. Also maybe think about providing an abstraction for pipeline
-    # specific arguments.
-    data_type: DataType
-
-    request_id: str | None = None
+    sampling_params: SamplingParams | None = None
 
     generator: torch.Generator | list[torch.Generator] | None = None
 
-    # Image inputs
-    image_path: str | None = None
     # Image encoder hidden states
     image_embeds: list[torch.Tensor] = field(default_factory=list)
 
     original_condition_image_size: tuple[int, int] = None
     condition_image: torch.Tensor | PIL.Image.Image | None = None
+    vae_image: torch.Tensor | PIL.Image.Image | None = None
     pixel_values: torch.Tensor | PIL.Image.Image | None = None
     preprocessed_image: torch.Tensor | None = None
 
-    # Text inputs
-    prompt: str | list[str] | None = None
-    negative_prompt: str | list[str] | None = None
-    prompt_path: str | None = None
-    output_path: str = "outputs/"
-    # without extension
-    output_file_name: str | None = None
     output_file_ext: str | None = None
     # Primary encoder embeddings
     prompt_embeds: list[torch.Tensor] | torch.Tensor = field(default_factory=list)
@@ -84,11 +77,7 @@ class Req:
     prompt_template: dict[str, Any] | None = None
     do_classifier_free_guidance: bool = False
 
-    # Batch info
-    num_outputs_per_prompt: int = 1
-    seed: int | None = None
     seeds: list[int] | None = None
-    generator_device: str = "cuda"  # Device for random generator: "cuda" or "cpu"
 
     # Tracking if embeddings are already processed
     is_prompt_processed: bool = False
@@ -107,29 +96,12 @@ class Req:
     # Latent dimensions
     height_latents: list[int] | int | None = None
     width_latents: list[int] | int | None = None
-    num_frames: list[int] | int = 1  # Default for image models
-    num_frames_round_down: bool = (
-        False  # Whether to round down num_frames if it's not divisible by num_gpus
-    )
-
-    # Original dimensions (before VAE scaling)
-    height: list[int] | int | None = None
-    width: list[int] | int | None = None
-    fps: list[int] | int | None = None
-    height_not_provided: bool = False
-    width_not_provided: bool = False
 
     # Timesteps
     timesteps: torch.Tensor | None = None
     timestep: torch.Tensor | float | int | None = None
     step_index: int | None = None
-    boundary_ratio: float | None = None
 
-    # Scheduler parameters
-    num_inference_steps: int = 50
-    guidance_scale: float = 1.0
-    guidance_scale_2: float | None = None
-    guidance_rescale: float = 0.0
     eta: float = 0.0
     sigmas: list[float] | None = None
 
@@ -141,20 +113,15 @@ class Req:
     # Component modules (populated by the pipeline)
     modules: dict[str, Any] = field(default_factory=dict)
 
-    return_trajectory_latents: bool = False
-    return_trajectory_decoded: bool = False
     trajectory_timesteps: list[torch.Tensor] | None = None
     trajectory_latents: torch.Tensor | None = None
 
     # Extra parameters that might be needed by specific pipeline implementations
     extra: dict[str, Any] = field(default_factory=dict)
 
-    # Misc
-    save_output: bool = True
-    return_frames: bool = False
+    is_warmup: bool = False
 
     # TeaCache parameters
-    enable_teacache: bool = False
     teacache_params: TeaCacheParams | WanTeaCacheParams | None = None
 
     # STA parameters
@@ -169,17 +136,73 @@ class Req:
     # stage logging
     timings: Optional["RequestTimings"] = None
 
-    # profile
-    profile: bool = False
-    num_profiled_timesteps: int = 8
-
-    # debugging
-    debug: bool = False
-    # dummy for now
-    perf_dump_path: str | None = None
-
     # results
     output: torch.Tensor | None = None
+
+    def __init__(self, **kwargs):
+        # Initialize dataclass fields
+        for name, field in self.__class__.__dataclass_fields__.items():
+            if name in kwargs:
+                object.__setattr__(self, name, kwargs.pop(name))
+            elif field.default is not MISSING:
+                object.__setattr__(self, name, field.default)
+            elif field.default_factory is not MISSING:
+                object.__setattr__(self, name, field.default_factory())
+
+        for name, value in kwargs.items():
+            setattr(self, name, value)
+
+        self.validate()
+
+    def __getattr__(self, name: str) -> Any:
+        """
+        Delegate attribute access to sampling_params if not found in Req.
+        This is only called when the attribute is not found in the instance.
+        """
+        if name == "sampling_params":
+            raise AttributeError(
+                f"'{type(self).__name__}' object has no attribute '{name}'"
+            )
+
+        sampling_params = object.__getattribute__(self, "sampling_params")
+        if sampling_params is not None and hasattr(sampling_params, name):
+            return getattr(sampling_params, name)
+
+        raise AttributeError(
+            f"'{type(self).__name__}' object has no attribute '{name}'"
+        )
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        """
+        Smart attribute setting:
+        1. If field exists in Req, set it in Req
+        2. Else if field exists in sampling_params, set it in sampling_params
+        3. Else set it in Req (for dynamic attributes)
+        """
+        if name == "sampling_params":
+            object.__setattr__(self, name, value)
+            return
+
+        if name in self.__class__.__dataclass_fields__:
+            object.__setattr__(self, name, value)
+            return
+
+        try:
+            sampling_params = object.__getattribute__(self, "sampling_params")
+        except AttributeError:
+            sampling_params = None
+
+        if sampling_params is not None and hasattr(sampling_params, name):
+            setattr(sampling_params, name, value)
+            return
+
+        if sampling_params is None and name in SAMPLING_PARAMS_FIELDS:
+            new_sp = SamplingParams()
+            object.__setattr__(self, "sampling_params", new_sp)
+            setattr(new_sp, name, value)
+            return
+
+        object.__setattr__(self, name, value)
 
     @property
     def batch_size(self):
@@ -195,7 +218,7 @@ class Req:
         batch_size *= self.num_outputs_per_prompt
         return batch_size
 
-    def output_file_path(self, num_outputs, output_idx):
+    def output_file_path(self, num_outputs=1, output_idx=None):
         output_file_name = self.output_file_name
         if num_outputs > 1 and output_file_name:
             base, ext = os.path.splitext(output_file_name)
@@ -207,7 +230,12 @@ class Req:
             else None
         )
 
-    def __post_init__(self):
+    def set_as_warmup(self):
+        self.is_warmup = True
+        self.extra["cache_dit_num_inference_steps"] = self.num_inference_steps
+        self.num_inference_steps = 1
+
+    def validate(self):
         """Initialize dependent fields after dataclass initialization."""
         # Set do_classifier_free_guidance based on guidance scale and negative prompt
         if self.guidance_scale > 1.0 and self.negative_prompt is not None:
@@ -217,13 +245,49 @@ class Req:
         if self.guidance_scale_2 is None:
             self.guidance_scale_2 = self.guidance_scale
 
+        self.timings = RequestTimings(request_id=self.request_id)
+
+        if self.is_warmup:
+            self.set_as_warmup()
+
     def adjust_size(self, server_args: ServerArgs):
-        if self.height is None or self.width is None:
-            self.width = 1280
-            self.height = 720
+        pass
 
     def __str__(self):
         return pprint.pformat(asdict(self), indent=2, width=120)
+
+    def log(self, server_args: ServerArgs):
+        if self.is_warmup:
+            return
+        # TODO: in some cases (e.g., TI2I), height and weight might be undecided at this moment
+        if self.height:
+            target_height = align_to(self.height, 16)
+        else:
+            target_height = -1
+        if self.width:
+            target_width = align_to(self.width, 16)
+        else:
+            target_width = -1
+
+        # Log sampling parameters
+        debug_str = f"""Sampling params:
+                       width: {target_width}
+                      height: {target_height}
+                  num_frames: {self.num_frames}
+                      prompt: {self.prompt}
+                  neg_prompt: {self.negative_prompt}
+                        seed: {self.seed}
+                 infer_steps: {self.num_inference_steps}
+      num_outputs_per_prompt: {self.num_outputs_per_prompt}
+              guidance_scale: {self.guidance_scale}
+     embedded_guidance_scale: {server_args.pipeline_config.embedded_cfg_scale}
+                    n_tokens: {self.n_tokens}
+                  flow_shift: {server_args.pipeline_config.flow_shift}
+                  image_path: {self.image_path}
+                 save_output: {self.save_output}
+            output_file_path: {self.output_file_path()}
+        """  # type: ignore[attr-defined]
+        logger.info(debug_str)
 
 
 @dataclass
@@ -240,3 +304,7 @@ class OutputBatch:
 
     # logged timings info, directly from Req.timings
     timings: Optional["RequestTimings"] = None
+
+    # For ComfyUI integration: noise prediction from denoising stage
+    noise_pred: torch.Tensor | None = None
+    peak_memory_mb: float = 0.0

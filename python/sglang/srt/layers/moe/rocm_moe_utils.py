@@ -6,7 +6,8 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.utils import direct_register_custom_op, get_bool_env_var, is_hip
+from sglang.srt.utils import get_bool_env_var, is_hip
+from sglang.srt.utils.custom_op import register_custom_op
 
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
@@ -19,7 +20,10 @@ class ActivationMethod(IntEnum):
     GELU = 1
 
 
-def rocm_aiter_asm_moe_tkw1_impl(
+# NOTE: for non _use_aiter case, use lazy registration to avoid overhead
+# (registration may not be trigger actually, since it will not be called)
+@register_custom_op(out_shape="hidden_states", eager=_use_aiter)
+def rocm_aiter_asm_moe_tkw1(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
     w2: torch.Tensor,
@@ -54,34 +58,6 @@ def rocm_aiter_asm_moe_tkw1_impl(
         per_tensor_quant_scale=per_tensor_quant_scale,
         expert_mask=expert_mask,
         activation=activation,
-    )
-
-
-def rocm_aiter_asm_moe_tkw1_fake(
-    hidden_states: torch.Tensor,
-    w1: torch.Tensor,
-    w2: torch.Tensor,
-    topk_weights: torch.Tensor,
-    topk_ids: torch.Tensor,
-    fc1_scale: Optional[torch.Tensor] = None,
-    fc2_scale: Optional[torch.Tensor] = None,
-    fc1_smooth_scale: Optional[torch.Tensor] = None,
-    fc2_smooth_scale: Optional[torch.Tensor] = None,
-    a16: bool = False,
-    per_tensor_quant_scale: Optional[torch.Tensor] = None,
-    expert_mask: Optional[torch.Tensor] = None,
-    activation_method: int = ActivationMethod.SILU.value,
-) -> torch.Tensor:
-    return torch.empty_like(hidden_states)
-
-
-if _use_aiter:
-
-    direct_register_custom_op(
-        op_name="rocm_aiter_asm_moe_tkw1",
-        op_func=rocm_aiter_asm_moe_tkw1_impl,
-        mutates_args=[],
-        fake_impl=rocm_aiter_asm_moe_tkw1_fake,
     )
 
 
@@ -121,7 +97,7 @@ def rocm_fused_experts_tkw1(
             "Only support topk=1 when" " `apply_router_weight_on_input` is True"
         )
 
-        return torch.ops.sglang.rocm_aiter_asm_moe_tkw1(
+        return rocm_aiter_asm_moe_tkw1(
             hidden_states,
             w1,
             w2,

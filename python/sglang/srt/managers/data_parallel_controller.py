@@ -19,14 +19,14 @@ import multiprocessing as mp
 import signal
 import threading
 import time
-from collections import deque
 from enum import Enum, auto
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 import psutil
 import setproctitle
 import zmq
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.managers.io_struct import (
     BlockReqInput,
@@ -36,6 +36,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.schedule_batch import Req, RequestStage
 from sglang.srt.managers.scheduler import run_scheduler_process
+from sglang.srt.metrics.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.server_args import (
     DP_ATTENTION_HANDSHAKE_PORT_DELTA,
     PortArgs,
@@ -59,6 +60,7 @@ from sglang.srt.utils.common import (
     maybe_reindex_device_id,
 )
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+from sglang.srt.utils.watchdog import Watchdog
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -68,8 +70,9 @@ class LoadBalanceMethod(Enum):
     """Load balance method."""
 
     ROUND_ROBIN = auto()
-    SHORTEST_QUEUE = auto()
-    MINIMUM_TOKENS = auto()
+    FOLLOW_BOOTSTRAP_ROOM = auto()
+    TOTAL_REQUESTS = auto()
+    TOTAL_TOKENS = auto()
 
     @classmethod
     def from_str(cls, method: str):
@@ -81,52 +84,50 @@ class LoadBalanceMethod(Enum):
 
 
 class DPBudget:
-    def __init__(self):
-        # TODO: support minimum tokens method
-        self.budget_queue = deque()
+    def __init__(self, dp_size: int):
+        self.dp_size = dp_size
+        self.total_requests = [0] * dp_size
+        self.total_tokens = [0] * dp_size
 
     def update_budget(self, load_update: WatchLoadUpdateReq):
-        """Update the budget queue.
-        Use num_reqs instead of num_waiting_reqs to balance decode running batch.
-        """
-        loads = load_update.loads
-        self.budget_queue.clear()
+        """Update the budget."""
+        for load in load_update.loads:
+            self.total_requests[load.dp_rank] = load.num_reqs
+            self.total_tokens[load.dp_rank] = load.num_tokens
 
-        num_reqs = [load.num_reqs for load in loads]
-        if not num_reqs:
-            return
-
-        max_num_reqs = max(num_reqs)
-        if all(x == max_num_reqs for x in num_reqs):
-            return
-
-        while any(x != num_reqs[0] for x in num_reqs):
-            min_load = min(num_reqs)
-            min_indices = [i for i, x in enumerate(num_reqs) if x == min_load]
-            second_min_load = min(x for x in num_reqs if x > min_load)
-            self.budget_queue.extend(
-                [loads[i].dp_rank for i in min_indices] * (second_min_load - min_load)
+    def dispatch(self, method: LoadBalanceMethod):
+        if method == LoadBalanceMethod.TOTAL_REQUESTS:
+            target_rank = self.total_requests.index(min(self.total_requests))
+        elif method == LoadBalanceMethod.TOTAL_TOKENS:
+            # Use total_requests as a tie-breaker when total_tokens are equal
+            target_rank = min(
+                range(self.dp_size),
+                key=lambda i: (self.total_tokens[i], self.total_requests[i]),
             )
-            for idx in min_indices:
-                num_reqs[idx] = second_min_load
+        else:
+            return None
 
-    def dispatch(self):
-        if self.budget_queue:
-            return self.budget_queue.popleft()
-        return None
+        # Increment the load of that worker by one as a heuristic
+        self.total_requests[target_rank] += 1
+        return target_rank
 
 
 class DataParallelController:
     """A controller that dispatches requests to multiple data parallel workers."""
 
-    def __init__(self, server_args: ServerArgs, port_args: PortArgs) -> None:
+    def __init__(
+        self,
+        server_args: ServerArgs,
+        port_args: PortArgs,
+        run_scheduler_process_func: Callable,
+    ) -> None:
         # Parse args
         self.server_args = server_args
         self.port_args = port_args
         self.load_balance_method = LoadBalanceMethod.from_str(
             server_args.load_balance_method
         )
-        self.run_scheduler_process = run_scheduler_process
+        self.run_scheduler_process_func = run_scheduler_process_func
 
         # For DP balance
         self.global_balance_id = 0
@@ -142,13 +143,14 @@ class DataParallelController:
         self.round_robin_counter = 0
         dispatch_lookup = {
             LoadBalanceMethod.ROUND_ROBIN: self.round_robin_scheduler,
-            LoadBalanceMethod.SHORTEST_QUEUE: self.shortest_queue_scheduler,
-            LoadBalanceMethod.MINIMUM_TOKENS: self.minimum_tokens_scheduler,
+            LoadBalanceMethod.FOLLOW_BOOTSTRAP_ROOM: self.follow_bootstrap_room_scheduler,
+            LoadBalanceMethod.TOTAL_REQUESTS: self.total_requests_scheduler,
+            LoadBalanceMethod.TOTAL_TOKENS: self.total_tokens_scheduler,
         }
         self.dispatching = dispatch_lookup[self.load_balance_method]
 
         # Load balance budget
-        self.dp_budget = DPBudget()
+        self.dp_budget = DPBudget(server_args.dp_size)
 
         # To protect changing env vars to set CUDA_VISIBLE_DEVICES.
         self.env_lock = threading.Lock()
@@ -165,6 +167,16 @@ class DataParallelController:
             self.control_message_step = 1
 
         self.init_dispatcher()
+
+        self.soft_watchdog = Watchdog.create(
+            debug_name="DataParallelController",
+            watchdog_timeout=server_args.soft_watchdog_timeout,
+            soft=True,
+            test_stuck_time=envs.SGLANG_TEST_STUCK_DP_CONTROLLER.get(),
+        )
+
+        if server_args.enable_metrics:
+            start_cpu_monitor_thread("data_parallel_controller")
 
     def send_to_all_workers(self, obj):
         for worker in self.workers:
@@ -429,7 +441,7 @@ class DataParallelController:
                 moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
                 with self.env_lock, maybe_reindex_device_id(gpu_id) as gpu_id:
                     proc = mp.Process(
-                        target=self.run_scheduler_process,
+                        target=self.run_scheduler_process_func,
                         args=(
                             server_args,
                             rank_port_args,
@@ -467,39 +479,46 @@ class DataParallelController:
         if self.maybe_external_dp_rank_routing(req):
             return
 
-        if self.server_args.disaggregation_mode == "null":
-            self.workers[self.round_robin_counter].send_pyobj(req)
+        self.workers[self.round_robin_counter].send_pyobj(req)
+        self.round_robin_counter = (self.round_robin_counter + 1) % len(self.workers)
+
+    def follow_bootstrap_room_scheduler(self, req: Req):
+        if self.maybe_external_dp_rank_routing(req):
+            return
+
+        # Set default bootstrap_room if in FAKE auto mode and room is None
+        if (
+            req.bootstrap_room is None
+            and self.server_args.disaggregation_decode_enable_fake_auto
+        ):
+            req.bootstrap_room = self.round_robin_counter
             self.round_robin_counter = (self.round_robin_counter + 1) % len(
                 self.workers
             )
-        else:
-            assert (
-                req.bootstrap_room is not None
-            ), "req.bootstrap_room should not be None. Do not send requests directly to prefill or decode instances, but send to the router instead."
-            self.workers[req.bootstrap_room % len(self.workers)].send_pyobj(req)
 
-    def shortest_queue_scheduler(self, req):
-        if self.maybe_external_dp_rank_routing(req):
-            return
-        target_worker = self.dp_budget.dispatch()
-        if target_worker is None:
-            self.round_robin_scheduler(req)
-        else:
-            self.workers[target_worker].send_pyobj(req)
-
-    def minimum_tokens_scheduler(self, req):
-        if self.maybe_external_dp_rank_routing(req):
-            return
-
-        logger.warning(
-            "The 'minimum_tokens' load balancing method is deprecated for now and will introduced later."
-            "Fall back to 'round_robin_scheduler'"
+        assert req.bootstrap_room is not None, (
+            "req.bootstrap_room should not be None. Do not send requests directly to "
+            "prefill or decode instances; send to the router instead."
         )
-        self.round_robin_scheduler(req)
+        target_rank = req.bootstrap_room % len(self.workers)
+        self.workers[target_rank].send_pyobj(req)
+
+    def total_requests_scheduler(self, req: Req):
+        if self.maybe_external_dp_rank_routing(req):
+            return
+        target_worker = self.dp_budget.dispatch(LoadBalanceMethod.TOTAL_REQUESTS)
+        self.workers[target_worker].send_pyobj(req)
+
+    def total_tokens_scheduler(self, req: Req):
+        if self.maybe_external_dp_rank_routing(req):
+            return
+        target_worker = self.dp_budget.dispatch(LoadBalanceMethod.TOTAL_TOKENS)
+        self.workers[target_worker].send_pyobj(req)
 
     def event_loop(self):
         while True:
             while True:
+                self.soft_watchdog.feed()
                 try:
                     recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
                 except zmq.ZMQError:
@@ -511,7 +530,7 @@ def run_data_parallel_controller_process(
     server_args: ServerArgs,
     port_args: PortArgs,
     pipe_writer,
-    data_parallel_controller_class=DataParallelController,
+    run_scheduler_process_func: Callable = run_scheduler_process,
 ):
     setproctitle.setproctitle("sglang::data_parallel_controller")
     faulthandler.enable()
@@ -529,7 +548,9 @@ def run_data_parallel_controller_process(
         trace_set_thread_info(thread_label)
 
     try:
-        controller = data_parallel_controller_class(server_args, port_args)
+        controller = DataParallelController(
+            server_args, port_args, run_scheduler_process_func
+        )
         pipe_writer.send(
             {
                 "status": "ready",

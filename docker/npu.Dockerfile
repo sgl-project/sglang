@@ -1,4 +1,4 @@
-ARG CANN_VERSION=8.3.rc1
+ARG CANN_VERSION=8.3.rc2
 ARG DEVICE_TYPE=a3
 ARG OS=ubuntu22.04
 ARG PYTHON_VERSION=py3.11
@@ -57,7 +57,7 @@ ENV LC_ALL=en_US.UTF-8
 
 
 ### Install MemFabric
-RUN ${PIP_INSTALL} mf-adapter==1.0.0
+RUN ${PIP_INSTALL} memfabric-hybrid==1.0.0
 ### Install SGLang Model Gateway
 RUN ${PIP_INSTALL} sglang-router
 
