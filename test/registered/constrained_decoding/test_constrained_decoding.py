@@ -74,7 +74,7 @@ class TestLLGuidanceBackend(
 class TestLLGuidanceSpeculatorWithFastForwardTokens(
     ServerWithGrammar,
     TestJSONConstrainedMixin,
-    TestEBNFConstrainedMinxin,
+    TestEBNFConstrainedMixin,
     TestRegexConstrainedMixin,
 ):
     backend = "llguidance"
