@@ -1,0 +1,955 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Attention-Guided RAG Explorer</title>
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500;600;700&family=Outfit:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --void: #030308;
+            --abyss: #08080f;
+            --deep: #0c0c14;
+            --surface: #12121c;
+            --elevated: #1a1a28;
+            --border: #252538;
+            --border-glow: #3a3a55;
+
+            --cyan: #00e5ff;
+            --magenta: #ff0099;
+            --lime: #b4ff00;
+            --amber: #ffaa00;
+            --violet: #aa00ff;
+            --blue: #0088ff;
+
+            --text: #e8e8f4;
+            --text-dim: #707090;
+            --text-muted: #50506a;
+
+            /* Zone colors */
+            --semantic-bridge: #00e5ff;
+            --long-range: #aa00ff;
+            --syntax-floor: #50506a;
+            --diffuse: #ffaa00;
+        }
+
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        html, body {
+            font-family: 'IBM Plex Mono', monospace;
+            background: var(--void);
+            color: var(--text);
+            min-height: 100vh;
+        }
+
+        /* Layout */
+        .app {
+            display: grid;
+            grid-template-rows: 70px 1fr;
+            min-height: 100vh;
+        }
+
+        /* Header */
+        .header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 0 32px;
+            background: linear-gradient(180deg, var(--abyss) 0%, var(--void) 100%);
+            border-bottom: 1px solid var(--border);
+        }
+
+        .logo {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+        }
+
+        .logo-icon {
+            width: 44px;
+            height: 44px;
+            background: linear-gradient(135deg, var(--cyan), var(--magenta));
+            border-radius: 12px;
+            display: grid;
+            place-items: center;
+            font-weight: 800;
+            font-size: 20px;
+            color: var(--void);
+        }
+
+        .logo-text h1 {
+            font-family: 'Outfit', sans-serif;
+            font-size: 20px;
+            font-weight: 700;
+            background: linear-gradient(90deg, var(--text), var(--cyan));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
+        .logo-text span {
+            font-size: 11px;
+            color: var(--text-dim);
+            letter-spacing: 1px;
+        }
+
+        .server-status {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 16px;
+            background: var(--surface);
+            border-radius: 8px;
+            font-size: 12px;
+        }
+
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: var(--text-muted);
+        }
+
+        .status-dot.connected { background: var(--lime); }
+        .status-dot.error { background: var(--magenta); }
+
+        /* Main Content */
+        .main {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 24px;
+            padding: 24px 32px;
+            overflow: auto;
+        }
+
+        /* Cards */
+        .card {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            overflow: hidden;
+        }
+
+        .card-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 16px 20px;
+            background: var(--elevated);
+            border-bottom: 1px solid var(--border);
+        }
+
+        .card-title {
+            font-family: 'Outfit', sans-serif;
+            font-size: 14px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            color: var(--text-dim);
+        }
+
+        .card-body {
+            padding: 20px;
+        }
+
+        /* Query Section */
+        .query-input {
+            width: 100%;
+            background: var(--deep);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 16px;
+            color: var(--text);
+            font-family: inherit;
+            font-size: 14px;
+            resize: vertical;
+            min-height: 80px;
+        }
+
+        .query-input:focus {
+            outline: none;
+            border-color: var(--cyan);
+            box-shadow: 0 0 0 2px rgba(0, 229, 255, 0.1);
+        }
+
+        .btn {
+            padding: 12px 24px;
+            background: linear-gradient(135deg, var(--cyan), var(--blue));
+            border: none;
+            border-radius: 8px;
+            color: var(--void);
+            font-family: inherit;
+            font-size: 13px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: transform 0.1s, box-shadow 0.2s;
+        }
+
+        .btn:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 4px 20px rgba(0, 229, 255, 0.3);
+        }
+
+        .btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        .btn-secondary {
+            background: var(--elevated);
+            color: var(--text);
+            border: 1px solid var(--border);
+        }
+
+        .query-actions {
+            display: flex;
+            gap: 12px;
+            margin-top: 16px;
+        }
+
+        /* Retrieval Need Meter */
+        .retrieval-meter {
+            margin-top: 20px;
+            padding: 16px;
+            background: var(--deep);
+            border-radius: 8px;
+        }
+
+        .meter-label {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 8px;
+            font-size: 12px;
+            color: var(--text-dim);
+        }
+
+        .meter-bar {
+            height: 8px;
+            background: var(--border);
+            border-radius: 4px;
+            overflow: hidden;
+        }
+
+        .meter-fill {
+            height: 100%;
+            background: linear-gradient(90deg, var(--lime), var(--amber), var(--magenta));
+            border-radius: 4px;
+            transition: width 0.3s ease;
+        }
+
+        .retrieval-decision {
+            margin-top: 12px;
+            padding: 12px;
+            border-radius: 6px;
+            font-size: 13px;
+            text-align: center;
+        }
+
+        .retrieval-decision.retrieve {
+            background: rgba(0, 229, 255, 0.1);
+            border: 1px solid var(--cyan);
+            color: var(--cyan);
+        }
+
+        .retrieval-decision.skip {
+            background: rgba(180, 255, 0, 0.1);
+            border: 1px solid var(--lime);
+            color: var(--lime);
+        }
+
+        /* Token Analysis */
+        .token-analysis {
+            margin-top: 20px;
+        }
+
+        .token-list {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+            margin-top: 12px;
+        }
+
+        .token {
+            padding: 6px 10px;
+            background: var(--deep);
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            font-size: 12px;
+            transition: all 0.2s;
+        }
+
+        .token.anchor {
+            background: rgba(0, 229, 255, 0.15);
+            border-color: var(--cyan);
+            color: var(--cyan);
+        }
+
+        .token.semantic-bridge {
+            border-left: 3px solid var(--semantic-bridge);
+        }
+
+        .token.long-range {
+            border-left: 3px solid var(--long-range);
+        }
+
+        .token.syntax-floor {
+            border-left: 3px solid var(--syntax-floor);
+        }
+
+        /* Documents Section */
+        .document-list {
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }
+
+        .document-item {
+            padding: 16px;
+            background: var(--deep);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .document-item:hover {
+            border-color: var(--border-glow);
+        }
+
+        .document-item.selected {
+            border-color: var(--cyan);
+            background: rgba(0, 229, 255, 0.05);
+        }
+
+        .document-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 8px;
+        }
+
+        .document-title {
+            font-size: 12px;
+            font-weight: 600;
+            color: var(--text-dim);
+        }
+
+        .document-score {
+            font-size: 11px;
+            padding: 4px 8px;
+            background: var(--surface);
+            border-radius: 4px;
+        }
+
+        .document-text {
+            font-size: 13px;
+            line-height: 1.5;
+            color: var(--text);
+        }
+
+        .score-bar {
+            margin-top: 12px;
+            display: flex;
+            gap: 8px;
+            align-items: center;
+        }
+
+        .score-bar-label {
+            font-size: 10px;
+            color: var(--text-muted);
+            width: 80px;
+        }
+
+        .score-bar-track {
+            flex: 1;
+            height: 4px;
+            background: var(--border);
+            border-radius: 2px;
+            overflow: hidden;
+        }
+
+        .score-bar-fill {
+            height: 100%;
+            border-radius: 2px;
+            transition: width 0.3s;
+        }
+
+        .score-bar-fill.fp { background: var(--cyan); }
+        .score-bar-fill.quality { background: var(--magenta); }
+        .score-bar-fill.semantic { background: var(--lime); }
+
+        /* Answer Section */
+        .answer-card {
+            grid-column: 1 / -1;
+        }
+
+        .answer-content {
+            padding: 20px;
+            background: var(--deep);
+            border-radius: 8px;
+            font-size: 14px;
+            line-height: 1.7;
+            min-height: 100px;
+        }
+
+        .answer-content.loading {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: var(--text-dim);
+        }
+
+        .answer-content.loading::after {
+            content: '';
+            width: 20px;
+            height: 20px;
+            border: 2px solid var(--border);
+            border-top-color: var(--cyan);
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin-left: 12px;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        /* Fingerprint Viz */
+        .fingerprint-viz {
+            margin-top: 16px;
+            padding: 16px;
+            background: var(--deep);
+            border-radius: 8px;
+        }
+
+        .fingerprint-title {
+            font-size: 11px;
+            color: var(--text-muted);
+            margin-bottom: 12px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+
+        .fingerprint-bars {
+            display: flex;
+            gap: 4px;
+            height: 60px;
+            align-items: flex-end;
+        }
+
+        .fp-bar {
+            flex: 1;
+            background: linear-gradient(180deg, var(--cyan) 0%, var(--violet) 100%);
+            border-radius: 2px 2px 0 0;
+            min-width: 3px;
+            transition: height 0.3s;
+        }
+
+        /* Legend */
+        .legend {
+            display: flex;
+            gap: 16px;
+            margin-top: 16px;
+            padding-top: 16px;
+            border-top: 1px solid var(--border);
+        }
+
+        .legend-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 11px;
+            color: var(--text-dim);
+        }
+
+        .legend-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+        }
+
+        /* Sample Queries */
+        .sample-queries {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin-top: 12px;
+        }
+
+        .sample-query {
+            padding: 8px 12px;
+            background: var(--deep);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            font-size: 11px;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .sample-query:hover {
+            border-color: var(--cyan);
+            color: var(--cyan);
+        }
+
+        /* Empty state */
+        .empty-state {
+            text-align: center;
+            padding: 40px;
+            color: var(--text-dim);
+        }
+
+        .empty-state-icon {
+            font-size: 48px;
+            margin-bottom: 16px;
+            opacity: 0.5;
+        }
+    </style>
+</head>
+<body>
+    <div class="app">
+        <header class="header">
+            <div class="logo">
+                <div class="logo-icon">R</div>
+                <div class="logo-text">
+                    <h1>Attention-Guided RAG</h1>
+                    <span>Fingerprint-based Retrieval</span>
+                </div>
+            </div>
+            <div class="server-status">
+                <div class="status-dot" id="statusDot"></div>
+                <span id="statusText">Connecting...</span>
+            </div>
+        </header>
+
+        <main class="main">
+            <!-- Query Analysis -->
+            <div class="card">
+                <div class="card-header">
+                    <div class="card-title">Query Analysis</div>
+                </div>
+                <div class="card-body">
+                    <textarea class="query-input" id="queryInput" placeholder="Enter your question...">What are the health benefits of green tea?</textarea>
+
+                    <div class="sample-queries">
+                        <div class="sample-query" onclick="setQuery('What is the capital of France?')">Capital of France</div>
+                        <div class="sample-query" onclick="setQuery('Explain quantum entanglement')">Quantum Physics</div>
+                        <div class="sample-query" onclick="setQuery('How does photosynthesis work?')">Photosynthesis</div>
+                        <div class="sample-query" onclick="setQuery('Hello, how are you?')">Simple Greeting</div>
+                    </div>
+
+                    <div class="query-actions">
+                        <button class="btn" onclick="analyzeQuery()">Analyze Query</button>
+                        <button class="btn btn-secondary" onclick="runRAG()">Run RAG Pipeline</button>
+                    </div>
+
+                    <div class="retrieval-meter" id="retrievalMeter" style="display: none;">
+                        <div class="meter-label">
+                            <span>Retrieval Need</span>
+                            <span id="retrievalScore">0%</span>
+                        </div>
+                        <div class="meter-bar">
+                            <div class="meter-fill" id="meterFill" style="width: 0%"></div>
+                        </div>
+                        <div class="retrieval-decision" id="retrievalDecision"></div>
+                    </div>
+
+                    <div class="token-analysis" id="tokenAnalysis" style="display: none;">
+                        <div class="card-title" style="font-size: 12px; margin-bottom: 8px;">Token Classification</div>
+                        <div class="token-list" id="tokenList"></div>
+                        <div class="legend">
+                            <div class="legend-item">
+                                <div class="legend-dot" style="background: var(--cyan)"></div>
+                                Retrieval Anchor
+                            </div>
+                            <div class="legend-item">
+                                <div class="legend-dot" style="background: var(--violet)"></div>
+                                Long Range
+                            </div>
+                            <div class="legend-item">
+                                <div class="legend-dot" style="background: var(--text-muted)"></div>
+                                Syntax
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Document Ranking -->
+            <div class="card">
+                <div class="card-header">
+                    <div class="card-title">Document Ranking</div>
+                    <span style="font-size: 11px; color: var(--text-muted);" id="docCount">5 documents</span>
+                </div>
+                <div class="card-body">
+                    <div class="document-list" id="documentList">
+                        <!-- Documents will be populated here -->
+                    </div>
+                </div>
+            </div>
+
+            <!-- Answer -->
+            <div class="card answer-card">
+                <div class="card-header">
+                    <div class="card-title">Generated Answer</div>
+                    <span style="font-size: 11px; color: var(--text-muted);" id="answerMeta"></span>
+                </div>
+                <div class="card-body">
+                    <div class="answer-content" id="answerContent">
+                        <div class="empty-state">
+                            <div class="empty-state-icon">?</div>
+                            <p>Run the RAG pipeline to see the answer</p>
+                        </div>
+                    </div>
+
+                    <div class="fingerprint-viz" id="fingerprintViz" style="display: none;">
+                        <div class="fingerprint-title">Generation Attention Fingerprint</div>
+                        <div class="fingerprint-bars" id="fingerprintBars"></div>
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <script>
+        // Sample documents for demo
+        const sampleDocuments = [
+            {
+                id: 1,
+                title: "Green Tea Benefits",
+                text: "Green tea contains catechins and antioxidants that boost metabolism, support heart health, and may reduce the risk of certain cancers. The polyphenols in green tea have anti-inflammatory properties.",
+                fingerprint: [0.2, 0.5, 0.3, 0.25, 0.1, 0.15, 0.2, 0.1]
+            },
+            {
+                id: 2,
+                title: "Tea History",
+                text: "Tea has been consumed for thousands of years, originating in China. It spread to Japan, then to Europe through trade routes. Today, tea is the second most consumed beverage worldwide after water.",
+                fingerprint: [0.3, 0.4, 0.3, 0.4, 0.2, 0.1, 0.15, 0.2]
+            },
+            {
+                id: 3,
+                title: "Coffee vs Tea",
+                text: "Coffee contains more caffeine than tea but lacks the L-theanine that gives tea its calming properties. Both beverages have antioxidants, though they differ in type and concentration.",
+                fingerprint: [0.35, 0.35, 0.25, 0.5, 0.15, 0.2, 0.1, 0.25]
+            },
+            {
+                id: 4,
+                title: "Cardiovascular Health",
+                text: "Regular tea consumption has been associated with reduced risk of cardiovascular disease. Studies show that drinking 3-4 cups of green tea daily may lower blood pressure and cholesterol levels.",
+                fingerprint: [0.15, 0.55, 0.3, 0.2, 0.1, 0.2, 0.25, 0.15]
+            },
+            {
+                id: 5,
+                title: "Weather Report",
+                text: "Today's weather will be sunny with temperatures around 75 degrees Fahrenheit. Expect clear skies throughout the day with light winds from the southwest.",
+                fingerprint: [0.4, 0.3, 0.2, 0.8, 0.3, 0.25, 0.1, 0.3]
+            }
+        ];
+
+        // State
+        let currentQuery = "";
+        let queryAnalysis = null;
+        let rankedDocuments = [];
+        let serverUrl = "http://localhost:30000";
+        let isConnected = false;
+
+        // Initialize
+        document.addEventListener('DOMContentLoaded', () => {
+            checkServerConnection();
+            renderDocuments(sampleDocuments.map((d, i) => ({...d, score: 0, rank: i + 1})));
+        });
+
+        async function checkServerConnection() {
+            try {
+                const response = await fetch(`${serverUrl}/health`, { timeout: 3000 });
+                if (response.ok) {
+                    setConnectionStatus(true);
+                } else {
+                    setConnectionStatus(false);
+                }
+            } catch (e) {
+                setConnectionStatus(false);
+            }
+        }
+
+        function setConnectionStatus(connected) {
+            isConnected = connected;
+            const dot = document.getElementById('statusDot');
+            const text = document.getElementById('statusText');
+
+            if (connected) {
+                dot.className = 'status-dot connected';
+                text.textContent = 'Connected';
+            } else {
+                dot.className = 'status-dot error';
+                text.textContent = 'Demo Mode (no server)';
+            }
+        }
+
+        function setQuery(query) {
+            document.getElementById('queryInput').value = query;
+        }
+
+        async function analyzeQuery() {
+            const query = document.getElementById('queryInput').value.trim();
+            if (!query) return;
+
+            currentQuery = query;
+
+            // Simulate query analysis with synthetic fingerprints
+            const tokens = query.split(/\s+/);
+            const analysis = simulateQueryAnalysis(tokens);
+            queryAnalysis = analysis;
+
+            // Update UI
+            showRetrievalMeter(analysis.retrievalNeed);
+            showTokenAnalysis(tokens, analysis.tokenZones, analysis.anchors);
+
+            // Score and rank documents
+            scoreDocuments(analysis);
+        }
+
+        function simulateQueryAnalysis(tokens) {
+            // Simulate zone classification based on token characteristics
+            const questionWords = ['what', 'how', 'why', 'when', 'where', 'who', 'which', 'explain'];
+            const topicWords = ['health', 'benefits', 'effects', 'causes', 'process', 'mechanism'];
+
+            const tokenZones = tokens.map(token => {
+                const lower = token.toLowerCase().replace(/[?.,!]/g, '');
+                if (questionWords.includes(lower)) return 'semantic_bridge';
+                if (topicWords.includes(lower)) return 'long_range';
+                if (lower.length <= 3) return 'syntax_floor';
+                return Math.random() > 0.5 ? 'semantic_bridge' : 'syntax_floor';
+            });
+
+            const anchors = tokenZones.map((zone, i) =>
+                zone === 'semantic_bridge' || zone === 'long_range' ? i : -1
+            ).filter(i => i >= 0);
+
+            // Calculate retrieval need
+            const semanticCount = tokenZones.filter(z => z === 'semantic_bridge').length;
+            const longRangeCount = tokenZones.filter(z => z === 'long_range').length;
+            const retrievalNeed = Math.min(1, (semanticCount * 0.15 + longRangeCount * 0.1 + 0.2));
+
+            return {
+                tokens,
+                tokenZones,
+                anchors,
+                retrievalNeed
+            };
+        }
+
+        function showRetrievalMeter(score) {
+            const meter = document.getElementById('retrievalMeter');
+            const scoreEl = document.getElementById('retrievalScore');
+            const fill = document.getElementById('meterFill');
+            const decision = document.getElementById('retrievalDecision');
+
+            meter.style.display = 'block';
+            scoreEl.textContent = `${Math.round(score * 100)}%`;
+            fill.style.width = `${score * 100}%`;
+
+            if (score >= 0.4) {
+                decision.className = 'retrieval-decision retrieve';
+                decision.textContent = 'RETRIEVE - Query needs external information';
+            } else {
+                decision.className = 'retrieval-decision skip';
+                decision.textContent = 'SKIP - Query is self-contained';
+            }
+        }
+
+        function showTokenAnalysis(tokens, zones, anchors) {
+            const container = document.getElementById('tokenAnalysis');
+            const list = document.getElementById('tokenList');
+
+            container.style.display = 'block';
+            list.innerHTML = tokens.map((token, i) => {
+                const isAnchor = anchors.includes(i);
+                const zone = zones[i];
+                return `<span class="token ${zone} ${isAnchor ? 'anchor' : ''}">${token}</span>`;
+            }).join('');
+        }
+
+        function scoreDocuments(analysis) {
+            // Score each document based on fingerprint similarity and target quality
+            const scored = sampleDocuments.map(doc => {
+                // Simulate fingerprint similarity
+                const fpSim = calculateSimilarity(analysis, doc);
+
+                // Target quality based on document fingerprint entropy
+                const avgEntropy = doc.fingerprint.reduce((a, b) => a + b, 0) / doc.fingerprint.length;
+                const targetQuality = 1 - avgEntropy;
+
+                // Check for keyword matches (semantic relevance)
+                const queryLower = currentQuery.toLowerCase();
+                const docLower = doc.text.toLowerCase();
+                const keywordMatches = analysis.tokens.filter(t =>
+                    docLower.includes(t.toLowerCase())
+                ).length / analysis.tokens.length;
+
+                // Combined score
+                const score = 0.35 * fpSim + 0.25 * targetQuality + 0.4 * keywordMatches;
+
+                return {
+                    ...doc,
+                    score,
+                    fpSimilarity: fpSim,
+                    targetQuality,
+                    semanticScore: keywordMatches
+                };
+            });
+
+            // Sort by score
+            scored.sort((a, b) => b.score - a.score);
+            scored.forEach((doc, i) => doc.rank = i + 1);
+
+            rankedDocuments = scored;
+            renderDocuments(scored);
+        }
+
+        function calculateSimilarity(analysis, doc) {
+            // Simple similarity based on zone distribution
+            const anchorRatio = analysis.anchors.length / analysis.tokens.length;
+            const docFocus = 1 - (doc.fingerprint[3] || 0.5); // Lower entropy = more focused
+            return 0.5 + 0.5 * (anchorRatio * docFocus);
+        }
+
+        function renderDocuments(documents) {
+            const container = document.getElementById('documentList');
+            document.getElementById('docCount').textContent = `${documents.length} documents`;
+
+            container.innerHTML = documents.map(doc => `
+                <div class="document-item" data-id="${doc.id}">
+                    <div class="document-header">
+                        <span class="document-title">#${doc.rank} ${doc.title}</span>
+                        <span class="document-score" style="color: ${getScoreColor(doc.score)}">
+                            ${doc.score ? (doc.score * 100).toFixed(0) + '%' : '-'}
+                        </span>
+                    </div>
+                    <div class="document-text">${doc.text}</div>
+                    ${doc.score ? `
+                    <div class="score-bar">
+                        <span class="score-bar-label">FP Similarity</span>
+                        <div class="score-bar-track">
+                            <div class="score-bar-fill fp" style="width: ${(doc.fpSimilarity || 0) * 100}%"></div>
+                        </div>
+                    </div>
+                    <div class="score-bar">
+                        <span class="score-bar-label">Target Quality</span>
+                        <div class="score-bar-track">
+                            <div class="score-bar-fill quality" style="width: ${(doc.targetQuality || 0) * 100}%"></div>
+                        </div>
+                    </div>
+                    <div class="score-bar">
+                        <span class="score-bar-label">Semantic</span>
+                        <div class="score-bar-track">
+                            <div class="score-bar-fill semantic" style="width: ${(doc.semanticScore || 0) * 100}%"></div>
+                        </div>
+                    </div>
+                    ` : ''}
+                </div>
+            `).join('');
+        }
+
+        function getScoreColor(score) {
+            if (!score) return 'var(--text-muted)';
+            if (score >= 0.7) return 'var(--lime)';
+            if (score >= 0.4) return 'var(--amber)';
+            return 'var(--text-dim)';
+        }
+
+        async function runRAG() {
+            if (!queryAnalysis) {
+                await analyzeQuery();
+            }
+
+            const answerContent = document.getElementById('answerContent');
+            const answerMeta = document.getElementById('answerMeta');
+            const fpViz = document.getElementById('fingerprintViz');
+
+            // Show loading
+            answerContent.innerHTML = '';
+            answerContent.className = 'answer-content loading';
+            answerContent.textContent = 'Generating answer';
+
+            // Get top 3 documents
+            const topDocs = rankedDocuments.slice(0, 3);
+            const context = topDocs.map(d => d.text).join('\n\n');
+
+            // Try live generation or simulate
+            let answer;
+            if (isConnected) {
+                try {
+                    answer = await generateAnswer(currentQuery, context);
+                } catch (e) {
+                    answer = simulateAnswer(currentQuery, topDocs);
+                }
+            } else {
+                // Simulate response
+                await new Promise(r => setTimeout(r, 1000));
+                answer = simulateAnswer(currentQuery, topDocs);
+            }
+
+            // Display answer
+            answerContent.className = 'answer-content';
+            answerContent.textContent = answer;
+            answerMeta.textContent = `Using ${topDocs.length} sources`;
+
+            // Show fingerprint visualization
+            showFingerprintViz(topDocs);
+        }
+
+        async function generateAnswer(query, context) {
+            const response = await fetch(`${serverUrl}/v1/chat/completions`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    model: 'default',
+                    messages: [{
+                        role: 'user',
+                        content: `Context:\n${context}\n\nQuestion: ${query}\n\nAnswer based on the context:`
+                    }],
+                    max_tokens: 300
+                })
+            });
+
+            const data = await response.json();
+            return data.choices[0].message.content;
+        }
+
+        function simulateAnswer(query, topDocs) {
+            // Generate a simulated answer based on top documents
+            const queryLower = query.toLowerCase();
+
+            if (queryLower.includes('health') || queryLower.includes('benefit')) {
+                return `Based on the retrieved information, ${topDocs[0].text.split('.')[0].toLowerCase()}. Additionally, ${topDocs[1] ? topDocs[1].text.split('.')[0].toLowerCase() : 'regular consumption has shown positive health effects'}. These benefits are attributed to the antioxidants and polyphenols present in the substance.`;
+            }
+
+            if (queryLower.includes('capital')) {
+                return "Paris is the capital of France. It is located in the north-central part of the country along the Seine River and is known for landmarks like the Eiffel Tower.";
+            }
+
+            if (queryLower.includes('hello') || queryLower.includes('how are you')) {
+                return "Hello! I'm doing well, thank you for asking. How can I help you today?";
+            }
+
+            return `Based on the available information: ${topDocs[0].text.split('.').slice(0, 2).join('. ')}.`;
+        }
+
+        function showFingerprintViz(docs) {
+            const container = document.getElementById('fingerprintViz');
+            const bars = document.getElementById('fingerprintBars');
+
+            container.style.display = 'block';
+
+            // Aggregate fingerprints from top docs
+            const aggregated = docs[0].fingerprint.map((_, i) => {
+                return docs.reduce((sum, d) => sum + (d.fingerprint[i] || 0), 0) / docs.length;
+            });
+
+            bars.innerHTML = aggregated.map(val =>
+                `<div class="fp-bar" style="height: ${val * 100}%"></div>`
+            ).join('');
+        }
+    </script>
+</body>
+</html>
