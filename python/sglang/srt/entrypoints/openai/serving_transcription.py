@@ -1,4 +1,4 @@
-# Copyright 2023-2024 SGLang Team
+# Copyright 2025 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -69,14 +69,13 @@ class OpenAIServingTranscription(OpenAIServingBase):
         """
         audio_data = request.get("audio_data")
         temperature = request.get("temperature", 0.0)
-        # Note: language parameter is stored in request for future use
-        # when WhisperProcessor supports language-specific decoding
-        _ = request.get("language")
+        language = request.get("language")
 
-        # Build sampling params
+        # Build sampling params - include language for WhisperProcessor
         sampling_params = {
             "temperature": temperature,
             "max_new_tokens": 448,  # Whisper default max tokens
+            "language": language,  # Pass to WhisperProcessor for language-specific decoding
         }
 
         # For Whisper, we pass audio_data and let the processor handle it
@@ -121,7 +120,7 @@ class OpenAIServingTranscription(OpenAIServingBase):
         # Calculate audio duration for usage reporting
         audio_duration_s = self._get_audio_duration(audio_data)
 
-        # Build request dict (since we're using form data, not JSON)
+        # Build request dict
         request = {
             "audio_data": audio_data,
             "model": model,

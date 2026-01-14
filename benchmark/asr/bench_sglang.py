@@ -263,6 +263,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--n-examples",
+        "-n",
         type=int,
         default=-1,
         help="Number of examples to test (-1 for all)",
