@@ -110,10 +110,8 @@ from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
     HybridReqToTokenPool,
     MHATokenToKVPool,
-    MHATokenToKVPoolCPUFP8,
     MHATokenToKVPoolFP4,
     MLATokenToKVPool,
-    MLATokenToKVPoolCPUFP8,
     MLATokenToKVPoolFP4,
     NSATokenToKVPool,
     ReqToTokenPool,
@@ -1871,12 +1869,6 @@ class ModelRunner:
             mla_token_to_kv_pool_class = MLATokenToKVPool
             if is_float4_e2m1fn_x2(self.kv_cache_dtype):
                 mla_token_to_kv_pool_class = MLATokenToKVPoolFP4
-            elif (
-                _is_cpu
-                and _is_cpu_amx_available
-                and self.kv_cache_dtype == torch.float8_e4m3fn
-            ):
-                mla_token_to_kv_pool_class = MLATokenToKVPoolCPUFP8
             self.token_to_kv_pool = mla_token_to_kv_pool_class(
                 self.max_total_num_tokens,
                 page_size=self.page_size,
@@ -1948,12 +1940,6 @@ class ModelRunner:
                 mha_token_to_kv_pool_class = MHATokenToKVPool
                 if is_float4_e2m1fn_x2(self.kv_cache_dtype):
                     mha_token_to_kv_pool_class = MHATokenToKVPoolFP4
-                elif (
-                    _is_cpu
-                    and _is_cpu_amx_available
-                    and self.kv_cache_dtype == torch.float8_e4m3fn
-                ):
-                    mha_token_to_kv_pool_class = MHATokenToKVPoolCPUFP8
                 self.token_to_kv_pool = mha_token_to_kv_pool_class(
                     self.max_total_num_tokens,
                     page_size=self.page_size,

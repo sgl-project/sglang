@@ -50,7 +50,13 @@ from sglang.srt.mem_cache.utils import (
     set_mla_kv_buffer_triton,
     set_mla_kv_scale_buffer_triton,
 )
-from sglang.srt.utils import is_cuda, is_npu, next_power_of_2
+from sglang.srt.utils import (
+    cpu_has_amx_support,
+    is_cpu,
+    is_cuda,
+    is_npu,
+    next_power_of_2,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import LayerDoneCounter
@@ -60,8 +66,10 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 GB = 1024 * 1024 * 1024
+_is_cpu = is_cpu()
 _is_cuda = is_cuda()
 _is_npu = is_npu()
+_is_cpu_amx_available = cpu_has_amx_support()
 
 
 def get_tensor_size_bytes(t: Union[torch.Tensor, List[torch.Tensor]]):
@@ -631,6 +639,27 @@ class MHATokenToKVPool(KVCache):
                     )
                     for _ in range(self.layer_num)
                 ]
+                if (
+                    _is_cpu
+                    and _is_cpu_amx_available
+                    and self.dtype == torch.float8_e4m3fn
+                ):
+                    self.k_scale_buffer = [
+                        torch.zeros(
+                            (self.size + self.page_size, 1, 1),
+                            dtype=torch.float32,
+                            device=self.device,
+                        )
+                        for _ in range(self.layer_num)
+                    ]
+                    self.v_scale_buffer = [
+                        torch.zeros(
+                            (self.size + self.page_size, 1, 1),
+                            dtype=torch.float32,
+                            device=self.device,
+                        )
+                        for _ in range(self.layer_num)
+                    ]
 
         self.k_data_ptrs = torch.tensor(
             [x.data_ptr() for x in self.k_buffer],
@@ -654,6 +683,10 @@ class MHATokenToKVPool(KVCache):
     def _clear_buffers(self):
         del self.k_buffer
         del self.v_buffer
+        if hasattr(self, "k_scale_buffer"):
+            del self.k_scale_buffer
+        if hasattr(self, "v_scale_buffer"):
+            del self.v_scale_buffer
 
     def get_kv_size_bytes(self):
         assert hasattr(self, "k_buffer")
@@ -731,6 +764,11 @@ class MHATokenToKVPool(KVCache):
     def _get_key_buffer(self, layer_id: int):
         # for internal use of referencing
         if self.store_dtype != self.dtype:
+            if hasattr(self, "k_scale_buffer"):
+                return (
+                    self.k_buffer[layer_id - self.start_layer].view(self.dtype),
+                    self.k_scale_buffer[layer_id - self.start_layer],
+                )
             return self.k_buffer[layer_id - self.start_layer].view(self.dtype)
         return self.k_buffer[layer_id - self.start_layer]
 
@@ -745,6 +783,11 @@ class MHATokenToKVPool(KVCache):
     def _get_value_buffer(self, layer_id: int):
         # for internal use of referencing
         if self.store_dtype != self.dtype:
+            if hasattr(self, "v_scale_buffer"):
+                return (
+                    self.v_buffer[layer_id - self.start_layer].view(self.dtype),
+                    self.v_scale_buffer[layer_id - self.start_layer],
+                )
             return self.v_buffer[layer_id - self.start_layer].view(self.dtype)
         return self.v_buffer[layer_id - self.start_layer]
 
@@ -773,12 +816,20 @@ class MHATokenToKVPool(KVCache):
         else:
             layer_id = layer.layer_id
         if cache_k.dtype != self.dtype:
-            if k_scale is not None:
-                cache_k.div_(k_scale)
-            if v_scale is not None:
-                cache_v.div_(v_scale)
-            cache_k = cache_k.to(self.dtype)
-            cache_v = cache_v.to(self.dtype)
+            if hasattr(self, "k_scale_buffer") and hasattr(self, "v_scale_buffer"):
+                from sglang.srt.layers.quantization.fp8_utils import input_to_float8
+
+                cache_k_fp8, cache_k_scale = input_to_float8(cache_k, dtype=self.dtype)
+                cache_k = cache_k_fp8
+                cache_v_fp8, cache_v_scale = input_to_float8(cache_v, dtype=self.dtype)
+                cache_v = cache_v_fp8
+            else:
+                if k_scale is not None:
+                    cache_k.div_(k_scale)
+                if v_scale is not None:
+                    cache_v.div_(v_scale)
+                cache_k = cache_k.to(self.dtype)
+                cache_v = cache_v.to(self.dtype)
 
         if self.store_dtype != self.dtype:
             cache_k = cache_k.view(self.store_dtype)
@@ -795,6 +846,9 @@ class MHATokenToKVPool(KVCache):
         else:
             self.k_buffer[layer_id - self.start_layer][loc] = cache_k
             self.v_buffer[layer_id - self.start_layer][loc] = cache_v
+            if hasattr(self, "k_scale_buffer") and hasattr(self, "v_scale_buffer"):
+                self.k_scale_buffer[layer_id - self.start_layer][loc] = cache_k_scale
+                self.v_scale_buffer[layer_id - self.start_layer][loc] = cache_v_scale
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         N = tgt_loc.numel()
@@ -963,126 +1017,6 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
 
             self.k_scale_buffer[layer_id - self.start_layer][loc] = cache_k_fp4_sf
             self.v_scale_buffer[layer_id - self.start_layer][loc] = cache_v_fp4_sf
-
-
-class MHATokenToKVPoolCPUFP8(MHATokenToKVPool):
-
-    def _create_buffers(self):
-        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
-            with (
-                torch.cuda.use_mem_pool(self.custom_mem_pool)
-                if self.enable_custom_mem_pool
-                else nullcontext()
-            ):
-                # [size, head_num, head_dim] for each layer
-                # The padded slot 0 is used for writing dummy outputs from padded tokens.
-                self.k_buffer = [
-                    torch.zeros(
-                        (self.size + self.page_size, self.head_num, self.head_dim),
-                        dtype=self.store_dtype,
-                        device=self.device,
-                    )
-                    for _ in range(self.layer_num)
-                ]
-                self.v_buffer = [
-                    torch.zeros(
-                        (self.size + self.page_size, self.head_num, self.head_dim),
-                        dtype=self.store_dtype,
-                        device=self.device,
-                    )
-                    for _ in range(self.layer_num)
-                ]
-
-        self.k_data_ptrs = torch.tensor(
-            [x.data_ptr() for x in self.k_buffer],
-            dtype=torch.uint64,
-            device=self.device,
-        )
-        self.v_data_ptrs = torch.tensor(
-            [x.data_ptr() for x in self.v_buffer],
-            dtype=torch.uint64,
-            device=self.device,
-        )
-        self.data_ptrs = torch.cat([self.k_data_ptrs, self.v_data_ptrs], dim=0)
-        self.data_strides = torch.tensor(
-            [
-                np.prod(x.shape[1:]) * x.dtype.itemsize
-                for x in self.k_buffer + self.v_buffer
-            ],
-            device=self.device,
-        )
-
-        self.k_scale_buffer = [
-            torch.zeros(
-                (self.size + self.page_size, 1, 1),
-                dtype=torch.float32,
-                device=self.device,
-            )
-            for _ in range(self.layer_num)
-        ]
-        self.v_scale_buffer = [
-            torch.zeros(
-                (self.size + self.page_size, 1, 1),
-                dtype=torch.float32,
-                device=self.device,
-            )
-            for _ in range(self.layer_num)
-        ]
-
-    def _clear_buffers(self):
-        del self.k_buffer
-        del self.v_buffer
-        del self.k_scale_buffer
-        del self.v_scale_buffer
-
-    def _get_key_buffer(self, layer_id: int):
-        # for internal use of referencing
-        if self.store_dtype != self.dtype:
-            return (
-                self.k_buffer[layer_id - self.start_layer].view(self.dtype),
-                self.k_scale_buffer[layer_id - self.start_layer],
-            )
-        return self.k_buffer[layer_id - self.start_layer]
-
-    def _get_value_buffer(self, layer_id: int):
-        # for internal use of referencing
-        if self.store_dtype != self.dtype:
-            return (
-                self.v_buffer[layer_id - self.start_layer].view(self.dtype),
-                self.v_scale_buffer[layer_id - self.start_layer],
-            )
-        return self.v_buffer[layer_id - self.start_layer]
-
-    def set_kv_buffer(
-        self,
-        layer: RadixAttention,
-        loc: torch.Tensor,
-        cache_k: torch.Tensor,
-        cache_v: torch.Tensor,
-        k_scale: Optional[float] = None,
-        v_scale: Optional[float] = None,
-        layer_id_override: Optional[int] = None,
-    ):
-        if layer_id_override is not None:
-            layer_id = layer_id_override
-        else:
-            layer_id = layer.layer_id
-        if cache_k.dtype != self.dtype:
-            from sglang.srt.layers.quantization.fp8_utils import input_to_float8
-
-            cache_k_fp8, cache_k_scale = input_to_float8(cache_k, dtype=self.dtype)
-            cache_k = cache_k_fp8
-            cache_v_fp8, cache_v_scale = input_to_float8(cache_v, dtype=self.dtype)
-            cache_v = cache_v_fp8
-
-        if self.store_dtype != self.dtype:
-            cache_k = cache_k.view(self.store_dtype)
-            cache_v = cache_v.view(self.store_dtype)
-
-        self.k_buffer[layer_id - self.start_layer][loc] = cache_k
-        self.k_scale_buffer[layer_id - self.start_layer][loc] = cache_k_scale
-        self.v_buffer[layer_id - self.start_layer][loc] = cache_v
-        self.v_scale_buffer[layer_id - self.start_layer][loc] = cache_v_scale
 
 
 class HybridLinearKVPool(KVCache):
@@ -1490,9 +1424,24 @@ class MLATokenToKVPool(KVCache):
                     )
                     for _ in range(self.layer_num)
                 ]
+                if (
+                    _is_cpu
+                    and _is_cpu_amx_available
+                    and self.dtype == torch.float8_e4m3fn
+                ):
+                    self.kv_scale_buffer = [
+                        torch.zeros(
+                            (self.size + self.page_size, 1, 1),
+                            dtype=torch.float32,
+                            device=self.device,
+                        )
+                        for _ in range(self.layer_num)
+                    ]
 
     def _clear_buffers(self):
         del self.kv_buffer
+        if hasattr(self, "kv_scale_buffer"):
+            del self.kv_scale_buffer
 
     def get_kv_size_bytes(self):
         assert hasattr(self, "kv_buffer")
@@ -1516,6 +1465,11 @@ class MLATokenToKVPool(KVCache):
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
 
         if self.store_dtype != self.dtype:
+            if hasattr(self, "kv_scale_buffer"):
+                return (
+                    self.kv_buffer[layer_id - self.start_layer].view(self.dtype),
+                    self.kv_scale_buffer[layer_id - self.start_layer],
+                )
             return self.kv_buffer[layer_id - self.start_layer].view(self.dtype)
 
         return self.kv_buffer[layer_id - self.start_layer]
@@ -1525,6 +1479,13 @@ class MLATokenToKVPool(KVCache):
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
 
         if self.store_dtype != self.dtype:
+            if hasattr(self, "kv_scale_buffer"):
+                return (
+                    self.kv_buffer[layer_id - self.start_layer][
+                        ..., : self.kv_lora_rank
+                    ].view(self.dtype),
+                    self.kv_scale_buffer[layer_id - self.start_layer],
+                )
             return self.kv_buffer[layer_id - self.start_layer][
                 ..., : self.kv_lora_rank
             ].view(self.dtype)
@@ -1543,12 +1504,22 @@ class MLATokenToKVPool(KVCache):
         layer_id = layer.layer_id
         assert not (self.use_nsa and self.nsa_kv_cache_store_fp8)
         if cache_k.dtype != self.dtype:
-            cache_k = cache_k.to(self.dtype)
+            if hasattr(self, "kv_scale_buffer"):
+                from sglang.srt.layers.quantization.fp8_utils import input_to_float8
+
+                cache_k_fp8, cache_k_scale = input_to_float8(cache_k, dtype=self.dtype)
+                cache_k = cache_k_fp8
+            else:
+                cache_k = cache_k.to(self.dtype)
 
         if self.store_dtype != self.dtype:
             self.kv_buffer[layer_id - self.start_layer][loc] = cache_k.view(
                 self.store_dtype
             )
+            if hasattr(self, "kv_scale_buffer"):
+                self.kv_scale_buffer[layer_id - self.start_layer][loc] = (
+                    cache_k_scale.view(torch.float32)
+                )
         else:
             self.kv_buffer[layer_id - self.start_layer][loc] = cache_k
 
@@ -1761,95 +1732,6 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
                 cache_k_nope_fp4_sf,
                 cache_k_rope_fp4_sf,
             )
-
-
-class MLATokenToKVPoolCPUFP8(MLATokenToKVPool):
-
-    def _create_buffers(self):
-        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
-            with (
-                torch.cuda.use_mem_pool(self.custom_mem_pool)
-                if self.custom_mem_pool
-                else nullcontext()
-            ):
-                # The padded slot 0 is used for writing dummy outputs from padded tokens.
-                self.kv_buffer = [
-                    torch.zeros(
-                        (self.size + self.page_size, 1, self.kv_cache_dim),
-                        dtype=self.store_dtype,
-                        device=self.device,
-                    )
-                    for _ in range(self.layer_num)
-                ]
-                self.kv_scale_buffer = [
-                    torch.zeros(
-                        (self.size + self.page_size, 1, 1),
-                        dtype=torch.float32,
-                        device=self.device,
-                    )
-                    for _ in range(self.layer_num)
-                ]
-
-        self.data_ptrs = torch.tensor(
-            [x.data_ptr() for x in self.kv_buffer],
-            dtype=torch.uint64,
-            device=self.device,
-        )
-
-    def _clear_buffers(self):
-        del self.kv_buffer
-        del self.kv_scale_buffer
-
-    def get_key_buffer(self, layer_id: int):
-        if self.layer_transfer_counter is not None:
-            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
-
-        if self.store_dtype != self.dtype:
-            return (
-                self.kv_buffer[layer_id - self.start_layer].view(self.dtype),
-                self.kv_scale_buffer[layer_id - self.start_layer],
-            )
-
-        return self.kv_buffer[layer_id - self.start_layer]
-
-    def get_value_buffer(self, layer_id):
-        if self.layer_transfer_counter is not None:
-            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
-
-        if self.store_dtype != self.dtype:
-            return (
-                self.kv_buffer[layer_id - self.start_layer][
-                    ..., : self.kv_lora_rank
-                ].view(self.dtype),
-                self.kv_scale_buffer[layer_id - self.start_layer],
-            )
-
-        return self.kv_buffer[layer_id - self.start_layer][..., : self.kv_lora_rank]
-
-    def set_kv_buffer(
-        self,
-        layer: RadixAttention,
-        loc: torch.Tensor,
-        cache_k: torch.Tensor,
-        cache_v: torch.Tensor,
-    ):
-        layer_id = layer.layer_id
-        assert not (self.use_nsa and self.nsa_kv_cache_store_fp8)
-        if cache_k.dtype != self.dtype:
-            from sglang.srt.layers.quantization.fp8_utils import input_to_float8
-
-            cache_k_fp8, cache_k_scale = input_to_float8(cache_k, dtype=self.dtype)
-            cache_k = cache_k_fp8
-
-        if self.store_dtype != self.dtype:
-            self.kv_buffer[layer_id - self.start_layer][loc] = cache_k.view(
-                self.store_dtype
-            )
-            self.kv_scale_buffer[layer_id - self.start_layer][loc] = cache_k_scale.view(
-                torch.float32
-            )
-        else:
-            self.kv_buffer[layer_id - self.start_layer][loc] = cache_k
 
 
 class NSATokenToKVPool(MLATokenToKVPool):

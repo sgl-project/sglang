@@ -75,7 +75,6 @@ void MM512_LOAD_VEC(
     int64_t ld_src,
     int64_t index,
     __m512i& dst) {
-  __m512 scale = _mm512_set1_ps(src_scale[index]);
   __m512i s8 = _mm512_loadu_si512(src + index * ld_src);
   __m256i s8_0 = _mm512_extracti32x8_epi32(s8, 0);
   __m512i a = _mm512_slli_epi16(_mm512_cvtepi8_epi16(s8_0), 8);
