@@ -131,8 +131,10 @@ class LlamaAttention(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         bias: bool = False,
+        force_native_attention_path: bool = False,
     ) -> None:
         super().__init__()
+        self.force_native_attention_path = force_native_attention_path
         self.hidden_size = hidden_size
         tp_size = get_attention_tp_size()
         self.attn_tp_size = tp_size
@@ -228,7 +230,7 @@ class LlamaAttention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        if not _is_npu:
+        if not _is_npu or not hasattr(self.rotary_emb, 'get_cos_sin_with_position') or self.force_native_attention_path:
             q, k, v = self.forward_prepare_native(
                 positions=positions,
                 hidden_states=hidden_states,

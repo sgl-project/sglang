@@ -441,7 +441,7 @@ class ServerArgs:
     speculative_ngram_capacity: int = 10 * 1000 * 1000
     # For suffix decoding only
     speculative_suffix_max_tree_depth: int = 24
-    speculative_suffix_max_cached_requests: int = 10000
+    speculative_suffix_max_cached_requests: int = 50000
     speculative_suffix_max_spec_factor: float = 1.0
     speculative_suffix_min_token_prob: float = 0.1
 
@@ -1092,6 +1092,10 @@ class ServerArgs:
                     )
 
                     print_nsa_bool_env_vars()
+                if self.enable_nsa_prefill_context_parallel:
+                    assert (
+                        self.disaggregation_mode != "decode"
+                    ), "CP is only supported for prefill when PD disaggregation, please remove --enable-nsa-prefill-context-parallel."
 
             else:
                 # DeepSeek V3/R1/V3.1
@@ -2099,7 +2103,9 @@ class ServerArgs:
                 )
 
             if not self.device.startswith("cuda") and not is_npu():
-                raise ValueError("Suffix decoding only supports CUDA device or NPU device.")
+                raise ValueError(
+                    "Suffix decoding only supports CUDA device or NPU device."
+                )
 
             if self.max_running_requests is None:
                 self.max_running_requests = 48
@@ -2142,12 +2148,6 @@ class ServerArgs:
                     f"speculative_suffix_min_token_prob={self.speculative_suffix_min_token_prob} must be in [0, 1]"
                 )
 
-            if self.enable_dp_attention:
-                # TODO: support dp attention for suffix decoding
-                raise ValueError(
-                    "Currently suffix decoding does not support dp attention."
-                )
-
             logger.info(
                 f"Suffix decoding configured with: "
                 f"max_tree_depth={self.speculative_suffix_max_tree_depth}, "
@@ -2155,6 +2155,7 @@ class ServerArgs:
                 f"max_spec_factor={self.speculative_suffix_max_spec_factor}, "
                 f"min_token_prob={self.speculative_suffix_min_token_prob}"
             )
+
     def _handle_load_format(self):
         if (
             self.load_format == "auto" or self.load_format == "gguf"
@@ -3549,32 +3550,32 @@ class ServerArgs:
             type=int,
             default=ServerArgs.speculative_suffix_max_tree_depth,
             help="The maximum depth of the suffix decoding global and prompt trees. "
-                 "The tree depth limits the sum of the prefix match and speculation lengths.",
+            "The tree depth limits the sum of the prefix match and speculation lengths.",
         )
         parser.add_argument(
             "--speculative-suffix-max-cached-requests",
             type=int,
             default=ServerArgs.speculative_suffix_max_cached_requests,
             help="The maximum number of requests to cache in the global suffix tree. "
-                 "If exceeded, will trigger eviction in FIFO order. Set to -1 for unlimited "
-                 "cache size, or 0 to disable the global suffix tree (past responses are not "
-                 "cached, but prompt trees are still used).",
+            "If exceeded, will trigger eviction in FIFO order. Set to -1 for unlimited "
+            "cache size, or 0 to disable the global suffix tree (past responses are not "
+            "cached, but prompt trees are still used).",
         )
         parser.add_argument(
             "--speculative-suffix-max-spec-factor",
             type=float,
             default=ServerArgs.speculative_suffix_max_spec_factor,
             help="The maximum spec factor for suffix decoding. The spec factor controls "
-                 "speculation lengths based on the prefix match length: max_spec_tokens = "
-                 "max_spec_factor * prefix_match_length.",
+            "speculation lengths based on the prefix match length: max_spec_tokens = "
+            "max_spec_factor * prefix_match_length.",
         )
         parser.add_argument(
             "--speculative-suffix-min-token-prob",
             type=float,
             default=ServerArgs.speculative_suffix_min_token_prob,
             help="The minimum token probability for suffix decoding. Will only speculate "
-                 "tokens with estimated probability (based on frequency counts) greater than "
-                 "or equal to this value.",
+            "tokens with estimated probability (based on frequency counts) greater than "
+            "or equal to this value.",
         )
         # Speculative decoding (MTP)
         parser.add_argument(
@@ -4779,7 +4780,7 @@ class ServerArgs:
 
         if self.enable_lora:
             # Validate compatibility with speculative decoding
-            if self.speculative_algorithm not in ["NGRAM", None]:
+            if self.speculative_algorithm not in ["NGRAM", "SUFFIX", None]:
                 raise ValueError(
                     "Currently LoRA is only compatible with NGRAM speculative decoding."
                 )

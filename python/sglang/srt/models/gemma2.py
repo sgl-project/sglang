@@ -15,6 +15,8 @@
 # Adapted from:
 # https://github.com/vllm-project/vllm/blob/56b325e977435af744f8b3dca7af0ca209663558/vllm/model_executor/models/gemma2.py
 
+import functools
+import math
 from typing import Iterable, Optional, Set, Tuple
 
 import torch
@@ -46,7 +48,6 @@ from sglang.srt.utils import add_prefix, make_layers
 # SGLang assumes exclusive
 def get_attention_sliding_window_size(config):
     return config.sliding_window - 1
-
 
 class Gemma2MLP(nn.Module):
     def __init__(
@@ -83,7 +84,9 @@ class Gemma2MLP(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
+        d = gate_up.shape[-1] // 2
+        gate, up = gate_up[..., :d], gate_up[..., d:]
+        x = self.act_fn(gate) * up
         x, _ = self.down_proj(x)
         return x
 
@@ -294,7 +297,9 @@ class Gemma2Model(nn.Module):
             hidden_states = self.embed_tokens(input_ids)
         else:
             hidden_states = input_embeds
-        normalizer = torch.tensor(self.config.hidden_size**0.5, dtype=torch.float16)
+        normalizer = torch.tensor(
+            self.config.hidden_size**0.5, dtype=hidden_states.dtype
+        )
         hidden_states *= normalizer
 
         residual = None

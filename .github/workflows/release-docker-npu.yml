@@ -70,7 +70,7 @@ jobs:
           push: ${{ github.repository == 'sgl-project/sglang' && github.event_name != 'pull_request' }}
           provenance: false
           build-args: |
-            SGLANG_KERNEL_NPU_TAG=2025.12.29
+            SGLANG_KERNEL_NPU_TAG=2026.01.07
             CANN_VERSION=${{ matrix.cann_version }}
             DEVICE_TYPE=${{ matrix.device_type }}
             SGLANG_TAG=$GITHUB_REF_NAME

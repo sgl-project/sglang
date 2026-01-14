@@ -54,7 +54,6 @@ logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 _is_npu = is_npu()
 
-
 import triton
 import triton.language as tl
 

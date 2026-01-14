@@ -31,6 +31,9 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from sglang.srt.distributed.parallel_state import get_pp_group
+from sglang.srt.hardware_backend.npu.multimodel.vit_npu_graph_runner import (
+    ViTNpuGraphRunner,
+)
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -348,6 +351,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             1 if use_data_parallel else get_tensor_model_parallel_world_size()
         )
         self.cuda_graph_runner: Optional[ViTCudaGraphRunner] = ViTCudaGraphRunner(self)
+        self.npu_graph_runner: Optional[ViTNpuGraphRunner] = ViTNpuGraphRunner(self)
 
     @property
     def dtype(self) -> torch.dtype:
@@ -468,6 +472,8 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
     ) -> torch.Tensor:
         if get_bool_env_var("SGLANG_VIT_ENABLE_CUDA_GRAPH"):
             return self.forward_with_cuda_graph(x, grid_thw)
+        elif get_bool_env_var("SGLANG_VIT_ENABLE_NPU_GRAPH"):
+            return self.forward_with_npu_graph(x, grid_thw)
 
         x = x.to(device=self.device, dtype=self.dtype)
         x = self.patch_embed(x)
@@ -553,6 +559,40 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             rotary_pos_emb_sin=rotary_pos_emb_sin,
             cu_seqlens=cu_seqlens,
             cu_window_seqlens=None,
+            output_indices=None,
+        )
+
+    def forward_with_npu_graph(
+        self,
+        x: torch.Tensor,
+        grid_thw: torch.Tensor,
+    ) -> torch.Tensor:
+        # patchify
+        x = x.to(device=self.device, dtype=self.dtype)
+        x = self.patch_embed(x)
+
+        if isinstance(grid_thw, list):
+            grid_thw_list = grid_thw
+            grid_thw = torch.tensor(grid_thw, dtype=torch.int32)
+        else:
+            grid_thw_list = grid_thw.tolist()
+
+        pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
+        x += pos_embeds
+
+        # rotary embedding -> (cos, sin)
+        rotary_pos_emb_cos, rotary_pos_emb_sin = self.rot_pos_emb(grid_thw_list)
+
+        # compute cu_seqlens
+        cu_seqlens = compute_cu_seqlens_from_grid_numpy(grid_thw)
+        cu_seqlens = cu_seqlens.to("cpu")
+
+        # blocks + merger + deepstack(optional) via NPU Graph Runner
+        return self.npu_graph_runner.run(
+            x=x,
+            rotary_pos_emb_cos=rotary_pos_emb_cos,
+            rotary_pos_emb_sin=rotary_pos_emb_sin,
+            cu_seqlens=cu_seqlens,
             output_indices=None,
         )
 
@@ -780,15 +820,15 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         max_images_per_call = get_int_env_var("SGLANG_VLM_MAX_IMAGES_PER_VIT", 0)
 
         if max_patches_per_call == 0 and max_images_per_call == 0:
-            if self.use_data_parallel:
-                return run_dp_sharded_mrope_vision_model(
-                    self.visual,
-                    pixel_values,
-                    image_grid_thw.tolist(),
-                    rope_type="rope_3d",
-                )
-            else:
-                return self.visual(pixel_values, grid_thw=image_grid_thw)
+            # if self.use_data_parallel:
+            #     return run_dp_sharded_mrope_vision_model(
+            #         self.visual,
+            #         pixel_values,
+            #         image_grid_thw.tolist(),
+            #         rope_type="rope_3d",
+            #     )
+            # else:
+            return self.visual(pixel_values, grid_thw=image_grid_thw)
 
         # compute the number of patches per image and the slice positions in pixel_values
         grid_thw_list = (

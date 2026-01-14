@@ -31,6 +31,7 @@ RUN if [ -n "$APTMIRROR" ];then sed -i "s|.*.ubuntu.com|$APTMIRROR|g" /etc/apt/s
 
 # Install development tools and utilities
 RUN apt-get update -y && apt upgrade -y && apt-get install -y \
+    unzip \
     build-essential \
     cmake \
     vim \
@@ -57,7 +58,7 @@ ENV LC_ALL=en_US.UTF-8
 
 
 ### Install MemFabric
-RUN ${PIP_INSTALL} mf-adapter==1.0.0
+RUN ${PIP_INSTALL} memfabric-hybrid==1.0.0
 ### Install SGLang Model Gateway
 RUN ${PIP_INSTALL} sglang-router
 
@@ -92,8 +93,8 @@ RUN ${PIP_INSTALL} wheel==0.45.1 && mkdir sgl-kernel-npu \
 RUN wget https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/ops/CANN-custom_ops-8.3.0.1-$DEVICE_TYPE-linux.aarch64.run && \
     chmod a+x ./CANN-custom_ops-8.3.0.1-$DEVICE_TYPE-linux.aarch64.run && \
     ./CANN-custom_ops-8.3.0.1-$DEVICE_TYPE-linux.aarch64.run --quiet --install-path=/usr/local/Ascend/ascend-toolkit/latest/opp && \
-    wget https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/ops/custom_ops-1.0.$DEVICE_TYPE-cp311-cp311-linux_aarch64.whl && \
-    ${PIP_INSTALL} ./custom_ops-1.0.$DEVICE_TYPE-cp311-cp311-linux_aarch64.whl
+    wget https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/ops/custom_ops-2.0.$DEVICE_TYPE-cp311-cp311-linux_aarch64.whl && \
+    ${PIP_INSTALL} ./custom_ops-2.0.$DEVICE_TYPE-cp311-cp311-linux_aarch64.whl
 
 # Install Bisheng
 RUN wget -O "${BISHENG_NAME}" "${BISHENG_URL}" && chmod a+x "${BISHENG_NAME}" && "./${BISHENG_NAME}" --install && rm "${BISHENG_NAME}"

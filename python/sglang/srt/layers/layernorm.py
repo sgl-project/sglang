@@ -75,6 +75,7 @@ logger = logging.getLogger(__name__)
 
 if _is_npu:
     import torch_npu
+    from sgl_kernel_npu.norm.add_rmsnorm_bias import add_gemma_rms_norm
 
 
 class RMSNorm(CustomOp):
@@ -429,9 +430,11 @@ class GemmaRMSNorm(CustomOp):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if get_bool_env_var("SGLANG_ENABLE_TORCH_COMPILE"):
+            return self.forward_native(x, residual)
         if residual is not None:
-            x = x + residual
-            residual = x
+            norm_out, residual = add_gemma_rms_norm(x, self.weight, residual, self.variance_epsilon)
+            return norm_out, residual
 
         x, _ = torch_npu.npu_gemma_rms_norm(x, self.weight, self.variance_epsilon)
         return x if residual is None else (x, residual)

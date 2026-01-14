@@ -200,6 +200,8 @@ class MllamaVisionEncoderLayer(nn.Module):
             self.hidden_size,
             self.num_attention_heads,
             self.hidden_size,
+            proj_bias = False,
+            qkv_bias = False,
             use_qkv_parallel=True,
             quant_config=quant_config,
             flatten_batch=False,
@@ -577,6 +579,8 @@ class MllamaTextCrossAttention(nn.Module):
         q = self.q_norm(q)
 
         output = self.attn(q, k, v, forward_batch)
+        if output.shape[-1] != self.num_heads * self.head_dim:
+            output = output.view(-1, self.num_heads * self.head_dim)
         out, _ = self.o_proj(output)
         return out
 

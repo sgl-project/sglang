@@ -377,7 +377,8 @@ class SchedulerOutputProcessorMixin:
                 new_accepted_len = len(next_token_id)
 
             # Update Mamba last track seqlen
-            self._mamba_prefix_cache_update(req, batch, result, i)
+            if req.mamba_ping_pong_track_buffer is not None:
+                self._mamba_prefix_cache_update(req, batch, result, i)
 
             req.check_finished(new_accepted_len)
 

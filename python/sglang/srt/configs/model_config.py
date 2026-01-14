@@ -409,6 +409,8 @@ class ModelConfig:
             self.attention_arch = AttentionArch.MLA
             self.kv_lora_rank = self.hf_config.kv_lora_rank
             self.qk_rope_head_dim = self.hf_config.qk_rope_head_dim
+            self.qk_nope_head_dim = self.hf_config.qk_nope_head_dim
+            self.not_use_fused_infer_attention_score = True
         elif "DeepseekVL2ForCausalLM" in self.hf_config.architectures and getattr(
             self.hf_text_config, "use_mla", True
         ):
@@ -449,6 +451,10 @@ class ModelConfig:
                     ):
                         setattr(self.hf_text_config, "head_dim", self.head_dim)
 
+            elif "BaichuanForCausalLM" in self.hf_config.architectures:
+                self.use_alibi = True if self.hf_config.hidden_size !=4096 else False
+            elif "Gemma2ForSequenceClassification" in self.hf_config.architectures:
+                self.use_sdpa = True
             self.attention_arch = AttentionArch.MHA
 
         self.num_attention_heads = self.hf_text_config.num_attention_heads
@@ -1036,6 +1042,7 @@ def is_generation_model(model_architectures: List[str], is_embedding: bool = Fal
         or "BertForSequenceClassification" in model_architectures
         or "XLMRobertaModel" in model_architectures
         or "XLMRobertaForSequenceClassification" in model_architectures
+        or "Gemma2ForSequenceClassification" in model_architectures
     ):
         return False
     else:

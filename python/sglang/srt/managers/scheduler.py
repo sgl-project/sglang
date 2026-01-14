@@ -1094,9 +1094,9 @@ class Scheduler(
         enable_profiling: bool = (
             os.getenv("ENABLE_PROFILING", "0") == "1" and self.tp_rank == 0
         )
-        prof_bs: int = os.getenv("PROFILING_BS", 8)
+        prof_bs: int = int(os.getenv("PROFILING_BS", 8))
         profiling_stage: str = os.getenv("PROFILING_STAGE", "decode")
-        prof_step: int = os.getenv("PROFILING_step", 10)
+        prof_step: int = int(os.getenv("PROFILING_step", 10))
         if enable_profiling:
             prof_cnt = 0
             import torch_npu
@@ -1187,7 +1187,8 @@ class Scheduler(
 
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
-            self.launch_batch_sample_if_needed(batch_result)
+            if self.is_generation:
+                self.launch_batch_sample_if_needed(batch_result)
 
             # Update last_batch
             self.last_batch = batch
@@ -1821,10 +1822,15 @@ class Scheduler(
                 self.chunked_req = None
 
         skip_prefill_scheduler = False
-        if self.schedule_enhancer and not self.schedule_enhancer.get_schedule_decision(
-            self.running_batch, self.max_prefill_bs
+        chunked_back = None
+        if (
+            self.chunked_req
+            and self.schedule_enhancer
+            and not self.schedule_enhancer.get_schedule_decision(
+                self.running_batch, self.max_prefill_bs
+            )
         ):
-            # Decrease prefill idle as much as possible during high dp load.
+            # Backup chunk req when prefill needs to be skipped.
             skip_prefill_scheduler = True
             chunked_back = self.chunked_req
             self.chunked_req = None
@@ -1868,6 +1874,16 @@ class Scheduler(
                     # Merge running_batch with prefill batch
                     self.running_batch.merge_batch(self.last_batch)
 
+        if (
+            (not self.chunked_req and not chunked_back)
+            and self.schedule_enhancer
+            and not self.schedule_enhancer.get_schedule_decision(
+                self.running_batch, self.max_prefill_bs
+            )
+        ):
+            # Decrease prefill idle as much as possible during high dp load.
+            skip_prefill_scheduler = True
+
         if skip_prefill_scheduler:
             new_batch = None
         else:
@@ -1899,7 +1915,7 @@ class Scheduler(
 
         if ret:
             trace_event_batch("schedule", ret.reqs)
-        if skip_prefill_scheduler:
+        if chunked_back:
             self.chunked_req = chunked_back
         return ret
 
