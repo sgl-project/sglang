@@ -32,10 +32,33 @@ python -m sglang.launch_server --model-path openai/whisper-large-v3 --port 30000
 
 ### 2. Run the Benchmark Script
 
-Basic usage:
+Basic usage (using chat completions API):
 
 ```bash
 python bench_sglang.py --base-url http://localhost:30000 --model openai/whisper-large-v3 --n-examples 10
+```
+
+Using the OpenAI-compatible transcription API:
+
+```bash
+python bench_sglang.py \
+    --base-url http://localhost:30000 \
+    --model openai/whisper-large-v3 \
+    --api-type transcription \
+    --language English \
+    --n-examples 10
+```
+
+Run with streaming and show real-time output:
+
+```bash
+python bench_sglang.py \
+    --base-url http://localhost:30000 \
+    --model openai/whisper-large-v3 \
+    --api-type transcription \
+    --stream \
+    --show-predictions \
+    --concurrency 1
 ```
 
 Run with higher concurrency and save results:
@@ -63,6 +86,9 @@ python bench_sglang.py \
 | `--output` | Path to save results as JSON | `None` |
 | `--show-predictions` | Display sample predictions | `False` |
 | `--print-n` | Number of samples to display | `5` |
+| `--api-type` | API to use: `chat` (chat completions) or `transcription` (audio transcriptions) | `chat` |
+| `--language` | Language for transcription API (e.g., `English`, `en`) | `None` |
+| `--stream` | Enable streaming mode for transcription API | `False` |
 
 ## Metrics
 
@@ -81,16 +107,24 @@ The benchmark outputs:
 ## Example Output
 
 ```bash
+python bench_sglang.py --api-type transcription --concurrency 128 --model openai/whisper-large-v3 --show-predictions
+
+Loading dataset: D4nt3/esb-datasets-earnings22-validation-tiny-filtered...
+Using API type: transcription
+Repo card metadata block was not found. Setting CardData to empty.
+WARNING:huggingface_hub.repocard:Repo card metadata block was not found. Setting CardData to empty.
+Performing warmup...
+Processing 511 samples...
 ------------------------------
 Results for openai/whisper-large-v3:
 Total Requests: 511
-WER: 12.7931
-Average Latency: 3.1487s
-Median Latency: 2.8786s
-95th Latency: 6.9032s
-Throughput: 23.95 req/s
-Token Throughput: 446.40 tok/s
-Total Test Time: 21.3374s
+WER: 12.7690
+Average Latency: 1.3602s
+Median Latency: 1.2090s
+95th Latency: 2.9986s
+Throughput: 19.02 req/s
+Token Throughput: 354.19 tok/s
+Total Test Time: 26.8726s
 ------------------------------
 
 ==================== Sample Predictions ====================
@@ -113,6 +147,8 @@ Sample 4:
 Sample 5:
   REF: so on on sinopec what we have agreed with sinopec way back then is that free cash flows after paying all capexs are distributed out 30 70%
   PRED: so on sinopec what we have agreed with sinopec way back then is that free cash flows after paying all capexes are distributed out 30% 70%
+----------------------------------------
+============================================================
 ```
 
 ## Notes
@@ -120,6 +156,8 @@ Sample 5:
 - Audio samples longer than 30 seconds are automatically filtered out (Whisper limitation)
 - The benchmark performs a warmup request before measuring performance
 - Results are normalized using the model's tokenizer when available
+- When using `--stream` with `--show-predictions`, use `--concurrency 1` for clean sequential output
+- The `--language` option accepts both full names (e.g., `English`) and ISO 639-1 codes (e.g., `en`)
 
 ## Troubleshooting
 

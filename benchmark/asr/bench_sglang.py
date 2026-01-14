@@ -2,9 +2,11 @@ import argparse
 import asyncio
 import base64
 import io
+import json
 import time
 from statistics import mean, median
 
+import httpx
 import librosa
 import soundfile
 from datasets import load_dataset
@@ -69,22 +71,108 @@ def run_asr_transcription_sync(client, model_name, y, sr, language=None):
     return latency, transcription.text
 
 
-async def run_asr_transcription(client, model_name, y, sr, language=None):
+def run_asr_transcription_stream_sync(
+    base_url, model_name, y, sr, language=None, show_stream=False
+):
+    """Use audio transcriptions API with streaming for ASR."""
+    audio_buffer = to_bytes(y, sr)
+    audio_bytes = audio_buffer.read()
+
+    data = {
+        "model": model_name,
+        "response_format": "json",
+        "stream": "true",
+    }
+    if language:
+        data["language"] = language
+
+    start_time = time.perf_counter()
+    text_chunks = []
+
+    if show_stream:
+        print("[STREAM] ", end="", flush=True)
+
+    with httpx.stream(
+        "POST",
+        f"{base_url}/v1/audio/transcriptions",
+        data=data,
+        files={"file": ("audio.wav", audio_bytes, "audio/wav")},
+        timeout=60.0,
+    ) as response:
+        for line in response.iter_lines():
+            if line.startswith("data: ") and not line.startswith("data: [DONE]"):
+                try:
+                    chunk = json.loads(line[6:])
+                    if "choices" in chunk and chunk["choices"]:
+                        delta = chunk["choices"][0].get("delta", {})
+                        content = delta.get("content", "")
+                        if content:
+                            text_chunks.append(content)
+                            if show_stream:
+                                print(content, end="", flush=True)
+                except json.JSONDecodeError:
+                    pass
+
+    if show_stream:
+        print()  # newline after stream
+
+    end_time = time.perf_counter()
+    latency = end_time - start_time
+    return latency, "".join(text_chunks)
+
+
+async def run_asr_transcription(
+    client,
+    model_name,
+    y,
+    sr,
+    language=None,
+    stream=False,
+    base_url=None,
+    show_stream=False,
+):
     """Async wrapper for transcription API (runs sync call in executor)."""
     loop = asyncio.get_event_loop()
+    if stream:
+        return await loop.run_in_executor(
+            None,
+            run_asr_transcription_stream_sync,
+            base_url,
+            model_name,
+            y,
+            sr,
+            language,
+            show_stream,
+        )
     return await loop.run_in_executor(
         None, run_asr_transcription_sync, client, model_name, y, sr, language
     )
 
 
 async def bound_asr(
-    sem, client, model_name, tokenizer, audio, reference, api_type="chat", language=None
+    sem,
+    client,
+    model_name,
+    tokenizer,
+    audio,
+    reference,
+    api_type="chat",
+    language=None,
+    stream=False,
+    base_url=None,
+    show_stream=False,
 ):
     async with sem:
         try:
             if api_type == "transcription":
                 latency, text = await run_asr_transcription(
-                    client, model_name, *audio, language=language
+                    client,
+                    model_name,
+                    *audio,
+                    language=language,
+                    stream=stream,
+                    base_url=base_url,
+                    show_stream=show_stream,
                 )
             else:
                 latency, text = await run_asr_chat(client, model_name, *audio)
@@ -108,7 +196,15 @@ async def bound_asr(
 
 
 async def process_dataset(
-    model_name, client, data, concurrent_request, api_type="chat", language=None
+    model_name,
+    client,
+    data,
+    concurrent_request,
+    api_type="chat",
+    language=None,
+    stream=False,
+    base_url=None,
+    show_predictions=False,
 ):
     sem = asyncio.Semaphore(concurrent_request)
     tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -128,6 +224,9 @@ async def process_dataset(
         "",
         api_type=api_type,
         language=language,
+        stream=stream,
+        base_url=base_url,
+        show_stream=False,  # Don't show stream during warmup
     )
 
     tasks = []
@@ -145,6 +244,9 @@ async def process_dataset(
                     sample["text"],
                     api_type=api_type,
                     language=language,
+                    stream=stream,
+                    base_url=base_url,
+                    show_stream=show_predictions and stream,
                 )
             )
         )
@@ -161,7 +263,7 @@ def run_evaluation(args):
         client = AsyncOpenAI(base_url=f"{args.base_url}/v1", api_key="None")
 
     print(f"Loading dataset: {args.dataset}...")
-    print(f"Using API type: {args.api_type}")
+    print(f"Using API type: {args.api_type}" + (f" (streaming)" if args.stream else ""))
     dataset = load_dataset(args.dataset, split=args.split)
 
     # Filter by duration if needed (Whisper max is 30s)
@@ -187,6 +289,9 @@ def run_evaluation(args):
             args.concurrency,
             api_type=args.api_type,
             language=args.language,
+            stream=args.stream,
+            base_url=args.base_url,
+            show_predictions=args.show_predictions,
         )
     )
     total_test_time = time.perf_counter() - start
@@ -287,6 +392,11 @@ if __name__ == "__main__":
         "--language",
         default=None,
         help="Language code for transcription API (e.g., 'en')",
+    )
+    parser.add_argument(
+        "--stream",
+        action="store_true",
+        help="Use streaming mode for transcription API",
     )
     args = parser.parse_args()
 
