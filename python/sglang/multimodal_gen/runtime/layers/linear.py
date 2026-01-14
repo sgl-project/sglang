@@ -55,6 +55,9 @@ WEIGHT_LOADER_V2_SUPPORTED = [
     "IPEXGPTQLinearMethod",
     "HQQMarlinMethod",
     "QuarkLinearMethod",
+    # Nunchaku SVDQuant methods
+    "NunchakuSVDQLinearMethod",
+    "NunchakuAWQLinearMethod",
 ]
 
 

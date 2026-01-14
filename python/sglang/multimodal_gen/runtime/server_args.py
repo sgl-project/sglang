@@ -19,6 +19,7 @@ from typing import Any, Optional
 
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig, STA_Mode
+from sglang.multimodal_gen.configs.quantization import NunchakuSVDQuantArgs
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
@@ -314,6 +315,11 @@ class ServerArgs:
     moba_config_path: str | None = None
     moba_config: dict[str, Any] = field(default_factory=dict)
 
+    # Quantization / Nunchaku SVDQuant configuration
+    nunchaku_config: NunchakuSVDQuantArgs = field(
+        default_factory=NunchakuSVDQuantArgs, repr=False
+    )
+
     # Master port for distributed inference
     # TODO: do not hard code
     master_port: int | None = None
@@ -419,6 +425,9 @@ class ServerArgs:
                     "Failed to load V-MoBA config from %s: %s", self.moba_config_path, e
                 )
                 raise
+
+        # Validate Nunchaku configuration
+        self.nunchaku_config.validate()
 
         self.check_server_args()
 
@@ -644,6 +653,9 @@ class ServerArgs:
             help="Validation sparsity for VSA",
         )
 
+        # Nunchaku SVDQuant quantization parameters
+        NunchakuSVDQuantArgs.add_cli_args(parser)
+
         # Master port for distributed inference
         parser.add_argument(
             "--master-port",
@@ -794,6 +806,9 @@ class ServerArgs:
                 pipeline_config = PipelineConfig.from_kwargs(kwargs)
                 logger.debug(f"Using PipelineConfig: {type(pipeline_config)}")
                 server_args_kwargs["pipeline_config"] = pipeline_config
+            elif attr == "nunchaku_config":
+                nunchaku_config = NunchakuSVDQuantArgs.from_dict(kwargs)
+                server_args_kwargs["nunchaku_config"] = nunchaku_config
             elif attr in kwargs:
                 server_args_kwargs[attr] = kwargs[attr]
 

@@ -63,9 +63,35 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
     return method_to_config[quantization]
 
 
-all = [
+try:
+    from sglang.multimodal_gen.runtime.layers.quantization.nunchaku_config import (
+        NunchakuConfig,
+    )
+    from sglang.multimodal_gen.runtime.layers.quantization.nunchaku_linear import (
+        NunchakuAWQLinearMethod,
+        NunchakuSVDQLinearMethod,
+    )
+
+    @register_quantization_config("svdquant")
+    class _RegisteredNunchakuConfig(NunchakuConfig):
+        """Alias class to register NunchakuConfig as the 'svdquant' quantization method."""
+
+        pass
+
+except ImportError:
+    _RegisteredNunchakuConfig = None
+    NunchakuConfig = None
+    NunchakuSVDQLinearMethod = None
+    NunchakuAWQLinearMethod = None
+
+
+__all__ = [
     "QuantizationMethods",
     "QuantizationConfig",
     "get_quantization_config",
     "QUANTIZATION_METHODS",
+    # Nunchaku exports
+    "NunchakuConfig",
+    "NunchakuSVDQLinearMethod",
+    "NunchakuAWQLinearMethod",
 ]
