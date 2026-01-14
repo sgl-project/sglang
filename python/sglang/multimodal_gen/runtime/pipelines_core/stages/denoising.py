@@ -1016,6 +1016,25 @@ class DenoisingStage(PipelineStage):
                             latent_model_input, t_device
                         )
 
+                        # TODO: debug
+                        # concat condition latents here???
+                        if batch.condition_latents is not None:
+                            condition_latents_model_input = batch.condition_latents
+                            assert (
+                                len(latent_model_input) == 1
+                            ), f"Single batch only: {len(latent_model_input)=}."
+                            current_batch_size = len(latent_model_input)
+
+                            # condition images + 1 target image
+                            x_combined = [
+                                condition_latents_model_input[i]
+                                + [latent_model_input[i]]
+                                for i in range(current_batch_size)
+                            ]
+
+                            # TODO: review, refactor
+                            latent_model_input = x_combined
+
                         # Predict noise residual
                         attn_metadata = self._build_attn_metadata(i, batch, server_args)
                         noise_pred = self._predict_noise_with_cfg(

@@ -995,15 +995,15 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
     def _build_unified_sequence(
         self,
         x: torch.Tensor,
-        x_freqs: torch.Tensor,
+        x_freqs: Tuple[torch.Tensor, torch.Tensor],  # (cos, sin)
         x_seqlens: List[int],
         x_noise_mask: Optional[List[List[int]]],
         cap: torch.Tensor,
-        cap_freqs: torch.Tensor,
+        cap_freqs: Tuple[torch.Tensor, torch.Tensor],
         cap_seqlens: List[int],
         cap_noise_mask: Optional[List[List[int]]],
         siglip: Optional[torch.Tensor],
-        siglip_freqs: Optional[torch.Tensor],
+        siglip_freqs: Optional[Tuple[torch.Tensor, torch.Tensor]],
         siglip_seqlens: Optional[List[int]],
         siglip_noise_mask: Optional[List[List[int]]],
         omni_mode: bool,
@@ -1262,9 +1262,9 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
 
         x = hidden_states
 
-        # omni_mode = isinstance(x[0], list)
-        # TODO: test base mode only for now.
-        omni_mode = False
+        # TODO: review
+        # ugly?
+        omni_mode = isinstance(x[0], list)
         device = x[0][-1].device if omni_mode else x[0].device
 
         cap_feats = encoder_hidden_states
@@ -1365,10 +1365,7 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         for layer in self.context_refiner:
             cap_feats = layer(cap_feats, cap_freqs_cis)
 
-        # TODO: debug ignore
-        # review
-        # siglip_freqs_cis = torch.stack(freqs_cis[2])
-        siglip_freqs_cis = None
+        siglip_freqs_cis = freqs_cis[2]
         siglip_seqlens = siglip_freqs = None
 
         if (
@@ -1390,6 +1387,18 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
 
             for layer in self.siglip_refiner:
                 siglip_feats = layer(siglip_feats, siglip_freqs_cis)
+
+        assert len(x) == 1, "single batch only."
+        assert len(cap_feats) == 1, "single batch only."
+        assert isinstance(
+            x_freqs_cis, Tuple
+        ), f"should be tuple of (cos, sin), got {type(x_freqs_cis)}"
+        assert isinstance(
+            cap_freqs_cis, Tuple
+        ), f"should be tuple of (cos, sin), got {type(cap_freqs_cis)}"
+        assert isinstance(
+            siglip_freqs_cis, Tuple
+        ), f"should be tuple of (cos, sin), got {type(siglip_freqs_cis)}"
 
         x_seqlens = [len(xi) for xi in x]
         cap_seqlens = [len(ci) for ci in cap_feats]

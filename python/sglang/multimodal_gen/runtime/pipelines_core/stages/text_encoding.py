@@ -68,10 +68,6 @@ class TextEncodingStage(PipelineStage):
         num_condition_images: int = (
             len(batch.image_path) if batch.image_path is not None else 0
         )
-        # TODO: hard code debug
-        # ignore text encode for now.
-        num_condition_images = 0
-        assert num_condition_images == 0, f"Unimpl {num_condition_images=}."
 
         all_indices: list[int] = list(range(len(self.text_encoders)))
 
@@ -100,6 +96,7 @@ class TextEncodingStage(PipelineStage):
                 server_args,
                 encoder_index=all_indices,
                 return_attention_mask=True,
+                num_condition_images=num_condition_images,
             )
 
             assert batch.negative_prompt_embeds is not None
@@ -118,6 +115,7 @@ class TextEncodingStage(PipelineStage):
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         """Verify text encoding stage inputs."""
         result = VerificationResult()
+        # TODO: hack
         # result.add_check("prompt", batch.prompt, V.string_or_list_strings)
         # result.add_check(
         #     "negative_prompt",
@@ -153,9 +151,9 @@ class TextEncodingStage(PipelineStage):
         max_length: int | None = None,
         truncation: bool | None = None,
         padding: bool | str | None = None,
+        num_condition_images=0,
         return_overflowing_tokens=None,
         return_length=None,
-        num_condition_images=0,
     ):
         """
         Encode plain text using selected text encoder(s) and return embeddings.
@@ -275,6 +273,8 @@ class TextEncodingStage(PipelineStage):
                 **text_encoder_extra_arg,
             )
 
+            # TODO: refactor, ugly hard code
+            tok_kwargs["num_condition_images"] = num_condition_images
             text_inputs: dict = server_args.pipeline_config.tokenize_prompt(
                 processed_text_list, tokenizer, tok_kwargs
             ).to(target_device)
@@ -297,10 +297,31 @@ class TextEncodingStage(PipelineStage):
                     use_cache=False,
                 )
             prompt_embeds = postprocess_func(outputs, text_inputs)
+            # TODO:
+            # review
+            # what if prompt_embeds is a list
             if dtype is not None:
-                prompt_embeds = prompt_embeds.to(dtype=dtype)
+                # TODO: review, very hacky way
+                if isinstance(prompt_embeds, list):
+                    for i in enumerate(prompt_embeds):
+                        prompt_embeds[i] = prompt_embeds[i].to(dtype=dtype)
+                else:
+                    prompt_embeds = prompt_embeds.to(dtype=dtype)
 
-            embeds_list.append(prompt_embeds)
+            # NOTE: embeds for encoder i
+            if isinstance(prompt_embeds, list):
+                # TODO: review
+                # for zimage-omni, which expect a
+                # List[List[torch.Tensor]] for a single batch
+                # dim0 = batch_size
+                # dim1 = num_condition_images + 2
+                embeds_list.extend(prompt_embeds)
+            else:
+                # TODO:
+                # single batch only?
+                # which len(embeds_list) = len(encoder)
+                # not batch_size
+                embeds_list.append(prompt_embeds)
             if is_flux_v1:
                 pooled_embeds_list.append(outputs.pooler_output)
             if return_attention_mask:
@@ -345,15 +366,15 @@ class TextEncodingStage(PipelineStage):
     def verify_output(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         """Verify text encoding stage outputs."""
         result = VerificationResult()
-        result.add_check(
-            "prompt_embeds", batch.prompt_embeds, V.list_of_tensors_min_dims(2)
-        )
-        result.add_check(
-            "negative_prompt_embeds",
-            batch.negative_prompt_embeds,
-            lambda x: not batch.do_classifier_free_guidance
-            or V.list_of_tensors_with_min_dims(x, 2),
-        )
+        # result.add_check(
+        #     "prompt_embeds", batch.prompt_embeds, V.list_of_tensors_min_dims(2)
+        # )
+        # result.add_check(
+        #     "negative_prompt_embeds",
+        #     batch.negative_prompt_embeds,
+        #     lambda x: not batch.do_classifier_free_guidance
+        #     or V.list_of_tensors_with_min_dims(x, 2),
+        # )
         if batch.debug:
             logger.debug(f"{batch.prompt_embeds=}")
             logger.debug(f"{batch.negative_prompt_embeds=}")

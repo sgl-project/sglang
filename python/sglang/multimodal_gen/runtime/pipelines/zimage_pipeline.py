@@ -350,6 +350,11 @@ class ZImagePipeline(LoRAPipeline, ComposedPipelineBase):
             vae_scale_factor=vae_scale_factor * 2
         )
 
+        # import debugpy
+        # debugpy.listen(('127.0.0.1', 9901))
+        # print('Waiting for debugger attach')
+        # debugpy.wait_for_client()
+
         self.add_stage(
             stage_name="input_validation_stage", stage=InputValidationStage()
         )

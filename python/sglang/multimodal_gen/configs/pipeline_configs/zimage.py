@@ -173,6 +173,10 @@ def zimage_omni_postprocess_text(
 ) -> torch.Tensor:
     """
     # TODO: debug note, remove later
+    Basic mode:
+        single text embeds
+        which assert batch_size == 1
+        torch.tensor
     Omni mode:
         Omni mode text embedding require a fregment pattern
         which break a single text into fregments(split by <|vision_start|>).
@@ -185,9 +189,34 @@ def zimage_omni_postprocess_text(
             List[List[torch.Tensor]]: single batch fregs of embeds.
             where len(d) == batch size. len(d[bid]) == num_image + 2
     """
-    device = outputs.hidden_states[-2].device
-    prompt_mask = _text_inputs.attention_mask.to(device).bool()
-    return outputs.hidden_states[-2][0][prompt_mask[0]]
+
+    prompt_list_lengths = getattr(_text_inputs, "prompt_list_lengths", None)
+    if prompt_list_lengths is None:
+        # Basic mode
+        device = outputs.hidden_states[-2].device
+        prompt_mask = _text_inputs.attention_mask.to(device).bool()
+        embeds = outputs.hidden_states[-2][0][prompt_mask[0]]
+    else:
+        # Omni mode
+        # from flatten to batching
+        # List[List[torch.Tensor]]
+
+        device = outputs.hidden_states[-2].device
+        embeddings_list = []
+        start_idx = 0
+        for i in range(len(prompt_list_lengths)):
+            batch_embeddings = []
+            end_idx = start_idx + prompt_list_lengths[i]
+            prompt_embeds = outputs.hidden_states[-2]
+            prompt_masks = _text_inputs.attention_mask.to(device).bool()
+            for j in range(start_idx, end_idx):
+                batch_embeddings.append(prompt_embeds[j][prompt_masks[j]])
+            embeddings_list.append(batch_embeddings)
+            start_idx = end_idx
+        # TODO: hard code debug.
+        embeds = embeddings_list
+
+    return embeds
 
 
 @dataclass
@@ -213,6 +242,12 @@ class ZImageOmniPipelineConfig(ZImagePipelineConfig):
             prompts = [[prompts]]
         elif isinstance(prompts, list) and isinstance(prompts[0], str):
             prompts = [prompts]
+        elif (
+            isinstance(prompts, list)
+            and isinstance(prompts[0], list)
+            and isinstance(prompts[0][0], str)
+        ):
+            pass
         else:
             raise NotImplementedError
 
@@ -241,3 +276,28 @@ class ZImageOmniPipelineConfig(ZImagePipelineConfig):
         inputs.prompt_list_lengths = prompt_list_lengths
 
         return inputs
+
+    # TODO: hack
+    # pos and freq is online compute
+    def prepare_pos_cond_kwargs(self, batch, device, rotary_emb, dtype):
+        pos_cond_kwargs = {}
+        if (
+            batch.condition_siglip_embeds is not None
+            and batch.condition_latents is not None
+        ):
+            assert len(batch.condition_siglip_embeds) == 1, "Single batch only for now."
+            assert len(batch.condition_latents) == 1, "Single batch only for now."
+
+            current_batch_size = len(batch.condition_latents)
+
+            condition_latents_model_input = batch.condition_latents
+            # Create noise mask: 0 for condition images (clean), 1 for target image (noisy)
+            image_noise_mask = [
+                [0] * len(condition_latents_model_input[i]) + [1]
+                for i in range(current_batch_size)
+            ]
+
+            pos_cond_kwargs["siglip_feats"] = batch.condition_siglip_embeds
+            pos_cond_kwargs["image_noise_mask"] = image_noise_mask
+
+        return pos_cond_kwargs
