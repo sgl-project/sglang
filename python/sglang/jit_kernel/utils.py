@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import functools
 import pathlib
+from enum import Enum
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Callable, List, Tuple, TypeAlias, TypeVar, Union
-from enum import Enum
+
 import torch
 
 if TYPE_CHECKING:
@@ -69,7 +70,9 @@ def make_cpp_args(*args: CPP_TEMPLATE_TYPE) -> CPPArgList:
             # Note: Python Enum must mirror the corresponding C++ enum class exactly.
             enum_type = arg.__class__.__name__
             return f"{enum_type}::{arg.name}"
-        raise TypeError(f"Unsupported argument type for cpp template: {type(arg)}, arg={arg}")
+        raise TypeError(
+            f"Unsupported argument type for cpp template: {type(arg)}, arg={arg}"
+        )
 
     return CPPArgList(_convert(arg) for arg in args)
 

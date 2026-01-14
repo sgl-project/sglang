@@ -10,7 +10,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from sgl_kernel import fused_add_rmsnorm, rmsnorm
 
-from sglang.jit_kernel.diffusion.norm_fusion.fused_norm_scale_shift import fused_norm_scale_shift
+from sglang.jit_kernel.diffusion.norm_fusion.fused_norm_scale_shift import (
+    fused_norm_scale_shift,
+)
 from sglang.jit_kernel.diffusion.norm_fusion.fused_scale_residual_norm_scale_shift import (
     fused_scale_residual_norm_scale_shift,
 )
@@ -83,12 +85,10 @@ class RMSNorm(CustomOp):
         elif self.variance_size_override is not None:
             return self.forward_native(x, residual)
         elif residual is not None:
-            fused_add_rmsnorm(x, residual, self.weight.data,
-                              self.variance_epsilon)
+            fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
             return x.view(shape), residual.view(residual_shape)
         else:
-            out = rmsnorm(x, self.weight.data.to(
-                device), self.variance_epsilon)
+            out = rmsnorm(x, self.weight.data.to(device), self.variance_epsilon)
         out = out.view(shape)
         return out
 
@@ -169,8 +169,7 @@ class LayerNorm(CustomOp):
         factory_kwargs = {"device": device, "dtype": dtype}
         self.hidden_size = hidden_size
         if elementwise_affine:
-            self.weight = torch.nn.Parameter(
-                torch.empty(hidden_size, **factory_kwargs))
+            self.weight = torch.nn.Parameter(torch.empty(hidden_size, **factory_kwargs))
             self.bias = (
                 torch.nn.Parameter(torch.empty(hidden_size, **factory_kwargs))
                 if bias

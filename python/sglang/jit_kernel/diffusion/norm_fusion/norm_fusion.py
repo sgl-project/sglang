@@ -1,6 +1,6 @@
-
 from enum import Enum
 from typing import Union
+
 import torch
 
 
@@ -75,4 +75,5 @@ def get_norm_enum(norm_str: str) -> NormEnum:
     elif norm_str == "rms":
         return NormEnum.RMSNorm
     raise ValueError(
-        f"Unsupported norm type: '{norm_str}'. Expected one of: 'layer', 'rms'.")
+        f"Unsupported norm type: '{norm_str}'. Expected one of: 'layer', 'rms'."
+    )

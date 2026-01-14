@@ -2,13 +2,15 @@ from typing import Optional
 
 import pytest
 import torch
+from einops import rearrange
 
-from sglang.jit_kernel.diffusion.norm_fusion.fused_norm_scale_shift import fused_norm_scale_shift
+from sglang.jit_kernel.diffusion.norm_fusion.fused_norm_scale_shift import (
+    fused_norm_scale_shift,
+)
 from sglang.jit_kernel.diffusion.norm_fusion.fused_scale_residual_norm_scale_shift import (
     fused_scale_residual_norm_scale_shift,
 )
 
-from einops import rearrange
 
 def _tol(dtype: torch.dtype):
     return 2e-5 if dtype == torch.float32 else 5e-2

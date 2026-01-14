@@ -55,7 +55,11 @@ struct Matcher {
       if (tensor.ndim() == 2) {
         TensorMatcher({B_, D_}).with_strides({D_, 1}).with_dtype<T>().template with_device<kDLCUDA>().verify(tensor);
       } else if (tensor.ndim() == 3) {
-        TensorMatcher({B_, 1, D_}).with_strides({S0_, D_, 1}).with_dtype<T>().template with_device<kDLCUDA>().verify(tensor);
+        TensorMatcher({B_, 1, D_})
+            .with_strides({S0_, D_, 1})
+            .with_dtype<T>()
+            .template with_device<kDLCUDA>()
+            .verify(tensor);
       } else {
         RuntimeCheck(
             false, "Invalid tensor rank for index_enum=BroadcastS: expected ndim=2 ([B, D]) or ndim=3 ([B, 1, D]).");
