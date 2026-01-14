@@ -227,6 +227,7 @@ def handle_rerun_stage(
         "stage-a-cpu-only",
         "stage-b-test-small-1-gpu",
         "stage-b-test-large-1-gpu",
+        "stage-b-test-small-1-gpu-5090",
         "stage-b-test-large-2-gpu",
         "stage-c-test-large-4-gpu",
         "stage-c-test-large-4-gpu-b200",
