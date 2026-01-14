@@ -1246,3 +1246,38 @@ class ResponseReasoningTextContent(BaseModel):
 ResponseInputOutputItem: TypeAlias = Union[
     ResponseInputItemParam, "ResponseReasoningItem", ResponseFunctionToolCall
 ]
+
+
+# ================== Transcription API Protocol Definitions ==================
+
+
+class TranscriptionUsage(BaseModel):
+    """Usage info for transcription response (duration-based)."""
+
+    type: Literal["duration"] = "duration"
+    seconds: int  # Audio duration in seconds (rounded up)
+
+
+class TranscriptionResponse(BaseModel):
+    """Non-streaming transcription response (OpenAI-compatible)."""
+
+    text: str
+    usage: Optional[TranscriptionUsage] = None
+
+
+class TranscriptionStreamChoice(BaseModel):
+    """Delta content for streaming transcription."""
+
+    delta: DeltaMessage
+    finish_reason: Optional[str] = None
+
+
+class TranscriptionStreamResponse(BaseModel):
+    """Streaming transcription chunk (OpenAI-compatible)."""
+
+    id: str = Field(default_factory=lambda: f"trsc-{uuid.uuid4().hex}")
+    object: Literal["transcription.chunk"] = "transcription.chunk"
+    created: int = Field(default_factory=lambda: int(time.time()))
+    model: str
+    choices: List[TranscriptionStreamChoice]
+    usage: Optional[UsageInfo] = None
