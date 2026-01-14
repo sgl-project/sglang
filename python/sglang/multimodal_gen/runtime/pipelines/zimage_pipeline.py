@@ -273,10 +273,7 @@ class _PrepareSiglipStage(PipelineStage):
                 .to(device)
                 .to(dtype)
             )
-            # TODO:
-            # shape = siglip_inputs.spatial_shapes[0]
-            # TODO: test
-            shape = list(siglip_inputs.pixel_values.shape)
+            shape = siglip_inputs.spatial_shapes[0]
             hidden_state = self.siglip(**siglip_inputs).last_hidden_state
             B, N, C = hidden_state.shape
             hidden_state = hidden_state[:, : shape[0] * shape[1]]
