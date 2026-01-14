@@ -11,6 +11,14 @@
 namespace host::norm {
 
 /**
+ * \brief Norm type selector for fused norm kernels.
+ */
+enum NormEnum : int {
+  LayerNorm = 0,
+  RMSNorm = 1,
+};
+
+/**
  * \brief Check if the given configuration is supported.
  * \tparam T Element type (only fp16_t/bf16_t is supported)
  * \tparam kDim Dimension size (usually hidden size)

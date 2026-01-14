@@ -27,21 +27,21 @@ EPS = 1e-5
 
 if IS_CI:
     B_RANGE = [1]
-    L_RANGE = [128]
-    C_RANGE = [1024]
+    S_RANGE = [128]
+    D_RANGE = [1024]
 else:
     B_RANGE = [1]
-    L_RANGE = [128, 1024, 4096]
-    C_RANGE = [1024, 3072, 4096]
+    S_RANGE = [128, 1024, 4096]
+    D_RANGE = [1024, 3072, 4096]
 
 NORM_TYPE_RANGE = ["layer", "rms"]
 
 
-def create_norm_scale_shift_layer(C: int, norm_type: str):
+def create_norm_scale_shift_layer(D: int, norm_type: str):
     """Create layer with affine parameters."""
-    layer = _NormScaleShift(C, norm_type, eps=EPS, elementwise_affine=True, dtype=DTYPE)
-    weight = torch.randn(C, dtype=DTYPE, device=DEVICE)
-    bias = torch.randn(C, dtype=DTYPE, device=DEVICE)
+    layer = _NormScaleShift(D, norm_type, eps=EPS, elementwise_affine=True, dtype=DTYPE)
+    weight = torch.randn(D, dtype=DTYPE, device=DEVICE)
+    bias = torch.randn(D, dtype=DTYPE, device=DEVICE)
     with torch.no_grad():
         layer.norm.weight.copy_(weight)
         if norm_type == "layer":
@@ -49,21 +49,21 @@ def create_norm_scale_shift_layer(C: int, norm_type: str):
     return layer
 
 
-def create_norm_scale_shift_no_affine_layer(C: int, norm_type: str):
+def create_norm_scale_shift_no_affine_layer(D: int, norm_type: str):
     """Create layer without affine parameters."""
     layer = _NormScaleShift(
-        C, norm_type, eps=EPS, elementwise_affine=False, dtype=DTYPE
+        D, norm_type, eps=EPS, elementwise_affine=False, dtype=DTYPE
     )
     return layer
 
 
-def create_scale_residual_norm_scale_shift_layer(C: int, norm_type: str):
+def create_scale_residual_norm_scale_shift_layer(D: int, norm_type: str):
     """Create layer with residual, gate, and affine parameters."""
     layer = _ScaleResidualNormScaleShift(
-        C, norm_type, eps=EPS, elementwise_affine=True, dtype=DTYPE
+        D, norm_type, eps=EPS, elementwise_affine=True, dtype=DTYPE
     )
-    weight = torch.randn(C, dtype=DTYPE, device=DEVICE)
-    bias = torch.randn(C, dtype=DTYPE, device=DEVICE)
+    weight = torch.randn(D, dtype=DTYPE, device=DEVICE)
+    bias = torch.randn(D, dtype=DTYPE, device=DEVICE)
     with torch.no_grad():
         layer.norm.weight.copy_(weight)
         if norm_type == "layer":
@@ -79,13 +79,13 @@ LINE_NAMES = ["SGLang Native", "SGLang Fused"]
 STYLES = [("red", "-"), ("blue", "--")]
 
 configs_norm_scale_shift = list(
-    itertools.product(B_RANGE, L_RANGE, C_RANGE, NORM_TYPE_RANGE)
+    itertools.product(B_RANGE, S_RANGE, D_RANGE, NORM_TYPE_RANGE)
 )
 
 
 @triton.testing.perf_report(
     triton.testing.Benchmark(
-        x_names=["B", "L", "C", "norm_type"],
+        x_names=["B", "S", "D", "norm_type"],
         x_vals=configs_norm_scale_shift,
         line_arg="provider",
         line_vals=LINE_VALS,
@@ -97,12 +97,12 @@ configs_norm_scale_shift = list(
     )
 )
 def bench_fused_norm_scale_shift(
-    B: int, L: int, C: int, norm_type: str, provider: str
+    B: int, S: int, D: int, norm_type: str, provider: str
 ) -> Tuple[float, float, float]:
-    x = torch.randn(B, L, C, dtype=DTYPE, device=DEVICE)
-    scale = torch.randn(B, L, C, dtype=DTYPE, device=DEVICE)
-    shift = torch.randn(B, L, C, dtype=DTYPE, device=DEVICE)
-    layer = create_norm_scale_shift_layer(C, norm_type)
+    x = torch.randn(B, S, D, dtype=DTYPE, device=DEVICE)
+    scale = torch.randn(B, S, D, dtype=DTYPE, device=DEVICE)
+    shift = torch.randn(B, S, D, dtype=DTYPE, device=DEVICE)
+    layer = create_norm_scale_shift_layer(D, norm_type)
 
     if provider == "native":
         fn = lambda: layer.forward_native(x, shift, scale)
@@ -119,7 +119,7 @@ def bench_fused_norm_scale_shift(
 # ============================================================================
 @triton.testing.perf_report(
     triton.testing.Benchmark(
-        x_names=["B", "L", "C", "norm_type"],
+        x_names=["B", "S", "D", "norm_type"],
         x_vals=configs_norm_scale_shift,
         line_arg="provider",
         line_vals=LINE_VALS,
@@ -131,12 +131,12 @@ def bench_fused_norm_scale_shift(
     )
 )
 def bench_fused_norm_scale_shift_no_affine(
-    B: int, L: int, C: int, norm_type: str, provider: str
+    B: int, S: int, D: int, norm_type: str, provider: str
 ) -> Tuple[float, float, float]:
-    x = torch.randn(B, L, C, dtype=DTYPE, device=DEVICE)
-    scale = torch.randn(B, L, C, dtype=DTYPE, device=DEVICE)
-    shift = torch.randn(B, L, C, dtype=DTYPE, device=DEVICE)
-    layer = create_norm_scale_shift_no_affine_layer(C, norm_type)
+    x = torch.randn(B, S, D, dtype=DTYPE, device=DEVICE)
+    scale = torch.randn(B, S, D, dtype=DTYPE, device=DEVICE)
+    shift = torch.randn(B, S, D, dtype=DTYPE, device=DEVICE)
+    layer = create_norm_scale_shift_no_affine_layer(D, norm_type)
 
     if provider == "native":
         fn = lambda: layer.forward_native(x, shift, scale)
@@ -153,7 +153,7 @@ def bench_fused_norm_scale_shift_no_affine(
 # ============================================================================
 @triton.testing.perf_report(
     triton.testing.Benchmark(
-        x_names=["B", "L", "C", "norm_type"],
+        x_names=["B", "S", "D", "norm_type"],
         x_vals=configs_norm_scale_shift,
         line_arg="provider",
         line_vals=LINE_VALS,
@@ -165,14 +165,14 @@ def bench_fused_norm_scale_shift_no_affine(
     )
 )
 def bench_fused_scale_residual_norm_scale_shift(
-    B: int, L: int, C: int, norm_type: str, provider: str
+    B: int, S: int, D: int, norm_type: str, provider: str
 ) -> Tuple[float, float, float]:
-    residual = torch.randn(B, L, C, dtype=DTYPE, device=DEVICE)
-    x = torch.randn(B, L, C, dtype=DTYPE, device=DEVICE)
-    scale = torch.randn(B, L, C, dtype=DTYPE, device=DEVICE)
-    shift = torch.randn(B, L, C, dtype=DTYPE, device=DEVICE)
-    gate = torch.randn(B, 1, C, dtype=DTYPE, device=DEVICE)
-    layer = create_scale_residual_norm_scale_shift_layer(C, norm_type)
+    residual = torch.randn(B, S, D, dtype=DTYPE, device=DEVICE)
+    x = torch.randn(B, S, D, dtype=DTYPE, device=DEVICE)
+    scale = torch.randn(B, S, D, dtype=DTYPE, device=DEVICE)
+    shift = torch.randn(B, S, D, dtype=DTYPE, device=DEVICE)
+    gate = torch.randn(B, 1, D, dtype=DTYPE, device=DEVICE)
+    layer = create_scale_residual_norm_scale_shift_layer(D, norm_type)
 
     if provider == "native":
         fn = lambda: layer.forward_native(residual, x, gate, shift, scale)
