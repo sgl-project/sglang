@@ -72,12 +72,19 @@ def hf_to_custom_state_dict(
         custom_param_sd (Dict[str, torch.Tensor]): The custom formatted parameter state dict
         reverse_param_names_mapping (Dict[str, Tuple[str, Any, Any]]): Maps back from custom to hf
     """
+    logger.info("hf_to_custom_state_dict: Starting state dict conversion...")
     custom_param_sd = {}
     to_merge_params = defaultdict(dict)  # type: ignore
     reverse_param_names_mapping = {}
     if isinstance(hf_param_sd, dict):
         hf_param_sd = hf_param_sd.items()  # type: ignore
+    param_count = 0
     for source_param_name, full_tensor in hf_param_sd:  # type: ignore
+        param_count += 1
+        if param_count % 200 == 0:
+            logger.info(
+                "hf_to_custom_state_dict: Processing parameter %d...", param_count
+            )
         target_param_name, merge_index, num_params_to_merge = param_names_mapping(
             source_param_name
         )
@@ -99,4 +106,8 @@ def hf_to_custom_state_dict(
             else:
                 continue
         custom_param_sd[target_param_name] = full_tensor
+    logger.info(
+        "hf_to_custom_state_dict: Conversion completed. %d parameters converted",
+        len(custom_param_sd),
+    )
     return custom_param_sd, reverse_param_names_mapping
