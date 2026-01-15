@@ -1,6 +1,4 @@
 import logging
-import os
-import json
 from typing import Optional, Union
 
 import torch
@@ -11,95 +9,6 @@ import triton.language as tl
 from einops import rearrange
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-
-# ============================================================================
-# Tensor Logging for Precision Analysis
-# Enable with: SGLANG_GDN_DEBUG=1
-# Logs are written to: $SGLANG_GDN_DEBUG_DIR/gdn_tensor_log.jsonl
-# Only rank 0 logs to avoid duplicates in TP mode
-# ============================================================================
-_GDN_DEBUG_ENABLED = os.environ.get("SGLANG_GDN_DEBUG", "0") == "1"
-_GDN_DEBUG_DIR = os.environ.get("SGLANG_GDN_DEBUG_DIR", "/tmp")
-_GDN_DEBUG_LOG_FILE = None
-_GDN_DEBUG_STEP = 0
-
-
-def _is_rank_zero():
-    """Check if current process is rank 0."""
-    try:
-        if torch.distributed.is_initialized():
-            return torch.distributed.get_rank() == 0
-    except:
-        pass
-    return True  # Default to True if distributed not initialized
-
-
-def _init_debug_log():
-    """Initialize debug log file."""
-    global _GDN_DEBUG_LOG_FILE
-    if _GDN_DEBUG_LOG_FILE is None and _GDN_DEBUG_ENABLED and _is_rank_zero():
-        log_path = os.path.join(_GDN_DEBUG_DIR, "gdn_tensor_log.jsonl")
-        _GDN_DEBUG_LOG_FILE = open(log_path, "a")
-        logger.info(f"GDN tensor logging enabled, writing to: {log_path}")
-
-
-def log_tensor(name: str, tensor: torch.Tensor, layer_id: int, phase: str, extra: dict = None):
-    """
-    Log tensor statistics for precision analysis.
-    
-    Args:
-        name: Tensor name (e.g., "query", "key", "output")
-        tensor: The tensor to log
-        layer_id: Layer index
-        phase: Phase name (e.g., "verify_input", "verify_output", "extend_output")
-        extra: Additional metadata
-    """
-    global _GDN_DEBUG_STEP
-    if not _GDN_DEBUG_ENABLED:
-        return
-    
-    # Only log on rank 0 to avoid duplicates in TP mode
-    if not _is_rank_zero():
-        return
-    
-    # Skip during CUDA graph capture (tensors are dummy)
-    if torch.cuda.is_current_stream_capturing():
-        return
-    
-    _init_debug_log()
-    
-    try:
-        t = tensor.float()
-        # Get statistics
-        stats = {
-            "step": _GDN_DEBUG_STEP,
-            "layer_id": layer_id,
-            "phase": phase,
-            "name": name,
-            "shape": list(tensor.shape),
-            "dtype": str(tensor.dtype),
-            "mean": t.mean().item(),
-            "std": t.std().item(),
-            "min": t.min().item(),
-            "max": t.max().item(),
-            "abs_mean": t.abs().mean().item(),
-            # Sample values for detailed comparison
-            "vals": t.flatten()[:16].tolist(),
-        }
-        if extra:
-            stats.update(extra)
-        
-        _GDN_DEBUG_LOG_FILE.write(json.dumps(stats) + "\n")
-        _GDN_DEBUG_LOG_FILE.flush()
-    except Exception as e:
-        logger.warning(f"Failed to log tensor {name}: {e}")
-
-
-def increment_debug_step():
-    """Increment the debug step counter (call once per forward pass)."""
-    global _GDN_DEBUG_STEP
-    if _GDN_DEBUG_ENABLED:
-        _GDN_DEBUG_STEP += 1
 from sglang.srt.layers.attention.fla.chunk import chunk_gated_delta_rule
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.layers.attention.fla.fused_gdn_gating import fused_gdn_gating
@@ -1233,12 +1142,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
         value = value.view(1, actual_seq_len, num_value_heads, head_v_dim)
 
         if is_target_verify:
-            # Log verify kernel inputs
-            log_tensor("query", query, layer_id, "verify_input")
-            log_tensor("key", key, layer_id, "verify_input")
-            log_tensor("value", value, layer_id, "verify_input")
-            log_tensor("ssm_state", ssm_states[cache_indices[:query.shape[1]]], layer_id, "verify_input")
-            
             # Check if K-last GDN verify kernel should be used
             use_k_last_gdn = self.ssm_k_last and retrieve_parent_token is None
             if use_k_last_gdn:
@@ -1274,8 +1177,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 # Reshape output: [B, T, HV, V] -> [1, seq_len, HV, V]
                 core_attn_out = core_attn_out.view(1, seq_len, num_value_heads, head_v_dim)
                 
-                # Log K-last verify kernel output
-                log_tensor("output", core_attn_out, layer_id, "verify_klast_output")
             else:
                 # Use original V-last kernel with pre-computed gates
                 g, beta = fused_gdn_gating(A_log, a, b, dt_bias)
@@ -1297,12 +1198,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     retrieve_parent_token=retrieve_parent_token,
                 )
                 
-                # Log V-last verify kernel output
-                log_tensor("output", core_attn_out, layer_id, "verify_vlast_output")
-            
-            # Increment step counter after verify (for tracking iterations)
-            if layer_id == 0:
-                increment_debug_step()
         else:
             # Prefill/Extend path
             g, beta = fused_gdn_gating(A_log, a, b, dt_bias)
@@ -1338,13 +1233,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     recurrent_state = ssm_states[cache_indices]
                     recurrent_state_indices_args = {}
 
-            # Log extend kernel inputs
-            log_tensor("query", query, layer_id, "extend_input")
-            log_tensor("key", key, layer_id, "extend_input")
-            log_tensor("value", value, layer_id, "extend_input")
-            log_tensor("g", g, layer_id, "extend_input")
-            log_tensor("beta", beta, layer_id, "extend_input")
-            
             core_attn_out, last_recurrent_state, h = chunk_gated_delta_rule(
                 q=query,
                 k=key,
@@ -1358,10 +1246,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 **recurrent_state_indices_args,
             )
             
-            # Log extend kernel output
-            log_tensor("output", core_attn_out, layer_id, "extend_output")
-            log_tensor("final_state", last_recurrent_state if last_recurrent_state is not None else h, layer_id, "extend_output")
-
             if self.ssm_k_last:
                 # V-last -> K-last: transpose kernel output back to pool layout
                 # Note: INPLACE_UPDATE=True in kernel, so recurrent_state is updated in-place

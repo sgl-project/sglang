@@ -667,10 +667,6 @@ def cutedsl_gdn_verify_k_last(
     
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
-    # DEBUG logging disabled for CUDA Graph compatibility
-    # Uncomment below for debugging (will break CUDA Graph capture)
-    # _debug_log_inputs(h0_source, initial_state_source, q, v, initial_state_indices, HV, pool_size)
-
     compiled_kernel = _get_compiled_kernel(
         B, T, H, HV, K_dim, V_dim, pool_size, cache_steps,
         disable_state_update, cache_intermediate_states, use_qk_l2norm_in_kernel
@@ -685,57 +681,4 @@ def cutedsl_gdn_verify_k_last(
         stream
     )
     
-    # DEBUG logging disabled for CUDA Graph compatibility
-    # Uncomment below for debugging (will break CUDA Graph capture)
-    # _debug_log_outputs(o, B, T, H, HV, K_dim, V_dim)
-    
     return o
-
-
-def _debug_log_inputs(h0_source, initial_state_source, q, v, initial_state_indices, HV, pool_size):
-    """Debug logging helper - only call when debugging (breaks CUDA Graph!)"""
-    try:
-        import torch.distributed as dist
-        is_rank0 = not dist.is_initialized() or dist.get_rank() == 0
-    except:
-        is_rank0 = True
-    
-    if is_rank0:
-        import json
-        torch.cuda.synchronize()
-        idx0 = initial_state_indices[0].item() if len(initial_state_indices) > 0 else 0
-        accessed_start = idx0 * HV
-        h0_accessed = h0_source[accessed_start:accessed_start+HV].flatten()[:8].tolist() if accessed_start < h0_source.shape[0] else []
-        orig_vals = initial_state_source[idx0].flatten()[:8].tolist() if idx0 < initial_state_source.shape[0] else []
-        h0_vals = h0_source.flatten()[:8].tolist()
-        q_vals = q.flatten()[:8].tolist()
-        v_vals_dbg = v.flatten()[:8].tolist()
-        open('/lustre/raplab/client/xutingz/workspace/gdn_log/sglang_debug.log', 'a').write(json.dumps({
-            "loc": "cutedsl_gdn_verify_k_last", "name": "kernel_inputs",
-            "h0_shape": list(h0_source.shape), "h0_vals": h0_vals, "h0_dtype": str(h0_source.dtype),
-            "h0_accessed_idx": accessed_start, "h0_accessed_vals": h0_accessed,
-            "orig_shape": list(initial_state_source.shape), "orig_idx": idx0, "orig_vals": orig_vals,
-            "q_shape": list(q.shape), "q_vals": q_vals, "q_dtype": str(q.dtype),
-            "v_shape": list(v.shape), "v_vals": v_vals_dbg, "v_dtype": str(v.dtype),
-            "initial_state_indices": initial_state_indices.tolist()[:4],
-            "HV": HV, "pool_size": pool_size,
-        }) + '\n')
-
-
-def _debug_log_outputs(o, B, T, H, HV, K_dim, V_dim):
-    """Debug logging helper - only call when debugging (breaks CUDA Graph!)"""
-    try:
-        import torch.distributed as dist
-        is_rank0 = not dist.is_initialized() or dist.get_rank() == 0
-    except:
-        is_rank0 = True
-    
-    if is_rank0:
-        import json
-        torch.cuda.synchronize()
-        o_vals = o.flatten()[:8].tolist()
-        open('/lustre/raplab/client/xutingz/workspace/gdn_log/sglang_debug.log', 'a').write(json.dumps({
-            "loc": "cutedsl_gdn_verify_k_last", "name": "kernel_output",
-            "o_shape": list(o.shape), "o_vals": o_vals,
-            "B": B, "T": T, "H": H, "HV": HV, "K": K_dim, "V": V_dim,
-        }) + '\n')
