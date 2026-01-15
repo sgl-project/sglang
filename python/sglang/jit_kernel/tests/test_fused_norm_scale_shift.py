@@ -220,7 +220,7 @@ CASES_3D = [
 CASES_4D = [(2, 12, 4, 1024)]
 
 
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("B,S,D", CASES_3D)
 @pytest.mark.parametrize("norm_type", ["layer", "rms"])
 class TestFusedNorm2D:
@@ -235,16 +235,14 @@ class TestFusedNorm2D:
         run_fused_norm_test(dtype, B, S, D, norm_type, with_affine=False)
 
 
-@pytest.mark.parametrize("dtype", [torch.float32])
-# @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("B,S,F,D", CASES_4D)
-# @pytest.mark.parametrize("norm_type", ["layer", "rms"])
-@pytest.mark.parametrize("norm_type", ["rms"])
+@pytest.mark.parametrize("norm_type", ["layer", "rms"])
 def test_fused_norm_4d(dtype, B, S, F, D, norm_type):
     run_fused_norm_test(dtype, B, S, D, norm_type, scale_shape=(B, F, 1, D))
 
 
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("norm_type", ["layer", "rms"])
 class TestResidualGate:
     @pytest.mark.parametrize("B,S,D", [(2, 5, 1024), (16, 32, 4096), (1, 32760, 1536)])
@@ -285,7 +283,7 @@ class TestResidualGate:
         )
 
 
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("norm_type", ["layer", "rms"])
 @pytest.mark.parametrize(
     "broadcast_dims",
