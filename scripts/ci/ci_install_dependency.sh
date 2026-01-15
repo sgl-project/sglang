@@ -26,6 +26,9 @@ echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-}"
 # Clear torch compilation cache
 python3 -c 'import os, shutil, tempfile, getpass; cache_dir = os.environ.get("TORCHINDUCTOR_CACHE_DIR") or os.path.join(tempfile.gettempdir(), "torchinductor_" + getpass.getuser()); shutil.rmtree(cache_dir, ignore_errors=True)'
 
+# Fix corrupted apt cache if present (common on self-hosted runners)
+rm -f /var/cache/apt/*.bin 2>/dev/null || true
+
 # Install apt packages
 apt install -y git libnuma-dev libssl-dev pkg-config libibverbs-dev libibverbs1 ibverbs-providers ibverbs-utils
 
@@ -133,46 +136,11 @@ if [ "$IS_BLACKWELL" = "1" ]; then
     done
 fi
 
-# Clean up existing installations
-$PIP_UNINSTALL_CMD sgl-kernel sglang $PIP_UNINSTALL_SUFFIX || true
+# Clean up existing installations (skip for Blackwell - dependencies are pre-installed)
 if [ "$IS_BLACKWELL" != "1" ]; then
+    $PIP_UNINSTALL_CMD sgl-kernel sglang $PIP_UNINSTALL_SUFFIX || true
     $PIP_UNINSTALL_CMD flashinfer-python flashinfer-cubin flashinfer-jit-cache $PIP_UNINSTALL_SUFFIX || true
-fi
-$PIP_UNINSTALL_CMD opencv-python opencv-python-headless $PIP_UNINSTALL_SUFFIX || true
-
-# On Blackwell machines, pre-install flashinfer to avoid race condition during main pip install
-# When pip installs sglang, it would try to install flashinfer_cubin and flashinfer_python in parallel,
-# causing a race condition on .lock files. Pre-installing them sequentially avoids this.
-if [ "$IS_BLACKWELL" = "1" ]; then
-    FLASHINFER_CACHE_DIR="${HOME}/.cache/flashinfer-wheels"
-    mkdir -p "${FLASHINFER_CACHE_DIR}"
-
-    INSTALLED_FLASHINFER=$(pip show flashinfer-jit-cache 2>/dev/null | grep "^Version:" | awk '{print $2}' | cut -d'+' -f1 || echo "")
-    if [ "$INSTALLED_FLASHINFER" = "$FLASHINFER_VERSION" ]; then
-        echo "flashinfer-jit-cache==${FLASHINFER_VERSION} already installed on Blackwell, skipping pre-install"
-    else
-        echo "Pre-installing flashinfer-jit-cache on Blackwell to avoid race condition..."
-        FLASHINFER_WHEEL_PATTERN="flashinfer_jit_cache-${FLASHINFER_VERSION}*.whl"
-        CACHED_WHEEL=$(find "${FLASHINFER_CACHE_DIR}" -name "${FLASHINFER_WHEEL_PATTERN}" -type f 2>/dev/null | head -n 1)
-
-        if [ -n "$CACHED_WHEEL" ] && [ -f "$CACHED_WHEEL" ]; then
-            echo "Installing from cached wheel: $CACHED_WHEEL"
-            $PIP_CMD install "$CACHED_WHEEL" $PIP_INSTALL_SUFFIX || true
-        else
-            for i in {1..3}; do
-                if pip download flashinfer-jit-cache==${FLASHINFER_VERSION} \
-                    --index-url https://flashinfer.ai/whl/${CU_VERSION} \
-                    -d "${FLASHINFER_CACHE_DIR}"; then
-                    CACHED_WHEEL=$(find "${FLASHINFER_CACHE_DIR}" -name "${FLASHINFER_WHEEL_PATTERN}" -type f 2>/dev/null | head -n 1)
-                    if [ -n "$CACHED_WHEEL" ] && [ -f "$CACHED_WHEEL" ]; then
-                        $PIP_CMD install "$CACHED_WHEEL" $PIP_INSTALL_SUFFIX && break
-                    fi
-                fi
-                echo "Attempt $i failed, retrying..."
-                sleep 5
-            done
-        fi
-    fi
+    $PIP_UNINSTALL_CMD opencv-python opencv-python-headless $PIP_UNINSTALL_SUFFIX || true
 fi
 
 # Install the main package
@@ -182,10 +150,18 @@ if [ -n "$OPTIONAL_DEPS" ]; then
 fi
 echo "Installing python extras: [${EXTRAS}]"
 
-$PIP_CMD install -e "python[${EXTRAS}]" --extra-index-url https://download.pytorch.org/whl/${CU_VERSION} $PIP_INSTALL_SUFFIX
+if [ "$IS_BLACKWELL" = "1" ]; then
+    # For Blackwell, use --no-deps and --no-build-isolation to avoid race conditions
+    # Dependencies are pre-installed on the machines
+    $PIP_CMD install -e "python" --no-deps --no-build-isolation $PIP_INSTALL_SUFFIX
+else
+    $PIP_CMD install -e "python[${EXTRAS}]" --extra-index-url https://download.pytorch.org/whl/${CU_VERSION} $PIP_INSTALL_SUFFIX
+fi
 
-# Install router for pd-disagg test
-$PIP_CMD install sglang-router $PIP_INSTALL_SUFFIX
+# Install router for pd-disagg test (skip for Blackwell if already installed)
+if [ "$IS_BLACKWELL" != "1" ]; then
+    $PIP_CMD install sglang-router $PIP_INSTALL_SUFFIX
+fi
 
 # Remove flash_attn folder to avoid conflicts
 PYTHON_LIB_PATH=$(python3 -c "import site; print(site.getsitepackages()[0])")
@@ -230,111 +206,77 @@ fi
 # Show current packages
 $PIP_CMD list
 
-# Install other python dependencies
-$PIP_CMD install mooncake-transfer-engine==0.3.8.post1 "${NVRTC_SPEC}" py-spy scipy huggingface_hub[hf_xet] pytest $PIP_INSTALL_SUFFIX
-
+# Install other python dependencies (skip for Blackwell - pre-installed)
 if [ "$IS_BLACKWELL" != "1" ]; then
+    $PIP_CMD install mooncake-transfer-engine==0.3.8.post1 "${NVRTC_SPEC}" py-spy scipy huggingface_hub[hf_xet] pytest $PIP_INSTALL_SUFFIX
+
     # For lmms_evals evaluating MMMU
     git clone --branch v0.5 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
     $PIP_CMD install -e lmms-eval/ $PIP_INSTALL_SUFFIX
-fi
 
-# DeepEP depends on nvshmem 3.4.5
-# On Blackwell machines, skip reinstall if correct version already installed to avoid race conditions
-if [ "$IS_BLACKWELL" = "1" ]; then
-    INSTALLED_NVSHMEM=$(pip show nvidia-nvshmem-cu12 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
-    if [ "$INSTALLED_NVSHMEM" = "3.4.5" ]; then
-        echo "nvidia-nvshmem-cu12==3.4.5 already installed, skipping reinstall"
-    else
-        $PIP_CMD install nvidia-nvshmem-cu12==3.4.5 $PIP_INSTALL_SUFFIX
-    fi
-else
+    # DeepEP depends on nvshmem 3.4.5
     $PIP_CMD install nvidia-nvshmem-cu12==3.4.5 --force-reinstall $PIP_INSTALL_SUFFIX
-fi
 
-# Cudnn with version less than 9.16.0.29 will cause performance regression on Conv3D kernel
-# On Blackwell machines, skip reinstall if correct version already installed to avoid race conditions
-if [ "$IS_BLACKWELL" = "1" ]; then
-    INSTALLED_CUDNN=$(pip show nvidia-cudnn-cu12 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
-    if [ "$INSTALLED_CUDNN" = "9.16.0.29" ]; then
-        echo "nvidia-cudnn-cu12==9.16.0.29 already installed, skipping reinstall"
-    else
-        $PIP_CMD install nvidia-cudnn-cu12==9.16.0.29 $PIP_INSTALL_SUFFIX
-    fi
-else
+    # Cudnn with version less than 9.16.0.29 will cause performance regression on Conv3D kernel
     $PIP_CMD install nvidia-cudnn-cu12==9.16.0.29 --force-reinstall $PIP_INSTALL_SUFFIX
-fi
-$PIP_CMD uninstall xformers || true
 
-# Skip flashinfer installation for Blackwell (pre-installed)
-if [ "$IS_BLACKWELL" = "1" ]; then
-    INSTALLED_FLASHINFER=$(pip show flashinfer-jit-cache 2>/dev/null | grep "^Version:" | awk '{print $2}' | cut -d'+' -f1 || echo "")
-    if [ "$INSTALLED_FLASHINFER" = "$FLASHINFER_VERSION" ]; then
-        echo "flashinfer-jit-cache==${FLASHINFER_VERSION} already installed, skipping"
-        FLASHINFER_INSTALLED=true
-    else
-        echo "Installing flashinfer-jit-cache==${FLASHINFER_VERSION} (current: ${INSTALLED_FLASHINFER:-none})"
-        FLASHINFER_INSTALLED=false
-    fi
-else
+    $PIP_CMD uninstall xformers || true
+fi
+
+# Install flashinfer-jit-cache (skip for Blackwell - pre-installed)
+if [ "$IS_BLACKWELL" != "1" ]; then
+    # Install flashinfer-jit-cache with caching and retry logic (flashinfer.ai can have transient DNS issues)
+    # Cache directory for flashinfer wheels (persists across CI runs on self-hosted runners)
+    FLASHINFER_CACHE_DIR="${HOME}/.cache/flashinfer-wheels"
+    mkdir -p "${FLASHINFER_CACHE_DIR}"
+
+    # Clean up old versions to avoid cache bloat
+    find "${FLASHINFER_CACHE_DIR}" -name "flashinfer_jit_cache-*.whl" ! -name "flashinfer_jit_cache-${FLASHINFER_VERSION}*" -type f -delete 2>/dev/null || true
+
+    FLASHINFER_WHEEL_PATTERN="flashinfer_jit_cache-${FLASHINFER_VERSION}*.whl"
+    CACHED_WHEEL=$(find "${FLASHINFER_CACHE_DIR}" -name "${FLASHINFER_WHEEL_PATTERN}" -type f 2>/dev/null | head -n 1)
     FLASHINFER_INSTALLED=false
-fi
 
-# Install flashinfer-jit-cache with caching and retry logic (flashinfer.ai can have transient DNS issues)
-# Cache directory for flashinfer wheels (persists across CI runs on self-hosted runners)
-FLASHINFER_CACHE_DIR="${HOME}/.cache/flashinfer-wheels"
-mkdir -p "${FLASHINFER_CACHE_DIR}"
-
-# Clean up old versions to avoid cache bloat
-find "${FLASHINFER_CACHE_DIR}" -name "flashinfer_jit_cache-*.whl" ! -name "flashinfer_jit_cache-${FLASHINFER_VERSION}*" -type f -delete 2>/dev/null || true
-
-FLASHINFER_WHEEL_PATTERN="flashinfer_jit_cache-${FLASHINFER_VERSION}*.whl"
-CACHED_WHEEL=$(find "${FLASHINFER_CACHE_DIR}" -name "${FLASHINFER_WHEEL_PATTERN}" -type f 2>/dev/null | head -n 1)
-
-# Only set FLASHINFER_INSTALLED to false if not already set by Blackwell check above
-if [ "$FLASHINFER_INSTALLED" != "true" ]; then
-    FLASHINFER_INSTALLED=false
-fi
-
-# Try to install from cache first
-if [ -n "$CACHED_WHEEL" ] && [ -f "$CACHED_WHEEL" ]; then
-    echo "Found cached flashinfer wheel: $CACHED_WHEEL"
-    if $PIP_CMD install "$CACHED_WHEEL" $PIP_INSTALL_SUFFIX; then
-        FLASHINFER_INSTALLED=true
-        echo "Successfully installed flashinfer-jit-cache from cache"
-    else
-        echo "Failed to install from cache, will try downloading..."
-        rm -f "$CACHED_WHEEL"
-    fi
-fi
-
-# If not installed from cache, download with retry logic
-if [ "$FLASHINFER_INSTALLED" = false ]; then
-    for i in {1..5}; do
-        # Download wheel to cache directory (use pip directly as uv pip doesn't support download)
-        if pip download flashinfer-jit-cache==${FLASHINFER_VERSION} \
-            --index-url https://flashinfer.ai/whl/${CU_VERSION} \
-            -d "${FLASHINFER_CACHE_DIR}"; then
-
-            CACHED_WHEEL=$(find "${FLASHINFER_CACHE_DIR}" -name "${FLASHINFER_WHEEL_PATTERN}" -type f 2>/dev/null | head -n 1)
-            if [ -n "$CACHED_WHEEL" ] && [ -f "$CACHED_WHEEL" ]; then
-                if $PIP_CMD install "$CACHED_WHEEL" $PIP_INSTALL_SUFFIX; then
-                    FLASHINFER_INSTALLED=true
-                    echo "Successfully downloaded and installed flashinfer-jit-cache"
-                    break
-                fi
-            else
-                echo "Warning: Download succeeded but wheel file not found"
-            fi
+    # Try to install from cache first
+    if [ -n "$CACHED_WHEEL" ] && [ -f "$CACHED_WHEEL" ]; then
+        echo "Found cached flashinfer wheel: $CACHED_WHEEL"
+        if $PIP_CMD install "$CACHED_WHEEL" $PIP_INSTALL_SUFFIX; then
+            FLASHINFER_INSTALLED=true
+            echo "Successfully installed flashinfer-jit-cache from cache"
+        else
+            echo "Failed to install from cache, will try downloading..."
+            rm -f "$CACHED_WHEEL"
         fi
-        echo "Attempt $i to download flashinfer-jit-cache failed, retrying in 10 seconds..."
-        sleep 10
-    done
-fi
+    fi
 
-if [ "$FLASHINFER_INSTALLED" = false ]; then
-    echo "ERROR: Failed to install flashinfer-jit-cache after 5 attempts"
-    exit 1
+    # If not installed from cache, download with retry logic
+    if [ "$FLASHINFER_INSTALLED" = false ]; then
+        for i in {1..5}; do
+            # Download wheel to cache directory (use pip directly as uv pip doesn't support download)
+            if pip download flashinfer-jit-cache==${FLASHINFER_VERSION} \
+                --index-url https://flashinfer.ai/whl/${CU_VERSION} \
+                -d "${FLASHINFER_CACHE_DIR}"; then
+
+                CACHED_WHEEL=$(find "${FLASHINFER_CACHE_DIR}" -name "${FLASHINFER_WHEEL_PATTERN}" -type f 2>/dev/null | head -n 1)
+                if [ -n "$CACHED_WHEEL" ] && [ -f "$CACHED_WHEEL" ]; then
+                    if $PIP_CMD install "$CACHED_WHEEL" $PIP_INSTALL_SUFFIX; then
+                        FLASHINFER_INSTALLED=true
+                        echo "Successfully downloaded and installed flashinfer-jit-cache"
+                        break
+                    fi
+                else
+                    echo "Warning: Download succeeded but wheel file not found"
+                fi
+            fi
+            echo "Attempt $i to download flashinfer-jit-cache failed, retrying in 10 seconds..."
+            sleep 10
+        done
+    fi
+
+    if [ "$FLASHINFER_INSTALLED" = false ]; then
+        echo "ERROR: Failed to install flashinfer-jit-cache after 5 attempts"
+        exit 1
+    fi
 fi
 
 # Show current packages
