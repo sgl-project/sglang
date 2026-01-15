@@ -239,7 +239,7 @@ class SGLangFailuresAnalyzer:
     def find_last_running_test(self, logs: str) -> Optional[Dict]:
         """
         Find the last test that was running before logs cut off (for timeout/exit scenarios).
-        Searches from the bottom of logs upward to find the most recent test being executed.
+        Finds the last instance of 'server_args:' and looks for the test file a few lines above it.
 
         Returns:
             Dict with test info if found, or None if no test found.
@@ -250,39 +250,46 @@ class SGLangFailuresAnalyzer:
         ansi_escape = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
         logs = ansi_escape.sub("", logs)
 
-        # Split logs into lines and reverse them (bottom to top)
         lines = logs.split("\n")
-        lines.reverse()
 
-        # Common pytest test execution patterns (looking for most recent test being run)
+        # Patterns to match test files
         # Examples:
-        # - "test/test_example.py::test_function PASSED"
-        # - "test/test_example.py::TestClass::test_method FAILED"
-        # - "test_example.py::test_function"
-        # - "RUNNING test_example.py::test_function"
+        # - "sglang/test/test_example.py::TestClass::test_method[param]"
+        # - "python3 /path/to/test_example.py"
+        # - "Begin (0/0):" then "python3 /path/to/test.py" on next line
         test_patterns = [
-            r"(\S+\.py)::",  # General pattern: something.py::
-            r"RUNNING\s+(\S+\.py)",  # Explicit RUNNING marker
-            r"test[_/](\S+\.py)",  # test/something.py or test_something.py
+            r"(\S+\.py)::",  # pytest format: something.py::
+            r"python3?\s+(\S+\.py)",  # python3 /path/to/test.py
         ]
 
-        for line in lines[:1000]:  # Check last 1000 lines
-            for pattern in test_patterns:
-                match = re.search(pattern, line)
-                if match:
-                    # Extract the test file path
-                    full_path = match.group(1)
-                    test_file = (
-                        full_path.split("/")[-1] if "/" in full_path else full_path
-                    )
+        # Find the last occurrence of server_args: (searching from bottom)
+        server_args_idx = None
+        for i in range(len(lines) - 1, -1, -1):
+            if "server_args:" in lines[i].lower() or "server_args =" in lines[i]:
+                server_args_idx = i
+                break
 
-                    # Make sure it's a valid .py file
-                    if test_file.endswith(".py"):
-                        return {
-                            "test_file": test_file,
-                            "full_path": full_path,
-                            "context": "last_running",  # Mark that this is inferred
-                        }
+        if server_args_idx is not None:
+            # Look at lines above server_args (up to 10 lines)
+            for j in range(1, 11):
+                line_idx = server_args_idx - j
+                if line_idx >= 0:
+                    line = lines[line_idx]
+                    for pattern in test_patterns:
+                        match = re.search(pattern, line)
+                        if match:
+                            full_path = match.group(1)
+                            test_file = (
+                                full_path.split("/")[-1]
+                                if "/" in full_path
+                                else full_path
+                            )
+                            if test_file.endswith(".py"):
+                                return {
+                                    "test_file": test_file,
+                                    "full_path": full_path,
+                                    "context": "last_running",
+                                }
 
         return None
 
