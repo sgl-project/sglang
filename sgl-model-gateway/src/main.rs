@@ -169,6 +169,10 @@ struct CliArgs {
     #[arg(long, default_value_t = 67108864, help_heading = "Routing Policy")]
     max_tree_size: usize,
 
+    /// Interval in seconds for mesh synchronization batches
+    #[arg(long, default_value_t = 1, help_heading = "Routing Policy")]
+    mesh_sync_interval_secs: u64,
+
     /// Maximum idle time in seconds before eviction (for manual policy)
     #[arg(long, default_value_t = 14400, help_heading = "Routing Policy")]
     max_idle_secs: u64,
@@ -724,6 +728,7 @@ impl CliArgs {
                 balance_rel_threshold: self.balance_rel_threshold,
                 eviction_interval_secs: self.eviction_interval,
                 max_tree_size: self.max_tree_size,
+                mesh_sync_interval_secs: self.mesh_sync_interval_secs,
             },
             "power_of_two" => PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 5,

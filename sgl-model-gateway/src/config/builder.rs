@@ -113,6 +113,7 @@ impl RouterConfigBuilder {
         balance_rel_threshold: f32,
         eviction_interval_secs: u64,
         max_tree_size: usize,
+        mesh_sync_interval_secs: u64,
     ) -> Self {
         self.config.policy = PolicyConfig::CacheAware {
             cache_threshold,
@@ -120,7 +121,7 @@ impl RouterConfigBuilder {
             balance_rel_threshold,
             eviction_interval_secs,
             max_tree_size,
-            mesh_sync_interval_secs: 1,
+            mesh_sync_interval_secs,
         };
         self
     }
