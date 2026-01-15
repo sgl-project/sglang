@@ -215,15 +215,20 @@ impl CacheAwarePolicy {
         let mesh_model_id = Self::normalize_mesh_model_id(model_id).to_string();
 
         // Scope the entry acquisition to fix lifetime issues with MutexGuard
-        if let Ok(mut ops) = self
+        let mut ops = match self
             .pending_ops
             .entry(mesh_model_id)
             .or_insert_with(|| Mutex::new(Vec::new()))
             .value()
             .lock()
         {
-            ops.push(operation);
-        }
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                warn!("Mutex for model {} is poisoned. Recovering.", model_id);
+                poisoned.into_inner()
+            }
+        };
+        ops.push(operation);
     }
 
     /// Initialize the tree with worker URLs (used only during initial setup)
