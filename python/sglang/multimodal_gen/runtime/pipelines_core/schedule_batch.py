@@ -150,7 +150,6 @@ class Req:
     condition_siglip_embeds = None
     negative_condition_siglip_embeds = None
 
-
     def __init__(self, **kwargs):
         # Initialize dataclass fields
         for name, field in self.__class__.__dataclass_fields__.items():
