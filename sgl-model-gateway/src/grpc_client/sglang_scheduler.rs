@@ -306,7 +306,6 @@ impl SglangSchedulerClient {
             logprob_start_len: -1,
             top_logprobs_num: body.top_logprobs.unwrap_or(0) as i32,
             return_hidden_states: body.return_hidden_states,
-            return_routed_experts: body.return_routed_experts,
             stream: body.stream,
             ..Default::default()
         };
@@ -337,7 +336,6 @@ impl SglangSchedulerClient {
             top_logprobs_num: body.top_logprobs_num.unwrap_or(0),
             token_ids_logprob: body.token_ids_logprob.clone().unwrap_or_default(),
             return_hidden_states: body.return_hidden_states,
-            return_routed_experts: body.return_routed_experts,
             stream: body.stream,
             log_metrics: body.log_metrics,
             ..Default::default()
@@ -380,7 +378,6 @@ impl SglangSchedulerClient {
             logprob_start_len: -1,
             top_logprobs_num: body.top_logprobs.unwrap_or(0) as i32,
             return_hidden_states: false,
-            return_routed_experts: body.return_routed_experts,
             stream: body.stream.unwrap_or(false),
             ..Default::default()
         };

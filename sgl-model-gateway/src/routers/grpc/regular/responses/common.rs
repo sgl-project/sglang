@@ -466,6 +466,5 @@ pub(super) fn build_next_request(
         top_k: current_request.top_k,
         min_p: current_request.min_p,
         repetition_penalty: current_request.repetition_penalty,
-        return_routed_experts: false,
     }
 }
