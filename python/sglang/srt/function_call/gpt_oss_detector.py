@@ -125,6 +125,9 @@ class GptOssDetector(BaseFormatDetector):
         # Parse with HarmonyParser - it manages all buffer state
         events = self.harmony_parser.parse(new_text)
 
+        if events:
+            logger.debug(f"[DEBUG] GptOssDetector events: {events}")
+
         # Accumulate normal text from events
         calls = []
         normal_text = ""

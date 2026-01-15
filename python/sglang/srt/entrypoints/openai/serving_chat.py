@@ -641,6 +641,9 @@ class OpenAIServingChat(OpenAIServingBase):
                     and request.tools
                     and self.tool_call_parser
                 ):
+                    logger.debug(
+                        f"[DEBUG] Processing tool call stream. parser={self.tool_call_parser}, delta={repr(delta)}"
+                    )
                     async for chunk in self._process_tool_call_stream(
                         index,
                         delta,
@@ -662,6 +665,11 @@ class OpenAIServingChat(OpenAIServingBase):
                             yield remaining_chunk
 
                 else:
+                    if request.tools and not self.tool_call_parser:
+                        logger.warning(
+                            "[DEBUG] Tools provided but tool_call_parser is not set. "
+                            "Tool calls will be treated as normal content."
+                        )
                     # Regular content
                     if delta:
                         choice_data = ChatCompletionResponseStreamChoice(
@@ -1014,11 +1022,17 @@ class OpenAIServingChat(OpenAIServingBase):
         # Use parser since output is not constrained by JSON schema
         parser = FunctionCallParser(tools, self.tool_call_parser)
         if parser.has_tool_call(text):
+            logger.debug(
+                f"[DEBUG] Tool call detected in non-streaming response. Parser: {self.tool_call_parser}"
+            )
             if finish_reason["type"] == "stop":
                 finish_reason["type"] = "tool_calls"
                 finish_reason["matched"] = None
             try:
                 text, call_info_list = parser.parse_non_stream(text)
+                logger.debug(
+                    f"[DEBUG] Parsed tool calls (non-stream): {call_info_list}"
+                )
                 tool_calls = []
                 for call_info in call_info_list:
                     tool_id = self._process_tool_call_id(
@@ -1150,6 +1164,12 @@ class OpenAIServingChat(OpenAIServingBase):
             normal_text, calls = result.normal_text, result.calls
         else:
             normal_text, calls = parser.parse_stream_chunk(delta)
+
+        if calls:
+            logger.debug(f"[DEBUG] Parsed tool calls: {calls}")
+        if normal_text:
+            logger.debug(f"[DEBUG] Parsed normal text: {normal_text}")
+
         logger.debug(
             f"[DEBUG] After parse_stream_chunk: delta_input={repr(delta)}, normal_text={repr(normal_text)}, calls={len(calls)}"
         )
