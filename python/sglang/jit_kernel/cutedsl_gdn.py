@@ -17,8 +17,9 @@ _compiled_kernels: Dict[Tuple, object] = {}
 _cu_seqlens_cache: Dict[Tuple, torch.Tensor] = {}
 TILE_K = 128
 TILE_V = 32
-TILE_V_PADDED = 36  # TILE_V + 4 for bank conflict free (128-bit aligned padding)
+TILE_V_PADDED = 36
 TILE_V_SMALL = 16
+TILE_V_SMALL_PADDED = 20
 NUM_STAGES = 2
 NUM_THREADS = 128
 NUM_BLOCKS_PER_STATE_SMALL = 8
@@ -69,18 +70,22 @@ def _define_kernels():
     cutlass = _cutlass
     cpasync = _cpasync
 
+    # Small batch constants (follow large batch style)
+    NUM_WARPS_SMALL = 4  # 128 threads / 32
+    V_PER_WARP_SMALL = TILE_V_SMALL // NUM_WARPS_SMALL  # 16 / 4 = 4
+    ROWS_PER_ITER_SMALL = 32 // V_PER_WARP_SMALL  # 8
+    NUM_K_ITERS_SMALL = TILE_K // ROWS_PER_ITER_SMALL  # 16
+
     @cute.kernel
     def gdn_kernel_small_batch(
         tiled_copy_load: cute.TiledCopy,
         h0_source: cute.Tensor,
-        smem_layout_staged: cute.ComposedLayout,
+        smem_layout_staged: cute.Layout,
         num_v_tiles: cutlass.Constexpr[int],
-        vec_size: cutlass.Constexpr[int],
-        cu_seqlens: cute.Tensor,
-        q: cute.Tensor,  # (N, 1, H, K)
+        q: cute.Tensor,
         k: cute.Tensor,
         v: cute.Tensor,
-        a: cute.Tensor,  # (N, 1, HV)
+        a: cute.Tensor,
         b: cute.Tensor,
         A_log: cute.Tensor,
         dt_bias: cute.Tensor,
@@ -89,15 +94,9 @@ def _define_kernels():
         softplus_beta: cutlass.Constexpr[float],
         softplus_threshold: cutlass.Constexpr[float],
         scale: cutlass.Constexpr[float],
-        B: cutlass.Constexpr[int],
-        T: cutlass.Constexpr[int],
         H: cutlass.Constexpr[int],
         HV: cutlass.Constexpr[int],
-        K: cutlass.Constexpr[int],
-        V: cutlass.Constexpr[int],
-        use_initial_state: cutlass.Constexpr[bool],
         use_qk_l2norm: cutlass.Constexpr[bool],
-        is_varlen: cutlass.Constexpr[bool],
     ):
         """Small batch kernel for (N, 1, ...) format."""
         tidx, _, _ = cute.arch.thread_idx()
@@ -117,34 +116,24 @@ def _define_kernels():
 
         pool_idx = h0_indices[i_n]
 
-        # Only process valid indices (skip padding slots in CUDA graph replay)
         if pool_idx >= 0:
-            v_per_warp = TILE_V_SMALL // 4
+            k_local = in_warp_tid // V_PER_WARP_SMALL
+            v_local = in_warp_tid % V_PER_WARP_SMALL
+            v_base = warp_idx * V_PER_WARP_SMALL
+            v_idx = v_base + v_local
 
             smem = cutlass.utils.SmemAllocator()
             sData = smem.allocate_tensor(cutlass.Float32, smem_layout_staged, 128)
             smem_o_layout = cute.make_layout((TILE_V_SMALL,), stride=(1,))
             smem_o = smem.allocate_tensor(cutlass.Float32, smem_o_layout, 128)
+            smem_k_layout = cute.make_layout((TILE_K,), stride=(1,))
+            smem_q_layout = cute.make_layout((TILE_K,), stride=(1,))
+            sK = smem.allocate_tensor(cutlass.Float32, smem_k_layout, 128)
+            sQ = smem.allocate_tensor(cutlass.Float32, smem_q_layout, 128)
 
-            r_k = cute.make_rmem_tensor(
-                cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32
-            )
-            r_q = cute.make_rmem_tensor(
-                cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32
-            )
-            r_h = cute.make_rmem_tensor(
-                cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32
-            )
-            r_v_local = cute.make_rmem_tensor(
-                cute.make_layout((v_per_warp,), stride=(1,)), cutlass.Float32
-            )
-
-            for i in range(vec_size):
-                k_idx = i * 32 + in_warp_tid
-                r_k[i] = cutlass.Float32(k[i_n, 0, i_h, k_idx])
-                r_q[i] = cutlass.Float32(q[i_n, 0, i_h, k_idx])
-
-            cute.arch.barrier()
+            if tidx < TILE_K:
+                sK[tidx] = cutlass.Float32(k[i_n, 0, i_h, tidx])
+                sQ[tidx] = cutlass.Float32(q[i_n, 0, i_h, tidx])
 
             gSrc_batch = h0_source[(pool_idx, i_hv, None, None)]
             gSrc = cute.local_tile(gSrc_batch, (TILE_K, TILE_V_SMALL), (0, None))
@@ -188,29 +177,62 @@ def _define_kernels():
             r_g = cute.arch.shuffle_sync(r_g, 0)
             r_beta = cute.arch.shuffle_sync(r_beta, 0)
 
+            cute.arch.barrier()
+
             if use_qk_l2norm:
-                sum_q = 0.0
-                sum_k = 0.0
-                for i in range(vec_size):
-                    sum_q += r_q[i] * r_q[i]
-                    sum_k += r_k[i] * r_k[i]
+                sum_q_partial = 0.0
+                sum_k_partial = 0.0
+                if tidx < TILE_K:
+                    q_val = sQ[tidx]
+                    k_val = sK[tidx]
+                    sum_q_partial = q_val * q_val
+                    sum_k_partial = k_val * k_val
+
                 for offset in [16, 8, 4, 2, 1]:
-                    sum_q += cute.arch.shuffle_sync_bfly(
-                        sum_q, offset=offset, mask=-1, mask_and_clamp=31
+                    sum_q_partial += cute.arch.shuffle_sync_bfly(
+                        sum_q_partial, offset=offset, mask=-1, mask_and_clamp=31
                     )
-                    sum_k += cute.arch.shuffle_sync_bfly(
-                        sum_k, offset=offset, mask=-1, mask_and_clamp=31
+                    sum_k_partial += cute.arch.shuffle_sync_bfly(
+                        sum_k_partial, offset=offset, mask=-1, mask_and_clamp=31
                     )
-                inv_norm_q = cute.rsqrt(sum_q + 1e-6)
-                inv_norm_k = cute.rsqrt(sum_k + 1e-6)
-                for i in range(vec_size):
-                    r_q[i] = r_q[i] * inv_norm_q
-                    r_k[i] = r_k[i] * inv_norm_k
 
-            for i in range(vec_size):
-                r_q[i] = r_q[i] * scale
+                if in_warp_tid == 0:
+                    smem_o[warp_idx] = sum_q_partial
+                    smem_o[warp_idx + 4] = sum_k_partial
+                cute.arch.barrier()
 
-            # Mainloop: process each v_tile
+                inv_norm_q = 0.0
+                inv_norm_k = 0.0
+                if warp_idx == 0:
+                    local_sum_q = 0.0
+                    local_sum_k = 0.0
+                    if in_warp_tid < NUM_WARPS_SMALL:
+                        local_sum_q = smem_o[in_warp_tid]
+                        local_sum_k = smem_o[in_warp_tid + 4]
+                    for offset in [2, 1]:
+                        local_sum_q += cute.arch.shuffle_sync_bfly(
+                            local_sum_q, offset=offset, mask=-1, mask_and_clamp=31
+                        )
+                        local_sum_k += cute.arch.shuffle_sync_bfly(
+                            local_sum_k, offset=offset, mask=-1, mask_and_clamp=31
+                        )
+                    if in_warp_tid == 0:
+                        smem_o[0] = cute.rsqrt(local_sum_q + 1e-6)
+                        smem_o[1] = cute.rsqrt(local_sum_k + 1e-6)
+                cute.arch.barrier()
+
+                inv_norm_q = smem_o[0]
+                inv_norm_k = smem_o[1]
+
+                if tidx < TILE_K:
+                    sK[tidx] = sK[tidx] * inv_norm_k
+                    sQ[tidx] = sQ[tidx] * scale * inv_norm_q
+                cute.arch.barrier()
+            else:
+                if tidx < TILE_K:
+                    sQ[tidx] = sQ[tidx] * scale
+                cute.arch.barrier()
+
             for v_tile_offset in range(num_v_tiles_per_block):
                 v_tile = start_v_tile + v_tile_offset
                 stage = v_tile_offset % NUM_STAGES
@@ -218,7 +240,6 @@ def _define_kernels():
                 cute.arch.cp_async_wait_group(0)
                 cute.arch.barrier()
 
-                # Prefetch next tile
                 next_v_tile_offset = v_tile_offset + prefetch_count
                 if next_v_tile_offset < num_v_tiles_per_block:
                     next_v_tile = start_v_tile + next_v_tile_offset
@@ -230,61 +251,61 @@ def _define_kernels():
                     cute.copy(tiled_copy_load, thr_gSrc, thr_sData)
                     cute.arch.cp_async_commit_group()
 
-                # Load v values
-                v_base = warp_idx * v_per_warp
-                v_loaded = 0.0
-                if in_warp_tid < v_per_warp:
-                    v_global = v_tile * TILE_V_SMALL + v_base + in_warp_tid
-                    v_loaded = cutlass.Float32(v[i_n, 0, i_hv, v_global])
+                v_global = v_tile * TILE_V_SMALL + v_idx
+                r_v = cutlass.Float32(v[i_n, 0, i_hv, v_global])
 
-                for v_off in range(v_per_warp):
-                    r_v_local[v_off] = cute.arch.shuffle_sync(v_loaded, v_off)
+                sum_hk = 0.0
+                for k_iter in cutlass.range_dynamic(NUM_K_ITERS_SMALL, unroll=16):
+                    k_base = k_iter * ROWS_PER_ITER_SMALL
+                    k_idx = k_base + k_local
+                    h_val = sData[(k_idx, v_idx, stage)] * r_g
+                    r_k_val = sK[k_idx]
+                    sum_hk += h_val * r_k_val
 
-                # Compute for each V in this warp's range
-                for v_off in range(v_per_warp):
-                    v_local = v_base + v_off
-                    sum_hk = 0.0
-                    for i in range(vec_size):
-                        k_idx = i * 32 + in_warp_tid
-                        h_val = sData[(k_idx, v_local, stage)] * r_g
-                        r_h[i] = h_val
-                        sum_hk += h_val * r_k[i]
+                for offset in [4, 2, 1]:
+                    sum_hk += cute.arch.shuffle_sync_bfly(
+                        sum_hk,
+                        offset=offset * V_PER_WARP_SMALL,
+                        mask=-1,
+                        mask_and_clamp=31,
+                    )
 
-                    for offset in [16, 8, 4, 2, 1]:
-                        sum_hk += cute.arch.shuffle_sync_bfly(
-                            sum_hk, offset=offset, mask=-1, mask_and_clamp=31
-                        )
+                v_new = (r_v - sum_hk) * r_beta
+                v_new = cute.arch.shuffle_sync(v_new, v_local)
 
-                    v_new = (r_v_local[v_off] - sum_hk) * r_beta
-                    sum_hq = 0.0
-                    for i in range(vec_size):
-                        k_idx = i * 32 + in_warp_tid
-                        h_new = r_h[i] + r_k[i] * v_new
-                        sData[(k_idx, v_local, stage)] = h_new
-                        sum_hq += h_new * r_q[i]
+                sum_hq = 0.0
+                for k_iter in cutlass.range_dynamic(NUM_K_ITERS_SMALL, unroll=16):
+                    k_base = k_iter * ROWS_PER_ITER_SMALL
+                    k_idx = k_base + k_local
+                    h_old = sData[(k_idx, v_idx, stage)] * r_g
+                    r_k_val = sK[k_idx]
+                    r_q_val = sQ[k_idx]
+                    h_new = h_old + r_k_val * v_new
+                    sData[(k_idx, v_idx, stage)] = h_new
+                    sum_hq += h_new * r_q_val
 
-                    for offset in [16, 8, 4, 2, 1]:
-                        sum_hq += cute.arch.shuffle_sync_bfly(
-                            sum_hq, offset=offset, mask=-1, mask_and_clamp=31
-                        )
+                for offset in [4, 2, 1]:
+                    sum_hq += cute.arch.shuffle_sync_bfly(
+                        sum_hq,
+                        offset=offset * V_PER_WARP_SMALL,
+                        mask=-1,
+                        mask_and_clamp=31,
+                    )
 
-                    if in_warp_tid == 0:
-                        smem_o[v_local] = sum_hq
+                if k_local == 0:
+                    v_global_out = v_tile * TILE_V_SMALL + v_idx
+                    o[(i_n, 0, i_hv, v_global_out)] = cutlass.BFloat16(sum_hq)
 
                 cute.arch.barrier()
 
-                # Write output
-                if tidx < TILE_V_SMALL:
-                    v_global = v_tile * TILE_V_SMALL + tidx
-                    o[(i_n, 0, i_hv, v_global)] = cutlass.BFloat16(smem_o[tidx])
-
-                # Write h back from CURRENT stage
-                for k_chunk in range(TILE_K // 8):
-                    k_idx = k_chunk * 8 + warp_idx * 2 + in_warp_tid // 16
-                    v_idx = in_warp_tid % 16
-                    h_val = sData[(k_idx, v_idx, stage)]
-                    v_global_wb = v_tile * TILE_V_SMALL + v_idx
-                    h0_source[(pool_idx, i_hv, k_idx, v_global_wb)] = h_val
+                for k_iter in range(NUM_K_ITERS_SMALL):
+                    flat_idx = tidx + k_iter * 128
+                    k_write = flat_idx // TILE_V_SMALL
+                    v_write = flat_idx % TILE_V_SMALL
+                    if k_write < TILE_K:
+                        h_val = sData[(k_write, v_write, stage)]
+                        v_global_write = v_tile * TILE_V_SMALL + v_write
+                        h0_source[(pool_idx, i_hv, k_write, v_global_write)] = h_val
 
                 cute.arch.barrier()
 
@@ -292,31 +313,23 @@ def _define_kernels():
     def gdn_kernel_small_batch_varlen(
         tiled_copy_load: cute.TiledCopy,
         h0_source: cute.Tensor,
-        smem_layout_staged: cute.ComposedLayout,
+        smem_layout_staged: cute.Layout,
         num_v_tiles: cutlass.Constexpr[int],
-        vec_size: cutlass.Constexpr[int],
-        cu_seqlens: cute.Tensor,
-        q: cute.Tensor,  # (1, N, H, K)
+        q: cute.Tensor,
         k: cute.Tensor,
         v: cute.Tensor,
-        a: cute.Tensor,  # (N, HV) 2D
+        a: cute.Tensor,
         b: cute.Tensor,
         A_log: cute.Tensor,
         dt_bias: cute.Tensor,
-        o: cute.Tensor,  # (1, N, HV, V)
+        o: cute.Tensor,
         h0_indices: cute.Tensor,
         softplus_beta: cutlass.Constexpr[float],
         softplus_threshold: cutlass.Constexpr[float],
         scale: cutlass.Constexpr[float],
-        B: cutlass.Constexpr[int],
-        T: cutlass.Constexpr[int],
         H: cutlass.Constexpr[int],
         HV: cutlass.Constexpr[int],
-        K: cutlass.Constexpr[int],
-        V: cutlass.Constexpr[int],
-        use_initial_state: cutlass.Constexpr[bool],
         use_qk_l2norm: cutlass.Constexpr[bool],
-        is_varlen: cutlass.Constexpr[bool],
     ):
         """Small batch kernel for varlen decode (1, N, ...) format."""
         tidx, _, _ = cute.arch.thread_idx()
@@ -338,33 +351,29 @@ def _define_kernels():
 
         # Only process valid indices (skip padding slots in CUDA graph replay)
         if pool_idx >= 0:
-            v_per_warp = TILE_V_SMALL // 4
+            # Thread mapping (follow large batch style)
+            k_local = in_warp_tid // V_PER_WARP_SMALL  # 0-7
+            v_local = in_warp_tid % V_PER_WARP_SMALL  # 0-3
+            v_base = warp_idx * V_PER_WARP_SMALL
+            v_idx = v_base + v_local  # 0-15
 
             smem = cutlass.utils.SmemAllocator()
             sData = smem.allocate_tensor(cutlass.Float32, smem_layout_staged, 128)
+            # smem_o for l2norm cross-warp reduction (need 4 + 4 = 8 slots)
             smem_o_layout = cute.make_layout((TILE_V_SMALL,), stride=(1,))
             smem_o = smem.allocate_tensor(cutlass.Float32, smem_o_layout, 128)
+            # sK and sQ in shared memory (follow large batch)
+            smem_k_layout = cute.make_layout((TILE_K,), stride=(1,))
+            smem_q_layout = cute.make_layout((TILE_K,), stride=(1,))
+            sK = smem.allocate_tensor(cutlass.Float32, smem_k_layout, 128)
+            sQ = smem.allocate_tensor(cutlass.Float32, smem_q_layout, 128)
 
-            r_k = cute.make_rmem_tensor(
-                cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32
-            )
-            r_q = cute.make_rmem_tensor(
-                cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32
-            )
-            r_h = cute.make_rmem_tensor(
-                cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32
-            )
-            r_v_local = cute.make_rmem_tensor(
-                cute.make_layout((v_per_warp,), stride=(1,)), cutlass.Float32
-            )
+            # Load q/k to shared memory (follow large batch)
+            if tidx < TILE_K:
+                sK[tidx] = cutlass.Float32(k[0, i_n, i_h, tidx])
+                sQ[tidx] = cutlass.Float32(q[0, i_n, i_h, tidx])
 
-            for i in range(vec_size):
-                k_idx = i * 32 + in_warp_tid
-                r_k[i] = cutlass.Float32(k[0, i_n, i_h, k_idx])
-                r_q[i] = cutlass.Float32(q[0, i_n, i_h, k_idx])
-
-            cute.arch.barrier()
-
+            # Setup h0 prefetch
             gSrc_batch = h0_source[(pool_idx, i_hv, None, None)]
             gSrc = cute.local_tile(gSrc_batch, (TILE_K, TILE_V_SMALL), (0, None))
             thr_copy_load = tiled_copy_load.get_slice(tidx)
@@ -382,7 +391,6 @@ def _define_kernels():
 
             r_A_log = cutlass.Float32(A_log[i_hv])
             r_dt_bias = cutlass.Float32(dt_bias[i_hv])
-            # a/b are 2D (N, HV) for varlen decode
             r_a = cutlass.Float32(a[i_n, i_hv])
             r_b = cutlass.Float32(b[i_n, i_hv])
 
@@ -408,29 +416,62 @@ def _define_kernels():
             r_g = cute.arch.shuffle_sync(r_g, 0)
             r_beta = cute.arch.shuffle_sync(r_beta, 0)
 
+            cute.arch.barrier()
+
             if use_qk_l2norm:
-                sum_q = 0.0
-                sum_k = 0.0
-                for i in range(vec_size):
-                    sum_q += r_q[i] * r_q[i]
-                    sum_k += r_k[i] * r_k[i]
+                sum_q_partial = 0.0
+                sum_k_partial = 0.0
+                if tidx < TILE_K:
+                    q_val = sQ[tidx]
+                    k_val = sK[tidx]
+                    sum_q_partial = q_val * q_val
+                    sum_k_partial = k_val * k_val
+
                 for offset in [16, 8, 4, 2, 1]:
-                    sum_q += cute.arch.shuffle_sync_bfly(
-                        sum_q, offset=offset, mask=-1, mask_and_clamp=31
+                    sum_q_partial += cute.arch.shuffle_sync_bfly(
+                        sum_q_partial, offset=offset, mask=-1, mask_and_clamp=31
                     )
-                    sum_k += cute.arch.shuffle_sync_bfly(
-                        sum_k, offset=offset, mask=-1, mask_and_clamp=31
+                    sum_k_partial += cute.arch.shuffle_sync_bfly(
+                        sum_k_partial, offset=offset, mask=-1, mask_and_clamp=31
                     )
-                inv_norm_q = cute.rsqrt(sum_q + 1e-6)
-                inv_norm_k = cute.rsqrt(sum_k + 1e-6)
-                for i in range(vec_size):
-                    r_q[i] = r_q[i] * inv_norm_q
-                    r_k[i] = r_k[i] * inv_norm_k
 
-            for i in range(vec_size):
-                r_q[i] = r_q[i] * scale
+                if in_warp_tid == 0:
+                    smem_o[warp_idx] = sum_q_partial
+                    smem_o[warp_idx + 4] = sum_k_partial
+                cute.arch.barrier()
 
-            # Mainloop: process each v_tile
+                inv_norm_q = 0.0
+                inv_norm_k = 0.0
+                if warp_idx == 0:
+                    local_sum_q = 0.0
+                    local_sum_k = 0.0
+                    if in_warp_tid < NUM_WARPS_SMALL:
+                        local_sum_q = smem_o[in_warp_tid]
+                        local_sum_k = smem_o[in_warp_tid + 4]
+                    for offset in [2, 1]:
+                        local_sum_q += cute.arch.shuffle_sync_bfly(
+                            local_sum_q, offset=offset, mask=-1, mask_and_clamp=31
+                        )
+                        local_sum_k += cute.arch.shuffle_sync_bfly(
+                            local_sum_k, offset=offset, mask=-1, mask_and_clamp=31
+                        )
+                    if in_warp_tid == 0:
+                        smem_o[0] = cute.rsqrt(local_sum_q + 1e-6)
+                        smem_o[1] = cute.rsqrt(local_sum_k + 1e-6)
+                cute.arch.barrier()
+
+                inv_norm_q = smem_o[0]
+                inv_norm_k = smem_o[1]
+
+                if tidx < TILE_K:
+                    sK[tidx] = sK[tidx] * inv_norm_k
+                    sQ[tidx] = sQ[tidx] * scale * inv_norm_q
+                cute.arch.barrier()
+            else:
+                if tidx < TILE_K:
+                    sQ[tidx] = sQ[tidx] * scale
+                cute.arch.barrier()
+
             for v_tile_offset in range(num_v_tiles_per_block):
                 v_tile = start_v_tile + v_tile_offset
                 stage = v_tile_offset % NUM_STAGES
@@ -438,7 +479,6 @@ def _define_kernels():
                 cute.arch.cp_async_wait_group(0)
                 cute.arch.barrier()
 
-                # Prefetch next tile
                 next_v_tile_offset = v_tile_offset + prefetch_count
                 if next_v_tile_offset < num_v_tiles_per_block:
                     next_v_tile = start_v_tile + next_v_tile_offset
@@ -450,61 +490,61 @@ def _define_kernels():
                     cute.copy(tiled_copy_load, thr_gSrc, thr_sData)
                     cute.arch.cp_async_commit_group()
 
-                # Load v values
-                v_base = warp_idx * v_per_warp
-                v_loaded = 0.0
-                if in_warp_tid < v_per_warp:
-                    v_global = v_tile * TILE_V_SMALL + v_base + in_warp_tid
-                    v_loaded = cutlass.Float32(v[0, i_n, i_hv, v_global])
+                v_global = v_tile * TILE_V_SMALL + v_idx
+                r_v = cutlass.Float32(v[0, i_n, i_hv, v_global])
 
-                for v_off in range(v_per_warp):
-                    r_v_local[v_off] = cute.arch.shuffle_sync(v_loaded, v_off)
+                sum_hk = 0.0
+                for k_iter in cutlass.range_dynamic(NUM_K_ITERS_SMALL, unroll=16):
+                    k_base = k_iter * ROWS_PER_ITER_SMALL
+                    k_idx = k_base + k_local
+                    h_val = sData[(k_idx, v_idx, stage)] * r_g
+                    r_k_val = sK[k_idx]
+                    sum_hk += h_val * r_k_val
 
-                # Compute for each V in this warp's range
-                for v_off in range(v_per_warp):
-                    v_local = v_base + v_off
-                    sum_hk = 0.0
-                    for i in range(vec_size):
-                        k_idx = i * 32 + in_warp_tid
-                        h_val = sData[(k_idx, v_local, stage)] * r_g
-                        r_h[i] = h_val
-                        sum_hk += h_val * r_k[i]
+                for offset in [4, 2, 1]:
+                    sum_hk += cute.arch.shuffle_sync_bfly(
+                        sum_hk,
+                        offset=offset * V_PER_WARP_SMALL,
+                        mask=-1,
+                        mask_and_clamp=31,
+                    )
 
-                    for offset in [16, 8, 4, 2, 1]:
-                        sum_hk += cute.arch.shuffle_sync_bfly(
-                            sum_hk, offset=offset, mask=-1, mask_and_clamp=31
-                        )
+                v_new = (r_v - sum_hk) * r_beta
+                v_new = cute.arch.shuffle_sync(v_new, v_local)
 
-                    v_new = (r_v_local[v_off] - sum_hk) * r_beta
-                    sum_hq = 0.0
-                    for i in range(vec_size):
-                        k_idx = i * 32 + in_warp_tid
-                        h_new = r_h[i] + r_k[i] * v_new
-                        sData[(k_idx, v_local, stage)] = h_new
-                        sum_hq += h_new * r_q[i]
+                sum_hq = 0.0
+                for k_iter in cutlass.range_dynamic(NUM_K_ITERS_SMALL, unroll=16):
+                    k_base = k_iter * ROWS_PER_ITER_SMALL
+                    k_idx = k_base + k_local
+                    h_old = sData[(k_idx, v_idx, stage)] * r_g
+                    r_k_val = sK[k_idx]
+                    r_q_val = sQ[k_idx]
+                    h_new = h_old + r_k_val * v_new
+                    sData[(k_idx, v_idx, stage)] = h_new
+                    sum_hq += h_new * r_q_val
 
-                    for offset in [16, 8, 4, 2, 1]:
-                        sum_hq += cute.arch.shuffle_sync_bfly(
-                            sum_hq, offset=offset, mask=-1, mask_and_clamp=31
-                        )
+                for offset in [4, 2, 1]:
+                    sum_hq += cute.arch.shuffle_sync_bfly(
+                        sum_hq,
+                        offset=offset * V_PER_WARP_SMALL,
+                        mask=-1,
+                        mask_and_clamp=31,
+                    )
 
-                    if in_warp_tid == 0:
-                        smem_o[v_local] = sum_hq
+                if k_local == 0:
+                    v_global_out = v_tile * TILE_V_SMALL + v_idx
+                    o[(0, i_n, i_hv, v_global_out)] = cutlass.BFloat16(sum_hq)
 
                 cute.arch.barrier()
 
-                # Write output
-                if tidx < TILE_V_SMALL:
-                    v_global = v_tile * TILE_V_SMALL + tidx
-                    o[(0, i_n, i_hv, v_global)] = cutlass.BFloat16(smem_o[tidx])
-
-                # Write h back from CURRENT stage
-                for k_chunk in range(TILE_K // 8):
-                    k_idx = k_chunk * 8 + warp_idx * 2 + in_warp_tid // 16
-                    v_idx = in_warp_tid % 16
-                    h_val = sData[(k_idx, v_idx, stage)]
-                    v_global_wb = v_tile * TILE_V_SMALL + v_idx
-                    h0_source[(pool_idx, i_hv, k_idx, v_global_wb)] = h_val
+                for k_iter in range(NUM_K_ITERS_SMALL):
+                    flat_idx = tidx + k_iter * 128
+                    k_write = flat_idx // TILE_V_SMALL
+                    v_write = flat_idx % TILE_V_SMALL
+                    if k_write < TILE_K:
+                        h_val = sData[(k_write, v_write, stage)]
+                        v_global_write = v_tile * TILE_V_SMALL + v_write
+                        h0_source[(pool_idx, i_hv, k_write, v_global_write)] = h_val
 
                 cute.arch.barrier()
 
@@ -514,11 +554,10 @@ def _define_kernels():
         h0_source: cute.Tensor,
         smem_layout_staged: cute.Layout,
         num_v_tiles: cutlass.Constexpr[int],
-        cu_seqlens: cute.Tensor,
-        q: cute.Tensor,  # (N, 1, H, K)
+        q: cute.Tensor,
         k: cute.Tensor,
         v: cute.Tensor,
-        a: cute.Tensor,  # (N, 1, HV)
+        a: cute.Tensor,
         b: cute.Tensor,
         A_log: cute.Tensor,
         dt_bias: cute.Tensor,
@@ -527,15 +566,9 @@ def _define_kernels():
         softplus_beta: cutlass.Constexpr[float],
         softplus_threshold: cutlass.Constexpr[float],
         scale: cutlass.Constexpr[float],
-        B: cutlass.Constexpr[int],
-        T: cutlass.Constexpr[int],
         H: cutlass.Constexpr[int],
         HV: cutlass.Constexpr[int],
-        K: cutlass.Constexpr[int],
-        V: cutlass.Constexpr[int],
-        use_initial_state: cutlass.Constexpr[bool],
         use_qk_l2norm: cutlass.Constexpr[bool],
-        is_varlen: cutlass.Constexpr[bool],
     ):
         """Large batch kernel for (N, 1, ...) format."""
         tidx, _, _ = cute.arch.thread_idx()
@@ -549,7 +582,6 @@ def _define_kernels():
 
         pool_idx = h0_indices[i_n]
 
-        # Only process valid indices (skip padding slots in CUDA graph replay)
         if pool_idx >= 0:
             k_local = in_warp_tid // V_PER_WARP
             v_local = in_warp_tid % V_PER_WARP
@@ -568,8 +600,6 @@ def _define_kernels():
             if tidx < TILE_K:
                 sK[tidx] = cutlass.Float32(k[i_n, 0, i_h, tidx])
                 sQ[tidx] = cutlass.Float32(q[i_n, 0, i_h, tidx])
-
-            cute.arch.barrier()
 
             gSrc_batch = h0_source[(pool_idx, i_hv, None, None)]
             gSrc = cute.local_tile(gSrc_batch, (TILE_K, TILE_V), (0, None))
@@ -612,6 +642,9 @@ def _define_kernels():
             r_g = cute.arch.shuffle_sync(r_g, 0)
             r_beta = cute.arch.shuffle_sync(r_beta, 0)
 
+            # barrier for q/k shared memory (moved from after q/k load to overlap with prefetch + gate)
+            cute.arch.barrier()
+
             if use_qk_l2norm:
                 sum_q_partial = 0.0
                 sum_k_partial = 0.0
@@ -666,14 +699,12 @@ def _define_kernels():
                     sQ[tidx] = sQ[tidx] * scale
                 cute.arch.barrier()
 
-            # Mainloop: process each v_tile
             for v_tile in range(num_v_tiles):
                 stage = v_tile % NUM_STAGES
 
                 cute.arch.cp_async_wait_group(0)
                 cute.arch.barrier()
 
-                # Prefetch next tile
                 next_v_tile = v_tile + prefetch_count
                 if next_v_tile < num_v_tiles:
                     next_stage = next_v_tile % NUM_STAGES
@@ -684,13 +715,11 @@ def _define_kernels():
                     cute.copy(tiled_copy_load, thr_gSrc, thr_sData)
                     cute.arch.cp_async_commit_group()
 
-                # Load v value for this thread's V position
                 v_global = v_tile * TILE_V + v_idx
                 r_v = cutlass.Float32(v[i_n, 0, i_hv, v_global])
 
-                # Phase 1: Compute sum_hk
                 sum_hk = 0.0
-                for k_iter in range(NUM_K_ITERS):
+                for k_iter in cutlass.range_dynamic(NUM_K_ITERS, unroll=8):
                     k_base = k_iter * ROWS_PER_ITER
                     k_idx = k_base + k_local
                     h_val = sData[(k_idx, v_idx, stage)] * r_g
@@ -705,9 +734,8 @@ def _define_kernels():
                 v_new = (r_v - sum_hk) * r_beta
                 v_new = cute.arch.shuffle_sync(v_new, v_local)
 
-                # Phase 2: Update h and compute sum_hq
                 sum_hq = 0.0
-                for k_iter in range(NUM_K_ITERS):
+                for k_iter in cutlass.range_dynamic(NUM_K_ITERS, unroll=8):
                     k_base = k_iter * ROWS_PER_ITER
                     k_idx = k_base + k_local
                     h_old = sData[(k_idx, v_idx, stage)] * r_g
@@ -722,16 +750,14 @@ def _define_kernels():
                         sum_hq, offset=offset * V_PER_WARP, mask=-1, mask_and_clamp=31
                     )
 
-                # Direct register → global write (skip smem_o)
                 if k_local == 0:
                     v_global_out = v_tile * TILE_V + v_idx
                     o[(i_n, 0, i_hv, v_global_out)] = cutlass.BFloat16(sum_hq)
 
                 cute.arch.barrier()
 
-                # Write h back to GMEM (each thread writes 16 elements)
-                for elem in range(16):
-                    flat_idx = tidx + elem * 256
+                for k_iter in range(NUM_K_ITERS):
+                    flat_idx = tidx + k_iter * 256
                     k_write = flat_idx // TILE_V
                     v_write = flat_idx % TILE_V
                     if k_write < TILE_K:
@@ -747,28 +773,21 @@ def _define_kernels():
         h0_source: cute.Tensor,
         smem_layout_staged: cute.Layout,
         num_v_tiles: cutlass.Constexpr[int],
-        cu_seqlens: cute.Tensor,
-        q: cute.Tensor,  # (1, N, H, K)
+        q: cute.Tensor,
         k: cute.Tensor,
         v: cute.Tensor,
-        a: cute.Tensor,  # (N, HV) 2D
+        a: cute.Tensor,
         b: cute.Tensor,
         A_log: cute.Tensor,
         dt_bias: cute.Tensor,
-        o: cute.Tensor,  # (1, N, HV, V)
+        o: cute.Tensor,
         h0_indices: cute.Tensor,
         softplus_beta: cutlass.Constexpr[float],
         softplus_threshold: cutlass.Constexpr[float],
         scale: cutlass.Constexpr[float],
-        B: cutlass.Constexpr[int],
-        T: cutlass.Constexpr[int],
         H: cutlass.Constexpr[int],
         HV: cutlass.Constexpr[int],
-        K: cutlass.Constexpr[int],
-        V: cutlass.Constexpr[int],
-        use_initial_state: cutlass.Constexpr[bool],
         use_qk_l2norm: cutlass.Constexpr[bool],
-        is_varlen: cutlass.Constexpr[bool],
     ):
         """Large batch kernel for varlen decode (1, N, ...) format."""
         tidx, _, _ = cute.arch.thread_idx()
@@ -782,7 +801,6 @@ def _define_kernels():
 
         pool_idx = h0_indices[i_n]
 
-        # Only process valid indices (skip padding slots in CUDA graph replay)
         if pool_idx >= 0:
             k_local = in_warp_tid // V_PER_WARP
             v_local = in_warp_tid % V_PER_WARP
@@ -802,8 +820,6 @@ def _define_kernels():
                 sK[tidx] = cutlass.Float32(k[0, i_n, i_h, tidx])
                 sQ[tidx] = cutlass.Float32(q[0, i_n, i_h, tidx])
 
-            cute.arch.barrier()
-
             gSrc_batch = h0_source[(pool_idx, i_hv, None, None)]
             gSrc = cute.local_tile(gSrc_batch, (TILE_K, TILE_V), (0, None))
             thr_copy_load = tiled_copy_load.get_slice(tidx)
@@ -820,7 +836,6 @@ def _define_kernels():
 
             r_A_log = cutlass.Float32(A_log[i_hv])
             r_dt_bias = cutlass.Float32(dt_bias[i_hv])
-            # a/b are 2D (N, HV) for varlen decode
             r_a = cutlass.Float32(a[i_n, i_hv])
             r_b = cutlass.Float32(b[i_n, i_hv])
 
@@ -846,6 +861,9 @@ def _define_kernels():
             r_g = cute.arch.shuffle_sync(r_g, 0)
             r_beta = cute.arch.shuffle_sync(r_beta, 0)
 
+            # barrier for q/k shared memory (moved from after q/k load to overlap with prefetch + gate)
+            cute.arch.barrier()
+
             if use_qk_l2norm:
                 sum_q_partial = 0.0
                 sum_k_partial = 0.0
@@ -900,14 +918,12 @@ def _define_kernels():
                     sQ[tidx] = sQ[tidx] * scale
                 cute.arch.barrier()
 
-            # Mainloop: process each v_tile
             for v_tile in range(num_v_tiles):
                 stage = v_tile % NUM_STAGES
 
                 cute.arch.cp_async_wait_group(0)
                 cute.arch.barrier()
 
-                # Prefetch next tile
                 next_v_tile = v_tile + prefetch_count
                 if next_v_tile < num_v_tiles:
                     next_stage = next_v_tile % NUM_STAGES
@@ -918,13 +934,11 @@ def _define_kernels():
                     cute.copy(tiled_copy_load, thr_gSrc, thr_sData)
                     cute.arch.cp_async_commit_group()
 
-                # Load v value for this thread's V position
                 v_global = v_tile * TILE_V + v_idx
                 r_v = cutlass.Float32(v[0, i_n, i_hv, v_global])
 
-                # Phase 1: Compute sum_hk
                 sum_hk = 0.0
-                for k_iter in range(NUM_K_ITERS):
+                for k_iter in cutlass.range_dynamic(NUM_K_ITERS, unroll=8):
                     k_base = k_iter * ROWS_PER_ITER
                     k_idx = k_base + k_local
                     h_val = sData[(k_idx, v_idx, stage)] * r_g
@@ -939,9 +953,8 @@ def _define_kernels():
                 v_new = (r_v - sum_hk) * r_beta
                 v_new = cute.arch.shuffle_sync(v_new, v_local)
 
-                # Phase 2: Update h and compute sum_hq
                 sum_hq = 0.0
-                for k_iter in range(NUM_K_ITERS):
+                for k_iter in cutlass.range_dynamic(NUM_K_ITERS, unroll=8):
                     k_base = k_iter * ROWS_PER_ITER
                     k_idx = k_base + k_local
                     h_old = sData[(k_idx, v_idx, stage)] * r_g
@@ -956,16 +969,14 @@ def _define_kernels():
                         sum_hq, offset=offset * V_PER_WARP, mask=-1, mask_and_clamp=31
                     )
 
-                # Direct register → global write (skip smem_o)
                 if k_local == 0:
                     v_global_out = v_tile * TILE_V + v_idx
                     o[(0, i_n, i_hv, v_global_out)] = cutlass.BFloat16(sum_hq)
 
                 cute.arch.barrier()
 
-                # Write h back to GMEM (each thread writes 16 elements)
-                for elem in range(16):
-                    flat_idx = tidx + elem * 256
+                for k_iter in range(NUM_K_ITERS):
+                    flat_idx = tidx + k_iter * 256
                     k_write = flat_idx // TILE_V
                     v_write = flat_idx % TILE_V
                     if k_write < TILE_K:
@@ -1028,14 +1039,9 @@ def _create_jit_functions():
             num_bits_per_copy=128,
         )
         num_v_tiles_small = cute.ceil_div(v_dim, TILE_V_SMALL)
-        vec_size = TILE_K // 32
-        base_smem_layout_small = cute.make_layout(
+        smem_layout_small = cute.make_layout(
             (TILE_K, TILE_V_SMALL, NUM_STAGES),
-            stride=(TILE_V_SMALL, 1, TILE_K * TILE_V_SMALL),
-        )
-        swizzle_small = cute.make_swizzle(2, 2, 4)
-        smem_layout_small = cute.make_composed_layout(
-            swizzle_small, 0, base_smem_layout_small
+            stride=(TILE_V_SMALL_PADDED, 1, TILE_K * TILE_V_SMALL_PADDED),
         )
         thread_layout_small = cute.make_layout((32, 4), stride=(4, 1))
         val_layout_small = cute.make_layout((1, 4))
@@ -1043,7 +1049,10 @@ def _create_jit_functions():
             copy_atom, thread_layout_small, val_layout_small
         )
         smem_bytes_small = (
-            4 * TILE_K * TILE_V_SMALL * NUM_STAGES + 4 * TILE_V_SMALL + 32
+            4 * TILE_K * TILE_V_SMALL_PADDED * NUM_STAGES
+            + 4 * TILE_V_SMALL
+            + 4 * TILE_K * 2
+            + 64
         )
 
         gdn_small(
@@ -1051,8 +1060,6 @@ def _create_jit_functions():
             h0_source,
             smem_layout_small,
             num_v_tiles_small,
-            vec_size,
-            cu_seqlens,
             q,
             k,
             v,
@@ -1065,15 +1072,9 @@ def _create_jit_functions():
             softplus_beta,
             softplus_threshold,
             scale,
-            B,
-            T,
             H,
             HV,
-            K,
-            V,
-            use_initial_state,
             use_qk_l2norm,
-            False,
         ).launch(
             grid=(batch_size * NUM_BLOCKS_PER_STATE_SMALL, 1, 1),
             block=[NUM_THREADS, 1, 1],
@@ -1117,14 +1118,9 @@ def _create_jit_functions():
             num_bits_per_copy=128,
         )
         num_v_tiles_small = cute.ceil_div(v_dim, TILE_V_SMALL)
-        vec_size = TILE_K // 32
-        base_smem_layout_small = cute.make_layout(
+        smem_layout_small = cute.make_layout(
             (TILE_K, TILE_V_SMALL, NUM_STAGES),
-            stride=(TILE_V_SMALL, 1, TILE_K * TILE_V_SMALL),
-        )
-        swizzle_small = cute.make_swizzle(2, 2, 4)
-        smem_layout_small = cute.make_composed_layout(
-            swizzle_small, 0, base_smem_layout_small
+            stride=(TILE_V_SMALL_PADDED, 1, TILE_K * TILE_V_SMALL_PADDED),
         )
         thread_layout_small = cute.make_layout((32, 4), stride=(4, 1))
         val_layout_small = cute.make_layout((1, 4))
@@ -1132,7 +1128,10 @@ def _create_jit_functions():
             copy_atom, thread_layout_small, val_layout_small
         )
         smem_bytes_small = (
-            4 * TILE_K * TILE_V_SMALL * NUM_STAGES + 4 * TILE_V_SMALL + 32
+            4 * TILE_K * TILE_V_SMALL_PADDED * NUM_STAGES
+            + 4 * TILE_V_SMALL
+            + 4 * TILE_K * 2
+            + 64
         )
 
         gdn_small_varlen(
@@ -1140,8 +1139,6 @@ def _create_jit_functions():
             h0_source,
             smem_layout_small,
             num_v_tiles_small,
-            vec_size,
-            cu_seqlens,
             q,
             k,
             v,
@@ -1154,15 +1151,9 @@ def _create_jit_functions():
             softplus_beta,
             softplus_threshold,
             scale,
-            B,
-            T,
             H,
             HV,
-            K,
-            V,
-            use_initial_state,
             use_qk_l2norm,
-            True,
         ).launch(
             grid=(batch_size * NUM_BLOCKS_PER_STATE_SMALL, 1, 1),
             block=[NUM_THREADS, 1, 1],
@@ -1206,7 +1197,6 @@ def _create_jit_functions():
             num_bits_per_copy=128,
         )
         num_v_tiles = cute.ceil_div(v_dim, TILE_V)
-        # Padded layout (stride=36) to avoid shared memory bank conflicts
         base_smem_layout = cute.make_layout(
             (TILE_K, TILE_V, NUM_STAGES),
             stride=(TILE_V_PADDED, 1, TILE_K * TILE_V_PADDED),
@@ -1223,7 +1213,6 @@ def _create_jit_functions():
             h0_source,
             base_smem_layout,
             num_v_tiles,
-            cu_seqlens,
             q,
             k,
             v,
@@ -1236,15 +1225,9 @@ def _create_jit_functions():
             softplus_beta,
             softplus_threshold,
             scale,
-            B,
-            T,
             H,
             HV,
-            K,
-            V,
-            use_initial_state,
             use_qk_l2norm,
-            False,
         ).launch(
             grid=(batch_size, 1, 1),
             block=[NUM_THREADS_LARGE, 1, 1],
@@ -1288,7 +1271,6 @@ def _create_jit_functions():
             num_bits_per_copy=128,
         )
         num_v_tiles = cute.ceil_div(v_dim, TILE_V)
-        # Padded layout (stride=36) to avoid shared memory bank conflicts
         base_smem_layout = cute.make_layout(
             (TILE_K, TILE_V, NUM_STAGES),
             stride=(TILE_V_PADDED, 1, TILE_K * TILE_V_PADDED),
@@ -1305,7 +1287,6 @@ def _create_jit_functions():
             h0_source,
             base_smem_layout,
             num_v_tiles,
-            cu_seqlens,
             q,
             k,
             v,
@@ -1318,15 +1299,9 @@ def _create_jit_functions():
             softplus_beta,
             softplus_threshold,
             scale,
-            B,
-            T,
             H,
             HV,
-            K,
-            V,
-            use_initial_state,
             use_qk_l2norm,
-            True,
         ).launch(
             grid=(batch_size, 1, 1),
             block=[NUM_THREADS_LARGE, 1, 1],
@@ -1334,7 +1309,12 @@ def _create_jit_functions():
             stream=stream,
         )
 
-    return run_small_batch, run_small_batch_varlen, run_large_batch, run_large_batch_varlen
+    return (
+        run_small_batch,
+        run_small_batch_varlen,
+        run_large_batch,
+        run_large_batch_varlen,
+    )
 
 
 _jit_functions = None

@@ -300,6 +300,13 @@ def test_cutedsl_gdn_performance(B: int):
         [],
         [],
     )
+    q_triton_list, k_triton_list, v_triton_list, a_triton_list, b_triton_list = (
+        [],
+        [],
+        [],
+        [],
+        [],
+    )
     for ri in range(run_iters):
         torch.manual_seed(2025 + ri)
         if is_varlen_decode:
@@ -309,12 +316,23 @@ def test_cutedsl_gdn_performance(B: int):
             v_i = torch.randn(1, N, HV, V, dtype=torch.bfloat16, device="cuda")
             a_i = torch.randn(N, HV, dtype=torch.bfloat16, device="cuda")
             b_i = torch.randn(N, HV, dtype=torch.bfloat16, device="cuda")
+            # Triton format: (N, 1, H, K)
+            q_triton_list.append(q_i.transpose(0, 1).contiguous())
+            k_triton_list.append(k_i.transpose(0, 1).contiguous())
+            v_triton_list.append(v_i.transpose(0, 1).contiguous())
+            a_triton_list.append(a_i.unsqueeze(1).contiguous())
+            b_triton_list.append(b_i.unsqueeze(1).contiguous())
         else:
             q_i = torch.randn(N, 1, H, K, dtype=torch.bfloat16, device="cuda")
             k_i = torch.randn(N, 1, H, K, dtype=torch.bfloat16, device="cuda")
             v_i = torch.randn(N, 1, HV, V, dtype=torch.bfloat16, device="cuda")
             a_i = torch.randn(N, 1, HV, dtype=torch.bfloat16, device="cuda")
             b_i = torch.randn(N, 1, HV, dtype=torch.bfloat16, device="cuda")
+            q_triton_list.append(q_i)
+            k_triton_list.append(k_i)
+            v_triton_list.append(v_i)
+            a_triton_list.append(a_i)
+            b_triton_list.append(b_i)
         q_list.append(q_i)
         k_list.append(k_i)
         v_list.append(v_i)
@@ -349,11 +367,11 @@ def test_cutedsl_gdn_performance(B: int):
         _ = run_triton_kernel(
             A_log,
             dt_bias,
-            q_list[ri],
-            k_list[ri],
-            v_list[ri],
-            a_list[ri],
-            b_list[ri],
+            q_triton_list[ri],
+            k_triton_list[ri],
+            v_triton_list[ri],
+            a_triton_list[ri],
+            b_triton_list[ri],
             initial_state_triton,
             initial_state_indices,
             scale,
@@ -383,11 +401,11 @@ def test_cutedsl_gdn_performance(B: int):
             _ = run_triton_kernel(
                 A_log,
                 dt_bias,
-                q_list[ri],
-                k_list[ri],
-                v_list[ri],
-                a_list[ri],
-                b_list[ri],
+                q_triton_list[ri],
+                k_triton_list[ri],
+                v_triton_list[ri],
+                a_triton_list[ri],
+                b_triton_list[ri],
                 initial_state_triton,
                 initial_state_indices,
                 scale,
@@ -561,6 +579,13 @@ def run_benchmark(
         [],
         [],
     )
+    q_triton_list, k_triton_list, v_triton_list, a_triton_list, b_triton_list = (
+        [],
+        [],
+        [],
+        [],
+        [],
+    )
     for ri in range(run_iters):
         torch.manual_seed(2025 + ri)
         if is_varlen_decode:
@@ -570,12 +595,23 @@ def run_benchmark(
             v_i = torch.randn(1, N, HV, V, dtype=torch.bfloat16, device="cuda")
             a_i = torch.randn(N, HV, dtype=torch.bfloat16, device="cuda")
             b_i = torch.randn(N, HV, dtype=torch.bfloat16, device="cuda")
+            # Triton format: (N, 1, H, K)
+            q_triton_list.append(q_i.transpose(0, 1).contiguous())
+            k_triton_list.append(k_i.transpose(0, 1).contiguous())
+            v_triton_list.append(v_i.transpose(0, 1).contiguous())
+            a_triton_list.append(a_i.unsqueeze(1).contiguous())
+            b_triton_list.append(b_i.unsqueeze(1).contiguous())
         else:
             q_i = torch.randn(N, 1, H, K, dtype=torch.bfloat16, device="cuda")
             k_i = torch.randn(N, 1, H, K, dtype=torch.bfloat16, device="cuda")
             v_i = torch.randn(N, 1, HV, V, dtype=torch.bfloat16, device="cuda")
             a_i = torch.randn(N, 1, HV, dtype=torch.bfloat16, device="cuda")
             b_i = torch.randn(N, 1, HV, dtype=torch.bfloat16, device="cuda")
+            q_triton_list.append(q_i)
+            k_triton_list.append(k_i)
+            v_triton_list.append(v_i)
+            a_triton_list.append(a_i)
+            b_triton_list.append(b_i)
         q_list.append(q_i)
         k_list.append(k_i)
         v_list.append(v_i)
@@ -619,11 +655,11 @@ def run_benchmark(
         _ = run_triton_kernel(
             A_log,
             dt_bias,
-            q_list[ri],
-            k_list[ri],
-            v_list[ri],
-            a_list[ri],
-            b_list[ri],
+            q_triton_list[ri],
+            k_triton_list[ri],
+            v_triton_list[ri],
+            a_triton_list[ri],
+            b_triton_list[ri],
             initial_state_triton,
             initial_state_indices,
             scale,
@@ -653,11 +689,11 @@ def run_benchmark(
             _ = run_triton_kernel(
                 A_log,
                 dt_bias,
-                q_list[ri],
-                k_list[ri],
-                v_list[ri],
-                a_list[ri],
-                b_list[ri],
+                q_triton_list[ri],
+                k_triton_list[ri],
+                v_triton_list[ri],
+                a_triton_list[ri],
+                b_triton_list[ri],
                 initial_state_triton,
                 initial_state_indices,
                 scale,
