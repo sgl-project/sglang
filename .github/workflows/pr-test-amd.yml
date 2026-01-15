@@ -547,12 +547,12 @@ jobs:
           free -h
 
 
-  unit-test-backend-8-gpu-amd:
-    needs: [check-changes, stage-a-test-1-amd]
+  stage-c-test-large-8-gpu-amd:
+    needs: [check-changes, call-gate, stage-b-test-small-1-gpu-amd, stage-b-test-large-2-gpu-amd]
     if: |
       always() &&
       (
-        (inputs.target_stage == 'unit-test-backend-8-gpu-amd') ||
+        (inputs.target_stage == 'stage-c-test-large-8-gpu-amd') ||
         (
           !inputs.target_stage &&
           (!failure() && !cancelled()) &&
@@ -593,7 +593,7 @@ jobs:
       - name: Run test
         timeout-minutes: 60
         run: |
-          bash scripts/ci/amd_ci_exec.sh python3 run_suite.py --suite per-commit-8-gpu-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --timeout-per-file 3600
+          bash scripts/ci/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-c-test-large-8-gpu-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --timeout-per-file 3600
 
   stage-c-test-large-8-gpu-amd-mi35x:
     needs: [check-changes, call-gate, stage-b-test-small-1-gpu-amd, stage-b-test-large-2-gpu-amd]
@@ -900,8 +900,7 @@ jobs:
         stage-b-test-small-1-gpu-amd,
         stage-b-test-small-1-gpu-amd-mi35x,
         stage-b-test-large-2-gpu-amd,
-        unit-test-backend-1-gpu-amd,
-        unit-test-backend-8-gpu-amd,
+        stage-c-test-large-8-gpu-amd,
         stage-c-test-large-8-gpu-amd-mi35x,
         performance-test-1-gpu-part-1-amd,
         performance-test-1-gpu-part-2-amd,

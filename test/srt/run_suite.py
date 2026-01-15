@@ -101,10 +101,6 @@ suite_amd = {
     "per-commit-4-gpu-amd": [
         TestFile("test_pp_single_node.py", 150),
     ],
-    "per-commit-8-gpu-amd": [
-        TestFile("test_deepseek_v3_basic.py", 275),
-        TestFile("test_deepseek_v3_mtp.py", 275),
-    ],
     # NOTE: AMD nightly suites (nightly-amd, nightly-amd-vlm, nightly-amd-8-gpu)
     # have been migrated to test/registered/amd/nightly/ and are now managed
     # by test/run_suite.py using the registry system.
