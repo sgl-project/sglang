@@ -82,7 +82,6 @@ import torch.distributed
 import torch.distributed as dist
 import triton
 import zmq
-from fastapi.responses import ORJSONResponse
 from packaging import version as pkg_version
 from PIL import Image
 from starlette.routing import Mount
@@ -120,6 +119,12 @@ FP8_E4M3_MIN = -FP8_E4M3_MAX
 
 builtins.FP8_E4M3_MAX = FP8_E4M3_MAX
 builtins.FP8_E4M3_MIN = FP8_E4M3_MIN
+
+# explicitly use pure text format, with a newline at the end
+# this makes it impossible to see the animation in the progress bar
+# but will avoid messing up with ray or multiprocessing, which wraps
+# each line of output with some prefix.
+BAR_FORMAT = "{desc}: {percentage:3.0f}% Completed | {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]\n"  # noqa: E501
 
 
 @lru_cache(maxsize=1)
@@ -1129,20 +1134,6 @@ def rank0_log(msg: str):
 
     if not model_parallel_is_initialized() or get_tensor_model_parallel_rank() == 0:
         logger.info(msg)
-
-
-def add_api_key_middleware(app, api_key: str):
-    @app.middleware("http")
-    async def authentication(request, call_next):
-        if request.method == "OPTIONS":
-            return await call_next(request)
-        if request.url.path.startswith("/health") or request.url.path.startswith(
-            "/metrics"
-        ):
-            return await call_next(request)
-        if request.headers.get("Authorization") != "Bearer " + api_key:
-            return ORJSONResponse(content={"error": "Unauthorized"}, status_code=401)
-        return await call_next(request)
 
 
 def configure_logger(server_args, prefix: str = ""):
