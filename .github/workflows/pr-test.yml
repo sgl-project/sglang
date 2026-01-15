@@ -635,9 +635,11 @@ jobs:
             -w /workspace \
             lmsysorg/sglang:dev \
             bash -c "
-              # Install sgl-kernel wheel if custom build exists
+              # Install sgl-kernel wheel if custom build exists, otherwise upgrade from PyPI
               if [ \"\$CUSTOM_BUILD_SGL_KERNEL\" = 'true' ] && ls sgl-kernel/dist/*.whl 2>/dev/null; then
                 pip install sgl-kernel/dist/*.whl --force-reinstall --no-deps --break-system-packages
+              else
+                pip install sgl-kernel --upgrade --break-system-packages
               fi && \
               pip install -e python --no-deps --no-build-isolation --break-system-packages && \
               pip install sentence-transformers --break-system-packages && \
