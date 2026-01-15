@@ -482,6 +482,53 @@ The HTTP router exposes the full OpenAI-compatible surface area (`/generate`, `/
 | `POST /v1/rerank`, `POST /rerank`                                                | Ranking APIs.                                              |
 | `POST /v1/classify`                                                              | Text classification endpoint.                              |
 
+### Classification API
+
+The `/v1/classify` endpoint provides text classification using sequence classification models (e.g., `Qwen2ForSequenceClassification`, `BertForSequenceClassification`).
+
+**Request:**
+```bash
+curl http://localhost:30000/v1/classify \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "jason9693/Qwen2.5-1.5B-apeach",
+    "input": "I love this product!"
+  }'
+```
+
+**Response:**
+```json
+{
+  "id": "classify-a1b2c3d4-5678-90ab-cdef-1234567890ab",
+  "object": "list",
+  "created": 1767034308,
+  "model": "jason9693/Qwen2.5-1.5B-apeach",
+  "data": [
+    {
+      "index": 0,
+      "label": "positive",
+      "probs": [0.12, 0.88],
+      "num_classes": 2
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 6,
+    "completion_tokens": 0,
+    "total_tokens": 6
+  }
+}
+```
+
+**Fields:**
+- `label`: Predicted class label (from model's `id2label` config, or `LABEL_N` fallback)
+- `probs`: Probability distribution over all classes (softmax of logits)
+- `num_classes`: Number of classification classes
+
+**Notes:**
+- Classification reuses the embedding backend—the scheduler returns logits which are converted to probabilities via softmax
+- Labels come from the model's HuggingFace config (`id2label` field); models without this mapping use generic labels (`LABEL_0`, `LABEL_1`, etc.)
+- Both HTTP and gRPC routers support classification
+
 Public health endpoints (`/liveness`, `/readiness`, `/health`, `/health_generate`) reflect registry state; readiness ensures PD workers are paired and IGW has at least one healthy route.
 
 ### Tokenization Endpoints
@@ -592,6 +639,7 @@ Supported tool parsers: `json`, `python`, `xml`.
 - `--history-backend none` disables persistence while keeping APIs.
 - `--history-backend oracle` uses Oracle Autonomous Database; provide credentials via flags or environment variables.
 - `--history-backend postgres` uses PostgreSQL Database.
+- `--history-backend redis` uses Redis.
 - Conversation item storage mirrors the history backend (Oracle or memory). The same storage powers OpenAI `/responses` and conversation APIs.
 
 ### History Backend (OpenAI Router Mode)
@@ -604,6 +652,7 @@ Store conversation and response data for tracking, debugging, or analytics.
 - **None**: No storage, minimal overhead.
 - **Oracle**: Persistent storage backed by Oracle Autonomous Database.
 - **Postgres**: Persistent storage backed by PostgreSQL Database.
+- **Redis**: Persistent storage backed by Redis.
 
 ```bash
 # Memory backend (default)
@@ -629,6 +678,12 @@ python3 -m sglang_router.launch_router \
   --backend openai \
   --worker-urls https://api.openai.com \
   --history-backend postgres
+
+# Redis backend
+python3 -m sglang_router.launch_router \
+  --backend openai \
+  --worker-urls https://api.openai.com \
+  --history-backend redis
 ```
 
 #### Oracle configuration
@@ -657,11 +712,24 @@ Router flags map to these values:
 
 Only one of `--oracle-dsn` or `--oracle-tns-alias` should be supplied.
 
+#### Redis configuration
+Provide Redis connection URL and optional pool sizing:
+```bash
+export REDIS_URL="redis://localhost:6379"
+export REDIS_POOL_MAX=16
+export REDIS_RETENTION_DAYS=30
+```
+
+Router flags map to these values:
+- `--redis-url` (env: `REDIS_URL`)
+- `--redis-pool-max` (env: `REDIS_POOL_MAX`)
+- `--redis-retention-days` (env: `REDIS_RETENTION_DAYS`). Set to `-1` for persistent storage (default: 30 days).
+
 ## Reliability & Flow Control
 - **Retries**: Default max retries = 5 with exponential backoff (`--retry-max-retries`, `--retry-initial-backoff-ms`, `--retry-max-backoff-ms`, `--retry-backoff-multiplier`, `--retry-jitter-factor`). Retries trigger on 408/429/500/502/503/504.
 - **Circuit Breakers**: Per worker thresholds (`--cb-failure-threshold`, `--cb-success-threshold`, `--cb-timeout-duration-secs`, `--cb-window-duration-secs`). Disable via `--disable-circuit-breaker`.
 - **Rate Limiting**: Token bucket driven by `--max-concurrent-requests`. Set `--rate-limit-tokens-per-second` to override refill rate. Configure request queue via `--queue-size` and `--queue-timeout-secs`; queued requests observe FIFO order and respect cancellation.
-- **Health Checks**: Runtime probes via `--health-check-interval-secs`, `--health-check-timeout-secs`, failure/success thresholds, and `--health-check-endpoint`.
+- **Health Checks**: Runtime probes via `--health-check-interval-secs`, `--health-check-timeout-secs`, failure/success thresholds, and `--health-check-endpoint`. Use `--disable-health-check` to skip health checks entirely.
 - **Cache Management**: `/flush_cache` ensures LRU eviction when redeploying PD workers.
 
 ## Load Balancing Policies
@@ -954,7 +1022,7 @@ cd bindings/python && maturin develop
 
 # Run Python tests
 cd ../..  # Back to sgl-model-gateway root
-pytest py_test/
+pytest e2e_test/
 ```
 For production builds, use `maturin build --release --out dist` from the `bindings/python/` directory to create optimized wheels. During development, `maturin develop` rebuilds and installs instantly without creating wheel files. Use `python -m sglang_router.launch_server` to co-launch router and SGLang workers in small clusters for local validation.
 
@@ -977,7 +1045,7 @@ cargo build --release
 # rustc-wrapper = "sccache"
 ```
 
-> **Note:** sccache and incremental compilation are mutually exclusive—sccache cannot cache incrementally compiled crates. The project defaults to incremental compilation for faster local iteration. Use sccache for clean/release builds where caching across builds matters more.
+> **Note:** sccache and incremental compilation are mutually exclusive—sccache cannot cache incrementally compiled crates. The project defaults to incremental compilation for faster local iteration. Use sccache for clean/release builds where caching across builds matters more. CI workflows use sccache with GitHub Actions cache backend for cross-job compilation caching.
 
 ---
 

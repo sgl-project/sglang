@@ -1,10 +1,7 @@
 //! Response processing stage for embedding requests
 
 use async_trait::async_trait;
-use axum::{
-    response::{IntoResponse, Response},
-    Json,
-};
+use axum::response::Response;
 use tracing::error;
 
 use crate::{
@@ -20,7 +17,7 @@ use crate::{
 };
 
 /// Response processing stage for embedding requests
-pub struct EmbeddingResponseProcessingStage;
+pub(crate) struct EmbeddingResponseProcessingStage;
 
 impl EmbeddingResponseProcessingStage {
     pub fn new() -> Self {
@@ -65,12 +62,10 @@ impl PipelineStage for EmbeddingResponseProcessingStage {
             .convert_response(ctx, proto_response)
             .map_err(|boxed_err| *boxed_err)?;
 
-        // Store in context
-        ctx.state.response.final_response =
-            Some(FinalResponse::Embedding(embedding_response.clone()));
+        // Store in context for pipeline to extract
+        ctx.state.response.final_response = Some(FinalResponse::Embedding(embedding_response));
 
-        // Return the HTTP response directly
-        Ok(Some(Json(embedding_response).into_response()))
+        Ok(None)
     }
 
     fn name(&self) -> &'static str {

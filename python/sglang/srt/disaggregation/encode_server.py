@@ -1,4 +1,5 @@
 import asyncio
+import concurrent.futures
 import ctypes
 import logging
 import multiprocessing as mp
@@ -17,7 +18,6 @@ import zmq.asyncio
 from fastapi import FastAPI
 from fastapi.responses import ORJSONResponse, Response
 from transformers import AutoImageProcessor
-from transformers.image_utils import load_images
 
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
@@ -29,21 +29,33 @@ from sglang.srt.distributed.parallel_state import (
     initialize_model_parallel,
 )
 from sglang.srt.layers.dp_attention import initialize_dp_attention
+from sglang.srt.managers.io_struct import ProfileReq, ProfileReqInput, ProfileReqType
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
-from sglang.srt.mem_cache.multimodal_cache import MultiModalStaticCache
+from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
 from sglang.srt.model_loader import get_model
 from sglang.srt.server_args import (
     PortArgs,
     ServerArgs,
     set_global_server_args_for_scheduler,
 )
-from sglang.srt.utils import get_local_ip_auto, get_zmq_socket, random_uuid
+from sglang.srt.utils import (
+    get_local_ip_auto,
+    get_zmq_socket,
+    load_audio,
+    load_image,
+    load_video,
+    random_uuid,
+)
 
 logger = logging.getLogger(__name__)
 
 rid_lock = asyncio.Lock()
 rid_to_receive_endpoint: Dict[str, List[str]] = dict()
 rid_to_receive_count: Dict[str, int] = dict()
+
+use_image_processor_gpu = (
+    int(os.getenv("SGLANG_ENCODER_IMAGE_PROCESSOR_USE_GPU", "0")) == 1
+)
 
 
 class TensorWrapper:
@@ -106,6 +118,7 @@ class MMEncoder:
         self.server_args = server_args
         set_global_server_args_for_scheduler(server_args)
         self.rank = rank
+        self.profiler = EncoderProfiler(rank)
 
         self.image_processor = AutoImageProcessor.from_pretrained(
             server_args.model_path,
@@ -136,6 +149,8 @@ class MMEncoder:
 
         torch.get_device_module(self.device).set_device(self.gpu_id)
 
+        self.use_image_processor_gpu = use_image_processor_gpu
+
         init_distributed_environment(
             world_size=server_args.tp_size,
             rank=rank,
@@ -156,6 +171,10 @@ class MMEncoder:
         embedding_cache_size = int(os.environ.get("SGLANG_VLM_CACHE_SIZE_MB", "4096"))
         self.mm_cache = MultiModalStaticCache(embedding_cache_size * 1024 * 1024)
         self.mm_cache_lock = asyncio.Lock()
+
+        self.io_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=int(os.environ.get("SGLANG_ENCODER_MM_LOAD_WORKERS", 4))
+        )
 
         if schedule_path is not None:
             self.schedule_socket = get_zmq_socket(
@@ -180,10 +199,102 @@ class MMEncoder:
 
         logger.info(f"rank {rank} init finish ")
 
-    async def _encode(self, mm_items) -> torch.Tensor:
-        images = load_images(mm_items)
+    def _load_single_item(
+        self,
+        data,
+        modality: Modality,
+        frame_count_limit=None,
+        audio_sample_rate: Optional[int] = None,
+        discard_alpha_channel=True,
+    ):
+        """
+        Load a single multimodal data.
+        If data is precomputed, returns directly.
+        Static method that can be pickled for multiprocessing"""
+        if isinstance(data, dict):
+            return data
+        try:
+            if modality == Modality.IMAGE:
+                img, _ = load_image(data)
+                if discard_alpha_channel and img.mode != "RGB":
+                    img = img.convert("RGB")
+                return img
+            elif modality == Modality.VIDEO:
+                return load_video(data, frame_count_limit)
+            elif modality == Modality.AUDIO:
+                return load_audio(data, audio_sample_rate)
 
-        images_input = self.image_processor(images=images)
+        except Exception as e:
+            raise RuntimeError(f"Error while loading data {data}: {e}")
+
+    def submit_data_loading_tasks(self, items, modalities):
+        futures = []
+        task_info = []
+
+        for data, modality in zip(items, modalities):
+            if modality is not None:
+                futures.append(
+                    self.io_executor.submit(
+                        self._load_single_item,
+                        data,
+                        modality,
+                    )
+                )
+                task_info.append((modality, data))
+        return futures, task_info
+
+    async def _flatten_and_load_images(self, mm_items):
+        """
+        Flatten mm_items structure, load images concurrently, and restore original structure.
+
+        Returns:
+            Same structure as load_images would return
+        """
+        # Handle single image (not a list)
+        if not isinstance(mm_items, (list, tuple)):
+            futures, _ = self.submit_data_loading_tasks([mm_items], [Modality.IMAGE])
+            return await asyncio.wrap_future(futures[0])
+
+        # Handle nested list (list of lists)
+        if len(mm_items) > 0 and isinstance(mm_items[0], (list, tuple)):
+            # Flatten nested structure
+            flat_data = []
+            flat_indices = []  # Track which group each item belongs to
+            for group_idx, image_group in enumerate(mm_items):
+                for item in image_group:
+                    flat_data.append(item)
+                    flat_indices.append(group_idx)
+
+            # Submit all tasks concurrently
+            futures, _ = self.submit_data_loading_tasks(
+                flat_data, [Modality.IMAGE] * len(flat_data)
+            )
+
+            # Wait for all tasks to complete asynchronously
+            async_futures = [asyncio.wrap_future(f) for f in futures]
+            results = await asyncio.gather(*async_futures)
+
+            # Restore nested structure
+            nested_results = [[] for _ in range(len(mm_items))]
+            for idx, result in zip(flat_indices, results):
+                nested_results[idx].append(result)
+
+            return nested_results
+
+        # Handle simple list
+        else:
+            futures, _ = self.submit_data_loading_tasks(
+                mm_items, [Modality.IMAGE] * len(mm_items)
+            )
+            # Wait for all tasks to complete asynchronously
+            async_futures = [asyncio.wrap_future(f) for f in futures]
+            return await asyncio.gather(*async_futures)
+
+    async def _encode(self, mm_items) -> torch.Tensor:
+        images = await self._flatten_and_load_images(mm_items)
+
+        kwargs = {"device": self.device} if self.use_image_processor_gpu else {}
+        images_input = self.image_processor(images=images, **kwargs)
         feature = images_input["pixel_values"]
         mm_item = MultimodalDataItem.from_dict(
             {
@@ -207,7 +318,7 @@ class MMEncoder:
             async with self.mm_cache_lock:
                 mm_cache = self.mm_cache.get([mm_item.hash])
                 if mm_cache is not None:
-                    mm_embedding = mm_cache
+                    mm_embedding = mm_cache.embedding
 
         if mm_embedding is None:
             with torch.inference_mode():
@@ -218,11 +329,13 @@ class MMEncoder:
 
         if self.server_args.enable_prefix_mm_cache:
             async with self.mm_cache_lock:
-                self.mm_cache.set(mm_hash, mm_embedding)
+                self.mm_cache.set(mm_hash, EmbeddingResult(embedding=mm_embedding))
         end_time = time.perf_counter()
         logger.info(
             f"Vit time : {(end_time - start_time)*1000:.2f} ms {mm_embedding.shape = }"
         )
+        if self.profiler is not None:
+            self.profiler.step()
 
         return _get_image_grid_dim(images_input), mm_embedding
 
@@ -384,6 +497,71 @@ class MMEncoder:
             return response_json["embedding_port"]
 
 
+class EncoderProfiler:
+    def __init__(self, rank: int):
+        self.rank = rank
+        self.profiler = None
+        self.steps_left = None
+        self.output_dir = None
+        self.prefix = None
+        self.profile_id = None
+
+    def start(self, obj: ProfileReq):
+        if self.profiler is not None:
+            return False, "profiling already running"
+
+        output_dir = obj.output_dir or os.getenv("SGLANG_TORCH_PROFILER_DIR", "/tmp")
+        os.makedirs(output_dir, exist_ok=True)
+        self.output_dir = output_dir
+        self.prefix = obj.profile_prefix or "encoder"
+        self.profile_id = str(time.time())
+
+        activities = obj.activities or ["CPU", "GPU"]
+        torch_activities = []
+        if "CPU" in activities:
+            torch_activities.append(torch.profiler.ProfilerActivity.CPU)
+        if "GPU" in activities:
+            torch_activities.append(torch.profiler.ProfilerActivity.CUDA)
+
+        profile_memory = "MEM" in activities
+        if not torch_activities and not profile_memory:
+            return False, "no supported activities"
+
+        self.profiler = torch.profiler.profile(
+            activities=torch_activities,
+            with_stack=True if obj.with_stack is None else obj.with_stack,
+            record_shapes=False if obj.record_shapes is None else obj.record_shapes,
+            profile_memory=profile_memory,
+        )
+        self.profiler.start()
+        self.steps_left = obj.num_steps
+        logger.info(
+            f"Encoder profiling started. output_dir={self.output_dir} profile_id={self.profile_id}"
+        )
+        return True, None
+
+    def step(self):
+        if self.profiler is None:
+            return
+        self.profiler.step()
+        if self.steps_left is not None:
+            self.steps_left -= 1
+            if self.steps_left <= 0:
+                self.stop()
+
+    def stop(self):
+        if self.profiler is None:
+            return False, "profiling not running"
+        self.profiler.stop()
+        filename = f"{self.prefix}-rank{self.rank}-{self.profile_id}.trace.json"
+        trace_path = os.path.join(self.output_dir, filename)
+        self.profiler.export_chrome_trace(trace_path)
+        logger.info("Encoder profiling saved to: %s", trace_path)
+        self.profiler = None
+        self.steps_left = None
+        return True, None
+
+
 app = FastAPI()
 encoder: Optional[MMEncoder] = None
 send_sockets: List[zmq.Socket] = []
@@ -395,12 +573,20 @@ async def run_encoder(
     encoder = MMEncoder(server_args, schedule_path, dist_init_method, rank)
     while True:
         request = await encoder.schedule_socket.recv_pyobj()
-        await encoder.encode(
-            mm_items=request["mm_items"],
-            req_id=request["req_id"],
-            num_parts=request["num_parts"],
-            part_idx=request["part_idx"],
-        )
+        if isinstance(request, ProfileReq):
+            if request.type == ProfileReqType.START_PROFILE:
+                if encoder.profiler is None:
+                    encoder.profiler = EncoderProfiler(encoder.rank)
+                encoder.profiler.start(request)
+            else:
+                encoder.profiler.stop()
+        else:
+            await encoder.encode(
+                mm_items=request["mm_items"],
+                req_id=request["req_id"],
+                num_parts=request["num_parts"],
+                part_idx=request["part_idx"],
+            )
 
 
 def launch_encoder(server_args, schedule_path, dist_init_method, rank):
@@ -525,3 +711,54 @@ async def health_generate():
     if encoder is None:
         return Response(status_code=503)
     return Response(status_code=200)
+
+
+@app.api_route("/start_profile", methods=["GET", "POST"])
+async def start_profile_async(obj: Optional[ProfileReqInput] = None):
+    if encoder is None:
+        return Response(content="encoder not ready\n", status_code=503)
+    req = None
+    if obj is None:
+        req = ProfileReq(ProfileReqType.START_PROFILE)
+    else:
+        req = ProfileReq(
+            type=ProfileReqType.START_PROFILE,
+            output_dir=obj.output_dir,
+            start_step=obj.start_step,
+            num_steps=obj.num_steps,
+            activities=obj.activities,
+            with_stack=obj.with_stack,
+            record_shapes=obj.record_shapes,
+            profile_by_stage=obj.profile_by_stage,
+            profile_id=str(time.time()),
+            merge_profiles=obj.merge_profiles,
+            profile_prefix=obj.profile_prefix,
+            profile_stages=obj.profile_stages,
+        )
+    for socket in send_sockets:
+        socket.send_pyobj(req)
+    if encoder.profiler is None:
+        encoder.profiler = EncoderProfiler(encoder.rank)
+    ok, msg = encoder.profiler.start(req)
+    if ok:
+        detail = (
+            f"Start profiling. output_dir={encoder.profiler.output_dir} "
+            f"profile_id={encoder.profiler.profile_id}\n"
+        )
+        return Response(content=detail, status_code=200)
+    return Response(content=(msg or "Start profiling failed.\n"), status_code=400)
+
+
+@app.api_route("/stop_profile", methods=["GET", "POST"])
+async def stop_profile_async():
+    if encoder is None:
+        return Response(content="encoder not ready\n", status_code=503)
+    if encoder.profiler is None:
+        return Response(content="profiling not initialized\n", status_code=400)
+    req = ProfileReq(ProfileReqType.STOP_PROFILE)
+    for socket in send_sockets:
+        socket.send_pyobj(req)
+    ok, msg = encoder.profiler.stop()
+    if ok:
+        return Response(content="Stop profiling.\n", status_code=200)
+    return Response(content=(msg or "Stop profiling failed.\n"), status_code=400)

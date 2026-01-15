@@ -28,7 +28,6 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 import torch
 from numpy import float64
 
-from sglang.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.radix_cache import (
@@ -37,6 +36,7 @@ from sglang.srt.mem_cache.radix_cache import (
     _key_match_paged,
     get_child_key,
 )
+from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.utils import convert_to_bigram_key
 
 if TYPE_CHECKING:
@@ -361,6 +361,9 @@ class SWARadixCache(BasePrefixCache):
         self.reset()
 
     ##### Public API #####
+
+    def supports_swa(self) -> bool:
+        return True
 
     def reset(self) -> None:
         self.root_node = TreeNode()
@@ -818,13 +821,12 @@ class SWARadixCache(BasePrefixCache):
         while len(key) > 0 and child_key in node.children.keys():
             child = node.children[child_key]
 
-            # update best_value_len and best_last_node if needed
-            if (
-                child.swa_tombstone
-                and match_len_since_tombstone >= self.sliding_window_size
-            ):
-                best_value_len = len(value)
-                best_last_node = node
+            if child.swa_tombstone:
+                # update best_value_len and best_last_node if needed
+                if match_len_since_tombstone >= self.sliding_window_size:
+                    best_value_len = len(value)
+                    best_last_node = node
+                # reset match_len_since_tombstone if we hit a tombstone node
                 match_len_since_tombstone = 0
 
             prefix_len = self.key_match_fn(child.key, key)
