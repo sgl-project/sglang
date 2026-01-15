@@ -68,6 +68,7 @@ if _is_npu:
     def _get_npu_hccl_pg_options():
         """Helper to create ProcessGroupHCCL options for NPU."""
         import torch_npu
+        
         options = torch_npu._C._distributed_c10d.ProcessGroupHCCL.Options()
         hccl_buffer_size = int(
             os.environ.get("DEEPEP_HCCL_BUFFSIZE")
@@ -255,7 +256,7 @@ class GroupCoordinator:
             if _is_npu and group_name != "attention_tp":
                 pg_options = _get_npu_hccl_pg_options()
             else:
-                pg_options=None
+                pg_options = None
             device_group = torch.distributed.new_group(
                 ranks, backend=torch_distributed_backend, pg_options=pg_options
             )
@@ -1504,7 +1505,7 @@ def init_distributed_environment(
             assert isinstance(timeout, (int)), "timeout must be a number"
             assert timeout > 0, "timeout must be positive"
             timeout = timedelta(seconds=timeout)
-        
+
         if _is_npu:
             pg_options = _get_npu_hccl_pg_options()
         else:
@@ -1517,7 +1518,7 @@ def init_distributed_environment(
             world_size=world_size,
             rank=rank,
             timeout=timeout,
-            pg_options=pg_options
+            pg_options=pg_options,
         )
 
     # set the local rank

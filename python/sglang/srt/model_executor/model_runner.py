@@ -2263,9 +2263,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 pp_proxy_tensors=pp_proxy_tensors,
             )
             return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
-        NPU_ALLOC_CONF_FLAG = _is_npu and forward_batch.forward_mode.is_extend() \
-            and not forward_batch.forward_mode.is_draft_extend(include_v2=True) \
+        NPU_ALLOC_CONF_FLAG = (
+            _is_npu
+            and forward_batch.forward_mode.is_extend()
+            and not forward_batch.forward_mode.is_draft_extend(include_v2=True)
             and not forward_batch.forward_mode.is_target_verify()
+        )
         if NPU_ALLOC_CONF_FLAG:
             torch.npu.memory._set_allocator_settings("expandable_segments:True")
 
@@ -2317,7 +2320,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if NPU_ALLOC_CONF_FLAG:
             torch.npu.memory._set_allocator_settings("expandable_segments:False")
-            
+
         return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
 
     def _preprocess_logits(
