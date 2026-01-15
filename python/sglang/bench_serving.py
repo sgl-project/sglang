@@ -105,6 +105,9 @@ class RequestFuncOutput:
     error: str = ""
     output_len: int = 0
     start_time: float = 0.0
+    spec_verify_ct: int = 0
+    spec_accept_token_num: int = 0
+    spec_draft_token_num: int = 0
 
     @staticmethod
     def init_new(request_func_input: RequestFuncInput):
@@ -630,7 +633,19 @@ async def async_request_sglang_generate(
                             if "text" in data and data["text"]:
                                 timestamp = time.perf_counter()
                                 generated_text = data["text"]
-                                output_len = data["meta_info"]["completion_tokens"]
+                                meta_info = data.get("meta_info", {})
+                                output_len = meta_info.get("completion_tokens", 0)
+
+                                if "spec_verify_ct" in meta_info:
+                                    output.spec_verify_ct = meta_info["spec_verify_ct"]
+                                if "spec_accept_token_num" in meta_info:
+                                    output.spec_accept_token_num = meta_info[
+                                        "spec_accept_token_num"
+                                    ]
+                                if "spec_draft_token_num" in meta_info:
+                                    output.spec_draft_token_num = meta_info[
+                                        "spec_draft_token_num"
+                                    ]
 
                                 # First token
                                 if ttft == 0.0:
@@ -951,6 +966,58 @@ class BenchmarkMetrics:
     concurrency: float
     max_output_tokens_per_s: float = 0.0
     max_concurrent_requests: int = 0
+
+
+@dataclass
+class SpecDecodeMetrics:
+    """Speculative decoding metrics aggregated from benchmark requests.
+
+    Note on acceptance_length calculation:
+      Per-request meta_info returns spec_accepted_tokens with a -1 adjustment per step
+      (excludes the target model's verified token). The true acceptance length is:
+        acceptance_length = completion_tokens / verify_ct
+                          = (spec_accepted_tokens + verify_ct) / verify_ct
+                          = 1 + spec_accepted_tokens / verify_ct
+      This differs from the server's avg_spec_accept_length which may include warmup
+      requests and uses server-lifetime totals rather than benchmark-only data.
+    """
+
+    num_drafts: int
+    draft_tokens: int
+    accepted_tokens: int
+    acceptance_rate: float
+    acceptance_length: float
+
+    @staticmethod
+    def from_outputs(outputs: List[RequestFuncOutput]) -> Optional["SpecDecodeMetrics"]:
+        """Calculate aggregated speculative decoding metrics from request outputs."""
+        total_drafts = 0
+        total_draft_tokens = 0
+        total_accepted_tokens = 0
+
+        for output in outputs:
+            if output.success and output.spec_verify_ct > 0:
+                total_drafts += output.spec_verify_ct
+                total_draft_tokens += output.spec_draft_token_num
+                total_accepted_tokens += output.spec_accept_token_num
+
+        if total_drafts == 0 or total_draft_tokens == 0:
+            return None
+
+        acceptance_rate = (total_accepted_tokens / total_draft_tokens) * 100
+        # Formula: 1 + accepted/drafts = completion_tokens/verify_ct
+        # We only account for the drafts in the benchmark itself,
+        # unlike server metric that are aggregated over
+        # server lifetime (i.e warmups, previous benchmarks)
+        acceptance_length = 1 + (total_accepted_tokens / total_drafts)
+
+        return SpecDecodeMetrics(
+            num_drafts=total_drafts,
+            draft_tokens=total_draft_tokens,
+            accepted_tokens=total_accepted_tokens,
+            acceptance_rate=acceptance_rate,
+            acceptance_length=acceptance_length,
+        )
 
 
 SHAREGPT_REPO_ID = "anon8231489123/ShareGPT_Vicuna_unfiltered"
@@ -2473,8 +2540,6 @@ async def benchmark(
         )
     )
     print("{:<40} {:<10.2f}".format("Concurrency:", metrics.concurrency))
-    if accept_length:
-        print("{:<40} {:<10.2f}".format("Accept length:", accept_length))
     print("{s:{c}^{n}}".format(s="End-to-End Latency", n=50, c="-"))
     print(
         "{:<40} {:<10.2f}".format("Mean E2E Latency (ms):", metrics.mean_e2e_latency_ms)
@@ -2506,6 +2571,42 @@ async def benchmark(
     print("{:<40} {:<10.2f}".format("P95 ITL (ms):", metrics.p95_itl_ms))
     print("{:<40} {:<10.2f}".format("P99 ITL (ms):", metrics.p99_itl_ms))
     print("{:<40} {:<10.2f}".format("Max ITL (ms):", metrics.max_itl_ms))
+
+    spec_decode_metrics = SpecDecodeMetrics.from_outputs(outputs)
+    if spec_decode_metrics is not None or accept_length is not None:
+        print("{s:{c}^{n}}".format(s="Speculative Decoding", n=50, c="-"))
+        if spec_decode_metrics is not None:
+            print(
+                "{:<40} {:<10.2f}".format(
+                    "Acceptance rate (%):", spec_decode_metrics.acceptance_rate
+                )
+            )
+        # These accept len are computed differently.
+        # - Server: from /get_server_info, includes all requests since server start
+        # - Benchmark: 1 + accepted/drafts, only benchmark requests
+        if accept_length is not None:
+            print(
+                "{:<40} {:<10.2f}".format("Acceptance length (server):", accept_length)
+            )
+        if spec_decode_metrics is not None:
+            print(
+                "{:<40} {:<10.2f}".format(
+                    "Acceptance length (benchmark):",
+                    spec_decode_metrics.acceptance_length,
+                )
+            )
+            print(
+                "{:<40} {:<10}".format(
+                    "Draft tokens:", spec_decode_metrics.draft_tokens
+                )
+            )
+            print(
+                "{:<40} {:<10}".format(
+                    "Accepted tokens:", spec_decode_metrics.accepted_tokens
+                )
+            )
+            print("{:<40} {:<10}".format("Drafts:", spec_decode_metrics.num_drafts))
+
     print("=" * 50)
 
     resp = requests.get(base_url + "/get_server_info", headers=get_auth_headers())
@@ -2560,10 +2661,27 @@ async def benchmark(
             "p95_itl_ms": metrics.p95_itl_ms,
             "p99_itl_ms": metrics.p99_itl_ms,
             "concurrency": metrics.concurrency,
-            "accept_length": accept_length,
             "max_output_tokens_per_s": metrics.max_output_tokens_per_s,
             "max_concurrent_requests": metrics.max_concurrent_requests,
         }
+
+        if spec_decode_metrics is not None or accept_length is not None:
+            # Server value: from /get_server_info, all requests since server start
+            if accept_length is not None:
+                result["spec_decode_acceptance_length_server"] = accept_length
+            # Benchmark values: aggregated from per-request meta_info
+            if spec_decode_metrics is not None:
+                result["spec_decode_acceptance_length"] = (
+                    spec_decode_metrics.acceptance_length
+                )
+                result["spec_decode_acceptance_rate"] = (
+                    spec_decode_metrics.acceptance_rate
+                )
+                result["spec_decode_num_drafts"] = spec_decode_metrics.num_drafts
+                result["spec_decode_draft_tokens"] = spec_decode_metrics.draft_tokens
+                result["spec_decode_accepted_tokens"] = (
+                    spec_decode_metrics.accepted_tokens
+                )
     else:
         print(f"Error running benchmark for request rate: {request_rate}")
         print("-" * 30)
