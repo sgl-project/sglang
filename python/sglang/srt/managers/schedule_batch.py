@@ -2209,7 +2209,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.tree_cache.supports_swa():
             sliding_window_size = self.tree_cache.sliding_window_size
             for idx, req in enumerate(self.reqs):
-                # TODO(ispobock): handle spec batch idx update
                 if self.forward_mode.is_decode():
                     # We set evict_swa condition here with two reasons:
                     # 1. In overlap scheduler, we cannot evict swa when req.decode_batch_idx == 0 since the prev extend batch is still running.

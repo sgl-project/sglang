@@ -374,8 +374,6 @@ class EAGLEWorker(TpModelWorker):
         )
 
     def _draft_preprocess_decode(self, batch: ScheduleBatch):
-        batch.maybe_evict_swa()
-
         # Parse args
         num_seqs = batch.batch_size()
         spec_info = batch.spec_info
