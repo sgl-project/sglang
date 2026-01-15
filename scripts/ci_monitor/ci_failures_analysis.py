@@ -1313,6 +1313,8 @@ class SGLangFailuresAnalyzer:
         online_runners: Optional[Dict[str, Dict]] = None,
         # Test failures (per job -> per test)
         job_test_failures: Optional[Dict[str, Dict[str, Dict]]] = None,
+        # Test failures for general runs (per job -> per test)
+        job_test_failures_general: Optional[Dict[str, Dict[str, Dict]]] = None,
         # Runner-specific test failures
         runner_test_failures: Optional[Dict[str, Dict[str, Dict]]] = None,
         # Config
@@ -1436,6 +1438,9 @@ class SGLangFailuresAnalyzer:
                 runner_instance_streak_data if runner_instance_streak_data else {}
             ),
             "job_test_failures": job_test_failures if job_test_failures else {},
+            "job_test_failures_general": (
+                job_test_failures_general if job_test_failures_general else {}
+            ),
             "runner_test_failures": (
                 runner_test_failures if runner_test_failures else {}
             ),
@@ -1597,10 +1602,14 @@ class SGLangFailuresAnalyzer:
 
             # Get test failures data
             job_test_failures = report_data.get("job_test_failures", {})
+            job_test_failures_general = report_data.get("job_test_failures_general", {})
 
             # Helper function to generate job section for GitHub markdown
             def generate_job_section_md(
-                title: str, data: Dict[str, Dict], show_test_failures: bool = True
+                title: str,
+                data: Dict[str, Dict],
+                show_test_failures: bool = True,
+                test_failures_dict: Optional[Dict[str, Dict[str, Dict]]] = None,
             ):
                 sorted_data = sorted(
                     data.items(),
@@ -1631,12 +1640,19 @@ class SGLangFailuresAnalyzer:
 
                 # ==== TEST-LEVEL FAILURES FIRST (if show_test_failures is enabled) ====
                 if show_test_failures:
+                    # Use the provided test_failures_dict, or default to job_test_failures
+                    active_test_failures = (
+                        test_failures_dict
+                        if test_failures_dict is not None
+                        else job_test_failures
+                    )
+
                     # Collect all test failures from broken and high_failure_rate jobs
                     all_test_failures = []
 
                     # Collect from broken jobs (current_streak >= 2)
                     for job_name, job_data in broken:
-                        test_failures = job_test_failures.get(job_name, {})
+                        test_failures = active_test_failures.get(job_name, {})
                         if test_failures and not test_failures.get("_no_test_summary"):
                             for test_file, test_data in test_failures.items():
                                 if not test_file.startswith("_"):  # Skip marker keys
@@ -1651,7 +1667,7 @@ class SGLangFailuresAnalyzer:
 
                     # Collect from high_failure_rate jobs
                     for job_name, job_data in high_failure_rate:
-                        test_failures = job_test_failures.get(job_name, {})
+                        test_failures = active_test_failures.get(job_name, {})
                         if test_failures and not test_failures.get("_no_test_summary"):
                             for test_file, test_data in test_failures.items():
                                 if not test_file.startswith("_"):
@@ -2320,53 +2336,62 @@ class SGLangFailuresAnalyzer:
 
             gen_limit = report_data.get("general_limit", 100)
 
-            # PR Tests - General (5 workflows) - no test failure analysis
+            # PR Tests - General (5 workflows) - with test failure analysis
             generate_job_section_md(
                 f"10. PR Test NVIDIA - General (latest {gen_limit} runs)",
                 report_data.get("pr_test_nvidia_general_data", {}),
-                show_test_failures=False,
+                show_test_failures=True,
+                test_failures_dict=job_test_failures_general,
             )
             generate_job_section_md(
                 f"11. PR Test AMD - General (latest {gen_limit} runs)",
                 report_data.get("pr_test_amd_general_data", {}),
-                show_test_failures=False,
+                show_test_failures=True,
+                test_failures_dict=job_test_failures_general,
             )
             generate_job_section_md(
                 f"12. PR Test Xeon - General (latest {gen_limit} runs)",
                 report_data.get("pr_test_xeon_general_data", {}),
-                show_test_failures=False,
+                show_test_failures=True,
+                test_failures_dict=job_test_failures_general,
             )
             generate_job_section_md(
                 f"13. PR Test XPU - General (latest {gen_limit} runs)",
                 report_data.get("pr_test_xpu_general_data", {}),
-                show_test_failures=False,
+                show_test_failures=True,
+                test_failures_dict=job_test_failures_general,
             )
             generate_job_section_md(
                 f"14. PR Test NPU - General (latest {gen_limit} runs)",
                 report_data.get("pr_test_npu_general_data", {}),
-                show_test_failures=False,
+                show_test_failures=True,
+                test_failures_dict=job_test_failures_general,
             )
 
-            # Nightly Tests - General (4 workflows) - no test failure analysis
+            # Nightly Tests - General (4 workflows) - with test failure analysis
             generate_job_section_md(
                 f"15. Nightly NVIDIA - General (latest {gen_limit} runs)",
                 report_data.get("nightly_nvidia_general_data", {}),
-                show_test_failures=False,
+                show_test_failures=True,
+                test_failures_dict=job_test_failures_general,
             )
             generate_job_section_md(
                 f"16. Nightly AMD - General (latest {gen_limit} runs)",
                 report_data.get("nightly_amd_general_data", {}),
-                show_test_failures=False,
+                show_test_failures=True,
+                test_failures_dict=job_test_failures_general,
             )
             generate_job_section_md(
                 f"17. Nightly Intel - General (latest {gen_limit} runs)",
                 report_data.get("nightly_intel_general_data", {}),
-                show_test_failures=False,
+                show_test_failures=True,
+                test_failures_dict=job_test_failures_general,
             )
             generate_job_section_md(
                 f"18. Nightly NPU - General (latest {gen_limit} runs)",
                 report_data.get("nightly_npu_general_data", {}),
-                show_test_failures=False,
+                show_test_failures=True,
+                test_failures_dict=job_test_failures_general,
             )
 
             # Write summary
@@ -2638,6 +2663,22 @@ def main():
             all_scheduled_data
         )
 
+        # Analyze test-level failures for general runs (all branches)
+        all_general_data = {
+            **pr_test_nvidia_general_data,
+            **pr_test_amd_general_data,
+            **pr_test_xeon_general_data,
+            **pr_test_xpu_general_data,
+            **pr_test_npu_general_data,
+            **nightly_nvidia_general_data,
+            **nightly_amd_general_data,
+            **nightly_intel_general_data,
+            **nightly_npu_general_data,
+        }
+        job_test_failures_general = analyzer.analyze_test_failures_for_broken_jobs(
+            all_general_data
+        )
+
         # Analyze runner-specific test failures
         runner_test_failures = analyzer.analyze_runner_specific_test_failures(
             runner_runs
@@ -2673,6 +2714,7 @@ def main():
             online_runners,
             # Test failures
             job_test_failures,
+            job_test_failures_general,
             runner_test_failures,
             # Config
             args.output,
