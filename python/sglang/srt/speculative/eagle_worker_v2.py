@@ -909,7 +909,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     model_worker_batch, batch_output
                 )
                 if self.draft_worker.enable_spec_overlap_reflow:
-                    self.draft_v2(model_worker_batch, batch_output)
+                    self.draft_worker.draft_v2(model_worker_batch, batch_output)
             return batch_output
 
     def verify(self, batch: ModelWorkerBatch):
