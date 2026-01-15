@@ -129,9 +129,6 @@ class Phi4MiniDetector(BaseFormatDetector):
             # Parse the JSON array
             function_call_arr = json.loads(json_content)
 
-            if not isinstance(function_call_arr, list):
-                function_call_arr = [function_call_arr]
-
             # Parse tool calls using base class method
             calls = self.parse_base_json(function_call_arr, tools)
 
@@ -196,38 +193,9 @@ class Phi4MiniDetector(BaseFormatDetector):
             current_text[:functools_start] if functools_start > 0 else ""
         )
 
-        # Find the matching closing bracket
-        # Need to handle JSON properly - ignore brackets inside strings
+        # Find the matching closing bracket using helper method
         bracket_start = functools_start + len("functools[")
-        bracket_count = 1
-        bracket_end = -1
-        in_string = False
-        escape_next = False
-
-        for i in range(bracket_start, len(current_text)):
-            char = current_text[i]
-
-            if escape_next:
-                escape_next = False
-                continue
-
-            if char == "\\":
-                escape_next = True
-                continue
-
-            if char == '"':
-                in_string = not in_string
-                continue
-
-            # Only count brackets outside of strings
-            if not in_string:
-                if char == "[":
-                    bracket_count += 1
-                elif char == "]":
-                    bracket_count -= 1
-                    if bracket_count == 0:
-                        bracket_end = i
-                        break
+        bracket_end = self._find_functools_end(current_text, bracket_start)
 
         if bracket_end == -1:
             # Incomplete functools block, keep buffering
