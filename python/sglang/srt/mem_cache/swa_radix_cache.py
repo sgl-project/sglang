@@ -427,7 +427,7 @@ class SWARadixCache(BasePrefixCache):
         key: RadixKey,
         value=None,
         prev_prefix_len: int = 0,
-        evicted_seqlen: int = 0,
+        swa_evicted_seqlen: int = 0,
     ) -> int:
         if self.disable:
             return 0
@@ -442,7 +442,7 @@ class SWARadixCache(BasePrefixCache):
             value = value[: len(key)]
 
         return self._insert_helper(
-            self.root_node, key, value, prev_prefix_len, evicted_seqlen
+            self.root_node, key, value, prev_prefix_len, swa_evicted_seqlen
         )
 
     def cache_finished_req(self, req: Req, is_insert: bool = True) -> None:
@@ -922,7 +922,7 @@ class SWARadixCache(BasePrefixCache):
         key: RadixKey,
         value,
         update_kv_after_len: int,
-        evicted_seqlen: int = 0,
+        swa_evicted_seqlen: int = 0,
     ) -> int:
         # Update the last access time from root to leaf, so that
         # swa will tombstone the node closer to root first
@@ -955,18 +955,40 @@ class SWARadixCache(BasePrefixCache):
             # the prefill prefix matching will stuck.
             if update_kv_after_len < total_prefix_length + prefix_len:
                 first_diff_idx = max(0, update_kv_after_len - total_prefix_length)
-                if node.swa_tombstone and evicted_seqlen < total_prefix_length:
+                assert (
+                    first_diff_idx == 0
+                ), f"first_diff_idx should be 0, {first_diff_idx=}, {update_kv_after_len=}, {total_prefix_length=}, {prefix_len=}"
+                if node.swa_tombstone:
                     assert (
                         node.swa_lock_ref == 0
                     ), f"tombstone swa_lock_ref should always be 0, {node.full_lock_ref=}, {node.swa_lock_ref=}, {node.id=}"
-                    self.token_to_kv_pool_allocator.free(node.value[first_diff_idx:])
-                    node.value = value[:prefix_len]
-                    node.swa_tombstone = False
-
-                    # insert the node into the lru lists
-                    self.swa_lru_list.insert_mru(node)
-
-                    self.swa_evictable_size_ += len(node.value)
+                    assert (
+                        swa_evicted_seqlen % self.page_size == 0
+                    ), f"swa_evicted_seqlen must be page aligned, {swa_evicted_seqlen=}, {self.page_size=}"
+                    if swa_evicted_seqlen < total_prefix_length:
+                        self.token_to_kv_pool_allocator.free(
+                            node.value[first_diff_idx:]
+                        )
+                        node.value = value[:prefix_len]
+                        node.swa_tombstone = False
+                        # insert the node into the lru lists
+                        self.swa_lru_list.insert_mru(node)
+                        self.swa_evictable_size_ += len(node.value)
+                    elif swa_evicted_seqlen < total_prefix_length + prefix_len:
+                        swa_evicted_len = swa_evicted_seqlen - total_prefix_length
+                        self.token_to_kv_pool_allocator.free(
+                            node.value[first_diff_idx:]
+                        )
+                        self._split_node(node.key, node, swa_evicted_len)
+                        node.value = value[swa_evicted_len:prefix_len]
+                        node.swa_tombstone = False
+                        # insert the node into the lru lists
+                        self.swa_lru_list.insert_mru(node)
+                        self.swa_evictable_size_ += len(node.value)
+                    else:
+                        self.token_to_kv_pool_allocator.free(
+                            node.value[first_diff_idx:prefix_len]
+                        )
                 else:
                     self.token_to_kv_pool_allocator.free(
                         value[first_diff_idx:prefix_len]
@@ -981,17 +1003,20 @@ class SWARadixCache(BasePrefixCache):
 
         if len(key):
             if (
-                evicted_seqlen > total_prefix_length
-                and evicted_seqlen < total_prefix_length + len(key)
+                swa_evicted_seqlen > total_prefix_length
+                and swa_evicted_seqlen < total_prefix_length + len(key)
             ):
-                swa_evicted_len = evicted_seqlen - total_prefix_length
+                swa_evicted_len = swa_evicted_seqlen - total_prefix_length
                 node = self._add_new_node(
-                    node, key[:swa_evicted_len], value[:swa_evicted_len], True
+                    node,
+                    key[:swa_evicted_len],
+                    value[:swa_evicted_len],
+                    swa_tombstone=True,
                 )
                 key = key[swa_evicted_len:]
                 value = value[swa_evicted_len:]
 
-            self._add_new_node(node, key, value, False)
+            self._add_new_node(node, key, value, swa_tombstone=False)
         return total_prefix_length
 
     def _add_new_node(
