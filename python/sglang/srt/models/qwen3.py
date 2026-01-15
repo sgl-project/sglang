@@ -297,11 +297,7 @@ class Qwen3DecoderLayer(nn.Module):
             hidden_states,
             residual,
             forward_batch,
-            cache=(
-                [self.mlp.gate_up_proj.weight, self.mlp.down_proj.weight]
-                if _is_npu
-                else None
-            ),
+            cache=self._get_prefetch_cache_for_npu(),
         )
         hidden_states = self.mlp(hidden_states)
         if _is_npu and get_cmo_stream():
@@ -310,6 +306,21 @@ class Qwen3DecoderLayer(nn.Module):
             hidden_states, residual, forward_batch
         )
         return hidden_states, residual
+
+    def _get_prefetch_cache_for_npu(self):
+        if not _is_npu:
+            return None
+
+        def _get_weights(layer):
+            weight_attrs = ["weight", "qweight"]
+            for attr_name in weight_attrs:
+                weight = getattr(layer, attr_name, None)
+                if weight is not None:
+                    return [weight]
+            return []
+
+        combined_cache = _get_weights(self.mlp.gate_up_proj) + _get_weights(self.mlp.down_proj)
+        return combined_cache or None
 
 
 class Qwen3Model(Qwen2Model):
