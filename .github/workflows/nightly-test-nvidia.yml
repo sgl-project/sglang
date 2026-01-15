@@ -114,7 +114,7 @@ jobs:
         run: |
           bash scripts/ci/ci_install_dependency.sh
 
-      - name: Run common 8-GPU model tests (partition ${{ matrix.partition }})
+      - name: Run common 8-GPU model tests
         if: always()
         timeout-minutes: 300
         env:
@@ -176,7 +176,7 @@ jobs:
         run: |
           IS_BLACKWELL=1 bash scripts/ci/ci_install_dependency.sh
 
-      - name: Run common 8-GPU model tests (partition ${{ matrix.partition }})
+      - name: Run common 8-GPU model tests
         if: always()
         timeout-minutes: 300
         env:
