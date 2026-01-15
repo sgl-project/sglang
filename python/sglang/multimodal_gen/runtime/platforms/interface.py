@@ -45,6 +45,7 @@ class PlatformEnum(enum.Enum):
     TPU = enum.auto()
     CPU = enum.auto()
     MPS = enum.auto()
+    MUSA = enum.auto()
     OOT = enum.auto()
     UNSPECIFIED = enum.auto()
 
@@ -147,7 +148,7 @@ class Platform:
     @lru_cache(maxsize=1)
     def is_cuda_alike(self) -> bool:
         """Stateless version of :func:`torch.cuda.is_available`."""
-        return self._enum in (PlatformEnum.CUDA, PlatformEnum.ROCM)
+        return self._enum in (PlatformEnum.CUDA, PlatformEnum.ROCM, PlatformEnum.MUSA)
 
     @lru_cache(maxsize=1)
     def is_mps(self) -> bool:
