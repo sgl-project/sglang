@@ -188,7 +188,7 @@ jobs:
       - name: Run test
         timeout-minutes: 10
         run: |
-          bash scripts/ci/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-a-test-1
+          bash scripts/ci/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-a-test-1-amd
 
   stage-b-test-small-1-gpu-amd:
     needs: [check-changes, stage-a-test-1-amd]
