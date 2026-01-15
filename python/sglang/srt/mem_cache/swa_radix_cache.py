@@ -821,13 +821,12 @@ class SWARadixCache(BasePrefixCache):
         while len(key) > 0 and child_key in node.children.keys():
             child = node.children[child_key]
 
-            # update best_value_len and best_last_node if needed
-            if (
-                child.swa_tombstone
-                and match_len_since_tombstone >= self.sliding_window_size
-            ):
-                best_value_len = len(value)
-                best_last_node = node
+            if child.swa_tombstone:
+                # update best_value_len and best_last_node if needed
+                if match_len_since_tombstone >= self.sliding_window_size:
+                    best_value_len = len(value)
+                    best_last_node = node
+                # reset match_len_since_tombstone if we hit a tombstone node
                 match_len_since_tombstone = 0
 
             prefix_len = self.key_match_fn(child.key, key)
