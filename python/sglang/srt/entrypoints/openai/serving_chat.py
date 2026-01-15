@@ -626,7 +626,6 @@ class OpenAIServingChat(OpenAIServingBase):
                             choices=[choice_data],
                             model=request.model,
                         )
-                        yield f"data: {chunk.model_dump_json()}\n\n"
 
                         # Add usage stats if continuous_usage_stats is enabled
                         if (
