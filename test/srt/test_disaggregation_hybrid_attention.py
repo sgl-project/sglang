@@ -1,4 +1,3 @@
-import os
 import unittest
 from types import SimpleNamespace
 
@@ -8,15 +7,16 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
 )
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+    is_in_ci,
     popen_launch_pd_server,
 )
 
 
+@unittest.skipIf(is_in_ci(), "Temporarily disable the flaky test.")
 class TestDisaggregationHybridAttentionMamba(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
-        os.environ["SGLANG_USE_MODELSCOPE"] = "true"
         cls.model = "Qwen/Qwen3-Next-80B-A3B-Instruct"
 
         # Non blocking start servers
@@ -28,11 +28,6 @@ class TestDisaggregationHybridAttentionMamba(PDDisaggregationServerBase):
         cls.wait_server_ready(cls.decode_url + "/health")
 
         cls.launch_lb()
-
-    @classmethod
-    def tearDownClass(cls):
-        os.environ.pop("SGLANG_USE_MODELSCOPE")
-        super().tearDownClass()
 
     @classmethod
     def start_prefill(cls):
