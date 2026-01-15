@@ -30,6 +30,8 @@ class TestAscendNpuGraphCompile(CustomTestCase):
                 "--mem-fraction-static",
                 0.7,
                 "--enable-torch-compile",
+                "--watchdog-timeout",
+                30000,
             ],
         )
 

@@ -29,7 +29,7 @@ original_disable_context_call = None
 original_disable = None
 
 
-def decorators_disable(fn=None, recursive=True):
+def decorators_disable(fn=None, recursive=True, **kwargs):
     if recursive:
         if fn is not None:
             fn = innermost_fn(fn)

@@ -12,7 +12,6 @@ from sglang.srt.layers.quantization.unquant import (
     LinearMethodBase,
     UnquantizedLinearMethod,
 )
-from sglang.srt.models.qwen3_vl import Qwen3VLMoeVisionModel
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 
 
@@ -65,6 +64,10 @@ class TestEmbedInterpolate(unittest.TestCase):
             server_args=sarg,
             model_config=mconf,
         )
+
+        # in real pipeline, a model is imported after command line argument parsing
+        from sglang.srt.models.qwen3_vl import Qwen3VLMoeVisionModel
+
         model = Qwen3VLMoeVisionModel(
             mconf,
             quant_config=None,
