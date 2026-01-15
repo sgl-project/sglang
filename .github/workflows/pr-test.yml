@@ -618,7 +618,7 @@ jobs:
           merge-multiple: true
           pattern: wheel-python3.10-cuda12.9
 
-      - name: Run test in container
+      - name: Run test
         timeout-minutes: 45
         run: |
           # Run tests inside Docker container with CUDA 12.9 for sm_120 (Blackwell) support
