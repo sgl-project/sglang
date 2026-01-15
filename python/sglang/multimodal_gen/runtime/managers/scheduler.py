@@ -202,7 +202,6 @@ class Scheduler:
                         prompt="",
                         is_warmup=True,
                     )
-
                 self.waiting_queue.append((None, req))
             # if server is warmed-up, set this flag to avoid req-based warmup
             self.warmed_up = True
@@ -226,8 +225,7 @@ class Scheduler:
             warmup_req.set_as_warmup()
             recv_reqs.insert(0, (identity, warmup_req))
             self._warmup_total = 1
-            self._warmup_processed = 1
-            logger.info("Processing warmup req... (1/1)")
+            self._warmup_processed = 0
             self.warmed_up = True
         return recv_reqs
 
