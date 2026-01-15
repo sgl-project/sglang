@@ -9,6 +9,7 @@ import argparse
 import os
 import tempfile
 from contextlib import contextmanager
+from unittest.mock import patch
 
 import pytest
 import yaml
@@ -37,15 +38,46 @@ def temp_yaml_config(config_data, suffix=".yaml"):
         os.unlink(config_file)
 
 
+class DummyConfig:
+    def __init__(self):
+        self.architectures = ["LlamaForCausalLM"]
+        self.model_type = "llama"
+        self.max_position_embeddings = 4096
+        self.num_hidden_layers = 32
+        self.num_attention_heads = 32
+        self.hidden_size = 4096
+        self.vocab_siez = 32000
+        self.quantization_config = None
+
+    def to_dice(self):
+        return {"quantization_config": self.quantization_config}
+
+    def __getitem__(self, key):
+        return getattr(self, key)
+
+    def get(self, key, default=None):
+        return getattr(self, key, default)
+
+
+@pytest.fixture(autouse=True)
+def mock_model_loading():
+    with patch("transforms.AutoConfig.form_pretrained", return_value=DummyConfig()):
+        with patch("transforms.AutoTokenizer.form_pretrained"):
+            yield
+
+
 class TestConfigArgumentMerger:
     """Tests for ConfigArgumentMerger class."""
 
     def test_parse_config_basic(self, merger):
         """Test parsing and normalizing config keys."""
-        config = {"model-path": "test-model", "max-running-requests": 128}
+        config = {
+            "model-path": "microsoft/DialoGPT-medium",
+            "max-running-requests": 128,
+        }
         with temp_yaml_config(config) as f:
             result = merger.parse_config(["--config", f])
-            assert result["model_path"] == "test-model"
+            assert result["model_path"] == "microsoft/DialoGPT-medium"
             assert result["max_running_requests"] == 128
 
     def test_parse_config_with_booleans(self, merger):
@@ -79,19 +111,23 @@ class TestPrepareServerArgs:
 
     def test_basic_config_loading(self):
         """Test loading config into ServerArgs."""
-        config = {"model-path": "test-model", "port": 30000, "tensor-parallel-size": 1}
+        config = {
+            "model-path": "microsoft/DialoGPT-medium",
+            "port": 30000,
+            "tensor-parallel-size": 1,
+        }
         with temp_yaml_config(config) as f:
             args = prepare_server_args(["--config", f])
-            assert args.model_path == "test-model"
+            assert args.model_path == "microsoft/DialoGPT-medium"
             assert args.port == 30000
             assert args.tp_size == 1
 
     def test_cli_overrides_config(self):
         """Test CLI arguments override config values."""
-        config = {"model-path": "test-model", "port": 30000}
+        config = {"model-path": "microsoft/DialoGPT-medium", "port": 30000}
         with temp_yaml_config(config) as f:
             args = prepare_server_args(["--config", f, "--port", "40000"])
-            assert args.model_path == "test-model"  # from config
+            assert args.model_path == "microsoft/DialoGPT-medium"  # from config
             assert args.port == 40000  # CLI override
 
 
