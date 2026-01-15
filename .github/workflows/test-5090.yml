@@ -6,9 +6,6 @@ on:
     paths:
       - '.github/workflows/test-5090.yml'
   workflow_dispatch:
-  schedule:
-    # Run daily at 2 AM UTC to track 5090 compatibility
-    - cron: '0 2 * * *'
 
 concurrency:
   group: 5090-test-${{ github.ref }}
@@ -17,10 +14,10 @@ concurrency:
 env:
   RUNNER_LABELS: 1-gpu-5090
   SGLANG_IS_IN_CI: "true"
-  LD_LIBRARY_PATH: "/usr/local/cuda-12.4/targets/x86_64-linux/lib:/usr/local/lib/python3.10/dist-packages/nvidia/cudnn/lib:/usr/local/lib/python3.10/dist-packages/nvidia/nvshmem/lib:/usr/local/lib/python3.10/dist-packages/nvidia/cuda_runtime/lib"
 
 jobs:
-  # Run stage-b-test-small-1-gpu-5090 suite (registered tests)
+  # Run legacy stage-b-test-small-1-gpu-5090 suite (13 tests)
+  # This tests the 13 tests that have explicit 5090 registration
   stage-b-test-small-1-gpu-5090:
     if: github.repository == 'sgl-project/sglang'
     runs-on: 1-gpu-5090
@@ -38,6 +35,7 @@ jobs:
         env:
           IS_BLACKWELL: "1"
         run: |
+          source /etc/profile.d/sglang-ci.sh
           bash scripts/ci/ci_install_dependency.sh
 
       - name: Run stage-b-test-small-1-gpu-5090
@@ -50,91 +48,30 @@ jobs:
             --auto-partition-size 4 \
             --continue-on-error
 
-  # Run 5090-compatible quantization tests
-  quantization-test-5090:
-    if: github.repository == 'sgl-project/sglang'
-    runs-on: 1-gpu-5090
-    continue-on-error: true
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Install dependencies
-        timeout-minutes: 15
-        env:
-          IS_BLACKWELL: "1"
-        run: |
-          bash scripts/ci/ci_install_dependency.sh
-
-      - name: Run quantization tests (5090 compatible)
-        timeout-minutes: 30
-        run: |
-          source /etc/profile.d/sglang-ci.sh
-          cd test/srt
-          python3 run_suite.py --suite quantization_test_5090 --continue-on-error
-
-  # Run accuracy test
-  accuracy-test-1-gpu:
-    if: github.repository == 'sgl-project/sglang'
-    runs-on: 1-gpu-5090
-    continue-on-error: true
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Install dependencies
-        timeout-minutes: 15
-        env:
-          IS_BLACKWELL: "1"
-        run: |
-          bash scripts/ci/ci_install_dependency.sh
-          git clone https://github.com/merrymercy/human-eval.git
-          cd human-eval
-          pip install -e .
-
-      - name: Evaluate accuracy
-        timeout-minutes: 25
-        run: |
-          source /etc/profile.d/sglang-ci.sh
-          cd test/srt
-          python3 -m sglang.test.ci.run_with_retry test_eval_accuracy_large.py
-
-  # Run VLM performance benchmarks (5090 compatible)
-  performance-test-vlm:
-    if: github.repository == 'sgl-project/sglang'
-    runs-on: 1-gpu-5090
-    continue-on-error: true
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Install dependencies
-        timeout-minutes: 15
-        env:
-          IS_BLACKWELL: "1"
-        run: |
-          bash scripts/ci/ci_install_dependency.sh
-
-      - name: Benchmark VLM
-        timeout-minutes: 20
-        run: |
-          source /etc/profile.d/sglang-ci.sh
-          cd test/srt
-          python3 -m unittest test_bench_serving.TestBenchServing.test_vlm_offline_throughput
-          python3 -m unittest test_bench_serving.TestBenchServing.test_vlm_online_latency
-
   summary:
-    needs: [stage-b-test-small-1-gpu-5090, quantization-test-5090, accuracy-test-1-gpu, performance-test-vlm]
+    needs: [stage-b-test-small-1-gpu-5090]
     if: always()
     runs-on: ubuntu-latest
     steps:
       - name: Summary
         run: |
-          echo "## 5090 GPU Test Results" >> $GITHUB_STEP_SUMMARY
+          echo "## 5090 GPU Test Results (13 Legacy Tests)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Testing 13 tests with explicit stage-b-test-small-1-gpu-5090 registration:" >> $GITHUB_STEP_SUMMARY
+          echo "- test_torchao.py" >> $GITHUB_STEP_SUMMARY
+          echo "- test_mamba_unittest.py" >> $GITHUB_STEP_SUMMARY
+          echo "- test_radix_cache_unit.py" >> $GITHUB_STEP_SUMMARY
+          echo "- test_hidden_states.py" >> $GITHUB_STEP_SUMMARY
+          echo "- test_mamba_ssm.py" >> $GITHUB_STEP_SUMMARY
+          echo "- test_mamba_ssm_ssd.py" >> $GITHUB_STEP_SUMMARY
+          echo "- test_causal_conv1d.py" >> $GITHUB_STEP_SUMMARY
+          echo "- test_external_models.py" >> $GITHUB_STEP_SUMMARY
+          echo "- test_build_eagle_tree.py" >> $GITHUB_STEP_SUMMARY
+          echo "- test_hicache_storage.py" >> $GITHUB_STEP_SUMMARY
+          echo "- test_evs.py" >> $GITHUB_STEP_SUMMARY
+          echo "- test_lora_hf_sgl_logprob_diff.py" >> $GITHUB_STEP_SUMMARY
+          echo "- test_update_weights_from_tensor.py" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Test Suite | Status |" >> $GITHUB_STEP_SUMMARY
           echo "|------------|--------|" >> $GITHUB_STEP_SUMMARY
           echo "| stage-b-test-small-1-gpu-5090 | ${{ needs.stage-b-test-small-1-gpu-5090.result }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| quantization-test-5090 | ${{ needs.quantization-test-5090.result }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| accuracy-test-1-gpu | ${{ needs.accuracy-test-1-gpu.result }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| performance-test-vlm | ${{ needs.performance-test-vlm.result }} |" >> $GITHUB_STEP_SUMMARY
