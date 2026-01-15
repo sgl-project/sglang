@@ -19,8 +19,7 @@ import os
 import signal
 import sys
 import time
-from collections import deque
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import Any, Deque, Dict, List, Optional, Tuple, Union
@@ -776,7 +775,8 @@ class Scheduler(
             )
         # Enable preemption for priority scheduling.
         self.try_preemption = (
-            self.enable_priority_scheduling and self.server_args.enable_try_preemption_by_priority
+            self.enable_priority_scheduling
+            and self.server_args.enable_try_preemption_by_priority
         )
         self.init_new_token_ratio = min(
             envs.SGLANG_INIT_NEW_TOKEN_RATIO.get()

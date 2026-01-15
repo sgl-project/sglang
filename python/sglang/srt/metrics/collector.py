@@ -223,13 +223,21 @@ class SchedulerStats:
 
     # PD disaggregation
     num_prefill_prealloc_queue_reqs: int = 0
-    num_prefill_prealloc_queue_reqs_by_priority: Dict[int, int] = field(default_factory=dict)
+    num_prefill_prealloc_queue_reqs_by_priority: Dict[int, int] = field(
+        default_factory=dict
+    )
     num_prefill_inflight_queue_reqs: int = 0
-    num_prefill_inflight_queue_reqs_by_priority: Dict[int, int] = field(default_factory=dict)
+    num_prefill_inflight_queue_reqs_by_priority: Dict[int, int] = field(
+        default_factory=dict
+    )
     num_decode_prealloc_queue_reqs: int = 0
-    num_decode_prealloc_queue_reqs_by_priority: Dict[int, int] = field(default_factory=dict)
+    num_decode_prealloc_queue_reqs_by_priority: Dict[int, int] = field(
+        default_factory=dict
+    )
     num_decode_transfer_queue_reqs: int = 0
-    num_decode_transfer_queue_reqs_by_priority: Dict[int, int] = field(default_factory=dict)
+    num_decode_transfer_queue_reqs_by_priority: Dict[int, int] = field(
+        default_factory=dict
+    )
     kv_transfer_speed_gb_s: float = 0.0
     kv_transfer_latency_ms: float = 0.0
     kv_transfer_bootstrap_ms: float = 0.0
@@ -847,7 +855,9 @@ class SchedulerMetricsCollector:
             ],
         )
 
-    def _log_gauge(self, gauge, data: Union[int, float], priority: Optional[int] = None) -> None:
+    def _log_gauge(
+        self, gauge, data: Union[int, float], priority: Optional[int] = None
+    ) -> None:
         # Convenience function for logging to gauge.
         labels = dict(self.labels)
         if priority is not None:
@@ -989,31 +999,43 @@ class SchedulerMetricsCollector:
         # PD disaggregation
         if stats.num_prefill_prealloc_queue_reqs_by_priority:
             for key, value in stats.num_prefill_prealloc_queue_reqs_by_priority.items():
-                self._log_gauge(self.num_prefill_prealloc_queue_reqs, value, priority=key)
+                self._log_gauge(
+                    self.num_prefill_prealloc_queue_reqs, value, priority=key
+                )
         else:
             self._log_gauge(
-                self.num_prefill_prealloc_queue_reqs, stats.num_prefill_prealloc_queue_reqs
+                self.num_prefill_prealloc_queue_reqs,
+                stats.num_prefill_prealloc_queue_reqs,
             )
         if stats.num_prefill_inflight_queue_reqs_by_priority:
             for key, value in stats.num_prefill_inflight_queue_reqs_by_priority.items():
-                self._log_gauge(self.num_prefill_inflight_queue_reqs, value, priority=key)
+                self._log_gauge(
+                    self.num_prefill_inflight_queue_reqs, value, priority=key
+                )
         else:
             self._log_gauge(
-                self.num_prefill_inflight_queue_reqs, stats.num_prefill_inflight_queue_reqs
+                self.num_prefill_inflight_queue_reqs,
+                stats.num_prefill_inflight_queue_reqs,
             )
         if stats.num_decode_prealloc_queue_reqs_by_priority:
             for key, value in stats.num_decode_prealloc_queue_reqs_by_priority.items():
-                self._log_gauge(self.num_decode_prealloc_queue_reqs, value, priority=key)
+                self._log_gauge(
+                    self.num_decode_prealloc_queue_reqs, value, priority=key
+                )
         else:
             self._log_gauge(
-                self.num_decode_prealloc_queue_reqs, stats.num_decode_prealloc_queue_reqs
+                self.num_decode_prealloc_queue_reqs,
+                stats.num_decode_prealloc_queue_reqs,
             )
         if stats.num_decode_transfer_queue_reqs_by_priority:
             for key, value in stats.num_decode_transfer_queue_reqs_by_priority.items():
-                self._log_gauge(self.num_decode_transfer_queue_reqs, value, priority=key)
+                self._log_gauge(
+                    self.num_decode_transfer_queue_reqs, value, priority=key
+                )
         else:
             self._log_gauge(
-                self.num_decode_transfer_queue_reqs, stats.num_decode_transfer_queue_reqs
+                self.num_decode_transfer_queue_reqs,
+                stats.num_decode_transfer_queue_reqs,
             )
         self._log_gauge(self.kv_transfer_speed_gb_s, stats.kv_transfer_speed_gb_s)
         self._log_gauge(self.kv_transfer_latency_ms, stats.kv_transfer_latency_ms)

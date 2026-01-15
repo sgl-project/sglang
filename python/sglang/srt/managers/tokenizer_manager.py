@@ -2237,8 +2237,13 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
     def _set_default_priority(self, obj: Union[GenerateReqInput, EmbeddingReqInput]):
         """Set the default priority value."""
-        if self.enable_priority_scheduling and obj.priority is None and self.default_priority_value is not None:
+        if (
+            self.enable_priority_scheduling
+            and obj.priority is None
+            and self.default_priority_value is not None
+        ):
             obj.priority = self.default_priority_value
+
 
 class ServerStatus(Enum):
     Up = "Up"
