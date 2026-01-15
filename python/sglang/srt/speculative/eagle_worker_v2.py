@@ -274,17 +274,77 @@ class EagleDraftWorker(BaseDraftWorker):
                 f"Capture draft extend cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB."
             )
 
-    def prepare_verify_reflow(self, model_worker_batch: ModelWorkerBatch):
-        draft_input: EagleDraftInput = model_worker_batch.spec_info
-        forward_batch, can_cuda_graph = draft_input.prepare_for_v2_draft(
-            self.req_to_token_pool,
-            model_worker_batch,
-            self.cuda_graph_runner,
-            self.draft_runner,
-            self.topk,
-            self.speculative_num_steps,
-        )
+    @staticmethod
+    def draft_wrapper(draft_func):
+        def wrapper(self, model_worker_batch: ModelWorkerBatch):
+            draft_input: EagleDraftInput = model_worker_batch.spec_info
+            forward_batch, can_cuda_graph = draft_input.prepare_for_v2_draft(
+                self.req_to_token_pool,
+                model_worker_batch,
+                self.cuda_graph_runner,
+                self.draft_runner,
+                self.topk,
+                self.speculative_num_steps,
+            )
 
+            parent_list, top_scores_index, draft_tokens = draft_func(
+                self, forward_batch, can_cuda_graph
+            )
+
+            if model_worker_batch.forward_mode.is_idle():
+                return EagleVerifyInput.create_idle_input(
+                    self.topk,
+                    self.speculative_num_steps,
+                    self.speculative_num_draft_tokens,
+                )
+
+            # Build tree mask
+            # Directly write to cuda graph buffers for verify attn
+            tree_mask_buf, position_buf = (
+                self.target_worker.model_runner.attn_backend.get_verify_buffers_to_fill_after_draft()
+            )
+
+            (
+                tree_mask,
+                position,
+                retrive_index,
+                retrive_next_token,
+                retrive_next_sibling,
+                draft_tokens,
+            ) = build_tree_kernel_efficient(
+                draft_input.verified_id,
+                parent_list,
+                top_scores_index,
+                draft_tokens,
+                model_worker_batch.seq_lens,
+                model_worker_batch.seq_lens_sum,
+                self.topk,
+                self.speculative_num_steps,
+                self.speculative_num_draft_tokens,
+                self.tree_mask_mode,
+                tree_mask_buf,
+                position_buf,
+            )
+
+            return EagleVerifyInput(
+                draft_token=draft_tokens,
+                custom_mask=tree_mask,
+                positions=position,
+                retrive_index=retrive_index,
+                retrive_next_token=retrive_next_token,
+                retrive_next_sibling=retrive_next_sibling,
+                retrive_cum_len=None,
+                spec_steps=self.speculative_num_steps,
+                topk=self.topk,
+                draft_token_num=self.speculative_num_draft_tokens,
+                capture_hidden_mode=None,
+                seq_lens_sum=None,
+                seq_lens_cpu=None,
+            )
+        return wrapper
+
+    @draft_wrapper
+    def prepare_verify_reflow(self, forward_batch, can_cuda_graph):
         # Parse args
         spec_info: EagleDraftInput = forward_batch.spec_info
         topk_p, topk_index, hidden_states = (
@@ -325,68 +385,10 @@ class EagleDraftWorker(BaseDraftWorker):
             batch_size = parents_list[0].shape[0]
             parent_list = torch.empty(batch_size, 0, device=parents_list[0].device)
 
-        if model_worker_batch.forward_mode.is_idle():
-            return EagleVerifyInput.create_idle_input(
-                self.topk,
-                self.speculative_num_steps,
-                self.speculative_num_draft_tokens,
-            )
+        return parent_list, top_scores_index, draft_tokens
 
-        # Build tree mask
-        # Directly write to cuda graph buffers for verify attn
-        tree_mask_buf, position_buf = (
-            self.target_worker.model_runner.attn_backend.get_verify_buffers_to_fill_after_draft()
-        )
-
-        (
-            tree_mask,
-            position,
-            retrive_index,
-            retrive_next_token,
-            retrive_next_sibling,
-            draft_tokens,
-        ) = build_tree_kernel_efficient(
-            draft_input.verified_id,
-            parent_list,
-            top_scores_index,
-            draft_tokens,
-            model_worker_batch.seq_lens,
-            model_worker_batch.seq_lens_sum,
-            self.topk,
-            self.speculative_num_steps,
-            self.speculative_num_draft_tokens,
-            self.tree_mask_mode,
-            tree_mask_buf,
-            position_buf,
-        )
-
-        return EagleVerifyInput(
-            draft_token=draft_tokens,
-            custom_mask=tree_mask,
-            positions=position,
-            retrive_index=retrive_index,
-            retrive_next_token=retrive_next_token,
-            retrive_next_sibling=retrive_next_sibling,
-            retrive_cum_len=None,
-            spec_steps=self.speculative_num_steps,
-            topk=self.topk,
-            draft_token_num=self.speculative_num_draft_tokens,
-            capture_hidden_mode=None,
-            seq_lens_sum=None,
-            seq_lens_cpu=None,
-        )
-
-    def draft(self, model_worker_batch: ModelWorkerBatch):
-        draft_input: EagleDraftInput = model_worker_batch.spec_info
-        forward_batch, can_cuda_graph = draft_input.prepare_for_v2_draft(
-            self.req_to_token_pool,
-            model_worker_batch,
-            self.cuda_graph_runner,
-            self.draft_runner,
-            self.topk,
-            self.speculative_num_steps,
-        )
-
+    @draft_wrapper
+    def draft(self, forward_batch, can_cuda_graph):
         # Run draft
         if can_cuda_graph:
             parent_list, top_scores_index, draft_tokens = self.cuda_graph_runner.replay(
@@ -404,56 +406,7 @@ class EagleDraftWorker(BaseDraftWorker):
                 forward_batch
             )
 
-        if model_worker_batch.forward_mode.is_idle():
-            return EagleVerifyInput.create_idle_input(
-                self.topk,
-                self.speculative_num_steps,
-                self.speculative_num_draft_tokens,
-            )
-
-        # Build tree mask
-        # Directly write to cuda graph buffers for verify attn
-        tree_mask_buf, position_buf = (
-            self.target_worker.model_runner.attn_backend.get_verify_buffers_to_fill_after_draft()
-        )
-
-        (
-            tree_mask,
-            position,
-            retrive_index,
-            retrive_next_token,
-            retrive_next_sibling,
-            draft_tokens,
-        ) = build_tree_kernel_efficient(
-            draft_input.verified_id,
-            parent_list,
-            top_scores_index,
-            draft_tokens,
-            model_worker_batch.seq_lens,
-            model_worker_batch.seq_lens_sum,
-            self.topk,
-            self.speculative_num_steps,
-            self.speculative_num_draft_tokens,
-            self.tree_mask_mode,
-            tree_mask_buf,
-            position_buf,
-        )
-
-        return EagleVerifyInput(
-            draft_token=draft_tokens,
-            custom_mask=tree_mask,
-            positions=position,
-            retrive_index=retrive_index,
-            retrive_next_token=retrive_next_token,
-            retrive_next_sibling=retrive_next_sibling,
-            retrive_cum_len=None,
-            spec_steps=self.speculative_num_steps,
-            topk=self.topk,
-            draft_token_num=self.speculative_num_draft_tokens,
-            capture_hidden_mode=None,
-            seq_lens_sum=None,
-            seq_lens_cpu=None,
-        )
+        return parent_list, top_scores_index, draft_tokens
 
     def draft_v2(self, model_worker_batch: ModelWorkerBatch, batch_result: GenerationBatchResult):
         if self.speculative_num_steps <= 1:
