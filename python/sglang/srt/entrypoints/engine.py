@@ -573,7 +573,7 @@ class Engine(EngineBase):
             return loop.run_until_complete(
                 self.tokenizer_manager.post_loaded_weights(obj, None)
             )
-            
+
     def update_weights_from_disk(
         self,
         model_path: str,
