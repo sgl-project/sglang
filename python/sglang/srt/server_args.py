@@ -4591,7 +4591,7 @@ class ServerArgs:
             type=str,
             default=ServerArgs.disaggregation_nixl_backend,
             help="The NIXL plugin backend for KV cache transfer. "
-            "Available options depend on NIXL installation: UCX (default), LIBFABRIC, etc."
+            "Available options depend on NIXL installation: UCX (default), LIBFABRIC, etc.",
         )
         parser.add_argument(
             "--disaggregation-decode-enable-offload-kvcache",
