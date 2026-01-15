@@ -33,6 +33,7 @@ class AttentionBackendEnum(enum.Enum):
     VIDEO_SPARSE_ATTN = enum.auto()
     VMOBA_ATTN = enum.auto()
     AITER = enum.auto()
+    SLA_ATTN = enum.auto()
     NO_ATTENTION = enum.auto()
 
     def __str__(self):
@@ -113,6 +114,13 @@ class Platform:
         if not cls.is_cuda_static():
             return False
         return torch.cuda.get_device_capability()[0] == 10
+
+    @classmethod
+    @lru_cache(maxsize=1)
+    def is_hopper(cls):
+        if not cls.is_cuda_static():
+            return False
+        return torch.cuda.get_device_capability() == (9, 0)
 
     @classmethod
     @lru_cache(maxsize=1)
