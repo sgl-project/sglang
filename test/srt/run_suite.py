@@ -53,21 +53,11 @@ suites = {
     # "per-commit-8-gpu-h200-deepep": [
     #     TestFile("ep/test_deepep_large.py", 563),
     # ],
-    "quantization_test": [
-        TestFile("quant/test_awq.py", 163),
-        TestFile("quant/test_marlin_moe.py", 200),
-        TestFile("test_bnb.py", 5),
-        TestFile("test_gptqmodel_dynamic.py", 102),
-        TestFile("test_quantization.py", 185),
-        TestFile("test_gguf.py", 96),
-    ],
+    # quantization_test suite migrated to test/registered/quant/
     "__not_in_ci__": [
         TestFile("test_release_memory_occupation.py", 200),  # Temporarily disabled
         TestFile("models/test_dummy_grok_models.py"),
         TestFile("test_bench_one_batch.py"),
-        TestFile("test_bench_serving.py"),
-        TestFile("test_eval_accuracy_large.py"),
-        TestFile("test_moe_eval_accuracy_large.py"),
         TestFile("test_profile_v2.py"),
         TestFile("models/test_ministral3_models.py"),
         TestFile("test_mistral_large3_basic.py"),
