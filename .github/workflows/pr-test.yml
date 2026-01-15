@@ -640,6 +640,7 @@ jobs:
                 pip install sgl-kernel/dist/*.whl --force-reinstall --no-deps --break-system-packages
               fi && \
               pip install -e python --no-deps --no-build-isolation --break-system-packages && \
+              pip install sentence-transformers --break-system-packages && \
               cd test && \
               CONTINUE_ON_ERROR_FLAG='' && \
               if [[ '${{ needs.check-changes.outputs.continue_on_error }}' == 'true' ]]; then
