@@ -607,25 +607,15 @@ def maybe_add_mtp_safetensors(
     baseten-admin/glm-4.7-fp4 where mtp.safetensors exists but
     isn't referenced in model.safetensors.index.json.
     """
-    # Only apply for GLM4Moe architecture
+    # Only apply for GLM4Moe architecture with nextn layers
     arch = getattr(hf_config, "architectures", [None])[0]
-    if arch not in ["Glm4MoeForCausalLM", "Glm4MoeForCausalLMNextN"]:
+    num_nextn_layers = getattr(hf_config, "num_nextn_predict_layers", 0)
+    if not (arch in ["Glm4MoeForCausalLM", "Glm4MoeForCausalLMNextN"] and num_nextn_layers > 0):
         return hf_weights_files
 
-    # Check if model has num_nextn_predict_layers
-    if not hasattr(hf_config, "num_nextn_predict_layers"):
-        return hf_weights_files
-
-    if hf_config.num_nextn_predict_layers <= 0:
-        return hf_weights_files
-
-    # Check if mtp.safetensors exists
+    # Check if mtp.safetensors exists and is not already in the file list
     mtp_path = os.path.join(hf_folder, "mtp.safetensors")
-    if not os.path.isfile(mtp_path):
-        return hf_weights_files
-
-    # Check if it's already in the list (from index)
-    if mtp_path in hf_weights_files:
+    if not os.path.isfile(mtp_path) or mtp_path in hf_weights_files:
         return hf_weights_files
 
     # mtp.safetensors exists but not in index - this is a bug
