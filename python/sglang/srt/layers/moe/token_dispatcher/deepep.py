@@ -912,9 +912,8 @@ class _DeepEPDispatcherImplLowLatencyPEO(_DeepEPDispatcherImplLowLatency):
             is_x_in_round=peo_overlap_args.is_x_in_round,
         )
 
-        if peo_overlap_args.round_id == 0:
-            self.combined_x = combined_hidden_states
         if peo_overlap_args.round_id == peo_overlap_args.num_rounds - 1:
+            self.combined_x = combined_hidden_states
             del self.handle
             self.handle = None
 
