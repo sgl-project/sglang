@@ -596,9 +596,13 @@ class OpenAIServingChat(OpenAIServingBase):
                     yield f"data: {chunk.model_dump_json()}\n\n"
 
                 stream_buffer = stream_buffers.get(index, "")
+                # IMPORTANT: Only process new content, not re-parse markers
+                # When content["text"] contains markers already in stream_buffer,
+                # we must not re-process them to avoid marker splitting
                 delta = content["text"][len(stream_buffer) :]
                 stream_buffers[index] = stream_buffer + delta
 
+                finish_reason = content["meta_info"]["finish_reason"]
                 # Handle reasoning content
                 if self.reasoning_parser and request.separate_reasoning:
                     logger.debug(
@@ -622,6 +626,7 @@ class OpenAIServingChat(OpenAIServingBase):
                             choices=[choice_data],
                             model=request.model,
                         )
+                        yield f"data: {chunk.model_dump_json()}\n\n"
 
                         # Add usage stats if continuous_usage_stats is enabled
                         if (

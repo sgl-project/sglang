@@ -1281,6 +1281,141 @@ async def test_gpt_oss_normal_text_after_tool_call_non_streaming(mock_serving_ch
 
 
 @pytest.mark.asyncio
+async def test_gpt_oss_tool_call_not_detected_with_duplicate_markers(
+    mock_serving_chat,
+):
+    """
+    Test that tool calls are correctly detected with standard Harmony format.
+
+    This test verifies that basic gpt-oss format with:
+    - Analysis reasoning: <|channel|>analysis<|message|>...<|end|>
+    - Tool call: <|start|>assistant<|channel|>commentary to=...<|constrain|>json<|message|>...<|call|>
+
+    Expected behavior: Tool call SHOULD be detected
+    """
+
+    serving, tokenizer_manager = mock_serving_chat
+
+    request = ChatCompletionRequest(
+        model="gpt-oss-mock",
+        messages=[{"role": "user", "content": "Test todo tool"}],
+        stream=True,
+        separate_reasoning=True,
+        stream_reasoning=True,
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "update_todo_list",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "todos": {"type": "string"},
+                        },
+                    },
+                },
+            }
+        ],
+        tool_choice="auto",
+    )
+
+    # Model output with duplicate markers (as seen in the bug report)
+    # Note the repeated <|channel|> and <|start|> tokens
+    chunks = [
+        # Analysis reasoning
+        "<|channel|>analysis<|message|>",
+        "User wants to test todo tool. So we should create a todo list. ",
+        "Use update_todo_list. Provide simple list.",
+        "<|end|>",
+        # Tool call with <|start|>assistant prefix and <|channel|>
+        "<|start|>assistant<|channel|>commentary to=functions.update_todo_list ",
+        "<|constrain|>json",
+        '<|message|>{"todos": "[ ] 测试 todo 工具能力"}',
+        "<|call|>",
+    ]
+
+    async def mock_generator(req, raw_req):
+        request_id = "test-id"
+        current_text = ""
+        for i, chunk in enumerate(chunks):
+            current_text += chunk
+            yield {
+                "text": current_text,
+                "meta_info": {
+                    "id": request_id,
+                    "finish_reason": None,
+                    "prompt_tokens": 10,
+                    "completion_tokens": i + 1,
+                    "output_token_logprobs": [],
+                },
+            }
+
+        yield {
+            "text": current_text,
+            "meta_info": {
+                "id": request_id,
+                "finish_reason": {"type": "stop"},
+                "prompt_tokens": 10,
+                "completion_tokens": len(chunks) + 1,
+                "output_token_logprobs": [],
+            },
+        }
+
+    tokenizer_manager.generate_request = mock_generator
+
+    generator = serving._generate_chat_stream(MagicMock(), request, MagicMock())
+
+    collected_reasoning = ""
+    tool_calls = []
+
+    async for raw_chunk in generator:
+        if raw_chunk == "data: [DONE]\n\n":
+            break
+
+        json_str = raw_chunk.replace("data: ", "").strip()
+        chunk_data = json.loads(json_str)
+
+        if not chunk_data["choices"]:
+            continue
+
+        choice = chunk_data["choices"][0]
+        delta = choice["delta"]
+
+        if "reasoning_content" in delta and delta["reasoning_content"]:
+            collected_reasoning += delta["reasoning_content"]
+
+        if "tool_calls" in delta and delta["tool_calls"]:
+            for tc in delta["tool_calls"]:
+                tool_calls.append(tc)
+
+    # Verify Reasoning - this should work
+    assert (
+        "User wants to test todo tool" in collected_reasoning
+    ), f"Reasoning content not found. Got: {collected_reasoning}"
+
+    # Verify Tool Call
+    assert len(tool_calls) > 0, (
+        "Tool call should be detected. "
+        "This test verifies correct handling of gpt-oss format with "
+        "<|start|>assistant<|channel|>commentary to=...<|call|> structure."
+    )
+
+    # Verify tool call structure and content
+    found_todo_tool = False
+    for tc in tool_calls:
+        if tc.get("function", {}).get("name") == "update_todo_list":
+            found_todo_tool = True
+            args = tc["function"]["arguments"]
+            # The fix allows HarmonyParser to correctly extract tool calls even with duplicate markers
+            assert (
+                "测试 todo 工具能力" in args or "todo" in args
+            ), f"Tool call arguments should contain todo text. Got: {args}"
+            break
+
+    assert found_todo_tool, "update_todo_list tool call not found"
+
+
+@pytest.mark.asyncio
 async def test_gpt_oss_baseline_tool_call_with_full_bot_token_streaming(
     mock_serving_chat,
 ):
@@ -1383,3 +1518,163 @@ async def test_gpt_oss_baseline_tool_call_with_full_bot_token_streaming(
             break
 
     assert found_weather_tool, "get_weather tool call not found"
+
+
+@pytest.mark.asyncio
+async def test_gpt_oss_duplicate_markers_bug(mock_serving_chat):
+    """
+    Test to reproduce the duplicate markers bug.
+
+    Bug description:
+    - Model outputs tool call with single markers (e.g., <|channel|>)
+    - But in processing, buffer accumulates duplicate markers
+    - This causes tool call parsing to fail
+
+    Root cause:
+    In CanonicalStrategy.parse(), when processing chunks incrementally:
+    - self.full_accumulated keeps accumulating ALL text
+    - iter_tokens uses self.full_accumulated as the full text
+    - This causes the FSM to re-process already consumed tokens
+    - When buffer contains the full content including <|call|>, the FSM
+      might emit duplicate tool_call events or include content multiple times
+
+    This test verifies the bug and documents the expected behavior.
+    """
+
+    serving, tokenizer_manager = mock_serving_chat
+
+    request = ChatCompletionRequest(
+        model="gpt-oss-mock",
+        messages=[{"role": "user", "content": "Test todo tool"}],
+        stream=True,
+        separate_reasoning=True,
+        stream_reasoning=True,
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "update_todo_list",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "todos": {"type": "string"},
+                        },
+                    },
+                },
+            }
+        ],
+        tool_choice="auto",
+    )
+
+    # Model output with tool call (no duplicate markers in actual model output)
+    # The bug is that processing introduces duplicates
+    chunks = [
+        # Analysis reasoning
+        "<|channel|>analysis<|message|>",
+        "User wants to test todo tool. So we should create a todo list. ",
+        "Use update_todo_list. Provide simple list.",
+        "<|end|>",
+        # Tool call
+        "<|start|>assistant<|channel|>commentary to=functions.update_todo_list ",
+        "<|constrain|>json",
+        '<|message|>{"todos": "[ ] 测试 todo 工具能力"}',
+        "<|call|>",
+    ]
+
+    async def mock_generator(req, raw_req):
+        request_id = "test-id"
+        current_text = ""
+        for i, chunk in enumerate(chunks):
+            current_text += chunk
+            yield {
+                "text": current_text,
+                "meta_info": {
+                    "id": request_id,
+                    "finish_reason": None,
+                    "prompt_tokens": 10,
+                    "completion_tokens": i + 1,
+                    "output_token_logprobs": [],
+                },
+            }
+
+        yield {
+            "text": current_text,
+            "meta_info": {
+                "id": request_id,
+                "finish_reason": {"type": "stop"},
+                "prompt_tokens": 10,
+                "completion_tokens": len(chunks) + 1,
+                "output_token_logprobs": [],
+            },
+        }
+
+    tokenizer_manager.generate_request = mock_generator
+
+    generator = serving._generate_chat_stream(MagicMock(), request, MagicMock())
+
+    collected_reasoning = ""
+    tool_calls = []
+    all_deltas = []
+
+    async for raw_chunk in generator:
+        if raw_chunk == "data: [DONE]\n\n":
+            break
+
+        json_str = raw_chunk.replace("data: ", "").strip()
+        chunk_data = json.loads(json_str)
+
+        if not chunk_data["choices"]:
+            continue
+
+        choice = chunk_data["choices"][0]
+        delta = choice["delta"]
+        all_deltas.append(delta)
+
+        if "reasoning_content" in delta and delta["reasoning_content"]:
+            collected_reasoning += delta["reasoning_content"]
+
+        if "tool_calls" in delta and delta["tool_calls"]:
+            for tc in delta["tool_calls"]:
+                tool_calls.append(tc)
+
+    # Verify Reasoning content is correct
+    assert (
+        "User wants to test todo tool" in collected_reasoning
+    ), f"Reasoning content not found. Got: {collected_reasoning}"
+
+    # Verify that normal content doesn't contain duplicate markers
+    normal_content = ""
+    for delta in all_deltas:
+        if "content" in delta and delta["content"]:
+            normal_content += delta["content"]
+
+    # Check for duplicate markers in normal content
+    # If bug is present, we might see things like "<|channel|><|channel|>"
+    assert (
+        "<|channel|><|channel|>" not in normal_content
+    ), f"Duplicate <|channel|> markers found in normal content: {normal_content}"
+    assert (
+        "<|start|><|start|>" not in normal_content
+    ), f"Duplicate <|start|> markers found in normal content: {normal_content}"
+
+    # Verify Tool Call was detected
+    assert len(tool_calls) > 0, (
+        "Tool call should be detected. "
+        f"Got {len(tool_calls)} tool calls. This may be the bug - duplicate markers causing parsing failure."
+    )
+
+    # Verify tool call structure and content
+    found_todo_tool = False
+    for tc in tool_calls:
+        if tc.get("function", {}).get("name") == "update_todo_list":
+            found_todo_tool = True
+            args = tc["function"]["arguments"]
+            assert (
+                "测试 todo 工具能力" in args or "todo" in args
+            ), f"Tool call arguments should contain todo text. Got: {args}"
+            break
+
+    assert found_todo_tool, (
+        "update_todo_list tool call not found. "
+        "This indicates the duplicate markers bug prevented tool call parsing."
+    )

@@ -373,20 +373,35 @@ class HarmonyStateMachine:
 
             next_token = tokens[pos + 1]
             if next_token.type == "TEXT":
-                channel_text = full_text[next_token.start : next_token.end].strip()
+                # Extract channel text, but EXCLUDE the channel marker itself
+                # The channel_text includes <channel>...</>, so we need to strip it
+                raw_channel_text = full_text[next_token.start : next_token.end]
+
+                # Remove the channel marker from the text
+                # Pattern: <|channel|>type to=target or <|channel|>type
+                if raw_channel_text.startswith("<|channel|>"):
+                    # Strip the <|channel|> prefix
+                    channel_text = raw_channel_text[
+                        11:
+                    ].strip()  # 11 = len("<|channel|>")
+                else:
+                    channel_text = raw_channel_text.strip()
 
                 # Check if this is a tool call (contains 'to=')
-                # Pattern: <channel>type to=target or <channel>type
+                # Pattern: type to=target or type
                 is_tool_call = re.search(r"(?:\s|^)to=", channel_text) is not None
 
                 # Extract the base channel type (first word)
                 channel_parts = channel_text.split()
                 base_channel_type = channel_parts[0].lower() if channel_parts else ""
 
+                # Valid channel types
+                valid_channels = {"analysis", "commentary", "final"}
+
                 # Exact match check for known channel types
                 # Only accept known channel types (analysis, commentary, final)
                 # Unknown channel types return empty events (skip tokens up to MESSAGE)
-                if base_channel_type in ("analysis", "commentary", "final"):
+                if base_channel_type in valid_channels:
                     if is_tool_call:
                         # Built-in tool call (e.g., "analysis to=browser.search" or "commentary to=functions.get_weather")
                         # Use COMMENTARY state to buffer the tool info and wait for CONSTRAIN marker
@@ -408,6 +423,14 @@ class HarmonyStateMachine:
                         # Final block
                         self.context.state = ParserState.IN_FINAL
                         return [], self._skip_to_after_message(tokens, pos)
+                elif (
+                    any(vc.startswith(base_channel_type) for vc in valid_channels)
+                    and pos + 1 == len(tokens) - 1
+                ):
+                    # Partial match of a valid channel type (e.g. "comment" of "commentary")
+                    # AND this is the last token available.
+                    # Hold to wait for more text.
+                    return [], pos
                 else:
                     # Unknown channel type - skip all tokens up to END (ignore content)
                     return [], self._skip_to_after_end(tokens, pos)
@@ -746,13 +769,37 @@ def iter_tokens(text: str, start_pos: int = 0) -> Iterator[Token]:
                 found_token = True
                 break
         if not found_token:
+            # When markers are split (e.g., "<|chan" + "nel|>"), we need to
+            # handle them correctly. The key insight is:
+            # - If we can find a closing "|>" that completes a marker, do so
+            # - Otherwise, we might have a partial marker that should be held
             tail = text[marker_pos:]
-            is_partial = any(lit.startswith(tail) for lit in TOKENS)
-            if is_partial:
-                # Hold whole tail (partial token)
-                yield Token("TEXT", marker_pos, len(text))
-                pos = len(text)
-                break
+
+            # First check if we can find a closing "|>" that would complete a marker
+            close_pos = tail.find("|>")
+
+            if close_pos != -1:
+                # We have a closing "|>", check if it completes a known token
+                # The full potential token would be text[marker_pos:marker_pos + close_pos + 2]
+                full_token_candidate = text[marker_pos : marker_pos + close_pos + 2]
+
+                if full_token_candidate in TOKENS:
+                    # This is a complete marker! Emit it and move on.
+                    yield Token(
+                        TOKENS[full_token_candidate],
+                        marker_pos,
+                        marker_pos + close_pos + 2,
+                    )
+                    pos = marker_pos + close_pos + 2
+                    break
+                else:
+                    # Has closing "|>" but not a known token - emit text up to close
+                    # This handles cases like "<|something|>" where "something" isn't a keyword
+                    yield Token("TEXT", marker_pos, marker_pos + close_pos + 2)
+                    pos = marker_pos + close_pos + 2
+
+                    # Continue to next iteration to process rest
+                    continue
             else:
                 # Unknown token like <|weird|> ...
                 has_unknown_tokens = True
@@ -815,6 +862,9 @@ class CanonicalStrategy:
         )
         self.fsm = HarmonyStateMachine(initial_state=initial_state)
         self.accumulated_text = ""  # Track accumulated text for raw_text extraction
+        self.prev_buffer_content = (
+            ""  # Track previous buffer to avoid duplicate accumulation
+        )
 
     def parse(self, text: str) -> Tuple[List[Event], str]:
         """Parse text using the FSM and return (events, remaining).
@@ -836,7 +886,18 @@ class CanonicalStrategy:
 
         # Add the new text (which is unparsed buffer from SemanticBuffer)
         # to our FULL accumulated text
-        self.full_accumulated += text
+        # FIX: Only accumulate the new part, not the entire buffer
+        # This prevents duplicate accumulation when HarmonyParser passes the full buffer
+        if self.prev_buffer_content and text.startswith(self.prev_buffer_content):
+            # Text contains previous content, only append the new part
+            new_text = text[len(self.prev_buffer_content) :]
+            self.full_accumulated += new_text
+        else:
+            # First call or buffer doesn't start with previous content
+            self.full_accumulated += text
+
+        # Update previous buffer tracking for next call
+        self.prev_buffer_content = text
 
         # Also update simpler accumulated pointer for consistency
         self.accumulated_text = self.full_accumulated
