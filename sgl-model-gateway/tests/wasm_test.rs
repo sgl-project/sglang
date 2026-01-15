@@ -179,6 +179,8 @@ async fn create_test_app_with_wasm() -> (axum::Router, Arc<AppContext>, TempDir)
         context: app_context.clone(),
         concurrency_queue_tx: None,
         router_manager: None,
+        mesh_handler: None,
+        mesh_sync_manager: None,
     });
 
     let request_id_headers = vec!["x-request-id".to_string(), "x-correlation-id".to_string()];
@@ -710,6 +712,7 @@ async fn test_wasm_module_execution() {
         let state = engines
             .wasm_registration
             .get_status(instance_id)
+            .await
             .expect("Failed to get workflow status");
 
         match state.status {
