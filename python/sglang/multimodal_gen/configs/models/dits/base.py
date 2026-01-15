@@ -57,12 +57,21 @@ class DiTConfig(ModelConfig):
     # sglang-diffusion DiT-specific parameters
     prefix: str = ""
     quant_config: QuantizationConfig | None = None
-    quantization_config: QuantizationConfig | None = None
 
     def __post_init__(self):
-        super().__post_init__()
+        if self.quant_config is not None and isinstance(
+            self.quant_config, QuantizationConfig
+        ):
+            return
 
+        # get quant_config from arch_config.extra_attrs
         config_dict = None
+        if hasattr(self.arch_config, "extra_attrs"):
+            if "quant_config" in self.arch_config.extra_attrs:
+                config_dict = self.arch_config.extra_attrs["quant_config"]
+            elif "quantization_config" in self.arch_config.extra_attrs:
+                config_dict = self.arch_config.extra_attrs["quantization_config"]
+
         if self.quant_config is not None:
             config_dict = self.quant_config
         elif self.quantization_config is not None:
