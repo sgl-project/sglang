@@ -19,10 +19,13 @@ suites = {
     "per-commit-8-gpu-h200": [
         TestFile("test_deepseek_v3_basic.py", 275),
         TestFile("test_deepseek_v3_mtp.py", 275),
+        TestFile("test_disaggregation_hybrid_attention.py", 400),
         TestFile("models/test_kimi_k2_models.py", 200),
         TestFile("test_deepseek_v32_basic.py", 360),
         TestFile("test_deepseek_v32_mtp.py", 360),
         TestFile("models/test_mimo_models.py", 200),
+    ],
+    "per-commit-8-gpu-h20": [
         TestFile("quant/test_w4a8_deepseek_v3.py", 520),
         TestFile("test_disaggregation_different_tp.py", 600),
         TestFile("test_disaggregation_pp.py", 180),
