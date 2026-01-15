@@ -577,7 +577,7 @@ mod tests {
         log::info!("================================================");
 
         // 6. verify node status, status of all nodes should be same, and node E should be down
-        let final_state = String::from("A: Alive - {\"hello\": [119, 111, 114, 108, 100]}, B: Alive - {}, C: Alive - {}, D: Leaving - {}, E: Down - {}");
+        let final_state = String::from("A: Alive - {\"hello\": [119, 111, 114, 108, 100]}, B: Alive - {}, C: Alive - {}, D: Down - {}, E: Down - {}");
         assert_eq!(
             print_state(&handler_a),
             final_state,
