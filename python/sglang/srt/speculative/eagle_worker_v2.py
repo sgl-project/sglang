@@ -709,8 +709,8 @@ class EagleDraftWorker(BaseDraftWorker):
 
         # Update spec_info for the next draft step
         probs = torch.softmax(logits_output.next_token_logits, dim=-1)
+        next_draft_input.hidden_states = logits_output.hidden_states
         topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
-        # next_draft_input.hidden_states = logits_output.hidden_states
         if self.enable_spec_overlap_reflow and self.speculative_num_steps > 1:
             topk_p = torch.cat(
                 [
