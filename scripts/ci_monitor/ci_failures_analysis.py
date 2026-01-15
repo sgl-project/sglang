@@ -123,7 +123,13 @@ class SGLangFailuresAnalyzer:
                     links = link_header.split(", ")
                     for link in links:
                         if 'rel="next"' in link:
-                            next_url = link.split(";")[0].strip("<>")
+                            try:
+                                parts = link.split(";")
+                                if parts:
+                                    next_url = parts[0].strip("<>")
+                            except Exception as e:
+                                print(f"Error parsing Link header: {link}, error: {e}")
+                                next_url = None
                             break
                 url = next_url
                 params = {}  # Clear params for subsequent requests (URL has them)
@@ -186,7 +192,13 @@ class SGLangFailuresAnalyzer:
                     links = link_header.split(", ")
                     for link in links:
                         if 'rel="next"' in link:
-                            next_url = link.split(";")[0].strip("<>")
+                            try:
+                                parts = link.split(";")
+                                if parts:
+                                    next_url = parts[0].strip("<>")
+                            except Exception as e:
+                                print(f"Error parsing Link header: {link}, error: {e}")
+                                next_url = None
                             break
                 url = next_url
                 params = {}  # Clear params for subsequent requests
@@ -303,8 +315,12 @@ class SGLangFailuresAnalyzer:
                 }
             return None
 
-        passed = int(summary_match.group(1))
-        total = int(summary_match.group(2))
+        try:
+            passed = int(summary_match.group(1))
+            total = int(summary_match.group(2))
+        except (ValueError, TypeError) as e:
+            print(f"Error parsing test summary numbers: {e}")
+            return None
 
         # Find failed tests section
         # Look for "FAILED:" (the ✗ character may be mangled due to encoding)
@@ -632,7 +648,10 @@ class SGLangFailuresAnalyzer:
                                 runner_instance_queue_times[runner_instance_key].append(
                                     queue_time_seconds
                                 )
-                        except (ValueError, AttributeError):
+                        except (ValueError, AttributeError, TypeError) as e:
+                            print(
+                                f"Error parsing timestamps for job {job.get('id')}: {e}"
+                            )
                             pass  # Skip if timestamp parsing fails
 
                 conclusion = job.get("conclusion")
@@ -1116,7 +1135,7 @@ class SGLangFailuresAnalyzer:
         return job_test_failures
 
     def analyze_runner_specific_test_failures(
-        self, runs: List[Dict], test_summaries: Dict[int, Dict]
+        self, runs: List[Dict]
     ) -> Dict[str, Dict[str, Dict]]:
         """
         Analyze test failures grouped by runner to identify runner-specific issues.
