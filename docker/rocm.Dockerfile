@@ -1,7 +1,7 @@
 # Usage (to build SGLang ROCm docker image):
-#   docker build --build-arg SGL_BRANCH=v0.5.6.post1 --build-arg GPU_ARCH=gfx942 -t v0.5.6.post1-rocm630-mi30x -f rocm.Dockerfile .
-#   docker build --build-arg SGL_BRANCH=v0.5.6.post1 --build-arg GPU_ARCH=gfx942-rocm700 -t v0.5.6.post1-rocm700-mi30x -f rocm.Dockerfile .
-#   docker build --build-arg SGL_BRANCH=v0.5.6.post1 --build-arg GPU_ARCH=gfx950 -t v0.5.6.post1-rocm700-mi35x -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.6.post2 --build-arg GPU_ARCH=gfx942 -t v0.5.6.post2-rocm630-mi30x -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.6.post2 --build-arg GPU_ARCH=gfx942-rocm700 -t v0.5.6.post2-rocm700-mi30x -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.6.post2 --build-arg GPU_ARCH=gfx950 -t v0.5.6.post2-rocm700-mi35x -f rocm.Dockerfile .
 
 
 # Default base images
@@ -21,7 +21,6 @@ ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
 ENV AITER_COMMIT="v0.1.4"
-ENV NO_DEPS_FLAG=""
 
 # ===============================
 # Base image 942 and args
@@ -31,8 +30,7 @@ ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT="v0.1.7.post5"
-ENV NO_DEPS_FLAG=""
+ENV AITER_COMMIT="v0.1.9.post1"
 
 # ===============================
 # Base image 950 and args
@@ -42,8 +40,7 @@ ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="0"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT="v0.1.7.post5"
-ENV NO_DEPS_FLAG=""
+ENV AITER_COMMIT="v0.1.9.post1"
 # ===============================
 # Chosen arch and args
 FROM ${GPU_ARCH}
@@ -187,9 +184,9 @@ RUN git clone ${SGL_REPO} \
     && cd .. \
     && rm -rf python/pyproject.toml && mv python/pyproject_other.toml python/pyproject.toml \
     && if [ "$BUILD_TYPE" = "srt" ]; then \
-         python -m pip --no-cache-dir install -e "python[srt_hip]" ${NO_DEPS_FLAG}; \
+         python -m pip --no-cache-dir install -e "python[srt_hip,diffusion]"; \
        else \
-         python -m pip --no-cache-dir install -e "python[all_hip]" ${NO_DEPS_FLAG}; \
+         python -m pip --no-cache-dir install -e "python[all_hip,diffusion]"; \
        fi
 
 RUN python -m pip cache purge

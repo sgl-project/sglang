@@ -67,6 +67,7 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed.parallel_state import destroy_distributed_environment
 from sglang.srt.entrypoints.engine import _set_envs_and_config
 from sglang.srt.layers.moe import initialize_moe_config
+from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler_dp_attn_mixin import prepare_mlp_sync_batch_raw
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -300,8 +301,8 @@ def prepare_inputs_for_correctness_test(bench_args, tokenizer, custom_prompts):
             sampling_params=sampling_params,
         )
         req.fill_ids = req.origin_input_ids
-        req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
-        req.logprob_start_len = len(req.origin_input_ids) - 1
+        req.logprob_start_len = -1
+        req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
         reqs.append(req)
 
     return input_ids, reqs
@@ -311,13 +312,13 @@ def prepare_extend_inputs_for_correctness_test(
     bench_args, input_ids, reqs, model_runner
 ):
     for i in range(len(reqs)):
-        req = reqs[i]
+        req: Req = reqs[i]
         req.fill_ids += input_ids[i][bench_args.cut_len :]
         req.prefix_indices = model_runner.req_to_token_pool.req_to_token[
             i, : bench_args.cut_len
         ]
-        req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
-        req.logprob_start_len = len(req.origin_input_ids) - 1
+        req.logprob_start_len = -1
+        req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
     return reqs
 
 
@@ -343,17 +344,31 @@ def prepare_synthetic_inputs_for_latency_test(
             sampling_params=sampling_params,
         )
         req.fill_ids = req.origin_input_ids
-        req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
-        req.logprob_start_len = len(req.origin_input_ids) - 1
+        req.logprob_start_len = -1
+        req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
         reqs.append(req)
 
     return reqs
 
 
+class TreeCacheNamespace(SimpleNamespace):
+    def supports_swa(self) -> bool:
+        return False
+
+    def supports_mamba(self) -> bool:
+        return False
+
+    def is_chunk_cache(self) -> bool:
+        return False
+
+    def is_tree_cache(self) -> bool:
+        return not self.is_chunk_cache()
+
+
 @torch.no_grad
 def extend(reqs, model_runner):
     # Create dummy tree_cache for benchmarks (no prefix caching, just allocation)
-    dummy_tree_cache = SimpleNamespace(
+    dummy_tree_cache = TreeCacheNamespace(
         page_size=model_runner.server_args.page_size,
         device=model_runner.device,
         token_to_kv_pool_allocator=model_runner.token_to_kv_pool_allocator,
@@ -372,7 +387,7 @@ def extend(reqs, model_runner):
     _maybe_prepare_mlp_sync_batch(batch, model_runner)
     model_worker_batch = batch.get_model_worker_batch()
     forward_batch = ForwardBatch.init_new(model_worker_batch, model_runner)
-    logits_output, _ = model_runner.forward(forward_batch)
+    logits_output = model_runner.forward(forward_batch).logits_output
     next_token_ids = model_runner.sample(logits_output, forward_batch)
     return next_token_ids, logits_output.next_token_logits, batch
 
@@ -384,7 +399,7 @@ def decode(input_token_ids, batch, model_runner):
     _maybe_prepare_mlp_sync_batch(batch, model_runner)
     model_worker_batch = batch.get_model_worker_batch()
     forward_batch = ForwardBatch.init_new(model_worker_batch, model_runner)
-    logits_output, _ = model_runner.forward(forward_batch)
+    logits_output = model_runner.forward(forward_batch).logits_output
     next_token_ids = model_runner.sample(logits_output, forward_batch)
     return next_token_ids, logits_output.next_token_logits
 
@@ -631,6 +646,7 @@ def latency_test(
     tp_rank,
 ):
     initialize_moe_config(server_args)
+    initialize_fp8_gemm_config(server_args)
 
     # Set CPU affinity
     if get_bool_env_var("SGLANG_SET_CPU_AFFINITY"):

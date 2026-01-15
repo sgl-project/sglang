@@ -1,17 +1,22 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
 
 from sglang.srt.batch_overlap.two_batch_overlap import TboDPAttentionPreparer
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.metrics.collector import DPCooperationInfo
 from sglang.srt.utils.common import require_mlp_tp_gather
 
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state import GroupCoordinator
     from sglang.srt.managers.scheduler import Scheduler
+
+
+_ENABLE_METRICS_DP_ATTENTION = envs.SGLANG_ENABLE_METRICS_DP_ATTENTION.get()
 
 
 @dataclass
@@ -32,6 +37,7 @@ class MLPSyncBatchInfo:
     global_num_tokens_for_logprob: list[int] = None
     tbo_split_seq_index: torch.Tensor = None
     global_forward_mode: int = None
+    dp_cooperation_info: Optional[DPCooperationInfo] = None
 
     def _get_local_tensor(self, device, dtype=torch.int64) -> torch.Tensor:
         return torch.tensor(
@@ -67,12 +73,15 @@ class MLPSyncBatchInfo:
         self.global_num_tokens_for_logprob = tp0_info[:, 1].tolist()
         self.can_cuda_graph = bool(tp0_info[:, 2].min().item())
         self.is_extend_in_batch = bool(tp0_info[:, 3].max().item())
+        if _ENABLE_METRICS_DP_ATTENTION:
+            self.dp_cooperation_info = DPCooperationInfo.create(tp0_info[:, 5].tolist())
 
 
 def _update_gather_batch(
     batch: ScheduleBatch,
     mlp_sync_info: MLPSyncBatchInfo,
     require_mlp_tp_gather: bool,
+    skip_all_gather=False,
 ):
     # TODO: handle the case when moe_dense_tp_size != 1
     if not require_mlp_tp_gather:
@@ -83,9 +92,10 @@ def _update_gather_batch(
         batch.global_num_tokens_for_logprob = (
             mlp_sync_info.global_num_tokens_for_logprob
         )
-    batch.is_extend_in_batch = mlp_sync_info.is_extend_in_batch
-    batch.tbo_split_seq_index = mlp_sync_info.tbo_split_seq_index
-    batch.global_forward_mode = mlp_sync_info.global_forward_mode
+    if not skip_all_gather:
+        batch.is_extend_in_batch = mlp_sync_info.is_extend_in_batch
+        batch.tbo_split_seq_index = mlp_sync_info.tbo_split_seq_index
+        batch.global_forward_mode = mlp_sync_info.global_forward_mode
 
     # Check forward mode for cuda graph
     batch.can_run_dp_cuda_graph = mlp_sync_info.can_cuda_graph
@@ -111,19 +121,20 @@ def prepare_mlp_sync_batch_raw(
         num_tokens_for_logprob = num_tokens
     else:
         num_tokens = local_batch.extend_num_tokens
-        if local_batch.return_logprob:
-            num_tokens_for_logprob = sum(
-                # We should have at least 1 token for sample in every case.
-                max(extend_len - logprob_start_len, 1)
-                for logprob_start_len, extend_len in zip(
-                    local_batch.extend_logprob_start_lens,
-                    local_batch.extend_lens,
-                )
+        num_tokens_for_logprob = sum(
+            # We should have at least 1 token for sample in every case.
+            max(extend_len - logprob_start_len, 1)
+            for logprob_start_len, extend_len in zip(
+                local_batch.extend_logprob_start_lens,
+                local_batch.extend_lens,
             )
-        else:
-            # When return_logprob = False, only need last token per request
-            num_tokens_for_logprob = local_batch.batch_size()
+        )
+        assert (
+            local_batch.return_logprob
+            or num_tokens_for_logprob == local_batch.batch_size()
+        )
 
+    skip_all_gather = envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get()
     can_cuda_graph = (
         local_batch is None
         or local_batch.forward_mode.is_decode_or_idle()
@@ -154,15 +165,17 @@ def prepare_mlp_sync_batch_raw(
         local_can_run_tbo=local_can_run_tbo,
         local_forward_mode=local_forward_mode,
     )
-    mlp_sync_info.all_gather(device=device, group=group)
 
-    mlp_sync_info.tbo_split_seq_index, mlp_sync_info.global_forward_mode = (
-        tbo_preparer.compute_output(
-            mlp_sync_info.tp0_info[:, 4:6],
+    if not skip_all_gather:
+        mlp_sync_info.all_gather(device=device, group=group)
+
+        mlp_sync_info.tbo_split_seq_index, mlp_sync_info.global_forward_mode = (
+            tbo_preparer.compute_output(
+                mlp_sync_info.tp0_info[:, 4:6],
+            )
         )
-    )
 
-    need_idle_batch = max(mlp_sync_info.global_num_tokens) > 0
+    need_idle_batch = skip_all_gather or max(mlp_sync_info.global_num_tokens) > 0
     if need_idle_batch:
         batch_to_gather = local_batch
         if local_batch is None:
@@ -170,7 +183,12 @@ def prepare_mlp_sync_batch_raw(
         elif local_batch.forward_mode.is_prebuilt():
             # NOTE: for prebuilt batch, we add an inner idle batch to run MLP sync
             batch_to_gather = local_batch.inner_idle_batch = get_idle_batch()
-        _update_gather_batch(batch_to_gather, mlp_sync_info, require_mlp_tp_gather)
+        _update_gather_batch(
+            batch_to_gather, mlp_sync_info, require_mlp_tp_gather, skip_all_gather
+        )
+
+    if _ENABLE_METRICS_DP_ATTENTION and local_batch is not None:
+        local_batch.dp_cooperation_info = mlp_sync_info.dp_cooperation_info
 
     return local_batch
 
@@ -188,6 +206,27 @@ class SchedulerDPAttnMixin:
             disable_overlap_schedule=self.server_args.disable_overlap_schedule,
             offload_tags=self.offload_tags,
         )
+
+    def maybe_prepare_mlp_sync_batch_and_log_stats(
+        self: Scheduler,
+        batch: Optional[ScheduleBatch],
+        need_sync: Optional[bool] = None,
+        log_stats: bool = True,
+    ) -> Optional[ScheduleBatch]:
+        """
+        Helper to pair log_prefill_stats with log_prefill_stats_late.
+        Should be called after get_new_batch_prefill() to ensure proper pairing.
+
+        Args:
+            batch: The batch to process
+            need_sync: If specified, overrides self.require_mlp_sync for prepare_mlp_sync_batch decision
+            log_stats: Whether to call log_prefill_stats_late. Set to False for intermediate calls.
+        """
+        if need_sync if need_sync is not None else self.require_mlp_sync:
+            batch = self.prepare_mlp_sync_batch(batch)
+        if log_stats:
+            self.log_prefill_stats_late(batch)
+        return batch
 
     def get_idle_batch(self: Scheduler) -> ScheduleBatch:
         idle_batch = ScheduleBatch.init_new(

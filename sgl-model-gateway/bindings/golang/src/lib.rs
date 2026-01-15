@@ -63,6 +63,19 @@ pub use stream::{
 // Re-export client stream function (defined in client.rs but used by stream)
 pub use client::sgl_client_chat_completion_stream;
 
+// Re-export preprocessor functions
+pub use preprocessor::{
+    sgl_preprocess_chat_request,
+    sgl_preprocess_chat_request_with_tokenizer,
+    sgl_preprocessed_request_free,
+};
+
+// Re-export postprocessor functions
+pub use postprocessor::{
+    sgl_postprocess_stream_chunk,
+    sgl_postprocess_stream_chunks_batch,
+};
+
 // Re-export utility functions
 pub use utils::sgl_generate_tool_constraints;
 
@@ -75,6 +88,8 @@ mod grpc_converter;
 mod client;
 mod stream;
 mod utils;
+mod preprocessor;
+mod postprocessor;
 
 #[cfg(test)]
 mod tests {

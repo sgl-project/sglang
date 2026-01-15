@@ -10,8 +10,8 @@ pub type TokenIdType = u32;
 
 /// Core encoding trait - separate from decoding for modularity
 pub trait Encoder: Send + Sync {
-    fn encode(&self, input: &str) -> Result<Encoding>;
-    fn encode_batch(&self, inputs: &[&str]) -> Result<Vec<Encoding>>;
+    fn encode(&self, input: &str, add_special_tokens: bool) -> Result<Encoding>;
+    fn encode_batch(&self, inputs: &[&str], add_special_tokens: bool) -> Result<Vec<Encoding>>;
 }
 
 /// Core decoding trait - can be implemented independently
@@ -43,6 +43,7 @@ pub enum Encoding {
 
 impl Encoding {
     /// Returns a reference to token IDs - zero-copy operation
+    #[inline]
     pub fn token_ids(&self) -> &[TokenIdType] {
         match self {
             Encoding::Hf(inner) => inner.get_ids(),

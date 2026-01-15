@@ -11,6 +11,13 @@ from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
     npu_fused_experts,
 )
 from sglang.srt.layers.linear import LinearBase, set_weight_attrs
+from sglang.srt.layers.moe import (
+    MoeRunner,
+    MoeRunnerBackend,
+    MoeRunnerConfig,
+    get_moe_runner_backend,
+)
+from sglang.srt.layers.moe.moe_runner.marlin import MarlinMoeQuantInfo
 from sglang.srt.layers.parameter import GroupQuantScaleParameter, PackedvLLMParameter
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
@@ -37,10 +44,9 @@ from sglang.srt.layers.quantization.utils import get_scalar_types, replace_param
 from sglang.srt.utils.patch_torch import register_fake_if_exists
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
     from sglang.srt.layers.moe.token_dispatcher import (
-        StandardDispatchOutput,
         CombineInput,
+        StandardDispatchOutput,
     )
 
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
@@ -62,7 +68,6 @@ elif _is_hip:
         awq_dequantize_triton as awq_dequantize,
     )
 
-    warnings.warn(f"HIP does not support fused_marlin_moe currently.")
 elif _is_xpu:
     from sgl_kernel import awq_dequantize
 
@@ -192,6 +197,8 @@ class AWQMarlinConfig(QuantizationConfig):
         full_config: dict[str, Any],
     ) -> None:
         super().__init__()
+        if _is_hip:
+            warnings.warn(f"HIP does not support fused_marlin_moe currently.")
         self.pack_factor = 32 // weight_bits  # packed into int32
         self.group_size = group_size
         self.zero_point = zero_point
@@ -621,8 +628,8 @@ class AWQLinearAscendMethod(AWQLinearMethod):
         qzeros_tmp = -(qzeros_tmp - 8)
         qzeros_tmp = qzeros_tmp.to(layer.scales.data.dtype)
 
-        layer.qzeros = torch.nn.Parameter(qzeros_tmp, requires_grad=False)
-        layer.qweight = torch.nn.Parameter(qweight_tmp, requires_grad=False)
+        layer.zeros = torch.nn.Parameter(qzeros_tmp, requires_grad=False)
+        layer.weight = torch.nn.Parameter(qweight_tmp, requires_grad=False)
 
     def apply(
         self,
@@ -630,9 +637,9 @@ class AWQLinearAscendMethod(AWQLinearMethod):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        qweight = layer.qweight
+        qweight = layer.weight
         scales = layer.scales
-        qzeros = layer.qzeros
+        qzeros = layer.zeros
         pack_factor = self.quant_config.pack_factor
         out_shape = x.shape[:-1] + (qweight.shape[-1] * pack_factor,)
         reshaped_x = x.reshape(-1, x.shape[-1])
@@ -753,10 +760,6 @@ class AWQMoEMethod(FusedMoEMethodBase):
         layer.register_parameter("w2_qzeros", w2_qzeros)
         set_weight_attrs(w2_qzeros, extra_weight_attrs)
 
-        device = layer.w13_qweight.device
-        if not _is_npu:
-            layer.workspace = marlin_make_workspace(device, 4)
-
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         num_experts = layer.w13_qweight.shape[0]
         device = layer.w13_qweight.device
@@ -825,44 +828,29 @@ class AWQMoEMethod(FusedMoEMethodBase):
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
+        assert get_moe_runner_backend().is_auto()
         self.moe_runner_config = moe_runner_config
+        self.runner = MoeRunner(MoeRunnerBackend.MARLIN, moe_runner_config)
 
     def apply(
         self,
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
-        from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
-            fused_marlin_moe,
+
+        quant_info = MarlinMoeQuantInfo(
+            w13_qweight=layer.w13_qweight,
+            w2_qweight=layer.w2_qweight,
+            w13_scales=layer.w13_scales,
+            w2_scales=layer.w2_scales,
+            w13_g_idx_sort_indices=layer.w13_g_idx_sort_indices,
+            w2_g_idx_sort_indices=layer.w2_g_idx_sort_indices,
+            w13_qzeros=layer.w13_qzeros,
+            w2_qzeros=layer.w2_qzeros,
+            weight_bits=self.quant_config.weight_bits,
         )
-        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
-        assert (
-            self.moe_runner_config.activation == "silu"
-        ), "Only SiLU activation is supported."
-
-        x = dispatch_output.hidden_states
-        topk_output = dispatch_output.topk_output
-        orig_dtype = x.dtype
-
-        topk_weights, topk_ids, router_logits = topk_output
-
-        output = fused_marlin_moe(
-            x,
-            layer.w13_qweight,
-            layer.w2_qweight,
-            layer.w13_scales,
-            layer.w2_scales,
-            router_logits,
-            topk_weights,
-            topk_ids,
-            sort_indices1=layer.w13_g_idx_sort_indices,
-            sort_indices2=layer.w2_g_idx_sort_indices,
-            w1_zeros=layer.w13_qzeros,
-            w2_zeros=layer.w2_qzeros,
-            num_bits=self.quant_config.weight_bits,
-        ).to(orig_dtype)
-        return StandardCombineInput(hidden_states=output)
+        return self.runner.run(dispatch_output, quant_info)
 
 
 class AWQMoEAscendMethod(AWQMoEMethod):
