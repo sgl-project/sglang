@@ -285,4 +285,3 @@ jobs:
           export PATH="/usr/local/Ascend/8.3.RC1/compiler/bishengir/bin:${PATH}"
           cd python
           python3 sglang/multimodal_gen/test/run_suite.py --suite 1-npu
-
