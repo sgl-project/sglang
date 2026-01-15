@@ -41,11 +41,11 @@ class ConfigArgumentMerger:
         if not config_file_path:
             return {}
 
-        config_data = self._parse_yaml_config(config_file_path)
+        file_config_data = self._parse_yaml_config(config_file_path)
         dest_map = {action.dest: action for action in self.parser._actions}
 
         parsed_config = {}
-        for key, value in config_data.items():
+        for key, value in file_config_data.items():
             key_norm = key.replace("-", "_")
 
             if key_norm in self.unsupported_actions:
@@ -181,6 +181,10 @@ class ConfigArgumentMerger:
             value, (dict, list)
         ):
             return value
+
+        # Handle nullable_str: convert non-string values to string first
+        if type_func_name == "nullable_str" and not isinstance(value, str):
+            value = str(value)
 
         # Apply type conversion
         return type_func(value)
