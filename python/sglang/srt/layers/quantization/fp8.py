@@ -764,9 +764,14 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.w2_input_scale = None
 
     def process_weights_after_loading(self, layer: Module) -> None:
-        if _is_hip and _use_hip_int4:
-            self.process_weights_hip_int4(layer)
-            return
+
+        if _is_hip:
+            # set quant_method in dispatcher for SGLANG_MORI_FP8_DISP feature
+            layer.dispatcher.set_quant_config({"quant_method": (self)})
+
+            if _use_hip_int4:
+                self.process_weights_hip_int4(layer)
+                return
 
         # Block quant doesn't need to process weights after loading
         if self.block_quant:

@@ -2956,10 +2956,7 @@ class DeepseekV2Model(nn.Module):
                         or a2a_backend.is_mori()
                     )
                     tp_size = (
-                        1
-                        if is_a2a_moe
-                        or should_use_flashinfer_cutlass_moe_fp4_allgather()
-                        else get_tensor_model_parallel_world_size()
+                        1 if is_a2a_moe else get_tensor_model_parallel_world_size()
                     )
                     intermediate_size = (
                         config.moe_intermediate_size * config.n_shared_experts

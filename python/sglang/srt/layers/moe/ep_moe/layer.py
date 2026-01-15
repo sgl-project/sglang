@@ -47,7 +47,7 @@ _is_fp8_fnuz = is_fp8_fnuz()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _use_aiter:
-    from aiter import ActivationType, QuantType, get_hip_quant
+    from aiter import ActivationType, QuantType
     from aiter.fused_moe import fused_moe
 elif _is_npu:
     import torch_npu
@@ -598,8 +598,6 @@ class MoriEPMoE(FusedMoE):
         expert_end_idx = expert_start_idx + self.num_local_experts
         self.expert_mask[expert_start_idx:expert_end_idx] = 1
 
-        self.quant_func = get_hip_quant(QuantType.per_1x128)
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -613,9 +611,6 @@ class MoriEPMoE(FusedMoE):
         scale = None
         is_fp8_quant = isinstance(self.quant_method, Fp8MoEMethod)
         is_quark_w4a4 = isinstance(self.quant_method, QuarkW4A4MXFp4MoEMethod)
-
-        if is_fp8_quant and get_bool_env_var("SGLANG_MORI_FP8_DISP", "False"):
-            self.dispatcher.enable_fp8_dispatch()
 
         # dispatch
         dispatch_output = self.dispatcher.dispatch(

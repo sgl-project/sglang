@@ -14,6 +14,7 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
 )
 from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.moe.utils import DeepEPMode
+from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
 from sglang.srt.utils import get_bool_env_var, get_int_env_var, is_hip
 
 if TYPE_CHECKING:
@@ -223,10 +224,18 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
         hidden_states,
         topk_weights,
         topk_ids,
-        fp8_dispatch,
     ):
         num_token = hidden_states.shape[0]
         scale = None
+
+        is_fp8_quant = (
+            isinstance(self.quant_config["quant_method"], Fp8MoEMethod)
+            if hasattr(self.quant_config, "quant_method")
+            else False
+        )
+        fp8_dispatch = (
+            get_bool_env_var("SGLANG_MORI_FP8_DISP", "False") and is_fp8_quant
+        )
 
         if fp8_dispatch:
             # FP8 quant
@@ -360,7 +369,6 @@ class MoriEPDispatcher(BaseDispatcher):
             raise NotImplementedError
 
         self._stage = _Stage.INITIAL
-        self.fp8_dispatch = False
 
     def dispatch(self, *args, **kwargs) -> DispatchOutput:
         self.dispatch_a(*args, **kwargs)
@@ -383,7 +391,7 @@ class MoriEPDispatcher(BaseDispatcher):
         self._update_stage(_Stage.AFTER_DISPATCH_A, _Stage.AFTER_DISPATCH_B)
         inner_state = self._dispatch_intermediate_state
         del self._dispatch_intermediate_state
-        return self._get_impl().dispatch_b(*inner_state, self.fp8_dispatch)
+        return self._get_impl().dispatch_b(*inner_state)
 
     def combine(
         self,
@@ -434,6 +442,3 @@ class MoriEPDispatcher(BaseDispatcher):
             raise NotImplementedError
         if self.deepep_mode.enable_normal():
             self._normal_dispatcher.set_quant_config(quant_config)
-
-    def enable_fp8_dispatch(self):
-        self.fp8_dispatch = True
