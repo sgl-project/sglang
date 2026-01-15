@@ -1,4 +1,7 @@
 name: PR Test (AMD)
+# Dynamic run-name for /rerun-stage commands to enable URL lookup
+# Format: "[stage-name] sha" for fork PRs, "[stage-name]" for non-fork, default for normal runs
+run-name: ${{ inputs.target_stage && (inputs.pr_head_sha && format('[{0}] {1}', inputs.target_stage, inputs.pr_head_sha) || format('[{0}]', inputs.target_stage)) || '' }}
 
 on:
   push:
@@ -143,6 +146,7 @@ jobs:
           docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_activation.py
           docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_topk.py
           docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_kvcacheio.py
+          docker exec -w /sglang-checkout/sgl-kernel/tests/sgl_diffusion ci_sglang python3 -m pytest test_timestep_embedding.py
 
   # =============================================== primary ====================================================
 
@@ -224,7 +228,7 @@ jobs:
       - name: Run test
         timeout-minutes: 30
         run: |
-          bash scripts/ci/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-small-1-gpu-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 12
+          bash scripts/ci/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-small-1-gpu-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 12 --timeout-per-file 1800
 
   stage-b-test-small-1-gpu-amd-mi35x:
     needs: [check-changes, stage-a-test-1-amd]
@@ -630,10 +634,18 @@ jobs:
         run: |
           bash scripts/ci/amd_ci_exec.sh python3 run_suite.py --suite per-commit-8-gpu-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --timeout-per-file 3600
 
-  unit-test-backend-8-gpu-amd-mi35x:
-    needs: [check-changes, stage-a-test-1-amd]
-    if: always() && !failure() && !cancelled() &&
-      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+  stage-c-test-large-8-gpu-amd-mi35x:
+    needs: [check-changes, call-gate, stage-b-test-small-1-gpu-amd, stage-b-test-large-2-gpu-amd]
+    if: |
+      always() &&
+      (
+        (inputs.target_stage == 'stage-c-test-large-8-gpu-amd-mi35x') ||
+        (
+          !inputs.target_stage &&
+          (!failure() && !cancelled()) &&
+          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+        )
+      )
     strategy:
       fail-fast: false
       matrix:
@@ -642,6 +654,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Ensure VRAM is clear
         run: bash scripts/ensure_vram_clear.sh rocm
@@ -657,7 +671,7 @@ jobs:
       - name: Run test
         timeout-minutes: 60
         run: |
-          bash scripts/ci/amd_ci_exec.sh python3 run_suite.py --suite per-commit-8-gpu-amd-mi35x --timeout-per-file 3600
+          bash scripts/ci/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-c-test-large-8-gpu-amd-mi35x --timeout-per-file 3600
 
   performance-test-1-gpu-part-1-amd:
     needs: [check-changes, stage-a-test-1-amd]
@@ -927,7 +941,7 @@ jobs:
         stage-b-test-large-2-gpu-amd,
         unit-test-backend-1-gpu-amd,
         unit-test-backend-8-gpu-amd,
-        unit-test-backend-8-gpu-amd-mi35x,
+        stage-c-test-large-8-gpu-amd-mi35x,
         performance-test-1-gpu-part-1-amd,
         performance-test-1-gpu-part-2-amd,
         performance-test-2-gpu-amd,
