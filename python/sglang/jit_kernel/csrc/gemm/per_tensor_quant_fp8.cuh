@@ -23,7 +23,7 @@ per_tensor_absmax_kernel(const T* __restrict__ input, float* __restrict__ output
   using namespace device;
   constexpr uint32_t VEC_SIZE = 16 / sizeof(T);
 
-  const int64_t gid = blockIdx.x * gridDim.x + threadIdx.x;
+  const int64_t gid = blockIdx.x * blockDim.x + threadIdx.x;
 
   float max_value = 0.0f;
   if (gid * VEC_SIZE + VEC_SIZE <= num_elements) {

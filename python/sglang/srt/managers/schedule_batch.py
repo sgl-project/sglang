@@ -66,7 +66,6 @@ from sglang.srt.mem_cache.common import (
     evict_from_tree_cache,
     release_kv_cache,
 )
-from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
@@ -868,7 +867,7 @@ class Req:
                 key=RadixKey(token_ids=token_ids, extra_key=self.extra_key),
                 **(
                     {"req": self, "cow_mamba": True}
-                    if isinstance(tree_cache, MambaRadixCache)
+                    if tree_cache.supports_mamba()
                     else {}
                 ),
             )

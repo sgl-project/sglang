@@ -16,7 +16,7 @@ MISTRAL_LARGE3_EAGLE_MODEL_PATH = "mistralai/Mistral-Large-3-675B-Instruct-2512-
 
 
 @unittest.skipIf(not is_blackwell_system(), "Requires B200")
-class TestMistralLarge3Unified(unittest.TestCase):
+class TestMistralLarge3(unittest.TestCase):
     """Unified test class for Mistral-Large-3 performance and accuracy.
 
     Two variants:
