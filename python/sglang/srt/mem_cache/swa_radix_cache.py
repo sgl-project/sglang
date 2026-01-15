@@ -891,6 +891,7 @@ class SWARadixCache(BasePrefixCache):
         new_node.full_lock_ref = child.full_lock_ref
         new_node.swa_lock_ref = child.swa_lock_ref
         new_node.key = child.key[:split_len]
+        assert len(new_node.key) > 0, f"new_node.key should not be empty"
         new_node.value = child.value[:split_len]
         # parent inherits the swa_uuid from child for swa lock ref
         new_node.swa_uuid = child.swa_uuid
@@ -904,6 +905,7 @@ class SWARadixCache(BasePrefixCache):
             self.swa_lru_list.remove_node(child)
         child.parent = new_node
         child.key = child.key[split_len:]
+        assert len(child.key) > 0, f"child.key should not be empty"
         child.value = child.value[split_len:]
         new_node.parent.children[self.get_child_key_fn(key)] = new_node
 
@@ -965,7 +967,7 @@ class SWARadixCache(BasePrefixCache):
                     assert (
                         swa_evicted_seqlen % self.page_size == 0
                     ), f"swa_evicted_seqlen must be page aligned, {swa_evicted_seqlen=}, {self.page_size=}"
-                    if swa_evicted_seqlen < total_prefix_length:
+                    if swa_evicted_seqlen <= total_prefix_length:
                         self.token_to_kv_pool_allocator.free(
                             node.value[first_diff_idx:]
                         )
@@ -1026,6 +1028,7 @@ class SWARadixCache(BasePrefixCache):
         value: torch.Tensor,
         swa_tombstone: bool = False,
     ) -> TreeNode:
+        assert len(key) > 0, f"key should not be empty"
         new_node = TreeNode()
         new_node.parent = node
         new_node.key = key
