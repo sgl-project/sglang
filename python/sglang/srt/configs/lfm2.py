@@ -92,14 +92,9 @@ class Lfm2Config(HFLfm2Config):
             conv_kernel=conv_kernel,
         )
 
-        # Get conv dtype from torch default (set by model runner before this is called)
-        # Fall back to bfloat16 if default is float32
-        default_dtype = torch.get_default_dtype()
-        conv_dtype = (
-            default_dtype
-            if default_dtype in (torch.float16, torch.bfloat16)
-            else torch.bfloat16
-        )
+        # Use runtime dtype from model_config (propagated to hf_config.torch_dtype)
+        # Conv state must match model's inference dtype
+        conv_dtype = getattr(self, "torch_dtype", torch.bfloat16)
 
         return Mamba2CacheParams(
             shape=shape,

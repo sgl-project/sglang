@@ -41,13 +41,7 @@ class Mamba2StateDType:
     temporal: torch.dtype
 
 
-def get_conv_dtype() -> torch.dtype:
-    """Get conv state dtype - uses torch default dtype which is set by model runner."""
-    default_dtype = torch.get_default_dtype()
-    # Only use float16/bfloat16 for conv state, fall back to bfloat16 for float32
-    if default_dtype in (torch.float16, torch.bfloat16):
-        return default_dtype
-    return torch.bfloat16
+CONV_DTYPE = torch.bfloat16
 
 
 def mamba2_state_dtype() -> Mamba2StateDType:
@@ -59,7 +53,7 @@ def mamba2_state_dtype() -> Mamba2StateDType:
     ssm_dtype = dtype_map.get(
         os.environ.get("SGLANG_MAMBA_SSM_DTYPE", "float32"), torch.float32
     )
-    return Mamba2StateDType(conv=get_conv_dtype(), temporal=ssm_dtype)
+    return Mamba2StateDType(conv=CONV_DTYPE, temporal=ssm_dtype)
 
 
 @dataclass(kw_only=True, frozen=True)
