@@ -47,8 +47,12 @@ impl MeshSyncManager {
 
         // Get current tree state or create new one
         let mut tree_state = if let Some(policy_state) = self.stores.policy.get(&key) {
-            serde_json::from_slice::<TreeState>(&policy_state.config)
-                .map_err(|e| format!("Failed to deserialize tree state for model {}: {}", model_id, e))?
+            serde_json::from_slice::<TreeState>(&policy_state.config).map_err(|e| {
+                format!(
+                    "Failed to deserialize tree state for model {}: {}",
+                    model_id, e
+                )
+            })?
         } else {
             TreeState::new(model_id.clone())
         };

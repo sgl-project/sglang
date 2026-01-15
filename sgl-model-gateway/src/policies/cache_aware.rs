@@ -162,7 +162,10 @@ impl CacheAwarePolicy {
                             let mut guard = match entry.value().lock() {
                                 Ok(guard) => guard,
                                 Err(poisoned) => {
-                                    warn!("Mutex for model {} is poisoned. Recovering.", entry.key());
+                                    warn!(
+                                        "Mutex for model {} is poisoned. Recovering.",
+                                        entry.key()
+                                    );
                                     poisoned.into_inner()
                                 }
                             };
@@ -218,15 +221,12 @@ impl CacheAwarePolicy {
         }
 
         let mesh_model_id = Self::normalize_mesh_model_id(model_id).to_string();
-
-        // Scope the entry acquisition to fix lifetime issues with MutexGuard
-        let mut ops = match self
+        let entry = self
             .pending_ops
-            .entry(mesh_model_id)
-            .or_insert_with(|| Mutex::new(Vec::new()))
-            .value()
-            .lock()
-        {
+            .entry(mesh_model_id.clone())
+            .or_insert_with(|| Mutex::new(Vec::new()));
+
+        let mut ops = match entry.value().lock() {
             Ok(guard) => guard,
             Err(poisoned) => {
                 warn!("Mutex for model {} is poisoned. Recovering.", model_id);
