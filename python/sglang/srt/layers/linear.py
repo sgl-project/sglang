@@ -66,6 +66,7 @@ WEIGHT_LOADER_V2_SUPPORTED = [
     "ModelOptFp4LinearMethod",
     "IPEXAWQLinearMethod",
     "PetitNvFp4LinearMethod",
+    "QuarkInt4Fp8LinearMethod",
 ]
 
 _is_cpu = is_cpu()
