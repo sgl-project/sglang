@@ -53,6 +53,103 @@ logger = init_logger(__name__)
 # ==============================================================================
 
 
+class LTX2RotaryEmbedding(NDRotaryEmbedding):
+    """
+    LTX-2 specific RotaryEmbedding that includes helper methods for coordinate preparation.
+    Matches the interface expected by `denoising_av.py`.
+    """
+
+    def __init__(
+        self,
+        patch_size: tuple[int, int, int],
+        *args,
+        **kwargs,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self.patch_size = patch_size
+
+    def prepare_video_coords(
+        self,
+        batch_size: int,
+        num_frames: int,
+        height: int,
+        width: int,
+        device: torch.device,
+        fps: float = 24.0,
+    ) -> torch.Tensor:
+        """
+        Prepare video coordinates [B, 3, N, 2] where the last dim is [start, end).
+        Used by `denoising_av.py`.
+        """
+        p_t, p_h, p_w = self.patch_size
+
+        # Validate divisibility
+        if num_frames % p_t != 0 or height % p_h != 0 or width % p_w != 0:
+             # Just a warning or strict check? ltx_2.py prepare() checks strict divisibility.
+             # We assume caller passes valid latent dims.
+             pass
+
+        post_t = num_frames // p_t
+        post_h = height // p_h
+        post_w = width // p_w
+
+        # Generate grid coordinates (starts)
+        # indexing="ij" -> (t, h, w) order
+        grid_coords = torch.meshgrid(
+            torch.arange(start=0, end=post_t * p_t, step=p_t, device=device),
+            torch.arange(start=0, end=post_h * p_h, step=p_h, device=device),
+            torch.arange(start=0, end=post_w * p_w, step=p_w, device=device),
+            indexing="ij",
+        )
+        
+        # [3, num_tokens]
+        patch_starts = (
+            torch.stack(grid_coords, dim=0).reshape(3, -1).to(dtype=torch.float32)
+        )
+        
+        # [3, 1]
+        patch_size_delta = torch.tensor(
+            (p_t, p_h, p_w), device=device, dtype=torch.float32
+        ).view(3, 1)
+        
+        patch_ends = patch_starts + patch_size_delta
+        
+        # [3, num_tokens, 2] -> [B, 3, num_tokens, 2]
+        coords = torch.stack([patch_starts, patch_ends], dim=-1)
+        coords = coords.unsqueeze(0).repeat(batch_size, 1, 1, 1)
+        
+        return coords
+
+    def prepare_audio_coords(
+        self,
+        batch_size: int,
+        num_frames: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """
+        Prepare audio coordinates [B, 1, N, 2] (temporal only).
+        Used by `denoising_av.py`.
+        """
+        # Audio usually has patch_size=(1, 1, 1) in current LTX setup, or at least 1D.
+        # We use the first dim of patch_size as temporal patch size.
+        p_t = self.patch_size[0]
+        
+        # Generate temporal starts
+        # num_frames here is latent temporal dimension
+        starts = torch.arange(
+            start=0, end=num_frames, step=p_t, device=device, dtype=torch.float32
+        )
+        ends = starts + float(p_t)
+        
+        # [num_tokens, 2]
+        coords_t = torch.stack([starts, ends], dim=-1)
+        
+        # [B, 1, num_tokens, 2]
+        coords = coords_t.unsqueeze(0).unsqueeze(0).repeat(batch_size, 1, 1, 1)
+        
+        return coords
+
+
 @dataclass
 class LTX2TransformerConfig:
     """
@@ -1652,12 +1749,14 @@ class LTXModel(CachableDiT, OffloadableDiTMixin):
                 norm_eps=self.norm_eps,
             )
             # RoPE (grid-based) for video.
-            self.rotary_emb = NDRotaryEmbedding(
+            self.rotary_emb = LTX2RotaryEmbedding(
+                patch_size=self.patch_size,
                 rope_dim_list=list(self.rope_dim_list),
                 rope_theta=float(self.positional_embedding_theta),
                 use_real=True,
                 dtype=torch.float64 if self.double_precision_rope else torch.float32,
             )
+            self.rope = self.rotary_emb
 
         if self.model_type.is_audio_enabled():
             self.audio_positional_embedding_max_pos = arch.audio_positional_embedding_max_pos
@@ -1673,12 +1772,14 @@ class LTXModel(CachableDiT, OffloadableDiTMixin):
                 norm_eps=self.norm_eps,
             )
             # RoPE for audio (1D).
-            self.audio_rotary_emb = NDRotaryEmbedding(
+            self.audio_rotary_emb = LTX2RotaryEmbedding(
+                patch_size=(1, 1, 1),
                 rope_dim_list=list(self.audio_rope_dim_list),
                 rope_theta=float(self.positional_embedding_theta),
                 use_real=True,
                 dtype=torch.float64 if self.double_precision_rope else torch.float32,
             )
+            self.audio_rope = self.audio_rotary_emb
 
         if self.model_type.is_video_enabled() and self.model_type.is_audio_enabled():
             cross_pe_max_pos = max(
@@ -1979,6 +2080,13 @@ class LTXModel(CachableDiT, OffloadableDiTMixin):
         encoder_hidden_states: torch.Tensor | list[torch.Tensor] | None = None,
         timestep: torch.LongTensor | None = None,
         encoder_hidden_states_image: torch.Tensor | list[torch.Tensor] | None = None,
+        # Added args for denoising stage alignment
+        num_frames: int | None = None,
+        height: int | None = None,
+        width: int | None = None,
+        fps: float = 24.0,
+        audio_num_frames: int | None = None,
+        # End added args
         guidance=None,
         **kwargs,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
@@ -1998,7 +2106,7 @@ class LTXModel(CachableDiT, OffloadableDiTMixin):
           perturbations (via kwargs): Optional perturbation config.
 
         Returns:
-          (vx, ax): Processed output tensors (patchified tokens).
+          (vx, ax): Processed output tensors (patchified tokens or unpatchified latents).
         """
         # Upstream-style validation: check model capabilities vs inputs.
         if not self.model_type.is_video_enabled() and hidden_states is not None:
@@ -2017,7 +2125,8 @@ class LTXModel(CachableDiT, OffloadableDiTMixin):
         # - Upstream LTX-2 transformer/model.py returns patchified tokens.
         # - Diffusion pipelines typically expect "noise_pred" in the same latent shape.
         #   We support both by optionally unpatchifying when requested.
-        return_latents = bool(kwargs.get("return_latents", False))
+        #   Default to True to support denoising stage usage.
+        return_latents = bool(kwargs.get("return_latents", True))
 
         # Accept common mask naming from pipeline stages.
         attention_mask = kwargs.get("attention_mask", kwargs.get("encoder_attention_mask"))
