@@ -345,47 +345,7 @@ class EagleDraftWorker(BaseDraftWorker):
 
     @draft_wrapper
     def prepare_verify_reflow(self, forward_batch, can_cuda_graph):
-        # Parse args
-        spec_info: EagleDraftInput = forward_batch.spec_info
-        topk_p, topk_index, hidden_states = (
-            spec_info.topk_p,
-            spec_info.topk_index,
-            spec_info.hidden_states,
-        )
-        if self.hot_token_id is not None:
-            topk_index = self.hot_token_id[topk_index]
-
-        # Forward multiple steps
-        scores = None
-        input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
-            0, topk_p, topk_index, hidden_states, scores, self.topk
-        )
-        score_list = [tree_info[0][:, :, i].unsqueeze(-1) for i in range(self.speculative_num_steps)]
-        token_list = [tree_info[1][:, i].unsqueeze(-1) for i in range(self.speculative_num_steps)]
-        parents_list = [tree_info[2]] + [torch.full((tree_info[2].size(0), 1), i, dtype=torch.long, device="cuda")
-                                         for i in range(1, self.speculative_num_steps)]
-
-        # Organize the results
-        score_list = torch.cat(score_list, dim=1).flatten(
-            1
-        )  # b, n, topk; n= 1 + (num_steps-1) * self.topk
-        ss_token_list = torch.cat(
-            token_list, dim=1
-        )  # b, (self.topk + (num_steps-1) * self.topk)
-        top_scores = torch.topk(
-            score_list, self.speculative_num_draft_tokens - 1, dim=-1
-        )
-        top_scores_index = top_scores.indices
-        top_scores_index = torch.sort(top_scores_index).values
-        draft_tokens = torch.gather(ss_token_list, index=top_scores_index, dim=1)
-
-        if len(parents_list) > 1:
-            parent_list = torch.cat(parents_list[:-1], dim=1)
-        else:
-            batch_size = parents_list[0].shape[0]
-            parent_list = torch.empty(batch_size, 0, device=parents_list[0].device)
-
-        return parent_list, top_scores_index, draft_tokens
+        return self.draft_forward(forward_batch, is_prepare_reflow=True)
 
     @draft_wrapper
     def draft(self, forward_batch, can_cuda_graph):
@@ -465,7 +425,7 @@ class EagleDraftWorker(BaseDraftWorker):
 
         model_worker_batch.seq_lens = seq_lens_bk
 
-    def draft_forward(self, forward_batch: ForwardBatch):
+    def draft_forward(self, forward_batch: ForwardBatch, *, is_prepare_reflow: bool = False):
         # Parse args
         spec_info: EagleDraftInput = forward_batch.spec_info
         out_cache_loc = forward_batch.out_cache_loc
@@ -497,6 +457,15 @@ class EagleDraftWorker(BaseDraftWorker):
             input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
                 i, topk_p, topk_index, hidden_states, scores, self.topk
             )
+
+            if is_prepare_reflow:
+                score_list = [tree_info[0][:, :, i].unsqueeze(-1) for i in range(self.speculative_num_steps)]
+                token_list = [tree_info[1][:, i].unsqueeze(-1) for i in range(self.speculative_num_steps)]
+                parents_list = [tree_info[2]] + [
+                    torch.full((tree_info[2].size(0), 1), i, dtype=torch.long, device="cuda")
+                    for i in range(1, self.speculative_num_steps)]
+                break
+
             score_list.append(tree_info[0])
             token_list.append(tree_info[1])
             parents_list.append(tree_info[2])
@@ -527,7 +496,7 @@ class EagleDraftWorker(BaseDraftWorker):
             topk_p_list.append(topk_p)
             topk_index_list.append(topk_index)
 
-        if self.enable_spec_overlap_reflow:
+        if self.enable_spec_overlap_reflow and not is_prepare_reflow:
             if len(topk_p_list) > 1:
                 topk_p_list = torch.cat(topk_p_list, dim=1)
                 topk_index_list = torch.cat(topk_index_list, dim=1)
