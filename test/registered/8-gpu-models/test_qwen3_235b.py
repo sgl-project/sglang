@@ -1,15 +1,9 @@
-import sys
 import unittest
-from pathlib import Path
 
-# Add nightly directory to path for run_combined_tests import
-sys.path.insert(0, str(Path(__file__).parent.parent.parent / "nightly"))
-
-from accuracy_test_runner import AccuracyTestParams
-from performance_test_runner import PerformanceTestParams
-from run_combined_tests import run_combined_tests
-
+from sglang.test.accuracy_test_runner import AccuracyTestParams
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.performance_test_runner import PerformanceTestParams
+from sglang.test.run_combined_tests import run_combined_tests
 from sglang.test.test_utils import ModelLaunchSettings, is_blackwell_system
 
 # Runs on both H200 and B200 via nightly-8-gpu-common suite
@@ -19,7 +13,7 @@ QWEN3_235B_MODEL_PATH = "Qwen/Qwen3-235B-A22B-Instruct-2507"
 
 
 @unittest.skipIf(not is_blackwell_system(), "Requires B200")
-class TestQwen3235BUnified(unittest.TestCase):
+class TestQwen3235B(unittest.TestCase):
     """Unified test class for Qwen3-235B performance and accuracy.
 
     Single variant with simple TP=8 configuration.
@@ -40,6 +34,7 @@ class TestQwen3235BUnified(unittest.TestCase):
                 QWEN3_235B_MODEL_PATH,
                 tp_size=8,
                 extra_args=base_args,
+                variant="TP8",
             ),
         ]
 

@@ -1,27 +1,22 @@
 #!/bin/bash
 set -euo pipefail
 
-# Get version from SGLang version.py file
-SGLANG_VERSION_FILE="$(dirname "$0")/../../python/sglang/version.py"
-SGLANG_VERSION="v0.5.5"   # Default version, will be overridden if version.py is found
+# Get version from git tags
+SGLANG_VERSION="v0.5.5"   # Default version, will be overridden if git tags are found
 
-TMP_VERSION_FILE=$(mktemp)
-if git fetch --depth=1 origin main; then
-  if git show origin/main:python/sglang/version.py >"$TMP_VERSION_FILE" 2>/dev/null; then
-    VERSION_FROM_FILE="v$(cat "$SGLANG_VERSION_FILE" | cut -d'"' -f2)"
-    if [ -n "$VERSION_FROM_FILE" ]; then
-      SGLANG_VERSION="$VERSION_FROM_FILE"
-      echo "Using SGLang version from origin/main: $SGLANG_VERSION"
-    else
-      echo "Warning: Could not parse version from origin/main; using default $SGLANG_VERSION" >&2
-    fi
+# Fetch tags from origin to ensure we have the latest
+if git fetch --tags origin; then
+  # Get the latest version tag sorted by version number (e.g., v0.5.7)
+  VERSION_FROM_TAG=$(git tag -l 'v[0-9]*' --sort=-v:refname | head -1)
+  if [ -n "$VERSION_FROM_TAG" ]; then
+    SGLANG_VERSION="$VERSION_FROM_TAG"
+    echo "Using SGLang version from git tags: $SGLANG_VERSION"
   else
-    echo "Warning: version.py not found on origin/main; using default $SGLANG_VERSION" >&2
+    echo "Warning: No version tags found; using default $SGLANG_VERSION" >&2
   fi
 else
-  echo "Warning: failed to fetch origin/main; using default $SGLANG_VERSION" >&2
+  echo "Warning: Failed to fetch tags from origin; using default $SGLANG_VERSION" >&2
 fi
-rm -f "$TMP_VERSION_FILE"
 
 
 # Default base tags (can be overridden by command line arguments)
@@ -117,6 +112,18 @@ find_latest_image() {
     fi
   done
 
+  # If still not found, try finding any image matching ROCm+arch from remote registry
+  echo "Exact version not found. Searching remote registry for any ${ROCM_VERSION}-${gpu_arch} image…" >&2
+  for days_back in {0..6}; do
+    local target_date=$(date -d "${days_back} days ago" +%Y%m%d)
+    local remote_tags=$(curl -s "https://registry.hub.docker.com/v2/repositories/rocm/sgl-dev/tags?page_size=100&name=${ROCM_VERSION}-${gpu_arch}-${target_date}" 2>/dev/null | grep -o '"name":"[^"]*"' | cut -d'"' -f4 | head -n 1)
+    if [[ -n "$remote_tags" ]]; then
+      echo "Found available image: rocm/sgl-dev:${remote_tags}" >&2
+      echo "rocm/sgl-dev:${remote_tags}"
+      return 0
+    fi
+  done
+
   echo "No recent images found. Searching any cached local images matching ROCm+arch…" >&2
   local any_local
   any_local=$(docker images --format '{{.Repository}}:{{.Tag}}' --filter "reference=rocm/sgl-dev:*${ROCM_VERSION}*${gpu_arch}*" | sort -r | head -n 1)
@@ -156,6 +163,8 @@ docker run -dt --user root --device=/dev/kfd ${DEVICE_FLAG} \
   --cap-add=SYS_PTRACE \
   -e HF_TOKEN="${HF_TOKEN:-}" \
   -e HF_HOME=/sgl-data/hf-cache \
+  -e HF_HUB_ETAG_TIMEOUT=300 \
+  -e HF_HUB_DOWNLOAD_TIMEOUT=300 \
   -e MIOPEN_USER_DB_PATH=/sgl-data/miopen-cache \
   -e MIOPEN_CUSTOM_CACHE_DIR=/sgl-data/miopen-cache \
   --security-opt seccomp=unconfined \

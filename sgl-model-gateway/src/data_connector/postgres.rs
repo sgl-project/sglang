@@ -58,7 +58,7 @@ impl Clone for PostgresStore {
     }
 }
 
-pub struct PostgresConversationStorage {
+pub(super) struct PostgresConversationStorage {
     store: PostgresStore,
 }
 
@@ -198,7 +198,7 @@ impl ConversationStorage for PostgresConversationStorage {
     }
 }
 
-pub struct PostgresConversationItemStorage {
+pub(super) struct PostgresConversationItemStorage {
     store: PostgresStore,
 }
 
@@ -477,7 +477,7 @@ impl ConversationItemStorage for PostgresConversationItemStorage {
     }
 }
 
-pub struct PostgresResponseStorage {
+pub(super) struct PostgresResponseStorage {
     store: PostgresStore,
 }
 

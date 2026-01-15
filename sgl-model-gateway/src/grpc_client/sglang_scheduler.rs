@@ -180,6 +180,21 @@ impl SglangSchedulerClient {
         ))
     }
 
+    /// Submit an embedding request
+    pub async fn embed(
+        &self,
+        req: proto::EmbedRequest,
+    ) -> Result<proto::EmbedResponse, Box<dyn std::error::Error + Send + Sync>> {
+        let mut client = self.client.clone();
+        let mut request = Request::new(req);
+
+        // Inject W3C trace context into gRPC metadata
+        inject_trace_context_grpc(request.metadata_mut());
+
+        let response = client.embed(request).await?;
+        Ok(response.into_inner())
+    }
+
     /// Perform health check
     pub async fn health_check(
         &self,
@@ -246,6 +261,25 @@ impl SglangSchedulerClient {
         Ok(response.into_inner())
     }
 
+    /// Build a single SGLang EmbedRequest
+    pub fn build_embed_request(
+        &self,
+        request_id: String,
+        original_text: Option<String>,
+        token_ids: Vec<u32>,
+        log_metrics: Option<bool>,
+    ) -> proto::EmbedRequest {
+        proto::EmbedRequest {
+            request_id,
+            tokenized: Some(proto::TokenizedInput {
+                original_text: original_text.unwrap_or_default(),
+                input_ids: token_ids,
+            }),
+            log_metrics: log_metrics.unwrap_or(false), // Default to false if not specified
+            ..Default::default()
+        }
+    }
+
     /// Build a single SGLang GenerateRequest from OpenAI ChatCompletionRequest
     pub fn build_generate_request_from_chat(
         &self,
@@ -272,6 +306,7 @@ impl SglangSchedulerClient {
             logprob_start_len: -1,
             top_logprobs_num: body.top_logprobs.unwrap_or(0) as i32,
             return_hidden_states: body.return_hidden_states,
+            return_routed_experts: body.return_routed_experts,
             stream: body.stream,
             ..Default::default()
         };
@@ -302,6 +337,7 @@ impl SglangSchedulerClient {
             top_logprobs_num: body.top_logprobs_num.unwrap_or(0),
             token_ids_logprob: body.token_ids_logprob.clone().unwrap_or_default(),
             return_hidden_states: body.return_hidden_states,
+            return_routed_experts: body.return_routed_experts,
             stream: body.stream,
             log_metrics: body.log_metrics,
             ..Default::default()
@@ -344,6 +380,7 @@ impl SglangSchedulerClient {
             logprob_start_len: -1,
             top_logprobs_num: body.top_logprobs.unwrap_or(0) as i32,
             return_hidden_states: false,
+            return_routed_experts: body.return_routed_experts,
             stream: body.stream.unwrap_or(false),
             ..Default::default()
         };
