@@ -1048,40 +1048,24 @@ class QuantizedRLModelLoader(DefaultModelLoader):
         tp_rank = get_tensor_model_parallel_rank()
         tp_size = get_tensor_model_parallel_world_size()
 
-        def _get_tp_sharded_scale(full_scale_tensor, is_blockwise=False):
-            """Get tp sharded scale from full scale tensor
-
-            Args:
-                full_scale_tensor: Full scale tensor
-                is_blockwise: If True, scale is 2D (blk_m, blk_n) for blockwise quantization
-                             If False, scale is 1D or 2D (M, k) for perchannel quantization
+        def _get_tp_sharded_scale(full_scale_tensor):
+            """Get tp sharded scale from full scale tensor.
+            - Blockwise: scale shape (blk_m, blk_n) -> shard along blk_m dimension
+            - Perchannel: scale shape (M, k) -> shard along M dimension
             """
             if tp_size == 1:
                 return full_scale_tensor
 
-            if is_blockwise:
-                # For blockwise: scale shape is (blk_m, blk_n), shard along blk_m dimension
-                full_dim = full_scale_tensor.shape[0]
-                shard_dim = full_dim // tp_size
-                start_idx = tp_rank * shard_dim
-                end_idx = start_idx + shard_dim
-                return full_scale_tensor[start_idx:end_idx, :]
-            else:
-                # For perchannel: scale shape is (M, k), shard along M dimension
-                full_dim = full_scale_tensor.shape[0]
-                shard_dim = full_dim // tp_size
-                start_idx = tp_rank * shard_dim
-                end_idx = start_idx + shard_dim
-                return full_scale_tensor[start_idx:end_idx]
+            full_dim = full_scale_tensor.shape[0]
+            shard_dim = full_dim // tp_size
+            start_idx = tp_rank * shard_dim
+            end_idx = start_idx + shard_dim
+            return full_scale_tensor[start_idx:end_idx]
 
         # Check if this is blockwise (weight_scale_inv) or perchannel (weight_scale)
-        if param_name.endswith(".weight"):
-            base_name = param_name[:-7]
-            weight_scale_inv_name = f"{base_name}.weight_scale_inv"
-            weight_scale_name = f"{base_name}.weight_scale"
-        else:
-            weight_scale_inv_name = f"{param_name}.weight_scale_inv"
-            weight_scale_name = f"{param_name}.weight_scale"
+        base_name = param_name[:-7] if param_name.endswith(".weight") else param_name
+        weight_scale_inv_name = f"{base_name}.weight_scale_inv"
+        weight_scale_name = f"{base_name}.weight_scale"
 
         scale_param_inv = all_params.get(weight_scale_inv_name)
         scale_param = all_params.get(weight_scale_name)
@@ -1098,42 +1082,34 @@ class QuantizedRLModelLoader(DefaultModelLoader):
 
         if isinstance(scale_info, torch.Tensor):
             # Non-stacked parameter
-            if is_blockwise:
-                # Blockwise: no transpose, direct copy (matching initial load behavior)
-                new_scale = scale_info.contiguous()
-                new_scale = _get_tp_sharded_scale(new_scale, is_blockwise=True)
-                if scale_param_inv.data.shape == new_scale.shape:
-                    scale_param_inv.data.copy_(new_scale)
-                else:
-                    logger.warning(
-                        "[QuantizedRL] Scale shape mismatch for %s: expected %s, got %s",
-                        weight_scale_inv_name,
-                        scale_param_inv.data.shape,
-                        new_scale.shape,
-                    )
+            # Blockwise: no transpose, direct copy (matching initial load behavior)
+            # Perchannel: transpose needed (matching original behavior)
+            new_scale = scale_info.contiguous() if is_blockwise else scale_info.t().contiguous()
+            new_scale = _get_tp_sharded_scale(new_scale)
+            
+            # Determine which scale parameter to update
+            scale_param_to_update = scale_param_inv if is_blockwise else scale_param
+            scale_name = weight_scale_inv_name if is_blockwise else weight_scale_name
+            
+            if scale_param_to_update.data.shape == new_scale.shape:
+                scale_param_to_update.data.copy_(new_scale)
             else:
-                # Perchannel: transpose needed (matching original behavior)
-                new_scale = scale_info.t().contiguous()
-                new_scale = _get_tp_sharded_scale(new_scale, is_blockwise=False)
-                if scale_param.data.shape == new_scale.shape:
-                    scale_param.data.copy_(new_scale)
-                else:
-                    logger.warning(
-                        "[QuantizedRL] Scale shape mismatch for %s: expected %s, got %s",
-                        weight_scale_name,
-                        scale_param.data.shape,
-                        new_scale.shape,
-                    )
+                logger.warning(
+                    "[QuantizedRL] Scale shape mismatch for %s: expected %s, got %s",
+                    scale_name,
+                    scale_param_to_update.data.shape,
+                    new_scale.shape,
+                )
         else:
             # Stacked parameter (qkv_proj, gate_up_proj)
-            stacked_key = next(
-                (
-                    target
-                    for target, _ in QuantizedRLModelLoader.STACKED_PARAMS_MAPPING
-                    if target in param_name
-                ),
-                None,
-            )
+            stacked_key = None
+            shard_names = []
+            for target, names in QuantizedRLModelLoader.STACKED_PARAMS_MAPPING:
+                if target in param_name:
+                    stacked_key = target
+                    shard_names = names
+                    break
+
             if stacked_key is None:
                 logger.warning(
                     "[QuantizedRL] Stacked key not found for stacked scale_info: %s",
@@ -1141,29 +1117,12 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                 )
                 return
 
-            shard_names = next(
-                (
-                    names
-                    for target, names in QuantizedRLModelLoader.STACKED_PARAMS_MAPPING
-                    if target == stacked_key
-                ),
-                [],
-            )
-
-            if is_blockwise:
-                # Blockwise stacked: scale shape is (blk_m, blk_n) for each shard
-                # Stacked scale shape should be (blk_m_total, blk_n)
-                scale_param_to_update = scale_param_inv
-                rows_per_shard = scale_param_to_update.data.shape[0] // max(
-                    len(shard_names), 1
-                )
-            else:
-                # Perchannel stacked: scale shape is (M, k) for each shard
-                # Stacked scale shape should be (k, M_total)
-                scale_param_to_update = scale_param
-                rows_per_shard = scale_param_to_update.data.shape[-1] // max(
-                    len(shard_names), 1
-                )
+            # Determine which scale parameter to update and calculate rows per shard
+            # Blockwise: scale shape (blk_m, blk_n) -> use shape[0]
+            # Perchannel: scale shape (M, k) -> use shape[-1]
+            scale_param_to_update = scale_param_inv if is_blockwise else scale_param
+            dim_idx = 0 if is_blockwise else -1
+            rows_per_shard = scale_param_to_update.data.shape[dim_idx] // max(len(shard_names), 1)
 
             if rows_per_shard * len(shard_names) != (
                 scale_param_to_update.data.shape[0]
@@ -1186,26 +1145,21 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                     offset += rows_per_shard
                     continue
 
-                shard_scale = _get_tp_sharded_scale(
-                    shard_scale, is_blockwise=is_blockwise
-                )
+                shard_scale = _get_tp_sharded_scale(shard_scale)
 
+                # Common calculations for both blockwise and perchannel
+                shard_rows = shard_scale.shape[0]
+                start = offset
+                end = start + shard_rows
+
+                # Blockwise: no transpose, stack along first dimension
+                # Perchannel: transpose then stack along last dimension
                 if is_blockwise:
-                    # Blockwise: no transpose, stack along first dimension
-                    shard_rows = shard_scale.shape[0]
-                    start = offset
-                    end = start + shard_rows
                     scale_param_to_update.data[start:end, :] = shard_scale.contiguous()
-                    offset = end
                 else:
-                    # Perchannel: transpose then stack along last dimension
-                    shard_rows = shard_scale.shape[0]
-                    start = offset
-                    end = start + shard_rows
-                    scale_param_to_update.data[..., start:end] = (
-                        shard_scale.t().contiguous()
-                    )
-                    offset = end
+                    scale_param_to_update.data[..., start:end] = shard_scale.t().contiguous()
+
+                offset = end
 
     @staticmethod
     def rebinding_and_load_weights(model, first_time_load_weights, weights):
@@ -1296,7 +1250,7 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                                 f"[QuantizedRL] Quantize (blockwise): {name} {weight.dtype}→FP8 "
                                 f"(shape={weight.shape}, block_size={default_block_size})"
                             )
-                        except Exception as e:
+                        except (RuntimeError, ValueError) as e:
                             logger.warning(
                                 f"[QuantizedRL] Blockwise quantization failed for {name}: {e}, "
                                 "falling back to per_token_group_quant_fp8"
