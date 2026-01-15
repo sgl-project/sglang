@@ -2,8 +2,6 @@ syntax = "proto3";
 
 package vllm.grpc.engine;
 
-import "google/protobuf/struct.proto";
-
 // Service definition for vLLM engine communication
 // This protocol is designed for efficient binary communication between
 // the Rust router and vLLM Python engine (AsyncLLM).
@@ -125,9 +123,6 @@ message GenerateStreamChunk {
   // Logprobs support (TODO: implement in Phase 4)
   // OutputLogProbs output_logprobs = 5;
   // InputLogProbs input_logprobs = 6;  // Only in first chunk
-
-  // Index for ordering when n>1 (for parallel request multiplexing)
-  uint32 index = 7;
 }
 
 message GenerateComplete {
@@ -140,9 +135,6 @@ message GenerateComplete {
   // Logprobs support (TODO: implement in Phase 4)
   // OutputLogProbs output_logprobs = 6;
   // InputLogProbs input_logprobs = 7;
-
-  // Index for ordering when n>1 (for parallel request multiplexing)
-  uint32 index = 9;
 }
 
 message GenerateError {

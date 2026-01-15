@@ -585,15 +585,6 @@ class GrpcRequestManager:
                 },
             }
 
-            if (
-                state.obj.return_routed_experts
-                and batch_out.output_routed_experts
-                and i < len(batch_out.output_routed_experts)
-            ):
-                routed_experts_item = batch_out.output_routed_experts[i]
-                if routed_experts_item is not None:
-                    output_data["routed_experts"] = routed_experts_item
-
             # Accumulate logprobs (following tokenizer_manager pattern)
             if state.obj.return_logprob:
                 self._convert_logprob_style(state, batch_out, i)

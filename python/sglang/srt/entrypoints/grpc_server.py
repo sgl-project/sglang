@@ -14,7 +14,6 @@ from concurrent import futures
 from typing import AsyncIterator, Dict, Optional
 
 import grpc
-import pybase64
 from google.protobuf.json_format import MessageToDict
 from google.protobuf.struct_pb2 import Struct
 from google.protobuf.timestamp_pb2 import Timestamp
@@ -442,7 +441,6 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             bootstrap_host=bootstrap_host,
             bootstrap_port=bootstrap_port,
             bootstrap_room=bootstrap_room,
-            return_routed_experts=grpc_req.return_routed_experts,
         )
 
     def _convert_embed_request(
@@ -670,49 +668,21 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             output.get("input_logprobs")
         )
 
-        routed_experts_proto = None
-        if "routed_experts" in output and output["routed_experts"] is not None:
-            routed_experts_data = output["routed_experts"]
-            if isinstance(routed_experts_data, str):
-                routed_experts_proto = Struct()
-                routed_experts_proto["routed_experts_base64"] = routed_experts_data
-            elif isinstance(routed_experts_data, dict):
-                routed_experts_proto = Struct()
-                routed_experts_proto.update(routed_experts_data)
-            elif hasattr(routed_experts_data, "__iter__") and not isinstance(
-                routed_experts_data, (str, dict)
-            ):
-                try:
-                    if hasattr(routed_experts_data, "numpy"):
-                        routed_experts_bytes = routed_experts_data.numpy().tobytes()
-                    else:
-                        routed_experts_bytes = routed_experts_data
-                    routed_experts_proto = Struct()
-                    routed_experts_proto["routed_experts_base64"] = pybase64.b64encode(
-                        routed_experts_bytes
-                    ).decode("utf-8")
-                except Exception as e:
-                    logger.warning(f"Failed to encode routed_experts: {e}")
-
-        complete_kwargs = dict(
-            output_ids=output.get("token_ids", []),
-            finish_reason=finish_reason,
-            prompt_tokens=meta_info.get("prompt_tokens", 0),
-            completion_tokens=meta_info.get(
-                "completion_tokens", len(output.get("token_ids", []))
-            ),
-            cached_tokens=meta_info.get("cached_tokens", 0),
-            output_logprobs=output_logprobs_proto,
-            input_logprobs=input_logprobs_proto,
-            index=output.get("index", 0),
-            **matched_stop_kwargs,
-        )
-        if routed_experts_proto is not None:
-            complete_kwargs["routed_experts"] = routed_experts_proto
-
         return sglang_scheduler_pb2.GenerateResponse(
             request_id=request_id,
-            complete=sglang_scheduler_pb2.GenerateComplete(**complete_kwargs),
+            complete=sglang_scheduler_pb2.GenerateComplete(
+                output_ids=output.get("token_ids", []),
+                finish_reason=finish_reason,
+                prompt_tokens=meta_info.get("prompt_tokens", 0),
+                completion_tokens=meta_info.get(
+                    "completion_tokens", len(output.get("token_ids", []))
+                ),
+                cached_tokens=meta_info.get("cached_tokens", 0),
+                output_logprobs=output_logprobs_proto,
+                input_logprobs=input_logprobs_proto,
+                index=output.get("index", 0),
+                **matched_stop_kwargs,
+            ),
         )
 
     async def shutdown(self):

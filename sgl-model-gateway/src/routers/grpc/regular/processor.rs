@@ -436,25 +436,6 @@ impl ResponseProcessor {
                 None
             };
 
-            let routed_experts = complete.routed_experts().map(|proto_struct| {
-                let mut obj = serde_json::json!({});
-                if let Value::Object(ref mut map) = obj {
-                    for (key, value) in &proto_struct.fields {
-                        if let Some(prost_value) = value.kind.as_ref() {
-                            let json_value = match prost_value {
-                                prost_types::value::Kind::NullValue(_) => serde_json::json!(null),
-                                prost_types::value::Kind::NumberValue(n) => serde_json::json!(n),
-                                prost_types::value::Kind::StringValue(s) => serde_json::json!(s),
-                                prost_types::value::Kind::BoolValue(b) => serde_json::json!(b),
-                                _ => serde_json::json!({}),
-                            };
-                            map.insert(key.clone(), json_value);
-                        }
-                    }
-                }
-                obj
-            });
-
             // Build GenerateResponse struct
             let meta_info = GenerateMetaInfo {
                 id: dispatch.request_id.clone(),
@@ -470,7 +451,6 @@ impl ResponseProcessor {
                 cached_tokens: complete.cached_tokens() as u32,
                 e2e_latency: start_time.elapsed().as_secs_f64(),
                 matched_stop,
-                routed_experts,
             };
 
             result_array.push(GenerateResponse {

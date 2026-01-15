@@ -851,8 +851,6 @@ class SchedulerOutputProcessorMixin:
                 req.finished_output = True
                 if req.finished_len is None:
                     req.finished_len = len(req.output_ids)
-                if req.return_routed_experts:
-                    self.maybe_collect_routed_experts(req)
                 should_output = True
             else:
                 if req.stream:

@@ -127,9 +127,6 @@ message GenerateRequest {
 
   // Whether client wants streaming response
   bool stream = 17;
-
-  // Return routed experts information
-  bool return_routed_experts = 18;
 }
 
 message TokenizedInput {
@@ -221,9 +218,6 @@ message GenerateComplete {
 
   // Index for ordering when n>1 (for parallel request multiplexing)
   uint32 index = 11;
-
-  // Routed experts information
-  google.protobuf.Struct routed_experts = 12;
 }
 
 message GenerateError {
