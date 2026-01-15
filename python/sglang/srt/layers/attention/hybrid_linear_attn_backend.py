@@ -913,6 +913,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             use_qk_l2norm_in_kernel=True,
             softplus_beta=1.0,
             softplus_threshold=20.0,
+            enable_torch_compile=get_global_server_args().enable_torch_compile,
         )
 
         self._track_mamba_state_decode(
