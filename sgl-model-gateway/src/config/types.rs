@@ -386,6 +386,8 @@ pub enum PolicyConfig {
         balance_rel_threshold: f32,
         eviction_interval_secs: u64,
         max_tree_size: usize,
+        #[serde(default = "default_mesh_sync_interval_secs")]
+        mesh_sync_interval_secs: u64,
     },
 
     #[serde(rename = "power_of_two")]
@@ -441,6 +443,9 @@ pub enum PolicyConfig {
         #[serde(default = "default_load_factor")]
         load_factor: f64,
     },
+}
+fn default_mesh_sync_interval_secs() -> u64 {
+    1
 }
 
 fn default_prefix_token_count() -> usize {
