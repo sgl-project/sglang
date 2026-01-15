@@ -65,10 +65,11 @@ TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 REDUCE_OP_SUM = int(torch.distributed.ReduceOp.SUM)
 
 if _is_npu:
+
     def _get_npu_hccl_pg_options():
         """Helper to create ProcessGroupHCCL options for NPU."""
         import torch_npu
-        
+
         options = torch_npu._C._distributed_c10d.ProcessGroupHCCL.Options()
         hccl_buffer_size = int(
             os.environ.get("DEEPEP_HCCL_BUFFSIZE")
