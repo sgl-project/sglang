@@ -381,10 +381,30 @@ class SGLangFailuresAnalyzer:
         # Convert to regular dict and sort by streak then total failures
         result = {}
         for test_file, data in test_failures.items():
+            # Filter out test failures where the current streak is composed ONLY of
+            # skipped/cancelled/unknown runs (no actual failures in the streak)
+            # We do this by checking if there's at least one actual failure (failed=True)
+            # in the recent runs that contribute to the current streak
+            current_streak = data["current_streak"]
+            recent_runs = data["recent_runs"]
+
+            # If there's a current streak, check if it contains actual failures
+            if current_streak > 0:
+                # Look at the last N runs where N = current_streak
+                # Check if any of them are actual failures (not just cancelled/skipped)
+                streak_runs = recent_runs[-current_streak:]
+                has_actual_failure = any(
+                    run.get("failed") == True for run in streak_runs
+                )
+
+                # Skip this test if the streak contains no actual failures
+                if not has_actual_failure:
+                    continue
+
             result[test_file] = {
                 "total_failures": data["total_failures"],
-                "current_streak": data["current_streak"],
-                "recent_runs": data["recent_runs"][-10:],  # Keep last 10
+                "current_streak": current_streak,
+                "recent_runs": recent_runs[-10:],  # Keep last 10
             }
 
         return result
@@ -1329,90 +1349,6 @@ class SGLangFailuresAnalyzer:
             # Get test failures data
             job_test_failures = report_data.get("job_test_failures", {})
 
-            # Helper function to generate test failure dropdown for a job
-            def generate_test_failure_dropdown(job_name: str) -> List[str]:
-                """Generate collapsible test failure details for a job."""
-                lines = []
-                test_failures = job_test_failures.get(job_name, {})
-                if not test_failures:
-                    return lines
-
-                # Check if we couldn't parse any test summaries for this job
-                if test_failures.get("_no_test_summary"):
-                    lines.append("<details>")
-                    lines.append(
-                        f"<summary>🔬 Test failures for <code>{job_name}</code> (no test summary available)</summary>"
-                    )
-                    lines.append("")
-                    lines.append(
-                        "_Could not parse test summary from job logs. The job may not produce a test summary, or the log format may have changed._"
-                    )
-                    lines.append("")
-                    lines.append("</details>")
-                    lines.append("")
-                    return lines
-
-                # Filter out the marker key if present
-                test_failures = {
-                    k: v for k, v in test_failures.items() if not k.startswith("_")
-                }
-                if not test_failures:
-                    return lines
-
-                # Sort by current streak (descending), then total failures
-                sorted_tests = sorted(
-                    test_failures.items(),
-                    key=lambda x: (x[1]["current_streak"], x[1]["total_failures"]),
-                    reverse=True,
-                )
-
-                lines.append("<details>")
-                lines.append(
-                    f"<summary>🔬 Test failures for <code>{job_name}</code> ({len(sorted_tests)} tests)</summary>"
-                )
-                lines.append("")
-                lines.append(
-                    "| Test File | Failures | Streak | Recent Runs (oldest → latest) |"
-                )
-                lines.append(
-                    "|-----------|----------|--------|-------------------------------|"
-                )
-
-                for test_file, test_data in sorted_tests[:10]:  # Limit to top 10 tests
-                    total_failures = test_data["total_failures"]
-                    current_streak = test_data["current_streak"]
-                    recent_runs = test_data.get("recent_runs", [])
-
-                    # Format streak with fire emoji if consecutive
-                    streak_str = (
-                        f"🔥 {current_streak}"
-                        if current_streak >= 2
-                        else str(current_streak)
-                    )
-
-                    # Build history links
-                    if recent_runs:
-                        history_links = "… " + " ".join(
-                            [f"[{r['status']}]({r['job_url']})" for r in recent_runs]
-                        )
-                    else:
-                        history_links = "N/A"
-
-                    # Highlight tests with high streak
-                    if current_streak >= 3:
-                        lines.append(
-                            f"| <span style='color:red'>`{test_file}`</span> | <span style='color:red'>{total_failures}</span> | <span style='color:red'>{streak_str}</span> | <span style='color:red'>{history_links}</span> |"
-                        )
-                    else:
-                        lines.append(
-                            f"| `{test_file}` | {total_failures} | {streak_str} | {history_links} |"
-                        )
-
-                lines.append("")
-                lines.append("</details>")
-                lines.append("")
-                return lines
-
             # Helper function to generate job section for GitHub markdown
             def generate_job_section_md(
                 title: str, data: Dict[str, Dict], show_test_failures: bool = True
@@ -1444,10 +1380,211 @@ class SGLangFailuresAnalyzer:
                 summary_lines.append(f"## {title}")
                 summary_lines.append("")
 
+                # ==== TEST-LEVEL FAILURES FIRST (if show_test_failures is enabled) ====
+                if show_test_failures:
+                    # Collect all test failures from broken and high_failure_rate jobs
+                    all_test_failures = []
+
+                    # Collect from broken jobs (current_streak >= 2)
+                    for job_name, job_data in broken:
+                        test_failures = job_test_failures.get(job_name, {})
+                        if test_failures and not test_failures.get("_no_test_summary"):
+                            for test_file, test_data in test_failures.items():
+                                if not test_file.startswith("_"):  # Skip marker keys
+                                    all_test_failures.append(
+                                        {
+                                            "job_name": job_name,
+                                            "test_file": test_file,
+                                            "test_data": test_data,
+                                            "job_data": job_data,
+                                        }
+                                    )
+
+                    # Collect from high_failure_rate jobs
+                    for job_name, job_data in high_failure_rate:
+                        test_failures = job_test_failures.get(job_name, {})
+                        if test_failures and not test_failures.get("_no_test_summary"):
+                            for test_file, test_data in test_failures.items():
+                                if not test_file.startswith("_"):
+                                    all_test_failures.append(
+                                        {
+                                            "job_name": job_name,
+                                            "test_file": test_file,
+                                            "test_data": test_data,
+                                            "job_data": job_data,
+                                        }
+                                    )
+
+                    # Sort by current_streak descending, then total_failures descending
+                    all_test_failures.sort(
+                        key=lambda x: (
+                            x["test_data"]["current_streak"],
+                            x["test_data"]["total_failures"],
+                        ),
+                        reverse=True,
+                    )
+
+                    # Split into streak tests and high failure rate tests
+                    streak_tests = [
+                        t
+                        for t in all_test_failures
+                        if t["test_data"]["current_streak"] >= 2
+                    ]
+                    high_rate_tests = [
+                        t
+                        for t in all_test_failures
+                        if t["test_data"]["current_streak"] < 2
+                    ]
+
+                    # Show tests with consecutive failures
+                    if streak_tests:
+                        summary_lines.append(
+                            "🔥 **Tests with consecutive failures (≥2) & currently failing**"
+                        )
+                        summary_lines.append("")
+                        summary_lines.append(
+                            "| Test File | Job | Failures | Streak | First | Last | Recent Runs (oldest → latest) |"
+                        )
+                        summary_lines.append(
+                            "|-----------|-----|----------|--------|-------|------|-------------------------------|"
+                        )
+
+                        for test_info in streak_tests[:20]:  # Show top 20 tests
+                            test_file = test_info["test_file"]
+                            job_name = test_info["job_name"]
+                            test_data = test_info["test_data"]
+                            job_data = test_info["job_data"]
+
+                            # Truncate names
+                            test_display = (
+                                test_file
+                                if len(test_file) <= 30
+                                else test_file[:27] + "..."
+                            )
+                            job_display = (
+                                job_name
+                                if len(job_name) <= 25
+                                else job_name[:22] + "..."
+                            )
+
+                            # Get first and last failure from job level
+                            first_failure = job_data.get("first_failure_in_streak")
+                            first_str = (
+                                f"[Run #{first_failure['run_number']}]({first_failure.get('job_url', first_failure['url'])})"
+                                if first_failure
+                                else "N/A"
+                            )
+
+                            last_failure = job_data.get("last_failure_in_streak")
+                            last_str = (
+                                f"[Run #{last_failure['run_number']}]({last_failure.get('job_url', last_failure['url'])})"
+                                if last_failure
+                                else "N/A"
+                            )
+
+                            # Format streak with fire emoji
+                            streak_str = f"🔥 {test_data['current_streak']}"
+
+                            # Build history links
+                            recent_runs = test_data.get("recent_runs", [])
+                            if recent_runs:
+                                history_links = "… " + " ".join(
+                                    [
+                                        f"[{r['status']}]({r['job_url']})"
+                                        for r in recent_runs[-5:]
+                                    ]  # Last 5 runs
+                                )
+                            else:
+                                history_links = "N/A"
+
+                            # Highlight if streak >= 3
+                            if test_data["current_streak"] >= 3:
+                                summary_lines.append(
+                                    f"| <span style='color:red'>`{test_display}`</span> | <span style='color:red'>`{job_display}`</span> | "
+                                    f"<span style='color:red'>{test_data['total_failures']}</span> | <span style='color:red'>{streak_str}</span> | "
+                                    f"<span style='color:red'>{first_str}</span> | <span style='color:red'>{last_str}</span> | "
+                                    f"<span style='color:red'>{history_links}</span> |"
+                                )
+                            else:
+                                summary_lines.append(
+                                    f"| `{test_display}` | `{job_display}` | {test_data['total_failures']} | {streak_str} | "
+                                    f"{first_str} | {last_str} | {history_links} |"
+                                )
+
+                        summary_lines.append("")
+
+                    # Show tests with high failure rate but no current streak
+                    if high_rate_tests:
+                        summary_lines.append(
+                            "⚠️ **Tests with no current failure streak but high intermittent failure rate**"
+                        )
+                        summary_lines.append("")
+                        summary_lines.append(
+                            "| Test File | Job | Failures | Streak | Recent Runs (oldest → latest) |"
+                        )
+                        summary_lines.append(
+                            "|-----------|-----|----------|--------|-------------------------------|"
+                        )
+
+                        for test_info in high_rate_tests[:15]:  # Show top 15
+                            test_file = test_info["test_file"]
+                            job_name = test_info["job_name"]
+                            test_data = test_info["test_data"]
+
+                            test_display = (
+                                test_file
+                                if len(test_file) <= 30
+                                else test_file[:27] + "..."
+                            )
+                            job_display = (
+                                job_name
+                                if len(job_name) <= 25
+                                else job_name[:22] + "..."
+                            )
+
+                            # Build history links
+                            recent_runs = test_data.get("recent_runs", [])
+                            if recent_runs:
+                                history_links = "… " + " ".join(
+                                    [
+                                        f"[{r['status']}]({r['job_url']})"
+                                        for r in recent_runs[-5:]
+                                    ]
+                                )
+                            else:
+                                history_links = "N/A"
+
+                            summary_lines.append(
+                                f"| <span style='color:orange'>`{test_display}`</span> | <span style='color:orange'>`{job_display}`</span> | "
+                                f"<span style='color:orange'>{test_data['total_failures']}</span> | <span style='color:orange'>{test_data['current_streak']}</span> | "
+                                f"<span style='color:orange'>{history_links}</span> |"
+                            )
+
+                        summary_lines.append("")
+
+                    # If no test failures found but we have broken/high_failure_rate jobs
+                    if (
+                        not streak_tests
+                        and not high_rate_tests
+                        and (broken or high_failure_rate)
+                    ):
+                        summary_lines.append(
+                            "_No test-level failure data available for this workflow_"
+                        )
+                        summary_lines.append("")
+
+                # ==== JOB-LEVEL SUMMARY (COLLAPSIBLE) ====
+                summary_lines.append("<details>")
+                summary_lines.append(
+                    "<summary><b>📊 Job-level summary (click to expand)</b></summary>"
+                )
+                summary_lines.append("")
+
+                # Broken jobs (with active streak)
                 if broken:
-                    # Add sub-header to clarify this shows ongoing failure streaks
+                    summary_lines.append("<details>")
                     summary_lines.append(
-                        "🔥 **Consecutive failures (≥2) & currently failing**"
+                        "<summary>🔥 <b>Consecutive failures (≥2) & currently failing</b></summary>"
                     )
                     summary_lines.append("")
                     summary_lines.append(
@@ -1475,7 +1612,6 @@ class SGLangFailuresAnalyzer:
                             else "N/A"
                         )
 
-                        # Recent history (last 5 runs as clickable emoji)
                         recent_runs = d.get("recent_runs", [])
                         if recent_runs:
                             history_links = "… " + " ".join(
@@ -1487,7 +1623,6 @@ class SGLangFailuresAnalyzer:
                         else:
                             history_links = "N/A"
 
-                        # Make entire row red if current streak >= 3
                         if d["current_streak"] >= 3:
                             summary_lines.append(
                                 f"| <span style='color:red'>`{display_name}`</span> | <span style='color:red'>{d['current_streak']}</span> | <span style='color:red'>{d['max_streak']}</span> | <span style='color:red'>{d['total_runs']}</span> | "
@@ -1499,23 +1634,15 @@ class SGLangFailuresAnalyzer:
                                 f"{first_str} | {last_str} | {history_links} |"
                             )
 
-                    # Add test failure dropdowns after the table (only for scheduled runs)
                     summary_lines.append("")
-                    if show_test_failures:
-                        for job_name, d in broken[:15]:
-                            test_dropdown = generate_test_failure_dropdown(job_name)
-                            if test_dropdown:
-                                summary_lines.extend(test_dropdown)
-                else:
-                    summary_lines.append(
-                        "✅ **No jobs with active failure streaks (streak >= 2)**"
-                    )
+                    summary_lines.append("</details>")
                     summary_lines.append("")
 
-                # Show high failure rate jobs (NOT collapsible)
+                # High failure rate jobs (no active streak)
                 if high_failure_rate:
+                    summary_lines.append("<details>")
                     summary_lines.append(
-                        "⚠️ **No current failure streak but high intermittent failure rate (≥50%)**"
+                        "<summary>⚠️ <b>No current failure streak but high intermittent failure rate (≥50%)</b></summary>"
                     )
                     summary_lines.append("")
                     summary_lines.append(
@@ -1539,32 +1666,20 @@ class SGLangFailuresAnalyzer:
                         else:
                             history_links = "N/A"
 
-                        # Highlight rows with failure rate >= 50%
                         summary_lines.append(
                             f"| <span style='color:orange'>`{display_name}`</span> | <span style='color:orange'>{d['total_failures']}</span> | <span style='color:orange'>{d['failure_rate']:.1f}%</span> | <span style='color:orange'>{d['total_runs']}</span> | <span style='color:orange'>{history_links}</span> |"
                         )
 
-                    # Add test failure dropdowns after the table (only for scheduled runs)
                     summary_lines.append("")
-                    if show_test_failures:
-                        for job_name, d in high_failure_rate[:15]:
-                            test_dropdown = generate_test_failure_dropdown(job_name)
-                            if test_dropdown:
-                                summary_lines.extend(test_dropdown)
+                    summary_lines.append("</details>")
+                    summary_lines.append("")
 
-                # Show recently failed jobs in a collapsible section
+                # Recently failed jobs (collapsible)
                 if recently_failed:
-                    # Extract just the workflow name without the run count for cleaner display
-                    # e.g., "1. PR Test NVIDIA - Scheduled (latest 12 runs)" -> "PR Test NVIDIA - Scheduled"
-                    short_title = title.split("(")[0].strip()
-                    # Remove the leading number and period if present
-                    if short_title and short_title[0].isdigit():
-                        short_title = short_title.split(".", 1)[-1].strip()
-                    # Get the max total_runs from recently_failed jobs to show the analysis window
                     max_total_runs = max(d["total_runs"] for _, d in recently_failed)
                     summary_lines.append("<details>")
                     summary_lines.append(
-                        f"<summary>📋 [{short_title}] No current failure streak, but had failures in the past {max_total_runs} runs - {len(recently_failed)} jobs</summary>"
+                        f"<summary>📋 <b>No current failure streak, but had failures in the past {max_total_runs} runs - {len(recently_failed)} jobs</b></summary>"
                     )
                     summary_lines.append("")
                     summary_lines.append(
@@ -1594,6 +1709,20 @@ class SGLangFailuresAnalyzer:
                     summary_lines.append("")
                     summary_lines.append("</details>")
                     summary_lines.append("")
+
+                # Combined message when no broken/high_failure_rate jobs but has recently_failed
+                if not broken and not high_failure_rate and recently_failed:
+                    max_total_runs = max(d["total_runs"] for _, d in recently_failed)
+                    summary_lines.append(
+                        f"✅ No jobs with active failure streaks, but **{len(recently_failed)} jobs** had failures in the past **{max_total_runs} runs**"
+                    )
+                    summary_lines.append("")
+                elif not broken and not high_failure_rate and not recently_failed:
+                    summary_lines.append("✅ **No jobs with active failure streaks**")
+                    summary_lines.append("")
+
+                summary_lines.append("</details>")
+                summary_lines.append("")
 
             # ========== RUNNERS (at the top) ==========
             summary_lines.append("---")
