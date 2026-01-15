@@ -47,21 +47,30 @@ _cutedsl_gdn_logged = False
 
 
 def _check_cutedsl_gdn_available():
-    """Check if CuTe DSL GDN kernel is available and import it."""
+    """Check if CuTe DSL GDN kernel is available by detecting cutlass dependency."""
     global _cutedsl_gdn_available, cutedsl_fused_sigmoid_gating_delta_rule_update
 
     if _cutedsl_gdn_available is not None:
         return _cutedsl_gdn_available
 
     try:
+        import cutlass
+        from packaging import version
+
+        if version.parse(cutlass.__version__) < version.parse("4.3.0"):
+            rank0_log(
+                f"CuTe DSL GDN kernel requires cutlass >= 4.3.0, "
+                f"but found {cutlass.__version__}"
+            )
+            _cutedsl_gdn_available = False
+            return _cutedsl_gdn_available
+
         from sglang.jit_kernel.cutedsl_gdn import (
             cutedsl_fused_sigmoid_gating_delta_rule_update as _func,
         )
-        from sglang.jit_kernel.cutedsl_gdn import is_cutedsl_gdn_available
 
-        _cutedsl_gdn_available = is_cutedsl_gdn_available()
-        if _cutedsl_gdn_available:
-            cutedsl_fused_sigmoid_gating_delta_rule_update = _func
+        cutedsl_fused_sigmoid_gating_delta_rule_update = _func
+        _cutedsl_gdn_available = True
     except ImportError:
         _cutedsl_gdn_available = False
 
