@@ -1,9 +1,10 @@
 """
 Configuration argument parser for command-line applications.
-Handles merging of YAML configuration files with command-line arguments.
+Handles merging of YAML/JSON configuration files with command-line arguments.
 """
 
 import argparse
+import json
 import logging
 from pathlib import Path
 from typing import Any, Callable, Dict, List
@@ -25,15 +26,12 @@ class ConfigArgumentMerger:
             for action in parser._actions
             if isinstance(action, argparse._StoreTrueAction)
         ]
-        self.unsupported_actions = {
-            a.dest: a
+
+        self.rejected_options = {"config", "help", "h"} | {
+            a.dest
             for a in parser._actions
-            if a.option_strings
-            and not isinstance(a, argparse._StoreTrueAction)
+            if not isinstance(a, argparse._StoreTrueAction)
             and not isinstance(a, argparse._StoreAction)
-            and "--config" not in a.option_strings
-            and "--help" not in a.option_strings
-            and "-h" not in a.option_strings
         }
 
     def parse_config(self, cli_args: List[str]) -> Dict[str, Any]:
@@ -41,17 +39,16 @@ class ConfigArgumentMerger:
         if not config_file_path:
             return {}
 
-        file_config_data = self._parse_yaml_config(config_file_path)
+        file_config_data = self._parse_config_file(config_file_path)
         dest_map = {action.dest: action for action in self.parser._actions}
 
         parsed_config = {}
         for key, value in file_config_data.items():
             key_norm = key.replace("-", "_")
 
-            if key_norm in self.unsupported_actions:
-                action = self.unsupported_actions[key_norm]
-                msg = f"Unsupported config option '{key_norm}' with action '{action.__class__.__name__}'"
-                raise ValueError(msg)
+            # Reject options that cannot be specified in config files
+            if key_norm in self.rejected_options:
+                raise ValueError(f"Option '{key}' cannot be specified in config file")
 
             if key_norm not in dest_map:
                 logger.warning(
@@ -125,24 +122,28 @@ class ConfigArgumentMerger:
 
         return args[config_index + 1]
 
-    def _parse_yaml_config(self, file_path: str) -> Dict[str, Any]:
+    def _parse_config_file(self, file_path: str) -> Dict[str, Any]:
         """
-        Parse YAML configuration file and convert to argument list.
+        Parse YAML or JSON configuration file.
 
         Args:
-            file_path: Path to the YAML configuration file
+            file_path: Path to the configuration file (YAML or JSON)
 
         Returns:
-            List of arguments in format ['--key', 'value', ...]
+            Dictionary of configuration values
 
         Raises:
-            ValueError: If file is not YAML or cannot be read
+            ValueError: If file format is unsupported or cannot be read
         """
-        self._validate_yaml_file(file_path)
+        path = Path(file_path)
+        self._validate_config_file(path)
 
         try:
-            with open(file_path, "r") as file:
-                config_data = yaml.safe_load(file)
+            with open(file_path, "r", encoding="utf-8") as file:
+                if path.suffix.lower() == ".json":
+                    config_data = json.load(file)
+                else:
+                    config_data = yaml.safe_load(file)
         except Exception as e:
             logger.error(f"Failed to read config file {file_path}: {e}")
             raise
@@ -156,14 +157,15 @@ class ConfigArgumentMerger:
 
         return config_data
 
-    def _validate_yaml_file(self, file_path: str) -> None:
-        """Validate that the file is a YAML file."""
-        path = Path(file_path)
-        if path.suffix.lower() not in [".yaml", ".yml"]:
-            raise ValueError(f"Config file must be YAML format, got: {path.suffix}")
-
+    def _validate_config_file(self, path: Path) -> None:
+        """Validate that the file exists and has a supported format."""
         if not path.exists():
-            raise ValueError(f"Config file not found: {file_path}")
+            raise ValueError(f"Config file not found: {path}")
+
+        if path.suffix.lower() not in [".yaml", ".yml", ".json"]:
+            raise ValueError(
+                f"Config file must be YAML or JSON format, got: {path.suffix}"
+            )
 
     def _convert_value(self, value: Any, type_func: Callable) -> Any:
         """
