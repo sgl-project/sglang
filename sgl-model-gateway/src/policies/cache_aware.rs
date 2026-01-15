@@ -59,7 +59,7 @@
     during the next eviction cycle.
 */
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use dashmap::DashMap;
 use rand::Rng;
@@ -86,7 +86,11 @@ pub struct CacheAwarePolicy {
     config: CacheAwareConfig,
     trees: Arc<DashMap<String, Arc<Tree>>>,
     mesh_sync: OptionalMeshSyncManager,
+    /// Local buffer for operations waiting to be synced to the mesh
+    pending_ops: Arc<DashMap<String, Mutex<Vec<TreeOperation>>>>,
     _eviction_task: Option<PeriodicTask>,
+    /// Background task for mesh synchronization
+    _sync_task: Option<PeriodicTask>,
 }
 
 impl CacheAwarePolicy {
@@ -96,6 +100,7 @@ impl CacheAwarePolicy {
 
     pub fn with_config(config: CacheAwareConfig) -> Self {
         let trees = Arc::new(DashMap::<String, Arc<Tree>>::new());
+        let pending_ops = Arc::new(DashMap::<String, Mutex<Vec<TreeOperation>>>::new());
 
         // Start background eviction thread if configured
         let eviction_task = if config.eviction_interval_secs > 0 {
@@ -126,15 +131,70 @@ impl CacheAwarePolicy {
             config,
             trees,
             mesh_sync: None,
+            pending_ops,
             _eviction_task: eviction_task,
+            _sync_task: None,
         }
     }
 
     /// Set mesh sync manager (can be called after construction)
     pub fn set_mesh_sync(&mut self, mesh_sync: OptionalMeshSyncManager) {
         self.mesh_sync = mesh_sync.clone();
-        if mesh_sync.is_some() {
+        if let Some(ref sync_manager) = mesh_sync {
             self.restore_tree_state_from_mesh();
+
+            // Start the background sync task to flush buffered operations periodically
+            let pending_ops_clone = Arc::clone(&self.pending_ops);
+            let sync_manager_clone = sync_manager.clone();
+            let interval = self.config.mesh_sync_interval_secs;
+
+            if interval > 0 {
+                self._sync_task = Some(PeriodicTask::spawn(interval, "MeshTreeSync", move || {
+                    for entry in pending_ops_clone.iter() {
+                        let model_id = entry.key();
+                        let mut ops_to_sync = Vec::new();
+
+                        // Extract batch from buffer
+                        if let Ok(mut ops) = entry.value().lock() {
+                            if ops.is_empty() {
+                                continue;
+                            }
+                            std::mem::swap(&mut ops_to_sync, &mut *ops);
+                        }
+
+                        // Perform synchronization in the background
+                        if !ops_to_sync.is_empty() {
+                            for op in ops_to_sync {
+                                if let Err(e) =
+                                    sync_manager_clone.sync_tree_operation(model_id.clone(), op)
+                                {
+                                    warn!(
+                                        "Failed to sync batched tree operation for model {}: {}",
+                                        model_id, e
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }));
+            }
+        }
+    }
+
+    /// Helper to queue an operation for background synchronization
+    fn queue_tree_operation(&self, model_id: &str, operation: TreeOperation) {
+        if self.mesh_sync.is_none() {
+            return;
+        }
+
+        let mesh_model_id = Self::normalize_mesh_model_id(model_id);
+        let entry = self
+            .pending_ops
+            .entry(mesh_model_id.to_string())
+            .or_insert_with(|| Mutex::new(Vec::new()));
+
+        if let Ok(mut ops) = entry.value().lock() {
+            ops.push(operation);
         }
     }
 
@@ -320,18 +380,12 @@ impl CacheAwarePolicy {
                 // Now we can work with the tree without holding the HashMap lock
                 tree.insert(text, worker_url);
 
-                // Sync insert operation to mesh if enabled (no-op if mesh is not enabled)
-                if let Some(ref mesh_sync) = self.mesh_sync {
-                    use crate::mesh::tree_ops::TreeInsertOp;
-                    let op = TreeOperation::Insert(TreeInsertOp {
-                        text: text.to_string(),
-                        tenant: worker_url.to_string(),
-                    });
-                    let mesh_model_id = Self::normalize_mesh_model_id(model_id);
-                    if let Err(e) = mesh_sync.sync_tree_operation(mesh_model_id.to_string(), op) {
-                        warn!("Failed to sync tree insert operation to mesh: {}", e);
-                    }
-                }
+                use crate::mesh::tree_ops::TreeInsertOp;
+                let op = TreeOperation::Insert(TreeInsertOp {
+                    text: text.to_string(),
+                    tenant: worker_url.to_string(),
+                });
+                self.queue_tree_operation(model_id, op);
             } else {
                 debug!(
                     "Warning: No tree found for model '{}', skipping cache update",
@@ -419,18 +473,13 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                 // Update the tree with this request (use worker URL directly, no allocation)
                 tree.insert(text, workers[idx].url());
 
-                // Sync insert operation to mesh if enabled (no-op if mesh is not enabled)
-                if let Some(ref mesh_sync) = self.mesh_sync {
-                    use crate::mesh::tree_ops::TreeInsertOp;
-                    let op = TreeOperation::Insert(TreeInsertOp {
-                        text: text.to_string(),
-                        tenant: workers[idx].url().to_string(),
-                    });
-                    let mesh_model_id = Self::normalize_mesh_model_id(model_id);
-                    if let Err(e) = mesh_sync.sync_tree_operation(mesh_model_id.to_string(), op) {
-                        warn!("Failed to sync tree insert operation to mesh: {}", e);
-                    }
-                }
+                // BATCHED: Queue insert operation for mesh
+                use crate::mesh::tree_ops::TreeInsertOp;
+                let op = TreeOperation::Insert(TreeInsertOp {
+                    text: text.to_string(),
+                    tenant: workers[idx].url().to_string(),
+                });
+                self.queue_tree_operation(model_id, op);
 
                 // Increment processed counter
                 workers[idx].increment_processed();
@@ -444,17 +493,11 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                 tree.remove_tenant(tenant_url);
                 debug!("Removed stale worker {} from cache tree", tenant_url);
 
-                // Sync removal to mesh if enabled (no-op if mesh is not enabled)
-                if let Some(ref mesh_sync) = self.mesh_sync {
-                    use crate::mesh::tree_ops::TreeRemoveOp;
-                    let op = TreeOperation::Remove(TreeRemoveOp {
-                        tenant: tenant_url.to_string(),
-                    });
-                    let mesh_model_id = Self::normalize_mesh_model_id(model_id);
-                    if let Err(e) = mesh_sync.sync_tree_operation(mesh_model_id.to_string(), op) {
-                        warn!("Failed to sync tree remove operation to mesh: {}", e);
-                    }
-                }
+                use crate::mesh::tree_ops::TreeRemoveOp;
+                let op = TreeOperation::Remove(TreeRemoveOp {
+                    tenant: tenant_url.to_string(),
+                });
+                self.queue_tree_operation(model_id, op);
             }
 
             // Fallback to first healthy worker
