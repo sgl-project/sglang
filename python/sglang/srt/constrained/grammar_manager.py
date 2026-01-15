@@ -133,6 +133,9 @@ class GrammarManager:
                 if req.grammar.done():
                     ready_req_idxs.add(i)
 
+            # Sleep a bit to avoid busy waiting
+            time.sleep(self.SGLANG_GRAMMAR_POLL_INTERVAL / 10)
+
         # Check failed requests
         for i, req in enumerate(self.grammar_queue):
             if i not in ready_req_idxs:
