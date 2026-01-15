@@ -196,25 +196,22 @@ def zimage_omni_postprocess_text(
         device = outputs.hidden_states[-2].device
         prompt_mask = _text_inputs.attention_mask.to(device).bool()
         embeds = outputs.hidden_states[-2][0][prompt_mask[0]]
+        raise NotImplementedError("useless, which equals to else case below")
     else:
-        # Omni mode
-        # from flatten to batching
-        # List[List[torch.Tensor]]
+        assert len(prompt_list_lengths) == 1, "Single batch only."
 
         device = outputs.hidden_states[-2].device
         embeddings_list = []
         start_idx = 0
-        for i in range(len(prompt_list_lengths)):
-            batch_embeddings = []
-            end_idx = start_idx + prompt_list_lengths[i]
-            prompt_embeds = outputs.hidden_states[-2]
-            prompt_masks = _text_inputs.attention_mask.to(device).bool()
-            for j in range(start_idx, end_idx):
-                batch_embeddings.append(prompt_embeds[j][prompt_masks[j]])
-            embeddings_list.append(batch_embeddings)
-            start_idx = end_idx
-        # TODO: hard code debug.
-        embeds = embeddings_list
+        batch_embeddings = []
+        end_idx = start_idx + prompt_list_lengths[0]  # single batch
+        prompt_embeds = outputs.hidden_states[-2]
+        prompt_masks = _text_inputs.attention_mask.to(device).bool()
+        for j in range(start_idx, end_idx):
+            batch_embeddings.append(prompt_embeds[j][prompt_masks[j]])
+        embeddings_list.append(batch_embeddings)
+        # assert single batch
+        embeds = torch.cat(embeddings_list[0], dim=0)
 
     return embeds
 
@@ -228,6 +225,14 @@ class ZImageOmniPipelineConfig(ZImagePipelineConfig):
     postprocess_text_funcs: tuple[Callable, ...] = field(
         default_factory=lambda: (zimage_omni_postprocess_text,)
     )
+
+    # TODO: review
+    # ugly hack
+    # pos token_lens, neg token_lens, pos token_lens, neg token_lens
+    # token_lens[0] for pos token_lens
+    # token_lens[1] for neg token_lens
+    # maybe bug in serving case
+    token_lens = []
 
     def _apply_zimage_omni_template(
         self, prompts: list[str], num_condition_images: int
@@ -298,6 +303,9 @@ class ZImageOmniPipelineConfig(ZImagePipelineConfig):
         # TODO: hack
         # prompt_list_lengths is used to reconstruct flattened_prompt into batching
         inputs.prompt_list_lengths = prompt_list_lengths
+        token_lens = inputs.attention_mask.sum(dim=-1).tolist()
+
+        self.token_lens.append(token_lens)
 
         return inputs
 
@@ -306,6 +314,7 @@ class ZImageOmniPipelineConfig(ZImagePipelineConfig):
     def prepare_pos_cond_kwargs(self, batch, device, rotary_emb, dtype):
         pos_cond_kwargs = {
             "condition_latents": batch.condition_latents,
+            "token_lens": self.token_lens[0],
         }
         if (
             batch.condition_siglip_embeds is not None
@@ -331,6 +340,7 @@ class ZImageOmniPipelineConfig(ZImagePipelineConfig):
     def prepare_neg_cond_kwargs(self, batch, device, rotary_emb, dtype):
         neg_cond_kwargs = {
             "condition_latents": batch.negative_condition_latents,
+            "token_lens": self.token_lens[1],
         }
         if (
             batch.negative_condition_siglip_embeds is not None

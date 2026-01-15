@@ -278,31 +278,10 @@ class TextEncodingStage(PipelineStage):
                     use_cache=False,
                 )
             prompt_embeds = postprocess_func(outputs, text_inputs)
-            # TODO:
-            # review
-            # what if prompt_embeds is a list
             if dtype is not None:
-                # TODO: review, very hacky way
-                if isinstance(prompt_embeds, list):
-                    for i in enumerate(prompt_embeds):
-                        prompt_embeds[i] = prompt_embeds[i].to(dtype=dtype)
-                else:
-                    prompt_embeds = prompt_embeds.to(dtype=dtype)
+                prompt_embeds = prompt_embeds.to(dtype=dtype)
 
-            # NOTE: embeds for encoder i
-            if isinstance(prompt_embeds, list):
-                # TODO: review
-                # for zimage-omni, which expect a
-                # List[List[torch.Tensor]] for a single batch
-                # dim0 = batch_size
-                # dim1 = num_condition_images + 2
-                embeds_list.extend(prompt_embeds)
-            else:
-                # TODO:
-                # single batch only?
-                # which len(embeds_list) = len(encoder)
-                # not batch_size
-                embeds_list.append(prompt_embeds)
+            embeds_list.append(prompt_embeds)
             if is_flux_v1:
                 pooled_embeds_list.append(outputs.pooler_output)
             if return_attention_mask:

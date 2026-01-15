@@ -1250,6 +1250,7 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         siglip_feats: Optional[List[List[torch.Tensor]]] = None,
         image_noise_mask: Optional[List[List[int]]] = None,
         condition_latents: Optional[List[List[torch.Tensor]]] = None,
+        token_lens: List[int] = None,
         **kwargs,
     ):
         # TODO: ignore control net for now.
@@ -1284,6 +1285,11 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         omni_mode = isinstance(x[0], list)
         device = x[0][-1].device if omni_mode else x[0].device
 
+        # TODO: review
+        # ugly hack
+        encoder_hidden_states = [
+            list(encoder_hidden_states[0].split_with_sizes(token_lens, dim=0))
+        ]
         cap_feats = encoder_hidden_states
         timestep = 1000.0 - timestep
         t = timestep
