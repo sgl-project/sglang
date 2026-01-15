@@ -1,11 +1,13 @@
-"""Nightly performance benchmark for DeepSeek-R1-MXFP4 model (MI35x).
+"""MI35x Nightly performance benchmark for DeepSeek-R1-MXFP4 model.
 
 This test benchmarks the DeepSeek-R1-MXFP4 quantized model on MI35x with 8 GPUs.
 
 The model path can be configured via DEEPSEEK_R1_MXFP4_MODEL_PATH environment variable.
 
+Registry: nightly-perf-8-gpu-mi35x-deepseek-r1-mxfp4 suite
+
 Example usage:
-    DEEPSEEK_R1_MXFP4_MODEL_PATH=/data2/models/amd-DeepSeek-R1-MXFP4-Preview python -m pytest test_deepseek_r1_mxfp4_perf.py -v
+    DEEPSEEK_R1_MXFP4_MODEL_PATH=/data2/models/amd-DeepSeek-R1-MXFP4-Preview python -m pytest test_deepseek_r1_mxfp4_perf_mi35x.py -v
 """
 
 import os
@@ -21,9 +23,9 @@ from sglang.test.nightly_bench_utils import BenchmarkResult
 from sglang.test.nightly_utils import NightlyBenchmarkRunner
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, _parse_int_list_env
 
-# Register for AMD CI - DeepSeek-R1-MXFP4 benchmark (~300 min)
+# Register for AMD CI - DeepSeek-R1-MXFP4 benchmark on MI35x (~300 min)
 register_amd_ci(
-    est_time=18000, suite="nightly-perf-8-gpu-deepseek-r1-mxfp4", nightly=True
+    est_time=18000, suite="nightly-perf-8-gpu-mi35x-deepseek-r1-mxfp4", nightly=True
 )
 
 
@@ -33,7 +35,7 @@ def generate_simple_markdown_report(results: List[BenchmarkResult]) -> str:
     if results[0].run_name and results[0].run_name != "default":
         model_header += f" ({results[0].run_name})"
 
-    gpu_config = os.getenv("GPU_CONFIG", "")
+    gpu_config = os.getenv("GPU_CONFIG", "MI35x")
     if gpu_config:
         model_header += f" [{gpu_config}]"
 
@@ -52,7 +54,7 @@ def generate_simple_markdown_report(results: List[BenchmarkResult]) -> str:
 # Priority: 1) env var, 2) local path, 3) HuggingFace model ID
 DEEPSEEK_R1_MXFP4_LOCAL_PATH = "/data2/models/amd-DeepSeek-R1-MXFP4-Preview"
 DEEPSEEK_R1_MXFP4_HF_MODEL_ID = "amd/DeepSeek-R1-MXFP4-Preview"
-PROFILE_DIR = "performance_profiles_deepseek_r1_mxfp4"
+PROFILE_DIR = "performance_profiles_deepseek_r1_mxfp4_mi35x"
 
 
 def get_model_path() -> str:
@@ -68,8 +70,8 @@ def get_model_path() -> str:
     return DEEPSEEK_R1_MXFP4_HF_MODEL_ID
 
 
-class TestNightlyDeepseekR1MXFP4Performance(unittest.TestCase):
-    """Nightly performance benchmark for DeepSeek-R1-MXFP4 model (MI35x).
+class TestDeepseekR1MXFP4PerfMI35x(unittest.TestCase):
+    """MI35x Nightly performance benchmark for DeepSeek-R1-MXFP4 model.
 
     Tests the DeepSeek-R1-MXFP4 quantized model on TP=8 with DP=8.
     Uses local path if available, otherwise downloads from HuggingFace.
