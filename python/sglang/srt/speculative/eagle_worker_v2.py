@@ -5,6 +5,7 @@ import time
 from typing import List, Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_extend_npu_graph_runner import (
@@ -669,30 +670,13 @@ class EagleDraftWorker(BaseDraftWorker):
 
         # Update spec_info for the next draft step
         probs = torch.softmax(logits_output.next_token_logits, dim=-1)
-        next_draft_input.hidden_states = logits_output.hidden_states
         topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
         if self.enable_spec_overlap_reflow and self.speculative_num_steps > 1:
-            topk_p = torch.cat(
-                [
-                    topk_p,
-                    topk_p.new_zeros(
-                        *topk_p.shape[:1],
-                        self.speculative_num_steps * self.topk - topk_p.shape[1],
-                    ),
-                ],
-                dim=1,
-            )
-            topk_index = torch.cat(
-                [
-                    topk_index,
-                    topk_index.new_zeros(
-                        *topk_index.shape[:1],
-                        self.speculative_num_steps * self.topk - topk_index.shape[1],
-                    ),
-                ],
-                dim=1,
-            )
+            topk_pad_size = self.speculative_num_steps * self.topk - topk_p.shape[-1]
+            topk_p = F.pad(topk_p, (0, topk_pad_size))
+            topk_index = F.pad(topk_index, (0, topk_pad_size))
         next_draft_input.topk_p, next_draft_input.topk_index = topk_p, topk_index
+        next_draft_input.hidden_states = logits_output.hidden_states
         return next_draft_input
 
     def _draft_extend_for_decode(
