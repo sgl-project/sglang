@@ -3315,9 +3315,7 @@ class DeepseekV2ForCausalLM(nn.Module):
 
         # Perform post-processing after loading all weights
         # TODO: Compatible with kv cache quantization
-        post_process_exclude_list = (
-            BaseKVCacheMethod,
-        )
+        post_process_exclude_list = (BaseKVCacheMethod,)
         for _, module in self.named_modules():
             quant_method = getattr(module, "quant_method", None)
             if quant_method is not None:
