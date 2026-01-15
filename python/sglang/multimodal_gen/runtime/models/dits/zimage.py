@@ -1249,6 +1249,7 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         freqs_cis=None,
         siglip_feats: Optional[List[List[torch.Tensor]]] = None,
         image_noise_mask: Optional[List[List[int]]] = None,
+        condition_latents: Optional[List[List[torch.Tensor]]] = None,
         **kwargs,
     ):
         # TODO: ignore control net for now.
@@ -1260,10 +1261,26 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         assert len(encoder_hidden_states) == 1, f"{len(encoder_hidden_states)=}"
         assert siglip_feats is None or len(siglip_feats) == 1, f"{len(siglip_feats)=}"
 
+        batch_size = len(hidden_states)
+        # construct a 2d list for omni mode
+        # dim0 = batch_size
+        # dim1 = latents: condition images + 1 target image
+        if condition_latents is not None:
+            assert batch_size == 1, "Only batch_size=1 is tested for now."
+            assert isinstance(condition_latents, list) and isinstance(
+                condition_latents[0], list
+            ), "condition_latents should be a 2d list."
+            assert len(condition_latents) == batch_size, "batch size mismatch"
+            hidden_states = [
+                condition_latents[i] + [hidden_states[i]] for i in range(batch_size)
+            ]
+
         x = hidden_states
 
         # TODO: review
         # ugly?
+        # can be
+        # omni_mode = condition_latents is not None
         omni_mode = isinstance(x[0], list)
         device = x[0][-1].device if omni_mode else x[0].device
 

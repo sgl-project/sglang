@@ -280,7 +280,9 @@ class ZImageOmniPipelineConfig(ZImagePipelineConfig):
     # TODO: hack
     # pos and freq is online compute
     def prepare_pos_cond_kwargs(self, batch, device, rotary_emb, dtype):
-        pos_cond_kwargs = {}
+        pos_cond_kwargs = {
+            "condition_latents": batch.condition_latents,
+        }
         if (
             batch.condition_siglip_embeds is not None
             and batch.condition_latents is not None
@@ -301,3 +303,32 @@ class ZImageOmniPipelineConfig(ZImagePipelineConfig):
             pos_cond_kwargs["image_noise_mask"] = image_noise_mask
 
         return pos_cond_kwargs
+
+    def prepare_neg_cond_kwargs(self, batch, device, rotary_emb, dtype):
+        neg_cond_kwargs = {
+            "condition_latents": batch.negative_condition_latents,
+        }
+        if (
+            batch.negative_condition_siglip_embeds is not None
+            and batch.negative_condition_latents is not None
+        ):
+            assert (
+                len(batch.negative_condition_siglip_embeds) == 1
+            ), "Single batch only for now."
+            assert (
+                len(batch.negative_condition_latents) == 1
+            ), "Single batch only for now."
+
+            current_batch_size = len(batch.negative_condition_latents)
+
+            condition_latents_model_input = batch.negative_condition_latents
+            # Create noise mask: 0 for condition images (clean), 1 for target image (noisy)
+            image_noise_mask = [
+                [0] * len(condition_latents_model_input[i]) + [1]
+                for i in range(current_batch_size)
+            ]
+
+            neg_cond_kwargs["siglip_feats"] = batch.negative_condition_siglip_embeds
+            neg_cond_kwargs["image_noise_mask"] = image_noise_mask
+
+        return neg_cond_kwargs

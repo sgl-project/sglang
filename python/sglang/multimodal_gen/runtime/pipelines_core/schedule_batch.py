@@ -147,6 +147,8 @@ class Req:
     resized_images = None
     condition_latents = None
     negative_condition_latents = None
+    condition_siglip_embeds = None
+    negative_condition_siglip_embeds = None
 
 
     def __init__(self, **kwargs):
