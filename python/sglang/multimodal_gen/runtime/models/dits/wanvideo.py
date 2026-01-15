@@ -35,6 +35,9 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     RowParallelLinear,
 )
 from sglang.multimodal_gen.runtime.layers.mlp import MLP
+from sglang.multimodal_gen.runtime.layers.quantization.base_config import (
+    QuantizationConfig,
+)
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     NDRotaryEmbedding,
     _apply_rotary_emb,
@@ -297,6 +300,7 @@ class WanTransformerBlock(nn.Module):
         added_kv_proj_dim: int | None = None,
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
         prefix: str = "",
+        quant_config: QuantizationConfig = None,
         attention_type: str = "original",
         sla_topk: float = 0.1,
     ):
@@ -304,11 +308,19 @@ class WanTransformerBlock(nn.Module):
 
         # 1. Self-attention
         self.norm1 = FP32LayerNorm(dim, eps, elementwise_affine=False)
-        self.to_q = ColumnParallelLinear(dim, dim, bias=True, gather_output=False)
-        self.to_k = ColumnParallelLinear(dim, dim, bias=True, gather_output=False)
-        self.to_v = ColumnParallelLinear(dim, dim, bias=True, gather_output=False)
+        self.to_q = ColumnParallelLinear(
+            dim, dim, bias=True, gather_output=False, quant_config=quant_config
+        )
+        self.to_k = ColumnParallelLinear(
+            dim, dim, bias=True, gather_output=False, quant_config=quant_config
+        )
+        self.to_v = ColumnParallelLinear(
+            dim, dim, bias=True, gather_output=False, quant_config=quant_config
+        )
 
-        self.to_out = RowParallelLinear(dim, dim, bias=True, reduce_results=True)
+        self.to_out = RowParallelLinear(
+            dim, dim, bias=True, reduce_results=True, quant_config=quant_config
+        )
         if attention_type == "sla":
             self.attn1 = MinimalA2AAttnOp(
                 SparseLinearAttention(
@@ -377,7 +389,9 @@ class WanTransformerBlock(nn.Module):
         )
 
         # 3. Feed-forward
-        self.ffn = MLP(dim, ffn_dim, act_type="gelu_pytorch_tanh")
+        self.ffn = MLP(
+            dim, ffn_dim, act_type="gelu_pytorch_tanh", quant_config=quant_config
+        )
         self.mlp_residual = ScaleResidual()
 
         self.scale_shift_table = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
