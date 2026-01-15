@@ -161,10 +161,9 @@ class ZImagePipelineConfig(ImagePipelineConfig):
 
 def zimage_omni_preprocess_text(prompt: str):
     """
-    TODO: reivew
-    delay process into tokenize_prompt
+    Simply return, delay process in tokenize_prompt
+        since we need a `self` object to take metadatas
     """
-
     return prompt
 
 
@@ -172,22 +171,17 @@ def zimage_omni_postprocess_text(
     outputs: BaseEncoderOutput, _text_inputs
 ) -> torch.Tensor:
     """
-    # TODO: debug note, remove later
+    assert batch_size == 1
+
     Basic mode:
         single text embeds
-        which assert batch_size == 1
         torch.tensor
     Omni mode:
-        Omni mode text embedding require a fregment pattern
-        which break a single text into fregments(split by <|vision_start|>).
-        number of fregments is num_image + 2
-        mask flatten embeds and reconstruct batch into
-        List[List[torch.Tensor]]
+        Omni mode break a prompt_str into list of slice.
+        which will be concat together cat([torch.tensor, ...])
+
     Returns:
-        (torch.tensor | List[List[torch.Tensor]])
-            torch.tensor: single batch embed
-            List[List[torch.Tensor]]: single batch fregs of embeds.
-            where len(d) == batch size. len(d[bid]) == num_image + 2
+        torch.tensor: a flatten tensor for single batch and concat all split prompts.
     """
 
     prompt_list_lengths = getattr(_text_inputs, "prompt_list_lengths", None)
@@ -288,13 +282,12 @@ class ZImageOmniPipelineConfig(ZImagePipelineConfig):
         for i in range(len(prompts)):
             # record freg numbers
             prompt_list_lengths.append(len(prompts[i]))
-            # NOTE: all batch flattened
+            # all batch flattened prompts
             flattened_prompt.extend(prompts[i])
 
         inputs = tokenizer(
             flattened_prompt,
             padding="max_length",
-            # TODO: review ?
             max_length=512,  # TODO (yhyang201): set max length according to config
             truncation=True,
             return_tensors="pt",
