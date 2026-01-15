@@ -59,6 +59,7 @@ from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 store_cache = register_custom_op(store_cache, mutates_args=["k_cache", "v_cache"])
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.managers.cache_controller import LayerDoneCounter
     from sglang.srt.managers.schedule_batch import Req
 
