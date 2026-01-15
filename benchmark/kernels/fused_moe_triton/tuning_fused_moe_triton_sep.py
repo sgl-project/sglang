@@ -224,7 +224,8 @@ def benchmark_config(
             expert_ids_.clone(),
             num_tokens_post_padded_.clone(),
         )
-    ] * inner_iter
+        for _ in range(inner_iter)
+    ]
     M = hidden_states.shape[0]
     E, N, _ = w1.shape
 
@@ -519,6 +520,7 @@ class BenchmarkWorker:
         cmp_config_files: List[str],
         topk_ids_dir: str,
     ):
+        # compare performance of different configs
         cmp_configs = []
         for file in cmp_config_files:
             with open(file) as f:
