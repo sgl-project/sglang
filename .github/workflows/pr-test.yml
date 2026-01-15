@@ -629,6 +629,7 @@ jobs:
             -v ${{ github.workspace }}:/workspace \
             -v /hf_home:/hf_home \
             -e HF_HOME=/hf_home \
+            -e HF_TOKEN \
             -e SGLANG_IS_IN_CI=true \
             -e CUDA_VISIBLE_DEVICES=0 \
             -e CUSTOM_BUILD_SGL_KERNEL=${{ needs.check-changes.outputs.sgl_kernel }} \
