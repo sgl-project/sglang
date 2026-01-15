@@ -377,7 +377,7 @@ class HarmonyStateMachine:
 
                 # Check if this is a tool call (contains 'to=')
                 # Pattern: <channel>type to=target or <channel>type
-                is_tool_call = " to=" in channel_text
+                is_tool_call = re.search(r"(?:\s|^)to=", channel_text) is not None
 
                 # Extract the base channel type (first word)
                 channel_parts = channel_text.split()
