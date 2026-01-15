@@ -1,7 +1,7 @@
 import json
 import logging
 import re
-from typing import List
+from typing import Any, Dict, List
 
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
@@ -237,3 +237,58 @@ class KimiK2Detector(BaseFormatDetector):
             )
 
         return get_info
+
+    def build_structural_tag(
+        self,
+        tools: List[Tool],
+        at_least_one: bool = False,
+        stop_after_first: bool = False,
+    ) -> Dict[str, Any]:
+        """Build structural tag for Kimi K2 format.
+
+        Uses dual triggers:
+        - First trigger: <|tool_calls_section_begin|> for the first tool call
+        - Second trigger: <|tool_call_begin|> for subsequent tool calls
+        """
+        tags = []
+
+        for index, tool in enumerate(tools):
+            name = tool.function.name
+            if not name:
+                continue
+
+            schema = tool.function.parameters or {}
+
+            # Tag for FIRST tool call (includes outer section wrapper)
+            tags.append(
+                {
+                    "begin": f"<|tool_calls_section_begin|><|tool_call_begin|>functions.{name}:{index}<|tool_call_argument_begin|>",
+                    "content": {
+                        "type": "json_schema",
+                        "json_schema": schema,
+                    },
+                    "end": "<|tool_call_end|>",
+                }
+            )
+
+            # Tag for SUBSEQUENT tool calls (no outer section wrapper)
+            tags.append(
+                {
+                    "begin": f"<|tool_call_begin|>functions.{name}:{index}<|tool_call_argument_begin|>",
+                    "content": {
+                        "type": "json_schema",
+                        "json_schema": schema,
+                    },
+                    "end": "<|tool_call_end|>",
+                }
+            )
+
+        return {
+            "format": {
+                "type": "triggered_tags",
+                "triggers": ["<|tool_calls_section_begin|>", "<|tool_call_begin|>"],
+                "tags": tags,
+                "at_least_one": at_least_one,
+                "stop_after_first": stop_after_first,
+            }
+        }

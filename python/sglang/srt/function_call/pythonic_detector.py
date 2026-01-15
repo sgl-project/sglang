@@ -2,7 +2,7 @@ import ast
 import json
 import logging
 import re
-from typing import List
+from typing import Any, Dict, List
 
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.environ import envs
@@ -222,3 +222,11 @@ class PythonicDetector(BaseFormatDetector):
 
     def structure_info(self) -> _GetInfoFunc:
         raise NotImplementedError
+
+    def build_structural_tag(
+        self,
+        tools: List[Tool],
+        at_least_one: bool = False,
+        stop_after_first: bool = False,
+    ) -> Dict[str, Any]:
+        raise NotImplementedError()

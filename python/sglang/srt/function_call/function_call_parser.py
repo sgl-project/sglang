@@ -1,13 +1,7 @@
 import logging
-from typing import Dict, List, Literal, Optional, Set, Tuple, Type, Union
+from typing import Dict, List, Literal, Optional, Tuple, Type, Union
 
-from sglang.srt.entrypoints.openai.protocol import (
-    LegacyStructuralTagResponseFormat,
-    StructuresResponseFormat,
-    Tool,
-    ToolCallConstraint,
-    ToolChoice,
-)
+from sglang.srt.entrypoints.openai.protocol import Tool, ToolCallConstraint, ToolChoice
 from sglang.srt.environ import ToolStrictLevel, envs
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import ToolCallItem
@@ -135,47 +129,10 @@ class FunctionCallParser:
 
         return final_normal_text, final_calls
 
-    def get_structure_tag(self) -> LegacyStructuralTagResponseFormat:
-        """
-        Generate a structural tag response format for all available tools.
-
-        This creates the necessary structural tags that guide the model's output format.
-        """
-        tool_structures: List[StructuresResponseFormat] = list()
-        tool_trigger_set: Set[str] = set()
-
-        get_structure_info = self.detector.structure_info()
-        for tool in self.tools:
-            function = tool.function
-            name = function.name
-            assert name is not None
-            info = get_structure_info(name)
-
-            # accept all if not strict, otherwise only accept the schema
-            is_strict = (
-                function.strict or self.tool_strict_level >= ToolStrictLevel.PARAMETER
-            )
-            schema = function.parameters if is_strict else {}
-
-            tool_structures.append(
-                StructuresResponseFormat(
-                    begin=info.begin,
-                    schema=schema or {},  # type: ignore
-                    end=info.end,
-                )
-            )
-            tool_trigger_set.add(info.trigger)
-
-        # TODO(dark): move this into new structural tag format
-        # This requires all grammar backend support the new format
-        return LegacyStructuralTagResponseFormat(
-            type="structural_tag",
-            structures=tool_structures,
-            triggers=list(tool_trigger_set),
-        )
-
     def get_structure_constraint(
-        self, tool_choice: Union[ToolChoice, Literal["auto", "required"]]
+        self,
+        tool_choice: Union[ToolChoice, Literal["auto", "required"]],
+        parallel_tool_calls: bool = True,
     ) -> Optional[ToolCallConstraint]:
         """
         Returns the appropriate structure constraint for tool calls based on the tool_choice.
@@ -183,6 +140,7 @@ class FunctionCallParser:
 
         Args:
             tool_choice: The tool choice setting from the request
+            parallel_tool_calls: Whether to allow multiple tool calls (default: True)
 
         Returns:
             A tuple of (constraint_type, constraint_value) to be added to sampling parameters,
@@ -198,8 +156,15 @@ class FunctionCallParser:
                 or self.tool_strict_level >= ToolStrictLevel.FUNCTION
             )
         ):
-            tag = self.get_structure_tag()
+            tag = self.detector.build_structural_tag(
+                tools=self.tools,
+                at_least_one=False,
+                stop_after_first=not parallel_tool_calls,
+            )
             return ("structural_tag", tag)
         elif tool_choice == "required" or isinstance(tool_choice, ToolChoice):
-            json_schema = get_json_schema_constraint(self.tools, tool_choice)
+            json_schema = get_json_schema_constraint(
+                self.tools, tool_choice, parallel_tool_calls
+            )
             return ("json_schema", json_schema)
+        return None

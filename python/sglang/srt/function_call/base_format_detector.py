@@ -344,3 +344,13 @@ class BaseFormatDetector(ABC):
             A function that takes a tool name (str) and returns StructureInfo
         """
         raise NotImplementedError()
+
+    @abstractmethod
+    def build_structural_tag(
+        self,
+        tools: List[Tool],
+        at_least_one: bool = False,
+        stop_after_first: bool = False,
+    ) -> Dict[str, Any]:
+        """Build xgrammar structural tag for this model's format."""
+        raise NotImplementedError()

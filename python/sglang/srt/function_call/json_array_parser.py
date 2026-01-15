@@ -1,4 +1,4 @@
-from typing import List
+from typing import Any, Dict, List
 
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
@@ -49,3 +49,18 @@ class JsonArrayParser(BaseFormatDetector):
         by the constraint backends directly.
         """
         raise NotImplementedError("structure_info not used for JSON schema constraints")
+
+    def build_structural_tag(
+        self,
+        tools: List[Tool],
+        at_least_one: bool = False,
+        stop_after_first: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Build structural tag for JSON array parser.
+        This is not used for JSON schema constraints as they are handled
+        by the constraint backends directly.
+        """
+        raise NotImplementedError(
+            "build_structural_tag not used for JSON schema constraints"
+        )
