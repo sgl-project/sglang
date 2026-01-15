@@ -621,8 +621,7 @@ jobs:
       - name: Run test
         timeout-minutes: 45
         run: |
-          # Run tests inside Docker container with CUDA 12.9 for sm_120 (Blackwell) support
-          # Each partition gets its own isolated container environment
+          source /etc/profile.d/sglang-ci.sh
           docker run --rm \
             --gpus "device=${{ matrix.partition }}" \
             --shm-size=16g \
