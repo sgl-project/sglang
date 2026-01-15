@@ -26,6 +26,9 @@ echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-}"
 # Clear torch compilation cache
 python3 -c 'import os, shutil, tempfile, getpass; cache_dir = os.environ.get("TORCHINDUCTOR_CACHE_DIR") or os.path.join(tempfile.gettempdir(), "torchinductor_" + getpass.getuser()); shutil.rmtree(cache_dir, ignore_errors=True)'
 
+# Fix corrupted apt cache if present (common on self-hosted runners)
+rm -f /var/cache/apt/*.bin 2>/dev/null || true
+
 # Install apt packages
 apt install -y git libnuma-dev libssl-dev pkg-config libibverbs-dev libibverbs1 ibverbs-providers ibverbs-utils
 
@@ -93,10 +96,12 @@ else
     PIP_UNINSTALL_SUFFIX=""
 fi
 
-# Clean up existing installations
-$PIP_UNINSTALL_CMD sgl-kernel sglang $PIP_UNINSTALL_SUFFIX || true
-$PIP_UNINSTALL_CMD flashinfer-python flashinfer-cubin flashinfer-jit-cache $PIP_UNINSTALL_SUFFIX || true
-$PIP_UNINSTALL_CMD opencv-python opencv-python-headless $PIP_UNINSTALL_SUFFIX || true
+# Clean up existing installations (skip for Blackwell - dependencies are pre-installed)
+if [ "$IS_BLACKWELL" != "1" ]; then
+    $PIP_UNINSTALL_CMD sgl-kernel sglang $PIP_UNINSTALL_SUFFIX || true
+    $PIP_UNINSTALL_CMD flashinfer-python flashinfer-cubin flashinfer-jit-cache $PIP_UNINSTALL_SUFFIX || true
+    $PIP_UNINSTALL_CMD opencv-python opencv-python-headless $PIP_UNINSTALL_SUFFIX || true
+fi
 
 # Install the main package
 EXTRAS="dev"
@@ -105,10 +110,18 @@ if [ -n "$OPTIONAL_DEPS" ]; then
 fi
 echo "Installing python extras: [${EXTRAS}]"
 
-$PIP_CMD install -e "python[${EXTRAS}]" --extra-index-url https://download.pytorch.org/whl/${CU_VERSION} $PIP_INSTALL_SUFFIX
+if [ "$IS_BLACKWELL" = "1" ]; then
+    # For Blackwell, use --no-deps and --no-build-isolation to avoid race conditions
+    # Dependencies are pre-installed on the machines
+    $PIP_CMD install -e "python" --no-deps --no-build-isolation $PIP_INSTALL_SUFFIX
+else
+    $PIP_CMD install -e "python[${EXTRAS}]" --extra-index-url https://download.pytorch.org/whl/${CU_VERSION} $PIP_INSTALL_SUFFIX
+fi
 
-# Install router for pd-disagg test
-$PIP_CMD install sglang-router $PIP_INSTALL_SUFFIX
+# Install router for pd-disagg test (skip for Blackwell if already installed)
+if [ "$IS_BLACKWELL" != "1" ]; then
+    $PIP_CMD install sglang-router $PIP_INSTALL_SUFFIX
+fi
 
 # Remove flash_attn folder to avoid conflicts
 PYTHON_LIB_PATH=$(python3 -c "import site; print(site.getsitepackages()[0])")
@@ -135,6 +148,15 @@ if [ "${CUSTOM_BUILD_SGL_KERNEL:-}" = "true" ]; then
         WHEEL_ARCH="x86_64"
     fi
     $PIP_CMD install sgl-kernel/dist/sgl_kernel-${SGL_KERNEL_VERSION_FROM_KERNEL}-cp310-abi3-manylinux2014_${WHEEL_ARCH}.whl --force-reinstall $PIP_INSTALL_SUFFIX
+elif [ "$IS_BLACKWELL" = "1" ]; then
+    # For Blackwell, check if correct version is already installed to avoid race conditions
+    INSTALLED_SGL_KERNEL=$(pip show sgl-kernel 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
+    if [ "$INSTALLED_SGL_KERNEL" = "$SGL_KERNEL_VERSION_FROM_SRT" ]; then
+        echo "sgl-kernel==${SGL_KERNEL_VERSION_FROM_SRT} already installed, skipping"
+    else
+        echo "Installing sgl-kernel==${SGL_KERNEL_VERSION_FROM_SRT} (current: ${INSTALLED_SGL_KERNEL:-none})"
+        $PIP_CMD install sgl-kernel==${SGL_KERNEL_VERSION_FROM_SRT} $PIP_INSTALL_SUFFIX
+    fi
 else
     # On Blackwell machines, skip reinstall if correct version already installed to avoid race conditions
     if [ "$IS_BLACKWELL" = "1" ]; then
@@ -153,8 +175,10 @@ fi
 # Show current packages
 $PIP_CMD list
 
-# Install other python dependencies
-$PIP_CMD install mooncake-transfer-engine==0.3.8.post1 "${NVRTC_SPEC}" py-spy scipy huggingface_hub[hf_xet] pytest $PIP_INSTALL_SUFFIX
+# Install other python dependencies (skip for Blackwell if already installed)
+if [ "$IS_BLACKWELL" != "1" ]; then
+    $PIP_CMD install mooncake-transfer-engine==0.3.8.post1 "${NVRTC_SPEC}" py-spy scipy huggingface_hub[hf_xet] pytest $PIP_INSTALL_SUFFIX
+fi
 
 if [ "$IS_BLACKWELL" != "1" ]; then
     # For lmms_evals evaluating MMMU
@@ -189,6 +213,20 @@ else
 fi
 $PIP_CMD uninstall xformers || true
 
+# Skip flashinfer installation for Blackwell (pre-installed)
+if [ "$IS_BLACKWELL" = "1" ]; then
+    INSTALLED_FLASHINFER=$(pip show flashinfer-jit-cache 2>/dev/null | grep "^Version:" | awk '{print $2}' | cut -d'+' -f1 || echo "")
+    if [ "$INSTALLED_FLASHINFER" = "$FLASHINFER_VERSION" ]; then
+        echo "flashinfer-jit-cache==${FLASHINFER_VERSION} already installed, skipping"
+        FLASHINFER_INSTALLED=true
+    else
+        echo "Installing flashinfer-jit-cache==${FLASHINFER_VERSION} (current: ${INSTALLED_FLASHINFER:-none})"
+        FLASHINFER_INSTALLED=false
+    fi
+else
+    FLASHINFER_INSTALLED=false
+fi
+
 # Install flashinfer-jit-cache with caching and retry logic (flashinfer.ai can have transient DNS issues)
 # Cache directory for flashinfer wheels (persists across CI runs on self-hosted runners)
 FLASHINFER_CACHE_DIR="${HOME}/.cache/flashinfer-wheels"
@@ -200,7 +238,10 @@ find "${FLASHINFER_CACHE_DIR}" -name "flashinfer_jit_cache-*.whl" ! -name "flash
 FLASHINFER_WHEEL_PATTERN="flashinfer_jit_cache-${FLASHINFER_VERSION}*.whl"
 CACHED_WHEEL=$(find "${FLASHINFER_CACHE_DIR}" -name "${FLASHINFER_WHEEL_PATTERN}" -type f 2>/dev/null | head -n 1)
 
-FLASHINFER_INSTALLED=false
+# Only set FLASHINFER_INSTALLED to false if not already set by Blackwell check above
+if [ "$FLASHINFER_INSTALLED" != "true" ]; then
+    FLASHINFER_INSTALLED=false
+fi
 
 # Try to install from cache first
 if [ -n "$CACHED_WHEEL" ] && [ -f "$CACHED_WHEEL" ]; then

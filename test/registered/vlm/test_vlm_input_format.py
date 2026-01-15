@@ -1,6 +1,6 @@
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=447, suite="stage-b-test-small-1-gpu")
+register_cuda_ci(est_time=447, suite="stage-b-test-large-1-gpu")
 
 import json
 import unittest

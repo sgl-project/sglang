@@ -61,6 +61,12 @@ suites = {
         TestFile("test_quantization.py", 185),
         TestFile("test_gguf.py", 96),
     ],
+    # 5090-compatible quantization tests (32GB VRAM)
+    "quantization_test_5090": [
+        TestFile("quant/test_marlin_moe.py", 85),
+        TestFile("test_bnb.py", 5),
+        TestFile("test_gguf.py", 83),
+    ],
     "__not_in_ci__": [
         TestFile("test_release_memory_occupation.py", 200),  # Temporarily disabled
         TestFile("models/test_dummy_grok_models.py"),
