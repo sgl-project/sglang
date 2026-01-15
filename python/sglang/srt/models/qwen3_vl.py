@@ -19,12 +19,11 @@ import re
 from functools import lru_cache, partial
 from typing import Callable, Iterable, List, Optional, Tuple, Union
 
+import numpy as np
 import torch
 import torch.nn as nn
 from einops import rearrange
 from transformers.activations import ACT2FN
-
-import numpy as np
 
 from sglang.srt.configs.qwen3_vl import Qwen3VLConfig, Qwen3VLVisionConfig
 from sglang.srt.distributed import (
@@ -398,90 +397,57 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
 
         return cos_combined, sin_combined
 
-    def fast_pos_embed_interpolate(self, grid_thw):
-        """使用NumPy进行CPU计算，更高效"""
-        grid_thw_cpu = grid_thw.cpu().numpy() if grid_thw.is_cuda else grid_thw.numpy()
+    def _get_interpolation_indices(self, dim_size: int) -> torch.Tensor:
+        """
+        Compute continuous interpolation indices for a single dimension.
 
-        batch_size = len(grid_thw_cpu)
-        grid_ts = grid_thw_cpu[:, 0].tolist()
-        grid_hs = grid_thw_cpu[:, 1].tolist()
-        grid_ws = grid_thw_cpu[:, 2].tolist()
+        Returns continuous indices.
+        """
+        if self.align_corners:
+            indices = np.linspace(
+                0, self.num_grid_per_side - 1, dim_size, dtype=np.float32
+            )
+        else:
+            indices = (np.arange(dim_size, dtype=np.float32) + 0.5) * (
+                self.num_grid_per_side / dim_size
+            ) - 0.5
+            indices = np.clip(indices, 0, self.num_grid_per_side - 1)
+        return indices
 
-        device = self.pos_embed.weight.device
-        dtype = self.pos_embed.weight.dtype
+    def _calculate_indices_and_weights(self, h_idxs, w_idxs):
+        """
+        Compute bilinear interpolation indices and weights.
 
-        # 预计算总大小
-        total_patches = sum(h * w for h, w in zip(grid_hs, grid_ws))
+        Returns tuple of (indices, weights), each as 4 numpy arrays for the 4 corner points.
+        """
+        h_f = np.floor(h_idxs).astype(np.int64)
+        h_c = np.clip(h_f + 1, 0, self.num_grid_per_side - 1)
+        dh = h_idxs - h_f
 
-        # 预分配NumPy数组（更高效）
-        all_indices_np = np.zeros((4, total_patches), dtype=np.int64)
-        all_weights_np = np.zeros((4, total_patches), dtype=np.float32)
+        w_f = np.floor(w_idxs).astype(np.int64)
+        w_c = np.clip(w_f + 1, 0, self.num_grid_per_side - 1)
+        dw = w_idxs - w_f
 
-        current_idx = 0
+        side = self.num_grid_per_side
 
-        for t, h, w in zip(grid_ts, grid_hs, grid_ws):
-            n_patches = h * w
+        indices = [
+            (h_f[:, None] * side + w_f).flatten(),
+            (h_f[:, None] * side + w_c).flatten(),
+            (h_c[:, None] * side + w_f).flatten(),
+            (h_c[:, None] * side + w_c).flatten(),
+        ]
+        weights = [
+            ((1 - dh)[:, None] * (1 - dw)).flatten(),
+            ((1 - dh)[:, None] * dw).flatten(),
+            (dh[:, None] * (1 - dw)).flatten(),
+            (dh[:, None] * dw).flatten(),
+        ]
+        return indices, weights
 
-            # 使用NumPy生成坐标（比PyTorch CPU更快）
-            if self.align_corners:
-                h_idxs = np.linspace(0, self.num_grid_per_side - 1, h, dtype=np.float32)
-                w_idxs = np.linspace(0, self.num_grid_per_side - 1, w, dtype=np.float32)
-            else:
-                h_idxs = (np.arange(h, dtype=np.float32) + 0.5) * (self.num_grid_per_side / h) - 0.5
-                w_idxs = (np.arange(w, dtype=np.float32) + 0.5) * (self.num_grid_per_side / w) - 0.5
-                h_idxs = np.clip(h_idxs, 0, self.num_grid_per_side - 1)
-                w_idxs = np.clip(w_idxs, 0, self.num_grid_per_side - 1)
-
-            # NumPy meshgrid
-            h_grid, w_grid = np.meshgrid(h_idxs, w_idxs, indexing='ij')
-            h_flat = h_grid.reshape(-1)
-            w_flat = w_grid.reshape(-1)
-
-            # NumPy floor和clamp
-            h_floor = np.floor(h_flat).astype(np.int64)
-            w_floor = np.floor(w_flat).astype(np.int64)
-            h_ceil = np.clip(h_floor + 1, 0, self.num_grid_per_side - 1)
-            w_ceil = np.clip(w_floor + 1, 0, self.num_grid_per_side - 1)
-
-            dh = h_flat - h_floor
-            dw = w_flat - w_floor
-
-            # 计算索引和权重
-            indices_00 = h_floor * self.num_grid_per_side + w_floor
-            indices_01 = h_floor * self.num_grid_per_side + w_ceil
-            indices_10 = h_ceil * self.num_grid_per_side + w_floor
-            indices_11 = h_ceil * self.num_grid_per_side + w_ceil
-
-            w00 = (1 - dh) * (1 - dw)
-            w01 = (1 - dh) * dw
-            w10 = dh * (1 - dw)
-            w11 = dh * dw
-
-            # 填充
-            end_idx = current_idx + n_patches
-            all_indices_np[0, current_idx:end_idx] = indices_00
-            all_indices_np[1, current_idx:end_idx] = indices_01
-            all_indices_np[2, current_idx:end_idx] = indices_10
-            all_indices_np[3, current_idx:end_idx] = indices_11
-
-            all_weights_np[0, current_idx:end_idx] = w00
-            all_weights_np[1, current_idx:end_idx] = w01
-            all_weights_np[2, current_idx:end_idx] = w10
-            all_weights_np[3, current_idx:end_idx] = w11
-
-            current_idx = end_idx
-
-        # 转换为PyTorch张量（一次性）
-        idx_tensor = torch.from_numpy(all_indices_np).to(device)
-        weight_tensor = torch.from_numpy(all_weights_np).to(dtype=dtype, device=device)
-
-        # 后续相同...
-        pos_embeds = self.pos_embed(idx_tensor.view(-1))
-        pos_embeds = pos_embeds.view(4, total_patches, -1)
-        patch_pos_embeds = (pos_embeds * weight_tensor.unsqueeze(-1)).sum(dim=0)
-
-        patch_pos_embeds = patch_pos_embeds.split([h * w for h, w in zip(grid_hs, grid_ws)])
-
+    def _get_position_embedding(self, patch_pos_embeds, grid_ts, grid_hs, grid_ws):
+        """
+        Tile and reorganize position embeddings to align with the token sequence.
+        """
         result_parts = []
         merge_size = self.spatial_merge_size
 
@@ -491,13 +457,71 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             h_merge = h // merge_size
             w_merge = w // merge_size
 
-            pos_embed = pos_embed.view(
-                t, h_merge, merge_size, w_merge, merge_size, -1
-            ).permute(0, 1, 3, 2, 4, 5).flatten(0, 4)
+            pos_embed = (
+                pos_embed.view(t, h_merge, merge_size, w_merge, merge_size, -1)
+                .permute(0, 1, 3, 2, 4, 5)
+                .flatten(0, 4)
+            )
 
             result_parts.append(pos_embed)
 
         return torch.cat(result_parts, dim=0)
+
+    def fast_pos_embed_interpolate(self, grid_thw):
+        """Interpolate position embeddings for (batch, 3) size input dimensions.
+
+        Performs bilinear interpolation on spatial dimensions (height, width) and replicates
+        along temporal dimension. The result is reorganized according to spatial_merge_size.
+
+        Args:
+            grid_thw: Tensor of shape [batch_size, 3] with (temporal, height, width) dimensions
+                     in patches for each sample.
+
+        Returns:
+            Interpolated position embeddings tensor.
+        """
+        grid_thw_cpu = grid_thw.cpu().numpy() if grid_thw.is_cuda else grid_thw.numpy()
+
+        # transfer data to CPU before loop
+        temporal_dims = grid_thw_cpu[:, 0].tolist()
+        height_dims = grid_thw_cpu[:, 1].tolist()
+        width_dims = grid_thw_cpu[:, 2].tolist()
+
+        device = self.pos_embed.weight.device
+        dtype = self.pos_embed.weight.dtype
+
+        patches_size = [h * w for h, w in zip(height_dims, width_dims)]
+        total_patches = sum(patches_size)
+        all_indices_np = np.zeros((4, total_patches), dtype=np.int64)
+        all_weights_np = np.zeros((4, total_patches), dtype=np.float32)
+
+        current_idx = 0
+
+        # calculate indices and weights on CPU
+        for t, h, w in zip(temporal_dims, height_dims, width_dims):
+            h_idxs = self._get_interpolation_indices(h)
+            w_idxs = self._get_interpolation_indices(w)
+
+            indices, weights = self._calculate_indices_and_weights(h_idxs, w_idxs)
+
+            end_idx = current_idx + h * w
+            for i in range(4):
+                all_indices_np[i, current_idx:end_idx] = indices[i]
+                all_weights_np[i, current_idx:end_idx] = weights[i]
+            current_idx = end_idx
+
+        idx_tensor = torch.from_numpy(all_indices_np).to(device)
+        weight_tensor = torch.from_numpy(all_weights_np).to(dtype=dtype, device=device)
+
+        # calculate interpolation
+        pos_embeds = self.pos_embed(idx_tensor.view(-1))
+        pos_embeds = pos_embeds.view(4, total_patches, -1)
+        patch_pos_embeds = (pos_embeds * weight_tensor.unsqueeze(-1)).sum(dim=0)
+        patch_pos_embeds = patch_pos_embeds.split(patches_size)
+        return self._get_position_embedding(
+            patch_pos_embeds, temporal_dims, height_dims, width_dims
+        )
+
     def forward(
         self,
         x: torch.Tensor,
