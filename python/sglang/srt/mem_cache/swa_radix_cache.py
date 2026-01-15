@@ -362,6 +362,9 @@ class SWARadixCache(BasePrefixCache):
 
     ##### Public API #####
 
+    def supports_swa(self) -> bool:
+        return True
+
     def reset(self) -> None:
         self.root_node = TreeNode()
         self.root_node.key = []
