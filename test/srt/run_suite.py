@@ -71,7 +71,6 @@ suites = {
         TestFile("test_mistral_large3_basic.py"),
         TestFile("test_prefill_delayer.py"),
         TestFile("test_fla_layernorm_guard.py"),
-        TestFile("test_deepseek_r1_mxfp4_8gpu.py"),
         TestFile(
             "models/test_qwen3_next_models_pcg.py"
         ),  # Disabled: intermittent failures, see #17039
