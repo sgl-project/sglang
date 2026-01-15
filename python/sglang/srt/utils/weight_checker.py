@@ -1,9 +1,10 @@
 import hashlib
 import logging
-from typing import Dict, Iterable, Tuple
+from typing import Dict, Iterable, Optional, Tuple
 
 import torch
 
+import sglang.srt.distributed.parallel_state as ps
 from sglang.srt.layers.quantization.fp8_utils import (
     block_quant_dequant,
     inverse_transform_scale_ue8m0,
@@ -17,7 +18,7 @@ class WeightChecker:
         self._model_runner = model_runner
         self._snapshot_tensors = None
 
-    def handle(self, action: str, checksums=None):
+    def handle(self, action: str, checksums: Optional[Dict[str, str]] = None):
         logger.info(f"[WeightChecker] handle action={action}")
         if action == "snapshot":
             self._snapshot()
@@ -30,86 +31,85 @@ class WeightChecker:
         else:
             raise Exception(f"Unsupported {action=}")
 
-    def _compare_checksum(self, expected_checksums):
-        if expected_checksums is None:
+    def _compare_checksum(self, expected_checksums: Optional[Dict[str, str]]):
+        if not expected_checksums:
             return
-
-        # 1. Get raw model state (BF16 for Qwen2.5-3B)
-        actual_state = dict(self._model_state())
-
-        import sglang.srt.distributed.parallel_state as ps
 
         tp_group = ps.get_tp_group()
         tp_rank = ps.get_tensor_model_parallel_rank()
 
+        requested_names = set(expected_checksums.keys())
+
+        scale_names = {
+            n.replace("weight", "weight_scale_inv")
+            for n in requested_names
+            if n.endswith("weight")
+        }
+
+        actual_state = {}
+        for name, param in self._model_state():
+            if name in requested_names or name in scale_names:
+                actual_state[name] = param
+            if len(actual_state) == len(requested_names) + len(scale_names):
+                break
+
         errors = []
         matched_count = 0
 
-        for name in sorted(actual_state.keys()):
-            if name in expected_checksums:
-                param = actual_state[name]
-                expected_hash = expected_checksums[name]
+        for name in sorted(expected_checksums.keys()):
+            if name not in actual_state:
+                continue
 
+            expected_hash = expected_checksums[name]
+            param = actual_state[name]
+
+            # 1. Alignment & Dequantization
+            if (
+                name.endswith("weight")
+                and name.replace("weight", "weight_scale_inv") in actual_state
+            ):
+                w_q = param
+                w_s = actual_state[name.replace("weight", "weight_scale_inv")]
+                try:
+                    w_s_inv = inverse_transform_scale_ue8m0(w_s, mn=w_q.shape[-2])
+                    data = block_quant_dequant(
+                        w_q, w_s_inv, block_size=[128, 128], dtype=torch.bfloat16
+                    )
+                except Exception as e:
+                    logger.error(f"Dequantization failed for {name}: {e}")
+                    continue
+            else:
                 data = param.data.to(torch.bfloat16)
 
-                # STAGE A: Direct Match (Handles Replicated layers like Norms/Embeds)
-                t_cpu = data.detach().cpu().contiguous()
-                actual_hash = hashlib.sha256(
-                    t_cpu.view(torch.uint8).numpy()
-                ).hexdigest()
-                if actual_hash == expected_hash:
-                    matched_count += 1
-                    continue
-
-                # STAGE B: Shard Reconstruction (Handles TP layers)
-                if tp_group.world_size > 1:
-                    # Gather shards from all TP ranks
-                    all_shards = [
-                        torch.empty_like(data) for _ in range(tp_group.world_size)
-                    ]
-                    torch.distributed.all_gather(
-                        all_shards, data, group=tp_group.device_group
-                    )
-
-                    # Try Dim 0 (ColumnParallel: Gate, Up, QKV)
-                    full_p0 = torch.cat(all_shards, dim=0)
-                    if (
-                        hashlib.sha256(
-                            full_p0.detach()
-                            .cpu()
-                            .contiguous()
-                            .view(torch.uint8)
-                            .numpy()
-                        ).hexdigest()
-                        == expected_hash
-                    ):
-                        matched_count += 1
-                        continue
-
-                    # Try Dim 1 (RowParallel: O_proj, Down_proj) - only for 2D weights
-                    if data.ndim > 1:
-                        full_p1 = torch.cat(all_shards, dim=1)
-                        if (
-                            hashlib.sha256(
-                                full_p1.detach()
-                                .cpu()
-                                .contiguous()
-                                .view(torch.uint8)
-                                .numpy()
-                            ).hexdigest()
-                            == expected_hash
-                        ):
-                            matched_count += 1
-                            continue
-
-                # record mismatch if all reconstruction attempts fail
-                errors.append(
-                    f"name={name} TP_rank={tp_rank} mismatch! expected={expected_hash}, actual_shard={actual_hash}"
+            # 2. Shard Reconstruction
+            shard_dim = _get_shard_dim(name, data.ndim)
+            if tp_group.world_size > 1 and shard_dim is not None:
+                all_shards = [
+                    torch.empty_like(data) for _ in range(tp_group.world_size)
+                ]
+                torch.distributed.all_gather(
+                    all_shards, data, group=tp_group.device_group
                 )
+                full_param = torch.cat(all_shards, dim=shard_dim)
+                actual_hash = _compute_hash(full_param)
+                del all_shards
+                del full_param
+            else:
+                actual_hash = _compute_hash(data)
 
-        logger.info(
-            f"[WeightChecker] verified {matched_count} parameters on TP_rank {tp_rank}"
-        )
+            # 3. Verification
+            if actual_hash == expected_hash:
+                matched_count += 1
+            else:
+                errors.append(f"name={name} TP_rank={tp_rank} mismatch!")
+
+            del data
+
+        if matched_count > 1:
+            logger.info(
+                f"[WeightChecker] verified {matched_count} parameters on TP_rank {tp_rank}"
+            )
+
         if errors:
             raise Exception(
                 "Weight checksum verification failed:\n" + "\n".join(errors[:5])
@@ -151,6 +151,38 @@ class WeightChecker:
         # TODO: support EAGLE etc (e.g. yield from both main model and draft model)
         yield from self._model_runner.model.named_parameters()
         yield from self._model_runner.model.named_buffers()
+
+
+def _compute_hash(t: torch.Tensor) -> str:
+    """Encapsulates hashing chain: detach -> cpu -> contiguous -> view -> numpy."""
+    return hashlib.sha256(
+        t.detach().cpu().contiguous().view(torch.uint8).numpy()
+    ).hexdigest()
+
+
+def _get_shard_dim(name: str, ndim: int) -> Optional[int]:
+    # ColumnParallel
+    if any(
+        k in name
+        for k in [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "qkv_proj",
+            "gate_proj",
+            "up_proj",
+            "gate_up_proj",
+            "wi",
+            "fc1",
+            "embed_tokens",
+            "lm_head",
+        ]
+    ):
+        return 0 if ndim == 2 else (1 if ndim == 3 else None)
+    # RowParallel
+    if any(k in name for k in ["o_proj", "down_proj", "wo", "fc2", "out_proj"]):
+        return 1 if ndim == 2 else (2 if ndim == 3 else None)
+    return None
 
 
 def _check_tensors(
