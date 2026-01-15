@@ -22,7 +22,7 @@
   {% for tool in tools %}
     {% set tool_ns.text = tool_ns.text + '\n### ' + tool.function.name + '\nDescription: ' + tool.function.description + '\n\nParameters: ' + (tool.function.parameters | tojson) + '\n' %}
   {% endfor %}
-  {% set tool_ns.text = tool_ns.text + "\nIMPORTANT: ALWAYS adhere to this exact format for tool use:\n<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>tool_call_name<｜tool▁sep｜>tool_call_arguments<｜tool▁call▁end｜>{{additional_tool_calls}}<｜tool▁calls▁end｜>\n\nWhere:\n\n- `tool_call_name` must be an exact match to one of the available tools\n- `tool_call_arguments` must be valid JSON that strictly follows the tool's Parameters Schema\n- For multiple tool calls, chain them directly without separators or spaces\n" %}
+  {% set tool_ns.text = tool_ns.text + "\nIMPORTANT: ALWAYS adhere to this exact format for tool use:\n<｜DSML｜function_calls>\n<｜DSML｜invoke name=\"tool_call_name\">\n<｜DSML｜parameter name=\"param_name\" string=\"true\">param_value</｜DSML｜parameter>\n...\n</｜DSML｜invoke>\n</｜DSML｜function_calls>\n\nWhere:\n- `tool_call_name` must be an exact match to one of the available tools\n- For multiple tool calls, nest multiple <｜DSML｜invoke> blocks inside <｜DSML｜function_calls>\n- Parameters should be passed as JSON object inside the invoke block, e.g.: {\"param_name\": \"param_value\"}\n" %}
   {% set ns.system_prompt = ns.system_prompt + '\n\n' + tool_ns.text %}
 {% endif %}
 
@@ -41,20 +41,14 @@
     {%- set ns.is_last_user = false -%}
     {%- set ns.is_first = false %}
     {%- set ns.is_tool = false -%}
+    {{'<｜DSML｜function_calls>'}}
     {%- for tool in message['tool_calls'] %}
       {%- set formatted_args = tool['function']['arguments'] if tool['function']['arguments'] is string else tool['function']['arguments']|tojson %}
-      {%- if not ns.is_first %}
-        {%- if message['content'] is none %}
-          {{'<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>'+ tool['function']['name'] + '<｜tool▁sep｜>' + formatted_args + '<｜tool▁call▁end｜>'}}
-        {%- else %}
-          {{message['content'] + '<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>' + tool['function']['name'] + '<｜tool▁sep｜>' + formatted_args + '<｜tool▁call▁end｜>'}}
-        {%- endif %}
-        {%- set ns.is_first = true -%}
-      {%- else %}
-        {{'<｜tool▁call▁begin｜>'+ tool['function']['name'] + '<｜tool▁sep｜>' + formatted_args + '<｜tool▁call▁end｜>'}}
-      {%- endif %}
+      {{'<｜DSML｜invoke name=\"' + tool['function']['name'] + '\">'}}
+      {{formatted_args}}
+      {{'</｜DSML｜invoke>'}}
     {%- endfor %}
-    {{'<｜tool▁calls▁end｜><｜end▁of▁sentence｜>'}}
+    {{'</｜DSML｜function_calls><｜end▁of▁sentence｜>'}}
   {%- endif %}
   {%- if message['role'] == 'assistant' and (message['tool_calls'] is not defined or message['tool_calls'] is none) %}
     {%- if ns.is_last_user %}
