@@ -230,3 +230,18 @@ def create_intel_xpu_backend(runner):
     from sglang.srt.layers.attention.xpu_backend import XPUAttentionBackend
 
     return XPUAttentionBackend(runner)
+
+
+@register_attention_backend("sage_attn")
+def create_sage_attn_backend(runner):
+    """
+    Create SageAttention backend for 8-bit quantized attention.
+
+    SageAttention provides ~2x speedup by quantizing Q and K to INT8
+    on-the-fly during attention computation, with minimal accuracy loss.
+
+    For decode operations, falls back to Triton backend for paged KV cache support.
+    """
+    from sglang.srt.layers.attention.sage_attention_backend import SageAttnBackend
+
+    return SageAttnBackend(runner)

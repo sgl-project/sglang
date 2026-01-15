@@ -131,6 +131,7 @@ ATTENTION_BACKEND_CHOICES = [
     "trtllm_mla",
     "trtllm_mha",
     "dual_chunk_flash_attn",
+    "sage_attn",  # SageAttention: 8-bit quantized attention for ~2x speedup
     # AMD specific
     "aiter",
     "wave",
