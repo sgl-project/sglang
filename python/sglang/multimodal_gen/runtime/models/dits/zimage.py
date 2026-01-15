@@ -1311,21 +1311,24 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         # TODO: single batch only
         # compute freqs before patchify
         # TODO: ugly
-        freqs_cis = self.get_freqs_cis(
-            prompt_embeds=(
-                encoder_hidden_states[0]
-                if isinstance(encoder_hidden_states[0], list)
-                else encoder_hidden_states
-            ),
-            images=(
-                hidden_states[0]
-                if isinstance(hidden_states[0], list)
-                else hidden_states
-            ),
-            siglips=siglip_feats[0] if siglip_feats is not None else None,
-            device=device,
-            rotary_emb=getattr(self, "rotary_emb", None),
-        )
+        if freqs_cis is None:
+            # omni-mode online compute
+            # TODO: try pre-compute
+            freqs_cis = self.get_freqs_cis(
+                prompt_embeds=(
+                    encoder_hidden_states[0]
+                    if isinstance(encoder_hidden_states[0], list)
+                    else encoder_hidden_states
+                ),
+                images=(
+                    hidden_states[0]
+                    if isinstance(hidden_states[0], list)
+                    else hidden_states
+                ),
+                siglips=siglip_feats[0] if siglip_feats is not None else None,
+                device=device,
+                rotary_emb=getattr(self, "rotary_emb", None),
+            )
 
         # Patchify
         if omni_mode:
