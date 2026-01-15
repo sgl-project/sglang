@@ -109,9 +109,6 @@ suite_amd = {
         TestFile("test_deepseek_v3_basic.py", 275),
         TestFile("test_deepseek_v3_mtp.py", 275),
     ],
-    "per-commit-8-gpu-amd-mi35x": [
-        TestFile("test_deepseek_r1_mxfp4_8gpu.py", 3600),
-    ],
     # NOTE: AMD nightly suites (nightly-amd, nightly-amd-vlm, nightly-amd-8-gpu)
     # have been migrated to test/registered/amd/nightly/ and are now managed
     # by test/run_suite.py using the registry system.
@@ -160,6 +157,7 @@ suite_ascend = {
         TestFile("ascend/test_ascend_sampling_backend.py", 400),
         TestFile("ascend/test_ascend_tp1_bf16.py", 400),
         TestFile("ascend/test_ascend_compile_graph_tp1_bf16.py", 400),
+        TestFile("ascend/test_ascend_w8a8_quantization.py", 400),
         TestFile("test_embed_interpolate_unittest.py", 400),
     ],
     "per-commit-2-npu-a2": [
@@ -174,8 +172,9 @@ suite_ascend = {
         TestFile("ascend/test_ascend_tp4_bf16.py", 400),
     ],
     "per-commit-16-npu-a3": [
-        TestFile("ascend/test_ascend_deepep.py", 400),
-        TestFile("ascend/test_ascend_deepseek_mtp.py", 400),
+        TestFile("ascend/test_ascend_deepep.py", 3600),
+        TestFile("ascend/test_ascend_deepseek_mtp.py", 2800),
+        TestFile("ascend/test_ascend_w4a4_quantization.py", 600),
     ],
 }
 

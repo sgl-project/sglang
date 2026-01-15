@@ -31,6 +31,7 @@ from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
     ModelOptFp8Config,
 )
+from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
 from sglang.srt.layers.quantization.moe_wna16 import MoeWNA16Config
 from sglang.srt.layers.quantization.mxfp4 import Mxfp4Config
 from sglang.srt.layers.quantization.petit import PetitNvFp4Config
@@ -69,6 +70,7 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "fbgemm_fp8": FBGEMMFp8Config,
     "quark": QuarkConfig,
     "auto-round": AutoRoundConfig,
+    "modelslim": ModelSlimConfig,
     "quark_int4fp8_moe": QuarkInt4Fp8Config,
 }
 
@@ -77,15 +79,6 @@ if is_cuda() or (_is_mxfp_supported and is_hip()):
     BASE_QUANTIZATION_METHODS.update(
         {
             "mxfp4": Mxfp4Config,
-        }
-    )
-
-if is_npu():
-    from sglang.srt.hardware_backend.npu.quantization.modelslim import ModelSlimConfig
-
-    BASE_QUANTIZATION_METHODS.update(
-        {
-            "modelslim": ModelSlimConfig,
         }
     )
 
