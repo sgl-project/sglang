@@ -58,7 +58,7 @@ ENV LC_ALL=en_US.UTF-8
 
 
 ### Install MemFabric
-RUN ${PIP_INSTALL} memfabric-hybrid==1.0.0
+RUN ${PIP_INSTALL} memfabric-hybrid==1.0.3
 ### Install SGLang Model Gateway
 RUN ${PIP_INSTALL} sglang-router
 
@@ -83,8 +83,8 @@ RUN ${PIP_INSTALL} wheel==0.45.1 && mkdir sgl-kernel-npu \
     && export LD_LIBRARY_PATH=${ASCEND_CANN_PATH}/latest/runtime/lib64/stub:$LD_LIBRARY_PATH && \
     source ${ASCEND_CANN_PATH}/set_env.sh && \
     cd sgl-kernel-npu && \
-    wget https://github.com/sgl-project/sgl-kernel-npu/releases/download/${SGLANG_KERNEL_NPU_TAG}/sgl-kernel-npu_${SGLANG_KERNEL_NPU_TAG}_8.3.rc2_910b.zip \
-    && unzip sgl-kernel-npu_${SGLANG_KERNEL_NPU_TAG}_8.3.rc2_910b.zip \
+    wget https://github.com/sgl-project/sgl-kernel-npu/releases/download/${SGLANG_KERNEL_NPU_TAG}/sgl-kernel-npu_${SGLANG_KERNEL_NPU_TAG}_8.3.rc2_${DEVICE_TYPE}.zip \
+    && unzip sgl-kernel-npu_${SGLANG_KERNEL_NPU_TAG}_8.3.rc2_${DEVICE_TYPE}.zip \
     && ${PIP_INSTALL} output/deep_ep*.whl output/sgl_kernel_npu*.whl \
     && cd .. && rm -rf sgl-kernel-npu \
     && cd "$(python3 -m pip show deep-ep | awk '/^Location:/ {print $2}')" && ln -s deep_ep/deep_ep_cpp*.so
