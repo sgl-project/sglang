@@ -1,6 +1,6 @@
 //! Metadata discovery step for local workers.
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{collections::HashMap, time::Duration};
 
 use async_trait::async_trait;
 use once_cell::sync::Lazy;
@@ -11,8 +11,7 @@ use tracing::{debug, warn};
 
 use super::strip_protocol;
 use crate::{
-    core::ConnectionMode,
-    protocols::worker_spec::WorkerConfigRequest,
+    core::{steps::workflow_data::LocalWorkerWorkflowData, ConnectionMode},
     routers::grpc::client::GrpcClient,
     workflow::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult},
 };
@@ -219,17 +218,23 @@ async fn fetch_grpc_metadata(
 pub struct DiscoverMetadataStep;
 
 #[async_trait]
-impl StepExecutor for DiscoverMetadataStep {
-    async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
-        let config: Arc<WorkerConfigRequest> = context.get_or_err("worker_config")?;
-        let connection_mode: Arc<ConnectionMode> = context.get_or_err("connection_mode")?;
+impl StepExecutor<LocalWorkerWorkflowData> for DiscoverMetadataStep {
+    async fn execute(
+        &self,
+        context: &mut WorkflowContext<LocalWorkerWorkflowData>,
+    ) -> WorkflowResult<StepResult> {
+        let config = &context.data.config;
+        let connection_mode =
+            context.data.connection_mode.as_ref().ok_or_else(|| {
+                WorkflowError::ContextValueNotFound("connection_mode".to_string())
+            })?;
 
         debug!(
             "Discovering metadata for {} ({:?})",
-            config.url, *connection_mode
+            config.url, connection_mode
         );
 
-        let (discovered_labels, detected_runtime) = match connection_mode.as_ref() {
+        let (discovered_labels, detected_runtime) = match connection_mode {
             ConnectionMode::Http => {
                 let mut labels = HashMap::new();
 
@@ -287,16 +292,18 @@ impl StepExecutor for DiscoverMetadataStep {
             (HashMap::new(), None)
         });
 
+        let url = config.url.clone();
         debug!(
             "Discovered {} metadata labels for {}",
             discovered_labels.len(),
-            config.url
+            url
         );
 
-        context.set("discovered_labels", discovered_labels);
+        // Update workflow data
+        context.data.discovered_labels = discovered_labels;
         if let Some(runtime) = detected_runtime {
             debug!("Detected runtime type: {}", runtime);
-            context.set("detected_runtime_type", runtime);
+            context.data.detected_runtime_type = Some(runtime);
         }
 
         Ok(StepResult::Success)
