@@ -598,6 +598,7 @@ jobs:
     runs-on: 1-gpu-5090
     env:
       RUNNER_LABELS: 1-gpu-5090
+      IS_BLACKWELL: "1"
     strategy:
       fail-fast: false
       max-parallel: 4
