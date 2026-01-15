@@ -67,10 +67,11 @@ jobs:
           fi
           echo "version=v${VERSION}" >> $GITHUB_OUTPUT
           echo "TAG=lmsysorg/sglang:v${VERSION}-cann${{ matrix.cann_version }}-${{ matrix.device_type }}" >> $GITHUB_OUTPUT
-
+      # Enable Docker multi-architecture build environment
+      # Emulate non-native architectures
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
-
+      # Required for building and pushing multi-arch Docker images
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
