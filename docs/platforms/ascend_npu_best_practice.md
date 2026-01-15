@@ -1,6 +1,6 @@
 # Best Practice on Ascend NPU
 
-This section describes the best practice data of mainstream LLM models such as DeepSeek and Qwen on the Ascend Npu.If
+This section describes the best practice data of mainstream LLM models such as DeepSeek and Qwen on the Ascend Npu. If
 you encounter issues or have any questions, please [open an issue](https://github.com/sgl-project/sglang/issues).
 
 ## DeepSeek Series Models
@@ -9,21 +9,21 @@ you encounter issues or have any questions, please [open an issue](https://githu
 
 | Model         | Hardware      | CardNum | Deploy Mode   | Dataset   | Quantization | Configuration                                            |
 |---------------|---------------|---------|---------------|-----------|--------------|----------------------------------------------------------|
-| Deepseek-R1   | Atlas 800I A3 | 32      | PD Separation | 6K-1.6K   | W8A8         | [Optimal Configuration](#deepSeek-r1-low-latency-20ms-1) |
-| Deepseek-R1   | Atlas 800I A3 | 32      | PD Separation | 3.9K-1K   | W8A8         | [Optimal Configuration](#deepSeek-r1-low-latency-20ms-2) |
-| Deepseek-R1   | Atlas 800I A3 | 32      | PD Separation | 3.5K-1.5K | W8A8         | [Optimal Configuration](#deepSeek-r1-low-latency-20ms-3) |
-| Deepseek-R1   | Atlas 800I A3 | 32      | PD Separation | 3.5K-1K   | W8A8         | [Optimal Configuration](#deepSeek-r1-low-latency-20ms-4) |
+| Deepseek-R1   | Atlas 800I A3 | 32      | PD Separation | 6K-1.6K   | W8A8         | [Optimal Configuration](#deepseek-r1-low-latency-20ms-1) |
+| Deepseek-R1   | Atlas 800I A3 | 32      | PD Separation | 3.9K-1K   | W8A8         | [Optimal Configuration](#deepseek-r1-low-latency-20ms-2) |
+| Deepseek-R1   | Atlas 800I A3 | 32      | PD Separation | 3.5K-1.5K | W8A8         | [Optimal Configuration](#deepseek-r1-low-latency-20ms-3) |
+| Deepseek-R1   | Atlas 800I A3 | 32      | PD Separation | 3.5K-1K   | W8A8         | [Optimal Configuration](#deepseek-r1-low-latency-20ms-4) |
 | Deepseek-V3.2 | Atlas 800I A3 | 32      | PD Separation | 64K-1K    | W8A8         | [Optimal Configuration](#deepseek-v32-low-latency-30ms)  |
 
 ### High Throughput
 
 | Model       | Hardware      | CardNum | Deploy Mode   | Dataset   | Quantization | Configuration                                                 |
 |-------------|---------------|---------|---------------|-----------|--------------|---------------------------------------------------------------|
-| Deepseek-R1 | Atlas 800I A3 | 32      | PD Separation | 3.5K-1.5K | W8A8         | [Optimal Configuration](#deepSeek-r1-high-performance-50ms-1) |
-| Deepseek-R1 | Atlas 800I A3 | 8       | PD Mixed      | 2K-2K     | W4A8         | [Optimal Configuration](#deepSeek-r1-high-performance-50ms-2) |
-| Deepseek-R1 | Atlas 800I A3 | 16      | PD Separation | 2K-2K     | W4A8         | [Optimal Configuration](#deepSeek-r1-high-performance-50ms-3) |
-| Deepseek-R1 | Atlas 800I A3 | 8       | PD Mixed      | 3.5K-1.5K | W4A8         | [Optimal Configuration](#deepSeek-r1-high-performance-50ms-4) |
-| Deepseek-R1 | Atlas 800I A3 | 16      | PD Separation | 3.5K-1.5K | W4A8         | [Optimal Configuration](#deepSeek-r1-high-performance-50ms-5) |
+| Deepseek-R1 | Atlas 800I A3 | 32      | PD Separation | 3.5K-1.5K | W8A8         | [Optimal Configuration](#deepseek-r1-high-performance-50ms-1) |
+| Deepseek-R1 | Atlas 800I A3 | 8       | PD Mixed      | 2K-2K     | W4A8         | [Optimal Configuration](#deepseek-r1-high-performance-50ms-2) |
+| Deepseek-R1 | Atlas 800I A3 | 16      | PD Separation | 2K-2K     | W4A8         | [Optimal Configuration](#deepseek-r1-high-performance-50ms-3) |
+| Deepseek-R1 | Atlas 800I A3 | 8       | PD Mixed      | 3.5K-1.5K | W4A8         | [Optimal Configuration](#deepseek-r1-high-performance-50ms-4) |
+| Deepseek-R1 | Atlas 800I A3 | 16      | PD Separation | 3.5K-1.5K | W4A8         | [Optimal Configuration](#deepseek-r1-high-performance-50ms-5) |
 
 ## Qwen Series Models
 
@@ -90,7 +90,7 @@ export ASCEND_MF_STORE_URL="tcp://your prefill ip1:24669"
 
 P_IP=('your prefill ip1' 'your prefill ip2')
 
-D_IP=('your prefill ip1' 'your prefill ip2')
+D_IP=('your decode ip1' 'your decode ip2')
 
 MODEL_PATH=xxx
 
@@ -140,7 +140,7 @@ do
         export HCCL_SOCKET_IFNAME=xxx
         export GLOO_SOCKET_IFNAME=xxx
         python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode --host ${D_IP[$i]} \
-        --port 8001 --trust-remote-code --dist-init-addr DIP1:5000 --nnodes 2 --node-rank $i --tp-size 32 --dp-size 32 \
+        --port 8001 --trust-remote-code --dist-init-addr ${D_IP[0]}:5000 --nnodes 2 --node-rank $i --tp-size 32 --dp-size 32 \
         --mem-fraction-static 0.815 --max-running-requests 832 --attention-backend ascend --device npu --quantization modelslim \
         --moe-a2a-backend deepep --enable-dp-attention --deepep-mode low_latency --enable-dp-lm-head --moe-dense-tp 1 \
         --cuda-graph-bs 12 14 16 18 20 22 24 26 --disaggregation-transfer-backend ascend --watchdog-timeout 9000 --context-length 8192 \
@@ -1019,7 +1019,7 @@ do
         --host ${P_IP[$i]} --port 8000 --disaggregation-bootstrap-port 8995 --trust-remote-code \
         --nnodes 1 --node-rank $i --tp-size 16 --dp-size 16 --mem-fraction-static 0.6 \
         --disable-radix-cache \
-        --ep-dispatch-algorithm static --init-expert-location /mnt/share/chenxu/hot_map/expert_distribution_recorder_1765615213.9892833.pt \
+        --ep-dispatch-algorithm static --init-expert-location /path/to/expert_distribution_recorder.pt \
         --attention-backend ascend --device npu --quantization modelslim --disaggregation-transfer-backend ascend \
         --speculative-algorithm EAGLE3 --speculative-draft-model-path xxx \
         --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
@@ -1345,7 +1345,7 @@ for i in "${!MIX_IP[@]}";
 do
     if [[ "$LOCAL_HOST1" == "${MIX_IP[$i]}" || "$LOCAL_HOST2" == "${MIX_IP[$i]}" ]];
     then
-        echo "${MIX_IP[$i]}"+
+        echo "${MIX_IP[$i]}"
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
         export SGLANG_ENABLE_SPEC_V2=1
         export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1
@@ -1355,7 +1355,7 @@ do
         --nnodes 2 --node-rank $i --tp-size 32 --dp-size 32 --mem-fraction-static 0.8 --max-running-requests 768 \
         --attention-backend ascend --device npu --quantization modelslim --enable-dp-attention \
         --moe-a2a-backend deepep --deepep-mode auto --cuda-graph-bs 6 8 10 12 18 24 \
-        --dist-init-addr 141.61.105.131:5000 --chunked-prefill-size 32768 --max-prefill-tokens 458880 \
+        --dist-init-addr ${MIX_IP[0]}:5000 --chunked-prefill-size 32768 --max-prefill-tokens 458880 \
         --speculative-algorithm EAGLE3 --speculative-draft-model-path xxx \
         --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
         --watchdog-timeout 9000 --context-length 8192 \
@@ -1574,7 +1574,7 @@ python -m sglang.launch_server --model-path $MODEL_PATH \
 #### Benchmark
 
 ```shell
-python3 -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 7239 --random-range-ratio 1 -max-concurrency 1 --random-output-len 1500 --random-input-len 4096 --num-prompts 4
+python3 -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 7239 --random-range-ratio 1 --max-concurrency 1 --random-output-len 1500 --random-input-len 4096 --num-prompts 4
 ```
 
 ### Qwen3 32B Low Latency 12ms
@@ -2272,7 +2272,7 @@ source /usr/local/Ascend/nnal/atb/set_env.sh
 source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
 export PATH=/usr/local/Ascend/8.5.0/compiler/bishengir/bin:$PATH
 
-#export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 
 MODEL_PATH=xxx
 
