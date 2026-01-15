@@ -172,6 +172,11 @@ class Envs:
     SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE = EnvBool(True)
     SGLANG_CI_SMALL_KV_SIZE = EnvInt(-1)
 
+    SGLANG_NPU_PROFILING = EnvBool(False)
+    SGLANG_NPU_PROFILING_BS = EnvInt(8)
+    SGLANG_NPU_PROFILING_STAGE = EnvStr("decode")
+    SGLANG_NPU_PROFILING_STEP = EnvInt(10)
+
     # Scheduler: new token ratio hyperparameters
     SGLANG_INIT_NEW_TOKEN_RATIO = EnvFloat(0.7)
     SGLANG_MIN_NEW_TOKEN_RATIO_FACTOR = EnvFloat(0.14)
@@ -193,7 +198,7 @@ class Envs:
     SGLANG_EXPERIMENTAL_CPP_RADIX_TREE = EnvBool(False)
     SGLANG_DYNAMIC_CHUNKING_SMOOTH_FACTOR = EnvFloat(0.75)
     SGLANG_SCHEDULER_SKIP_ALL_GATHER = EnvBool(False)
-    SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE = EnvBool(False)
+    SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE = EnvInt(0)
 
     # Test: pd-disaggregation
     SGLANG_TEST_PD_DISAGG_BACKEND = EnvStr("mooncake")
@@ -246,6 +251,7 @@ class Envs:
     SGLANG_MOE_NVFP4_DISPATCH = EnvBool(False)
     SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN = EnvBool(False)
     SGLANG_PER_TOKEN_GROUP_QUANT_8BIT_V2 = EnvBool(False)
+    SGLANG_UNQUANT_LINEAR_NZ = EnvBool(False)
 
     # Flashinfer
     SGLANG_IS_FLASHINFER_AVAILABLE = EnvBool(True)

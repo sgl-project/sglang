@@ -243,6 +243,8 @@ class AscendAttnBackend(AttentionBackend):
             if hasattr(model_runner.model_config, "not_use_fused_infer_attention_score"):
                 self.not_use_fused_infer_attention_score = True
         else:
+            if hasattr(model_runner.model_config, "use_sdpa"):
+                self.use_sdpa = True
             self.use_alibi = hasattr(model_runner.model_config, "use_alibi") and model_runner.model_config.use_alibi
         self.native_attn = TorchNativeAttnBackend(model_runner)
         self.graph_metadata = {}
@@ -441,7 +443,7 @@ class AscendAttnBackend(AttentionBackend):
         alibi_bias = alibi.view(num_heads, 1, seq_len)
         alibi_bias = alibi_bias.to(device).to(dtype)
         return alibi_bias
-    
+
     def generate_alibi_bias(
         self,
         q_seq_len: int,
@@ -457,7 +459,7 @@ class AscendAttnBackend(AttentionBackend):
             max_seq_len=max(kv_seq_len,q_seq_len)
             max_seq_len=max(max_seq_len,MAX_LEN_ALB)
             self.alibi_bias = self._generate_alibi_bias(max_seq_len,slopes,num_heads,device,dtype)
-            
+
         if not hasattr(self, "super_mask") or self.super_mask is None:
             MAX_LEN_ALB=5000
             max_seq_len=max(kv_seq_len,q_seq_len)
@@ -471,8 +473,6 @@ class AscendAttnBackend(AttentionBackend):
         else:
             return self.alibi_bias[:, :q_seq_len, :kv_seq_len]
 
-        
-    
     def attn_alibi(self,q,k_cache,v_cache,block_tables,seq_lens,query_lens,scale_value,num_heads,slopes,is_extend):
         curr=0
         num_prompts=query_lens.shape[0]
@@ -493,7 +493,7 @@ class AscendAttnBackend(AttentionBackend):
             v = v_cache[block_number,block_offset]
             k = k.view(seq_len, num_heads, head_size)
             v = v.view(seq_len, num_heads, head_size_v)
-            
+
             if is_extend:
                 q_len = query_lens[i].item()
                 querys = q[curr :curr + q_len]
@@ -501,7 +501,7 @@ class AscendAttnBackend(AttentionBackend):
             else:
                 q_len = 1
                 querys = q[curr :curr + 1]
-            
+
             querys = querys.to(torch.float32)
             querys = querys * scale_value
             querys = querys.permute(1, 0, 2)
@@ -533,7 +533,7 @@ class AscendAttnBackend(AttentionBackend):
         attn_output = torch.cat(attn_output, dim=0).to(q.dtype).to(q.device)
         attn_output = attn_output.view(-1, num_heads * head_size)
         return attn_output
-    
+
     def do_cp_balance_attn(
         self,
         q_nope,
@@ -558,7 +558,7 @@ class AscendAttnBackend(AttentionBackend):
         actual_seq_qlen_prev, actual_seq_qlen_next = actual_seq_qlen
         actual_seq_lengths_kv_prev, actual_seq_lengths_kv_next = actual_seq_lengths_kv
 
-        attn_out_prev = torch.ops.custom.npu_sparse_flash_attention(
+        attn_out_prev, _, _ = torch_npu.npu_sparse_flash_attention(
             query=q_nope_prev,
             key=k_nope,
             value=k_nope,
@@ -577,8 +577,10 @@ class AscendAttnBackend(AttentionBackend):
             layout_query="TND",
             layout_kv="PA_BSND",
             sparse_mode=3,
+            attention_mode=2,
+            return_softmax_lse=False,
         )
-        attn_out_next = torch.ops.custom.npu_sparse_flash_attention(
+        attn_out_next, _, _ = torch_npu.npu_sparse_flash_attention(
             query=q_nope_next,
             key=k_nope,
             value=k_nope,
@@ -597,6 +599,8 @@ class AscendAttnBackend(AttentionBackend):
             layout_query="TND",
             layout_kv="PA_BSND",
             sparse_mode=3,
+            attention_mode=2,
+            return_softmax_lse=False,
         )
         return torch.cat([attn_out_prev, attn_out_next], dim=0)
 
@@ -687,7 +691,7 @@ class AscendAttnBackend(AttentionBackend):
                 actual_seq_lengths_kv,
             )
         else:
-            attn_out = torch.ops.custom.npu_sparse_flash_attention(
+            attn_out, _, _ = torch_npu.npu_sparse_flash_attention(
                 query=q_nope,
                 key=k_nope,
                 value=k_nope,
@@ -706,6 +710,8 @@ class AscendAttnBackend(AttentionBackend):
                 layout_query="TND",
                 layout_kv="PA_BSND",
                 sparse_mode=3,
+                attention_mode=2,
+                return_softmax_lse=False,
             )
 
         return attn_out
@@ -756,9 +762,15 @@ class AscendAttnBackend(AttentionBackend):
             )
 
         if not self.use_mla:
-            if save_kv_cache:
+            if save_kv_cache and k is not None:
+                # support cross attention
+                cache_loc = (
+                    forward_batch.out_cache_loc
+                    if not layer.is_cross_attention
+                    else forward_batch.encoder_out_cache_loc
+                )
                 forward_batch.token_to_kv_pool.set_kv_buffer(
-                    layer, forward_batch.out_cache_loc, k, v
+                    layer, cache_loc, k, v
                 )
 
             k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
@@ -808,7 +820,7 @@ class AscendAttnBackend(AttentionBackend):
                 ):
                     causal = False
 
-                if layer.qk_head_dim <= 128 and layer.logit_cap == 0 and causal:
+                if layer.qk_head_dim <= 128 and layer.logit_cap == 0 and causal and forward_batch.encoder_lens is None:
                     """When logit_cap > 0, use torch native attention backend instead
                     cause Ascend attn ops do not support soft-capping attention currently.
                     """
@@ -844,9 +856,34 @@ class AscendAttnBackend(AttentionBackend):
                             scale_value=layer.scaling,
                             num_heads=layer.tp_q_head_num,
                             slopes=slopes,
-                            is_extend=True
+                            is_extend=True,
                         )
                 else:
+                    if hasattr(self, "use_sdpa"):
+                        use_gqa = layer.tp_q_head_num != layer.tp_k_head_num
+                        attn_output = torch.nn.functional.scaled_dot_product_attention(
+                            q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+                            .unsqueeze(0)
+                            .transpose(1, 2),
+                            k.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
+                            .unsqueeze(0)
+                            .transpose(1, 2),
+                            v.view(-1, layer.tp_k_head_num, layer.v_head_dim)
+                            .unsqueeze(0)
+                            .transpose(1, 2),
+                            attn_mask=None,
+                            dropout_p=0.0,
+                            enable_gqa=use_gqa,
+                            scale=layer.scaling,
+                            is_causal=True,
+                        )
+                        attn_output = attn_output.transpose(1, 2).contiguous()
+                        attn_output = (
+                            attn_output.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
+                            .contiguous()
+                            .squeeze(0)
+                        )
+                        return attn_output
                     if layer.qk_head_dim != layer.v_head_dim:
                         attn_output = q.new_empty(
                             (q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
@@ -869,6 +906,8 @@ class AscendAttnBackend(AttentionBackend):
                         forward_batch.seq_lens,
                         forward_batch.extend_prefix_lens,
                         forward_batch.extend_seq_lens,
+                        forward_batch.encoder_lens,
+                        is_cross_attention=layer.is_cross_attention,
                         scaling=layer.scaling,
                         enable_gqa=use_gqa,
                         causal=causal,
@@ -1446,9 +1485,15 @@ class AscendAttnBackend(AttentionBackend):
             )
 
         if not self.use_mla:
-            if save_kv_cache:
+            if save_kv_cache and k is not None:
+                # support cross attention
+                cache_loc = (
+                    forward_batch.out_cache_loc
+                    if not layer.is_cross_attention
+                    else forward_batch.encoder_out_cache_loc
+                )
                 forward_batch.token_to_kv_pool.set_kv_buffer(
-                    layer, forward_batch.out_cache_loc, k, v
+                    layer, cache_loc, k, v
                 )
             num_tokens = q.shape[0]
             k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
@@ -1482,7 +1527,7 @@ class AscendAttnBackend(AttentionBackend):
                     actual_seq_lengths_kv=actual_seq_len_kv,
                     scale=layer.scaling,
                 )
-            elif layer.logit_cap == 0:
+            elif layer.logit_cap == 0 and forward_batch.encoder_lens is None:
                 query = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
                 num_tokens = query.shape[0]
                 if not self.use_alibi:
@@ -1537,6 +1582,8 @@ class AscendAttnBackend(AttentionBackend):
                     forward_batch.req_to_token_pool.req_to_token,
                     forward_batch.req_pool_indices,
                     forward_batch.seq_lens,
+                    forward_batch.encoder_lens,
+                    is_cross_attention=layer.is_cross_attention,
                     scaling=layer.scaling,
                     enable_gqa=use_gqa,
                     causal=False,

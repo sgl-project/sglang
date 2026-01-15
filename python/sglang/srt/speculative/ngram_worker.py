@@ -147,9 +147,11 @@ class NGRAMWorker:
         return req_drafts, mask
 
     def _prepare_for_speculative_decoding(self, batch: ScheduleBatch):
-        if batch.forward_mode.is_extend():
+        if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             return
-
+        if batch.forward_mode.is_idle():
+            batch.spec_algorithm = SpeculativeAlgorithm.NGRAM
+            return
         bs = batch.batch_size()
 
         retrive_index = self.retrieve_indexes_batch[bs]
@@ -336,7 +338,25 @@ class NGRAMWorker:
         num_accepted_tokens = 0
         accept_lens = None
 
-        if model_worker_batch.forward_mode.is_target_verify():
+        if (
+            not model_worker_batch.forward_mode.is_target_verify()
+            and not model_worker_batch.forward_mode.is_idle()
+        ) or model_worker_batch.is_extend_in_batch:
+            batch_result = self.target_worker.forward_batch_generation(
+                model_worker_batch
+            )
+
+            logits_output, next_token_ids, can_run_cuda_graph = (
+                batch_result.logits_output,
+                batch_result.next_token_ids,
+                batch_result.can_run_cuda_graph,
+            )
+        else:
+            if model_worker_batch.spec_info is None:
+                model_worker_batch.spec_info = NgramVerifyInput.create_idle_input(
+                    draft_token_num=self.draft_token_num, device=self.device
+                )
+
             batch_result = self.target_worker.forward_batch_generation(
                 model_worker_batch, is_verify=True
             )
@@ -353,17 +373,9 @@ class NGRAMWorker:
             if batch.return_logprob:
                 self.add_logprob_values(batch, verify_input, logits_output)
             self._update_ngram_cache(batch)
-            batch.forward_mode = ForwardMode.DECODE
 
-        else:
-            batch_result = self.target_worker.forward_batch_generation(
-                model_worker_batch
-            )
-            logits_output, next_token_ids, can_run_cuda_graph = (
-                batch_result.logits_output,
-                batch_result.next_token_ids,
-                batch_result.can_run_cuda_graph,
-            )
+            if not batch.forward_mode.is_idle():
+                batch.forward_mode = ForwardMode.DECODE
 
         return GenerationBatchResult(
             logits_output=logits_output,

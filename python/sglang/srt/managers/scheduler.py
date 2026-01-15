@@ -1055,6 +1055,40 @@ class Scheduler(
     @DynamicGradMode()
     def event_loop_normal(self):
         """A normal scheduler loop."""
+        enable_profiling = envs.SGLANG_NPU_PROFILING.get() and self.tp_rank == 0
+        prof_bs = envs.SGLANG_NPU_PROFILING_BS.get()
+        prof_step = envs.SGLANG_NPU_PROFILING_STEP.get()
+        profiling_stage: str = envs.SGLANG_NPU_PROFILING_STAGE.get()
+        if enable_profiling:
+            prof_cnt = 0
+            import torch_npu
+
+            experimental_config = torch_npu.profiler._ExperimentalConfig(
+                aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
+                profiler_level=torch_npu.profiler.ProfilerLevel.Level2,
+                l2_cache=False,
+                data_simplification=False,
+            )
+            profiling_path = "profiling/"
+            prof = torch_npu.profiler.profile(
+                activities=[
+                    torch_npu.profiler.ProfilerActivity.CPU,
+                    torch_npu.profiler.ProfilerActivity.NPU,
+                ],
+                on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(
+                    profiling_path
+                ),
+                schedule=torch_npu.profiler.schedule(
+                    wait=1, warmup=1, active=10, repeat=1, skip_first=1
+                ),
+                record_shapes=True,
+                profile_memory=True,
+                with_stack=False,
+                with_flops=False,
+                with_modules=False,
+                experimental_config=experimental_config,
+            )
+
         while True:
             # Receive requests
             recv_reqs = self.recv_requests()
@@ -1068,8 +1102,33 @@ class Scheduler(
 
             # Launch the current batch
             if batch:
+                if enable_profiling:
+                    is_prof_stage = False
+                    if (
+                        profiling_stage == "decode" and batch.forward_mode.is_decode()
+                    ) or (
+                        profiling_stage == "prefill" and batch.forward_mode.is_extend()
+                    ):
+                        is_prof_stage = True
+
+                    if len(batch.reqs) >= prof_bs and prof_cnt == 0 and is_prof_stage:
+                        prof.start()
+                        prof_cnt += 1
+                    if prof_cnt > 0 and is_prof_stage:
+                        prof_cnt += 1
+                    if prof_cnt == prof_step and is_prof_stage:
+                        torch.npu.synchronize()
+                        prof.stop()
+
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
+                if (
+                    enable_profiling
+                    and prof_cnt > 0
+                    and prof_cnt < prof_step
+                    and is_prof_stage
+                ):
+                    prof.step()
             else:
                 # When the server is idle, do self-check and re-init some states
                 self.self_check_during_idle()
@@ -1089,14 +1148,10 @@ class Scheduler(
             tmp_batch, tmp_result = self.result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)
 
-        import os
-
-        enable_profiling: bool = (
-            os.getenv("ENABLE_PROFILING", "0") == "1" and self.tp_rank == 0
-        )
-        prof_bs: int = int(os.getenv("PROFILING_BS", 8))
-        profiling_stage: str = os.getenv("PROFILING_STAGE", "decode")
-        prof_step: int = int(os.getenv("PROFILING_step", 10))
+        enable_profiling = envs.SGLANG_NPU_PROFILING.get() and self.tp_rank == 0
+        prof_bs = envs.SGLANG_NPU_PROFILING_BS.get()
+        prof_step = envs.SGLANG_NPU_PROFILING_STEP.get()
+        profiling_stage: str = envs.SGLANG_NPU_PROFILING_STAGE.get()
         if enable_profiling:
             prof_cnt = 0
             import torch_npu
@@ -1187,7 +1242,8 @@ class Scheduler(
 
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
-            self.launch_batch_sample_if_needed(batch_result)
+            if self.is_generation:
+                self.launch_batch_sample_if_needed(batch_result)
 
             # Update last_batch
             self.last_batch = batch
@@ -1874,7 +1930,7 @@ class Scheduler(
                     self.running_batch.merge_batch(self.last_batch)
 
         if (
-            not self.chunked_req
+            (not self.chunked_req and not chunked_back)
             and self.schedule_enhancer
             and not self.schedule_enhancer.get_schedule_decision(
                 self.running_batch, self.max_prefill_bs

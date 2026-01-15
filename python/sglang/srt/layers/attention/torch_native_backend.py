@@ -81,6 +81,8 @@ class TorchNativeAttnBackend(AttentionBackend):
         seq_lens: torch.Tensor,
         extend_prefix_lens: torch.Tensor,
         extend_seq_lens: torch.Tensor,
+        encoder_lens: torch.Tensor = None,
+        is_cross_attention: bool = False,
         scaling=None,
         enable_gqa=False,
         causal=False,
@@ -123,7 +125,16 @@ class TorchNativeAttnBackend(AttentionBackend):
 
             seq_len_kv = seq_lens[seq_idx]
             end_q = start_q + extend_seq_len_q
+            atten_start_kv = 0
+            atten_end_kv = seq_lens[seq_idx]
             end_kv = start_kv + seq_len_kv
+            # support cross attention
+            if encoder_lens is not None:
+                if is_cross_attention:
+                    atten_end_kv = encoder_lens[seq_idx]
+                else:
+                    atten_start_kv = encoder_lens[seq_idx]
+                    atten_end_kv = encoder_lens[seq_idx] + extend_seq_len_q
 
             per_req_query = query[:, start_q:end_q, :]
             per_req_query_redudant = torch.empty(
@@ -137,7 +148,7 @@ class TorchNativeAttnBackend(AttentionBackend):
             # get key and value from cache. per_req_tokens contains the kv cache
             # index for each token in the sequence.
             req_pool_idx = req_pool_indices[seq_idx]
-            per_req_tokens = req_to_token[req_pool_idx, :seq_len_kv]
+            per_req_tokens = req_to_token[req_pool_idx, atten_start_kv : atten_end_kv]
             per_req_key = k_cache[per_req_tokens].movedim(0, query.dim() - 2)
             per_req_value = v_cache[per_req_tokens].movedim(0, query.dim() - 2)
 
@@ -182,6 +193,8 @@ class TorchNativeAttnBackend(AttentionBackend):
         req_to_token: torch.Tensor,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
+        encoder_lens: torch.Tensor = None,
+        is_cross_attention: bool = False,
         scaling=None,
         enable_gqa=False,
         causal=False,
@@ -217,14 +230,23 @@ class TorchNativeAttnBackend(AttentionBackend):
             seq_len_q = 1
             seq_len_kv = seq_lens[seq_idx]
             end_q = start_q + seq_len_q
+            atten_start_kv = 0
+            atten_end_kv = seq_lens[seq_idx]
             end_kv = start_kv + seq_len_kv
+            # support cross attention
+            if encoder_lens is not None:
+                if is_cross_attention:
+                    atten_end_kv = encoder_lens[seq_idx]
+                else:
+                    atten_start_kv = encoder_lens[seq_idx]
+                    atten_end_kv = encoder_lens[seq_idx] + seq_len_kv
 
             per_req_query = query[:, start_q:end_q, :]
 
             # get key and value from cache. per_req_tokens contains the kv cache
             # index for each token in the sequence.
             req_pool_idx = req_pool_indices[seq_idx]
-            per_req_tokens = req_to_token[req_pool_idx, :seq_len_kv]
+            per_req_tokens = req_to_token[req_pool_idx, atten_start_kv : atten_end_kv]
             per_req_key = k_cache[per_req_tokens].movedim(0, query.dim() - 2)
             per_req_value = v_cache[per_req_tokens].movedim(0, query.dim() - 2)
 

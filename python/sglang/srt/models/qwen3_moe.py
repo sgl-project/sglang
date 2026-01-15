@@ -69,6 +69,7 @@ from sglang.srt.models.utils import (
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     add_prefix,
+    get_bool_env_var,
     is_cuda,
     is_flashinfer_available,
     is_non_idle_and_non_empty,
@@ -672,6 +673,10 @@ class Qwen3MoeAttention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
+        prefill_padding_max = get_bool_env_var("PREFILL_PADDING_MAX")
+        if prefill_padding_max and hasattr(forward_batch, "_original_forward_mode"):
+            if forward_batch._original_forward_mode.is_idle():
+                return hidden_states
         s = self.forward_prepare(
             positions=positions,
             hidden_states=hidden_states,

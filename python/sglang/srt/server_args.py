@@ -441,7 +441,7 @@ class ServerArgs:
     speculative_ngram_capacity: int = 10 * 1000 * 1000
     # For suffix decoding only
     speculative_suffix_max_tree_depth: int = 24
-    speculative_suffix_max_cached_requests: int = 10000
+    speculative_suffix_max_cached_requests: int = 50000
     speculative_suffix_max_spec_factor: float = 1.0
     speculative_suffix_min_token_prob: float = 0.1
 
@@ -2146,12 +2146,6 @@ class ServerArgs:
             if not 0 <= self.speculative_suffix_min_token_prob <= 1:
                 raise ValueError(
                     f"speculative_suffix_min_token_prob={self.speculative_suffix_min_token_prob} must be in [0, 1]"
-                )
-
-            if self.enable_dp_attention:
-                # TODO: support dp attention for suffix decoding
-                raise ValueError(
-                    "Currently suffix decoding does not support dp attention."
                 )
 
             logger.info(
@@ -4786,7 +4780,7 @@ class ServerArgs:
 
         if self.enable_lora:
             # Validate compatibility with speculative decoding
-            if self.speculative_algorithm not in ["NGRAM", None]:
+            if self.speculative_algorithm not in ["NGRAM", "SUFFIX", None]:
                 raise ValueError(
                     "Currently LoRA is only compatible with NGRAM speculative decoding."
                 )

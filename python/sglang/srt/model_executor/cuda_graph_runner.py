@@ -375,7 +375,10 @@ class CudaGraphRunner:
         if self.require_mlp_tp_gather:
             cuda_graph_bs = (
                 max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
-                if self.model_runner.spec_algorithm.is_eagle()
+                if (
+                    self.model_runner.spec_algorithm.is_eagle()
+                    or self.model_runner.spec_algorithm.is_suffix()
+                )
                 else max(forward_batch.global_num_tokens_cpu)
             )
         else:
@@ -778,7 +781,10 @@ class CudaGraphRunner:
             max_num_tokens = max(forward_batch.global_num_tokens_cpu)
             max_batch_size = (
                 max_num_tokens / self.num_tokens_per_bs
-                if self.model_runner.spec_algorithm.is_eagle()
+                if (
+                    self.model_runner.spec_algorithm.is_eagle()
+                    or self.model_runner.spec_algorithm.is_suffix()
+                )
                 else max_num_tokens
             )
             index = bisect.bisect_left(self.capture_bs, max_batch_size)
