@@ -170,6 +170,7 @@ mod pd_routing_unit_tests {
                     balance_rel_threshold: 1.2,
                     eviction_interval_secs: 60,
                     max_tree_size: 1000000,
+                    mesh_sync_interval_secs: 1,
                 },
             ),
             (
