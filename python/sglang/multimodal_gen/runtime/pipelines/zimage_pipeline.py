@@ -211,15 +211,17 @@ class _PrepareImageLatentsStage(PipelineStage):
             [lat.to(dtype) for lat in lats] for lats in condition_latents
         ]
 
-        negative_condition_latents = [
-            [None for lat in lats] for lats in condition_latents
-        ]
-        # #  TODO: ignore neg for now.
-        # negative_condition_latents = None
-        # if batch.do_classifier_free_guidance:
-        #     negative_condition_latents = [
-        #         [lat.clone() for lat in batch] for batch in condition_latents
-        #     ]
+        # negative_condition_latents = [
+        #     [None for lat in lats] for lats in condition_latents
+        # ]
+        # TODO: review, flag by None
+        negative_condition_latents = None
+        if batch.do_classifier_free_guidance:
+            # negative_condition_latents = [
+            #     [lat.clone() for lat in batch] for batch in condition_latents
+            # ]
+            # TODO: review, readonly assert?
+            negative_condition_latents = condition_latents
 
         # TODO: comment usage
         # for condition_latents_model_input = condition_latents + negative_condition_latents
@@ -302,15 +304,17 @@ class _PrepareSiglipStage(PipelineStage):
 
         negative_condition_siglip_embeds = None
         if do_classifier_free_guidance:
-            negative_condition_siglip_embeds = [
-                [se.clone() for se in batch] for batch in condition_siglip_embeds
-            ]
+            # negative_condition_siglip_embeds = [
+            #     [se.clone() for se in batch] for batch in condition_siglip_embeds
+            # ]
+            # # TODO: debug remove
+            # negative_condition_siglip_embeds = [
+            #     None if sels == [] else sels + [None]
+            #     for sels in negative_condition_siglip_embeds
+            # ]
 
-            # TODO: debug remove
-            negative_condition_siglip_embeds = [
-                None if sels == [] else sels + [None]
-                for sels in negative_condition_siglip_embeds
-            ]
+            # TODO: review, readonly modify assert
+            negative_condition_siglip_embeds = condition_siglip_embeds
 
         # TODO: for siglip_feats = pos + neg
         # in denoising loop
