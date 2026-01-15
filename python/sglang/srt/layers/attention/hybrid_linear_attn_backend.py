@@ -54,17 +54,6 @@ def _check_cutedsl_gdn_available():
         return _cutedsl_gdn_available
 
     try:
-        import cutlass
-        from packaging import version
-
-        if version.parse(cutlass.__version__) < version.parse("4.3.0"):
-            rank0_log(
-                f"CuTe DSL GDN kernel requires cutlass >= 4.3.0, "
-                f"but found {cutlass.__version__}"
-            )
-            _cutedsl_gdn_available = False
-            return _cutedsl_gdn_available
-
         from sglang.jit_kernel.cutedsl_gdn import (
             cutedsl_fused_sigmoid_gating_delta_rule_update as _func,
         )
@@ -938,11 +927,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
         value = value.view(1, seq_len, value.shape[1] // head_v_dim, head_v_dim)
 
         global _cutedsl_gdn_logged
-        use_cutedsl = (
-            Envs.SGLANG_USE_CUTEDSL_GDN_DECODE.get() and _check_cutedsl_gdn_available()
-        )
-        if not _cutedsl_gdn_logged and Envs.SGLANG_USE_CUTEDSL_GDN_DECODE.get():
-            rank0_log(f"Using CuTe DSL GDN kernel for decode: {use_cutedsl}")
+        env_enabled = Envs.SGLANG_USE_CUTEDSL_GDN_DECODE.get()
+        kernel_available = _check_cutedsl_gdn_available() if env_enabled else False
+        use_cutedsl = env_enabled and kernel_available
+        if not _cutedsl_gdn_logged:
+            rank0_log(
+                f"CuTe DSL GDN decode: env_enabled={env_enabled}, "
+                f"kernel_available={kernel_available}, use_cutedsl={use_cutedsl}"
+            )
             _cutedsl_gdn_logged = True
 
         kernel_func = (
