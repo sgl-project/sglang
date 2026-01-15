@@ -19,7 +19,7 @@ suites = {
     "per-commit-8-gpu-h200": [
         TestFile("test_deepseek_v3_basic.py", 275),
         TestFile("test_deepseek_v3_mtp.py", 275),
-        TestFile("test_disaggregation_hybrid_attention.py", 600),
+        TestFile("test_disaggregation_hybrid_attention.py", 400),
         TestFile("models/test_kimi_k2_models.py", 200),
         TestFile("test_deepseek_v32_basic.py", 360),
         TestFile("test_deepseek_v32_mtp.py", 360),
@@ -99,6 +99,8 @@ suite_amd = {
         # TestFile("test_no_overlap_scheduler.py", 234), # Disabled temporarily and track in #7703
         # TestFile("test_vision_chunked_prefill.py", 175), # Disabled temporarily and track in #7701
         # TestFile("test_wave_attention_backend.py", 150), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/11127
+        # The time estimation for `test_int4fp8_moe.py` assumes `mistralai/Mixtral-8x7B-Instruct-v0.1` is already cached (running on 1xMI300X).
+        TestFile("test_int4fp8_moe.py", 313),
     ],
     "per-commit-4-gpu-amd": [
         TestFile("test_pp_single_node.py", 150),
@@ -106,9 +108,6 @@ suite_amd = {
     "per-commit-8-gpu-amd": [
         TestFile("test_deepseek_v3_basic.py", 275),
         TestFile("test_deepseek_v3_mtp.py", 275),
-    ],
-    "per-commit-8-gpu-amd-mi35x": [
-        TestFile("test_deepseek_r1_mxfp4_8gpu.py", 3600),
     ],
     # NOTE: AMD nightly suites (nightly-amd, nightly-amd-vlm, nightly-amd-8-gpu)
     # have been migrated to test/registered/amd/nightly/ and are now managed
@@ -158,6 +157,7 @@ suite_ascend = {
         TestFile("ascend/test_ascend_sampling_backend.py", 400),
         TestFile("ascend/test_ascend_tp1_bf16.py", 400),
         TestFile("ascend/test_ascend_compile_graph_tp1_bf16.py", 400),
+        TestFile("ascend/test_ascend_w8a8_quantization.py", 400),
         TestFile("test_embed_interpolate_unittest.py", 400),
     ],
     "per-commit-2-npu-a2": [
@@ -172,8 +172,9 @@ suite_ascend = {
         TestFile("ascend/test_ascend_tp4_bf16.py", 400),
     ],
     "per-commit-16-npu-a3": [
-        TestFile("ascend/test_ascend_deepep.py", 400),
-        TestFile("ascend/test_ascend_deepseek_mtp.py", 400),
+        TestFile("ascend/test_ascend_deepep.py", 3600),
+        TestFile("ascend/test_ascend_deepseek_mtp.py", 2800),
+        TestFile("ascend/test_ascend_w4a4_quantization.py", 600),
     ],
 }
 
