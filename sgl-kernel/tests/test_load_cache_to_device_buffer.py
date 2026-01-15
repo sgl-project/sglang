@@ -58,7 +58,7 @@ __device__ __forceinline__ int warp_inclusive_scan(int* s_data, int lane_id, int
     return accumulator;
 }
 
-template <int BLOCK_SIZE, int MAX_TOP_K, int HOT_BUFFER_SIZE>
+template <int BLOCK_SIZE, int NUM_TOP_K, int HOT_BUFFER_SIZE>
 __global__ void load_cache_to_device_buffer(
     const uint32_t* __restrict__ top_k_tokens,
     uint32_t* __restrict__ device_buffer_tokens,
@@ -69,13 +69,10 @@ __global__ void load_cache_to_device_buffer(
     void* __restrict__ device_buffer,
     int64_t* __restrict__ top_k_device_locs,
     uint32_t max_tokens,
-    int64_t item_size_bytes,
-    int32_t actual_num_top_k) {  // Added: actual number of tokens
+    int64_t item_size_bytes) {
     
     constexpr int NUM_WARPS = BLOCK_SIZE / WARP_SIZE;
-    // Use MAX_TOP_K for shared memory sizing, actual_num_top_k for bounds
-    const int num_chunks = (actual_num_top_k + WARP_SIZE - 1) / WARP_SIZE;
-    constexpr int MAX_CHUNKS = (MAX_TOP_K + WARP_SIZE - 1) / WARP_SIZE;
+    constexpr int NUM_CHUNKS = (NUM_TOP_K + WARP_SIZE - 1) / WARP_SIZE;
 
     const int tid = threadIdx.x;
     const int warp_id = tid / WARP_SIZE;
@@ -83,10 +80,10 @@ __global__ void load_cache_to_device_buffer(
     const unsigned int lanes_before = (1u << lane_id) - 1;
 
     __shared__ bool s_protected_bitmap[HOT_BUFFER_SIZE];
-    __shared__ int32_t s_chunk_miss_offset[MAX_CHUNKS + 1];
-    __shared__ int32_t s_missed_tokens[MAX_TOP_K];
-    __shared__ int16_t s_missed_tokens_idx[MAX_TOP_K];
-    __shared__ int32_t s_evictable_slots[MAX_TOP_K];
+    __shared__ int32_t s_chunk_miss_offset[NUM_CHUNKS + 1];
+    __shared__ int32_t s_missed_tokens[NUM_TOP_K];
+    __shared__ int16_t s_missed_tokens_idx[NUM_TOP_K];
+    __shared__ int32_t s_evictable_slots[NUM_TOP_K];
     __shared__ int32_t s_total_misses;
 
     if (tid == 0) {
@@ -95,20 +92,20 @@ __global__ void load_cache_to_device_buffer(
     for (int i = tid; i < HOT_BUFFER_SIZE; i += BLOCK_SIZE) {
         s_protected_bitmap[i] = false;
     }
-    for (int i = tid; i < num_chunks + 1; i += BLOCK_SIZE) {
+    for (int i = tid; i < NUM_CHUNKS + 1; i += BLOCK_SIZE) {
         s_chunk_miss_offset[i] = 0;
     }
     __syncthreads();
 
     // ===== Phase 1: Hit and Miss Detection ====
-    const int iterations_per_warp = (num_chunks + NUM_WARPS - 1) / NUM_WARPS;
-    for (int iter = 0; iter < iterations_per_warp; iter++) {
+    constexpr int ITERATIONS_PER_WARP = (NUM_CHUNKS + NUM_WARPS - 1) / NUM_WARPS;
+    for (int iter = 0; iter < ITERATIONS_PER_WARP; iter++) {
         int chunk_idx = warp_id + iter * NUM_WARPS;
-        bool has_valid_chunk = chunk_idx < num_chunks;
+        bool has_valid_chunk = chunk_idx < NUM_CHUNKS;
 
         const int chunk_token_start = chunk_idx * WARP_SIZE;
         const int my_token_idx = chunk_token_start + lane_id;
-        const bool has_valid_token = has_valid_chunk && (my_token_idx < actual_num_top_k);
+        const bool has_valid_token = has_valid_chunk && (my_token_idx < NUM_TOP_K);
 
         int32_t my_token = 0;
         bool is_hit = false;
@@ -142,7 +139,7 @@ __global__ void load_cache_to_device_buffer(
 
         if (warp_id == 0) {
             s_total_misses = warp_inclusive_scan(
-                s_chunk_miss_offset, lane_id, iter * NUM_WARPS + 1, num_chunks + 1, s_total_misses);
+                s_chunk_miss_offset, lane_id, iter * NUM_WARPS + 1, NUM_CHUNKS + 1, s_total_misses);
         }
         __syncthreads();
 
@@ -235,8 +232,7 @@ void load_cache_launcher_64_128(
     torch::Tensor device_buffer,
     torch::Tensor top_k_device_locs,
     int64_t max_tokens,
-    int64_t item_size_bytes,
-    int64_t actual_num_top_k
+    int64_t item_size_bytes
 ) {
     load_cache_to_device_buffer<256, 64, 128><<<1, 256>>>(
         reinterpret_cast<uint32_t*>(top_k_tokens.data_ptr<int32_t>()),
@@ -248,8 +244,7 @@ void load_cache_launcher_64_128(
         device_buffer.data_ptr<uint8_t>(),
         top_k_device_locs.data_ptr<int64_t>(),
         static_cast<uint32_t>(max_tokens),
-        item_size_bytes,
-        static_cast<int32_t>(actual_num_top_k)
+        item_size_bytes
     );
 }
 
@@ -263,8 +258,7 @@ void load_cache_launcher_256_512(
     torch::Tensor device_buffer,
     torch::Tensor top_k_device_locs,
     int64_t max_tokens,
-    int64_t item_size_bytes,
-    int64_t actual_num_top_k
+    int64_t item_size_bytes
 ) {
     load_cache_to_device_buffer<256, 256, 512><<<1, 256>>>(
         reinterpret_cast<uint32_t*>(top_k_tokens.data_ptr<int32_t>()),
@@ -276,8 +270,7 @@ void load_cache_launcher_256_512(
         device_buffer.data_ptr<uint8_t>(),
         top_k_device_locs.data_ptr<int64_t>(),
         static_cast<uint32_t>(max_tokens),
-        item_size_bytes,
-        static_cast<int32_t>(actual_num_top_k)
+        item_size_bytes
     );
 }
 '''
@@ -293,8 +286,7 @@ void load_cache_launcher_64_128(
     torch::Tensor device_buffer,
     torch::Tensor top_k_device_locs,
     int64_t max_tokens,
-    int64_t item_size_bytes,
-    int64_t actual_num_top_k
+    int64_t item_size_bytes
 );
 
 void load_cache_launcher_256_512(
@@ -307,8 +299,7 @@ void load_cache_launcher_256_512(
     torch::Tensor device_buffer,
     torch::Tensor top_k_device_locs,
     int64_t max_tokens,
-    int64_t item_size_bytes,
-    int64_t actual_num_top_k
+    int64_t item_size_bytes
 );
 '''
 
@@ -466,7 +457,6 @@ class CUDAKernel:
                 top_k_device_locs,
                 self.max_tokens,
                 self.item_size_bytes,
-                top_k_size,  # actual number of tokens
             )
         else:
             self._module.load_cache_launcher_256_512(
@@ -480,7 +470,6 @@ class CUDAKernel:
                 top_k_device_locs,
                 self.max_tokens,
                 self.item_size_bytes,
-                top_k_size,  # actual number of tokens
             )
         
         return top_k_device_locs
@@ -491,22 +480,22 @@ class TestLoadCacheToDeviceBuffer:
     
     @pytest.fixture
     def small_config(self):
-        """Small configuration for basic tests."""
+        """Small configuration - matches load_cache_launcher_64_128 template."""
         return {
             "max_tokens": 1000,
-            "hot_buffer_size": 100,
-            "item_size_bytes": 64,  # Must be multiple of 8
-            "num_top_k": 32,
+            "hot_buffer_size": 128,  # Must match template HOT_BUFFER_SIZE
+            "item_size_bytes": 64,   # Must be multiple of 8
+            "num_top_k": 64,         # Must match template NUM_TOP_K
         }
     
     @pytest.fixture
     def medium_config(self):
-        """Medium configuration."""
+        """Medium configuration - matches load_cache_launcher_256_512 template."""
         return {
             "max_tokens": 10000,
-            "hot_buffer_size": 500,
+            "hot_buffer_size": 512,  # Must match template HOT_BUFFER_SIZE
             "item_size_bytes": 128,
-            "num_top_k": 200,
+            "num_top_k": 256,        # Must match template NUM_TOP_K
         }
     
     def create_test_data(self, config):
@@ -539,8 +528,8 @@ class TestLoadCacheToDeviceBuffer:
         cuda_kernel = CUDAKernel(config["max_tokens"], config["hot_buffer_size"], 
                                   config["item_size_bytes"], config["num_top_k"])
         
-        # Test tokens (all new)
-        top_k_tokens = list(range(10, 10 + config["num_top_k"]))
+        # Test tokens (all new) - must be exactly num_top_k tokens
+        top_k_tokens = list(range(config["num_top_k"]))
         top_k_torch = torch.tensor(top_k_tokens, dtype=torch.int32, device="cuda")
         
         # Python reference
@@ -573,8 +562,8 @@ class TestLoadCacheToDeviceBuffer:
         cuda_kernel = CUDAKernel(config["max_tokens"], config["hot_buffer_size"], 
                                   config["item_size_bytes"], config["num_top_k"])
         
-        # First pass - load some tokens
-        top_k_tokens = list(range(10, 10 + config["num_top_k"]))
+        # First pass - load tokens (must be exactly num_top_k)
+        top_k_tokens = list(range(config["num_top_k"]))
         top_k_torch = torch.tensor(top_k_tokens, dtype=torch.int32, device="cuda")
         
         device_buffer_ref = bytearray(config["hot_buffer_size"] * config["item_size_bytes"])
@@ -599,8 +588,8 @@ class TestLoadCacheToDeviceBuffer:
         cuda_kernel = CUDAKernel(config["max_tokens"], config["hot_buffer_size"], 
                                   config["item_size_bytes"], config["num_top_k"])
         
-        # First pass
-        top_k_tokens1 = list(range(0, config["num_top_k"]))
+        # First pass - load tokens 0 to num_top_k-1
+        top_k_tokens1 = list(range(config["num_top_k"]))
         top_k_torch1 = torch.tensor(top_k_tokens1, dtype=torch.int32, device="cuda")
         
         device_buffer_ref = bytearray(config["hot_buffer_size"] * config["item_size_bytes"])
@@ -608,9 +597,10 @@ class TestLoadCacheToDeviceBuffer:
         cuda_kernel.process_topk(top_k_torch1, host_cache_torch, device_buffer_torch)
         torch.cuda.synchronize()
         
-        # Second pass - half old, half new
+        # Second pass - first half hits, second half new (misses)
+        # Total must still be num_top_k tokens
         half = config["num_top_k"] // 2
-        top_k_tokens2 = list(range(0, half)) + list(range(100, 100 + half))
+        top_k_tokens2 = list(range(0, half)) + list(range(200, 200 + half))
         top_k_torch2 = torch.tensor(top_k_tokens2, dtype=torch.int32, device="cuda")
         
         ref_locs2 = ref.process_topk(top_k_tokens2, host_cache_np, device_buffer_ref)
@@ -622,10 +612,7 @@ class TestLoadCacheToDeviceBuffer:
     
     def test_eviction(self, small_config):
         """Test that eviction works correctly when buffer is full."""
-        config = small_config.copy()
-        config["hot_buffer_size"] = 20  # Small buffer to force eviction
-        config["num_top_k"] = 10
-        
+        config = small_config
         host_cache_np, host_cache_torch, device_buffer_torch = self.create_test_data(config)
         
         ref = PythonReference(config["max_tokens"], config["hot_buffer_size"], config["item_size_bytes"])
@@ -634,16 +621,16 @@ class TestLoadCacheToDeviceBuffer:
         
         device_buffer_ref = bytearray(config["hot_buffer_size"] * config["item_size_bytes"])
         
-        # Fill buffer with tokens 0-19
-        for batch in range(2):
-            tokens = list(range(batch * 10, batch * 10 + 10))
-            top_k_torch = torch.tensor(tokens, dtype=torch.int32, device="cuda")
-            ref.process_topk(tokens, host_cache_np, device_buffer_ref)
-            cuda_kernel.process_topk(top_k_torch, host_cache_torch, device_buffer_torch)
+        # First pass: Fill buffer with tokens 0-63
+        tokens1 = list(range(config["num_top_k"]))
+        top_k_torch1 = torch.tensor(tokens1, dtype=torch.int32, device="cuda")
+        ref.process_topk(tokens1, host_cache_np, device_buffer_ref)
+        cuda_kernel.process_topk(top_k_torch1, host_cache_torch, device_buffer_torch)
         torch.cuda.synchronize()
         
-        # Now request tokens 0-4 (hits) and 100-104 (misses, require eviction)
-        top_k_tokens = list(range(0, 5)) + list(range(100, 105))
+        # Second pass: tokens 0-31 (hits) and 200-231 (misses, require eviction of tokens 32-63)
+        half = config["num_top_k"] // 2
+        top_k_tokens = list(range(0, half)) + list(range(200, 200 + half))
         top_k_torch = torch.tensor(top_k_tokens, dtype=torch.int32, device="cuda")
         
         ref_locs = ref.process_topk(top_k_tokens, host_cache_np, device_buffer_ref)
@@ -671,7 +658,7 @@ class TestLoadCacheToDeviceBuffer:
         random.seed(42)
         
         for iteration in range(10):
-            # Random tokens
+            # Random tokens - must be exactly num_top_k tokens
             tokens = random.sample(range(config["max_tokens"]), config["num_top_k"])
             top_k_torch = torch.tensor(tokens, dtype=torch.int32, device="cuda")
             
@@ -707,14 +694,13 @@ class TestLoadCacheToDeviceBuffer:
     def test_data_integrity(self, small_config):
         """Verify that copied data is correct."""
         config = small_config
-        config["num_top_k"] = 16
         host_cache_np, host_cache_torch, device_buffer_torch = self.create_test_data(config)
         
         cuda_kernel = CUDAKernel(config["max_tokens"], config["hot_buffer_size"], 
                                   config["item_size_bytes"], config["num_top_k"])
         
-        # Request specific tokens
-        tokens = [5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80]
+        # Request tokens 0 to num_top_k-1 (must be exactly num_top_k tokens)
+        tokens = list(range(config["num_top_k"]))
         top_k_torch = torch.tensor(tokens, dtype=torch.int32, device="cuda")
         
         cuda_locs = cuda_kernel.process_topk(top_k_torch, host_cache_torch, device_buffer_torch)
