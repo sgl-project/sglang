@@ -128,7 +128,7 @@ class StructuralTagFormatTestCase(unittest.TestCase):
         """Assert that individual tag items do NOT have the 'format': 'tag' key.
 
         The 'format': 'tag' key within individual tag items was removed for
-        xgrammar compatibility with stop_after_first handling.
+        xgrammar compatibility.
         """
         for tag_item in tag["format"]["tags"]:
             self.assertNotIn(
@@ -147,50 +147,28 @@ class TestLlama32Detector(StructuralTagFormatTestCase):
     def test_schema_always_included(self):
         """Test that schema is always included even with at_least_one=False."""
         tool = self.get_simple_tool()
-        tag = self.detector.build_structural_tag(
-            tools=[tool], at_least_one=False, stop_after_first=False
-        )
+        tag = self.detector.build_structural_tag(tools=[tool], at_least_one=False)
         self.assert_schema_always_included(tag)
 
     def test_at_least_one_parameter(self):
         """Test that at_least_one parameter affects structural tag format."""
         tool = self.get_simple_tool()
-        tag_false = self.detector.build_structural_tag(
-            tools=[tool], at_least_one=False, stop_after_first=False
-        )
-        tag_true = self.detector.build_structural_tag(
-            tools=[tool], at_least_one=True, stop_after_first=False
-        )
+        tag_false = self.detector.build_structural_tag(tools=[tool], at_least_one=False)
+        tag_true = self.detector.build_structural_tag(tools=[tool], at_least_one=True)
         self.assertFalse(tag_false["format"]["at_least_one"])
         self.assertTrue(tag_true["format"]["at_least_one"])
-
-    def test_stop_after_first_parameter(self):
-        """Test that stop_after_first parameter affects structural tag format."""
-        tool = self.get_simple_tool()
-        tag_false = self.detector.build_structural_tag(
-            tools=[tool], at_least_one=False, stop_after_first=False
-        )
-        tag_true = self.detector.build_structural_tag(
-            tools=[tool], at_least_one=False, stop_after_first=True
-        )
-        self.assertFalse(tag_false["format"]["stop_after_first"])
-        self.assertTrue(tag_true["format"]["stop_after_first"])
 
     def test_multiple_tools(self):
         """Test that multiple tools generate multiple tags."""
         tools = [self.get_simple_tool(), self.get_complex_tool()]
-        tag = self.detector.build_structural_tag(
-            tools=tools, at_least_one=False, stop_after_first=False
-        )
+        tag = self.detector.build_structural_tag(tools=tools, at_least_one=False)
         self.assert_structural_tag_structure(tag, expected_tools_count=2)
         self.assert_schema_always_included(tag)
 
     def test_empty_parameters_handling(self):
         """Test handling of tools with no parameters."""
         tool = self.get_empty_params_tool()
-        tag = self.detector.build_structural_tag(
-            tools=[tool], at_least_one=False, stop_after_first=False
-        )
+        tag = self.detector.build_structural_tag(tools=[tool], at_least_one=False)
         self.assert_structural_tag_structure(tag, expected_tools_count=1)
         self.assert_schema_always_included(tag)
         # Empty parameters should result in empty dict schema
@@ -200,9 +178,7 @@ class TestLlama32Detector(StructuralTagFormatTestCase):
     def test_structural_tag_matches_realistic_output(self):
         """Test that structural tag begin/end patterns match realistic model output."""
         tool = self.get_simple_tool()
-        tag = self.detector.build_structural_tag(
-            tools=[tool], at_least_one=False, stop_after_first=False
-        )
+        tag = self.detector.build_structural_tag(tools=[tool], at_least_one=False)
 
         # Create realistic output: <|python_tag|>{"name":"get_weather", "arguments":{"city":"Dallas"}}
         realistic_output = (
@@ -257,9 +233,7 @@ class TestLlama32Detector(StructuralTagFormatTestCase):
     def test_multiple_tools_generate_correct_tags(self):
         """Test that multiple tools generate separate tags with correct tool names."""
         tools = [self.get_simple_tool(), self.get_complex_tool()]
-        tag = self.detector.build_structural_tag(
-            tools=tools, at_least_one=False, stop_after_first=False
-        )
+        tag = self.detector.build_structural_tag(tools=tools, at_least_one=False)
 
         # Verify we have tags for all tools
         tags_list = tag["format"]["tags"]
@@ -284,9 +258,7 @@ class TestLlama32Detector(StructuralTagFormatTestCase):
     def test_no_format_tag_key(self):
         """Test that tag items do not have 'format': 'tag' key for xgrammar compatibility."""
         tool = self.get_simple_tool()
-        tag = self.detector.build_structural_tag(
-            tools=[tool], at_least_one=False, stop_after_first=False
-        )
+        tag = self.detector.build_structural_tag(tools=[tool], at_least_one=False)
         self.assert_no_format_tag_key(tag)
 
 
@@ -298,44 +270,19 @@ class TestMistralDetector(StructuralTagFormatTestCase):
 
     def test_schema_always_included(self):
         tool = self.get_simple_tool()
-        tag = self.detector.build_structural_tag(
-            tools=[tool], at_least_one=False, stop_after_first=False
-        )
+        tag = self.detector.build_structural_tag(tools=[tool], at_least_one=False)
         self.assert_schema_always_included(tag)
 
     def test_at_least_one_parameter(self):
         tool = self.get_simple_tool()
-        tag_false = self.detector.build_structural_tag(
-            tools=[tool], at_least_one=False, stop_after_first=False
-        )
-        tag_true = self.detector.build_structural_tag(
-            tools=[tool], at_least_one=True, stop_after_first=False
-        )
+        tag_false = self.detector.build_structural_tag(tools=[tool], at_least_one=False)
+        tag_true = self.detector.build_structural_tag(tools=[tool], at_least_one=True)
         self.assertFalse(tag_false["format"]["at_least_one"])
         self.assertTrue(tag_true["format"]["at_least_one"])
 
-    def test_stop_after_first_parameter(self):
-        """Test that stop_after_first parameter affects nested content structure."""
-        tool = self.get_simple_tool()
-        tag_false = self.detector.build_structural_tag(
-            tools=[tool], at_least_one=False, stop_after_first=False
-        )
-        tag_true = self.detector.build_structural_tag(
-            tools=[tool], at_least_one=False, stop_after_first=True
-        )
-        # Mistral uses nested tags_with_separator - stop_after_first is in nested content
-        # Format level stop_after_first is always True (outer wrapper only appears once)
-        self.assertTrue(tag_false["format"]["stop_after_first"])
-        self.assertTrue(tag_true["format"]["stop_after_first"])
-        # Check nested content's stop_after_first
-        self.assertFalse(tag_false["format"]["tags"][0]["content"]["stop_after_first"])
-        self.assertTrue(tag_true["format"]["tags"][0]["content"]["stop_after_first"])
-
     def test_multiple_tools(self):
         tools = [self.get_simple_tool(), self.get_complex_tool()]
-        tag = self.detector.build_structural_tag(
-            tools=tools, at_least_one=False, stop_after_first=False
-        )
+        tag = self.detector.build_structural_tag(tools=tools, at_least_one=False)
         # Mistral uses nested tags_with_separator - 1 outer tag with inner tags for each tool
         self.assertEqual(len(tag["format"]["tags"]), 1)
         # Inner tags should have one entry per tool
@@ -344,9 +291,7 @@ class TestMistralDetector(StructuralTagFormatTestCase):
 
     def test_empty_parameters_handling(self):
         tool = self.get_empty_params_tool()
-        tag = self.detector.build_structural_tag(
-            tools=[tool], at_least_one=False, stop_after_first=False
-        )
+        tag = self.detector.build_structural_tag(tools=[tool], at_least_one=False)
         # Mistral uses nested tags_with_separator - 1 outer tag with 1 inner tag
         self.assertEqual(len(tag["format"]["tags"]), 1)
         # Schema is in the inner tag's content
@@ -357,9 +302,7 @@ class TestMistralDetector(StructuralTagFormatTestCase):
     def test_structural_tag_matches_realistic_output(self):
         """Test that structural tag begin/end patterns match realistic model output."""
         tool = self.get_simple_tool()
-        tag = self.detector.build_structural_tag(
-            tools=[tool], at_least_one=False, stop_after_first=False
-        )
+        tag = self.detector.build_structural_tag(tools=[tool], at_least_one=False)
 
         # Create realistic output for single tool call
         realistic_single = (
@@ -399,9 +342,7 @@ class TestMistralDetector(StructuralTagFormatTestCase):
     def test_nested_tags_with_separator_structure(self):
         """Test that nested tags_with_separator is set up correctly for multiple tool calls."""
         tool = self.get_simple_tool()
-        tag = self.detector.build_structural_tag(
-            tools=[tool], at_least_one=False, stop_after_first=False
-        )
+        tag = self.detector.build_structural_tag(tools=[tool], at_least_one=False)
 
         # Should have 1 outer tag with nested tags_with_separator content
         self.assertEqual(len(tag["format"]["tags"]), 1)
@@ -427,9 +368,7 @@ class TestMistralDetector(StructuralTagFormatTestCase):
     def test_multiple_tool_calls_structural_tag(self):
         """Test that structural tag supports multiple tool calls via nested structure."""
         tools = [self.get_simple_tool(), self.get_complex_tool()]
-        tag = self.detector.build_structural_tag(
-            tools=tools, at_least_one=False, stop_after_first=False
-        )
+        tag = self.detector.build_structural_tag(tools=tools, at_least_one=False)
 
         # Realistic output with multiple tool calls
         realistic_multi = (
@@ -463,9 +402,7 @@ class TestMistralDetector(StructuralTagFormatTestCase):
     def test_no_format_tag_key(self):
         """Test that tag items do not have 'format': 'tag' key for xgrammar compatibility."""
         tool = self.get_simple_tool()
-        tag = self.detector.build_structural_tag(
-            tools=[tool], at_least_one=False, stop_after_first=False
-        )
+        tag = self.detector.build_structural_tag(tools=[tool], at_least_one=False)
         self.assert_no_format_tag_key(tag)
 
 
@@ -477,45 +414,24 @@ class TestQwen25Detector(StructuralTagFormatTestCase):
 
     def test_schema_always_included(self):
         tool = self.get_simple_tool()
-        tag = self.detector.build_structural_tag(
-            tools=[tool], at_least_one=False, stop_after_first=False
-        )
+        tag = self.detector.build_structural_tag(tools=[tool], at_least_one=False)
         self.assert_schema_always_included(tag)
 
     def test_at_least_one_parameter(self):
         tool = self.get_simple_tool()
-        tag_false = self.detector.build_structural_tag(
-            tools=[tool], at_least_one=False, stop_after_first=False
-        )
-        tag_true = self.detector.build_structural_tag(
-            tools=[tool], at_least_one=True, stop_after_first=False
-        )
+        tag_false = self.detector.build_structural_tag(tools=[tool], at_least_one=False)
+        tag_true = self.detector.build_structural_tag(tools=[tool], at_least_one=True)
         self.assertFalse(tag_false["format"]["at_least_one"])
         self.assertTrue(tag_true["format"]["at_least_one"])
 
-    def test_stop_after_first_parameter(self):
-        tool = self.get_simple_tool()
-        tag_false = self.detector.build_structural_tag(
-            tools=[tool], at_least_one=False, stop_after_first=False
-        )
-        tag_true = self.detector.build_structural_tag(
-            tools=[tool], at_least_one=False, stop_after_first=True
-        )
-        self.assertFalse(tag_false["format"]["stop_after_first"])
-        self.assertTrue(tag_true["format"]["stop_after_first"])
-
     def test_multiple_tools(self):
         tools = [self.get_simple_tool(), self.get_complex_tool()]
-        tag = self.detector.build_structural_tag(
-            tools=tools, at_least_one=False, stop_after_first=False
-        )
+        tag = self.detector.build_structural_tag(tools=tools, at_least_one=False)
         self.assert_structural_tag_structure(tag, expected_tools_count=2)
 
     def test_empty_parameters_handling(self):
         tool = self.get_empty_params_tool()
-        tag = self.detector.build_structural_tag(
-            tools=[tool], at_least_one=False, stop_after_first=False
-        )
+        tag = self.detector.build_structural_tag(tools=[tool], at_least_one=False)
         self.assert_structural_tag_structure(tag, expected_tools_count=1)
         schema = tag["format"]["tags"][0]["content"]["json_schema"]
         self.assertEqual(schema, {})
@@ -523,9 +439,7 @@ class TestQwen25Detector(StructuralTagFormatTestCase):
     def test_structural_tag_matches_realistic_output(self):
         """Test that structural tag begin/end patterns match realistic model output."""
         tool = self.get_simple_tool()
-        tag = self.detector.build_structural_tag(
-            tools=[tool], at_least_one=False, stop_after_first=False
-        )
+        tag = self.detector.build_structural_tag(tools=[tool], at_least_one=False)
 
         # Create realistic output: <tool_call>\n{"name":"get_weather", "arguments":{"city":"Dallas"}}\n</tool_call>
         realistic_output = '<tool_call>\n{"name":"get_weather", "arguments":{"city":"Dallas"}}\n</tool_call>'
@@ -561,9 +475,7 @@ class TestQwen25Detector(StructuralTagFormatTestCase):
     def test_no_format_tag_key(self):
         """Test that tag items do not have 'format': 'tag' key for xgrammar compatibility."""
         tool = self.get_simple_tool()
-        tag = self.detector.build_structural_tag(
-            tools=[tool], at_least_one=False, stop_after_first=False
-        )
+        tag = self.detector.build_structural_tag(tools=[tool], at_least_one=False)
         self.assert_no_format_tag_key(tag)
 
 
@@ -575,45 +487,24 @@ class TestQwen3CoderDetector(StructuralTagFormatTestCase):
 
     def test_schema_always_included(self):
         tool = self.get_simple_tool()
-        tag = self.detector.build_structural_tag(
-            tools=[tool], at_least_one=False, stop_after_first=False
-        )
+        tag = self.detector.build_structural_tag(tools=[tool], at_least_one=False)
         self.assert_schema_always_included(tag)
 
     def test_at_least_one_parameter(self):
         tool = self.get_simple_tool()
-        tag_false = self.detector.build_structural_tag(
-            tools=[tool], at_least_one=False, stop_after_first=False
-        )
-        tag_true = self.detector.build_structural_tag(
-            tools=[tool], at_least_one=True, stop_after_first=False
-        )
+        tag_false = self.detector.build_structural_tag(tools=[tool], at_least_one=False)
+        tag_true = self.detector.build_structural_tag(tools=[tool], at_least_one=True)
         self.assertFalse(tag_false["format"]["at_least_one"])
         self.assertTrue(tag_true["format"]["at_least_one"])
 
-    def test_stop_after_first_parameter(self):
-        tool = self.get_simple_tool()
-        tag_false = self.detector.build_structural_tag(
-            tools=[tool], at_least_one=False, stop_after_first=False
-        )
-        tag_true = self.detector.build_structural_tag(
-            tools=[tool], at_least_one=False, stop_after_first=True
-        )
-        self.assertFalse(tag_false["format"]["stop_after_first"])
-        self.assertTrue(tag_true["format"]["stop_after_first"])
-
     def test_multiple_tools(self):
         tools = [self.get_simple_tool(), self.get_complex_tool()]
-        tag = self.detector.build_structural_tag(
-            tools=tools, at_least_one=False, stop_after_first=False
-        )
+        tag = self.detector.build_structural_tag(tools=tools, at_least_one=False)
         self.assert_structural_tag_structure(tag, expected_tools_count=2)
 
     def test_empty_parameters_handling(self):
         tool = self.get_empty_params_tool()
-        tag = self.detector.build_structural_tag(
-            tools=[tool], at_least_one=False, stop_after_first=False
-        )
+        tag = self.detector.build_structural_tag(tools=[tool], at_least_one=False)
         self.assert_structural_tag_structure(tag, expected_tools_count=1)
         schema = tag["format"]["tags"][0]["content"]["json_schema"]
         self.assertEqual(schema, {})
@@ -621,9 +512,7 @@ class TestQwen3CoderDetector(StructuralTagFormatTestCase):
     def test_structural_tag_matches_realistic_output(self):
         """Test that structural tag begin/end patterns match realistic model output."""
         tool = self.get_simple_tool()
-        tag = self.detector.build_structural_tag(
-            tools=[tool], at_least_one=False, stop_after_first=False
-        )
+        tag = self.detector.build_structural_tag(tools=[tool], at_least_one=False)
 
         # Create realistic output: <tool_call>\n<function=get_weather>\n<parameter=city>\nDallas\n</parameter>\n</function>\n</tool_call>
         realistic_output = (
@@ -648,9 +537,7 @@ class TestQwen3CoderDetector(StructuralTagFormatTestCase):
     def test_no_format_tag_key(self):
         """Test that tag items do not have 'format': 'tag' key for xgrammar compatibility."""
         tool = self.get_simple_tool()
-        tag = self.detector.build_structural_tag(
-            tools=[tool], at_least_one=False, stop_after_first=False
-        )
+        tag = self.detector.build_structural_tag(tools=[tool], at_least_one=False)
         self.assert_no_format_tag_key(tag)
 
 
@@ -662,45 +549,20 @@ class TestDeepSeekV3Detector(StructuralTagFormatTestCase):
 
     def test_schema_always_included(self):
         tool = self.get_simple_tool()
-        tag = self.detector.build_structural_tag(
-            tools=[tool], at_least_one=False, stop_after_first=False
-        )
+        tag = self.detector.build_structural_tag(tools=[tool], at_least_one=False)
         self.assert_schema_always_included(tag)
 
     def test_at_least_one_parameter(self):
         tool = self.get_simple_tool()
-        tag_false = self.detector.build_structural_tag(
-            tools=[tool], at_least_one=False, stop_after_first=False
-        )
-        tag_true = self.detector.build_structural_tag(
-            tools=[tool], at_least_one=True, stop_after_first=False
-        )
+        tag_false = self.detector.build_structural_tag(tools=[tool], at_least_one=False)
+        tag_true = self.detector.build_structural_tag(tools=[tool], at_least_one=True)
         # DeepSeekV3 uses flat structure with dual triggers, at_least_one is at format level
         self.assertFalse(tag_false["format"]["at_least_one"])
         self.assertTrue(tag_true["format"]["at_least_one"])
 
-    def test_stop_after_first_parameter(self):
-        """Test that stop_after_first parameter affects nested content structure."""
-        tool = self.get_simple_tool()
-        tag_false = self.detector.build_structural_tag(
-            tools=[tool], at_least_one=False, stop_after_first=False
-        )
-        tag_true = self.detector.build_structural_tag(
-            tools=[tool], at_least_one=False, stop_after_first=True
-        )
-        # DeepSeekV3 uses nested tags_with_separator - stop_after_first is in nested content
-        # Format level stop_after_first is always True (outer wrapper only appears once)
-        self.assertTrue(tag_false["format"]["stop_after_first"])
-        self.assertTrue(tag_true["format"]["stop_after_first"])
-        # Check nested content's stop_after_first
-        self.assertFalse(tag_false["format"]["tags"][0]["content"]["stop_after_first"])
-        self.assertTrue(tag_true["format"]["tags"][0]["content"]["stop_after_first"])
-
     def test_multiple_tools(self):
         tools = [self.get_simple_tool(), self.get_complex_tool()]
-        tag = self.detector.build_structural_tag(
-            tools=tools, at_least_one=False, stop_after_first=False
-        )
+        tag = self.detector.build_structural_tag(tools=tools, at_least_one=False)
         # DeepSeekV3 uses nested tags_with_separator - 1 outer tag with inner tags for each tool
         self.assertIn("format", tag)
         self.assertEqual(len(tag["format"]["tags"]), 1)
@@ -710,9 +572,7 @@ class TestDeepSeekV3Detector(StructuralTagFormatTestCase):
 
     def test_empty_parameters_handling(self):
         tool = self.get_empty_params_tool()
-        tag = self.detector.build_structural_tag(
-            tools=[tool], at_least_one=False, stop_after_first=False
-        )
+        tag = self.detector.build_structural_tag(tools=[tool], at_least_one=False)
         self.assertIn("format", tag)
         # DeepSeekV3 uses nested tags_with_separator - 1 outer tag with 1 inner tag
         self.assertEqual(len(tag["format"]["tags"]), 1)
@@ -724,9 +584,7 @@ class TestDeepSeekV3Detector(StructuralTagFormatTestCase):
     def test_structural_tag_matches_realistic_output(self):
         """Test that structural tag begin/end patterns match realistic model output."""
         tool = self.get_simple_tool()
-        tag = self.detector.build_structural_tag(
-            tools=[tool], at_least_one=False, stop_after_first=False
-        )
+        tag = self.detector.build_structural_tag(tools=[tool], at_least_one=False)
 
         # Create realistic output for single tool call
         realistic_output = (
@@ -767,9 +625,7 @@ class TestDeepSeekV3Detector(StructuralTagFormatTestCase):
     def test_nested_tags_with_separator_structure(self):
         """Test that nested tags_with_separator is set up correctly for multiple tool calls."""
         tool = self.get_simple_tool()
-        tag = self.detector.build_structural_tag(
-            tools=[tool], at_least_one=False, stop_after_first=False
-        )
+        tag = self.detector.build_structural_tag(tools=[tool], at_least_one=False)
 
         # Should have 1 outer tag with nested tags_with_separator content
         self.assertEqual(len(tag["format"]["tags"]), 1)
@@ -795,9 +651,7 @@ class TestDeepSeekV3Detector(StructuralTagFormatTestCase):
     def test_no_format_tag_key(self):
         """Test that tag items do not have 'format': 'tag' key for xgrammar compatibility."""
         tool = self.get_simple_tool()
-        tag = self.detector.build_structural_tag(
-            tools=[tool], at_least_one=False, stop_after_first=False
-        )
+        tag = self.detector.build_structural_tag(tools=[tool], at_least_one=False)
         self.assert_no_format_tag_key(tag)
 
 
@@ -809,9 +663,7 @@ class TestDeepSeekV31Detector(StructuralTagFormatTestCase):
 
     def test_schema_always_included(self):
         tool = self.get_simple_tool()
-        tag = self.detector.build_structural_tag(
-            tools=[tool], at_least_one=False, stop_after_first=False
-        )
+        tag = self.detector.build_structural_tag(tools=[tool], at_least_one=False)
         # DeepSeekV31 uses flat structure - check first tag's schema
         first_tag = tag["format"]["tags"][0]
         self.assertIn("content", first_tag)
@@ -819,41 +671,22 @@ class TestDeepSeekV31Detector(StructuralTagFormatTestCase):
 
     def test_at_least_one_parameter(self):
         tool = self.get_simple_tool()
-        tag_false = self.detector.build_structural_tag(
-            tools=[tool], at_least_one=False, stop_after_first=False
-        )
-        tag_true = self.detector.build_structural_tag(
-            tools=[tool], at_least_one=True, stop_after_first=False
-        )
+        tag_false = self.detector.build_structural_tag(tools=[tool], at_least_one=False)
+        tag_true = self.detector.build_structural_tag(tools=[tool], at_least_one=True)
         # DeepSeekV31 uses flat structure with dual triggers, at_least_one is at format level
         self.assertFalse(tag_false["format"]["at_least_one"])
         self.assertTrue(tag_true["format"]["at_least_one"])
 
-    def test_stop_after_first_parameter(self):
-        tool = self.get_simple_tool()
-        tag_false = self.detector.build_structural_tag(
-            tools=[tool], at_least_one=False, stop_after_first=False
-        )
-        tag_true = self.detector.build_structural_tag(
-            tools=[tool], at_least_one=False, stop_after_first=True
-        )
-        self.assertFalse(tag_false["format"]["stop_after_first"])
-        self.assertTrue(tag_true["format"]["stop_after_first"])
-
     def test_multiple_tools(self):
         tools = [self.get_simple_tool(), self.get_complex_tool()]
-        tag = self.detector.build_structural_tag(
-            tools=tools, at_least_one=False, stop_after_first=False
-        )
+        tag = self.detector.build_structural_tag(tools=tools, at_least_one=False)
         # DeepSeekV31 uses dual triggers - 2 tags per tool (first call + subsequent calls)
         # 2 tools * 2 variants = 4 tags
         self.assertEqual(len(tag["format"]["tags"]), 4)
 
     def test_empty_parameters_handling(self):
         tool = self.get_empty_params_tool()
-        tag = self.detector.build_structural_tag(
-            tools=[tool], at_least_one=False, stop_after_first=False
-        )
+        tag = self.detector.build_structural_tag(tools=[tool], at_least_one=False)
         # DeepSeekV31 uses flat structure - check first tag's schema
         first_tag = tag["format"]["tags"][0]
         schema = first_tag["content"]["json_schema"]
@@ -862,9 +695,7 @@ class TestDeepSeekV31Detector(StructuralTagFormatTestCase):
     def test_structural_tag_matches_realistic_output(self):
         """Test that structural tag begin/end patterns match realistic model output."""
         tool = self.get_simple_tool()
-        tag = self.detector.build_structural_tag(
-            tools=[tool], at_least_one=False, stop_after_first=False
-        )
+        tag = self.detector.build_structural_tag(tools=[tool], at_least_one=False)
 
         # Create realistic output for single tool call
         realistic_output = (
@@ -899,9 +730,7 @@ class TestDeepSeekV31Detector(StructuralTagFormatTestCase):
     def test_dual_trigger_structure(self):
         """Test that dual triggers are set up correctly for multiple tool calls."""
         tool = self.get_simple_tool()
-        tag = self.detector.build_structural_tag(
-            tools=[tool], at_least_one=False, stop_after_first=False
-        )
+        tag = self.detector.build_structural_tag(tools=[tool], at_least_one=False)
 
         # Should have 2 tags: one for first call, one for subsequent calls
         self.assertEqual(len(tag["format"]["tags"]), 2)
@@ -918,9 +747,7 @@ class TestDeepSeekV31Detector(StructuralTagFormatTestCase):
     def test_no_format_tag_key(self):
         """Test that tag items do not have 'format': 'tag' key for xgrammar compatibility."""
         tool = self.get_simple_tool()
-        tag = self.detector.build_structural_tag(
-            tools=[tool], at_least_one=False, stop_after_first=False
-        )
+        tag = self.detector.build_structural_tag(tools=[tool], at_least_one=False)
         self.assert_no_format_tag_key(tag)
 
 
@@ -932,9 +759,7 @@ class TestGptOssDetector(StructuralTagFormatTestCase):
 
     def test_schema_always_included(self):
         tool = self.get_simple_tool()
-        tag = self.detector.build_structural_tag(
-            tools=[tool], at_least_one=False, stop_after_first=False
-        )
+        tag = self.detector.build_structural_tag(tools=[tool], at_least_one=False)
         # GPT-OSS has two patterns per tool (reasoning enabled/disabled)
         self.assertEqual(len(tag["format"]["tags"]), 2)
         for tag_item in tag["format"]["tags"]:
@@ -943,39 +768,20 @@ class TestGptOssDetector(StructuralTagFormatTestCase):
 
     def test_at_least_one_parameter(self):
         tool = self.get_simple_tool()
-        tag_false = self.detector.build_structural_tag(
-            tools=[tool], at_least_one=False, stop_after_first=False
-        )
-        tag_true = self.detector.build_structural_tag(
-            tools=[tool], at_least_one=True, stop_after_first=False
-        )
+        tag_false = self.detector.build_structural_tag(tools=[tool], at_least_one=False)
+        tag_true = self.detector.build_structural_tag(tools=[tool], at_least_one=True)
         self.assertFalse(tag_false["format"]["at_least_one"])
         self.assertTrue(tag_true["format"]["at_least_one"])
 
-    def test_stop_after_first_parameter(self):
-        tool = self.get_simple_tool()
-        tag_false = self.detector.build_structural_tag(
-            tools=[tool], at_least_one=False, stop_after_first=False
-        )
-        tag_true = self.detector.build_structural_tag(
-            tools=[tool], at_least_one=False, stop_after_first=True
-        )
-        self.assertFalse(tag_false["format"]["stop_after_first"])
-        self.assertTrue(tag_true["format"]["stop_after_first"])
-
     def test_multiple_tools(self):
         tools = [self.get_simple_tool(), self.get_complex_tool()]
-        tag = self.detector.build_structural_tag(
-            tools=tools, at_least_one=False, stop_after_first=False
-        )
+        tag = self.detector.build_structural_tag(tools=tools, at_least_one=False)
         # GPT-OSS has 2 patterns per tool
         self.assertEqual(len(tag["format"]["tags"]), 4)
 
     def test_empty_parameters_handling(self):
         tool = self.get_empty_params_tool()
-        tag = self.detector.build_structural_tag(
-            tools=[tool], at_least_one=False, stop_after_first=False
-        )
+        tag = self.detector.build_structural_tag(tools=[tool], at_least_one=False)
         self.assertEqual(len(tag["format"]["tags"]), 2)
         for tag_item in tag["format"]["tags"]:
             schema = tag_item["content"]["json_schema"]
@@ -984,9 +790,7 @@ class TestGptOssDetector(StructuralTagFormatTestCase):
     def test_structural_tag_matches_realistic_output(self):
         """Test that structural tag begin/end patterns match realistic model output."""
         tool = self.get_simple_tool()
-        tag = self.detector.build_structural_tag(
-            tools=[tool], at_least_one=False, stop_after_first=False
-        )
+        tag = self.detector.build_structural_tag(tools=[tool], at_least_one=False)
 
         # Create realistic output: <|start|>assistant<|channel|>commentary to=functions.get_weather<|constrain|>json<|message|>{"city":"Dallas"}<|call|>
         # Note: GPT-OSS detector's has_tool_call() checks for "<|start|>assistant<|channel|>commentary"
@@ -1028,9 +832,7 @@ class TestGptOssDetector(StructuralTagFormatTestCase):
     def test_no_format_tag_key(self):
         """Test that tag items do not have 'format': 'tag' key for xgrammar compatibility."""
         tool = self.get_simple_tool()
-        tag = self.detector.build_structural_tag(
-            tools=[tool], at_least_one=False, stop_after_first=False
-        )
+        tag = self.detector.build_structural_tag(tools=[tool], at_least_one=False)
         self.assert_no_format_tag_key(tag)
 
 
@@ -1042,47 +844,26 @@ class TestKimiK2Detector(StructuralTagFormatTestCase):
 
     def test_schema_always_included(self):
         tool = self.get_simple_tool()
-        tag = self.detector.build_structural_tag(
-            tools=[tool], at_least_one=False, stop_after_first=False
-        )
+        tag = self.detector.build_structural_tag(tools=[tool], at_least_one=False)
         self.assert_schema_always_included(tag)
 
     def test_at_least_one_parameter(self):
         tool = self.get_simple_tool()
-        tag_false = self.detector.build_structural_tag(
-            tools=[tool], at_least_one=False, stop_after_first=False
-        )
-        tag_true = self.detector.build_structural_tag(
-            tools=[tool], at_least_one=True, stop_after_first=False
-        )
+        tag_false = self.detector.build_structural_tag(tools=[tool], at_least_one=False)
+        tag_true = self.detector.build_structural_tag(tools=[tool], at_least_one=True)
         self.assertFalse(tag_false["format"]["at_least_one"])
         self.assertTrue(tag_true["format"]["at_least_one"])
 
-    def test_stop_after_first_parameter(self):
-        tool = self.get_simple_tool()
-        tag_false = self.detector.build_structural_tag(
-            tools=[tool], at_least_one=False, stop_after_first=False
-        )
-        tag_true = self.detector.build_structural_tag(
-            tools=[tool], at_least_one=False, stop_after_first=True
-        )
-        self.assertFalse(tag_false["format"]["stop_after_first"])
-        self.assertTrue(tag_true["format"]["stop_after_first"])
-
     def test_multiple_tools(self):
         tools = [self.get_simple_tool(), self.get_complex_tool()]
-        tag = self.detector.build_structural_tag(
-            tools=tools, at_least_one=False, stop_after_first=False
-        )
+        tag = self.detector.build_structural_tag(tools=tools, at_least_one=False)
         # KimiK2 uses dual triggers - 2 tags per tool (first call + subsequent calls)
         # 2 tools * 2 variants = 4 tags
         self.assertEqual(len(tag["format"]["tags"]), 4)
 
     def test_empty_parameters_handling(self):
         tool = self.get_empty_params_tool()
-        tag = self.detector.build_structural_tag(
-            tools=[tool], at_least_one=False, stop_after_first=False
-        )
+        tag = self.detector.build_structural_tag(tools=[tool], at_least_one=False)
         # KimiK2 uses dual triggers - 2 tags per tool (first call + subsequent calls)
         self.assertEqual(len(tag["format"]["tags"]), 2)
         for tag_item in tag["format"]["tags"]:
@@ -1092,9 +873,7 @@ class TestKimiK2Detector(StructuralTagFormatTestCase):
     def test_structural_tag_matches_realistic_output(self):
         """Test that structural tag begin/end patterns match realistic model output."""
         tool = self.get_simple_tool()
-        tag = self.detector.build_structural_tag(
-            tools=[tool], at_least_one=False, stop_after_first=False
-        )
+        tag = self.detector.build_structural_tag(tools=[tool], at_least_one=False)
 
         # Create realistic output: <|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{"city":"Dallas"}<|tool_call_end|><|tool_calls_section_end|>
         # Note: KimiK2 uses index in the format, so we need to check with index 0
@@ -1140,9 +919,7 @@ class TestKimiK2Detector(StructuralTagFormatTestCase):
     def test_multiple_tool_calls_structural_tag(self):
         """Test that structural tag supports multiple tool calls in sequence."""
         tools = [self.get_simple_tool(), self.get_complex_tool()]
-        tag = self.detector.build_structural_tag(
-            tools=tools, at_least_one=False, stop_after_first=False
-        )
+        tag = self.detector.build_structural_tag(tools=tools, at_least_one=False)
 
         # Realistic output with multiple tool calls
         realistic_output = (
@@ -1172,9 +949,7 @@ class TestKimiK2Detector(StructuralTagFormatTestCase):
     def test_no_format_tag_key(self):
         """Test that tag items do not have 'format': 'tag' key for xgrammar compatibility."""
         tool = self.get_simple_tool()
-        tag = self.detector.build_structural_tag(
-            tools=[tool], at_least_one=False, stop_after_first=False
-        )
+        tag = self.detector.build_structural_tag(tools=[tool], at_least_one=False)
         self.assert_no_format_tag_key(tag)
 
 
