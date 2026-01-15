@@ -389,7 +389,7 @@ class TokenizerCommunicatorMixin:
         self.auto_create_handle_loop()
         req = ExpertDistributionReq(action=ExpertDistributionReqType.DUMP_RECORD)
         await self.expert_distribution_communicator(req)
-    
+
     async def init_weights_update_group(
         self: TokenizerManager,
         obj: InitWeightsUpdateGroupReqInput,

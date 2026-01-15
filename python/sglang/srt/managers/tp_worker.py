@@ -174,7 +174,6 @@ class BaseTpWorker(ABC):
         return success, message
 
     def post_loaded_weights(self, recv_req: PostLoadedWeightsReqInput):
-
         monkey_patch_torch_reductions()
         success, message = self.model_runner.post_loaded_weights()
         return success, message
