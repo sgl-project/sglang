@@ -61,8 +61,8 @@ class DummyConfig:
 
 @pytest.fixture(autouse=True)
 def mock_model_loading():
-    with patch("transformers.AutoConfig.form_pretrained", return_value=DummyConfig()):
-        with patch("transformers.AutoTokenizer.form_pretrained"):
+    with patch("transformers.AutoConfig.from_pretrained", return_value=DummyConfig()):
+        with patch("transformers.AutoTokenizer.from_pretrained"):
             yield
 
 
