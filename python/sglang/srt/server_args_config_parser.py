@@ -62,10 +62,18 @@ class ConfigArgumentMerger:
 
             action = dest_map[key_norm]
 
-            if action.choices and value not in action.choices:
-                raise ValueError(
-                    f"Invalid value for '{key}': {value}. Allowed choices: {action.choices}"
-                )
+            if action.choices:
+                # For nargs arguments, check each element in the list
+                if action.nargs is not None and isinstance(value, list):
+                    invalid_values = [v for v in value if v not in action.choices]
+                    if invalid_values:
+                        raise ValueError(
+                            f"Invalid value(s) for '{key}': {invalid_values}. Allowed choices: {action.choices}"
+                        )
+                elif value not in action.choices:
+                    raise ValueError(
+                        f"Invalid value for '{key}': {value}. Allowed choices: {action.choices}"
+                    )
             # Validate store_true actions accept only boolean values
             if key_norm in self.store_true_actions and not isinstance(value, bool):
                 raise ValueError(

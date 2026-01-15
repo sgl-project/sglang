@@ -49,7 +49,7 @@ class DummyConfig:
         self.vocab_size = 32000
         self.quantization_config = None
 
-    def to_dice(self):
+    def to_dict(self):
         return {"quantization_config": self.quantization_config}
 
     def __getitem__(self, key):
@@ -69,28 +69,28 @@ def mock_model_loading():
 class TestConfigArgumentMerger:
     """Tests for ConfigArgumentMerger class."""
 
-    def test_parse_config_basic(self, merger):
+    def test_parse_config(self, merger):
         """Test parsing and normalizing config keys."""
         config = {
             "model-path": "microsoft/DialoGPT-medium",
             "max-running-requests": 128,
+            "port": "30001",
+            "mem-fraction-static": "0.85",
+            "trust-remote-code": True,
+            "enable-metrics": False,
+            "log-requests-target": ["path1", "path2"],
+            "quantization-param-path": "path3",
         }
         with temp_yaml_config(config) as f:
             result = merger.parse_config(["--config", f])
             assert result["model_path"] == "microsoft/DialoGPT-medium"
             assert result["max_running_requests"] == 128
-
-    def test_parse_config_with_booleans(self, merger):
-        """Test boolean values parsing."""
-        config = {
-            "model-path": "test",
-            "trust-remote-code": True,
-            "enable-metrics": False,
-        }
-        with temp_yaml_config(config) as f:
-            result = merger.parse_config(["--config", f])
+            assert result["port"] == 30001
+            assert result["mem_fraction_static"] == 0.85
             assert result["trust_remote_code"] is True
             assert result["enable_metrics"] is False
+            assert result["log_requests_target"] == ["path1", "path2"]
+            assert result["quantization_param_path"] == "path3"
 
     def test_remove_config_from_argv(self, merger):
         """Test removing --config from argv."""
@@ -171,22 +171,6 @@ class TestTypeValidation:
                 with pytest.raises(ValueError, match="Expected boolean"):
                     merger.parse_config(["--config", f])
 
-    def test_store_true_accepts_bool(self, merger):
-        """Test store_true accepts True/False."""
-        for val in [True, False]:
-            config = {"model-path": "test", "trust-remote-code": val}
-            with temp_yaml_config(config) as f:
-                result = merger.parse_config(["--config", f])
-                assert result["trust_remote_code"] is val
-
-    def test_type_conversion(self, merger):
-        """Test type conversion for int/float."""
-        config = {"model-path": "test", "port": "30000", "mem-fraction-static": "0.85"}
-        with temp_yaml_config(config) as f:
-            result = merger.parse_config(["--config", f])
-            assert result["port"] == 30000 and isinstance(result["port"], int)
-            assert result["mem_fraction_static"] == 0.85
-
     def test_type_conversion_failure(self, merger):
         """Test invalid type conversion raises error."""
         config = {"model-path": "test", "port": "not_a_number"}
@@ -207,17 +191,6 @@ class TestTypeValidation:
         with temp_yaml_config(config) as f:
             result = merger.parse_config(["--config", f])
             assert result["mm_process_config"] == {"image": {"resize": 224}}
-
-    def test_list_values(self):
-        """Test list values with nargs."""
-        config = {
-            "model-path": "test",
-            "log-requests": True,
-            "log-requests-target": ["a", "b"],
-        }
-        with temp_yaml_config(config) as f:
-            args = prepare_server_args(["--config", f])
-            assert args.log_requests_target == ["a", "b"]
 
 
 class TestEdgeCases:
