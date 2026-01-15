@@ -19,7 +19,7 @@ suites = {
     "per-commit-8-gpu-h200": [
         TestFile("test_deepseek_v3_basic.py", 275),
         TestFile("test_deepseek_v3_mtp.py", 275),
-        TestFile("test_disaggregation_hybrid_attention.py", 600),
+        TestFile("test_disaggregation_hybrid_attention.py", 400),
         TestFile("models/test_kimi_k2_models.py", 200),
         TestFile("test_deepseek_v32_basic.py", 360),
         TestFile("test_deepseek_v32_mtp.py", 360),
@@ -108,9 +108,6 @@ suite_amd = {
     "per-commit-8-gpu-amd": [
         TestFile("test_deepseek_v3_basic.py", 275),
         TestFile("test_deepseek_v3_mtp.py", 275),
-    ],
-    "per-commit-8-gpu-amd-mi35x": [
-        TestFile("test_deepseek_r1_mxfp4_8gpu.py", 3600),
     ],
     # NOTE: AMD nightly suites (nightly-amd, nightly-amd-vlm, nightly-amd-8-gpu)
     # have been migrated to test/registered/amd/nightly/ and are now managed
