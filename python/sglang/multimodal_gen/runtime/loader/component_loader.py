@@ -47,6 +47,7 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     get_hf_config,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.layers.quantization import get_quantization_config, get_quantization_dtype
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
 logger = init_logger(__name__)
@@ -675,10 +676,16 @@ class TransformerLoader(ComponentLoader):
             )
 
         server_args.model_paths["transformer"] = component_model_path
+        quant_dtype = get_quantization_dtype(dit_config.quant_config)
+        print(f"line 679: {server_args.model_paths}")
 
         # Config from Diffusers supersedes sgl_diffusion's model config
         dit_config = server_args.pipeline_config.dit_config
+        quant_cls = get_quantization_config(dit_config.quant_config)
+        dit_config.quant_config = quant_cls()
         dit_config.update_model_arch(config)
+        print(f"line 683: {dit_config.quant_config}")
+        raise ValueError("test")
 
         model_cls, _ = ModelRegistry.resolve_model_cls(cls_name)
 

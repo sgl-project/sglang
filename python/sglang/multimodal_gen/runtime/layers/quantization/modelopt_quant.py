@@ -157,7 +157,7 @@ class ModelOptQuantConfig(QuantizationConfig):
 
 
 class ModelOptFp4Config(ModelOptQuantConfig):
-    """Config class for FP4."""
+    """Config class for NVFP4."""
 
     def __init__(
         self,
