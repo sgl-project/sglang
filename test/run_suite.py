@@ -17,11 +17,18 @@ HW_MAPPING = {
 
 # Per-commit test suites (run on every PR)
 PER_COMMIT_SUITES = {
-    HWBackend.CPU: ["default"],
-    HWBackend.AMD: ["stage-a-test-1", "stage-b-test-small-1-gpu"],
+    HWBackend.CPU: ["default", "stage-a-cpu-only"],
+    HWBackend.AMD: [
+        "stage-a-test-1",
+        "stage-b-test-small-1-gpu-amd",
+        "stage-b-test-small-1-gpu-amd-mi35x",
+        "stage-b-test-large-2-gpu-amd",
+        "stage-c-test-large-8-gpu-amd-mi35x",
+    ],
     HWBackend.CUDA: [
         "stage-a-test-1",
         "stage-b-test-small-1-gpu",
+        "stage-b-test-small-1-gpu-5090",
         "stage-b-test-large-1-gpu",
         "stage-b-test-large-2-gpu",
         "stage-c-test-large-4-gpu",
@@ -51,7 +58,13 @@ NIGHTLY_SUITES = {
         "nightly-perf-text-2-gpu",
         "nightly-perf-vlm-2-gpu",
     ],
-    HWBackend.AMD: ["nightly-amd", "nightly-amd-8-gpu"],
+    HWBackend.AMD: [
+        "nightly-amd",
+        "nightly-amd-8-gpu",
+        "nightly-amd-vlm",
+        # MI35x 8-GPU suite (different model configs)
+        "nightly-amd-8-gpu-mi35x",
+    ],
     HWBackend.CPU: [],
     HWBackend.NPU: [
         "nightly-1-npu-a3",
