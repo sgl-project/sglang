@@ -108,7 +108,6 @@ from sglang.srt.layers.moe.utils import (
     filter_moe_weight_param_global_expert,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.fp8_kernel import (
     fp8_dtype,
@@ -126,6 +125,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
 from sglang.srt.layers.quantization.int8_utils import (
     block_dequant as int8_block_dequant,
 )
+from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
@@ -168,10 +168,10 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_non_idle_and_non_empty,
     is_nvidia_cublas_cu12_version_ge_12_9,
+    is_sm100_supported,
     log_info_on_rank0,
     make_layers,
     use_intel_amx_backend,
-    is_sm100_supported,
 )
 
 if _use_aiter_gfx95:
@@ -3525,18 +3525,24 @@ class DeepseekV2ForCausalLM(nn.Module):
         self.is_init = False
 
     def _maybe_use_scale_fp32(self, params_dict, name):
-        """ TODO: We can retain the fp32 scale metadata and rebuild it during reload, 
+        """TODO: We can retain the fp32 scale metadata and rebuild it during reload,
         rather than the tensor itself, because it requires additional memory
         """
-        if (is_sm100_supported()
-            and "weight_scale_inv" in name 
-            and f'{name}_buf' in params_dict 
+        if (
+            is_sm100_supported()
+            and "weight_scale_inv" in name
+            and f"{name}_buf" in params_dict
             and not self.is_init
-            and params_dict[name].format_ue8m0 # because may be called multi times by the same param
+            and params_dict[
+                name
+            ].format_ue8m0  # because may be called multi times by the same param
         ):
             # exchange param_fp32 (raw) and param_int32 (ue8m0 packed)
-            buf_name = f'{name}_buf'
-            params_dict[name], params_dict[buf_name] = params_dict[buf_name], params_dict[name]
+            buf_name = f"{name}_buf"
+            params_dict[name], params_dict[buf_name] = (
+                params_dict[buf_name],
+                params_dict[name],
+            )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
 

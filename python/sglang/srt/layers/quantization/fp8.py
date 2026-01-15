@@ -73,10 +73,10 @@ from sglang.srt.utils import (
     is_sm90_supported,
     is_sm100_supported,
     log_info_on_rank0,
+    offloader,
     print_warning_once,
     set_weight_attrs,
     use_intel_amx_backend,
-    offloader,
 )
 
 if TYPE_CHECKING:
@@ -410,14 +410,24 @@ class Fp8LinearMethod(LinearMethodBase):
                     is deepgemm_w8a8_block_fp8_linear_with_fallback
                 )
                 and (
-                    (not layer.weight_scale_inv.format_ue8m0) 
-                    or (layer.weight_scale_inv.format_ue8m0 != layer.weight_scale_inv_buf.format_ue8m0)
+                    (not layer.weight_scale_inv.format_ue8m0)
+                    or (
+                        layer.weight_scale_inv.format_ue8m0
+                        != layer.weight_scale_inv_buf.format_ue8m0
+                    )
                 )
             ):
-                is_init = layer.weight_scale_inv.format_ue8m0 == layer.weight_scale_inv_buf.format_ue8m0
+                is_init = (
+                    layer.weight_scale_inv.format_ue8m0
+                    == layer.weight_scale_inv_buf.format_ue8m0
+                )
                 new_weight, new_weight_scale_inv = requant_weight_ue8m0(
                     layer.weight,
-                    layer.weight_scale_inv_buf if not is_init else layer.weight_scale_inv,
+                    (
+                        layer.weight_scale_inv_buf
+                        if not is_init
+                        else layer.weight_scale_inv
+                    ),
                     self.quant_config.weight_block_size,
                 )
                 if not is_init:
@@ -425,8 +435,9 @@ class Fp8LinearMethod(LinearMethodBase):
                     layer.weight_scale_inv.data.copy_(new_weight_scale_inv.data)
                 else:
                     offloader.update_param(layer.weight, new_weight)
-                    layer.weight_scale_inv.data = new_weight_scale_inv 
-                layer.weight_scale_inv.format_ue8m0 = Trueht_scale_inv.data
+                    layer.weight_scale_inv.data = new_weight_scale_inv
+                layer.weight_scale_inv.format_ue8m0 = True
+            weight, weight_scale = layer.weight.data, layer.weight_scale_inv.data
 
         layer.weight.data = weight.data
         layer.weight_scale_inv.data = weight_scale.data

@@ -108,6 +108,7 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqInput,
     ParseFunctionCallReq,
     PauseGenerationReqInput,
+    PostLoadedWeightsReqInput,
     ProfileReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
@@ -120,7 +121,6 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
-    PostLoadedWeightsReqInput,
     UpdateWeightVersionReqInput,
     VertexGenerateReqInput,
 )
@@ -941,10 +941,9 @@ async def update_weights_from_tensor(
         content, status_code=200 if success else HTTPStatus.BAD_REQUEST
     )
 
+
 @app.post("/post_loaded_weights")
-async def post_loaded_weights(
-    obj: PostLoadedWeightsReqInput, request: Request
-):
+async def post_loaded_weights(obj: PostLoadedWeightsReqInput, request: Request):
     success, message = await _global_state.tokenizer_manager.post_loaded_weights(
         obj, request
     )
@@ -953,7 +952,8 @@ async def post_loaded_weights(
     return ORJSONResponse(
         content, status_code=200 if success else HTTPStatus.BAD_REQUEST
     )
-    
+
+
 @app.post("/update_weights_from_distributed")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def update_weights_from_distributed(

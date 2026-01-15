@@ -51,6 +51,8 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqOutput,
     LoRAUpdateOutput,
     OpenSessionReqInput,
+    PostLoadedWeightsReqInput,
+    PostLoadedWeightsReqOutput,
     ProfileReq,
     ProfileReqOutput,
     ProfileReqType,
@@ -72,8 +74,6 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromIPCReqOutput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
-    PostLoadedWeightsReqInput,
-    PostLoadedWeightsReqOutput,
 )
 from sglang.srt.server_args import LoRARef, ServerArgs
 from sglang.srt.utils import get_bool_env_var

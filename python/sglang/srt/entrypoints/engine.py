@@ -50,6 +50,7 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterReqInput,
     MultimodalDataInputFormat,
+    PostLoadedWeightsReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
     RpcReqInput,
@@ -59,7 +60,6 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
-    PostLoadedWeightsReqInput,
 )
 from sglang.srt.managers.multi_tokenizer_mixin import MultiTokenizerRouter
 from sglang.srt.managers.scheduler import run_scheduler_process
@@ -568,7 +568,9 @@ class Engine(EngineBase):
         loop = asyncio.get_event_loop()
 
         if loop.is_running():
-            task = asyncio.create_task(self.tokenizer_manager.post_loaded_weights(obj, None))
+            task = asyncio.create_task(
+                self.tokenizer_manager.post_loaded_weights(obj, None)
+            )
             return task
         else:
             return loop.run_until_complete(
