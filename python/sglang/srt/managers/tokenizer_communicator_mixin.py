@@ -70,6 +70,8 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromIPCReqOutput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
+    PostLoadedWeightsReqInput,
+    PostLoadedWeightsReqOutput,
 )
 from sglang.srt.server_args import LoRARef, ServerArgs
 from sglang.srt.utils import get_bool_env_var
@@ -174,6 +176,9 @@ class TokenizerCommunicatorMixin:
         self.update_weights_from_tensor_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        self.post_loaded_weights_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
         self.update_weights_from_ipc_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
@@ -245,6 +250,14 @@ class TokenizerCommunicatorMixin:
                 (
                     UpdateWeightsFromTensorReqOutput,
                     self.update_weights_from_tensor_communicator.handle_recv,
+                ),
+                (
+                    PostLoadedWeightsReqOutput,
+                    self.post_loaded_weights_communicator.handle_recv,
+                ),
+                (
+                    PostLoadedWeightsReqInput,
+                    self.post_loaded_weights_communicator.handle_recv,
                 ),
                 (
                     UpdateWeightsFromIPCReqOutput,
@@ -376,6 +389,35 @@ class TokenizerCommunicatorMixin:
         self.auto_create_handle_loop()
         req = ExpertDistributionReq(action=ExpertDistributionReqType.DUMP_RECORD)
         await self.expert_distribution_communicator(req)
+    
+    async def dump_expert_distribution_record_object(self):
+        """
+        Returns the expert-distribution recorder dump as a Python object
+        (not a file), merged across DP ranks if needed.
+        Requires the scheduler to support DUMP_RECORD_OBJECT and return
+        ExpertDistributionReqOutput with `payload` holding the object.
+        """
+        self.auto_create_handle_loop()
+        results: List[ExpertDistributionReqOutput] = await self.expert_distribution_communicator(
+            ExpertDistributionReq(action=ExpertDistributionReqType.DUMP_RECORD_OBJECT)
+        )
+        # `results` has one element per DP rank (fan_out = dp_size).
+        # Each `.payload` is either None or a dict like:
+        #   {"records": [...], "last_physical_to_logical_map": Tensor[L, E_phys]}
+        objs = [r.payload for r in results if getattr(r, "payload", None) is not None]
+        if not objs:
+            # Fallback empty shape if nothing was recorded
+            return {"records": [], "last_physical_to_logical_map": None}
+
+        merged = {
+            "records": [],
+            "last_physical_to_logical_map": objs[-1]["last_physical_to_logical_map"],
+        }
+        for o in objs:
+            merged["records"].extend(o["records"])
+            # We keep the "last" physical_to_logical_map; in practice maps
+            # are identical across ranks for a given run.
+        return merged
 
     async def init_weights_update_group(
         self: TokenizerManager,
@@ -490,6 +532,22 @@ class TokenizerCommunicatorMixin:
             message += f" Weight version updated to {obj.weight_version}."
 
         return success, message
+
+    async def post_loaded_weights(
+        self: TokenizerManager,
+        obj: PostLoadedWeightsReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> Tuple[bool, str]:
+        self.auto_create_handle_loop()
+        assert (
+            self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
+        ), "dp_size must be 1 or dp attention must be enabled for update weights from tensor"
+
+        # This means that weight sync
+        # cannot run while requests are in progress.
+        async with self.model_update_lock.writer_lock:
+            result = (await self.post_loaded_weights_communicator(obj))[0]
+            return result.success, result.message
 
     async def update_weights_from_ipc(
         self,

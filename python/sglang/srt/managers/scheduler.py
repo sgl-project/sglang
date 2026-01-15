@@ -116,6 +116,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
+    PostLoadedWeightsReqInput,
 )
 from sglang.srt.managers.mm_utils import init_mm_embedding_cache
 from sglang.srt.managers.overlap_utils import FutureMap
@@ -1048,6 +1049,7 @@ class Scheduler(
                     self.update_weights_from_distributed,
                 ),
                 (UpdateWeightsFromTensorReqInput, self.update_weights_from_tensor),
+                (PostLoadedWeightsReqInput, self.post_loaded_weights),
                 (UpdateWeightsFromIPCReqInput, self.update_weights_from_ipc),
                 (GetWeightsByNameReqInput, self.get_weights_by_name),
                 (ReleaseMemoryOccupationReqInput, self.release_memory_occupation),
@@ -1454,6 +1456,7 @@ class Scheduler(
                 ),
                 http_worker_ipc=recv_req.http_worker_ipc,
                 dllm_config=self.dllm_config,
+                extra_key=recv_req.extra_key,
             )
             req.tokenizer = self.tokenizer
 
@@ -2725,10 +2728,16 @@ class Scheduler(
         action = recv_req.action
         if action == ExpertDistributionReqType.START_RECORD:
             get_global_expert_distribution_recorder().start_record()
+            return ExpertDistributionReqOutput(success=True, message="started")
         elif action == ExpertDistributionReqType.STOP_RECORD:
             get_global_expert_distribution_recorder().stop_record()
+            return ExpertDistributionReqOutput(success=True, message="stopped")
         elif action == ExpertDistributionReqType.DUMP_RECORD:
             get_global_expert_distribution_recorder().dump_record()
+            return ExpertDistributionReqOutput(success=True, message="dumped_to_files")
+        elif action == ExpertDistributionReqType.DUMP_RECORD_OBJECT:
+            obj = get_global_expert_distribution_recorder().dump_record(output_mode="object")
+            return ExpertDistributionReqOutput(success=True, payload=obj)
         else:
             raise ValueError(f"Unrecognized ExpertDistributionReq value: {recv_req=}")
         return ExpertDistributionReqOutput()

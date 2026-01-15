@@ -1247,6 +1247,14 @@ class UpdateWeightsFromTensorReqOutput(BaseReq):
     success: bool
     message: str
 
+@dataclass
+class PostLoadedWeightsReqInput(BaseReq):
+    pass
+
+@dataclass
+class PostLoadedWeightsReqOutput(BaseReq):
+    success: bool
+    message: str
 
 @dataclass
 class InitWeightsSendGroupForRemoteInstanceReqInput(BaseReq):
@@ -1530,16 +1538,25 @@ class ExpertDistributionReqType(Enum):
     START_RECORD = 1
     STOP_RECORD = 2
     DUMP_RECORD = 3
+    DUMP_RECORD_OBJECT = 4
 
 
 @dataclass
 class ExpertDistributionReq(BaseReq):
     action: ExpertDistributionReqType
 
-
+    def __init__(self, action: ExpertDistributionReqType):
+        super().__init__()   # 调用父类的无参初始化
+        self.action = action
 @dataclass
 class ExpertDistributionReqOutput(BaseReq):
-    pass
+    # success/failure for the op
+    success: bool
+    # optional details
+    message: str = "" # message: Optional[str] = None
+    # New: used only by DUMP_RECORD_OBJECT; holds the recorder dump object
+    # shape: {"records": [...], "last_physical_to_logical_map": Tensor or list}
+    payload: Optional[Any] = None
 
 
 @dataclass

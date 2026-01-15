@@ -35,6 +35,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
+    PostLoadedWeightsReqInput,
 )
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
@@ -170,6 +171,12 @@ class BaseTpWorker(ABC):
             ),
             load_format=recv_req.load_format,
         )
+        return success, message
+
+    def post_loaded_weights(self, recv_req: PostLoadedWeightsReqInput):
+
+        monkey_patch_torch_reductions()
+        success, message = self.model_runner.post_loaded_weights()
         return success, message
 
     def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):

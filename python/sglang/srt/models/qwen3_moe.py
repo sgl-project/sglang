@@ -53,6 +53,7 @@ from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.moe.utils import RoutingMethodType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding, get_rope
 from sglang.srt.layers.utils import get_layer_id
@@ -1119,6 +1120,18 @@ class Qwen3MoeForCausalLM(nn.Module):
                 for layer_id in range(self.start_layer, self.end_layer)
                 if isinstance(self.model.layers[layer_id].mlp, Qwen3MoeSparseMoeBlock)
             }
+
+    def post_load_weights(self):
+        # Perform post-processing after loading all weights
+        post_process_exclude_list = (
+            BaseKVCacheMethod,
+        )
+        for _, module in self.named_modules():
+            quant_method = getattr(module, "quant_method", None)
+            if quant_method is not None:
+                if isinstance(quant_method, post_process_exclude_list):
+                    continue
+                quant_method.process_weights_after_loading(module)
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):

@@ -302,6 +302,9 @@ class BaseModelLoader(ABC):
 class DefaultModelLoader(BaseModelLoader):
     """Model loader that can load different file types from disk."""
 
+    """Model Loader is only used during initial load, in reload scenarios (eg. RL), you should: 
+    call update_weights_from_tensor → call post_loaded_weights (after all the weights have been reloaded)"""
+
     # default number of thread when enable multithread weight loading
     DEFAULT_NUM_THREADS = 8
 
@@ -636,27 +639,15 @@ class DefaultModelLoader(BaseModelLoader):
                 )
 
             self.load_weights_and_postprocess(
-                model, self._get_all_weights(model_config, model), target_device
+                model, self._get_all_weights(model_config, model), target_device, model_config
             )
 
         return model.eval()
 
     @staticmethod
-    def load_weights_and_postprocess(model, weights, target_device):
+    def load_weights_and_postprocess(model, weights, target_device, model_config):
         model.load_weights(weights)
-
-        for _, module in model.named_modules():
-            quant_method = getattr(module, "quant_method", None)
-            if quant_method is not None:
-                # When quant methods need to process weights after loading
-                # (for repacking, quantizing, etc), they expect parameters
-                # to be on the global target device. This scope is for the
-                # case where cpu offloading is used, where we will move the
-                # parameters onto device for processing and back off after.
-                with device_loading_context(module, target_device):
-                    quant_method.process_weights_after_loading(module)
-                if _is_npu:
-                    torch.npu.empty_cache()
+        post_load_weights(model, model_config)
 
 
 class LayeredModelLoader(DefaultModelLoader):
@@ -1236,11 +1227,6 @@ class DummyModelLoader(BaseModelLoader):
                     model_config,
                     self.load_config,
                 )
-
-            for _, module in model.named_modules():
-                quant_method = getattr(module, "quant_method", None)
-                if quant_method is not None:
-                    quant_method.process_weights_after_loading(module)
 
             # NOTE(woosuk): For accurate performance evaluation, we assign
             # random values to the weights.
