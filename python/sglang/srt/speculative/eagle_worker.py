@@ -304,26 +304,6 @@ class EAGLEWorker(TpModelWorker):
                 self.draft_model_runner.tp_group
             ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
                 spec_info = self.draft(batch)
-
-            # Print Draft Tokens for V1
-            tokenizer = self.target_worker.model_runner.tokenizer
-            if tokenizer is not None:
-                try:
-                    # For V1, spec_info is EagleDraftInput or EagleVerifyInput?
-                    # draft() returns EagleVerifyInput in V1.
-                    # It contains draft_token.
-                    if hasattr(spec_info, "draft_token") and spec_info.draft_token is not None:
-                        draft_ids = spec_info.draft_token
-                        if isinstance(draft_ids, torch.Tensor):
-                            ids_list = draft_ids.cpu().tolist()
-                        else:
-                            ids_list = list(draft_ids)
-                        
-                        decoded_text = tokenizer.batch_decode(ids_list)
-                        print(f"DEBUG: EagleV1 Draft Model Output (Candidates): {decoded_text}", flush=True)
-                except Exception as e:
-                    print(f"DEBUG: Failed to decode EagleV1 draft tokens: {e}", flush=True)
-
             logits_output, verify_output, model_worker_batch, can_run_cuda_graph = (
                 self.verify(batch, spec_info)
             )
@@ -770,21 +750,6 @@ class EAGLEWorker(TpModelWorker):
             res.accepted_indices
         ]
         logits_output.hidden_states = logits_output.hidden_states[res.accepted_indices]
-
-        # Print speculative accepted tokens
-        tokenizer = self.target_worker.model_runner.tokenizer
-        if tokenizer is not None:
-            try:
-                # res.verified_id contains the accepted token IDs
-                if isinstance(res.verified_id, torch.Tensor):
-                    ids_list = res.verified_id.cpu().tolist()
-                else:
-                    ids_list = list(res.verified_id)
-                
-                decoded_text = tokenizer.batch_decode(ids_list)
-                print(f"DEBUG: EagleV1 Target Model Output (Final Verified): {decoded_text}", flush=True)
-            except Exception as e:
-                print(f"DEBUG: Failed to decode EagleV1 tokens: {e}", flush=True)
 
         if (
             self.target_worker.model_runner.hybrid_gdn_config is not None
