@@ -1,10 +1,10 @@
-/* Copyright 2025 SGLang Team. */
+#include <sgl_kernel/tensor.h>
+#include <sgl_kernel/utils.h>
 
-#include <sgl_kernel/tensor.h>  // For TensorMatcher, SymbolicSize, SymbolicDevice
-#include <sgl_kernel/utils.h>   // For div_ceil, RuntimeCheck
-
-#include <sgl_kernel/utils.cuh>  // For LaunchKernel
-#include <sgl_kernel/vec.cuh>    // For AlignedVector
+#include <sgl_kernel/cta.cuh>
+#include <sgl_kernel/utils.cuh>
+#include <sgl_kernel/vec.cuh>
+#include <sgl_kernel/warp.cuh>
 
 #include <sgl_kernel/impl/norm.cuh>
 #include <sgl_kernel/impl/norm_fusion.cuh>
@@ -27,53 +27,6 @@ template <int V>
 struct ItemPerThreadTag {
   static constexpr int value = V;
 };
-
-template <typename T, int NumVals>
-__device__ __forceinline__ void warpReduceSum(T (&vals)[NumVals]) {
-  unsigned mask = 0xffffffffu;
-#pragma unroll
-  for (int offset = 16; offset > 0; offset >>= 1) {
-#pragma unroll
-    for (int i = 0; i < NumVals; ++i) {
-      vals[i] += __shfl_down_sync(mask, vals[i], offset);
-    }
-  }
-}
-
-template <typename T, int NumVals>
-__device__ __forceinline__ void blockReduceSum(T (&vals)[NumVals]) {
-  __shared__ T shared[32][NumVals];  // up to 32 warps (1024 threads)
-  int lane = threadIdx.x & 31;
-  int wid = threadIdx.x >> 5;
-  warpReduceSum<T, NumVals>(vals);
-  if (lane == 0) {
-#pragma unroll
-    for (int i = 0; i < NumVals; ++i) {
-      shared[wid][i] = vals[i];
-    }
-  }
-  __syncthreads();
-  if (wid == 0) {
-    T acc[NumVals];
-#pragma unroll
-    for (int i = 0; i < NumVals; ++i)
-      acc[i] = T(0);
-    int num_warps = (blockDim.x + 31) / 32;
-#pragma unroll
-    for (int w = 0; w < 32; ++w) {
-      if (w < num_warps) {
-#pragma unroll
-        for (int i = 0; i < NumVals; ++i) {
-          acc[i] += shared[w][i];
-        }
-      }
-    }
-#pragma unroll
-    for (int i = 0; i < NumVals; ++i)
-      vals[i] = acc[i];
-  }
-  __syncthreads();
-}
 
 // compute sum of elements in a Vec4
 template <typename T>
@@ -137,7 +90,8 @@ __global__ void norm_fused_scale_shift_kernel(
   const int shift_offset = norm_fusion::get_offset<shift_index_enum>(S, F, b_id, s_id) * D4;
 
   __shared__ float s_mean, s_variance;
-  float local_sums[1] = {0.0f};
+  __shared__ float smem_reduce[kWarpThreads];  // buffer for cta::reduce_sum
+  float local_sum = 0.0f;
   Vec4<T> local_val[ITEM_PER_THREAD];
 
   // Pass 1: Load input and compute sum (LayerNorm) or sum_sq (RMSNorm)
@@ -150,41 +104,43 @@ __global__ void norm_fused_scale_shift_kernel(
       local_val[i].fill(T(0.0f));
     }
     if constexpr (norm_enum == NormEnum::LayerNorm) {
-      local_sums[0] += vec4_sum(local_val[i]);
+      local_sum += vec4_sum(local_val[i]);
     } else {
-      local_sums[0] += vec4_sum_sq(local_val[i]);
+      local_sum += vec4_sum_sq(local_val[i]);
     }
   }
 
   // Reduce and compute mean
-  if (blockDim.x <= 32) {
-    warpReduceSum<float, 1>(local_sums);
+  if (blockDim.x <= kWarpThreads) {
+    local_sum = warp::reduce_sum(local_sum);
   } else {
-    blockReduceSum<float, 1>(local_sums);
+    cta::reduce_sum(local_sum, smem_reduce);
+    local_sum = smem_reduce[0];
   }
   if (threadIdx.x == 0) {
-    s_mean = local_sums[0] / D;
+    s_mean = local_sum / D;
   }
   __syncthreads();
 
   // Pass 2 (LayerNorm only): Compute variance
   if constexpr (norm_enum == NormEnum::LayerNorm) {
-    local_sums[0] = 0.0f;
+    local_sum = 0.0f;
 #pragma unroll
     for (int i = 0; i < ITEM_PER_THREAD; ++i) {
       const int index = i * bdimx + tidx;
       if (index < D4) {
-        local_sums[0] += vec4_variance_sum(local_val[i], s_mean);
+        local_sum += vec4_variance_sum(local_val[i], s_mean);
       }
     }
-    if (blockDim.x <= 32) {
-      warpReduceSum<float, 1>(local_sums);
+    if (blockDim.x <= kWarpThreads) {
+      local_sum = warp::reduce_sum(local_sum);
     } else {
-      blockReduceSum<float, 1>(local_sums);
+      cta::reduce_sum(local_sum, smem_reduce);
+      local_sum = smem_reduce[0];
     }
   }
   if (threadIdx.x == 0) {
-    s_variance = rsqrtf(local_sums[0] / D + eps);
+    s_variance = math::rsqrt(local_sum / D + eps);
   }
   __syncthreads();
 
@@ -210,12 +166,12 @@ __global__ void norm_fused_scale_shift_kernel(
       // Load scale/shift based on IndexEnum
       Vec4<T> scale_val, shift_val;
       if constexpr (scale_index_enum == IndexEnum::Scalar) {
-        scale_val.fill(T(scale[0]));
+        scale_val.fill(T(scalar_scale));
       } else {
         scale_val.load(scale, scale_offset + index);
       }
       if constexpr (shift_index_enum == IndexEnum::Scalar) {
-        shift_val.fill(T(shift[0]));
+        shift_val.fill(T(scalar_shift));
       } else {
         shift_val.load(shift, shift_offset + index);
       }
@@ -355,7 +311,8 @@ __global__ void norm_fused_res_gate_scale_shift_kernel(
   const int gate_offset = norm_fusion::get_offset<gate_index_enum>(S, F, b_id, s_id) * D4;
 
   __shared__ float s_mean, s_variance;
-  float local_sums[1] = {0.0f};
+  __shared__ float smem_reduce[kWarpThreads];  // buffer for cta::reduce_sum
+  float local_sum = 0.0f;
   Vec4<T> local_val[ITEM_PER_THREAD];
 
   // Pass 1: Load x, residual, gate and compute residual + x * gate
@@ -387,9 +344,9 @@ __global__ void norm_fused_res_gate_scale_shift_kernel(
       }
 
       if constexpr (norm_enum == NormEnum::LayerNorm) {
-        local_sums[0] += vec4_sum(sum_v);
+        local_sum += vec4_sum(sum_v);
       } else {
-        local_sums[0] += vec4_sum_sq(sum_v);
+        local_sum += vec4_sum_sq(sum_v);
       }
     } else {
       local_val[i].fill(T(0.0f));
@@ -397,34 +354,36 @@ __global__ void norm_fused_res_gate_scale_shift_kernel(
   }
 
   // Reduce and compute mean
-  if (blockDim.x <= 32) {
-    warpReduceSum<float, 1>(local_sums);
+  if (blockDim.x <= kWarpThreads) {
+    local_sum = warp::reduce_sum(local_sum);
   } else {
-    blockReduceSum<float, 1>(local_sums);
+    cta::reduce_sum(local_sum, smem_reduce);
+    local_sum = smem_reduce[0];
   }
   if (threadIdx.x == 0) {
-    s_mean = local_sums[0] / D;
+    s_mean = local_sum / D;
   }
   __syncthreads();
 
   // Pass 2 (LayerNorm only): Compute variance
   if constexpr (norm_enum == NormEnum::LayerNorm) {
-    local_sums[0] = 0.0f;
+    local_sum = 0.0f;
 #pragma unroll
     for (int i = 0; i < ITEM_PER_THREAD; ++i) {
       const int index = i * bdimx + tidx;
       if (index < D4) {
-        local_sums[0] += vec4_variance_sum(local_val[i], s_mean);
+        local_sum += vec4_variance_sum(local_val[i], s_mean);
       }
     }
-    if (blockDim.x <= 32) {
-      warpReduceSum<float, 1>(local_sums);
+    if (blockDim.x <= kWarpThreads) {
+      local_sum = warp::reduce_sum(local_sum);
     } else {
-      blockReduceSum<float, 1>(local_sums);
+      cta::reduce_sum(local_sum, smem_reduce);
+      local_sum = smem_reduce[0];
     }
   }
   if (threadIdx.x == 0) {
-    s_variance = rsqrtf(local_sums[0] / D + eps);
+    s_variance = math::rsqrt(local_sum / D + eps);
   }
   __syncthreads();
 
@@ -450,12 +409,12 @@ __global__ void norm_fused_res_gate_scale_shift_kernel(
       // Load scale/shift based on IndexEnum
       Vec4<T> scale_val, shift_val;
       if constexpr (scale_index_enum == IndexEnum::Scalar) {
-        scale_val.fill(T(scale[0]));
+        scale_val.fill(T(scalar_scale));
       } else {
         scale_val.load(scale, scale_offset + index);
       }
       if constexpr (shift_index_enum == IndexEnum::Scalar) {
-        shift_val.fill(T(shift[0]));
+        shift_val.fill(T(scalar_shift));
       } else {
         shift_val.load(shift, shift_offset + index);
       }
