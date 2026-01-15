@@ -95,8 +95,45 @@ fi
 
 # Clean up existing installations
 $PIP_UNINSTALL_CMD sgl-kernel sglang $PIP_UNINSTALL_SUFFIX || true
-$PIP_UNINSTALL_CMD flashinfer-python flashinfer-cubin flashinfer-jit-cache $PIP_UNINSTALL_SUFFIX || true
+if [ "$IS_BLACKWELL" != "1" ]; then
+    $PIP_UNINSTALL_CMD flashinfer-python flashinfer-cubin flashinfer-jit-cache $PIP_UNINSTALL_SUFFIX || true
+fi
 $PIP_UNINSTALL_CMD opencv-python opencv-python-headless $PIP_UNINSTALL_SUFFIX || true
+
+# On Blackwell machines, pre-install flashinfer to avoid race condition during main pip install
+# When pip installs sglang, it would try to install flashinfer_cubin and flashinfer_python in parallel,
+# causing a race condition on .lock files. Pre-installing them sequentially avoids this.
+if [ "$IS_BLACKWELL" = "1" ]; then
+    FLASHINFER_CACHE_DIR="${HOME}/.cache/flashinfer-wheels"
+    mkdir -p "${FLASHINFER_CACHE_DIR}"
+
+    INSTALLED_FLASHINFER=$(pip show flashinfer-jit-cache 2>/dev/null | grep "^Version:" | awk '{print $2}' | cut -d'+' -f1 || echo "")
+    if [ "$INSTALLED_FLASHINFER" = "$FLASHINFER_VERSION" ]; then
+        echo "flashinfer-jit-cache==${FLASHINFER_VERSION} already installed on Blackwell, skipping pre-install"
+    else
+        echo "Pre-installing flashinfer-jit-cache on Blackwell to avoid race condition..."
+        FLASHINFER_WHEEL_PATTERN="flashinfer_jit_cache-${FLASHINFER_VERSION}*.whl"
+        CACHED_WHEEL=$(find "${FLASHINFER_CACHE_DIR}" -name "${FLASHINFER_WHEEL_PATTERN}" -type f 2>/dev/null | head -n 1)
+
+        if [ -n "$CACHED_WHEEL" ] && [ -f "$CACHED_WHEEL" ]; then
+            echo "Installing from cached wheel: $CACHED_WHEEL"
+            $PIP_CMD install "$CACHED_WHEEL" $PIP_INSTALL_SUFFIX || true
+        else
+            for i in {1..3}; do
+                if pip download flashinfer-jit-cache==${FLASHINFER_VERSION} \
+                    --index-url https://flashinfer.ai/whl/${CU_VERSION} \
+                    -d "${FLASHINFER_CACHE_DIR}"; then
+                    CACHED_WHEEL=$(find "${FLASHINFER_CACHE_DIR}" -name "${FLASHINFER_WHEEL_PATTERN}" -type f 2>/dev/null | head -n 1)
+                    if [ -n "$CACHED_WHEEL" ] && [ -f "$CACHED_WHEEL" ]; then
+                        $PIP_CMD install "$CACHED_WHEEL" $PIP_INSTALL_SUFFIX && break
+                    fi
+                fi
+                echo "Attempt $i failed, retrying..."
+                sleep 5
+            done
+        fi
+    fi
+fi
 
 # Install the main package
 EXTRAS="dev"

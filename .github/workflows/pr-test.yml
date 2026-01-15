@@ -601,9 +601,9 @@ jobs:
       IS_BLACKWELL: "1"
     strategy:
       fail-fast: false
-      max-parallel: 4
+      max-parallel: 8
       matrix:
-        partition: [0, 1, 2, 3]
+        partition: [0, 1, 2, 3, 4, 5, 6, 7]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -633,7 +633,7 @@ jobs:
           if [[ "${{ needs.check-changes.outputs.continue_on_error }}" == "true" ]]; then
             CONTINUE_ON_ERROR_FLAG="--continue-on-error"
           fi
-          python3 run_suite.py --hw cuda --suite stage-b-test-small-1-gpu --auto-partition-id ${{ matrix.partition }} --auto-partition-size 4 $CONTINUE_ON_ERROR_FLAG
+          python3 run_suite.py --hw cuda --suite stage-b-test-small-1-gpu --auto-partition-id ${{ matrix.partition }} --auto-partition-size 8 $CONTINUE_ON_ERROR_FLAG
 
   # Runs on H200 (80GB, SM90) - tests that don't pass on 5090 (FA3, FP8, high VRAM, etc.)
   stage-b-test-large-1-gpu:
