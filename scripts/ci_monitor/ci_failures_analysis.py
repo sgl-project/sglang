@@ -365,7 +365,6 @@ class SGLangFailuresAnalyzer:
             if conclusion == "failure" and job_id:
                 logs = self.get_job_logs(job_id)
                 test_summary = self.parse_test_summary(logs) if logs else None
-                test_failures[job_id] = test_summary
                 self.test_summaries[job_id] = test_summary
 
                 if test_summary and test_summary["failed_tests"]:
