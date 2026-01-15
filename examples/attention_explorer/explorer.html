@@ -2528,6 +2528,102 @@
                         </div>
                     </div>
 
+                    <!-- HOW LAYERS BUILD ATTENTION -->
+                    <div class="help-section">
+                        <div class="help-section-title">🏗️ How Layers Build Attention (Visual Guide)</div>
+                        <div style="background: var(--deep); padding: 20px; border-radius: 12px; margin-bottom: 16px;">
+                            <div style="font-size: 12px; color: var(--text); line-height: 1.8;">
+                                <strong style="color: var(--cyan); font-size: 14px;">The AI is like a 32-story building. Each floor (layer) does different work:</strong>
+                            </div>
+
+                            <!-- Visual Layer Diagram -->
+                            <div style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; background: var(--void); padding: 16px; border-radius: 8px; margin: 16px 0; overflow-x: auto;">
+                                <div style="color: var(--text-dim);">
+<pre style="margin: 0; line-height: 1.6;">
+YOUR INPUT: "What is the capital of France?"
+     │
+     ▼
+┌─────────────────────────────────────────────────────────────┐
+│  <span style="color: #00e5ff;">LAYER 1-4: TOKENIZATION &amp; BASIC PATTERNS</span>                  │
+│  ─────────────────────────────────────────────────────────  │
+│  • Breaks text into tokens: ["What", "is", "the", ...]     │
+│  • Learns word shapes, punctuation, basic grammar          │
+│  • Attention: mostly LOCAL (nearby words)                  │
+│  • <span style="color: #ffaa00;">This is where "Syntax Floor" patterns dominate</span>          │
+└─────────────────────────────────────────────────────────────┘
+     │
+     ▼
+┌─────────────────────────────────────────────────────────────┐
+│  <span style="color: #ff0099;">LAYER 5-12: PHRASE &amp; SENTENCE STRUCTURE</span>                   │
+│  ─────────────────────────────────────────────────────────  │
+│  • Groups words into phrases: "the capital" → noun phrase  │
+│  • Understands sentence structure (subject, verb, object)  │
+│  • Attention: LOCAL + some MID-RANGE                       │
+│  • Starts connecting related concepts                      │
+└─────────────────────────────────────────────────────────────┘
+     │
+     ▼
+┌─────────────────────────────────────────────────────────────┐
+│  <span style="color: #b4ff00;">LAYER 13-24: SEMANTIC UNDERSTANDING</span>                       │
+│  ─────────────────────────────────────────────────────────  │
+│  • Understands MEANING, not just grammar                   │
+│  • Connects "capital" ↔ "France" ↔ "city" ↔ "Paris"       │
+│  • Attention: strong MID-RANGE (semantic bridges!)         │
+│  • <span style="color: #00e5ff;">This is where "Semantic Bridge" patterns emerge</span>         │
+└─────────────────────────────────────────────────────────────┘
+     │
+     ▼
+┌─────────────────────────────────────────────────────────────┐
+│  <span style="color: #a855f7;">LAYER 25-32: REASONING &amp; DECISION MAKING</span>                  │
+│  ─────────────────────────────────────────────────────────  │
+│  • Final reasoning: "France's capital = Paris"             │
+│  • Checks instructions (LONG-RANGE attention)              │
+│  • Makes final token prediction                            │
+│  • <span style="color: #b4ff00;">This is where "Steering" patterns appear</span>                │
+└─────────────────────────────────────────────────────────────┘
+     │
+     ▼
+OUTPUT: "Paris"
+</pre>
+                                </div>
+                            </div>
+
+                            <div style="font-size: 12px; color: var(--text-dim); line-height: 1.8; margin-top: 16px;">
+                                <strong style="color: var(--lime);">What we show you:</strong><br>
+                                We capture attention from the <strong style="color: var(--text);">FINAL layer</strong> (the "penthouse" - deepest understanding).
+                                This reveals what the AI <em>really</em> used to make its decision, not just grammar processing.
+                            </div>
+                        </div>
+
+                        <!-- Attention Flow Diagram -->
+                        <div style="background: var(--surface); padding: 16px; border-radius: 8px; border: 1px solid var(--border);">
+                            <div style="font-size: 13px; color: var(--cyan); font-weight: 600; margin-bottom: 12px;">How Attention Flows (Single Layer)</div>
+                            <div style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; background: var(--void); padding: 12px; border-radius: 6px;">
+<pre style="margin: 0; color: var(--text-dim); line-height: 1.5;">
+Token: "Paris"  ──────────────────────────────────────────────────────────
+
+   STEP 1: Create Query                STEP 2: Match with Keys
+   ┌───────────────┐                   ┌─────────────────────────────┐
+   │ "Paris" → Q   │                   │  Q · K("France") = <span style="color: #00e5ff;">0.85</span> ✓  │
+   │ (what am I    │     ─────────►    │  Q · K("capital") = <span style="color: #00e5ff;">0.72</span> ✓ │
+   │  looking for?)│                   │  Q · K("the") = <span style="color: #666;">0.12</span>        │
+   └───────────────┘                   │  Q · K("is") = <span style="color: #666;">0.08</span>         │
+                                       └─────────────────────────────┘
+                                                    │
+   STEP 4: Output                      STEP 3: Softmax (normalize)
+   ┌───────────────┐                   ┌─────────────────────────────┐
+   │ Weighted mix  │                   │  "France": <span style="color: #00e5ff;">45%</span>              │
+   │ of Values     │     ◄─────────    │  "capital": <span style="color: #00e5ff;">32%</span>             │
+   │ = "Paris"     │                   │  "the": <span style="color: #666;">12%</span>                 │
+   │  context      │                   │  "is": <span style="color: #666;">8%</span>                   │
+   └───────────────┘                   └─────────────────────────────┘
+
+   <span style="color: #b4ff00;">These percentages ARE the attention weights we visualize!</span>
+</pre>
+                            </div>
+                        </div>
+                    </div>
+
                     <!-- HOW IT WORKS TECHNICALLY -->
                     <div class="help-section">
                         <div class="help-section-title">🔬 Technical Deep Dive (Optional)</div>

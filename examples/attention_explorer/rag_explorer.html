@@ -1472,6 +1472,100 @@
                             <strong>4. Answer Generation:</strong> Top-ranked documents are used as context for generating the answer. The fingerprint visualization shows how attention was distributed during generation.
                         </div>
                     </div>
+
+                    <!-- Visual RAG Pipeline -->
+                    <div style="background: var(--void); padding: 16px; border-radius: 8px; margin-top: 16px;">
+                        <div style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; color: var(--text-dim); overflow-x: auto;">
+<pre style="margin: 0; line-height: 1.5;">
+<span style="color: #00e5ff;">THE RAG PIPELINE - Visual Flow</span>
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│  <span style="color: #ffaa00;">STEP 1: YOUR QUERY</span>                                                     │
+│  "What are the health benefits of green tea?"                           │
+│                                                                          │
+│  We analyze each word:                                                   │
+│  ┌─────┐ ┌─────┐ ┌─────┐ ┌─────┐ ┌────────┐ ┌─────┐ ┌─────┐ ┌─────┐    │
+│  │What │ │ are │ │ the │ │health│ │benefits│ │ of  │ │green│ │ tea │    │
+│  └──┬──┘ └──┬──┘ └──┬──┘ └──┬──┘ └───┬────┘ └──┬──┘ └──┬──┘ └──┬──┘    │
+│     │       │       │       │        │         │       │       │        │
+│   <span style="color: #00e5ff;">CYAN</span>    gray    gray   <span style="color: #00e5ff;">CYAN</span>     <span style="color: #00e5ff;">CYAN</span>      gray    <span style="color: #00e5ff;">CYAN</span>    <span style="color: #00e5ff;">CYAN</span>      │
+│  anchor  syntax  syntax  anchor   anchor    syntax  anchor  anchor     │
+└─────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│  <span style="color: #ff0099;">STEP 2: COMPUTE RETRIEVAL NEED</span>                                        │
+│                                                                          │
+│  Count "information-seeking" tokens (cyan = semantic bridges)           │
+│                                                                          │
+│  ████████████████████████████░░░░░░░░░░  <span style="color: #b4ff00;">65% RETRIEVAL NEED</span>             │
+│                                                                          │
+│  High % = "This question needs external information!"                   │
+│  Low %  = "AI can answer from memory"                                   │
+└─────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│  <span style="color: #b4ff00;">STEP 3: SCORE DOCUMENTS</span>                                               │
+│                                                                          │
+│  For each document, compute:                                            │
+│                                                                          │
+│  Document: "Green Tea Benefits"                                         │
+│  ┌──────────────────────────────────────────────────────────┐           │
+│  │ FP Similarity   ████████████████████░░░░  69%  (35%)     │           │
+│  │ Target Quality  ██████████████████████░░  78%  (25%)     │           │
+│  │ Semantic Match  ██████████████░░░░░░░░░░  50%  (40%)     │           │
+│  │ ───────────────────────────────────────────────────      │           │
+│  │ <span style="color: #00e5ff;">FINAL SCORE</span>     ██████████████████░░░░░░  <span style="color: #00e5ff;">63%</span>             │           │
+│  └──────────────────────────────────────────────────────────┘           │
+└─────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│  <span style="color: #a855f7;">STEP 4: GENERATE ANSWER</span>                                               │
+│                                                                          │
+│  AI reads top documents as "context" then generates answer:             │
+│                                                                          │
+│  "Green tea offers numerous health benefits including improved          │
+│   metabolism, heart health support, and antioxidant properties..."      │
+│                                                                          │
+│  The fingerprint chart shows WHERE the AI looked during generation!     │
+└─────────────────────────────────────────────────────────────────────────┘
+</pre>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- How Layers Build Understanding -->
+                <div class="help-section">
+                    <div class="help-section-title">
+                        <span style="color: var(--cyan);">&#9679;</span>
+                        How Transformer Layers Build Understanding
+                    </div>
+                    <div style="background: var(--deep); padding: 16px; border-radius: 8px;">
+                        <div style="font-size: 12px; color: var(--text); line-height: 1.8; margin-bottom: 12px;">
+                            <strong style="color: var(--cyan);">The AI processes your query through ~32 layers (like floors in a building):</strong>
+                        </div>
+                        <div style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; background: var(--void); padding: 12px; border-radius: 6px; overflow-x: auto;">
+<pre style="margin: 0; color: var(--text-dim); line-height: 1.4;">
+<span style="color: #ffaa00;">Layer 1-4</span>   │ Tokenize → basic patterns → word shapes
+            │ Attention: <span style="color: #ffaa00;">LOCAL</span> (nearby words only)
+            │
+<span style="color: #ff0099;">Layer 5-12</span>  │ Phrase structure → sentence parsing
+            │ Attention: LOCAL + some MID-RANGE
+            │
+<span style="color: #00e5ff;">Layer 13-24</span> │ <span style="color: #00e5ff;">SEMANTIC UNDERSTANDING</span> ← We capture this!
+            │ Connects: "health" ↔ "benefits" ↔ "tea"
+            │ Attention: strong <span style="color: #00e5ff;">MID-RANGE</span> (semantic bridges)
+            │
+<span style="color: #b4ff00;">Layer 25-32</span> │ Final reasoning → answer generation
+            │ Attention: includes <span style="color: #b4ff00;">LONG-RANGE</span> (instructions)
+</pre>
+                        </div>
+                        <div style="font-size: 11px; color: var(--text-muted); margin-top: 12px;">
+                            <strong style="color: var(--lime);">We show you the final layer's attention</strong> - this is where the AI makes its final decision about what information to use.
+                        </div>
+                    </div>
                 </div>
             </div>
         </div>
