@@ -804,6 +804,10 @@ class QuantizedRLModelLoader(DefaultModelLoader):
         "v_proj": "v",
     }
 
+    # Default block size for blockwise FP8 quantization
+    # Note: only [128, 128] block size is available for now
+    DEFAULT_BLOCK_SIZE = [128, 128]
+
     def __init__(self, load_config: LoadConfig):
         super().__init__(load_config)
         logger.info("[QuantizedRL] Profile-free FP8 quantization enabled")
@@ -879,8 +883,7 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                         recorded_loader[key][name] = attr
         model.recorded_loader = recorded_loader
 
-        # Note: only [128, 128] block size is available for now
-        default_block_size = [128, 128]
+        default_block_size = QuantizedRLModelLoader.DEFAULT_BLOCK_SIZE
 
         dtype = getattr(
             model.config, "dtype", getattr(model.config, "torch_dtype", torch.bfloat16)
@@ -971,7 +974,7 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                         logger.debug(
                             f"[QuantizedRL] Set quant_method weight_block_size={default_block_size} for module: {name}"
                         )
-                except Exception as e:
+                except (RuntimeError, ValueError) as e:
                     logger.warning(
                         f"[QuantizedRL] Blockwise quantization failed for {name}: {e}, "
                     )
@@ -980,7 +983,7 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                     if quant_method is not None:
                         quant_method.process_weights_after_loading(module)
                         logger.info(
-                            f"[QuantizedRL] Fllback to per-channel quantization for module: {name}; "
+                            f"[QuantizedRL] Fallback to per-channel quantization for module: {name}; "
                         )
 
         model.flash_rl_initial_load_complete = True
@@ -1269,8 +1272,7 @@ class QuantizedRLModelLoader(DefaultModelLoader):
         def quantize_weights_iterator(weights_iter):
             """Quantize individual shards before weight_loader stacks them."""
 
-            # Default block size for blockwise quantization
-            default_block_size = [128, 128]
+            default_block_size = QuantizedRLModelLoader.DEFAULT_BLOCK_SIZE
 
             for name, weight in weights_iter:
                 if any(
@@ -2943,7 +2945,7 @@ def get_model_loader(
             "Using QuantizedRLModelLoader for RL training with native FP8 quantization."
         )
         logger.info(
-            "FP8 approach: Model loads and gets blockwise fp8 quantization on    . "
+            "FP8 approach: Model is loaded and quantized online using blockwise FP8 scheme."
             "Same model path for both training and inference."
         )
         if model_config and not model_config.quantization:

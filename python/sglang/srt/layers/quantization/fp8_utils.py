@@ -1171,7 +1171,22 @@ def validate_fp8_block_shape(
 def scaled_fp8_blockwise(
     data_hp: torch.Tensor, weight_block_size: tuple[int, int] = (128, 128)
 ):
-    # cast tensor from high precision to FP8 with 128*128 blockwise quantization.
+    """Quantize a 2D high-precision tensor to FP8 (E4M3) using blockwise quantization.
+
+    This function partitions the input tensor into blocks of the specified size, computes per-block scaling factors 
+    for each block, based on the maximum absolute values of the block, and casts the block to FP8 with saturation.
+
+    Args:
+        data_hp: 2D input tensor of shape (M, N) in high precision (float16/bfloat16/float32).
+        weight_block_size: Block size tuple (block_m, block_n). Both dimensions must be equal,
+            and M, N must be divisible by block_m, block_n respectively. Defaults to (128, 128).
+
+    Returns:
+        fp_data: FP8-quantized tensor with same shape as input, dtype torch.float8_e4m3fn.
+        descale_fp: Per-block inverse scaling factors of shape (BLK_M, BLK_N, 1), where
+            BLK_M = M // block_m and BLK_N = N // block_n.
+    """
+
     if data_hp.ndim != 2:
         raise ValueError(
             f"Only 2d input tensor is supported, got shape {data_hp.shape}"
@@ -1203,6 +1218,7 @@ def scaled_fp8_blockwise(
     # Permute to (BLK_M, BLK_N, BLOCK_SIZE_M, BLOCK_SIZE_N)
     data_hp = data_hp.permute(0, 2, 1, 3)
     # Flatten to (BLK_M, BLK_N, BLOCK_SIZE_M * BLOCK_SIZE_N)
+    # Convert to float32 to avoid overflow.
     data_hp = data_hp.to(torch.float32).contiguous().flatten(start_dim=2)
 
     # Calculate max absolute value per block
