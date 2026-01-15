@@ -31,6 +31,7 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=200, suite="stage-b-test-large-2-gpu")
+register_cuda_ci(est_time=526, suite="stage-b-test-large-2-gpu-amd")
 
 
 class HiCacheStorageBaseMixin:
