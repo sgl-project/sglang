@@ -69,7 +69,7 @@ from sglang.utils import is_in_ci
 logger = logging.getLogger(__name__)
 
 # Define constants
-SAMPLING_BACKEND_CHOICES = {"flashinfer", "pytorch", "ascend"}
+SAMPLING_BACKEND_CHOICES = {"flashinfer", "pytorch", "ascend", "aiter"}
 LOAD_FORMAT_CHOICES = [
     "auto",
     "pt",
@@ -1581,9 +1581,22 @@ class ServerArgs:
 
     def _handle_sampling_backend(self):
         if self.sampling_backend is None:
-            self.sampling_backend = (
-                "flashinfer" if is_flashinfer_available() else "pytorch"
-            )
+            if is_hip() and get_bool_env_var("SGLANG_USE_AITER"):
+                self.sampling_backend = "aiter"
+            else:
+                self.sampling_backend = (
+                    "flashinfer" if is_flashinfer_available() else "pytorch"
+                )
+        elif self.sampling_backend == "aiter":
+            if not is_hip():
+                raise ValueError(
+                    "AITER sampling backend is only supported on ROCm devices."
+                )
+            if not get_bool_env_var("SGLANG_USE_AITER"):
+                logger.info(
+                    "Enabling SGLANG_USE_AITER=1 to match requested AITER sampling backend."
+                )
+                os.environ["SGLANG_USE_AITER"] = "1"
 
     def _handle_attention_backend_compatibility(self):
         model_config = self.get_model_config()
