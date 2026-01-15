@@ -16,6 +16,7 @@
 import asyncio
 import copy
 import dataclasses
+import json
 import logging
 import os
 import pickle
@@ -2299,6 +2300,16 @@ async def print_exception_wrapper(func):
 
 
 def _get_processor_wrapper(server_args):
+    # Parse mm_processor_kwargs if provided
+    processor_kwargs = {}
+    mm_processor_kwargs_set = False
+    if server_args.mm_processor_kwargs:
+        mm_processor_kwargs_set = True
+        try:
+            processor_kwargs = json.loads(server_args.mm_processor_kwargs)
+            logger.info(f"Using multimodal processor kwargs: {processor_kwargs}")
+        except json.JSONDecodeError as e:
+            logger.warning(f"Failed to parse mm_processor_kwargs: {e}. Ignoring.")
     try:
         processor = get_processor(
             server_args.tokenizer_path,
@@ -2306,6 +2317,8 @@ def _get_processor_wrapper(server_args):
             trust_remote_code=server_args.trust_remote_code,
             revision=server_args.revision,
             use_fast=not server_args.disable_fast_image_processor,
+            mm_processor_kwargs_set=mm_processor_kwargs_set,
+            **processor_kwargs,
         )
     except ValueError as e:
         error_message = str(e)
@@ -2319,6 +2332,8 @@ def _get_processor_wrapper(server_args):
                 trust_remote_code=server_args.trust_remote_code,
                 revision=server_args.revision,
                 use_fast=True,
+                mm_processor_kwargs_set=mm_processor_kwargs_set,
+                **processor_kwargs,
             )
         else:
             raise e
