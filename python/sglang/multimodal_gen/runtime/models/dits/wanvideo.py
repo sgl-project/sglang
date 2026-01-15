@@ -695,7 +695,9 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
 
     def __init__(self, config: WanVideoConfig, hf_config: dict[str, Any]) -> None:
         super().__init__(config=config, hf_config=hf_config)
-
+        self.quant_config = None
+        if config.quant_config is not None:
+            self.quant_config = config.quant_config
         inner_dim = config.num_attention_heads * config.attention_head_dim
         self.hidden_size = config.hidden_size
         self.num_attention_heads = config.num_attention_heads
