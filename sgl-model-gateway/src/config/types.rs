@@ -1257,7 +1257,7 @@ mod tests {
                 "http://worker2:8000".to_string(),
                 "http://worker3:8000".to_string(),
             ])
-            .cache_aware_policy(0.9, 5, 1.2, 600, 10000)
+            .cache_aware_policy(0.9, 5, 1.2, 600, 10000, 1)
             .host("0.0.0.0")
             .port(3001)
             .max_payload_size(536870912)
@@ -1435,6 +1435,7 @@ mod tests {
             balance_rel_threshold: 1.5,
             eviction_interval_secs: 300,
             max_tree_size: 2000,
+            mesh_sync_interval_secs: 1,
         };
 
         match pd.get_prefill_policy(&main_policy) {
