@@ -1,13 +1,10 @@
-//! Connection mode detection step.
-
-use std::{collections::HashMap, sync::Arc};
+//! Tokenizer registration step for local workers.
 
 use async_trait::async_trait;
 use tracing::{debug, warn};
 
 use crate::{
-    app_context::AppContext,
-    core::Worker,
+    core::steps::workflow_data::LocalWorkerWorkflowData,
     tokenizer::{factory, TokenizerRegistry},
     workflow::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult},
 };
@@ -16,16 +13,21 @@ use crate::{
 pub struct RegisterTokenizerStep;
 
 #[async_trait]
-impl StepExecutor for RegisterTokenizerStep {
-    async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
-        let labels: Arc<HashMap<String, String>> = context
-            .get("labels")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("labels".to_string()))?;
-        let app_context: Arc<AppContext> = context
-            .get("app_context")
+impl StepExecutor<LocalWorkerWorkflowData> for RegisterTokenizerStep {
+    async fn execute(
+        &self,
+        context: &mut WorkflowContext<LocalWorkerWorkflowData>,
+    ) -> WorkflowResult<StepResult> {
+        let labels = &context.data.final_labels;
+        let app_context = context
+            .data
+            .app_context
+            .as_ref()
             .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
-        let workers: Arc<Vec<Arc<dyn Worker>>> = context
-            .get("workers")
+        let workers = context
+            .data
+            .actual_workers
+            .as_ref()
             .ok_or_else(|| WorkflowError::ContextValueNotFound("workers".to_string()))?;
 
         for worker in workers.iter() {
@@ -52,10 +54,11 @@ impl StepExecutor for RegisterTokenizerStep {
             let source = tokenizer_path.clone();
 
             // Load tokenizer with thread safe lock
+            let tokenizer_path_owned = tokenizer_path.clone();
             if let Err(e) = app_context
                 .tokenizer_registry
                 .load(&tokenizer_id, &model_id, &source, || async move {
-                    factory::create_tokenizer_async(&tokenizer_path.to_string())
+                    factory::create_tokenizer_async(&tokenizer_path_owned)
                         .await
                         .map_err(|e| e.to_string())
                 })

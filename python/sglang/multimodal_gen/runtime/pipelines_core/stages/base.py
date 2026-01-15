@@ -82,13 +82,6 @@ class PipelineStage(ABC):
                 result.add_check("image_latent", batch.image_latent, V.is_tensor)
                 return result
 
-        Args:
-            batch: The current batch information.
-            server_args: The inference arguments.
-
-        Returns:
-            A VerificationResult containing the verification status.
-
         """
         # Default implementation - no verification
         return VerificationResult()
@@ -119,9 +112,7 @@ class PipelineStage(ABC):
         """
         Verify the output for the stage.
 
-        Args:
-            batch: The current batch information.
-            server_args: The inference arguments.
+
 
         Returns:
             A VerificationResult containing the verification status.
@@ -182,9 +173,7 @@ class PipelineStage(ABC):
         Execute the stage's processing on the batch with optional verification and logging.
         Should not be overridden by subclasses.
 
-        Args:
-            batch: The current batch information.
-            server_args: The inference arguments.
+
 
         Returns:
             The updated batch information after this stage's processing.
@@ -206,6 +195,7 @@ class PipelineStage(ABC):
             logger=logger,
             timings=batch.timings,
             perf_dump_path_provided=batch.perf_dump_path is not None,
+            log_stage_start_end=not batch.is_warmup,
         ):
             result = self.forward(batch, server_args)
 
@@ -231,9 +221,7 @@ class PipelineStage(ABC):
         This method should be implemented by subclasses to provide the forward
         processing logic for the stage.
 
-        Args:
-            batch: The current batch information.
-            server_args: The inference arguments.
+
 
         Returns:
             The updated batch information after this stage's processing.

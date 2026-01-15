@@ -38,10 +38,12 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.runners import HFRunner, SRTRunner
 
 register_cuda_ci(
-    est_time=300,
-    suite="nightly-1-gpu",
-    nightly=True,
-    disabled="Temporarily disabled, will be fixed later",
+    est_time=150,
+    suite="stage-b-test-small-1-gpu",
+)
+register_cuda_ci(
+    est_time=76,
+    suite="stage-b-test-small-1-gpu-5090",
 )
 
 from sglang.test.test_utils import DEFAULT_PORT_FOR_SRT_TEST_RUNNER, CustomTestCase
@@ -56,7 +58,7 @@ LOGPROB_THRESHOLD = 1e-01
 DEFAULT_TEST_PROMPTS = [
     "SGL is a",
     "AI is a field of computer science focused on",
-    "Computer science is the study of",
+    "Write a long story.",
     "Write a short story.",
     "What are the main components of a computer?",
 ]
