@@ -251,36 +251,58 @@ class LTX2PipelineConfig(PipelineConfig):
         )
 
     def get_decode_scale_and_shift(self, device, dtype, vae):
-        latents_mean = getattr(vae, "latents_mean", None)
-        latents_std = getattr(vae, "latents_std", None)
-
-        scaling_factor = (
-            getattr(getattr(vae, "config", None), "scaling_factor", None)
-            or getattr(vae, "scaling_factor", None)
-            or getattr(self.vae_config.arch_config, "scaling_factor", None)
-            or 1.0
-        )
-        if isinstance(scaling_factor, (int, float)) and float(scaling_factor) == 0.0:
-            scaling_factor = 1.0
-
-        if isinstance(latents_mean, torch.Tensor) and isinstance(
-            latents_std, torch.Tensor
-        ):
-            latents_mean = latents_mean.to(device=device, dtype=dtype).view(
-                1, -1, 1, 1, 1
-            )
-            latents_std = latents_std.to(device=device, dtype=dtype).view(
-                1, -1, 1, 1, 1
-            )
-            sf = torch.tensor(float(scaling_factor), device=device, dtype=dtype).view(
-                1, 1, 1, 1, 1
-            )
-            return sf / latents_std, latents_mean
-
-        sf = torch.tensor(float(scaling_factor), device=device, dtype=dtype).view(
-            1, 1, 1, 1, 1
-        )
+        # We handle scale and shift manually in preprocess_decoding because
+        # we need to unpack the latents first. Returning 1.0, None here disables
+        # the automatic scale_and_shift in DecodingStage.
+        sf = torch.tensor(1.0, device=device, dtype=dtype).view(1, 1, 1, 1, 1)
         return sf, None
+
+    def preprocess_decoding(self, latents, server_args, vae=None):
+        # We need to unpack and denormalize latents here
+        # This is called inside DecodingStage.decode
+        
+        # We need to get the original batch info to know dimensions
+        # But preprocess_decoding signature only gives latents and server_args
+        # This is tricky. 
+        # However, we can inspect server_args to get the batch? No.
+        # But wait, we can infer dimensions from packed latents?
+        # Packed: [B, S, D]
+        # D = C * p_t * p * p
+        # S = F_out * H_out * W_out
+        
+        # We really need height/width/num_frames from the request.
+        # But DecodingStage.decode doesn't take batch as argument.
+        # However, DecodingStage.forward DOES take batch.
+        # But it passes latents to decode(), not batch.
+        
+        # Wait, in DecodingStage.decode:
+        # latents = self.scale_and_shift(latents, server_args)
+        # latents = server_args.pipeline_config.preprocess_decoding(latents, server_args, vae=self.vae)
+        
+        # This design in DecodingStage is problematic for LTX-2 if we need batch info for unpacking.
+        # BUT, let's look at _unpack_latents implementation.
+        # It takes num_frames, height, width.
+        
+        # Can we calculate them?
+        # S = num_frames_latent * height_latent * width_latent
+        # We know C, p_t, p.
+        # But we can't uniquely factor S into F, H, W without external info.
+        
+        # Strategy:
+        # We must modify DecodingStage to pass batch to preprocess_decoding?
+        # Or we can attach the batch info to the latents tensor? (Ugly)
+        # Or we can modify LTX2AVDecodingStage to handle this BEFORE calling super().decode (if it called decode directly).
+        # But LTX2AVDecodingStage calls super().forward(), which calls self.decode().
+        
+        # Let's modify LTX2AVDecodingStage to override decode() instead of using super().decode()
+        # This seems like the cleanest way given the constraints.
+        
+        # So, for this file (ltx_2.py), we just disable get_decode_scale_and_shift.
+        # And we don't implement preprocess_decoding here (or keep it identity).
+        # We will implement the logic in LTX2AVDecodingStage.
+        
+        return latents
+
 
     @staticmethod
     def _unpack_latents(
