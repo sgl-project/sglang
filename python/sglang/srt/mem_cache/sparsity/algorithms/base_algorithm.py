@@ -3,6 +3,8 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.srt.mem_cache.sparsity.kernel.topk_kernel import invoke_topk_selection
+
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
@@ -268,92 +270,55 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
         **kwargs,
     ) -> tuple:
         """
-        Default TopK retrieval: score-based selection + recent pages.
-        Subclasses can override for query-dependent retrieval.
-
-        TODO:
-            1. Using triton kernel to speed up this function
-            2. Support CUDA Graph
+        Triton-accelerated TopK retrieval with support for CUDA Graphs.
+        Subclasses can override this method for custom retrieval logic.
         """
         bs, device = queries.shape[0], queries.device
 
-        seq_lens_source = kwargs.get("forward_batch", None)
-        if seq_lens_source is None or not hasattr(seq_lens_source, "seq_lens"):
+        # Ensure forward_batch is provided to access sequence lengths
+        forward_batch = kwargs.get("forward_batch")
+        if forward_batch is None or not hasattr(forward_batch, "seq_lens"):
             raise ValueError(
                 "forward_batch with seq_lens is required for TopK retrieval"
             )
-        seq_lens = seq_lens_source.seq_lens.to(device)
+        seq_lens = forward_batch.seq_lens.to(device)
 
         req_to_token = self.req_to_token_pool.req_to_token
+
+        # Calculate logical page counts for each request
+        num_pages = (seq_lens + self.page_size - 1) // self.page_size
+
+        # Use static max capacity to avoid CPU-GPU synchronization and support CUDA Graphs
         max_req_tokens = req_to_token.shape[1]
+        max_num_pages = (max_req_tokens + self.page_size - 1) // self.page_size
 
-        per_request_indices = []
-        per_request_lengths = []
+        # Vectorized mapping from logical pages to physical pages
+        # Shape: [bs, max_num_pages]
+        page_indices = (
+            torch.arange(max_num_pages, device=device).unsqueeze(0).expand(bs, -1)
+        )
+        token_indices = (page_indices * self.page_size).clamp(max=max_req_tokens - 1)
+        phys_pages = (
+            req_to_token[req_pool_indices.unsqueeze(1), token_indices] // self.page_size
+        )
 
-        for i in range(bs):
-            if not sparse_mask[i]:
-                per_request_indices.append(
-                    torch.empty(0, device=device, dtype=torch.int32)
-                )
-                per_request_lengths.append(0)
-                continue
+        # Compute importance scores for all potential pages
+        scores = self._retrieve_page_scores(
+            layer_id, phys_pages, req_pool_indices, queries
+        )
 
-            num_pages = int((seq_lens[i].item() + self.page_size - 1) // self.page_size)
-            if num_pages <= self.num_recent_pages:
-                per_request_indices.append(
-                    torch.empty(0, device=device, dtype=torch.int32)
-                )
-                per_request_lengths.append(0)
-                continue
+        # Apply sparsity mask: requests not requiring sparsity effectively have 0 pages
+        eff_num_pages = num_pages.clone()
+        eff_num_pages[~sparse_mask] = 0
 
-            page_idx = torch.arange(num_pages, device=device)
-            page_start_token = req_to_token[
-                req_pool_indices[i],
-                (page_idx * self.page_size).clamp(0, max_req_tokens - 1),
-            ]
-            phys_pages = (page_start_token // self.page_size).unsqueeze(0)
-
-            scores = self._retrieve_page_scores(
-                layer_id,
-                phys_pages,
-                req_pool_indices[i : i + 1],
-                queries[i : i + 1],
-            )
-
-            recent_start = max(num_pages - self.num_recent_pages, 0)
-            scores = scores.clone()
-            scores[:, recent_start:] = float("-inf")
-
-            history_pages = max(recent_start, 1)
-            if self.fixed_topk_page_cnt is not None:
-                k = max(self.fixed_topk_page_cnt - self.num_recent_pages, 1)
-            else:
-                k = max(int(history_pages * self.sparsity_ratio), 1)
-            k = min(k, history_pages)
-            topk_idx = torch.topk(scores, k=k, dim=1, sorted=False)[1].squeeze(0)
-
-            recent_idx = torch.arange(
-                recent_start, recent_start + self.num_recent_pages, device=device
-            )
-            recent_idx = recent_idx[recent_idx < num_pages]
-
-            combined = (
-                torch.cat([topk_idx, recent_idx], dim=0).sort()[0].to(torch.int32)
-            )
-
-            per_request_indices.append(combined)
-            per_request_lengths.append(int(combined.numel()))
-
-        max_len = max(max(per_request_lengths, default=0), 1)
-        out_indices = torch.full((bs, max_len), -1, dtype=torch.int32, device=device)
-        out_lengths = torch.zeros(bs, dtype=torch.int32, device=device)
-
-        for i, selected in enumerate(per_request_indices):
-            length = per_request_lengths[i]
-            if length == 0:
-                continue
-            out_indices[i, :length] = selected
-            out_lengths[i] = length
+        # Invoke Triton kernel for parallel Top-K selection
+        out_indices, out_lengths = invoke_topk_selection(
+            scores,
+            eff_num_pages,
+            self.num_recent_pages,
+            self.sparsity_ratio,
+            self.fixed_topk_page_cnt,
+        )
 
         return out_indices, out_lengths
 
