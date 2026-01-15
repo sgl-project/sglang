@@ -7,6 +7,7 @@ from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=66, suite="stage-b-test-small-1-gpu")
+register_cuda_ci(est_time=64, suite="stage-b-test-small-1-gpu-5090")
 register_amd_ci(est_time=66, suite="stage-b-test-small-1-gpu-amd")
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (

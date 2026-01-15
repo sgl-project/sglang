@@ -352,11 +352,10 @@ class SamplingParams:
                         [f"{w}x{h}" for w, h in self.supported_resolutions]
                     )
                     error_msg = (
-                        f"Unsupported resolution: {self.width}x{self.height}. "
+                        f"Unsupported resolution: {self.width}x{self.height}, output quality may suffer. "
                         f"Supported resolutions: {supported_str}"
                     )
-                    logger.error(error_msg)
-                    raise ValueError(error_msg)
+                    logger.warning(error_msg)
 
         if pipeline_config.task_type.is_image_gen():
             # settle num_frames
