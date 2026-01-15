@@ -63,6 +63,7 @@ suites = {
         TestFile("models/test_dummy_grok_models.py"),
         TestFile("test_bench_one_batch.py"),
         TestFile("test_bench_serving.py"),
+        TestFile("test_deepseek_ocr_pdf_input.py"),
         TestFile("test_eval_accuracy_large.py"),
         TestFile("test_moe_eval_accuracy_large.py"),
         TestFile("test_profile_v2.py"),
