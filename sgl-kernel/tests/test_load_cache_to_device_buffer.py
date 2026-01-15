@@ -195,7 +195,7 @@ __global__ void load_cache_to_device_buffer(
             const int top_k_idx = s_missed_tokens_idx[token_idx];
             const int32_t old_token = device_buffer_tokens[evict_slot];
             
-            if (old_token < max_tokens) {
+            if (old_token >= 0 && old_token < max_tokens) {
                 token_residence_mapping[old_token] = NOT_PRESENT;
             }
             token_residence_mapping[miss_token] = static_cast<uint16_t>(evict_slot);
@@ -322,7 +322,7 @@ def get_module():
 class PythonReference:
     """Python reference implementation for verification."""
     
-    NOT_PRESENT = 0xFFFF
+    NOT_PRESENT = -1  # 0xFFFF in uint16, but -1 in int16 (same bit pattern)
     
     def __init__(self, max_tokens: int, hot_buffer_size: int, item_size_bytes: int):
         self.max_tokens = max_tokens
@@ -396,7 +396,7 @@ class PythonReference:
 class CUDAKernel:
     """Wrapper for CUDA kernel."""
     
-    NOT_PRESENT = 0xFFFF
+    NOT_PRESENT = -1  # 0xFFFF in uint16, but -1 in int16 (same bit pattern)
     
     def __init__(self, max_tokens: int, hot_buffer_size: int, item_size_bytes: int, 
                  num_top_k: int = 64, device: str = "cuda"):
