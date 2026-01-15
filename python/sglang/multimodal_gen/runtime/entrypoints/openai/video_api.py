@@ -87,6 +87,10 @@ def _build_sampling_params_from_request(
         sampling_kwargs["enable_teacache"] = request.enable_teacache
     if request.output_path is not None:
         sampling_kwargs["output_path"] = request.output_path
+    if request.resolution is not None:
+        sampling_kwargs["resolution"] = request.resolution
+    if request.aspect_ratio is not None:
+        sampling_kwargs["aspect_ratio"] = request.aspect_ratio
     sampling_params = SamplingParams.from_user_sampling_params_args(
         model_path=server_args.model_path,
         server_args=server_args,
@@ -156,6 +160,8 @@ async def create_video(
     model: Optional[str] = Form(None),
     seconds: Optional[int] = Form(None),
     size: Optional[str] = Form(None),
+    resolution: Optional[str] = Form(None),
+    aspect_ratio: Optional[str] = Form(None),
     fps: Optional[int] = Form(None),
     num_frames: Optional[int] = Form(None),
     seed: Optional[int] = Form(1024),
@@ -210,6 +216,8 @@ async def create_video(
             model=model,
             seconds=seconds if seconds is not None else 4,
             size=size,
+            resolution=resolution,
+            aspect_ratio=aspect_ratio,
             fps=fps_val,
             num_frames=num_frames_val,
             seed=seed,

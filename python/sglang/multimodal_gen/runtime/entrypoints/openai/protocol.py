@@ -68,6 +68,8 @@ class VideoGenerationsRequest(BaseModel):
     model: Optional[str] = None
     seconds: Optional[int] = 4
     size: Optional[str] = ""
+    resolution: Optional[str] = None
+    aspect_ratio: Optional[str] = None
     fps: Optional[int] = None
     num_frames: Optional[int] = None
     seed: Optional[int] = 1024
