@@ -4,6 +4,7 @@ import unittest
 
 import requests
 
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_DRAFT_MODEL_EAGLE,
     DEFAULT_MODEL_NAME_FOR_TEST,
@@ -21,6 +22,8 @@ from sglang.test.test_utils import (
     run_score_benchmark,
     write_github_step_summary,
 )
+
+register_cuda_ci(est_time=300, suite="performance-test-vlm-5090")
 
 
 class TestBenchServing(CustomTestCase):
