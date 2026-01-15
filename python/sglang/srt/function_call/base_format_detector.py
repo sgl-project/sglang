@@ -350,7 +350,6 @@ class BaseFormatDetector(ABC):
         self,
         tools: List[Tool],
         at_least_one: bool = False,
-        stop_after_first: bool = False,
     ) -> Dict[str, Any]:
         """Build xgrammar structural tag for this model's format."""
         raise NotImplementedError()

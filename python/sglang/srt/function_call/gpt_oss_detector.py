@@ -244,7 +244,6 @@ class GptOssDetector(BaseFormatDetector):
         self,
         tools: List[Tool],
         at_least_one: bool = False,
-        stop_after_first: bool = False,
     ) -> Dict[str, Any]:
         """Build structural tag for GPT-OSS format."""
         tags = []
@@ -307,6 +306,5 @@ class GptOssDetector(BaseFormatDetector):
                 "triggers": list(triggers),
                 "tags": tags,
                 "at_least_one": at_least_one,
-                "stop_after_first": stop_after_first,
             }
         }

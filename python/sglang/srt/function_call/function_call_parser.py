@@ -2,7 +2,6 @@ import logging
 from typing import Dict, List, Literal, Optional, Tuple, Type, Union
 
 from sglang.srt.entrypoints.openai.protocol import Tool, ToolCallConstraint, ToolChoice
-from sglang.srt.environ import ToolStrictLevel, envs
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.deepseekv3_detector import DeepSeekV3Detector
@@ -65,7 +64,6 @@ class FunctionCallParser:
 
         self.detector = detector
         self.tools = tools
-        self.tool_strict_level = envs.SGLANG_TOOL_STRICT_LEVEL.get()
 
     def has_tool_call(self, text: str) -> bool:
         """
@@ -132,7 +130,6 @@ class FunctionCallParser:
     def get_structure_constraint(
         self,
         tool_choice: Union[ToolChoice, Literal["auto", "required"]],
-        parallel_tool_calls: bool = True,
     ) -> Optional[ToolCallConstraint]:
         """
         Returns the appropriate structure constraint for tool calls based on the tool_choice.
@@ -140,7 +137,6 @@ class FunctionCallParser:
 
         Args:
             tool_choice: The tool choice setting from the request
-            parallel_tool_calls: Whether to allow multiple tool calls (default: True)
 
         Returns:
             A tuple of (constraint_type, constraint_value) to be added to sampling parameters,
@@ -148,23 +144,13 @@ class FunctionCallParser:
         """
         # NOTE: structural_tag only supports JSON-compatible content between the begin and end.
         # It cannot parse or validate function call Pythonic or XML-ish syntax.
-        if (
-            self.detector.supports_structural_tag()
-            and tool_choice == "auto"
-            and (
-                any(tool.function.strict for tool in self.tools)
-                or self.tool_strict_level >= ToolStrictLevel.FUNCTION
-            )
-        ):
+        if self.detector.supports_structural_tag() and tool_choice == "auto":
             tag = self.detector.build_structural_tag(
                 tools=self.tools,
                 at_least_one=False,
-                stop_after_first=not parallel_tool_calls,
             )
             return ("structural_tag", tag)
         elif tool_choice == "required" or isinstance(tool_choice, ToolChoice):
-            json_schema = get_json_schema_constraint(
-                self.tools, tool_choice, parallel_tool_calls
-            )
+            json_schema = get_json_schema_constraint(self.tools, tool_choice)
             return ("json_schema", json_schema)
         return None

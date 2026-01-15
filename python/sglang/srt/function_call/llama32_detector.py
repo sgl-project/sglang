@@ -147,7 +147,6 @@ class Llama32Detector(BaseFormatDetector):
         self,
         tools: List[Tool],
         at_least_one: bool = False,
-        stop_after_first: bool = False,
     ) -> Dict[str, Any]:
         """Build structural tag for Llama 3.2 format."""
         tags = []
@@ -183,6 +182,5 @@ class Llama32Detector(BaseFormatDetector):
                 "triggers": list(triggers),
                 "tags": tags,
                 "at_least_one": at_least_one,
-                "stop_after_first": stop_after_first,
             }
         }

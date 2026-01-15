@@ -242,7 +242,6 @@ class KimiK2Detector(BaseFormatDetector):
         self,
         tools: List[Tool],
         at_least_one: bool = False,
-        stop_after_first: bool = False,
     ) -> Dict[str, Any]:
         """Build structural tag for Kimi K2 format.
 
@@ -289,6 +288,5 @@ class KimiK2Detector(BaseFormatDetector):
                 "triggers": ["<|tool_calls_section_begin|>", "<|tool_call_begin|>"],
                 "tags": tags,
                 "at_least_one": at_least_one,
-                "stop_after_first": stop_after_first,
             }
         }

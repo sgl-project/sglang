@@ -227,6 +227,5 @@ class PythonicDetector(BaseFormatDetector):
         self,
         tools: List[Tool],
         at_least_one: bool = False,
-        stop_after_first: bool = False,
     ) -> Dict[str, Any]:
         raise NotImplementedError()

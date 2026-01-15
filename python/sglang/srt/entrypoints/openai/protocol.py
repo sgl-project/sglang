@@ -147,7 +147,7 @@ StructuralTagResponseFormat: TypeAlias = Union[
 ]
 
 ToolCallConstraint: TypeAlias = Union[
-    Tuple[Literal["structural_tag"], StructuralTagResponseFormat],
+    Tuple[Literal["structural_tag"], Dict[str, Any]],  # New format only
     Tuple[Literal["json_schema"], Any],  # json_schema can be dict/str/None
 ]
 
@@ -701,7 +701,7 @@ class ChatCompletionRequest(BaseModel):
             constraint_type, constraint_value = tool_call_constraint
             if constraint_type == "structural_tag":
                 sampling_params[constraint_type] = convert_json_schema_to_str(
-                    constraint_value.model_dump(by_alias=True)
+                    constraint_value  # type: ignore
                 )
             elif constraint_type == "json_schema":
                 sampling_params[constraint_type] = convert_json_schema_to_str(

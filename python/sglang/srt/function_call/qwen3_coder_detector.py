@@ -356,13 +356,8 @@ class Qwen3CoderDetector(BaseFormatDetector):
         self,
         tools: List[Tool],
         at_least_one: bool = False,
-        stop_after_first: bool = False,
     ) -> Dict[str, Any]:
-        """Build structural tag for Qwen3 Coder format.
-
-        Note: Uses the same tag structure as DeepSeek (without "format": "tag" key)
-        for better compatibility with xgrammar's stop_after_first handling.
-        """
+        """Build structural tag for Qwen3 Coder format."""
         tags = []
         triggers = set()
 
@@ -378,8 +373,6 @@ class Qwen3CoderDetector(BaseFormatDetector):
             # Always include schema for parameter validation
             schema = tool.function.parameters or {}
 
-            # Use the same tag structure as DeepSeek (without "format": "tag")
-            # for better compatibility with xgrammar's stop_after_first handling
             tags.append(
                 {
                     "begin": begin,
@@ -398,6 +391,5 @@ class Qwen3CoderDetector(BaseFormatDetector):
                 "triggers": list(triggers),
                 "tags": tags,
                 "at_least_one": at_least_one,
-                "stop_after_first": stop_after_first,
             }
         }

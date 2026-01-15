@@ -338,7 +338,6 @@ class MistralDetector(BaseFormatDetector):
         self,
         tools: List[Tool],
         at_least_one: bool = False,
-        stop_after_first: bool = False,
     ) -> Dict[str, Any]:
         """Build structural tag for Mistral format.
 
@@ -379,11 +378,9 @@ class MistralDetector(BaseFormatDetector):
                             "type": "tags_with_separator",
                             "separator": ", ",
                             "tags": inner_tags,
-                            "stop_after_first": stop_after_first,
                         },
                     }
                 ],
                 "at_least_one": at_least_one,
-                "stop_after_first": True,
             }
         }

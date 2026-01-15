@@ -123,7 +123,6 @@ class Qwen25Detector(BaseFormatDetector):
         self,
         tools: List[Tool],
         at_least_one: bool = False,
-        stop_after_first: bool = False,
     ) -> Dict[str, Any]:
         """Build structural tag for Qwen 2.5 format."""
         tags = []
@@ -159,6 +158,5 @@ class Qwen25Detector(BaseFormatDetector):
                 "triggers": list(triggers),
                 "tags": tags,
                 "at_least_one": at_least_one,
-                "stop_after_first": stop_after_first,
             }
         }
