@@ -19,7 +19,7 @@ def sgemm_lora_a_fwd(
 
     num_loras, weight_out_dim, _ = weights.shape
     
-    if get_global_server_args().disable_overlap_schedule and torch.all(weight_indices == weight_indices[0]):
+    if len(weight_indices) == 1:
         idx = weight_indices[0]
         rank = lora_ranks[idx]
         scaling = scaling_tensor[idx]
@@ -83,7 +83,7 @@ def sgemm_lora_b_fwd(
         output = torch.zeros(
             total_seq_len, total_output_dim, dtype=inputs.dtype, device=inputs.device
         )
-    if get_global_server_args().disable_overlap_schedule and torch.all(weight_indices==weight_indices[0]):
+    if len(weight_indices) == 1:
         idx= weight_indices[0]
         rank = lora_ranks[idx]
         if rank > 0:
