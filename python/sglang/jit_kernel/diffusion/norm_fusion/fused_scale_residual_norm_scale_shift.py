@@ -28,14 +28,15 @@ def _jit_scale_residual_norm_scale_shift_module(
     scale_index_enum: IndexEnum,
     shift_index_enum: IndexEnum,
     gate_index_enum: IndexEnum,
+    head_dim: int,
 ) -> Module:
     kernel_name = _get_kernel_name()
+
     args = make_cpp_args(
-        norm_enum, dtype, scale_index_enum, shift_index_enum, gate_index_enum
+        norm_enum, dtype, scale_index_enum, shift_index_enum, gate_index_enum, head_dim
     )
-    marker = kernel_name
+    marker = f"{kernel_name}_d{head_dim}"  # Different marker for different dims
     export_name = kernel_name
-    print("args:", args)
 
     return load_jit(
         marker,
@@ -72,11 +73,29 @@ def fused_scale_residual_norm_scale_shift(
         scale_index_enum = get_index_enum(scale)
         shift_index_enum = get_index_enum(shift)
         gate_index_enum = get_index_enum(gate)
+        head_dim = x.shape[-1]
+
+        # Validate head_dim is supported by norm.cuh
+        if head_dim <= 256:
+            assert head_dim in (
+                64,
+                128,
+                256,
+            ), f"D={head_dim} not supported, must be 64, 128, or 256 for D <= 256"
+        else:
+            assert (
+                head_dim % 256 == 0 and head_dim <= 8192
+            ), f"D={head_dim} not supported, must be multiple of 256 and <= 8192"
 
         y = torch.empty_like(x)
         residual_output = torch.empty_like(x)
         module = _jit_scale_residual_norm_scale_shift_module(
-            norm_enum, x.dtype, scale_index_enum, shift_index_enum, gate_index_enum
+            norm_enum,
+            x.dtype,
+            scale_index_enum,
+            shift_index_enum,
+            gate_index_enum,
+            head_dim,
         )
         kernel = getattr(module, _get_kernel_name())
         kernel(y, residual_output, residual, x, gate, gamma, beta, scale, shift, eps)

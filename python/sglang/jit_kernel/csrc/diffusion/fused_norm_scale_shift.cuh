@@ -28,42 +28,7 @@ struct ItemPerThreadTag {
   static constexpr int value = V;
 };
 
-// compute sum of elements in a Vec4
-template <typename T>
-__device__ __forceinline__ float vec4_sum(const Vec4<T>& v) {
-  float sum = 0.0f;
-#pragma unroll
-  for (int j = 0; j < 4; ++j) {
-    sum += static_cast<float>(v[j]);
-  }
-  return sum;
-}
-
-// compute sum of squares of elements in a Vec4
-template <typename T>
-__device__ __forceinline__ float vec4_sum_sq(const Vec4<T>& v) {
-  float sum = 0.0f;
-#pragma unroll
-  for (int j = 0; j < 4; ++j) {
-    float val = static_cast<float>(v[j]);
-    sum += val * val;
-  }
-  return sum;
-}
-
-// compute sum of squared differences from mean
-template <typename T>
-__device__ __forceinline__ float vec4_variance_sum(const Vec4<T>& v, float mean) {
-  float sum = 0.0f;
-#pragma unroll
-  for (int j = 0; j < 4; ++j) {
-    float diff = static_cast<float>(v[j]) - mean;
-    sum += diff * diff;
-  }
-  return sum;
-}
-
-template <typename T, int ITEM_PER_THREAD, NormEnum norm_enum, IndexEnum scale_index_enum, IndexEnum shift_index_enum>
+template <typename T, int64_t kDim, NormEnum norm_enum, IndexEnum scale_index_enum, IndexEnum shift_index_enum>
 __global__ void norm_fused_scale_shift_kernel(
     T* __restrict__ output,
     const T* __restrict__ input,
@@ -71,132 +36,121 @@ __global__ void norm_fused_scale_shift_kernel(
     const T* __restrict__ beta,
     const T* __restrict__ scale,
     const T* __restrict__ shift,
-    const int B,
     const int S,
     const int F,
-    const int D,
     bool affine,
     float eps) {
   using namespace device;
+  using namespace device::norm;
+  using PackedT = packed_t<T>;
+  using Storage = StorageType<T, kDim>;
+
+  constexpr bool kUseCTA = host::norm::should_use_cta<T, kDim>();
+  // Storage size: for CTA norm it's 4, for warp norm it's kDim / (2 * 32)
+  constexpr int kStorageSize = kUseCTA ? 4 : (kDim / (2 * kWarpThreads));
+  constexpr int kPackedPerRow = kDim / 2;
+
+  __shared__ float smem_buffer[kSmemBufferSize];
 
   const int bidx = blockIdx.x;
   const int tidx = threadIdx.x;
-  const int bdimx = blockDim.x;
-  const int D4 = D >> 2;
   const int b_id = bidx / S;
   const int s_id = bidx % S;
-  const int offset = bidx * D4;
-  const int scale_offset = norm_fusion::get_offset<scale_index_enum>(S, F, b_id, s_id) * D4;
-  const int shift_offset = norm_fusion::get_offset<shift_index_enum>(S, F, b_id, s_id) * D4;
 
-  __shared__ float s_mean, s_variance;
-  __shared__ float smem_reduce[kWarpThreads];  // buffer for cta::reduce_sum
-  float local_sum = 0.0f;
-  Vec4<T> local_val[ITEM_PER_THREAD];
+  // Compute offsets
+  const int row_packed_offset = bidx * kPackedPerRow;
+  const int thread_packed_offset = row_packed_offset + tidx * kStorageSize;
+  const int gamma_packed_offset = tidx * kStorageSize;  // gamma/beta broadcast across rows
 
-  // Pass 1: Load input and compute sum (LayerNorm) or sum_sq (RMSNorm)
-#pragma unroll
-  for (int i = 0; i < ITEM_PER_THREAD; ++i) {
-    const int index = i * bdimx + tidx;
-    if (index < D4) {
-      local_val[i].load(input, offset + index);
-    } else {
-      local_val[i].fill(T(0.0f));
-    }
+  const int scale_row = norm_fusion::get_offset<scale_index_enum>(S, F, b_id, s_id);
+  const int shift_row = norm_fusion::get_offset<shift_index_enum>(S, F, b_id, s_id);
+
+  // ============ Step 1: Load data ============
+  const auto* input_packed = reinterpret_cast<const PackedT*>(input);
+  const auto* gamma_packed = reinterpret_cast<const PackedT*>(gamma);
+  const auto* beta_packed = reinterpret_cast<const PackedT*>(beta);
+
+  Storage input_vec, gamma_vec, beta_vec;
+  input_vec.load(input_packed + thread_packed_offset);
+
+  if (affine) {
+    gamma_vec.load(gamma_packed + gamma_packed_offset);
     if constexpr (norm_enum == NormEnum::LayerNorm) {
-      local_sum += vec4_sum(local_val[i]);
+      beta_vec.load(beta_packed + gamma_packed_offset);
     } else {
-      local_sum += vec4_sum_sq(local_val[i]);
+      // RMSNorm doesn't use beta, fill with zeros
+#pragma unroll
+      for (int i = 0; i < kStorageSize; ++i) {
+        beta_vec[i] = cast<PackedT, fp32x2_t>({0.0f, 0.0f});
+      }
     }
-  }
-
-  // Reduce and compute mean
-  if (blockDim.x <= kWarpThreads) {
-    local_sum = warp::reduce_sum(local_sum);
   } else {
-    cta::reduce_sum(local_sum, smem_reduce);
-    local_sum = smem_reduce[0];
-  }
-  if (threadIdx.x == 0) {
-    s_mean = local_sum / D;
-  }
-  __syncthreads();
-
-  // Pass 2 (LayerNorm only): Compute variance
-  if constexpr (norm_enum == NormEnum::LayerNorm) {
-    local_sum = 0.0f;
+    // Default values: gamma=1, beta=0
 #pragma unroll
-    for (int i = 0; i < ITEM_PER_THREAD; ++i) {
-      const int index = i * bdimx + tidx;
-      if (index < D4) {
-        local_sum += vec4_variance_sum(local_val[i], s_mean);
-      }
-    }
-    if (blockDim.x <= kWarpThreads) {
-      local_sum = warp::reduce_sum(local_sum);
-    } else {
-      cta::reduce_sum(local_sum, smem_reduce);
-      local_sum = smem_reduce[0];
+    for (int i = 0; i < kStorageSize; ++i) {
+      gamma_vec[i] = cast<PackedT, fp32x2_t>({1.0f, 1.0f});
+      beta_vec[i] = cast<PackedT, fp32x2_t>({0.0f, 0.0f});
     }
   }
-  if (threadIdx.x == 0) {
-    s_variance = math::rsqrt(local_sum / D + eps);
+
+  // ============ Step 2: Apply norm using norm template ============
+  Storage norm_output;
+  if constexpr (kUseCTA) {
+    norm_output = apply_norm_cta<norm_enum, kDim>(input_vec, gamma_vec, beta_vec, eps, smem_buffer);
+  } else {
+    norm_output = apply_norm_warp<norm_enum, kDim>(input_vec, gamma_vec, beta_vec, eps);
   }
-  __syncthreads();
 
-  // Pre-load scalar scale/shift if needed
-  float scalar_scale = 0.0f, scalar_shift = 0.0f;
-  if constexpr (scale_index_enum == IndexEnum::Scalar) scalar_scale = static_cast<float>(scale[0]);
-  if constexpr (shift_index_enum == IndexEnum::Scalar) scalar_shift = static_cast<float>(shift[0]);
+  // ============ Step 3: Load scale/shift and apply ============
+  const auto* scale_packed = reinterpret_cast<const PackedT*>(scale);
+  const auto* shift_packed = reinterpret_cast<const PackedT*>(shift);
 
-    // Pass 3: Apply normalization, affine, scale/shift
+  Storage scale_vec, shift_vec;
+
+  // Load scale based on IndexEnum
+  if constexpr (scale_index_enum == IndexEnum::Scalar) {
+    float s = static_cast<float>(scale[0]);
 #pragma unroll
-  for (int i = 0; i < ITEM_PER_THREAD; ++i) {
-    const int index = i * bdimx + tidx;
-    if (index < D4) {
-      Vec4<T> gamma_val, beta_val;
-      if (affine) {
-        gamma_val.load(gamma, index);
-        beta_val.load(beta, index);
-      } else {
-        gamma_val.fill(T(1.0f));
-        beta_val.fill(T(0.0f));
-      }
-
-      // Load scale/shift based on IndexEnum
-      Vec4<T> scale_val, shift_val;
-      if constexpr (scale_index_enum == IndexEnum::Scalar) {
-        scale_val.fill(T(scalar_scale));
-      } else {
-        scale_val.load(scale, scale_offset + index);
-      }
-      if constexpr (shift_index_enum == IndexEnum::Scalar) {
-        shift_val.fill(T(scalar_shift));
-      } else {
-        shift_val.load(shift, shift_offset + index);
-      }
-
-      Vec4<T> tmp;
-#pragma unroll
-      for (int j = 0; j < 4; ++j) {
-        float normalized;
-        if constexpr (norm_enum == NormEnum::LayerNorm) {
-          normalized = (static_cast<float>(local_val[i][j]) - s_mean) * s_variance;
-        } else {
-          normalized = static_cast<float>(local_val[i][j]) * s_variance;
-        }
-        float affine_out = normalized * static_cast<float>(gamma_val[j]);
-        if constexpr (norm_enum == NormEnum::LayerNorm) {
-          affine_out += static_cast<float>(beta_val[j]);
-        }
-        tmp[j] = T(affine_out * (1.0f + static_cast<float>(scale_val[j])) + static_cast<float>(shift_val[j]));
-      }
-      tmp.store(output, offset + index);
+    for (int i = 0; i < kStorageSize; ++i) {
+      scale_vec[i] = cast<PackedT, fp32x2_t>({s, s});
     }
+  } else {
+    const int scale_packed_offset = scale_row * kPackedPerRow + tidx * kStorageSize;
+    scale_vec.load(scale_packed + scale_packed_offset);
   }
+
+  // Load shift based on IndexEnum
+  if constexpr (shift_index_enum == IndexEnum::Scalar) {
+    float s = static_cast<float>(shift[0]);
+#pragma unroll
+    for (int i = 0; i < kStorageSize; ++i) {
+      shift_vec[i] = cast<PackedT, fp32x2_t>({s, s});
+    }
+  } else {
+    const int shift_packed_offset = shift_row * kPackedPerRow + tidx * kStorageSize;
+    shift_vec.load(shift_packed + shift_packed_offset);
+  }
+
+  // Apply: output = norm * (1 + scale) + shift
+  Storage output_vec;
+#pragma unroll
+  for (int i = 0; i < kStorageSize; ++i) {
+    auto norm_fp32 = cast<fp32x2_t>(norm_output[i]);
+    auto scale_fp32 = cast<fp32x2_t>(scale_vec[i]);
+    auto shift_fp32 = cast<fp32x2_t>(shift_vec[i]);
+
+    float out_x = norm_fp32.x * (1.0f + scale_fp32.x) + shift_fp32.x;
+    float out_y = norm_fp32.y * (1.0f + scale_fp32.y) + shift_fp32.y;
+
+    output_vec[i] = cast<PackedT, fp32x2_t>({out_x, out_y});
+  }
+
+  // ============ Step 4: Store output ============
+  auto* output_packed = reinterpret_cast<PackedT*>(output);
+  output_vec.store(output_packed + thread_packed_offset);
 }
 
-template <NormEnum norm_enum, typename T, IndexEnum scale_index_enum, IndexEnum shift_index_enum>
+template <NormEnum norm_enum, typename T, IndexEnum scale_index_enum, IndexEnum shift_index_enum, int64_t kDim>
 void fused_norm_scale_shift(
     tvm::ffi::TensorView out,
     const tvm::ffi::TensorView x,
@@ -208,10 +162,10 @@ void fused_norm_scale_shift(
   using namespace host;
 
   static_assert(
-      std::is_same_v<T, float> || std::is_same_v<T, half> || std::is_same_v<T, nv_bfloat16>,
-      "Only support float, fp16, bf16");
+      std::is_same_v<T, half> || std::is_same_v<T, nv_bfloat16>, "Only support fp16, bf16 for norm template version");
   static_assert(
       norm_enum == NormEnum::LayerNorm || norm_enum == NormEnum::RMSNorm, "norm_enum must be layernorm or rmsnorm.");
+  static_assert(host::norm::is_config_supported<T, kDim>(), "Unsupported norm configuration for kDim");
 
   host::norm_fusion::Matcher<T> checker;
   checker.template match<IndexEnum::NoBroadcast>(out);
@@ -230,53 +184,38 @@ void fused_norm_scale_shift(
   const auto S = checker.S_.unwrap();
   const auto F = checker.has_value_F ? checker.F_.unwrap() : 0;
   const auto D = checker.D_.unwrap();
-  RuntimeCheck((D % 4) == 0, "D must be divisible by 4");
+
+  // Verify D matches kDim
+  RuntimeCheck(D == kDim, "Tensor dimension D must match template kDim");
+
+  // Compute thread configuration based on kDim
+  constexpr bool kUseCTA = host::norm::should_use_cta<T, kDim>();
+  constexpr uint32_t kThreads = kUseCTA ? host::norm::get_cta_threads<T, kDim>() : device::kWarpThreads;
+
   dim3 grid(B * S);
-  dim3 block(0);
-  // Configure thread block
-  if (D <= 4096) {
-    block.x = (int)((D / 4 + 31) / 32 * 32);
-  } else {
-    block.x = (int)(((D + 7) / 8 + 31) / 32 * 32);
-  }
-  if (block.x > 1024) block.x = 1024;
+  dim3 block(kThreads);
 
   auto gamma_ptr = gamma_opt.has_value() ? gamma_opt.value().data_ptr() : nullptr;
   auto beta_ptr = beta_opt.has_value() ? beta_opt.value().data_ptr() : nullptr;
 
-  // Dispatch
-  auto dispatch = [&]() {
-    auto dispatch_ipt = [&](auto ipt_tag) {
-      LaunchKernel(grid, block, x.device())(
-          norm_fused_scale_shift_kernel<T, decltype(ipt_tag)::value, norm_enum, scale_index_enum, shift_index_enum>,
-          (T*)out.data_ptr(),
-          (const T*)x.data_ptr(),
-          (const T*)gamma_ptr,
-          (const T*)beta_ptr,
-          (const T*)scale.data_ptr(),
-          (const T*)shift.data_ptr(),
-          B,
-          S,
-          F,
-          D,
-          affine,
-          eps);
-    };
-
-    if (D <= 4096) {
-      dispatch_ipt(ItemPerThreadTag<1>{});
-    } else {
-      dispatch_ipt(ItemPerThreadTag<8>{});
-    }
-  };
-
-  dispatch();
+  // Launch kernel
+  LaunchKernel(grid, block, x.device())(
+      norm_fused_scale_shift_kernel<T, kDim, norm_enum, scale_index_enum, shift_index_enum>,
+      (T*)out.data_ptr(),
+      (const T*)x.data_ptr(),
+      (const T*)gamma_ptr,
+      (const T*)beta_ptr,
+      (const T*)scale.data_ptr(),
+      (const T*)shift.data_ptr(),
+      S,
+      F,
+      affine,
+      static_cast<float>(eps));
 }
 
-// Unified kernel for residual + gate + norm + scale/shift
 template <
     typename T,
-    int ITEM_PER_THREAD,
+    int64_t kDim,
     NormEnum norm_enum,
     IndexEnum scale_index_enum,
     IndexEnum shift_index_enum,
@@ -290,152 +229,162 @@ __global__ void norm_fused_res_gate_scale_shift_kernel(
     const T* __restrict__ beta,
     const T* __restrict__ scale,
     const T* __restrict__ shift,
-    const T* __restrict__ gate,  // nullptr means NoGate (use 1.0)
-    const int B,
+    const T* __restrict__ gate,
     const int S,
     const int F,
-    const int D,
     bool affine,
     float eps) {
   using namespace device;
+  using namespace device::norm;
+  using PackedT = packed_t<T>;
+  using Storage = StorageType<T, kDim>;
+
+  constexpr bool kUseCTA = host::norm::should_use_cta<T, kDim>();
+  // Storage size: for CTA norm it's 4, for warp norm it's kDim / (2 * 32)
+  constexpr int kStorageSize = kUseCTA ? 4 : (kDim / (2 * kWarpThreads));
+  constexpr int kPackedPerRow = kDim / 2;
+
+  // ============ Setup ============
+  __shared__ float smem_buffer[kSmemBufferSize];
 
   const int bidx = blockIdx.x;
   const int tidx = threadIdx.x;
-  const int bdimx = blockDim.x;
-  const int D4 = D >> 2;
   const int b_id = bidx / S;
   const int s_id = bidx % S;
-  const int offset = bidx * D4;
-  const int scale_offset = norm_fusion::get_offset<scale_index_enum>(S, F, b_id, s_id) * D4;
-  const int shift_offset = norm_fusion::get_offset<shift_index_enum>(S, F, b_id, s_id) * D4;
-  const int gate_offset = norm_fusion::get_offset<gate_index_enum>(S, F, b_id, s_id) * D4;
 
-  __shared__ float s_mean, s_variance;
-  __shared__ float smem_reduce[kWarpThreads];  // buffer for cta::reduce_sum
-  float local_sum = 0.0f;
-  Vec4<T> local_val[ITEM_PER_THREAD];
+  // Compute offsets
+  const int row_packed_offset = bidx * kPackedPerRow;
+  const int thread_packed_offset = row_packed_offset + tidx * kStorageSize;
+  const int gamma_packed_offset = tidx * kStorageSize;
 
-  // Pass 1: Load x, residual, gate and compute residual + x * gate
+  const int scale_row = norm_fusion::get_offset<scale_index_enum>(S, F, b_id, s_id);
+  const int shift_row = norm_fusion::get_offset<shift_index_enum>(S, F, b_id, s_id);
+  const int gate_row = norm_fusion::get_offset<gate_index_enum>(S, F, b_id, s_id);
+
+  // ============ Step 1: Load x, residual, gate and compute residual + x * gate ============
+  const auto* x_packed = reinterpret_cast<const PackedT*>(x);
+  const auto* residual_packed = reinterpret_cast<const PackedT*>(residual);
+  const auto* gate_packed = reinterpret_cast<const PackedT*>(gate);
+  const auto* gamma_packed = reinterpret_cast<const PackedT*>(gamma);
+  const auto* beta_packed = reinterpret_cast<const PackedT*>(beta);
+
+  Storage input_vec, gamma_vec, beta_vec;
+
+  // Load and compute residual + x * gate
+  Storage x_vec, r_vec, g_vec;
+  x_vec.load(x_packed + thread_packed_offset);
+  r_vec.load(residual_packed + thread_packed_offset);
+
+  // Load gate based on IndexEnum
+  if constexpr (gate_index_enum == IndexEnum::NotATensor) {
 #pragma unroll
-  for (int i = 0; i < ITEM_PER_THREAD; ++i) {
-    const int index = i * bdimx + tidx;
-    if (index < D4) {
-      Vec4<T> x_v, r_v, g_v;
-      x_v.load(x, offset + index);
-      r_v.load(residual, offset + index);
-      // Load gate based on IndexEnum (nullptr means NoGate)
-      if constexpr (gate_index_enum == IndexEnum::NotATensor) {
-        g_v.fill(T(1.0f));
-      } else if constexpr (gate_index_enum == IndexEnum::Scalar) {
-        g_v.fill(T(gate[0]));
-      } else {
-        g_v.load(gate, gate_offset + index);
-      }
-
-      Vec4<T> sum_v;
-#pragma unroll
-      for (int j = 0; j < 4; ++j) {
-        sum_v[j] = T(static_cast<float>(r_v[j]) + static_cast<float>(x_v[j]) * static_cast<float>(g_v[j]));
-      }
-      local_val[i] = sum_v;
-
-      if (residual_out != nullptr) {
-        sum_v.store(residual_out, offset + index);
-      }
-
-      if constexpr (norm_enum == NormEnum::LayerNorm) {
-        local_sum += vec4_sum(sum_v);
-      } else {
-        local_sum += vec4_sum_sq(sum_v);
-      }
-    } else {
-      local_val[i].fill(T(0.0f));
+    for (int i = 0; i < kStorageSize; ++i) {
+      g_vec[i] = cast<PackedT, fp32x2_t>({1.0f, 1.0f});
     }
-  }
-
-  // Reduce and compute mean
-  if (blockDim.x <= kWarpThreads) {
-    local_sum = warp::reduce_sum(local_sum);
+  } else if constexpr (gate_index_enum == IndexEnum::Scalar) {
+    float g = static_cast<float>(gate[0]);
+#pragma unroll
+    for (int i = 0; i < kStorageSize; ++i) {
+      g_vec[i] = cast<PackedT, fp32x2_t>({g, g});
+    }
   } else {
-    cta::reduce_sum(local_sum, smem_reduce);
-    local_sum = smem_reduce[0];
+    const int gate_packed_offset = gate_row * kPackedPerRow + tidx * kStorageSize;
+    g_vec.load(gate_packed + gate_packed_offset);
   }
-  if (threadIdx.x == 0) {
-    s_mean = local_sum / D;
-  }
-  __syncthreads();
 
-  // Pass 2 (LayerNorm only): Compute variance
-  if constexpr (norm_enum == NormEnum::LayerNorm) {
-    local_sum = 0.0f;
+  // Compute: input = residual + x * gate
 #pragma unroll
-    for (int i = 0; i < ITEM_PER_THREAD; ++i) {
-      const int index = i * bdimx + tidx;
-      if (index < D4) {
-        local_sum += vec4_variance_sum(local_val[i], s_mean);
-      }
-    }
-    if (blockDim.x <= kWarpThreads) {
-      local_sum = warp::reduce_sum(local_sum);
+  for (int i = 0; i < kStorageSize; ++i) {
+    auto x_fp32 = cast<fp32x2_t>(x_vec[i]);
+    auto r_fp32 = cast<fp32x2_t>(r_vec[i]);
+    auto g_fp32 = cast<fp32x2_t>(g_vec[i]);
+
+    float sum_x = r_fp32.x + x_fp32.x * g_fp32.x;
+    float sum_y = r_fp32.y + x_fp32.y * g_fp32.y;
+
+    input_vec[i] = cast<PackedT, fp32x2_t>({sum_x, sum_y});
+  }
+
+  // Store residual_out if needed
+  if (residual_out != nullptr) {
+    auto* residual_out_packed = reinterpret_cast<PackedT*>(residual_out);
+    input_vec.store(residual_out_packed + thread_packed_offset);
+  }
+
+  // ============ Step 2: Load gamma/beta ============
+  if (affine) {
+    gamma_vec.load(gamma_packed + gamma_packed_offset);
+    if constexpr (norm_enum == NormEnum::LayerNorm) {
+      beta_vec.load(beta_packed + gamma_packed_offset);
     } else {
-      cta::reduce_sum(local_sum, smem_reduce);
-      local_sum = smem_reduce[0];
+#pragma unroll
+      for (int i = 0; i < kStorageSize; ++i) {
+        beta_vec[i] = cast<PackedT, fp32x2_t>({0.0f, 0.0f});
+      }
+    }
+  } else {
+#pragma unroll
+    for (int i = 0; i < kStorageSize; ++i) {
+      gamma_vec[i] = cast<PackedT, fp32x2_t>({1.0f, 1.0f});
+      beta_vec[i] = cast<PackedT, fp32x2_t>({0.0f, 0.0f});
     }
   }
-  if (threadIdx.x == 0) {
-    s_variance = math::rsqrt(local_sum / D + eps);
+
+  // ============ Step 3: Apply norm using norm template ============
+  Storage norm_output;
+  if constexpr (kUseCTA) {
+    norm_output = apply_norm_cta<norm_enum, kDim>(input_vec, gamma_vec, beta_vec, eps, smem_buffer);
+  } else {
+    norm_output = apply_norm_warp<norm_enum, kDim>(input_vec, gamma_vec, beta_vec, eps);
   }
-  __syncthreads();
 
-  // Pre-load scalar scale/shift if needed
-  float scalar_scale = 0.0f, scalar_shift = 0.0f;
-  if constexpr (scale_index_enum == IndexEnum::Scalar) scalar_scale = static_cast<float>(scale[0]);
-  if constexpr (shift_index_enum == IndexEnum::Scalar) scalar_shift = static_cast<float>(shift[0]);
+  // ============ Step 4: Load scale/shift and apply ============
+  const auto* scale_packed = reinterpret_cast<const PackedT*>(scale);
+  const auto* shift_packed = reinterpret_cast<const PackedT*>(shift);
 
-    // Pass 3: Apply normalization, affine, scale/shift
+  Storage scale_vec, shift_vec;
+
+  // Load scale
+  if constexpr (scale_index_enum == IndexEnum::Scalar) {
+    float s = static_cast<float>(scale[0]);
 #pragma unroll
-  for (int i = 0; i < ITEM_PER_THREAD; ++i) {
-    const int index = i * bdimx + tidx;
-    if (index < D4) {
-      Vec4<T> gamma_val, beta_val;
-      if (affine) {
-        gamma_val.load(gamma, index);
-        beta_val.load(beta, index);
-      } else {
-        gamma_val.fill(T(1.0f));
-        beta_val.fill(T(0.0f));
-      }
-
-      // Load scale/shift based on IndexEnum
-      Vec4<T> scale_val, shift_val;
-      if constexpr (scale_index_enum == IndexEnum::Scalar) {
-        scale_val.fill(T(scalar_scale));
-      } else {
-        scale_val.load(scale, scale_offset + index);
-      }
-      if constexpr (shift_index_enum == IndexEnum::Scalar) {
-        shift_val.fill(T(scalar_shift));
-      } else {
-        shift_val.load(shift, shift_offset + index);
-      }
-      Vec4<T> tmp;
-#pragma unroll
-      for (int j = 0; j < 4; ++j) {
-        float normalized;
-        if constexpr (norm_enum == NormEnum::LayerNorm) {
-          normalized = (static_cast<float>(local_val[i][j]) - s_mean) * s_variance;
-        } else {
-          normalized = static_cast<float>(local_val[i][j]) * s_variance;
-        }
-        float affine_out = normalized * static_cast<float>(gamma_val[j]);
-        if constexpr (norm_enum == NormEnum::LayerNorm) {
-          affine_out += static_cast<float>(beta_val[j]);
-        }
-        tmp[j] = T(affine_out * (1.0f + static_cast<float>(scale_val[j])) + static_cast<float>(shift_val[j]));
-      }
-      tmp.store(output, offset + index);
+    for (int i = 0; i < kStorageSize; ++i) {
+      scale_vec[i] = cast<PackedT, fp32x2_t>({s, s});
     }
+  } else {
+    const int scale_packed_offset = scale_row * kPackedPerRow + tidx * kStorageSize;
+    scale_vec.load(scale_packed + scale_packed_offset);
   }
+
+  // Load shift
+  if constexpr (shift_index_enum == IndexEnum::Scalar) {
+    float s = static_cast<float>(shift[0]);
+#pragma unroll
+    for (int i = 0; i < kStorageSize; ++i) {
+      shift_vec[i] = cast<PackedT, fp32x2_t>({s, s});
+    }
+  } else {
+    const int shift_packed_offset = shift_row * kPackedPerRow + tidx * kStorageSize;
+    shift_vec.load(shift_packed + shift_packed_offset);
+  }
+
+  // Apply: output = norm * (1 + scale) + shift
+  Storage output_vec;
+#pragma unroll
+  for (int i = 0; i < kStorageSize; ++i) {
+    auto norm_fp32 = cast<fp32x2_t>(norm_output[i]);
+    auto scale_fp32 = cast<fp32x2_t>(scale_vec[i]);
+    auto shift_fp32 = cast<fp32x2_t>(shift_vec[i]);
+
+    float out_x = norm_fp32.x * (1.0f + scale_fp32.x) + shift_fp32.x;
+    float out_y = norm_fp32.y * (1.0f + scale_fp32.y) + shift_fp32.y;
+
+    output_vec[i] = cast<PackedT, fp32x2_t>({out_x, out_y});
+  }
+
+  // ============ Step 5: Store output ============
+  auto* output_packed = reinterpret_cast<PackedT*>(output);
+  output_vec.store(output_packed + thread_packed_offset);
 }
 
 template <
@@ -443,7 +392,8 @@ template <
     typename T,
     IndexEnum scale_index_enum,
     IndexEnum shift_index_enum,
-    IndexEnum gate_index_enum>
+    IndexEnum gate_index_enum,
+    int64_t kDim>
 void fused_scale_residual_norm_scale_shift(
     tvm::ffi::TensorView y,
     tvm::ffi::TensorView residual_out,
@@ -458,10 +408,10 @@ void fused_scale_residual_norm_scale_shift(
   using namespace host;
 
   static_assert(
-      std::is_same_v<T, float> || std::is_same_v<T, half> || std::is_same_v<T, nv_bfloat16>,
-      "Only support float, fp16, bf16");
+      std::is_same_v<T, half> || std::is_same_v<T, nv_bfloat16>, "Only support fp16, bf16 for norm template version");
   static_assert(
       norm_enum == NormEnum::LayerNorm || norm_enum == NormEnum::RMSNorm, "norm_enum must be layernorm or rmsnorm.");
+  static_assert(host::norm::is_config_supported<T, kDim>(), "Unsupported norm configuration for kDim");
 
   norm_fusion::Matcher<T> checker;
   checker.template match<IndexEnum::NoBroadcast>(y);
@@ -485,55 +435,37 @@ void fused_scale_residual_norm_scale_shift(
   const auto S = checker.S_.unwrap();
   const auto F = checker.has_value_F ? checker.F_.unwrap() : 0;
   const auto D = checker.D_.unwrap();
-  RuntimeCheck((D % 4) == 0, "D must be divisible by 4");
+
+  // Verify D matches kDim
+  RuntimeCheck(D == kDim, "Tensor dimension D must match template kDim");
+
+  // Compute thread configuration based on kDim
+  constexpr bool kUseCTA = host::norm::should_use_cta<T, kDim>();
+  constexpr uint32_t kThreads = kUseCTA ? host::norm::get_cta_threads<T, kDim>() : device::kWarpThreads;
+
   dim3 grid(B * S);
-  dim3 block(0);
-  // Configure thread block
-  if (D <= 4096) {
-    block.x = (int)((D / 4 + 31) / 32 * 32);
-  } else {
-    block.x = (int)(((D + 7) / 8 + 31) / 32 * 32);
-  }
-  if (block.x > 1024) block.x = 1024;
+  dim3 block(kThreads);
 
   auto gamma_ptr = gamma_opt.has_value() ? gamma_opt.value().data_ptr() : nullptr;
   auto beta_ptr = beta_opt.has_value() ? beta_opt.value().data_ptr() : nullptr;
   auto gate_ptr = gate_opt.has_value() ? gate_opt.value().data_ptr() : nullptr;
 
-  // Dispatch
-  auto launch = [&]() {
-    auto dispatch_ipt = [&](auto ipt_tag) {
-      LaunchKernel(grid, block, x.device())(
-          norm_fused_res_gate_scale_shift_kernel<
-              T,
-              decltype(ipt_tag)::value,
-              norm_enum,
-              scale_index_enum,
-              shift_index_enum,
-              gate_index_enum>,
-          (T*)y.data_ptr(),
-          (T*)residual_out.data_ptr(),
-          (const T*)x.data_ptr(),
-          (const T*)residual.data_ptr(),
-          (const T*)gamma_ptr,
-          (const T*)beta_ptr,
-          (const T*)scale.data_ptr(),
-          (const T*)shift.data_ptr(),
-          (const T*)gate_ptr,
-          B,
-          S,
-          F,
-          D,
-          affine,
-          eps);
-    };
-
-    if (D <= 4096) {
-      dispatch_ipt(ItemPerThreadTag<1>{});
-    } else {
-      dispatch_ipt(ItemPerThreadTag<8>{});
-    }
-  };
-  launch();
+  // Launch kernel
+  LaunchKernel(grid, block, x.device())(
+      norm_fused_res_gate_scale_shift_kernel<T, kDim, norm_enum, scale_index_enum, shift_index_enum, gate_index_enum>,
+      (T*)y.data_ptr(),
+      (T*)residual_out.data_ptr(),
+      (const T*)x.data_ptr(),
+      (const T*)residual.data_ptr(),
+      (const T*)gamma_ptr,
+      (const T*)beta_ptr,
+      (const T*)scale.data_ptr(),
+      (const T*)shift.data_ptr(),
+      (const T*)gate_ptr,
+      S,
+      F,
+      affine,
+      static_cast<float>(eps));
 }
+
 }  // namespace
