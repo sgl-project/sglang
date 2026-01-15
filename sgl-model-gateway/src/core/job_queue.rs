@@ -578,7 +578,7 @@ impl JobQueue {
                                 tokenizer_path: None,
                                 reasoning_parser: None,
                                 tool_parser: None,
-                                chat_template: None,
+                                chat_template: router_config.chat_template.clone(),
                                 bootstrap_port: None,
                                 health_check_timeout_secs: router_config.health_check.timeout_secs,
                                 health_check_interval_secs: router_config
@@ -590,6 +590,9 @@ impl JobQueue {
                                 health_failure_threshold: router_config
                                     .health_check
                                     .failure_threshold,
+                                disable_health_check: router_config
+                                    .health_check
+                                    .disable_health_check,
                                 max_connection_attempts: router_config
                                     .health_check
                                     .success_threshold
@@ -646,12 +649,13 @@ impl JobQueue {
                         tokenizer_path: None,
                         reasoning_parser: None,
                         tool_parser: None,
-                        chat_template: None,
+                        chat_template: router_config.chat_template.clone(),
                         bootstrap_port,
                         health_check_timeout_secs: router_config.health_check.timeout_secs,
                         health_check_interval_secs: router_config.health_check.check_interval_secs,
                         health_success_threshold: router_config.health_check.success_threshold,
                         health_failure_threshold: router_config.health_check.failure_threshold,
+                        disable_health_check: router_config.health_check.disable_health_check,
                         max_connection_attempts: router_config.health_check.success_threshold * 10,
                         dp_aware: router_config.dp_aware,
                     };

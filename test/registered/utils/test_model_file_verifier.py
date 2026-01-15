@@ -27,6 +27,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
+# Note: AMD registration removed - test_model_file_verifier fails on AMD
 register_cuda_ci(est_time=120, suite="nightly-1-gpu", nightly=True)
 
 MODEL_NAME = "Qwen/Qwen3-0.6B"

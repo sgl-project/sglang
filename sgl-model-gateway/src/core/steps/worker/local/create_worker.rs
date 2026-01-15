@@ -106,7 +106,7 @@ impl StepExecutor<LocalWorkerWorkflowData> for CreateLocalWorkerStep {
         let circuit_breaker_config = build_circuit_breaker_config(app_context);
 
         // Build health config
-        let health_config = build_health_config(app_context);
+        let health_config = build_health_config(app_context, config);
 
         // Normalize URL
         let normalized_url = normalize_url(&config.url, connection_mode);
@@ -270,7 +270,7 @@ fn build_circuit_breaker_config(app_context: &AppContext) -> CircuitBreakerConfi
     }
 }
 
-fn build_health_config(app_context: &AppContext) -> HealthConfig {
+fn build_health_config(app_context: &AppContext, config: &WorkerConfigRequest) -> HealthConfig {
     let cfg = &app_context.router_config.health_check;
     HealthConfig {
         timeout_secs: cfg.timeout_secs,
@@ -278,6 +278,7 @@ fn build_health_config(app_context: &AppContext) -> HealthConfig {
         endpoint: cfg.endpoint.clone(),
         failure_threshold: cfg.failure_threshold,
         success_threshold: cfg.success_threshold,
+        disable_health_check: cfg.disable_health_check || config.disable_health_check,
     }
 }
 
@@ -334,7 +335,11 @@ fn create_dp_aware_workers(
         }
 
         let worker = Arc::new(builder.build()) as Arc<dyn Worker>;
-        worker.set_healthy(false);
+        if health_config.disable_health_check {
+            worker.set_healthy(true);
+        } else {
+            worker.set_healthy(false);
+        }
         workers.push(worker);
 
         debug!(
@@ -358,6 +363,8 @@ fn create_single_worker(
     config: &WorkerConfigRequest,
     final_labels: &HashMap<String, String>,
 ) -> Vec<Arc<dyn Worker>> {
+    let health_check_disabled = health_config.disable_health_check;
+
     let mut builder = BasicWorkerBuilder::new(normalized_url.to_string())
         .model(model_card)
         .worker_type(worker_type)
@@ -374,7 +381,11 @@ fn create_single_worker(
     }
 
     let worker = Arc::new(builder.build()) as Arc<dyn Worker>;
-    worker.set_healthy(false);
+    if health_check_disabled {
+        worker.set_healthy(true);
+    } else {
+        worker.set_healthy(false);
+    }
 
     debug!(
         "Created worker object for {} ({:?}) with {} labels",
