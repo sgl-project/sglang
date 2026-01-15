@@ -8,11 +8,11 @@ python3 test_forward_split_prefill.py
 """
 
 import unittest
-from types import SimpleNamespace
 
 import numpy as np
 import torch
 
+from sglang.bench_one_batch import TreeCacheNamespace
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -61,6 +61,8 @@ class TestForwardSplitPrefill(CustomTestCase):
             pp_size=1,
             nccl_port=cls.port_args.nccl_port,
             server_args=cls.server_args,
+            moe_ep_rank=0,
+            moe_ep_size=1,
         )
 
         cls.tokenizer = get_tokenizer(
@@ -97,7 +99,7 @@ class TestForwardSplitPrefill(CustomTestCase):
             reqs.append(req)
 
         # Create dummy tree_cache for tests (no prefix caching, just allocation)
-        dummy_tree_cache = SimpleNamespace(
+        dummy_tree_cache = TreeCacheNamespace(
             page_size=1,
             device=self.model_runner.device,
             token_to_kv_pool_allocator=self.model_runner.token_to_kv_pool_allocator,
@@ -111,7 +113,6 @@ class TestForwardSplitPrefill(CustomTestCase):
             model_config=self.model_config,
             enable_overlap=False,
             spec_algorithm=SpeculativeAlgorithm.NONE,
-            enable_custom_logit_processor=False,
         )
         if is_split_prefill:
             batch.prepare_for_split_prefill()

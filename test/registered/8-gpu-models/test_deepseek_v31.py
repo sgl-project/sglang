@@ -12,7 +12,7 @@ register_cuda_ci(est_time=12000, suite="nightly-8-gpu-common", nightly=True)
 DEEPSEEK_V31_MODEL_PATH = "deepseek-ai/DeepSeek-V3.1"
 
 
-class TestDeepseekV31Unified(unittest.TestCase):
+class TestDeepseekV31(unittest.TestCase):
     """Unified test class for DeepSeek-V3.1 performance and accuracy.
 
     Two variants:
