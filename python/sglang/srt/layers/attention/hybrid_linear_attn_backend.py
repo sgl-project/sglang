@@ -973,26 +973,37 @@ class GDNAttnBackend(MambaAttnBackendBase):
         if self.ssm_k_last:
             # K-last -> V-last: transpose for kernel
             # ssm_states shape: (pool_size+1, HV, V, K) for K-last
-            ssm_input = ssm_states[cache_indices]  # [batch, HV, V, K]
-            ssm_states_v_last = ssm_input.transpose(-1, -2).contiguous()  # [batch, HV, K, V]
-            
-            core_attn_out = fused_sigmoid_gating_delta_rule_update(
-                A_log=A_log,
-                dt_bias=dt_bias,
-                q=query,
-                k=key,
-                v=value,
-                a=a,
-                b=b,
-                initial_state_source=ssm_states_v_last,
-                initial_state_indices=torch.arange(len(cache_indices), dtype=torch.int32, device=cache_indices.device),
-                cu_seqlens=query_start_loc,
-                use_qk_l2norm_in_kernel=True,
-                softplus_beta=1.0,
-                softplus_threshold=20.0,
-            )
-            # V-last -> K-last: transpose back and write to pool
-            ssm_states[cache_indices] = ssm_states_v_last.transpose(-1, -2)
+            valid_mask = cache_indices >= 0
+            if valid_mask.any():
+                valid_cache_indices = cache_indices[valid_mask]
+                ssm_input = ssm_states[valid_cache_indices]  # [valid, HV, V, K]
+                ssm_states_v_last = ssm_input.transpose(-1, -2).contiguous()  # [valid, HV, K, V]
+
+                core_attn_out = fused_sigmoid_gating_delta_rule_update(
+                    A_log=A_log,
+                    dt_bias=dt_bias,
+                    q=query,
+                    k=key,
+                    v=value,
+                    a=a,
+                    b=b,
+                    initial_state_source=ssm_states_v_last,
+                    initial_state_indices=torch.arange(
+                        ssm_states_v_last.shape[0],
+                        dtype=torch.int32,
+                        device=cache_indices.device,
+                    ),
+                    cu_seqlens=query_start_loc,
+                    use_qk_l2norm_in_kernel=True,
+                    softplus_beta=1.0,
+                    softplus_threshold=20.0,
+                )
+                # V-last -> K-last: transpose back and write to pool
+                ssm_states[valid_cache_indices] = ssm_states_v_last.transpose(-1, -2)
+            else:
+                core_attn_out = value.new_zeros(
+                    (1, seq_len, value.shape[1] // head_v_dim, head_v_dim)
+                )
         else:
             # V-last mode: ssm_states shape is (pool_size+1, HV, K, V)
             core_attn_out = fused_sigmoid_gating_delta_rule_update(
@@ -1211,8 +1222,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 if layer_id == 0:
                     self._cached_has_prefix_cache = (forward_batch.extend_prefix_lens > 0).any().item()
                 has_prefix_cache = self._cached_has_prefix_cache
+
+                # Only safe to use direct K-last buffer when K == V
+                kv_same = head_k_dim == head_v_dim
                 
-                if has_prefix_cache:
+                if has_prefix_cache or not kv_same:
                     # Has prefix cache: need to read and transpose existing state
                     ssm_input = ssm_states[cache_indices]  # [batch, HV, V, K]
                     recurrent_state = ssm_input.transpose(-1, -2).contiguous()  # [batch, HV, K, V]
