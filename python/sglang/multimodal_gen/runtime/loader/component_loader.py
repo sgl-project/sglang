@@ -422,7 +422,7 @@ class TextEncoderLoader(ComponentLoader):
         )
         model_config = get_diffusers_component_config(model_path=component_model_path)
         _clean_hf_config_inplace(model_config)
-        logger.info("HF model config: %s", model_config)
+        logger.debug("HF model config: %s", model_config)
 
         def is_not_first_encoder(module_name):
             return "2" in module_name
@@ -543,7 +543,7 @@ class ImageEncoderLoader(TextEncoderLoader):
         with open(os.path.join(component_model_path, "config.json")) as f:
             model_config = json.load(f)
         _clean_hf_config_inplace(model_config)
-        logger.info("HF model config: %s", model_config)
+        logger.debug("HF model config: %s", model_config)
 
         encoder_config = server_args.pipeline_config.image_encoder_config
         encoder_config.update_model_arch(model_config)
@@ -609,7 +609,7 @@ class VAELoader(ComponentLoader):
 
         server_args.model_paths["vae"] = component_model_path
 
-        logger.info("HF model config: %s", config)
+        logger.debug("HF model config: %s", config)
         vae_config = server_args.pipeline_config.vae_config
         vae_config.update_model_arch(config)
 
