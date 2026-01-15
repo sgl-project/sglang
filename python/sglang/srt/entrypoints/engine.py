@@ -605,9 +605,10 @@ class Engine(EngineBase):
         self, lora_name: str, tensors: List[Tuple[str, torch.Tensor]], config_dict: Dict
     ):
         # Load LoRA adapter again
-        serialized_tensors = MultiprocessingSerializer.serialize(
-            tensors, output_str=True
-        )
+        serialized_tensors = [
+            MultiprocessingSerializer.serialize(tensors, output_str=True)
+            for _ in range(self.server_args.tp_size)
+        ]
         lora_req = LoadLoRAAdapterFromTensorsReqInput(
             lora_name=lora_name,
             config_dict=config_dict,
