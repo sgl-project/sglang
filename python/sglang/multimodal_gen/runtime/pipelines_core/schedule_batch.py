@@ -138,6 +138,8 @@ class Req:
 
     # results
     output: torch.Tensor | None = None
+    audio: torch.Tensor | None = None
+    audio_sample_rate: int | None = None
 
     def __init__(self, **kwargs):
         # Initialize dataclass fields
@@ -297,6 +299,8 @@ class OutputBatch:
     """
 
     output: torch.Tensor | None = None
+    audio: torch.Tensor | None = None
+    audio_sample_rate: int | None = None
     trajectory_timesteps: list[torch.Tensor] | None = None
     trajectory_latents: torch.Tensor | None = None
     trajectory_decoded: list[torch.Tensor] | None = None

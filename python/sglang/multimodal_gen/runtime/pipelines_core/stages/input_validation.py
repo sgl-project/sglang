@@ -11,6 +11,7 @@ from PIL import Image
 
 from sglang.multimodal_gen.configs.pipeline_configs import WanI2V480PConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
+from sglang.multimodal_gen.configs.pipeline_configs.mova import MovaPipelineConfig
 from sglang.multimodal_gen.runtime.models.vision_utils import load_image, load_video
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
@@ -118,7 +119,10 @@ class InputValidationStage(PipelineStage):
                 batch.width = width
                 batch.height = height
 
-        elif server_args.pipeline_config.task_type == ModelTaskType.TI2V:
+        elif (
+            server_args.pipeline_config.task_type == ModelTaskType.TI2V
+            and not isinstance(server_args.pipeline_config, MovaPipelineConfig)
+        ):
             # duplicate with vae_image_processor
             # further processing for ti2v task
             if isinstance(

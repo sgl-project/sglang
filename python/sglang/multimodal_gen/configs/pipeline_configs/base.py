@@ -536,9 +536,29 @@ class PipelineConfig:
         )
         from sglang.multimodal_gen.registry import get_pipeline_config_classes
 
+        pipeline_config_cls = None
+
+        # If users explicitly specify a pipeline class name, try to resolve
+        # pipeline config classes directly without relying on model_index.json.
+        if pipeline_class_name:
+            config_classes = get_pipeline_config_classes(pipeline_class_name)
+            if config_classes is not None:
+                pipeline_config_cls, _ = config_classes
+                logger.info(
+                    "Using pipeline_class_name '%s' to resolve PipelineConfig: %s",
+                    pipeline_class_name,
+                    pipeline_config_cls.__name__,
+                )
+            else:
+                logger.warning(
+                    "pipeline_class_name '%s' not found in pipeline config registry; "
+                    "falling back to model auto-detection.",
+                    pipeline_class_name,
+                )
+
         # If model_path is a safetensors file and pipeline_class_name is specified,
         # try to get PipelineConfig from the registry first
-        if is_safetensors_file and pipeline_class_name:
+        if pipeline_config_cls is None and is_safetensors_file and pipeline_class_name:
             config_classes = get_pipeline_config_classes(pipeline_class_name)
             if config_classes is not None:
                 pipeline_config_cls, _ = config_classes
@@ -562,7 +582,7 @@ class PipelineConfig:
                         f"Available pipelines with config classes: {available_pipelines}"
                     )
                 pipeline_config_cls = model_info.pipeline_config_cls
-        else:
+        elif pipeline_config_cls is None:
             model_info = get_model_info(model_path)
             if model_info is None:
                 raise ValueError(

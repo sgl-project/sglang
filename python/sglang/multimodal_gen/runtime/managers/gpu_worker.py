@@ -129,6 +129,8 @@ class GPUWorker:
             if isinstance(result, Req):
                 output_batch = OutputBatch(
                     output=result.output,
+                    audio=getattr(result, "audio", None),
+                    audio_sample_rate=getattr(result, "audio_sample_rate", None),
                     timings=result.timings,
                     trajectory_timesteps=getattr(result, "trajectory_timesteps", None),
                     trajectory_latents=getattr(result, "trajectory_latents", None),

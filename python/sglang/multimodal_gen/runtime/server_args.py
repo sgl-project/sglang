@@ -727,6 +727,15 @@ class ServerArgs:
             help="The logging level of all loggers.",
         )
         parser.add_argument(
+            "--pipeline-class-name",
+            type=str,
+            default=None,
+            help=(
+                "Explicit pipeline class name to resolve PipelineConfig "
+                "when model auto-detection is insufficient (e.g., local paths)."
+            ),
+        )
+        parser.add_argument(
             "--backend",
             type=str,
             choices=Backend.choices(),

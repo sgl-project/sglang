@@ -233,6 +233,25 @@ class DiffGenerator:
                         continue
                     for output_idx, sample in enumerate(output_batch.output):
                         num_outputs = len(output_batch.output)
+                        audio = None
+                        audio_sample_rate = None
+                        if getattr(output_batch, "audio", None) is not None:
+                            audio_tensor = output_batch.audio
+                            if isinstance(audio_tensor, np.ndarray):
+                                audio = (
+                                    audio_tensor[output_idx]
+                                    if audio_tensor.ndim > 1
+                                    else audio_tensor
+                                )
+                            elif hasattr(audio_tensor, "shape"):
+                                audio = (
+                                    audio_tensor[output_idx]
+                                    if audio_tensor.ndim > 1
+                                    else audio_tensor
+                                )
+                            audio_sample_rate = getattr(
+                                output_batch, "audio_sample_rate", None
+                            )
                         frames = post_process_sample(
                             sample,
                             fps=req.fps,
@@ -242,6 +261,8 @@ class DiffGenerator:
                                 num_outputs, output_idx
                             ),
                             data_type=req.data_type,
+                            audio=audio,
+                            audio_sample_rate=audio_sample_rate,
                         )
 
                         result_item: dict[str, Any] = {

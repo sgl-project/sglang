@@ -45,6 +45,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.flux import (
 from sglang.multimodal_gen.configs.pipeline_configs.glm_image import (
     GlmImagePipelineConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.mova import MovaPipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImageEditPipelineConfig,
     QwenImageEditPlus_2511_PipelineConfig,
@@ -70,6 +71,7 @@ from sglang.multimodal_gen.configs.sample.hunyuan import (
     FastHunyuanSamplingParam,
     HunyuanSamplingParams,
 )
+from sglang.multimodal_gen.configs.sample.mova import MovaSamplingParams
 from sglang.multimodal_gen.configs.sample.qwenimage import (
     QwenImage2512SamplingParams,
     QwenImageEditPlusSamplingParams,
@@ -530,6 +532,12 @@ def _register_configs():
         hf_model_paths=[
             "FastVideo/FastWan2.1-T2V-1.3B-Diffusers",
         ],
+    )
+    # MoVA
+    register_configs(
+        sampling_param_cls=MovaSamplingParams,
+        pipeline_config_cls=MovaPipelineConfig,
+        model_detectors=[lambda hf_id: "mova" in hf_id.lower()],
     )
     # FLUX
     register_configs(

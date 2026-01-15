@@ -7,6 +7,7 @@ import time
 from typing import Any, List, Optional, Union
 
 import httpx
+import numpy as np
 from fastapi import UploadFile
 
 from sglang.multimodal_gen.configs.sample.sampling_params import DataType
@@ -221,12 +222,27 @@ async def process_generation_batch(
                 save_file_path = str(
                     os.path.join(batch.output_path, batch.output_file_name)
                 )
+                audio = None
+                audio_sample_rate = None
+                if getattr(result, "audio", None) is not None:
+                    audio_tensor = result.audio
+                    if isinstance(audio_tensor, np.ndarray):
+                        audio = (
+                            audio_tensor[idx] if audio_tensor.ndim > 1 else audio_tensor
+                        )
+                    elif hasattr(audio_tensor, "shape"):
+                        audio = (
+                            audio_tensor[idx] if audio_tensor.ndim > 1 else audio_tensor
+                        )
+                    audio_sample_rate = getattr(result, "audio_sample_rate", None)
                 post_process_sample(
                     result.output[idx],
                     batch.data_type,
                     batch.fps,
                     batch.save_output,
                     save_file_path,
+                    audio=audio,
+                    audio_sample_rate=audio_sample_rate,
                 )
                 save_file_path_list.append(save_file_path)
         else:
