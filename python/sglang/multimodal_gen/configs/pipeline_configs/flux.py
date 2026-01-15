@@ -15,10 +15,10 @@ from sglang.multimodal_gen.configs.models.encoders import (
     TextEncoderConfig,
 )
 from sglang.multimodal_gen.configs.models.encoders.base import TextEncoderArchConfig
+from sglang.multimodal_gen.configs.models.encoders.qwen3 import Qwen3TextConfig
 from sglang.multimodal_gen.configs.models.encoders.qwen_image import (
     _is_transformer_layer,
 )
-from sglang.multimodal_gen.configs.models.encoders.qwen3 import Qwen3TextConfig
 from sglang.multimodal_gen.configs.models.vaes.flux import Flux2VAEConfig, FluxVAEConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ImagePipelineConfig,

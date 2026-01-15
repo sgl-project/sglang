@@ -23,9 +23,10 @@ def _is_final_norm(n: str, m) -> bool:
 @dataclass
 class Qwen3TextArchConfig(TextEncoderArchConfig):
     """Architecture config for Qwen3 text encoder.
-    
+
     Qwen3 is similar to LLaMA but with QK-Norm (RMSNorm on Q and K before attention).
     """
+
     vocab_size: int = 151936
     hidden_size: int = 2560
     intermediate_size: int = 9728
@@ -49,7 +50,7 @@ class Qwen3TextArchConfig(TextEncoderArchConfig):
     head_dim: int = 128
     text_len: int = 512
     output_hidden_states: bool = True  # Klein needs hidden states from layers 9, 18, 27
-    
+
     # Stacked params for weight loading with tensor parallelism
     stacked_params_mapping: list[tuple[str, str, str]] = field(
         default_factory=lambda: [
@@ -61,7 +62,7 @@ class Qwen3TextArchConfig(TextEncoderArchConfig):
             (".gate_up_proj", ".up_proj", 1),
         ]
     )
-    
+
     # FSDP sharding conditions for CPU offload
     _fsdp_shard_conditions: list = field(
         default_factory=lambda: [_is_transformer_layer, _is_embeddings, _is_final_norm]
@@ -79,5 +80,6 @@ class Qwen3TextArchConfig(TextEncoderArchConfig):
 @dataclass
 class Qwen3TextConfig(TextEncoderConfig):
     """Top-level config for Qwen3 text encoder."""
+
     arch_config: TextEncoderArchConfig = field(default_factory=Qwen3TextArchConfig)
     prefix: str = "qwen3"

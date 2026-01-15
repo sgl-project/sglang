@@ -12,7 +12,6 @@ from sglang.multimodal_gen.configs.pipeline_configs.flux import (
     Flux2PipelineConfig,
     FluxPipelineConfig,
 )
-from sglang.multimodal_gen.configs.pipeline_configs.flux import FluxPipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.flux_finetuned import (
     Flux2FinetunedPipelineConfig,
 )

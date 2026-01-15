@@ -69,7 +69,7 @@ class Qwen3MLP(nn.Module):
 
 class Qwen3Attention(nn.Module):
     """Qwen3 attention with QK-Norm and tensor parallelism.
-    
+
     Key difference from LLaMA: RMSNorm is applied to Q and K before attention.
     """
 
@@ -98,7 +98,7 @@ class Qwen3Attention(nn.Module):
         else:
             assert tp_size % self.total_num_kv_heads == 0
         self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
-        
+
         self.head_dim = getattr(
             config, "head_dim", self.hidden_size // self.total_num_heads
         )
@@ -162,28 +162,28 @@ class Qwen3Attention(nn.Module):
         # QKV projection
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        
+
         # Reshape for QK-norm
         batch_size, seq_len = q.shape[0], q.shape[1]
         q = q.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
         k = k.reshape(batch_size, seq_len, self.num_kv_heads, self.head_dim)
         v = v.reshape(batch_size, seq_len, self.num_kv_heads, self.head_dim)
-        
+
         # Apply QK-Norm (key difference from LLaMA)
         q = self.q_norm(q)
         k = self.k_norm(k)
-        
+
         # Reshape back for rotary embeddings
         q = q.reshape(batch_size, seq_len, -1)
         k = k.reshape(batch_size, seq_len, -1)
-        
+
         # Apply rotary embeddings
         q, k = self.rotary_emb(positions, q, k)
-        
+
         # Reshape for attention
         q = q.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
         k = k.reshape(batch_size, seq_len, self.num_kv_heads, self.head_dim)
-        
+
         # Attention
         attn_output = self.attn(q, k, v)
         attn_output = attn_output.reshape(batch_size, seq_len, -1)
@@ -259,7 +259,7 @@ class Qwen3DecoderLayer(nn.Module):
 
 class Qwen3ForCausalLM(TextEncoder):
     """Qwen3 causal language model for text encoding in diffusion models.
-    
+
     Features:
     - Tensor parallelism support
     - FlashAttention/SageAttn/SDPA support via LocalAttention
@@ -272,7 +272,7 @@ class Qwen3ForCausalLM(TextEncoder):
 
         self.config = config
         self.quant_config = config.quant_config
-        
+
         # Embedding layer with tensor parallelism
         if config.lora_config is not None:
             max_loras = getattr(config.lora_config, "max_loras", 1)
@@ -322,12 +322,12 @@ class Qwen3ForCausalLM(TextEncoder):
             if output_hidden_states is not None
             else self.config.output_hidden_states
         )
-        
+
         if inputs_embeds is not None:
             hidden_states = inputs_embeds
         else:
             hidden_states = self.get_input_embeddings(input_ids)
-        
+
         residual = None
 
         if position_ids is None:
@@ -336,7 +336,7 @@ class Qwen3ForCausalLM(TextEncoder):
             ).unsqueeze(0)
 
         all_hidden_states: tuple[Any, ...] | None = () if output_hidden_states else None
-        
+
         for layer in self.layers:
             if all_hidden_states is not None:
                 all_hidden_states += (
@@ -361,18 +361,18 @@ class Qwen3ForCausalLM(TextEncoder):
         """Load weights with support for tensor parallelism and weight remapping."""
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
-        
+
         for name, loaded_weight in weights:
             # Strip 'model.' prefix from HuggingFace Qwen3 weights
             if name.startswith("model."):
                 name = name[6:]  # len("model.") == 6
-            
+
             # Skip rotary embedding weights
             if "rotary_emb.inv_freq" in name:
                 continue
             if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
                 continue
-            
+
             # Handle KV scale remapping
             if "scale" in name:
                 kv_scale_name: str | None = maybe_remap_kv_scale_name(name, params_dict)
@@ -380,7 +380,7 @@ class Qwen3ForCausalLM(TextEncoder):
                     continue
                 else:
                     name = kv_scale_name
-            
+
             # Handle stacked params mapping (qkv_proj, gate_up_proj)
             for (
                 param_name,
@@ -390,7 +390,7 @@ class Qwen3ForCausalLM(TextEncoder):
                 if weight_name not in name:
                     continue
                 name = name.replace(weight_name, param_name)
-                
+
                 # Skip loading extra bias for GPTQ models
                 if name.endswith(".bias") and name not in params_dict:
                     continue
@@ -413,9 +413,9 @@ class Qwen3ForCausalLM(TextEncoder):
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
-            
+
             loaded_params.add(name)
-        
+
         return loaded_params
 
 
