@@ -820,15 +820,15 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         max_images_per_call = get_int_env_var("SGLANG_VLM_MAX_IMAGES_PER_VIT", 0)
 
         if max_patches_per_call == 0 and max_images_per_call == 0:
-            # if self.use_data_parallel:
-            #     return run_dp_sharded_mrope_vision_model(
-            #         self.visual,
-            #         pixel_values,
-            #         image_grid_thw.tolist(),
-            #         rope_type="rope_3d",
-            #     )
-            # else:
-            return self.visual(pixel_values, grid_thw=image_grid_thw)
+            if self.use_data_parallel:
+                return run_dp_sharded_mrope_vision_model(
+                    self.visual,
+                    pixel_values,
+                    image_grid_thw.tolist(),
+                    rope_type="rope_3d",
+                )
+            else:
+                return self.visual(pixel_values, grid_thw=image_grid_thw)
 
         # compute the number of patches per image and the slice positions in pixel_values
         grid_thw_list = (
