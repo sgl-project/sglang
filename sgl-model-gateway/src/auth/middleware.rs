@@ -30,6 +30,9 @@ pub struct Principal {
     /// Display name if available
     pub name: Option<String>,
 
+    /// Tenant identifier from JWT claim (if available)
+    pub tenant_id: Option<String>,
+
     /// Authentication method used
     pub auth_method: AuthMethod,
 
@@ -77,22 +80,38 @@ pub struct ControlPlaneAuthState {
 
     /// Audit logger
     pub audit_logger: AuditLogger,
+
+    /// Optional tenant claim name for JWT extraction
+    pub tenant_claim: Option<String>,
 }
 
 impl ControlPlaneAuthState {
     /// Create a new control plane auth state.
-    pub fn new(config: ControlPlaneAuthConfig, jwt_validator: Option<Arc<JwtValidator>>) -> Self {
+    pub fn new(
+        config: ControlPlaneAuthConfig,
+        jwt_validator: Option<Arc<JwtValidator>>,
+        tenant_claim: Option<String>,
+    ) -> Self {
         let audit_logger = AuditLogger::new(config.audit_enabled);
         Self {
             config,
             jwt_validator,
             audit_logger,
+            tenant_claim,
         }
     }
 
     /// Create from config, initializing JWT validator if needed.
     pub async fn from_config(
         config: ControlPlaneAuthConfig,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Self::from_config_with_tenant_claim(config, None).await
+    }
+
+    /// Create from config with an optional tenant claim name.
+    pub async fn from_config_with_tenant_claim(
+        config: ControlPlaneAuthConfig,
+        tenant_claim: Option<String>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let jwt_validator = if let Some(jwt_config) = &config.jwt {
             Some(Arc::new(
@@ -102,7 +121,7 @@ impl ControlPlaneAuthState {
             None
         };
 
-        Ok(Self::new(config, jwt_validator))
+        Ok(Self::new(config, jwt_validator, tenant_claim))
     }
 
     /// Try to initialize control plane auth from config.
@@ -110,10 +129,18 @@ impl ControlPlaneAuthState {
     /// Returns `Some(state)` if auth is configured and initialized successfully.
     /// Returns `None` if auth is not configured or initialization fails (with error logged).
     pub async fn try_init(config: Option<&ControlPlaneAuthConfig>) -> Option<Self> {
+        Self::try_init_with_tenant_claim(config, None).await
+    }
+
+    /// Try to initialize control plane auth with an optional tenant claim name.
+    pub async fn try_init_with_tenant_claim(
+        config: Option<&ControlPlaneAuthConfig>,
+        tenant_claim: Option<String>,
+    ) -> Option<Self> {
         let config = config.filter(|c| c.is_enabled())?;
 
         info!("Initializing control plane authentication...");
-        match Self::from_config(config.clone()).await {
+        match Self::from_config_with_tenant_claim(config.clone(), tenant_claim).await {
             Ok(state) => {
                 if config.has_jwt() {
                     info!("Control plane JWT/OIDC authentication enabled");
@@ -264,9 +291,17 @@ pub async fn control_plane_auth_middleware(
                     return resp;
                 }
 
+                let tenant_id = auth_state
+                    .tenant_claim
+                    .as_deref()
+                    .and_then(|claim| validated_token.claims.extra.get(claim))
+                    .and_then(|value| value.as_str())
+                    .map(String::from);
+
                 let principal = Principal {
                     id: validated_token.subject.clone(),
                     name: validated_token.name.clone(),
+                    tenant_id,
                     auth_method: AuthMethod::Jwt {
                         issuer: validated_token.issuer.clone(),
                     },
@@ -325,6 +360,7 @@ pub async fn control_plane_auth_middleware(
         let principal = Principal {
             id: api_key_entry.id.clone(),
             name: Some(api_key_entry.name.clone()),
+            tenant_id: None,
             auth_method: AuthMethod::ApiKey {
                 key_id: api_key_entry.id.clone(),
             },

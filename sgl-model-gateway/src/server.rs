@@ -21,6 +21,7 @@ use tracing::{debug, error, info, warn, Level};
 
 use crate::{
     app_context::AppContext,
+    auth::PrincipalExt,
     config::{RouterConfig, RoutingMode},
     core::{
         job_queue::{JobQueue, JobQueueConfig},
@@ -148,7 +149,7 @@ async fn health_generate(State(state): State<Arc<AppState>>, req: Request) -> Re
 }
 
 async fn engine_metrics(State(state): State<Arc<AppState>>) -> Response {
-    WorkerManager::get_engine_metrics(&state.context.worker_registry, &state.context.client)
+    WorkerManager::get_engine_metrics(&state.context, None)
         .await
         .into_response()
 }
@@ -405,14 +406,20 @@ async fn v1_conversations_delete_item(
     .await
 }
 
-async fn flush_cache(State(state): State<Arc<AppState>>, _req: Request) -> Response {
-    WorkerManager::flush_cache_all(&state.context.worker_registry, &state.context.client)
+fn extract_tenant_id(req: &Request) -> Option<String> {
+    req.principal().and_then(|principal| principal.tenant_id.clone())
+}
+
+async fn flush_cache(State(state): State<Arc<AppState>>, req: Request) -> Response {
+    let tenant_id = extract_tenant_id(&req);
+    WorkerManager::flush_cache_all(&state.context, tenant_id.as_deref())
         .await
         .into_response()
 }
 
-async fn get_loads(State(state): State<Arc<AppState>>, _req: Request) -> Response {
-    WorkerManager::get_all_worker_loads(&state.context.worker_registry, &state.context.client)
+async fn get_loads(State(state): State<Arc<AppState>>, req: Request) -> Response {
+    let tenant_id = extract_tenant_id(&req);
+    WorkerManager::get_all_worker_loads(&state.context, tenant_id.as_deref())
         .await
         .into_response()
 }
@@ -1001,8 +1008,16 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     };
 
     // Initialize control plane authentication if configured
-    let control_plane_auth_state =
-        crate::auth::ControlPlaneAuthState::try_init(config.control_plane_auth.as_ref()).await;
+    let tenant_claim = config
+        .router_config
+        .worker_admin_key_map
+        .as_ref()
+        .map(|map| map.tenant_claim.clone());
+    let control_plane_auth_state = crate::auth::ControlPlaneAuthState::try_init_with_tenant_claim(
+        config.control_plane_auth.as_ref(),
+        tenant_claim,
+    )
+    .await;
 
     let app = build_app(
         app_state,

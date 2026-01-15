@@ -112,6 +112,19 @@ impl AppContext {
             .build()
             .map_err(|e| e.to_string())
     }
+
+    /// Resolve a worker admin API key from tenant + worker URL.
+    pub fn resolve_worker_admin_key(
+        &self,
+        tenant_id: Option<&str>,
+        worker_url: &str,
+    ) -> Option<String> {
+        let tenant_id = tenant_id?;
+        let map = self.router_config.worker_admin_key_map.as_ref()?;
+        let tenant = map.tenants.get(tenant_id)?;
+        let env_var = tenant.workers.get(worker_url)?;
+        std::env::var(env_var).ok()
+    }
 }
 
 impl AppContextBuilder {

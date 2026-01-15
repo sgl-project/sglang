@@ -563,6 +563,10 @@ struct CliArgs {
     #[arg(long = "control-plane-api-keys", action = ArgAction::Append, env = "CONTROL_PLANE_API_KEYS", help_heading = "Control Plane Authentication")]
     control_plane_api_keys: Vec<String>,
 
+    /// Path to worker admin key map YAML for multi-tenant worker auth
+    #[arg(long, help_heading = "Control Plane Authentication")]
+    worker_admin_key_map_path: Option<String>,
+
     /// Disable audit logging for control plane operations
     #[arg(
         long,
@@ -1024,6 +1028,7 @@ impl CliArgs {
             .circuit_breaker(!self.disable_circuit_breaker)
             .enable_wasm(self.enable_wasm)
             .igw(self.enable_igw)
+            .maybe_worker_admin_key_map_path(self.worker_admin_key_map_path.as_ref())
             .maybe_server_cert_and_key(self.tls_cert_path.as_ref(), self.tls_key_path.as_ref());
 
         builder.build()

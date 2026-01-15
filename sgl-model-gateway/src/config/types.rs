@@ -85,6 +85,30 @@ pub struct RouterConfig {
     /// Enable WASM support
     #[serde(default)]
     pub enable_wasm: bool,
+    /// Optional mapping for worker admin API keys (multi-tenant)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_admin_key_map: Option<WorkerAdminKeyMapConfig>,
+}
+
+/// Worker admin API key mapping for multi-tenant deployments.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerAdminKeyMapConfig {
+    /// JWT claim name for tenant identifier (default: "tenant_id")
+    #[serde(default = "default_tenant_claim")]
+    pub tenant_claim: String,
+    /// Mapping of tenant_id -> worker URL -> ENV var name
+    pub tenants: HashMap<String, WorkerAdminKeyTenantConfig>,
+}
+
+/// Per-tenant worker admin API key references.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerAdminKeyTenantConfig {
+    /// Worker URL -> ENV var name containing admin API key
+    pub workers: HashMap<String, String>,
+}
+
+fn default_tenant_claim() -> String {
+    "tenant_id".to_string()
 }
 
 /// Tokenizer cache configuration
@@ -670,6 +694,7 @@ impl Default for RouterConfig {
             enable_wasm: false,
             server_cert: None,
             server_key: None,
+            worker_admin_key_map: None,
         }
     }
 }
