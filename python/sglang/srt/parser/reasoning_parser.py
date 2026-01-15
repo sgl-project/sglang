@@ -161,7 +161,9 @@ class DeepSeekR1Detector(BaseReasoningFormatDetector):
     """
 
     def __init__(
-        self, stream_reasoning: bool = True, force_reasoning: bool = True, **kwargs
+        self, stream_reasoning: bool = True, force_reasoning: bool = True,
+        continue_final_message: bool = False,
+        previous_content: str = "",
     ):
         # DeepSeek-R1 is assumed to be reasoning until `</think>` token
         super().__init__(
@@ -169,7 +171,8 @@ class DeepSeekR1Detector(BaseReasoningFormatDetector):
             "</think>",
             force_reasoning=True,
             stream_reasoning=stream_reasoning,
-            **kwargs,
+            continue_final_message=continue_final_message,
+            previous_content=previous_content,
         )
         # https://github.com/sgl-project/sglang/pull/3202#discussion_r1950153599
 
