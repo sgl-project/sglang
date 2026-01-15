@@ -47,6 +47,7 @@ from sglang.srt.managers.io_struct import (
     GenerateReqInput,
     GetWeightsByNameReqInput,
     InitWeightsUpdateGroupReqInput,
+    LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterReqInput,
     MultimodalDataInputFormat,
     ReleaseMemoryOccupationReqInput,
@@ -600,6 +601,22 @@ class Engine(EngineBase):
             self.tokenizer_manager.get_weights_by_name(obj, None)
         )
 
+    def load_lora_adapter_from_tensors(
+        self, lora_name: str, tensors: List[Tuple[str, torch.Tensor]], config_dict: Dict
+    ):
+        # Load LoRA adapter again
+        serialized_tensors = MultiprocessingSerializer.serialize(
+            tensors, output_str=True
+        )
+        lora_req = LoadLoRAAdapterFromTensorsReqInput(
+            lora_name=lora_name,
+            config_dict=config_dict,
+            serialized_tensors=serialized_tensors,
+        )
+        return self.loop.run_until_complete(
+            self.tokenizer_manager.load_lora_adapter_from_tensors(lora_req, None)
+        )
+
     def load_lora_adapter(self, lora_name: str, lora_path: str, pinned: bool = False):
         """Load a new LoRA adapter without re-launching the engine."""
 
@@ -791,7 +808,7 @@ def _set_envs_and_config(server_args: ServerArgs):
         if _is_cuda:
             assert_pkg_version(
                 "sgl-kernel",
-                "0.3.20",
+                "0.3.21",
                 "Please reinstall the latest version with `pip install sgl-kernel --force-reinstall`",
             )
 
@@ -817,6 +834,31 @@ def _set_envs_and_config(server_args: ServerArgs):
 
     # Set mp start method
     mp.set_start_method("spawn", force=True)
+
+
+def _wait_for_scheduler_ready(
+    scheduler_pipe_readers: List,
+    scheduler_procs: List,
+) -> List[Dict]:
+    """Wait for the model to finish loading and return scheduler infos."""
+    scheduler_infos = []
+    for i in range(len(scheduler_pipe_readers)):
+        try:
+            data = scheduler_pipe_readers[i].recv()
+        except EOFError:
+            logger.error(
+                f"Rank {i} scheduler is dead. Please check if there are relevant logs."
+            )
+            scheduler_procs[i].join()
+            logger.error(f"Exit code: {scheduler_procs[i].exitcode}")
+            raise
+
+        if data["status"] != "ready":
+            raise RuntimeError(
+                "Initialization failed. Please see the error messages above."
+            )
+        scheduler_infos.append(data)
+    return scheduler_infos
 
 
 def _launch_scheduler_processes(
@@ -928,13 +970,13 @@ def _launch_subprocesses(
         # In multi-node cases, non-zero rank nodes do not need to run tokenizer or detokenizer,
         # so they can just wait here.
 
-        for reader in scheduler_pipe_readers:
-            data = reader.recv()
-            assert data["status"] == "ready"
+        scheduler_infos = _wait_for_scheduler_ready(
+            scheduler_pipe_readers, scheduler_procs
+        )
 
         if os.getenv("SGLANG_BLOCK_NONZERO_RANK_CHILDREN") == "0":
             # When using `Engine` as a Python API, we don't want to block here.
-            return None, None, None, port_args
+            return None, None, scheduler_infos, port_args
 
         launch_dummy_health_check_server(
             server_args.host, server_args.port, server_args.enable_metrics
@@ -945,7 +987,7 @@ def _launch_subprocesses(
             logger.error(
                 f"Scheduler or DataParallelController {proc.pid} terminated with {proc.exitcode}"
             )
-        return None, None, None, port_args
+        return None, None, scheduler_infos, port_args
 
     # Launch detokenizer process
     detoken_proc = mp.Process(
@@ -968,23 +1010,7 @@ def _launch_subprocesses(
         template_manager = None
 
     # Wait for the model to finish loading
-    scheduler_infos = []
-    for i in range(len(scheduler_pipe_readers)):
-        try:
-            data = scheduler_pipe_readers[i].recv()
-        except EOFError:
-            logger.error(
-                f"Rank {i} scheduler is dead. Please check if there are relevant logs."
-            )
-            scheduler_procs[i].join()
-            logger.error(f"Exit code: {scheduler_procs[i].exitcode}")
-            raise
-
-        if data["status"] != "ready":
-            raise RuntimeError(
-                "Initialization failed. Please see the error messages above."
-            )
-        scheduler_infos.append(data)
+    scheduler_infos = _wait_for_scheduler_ready(scheduler_pipe_readers, scheduler_procs)
 
     # Get back some info from scheduler to tokenizer_manager
     tokenizer_manager.max_req_input_len = scheduler_infos[0]["max_req_input_len"]

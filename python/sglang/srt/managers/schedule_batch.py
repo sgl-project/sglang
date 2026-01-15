@@ -58,22 +58,17 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
-from sglang.srt.mem_cache.allocator import (
-    BaseTokenToKVPoolAllocator,
-    SWATokenToKVPoolAllocator,
-)
+from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
-from sglang.srt.mem_cache.chunk_cache import SWAChunkCache
 from sglang.srt.mem_cache.common import (
     alloc_for_decode,
     alloc_for_extend,
     evict_from_tree_cache,
     release_kv_cache,
 )
-from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
+from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.metrics.collector import (
     DPCooperationInfo,
     SchedulerMetricsCollector,
@@ -262,6 +257,12 @@ class MultimodalDataItem:
 
         from sglang.srt.managers.mm_utils import hash_feature
 
+        if envs.SGLANG_MM_SKIP_COMPUTE_HASH.get():
+            import uuid
+
+            self.hash = uuid.uuid4().int
+            self.pad_value = self.hash % (1 << 30)
+            return
         if self.hash is None:
             if self.feature is not None:
                 hashed_feature = self.feature
@@ -358,6 +359,9 @@ class MultimodalInputs:
         ret.mm_items = [item for item in ret.mm_items if item.is_valid()]
 
         if envs.SGLANG_MM_BUFFER_SIZE_MB.get() > 0:
+            # Multi-modal feature hashing optimization:
+            # When SGLANG_MM_BUFFER_SIZE_MB > 0, we temporarily move feature tensors to GPU
+            # for faster hash computation, while avoiding OOM issues.
             from sglang.srt.managers.mm_utils import (
                 init_feature_buffer,
                 is_feature_buffer_initialized,
@@ -516,6 +520,7 @@ class Req:
         priority: Optional[int] = None,
         metrics_collector: Optional[SchedulerMetricsCollector] = None,
         extra_key: Optional[str] = None,
+        routing_key: Optional[str] = None,
         dimensions: Optional[int] = None,
         http_worker_ipc: Optional[str] = None,
     ):
@@ -544,8 +549,12 @@ class Req:
         # for corss-endoder model
         self.token_type_ids = token_type_ids
 
-        # The length of KV that have been removed in local attention chunked prefill
+        # The length of KV that have been removed in swa chunk cache
         self.evicted_seqlen_local = 0
+
+        # The index of the extend / decode batch
+        self.extend_batch_idx = 0
+        self.decode_batch_idx = 0
 
         # For multi-http worker
         self.http_worker_ipc = http_worker_ipc
@@ -571,6 +580,7 @@ class Req:
 
         self.extra_key = extra_key
         self.lora_id = lora_id
+        self.routing_key = routing_key
 
         # Memory pool info
         self.req_pool_idx: Optional[int] = None
@@ -708,6 +718,7 @@ class Req:
         self.embedding = None
 
         # Constrained decoding
+        self.grammar_key: Optional[str] = None
         self.grammar: Optional[BaseGrammarObject] = None
         self.grammar_wait_ct = 0
 
@@ -785,20 +796,11 @@ class Req:
 
     def pop_committed_kv_cache(self) -> int:
         """Return the length of committed KV cache and mark them as freed."""
-
-        # NOTE: This function is called exactly once after the request is finished.
-        global_server_args = get_global_server_args()
-        topk = global_server_args.speculative_eagle_topk
-
-        enable_kv_committed_len = topk is None or topk == 1
-        if enable_kv_committed_len:
-            assert (
-                not self.kv_committed_freed
-            ), f"Committed KV cache already freed ({self.kv_committed_len=})"
-            self.kv_committed_freed = True
-            return self.kv_committed_len
-        else:
-            return len(self.origin_input_ids) + max(len(self.output_ids) - 1, 0)
+        assert (
+            not self.kv_committed_freed
+        ), f"Committed KV cache already freed ({self.kv_committed_len=})"
+        self.kv_committed_freed = True
+        return self.kv_committed_len
 
     def pop_overallocated_kv_cache(self) -> Tuple[int, int]:
         """Return the range of over-allocated KV cache and mark them as freed."""
@@ -865,7 +867,7 @@ class Req:
                 key=RadixKey(token_ids=token_ids, extra_key=self.extra_key),
                 **(
                     {"req": self, "cow_mamba": True}
-                    if isinstance(tree_cache, MambaRadixCache)
+                    if tree_cache.supports_mamba()
                     else {}
                 ),
             )
@@ -1299,11 +1301,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         is_hybrid_swa = False
         if isinstance(token_to_kv_pool_allocator, SWATokenToKVPoolAllocator):
-            assert (
-                tree_cache is None
-                or isinstance(tree_cache, SWARadixCache)
-                or isinstance(tree_cache, SWAChunkCache)
-            ), "SWARadixCache or SWAChunkCache is required for SWATokenToKVPoolAllocator"
             is_hybrid_swa = True
 
         return cls(
@@ -1479,6 +1476,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req.req_pool_idx = req_pool_indices[i]
             assert seq_len - pre_len == req.extend_input_len
 
+            req.extend_batch_idx += 1
+
             # update req-level memory management fields
             req.kv_committed_len = seq_len
             req.kv_allocated_len = seq_len
@@ -1577,6 +1576,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     mm_item.feature = pixel_values.reconstruct_on_target_device(
                         torch.cuda.current_device()
                     )
+                    # The reference by CudaIpcTensorTransportProxy was cut off,
+                    # proactively delete to avoid slow gc.
+                    del pixel_values
         self.multimodal_inputs = multimodal_inputs
         self.token_type_ids = token_type_ids_tensor
         self.seq_lens_sum = sum(seq_lens)
@@ -1621,7 +1623,19 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         mamba_track_indices_cpu: List[int],
         mamba_track_seqlens_cpu: List[int],
     ):
-        mask = (req.extend_input_len // FLA_CHUNK_SIZE) * FLA_CHUNK_SIZE > 0
+        def _force_track_h(i: int) -> int:
+            assert i % FLA_CHUNK_SIZE == 0
+            # There are 3 cases for mamba_track_seqlen passed to mamba_track_seqlens_cpu:
+            # 1) aligned with FLA_CHUNK_SIZE-> retrieve from last_recurrent_state
+            #    a) is the last position -> retrieve from last_recurrent_state
+            #    b) is NOT the last position -> retrieve from h
+            # 2) unaligned with FLA_CHUNK_SIZE -> retrieve from h
+            # Currently, the math calculation only supports case 1a and 2. So for 1b, we need to add 1
+            # to force the math calculation to retrieve the correct mamba state from h.
+            return i + 1
+
+        mamba_cache_chunk_size = get_global_server_args().mamba_cache_chunk_size
+        mask = req.extend_input_len >= mamba_cache_chunk_size
         mamba_track_mask_cpu.append(mask)
         mamba_track_indices_cpu.append(
             req.mamba_ping_pong_track_buffer[req.mamba_next_track_idx].item()
@@ -1636,12 +1650,28 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # We need to pass the non-aligned seqlen to the calculation. Even though
             # we pass in mamba_track_seqlen, the actual tracked seqlen is mamba_last_track_seqlen.
             mamba_track_seqlen = len(req.prefix_indices) + req.extend_input_len
-            # mamba_last_track_seqlen is actual tracked seqlen. Used to pass to
+
+            # mamba_track_seqlen_aligned/mamba_last_track_seqlen is actual tracked seqlen. Used to pass to
             # mamba radix cache to track which seqlen this mamba state should store at.
             mamba_track_seqlen_aligned = (
                 len(req.prefix_indices)
+                + (req.extend_input_len // mamba_cache_chunk_size)
+                * mamba_cache_chunk_size
+            )
+
+            # mamba_track_fla_chunk_aligned is the aligned seqlen based on FLA_CHUNK_SIZE
+            # If mamba_track_fla_chunk_aligned != mamba_track_seqlen_aligned, which can be true when
+            # page_size > FLA_CHUNK_SIZE, we need to force the math calculation to retrieve the correct mamba state from h
+            # by _force_track_h()
+            mamba_track_fla_chunk_aligned = (
+                len(req.prefix_indices)
                 + (req.extend_input_len // FLA_CHUNK_SIZE) * FLA_CHUNK_SIZE
             )
+            if mamba_track_fla_chunk_aligned != mamba_track_seqlen_aligned:
+                # We want to track mamba_track_seqlen_aligned, and it's not the last position,
+                # so we need to add 1 to the seqlen to retrieve the correct mamba state from h.
+                mamba_track_seqlen = _force_track_h(mamba_track_seqlen_aligned)
+
             req.mamba_next_track_idx = (
                 self.req_to_token_pool.get_mamba_ping_pong_other_idx(
                     req.mamba_next_track_idx
@@ -1652,18 +1682,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 # is within the current extend batch.
                 branching_seqlen_aligned_mask = (
                     req.mamba_branching_seqlen - len(req.prefix_indices)
-                ) % FLA_CHUNK_SIZE == 0
+                ) % mamba_cache_chunk_size == 0
                 if (
                     req.mamba_branching_seqlen > len(req.prefix_indices)
                     and req.mamba_branching_seqlen < mamba_track_seqlen
                     and branching_seqlen_aligned_mask
                 ):
-                    # NOTE: See the comment above for mamba_track_seqlen, the +1 is necessary
-                    # because the branching point is not the last aligned position, so we need
-                    # to retrieve its state from h. Adding 1 will give us the correct index in h,
-                    # otherwise the calculation will retrieve the state from the last_recurrent_state,
-                    # which is not correct.
-                    mamba_track_seqlen = req.mamba_branching_seqlen + 1
+                    # We want to track mamba_track_seqlen_aligned, and it's not the last position,
+                    # so we need to add 1 to the seqlen to retrieve the correct mamba state from h.
+                    # See _force_track_h() for more details.
+                    mamba_track_seqlen = _force_track_h(req.mamba_branching_seqlen)
                     mamba_track_seqlen_aligned = req.mamba_branching_seqlen
             req.mamba_last_track_seqlen = mamba_track_seqlen_aligned
         mamba_track_seqlens_cpu.append(mamba_track_seqlen)
@@ -1907,6 +1935,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         # Update req-level memory management fields
         for req in self.reqs:
+            req.decode_batch_idx += 1
             req.kv_committed_len += 1
             req.kv_allocated_len += 1
 
