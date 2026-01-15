@@ -7,6 +7,7 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
@@ -17,6 +18,8 @@ from sglang.test.test_utils import (
     popen_launch_server,
     write_github_step_summary,
 )
+
+register_cuda_ci(est_time=300, suite="stage-b-test-small-1-gpu")
 
 
 class TestEvalAccuracyLarge(CustomTestCase):
