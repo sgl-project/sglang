@@ -53,7 +53,8 @@ class GptOssDetector(BaseFormatDetector):
 
         # Check for stream format without <|start|>assistant prefix
         # Pattern: <|channel|>commentary to=...
-        if "<|channel|>commentary to=" in text or "<|channel|>commentary  to=" in text:
+        # Use regex to handle variable whitespace (including newlines)
+        if re.search(r"<\|channel\|>commentary\s+to=", text):
             return True
 
         return False
