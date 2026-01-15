@@ -120,6 +120,7 @@ impl RouterConfigBuilder {
             balance_rel_threshold,
             eviction_interval_secs,
             max_tree_size,
+            mesh_sync_interval_secs: 1,
         };
         self
     }

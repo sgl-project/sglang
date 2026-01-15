@@ -42,6 +42,7 @@ impl MeshSyncManager {
             return Ok(());
         }
 
+        let num_ops = operations.len();
         let key = SKey::new(tree_state_key(&model_id));
 
         // Get current tree state or create new one
@@ -52,12 +53,10 @@ impl MeshSyncManager {
             TreeState::new(model_id.clone())
         };
 
-        // Add all operations in the batch
         for op in operations {
             tree_state.add_operation(op);
         }
 
-        // Serialize once for the entire batch
         let serialized = serde_json::to_vec(&tree_state)
             .map_err(|e| format!("Failed to serialize tree state: {}", e))?;
 
@@ -76,14 +75,13 @@ impl MeshSyncManager {
             version: new_version,
         };
 
-        let actor = self.self_name.clone();
-        self.stores.policy.insert(key, state, actor);
+        self.stores
+            .policy
+            .insert(key, state, self.self_name.clone());
 
         debug!(
             "Synced tree operation batch to mesh: model={} ops={} (version: {})",
-            model_id,
-            operations.len(),
-            new_version
+            model_id, num_ops, new_version
         );
 
         Ok(())

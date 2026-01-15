@@ -140,44 +140,35 @@ impl CacheAwarePolicy {
     /// Set mesh sync manager (can be called after construction)
     pub fn set_mesh_sync(&mut self, mesh_sync: OptionalMeshSyncManager) {
         self.mesh_sync = mesh_sync.clone();
+
         if let Some(ref sync_manager) = mesh_sync {
             self.restore_tree_state_from_mesh();
 
-            // Start the background sync task to flush buffered operations periodically
             let pending_ops_clone = Arc::clone(&self.pending_ops);
             let sync_manager_clone = sync_manager.clone();
             let interval = self.config.mesh_sync_interval_secs;
 
-            if interval > 0 {
-                self._sync_task = Some(PeriodicTask::spawn(interval, "MeshTreeSync", move || {
-                    for entry in pending_ops_clone.iter() {
-                        let model_id = entry.key();
-                        let mut ops_to_sync = Vec::new();
-
-                        // Extract batch from buffer
+            self._sync_task = Some(PeriodicTask::spawn(interval, "MeshTreeSync", move || {
+                for entry in pending_ops_clone.iter() {
+                    let model_id = entry.key().clone();
+                    let mut ops_to_sync = Vec::new();
+                    {
                         if let Ok(mut ops) = entry.value().lock() {
-                            if ops.is_empty() {
-                                continue;
-                            }
-                            std::mem::swap(&mut ops_to_sync, &mut *ops);
-                        }
-
-                        // Perform synchronization in the background
-                        if !ops_to_sync.is_empty() {
-                            for op in ops_to_sync {
-                                if let Err(e) =
-                                    sync_manager_clone.sync_tree_operation(model_id.clone(), op)
-                                {
-                                    warn!(
-                                        "Failed to sync batched tree operation for model {}: {}",
-                                        model_id, e
-                                    );
-                                }
+                            if !ops.is_empty() {
+                                std::mem::swap(&mut ops_to_sync, &mut *ops);
                             }
                         }
                     }
-                }));
-            }
+
+                    if !ops_to_sync.is_empty() {
+                        if let Err(e) =
+                            sync_manager_clone.sync_tree_operations_batch(model_id, ops_to_sync)
+                        {
+                            warn!("Failed to sync batch to mesh: {}", e);
+                        }
+                    }
+                }
+            }));
         }
     }
 
@@ -187,13 +178,14 @@ impl CacheAwarePolicy {
             return;
         }
 
-        let mesh_model_id = Self::normalize_mesh_model_id(model_id);
-        let entry = self
+        let mesh_model_id = Self::normalize_mesh_model_id(model_id).to_string();
+        if let Ok(mut ops) = self
             .pending_ops
-            .entry(mesh_model_id.to_string())
-            .or_insert_with(|| Mutex::new(Vec::new()));
-
-        if let Ok(mut ops) = entry.value().lock() {
+            .entry(mesh_model_id)
+            .or_insert_with(|| Mutex::new(Vec::new()))
+            .value()
+            .lock()
+        {
             ops.push(operation);
         }
     }

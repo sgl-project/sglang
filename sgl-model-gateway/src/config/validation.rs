@@ -157,12 +157,20 @@ impl ConfigValidator {
                 balance_rel_threshold,
                 eviction_interval_secs,
                 max_tree_size,
+                mesh_sync_interval_secs,
             } => {
                 if !(0.0..=1.0).contains(cache_threshold) {
                     return Err(ConfigError::InvalidValue {
                         field: "cache_threshold".to_string(),
                         value: cache_threshold.to_string(),
                         reason: "Must be between 0.0 and 1.0".to_string(),
+                    });
+                }
+                if *mesh_sync_interval_secs == 0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "mesh_sync_interval_secs".to_string(),
+                        value: mesh_sync_interval_secs.to_string(),
+                        reason: "Must be > 0".to_string(),
                     });
                 }
 
