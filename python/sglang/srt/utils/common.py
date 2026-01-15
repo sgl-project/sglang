@@ -45,6 +45,7 @@ import traceback
 import types
 import uuid
 import warnings
+import multiprocessing
 from collections import OrderedDict, defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -54,6 +55,7 @@ from importlib.util import find_spec
 from io import BytesIO
 from json import JSONDecodeError
 from multiprocessing.reduction import ForkingPickler
+
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
@@ -93,6 +95,7 @@ from typing_extensions import Literal
 
 from sglang.srt.environ import envs
 from sglang.srt.metrics.func_timer import enable_func_timer
+
 
 if TYPE_CHECKING:
     # Apparently importing this here is necessary to avoid a segfault, see comment in load_video below
@@ -2148,6 +2151,9 @@ def permute_weight(x: torch.Tensor) -> torch.Tensor:
 
 
 class MultiprocessingSerializer:
+
+    GLOBAL_AUTHKEY = 'SGLANG_IPC_GLOBAL_AUTHKEY'
+
     @staticmethod
     def serialize(obj, output_str: bool = False):
         """
@@ -2160,6 +2166,9 @@ class MultiprocessingSerializer:
         Returns:
             bytes or str: The serialized object.
         """
+        # HMAC key for integrity verification
+        multiprocessing.current_process().authkey = MultiprocessingSerializer.GLOBAL_AUTHKEY.encode()
+
         buf = io.BytesIO()
         ForkingPickler(buf).dump(obj)
         buf.seek(0)
@@ -2182,6 +2191,9 @@ class MultiprocessingSerializer:
         Returns:
             The deserialized Python object.
         """
+        # HMAC key for integrity verification
+        multiprocessing.current_process().authkey = MultiprocessingSerializer.GLOBAL_AUTHKEY.encode()
+
         if isinstance(data, str):
             # Decode base64 string to bytes
             data = pybase64.b64decode(data, validate=True)
