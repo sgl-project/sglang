@@ -683,6 +683,15 @@ class HiRadixCache(RadixCache):
 
         return True
 
+    def terminate_prefetch(self, req_id: str):
+        if req_id not in self.ongoing_prefetch:
+            return
+
+        _, _, _, operation = self.ongoing_prefetch[req_id]
+        if operation.host_indices is None:
+            return
+        operation.mark_terminate()
+
     def match_prefix(self, key: RadixKey, **kwargs):
         empty_value = torch.empty((0,), dtype=torch.int64, device=self.device)
         key, _ = self.maybe_bigram_convert(key)
