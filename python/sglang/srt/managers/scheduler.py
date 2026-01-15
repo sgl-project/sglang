@@ -1669,12 +1669,11 @@ class Scheduler(
         if (timeout_ms := envs.SGLANG_QUEUED_TIMEOUT_MS.get()) <= 0:
             return
 
-        deleted_reqs = []
+        deleted_reqs = set()
+        deadline = time.perf_counter() - (timeout_ms / 1000.0)
         for req in self.waiting_queue:
-            if (entry_time := req.time_stats.wait_queue_entry_time) <= 0:
-                continue
-            queued_ms = (time.perf_counter() - entry_time) * 1000
-            if queued_ms > timeout_ms:
+            entry_time = req.time_stats.wait_queue_entry_time
+            if 0 < entry_time < deadline:
                 self.send_to_tokenizer.send_output(
                     AbortReq(
                         finished_reason={
@@ -1686,7 +1685,7 @@ class Scheduler(
                     ),
                     req,
                 )
-                deleted_reqs.append(req)
+                deleted_reqs.add(req)
 
         if deleted_reqs:
             self.waiting_queue = [

@@ -232,9 +232,10 @@ class TestAbortWithQueueTimeout(CustomTestCase):
 
             error_count = 0
             for future in as_completed(futures):
-                if future.result().get("object") == "error":
+                result = future.result()
+                if result.get("object") == "error":
                     error_count += 1
-                    self.assertEqual(future.result()["code"], 503)
+                    self.assertEqual(result["code"], 503)
             self.assertEqual(error_count, 1)
 
 
