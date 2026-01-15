@@ -376,6 +376,15 @@ ChatCompletionMessageContentPart = Union[
     ChatCompletionMessageContentAudioPart,
 ]
 
+# Rerank content types for multimodal reranking (e.g., Qwen3-VL-Reranker)
+# Can be a simple string (text-only) or a list of multimodal content parts
+RerankContentPart = Union[
+    ChatCompletionMessageContentTextPart,
+    ChatCompletionMessageContentImagePart,
+    ChatCompletionMessageContentVideoPart,
+]
+RerankContent = Union[str, List[RerankContentPart]]
+
 
 class FunctionResponse(BaseModel):
     """Function response."""
@@ -872,15 +881,60 @@ class ScoringResponse(BaseModel):
 
 
 class V1RerankReqInput(BaseModel):
-    query: str
-    documents: List[str]
+    query: RerankContent = Field(
+        ...,
+        description="The query to match against documents. Can be a string (text-only) "
+        "or a list of content parts for multimodal queries (text, image_url, video_url).",
+    )
+    documents: List[RerankContent] = Field(
+        ...,
+        description="List of documents to rank. Each document can be a string (text-only) "
+        "or a list of content parts for multimodal documents (text, image_url, video_url).",
+    )
+    instruct: Optional[str] = Field(
+        default=None,
+        description="The instruct to the reranker model.",
+    )
+    top_n: Optional[int] = Field(
+        default=None,
+        description="Maximum number of documents to return. Defaults to returning all documents. "
+        "If specified value is greater than the total number of documents, all documents will be returned.",
+    )
+    return_documents: bool = Field(
+        default=True,
+        description="Whether to return documents in the response. Only included when set to true.",
+    )
+
+    @field_validator("top_n")
+    @classmethod
+    def validate_top_n(cls, v):
+        if v is not None and v < 1:
+            raise ValueError("Value error, parameter top_n should be larger than 0.")
+        return v
+
+    def is_multimodal(self) -> bool:
+        """Check if the request contains any multimodal content."""
+        if isinstance(self.query, list):
+            return True
+        for doc in self.documents:
+            if isinstance(doc, list):
+                return True
+        return False
 
 
 class RerankResponse(BaseModel):
     score: float
-    document: str
+    document: Optional[str] = None
     index: int
     meta_info: Optional[dict] = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        # Exclude document field if it's None
+        if self.document is None:
+            data.pop("document", None)
+        return data
 
 
 class TokenizeRequest(BaseModel):
