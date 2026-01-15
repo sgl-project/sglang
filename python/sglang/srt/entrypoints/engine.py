@@ -58,7 +58,6 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
-    PostLoadedWeightsReqInput,
 )
 from sglang.srt.managers.multi_tokenizer_mixin import MultiTokenizerRouter
 from sglang.srt.managers.scheduler import run_scheduler_process
@@ -91,118 +90,6 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 _is_cuda = is_cuda()
 
-# ---------------- MoE routing helpers ----------------
-from typing import Dict as _Dict, List as _List, Iterable as _Iterable, Set as _Set
-from collections import Counter
-import torch
-
-def _records_to_per_rids_subset(
-    records_obj,
-    wanted_rids: _Set[str],
-    *,
-    allow_multi_active_sequences: bool = False,
-) -> _Dict[str, _Dict]:
-    """
-    Fast path: single pass over records, accumulating only the RIDs we care about.
-    Handles both PREFILL (flattened tokens) and DECODE (1 token per row).
-    Output per rid: { "topk_ids_of_layer": Tensor[L, T_total, K], "positions": List[int], "physical_to_logical_map": Tensor[L,E_phys], "shape": {...} }
-    """
-    if not wanted_rids:
-        return {}
-
-    records = records_obj.get("records", [])
-    #print(f'wmy check records len {records}')
-    phys_to_log = records_obj.get("last_physical_to_logical_map", None)
-
-    per_rid_chunks: dict[str, _List[torch.Tensor]] = {rid: [] for rid in wanted_rids}
-    per_rid_prefill: dict[str, _List[torch.Tensor]] = {rid: [] for rid in wanted_rids}
-    per_rid_positions: dict[str, _List[int]] = {rid: [] for rid in wanted_rids}
-
-    def _append_piece(rid: str, topk_piece: torch.Tensor, pos_slice: _Iterable[int]):
-        per_rid_chunks[rid].append(topk_piece)
-        per_rid_positions[rid].extend(pos_slice)
-
-    for rec in records:
-        topk: torch.Tensor = rec["topk_ids_of_layer"]    # [L, T, K] (CPU)
-        rids: _List[str] = rec["rids"]
-        positions: _List[int] = rec["positions"]
-        ext: _List[int] | None = rec.get("extend_seq_lens", None)
-        T = int(topk.shape[1])
-
-        # Decode heuristic: exactly one token per active row
-        #print(f'wmy check ext {ext} len positions {len(positions)} len rids {len(rids)} topk size {topk.size()} token num {T}')
-        is_decode = (ext is None) or (len(positions) == len(rids))
-
-        if not allow_multi_active_sequences:
-            cnt = Counter(rids)
-            dups = [rid for rid, c in cnt.items() if c > 1]
-            if dups:
-                # If any of those dups intersect our wanted set, it's a real violation for our use-case
-                if any(r in wanted_rids for r in dups):
-                    stage = "DECODE" if is_decode else "PREFILL"
-                    raise AssertionError(
-                        f"Multiple active sequences detected in {stage} pass for RID(s): {sorted(set(dups) & wanted_rids)}. "
-                        f"Disable fan-out (n=1, no beam/best_of) or set allow_multi_active_sequences=True."
-                    )
-
-        if is_decode:
-            assert T == len(rids) == len(positions), \
-                f"Decode mismatch: T={T}, |rids|={len(rids)}, |positions|={len(positions)}"
-            # Column i belongs to rids[i]
-            for i, rid in enumerate(rids):
-                if rid in wanted_rids:
-                    _append_piece(rid, topk[:, i:i+1, :], [positions[i]])
-        else:
-            assert sum(ext) == T == len(positions), \
-                f"Prefill mismatch: sum(ext)={sum(ext)}, T={T}, |positions|={len(positions)}"
-            off = 0
-            for rid, n in zip(rids, ext):
-                if rid in wanted_rids and n > 0:
-                    sl = slice(off, off + n)
-                    _append_piece(rid, topk[:, sl, :], positions[off:off+n])
-                    per_rid_prefill[rid].append(topk[:, sl, :])
-                off += n
-
-    out: _Dict[str, _Dict] = {}
-    p2l = phys_to_log.cpu() if isinstance(phys_to_log, torch.Tensor) else phys_to_log
-    for rid in wanted_rids:
-        parts = per_rid_chunks[rid]
-        prefill = per_rid_prefill[rid]
-        if not parts:
-            continue
-        cat = torch.cat(parts, dim=1).cpu()  # [L, T_total, K]
-        prefill_c = torch.cat(prefill, dim=1).cpu()  # [L, T_total, K]
-        #print(f'wmy check cat size rid {rid=} {cat.size()} prefill size {prefill_c.size(1)} num_token {cat.shape[1]}')
-        out[rid] = {
-            "topk_ids_of_layer": cat,
-            "positions": per_rid_positions[rid],
-            "physical_to_logical_map": p2l,
-            "shape": {"num_layers": int(cat.shape[0]), "num_tokens": int(cat.shape[1]), "top_k": int(cat.shape[2])},
-        }
-    return out
-
-def _attach_routing_to_ret(ret, per_rid: _Dict[str, _Dict]) -> None:
-    """Attach per-RID routing to each response item's meta_info."""
-    def _serialize(entry: _Dict) -> _Dict:
-        topk = entry["topk_ids_of_layer"]
-        p2l = entry["physical_to_logical_map"]
-        return {
-            "topk_ids_of_layer": topk.tolist(),
-            "positions": entry["positions"],
-            "physical_to_logical_map": (p2l.tolist() if isinstance(p2l, torch.Tensor) else None),
-            "shape": entry["shape"],
-        }
-
-    if isinstance(ret, list):
-        for item in ret:
-            rid = item.get("meta_info", {}).get("id")
-            if rid and rid in per_rid:
-                item.setdefault("meta_info", {})["moe_routing"] = {"rid": rid, **_serialize(per_rid[rid])}
-    elif isinstance(ret, dict):
-        rid = ret.get("meta_info", {}).get("id")
-        if rid and rid in per_rid:
-            ret.setdefault("meta_info", {})["moe_routing"] = {"rid": rid, **_serialize(per_rid[rid])}
-# -----------------------------------------------------
 
 def init_tokenizer_manager(
     server_args: ServerArgs,
@@ -311,8 +198,6 @@ class Engine(EngineBase):
         except RuntimeError:
             self.loop = asyncio.new_event_loop()
             asyncio.set_event_loop(self.loop)
-            
-        self._expert_routing_lock = asyncio.Lock()
 
     def generate(
         self,
@@ -434,8 +319,6 @@ class Engine(EngineBase):
         data_parallel_rank: Optional[int] = None,
         external_trace_header: Optional[Dict] = None,
         rid: Optional[Union[List[str], str]] = None,
-        return_expert_routing: Optional[Union[List[bool], bool]] = False,
-        extra_key: Optional[Union[List[str], str]] = None,
     ) -> Union[Dict, AsyncIterator[Dict]]:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
@@ -474,64 +357,13 @@ class Engine(EngineBase):
             data_parallel_rank=data_parallel_rank,
             external_trace_header=external_trace_header,
             rid=rid,
-            extra_key=extra_key,
         )
-        def _any_true(x):
-            if isinstance(x, list):
-                return any(bool(v) for v in x)
-            return bool(x)
+        generator = self.tokenizer_manager.generate_request(obj, None)
 
-        if not _any_true(return_expert_routing):
-            generator = self.tokenizer_manager.generate_request(obj, None)
-
-            if stream is True:
-                return generator
-            else:
-                return await generator.__anext__()
+        if stream is True:
+            return generator
         else:
-            await self._expert_routing_lock.acquire()
-            try:
-                if stream is True:
-                    raise NotImplementedError("Expert statistics logging is not availale in streaming mode.")
-                else:
-                    await self.tokenizer_manager.start_expert_distribution_record()
-                    generator = self.tokenizer_manager.generate_request(obj, None)
-
-                    ret = await generator.__anext__()
-                    await self.tokenizer_manager.stop_expert_distribution_record()
-                    records_obj = await self.tokenizer_manager.dump_expert_distribution_record_object()
-
-                    # Determine which RIDs we actually need to attach
-                    if isinstance(ret, list):
-                        wanted = {item.get("meta_info", {}).get("id") for item in ret if item.get("meta_info")}
-                    else:
-                        wanted = {ret.get("meta_info", {}).get("id")} if ret.get("meta_info") else set()
-                    wanted = {rid for rid in wanted if rid}  # drop Nones
-                    print(f'zj check wanted {wanted}')
-
-                    # breakpoint()
-                    # Fast single-pass subset aggregation
-                    per_rid = _records_to_per_rids_subset(
-                        records_obj,
-                        wanted_rids=wanted,
-                        allow_multi_active_sequences=False,  # TODO flip to True only if you explicitly support fan-out
-                    )
-
-                    _attach_routing_to_ret(ret, per_rid)
-                    # breakpoint()
-
-                    # # TODO DEBUGGING ONLY
-                    # breakpoint() # TODO NOTE what if one prompt reaches EOS. records-1 or simply padding token id in the input_ids, where we can try using the rwo_idx to match back 
-                    # # TODO MOVE per req all to cpu
-                    # ret.setdefault("meta_info", {})["moe_routing_per_request"] = per_req
-                    return ret
-            finally:
-                # Safety: ensure recorder is not left on, and release the lock
-                try:
-                    await self.tokenizer_manager.stop_expert_distribution_record()
-                except Exception as e:
-                    logger.warning(f"Error stopping expert distribution record: {e}")
-                self._expert_routing_lock.release()
+            return await generator.__anext__()
 
     def encode(
         self,
@@ -726,20 +558,6 @@ class Engine(EngineBase):
         return self.loop.run_until_complete(
             self.tokenizer_manager.update_weights_from_tensor(obj, None)
         )
-
-    def post_loaded_weights(
-        self,
-    ):
-        obj = PostLoadedWeightsReqInput()
-        loop = asyncio.get_event_loop()
-
-        if loop.is_running():
-            task = asyncio.create_task(self.tokenizer_manager.post_loaded_weights(obj, None))
-            return task
-        else:
-            return loop.run_until_complete(
-                self.tokenizer_manager.post_loaded_weights(obj, None)
-            )
 
     def update_weights_from_disk(
         self,
