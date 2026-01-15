@@ -56,12 +56,7 @@ class LatentPreparationStage(PipelineStage):
         batch_size = batch.batch_size
 
         # Get required parameters
-        # TODO: debug hard code
-        dtype = (
-            batch.prompt_embeds[0][0].dtype
-            if isinstance(batch.prompt_embeds[0], list)
-            else batch.prompt_embeds[0].dtype
-        )
+        dtype = batch.prompt_embeds[0].dtype
         device = get_local_torch_device()
         generator = batch.generator
         latents = batch.latents
@@ -134,13 +129,13 @@ class LatentPreparationStage(PipelineStage):
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         """Verify latent preparation stage inputs."""
         result = VerificationResult()
-        # result.add_check(
-        #     "prompt_or_embeds",
-        #     None,
-        #     lambda _: V.string_or_list_strings(batch.prompt)
-        #     or V.list_not_empty(batch.prompt_embeds),
-        # )
-        # result.add_check("prompt_embeds", batch.prompt_embeds, V.list_of_tensors)
+        result.add_check(
+            "prompt_or_embeds",
+            None,
+            lambda _: V.string_or_list_strings(batch.prompt)
+            or V.list_not_empty(batch.prompt_embeds),
+        )
+        result.add_check("prompt_embeds", batch.prompt_embeds, V.list_of_tensors)
         result.add_check(
             "num_videos_per_prompt", batch.num_outputs_per_prompt, V.positive_int
         )

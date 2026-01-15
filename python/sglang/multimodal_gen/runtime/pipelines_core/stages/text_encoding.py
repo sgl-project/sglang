@@ -326,15 +326,15 @@ class TextEncodingStage(PipelineStage):
     def verify_output(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         """Verify text encoding stage outputs."""
         result = VerificationResult()
-        # result.add_check(
-        #     "prompt_embeds", batch.prompt_embeds, V.list_of_tensors_min_dims(2)
-        # )
-        # result.add_check(
-        #     "negative_prompt_embeds",
-        #     batch.negative_prompt_embeds,
-        #     lambda x: not batch.do_classifier_free_guidance
-        #     or V.list_of_tensors_with_min_dims(x, 2),
-        # )
+        result.add_check(
+            "prompt_embeds", batch.prompt_embeds, V.list_of_tensors_min_dims(2)
+        )
+        result.add_check(
+            "negative_prompt_embeds",
+            batch.negative_prompt_embeds,
+            lambda x: not batch.do_classifier_free_guidance
+            or V.list_of_tensors_with_min_dims(x, 2),
+        )
         if batch.debug:
             logger.debug(f"{batch.prompt_embeds=}")
             logger.debug(f"{batch.negative_prompt_embeds=}")
