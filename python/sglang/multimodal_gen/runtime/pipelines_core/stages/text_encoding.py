@@ -115,13 +115,12 @@ class TextEncodingStage(PipelineStage):
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         """Verify text encoding stage inputs."""
         result = VerificationResult()
-        # TODO: hack
-        # result.add_check("prompt", batch.prompt, V.string_or_list_strings)
-        # result.add_check(
-        #     "negative_prompt",
-        #     batch.negative_prompt,
-        #     lambda x: not batch.do_classifier_free_guidance or V.string_not_none(x),
-        # )
+        result.add_check("prompt", batch.prompt, V.string_or_list_strings)
+        result.add_check(
+            "negative_prompt",
+            batch.negative_prompt,
+            lambda x: not batch.do_classifier_free_guidance or V.string_not_none(x),
+        )
         result.add_check(
             "do_classifier_free_guidance",
             batch.do_classifier_free_guidance,
