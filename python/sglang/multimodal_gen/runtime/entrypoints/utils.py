@@ -163,13 +163,25 @@ def post_process_sample(
                         # Try to merge if ffmpeg is available
                         try:
                             import subprocess
+                            import shutil
+
+                            ffmpeg_exe = "ffmpeg"
+                            ffmpeg_on_path = shutil.which("ffmpeg")
+                            if ffmpeg_on_path:
+                                ffmpeg_exe = ffmpeg_on_path
+                            try:
+                                import imageio_ffmpeg
+
+                                ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+                            except Exception:
+                                pass
 
                             merged_path = (
                                 save_file_path.rsplit(".", 1)[0] + ".tmp_mux.mp4"
                             )
                             subprocess.run(
                                 [
-                                    "ffmpeg",
+                                    ffmpeg_exe,
                                     "-y",
                                     "-i",
                                     save_file_path,
@@ -195,8 +207,11 @@ def post_process_sample(
                             logger.info(
                                 f"Merged video saved to {CYAN}{save_file_path}{RESET}"
                             )
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            logger.warning(
+                                "Failed to mux audio into mp4 (kept separate wav): %s",
+                                str(e),
+                            )
 
             else:
                 quality = 75

@@ -368,19 +368,29 @@ class LTX2AVDenoisingStage(DenoisingStage):
             # We don't have SP support for audio latents yet (or needed?)
             batch.trajectory_audio_latents = trajectory_audio_tensor.cpu()
 
-        # 3. DO NOT Unpack and Denormalize here
-        # We move this responsibility to DecodingStage to avoid double processing
-        # and to keep Latents in packed format until the last moment if needed.
-        # But wait, DecodingStage expects latents to be... what?
-        # Standard DecodingStage expects latents to be [B, C, F, H, W] usually.
-        # But here latents are packed [B, S, D].
-        
-        # If we don't unpack here, we must ensure DecodingStage handles packed latents.
-        # We modified LTX2AVDecodingStage to handle packed latents via _unpad_and_unpack_latents.
-        # So we should skip it here.
-        
-        batch.latents = latents
-        batch.audio_latents = batch.audio_latents
+        # 3. Unpack and Denormalize
+        # Call pipeline_config._unpad_and_unpack_latents
+        # latents is video latents.
+        # batch.audio_latents is audio latents.
+
+        audio_latents = batch.audio_latents
+
+        # NOTE: self.vae and self.audio_vae should be populated via __init__ or manual setting
+        if self.vae is None or self.audio_vae is None:
+            logger.warning(
+                "VAE or Audio VAE not found in DenoisingStage. Skipping unpack and denormalize."
+            )
+            batch.latents = latents
+            batch.audio_latents = audio_latents
+        else:
+            latents, audio_latents = (
+                server_args.pipeline_config._unpad_and_unpack_latents(
+                    latents, audio_latents, batch, self.vae, self.audio_vae
+                )
+            )
+
+            batch.latents = latents
+            batch.audio_latents = audio_latents
 
         # 4. Cleanup
         offload_mgr = getattr(self.transformer, "_layerwise_offload_manager", None)
