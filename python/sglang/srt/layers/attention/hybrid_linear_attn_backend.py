@@ -914,6 +914,18 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 )
                 GDNAttnBackend._k_last_decode_warning_shown = True
 
+    def init_forward_metadata(self, forward_batch: ForwardBatch):
+        """Override to pre-compute has_prefix_cache, avoiding GPU-CPU sync in forward_extend."""
+        super().init_forward_metadata(forward_batch)
+        # Pre-compute has_prefix_cache only for K-last extend mode (not target_verify)
+        if (self.ssm_k_last 
+            and forward_batch.forward_mode.is_extend() 
+            and not forward_batch.forward_mode.is_target_verify()):
+            # This .item() call happens once per batch in init, not per layer in forward
+            self._cached_has_prefix_cache = (forward_batch.extend_prefix_lens > 0).any().item()
+        else:
+            self._cached_has_prefix_cache = False
+
     def forward_decode(
         self,
         q: torch.Tensor,
@@ -1217,10 +1229,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             # For K-last layout, we need to handle V-last kernel with K-last pool
             if self.ssm_k_last:
                 batch_size = cache_indices.shape[0]
-                # Check if any request has prefix cache (non-zero initial state)
-                # Only sync on layer 0, reuse cached result for subsequent layers
-                if layer_id == 0:
-                    self._cached_has_prefix_cache = (forward_batch.extend_prefix_lens > 0).any().item()
+                # has_prefix_cache is pre-computed in init_forward_metadata (no GPU-CPU sync here)
                 has_prefix_cache = self._cached_has_prefix_cache
 
                 # Only safe to use direct K-last buffer when K == V
