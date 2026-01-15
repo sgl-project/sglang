@@ -134,6 +134,12 @@ class _ImageProcessStage(PipelineStage):
                 f"Please adjust the width to a multiple of {vae_scale}."
             )
 
+        # TODO:
+        # hard code with image size
+        # dulplicate with input_validation_stage
+        batch.height = image_height
+        batch.width = image_width
+
         # TODO: hard code debug
         # should be condition_images(a list)
         # condition_images -> prepare_image_latents
@@ -204,7 +210,8 @@ class _PrepareImageLatentsStage(PipelineStage):
         # a 2d list
         # dim0 = batch_size
         # dim1 = num_images
-        condition_latents = [image_latents.copy() for _ in range(batch_size)]
+        # condition_latents = [image_latents.copy() for _ in range(batch_size)]
+        condition_latents = [image_latents for _ in range(batch_size)]
         # TODO: review
         # casting
         condition_latents = [
@@ -353,11 +360,6 @@ class ZImagePipeline(LoRAPipeline, ComposedPipelineBase):
         self.image_processor = Flux2ImageProcessor(
             vae_scale_factor=vae_scale_factor * 2
         )
-
-        # import debugpy
-        # debugpy.listen(('127.0.0.1', 9901))
-        # print('Waiting for debugger attach')
-        # debugpy.wait_for_client()
 
         self.add_stage(
             stage_name="input_validation_stage", stage=InputValidationStage()
