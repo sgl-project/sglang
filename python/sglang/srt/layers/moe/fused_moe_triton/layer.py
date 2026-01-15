@@ -27,6 +27,7 @@ from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import (
     MoeRunnerConfig,
+    enable_nextn_moe_sparse_fully_dp,
     get_deepep_mode,
     get_moe_a2a_backend,
     get_moe_runner_backend,
@@ -187,10 +188,16 @@ class FusedMoE(torch.nn.Module):
         self.enable_flashinfer_cutlass_moe = (
             get_moe_runner_backend().is_flashinfer_cutlass()
         )
-        self.moe_ep_size = get_moe_expert_parallel_world_size()
-        self.moe_ep_rank = get_moe_expert_parallel_rank()
-        self.moe_tp_size = get_moe_tensor_parallel_world_size()
-        self.moe_tp_rank = get_moe_tensor_parallel_rank()
+        if enable_nextn_moe_sparse_fully_dp():
+            self.moe_ep_size = 1
+            self.moe_ep_rank = 0
+            self.moe_tp_size = 1
+            self.moe_tp_rank = 0
+        else:
+            self.moe_ep_size = get_moe_expert_parallel_world_size()
+            self.moe_ep_rank = get_moe_expert_parallel_rank()
+            self.moe_tp_size = get_moe_tensor_parallel_world_size()
+            self.moe_tp_rank = get_moe_tensor_parallel_rank()
         assert (num_experts - num_fused_shared_experts) % self.moe_ep_size == 0
         self.num_local_experts = (
             num_experts - num_fused_shared_experts

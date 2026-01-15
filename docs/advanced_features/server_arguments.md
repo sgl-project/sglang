@@ -264,6 +264,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--speculative-attention-mode` | Attention backend for speculative decoding operations (both target verify and draft extend). Can be one of 'prefill' (default) or 'decode'. | `prefill` | `prefill`, `decode` |
 | `--speculative-moe-runner-backend` | MOE backend for EAGLE speculative decoding, see --moe-runner-backend for options. Same as moe runner backend if unset. | `None` | |
 | `--speculative-moe-a2a-backend` | MOE A2A backend for EAGLE speculative decoding, see --moe-a2a-backend for options. Same as moe a2a backend if unset. | `None` | |
+| `--speculative-moe-tp-size` | MOE TP size for EAGLE speculative decoding layer. Can be used to reduce communication overhead. Same as tp size if unset. | `None` | Type: int |
 
 ## Ngram speculative decoding
 | Argument | Description | Defaults | Options |

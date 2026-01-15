@@ -3,6 +3,7 @@ from sglang.srt.layers.moe.utils import (
     DeepEPMode,
     MoeA2ABackend,
     MoeRunnerBackend,
+    enable_nextn_moe_sparse_fully_dp,
     get_deepep_config,
     get_deepep_mode,
     get_moe_a2a_backend,
@@ -27,4 +28,5 @@ __all__ = [
     "is_tbo_enabled",
     "get_tbo_token_distribution_threshold",
     "get_deepep_config",
+    "enable_nextn_moe_sparse_fully_dp",
 ]
