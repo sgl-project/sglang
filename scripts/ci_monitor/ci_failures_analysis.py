@@ -383,6 +383,34 @@ class SGLangFailuresAnalyzer:
                 test_summary = self.parse_test_summary(logs) if logs else None
                 self.test_summaries[job_id] = test_summary
 
+                # Debug logging for failed jobs without test summary
+                if not test_summary:
+                    job_name = run_info.get("job_name", "unknown")
+                    run_number = run_info.get("run_number", "unknown")
+                    job_url = run_info.get("job_url", "N/A")
+                    log_size = len(logs) if logs else 0
+                    print(
+                        f"  ⚠️  Job failed without test summary: {job_name} (Run #{run_number})"
+                    )
+                    print(f"      URL: {job_url}")
+                    print(
+                        f"      Log size: {log_size} chars, Logs available: {bool(logs)}"
+                    )
+                    if logs:
+                        # Show a snippet of the logs to help debug
+                        log_snippet = logs[-500:] if len(logs) > 500 else logs
+                        print(f"      Last 500 chars of logs: {log_snippet[:200]}...")
+                elif test_summary.get("incomplete"):
+                    # Log when we inferred a test from timeout
+                    job_name = run_info.get("job_name", "unknown")
+                    run_number = run_info.get("run_number", "unknown")
+                    inferred_tests = [
+                        t["test_file"] for t in test_summary.get("failed_tests", [])
+                    ]
+                    print(
+                        f"  ⏱️  Inferred timeout test for {job_name} (Run #{run_number}): {inferred_tests}"
+                    )
+
                 if test_summary and test_summary["failed_tests"]:
                     parsed_any_test_summary = True
                     # Track each failed test
@@ -1680,10 +1708,20 @@ class SGLangFailuresAnalyzer:
                             "🔥 **Tests with consecutive failures (≥2) & currently failing**"
                         )
                         summary_lines.append("")
-                        summary_lines.append(
-                            "_Note: ⏱️ indicates test was last running when logs cut off (possible timeout)_"
+
+                        # Check if any test has timeout indicator
+                        has_timeout = any(
+                            any(
+                                r.get("status") == "⏱️"
+                                for r in t["test_data"].get("recent_runs", [])
+                            )
+                            for t in streak_tests
                         )
-                        summary_lines.append("")
+                        if has_timeout:
+                            summary_lines.append(
+                                "_Note: ⏱️ indicates test was last running when logs cut off (possible timeout)_"
+                            )
+                            summary_lines.append("")
                         summary_lines.append(
                             "| Test File | Job | Failures | Streak | First | Last | Recent Runs (oldest → latest) |"
                         )
@@ -1733,8 +1771,8 @@ class SGLangFailuresAnalyzer:
                                 history_links = "… " + " ".join(
                                     [
                                         f"[{r['status']}]({r['job_url']})"
-                                        for r in recent_runs[-5:]
-                                    ]  # Last 5 runs
+                                        for r in recent_runs[-10:]
+                                    ]  # Last 10 runs
                                 )
                             else:
                                 history_links = "N/A"
@@ -1761,10 +1799,20 @@ class SGLangFailuresAnalyzer:
                             "📋 **Other tests with failures (ranked by failure rate)**"
                         )
                         summary_lines.append("")
-                        summary_lines.append(
-                            "_Note: ⏱️ indicates test was last running when logs cut off (possible timeout)_"
+
+                        # Check if any test has timeout indicator
+                        has_timeout = any(
+                            any(
+                                r.get("status") == "⏱️"
+                                for r in t["test_data"].get("recent_runs", [])
+                            )
+                            for t in non_streak_tests
                         )
-                        summary_lines.append("")
+                        if has_timeout:
+                            summary_lines.append(
+                                "_Note: ⏱️ indicates test was last running when logs cut off (possible timeout)_"
+                            )
+                            summary_lines.append("")
                         summary_lines.append(
                             "| Test File | Job | Failed | Total | Fail Rate | Recent Runs (oldest → latest) |"
                         )
@@ -1797,7 +1845,7 @@ class SGLangFailuresAnalyzer:
                                 history_links = "… " + " ".join(
                                     [
                                         f"[{r['status']}]({r['job_url']})"
-                                        for r in recent_runs[-5:]
+                                        for r in recent_runs[-10:]
                                     ]
                                 )
                             else:
@@ -2146,32 +2194,6 @@ class SGLangFailuresAnalyzer:
                     key=lambda x: sum(test["count"] for test in x[1].values()),
                     reverse=True,
                 )
-
-                # Create summary table of all problematic runners first
-                summary_lines.append("**Runners with repeated test failures:**")
-                summary_lines.append("")
-                summary_lines.append("| Runner | Tests Affected | Total Failures |")
-                summary_lines.append("|--------|----------------|----------------|")
-
-                for runner_key, tests in sorted_runners[:20]:  # Show top 20 in summary
-                    # Get runner name from first test
-                    first_test = next(iter(tests.values()))
-                    runner_name = first_test.get("runner_name", runner_key)
-                    total_failures = sum(test["count"] for test in tests.values())
-
-                    # Highlight runners with many failures
-                    if total_failures >= 5:
-                        summary_lines.append(
-                            f"| <span style='color:red'>`{runner_name}`</span> | <span style='color:red'>{len(tests)}</span> | <span style='color:red'>{total_failures}</span> |"
-                        )
-                    else:
-                        summary_lines.append(
-                            f"| `{runner_name}` | {len(tests)} | {total_failures} |"
-                        )
-
-                summary_lines.append("")
-                summary_lines.append("**Detailed breakdown by runner:**")
-                summary_lines.append("")
 
                 for runner_key, tests in sorted_runners[:10]:  # Show top 10 runners
                     # Sort tests by failure count
