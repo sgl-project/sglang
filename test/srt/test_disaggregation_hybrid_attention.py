@@ -35,6 +35,7 @@ class TestDisaggregationHybridAttentionMamba(PDDisaggregationServerBase):
             "prefill",
             "--tp",
             "4",
+            "--disable-overlap-schedule",
         ]
         prefill_args += cls.transfer_backend + cls.rdma_devices
         cls.process_prefill = popen_launch_pd_server(
@@ -54,6 +55,7 @@ class TestDisaggregationHybridAttentionMamba(PDDisaggregationServerBase):
             "4",
             "--base-gpu-id",
             "4",
+            "--disable-overlap-schedule",
         ]
         decode_args += cls.transfer_backend + cls.rdma_devices
         cls.process_decode = popen_launch_pd_server(
