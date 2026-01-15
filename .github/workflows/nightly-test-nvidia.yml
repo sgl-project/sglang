@@ -98,6 +98,10 @@ jobs:
   nightly-test-general-8-gpu-h200:
     if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-general-8-gpu-h200')
     runs-on: 8-gpu-h200
+    strategy:
+      fail-fast: false
+      matrix:
+        partition: [0, 1]
     env:
       RUNNER_LABELS: 8-gpu-h200
     steps:
@@ -110,7 +114,7 @@ jobs:
         run: |
           bash scripts/ci/ci_install_dependency.sh
 
-      - name: Run common 8-GPU model tests
+      - name: Run common 8-GPU model tests (partition ${{ matrix.partition }})
         if: always()
         timeout-minutes: 300
         env:
@@ -120,7 +124,7 @@ jobs:
           IS_H200: "1"
         run: |
           cd test
-          python3 run_suite.py --hw cuda --suite nightly-8-gpu-common --nightly --timeout-per-file=18000 --continue-on-error
+          python3 run_suite.py --hw cuda --suite nightly-8-gpu-common --nightly --timeout-per-file=18000 --continue-on-error --auto-partition-id=${{ matrix.partition }} --auto-partition-size=2
 
       - name: Run test
         timeout-minutes: 30
@@ -158,6 +162,10 @@ jobs:
   nightly-test-general-8-gpu-b200:
     if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-general-8-gpu-h20')
     runs-on: 8-gpu-b200
+    strategy:
+      fail-fast: false
+      matrix:
+        partition: [0, 1]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -168,7 +176,7 @@ jobs:
         run: |
           IS_BLACKWELL=1 bash scripts/ci/ci_install_dependency.sh
 
-      - name: Run common 8-GPU model tests
+      - name: Run common 8-GPU model tests (partition ${{ matrix.partition }})
         if: always()
         timeout-minutes: 300
         env:
@@ -177,7 +185,7 @@ jobs:
           GPU_CONFIG: "8-gpu-b200"
         run: |
           cd test
-          IS_BLACKWELL=1 python3 run_suite.py --hw cuda --suite nightly-8-gpu-common --nightly --timeout-per-file=12000 --continue-on-error
+          IS_BLACKWELL=1 python3 run_suite.py --hw cuda --suite nightly-8-gpu-common --nightly --timeout-per-file=12000 --continue-on-error --auto-partition-id=${{ matrix.partition }} --auto-partition-size=2
 
   # Text model accuracy tests
   nightly-test-text-accuracy-2-gpu-runner:
