@@ -302,9 +302,6 @@ class BaseModelLoader(ABC):
 class DefaultModelLoader(BaseModelLoader):
     """Model loader that can load different file types from disk."""
 
-    """Model Loader is only used during initial load, in reload scenarios (eg. RL), you should: 
-    call update_weights_from_tensor → call post_loaded_weights (after all the weights have been reloaded)"""
-
     # default number of thread when enable multithread weight loading
     DEFAULT_NUM_THREADS = 8
 

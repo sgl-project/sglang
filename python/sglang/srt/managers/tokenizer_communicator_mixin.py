@@ -390,35 +390,6 @@ class TokenizerCommunicatorMixin:
         req = ExpertDistributionReq(action=ExpertDistributionReqType.DUMP_RECORD)
         await self.expert_distribution_communicator(req)
     
-    async def dump_expert_distribution_record_object(self):
-        """
-        Returns the expert-distribution recorder dump as a Python object
-        (not a file), merged across DP ranks if needed.
-        Requires the scheduler to support DUMP_RECORD_OBJECT and return
-        ExpertDistributionReqOutput with `payload` holding the object.
-        """
-        self.auto_create_handle_loop()
-        results: List[ExpertDistributionReqOutput] = await self.expert_distribution_communicator(
-            ExpertDistributionReq(action=ExpertDistributionReqType.DUMP_RECORD_OBJECT)
-        )
-        # `results` has one element per DP rank (fan_out = dp_size).
-        # Each `.payload` is either None or a dict like:
-        #   {"records": [...], "last_physical_to_logical_map": Tensor[L, E_phys]}
-        objs = [r.payload for r in results if getattr(r, "payload", None) is not None]
-        if not objs:
-            # Fallback empty shape if nothing was recorded
-            return {"records": [], "last_physical_to_logical_map": None}
-
-        merged = {
-            "records": [],
-            "last_physical_to_logical_map": objs[-1]["last_physical_to_logical_map"],
-        }
-        for o in objs:
-            merged["records"].extend(o["records"])
-            # We keep the "last" physical_to_logical_map; in practice maps
-            # are identical across ranks for a given run.
-        return merged
-
     async def init_weights_update_group(
         self: TokenizerManager,
         obj: InitWeightsUpdateGroupReqInput,
