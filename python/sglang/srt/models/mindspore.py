@@ -183,8 +183,10 @@ class MindSporeForCausalLM(torch.nn.Module):
         )
         self.key_cache = []
         self.value_cache = []
-        if hasattr(self.model, "hot_token_id"):
-            self.hot_token_id = self.model.hot_token_id
+    
+    @property
+    def hot_token_id(self):
+        return tensor_ms2torch(getattr(self.model, "hot_token_id", None))
 
     def get_arch(self, config):
         # Get all implemented models
@@ -330,16 +332,17 @@ class MindSporeForCausalLM(torch.nn.Module):
 
     # The following methods are used for speculative decoding
     def get_embed_and_head(self):
-        return self.model.get_embed_and_head()
+        embed, head = self.model.get_embed_and_head()
+        return tensor_ms2torch(embed), tensor_ms2torch(head)
 
     def set_embed_and_head(self, embed, head):
-        self.model.set_embed_and_head(embed, head)
+        self.model.set_embed_and_head(tensor_torch2ms(embed), tensor_torch2ms(head))
 
     def get_embed(self):
-        return self.model.get_embed()
+        return tensor_ms2torch(self.model.get_embed())
 
     def set_embed(self, embed):
-        self.model.set_embed(embed)
+        self.model.set_embed(tensor_torch2ms(embed))
 
     def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
         self.model.set_eagle3_layers_to_capture(layer_ids)
