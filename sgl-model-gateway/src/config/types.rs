@@ -897,6 +897,7 @@ mod tests {
             balance_rel_threshold: 1.5,
             eviction_interval_secs: 300,
             max_tree_size: 1000,
+            mesh_sync_interval_secs: 1,
         };
         assert_eq!(cache_aware.name(), "cache_aware");
 
@@ -918,6 +919,7 @@ mod tests {
             balance_rel_threshold: 1.5,
             eviction_interval_secs: 300,
             max_tree_size: 1000,
+            mesh_sync_interval_secs: 1,
         };
         let json = serde_json::to_string(&cache_aware).unwrap();
         assert!(json.contains("\"type\":\"cache_aware\""));
@@ -940,6 +942,7 @@ mod tests {
             balance_rel_threshold: 2.0,
             eviction_interval_secs: 600,
             max_tree_size: 5000,
+            mesh_sync_interval_secs: 1,
         };
 
         match cache_aware {
@@ -949,12 +952,14 @@ mod tests {
                 balance_rel_threshold,
                 eviction_interval_secs,
                 max_tree_size,
+                mesh_sync_interval_secs,
             } => {
                 assert!((cache_threshold - 0.75).abs() < 0.0001);
                 assert_eq!(balance_abs_threshold, 20);
                 assert!((balance_rel_threshold - 2.0).abs() < 0.0001);
                 assert_eq!(eviction_interval_secs, 600);
                 assert_eq!(max_tree_size, 5000);
+                assert_eq!(mesh_sync_interval_secs, 1);
             }
             _ => panic!("Expected CacheAware"),
         }
@@ -1342,6 +1347,7 @@ mod tests {
                 balance_rel_threshold: 1.1,
                 eviction_interval_secs: 60,
                 max_tree_size: 1000,
+                mesh_sync_interval_secs: 1,
             }),
             decode_policy: Some(PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 60,
@@ -1372,6 +1378,7 @@ mod tests {
                 balance_rel_threshold: 1.1,
                 eviction_interval_secs: 60,
                 max_tree_size: 1000,
+                mesh_sync_interval_secs: 1,
             }),
             decode_policy: None,
         };
