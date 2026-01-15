@@ -265,6 +265,11 @@ class ServerArgs:
 
     pipeline_config: PipelineConfig = field(default_factory=PipelineConfig, repr=False)
 
+    # Pipeline override
+    pipeline_class_name: str | None = (
+        None  # Override pipeline class from model_index.json
+    )
+
     # LoRA parameters
     # (Wenxuan) prefer to keep it here instead of in pipeline config to not make it complicated.
     lora_path: str | None = None
@@ -284,6 +289,9 @@ class ServerArgs:
     vae_cpu_offload: bool | None = None
     use_fsdp_inference: bool = False
     pin_cpu_memory: bool = True
+
+    # ComfyUI integration
+    comfyui_mode: bool = False
 
     # STA (Sliding Tile Attention) parameters
     mask_strategy_file_path: str | None = None
@@ -366,10 +374,14 @@ class ServerArgs:
             if self.vae_cpu_offload is None:
                 self.vae_cpu_offload = False
         else:
-            self.dit_cpu_offload = True
-            self.text_encoder_cpu_offload = True
-            self.image_encoder_cpu_offload = True
-            self.vae_cpu_offload = True
+            if self.dit_cpu_offload is None:
+                self.dit_cpu_offload = True
+            if self.text_encoder_cpu_offload is None:
+                self.text_encoder_cpu_offload = True
+            if self.image_encoder_cpu_offload is None:
+                self.image_encoder_cpu_offload = True
+            if self.vae_cpu_offload is None:
+                self.vae_cpu_offload = True
 
     def __post_init__(self):
         # configure logger before use
@@ -726,17 +738,6 @@ class ServerArgs:
     ) -> int:
         """
         Find an available port with retry logic.
-
-        Args:
-            port: Initial port to check
-            port_inc: Port increment for each attempt
-            max_attempts: Maximum number of attempts to find an available port
-
-        Returns:
-            An available port number
-
-        Raises:
-            RuntimeError: If no available port is found after max_attempts
         """
         attempts = 0
         original_port = port
@@ -931,7 +932,10 @@ class ServerArgs:
 
         if not envs.SGLANG_CACHE_DIT_ENABLED:
             # TODO: need a better way to tell this
-            if "wan" in self.pipeline_config.__class__.__name__.lower():
+            if (
+                "wan" in self.pipeline_config.__class__.__name__.lower()
+                and self.dit_layerwise_offload is None
+            ):
                 logger.info(
                     "Automatically enable dit_layerwise_offload for Wan for best performance"
                 )
@@ -1005,9 +1009,9 @@ class ServerArgs:
             has_sp = self.sp_degree > 1
             has_tp = self.tp_size > 1
             if has_sp and has_tp:
-                raise ValueError(
-                    "cache-dit does not support hybrid parallelism (SP + TP). "
-                    "Please use either sequence parallelism or tensor parallelism, not both."
+                logger.warning(
+                    "cache-dit is enabled with hybrid parallelism (SP + TP). "
+                    "Proceeding anyway (SGLang integration may support this mode)."
                 )
 
     def _set_default_attention_backend(self) -> None:
@@ -1073,13 +1077,6 @@ _global_server_args = None
 def prepare_server_args(argv: list[str]) -> ServerArgs:
     """
     Prepare the inference arguments from the command line arguments.
-
-    Args:
-        argv: The command line arguments. Typically, it should be `sys.argv[1:]`
-            to ensure compatibility with `parse_args` when no arguments are passed.
-
-    Returns:
-        The inference arguments.
     """
     parser = FlexibleArgumentParser()
     ServerArgs.add_cli_args(parser)
