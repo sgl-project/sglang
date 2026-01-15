@@ -862,9 +862,8 @@ class CanonicalStrategy:
         )
         self.fsm = HarmonyStateMachine(initial_state=initial_state)
         self.accumulated_text = ""  # Track accumulated text for raw_text extraction
-        self.prev_buffer_content = (
-            ""  # Track previous buffer to avoid duplicate accumulation
-        )
+        self.last_remaining = ""  # Track remaining text from last parse call
+        self.processed_len = 0  # Track position up to which text has been processed
 
     def parse(self, text: str) -> Tuple[List[Event], str]:
         """Parse text using the FSM and return (events, remaining).
@@ -881,74 +880,47 @@ class CanonicalStrategy:
         if not hasattr(self, "full_accumulated"):
             self.full_accumulated = ""
 
-        # Track how much was in accumulated before this parse
-        prev_accumulated_len = len(self.full_accumulated)
-
-        # Add the new text (which is unparsed buffer from SemanticBuffer)
-        # to our FULL accumulated text
-        # FIX: Only accumulate the new part, not the entire buffer
-        # This prevents duplicate accumulation when HarmonyParser passes the full buffer
-        if self.prev_buffer_content and text.startswith(self.prev_buffer_content):
-            # Text contains previous content, only append the new part
-            new_text = text[len(self.prev_buffer_content) :]
+        # Update full_accumulated efficiently
+        if self.last_remaining and text.startswith(self.last_remaining):
+            # Text contains previous remaining content, only append the new part
+            new_text = text[len(self.last_remaining) :]
             self.full_accumulated += new_text
         else:
-            # First call or buffer doesn't start with previous content
+            # First call or discontinuity (should generally match if using SemanticBuffer)
+            # If text doesn't start with last_remaining, we assume it's new content or
+            # the buffer was reset/modified externally, so we append all of it.
+            # In standard usage with HarmonyParser, text starts with last_remaining.
             self.full_accumulated += text
-
-        # Update previous buffer tracking for next call
-        self.prev_buffer_content = text
 
         # Also update simpler accumulated pointer for consistency
         self.accumulated_text = self.full_accumulated
 
-        tokens = list(
-            iter_tokens(self.full_accumulated, start_pos=prev_accumulated_len)
-        )
+        # Tokenize starting from where we left off (processed_len)
+        # This ensures we re-process any held tokens from the previous call
+        tokens = list(iter_tokens(self.full_accumulated, start_pos=self.processed_len))
 
         if not tokens:
+            self.last_remaining = ""
             return [], ""
 
         # Use full_accumulated for FSM processing (for raw_text extraction with absolute positions)
         events, next_pos = self.fsm.process_tokens(tokens, self.full_accumulated)
 
-        # Determine remaining text relative to full_accumulated
+        # Update processed_len based on how many tokens were processed
         if next_pos >= len(tokens):
+            # All tokens processed
+            self.processed_len = len(self.full_accumulated)
             remaining = ""
         else:
+            # Stopped early (held token), update processed_len to start of the first unprocessed token
             remaining_start = tokens[next_pos].start
+            self.processed_len = remaining_start
             remaining = self.full_accumulated[remaining_start:]
 
-        # Update full_accumulated to only keep unparsed portion
-        # WAIT - we should NOT do this because we need to keep the full text for raw_text extraction
-        # Instead, just return remaining relative to the cumulative buffer
+        # Update last_remaining for next call
+        self.last_remaining = remaining
 
-        # Actually, we need to return remaining relative to what was passed in (text),
-        # not relative to full_accumulated, because HarmonyParser expects that
-        # Let's compute how much of the input 'text' was consumed
-        #
-        # If remaining is empty, all of full_accumulated was consumed
-        # If remaining is non-empty, we need to figure out how much of 'text' to keep
-        #
-        # Since text was appended to full_accumulated, and remaining is a suffix of full_accumulated,
-        # we can compute the corresponding suffix of 'text'
-        if remaining:
-            # Find where remaining starts in full_accumulated
-            offset_in_full = len(self.full_accumulated) - len(remaining)
-            # Corresponding offset in text
-            offset_in_text = offset_in_full - prev_accumulated_len
-            if offset_in_text < 0:
-                # Remaining includes text from before this chunk
-                text_remaining = text
-            elif offset_in_text >= len(text):
-                # All of text was consumed
-                text_remaining = ""
-            else:
-                text_remaining = text[offset_in_text:]
-        else:
-            text_remaining = ""
-
-        return events, text_remaining
+        return events, remaining
 
 
 class TextStrategy:
