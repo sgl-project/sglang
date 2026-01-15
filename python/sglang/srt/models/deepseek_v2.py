@@ -24,6 +24,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
+from torch import distributed as dist
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -47,6 +48,7 @@ from sglang.srt.distributed import (
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
@@ -60,6 +62,7 @@ from sglang.srt.layers.attention.nsa.utils import (
     cp_all_gather_rerange_output,
     cp_split_and_rebuild_data,
     cp_split_and_rebuild_position,
+    is_enable_o_proj_tp,
     is_nsa_enable_prefill_cp,
     nsa_use_prefill_cp,
     prepare_input_dp_with_cp_dsa,
@@ -1103,10 +1106,17 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
         attn_tp_size = get_attention_tp_size()
         self.use_nsa = is_deepseek_nsa(config)
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
+        self.enable_o_proj_tp = is_enable_o_proj_tp()
         if self.nsa_enable_prefill_cp:
             assert self.use_nsa, "CP currently only supports deepseek v3.2 model"
         # cp reuse the attn_tp comm group but need to duplicate the weights
         if self.nsa_enable_prefill_cp and self.use_nsa:
+            if self.enable_o_proj_tp:
+                self.o_proj_tp_size = attn_tp_size
+                self.o_proj_tp_rank = attn_tp_rank
+            else:
+                self.o_proj_tp_size = 1
+                self.o_proj_tp_rank = 0
             attn_tp_rank = 0
             attn_tp_size = 1
             self.cp_size = get_attention_tp_size()
@@ -1195,8 +1205,8 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
             quant_config=quant_config,
             reduce_results=reduce_results,
             prefix=add_prefix("o_proj", prefix),
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            tp_rank=self.o_proj_tp_rank,
+            tp_size=self.o_proj_tp_size,
         )
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
 
@@ -1923,7 +1933,7 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
                         -1, self.num_local_heads, self.v_head_dim
                     ).transpose(0, 1),
                 )
-        output, _ = self.o_proj(attn_bmm_output)
+        output, _ = self._o_proj_warpper_forward(attn_output)
 
         return output
 
@@ -2168,7 +2178,7 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
         else:
             attn_bmm_output = torch.bmm(attn_output.transpose(0, 1), self.w_vc)
         attn_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
-        output, _ = self.o_proj(attn_output)
+        output, _ = self._o_proj_warpper_forward(attn_output)
 
         return output
 
@@ -2205,7 +2215,7 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
             None,  # scale
         )
         attn_output = output
-        output, _ = self.o_proj(attn_output)
+        output, _ = self._o_proj_warpper_forward(attn_output)
 
         return output
 
@@ -2219,6 +2229,41 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
             )
         else:
             return quant_config
+
+    def _o_proj_warpper_forward(self, attn_output: torch.Tensor):
+        if self.nsa_enable_prefill_cp and self.use_nsa and self.enable_o_proj_tp:
+            # change the attention output tensor from cp format to tp format with all to all
+            attn_output = attn_output.view(
+                -1,
+                self.o_proj_tp_size,
+                self.num_heads // self.o_proj_tp_size * self.v_head_dim,
+            )
+            # after transpose: (oproj_tp_size, bs*q_len, num_heads // oproj_tp_size * v_head_dim)
+            # after view: (oproj_tp_size * bs*q_len * num_heads // oproj_tp_size * v_head_dim)
+            attn_output = attn_output.transpose(1, 0).contiguous().view(-1)
+            all2all_output = torch.empty_like(attn_output)
+            # after all2all: (oproj_tp_size * bs*q_len * num_heads // oproj_tp_size * v_head_dim)
+            dist.all_to_all_single(
+                all2all_output, attn_output, group=get_tp_group().device_group
+            )
+            # after view: (oproj_tp_size * bs*q_len, num_heads // oproj_tp_size * v_head_dim)
+            attn_output = all2all_output.view(
+                -1, self.num_heads // self.o_proj_tp_size * self.v_head_dim
+            )
+
+        attn_output, output_bias = self.o_proj(attn_output)
+
+        if self.nsa_enable_prefill_cp and self.use_nsa and self.enable_o_proj_tp:
+            # Rebuild the attention output tensor for tp format to cp format with reduce scatter.
+            reduce_scatter_output = torch.empty(
+                (attn_output.size()[0] // self.o_proj_tp_size, attn_output.size()[1]),
+                dtype=attn_output.dtype,
+                device=attn_output.device,
+            )
+
+            get_tp_group().reduce_scatter_tensor(reduce_scatter_output, attn_output)
+            attn_output = reduce_scatter_output
+        return attn_output, output_bias
 
 
 class DeepseekV2DecoderLayer(nn.Module):
