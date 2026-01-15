@@ -52,6 +52,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.layers.quantization.marlin_utils_fp8 import (
     apply_fp8_marlin_linear,
+    prepare_moe_fp8_layer_for_marlin,
     prepare_fp8_layer_for_marlin,
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
@@ -555,6 +556,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
     def __init__(self, quant_config: Fp8Config):
         self.quant_config = quant_config
         self.block_quant = self.quant_config.weight_block_size is not None
+        self.use_marlin = False
+        if _is_cuda:
+            force_marlin = get_bool_env_var("SGLANG_FORCE_FP8_MARLIN")
+            auto_enable = can_auto_enable_marlin_fp8()
+            self.use_marlin = force_marlin or auto_enable
         if get_moe_runner_backend().is_cutlass():
             assert (
                 cutlass_fp8_supported()
@@ -588,6 +594,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
     ):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
+        layer.orig_dtype = params_dtype
         if self.quant_config.is_checkpoint_fp8_serialized:
             params_dtype = torch.uint32 if _use_hip_int4 else torch.float8_e4m3fn
         tp_size = get_tensor_model_parallel_world_size()
@@ -847,6 +854,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     )
                     layer.w13_weight_scale_inv.format_ue8m0 = True
                     layer.w2_weight_scale_inv.format_ue8m0 = True
+            if self.use_marlin:
+                layer.weight_block_size = self.quant_config.weight_block_size
+                prepare_moe_fp8_layer_for_marlin(layer, size_k_first=False)
             return
 
         # If checkpoint is fp16 or bfloat16, quantize in place.
@@ -877,6 +887,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
             if _is_hip:
                 self.process_weights_hip_scale_padding(layer)
+            if self.use_marlin:
+                prepare_moe_fp8_layer_for_marlin(layer, size_k_first=False)
             return
 
         # If checkpoint is fp8, we need to handle that the
@@ -968,6 +980,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 )
 
                 align_fp8_moe_weights_for_flashinfer_trtllm(layer)
+            if self.use_marlin:
+                prepare_moe_fp8_layer_for_marlin(layer, size_k_first=False)
             return
 
     def process_weights_hip_int4(self, layer: Module):
@@ -1053,7 +1067,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         moe_runner_backend = get_moe_runner_backend()
 
         if moe_runner_backend.is_auto():
-            if self.is_deepgemm_moe_runner_backend_enabled():
+            if self.use_marlin:
+                moe_runner_backend = MoeRunnerBackend.MARLIN
+            elif self.is_deepgemm_moe_runner_backend_enabled():
                 moe_runner_backend = MoeRunnerBackend.DEEP_GEMM
             else:
                 moe_runner_backend = MoeRunnerBackend.TRITON
@@ -1061,6 +1077,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             moe_runner_backend.is_deep_gemm()
             or moe_runner_backend.is_triton()
             or moe_runner_backend.is_flashinfer_trtllm()
+            or moe_runner_backend.is_marlin()
         ):
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
         else:
@@ -1250,6 +1267,21 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 a13_scale=layer.w13_input_scale,
                 a2_scale=layer.w2_input_scale,
                 block_shape=self.quant_config.weight_block_size,
+            )
+        elif self.runner.runner_backend.is_marlin():
+            from sgl_kernel.scalar_type import scalar_types
+            from sglang.srt.layers.moe.moe_runner.marlin import MarlinMoeQuantInfo
+
+            quant_info = MarlinMoeQuantInfo(
+                w13_qweight=layer.w13_weight,
+                w2_qweight=layer.w2_weight,
+                w13_scales=layer.w13_weight_scale,
+                w2_scales=layer.w2_weight_scale,
+                w13_g_idx_sort_indices=None,
+                w2_g_idx_sort_indices=None,
+                weight_bits=8,
+                w13_q_type_id=scalar_types.float8_e4m3fn.id,
+                w2_q_type_id=scalar_types.float8_e4m3fn.id,
             )
         else:
             raise NotImplementedError(

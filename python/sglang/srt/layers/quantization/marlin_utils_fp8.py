@@ -32,9 +32,8 @@ def fp8_fused_exponent_bias_into_scales(scales):
     # exponent_bias_fp16 = 2 ** 4 - 2 ** 3 = 8
     # exponent_bias_bf16 = 2 ** 7 - 2 ** 3 = 120
     exponent_bias = 2 ** (target_exponent - 1) - 2 ** (fp8_exponent - 1)
-    s = torch.ones_like(scales) * 2
-    s = s**exponent_bias
-    return scales * s
+    scale_factor = float(2**exponent_bias)
+    return scales * scale_factor
 
 
 def apply_fp8_marlin_linear(
@@ -197,7 +196,7 @@ def prepare_moe_fp8_layer_for_marlin(
     # Repack weights to marlin format
     for name in ["w13_weight", "w2_weight"]:
         weight = getattr(layer, name)
-        tensor_list = []
+        marlin_weight = None
         if "w13" in name:
             size_n, size_k = n * 2, k
         else:
@@ -208,6 +207,13 @@ def prepare_moe_fp8_layer_for_marlin(
         else:
             assert weight.shape == (e, size_n, size_k)
 
+        if marlin_weight is None:
+            tile_size = 16
+            pack_factor = 4
+            marlin_weight = weight.view(torch.int32).reshape(
+                e, size_k // tile_size, size_n * tile_size // pack_factor
+            )
+
         for i in range(e):
             qweight = pack_fp8_to_int32(weight[i], size_k_first)
             if not size_k_first:
@@ -216,10 +222,9 @@ def prepare_moe_fp8_layer_for_marlin(
             marlin_qweight = gptq_marlin_repack(
                 b_q_weight=qweight, perm=perm, size_k=size_k, size_n=size_n, num_bits=8
             )
-            tensor_list.append(marlin_qweight)
+            marlin_weight[i].copy_(marlin_qweight)
 
-        weight = torch.cat([x.unsqueeze(0) for x in tensor_list], 0)
-        weight = torch.nn.Parameter(weight, requires_grad=False)
+        weight = torch.nn.Parameter(marlin_weight, requires_grad=False)
 
         setattr(layer, name, weight)
 
@@ -237,7 +242,7 @@ def prepare_moe_fp8_layer_for_marlin(
             scales = getattr(layer, new_name).to(layer.orig_dtype)
             delattr(layer, new_name)
 
-        tensor_list = []
+        scales_out = None
         if "w13" in name:
             size_n, size_k = n * 2, k
         else:
@@ -277,10 +282,15 @@ def prepare_moe_fp8_layer_for_marlin(
             marlin_scales = marlin_permute_scales(
                 s=scales[i], size_k=size_k, size_n=size_n, group_size=group_size
             )
-            tensor_list.append(marlin_scales)
+            if scales_out is None:
+                scales_out = torch.empty(
+                    (e,) + marlin_scales.shape,
+                    device=marlin_scales.device,
+                    dtype=marlin_scales.dtype,
+                )
+            scales_out[i].copy_(marlin_scales)
 
-        scales = torch.cat([x.unsqueeze(0) for x in tensor_list], 0)
-        scales = fp8_fused_exponent_bias_into_scales(scales)
+        scales = fp8_fused_exponent_bias_into_scales(scales_out)
         scales = torch.nn.Parameter(scales, requires_grad=False)
 
         setattr(layer, name + "_weight_scale", scales)
