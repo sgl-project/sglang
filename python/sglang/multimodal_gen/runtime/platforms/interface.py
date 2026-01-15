@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import enum
 import random
+from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any, NamedTuple
 
@@ -23,20 +24,162 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+@dataclass(frozen=True)
+class AttentionBackendSpec:
+    imports: list[tuple[str, str | None]] = field(default_factory=list)
+    fallback: str | None = None
+    log_msg: str | None = None
+    import_path: str | None = None
+    fallback_msg: str | None = None
+    error_prefix: str | None = None
+    error_msg: str | None = None
+
+
 class AttentionBackendEnum(enum.Enum):
-    FA2 = enum.auto()
-    FA = enum.auto()
-    SLIDING_TILE_ATTN = enum.auto()
-    TORCH_SDPA = enum.auto()
-    SAGE_ATTN = enum.auto()
-    SAGE_ATTN_3 = enum.auto()
-    VIDEO_SPARSE_ATTN = enum.auto()
-    VMOBA_ATTN = enum.auto()
-    AITER = enum.auto()
-    NO_ATTENTION = enum.auto()
+    SLIDING_TILE_ATTN = AttentionBackendSpec(
+        log_msg="Using Sliding Tile Attention backend.",
+        import_path="sglang.multimodal_gen.runtime.layers.attention.backends.sliding_tile_attn.SlidingTileAttentionBackend",
+        error_prefix="Failed to import Sliding Tile Attention backend",
+        error_msg="Sliding Tile Attention backend is not installed. ",
+        imports=[
+            ("st_attn", "sliding_tile_attention"),
+            (
+                "sglang.multimodal_gen.runtime.layers.attention.backends.sliding_tile_attn",
+                "SlidingTileAttentionBackend",
+            ),
+        ],
+    )
+
+    SAGE_ATTN = AttentionBackendSpec(
+        fallback="torch_sdpa",
+        import_path="sglang.multimodal_gen.runtime.layers.attention.backends.sage_attn.SageAttentionBackend",
+        log_msg="Using SAGE Attention backend.",
+        fallback_msg=(
+            "Sage Attention backend is not installed (To install it, run "
+            "`pip install sageattention==2.2.0 --no-build-isolation`). "
+            "Falling back to Torch SDPA."
+        ),
+        imports=[
+            ("sageattention", "sageattn"),
+            (
+                "sglang.multimodal_gen.runtime.layers.attention.backends.sage_attn",
+                "SageAttentionBackend",
+            ),
+        ],
+    )
+
+    SAGE_ATTN_3 = AttentionBackendSpec(
+        fallback="torch_sdpa",
+        import_path="sglang.multimodal_gen.runtime.layers.attention.backends.sage_attn3.SageAttention3Backend",
+        log_msg="Using Sage Attention 3 backend",
+        fallback_msg=(
+            "Sage Attention 3 backend is not installed (To install it, see "
+            "https://github.com/thu-ml/SageAttention/tree/main/"
+            "sageattention3_blackwell#installation). Falling back to Torch SDPA."
+        ),
+        imports=[
+            (
+                "sglang.multimodal_gen.runtime.layers.attention.backends.sage_attn3",
+                "SageAttention3Backend",
+            )
+        ],
+    )
+
+    VIDEO_SPARSE_ATTN = AttentionBackendSpec(
+        log_msg="Using Video Sparse Attention backend.",
+        import_path="sglang.multimodal_gen.runtime.layers.attention.backends.video_sparse_attn.VideoSparseAttentionBackend",
+        error_prefix="Failed to import Video Sparse Attention backend",
+        error_msg="Video Sparse Attention backend is not installed.",
+        imports=[
+            ("vsa", "block_sparse_attn"),
+            (
+                "sglang.multimodal_gen.runtime.layers.attention.backends.video_sparse_attn",
+                "VideoSparseAttentionBackend",
+            ),
+        ],
+    )
+
+    VMOBA_ATTN = AttentionBackendSpec(
+        import_path="sglang.multimodal_gen.runtime.layers.attention.backends.vmoba.VMOBAAttentionBackend",
+        log_msg="Using Video MOBA Attention backend",
+        error_prefix="Failed to import Video MoBA Attention backend",
+        error_msg="Video MoBA Attention backend is not installed. ",
+        imports=[
+            ("kernel.attn.vmoba_attn.vmoba", "moba_attn_varlen"),
+            (
+                "sglang.multimodal_gen.runtime.layers.attention.backends.vmoba",
+                "VMOBAAttentionBackend",
+            ),
+        ],
+    )
+
+    AITER = AttentionBackendSpec(
+        import_path="sglang.multimodal_gen.runtime.layers.attention.backends.aiter.AITerBackend",
+        log_msg="Using AITer backend",
+    )
+
+    TORCH_SDPA = AttentionBackendSpec(
+        import_path="sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend",
+        log_msg="Using Torch SDPA backend.",
+    )
+
+    FA = AttentionBackendSpec(
+        import_path="sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn.FlashAttentionBackend",
+        log_msg="Using FlashAttention (FA3 for hopper, FA4 for blackwell) backend",
+        fallback="torch_sdpa",
+        fallback_msg=(
+            "Cannot use FlashAttention backend because the "
+            "flash_attn package is not found. "
+            "Make sure that flash_attn was built and installed "
+            "(on by default)."
+        ),
+        imports=[
+            (
+                "sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn",
+                "FlashAttentionBackend",
+            ),
+        ],
+    )
+    FA2 = AttentionBackendSpec()
+    NO_ATTENTION = AttentionBackendSpec()
 
     def __str__(self):
         return self.name.lower()
+
+    @property
+    def import_path(self) -> str:
+        return self.value.import_path
+
+    @property
+    def imports(self) -> tuple[tuple[str, str | None], ...]:
+        return tuple(self.value.imports)
+
+    @property
+    def log_msg(self) -> str:
+        return self.value.log_msg
+
+    @property
+    def fallback_msg(self) -> str:
+        return self.value.fallback_msg
+
+    @property
+    def fallback(self) -> AttentionBackendEnum | None:
+        fallback = self.value.fallback
+        if fallback is None:
+            return None
+        if isinstance(fallback, AttentionBackendEnum):
+            return fallback
+        if isinstance(fallback, str):
+            return AttentionBackendEnum[fallback.upper()]
+        raise TypeError(f"Invalid fallback type: {type(fallback)!r}")
+
+    @property
+    def error_prefix(self) -> str:
+        return self.value.error_prefix
+
+    @property
+    def error_msg(self) -> str:
+        return self.value.error_msg
 
 
 class PlatformEnum(enum.Enum):
