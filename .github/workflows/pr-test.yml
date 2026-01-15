@@ -623,7 +623,7 @@ jobs:
         run: |
           source /etc/profile.d/sglang-ci.sh
           docker run --rm \
-            --gpus "device=${{ matrix.partition }}" \
+            --gpus "device=${CUDA_VISIBLE_DEVICES}" \
             --shm-size=16g \
             -v ${{ github.workspace }}:/workspace \
             -v /hf_home:/hf_home \
