@@ -104,12 +104,6 @@ class GrammarManager:
 
         return add_to_grammar_queue
 
-    def finalize_grammar(self, req: Req):
-        self.grammar_backend.set_cache(req.grammar_key, req.grammar.copy())
-        if req.grammar is INVALID_GRAMMAR_OBJ:
-            error_msg = f"Invalid grammar request: {req.grammar_key=}"
-            req.set_finish_with_abort(error_msg)
-
     def get_ready_grammar_requests(self) -> List[Req]:
         """
         Move requests whose grammar objects are ready from grammar_queue to waiting_queue.
