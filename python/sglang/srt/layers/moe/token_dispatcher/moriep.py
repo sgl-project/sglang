@@ -111,7 +111,11 @@ def init_mori_op(
         world_size=world_size,
         data_type=fp8_dtype,
         hidden_dim=hidden_size,
-        scale_dim=hidden_size // 128,  # FIXME(billishyahao): remove magic number
+        scale_dim=(
+            hidden_size // 128
+            if get_bool_env_var("SGLANG_MORI_FP8_DISP", "False")
+            else 1
+        ),
         scale_type_size=torch.float32.itemsize,
         max_token_type_size=params_dtype.itemsize,
         max_num_inp_token_per_rank=num_max_dispatch_tokens_per_rank,
