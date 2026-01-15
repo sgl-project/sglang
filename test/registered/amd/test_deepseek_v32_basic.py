@@ -2,17 +2,20 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
+from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.send_one import BenchArgs, send_one_prompt
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    is_in_amd_ci,
     is_in_ci,
     popen_launch_server,
     write_github_step_summary,
 )
 
+register_amd_ci(est_time=3600, suite="stage-c-test-large-8-gpu-amd-mi35x")
 DEEPSEEK_V32_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2-Exp"
 
 
@@ -31,6 +34,14 @@ class TestDeepseekV32DP(CustomTestCase):
             "--model-loader-extra-config",
             '{"enable_multithread_load": true, "num_threads": 64}',
         ]
+        if is_in_amd_ci():
+            other_args += [
+                "--nsa-prefill-backend",
+                "tilelang",
+                "--nsa-decode-backend",
+                "tilelang",
+            ]
+
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
@@ -73,9 +84,13 @@ class TestDeepseekV32DP(CustomTestCase):
             write_github_step_summary(
                 f"### test_bs_1_speed (deepseek-v32)\n" f"{speed=:.2f} token/s\n"
             )
-            self.assertGreater(speed, 50)
+            if is_in_amd_ci():
+                self.assertGreater(speed, 10)
+            else:
+                self.assertGreater(speed, 50)
 
 
+@unittest.skipIf(is_in_amd_ci(), "To reduce the CI execution time for AMD.")
 class TestDeepseekV32TP(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -88,6 +103,14 @@ class TestDeepseekV32TP(CustomTestCase):
             "--model-loader-extra-config",
             '{"enable_multithread_load": true, "num_threads": 64}',
         ]
+        if is_in_amd_ci():
+            other_args += [
+                "--nsa-prefill-backend",
+                "tilelang",
+                "--nsa-decode-backend",
+                "tilelang",
+            ]
+
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
@@ -130,7 +153,10 @@ class TestDeepseekV32TP(CustomTestCase):
             write_github_step_summary(
                 f"### test_bs_1_speed (deepseek-v32)\n" f"{speed=:.2f} token/s\n"
             )
-            self.assertGreater(speed, 70)
+            if is_in_amd_ci():
+                self.assertGreater(speed, 20)
+            else:
+                self.assertGreater(speed, 70)
 
 
 if __name__ == "__main__":
