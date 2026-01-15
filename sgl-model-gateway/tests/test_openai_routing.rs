@@ -620,7 +620,6 @@ async fn test_unsupported_endpoints() {
         stream: false,
         log_metrics: true,
         return_hidden_states: false,
-        return_routed_experts: false,
         modalities: None,
         session_params: None,
         lora_path: None,
