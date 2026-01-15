@@ -56,6 +56,67 @@ def prepare_mu(batch: Req, server_args: ServerArgs):
     return "mu", mu
 
 
+class ZImagePipeline(LoRAPipeline, ComposedPipelineBase):
+    pipeline_name = "ZImagePipeline"
+
+    _required_config_modules = [
+        "text_encoder",
+        "tokenizer",
+        "vae",
+        "transformer",
+        "scheduler",
+    ]
+
+    def create_pipeline_stages(self, server_args: ServerArgs):
+        """Set up pipeline stages with proper dependency injection."""
+
+        self.add_stage(
+            stage_name="input_validation_stage", stage=InputValidationStage()
+        )
+
+        self.add_stage(
+            stage_name="prompt_encoding_stage_primary",
+            stage=TextEncodingStage(
+                text_encoders=[
+                    self.get_module("text_encoder"),
+                ],
+                tokenizers=[
+                    self.get_module("tokenizer"),
+                ],
+            ),
+        )
+
+        self.add_stage(stage_name="conditioning_stage", stage=ConditioningStage())
+
+        self.add_stage(
+            stage_name="timestep_preparation_stage",
+            stage=TimestepPreparationStage(
+                scheduler=self.get_module("scheduler"),
+                prepare_extra_set_timesteps_kwargs=[prepare_mu],
+            ),
+        )
+
+        self.add_stage(
+            stage_name="latent_preparation_stage",
+            stage=LatentPreparationStage(
+                scheduler=self.get_module("scheduler"),
+                transformer=self.get_module("transformer"),
+            ),
+        )
+
+        self.add_stage(
+            stage_name="denoising_stage",
+            stage=DenoisingStage(
+                transformer=self.get_module("transformer"),
+                scheduler=self.get_module("scheduler"),
+            ),
+        )
+
+        self.add_stage(
+            stage_name="decoding_stage", stage=DecodingStage(vae=self.get_module("vae"))
+        )
+
+
 class _ImageProcessStage(PipelineStage):
     def __init__(
         self,
@@ -331,8 +392,8 @@ class _PrepareSiglipStage(PipelineStage):
         return batch
 
 
-class ZImagePipeline(LoRAPipeline, ComposedPipelineBase):
-    pipeline_name = "ZImagePipeline"
+class ZImageOmniPipeline(ZImagePipeline):
+    pipeline_name = "ZOmniImagePipeline"
 
     # TODO: review how to add extra component?
     _extra_config_module_map = {
@@ -434,4 +495,7 @@ class ZImagePipeline(LoRAPipeline, ComposedPipelineBase):
         )
 
 
-EntryClass = ZImagePipeline
+EntryClass = [
+    ZImagePipeline,
+    ZImageOmniPipeline,
+]

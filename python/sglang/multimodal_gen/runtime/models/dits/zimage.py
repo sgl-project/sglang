@@ -1285,11 +1285,12 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         omni_mode = isinstance(x[0], list)
         device = x[0][-1].device if omni_mode else x[0].device
 
-        # TODO: review
-        # ugly hack
-        encoder_hidden_states = [
-            list(encoder_hidden_states[0].split_with_sizes(token_lens, dim=0))
-        ]
+        if omni_mode:
+            # TODO: review
+            # ugly hack
+            encoder_hidden_states = [
+                list(encoder_hidden_states[0].split_with_sizes(token_lens, dim=0))
+            ]
         cap_feats = encoder_hidden_states
         timestep = 1000.0 - timestep
         t = timestep
@@ -1388,14 +1389,14 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         for layer in self.context_refiner:
             cap_feats = layer(cap_feats, cap_freqs_cis)
 
-        siglip_freqs_cis = freqs_cis[2]
-        siglip_seqlens = siglip_freqs = None
+        siglip_freqs_cis = siglip_seqlens = siglip_freqs = None
 
         if (
             omni_mode
             and siglip_feats[0] is not None
             and self.siglip_embedder is not None
         ):
+            siglip_freqs_cis = freqs_cis[2]
             # process siglip
             # TODO: review shape
             siglip_feats = torch.cat(siglip_feats, dim=0)
@@ -1419,7 +1420,7 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         assert isinstance(
             cap_freqs_cis, Tuple
         ), f"should be tuple of (cos, sin), got {type(cap_freqs_cis)}"
-        assert isinstance(
+        assert siglip_freqs_cis is None or isinstance(
             siglip_freqs_cis, Tuple
         ), f"should be tuple of (cos, sin), got {type(siglip_freqs_cis)}"
 
