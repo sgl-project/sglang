@@ -50,8 +50,6 @@ if _use_aiter:
     from aiter.ops.shuffle import shuffle_weight
 
 if _is_npu:
-    import torch_npu
-
     from sglang.srt.hardware_backend.npu.utils import npu_format_cast
 
 try:
