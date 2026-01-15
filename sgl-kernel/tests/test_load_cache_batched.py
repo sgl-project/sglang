@@ -650,10 +650,11 @@ class TestBatchedLoadCache:
         
         device_buffer_ref = bytearray(len(host_cache_np))
         
-        # First pass
+        # First pass - load tokens 0-63 for each request
         top_k_batch1 = []
         for r in range(config["num_requests"]):
-            tokens = list(range(r * config["num_top_k"], (r + 1) * config["num_top_k"]))
+            # Use same token range for all requests (each request has its own state)
+            tokens = list(range(config["num_top_k"]))
             top_k_batch1.append(tokens)
         
         top_k_torch1 = torch.tensor(top_k_batch1, dtype=torch.int32, device="cuda")
@@ -661,12 +662,13 @@ class TestBatchedLoadCache:
         cuda_mgr.process_batch(top_k_torch1, host_cache_torch, device_buffer_torch)
         torch.cuda.synchronize()
         
-        # Second pass - half old, half new
+        # Second pass - half old (0-31), half new (100-131)
+        # All within max_tokens=500
         top_k_batch2 = []
         half = config["num_top_k"] // 2
         for r in range(config["num_requests"]):
-            old_tokens = list(range(r * config["num_top_k"], r * config["num_top_k"] + half))
-            new_tokens = list(range(400 + r * half, 400 + (r + 1) * half))
+            old_tokens = list(range(half))  # 0-31 (hits)
+            new_tokens = list(range(100, 100 + half))  # 100-131 (misses)
             top_k_batch2.append(old_tokens + new_tokens)
         
         top_k_torch2 = torch.tensor(top_k_batch2, dtype=torch.int32, device="cuda")
@@ -709,7 +711,11 @@ class TestBatchedLoadCache:
     
     def test_data_integrity_batched(self, config):
         """Verify data is correctly copied for all requests."""
-        host_cache_np, host_cache_torch, device_buffer_torch = self.create_test_data(config)
+        # Create larger shared buffers to avoid overlap between requests
+        total_buffer_entries = config["num_requests"] * config["hot_buffer_size"]
+        host_cache_np, host_cache_torch, device_buffer_torch = self.create_test_data(
+            config, total_cache_size=total_buffer_entries
+        )
         
         cuda_mgr = BatchedCacheManager(
             config["num_requests"], config["max_tokens"],
@@ -717,10 +723,19 @@ class TestBatchedLoadCache:
             config["num_top_k"]
         )
         
-        # Each request loads different tokens
+        # Give each request a different region in the shared device_buffer
+        # Request r uses device locations [r*hot_buffer_size, (r+1)*hot_buffer_size)
+        for r in range(config["num_requests"]):
+            offset = r * config["hot_buffer_size"]
+            locs = torch.arange(offset, offset + config["hot_buffer_size"], 
+                               dtype=torch.int64, device="cuda")
+            cuda_mgr.device_buffer_locs[r] = locs
+        
+        # Each request loads same tokens (0 to num_top_k-1)
+        # But writes to different device buffer regions
         top_k_batch = []
         for r in range(config["num_requests"]):
-            tokens = list(range(r * config["num_top_k"], (r + 1) * config["num_top_k"]))
+            tokens = list(range(config["num_top_k"]))
             top_k_batch.append(tokens)
         
         top_k_torch = torch.tensor(top_k_batch, dtype=torch.int32, device="cuda")
@@ -746,7 +761,7 @@ class TestBatchedLoadCache:
                 
                 actual = list(device_buffer_cpu[offset:offset + config["item_size_bytes"]])
                 assert actual == expected, \
-                    f"Request {r}, token {token}: data mismatch"
+                    f"Request {r}, token {token}, loc {loc}: data mismatch"
 
 
 if __name__ == "__main__":
