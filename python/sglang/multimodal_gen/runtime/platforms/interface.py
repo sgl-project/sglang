@@ -116,6 +116,13 @@ class Platform:
 
     @classmethod
     @lru_cache(maxsize=1)
+    def is_hopper(cls):
+        if not cls.is_cuda_static():
+            return False
+        return torch.cuda.get_device_capability() == (9, 0)
+
+    @classmethod
+    @lru_cache(maxsize=1)
     def is_sm120(cls):
         if not cls.is_cuda_static():
             return False

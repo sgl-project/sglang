@@ -7,7 +7,10 @@ from typing import Any, List, Optional, Tuple
 import torch
 
 from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
-from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
 from sglang.srt.utils.custom_op import register_custom_op
 
 try:
@@ -18,6 +21,10 @@ try:
     flash_attn_func = flash_attn_varlen_func
 except ImportError as e:
     raise e
+
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
 
 
 def maybe_contiguous(x: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
@@ -294,11 +301,21 @@ def flash_attn_varlen_func_op_lse(
 
 
 try:
-    from flash_attn_interface import (
-        flash_attn_varlen_func as flash_attn_varlen_func_upstream,
-    )
+    # from flash_attn.flash_attn_interface import (
+    #     flash_attn_varlen_func as flash_attn_varlen_func_upstream,
+    # )
+    if current_platform.is_hopper():
+        from flash_attn_interface import (
+            flash_attn_varlen_func as flash_attn_varlen_func_upstream,
+        )
+    else:
+        flash_attn_varlen_func_upstream = None
+
 except Exception:
     flash_attn_varlen_func_upstream = None
+    logger.warning(
+        "flash_attn 3 package is not installed. It's recommended to install flash_attn3 on hopper, otherwise performance is sub-optimal"
+    )
 
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionBackend,
@@ -306,9 +323,6 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
     AttentionMetadata,
     AttentionMetadataBuilder,
 )
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-
-logger = init_logger(__name__)
 
 fa_ver = 3
 
@@ -332,6 +346,8 @@ def _should_use_upstream_flash_attention(
     k_shape: tuple[int, ...],
     v_shape: tuple[int, ...],
 ) -> bool:
+    print(f"{upstream_available=}")
+    print(f"{upstream_heads_ok=}")
     if not upstream_available or not upstream_heads_ok:
         return False
 
@@ -355,6 +371,10 @@ def _should_use_upstream_flash_attention(
         return False
     if nheads_k == 0 or (nheads_q % nheads_k) != 0:
         return False
+
+    # if not upstream_available or not upstream_heads_ok:
+    #     # raise ValueError(f"{upstream_available=}")
+    #     return False
     return True
 
 
@@ -471,6 +491,7 @@ class FlashAttentionImpl(AttentionImpl):
             k_shape,
             v_shape,
         )
+        # print(f"{use_upstream=}")
 
         if use_upstream:
             bsz, seqlen, nheads_q, d = q_shape
