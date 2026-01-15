@@ -125,7 +125,7 @@ class GrammarManager:
                 if i in ready_req_idxs:
                     continue
 
-                if req.finished():  # It is aborted by AbortReq
+                if req.finished() or req.grammar is None:  # It is aborted by AbortReq
                     ready_req_idxs.add(i)
                     continue
 
