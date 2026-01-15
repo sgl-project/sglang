@@ -93,6 +93,36 @@ else
     PIP_UNINSTALL_SUFFIX=""
 fi
 
+# Clean up corrupted packages on Blackwell (race conditions can leave packages in broken state)
+if [ "$IS_BLACKWELL" = "1" ]; then
+    PYTHON_SITE_PACKAGES=$(python3 -c "import site; print(site.getsitepackages()[0])")
+
+    # Check for corrupted sgl-kernel (missing METADATA file)
+    if [ -d "${PYTHON_SITE_PACKAGES}/sgl_kernel-"*".dist-info" ] 2>/dev/null; then
+        for dist_info in "${PYTHON_SITE_PACKAGES}"/sgl_kernel-*.dist-info; do
+            if [ ! -f "${dist_info}/METADATA" ]; then
+                echo "Detected corrupted sgl-kernel installation (missing METADATA), cleaning up..."
+                rm -rf "${PYTHON_SITE_PACKAGES}"/sgl_kernel*
+                rm -rf "${PYTHON_SITE_PACKAGES}"/sgl-kernel*
+                break
+            fi
+        done
+    fi
+
+    # Check for corrupted nvidia packages
+    for pkg in nvidia_nvshmem_cu12 nvidia_cudnn_cu12; do
+        if [ -d "${PYTHON_SITE_PACKAGES}/${pkg}-"*".dist-info" ] 2>/dev/null; then
+            for dist_info in "${PYTHON_SITE_PACKAGES}"/${pkg}-*.dist-info; do
+                if [ ! -f "${dist_info}/METADATA" ]; then
+                    echo "Detected corrupted ${pkg} installation, cleaning up..."
+                    rm -rf "${PYTHON_SITE_PACKAGES}"/${pkg}*
+                    break
+                fi
+            done
+        fi
+    done
+fi
+
 # Clean up existing installations
 $PIP_UNINSTALL_CMD sgl-kernel sglang $PIP_UNINSTALL_SUFFIX || true
 if [ "$IS_BLACKWELL" != "1" ]; then
