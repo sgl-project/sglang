@@ -312,7 +312,7 @@ class EAGLEDraftCudaGraphRunner:
 
     def _postprocess_output_to_raw_bs(self, out, raw_bs):
         # Keep the variables name for readability
-        if len(out) == 2:
+        if len(out) == 2 and self.eagle_worker.enable_spec_overlap_reflow:
             ret_topk_p_list, ret_topk_index_list = (t[:raw_bs] for t in out)
             return ret_topk_p_list, ret_topk_index_list
 
