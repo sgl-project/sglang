@@ -30,6 +30,13 @@ except ImportError:
 if torch.version.hip is not None:
     HAS_RUNAI_MODEL_STREAMER = False
 
+# Disable runai_model_streamer in CI environment due to intermittent hangs
+# that cause server startup timeouts
+from sglang.utils import is_in_ci
+
+if is_in_ci():
+    HAS_RUNAI_MODEL_STREAMER = False
+
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
