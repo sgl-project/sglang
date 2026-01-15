@@ -1424,17 +1424,41 @@ class SGLangFailuresAnalyzer:
                         reverse=True,
                     )
 
-                    # Split into streak tests and high failure rate tests
+                    # Split into streak tests and non-streak tests
                     streak_tests = [
                         t
                         for t in all_test_failures
                         if t["test_data"]["current_streak"] >= 2
                     ]
-                    high_rate_tests = [
-                        t
-                        for t in all_test_failures
-                        if t["test_data"]["current_streak"] < 2
-                    ]
+
+                    # For non-streak tests, calculate failure rate and include all that have failed
+                    non_streak_tests = []
+                    for t in all_test_failures:
+                        if t["test_data"]["current_streak"] < 2:
+                            # Calculate test failure rate from recent_runs
+                            recent_runs = t["test_data"].get("recent_runs", [])
+                            if recent_runs:
+                                # Count actual failures (failed=True) vs total runs
+                                total_runs = len(recent_runs)
+                                failed_runs = sum(
+                                    1 for r in recent_runs if r.get("failed") == True
+                                )
+                                failure_rate = (
+                                    (failed_runs / total_runs * 100)
+                                    if total_runs > 0
+                                    else 0
+                                )
+
+                                # Include all tests that have at least 1 failure
+                                if failed_runs >= 1:
+                                    # Store failure rate for sorting
+                                    t["failure_rate"] = failure_rate
+                                    t["failed_runs"] = failed_runs
+                                    t["total_test_runs"] = total_runs
+                                    non_streak_tests.append(t)
+
+                    # Sort by failure rate descending
+                    non_streak_tests.sort(key=lambda x: x["failure_rate"], reverse=True)
 
                     # Show tests with consecutive failures
                     if streak_tests:
@@ -1513,23 +1537,26 @@ class SGLangFailuresAnalyzer:
 
                         summary_lines.append("")
 
-                    # Show tests with high failure rate but no current streak
-                    if high_rate_tests:
+                    # Show all tests that have failed (no current streak), ranked by failure rate
+                    if non_streak_tests:
                         summary_lines.append(
-                            "⚠️ **Tests with no current failure streak but high intermittent failure rate**"
+                            "📋 **Other tests with failures (ranked by failure rate)**"
                         )
                         summary_lines.append("")
                         summary_lines.append(
-                            "| Test File | Job | Failures | Streak | Recent Runs (oldest → latest) |"
+                            "| Test File | Job | Failed | Total | Fail Rate | Recent Runs (oldest → latest) |"
                         )
                         summary_lines.append(
-                            "|-----------|-----|----------|--------|-------------------------------|"
+                            "|-----------|-----|--------|-------|-----------|-------------------------------|"
                         )
 
-                        for test_info in high_rate_tests[:15]:  # Show top 15
+                        for test_info in non_streak_tests[:20]:  # Show top 20
                             test_file = test_info["test_file"]
                             job_name = test_info["job_name"]
                             test_data = test_info["test_data"]
+                            failure_rate = test_info["failure_rate"]
+                            failed_runs = test_info["failed_runs"]
+                            total_test_runs = test_info["total_test_runs"]
 
                             test_display = (
                                 test_file
@@ -1554,18 +1581,25 @@ class SGLangFailuresAnalyzer:
                             else:
                                 history_links = "N/A"
 
-                            summary_lines.append(
-                                f"| <span style='color:orange'>`{test_display}`</span> | <span style='color:orange'>`{job_display}`</span> | "
-                                f"<span style='color:orange'>{test_data['total_failures']}</span> | <span style='color:orange'>{test_data['current_streak']}</span> | "
-                                f"<span style='color:orange'>{history_links}</span> |"
-                            )
+                            # Highlight if failure rate >= 50%
+                            if failure_rate >= 50.0:
+                                summary_lines.append(
+                                    f"| <span style='color:orange'>`{test_display}`</span> | <span style='color:orange'>`{job_display}`</span> | "
+                                    f"<span style='color:orange'>{failed_runs}</span> | <span style='color:orange'>{total_test_runs}</span> | "
+                                    f"<span style='color:orange'>{failure_rate:.1f}%</span> | <span style='color:orange'>{history_links}</span> |"
+                                )
+                            else:
+                                summary_lines.append(
+                                    f"| `{test_display}` | `{job_display}` | {failed_runs} | {total_test_runs} | "
+                                    f"{failure_rate:.1f}% | {history_links} |"
+                                )
 
                         summary_lines.append("")
 
                     # If no test failures found but we have broken/high_failure_rate jobs
                     if (
                         not streak_tests
-                        and not high_rate_tests
+                        and not non_streak_tests
                         and (broken or high_failure_rate)
                     ):
                         summary_lines.append(
@@ -1763,15 +1797,28 @@ class SGLangFailuresAnalyzer:
                     reverse=True,
                 )
 
-                runners_with_issues = [
+                # Split runners into consecutive failures and high failure rate
+                runners_with_streak = [
                     r for r in sorted_runners if r["current_streak"] >= 2
+                ]
+                runners_high_fail_rate = [
+                    r
+                    for r in sorted_runners
+                    if r["current_streak"] < 2
+                    and r["failure_rate"] >= 50.0
+                    and r["total_jobs"] >= 2
                 ]
 
                 # Always show section header
                 summary_lines.append("## Workers")
                 summary_lines.append("")
 
-                if runners_with_issues:
+                # Runners with consecutive failures
+                if runners_with_streak:
+                    summary_lines.append(
+                        "🔥 **Consecutive failures (≥2) & currently failing**"
+                    )
+                    summary_lines.append("")
                     summary_lines.append(
                         "| Machine Name | Current Streak | Max | Fail Rate | Avg Queue | Total Jobs | Unique Jobs | First Failure | Last Failure |"
                     )
@@ -1779,7 +1826,7 @@ class SGLangFailuresAnalyzer:
                         "|--------------|----------------|-----|-----------|-----------|------------|-------------|---------------|--------------|"
                     )
 
-                    for runner_data in runners_with_issues[:15]:
+                    for runner_data in runners_with_streak[:15]:
                         display_name = (
                             runner_data["runner_name"]
                             if len(runner_data["runner_name"]) <= 28
@@ -1819,9 +1866,45 @@ class SGLangFailuresAnalyzer:
                             )
 
                     summary_lines.append("")
-                else:
+
+                # Runners with high failure rate (but no current streak)
+                if runners_high_fail_rate:
                     summary_lines.append(
-                        "✅ **No runners with active failure streaks (streak >= 2)**"
+                        "⚠️ **No current failure streak but high failure rate (≥50%)**"
+                    )
+                    summary_lines.append("")
+                    summary_lines.append(
+                        "| Machine Name | Fail Rate | Avg Queue | Total Jobs | Unique Jobs |"
+                    )
+                    summary_lines.append(
+                        "|--------------|-----------|-----------|------------|-------------|"
+                    )
+
+                    for runner_data in runners_high_fail_rate[:15]:
+                        display_name = (
+                            runner_data["runner_name"]
+                            if len(runner_data["runner_name"]) <= 28
+                            else runner_data["runner_name"][:25] + "..."
+                        )
+
+                        avg_queue_str = (
+                            f"{runner_data['avg_queue'] / 60:.1f}m"
+                            if runner_data["avg_queue"] > 0
+                            else "N/A"
+                        )
+
+                        summary_lines.append(
+                            f"| <span style='color:orange'>`{display_name}`</span> | <span style='color:orange'>{runner_data['failure_rate']:.1f}%</span> | "
+                            f"<span style='color:orange'>{avg_queue_str}</span> | <span style='color:orange'>{runner_data['total_jobs']}</span> | "
+                            f"<span style='color:orange'>{runner_data.get('unique_jobs', 0)}</span> |"
+                        )
+
+                    summary_lines.append("")
+
+                # If no issues
+                if not runners_with_streak and not runners_high_fail_rate:
+                    summary_lines.append(
+                        "✅ **No runners with active failure streaks or high failure rates**"
                     )
                     summary_lines.append("")
 
