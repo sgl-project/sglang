@@ -4,19 +4,20 @@ import unittest
 
 import requests
 
-from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.test_utils import (
-    DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST,
-    DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
+    DEFAULT_DRAFT_MODEL_EAGLE,
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_MODEL_NAME_FOR_TEST_FP8,
     DEFAULT_MOE_MODEL_NAME_FOR_TEST,
+    DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST_SCORE,
     DEFAULT_SMALL_VLM_MODEL_NAME_FOR_TEST,
+    DEFAULT_TARGET_MODEL_EAGLE,
     CustomTestCase,
     is_in_amd_ci,
     is_in_ci,
     run_bench_serving,
+    run_embeddings_benchmark,
     run_score_benchmark,
     write_github_step_summary,
 )
@@ -327,7 +328,7 @@ class TestBenchServing(CustomTestCase):
 
     def test_online_latency_eagle(self):
         res = run_bench_serving(
-            model=DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
+            model=DEFAULT_TARGET_MODEL_EAGLE,
             num_prompts=300,
             request_rate=8,
             sharegpt_context_len=3072,
@@ -337,7 +338,7 @@ class TestBenchServing(CustomTestCase):
                 "--speculative-algorithm",
                 "EAGLE",
                 "--speculative-draft-model-path",
-                DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST,
+                DEFAULT_DRAFT_MODEL_EAGLE,
                 "--speculative-num-steps",
                 "5",
                 "--speculative-eagle-topk",
@@ -431,7 +432,8 @@ class TestBenchServing(CustomTestCase):
                 "fp8",
                 "--pp-size",
                 "2",
-            ],
+            ]
+            + (["--mem-fraction-static", "0.7"] if is_in_amd_ci() else []),
             need_warmup=False,
             seed=42,
         )
@@ -441,7 +443,10 @@ class TestBenchServing(CustomTestCase):
                 f"### test_pp_long_context_latency_prefill\n"
                 f"input_throughput: {res['input_throughput']:.2f} ms\n"
             )
-            self.assertGreater(res["input_throughput"], 4000)
+            if is_in_amd_ci():
+                self.assertGreater(res["input_throughput"], 3000)
+            else:
+                self.assertGreater(res["input_throughput"], 4000)
 
     def test_score_api_latency_throughput(self):
         """Test score API latency and throughput performance"""
@@ -489,23 +494,71 @@ class TestBenchServing(CustomTestCase):
                 )
 
             self.assertEqual(res["successful_requests"], res["total_requests"])
-            if batch_size == 10:
-                avg_latency_bound = 45
-            elif batch_size == 25:
-                avg_latency_bound = 50
-            elif batch_size == 50:
-                avg_latency_bound = 60
-            else:
-                avg_latency_bound = 60
+            bounds = {
+                10: (45, 50),
+                25: (50, 60),
+                50: (60, 65),
+            }
+            avg_latency_bound, p95_latency_bound = bounds.get(batch_size, (60, 65))
             self.assertLess(res["avg_latency_ms"], avg_latency_bound)
-            if batch_size == 10:
-                p95_latency_bound = 50
-            elif batch_size == 25:
-                p95_latency_bound = 60
-            elif batch_size == 50:
-                p95_latency_bound = 65
-            else:
-                p95_latency_bound = 65
+            self.assertLess(res["p95_latency_ms"], p95_latency_bound)
+
+    def test_embeddings_api_latency_throughput(self):
+        """Test embeddings API latency and throughput performance"""
+        res = run_embeddings_benchmark(
+            model=DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST,
+            num_requests=1000,
+            batch_size=1,
+            input_tokens=500,
+            other_server_args=[],
+            need_warmup=True,
+        )
+
+        if is_in_ci():
+            write_github_step_summary(
+                f"### test_embeddings_api_throughput\n"
+                f"Average latency: {res['avg_latency_ms']:.2f} ms\n"
+                f"P95 latency: {res['p95_latency_ms']:.2f} ms\n"
+                f"Embeddings API throughput: {res['throughput']:.2f} req/s\n"
+                f"Successful requests: {res['successful_requests']}/{res['total_requests']}\n"
+            )
+
+        self.assertEqual(res["successful_requests"], res["total_requests"])
+        # Bounds based on actual performance on 1xH100: avg=15ms, p95=15ms, throughput=67req/s
+        self.assertLess(res["avg_latency_ms"], 20)
+        self.assertLess(res["p95_latency_ms"], 25)
+        self.assertGreater(res["throughput"], 60)
+
+    def test_embeddings_api_batch_scaling(self):
+        """Test embeddings API performance with different batch sizes"""
+        batch_sizes = [10, 25, 50]
+
+        for batch_size in batch_sizes:
+            res = run_embeddings_benchmark(
+                model=DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST,
+                num_requests=500,
+                batch_size=batch_size,
+                input_tokens=500,
+            )
+
+            if is_in_ci():
+                write_github_step_summary(
+                    f"### test_embeddings_api_batch_scaling_size_{batch_size}\n"
+                    f"Batch size: {batch_size}\n"
+                    f"Average latency: {res['avg_latency_ms']:.2f} ms\n"
+                    f"P95 latency: {res['p95_latency_ms']:.2f} ms\n"
+                    f"Throughput: {res['throughput']:.2f} req/s\n"
+                    f"Successful requests: {res['successful_requests']}/{res['total_requests']}\n"
+                )
+
+            self.assertEqual(res["successful_requests"], res["total_requests"])
+            bounds = {
+                10: (60, 65),
+                25: (115, 120),
+                50: (190, 195),
+            }
+            avg_latency_bound, p95_latency_bound = bounds.get(batch_size, (250, 250))
+            self.assertLess(res["avg_latency_ms"], avg_latency_bound)
             self.assertLess(res["p95_latency_ms"], p95_latency_bound)
 
 

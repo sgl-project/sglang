@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import NamedTuple, Optional, Tuple
+from enum import Enum, auto
+from typing import NamedTuple, Optional
+
+import torch
+import torch.distributed as dist
 
 from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -17,18 +21,6 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
 from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.moe.utils import DeepEPMode
 from sglang.srt.utils import get_int_env_var
-
-try:
-    from mooncake.mooncake_ep_buffer import Buffer
-
-    use_mooncake_ep = True
-except ImportError:
-    use_mooncake_ep = False
-
-from enum import Enum, auto
-
-import torch
-import torch.distributed as dist
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +75,9 @@ class EPBuffer:
         if cls._buffer is not None:
             return cls._buffer
 
+        # Lazy import Buffer to avoid creating CUDA context at module import time
+        from mooncake.mooncake_ep_buffer import Buffer
+
         cls._hidden_size = hidden_size
         cls._num_max_dispatch_tokens_per_rank = num_max_dispatch_tokens_per_rank
         cls._num_experts = num_experts
@@ -119,7 +114,9 @@ class _MooncakeEPDispatcherImpl:
         return_recv_hook: bool,
         deepep_mode: DeepEPMode,
     ):
-        if not use_mooncake_ep:
+        try:
+            from mooncake.mooncake_ep_buffer import Buffer  # noqa: F401
+        except ImportError:
             raise ImportError(
                 "Mooncake EP is not installed. Please install Mooncake package at "
                 "https://github.com/kvcache-ai/Mooncake/blob/main/doc/en/build.md "
@@ -145,8 +142,6 @@ class _MooncakeEPDispatcherImpl:
 
         self.first_execution = True
         self.timeout_us = 10000000
-
-        self.active_ranks = ElasticEPStateManager.instance().active_ranks
 
         self.handle = None
 
@@ -214,11 +209,12 @@ class _MooncakeEPDispatcherImpl:
         use_fp8: bool = False,
     ):
         buffer = self._get_buffer()
+        active_ranks = ElasticEPStateManager.instance().active_ranks
         packed_recv_hidden, packed_recv_count, self.handle, event, hook = (
             buffer.dispatch(
                 hidden_states,
                 topk_ids,
-                self.active_ranks,
+                active_ranks,
                 self.num_max_dispatch_tokens_per_rank,
                 self.num_experts,
                 -1 if self.first_execution else self.timeout_us,
@@ -253,11 +249,12 @@ class _MooncakeEPDispatcherImpl:
         topk_weights: torch.Tensor,
     ):
         buffer = self._get_buffer()
+        active_ranks = ElasticEPStateManager.instance().active_ranks
         combined_hidden_states, event, hook = buffer.combine(
             hidden_states,
             topk_ids,
             topk_weights,
-            self.active_ranks,
+            active_ranks,
             -1 if self.first_execution else self.timeout_us,
             self.handle,
             async_finish=not self.return_recv_hook,
@@ -300,6 +297,8 @@ class MooncakeEPDispatcher(BaseDispatcher):
         async_finish: bool = False,
         return_recv_hook: bool = False,
     ):
+        super().__init__()
+
         self.deepep_mode = deepep_mode
 
         if self.deepep_mode.enable_low_latency():
@@ -319,8 +318,12 @@ class MooncakeEPDispatcher(BaseDispatcher):
 
         self._stage = _Stage.INITIAL
 
-    def dispatch(self, *args, **kwargs) -> DispatchOutput:
-        self.dispatch_a(*args, **kwargs)
+    def dispatch(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: TopKOutput,
+    ) -> DispatchOutput:
+        self.dispatch_a(hidden_states, topk_output)
         ret = self.dispatch_b()
         return ret
 
@@ -342,18 +345,19 @@ class MooncakeEPDispatcher(BaseDispatcher):
         del self._dispatch_intermediate_state
         return self._get_impl().dispatch_b(*inner_state)
 
-    def combine(self, *args, **kwargs) -> Tuple:
-        self.combine_a(*args, **kwargs)
+    def combine(
+        self,
+        combine_input: CombineInput,
+    ) -> torch.Tensor:
+        self.combine_a(combine_input)
         ret = self.combine_b()
         return ret
 
     def combine_a(
         self,
-        hidden_states: torch.Tensor,
-        topk_ids: torch.Tensor,
-        topk_weights: torch.Tensor,
-        overlap_args: Optional = None,
+        combine_input: CombineInput,
     ):
+        hidden_states, topk_ids, topk_weights = combine_input
         self._update_stage(_Stage.AFTER_DISPATCH_B, _Stage.AFTER_COMBINE_A)
         inner_state = self._get_impl().combine_a(
             hidden_states=hidden_states,
@@ -381,6 +385,3 @@ class MooncakeEPDispatcher(BaseDispatcher):
     def _update_stage(self, old_stage, new_stage):
         assert self._stage == old_stage
         self._stage = new_stage
-
-    def set_quant_config(self, quant_config: dict):
-        pass

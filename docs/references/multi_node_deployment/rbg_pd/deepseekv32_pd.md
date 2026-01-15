@@ -53,7 +53,6 @@ spec:
               - --trust-remote
               - --host
               -  0.0.0.0
-              - --disable-radix-cache
               - --disaggregation-ib-device
               -  mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7
               - --disable-radix-cache
@@ -261,7 +260,6 @@ spec:
                   -  mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7
                   - --chunked-prefill-size
                   - "131072"
-                  - --prefill-round-robin-balance
                   - --eplb-rebalance-layers-per-chunk
                   - "29"
                   - --page-size
@@ -333,7 +331,6 @@ spec:
                 -  /log
                 - --chunked-prefill-size
                 - "262144"
-                - --prefill-round-robin-balance
                 - --eplb-rebalance-layers-per-chunk
                 - "29"
                 - --page-size

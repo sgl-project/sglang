@@ -14,6 +14,7 @@
 # ==============================================================================
 """Inference-only Qwen3-VL model compatible with HuggingFace weights."""
 import logging
+import re
 from functools import lru_cache
 from typing import Iterable, Optional, Tuple, Union
 
@@ -21,10 +22,7 @@ import torch
 import torch.nn as nn
 
 from sglang.srt.configs.qwen3_vl import Qwen3VLMoeConfig, Qwen3VLMoeTextConfig
-from sglang.srt.distributed import (
-    get_moe_expert_parallel_world_size,
-    get_tensor_model_parallel_rank,
-)
+from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
@@ -48,9 +46,25 @@ class Qwen3MoeLLMModel(Qwen3MoeModel):
     ):
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)
         self.hidden_size = config.hidden_size
+        # Currently, we use 3 as len(config.vision_config.deepstack_visual_indexes) is not directly accessible here.
+        # This approach follows the original implementation.
+        # TODO: make config of type Qwen3VLMoeConfig, so that we can directly obtain deepstack_visual_indexes.
+        self.deepstack_embed_to_decoder_layer = range(3)
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.embed_tokens
+
+    def get_deepstack_embeds(
+        self, layer_idx: int, input_deepstack_embeds: Optional[torch.Tensor]
+    ) -> Optional[torch.Tensor]:
+        """Get deepstack embeddings for a given layer index, or None if not applicable."""
+        if (
+            input_deepstack_embeds is None
+            or layer_idx not in self.deepstack_embed_to_decoder_layer
+        ):
+            return None
+        sep = self.hidden_size * layer_idx
+        return input_deepstack_embeds[:, sep : sep + self.hidden_size]
 
     def forward(
         self,
@@ -82,19 +96,26 @@ class Qwen3MoeLLMModel(Qwen3MoeModel):
                     hidden_states + residual if residual is not None else hidden_states
                 )
 
+            # SGLang applies residual at the START of the next layer, not at the END like HuggingFace.
+            # See: https://github.com/huggingface/transformers/blob/v5.0.0rc0/src/transformers/models/qwen3_vl/modeling_qwen3_vl.py#L549
+            # To match HF behavior, deepstack must be added AFTER residual: (hidden_states + residual) + deepstack
+            # The order matters because addition with different tensors is not associative in practice.
+            # Deepstack for prev_layer is applied at the start of current layer via post_residual_addition.
+            deepstack_embeds = self.get_deepstack_embeds(
+                layer_idx - 1, input_deepstack_embeds
+            )
             hidden_states, residual = layer(
                 positions,
                 hidden_states,
                 forward_batch,
                 residual,
+                post_residual_addition=deepstack_embeds,
             )
 
-            # process deepstack
-            if input_deepstack_embeds is not None and layer_idx < 3:
-                sep = self.hidden_size * layer_idx
-                hidden_states.add_(
-                    input_deepstack_embeds[:, sep : sep + self.hidden_size]
-                )
+        # Handle deepstack for the last processed layer if it exists.
+        last_deepstack = self.get_deepstack_embeds(
+            self.end_layer - 1, input_deepstack_embeds
+        )
 
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
@@ -108,7 +129,9 @@ class Qwen3MoeLLMModel(Qwen3MoeModel):
                 if residual is None:
                     hidden_states = self.norm(hidden_states)
                 else:
-                    hidden_states, _ = self.norm(hidden_states, residual)
+                    hidden_states, _ = self.norm(
+                        hidden_states, residual, post_residual_addition=last_deepstack
+                    )
 
         if len(aux_hidden_states) == 0:
             return hidden_states
@@ -126,34 +149,16 @@ def load_fused_expert_weights(
     param = params_dict[name]
     # weight_loader = typing.cast(Callable[..., bool], param.weight_loader)
     weight_loader = param.weight_loader
-    ep_rank = get_tensor_model_parallel_rank()
-    ep_size = get_moe_expert_parallel_world_size()
-    if ep_size == 1:
-        for expert_id in range(num_experts):
-            curr_expert_weight = loaded_weight[expert_id]
-            weight_loader(
-                param,
-                curr_expert_weight,
-                name,
-                shard_id,
-                expert_id,
-            )
-    else:
-        experts_per_ep = num_experts // ep_size
-        start_expert = ep_rank * experts_per_ep
-        end_expert = (
-            (ep_rank + 1) * experts_per_ep if ep_rank != ep_size - 1 else num_experts
+    # let ep moe layer to gracefully handle expert_ids that do not belong to local moe rank
+    for expert_id in range(num_experts):
+        curr_expert_weight = loaded_weight[expert_id]
+        weight_loader(
+            param,
+            curr_expert_weight,
+            name,
+            shard_id,
+            expert_id,
         )
-
-        for idx, expert_id in enumerate(range(start_expert, end_expert)):
-            curr_expert_weight = loaded_weight[expert_id]
-            weight_loader(
-                param,
-                curr_expert_weight,
-                name,
-                shard_id,
-                idx,
-            )
     return True
 
 
@@ -166,6 +171,14 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         language_model_cls=Qwen3MoeLLMModel,
     ):
         super().__init__(config, quant_config, prefix, language_model_cls)
+
+    # Only allow LoRA on attention projections within text layers for MoE.
+    _lora_pattern_moe = re.compile(
+        r"^model\.layers\.(\d+)\.self_attn\.(?:qkv_proj|o_proj)$"
+    )
+
+    def should_apply_lora(self, module_name: str) -> bool:
+        return bool(self._lora_pattern_moe.match(module_name))
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
@@ -255,7 +268,7 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     param_name, weight_name, expert_id, shard_id = mapping
                     if weight_name not in name:
                         continue
-                    if "visual" in name:
+                    if "visual" in name or self.config.encoder_only:
                         continue
                     # Anyway, this is an expert weight and should not be
                     # attempted to load as other weights later
@@ -321,6 +334,12 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     if name.endswith(ignore_suffixes) and name not in params_dict:
                         continue
 
+                    # Skip loading mm/language parameters
+                    if (
+                        self.config.encoder_only or self.config.language_only
+                    ) and name not in params_dict:
+                        continue
+
                     if name in params_dict.keys():
                         param = params_dict[name]
                         weight_loader = getattr(
@@ -338,6 +357,14 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         #         for layer_id in range(self.start_layer, self.end_layer)
         #         if isinstance(self.model.layers[layer_id].mlp, Qwen3MoeSparseMoeBlock)
         #     }
+
+    @classmethod
+    def get_model_config_for_expert_location(cls, config):
+        return ModelConfigForExpertLocation(
+            num_layers=config.text_config.num_hidden_layers,
+            num_logical_experts=config.text_config.num_experts,
+            num_groups=None,
+        )
 
 
 EntryClass = Qwen3VLMoeForConditionalGeneration

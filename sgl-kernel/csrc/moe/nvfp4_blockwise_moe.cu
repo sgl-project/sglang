@@ -27,6 +27,7 @@
 #include "cutlass/util/reference/host/tensor_fill.h"
 #include "cutlass/util/reference/host/tensor_norm.h"
 #include "cutlass/util/tensor_view_io.h"
+#include "utils.h"
 
 using namespace cute;
 
@@ -178,8 +179,205 @@ void run_get_group_gemm_starts(
   }
 }
 
+void run_fp4_blockwise_scaled_group_mm_sm120(
+    torch::Tensor& output,
+    const torch::Tensor& a,
+    const torch::Tensor& b,
+    const torch::Tensor& a_blockscale,
+    const torch::Tensor& b_blockscales,
+    const torch::Tensor& alphas,
+    const torch::Tensor& ab_strides,
+    const torch::Tensor& c_strides,
+    const torch::Tensor& problem_sizes,
+    const torch::Tensor& expert_offsets,
+    const torch::Tensor& sf_offsets,
+    int M,
+    int N,
+    int K) {
+  using ProblemShape = cutlass::gemm::GroupProblemShape<Shape<int32_t, int32_t, int32_t>>;
+  using ElementType = cutlass::float_e2m1_t;
+  using ElementSFType = cutlass::float_ue4m3_t;
+  using ElementA = cutlass::nv_float4_t<cutlass::float_e2m1_t>;
+  using ElementB = cutlass::nv_float4_t<cutlass::float_e2m1_t>;
+
+  using ElementC = cutlass::bfloat16_t;
+  using ElementD = cutlass::bfloat16_t;
+  using ElementAccumulator = float;
+  // Layout definitions
+  using LayoutA = cutlass::layout::RowMajor;
+  using LayoutB = cutlass::layout::ColumnMajor;
+  using LayoutC = cutlass::layout::RowMajor;
+  using LayoutD = cutlass::layout::RowMajor;
+
+  // Alignment constraints
+  static constexpr int AlignmentA = 32;
+  static constexpr int AlignmentB = 32;
+  static constexpr int AlignmentC = 128 / cutlass::sizeof_bits<ElementC>::value;
+  static constexpr int AlignmentD = 128 / cutlass::sizeof_bits<ElementD>::value;
+
+  // Architecture definitions
+  using ArchTag = cutlass::arch::Sm120;
+  using OperatorClass = cutlass::arch::OpClassBlockScaledTensorOp;
+  using StageCountType = cutlass::gemm::collective::StageCountAuto;
+  using ThreadBlockShape = Shape<_128, _128, _128>;
+  // on the tile size
+
+  using ClusterShape = Shape<_1, _1, _1>;
+
+  using FusionOperation =
+      cutlass::epilogue::fusion::LinearCombination<ElementD, ElementAccumulator, ElementC, ElementAccumulator>;
+
+  using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+      ArchTag,
+      OperatorClass,
+      ThreadBlockShape,
+      ClusterShape,
+      cutlass::epilogue::collective::EpilogueTileAuto,
+      ElementAccumulator,
+      ElementAccumulator,
+      ElementC,
+      LayoutC*,
+      AlignmentC,
+      ElementD,
+      LayoutC*,
+      AlignmentD,
+      cutlass::epilogue::collective::EpilogueScheduleAuto,
+      FusionOperation>::CollectiveOp;
+
+  using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
+      ArchTag,
+      OperatorClass,
+      ElementA,
+      LayoutA*,
+      AlignmentA,
+      ElementB,
+      LayoutB*,
+      AlignmentB,
+      ElementAccumulator,
+      ThreadBlockShape,
+      ClusterShape,
+      cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
+          sizeof(typename CollectiveEpilogue::SharedStorage))>,
+      cutlass::gemm::KernelPtrArrayTmaWarpSpecializedPingpong>::CollectiveOp;
+
+  using GemmKernel = cutlass::gemm::kernel::GemmUniversal<ProblemShape, CollectiveMainloop, CollectiveEpilogue>;
+
+  using Gemm1SM = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+  using Gemm = Gemm1SM;
+  using StrideA = typename Gemm::GemmKernel::InternalStrideA;
+  using StrideB = typename Gemm::GemmKernel::InternalStrideB;
+  using StrideC = typename Gemm::GemmKernel::InternalStrideC;
+  using StrideD = typename Gemm::GemmKernel::InternalStrideD;
+
+  using LayoutSFA = typename Gemm::GemmKernel::CollectiveMainloop::InternalLayoutSFA;
+  using LayoutSFB = typename Gemm::GemmKernel::CollectiveMainloop::InternalLayoutSFB;
+  using ScaleConfig = typename Gemm::GemmKernel::CollectiveMainloop::Sm1xxBlkScaledConfig;
+
+  using UnderlyingProblemShape = ProblemShape::UnderlyingProblemShape;
+  int num_experts = static_cast<int>(expert_offsets.size(0));
+  auto options_int = torch::TensorOptions().dtype(torch::kInt64).device(a.device());
+
+  torch::Tensor a_ptrs = torch::empty(num_experts, options_int);
+  torch::Tensor b_ptrs = torch::empty(num_experts, options_int);
+  torch::Tensor out_ptrs = torch::empty(num_experts, options_int);
+  torch::Tensor a_scales_ptrs = torch::empty(num_experts, options_int);
+  torch::Tensor b_scales_ptrs = torch::empty(num_experts, options_int);
+  torch::Tensor alpha_ptrs = torch::empty(num_experts, options_int);
+  torch::Tensor layout_sfa = torch::empty({num_experts, 5}, options_int);
+  torch::Tensor layout_sfb = torch::empty({num_experts, 5}, options_int);
+
+  run_get_group_gemm_starts<LayoutSFA, LayoutSFB, ScaleConfig>(
+      a_ptrs,
+      b_ptrs,
+      out_ptrs,
+      a_scales_ptrs,
+      b_scales_ptrs,
+      alpha_ptrs,
+      layout_sfa,
+      layout_sfb,
+      a,
+      b,
+      output,
+      a_blockscale,
+      b_blockscales,
+      alphas,
+      expert_offsets,
+      sf_offsets,
+      problem_sizes,
+      M,
+      N,
+      K);
+
+  // Create an instance of the GEMM
+  Gemm gemm_op;
+
+  // Initialize problem_sizes_as_shapes correctly
+  UnderlyingProblemShape* problem_sizes_as_shapes = static_cast<UnderlyingProblemShape*>(problem_sizes.data_ptr());
+
+  // Set the Scheduler info
+  cutlass::KernelHardwareInfo hw_info;
+
+  using RasterOrderOptions = cutlass::gemm::kernel::detail::RasterOrderOptions;
+  typename Gemm::GemmKernel::TileSchedulerArguments scheduler;
+  scheduler.raster_order = RasterOrderOptions::AlongM;
+  hw_info.device_id = a.get_device();
+  static std::unordered_map<int, int> cached_sm_counts;
+  if (cached_sm_counts.find(hw_info.device_id) == cached_sm_counts.end()) {
+    cached_sm_counts[hw_info.device_id] =
+        cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);
+  }
+  hw_info.sm_count = min(cached_sm_counts[hw_info.device_id], INT_MAX);
+
+  // Mainloop Arguments
+  typename GemmKernel::MainloopArguments mainloop_args{
+      static_cast<const ElementType**>(a_ptrs.data_ptr()),
+      static_cast<StrideA*>(ab_strides.data_ptr()),
+      static_cast<const ElementType**>(b_ptrs.data_ptr()),
+      static_cast<StrideB*>(ab_strides.data_ptr()),
+      static_cast<const ElementSFType**>(a_scales_ptrs.data_ptr()),
+      reinterpret_cast<LayoutSFA*>(layout_sfa.data_ptr()),
+      static_cast<const ElementSFType**>(b_scales_ptrs.data_ptr()),
+      reinterpret_cast<LayoutSFB*>(layout_sfb.data_ptr())};
+
+  // Epilogue Arguments
+  typename GemmKernel::EpilogueArguments epilogue_args{
+      {},  // epilogue.thread
+      nullptr,
+      static_cast<StrideC*>(c_strides.data_ptr()),
+      static_cast<ElementD**>(out_ptrs.data_ptr()),
+      static_cast<StrideC*>(c_strides.data_ptr())};
+  auto& fusion_args = epilogue_args.thread;
+  fusion_args.alpha_ptr_array = reinterpret_cast<float**>(alpha_ptrs.data_ptr());
+  fusion_args.dAlpha = {_0{}, _0{}, 1};
+  fusion_args.beta = 0.0f;
+
+  // Gemm Arguments
+  typename GemmKernel::Arguments args{
+      cutlass::gemm::GemmUniversalMode::kGrouped,
+      {num_experts, problem_sizes_as_shapes, nullptr},
+      mainloop_args,
+      epilogue_args,
+      hw_info,
+      scheduler};
+
+  size_t workspace_size = Gemm::get_workspace_size(args);
+  auto const workspace_options = torch::TensorOptions().dtype(torch::kUInt8).device(a.device());
+  auto workspace = torch::empty(workspace_size, workspace_options);
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream(a.get_device());
+
+  auto can_implement_status = gemm_op.can_implement(args);
+  TORCH_CHECK(can_implement_status == cutlass::Status::kSuccess, "Failed to implement GEMM");
+
+  // Run the GEMM
+  auto status = gemm_op.initialize(args, workspace.data_ptr());
+  TORCH_CHECK(status == cutlass::Status::kSuccess, "Failed to initialize GEMM");
+
+  status = gemm_op.run(args, workspace.data_ptr(), stream);
+  TORCH_CHECK(status == cutlass::Status::kSuccess, "Failed to run GEMM");
+}
+
 template <typename OutType>
-void run_fp4_blockwise_scaled_group_mm(
+void run_fp4_blockwise_scaled_group_mm_sm100(
     torch::Tensor& output,
     const torch::Tensor& a,
     const torch::Tensor& b,
@@ -376,6 +574,10 @@ void run_fp4_blockwise_scaled_group_mm(
   TORCH_CHECK(status == cutlass::Status::kSuccess, "Failed to run GEMM");
 }
 
+// Undefine macros from utils.h to redefine with custom signatures
+#undef CHECK_CONTIGUOUS
+#undef CHECK_INPUT
+
 #define CHECK_TYPE(x, st, m) TORCH_CHECK(x.scalar_type() == st, ": Inconsistency of Tensor type:", m)
 #define CHECK_TH_CUDA(x, m) TORCH_CHECK(x.is_cuda(), m, ": must be a CUDA tensor.")
 #define CHECK_CONTIGUOUS(x, m) TORCH_CHECK(x.is_contiguous(), m, ": must be contiguous.")
@@ -428,38 +630,63 @@ void cutlass_fp4_group_mm(
   int E = static_cast<int>(b.size(0));
   int K = static_cast<int>(2 * b.size(2));
 
-  if (output.scalar_type() == torch::kBFloat16) {
-    run_fp4_blockwise_scaled_group_mm<cutlass::bfloat16_t>(
-        output,
-        a,
-        b,
-        a_blockscale,
-        b_blockscales,
-        alphas,
-        ab_strides,
-        c_strides,
-        problem_sizes,
-        expert_offsets,
-        sf_offsets,
-        M,
-        N,
-        K);
+  auto sm_version = getSMVersion();
+  if (sm_version == 100 || sm_version == 103) {
+    if (output.scalar_type() == torch::kBFloat16) {
+      run_fp4_blockwise_scaled_group_mm_sm100<cutlass::bfloat16_t>(
+          output,
+          a,
+          b,
+          a_blockscale,
+          b_blockscales,
+          alphas,
+          ab_strides,
+          c_strides,
+          problem_sizes,
+          expert_offsets,
+          sf_offsets,
+          M,
+          N,
+          K);
+    } else {
+      run_fp4_blockwise_scaled_group_mm_sm100<cutlass::half_t>(
+          output,
+          a,
+          b,
+          a_blockscale,
+          b_blockscales,
+          alphas,
+          ab_strides,
+          c_strides,
+          problem_sizes,
+          expert_offsets,
+          sf_offsets,
+          M,
+          N,
+          K);
+    }
+  } else if (sm_version == 120) {
+    if (output.scalar_type() == torch::kBFloat16) {
+      run_fp4_blockwise_scaled_group_mm_sm120(
+          output,
+          a,
+          b,
+          a_blockscale,
+          b_blockscales,
+          alphas,
+          ab_strides,
+          c_strides,
+          problem_sizes,
+          expert_offsets,
+          sf_offsets,
+          M,
+          N,
+          K);
+    } else {
+      std::cout << "run_fp4_blockwise_scaled_group_mm_sm120 half no implementation" << std::endl;
+    }
   } else {
-    run_fp4_blockwise_scaled_group_mm<cutlass::half_t>(
-        output,
-        a,
-        b,
-        a_blockscale,
-        b_blockscales,
-        alphas,
-        ab_strides,
-        c_strides,
-        problem_sizes,
-        expert_offsets,
-        sf_offsets,
-        M,
-        N,
-        K);
+    TORCH_CHECK_NOT_IMPLEMENTED(false, "Unsupported SM version: " + std::to_string(sm_version));
   }
 #else
   TORCH_CHECK_NOT_IMPLEMENTED(

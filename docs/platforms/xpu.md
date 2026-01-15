@@ -30,7 +30,7 @@ conda create -n sgl-xpu python=3.12 -y
 conda activate sgl-xpu
 
 # Set PyTorch XPU as primary pip install channel to avoid installing the larger CUDA-enabled version and prevent potential runtime issues.
-pip3 install torch==2.8.0+xpu torchao torchvision torchaudio pytorch-triton-xpu==3.4.0 --index-url https://download.pytorch.org/whl/xpu
+pip3 install torch==2.9.0+xpu torchao torchvision torchaudio pytorch-triton-xpu==3.5.0 --index-url https://download.pytorch.org/whl/xpu
 pip3 install xgrammar --no-deps # xgrammar will introduce CUDA-enabled triton which might conflict with XPU
 
 # Clone the SGLang code
@@ -88,5 +88,5 @@ python -m sglang.bench_serving -h
 ```
 
 Additionally, the requests can be formed with
-[OpenAI Completions API](https://docs.sglang.ai/basic_usage/openai_api_completions.html)
+[OpenAI Completions API](https://docs.sglang.io/basic_usage/openai_api_completions.html)
 and sent via the command line (e.g. using `curl`) or via your own script.
