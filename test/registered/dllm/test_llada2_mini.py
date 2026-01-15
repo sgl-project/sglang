@@ -1,8 +1,12 @@
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+
+register_cuda_ci(est_time=181, suite="stage-b-test-small-1-gpu")
+register_amd_ci(est_time=330, suite="stage-b-test-small-1-gpu-amd")
+
 import unittest
 from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.send_one import BenchArgs, send_one_prompt
 from sglang.test.test_utils import (
@@ -14,8 +18,6 @@ from sglang.test.test_utils import (
     popen_launch_server,
     write_github_step_summary,
 )
-
-register_cuda_ci(est_time=181, suite="stage-b-test-large-1-gpu")
 
 
 class TestLLaDA2Mini(CustomTestCase):
@@ -61,7 +63,10 @@ class TestLLaDA2Mini(CustomTestCase):
         print(f"{metrics=}")
 
         self.assertGreater(metrics["accuracy"], 0.88)
-        self.assertGreater(metrics["output_throughput"], 150)
+        if is_in_amd_ci():
+            self.assertGreater(metrics["output_throughput"], 80)
+        else:
+            self.assertGreater(metrics["output_throughput"], 150)
 
     def test_bs_1_speed(self):
         args = BenchArgs(port=int(self.base_url.split(":")[-1]), max_new_tokens=2048)

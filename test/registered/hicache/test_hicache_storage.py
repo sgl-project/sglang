@@ -1,9 +1,14 @@
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+
+register_cuda_ci(est_time=96, suite="stage-b-test-small-1-gpu")
+register_amd_ci(est_time=300, suite="stage-b-test-small-1-gpu-amd")
+register_cuda_ci(est_time=96, suite="stage-b-test-small-1-gpu-5090")
+
 import time
 import unittest
 from types import SimpleNamespace
 
 from sglang.srt.utils import is_hip, kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
@@ -12,8 +17,6 @@ from sglang.test.test_utils import (
     CustomTestCase,
     popen_launch_server,
 )
-
-register_cuda_ci(est_time=96, suite="stage-b-test-small-1-gpu")
 
 _is_hip = is_hip()
 
