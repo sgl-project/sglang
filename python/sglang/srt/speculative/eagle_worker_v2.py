@@ -295,36 +295,15 @@ class EagleDraftWorker(BaseDraftWorker):
         if self.hot_token_id is not None:
             topk_index = self.hot_token_id[topk_index]
 
-        # Return values
-        score_list: List[torch.Tensor] = []
-        token_list: List[torch.Tensor] = []
-        parents_list: List[torch.Tensor] = []
-
         # Forward multiple steps
         scores = None
         input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
             0, topk_p, topk_index, hidden_states, scores, self.topk
         )
-        if self.speculative_num_steps == 1:
-            score_list.append(tree_info[0])
-            token_list.append(tree_info[1])
-            parents_list.append(tree_info[2])
-        else:
-            for i in range(self.speculative_num_steps):
-                score_list.append(tree_info[0][:, :, i].unsqueeze(-1))
-                token_index = tree_info[1][:, i].unsqueeze(-1)
-                token_list.append(token_index)
-                if i == 0:
-                    parents_list.append(tree_info[2])
-                else:
-                    parents_list.append(
-                        torch.full(
-                            (tree_info[2].size(0), 1),
-                            i,
-                            dtype=torch.long,
-                            device="cuda",
-                        )
-                    )
+        score_list = [tree_info[0][:, :, i].unsqueeze(-1) for i in range(self.speculative_num_steps)]
+        token_list = [tree_info[1][:, i].unsqueeze(-1) for i in range(self.speculative_num_steps)]
+        parents_list = [tree_info[2]] + [torch.full((tree_info[2].size(0), 1), i, dtype=torch.long, device="cuda")
+                                         for i in range(1, self.speculative_num_steps)]
 
         # Organize the results
         score_list = torch.cat(score_list, dim=1).flatten(
@@ -477,7 +456,7 @@ class EagleDraftWorker(BaseDraftWorker):
         )
 
     def draft_v2(self, model_worker_batch: ModelWorkerBatch, batch_result: GenerationBatchResult):
-        if self.speculative_num_steps == 0:
+        if self.speculative_num_steps <= 1:
             return
 
         seq_lens_bk = model_worker_batch.seq_lens
@@ -509,7 +488,10 @@ class EagleDraftWorker(BaseDraftWorker):
                 forward_batch,
             )
         else:
-            if not forward_batch.forward_mode.is_idle():
+            if (
+                not forward_batch.forward_mode.is_idle()
+                and self.speculative_num_steps > 1
+            ):
                 self.draft_attn_backend.init_forward_metadata(forward_batch)
             ret_topk_p_list, ret_topk_index_list = self.draft_forward(
                 forward_batch
