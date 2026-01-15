@@ -43,6 +43,7 @@ fi
 
 # Install protoc for router build (gRPC protobuf compilation)
 if [ "${INSTALL_PROTOC:-0}" = "1" ]; then
+    # TODO: move this to a separate script
     echo "Installing protoc..."
     if command -v apt-get &> /dev/null; then
         # Ubuntu/Debian
@@ -95,6 +96,7 @@ fi
 # Clean up existing installations
 $PIP_UNINSTALL_CMD sgl-kernel sglang $PIP_UNINSTALL_SUFFIX || true
 $PIP_UNINSTALL_CMD flashinfer-python flashinfer-cubin flashinfer-jit-cache $PIP_UNINSTALL_SUFFIX || true
+$PIP_UNINSTALL_CMD opencv-python opencv-python-headless $PIP_UNINSTALL_SUFFIX || true
 
 # Install the main package
 EXTRAS="dev"
@@ -108,6 +110,7 @@ $PIP_CMD install -e "python[${EXTRAS}]" --extra-index-url https://download.pytor
 # Install router for pd-disagg test
 $PIP_CMD install sglang-router $PIP_INSTALL_SUFFIX
 
+# Remove flash_attn folder to avoid conflicts
 PYTHON_LIB_PATH=$(python3 -c "import site; print(site.getsitepackages()[0])")
 FLASH_ATTN_PATH="${PYTHON_LIB_PATH}/flash_attn"
 
@@ -133,14 +136,25 @@ if [ "${CUSTOM_BUILD_SGL_KERNEL:-}" = "true" ]; then
     fi
     $PIP_CMD install sgl-kernel/dist/sgl_kernel-${SGL_KERNEL_VERSION_FROM_KERNEL}-cp310-abi3-manylinux2014_${WHEEL_ARCH}.whl --force-reinstall $PIP_INSTALL_SUFFIX
 else
-    $PIP_CMD install sgl-kernel==${SGL_KERNEL_VERSION_FROM_SRT} --force-reinstall $PIP_INSTALL_SUFFIX
+    # On Blackwell machines, skip reinstall if correct version already installed to avoid race conditions
+    if [ "$IS_BLACKWELL" = "1" ]; then
+        INSTALLED_SGL_KERNEL=$(pip show sgl-kernel 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
+        if [ "$INSTALLED_SGL_KERNEL" = "$SGL_KERNEL_VERSION_FROM_SRT" ]; then
+            echo "sgl-kernel==${SGL_KERNEL_VERSION_FROM_SRT} already installed, skipping reinstall"
+        else
+            echo "Installing sgl-kernel==${SGL_KERNEL_VERSION_FROM_SRT} (current: ${INSTALLED_SGL_KERNEL:-none})"
+            $PIP_CMD install sgl-kernel==${SGL_KERNEL_VERSION_FROM_SRT} $PIP_INSTALL_SUFFIX
+        fi
+    else
+        $PIP_CMD install sgl-kernel==${SGL_KERNEL_VERSION_FROM_SRT} --force-reinstall $PIP_INSTALL_SUFFIX
+    fi
 fi
 
 # Show current packages
 $PIP_CMD list
 
 # Install other python dependencies
-$PIP_CMD install mooncake-transfer-engine==0.3.7.post2 "${NVRTC_SPEC}" py-spy scipy huggingface_hub[hf_xet] pytest $PIP_INSTALL_SUFFIX
+$PIP_CMD install mooncake-transfer-engine==0.3.8.post1 "${NVRTC_SPEC}" py-spy scipy huggingface_hub[hf_xet] pytest $PIP_INSTALL_SUFFIX
 
 if [ "$IS_BLACKWELL" != "1" ]; then
     # For lmms_evals evaluating MMMU
@@ -149,10 +163,30 @@ if [ "$IS_BLACKWELL" != "1" ]; then
 fi
 
 # DeepEP depends on nvshmem 3.4.5
-$PIP_CMD install nvidia-nvshmem-cu12==3.4.5 --force-reinstall $PIP_INSTALL_SUFFIX
+# On Blackwell machines, skip reinstall if correct version already installed to avoid race conditions
+if [ "$IS_BLACKWELL" = "1" ]; then
+    INSTALLED_NVSHMEM=$(pip show nvidia-nvshmem-cu12 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
+    if [ "$INSTALLED_NVSHMEM" = "3.4.5" ]; then
+        echo "nvidia-nvshmem-cu12==3.4.5 already installed, skipping reinstall"
+    else
+        $PIP_CMD install nvidia-nvshmem-cu12==3.4.5 $PIP_INSTALL_SUFFIX
+    fi
+else
+    $PIP_CMD install nvidia-nvshmem-cu12==3.4.5 --force-reinstall $PIP_INSTALL_SUFFIX
+fi
 
 # Cudnn with version less than 9.16.0.29 will cause performance regression on Conv3D kernel
-$PIP_CMD install nvidia-cudnn-cu12==9.16.0.29 --force-reinstall $PIP_INSTALL_SUFFIX
+# On Blackwell machines, skip reinstall if correct version already installed to avoid race conditions
+if [ "$IS_BLACKWELL" = "1" ]; then
+    INSTALLED_CUDNN=$(pip show nvidia-cudnn-cu12 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
+    if [ "$INSTALLED_CUDNN" = "9.16.0.29" ]; then
+        echo "nvidia-cudnn-cu12==9.16.0.29 already installed, skipping reinstall"
+    else
+        $PIP_CMD install nvidia-cudnn-cu12==9.16.0.29 $PIP_INSTALL_SUFFIX
+    fi
+else
+    $PIP_CMD install nvidia-cudnn-cu12==9.16.0.29 --force-reinstall $PIP_INSTALL_SUFFIX
+fi
 $PIP_CMD uninstall xformers || true
 
 # Install flashinfer-jit-cache with caching and retry logic (flashinfer.ai can have transient DNS issues)
@@ -215,15 +249,3 @@ python3 -c "import torch; print(torch.version.cuda)"
 
 # Prepare the CI runner (cleanup HuggingFace cache, etc.)
 bash "${SCRIPT_DIR}/prepare_runner.sh"
-
-# Remove flash_attn folder to avoid conflicts with sgl-kernel
-PYTHON_LIB_PATH=$(python3 -c "import site; print(site.getsitepackages()[0])")
-FLASH_ATTN_PATH="${PYTHON_LIB_PATH}/flash_attn"
-
-if [ -d "$FLASH_ATTN_PATH" ]; then
-    echo "Directory $FLASH_ATTN_PATH exists. Removing..."
-    rm -rf "$FLASH_ATTN_PATH"
-    echo "error: this should not happen"
-else
-    echo "Directory $FLASH_ATTN_PATH does not exist."
-fi

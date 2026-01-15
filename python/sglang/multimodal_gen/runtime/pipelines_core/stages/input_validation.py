@@ -18,6 +18,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     StageValidators,
     VerificationResult,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import best_output_size
@@ -61,7 +62,7 @@ class InputValidationStage(PipelineStage):
         if generator_device == "cpu":
             device_str = "cpu"
         else:
-            device_str = "cuda" if torch.cuda.is_available() else "cpu"
+            device_str = current_platform.device_type
 
         batch.generator = [
             torch.Generator(device_str).manual_seed(seed) for seed in seeds
@@ -78,7 +79,10 @@ class InputValidationStage(PipelineStage):
         preprocess condition image
         NOTE: condition image resizing is only allowed in InputValidationStage
         """
-        if server_args.pipeline_config.task_type == ModelTaskType.I2I:
+        if batch.condition_image is not None and (
+            server_args.pipeline_config.task_type == ModelTaskType.I2I
+            or server_args.pipeline_config.task_type == ModelTaskType.TI2I
+        ):
             # calculate new condition image size
             if not isinstance(batch.condition_image, list):
                 batch.condition_image = [batch.condition_image]
@@ -178,13 +182,6 @@ class InputValidationStage(PipelineStage):
     ) -> Req:
         """
         Validate and prepare inputs.
-
-        Args:
-            batch: The current batch information.
-            server_args: The inference arguments.
-
-        Returns:
-            The validated batch information.
         """
 
         self._generate_seeds(batch, server_args)
@@ -293,16 +290,6 @@ class InputValidationStage(PipelineStage):
         result = VerificationResult()
         result.add_check("height", batch.height, V.positive_int)
         result.add_check("width", batch.width, V.positive_int)
-
-        # Validate height and width
-        def check_size(value: int, name: str):
-            if value % (8 * server_args.num_gpus) != 0:
-                raise ValueError(
-                    f"{name} must be divisible by (8 x num_gpus) but {value} % (8 * {server_args.num_gpus}) != 0."
-                )
-
-        check_size(batch.height, "Height")
-        check_size(batch.width, "Width")
         result.add_check("seeds", batch.seeds, V.list_not_empty)
         result.add_check("generator", batch.generator, V.generator_or_list_generators)
         return result

@@ -31,6 +31,7 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     get_compiler_backend,
     is_cpu,
+    is_npu,
     set_weight_attrs,
 )
 
@@ -38,6 +39,7 @@ DEFAULT_VOCAB_PADDING_SIZE = 64
 
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
+_is_npu = is_npu()
 
 logger = logging.getLogger(__name__)
 
@@ -123,7 +125,7 @@ class VocabParallelEmbeddingShardIndices:
         assert self.num_added_elements <= self.num_added_elements_padded
 
 
-@torch.compile(dynamic=True, backend=get_compiler_backend())
+@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
 def get_masked_input_and_mask(
     input_: torch.Tensor,
     org_vocab_start_index: int,
