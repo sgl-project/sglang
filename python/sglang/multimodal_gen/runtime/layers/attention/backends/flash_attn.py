@@ -301,9 +301,6 @@ def flash_attn_varlen_func_op_lse(
 
 
 try:
-    # from flash_attn.flash_attn_interface import (
-    #     flash_attn_varlen_func as flash_attn_varlen_func_upstream,
-    # )
     if current_platform.is_hopper():
         from flash_attn_interface import (
             flash_attn_varlen_func as flash_attn_varlen_func_upstream,
@@ -346,8 +343,6 @@ def _should_use_upstream_flash_attention(
     k_shape: tuple[int, ...],
     v_shape: tuple[int, ...],
 ) -> bool:
-    print(f"{upstream_available=}")
-    print(f"{upstream_heads_ok=}")
     if not upstream_available or not upstream_heads_ok:
         return False
 
@@ -371,10 +366,6 @@ def _should_use_upstream_flash_attention(
         return False
     if nheads_k == 0 or (nheads_q % nheads_k) != 0:
         return False
-
-    # if not upstream_available or not upstream_heads_ok:
-    #     # raise ValueError(f"{upstream_available=}")
-    #     return False
     return True
 
 
@@ -491,7 +482,6 @@ class FlashAttentionImpl(AttentionImpl):
             k_shape,
             v_shape,
         )
-        # print(f"{use_upstream=}")
 
         if use_upstream:
             bsz, seqlen, nheads_q, d = q_shape
