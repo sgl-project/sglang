@@ -93,13 +93,8 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--context-length` | The model's maximum context length. Defaults to None (will use the value from the model's config.json instead). | `None` | Type: int |
 | `--is-embedding` | Whether to use a CausalLM as an embedding model. | `False` | bool flag (set to enable) |
 | `--enable-multimodal` | Enable the multimodal functionality for the served model. If the model being served is not multimodal, nothing will happen | `None` | bool flag (set to enable) |
-| `--limit-mm-data-per-request` | Limit the number of multimodal inputs per request. e.g. '{"image": 1, "video": 1, "audio": 1}' | `None` | Type: JSON / Dict |
 | `--revision` | The specific model version to use. It can be a branch name, a tag name, or a commit id. If unspecified, will use the default version. | `None` | Type: str |
 | `--model-impl` | Which implementation of the model to use. * "auto" will try to use the SGLang implementation if it exists and fall back to the Transformers implementation if no SGLang implementation is available. * "sglang" will use the SGLang model implementation. * "transformers" will use the Transformers model implementation. | `auto` | Type: str |
-| `--fastapi-root-path` | App is behind a path based routing proxy. | `""` | Type: str |
-| `--grpc-mode` | If set, use gRPC server instead of HTTP server. | `False` | bool flag (set to enable) |
-| `--checkpoint-engine-wait-weights-before-ready` | If set, the server will wait for initial weights to be loaded via checkpoint-engine or other update methods before serving inference requests. | `False` | bool flag (set to enable) |
-| `--model-checksum` | Model file integrity verification. If provided without value, uses model-path as HF repo ID. Otherwise, provide checksums JSON file path or HuggingFace repo ID. | `None` | Type: str |
 
 ## HTTP server
 | Argument | Description | Defaults | Options |
@@ -111,6 +106,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--skip-server-warmup` | If set, skip warmup. | `False` | bool flag (set to enable) |
 | `--warmups` | Specify custom warmup functions (csv) to run before server starts eg. --warmups=warmup_name1,warmup_name2 will run the functions `warmup_name1` and `warmup_name2` specified in warmup.py before the server starts listening for requests | `None` | Type: str |
 | `--nccl-port` | The port for NCCL distributed environment setup. Defaults to a random port. | `None` | Type: int |
+| `--checkpoint-engine-wait-weights-before-ready` | If set, the server will wait for initial weights to be loaded via checkpoint-engine or other update methods before serving inference requests. | `False` | bool flag (set to enable) |
 
 ## Quantization and data type
 | Argument | Description | Defaults | Options |
@@ -135,8 +131,8 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--max-queued-requests` | The maximum number of queued requests. This option is ignored when using disaggregation-mode. | `None` | Type: int |
 | `--max-total-tokens` | The maximum number of tokens in the memory pool. If not specified, it will be automatically calculated based on the memory usage fraction. This option is typically used for development and debugging purposes. | `None` | Type: int |
 | `--chunked-prefill-size` | The maximum number of tokens in a chunk for the chunked prefill. Setting this to -1 means disabling chunked prefill. | `None` | Type: int |
-| `--enable-dynamic-chunking` | Enable dynamic chunk size adjustment for pipeline parallelism. When enabled, chunk sizes are dynamically calculated based on fitted function to maintain consistent execution time across chunks. | `False` | bool flag (set to enable) |
 | `--prefill-max-requests` | The maximum number of requests in a prefill batch. If not specified, there is no limit. | `None` | Type: int |
+| `--enable-dynamic-chunking` | Enable dynamic chunk size adjustment for pipeline parallelism. When enabled, chunk sizes are dynamically calculated based on fitted function to maintain consistent execution time across chunks. | `False` | bool flag (set to enable) |
 | `--max-prefill-tokens` | The maximum number of tokens in a prefill batch. The real bound will be the maximum of this value and the model's maximum context length. | `16384` | Type: int |
 | `--schedule-policy` | The scheduling policy of the requests. | `fcfs` | `lpm`, `random`, `fcfs`, `dfs-weight`, `lof`, `priority`, `routing-key` |
 | `--enable-priority-scheduling` | Enable priority scheduling. Requests with higher priority integer values will be scheduled first by default. | `False` | bool flag (set to enable) |
@@ -152,13 +148,13 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--enable-prefill-delayer` | Enable prefill delayer for DP attention to reduce idle time. | `False` | bool flag (set to enable) |
 | `--prefill-delayer-max-delay-passes` | Maximum forward passes to delay prefill. | `30` | Type: int |
 | `--prefill-delayer-token-usage-low-watermark` | Token usage low watermark for prefill delayer. | `None` | Type: float |
+| `--prefill-delayer-forward-passes-buckets` | Custom buckets for prefill delayer forward passes histogram. 0 and max_delay_passes-1 will be auto-added. | `None` | List[float] |
+| `--prefill-delayer-wait-seconds-buckets` | Custom buckets for prefill delayer wait seconds histogram. 0 will be auto-added. | `None` | List[float] |
 
 ## Runtime options
 | Argument | Description | Defaults | Options |
 | --- | --- | --- | --- |
 | `--device` | The device to use ('cuda', 'xpu', 'hpu', 'npu', 'cpu'). Defaults to auto-detection if not specified. | `None` | Type: str |
-| `--elastic-ep-backend` | Select the collective communication backend for elastic EP. Currently supports 'mooncake'. | None | N/A       |
-| `--mooncake-ib-device` | The InfiniBand devices for Mooncake Backend, accepts multiple comma-separated devices. Default is None, which triggers automatic device detection when Mooncake Backend is enabled. | None | N/A   |
 | `--tensor-parallel-size`<br>`--tp-size` | The tensor parallelism size. | `1` | Type: int |
 | `--pipeline-parallel-size`<br>`--pp-size` | The pipeline parallelism size. | `1` | Type: int |
 | `--pp-max-micro-batch-size` | The maximum micro batch size in pipeline parallelism. | `None` | Type: int |
@@ -172,10 +168,10 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--soft-watchdog-timeout` | Set soft watchdog timeout in seconds. If a forward batch takes longer than this, the server will dump information for debugging. | `None` | Type: float |
 | `--dist-timeout` | Set timeout for torch.distributed initialization. | `None` | Type: int |
 | `--download-dir` | Model download directory for huggingface. | `None` | Type: str |
+| `--model-checksum` | Model file integrity verification. If provided without value, uses model-path as HF repo ID. Otherwise, provide checksums JSON file path or HuggingFace repo ID. | `None` | Type: str |
 | `--base-gpu-id` | The base GPU ID to start allocating GPUs from. Useful when running multiple instances on the same machine. | `0` | Type: int |
 | `--gpu-id-step` | The delta between consecutive GPU IDs that are used. For example, setting it to 2 will use GPU 0,2,4,... | `1` | Type: int |
 | `--sleep-on-idle` | Reduce CPU usage when sglang is idle. | `False` | bool flag (set to enable) |
-| `--mm-process-config` | A JSON string for multimodal preprocessing configuration. It can contain keys: `image`, `video`, `audio`. | `{}` |
 | `--custom-sigquit-handler` | Register a custom sigquit handler so you can do additional cleanup after the server is shutdown. This is only available for Engine, not for CLI. | `None` | Type: str |
 
 ## Logging
@@ -188,7 +184,6 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--log-requests-format` | Format for request logging: 'text' (human-readable) or 'json' (structured) | `text` | `text`, `json` |
 | `--log-requests-target` | Target(s) for request logging: 'stdout' and/or directory path(s) for file output. Can specify multiple targets, e.g., '--log-requests-target stdout /my/path'. | `None` | List[str] |
 | `--crash-dump-folder` | Folder path to dump requests from the last 5 min before a crash (if any). If not specified, crash dumping is disabled. | `None` | Type: str |
-| `--crash-on-nan` | Crash the server on nan logprobs. | `False` | Type: str |
 | `--show-time-cost` | Show time cost of custom marks. | `False` | bool flag (set to enable) |
 | `--enable-metrics` | Enable log prometheus metrics. | `False` | bool flag (set to enable) |
 | `--enable-metrics-for-all-schedulers` | Enable --enable-metrics-for-all-schedulers when you want schedulers on all TP ranks (not just TP 0) to record request metrics separately. This is especially useful when dp_attention is enabled, as otherwise all metrics appear to come from TP 0. | `False` | bool flag (set to enable) |
@@ -205,7 +200,11 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--enable-request-time-stats-logging` | Enable per request time stats logging | `False` | bool flag (set to enable) |
 | `--kv-events-config` | Config in json format for NVIDIA dynamo KV event publishing. Publishing will be enabled if this flag is used. | `None` | Type: str |
 | `--enable-trace` | Enable opentelemetry trace | `False` | bool flag (set to enable) |
-| `--oltp-traces-endpoint` | Config opentelemetry collector endpoint if --enable-trace is set. format: <ip>:<port> | `localhost:4317` | Type: str |
+| `--otlp-traces-endpoint` | Config opentelemetry collector endpoint if --enable-trace is set. format: <ip>:<port> | `localhost:4317` | Type: str |
+
+## RequestMetricsExporter configuration
+| Argument | Description | Defaults | Options |
+| --- | --- | --- | --- |
 | `--export-metrics-to-file` | Export performance metrics for each request to local file (e.g. for forwarding to external systems). | `False` | bool flag (set to enable) |
 | `--export-metrics-to-file-dir` | Directory path for writing performance metrics files (required when --export-metrics-to-file is enabled). | `None` | Type: str |
 
@@ -222,15 +221,15 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--enable-cache-report` | Return number of cached tokens in usage.prompt_tokens_details for each openai request. | `False` | bool flag (set to enable) |
 | `--reasoning-parser` | Specify the parser for reasoning models. Supported parsers: [deepseek-r1, deepseek-v3, glm45, gpt-oss, kimi, qwen3, qwen3-thinking, step3]. | `None` | `deepseek-r1`, `deepseek-v3`, `glm45`, `gpt-oss`, `kimi`, `qwen3`, `qwen3-thinking`, `step3` |
 | `--tool-call-parser` | Specify the parser for handling tool-call interactions. Supported parsers: [deepseekv3, deepseekv31, glm, glm45, glm47, gpt-oss, kimi_k2, llama3, mistral, pythonic, qwen, qwen25, qwen3_coder, step3]. | `None` | `deepseekv3`, `deepseekv31`, `glm`, `glm45`, `glm47`, `gpt-oss`, `kimi_k2`, `llama3`, `mistral`, `pythonic`, `qwen`, `qwen25`, `qwen3_coder`, `step3` |
-| `--sampling-defaults` | Where to get default sampling parameters. 'openai' uses SGLang/OpenAI defaults (temperature=1.0, top_p=1.0, etc.). 'model' uses the model's generation_config.json to get the recommended sampling parameters if available. Default is 'model'. | `model` | `openai`, `model` |
 | `--tool-server` | Either 'demo' or a comma-separated list of tool server urls to use for the model. If not specified, no tool server will be used. | `None` | Type: str |
+| `--sampling-defaults` | Where to get default sampling parameters. 'openai' uses SGLang/OpenAI defaults (temperature=1.0, top_p=1.0, etc.). 'model' uses the model's generation_config.json to get the recommended sampling parameters if available. Default is 'model'. | `model` | `openai`, `model` |
 
 ## Data parallelism
 | Argument | Description | Defaults | Options |
 | --- | --- | --- | --- |
 | `--data-parallel-size`<br>`--dp-size` | The data parallelism size. | `1` | Type: int |
 | `--load-balance-method` | The load balancing strategy for data parallelism. The `total_tokens` algorithm can only be used when DP attention is applied. This algorithm performs load balancing based on the real-time token load of the DP workers. | `auto` | `auto`, `round_robin`, `follow_bootstrap_room`, `total_requests`, `total_tokens` |
-| `--load-watch-interval` | The interval of load watching in seconds. | `0.1` | Type: float |
+| `--prefill-round-robin-balance` | Note: --prefill-round-robin-balance is deprecated now. | `None` | N/A |
 
 ## Multi-node distributed serving
 | Argument | Description | Defaults | Options |
@@ -290,7 +289,6 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--speculative-moe-runner-backend` | MOE backend for EAGLE speculative decoding, see --moe-runner-backend for options. Same as moe runner backend if unset. | `None` | Same as --moe-runner-backend options |
 | `--speculative-moe-a2a-backend` | MOE A2A backend for EAGLE speculative decoding, see --moe-a2a-backend for options. Same as moe a2a backend if unset. | `None` | Same as --moe-a2a-backend options |
 | `--speculative-draft-model-quantization` | The quantization method for speculative model. | `None` | Same as --quantization options |
-| `--enable-multi-layer-eagle` | Enable multi-layer Eagle speculative decoding. | `False` | bool flag (set to enable) |
 
 ## Ngram speculative decoding
 | Argument | Description | Defaults | Options |
@@ -302,6 +300,11 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--speculative-ngram-match-type` | The match type for cache tree. | `BFS` | `BFS`, `PROB` |
 | `--speculative-ngram-branch-length` | The branch length for ngram speculative decoding. | `18` | Type: int |
 | `--speculative-ngram-capacity` | The cache capacity for ngram speculative decoding. | `10000000` | Type: int |
+
+## Multi-layer Eagle speculative decoding
+| Argument | Description | Defaults | Options |
+| --- | --- | --- | --- |
+| `--enable-multi-layer-eagle` | Enable multi-layer Eagle speculative decoding. | `False` | bool flag (set to enable) |
 
 ## MoE
 | Argument | Description | Defaults | Options |
@@ -325,6 +328,8 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--enable-expert-distribution-metrics` | Enable logging metrics for expert balancedness | `False` | bool flag (set to enable) |
 | `--deepep-config` | Tuned DeepEP config suitable for your own cluster. It can be either a string with JSON content or a file path. | `None` | Type: str |
 | `--moe-dense-tp-size` | TP size for MoE dense MLP layers. This flag is useful when, with large TP size, there are errors caused by weights in MLP layers having dimension smaller than the min dimension GEMM supports. | `None` | Type: int |
+| `--elastic-ep-backend` | Specify the collective communication backend for elastic EP. Currently supports 'mooncake'. | `none` | `none`, `mooncake` |
+| `--mooncake-ib-device` | The InfiniBand devices for Mooncake Backend transfer, accepts multiple comma-separated devices (e.g., --mooncake-ib-device mlx5_0,mlx5_1). Default is None, which triggers automatic device detection when Mooncake Backend is enabled. | `None` | Type: str |
 
 ## Mamba Cache
 | Argument | Description | Defaults | Options |
@@ -335,11 +340,6 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--mamba-scheduler-strategy` | The strategy to use for mamba scheduler. `auto` currently defaults to `no_buffer`. 1. `no_buffer` does not support overlap scheduler due to not allocating extra mamba state buffers. Branching point caching support is feasible but not implemented. 2. `extra_buffer` supports overlap schedule by allocating extra mamba state buffers to track mamba state for caching (mamba state usage per running req becomes `2x` for non-spec; `1+(1/(2+speculative_num_draft_tokens))x` for spec dec (e.g. 1.16x if speculative_num_draft_tokens==4)). 2a. `extra_buffer` is strictly better for non-KV-cache-bound cases; for KV-cache-bound cases, the tradeoff depends on whether enabling overlap outweighs reduced max running requests. 2b. mamba caching at radix cache branching point is strictly better than non-branch but requires kernel support (currently only FLA backend), currently only extra_buffer supports branching. | `auto` | `auto`, `no_buffer`, `extra_buffer` |
 | `--mamba-track-interval` | The interval (in tokens) to track the mamba state during decode. Only used when `--mamba-scheduler-strategy` is `extra_buffer`. Must be divisible by page_size if set, and must be >= speculative_num_draft_tokens when using speculative decoding. | `256` | Type: int |
 
-## Args for multi-item scoring
-| Argument | Description | Defaults | Options |
-| --- | --- | --- | --- |
-| `--multi-item-scoring-delimiter` | Delimiter token ID for multi-item scoring. Used to combine Query and Items into a single sequence: Query<delimiter>Item1<delimiter>Item2<delimiter>... This enables efficient batch processing of multiple items against a single query. | `None` | Type: int |
-
 ## Hierarchical cache
 | Argument | Description | Defaults | Options |
 | --- | --- | --- | --- |
@@ -347,17 +347,37 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--hicache-ratio` | The ratio of the size of host KV cache memory pool to the size of device pool. | `2.0` | Type: float |
 | `--hicache-size` | The size of host KV cache memory pool in gigabytes, which will override the hicache_ratio if set. | `0` | Type: int |
 | `--hicache-write-policy` | The write policy of hierarchical cache. | `write_through` | `write_back`, `write_through`, `write_through_selective` |
-| `--radix-eviction-policy` | The eviction policy of radix trees. 'lru' stands for Least Recently Used, 'lfu' stands for Least Frequently Used. | `lru` | `lru`, `lfu` |
 | `--hicache-io-backend` | The IO backend for KV cache transfer between CPU and GPU | `kernel` | `direct`, `kernel`, `kernel_ascend` |
 | `--hicache-mem-layout` | The layout of host memory pool for hierarchical cache. | `layer_first` | `layer_first`, `page_first`, `page_first_direct`, `page_first_kv_split`, `page_head` |
 | `--hicache-storage-backend` | The storage backend for hierarchical KV cache. Built-in backends: file, mooncake, hf3fs, nixl, aibrix. For dynamic backend, use --hicache-storage-backend-extra-config to specify: backend_name (custom name), module_path (Python module path), class_name (backend class name). | `None` | `file`, `mooncake`, `hf3fs`, `nixl`, `aibrix`, `dynamic`, `eic` |
 | `--hicache-storage-prefetch-policy` | Control when prefetching from the storage backend should stop. | `best_effort` | `best_effort`, `wait_complete`, `timeout` |
 | `--hicache-storage-backend-extra-config` | A dictionary in JSON string format containing extra configuration for the storage backend. | `None` | Type: str |
 
+## Hierarchical sparse attention
+| Argument | Description | Defaults | Options |
+| --- | --- | --- | --- |
+| `--hierarchical-sparse-attention-extra-config` | A dictionary in JSON string format for hierarchical sparse attention configuration. Required fields: `algorithm` (str), `backend` (str). All other fields are algorithm-specific and passed to the algorithm constructor. | `None` | Type: str |
+
 ## LMCache
 | Argument | Description | Defaults | Options |
 | --- | --- | --- | --- |
 | `--enable-lmcache` | Using LMCache as an alternative hierarchical cache solution | `False` | bool flag (set to enable) |
+
+## Ktransformers
+| Argument | Description | Defaults | Options |
+| --- | --- | --- | --- |
+| `--kt-weight-path` | [ktransformers parameter] The path of the quantized expert weights for amx kernel. A local folder. | `None` | Type: str |
+| `--kt-method` | [ktransformers parameter] Quantization formats for CPU execution. | `AMXINT4` | Type: str |
+| `--kt-cpuinfer` | [ktransformers parameter] The number of CPUInfer threads. | `None` | Type: int |
+| `--kt-threadpool-count` | [ktransformers parameter] One-to-one with the number of NUMA nodes (one thread pool per NUMA). | `2` | Type: int |
+| `--kt-num-gpu-experts` | [ktransformers parameter] The number of GPU experts. | `None` | Type: int |
+| `--kt-max-deferred-experts-per-token` | [ktransformers parameter] Maximum number of experts deferred to CPU per token. All MoE layers except the final one use this value; the final layer always uses 0. | `None` | Type: int |
+
+## Diffusion LLM
+| Argument | Description | Defaults | Options |
+| --- | --- | --- | --- |
+| `--dllm-algorithm` | The diffusion LLM algorithm, such as LowConfidence. | `None` | Type: str |
+| `--dllm-algorithm-config` | The diffusion LLM algorithm configurations. Must be a YAML file. | `None` | Type: str |
 
 ## Double Sparsity
 | Argument | Description | Defaults | Options |
@@ -377,6 +397,11 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--offload-num-in-group` | Number of layers to be offloaded within a group. | `1` | Type: int |
 | `--offload-prefetch-step` | Steps to prefetch in offloading. | `1` | Type: int |
 | `--offload-mode` | Mode of offloading. | `cpu` | Type: str |
+
+## Args for multi-item scoring
+| Argument | Description | Defaults | Options |
+| --- | --- | --- | --- |
+| `--multi-item-scoring-delimiter` | Delimiter token ID for multi-item scoring. Used to combine Query and Items into a single sequence: Query<delimiter>Item1<delimiter>Item2<delimiter>... This enables efficient batch processing of multiple items against a single query. | `None` | Type: int |
 
 ## Optimization/debug options
 | Argument | Description | Defaults | Options |
@@ -442,10 +467,12 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--enable-fused-qk-norm-rope` | Enable fused qk normalization and rope rotary embedding. | `False` | bool flag (set to enable) |
 | `--enable-precise-embedding-interpolation` | Enable corner alignment for resize of embeddings grid to ensure more accurate(but slower) evaluation of interpolated embedding values. | `False` | bool flag (set to enable) |
 
-## Forward hooks
+## Dynamic batch tokenizer
 | Argument | Description | Defaults | Options |
 | --- | --- | --- | --- |
-| `--forward-hooks` | JSON-formatted list of forward hook specifications. Each element must include `target_modules` (list of glob patterns matched against `model.named_modules()` names) and `hook_factory` (Python import path to a factory, e.g. `my_package.hooks:make_hook`). An optional `name` field is used for logging, and an optional `config` object is passed as a `dict` to the factory. | `None` | Type: JSON list |
+| `--enable-dynamic-batch-tokenizer` | Enable async dynamic batch tokenizer for improved performance when multiple requests arrive concurrently. | `False` | bool flag (set to enable) |
+| `--dynamic-batch-tokenizer-batch-size` | [Only used if --enable-dynamic-batch-tokenizer is set] Maximum batch size for dynamic batch tokenizer. | `32` | Type: int |
+| `--dynamic-batch-tokenizer-batch-timeout` | [Only used if --enable-dynamic-batch-tokenizer is set] Timeout in seconds for batching tokenization requests. | `0.002` | Type: float |
 
 ## Debug tensor dumps
 | Argument | Description | Defaults | Options |
@@ -454,13 +481,6 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--debug-tensor-dump-layers` | The layer ids to dump. Dump all layers if not specified. | `None` | Type: JSON list |
 | `--debug-tensor-dump-input-file` | The input filename for dumping tensors | `None` | Type: str |
 | `--debug-tensor-dump-inject` | Inject the outputs from jax as the input of every layer. | `False` | Type: str |
-
-## Dynamic batch tokenizer
-| Argument | Description | Defaults | Options |
-| --- | --- | --- | --- |
-| `--enable-dynamic-batch-tokenizer` | Enable async dynamic batch tokenizer for improved performance when multiple requests arrive concurrently. | `False` | bool flag (set to enable) |
-| `--dynamic-batch-tokenizer-batch-size` | [Only used if --enable-dynamic-batch-tokenizer is set] Maximum batch size for dynamic batch tokenizer. | `32` | Type: int |
-| `--dynamic-batch-tokenizer-batch-timeout` | [Only used if --enable-dynamic-batch-tokenizer is set] Timeout in seconds for batching tokenization requests. | `0.002` | Type: float |
 
 ## PD disaggregation
 | Argument | Description | Defaults | Options |
@@ -503,23 +523,6 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--pdmux-config-path` | The path of the PD-Multiplexing config file. | `None` | Type: str |
 | `--sm-group-num` | Number of sm partition groups. | `8` | Type: int |
 
-## For deterministic inference
-| Argument | Description | Defaults | Options |
-| --- | --- | --- | --- |
-| `--enable-deterministic-inference` | Enable deterministic inference mode with batch invariant ops. | `False` | bool flag (set to enable) |
-
-## Deprecated arguments
-| Argument | Description | Defaults | Options |
-| --- | --- | --- | --- |
-| `--enable-ep-moe` | NOTE: --enable-ep-moe is deprecated. Please set `--ep-size` to the same value as `--tp-size` instead. | `None` | N/A |
-| `--enable-deepep-moe` | NOTE: --enable-deepep-moe is deprecated. Please set `--moe-a2a-backend` to 'deepep' instead. | `None` | N/A |
-| `--prefill-round-robin-balance` | Note: Note: --prefill-round-robin-balance is deprecated now. | `None` | N/A |
-| `--enable-flashinfer-cutlass-moe` | NOTE: --enable-flashinfer-cutlass-moe is deprecated. Please set `--moe-runner-backend` to 'flashinfer_cutlass' instead. | `None` | N/A |
-| `--enable-flashinfer-cutedsl-moe` | NOTE: --enable-flashinfer-cutedsl-moe is deprecated. Please set `--moe-runner-backend` to 'flashinfer_cutedsl' instead. | `None` | N/A |
-| `--enable-flashinfer-trtllm-moe` | NOTE: --enable-flashinfer-trtllm-moe is deprecated. Please set `--moe-runner-backend` to 'flashinfer_trtllm' instead. | `None` | N/A |
-| `--enable-triton-kernel-moe` | NOTE: --enable-triton-kernel-moe is deprecated. Please set `--moe-runner-backend` to 'triton_kernel' instead. | `None` | N/A |
-| `--enable-flashinfer-mxfp4-moe` | NOTE: --enable-flashinfer-mxfp4-moe is deprecated. Please set `--moe-runner-backend` to 'flashinfer_mxfp4' instead. | `None` | N/A |
-
 ## Configuration file support
 | Argument | Description | Defaults | Options |
 | --- | --- | --- | --- |
@@ -531,7 +534,9 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--mm-max-concurrent-calls` | The max concurrent calls for async mm data processing. | `32` | Type: int |
 | `--mm-per-request-timeout` | The timeout for each multi-modal request in seconds. | `10.0` | Type: int |
 | `--enable-broadcast-mm-inputs-process` | Enable broadcast mm-inputs process in scheduler. | `False` | bool flag (set to enable) |
+| `--mm-process-config` | Multimodal preprocessing config, a json config contains keys: `image`, `video`, `audio`. | `{}` | Type: JSON / Dict |
 | `--mm-enable-dp-encoder` | Enabling data parallelism for mm encoder. The dp size will be set to the tp size automatically. | `False` | bool flag (set to enable) |
+| `--limit-mm-data-per-request` | Limit the number of multimodal inputs per request. e.g. '{"image": 1, "video": 1, "audio": 1}' | `None` | Type: JSON / Dict |
 
 ## For checkpoint decryption
 | Argument | Description | Defaults | Options |
@@ -539,3 +544,8 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--decrypted-config-file` | The path of the decrypted config file. | `None` | Type: str |
 | `--decrypted-draft-config-file` | The path of the decrypted draft config file. | `None` | Type: str |
 | `--enable-prefix-mm-cache` | Enable prefix multimodal cache. Currently only supports mm-only. | `False` | bool flag (set to enable) |
+
+## Forward hooks
+| Argument | Description | Defaults | Options |
+| --- | --- | --- | --- |
+| `--forward-hooks` | JSON-formatted list of forward hook specifications. Each element must include `target_modules` (list of glob patterns matched against `model.named_modules()` names) and `hook_factory` (Python import path to a factory, e.g. `my_package.hooks:make_hook`). An optional `name` field is used for logging, and an optional `config` object is passed as a `dict` to the factory. | `None` | Type: JSON list |
