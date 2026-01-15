@@ -39,7 +39,11 @@ from sglang.srt.disaggregation.kv_events import (
     BlockRemoved,
     BlockStored,
 )
-from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
+from sglang.srt.mem_cache.base_prefix_cache import (
+    BasePrefixCache,
+    MatchPrefixParams,
+    MatchResult,
+)
 from sglang.srt.mem_cache.evict_policy import (
     EvictionStrategy,
     FIFOStrategy,
@@ -337,7 +341,7 @@ class RadixCache(BasePrefixCache):
 
         return key, value
 
-    def match_prefix(self, key: RadixKey, **kwargs) -> MatchResult:
+    def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         """Find the longest cached prefix of ``key`` in the radix tree.
 
         The logical namespace for prefix matching is determined by both the
@@ -352,12 +356,11 @@ class RadixCache(BasePrefixCache):
           context) by supplying a distinct ``extra_key``.
 
         Args:
-            key (RadixKey): The lookup key containing a list of token ids and an
-                optional ``extra_key`` namespace tag. If ``page_size > 1`` the
-                length is internally truncated to a multiple of ``page_size``
-                before matching. Passing an empty key returns an empty result
-                with the root as the last node.
-            **kwargs: Reserved for future extensions (ignored currently).
+            params (MatchPrefixParams): Parameters containing the lookup key
+                with a list of token ids and an optional ``extra_key`` namespace tag.
+                If ``page_size > 1`` the length is internally truncated to a multiple
+                of ``page_size`` before matching. Passing an empty key returns an
+                empty result with the root as the last node.
 
         Returns:
             MatchResult: ``device_indices`` is a 1-D ``torch.int64`` tensor of
@@ -375,6 +378,7 @@ class RadixCache(BasePrefixCache):
                 to expose a precise boundary; this structural refinement improves
                 subsequent match efficiency and does not duplicate data.
         """
+        key = params.key
         key, _ = self.maybe_bigram_convert(key)
 
         def empty_match_result():
@@ -501,7 +505,7 @@ class RadixCache(BasePrefixCache):
         )
 
         # The prefix indices could be updated, reuse it
-        match_result = self.match_prefix(radix_key)
+        match_result = self.match_prefix(MatchPrefixParams(key=radix_key))
         (new_indices, new_last_node) = (
             match_result.device_indices,
             match_result.last_device_node,
@@ -845,4 +849,8 @@ if __name__ == "__main__":
     tree.insert(RadixKey(token_ids=[8, 9, 10, 11, 12], extra_key=None))
     tree.pretty_print()
 
-    print(tree.match_prefix(RadixKey(token_ids=[1, 2, 3, 13, 14], extra_key=None)))
+    print(
+        tree.match_prefix(
+            MatchPrefixParams(key=RadixKey(token_ids=[1, 2, 3, 13, 14], extra_key=None))
+        )
+    )
