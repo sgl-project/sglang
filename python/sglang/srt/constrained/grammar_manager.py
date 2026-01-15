@@ -111,7 +111,16 @@ class GrammarManager:
             req.set_finish_with_abort(error_msg)
 
     def get_ready_grammar_requests(self) -> List[Req]:
-        """Move requests whose grammar objects are ready from grammar_queue to waiting_queue."""
+        """
+        Move requests whose grammar objects are ready from grammar_queue to waiting_queue.
+
+        Rank i returns two sets ready_reqs_i, failed_reqs_i
+        ready_reqs_all = all_gather(ready_reqs_i)
+        failed_reqs_all = all_gather(failed_reqs_i)
+
+        ready_reqs = intersect(ready_reqs_all)
+        failed_reqs = union(failed_reqs_all)
+        """
         ready_req_idxs: set[int] = set()
         failed_req_idxs: set[int] = set()
 
@@ -139,42 +148,51 @@ class GrammarManager:
                     >= self.SGLANG_GRAMMAR_MAX_POLL_ITERATIONS
                 ):
                     # Timeout after max poll iterations
+                    # The actual waiting time is SGLANG_GRAMMAR_MAX_POLL_ITERATIONS * max(SGLANG_GRAMMAR_POLL_INTERVAL, GPU_forward_batch_latency)
                     failed_req_idxs.add(i)
 
         # Sync ready and failed requests across all ranks
-        if self.grammar_sync_size > 1:
-            ready_req_idxs_list = [None] * self.grammar_sync_size
-            failed_req_idxs_list = [None] * self.grammar_sync_size
-            torch.distributed.all_gather_object(
-                ready_req_idxs_list, ready_req_idxs, group=self.grammar_sync_group
-            )
-            torch.distributed.all_gather_object(
-                failed_req_idxs_list, failed_req_idxs, group=self.grammar_sync_group
-            )
-            synced_ready_req_idxs = set.intersection(*ready_req_idxs_list)
-            synced_failed_req_idxs = set.intersection(*failed_req_idxs_list)
-        else:
+        if self.grammar_sync_size == 1:
             synced_ready_req_idxs = ready_req_idxs
             synced_failed_req_idxs = failed_req_idxs
+        else:
+            all_gather_output = [None] * self.grammar_sync_size
+            torch.distributed.all_gather_object(
+                all_gather_output,
+                (ready_req_idxs, failed_req_idxs),
+                group=self.grammar_sync_group,
+            )
+            synced_ready_req_idxs = set.intersection(*[x[0] for x in all_gather_output])
+            synced_failed_req_idxs = set.union(*[x[1] for x in all_gather_output])
 
         # Return ready requests
         return_reqs: List[Req] = []
         for i in synced_ready_req_idxs:
             req = self.grammar_queue[i]
+            return_reqs.append(req)
+            if req.finished():
+                continue
+
             req.grammar = req.grammar.result()
             self.grammar_backend.set_cache(req.grammar_key, req.grammar.copy())
             if req.grammar is INVALID_GRAMMAR_OBJ:
                 error_msg = f"Invalid grammar request: {req.grammar_key=}"
                 req.set_finish_with_abort(error_msg)
-            return_reqs.append(req)
 
         # Return failed requests
         for i in synced_failed_req_idxs:
             req = self.grammar_queue[i]
+            return_reqs.append(req)
+
             req.grammar.cancel()
             self.grammar_backend.set_cache(req.grammar_key, INVALID_GRAMMAR_OBJ)
             error_msg = f"Grammar preprocessing timed out: {req.grammar_key=}"
             req.set_finish_with_abort(error_msg)
-            return_reqs.append(req)
 
+        # Remove finished requests from grammar_queue
+        self.grammar_queue = [
+            req
+            for i, req in enumerate(self.grammar_queue)
+            if i not in synced_ready_req_idxs and i not in synced_failed_req_idxs
+        ]
         return return_reqs
