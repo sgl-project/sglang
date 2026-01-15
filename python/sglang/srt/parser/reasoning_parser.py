@@ -161,7 +161,9 @@ class DeepSeekR1Detector(BaseReasoningFormatDetector):
     """
 
     def __init__(
-        self, stream_reasoning: bool = True, force_reasoning: bool = True,
+        self,
+        stream_reasoning: bool = True,
+        force_reasoning: bool = True,
         continue_final_message: bool = False,
         previous_content: str = "",
     ):
