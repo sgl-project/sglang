@@ -7,58 +7,15 @@ import torch
 from torch.utils.cpp_extension import load
 
 _abs_path = os.path.dirname(os.path.abspath(__file__))
-# Tracy integration notes:
-# - This module uses torch.utils.cpp_extension.load() to JIT-compile the radix
-#   tree C++ extension at import time. We cannot rely on a CMakeLists.txt here
-# (easier to not do ),
-#   it is easier to just fake a cmake target using the following steps:
-#     * add TracyClient.cpp to the build (equivalent to target_sources)
-#     * add Tracy's include path (equivalent to target_include_directories)
-#     * define TRACY_ENABLE (equivalent to target_compile_definitions)
-_repo_root = os.path.abspath(os.path.join(_abs_path, "../../../../../"))
-_tracy_root = os.path.join(_repo_root, "3rdparty", "tracy")
-_enable_tracy = os.getenv("SGLANG_ENABLE_TRACY", "").lower() in (
-    "1",
-    "true",
-    "yes",
-    "on",
-)
-
-_sources = [
-    f"{_abs_path}/tree_v2_binding.cpp",
-    f"{_abs_path}/tree_v2_debug.cpp",
-    f"{_abs_path}/tree_v2.cpp",
-]
-_extra_include_paths = []
-_extra_cflags = ["-O3", "-std=c++20"]
-_extra_ldflags = []
-
-if _enable_tracy:
-    # When Tracy is enabled, we must compile its client into the extension and
-    # expose its headers to our C++ translation units. This is the JIT-build
-    # equivalent of:
-    #   target_compile_definitions(app PRIVATE TRACY_ENABLE)
-    #   target_include_directories(app PRIVATE third_party/tracy/public)
-    #   target_sources(app PRIVATE third_party/tracy/public/TracyClient.cpp)
-    # We also link pthread/dl on non-Windows platforms because Tracy uses
-    # threads and dynamic loading on POSIX. (seem to have some error previously)
-    if not os.path.isdir(_tracy_root):
-        raise FileNotFoundError(
-            f"Tracy requested but not found at {_tracy_root}. "
-            "Clone https://github.com/wolfpld/tracy into 3rdparty/tracy."
-        )
-    _sources.append(os.path.join(_tracy_root, "public", "TracyClient.cpp"))
-    _extra_include_paths.append(os.path.join(_tracy_root, "public"))
-    _extra_cflags.append("-DTRACY_ENABLE")
-    if os.name != "nt":
-        _extra_ldflags.extend(["-pthread", "-ldl"])
 
 radix_tree_cpp = load(
     name="radix_tree_cpp",
-    sources=_sources,
-    extra_cflags=_extra_cflags,
-    extra_include_paths=_extra_include_paths,
-    extra_ldflags=_extra_ldflags,
+    sources=[
+        f"{_abs_path}/tree_v2_binding.cpp",
+        f"{_abs_path}/tree_v2_debug.cpp",
+        f"{_abs_path}/tree_v2.cpp",
+    ],
+    extra_cflags=["-O3", "-std=c++20"],
 )
 
 if TYPE_CHECKING:
