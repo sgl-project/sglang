@@ -189,6 +189,20 @@ else
 fi
 $PIP_CMD uninstall xformers || true
 
+# Skip flashinfer installation for Blackwell (pre-installed)
+if [ "$IS_BLACKWELL" = "1" ]; then
+    INSTALLED_FLASHINFER=$(pip show flashinfer-jit-cache 2>/dev/null | grep "^Version:" | awk '{print $2}' | cut -d'+' -f1 || echo "")
+    if [ "$INSTALLED_FLASHINFER" = "$FLASHINFER_VERSION" ]; then
+        echo "flashinfer-jit-cache==${FLASHINFER_VERSION} already installed, skipping"
+        FLASHINFER_INSTALLED=true
+    else
+        echo "Installing flashinfer-jit-cache==${FLASHINFER_VERSION} (current: ${INSTALLED_FLASHINFER:-none})"
+        FLASHINFER_INSTALLED=false
+    fi
+else
+    FLASHINFER_INSTALLED=false
+fi
+
 # Install flashinfer-jit-cache with caching and retry logic (flashinfer.ai can have transient DNS issues)
 # Cache directory for flashinfer wheels (persists across CI runs on self-hosted runners)
 FLASHINFER_CACHE_DIR="${HOME}/.cache/flashinfer-wheels"
@@ -200,7 +214,10 @@ find "${FLASHINFER_CACHE_DIR}" -name "flashinfer_jit_cache-*.whl" ! -name "flash
 FLASHINFER_WHEEL_PATTERN="flashinfer_jit_cache-${FLASHINFER_VERSION}*.whl"
 CACHED_WHEEL=$(find "${FLASHINFER_CACHE_DIR}" -name "${FLASHINFER_WHEEL_PATTERN}" -type f 2>/dev/null | head -n 1)
 
-FLASHINFER_INSTALLED=false
+# Only set FLASHINFER_INSTALLED to false if not already set by Blackwell check above
+if [ "$FLASHINFER_INSTALLED" != "true" ]; then
+    FLASHINFER_INSTALLED=false
+fi
 
 # Try to install from cache first
 if [ -n "$CACHED_WHEEL" ] && [ -f "$CACHED_WHEEL" ]; then
