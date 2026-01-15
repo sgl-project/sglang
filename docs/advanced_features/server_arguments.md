@@ -118,13 +118,13 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--dtype` | Data type for model weights and activations. * "auto" will use FP16 precision for FP32 and FP16 models, and BF16 precision for BF16 models. * "half" for FP16. Recommended for AWQ quantization. * "float16" is the same as "half". * "bfloat16" for a balance between precision and range. * "float" is shorthand for FP32 precision. * "float32" for FP32 precision. | `auto` | `auto`, `half`, `float16`, `bfloat16`, `float`, `float32` |
 | `--quantization` | The quantization method. | `None` | `awq`, `fp8`, `gptq`, `marlin`, `gptq_marlin`, `awq_marlin`, `bitsandbytes`, `gguf`, `modelopt`, `modelopt_fp8`, `modelopt_fp4`, `petit_nvfp4`, `w8a8_int8`, `w8a8_fp8`, `moe_wna16`, `qoq`, `w4afp8`, `mxfp4`, `auto-round`, `compressed-tensors`, `modelslim`, `quark_int4fp8_moe` |
 | `--quantization-param-path` | Path to the JSON file containing the KV cache scaling factors. This should generally be supplied, when KV cache dtype is FP8. Otherwise, KV cache scaling factors default to 1.0, which may cause accuracy issues. | `None` | Type: Optional[str] |
-| `--modelopt-quant` | The ModelOpt quantization configuration. Supported values: 'fp8', 'int4_awq', 'w4a8_awq', 'nvfp4', 'nvfp4_awq'. This requires the NVIDIA Model Optimizer library to be installed: pip install nvidia-modelopt | `None` | Type: str or dict |
+| `--kv-cache-dtype` | Data type for kv cache storage. "auto" will use model data type. "bf16" or "bfloat16" for BF16 KV cache. "fp8_e5m2" and "fp8_e4m3" are supported for CUDA 11.8+. "fp4_e2m1" (only mxfp4) is supported for CUDA 12.8+ and PyTorch 2.8.0+ | `auto` | `auto`, `fp8_e5m2`, `fp8_e4m3`, `bf16`, `bfloat16`, `fp4_e2m1` |
+| `--enable-fp32-lm-head` | If set, the LM head outputs (logits) are in FP32. | `False` | bool flag (set to enable) |
+| `--modelopt-quant` | The ModelOpt quantization configuration. Supported values: 'fp8', 'int4_awq', 'w4a8_awq', 'nvfp4', 'nvfp4_awq'. This requires the NVIDIA Model Optimizer library to be installed: pip install nvidia-modelopt | `None` | Type: str |
 | `--modelopt-checkpoint-restore-path` | Path to restore a previously saved ModelOpt quantized checkpoint. If provided, the quantization process will be skipped and the model will be loaded from this checkpoint. | `None` | Type: str |
 | `--modelopt-checkpoint-save-path` | Path to save the ModelOpt quantized checkpoint after quantization. This allows reusing the quantized model in future runs. | `None` | Type: str |
 | `--modelopt-export-path` | Path to export the quantized model in HuggingFace format after ModelOpt quantization. The exported model can then be used directly with SGLang for inference. If not provided, the model will not be exported. | `None` | Type: str |
 | `--quantize-and-serve` | Quantize the model with ModelOpt and immediately serve it without exporting. This is useful for development and prototyping. For production, it's recommended to use separate quantization and deployment steps. | `False` | bool flag (set to enable) |
-| `--kv-cache-dtype` | Data type for kv cache storage. "auto" will use model data type. "bf16" or "bfloat16" for BF16 KV cache. "fp8_e5m2" and "fp8_e4m3" are supported for CUDA 11.8+. "fp4_e2m1" (only mxfp4) is supported for CUDA 12.8+ and PyTorch 2.8.0+ | `auto` | `auto`, `fp8_e5m2`, `fp8_e4m3`, `bf16`, `bfloat16`, `fp4_e2m1` |
-| `--enable-fp32-lm-head` | If set, the LM head outputs (logits) are in FP32. | `False` | bool flag (set to enable) |
 | `--rl-quant-profile` | Path to the FlashRL quantization profile. Required when using --load-format flash_rl. | `None` | Type: str |
 
 ## Memory and scheduling
@@ -477,6 +477,14 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--num-reserved-decode-tokens` | Number of decode tokens that will have memory reserved when adding new request to the running batch. | `512` | Type: int |
 | `--disaggregation-decode-polling-interval` | The interval to poll requests in decode server. Can be set to >1 to reduce the overhead of this. | `1` | Type: int |
 
+## Encode prefill disaggregation
+| Argument | Description | Defaults | Options |
+| --- | --- | --- | --- |
+| `--encoder-only` | For MLLM with an encoder, launch an encoder-only server | `False` | bool flag (set to enable) |
+| `--language-only` | For VLM, load weights for the language model only. | `False` | bool flag (set to enable) |
+| `--encoder-transfer-backend` | The backend for encoder disaggregation transfer. Default is zmq_to_scheduler. | `zmq_to_scheduler` | `zmq_to_scheduler`, `zmq_to_tokenizer`, `mooncake` |
+| `--encoder-urls` | List of encoder server urls. | `[]` | Type: JSON list |
+
 ## Custom weight loader
 | Argument | Description | Defaults | Options |
 | --- | --- | --- | --- |
@@ -512,26 +520,22 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--enable-triton-kernel-moe` | NOTE: --enable-triton-kernel-moe is deprecated. Please set `--moe-runner-backend` to 'triton_kernel' instead. | `None` | N/A |
 | `--enable-flashinfer-mxfp4-moe` | NOTE: --enable-flashinfer-mxfp4-moe is deprecated. Please set `--moe-runner-backend` to 'flashinfer_mxfp4' instead. | `None` | N/A |
 
-## For Multi-Modal
-| Argument | Description | Defaults | Options |
-| --- | --- | --- | --- |
-| `--encoder-only` | For MLLM with an encoder, launch an encoder-only server | `False` | bool flag (set to enable) |
-| `--language-only` | For VLM, load weights for the language model only. | `False` | bool flag (set to enable) |
-| `--encoder-transfer-backend` | The backend for encoder disaggregation transfer. Default is zmq_to_scheduler. | `zmq_to_scheduler` | `zmq_to_scheduler`, `zmq_to_tokenizer`, `mooncake` |
-| `--encoder-urls` | List of encoder server urls. | `[]` | Type: JSON list |
-| `--mm-max-concurrent-calls` | The max concurrent calls for async mm data processing. | `32` | Type: int |
-| `--mm-per-request-timeout` | The timeout for each multi-modal request in seconds. | `10.0` | Type: int |
-| `--enable-broadcast-mm-inputs-process` | Enable broadcast mm-inputs process in scheduler. | `False` | bool flag (set to enable) |
-| `--mm-enable-dp-encoder` | Enabling data parallelism for mm encoder. The dp size will be set to the tp size automatically. | `False` | bool flag (set to enable) |
-| `--enable-prefix-mm-cache` | Enable prefix multimodal cache. Currently only supports mm-only. | `False` | bool flag (set to enable) |
-
-## Checkpoint decryption
-| Argument | Description | Defaults | Options |
-| --- | --- | --- | --- |
-| `--decrypted-config-file` | The path of the decrypted config file. | `None` | Type: str |
-| `--decrypted-draft-config-file` | The path of the decrypted draft config file. | `None` | Type: str |
-
 ## Configuration file support
 | Argument | Description | Defaults | Options |
 | --- | --- | --- | --- |
 | `--config` | Read CLI options from a config file. Must be a YAML file with configuration options. | `None` | Type: str |
+
+## For Multi-Modal
+| Argument | Description | Defaults | Options |
+| --- | --- | --- | --- |
+| `--mm-max-concurrent-calls` | The max concurrent calls for async mm data processing. | `32` | Type: int |
+| `--mm-per-request-timeout` | The timeout for each multi-modal request in seconds. | `10.0` | Type: int |
+| `--enable-broadcast-mm-inputs-process` | Enable broadcast mm-inputs process in scheduler. | `False` | bool flag (set to enable) |
+| `--mm-enable-dp-encoder` | Enabling data parallelism for mm encoder. The dp size will be set to the tp size automatically. | `False` | bool flag (set to enable) |
+
+## For checkpoint decryption
+| Argument | Description | Defaults | Options |
+| --- | --- | --- | --- |
+| `--decrypted-config-file` | The path of the decrypted config file. | `None` | Type: str |
+| `--decrypted-draft-config-file` | The path of the decrypted draft config file. | `None` | Type: str |
+| `--enable-prefix-mm-cache` | Enable prefix multimodal cache. Currently only supports mm-only. | `False` | bool flag (set to enable) |
