@@ -46,7 +46,7 @@ class DummyConfig:
         self.num_hidden_layers = 32
         self.num_attention_heads = 32
         self.hidden_size = 4096
-        self.vocab_siez = 32000
+        self.vocab_size = 32000
         self.quantization_config = None
 
     def to_dice(self):
