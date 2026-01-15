@@ -1665,6 +1665,34 @@ class Scheduler(
         )
         return req_to_abort.rid == recv_req.rid
 
+    def _abort_on_queued_timeout(self):
+        if (timeout_ms := envs.SGLANG_QUEUED_TIMEOUT_MS.get()) <= 0:
+            return
+
+        deleted_reqs = []
+        for req in self.waiting_queue:
+            if (entry_time := req.time_stats.wait_queue_entry_time) <= 0:
+                continue
+            queued_ms = (time.perf_counter() - entry_time) * 1000
+            if queued_ms > timeout_ms:
+                self.send_to_tokenizer.send_output(
+                    AbortReq(
+                        finished_reason={
+                            "type": "abort",
+                            "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
+                            "message": "Request queue timeout reached.",
+                        },
+                        rid=req.rid,
+                    ),
+                    req,
+                )
+                deleted_reqs.append(req)
+
+        if deleted_reqs:
+            self.waiting_queue = [
+                req for req in self.waiting_queue if req not in deleted_reqs
+            ]
+
     def handle_embedding_request(
         self,
         recv_req: TokenizedEmbeddingReqInput,
@@ -1733,6 +1761,7 @@ class Scheduler(
             self.handle_embedding_request(tokenized_req)
 
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
+        self._abort_on_queued_timeout()
         if self.dllm_config is not None:
             if self.chunked_req is not None and self.chunked_req.finished():
                 self.chunked_req = None
