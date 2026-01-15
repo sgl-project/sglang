@@ -160,12 +160,12 @@ class ZImagePipelineConfig(ImagePipelineConfig):
 
 
 def zimage_omni_preprocess_text(prompt: str):
-    # TODO: single image only
-    #
-    # elif num_condition_images > 0:
-    #  ....
+    """
+    TODO: reivew
+    delay process into tokenize_prompt
+    """
 
-    return "<|im_start|>user\n" + prompt + "<|im_end|>\n<|im_start|>assistant\n"
+    return prompt
 
 
 def zimage_omni_postprocess_text(
@@ -229,27 +229,51 @@ class ZImageOmniPipelineConfig(ZImagePipelineConfig):
         default_factory=lambda: (zimage_omni_postprocess_text,)
     )
 
+    def _apply_zimage_omni_template(
+        self, prompts: list[str], num_condition_images: int
+    ):
+        """
+        Args:
+            prompts (list[str]): 1d list of strings
+        Returns
+            processed_text_list (list[list[str]]): 2d list of strings
+                a single prompt_str was break into list of strings, split by <|vision_start|>
+        """
+        processed_text_list: list[list[str]] = []
+        for prompt_str in prompts:
+            if num_condition_images == 0:
+                prompt_str = [
+                    "<|im_start|>user\n"
+                    + prompt_str
+                    + "<|im_end|>\n<|im_start|>assistant\n"
+                ]
+                processed_text_list.append(prompt_str)
+            else:
+                prompt_list = ["<|im_start|>user\n<|vision_start|>"]
+                prompt_list += ["<|vision_end|><|vision_start|>"] * (
+                    num_condition_images - 1
+                )
+                prompt_list += [
+                    "<|vision_end|>"
+                    + prompt_str
+                    + "<|im_end|>\n<|im_start|>assistant\n<|vision_start|>"
+                ]
+                prompt_list += ["<|vision_end|><|im_end|>"]
+                processed_text_list.append(prompt_list)
+        return processed_text_list
+
     def tokenize_prompt(self, prompts, tokenizer, tok_kwargs) -> dict:
         """
         template was inject in preprocess, no apply_chat_template now.
         """
-
-        # TODO: 2d list for omni mode
-        # where
-        # dim0 = batch size
-        # dim1 = sequence-item len
-        if isinstance(prompts, str):
-            prompts = [[prompts]]
-        elif isinstance(prompts, list) and isinstance(prompts[0], str):
-            prompts = [prompts]
-        elif (
+        prompts = self._apply_zimage_omni_template(
+            prompts, tok_kwargs.get("num_condition_images", 0)
+        )
+        assert (
             isinstance(prompts, list)
             and isinstance(prompts[0], list)
             and isinstance(prompts[0][0], str)
-        ):
-            pass
-        else:
-            raise NotImplementedError
+        ), "Process type mismatch."
 
         # all batch flattened
         flattened_prompt = []

@@ -244,28 +244,9 @@ class TextEncodingStage(PipelineStage):
             )
 
             processed_text_list: list[str] = []
-            # TODO: hard code
-            # preprocess_func need more arguments like num_condition_images
             for prompt_str in texts:
-                if num_condition_images == 0:
-                    preprocessed = preprocess_func(prompt_str)
-                    processed_text_list.append(preprocessed)
-                else:
-                    # TODO: refactor, hard code for z-image-omni only for now.
-                    # which create a batch of placeholder
-                    prompt_list = ["<|im_start|>user\n<|vision_start|>"]
-                    prompt_list += ["<|vision_end|><|vision_start|>"] * (
-                        num_condition_images - 1
-                    )
-                    prompt_list += [
-                        "<|vision_end|>"
-                        + prompt_str
-                        + "<|im_end|>\n<|im_start|>assistant\n<|vision_start|>"
-                    ]
-                    prompt_list += ["<|vision_end|><|im_end|>"]
-                    # TODO: note review, a list where split by vision block like
-                    # ['<|im_start|>user\n<|vision_start|>', '<|vision_end|><|vision_start|>', '<|vision_end|> USER PROMPT <|im_end|>\n<|im_start|>assistant\n<|vision_start|>', '<|vision_end|><|im_end|> ']
-                    processed_text_list.append(prompt_list)
+                preprocessed = preprocess_func(prompt_str)
+                processed_text_list.append(preprocessed)
 
             # Prepare tokenizer args
             tok_kwargs = self.prepare_tokenizer_kwargs(
