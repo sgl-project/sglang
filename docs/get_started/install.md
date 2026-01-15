@@ -21,7 +21,7 @@ For example, on GB200, you will need to do the following. Otherwise, it will ins
 uv pip install "sglang" --extra-index-url https://download.pytorch.org/whl/cu129
 ```
 
-On B300 [SM103], we recomend using the image at lmsysorg/sglang:dev-cu13.
+On B300 (SM103), we recommend using the image at lmsysorg/sglang:dev-cu13.
 Please, do not re-install the project as editable inside the docker image, since it will override the version of
 libraries specified by the cu13 docker image.
 
