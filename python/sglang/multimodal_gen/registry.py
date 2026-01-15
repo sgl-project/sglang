@@ -546,6 +546,7 @@ def _register_configs():
         ],
         model_detectors=[lambda hf_id: "flux.2" in hf_id.lower()],
     )
+    # Z-Image
     register_configs(
         sampling_param_cls=ZImageSamplingParams,
         pipeline_config_cls=ZImagePipelineConfig,

@@ -393,7 +393,7 @@ class _PrepareSiglipStage(PipelineStage):
 
 
 class ZImageOmniPipeline(ZImagePipeline):
-    pipeline_name = "ZOmniImagePipeline"
+    pipeline_name = "ZImageOmniPipeline"
 
     # TODO: review how to add extra component?
     _extra_config_module_map = {
