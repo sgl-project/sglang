@@ -13,6 +13,10 @@
 #include "tree_v2.h"
 #include "tree_v2_node.h"
 
+#ifdef TRACY_ENABLE
+#include "tracy/Tracy.hpp"
+#endif
+
 namespace radix_tree_v2 {
 
 using node_iterator_t = typename TreeNode::iterator_t;
@@ -38,6 +42,9 @@ struct RadixTree::Impl {
   }
 
   TreeNode* split_node(node_iterator_t iterator, std::size_t prefix_length) {
+#ifdef TRACY_ENABLE
+    ZoneScopedN("Impl/split_node");
+#endif
     // from `parent -> old_node` to `parent-> new_node -> old_node`
     // the prefix part of the old node is moved to the new node
     auto old_node_ptr = std::move(iterator->second);
@@ -48,20 +55,43 @@ struct RadixTree::Impl {
     // set up data structures
     split_prefix(new_node, old_node, prefix_length);
     // set up parent-child relationship
-    add_child(new_node, std::move(old_node_ptr));
-    add_child(parent, std::move(new_node_ptr), iterator);
+    {
+#ifdef TRACY_ENABLE
+      ZoneScopedN("Impl/split_node/add_child");
+#endif
+      add_child(new_node, std::move(old_node_ptr));
+      add_child(parent, std::move(new_node_ptr), iterator);
+    }
     m_node_map[new_node->node_id] = new_node;  // add to the map
     return new_node;
   }
 
   // node: x -> [GPU]
   TreeNode* create_device_node(TreeNode* parent, token_vec_t vec, at::Tensor indices) {
+#ifdef TRACY_ENABLE
+    ZoneScopedN("Impl/create_device_node");
+#endif
     auto new_node_ptr = std::make_unique<TreeNode>(m_node_counter++);
     auto new_node = new_node_ptr.get();
-    new_node_ptr->_unsafe_tokens() = std::move(vec);
-    new_node_ptr->_unsafe_device_indices() = std::move(indices);
+    {
+#ifdef TRACY_ENABLE
+      ZoneScopedN("Impl/create_device_node/assign_tokens");
+#endif
+      new_node_ptr->_unsafe_tokens() = std::move(vec);
+    }
+    {
+#ifdef TRACY_ENABLE
+      ZoneScopedN("Impl/create_device_node/assign_indices");
+#endif
+      new_node_ptr->_unsafe_device_indices() = std::move(indices);
+    }
     m_evictable_size += new_node_ptr->length();
-    add_child(parent, std::move(new_node_ptr));
+    {
+#ifdef TRACY_ENABLE
+      ZoneScopedN("Impl/create_device_node/add_child");
+#endif
+      add_child(parent, std::move(new_node_ptr));
+    }
     m_node_map[new_node->node_id] = new_node;  // add to the map
     return new_node;
   }
@@ -81,6 +111,9 @@ struct RadixTree::Impl {
    * the total prefix length matched (on gpu and cpu) so far.
    */
   std::pair<TreeNode*, std::size_t> tree_walk(token_slice key) {
+#ifdef TRACY_ENABLE
+    ZoneScopedN("Impl/tree_walk");
+#endif
     _assert(key.size() % page_size == 0, "Key should be page-aligned");
 
     std::size_t total_prefix_length = 0;
@@ -88,7 +121,12 @@ struct RadixTree::Impl {
 
     const auto now = std::chrono::steady_clock::now();
     while (key.size() > 0) {
-      const auto iterator = node->find_child(get_key(key));
+      const auto iterator = [&]() {
+#ifdef TRACY_ENABLE
+        ZoneScopedN("Impl/tree_walk/find_child");
+#endif
+        return node->find_child(get_key(key));
+      }();
       if (iterator == node->end()) break;
 
       // walk to the child node
@@ -96,7 +134,12 @@ struct RadixTree::Impl {
 
       // at least `page_size` tokens are matched, and there may be more tokens to match
       // the return value prefix_length is no less than `page_size`
-      const auto prefix_length = align(node->diff_key(key, page_size) + page_size);
+      const auto prefix_length = [&]() {
+#ifdef TRACY_ENABLE
+        ZoneScopedN("Impl/tree_walk/diff_key");
+#endif
+        return align(node->diff_key(key, page_size) + page_size);
+      }();
       total_prefix_length += prefix_length;
 
       // split the node if the prefix is not the whole token vector
@@ -249,6 +292,9 @@ struct RadixTree::Impl {
  private:
   // some auxiliary functions
   token_vec_t& get_key(token_slice tokens) {
+#ifdef TRACY_ENABLE
+    ZoneScopedN("Impl/get_key");
+#endif
     _assert(tokens.size() >= page_size, "Key should be at least page-sized");
     tokens = tokens.subspan(0, page_size);
     m_cached_vec.assign(tokens.begin(), tokens.end());

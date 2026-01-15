@@ -17,6 +17,10 @@
 #include "tree_v2_impl.h"
 #include "tree_v2_node.h"
 
+#ifdef TRACY_ENABLE
+#include "tracy/Tracy.hpp"
+#endif
+
 namespace radix_tree_v2 {
 
 static NodeHandle node2id(TreeNode* node) {
@@ -35,10 +39,27 @@ RadixTree::~RadixTree() = default;
 
 std::tuple<std::vector<at::Tensor>, std::size_t, NodeHandle, NodeHandle>
 RadixTree::match_prefix(const token_vec_t& _key) {
+#ifdef TRACY_ENABLE
+  // This is a cpp tracy zone for the full prefix lookup. This zone
+  // returns us "time in function" view that is easy to compare
+  // across runs. And repeat for any other zones.
+  ZoneScoped;
+#endif
   if (m_impl->disabled) return {};
 
-  const auto key = token_slice{_key.data(), m_impl->align(_key.size())};
-  const auto [host_node, _] = m_impl->tree_walk(key);
+  const auto key = [&]() {
+#ifdef TRACY_ENABLE
+    ZoneScopedN("match_prefix/align");
+#endif
+    return token_slice{_key.data(), m_impl->align(_key.size())};
+  }();
+
+  const auto [host_node, _] = [&]() {
+#ifdef TRACY_ENABLE
+    ZoneScopedN("match_prefix/tree_walk");
+#endif
+    return m_impl->tree_walk(key);
+  }();
 
   // walk up to the first non-evicted node
   std::size_t host_hit_length = 0;
@@ -46,13 +67,22 @@ RadixTree::match_prefix(const token_vec_t& _key) {
 
   // collect all the device indices
   std::vector<at::Tensor> indices{};
-  walk_to_root(device_node, [&](TreeNode* n) { indices.push_back(n->device_indices()); });
-  std::reverse(indices.begin(), indices.end());
+  {
+#ifdef TRACY_ENABLE
+    ZoneScopedN("match_prefix/collect_indices");
+#endif
+    walk_to_root(device_node, [&](TreeNode* n) { indices.push_back(n->device_indices()); });
+    std::reverse(indices.begin(), indices.end());
+  }
 
   return {std::move(indices), host_hit_length, node2id(device_node), node2id(host_node)};
 }
 
 std::vector<at::Tensor> RadixTree::evict(std::size_t num_tokens) {
+#ifdef TRACY_ENABLE
+  // Test eviction tracy
+  ZoneScoped;
+#endif
   if (m_impl->disabled || num_tokens == 0) return {};
   auto heap = std::priority_queue{cmp, m_impl->collect_leaves_device()};
   std::vector<at::Tensor> evicted_values;
@@ -77,25 +107,49 @@ std::vector<at::Tensor> RadixTree::evict(std::size_t num_tokens) {
 
 std::tuple<std::vector<std::tuple<IOTicket, at::Tensor, at::Tensor>>, std::size_t>
 RadixTree::writing_through(const token_vec_t& _key, at::Tensor value) {
+#ifdef TRACY_ENABLE
+  // Write-thru tracy
+  ZoneScoped;
+#endif
   if (m_impl->disabled) return {};
   _assert(_key.size() == std::size_t(value.size(0)), "Key and value must have the same size");
 
   // just align the key to the page size, clip the unaligned tail
-  const auto key = token_slice{_key.data(), m_impl->align(_key.size())};
+  const auto key = [&]() {
+#ifdef TRACY_ENABLE
+    ZoneScopedN("writing_through/align");
+#endif
+    return token_slice{_key.data(), m_impl->align(_key.size())};
+  }();
 
   // walk the tree to find the right place to insert
-  const auto [host_node, host_prefix_length] = m_impl->tree_walk(key);
+  const auto [host_node, host_prefix_length] = [&]() {
+#ifdef TRACY_ENABLE
+    ZoneScopedN("writing_through/tree_walk");
+#endif
+    return m_impl->tree_walk(key);
+  }();
 
   // insert and create a new node if the remaining part of the key is not empty
   if (host_prefix_length != key.size()) {
-    m_impl->create_device_node(
-        host_node,
-        {key.begin() + host_prefix_length, key.end()},
-        value.slice(/*dim=*/0, host_prefix_length, key.size()));
+    {
+#ifdef TRACY_ENABLE
+      ZoneScopedN("writing_through/create_device_node");
+#endif
+      m_impl->create_device_node(
+          host_node,
+          {key.begin() + host_prefix_length, key.end()},
+          value.slice(/*dim=*/0, host_prefix_length, key.size()));
+    }
   }
 
   // add the hit count for the device node
-  walk_to_root(host_node, [&](TreeNode* n) { n->hit_count++; });
+  {
+#ifdef TRACY_ENABLE
+    ZoneScopedN("writing_through/hit_count");
+#endif
+    walk_to_root(host_node, [&](TreeNode* n) { n->hit_count++; });
+  }
 
   std::vector<std::tuple<IOTicket, at::Tensor, at::Tensor>> result;
 

@@ -13,6 +13,10 @@
 
 #include "common.h"
 
+#ifdef TRACY_ENABLE
+#include "tracy/Tracy.hpp"
+#endif
+
 namespace radix_tree_v2 {
 
 struct std_vector_hash {
@@ -94,20 +98,32 @@ struct TreeNode {
   }
 
   void add_child(const token_vec_t& v, std::unique_ptr<TreeNode>&& child) {
+#ifdef TRACY_ENABLE
+    ZoneScopedN("TreeNode/add_child");
+#endif
     child->m_parent = this;
     m_children[v] = std::move(child);
   }
 
   void add_child(iterator_t it, std::unique_ptr<TreeNode>&& child) {
+#ifdef TRACY_ENABLE
+    ZoneScopedN("TreeNode/add_child_iter");
+#endif
     child->m_parent = this;
     it->second = std::move(child);
   }
 
   void erase_child(const token_vec_t& v) {
+#ifdef TRACY_ENABLE
+    ZoneScopedN("TreeNode/erase_child");
+#endif
     _assert(m_children.erase(v) > 0, "Child node not found");
   }
 
   iterator_t find_child(const token_vec_t& v) {
+#ifdef TRACY_ENABLE
+    ZoneScopedN("TreeNode/find_child");
+#endif
     return m_children.find(v);
   }
 
@@ -133,6 +149,9 @@ struct TreeNode {
 
   // set up all data structures except for parent-child relationship
   friend void split_prefix(TreeNode* new_node, TreeNode* old_node, std::size_t prefix_length) {
+#ifdef TRACY_ENABLE
+    ZoneScopedN("TreeNode/split_prefix");
+#endif
     auto tokens = std::move(old_node->m_tokens);
     _assert(0 < prefix_length && prefix_length < tokens.size(), "Invalid prefix size for split");
 
@@ -170,10 +189,26 @@ struct TreeNode {
 
   /// @return The first index in `m_tokens` that differs from `key`.
   std::size_t diff_key(token_slice key, std::size_t offset) const {
-    const auto a = token_slice{key}.subspan(offset);
-    const auto b = token_slice{m_tokens}.subspan(offset);
-    const auto [it_a, it_b] = std::ranges::mismatch(a, b);
-    return it_a - a.begin();  // return the index of the first differing token
+#ifdef TRACY_ENABLE
+    ZoneScopedN("TreeNode/diff_key");
+#endif
+    // diff_key is candidate for lookup quite often. Here (raw ptr) and
+    // avoid std::ranges/iterator abstraction, easier on compiler.
+    // This way, we could have a simple memcmp-style compare for tokens (int).
+    // Logics: bound, then comparing
+    // from `offset` and returning the first mismatching index (relative to
+    // `offset`) or the full matched length if all tokens are equal.
+    if (offset >= key.size() || offset >= m_tokens.size()) {
+      return 0;
+    }
+    const token_t* a = key.data() + offset;
+    const token_t* b = m_tokens.data() + offset;
+    const std::size_t len = std::min(key.size(), m_tokens.size()) - offset;
+    std::size_t i = 0;
+    for (; i < len; ++i) {
+      if (a[i] != b[i]) break;
+    }
+    return i;  // return the index of the first differing token
   }
 
   at::Tensor device_indices() const {
