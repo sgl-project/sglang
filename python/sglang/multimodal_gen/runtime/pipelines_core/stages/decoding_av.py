@@ -29,6 +29,7 @@ class LTX2AVDecodingStage(DecodingStage):
         self.load_model()
 
         self.vae = self.vae.to(get_local_torch_device())
+        self.vae.eval()
         latents = batch.latents.to(get_local_torch_device())
 
         vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
@@ -74,6 +75,8 @@ class LTX2AVDecodingStage(DecodingStage):
             device = get_local_torch_device()
             self.audio_vae = self.audio_vae.to(device)
             self.vocoder = self.vocoder.to(device)
+            self.audio_vae.eval()
+            self.vocoder.eval()
             dtype = getattr(self.audio_vae, "dtype", None)
             if dtype is None:
                 try:
@@ -81,6 +84,9 @@ class LTX2AVDecodingStage(DecodingStage):
                 except StopIteration:
                     dtype = torch.float32
             audio_latents = audio_latents.to(device, dtype=dtype)
+            latents_std = getattr(self.audio_vae, "latents_std", None)
+            if isinstance(latents_std, torch.Tensor) and torch.all(latents_std == 0):
+                logger.warning("audio_vae.latents_std is all zeros; audio denorm may be incorrect.")
 
             with torch.no_grad():
                 # Decode latents to spectrogram

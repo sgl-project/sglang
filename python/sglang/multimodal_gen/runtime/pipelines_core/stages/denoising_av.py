@@ -324,6 +324,7 @@ class LTX2AVDenoisingStage(DenoisingStage):
                 (denoising_end_time - denoising_start_time) / len(timesteps),
             )
 
+        batch.audio_latents = audio_latents
         self._post_denoising_loop(
             batch=batch,
             latents=latents,

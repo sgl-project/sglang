@@ -156,8 +156,22 @@ def post_process_sample(
                                 # Or shape[0] is huge and shape[1] is huge?
                                 pass
 
-                        # LTX default sample rate is 24000
-                        scipy.io.wavfile.write(audio_path, 24000, audio_np)
+                        audio_sample_rate = 16000
+                        try:
+                            duration_s = float(len(frames)) / float(fps) if fps else 0.0
+                            if duration_s > 0:
+                                audio_len = (
+                                    int(audio_np.shape[0])
+                                    if audio_np.ndim == 2
+                                    else int(audio_np.shape[-1])
+                                )
+                                inferred_sr = int(round(float(audio_len) / duration_s))
+                                if 8000 <= inferred_sr <= 96000:
+                                    audio_sample_rate = inferred_sr
+                        except Exception:
+                            pass
+
+                        scipy.io.wavfile.write(audio_path, audio_sample_rate, audio_np)
                         logger.info(f"Audio saved to {CYAN}{audio_path}{RESET}")
 
                         # Try to merge if ffmpeg is available

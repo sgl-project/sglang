@@ -1394,8 +1394,6 @@ class LTXModel(CachableDiT, OffloadableDiTMixin):
         encoder_hidden_states = self.caption_projection(encoder_hidden_states)
         audio_encoder_hidden_states = self.audio_caption_projection(audio_encoder_hidden_states)
 
-        print(video_rotary_emb, audio_rotary_emb, ca_video_rotary_emb, ca_audio_rotary_emb, flush=True)
-
         # 5. Run blocks
         for block in self.transformer_blocks:
             hidden_states, audio_hidden_states = block(
