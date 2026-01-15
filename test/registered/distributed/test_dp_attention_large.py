@@ -35,18 +35,17 @@ class TestDPAttentionDP2TP4(
     def setUpClass(cls):
         cls.model = DEFAULT_MLA_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
-        with envs.SGLANG_GRAMMAR_SIMULATE_TIMEOUT.override(0.5):
-            cls.process = popen_launch_server(
-                cls.model,
-                cls.base_url,
-                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-                other_args=[
-                    "--trust-remote-code",
-                    "--tp=4",
-                    "--enable-dp-attention",
-                    "--dp=2",
-                ],
-            )
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--trust-remote-code",
+                "--tp=4",
+                "--enable-dp-attention",
+                "--dp=2",
+            ],
+        )
 
     @classmethod
     def tearDownClass(cls):
@@ -91,13 +90,12 @@ class TestDPAttentionDP2TP2DeepseekV3MTP(
         ]
         if not is_in_amd_ci():
             other_args += ["--mem-frac", "0.7"]
-        with envs.SGLANG_GRAMMAR_SIMULATE_TIMEOUT.override(0.5):
-            cls.process = popen_launch_server(
-                cls.model,
-                cls.base_url,
-                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-                other_args=other_args,
-            )
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=other_args,
+        )
 
     @classmethod
     def tearDownClass(cls):
