@@ -166,6 +166,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--log-level-http` | The logging level of HTTP server. If not set, reuse --log-level by default. | `None` | Type: str |
 | `--log-requests` | Log metadata, inputs, outputs of all requests. The verbosity is decided by --log-requests-level | `False` | bool flag (set to enable) |
 | `--log-requests-level` | 0: Log metadata (no sampling parameters). 1: Log metadata and sampling parameters. 2: Log metadata, sampling parameters and partial input/output. 3: Log every input/output. | `2` | `0`, `1`, `2`, `3` |
+| `--uvicorn-access-log-exclude-prefixes` | Exclude uvicorn access logs whose request path starts with any of these prefixes. Defaults to empty (disabled). | `[]` | List[str] |
 | `--crash-dump-folder` | Folder path to dump requests from the last 5 min before a crash (if any). If not specified, crash dumping is disabled. | `None` | Type: str |
 | `--crash-on-nan` | Crash the server on nan logprobs. | `False` | Type: str |
 | `--show-time-cost` | Show time cost of custom marks. | `False` | bool flag (set to enable) |

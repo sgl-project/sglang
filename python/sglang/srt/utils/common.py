@@ -2350,13 +2350,10 @@ def _configure_uvicorn_access_log_filter(
     Args:
         uvicorn_logging_config: The dict-like LOGGING_CONFIG from uvicorn.
         server_args: Parsed server args object that may contain:
-            - enable_uvicorn_access_log_filter (bool)
             - uvicorn_access_log_exclude_prefixes (list[str] | tuple[str] | None)
     """
     # Optionally filter uvicorn access logs (e.g., suppress noisy /metrics polling).
-    if server_args is None or not getattr(
-        server_args, "enable_uvicorn_access_log_filter", True
-    ):
+    if server_args is None:
         return
 
     filter_name = "sglang_uvicorn_access_path_filter"

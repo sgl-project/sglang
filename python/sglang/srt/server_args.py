@@ -69,7 +69,7 @@ from sglang.utils import is_in_ci
 logger = logging.getLogger(__name__)
 
 # Define constants
-DEFAULT_UVICORN_ACCESS_LOG_EXCLUDE_PREFIXES = ("/metrics",)
+DEFAULT_UVICORN_ACCESS_LOG_EXCLUDE_PREFIXES = ()
 SAMPLING_BACKEND_CHOICES = {"flashinfer", "pytorch", "ascend"}
 LOAD_FORMAT_CHOICES = [
     "auto",
@@ -341,7 +341,6 @@ class ServerArgs:
     log_requests_level: int = 2
     log_requests_format: str = "text"
     log_requests_target: Optional[List[str]] = None
-    enable_uvicorn_access_log_filter: bool = True
     uvicorn_access_log_exclude_prefixes: List[str] = dataclasses.field(
         default_factory=lambda: list(DEFAULT_UVICORN_ACCESS_LOG_EXCLUDE_PREFIXES)
     )
@@ -3033,17 +3032,8 @@ class ServerArgs:
             nargs="*",
             default=list(DEFAULT_UVICORN_ACCESS_LOG_EXCLUDE_PREFIXES),
             help="Exclude uvicorn access logs whose request path starts with any of these prefixes. "
-            "Defaults to '/metrics' to reduce noise. "
-            "Pass an empty list to restore the original behavior (no filtering), e.g. "
-            "'--uvicorn-access-log-exclude-prefixes' (no values). "
+            "Defaults to empty (disabled). "
             "Example: --uvicorn-access-log-exclude-prefixes /metrics /health",
-        )
-        parser.add_argument(
-            "--disable-uvicorn-access-log-filter",
-            dest="enable_uvicorn_access_log_filter",
-            action="store_false",
-            default=ServerArgs.enable_uvicorn_access_log_filter,
-            help="Disable uvicorn access-log path filtering entirely (restore original behavior).",
         )
         parser.add_argument(
             "--crash-dump-folder",
