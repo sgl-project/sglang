@@ -17,8 +17,16 @@ from sglang.srt.server_args import ServerArgs, set_global_server_args_for_schedu
 from sglang.srt.utils import add_prefix
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=9, suite="stage-b-test-small-1-gpu", disabled="Test uses pytest-style function without TestCase class - see #17145")
-register_amd_ci(est_time=15, suite="stage-b-test-small-1-gpu-amd", disabled="Test uses pytest-style function without TestCase class - see #17145")
+register_cuda_ci(
+    est_time=9,
+    suite="stage-b-test-small-1-gpu",
+    disabled="Test uses pytest-style function without TestCase class - see #17145",
+)
+register_amd_ci(
+    est_time=15,
+    suite="stage-b-test-small-1-gpu-amd",
+    disabled="Test uses pytest-style function without TestCase class - see #17145",
+)
 
 TEST_HIDDEN_SIZE = 32
 
