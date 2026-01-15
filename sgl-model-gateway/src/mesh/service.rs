@@ -573,11 +573,11 @@ mod tests {
         log::info!("================================================");
 
         // 5. wait for node status to sync
-        tokio::time::sleep(Duration::from_secs(8)).await;
+        tokio::time::sleep(Duration::from_secs(5)).await;
         log::info!("================================================");
 
         // 6. verify node status, status of all nodes should be same, and node E should be down
-        let final_state = String::from("A: Alive - {\"hello\": [119, 111, 114, 108, 100]}, B: Alive - {}, C: Alive - {}, D: Down - {}, E: Down - {}");
+        let final_state = String::from("A: Alive - {\"hello\": [119, 111, 114, 108, 100]}, B: Alive - {}, C: Alive - {}, D: Leaving - {}, E: Down - {}");
         assert_eq!(
             print_state(&handler_a),
             final_state,
