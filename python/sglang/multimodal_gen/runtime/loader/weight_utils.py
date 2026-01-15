@@ -225,28 +225,17 @@ def safetensors_weights_iterator(
     use_runai_model_streamer: bool = HAS_RUNAI_MODEL_STREAMER,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files."""
-    logger.info(
-        "safetensors_weights_iterator: Starting. num_files=%d, to_cpu=%s, use_runai=%s",
-        len(hf_weights_files),
-        to_cpu,
-        use_runai_model_streamer,
-    )
     enable_tqdm = (
         not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
     )
     device = "cpu" if to_cpu else str(get_local_torch_device())
 
     # Validate files before loading
-    logger.info(
-        "safetensors_weights_iterator: Validating %d safetensors files...",
-        len(hf_weights_files),
-    )
     corrupted_files = [
         st_file
         for st_file in hf_weights_files
         if not _validate_safetensors_file(st_file)
     ]
-    logger.info("safetensors_weights_iterator: File validation completed")
 
     if corrupted_files:
         # Only rank 0 should delete files to avoid race conditions in multi-GPU setup
@@ -301,23 +290,14 @@ def safetensors_weights_iterator(
             )
 
     if use_runai_model_streamer:
-        logger.info(
-            "safetensors_weights_iterator: Starting RunAI SafetensorsStreamer..."
-        )
         with SafetensorsStreamer() as streamer:
             streamer.stream_files(hf_weights_files)
-            logger.info(
-                "safetensors_weights_iterator: RunAI streamer files loaded, iterating tensors..."
-            )
             for name, tensor in streamer.get_tensors():
                 if to_cpu:
                     yield name, tensor.clone().detach()
                 else:
                     yield name, tensor.to(device)
     else:
-        logger.info(
-            "safetensors_weights_iterator: Using standard safetensors loading (no RunAI)"
-        )
         for st_file in tqdm(
             hf_weights_files,
             desc="Loading safetensors checkpoint shards",

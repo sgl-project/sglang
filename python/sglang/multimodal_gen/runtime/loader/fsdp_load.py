@@ -94,16 +94,6 @@ def maybe_load_fsdp_model(
     """
     Load the model with FSDP if is training, else load the model without FSDP.
     """
-    logger.info(
-        "maybe_load_fsdp_model: Starting model load. model_cls=%s, num_weight_files=%d, "
-        "device=%s, cpu_offload=%s, fsdp_inference=%s",
-        model_cls.__name__,
-        len(weight_dir_list),
-        device,
-        cpu_offload,
-        fsdp_inference,
-    )
-
     # NOTE(will): cast_forward_inputs=True shouldn't be needed as we are
     # manually casting the inputs to the model
     mp_policy = MixedPrecisionPolicy(
@@ -117,13 +107,8 @@ def maybe_load_fsdp_model(
         mp_policy=mp_policy,
     )
 
-    logger.info(
-        "maybe_load_fsdp_model: Creating model on meta device "
-        "(may trigger JIT compilation for attention backends)..."
-    )
     with set_default_dtype(default_dtype), torch.device("meta"):
         model = model_cls(**init_params)
-    logger.info("maybe_load_fsdp_model: Model created on meta device successfully")
 
     # Check if we should use FSDP
     use_fsdp = fsdp_inference
@@ -141,11 +126,6 @@ def maybe_load_fsdp_model(
             hsdp_replicate_dim = world_size
             hsdp_shard_dim = 1
 
-        logger.info(
-            "maybe_load_fsdp_model: Starting FSDP sharding with mesh_shape=(%d, %d)",
-            hsdp_replicate_dim,
-            hsdp_shard_dim,
-        )
         device_mesh = init_device_mesh(
             current_platform.device_type,
             # (Replicate(), Shard(dim=0))
@@ -161,17 +141,9 @@ def maybe_load_fsdp_model(
             fsdp_shard_conditions=model._fsdp_shard_conditions,
             pin_cpu_memory=pin_cpu_memory,
         )
-        logger.info("maybe_load_fsdp_model: FSDP sharding completed")
 
-    logger.info(
-        "maybe_load_fsdp_model: Creating weight iterator for %d files",
-        len(weight_dir_list),
-    )
     weight_iterator = safetensors_weights_iterator(weight_dir_list)
     param_names_mapping_fn = get_param_names_mapping(model.param_names_mapping)
-    logger.info(
-        "maybe_load_fsdp_model: Starting load_model_from_full_model_state_dict..."
-    )
     load_model_from_full_model_state_dict(
         model,
         weight_iterator,
@@ -181,16 +153,12 @@ def maybe_load_fsdp_model(
         cpu_offload=cpu_offload,
         param_names_mapping=param_names_mapping_fn,
     )
-    logger.info(
-        "maybe_load_fsdp_model: load_model_from_full_model_state_dict completed"
-    )
     for n, p in chain(model.named_parameters(), model.named_buffers()):
         if p.is_meta:
             raise RuntimeError(f"Unexpected param or buffer {n} on meta device.")
         # Avoid unintended computation graph accumulation during inference
         if isinstance(p, torch.nn.Parameter):
             p.requires_grad = False
-    logger.info("maybe_load_fsdp_model: Model loading completed successfully")
     return model
 
 
@@ -285,27 +253,12 @@ def load_model_from_full_model_state_dict(
             * **unexpected_keys** is a list of str containing the unexpected keys
 
     """
-    logger.info(
-        "load_model_from_full_model_state_dict: Starting. strict=%s, cpu_offload=%s",
-        strict,
-        cpu_offload,
-    )
     meta_sd = model.state_dict()
     param_dict = dict(model.named_parameters())
     sharded_sd = {}
-    logger.info(
-        "load_model_from_full_model_state_dict: Converting HF state dict to custom format..."
-    )
     custom_param_sd, reverse_param_names_mapping = hf_to_custom_state_dict(
         full_sd_iterator, param_names_mapping
     )  # type: ignore
-    logger.info(
-        "load_model_from_full_model_state_dict: State dict conversion completed, "
-        "%d parameters to load",
-        len(custom_param_sd),
-    )
-    loaded_count = 0
-    total_params = len(custom_param_sd)
     for target_param_name, full_tensor in custom_param_sd.items():
         meta_sharded_param = meta_sd.get(target_param_name)
         if meta_sharded_param is None:
@@ -346,13 +299,6 @@ def load_model_from_full_model_state_dict(
             if cpu_offload:
                 sharded_tensor = sharded_tensor.to("cpu")
         sharded_sd[target_param_name] = nn.Parameter(sharded_tensor)
-        loaded_count += 1
-        if loaded_count % 100 == 0 or loaded_count == total_params:
-            logger.info(
-                "load_model_from_full_model_state_dict: Loading parameters... %d/%d",
-                loaded_count,
-                total_params,
-            )
 
     model.reverse_param_names_mapping = reverse_param_names_mapping
     unused_keys = set(meta_sd.keys()) - set(sharded_sd.keys())
@@ -393,13 +339,4 @@ def load_model_from_full_model_state_dict(
         sharded_sd[new_param_name] = nn.Parameter(sharded_tensor)
 
     # choose `assign=True` since we cannot call `copy_` on meta tensor
-    logger.info(
-        "load_model_from_full_model_state_dict: Calling model.load_state_dict "
-        "with %d parameters...",
-        len(sharded_sd),
-    )
-    result = model.load_state_dict(sharded_sd, strict=strict, assign=True)
-    logger.info(
-        "load_model_from_full_model_state_dict: model.load_state_dict completed"
-    )
-    return result
+    return model.load_state_dict(sharded_sd, strict=strict, assign=True)
