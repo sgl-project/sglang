@@ -12,10 +12,21 @@ PERMISSIONS_FILE_PATH = ".github/CI_PERMISSIONS.json"
 
 
 def find_workflow_run_url(
-    gh_repo, workflow_id, ref, target_stage, token, dispatch_time, max_wait=30
+    gh_repo,
+    workflow_id,
+    ref,
+    target_stage,
+    token,
+    dispatch_time,
+    pr_head_sha=None,
+    max_wait=30,
 ):
     """
     Poll for the workflow run URL after dispatch.
+
+    Uses the dynamic run-name feature to identify runs:
+    - Fork PRs: display_title = "[stage-name] sha"
+    - Non-fork PRs: display_title = "[stage-name]"
 
     Args:
         gh_repo: PyGithub repository object
@@ -24,11 +35,21 @@ def find_workflow_run_url(
         target_stage: The stage name we're looking for
         token: GitHub API token
         dispatch_time: Unix timestamp when dispatch was triggered
+        pr_head_sha: PR head SHA (for fork PRs, used to match display_title)
         max_wait: Maximum seconds to wait for the run to appear
 
     Returns:
         The workflow run URL if found, None otherwise.
     """
+    # Build expected display_title pattern based on workflow's run-name
+    # Format: "[stage-name] sha" for fork PRs, "[stage-name]" for non-fork
+    if pr_head_sha:
+        expected_title = f"[{target_stage}] {pr_head_sha}"
+    else:
+        expected_title = f"[{target_stage}]"
+
+    print(f"Looking for workflow run with display_title: {expected_title}")
+
     for attempt in range(max_wait // 5):
         time.sleep(5)
 
@@ -55,25 +76,14 @@ def find_workflow_run_url(
             if run_created < dispatch_time - 10:
                 continue
 
-            # Verify: check if target_stage job exists and is NOT skipped
-            # This distinguishes our run from other workflow_dispatch runs
-            jobs_resp = requests.get(
-                f"https://api.github.com/repos/{gh_repo.full_name}/actions/runs/{run['id']}/jobs",
-                headers={
-                    "Authorization": f"Bearer {token}",
-                    "Accept": "application/vnd.github+json",
-                },
-            )
-
-            if jobs_resp.status_code == 200:
-                for job in jobs_resp.json().get("jobs", []):
-                    # Match job name containing target_stage
-                    # Job names may include partition suffix like "stage-b-test-small-1-gpu (0)"
-                    if target_stage in job["name"] and job["conclusion"] != "skipped":
-                        print(
-                            f"Found matching workflow run: {run['id']} with job {job['name']}"
-                        )
-                        return run["html_url"]
+            # Match by display_title (set by workflow's run-name directive)
+            # This is immediately available, unlike job names which require waiting
+            display_title = run.get("display_title", "")
+            if display_title == expected_title:
+                print(
+                    f"Found matching workflow run: {run['id']} with title '{display_title}'"
+                )
+                return run["html_url"]
 
     print(f"Could not find workflow run after {max_wait} seconds")
     return None
@@ -217,6 +227,7 @@ def handle_rerun_stage(
         "stage-a-cpu-only",
         "stage-b-test-small-1-gpu",
         "stage-b-test-large-1-gpu",
+        "stage-b-test-small-1-gpu-5090",
         "stage-b-test-large-2-gpu",
         "stage-c-test-large-4-gpu",
         "stage-c-test-large-4-gpu-b200",
@@ -293,6 +304,9 @@ def handle_rerun_stage(
         )
         print(f"PR is from fork: {is_fork}")
 
+        # pr_head_sha is used for fork PRs (passed to workflow and used for URL lookup)
+        pr_head_sha = None
+
         if is_fork:
             # For fork PRs: dispatch on main and pass SHA as input
             # This is needed because fork branch names don't exist in the main repo
@@ -352,6 +366,7 @@ def handle_rerun_stage(
                     stage_name,
                     token,
                     dispatch_time,
+                    pr_head_sha=pr_head_sha,
                     max_wait=30,
                 )
                 if run_url:

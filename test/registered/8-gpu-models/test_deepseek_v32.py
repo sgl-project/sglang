@@ -27,7 +27,7 @@ GSM8K_BASELINE = 0.935
 GPQA_BASELINE = 0.835
 
 
-class TestDeepseekV32Unified(unittest.TestCase):
+class TestDeepseekV32(unittest.TestCase):
     """Unified test class for DeepSeek V3.2 performance and accuracy.
 
     Tests multiple variants with both performance and accuracy tests:

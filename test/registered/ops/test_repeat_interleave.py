@@ -1,7 +1,8 @@
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 # Ops - Repeat Interleave tests (1-GPU)
-register_cuda_ci(est_time=60, suite="stage-b-test-small-1-gpu")
+register_cuda_ci(est_time=8, suite="stage-b-test-small-1-gpu")
+register_cuda_ci(est_time=7, suite="stage-b-test-small-1-gpu-5090")
 register_amd_ci(est_time=75, suite="stage-b-test-small-1-gpu-amd")
 
 import time

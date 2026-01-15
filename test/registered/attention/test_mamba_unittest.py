@@ -15,15 +15,13 @@ from sglang.srt.server_args import ServerArgs, set_global_server_args_for_schedu
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=9, suite="stage-b-test-small-1-gpu")
+register_cuda_ci(est_time=7, suite="stage-b-test-small-1-gpu-5090")
 
 
 class TestMamba(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        server_args = ServerArgs(model_path="dummy")
-        server_args.enable_dp_attention = False
-        server_args.page_size = 1
-        set_global_server_args_for_scheduler(server_args)
+        pass
 
     @classmethod
     def tearDownClass(cls):

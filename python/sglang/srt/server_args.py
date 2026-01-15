@@ -109,6 +109,7 @@ QUANTIZATION_CHOICES = [
     "auto-round",
     "compressed-tensors",  # for Ktransformers
     "modelslim",  # for NPU
+    "quark_int4fp8_moe",
 ]
 
 SPECULATIVE_DRAFT_MODEL_QUANTIZATION_CHOICES = [*QUANTIZATION_CHOICES, "unquant"]
@@ -370,6 +371,7 @@ class ServerArgs:
 
     # API related
     api_key: Optional[str] = None
+    admin_api_key: Optional[str] = None
     served_model_name: Optional[str] = None
     weight_version: str = "default"
     chat_template: Optional[str] = None
@@ -690,9 +692,6 @@ class ServerArgs:
         # Apply model-specific adjustments.
         self._handle_model_specific_adjustments()
 
-        # Handle Hicache settings.
-        self._handle_hicache()
-
         # Set kernel backends.
         self._handle_sampling_backend()
         self._handle_attention_backend_compatibility()
@@ -700,6 +699,9 @@ class ServerArgs:
         self._handle_page_size()
         self._handle_amd_specifics()
         self._handle_grammar_backend()
+
+        # Handle Hicache settings.
+        self._handle_hicache()
 
         # Handle data parallelism.
         self._handle_data_parallelism()
@@ -950,10 +952,13 @@ class ServerArgs:
             self.cuda_graph_max_bs = max(self.cuda_graph_bs)
 
         if self.piecewise_cuda_graph_max_tokens is None:
-            # Capture piecewise cuda graph tokens up to the chunked prefill size. Two benefits:
-            # 1. cuda graph acceleration for all prefill lengths.
-            # 2. do not need more temporary memory for activations. Less fragmentation.
-            self.piecewise_cuda_graph_max_tokens = self.chunked_prefill_size
+            # Refer to pr #15927, by default we set the piecewise cuda graph max tokens to the chunked prefill size by default.
+            # For MLA backend, the introduction of piecewise cuda graph will influence the kernel dispatch difference compared to the original mode.
+            # To avoid the performance regression, we set the max tokens to 2048 by default.
+            if not self.use_mla_backend():
+                self.piecewise_cuda_graph_max_tokens = self.chunked_prefill_size
+            else:
+                self.piecewise_cuda_graph_max_tokens = 2048
 
         if self.piecewise_cuda_graph_tokens is None:
             self.piecewise_cuda_graph_tokens = (
@@ -983,6 +988,11 @@ class ServerArgs:
                 if self.cuda_graph_max_bs > 300:
                     reserved_mem += self.cuda_graph_max_bs * self.dp_size * 1.5
 
+            # For piecewise cuda graphs
+            if self.enable_piecewise_cuda_graph:
+                # Only calculate the memory overhead for Non-Torch Memory use since the Torch Memory can be reused with Cuda Graph Capture
+                reserved_mem += len(self.piecewise_cuda_graph_tokens) * 8
+
             if gpu_mem is not None and gpu_mem > 60 * 1024:
                 reserved_mem = max(reserved_mem, 10 * 1024)
 
@@ -993,10 +1003,6 @@ class ServerArgs:
                 elif self.speculative_algorithm != "NGRAM":
                     # eagle draft models and cuda graphs
                     reserved_mem += 2 * 1024
-
-            # For piecewise cuda graphs
-            if self.enable_piecewise_cuda_graph:
-                reserved_mem += self.piecewise_cuda_graph_max_tokens // 8
 
             self.mem_fraction_static = (
                 round((gpu_mem - reserved_mem) / gpu_mem, 3)
@@ -1049,8 +1055,9 @@ class ServerArgs:
             list(range(4, 33, 4))
             + list(range(48, 257, 16))
             + list(range(288, 513, 32))
-            + list(range(640, 4096 + 1, 128))
-            + list(range(4352, self.piecewise_cuda_graph_max_tokens + 1, 256))
+            + list(range(640, 1024 + 1, 64))
+            + list(range(1280, 4096 + 1, 256))
+            + list(range(4608, self.piecewise_cuda_graph_max_tokens + 1, 512))
         )
 
         capture_sizes = [
@@ -1085,7 +1092,7 @@ class ServerArgs:
                     self.attention_backend = "nsa"
                     logger.info("Use nsa attention backend for DeepSeek with DSA.")
 
-                if not is_npu():  # CUDA GPU
+                if not is_npu():  # CUDA or ROCm GPU
                     if self.enable_nsa_prefill_context_parallel:
                         logger.warning(
                             f"Context parallel feature is still under experiment. It has only been verified on Hopper platform."
@@ -1121,8 +1128,15 @@ class ServerArgs:
                                 f"attn_tp_size={self.tp_size}, attention weights will be sharded across {self.tp_size} ranks."
                             )
 
-                    self.page_size = 64
-                    logger.warning("Setting page size to 64 for DeepSeek DSA.")
+                    if is_hip():
+                        self.page_size = 1
+                        logger.warning(
+                            "Setting page size to 1 for DeepSeek DSA on ROCm."
+                        )
+                    else:
+                        # For CUDA GPU
+                        self.page_size = 64
+                        logger.warning("Setting page size to 64 for DeepSeek DSA.")
 
                     # For Hopper, we support both bf16 and fp8 kv cache; for Blackwell, we support fp8 only currently
                     import torch
@@ -1993,23 +2007,14 @@ class ServerArgs:
             )
 
     def _handle_hicache(self):
-        if self.hicache_storage_backend == "mooncake":
-            if self.hicache_mem_layout == "layer_first":
-                if self.hicache_io_backend == "direct":
-                    self.hicache_mem_layout = "page_first_direct"
-                elif self.hicache_io_backend == "kernel":
-                    self.hicache_mem_layout = "page_first"
-                logger.warning(
-                    f"Mooncake storage backend does not support layer_first layout, "
-                    f"switching to {self.hicache_mem_layout} layout for {self.hicache_io_backend} io backend"
-                )
-
-        if self.hicache_mem_layout == "page_first_direct":
-            if self.hicache_io_backend not in ["direct", "kernel_ascend"]:
-                self.hicache_io_backend = "direct"
-                logger.warning(
-                    "Page first direct layout only support direct io backend"
-                )
+        if (
+            self.hicache_mem_layout == "page_first_direct"
+            and self.hicache_io_backend == "kernel"
+        ):
+            self.hicache_io_backend = "direct"
+            logger.warning(
+                "Kernel io backend does not support page first direct layout"
+            )
 
         if (
             self.enable_hierarchical_cache
@@ -2041,6 +2046,17 @@ class ServerArgs:
                         "FlashAttention3 decode backend is not compatible with hierarchical cache. "
                         "Setting hicache_io_backend to vanilla I/O, which may lead to suboptimal performance with small page sizes."
                     )
+
+        if self.hicache_storage_backend == "mooncake":
+            if self.hicache_mem_layout == "layer_first":
+                if self.hicache_io_backend == "direct":
+                    self.hicache_mem_layout = "page_first_direct"
+                elif self.hicache_io_backend == "kernel":
+                    self.hicache_mem_layout = "page_first"
+                logger.warning(
+                    f"Mooncake storage backend does not support layer_first layout, "
+                    f"switching to {self.hicache_mem_layout} layout for {self.hicache_io_backend} io backend"
+                )
 
     def _handle_speculative_decoding(self):
         if (
@@ -3237,6 +3253,15 @@ class ServerArgs:
             help="Set API key of the server. It is also used in the OpenAI API compatible server.",
         )
         parser.add_argument(
+            "--admin-api-key",
+            type=str,
+            default=ServerArgs.admin_api_key,
+            help=(
+                "Set admin API key for sensitive management endpoints (e.g. /clear_hicache_storage_backend). "
+                "When set, admin endpoints require this key and do NOT accept --api-key."
+            ),
+        )
+        parser.add_argument(
             "--served-model-name",
             type=str,
             default=ServerArgs.served_model_name,
@@ -3320,8 +3345,8 @@ class ServerArgs:
                 "auto",
                 "round_robin",
                 "follow_bootstrap_room",
-                "shortest_queue",
-                "minimum_tokens",
+                "total_requests",
+                "total_tokens",
             ],
         )
         parser.add_argument(
@@ -4175,9 +4200,9 @@ class ServerArgs:
         )
         parser.add_argument(
             "--piecewise-cuda-graph-tokens",
-            type=json_list_type,
-            default=ServerArgs.piecewise_cuda_graph_tokens,
-            help="Set the list of tokens when using piecewise cuda graph.",
+            type=int,
+            nargs="+",
+            help="Set the list of token lengths for piecewise cuda graph capture.",
         )
         parser.add_argument(
             "--piecewise-cuda-graph-compiler",
