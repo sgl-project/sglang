@@ -13,7 +13,7 @@ QWEN3_235B_MODEL_PATH = "Qwen/Qwen3-235B-A22B-Instruct-2507"
 
 
 @unittest.skipIf(not is_blackwell_system(), "Requires B200")
-class TestQwen3235BUnified(unittest.TestCase):
+class TestQwen3235B(unittest.TestCase):
     """Unified test class for Qwen3-235B performance and accuracy.
 
     Single variant with simple TP=8 configuration.
@@ -34,6 +34,7 @@ class TestQwen3235BUnified(unittest.TestCase):
                 QWEN3_235B_MODEL_PATH,
                 tp_size=8,
                 extra_args=base_args,
+                variant="TP8",
             ),
         ]
 

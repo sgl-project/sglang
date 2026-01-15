@@ -148,6 +148,7 @@ from sglang.srt.utils import (
     get_local_ip_auto,
     init_custom_process_group,
     is_hip,
+    is_host_cpu_arm64,
     is_npu,
     log_info_on_rank0,
     monkey_patch_p2p_access_check,
@@ -178,6 +179,7 @@ from sglang.srt.weight_sync.tensor_bucket import (
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
+_is_cpu_arm64 = is_host_cpu_arm64()
 
 if _is_npu:
     from sglang.srt.hardware_backend.npu.utils import init_npu_backend
@@ -314,6 +316,32 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.remote_instance_transfer_engine = None
         self.remote_instance_transfer_engine_session_id = ""
         self.remote_instance_transfer_engine_weight_info = None
+        # auxiliary hidden capture mode. TODO: expose this to server args?
+        self.eagle_use_aux_hidden_state = False
+        if self.spec_algorithm.is_eagle3() and not self.is_draft_worker:
+            # load draft config
+            draft_model_config = ModelConfig.from_server_args(
+                server_args,
+                model_path=(server_args.speculative_draft_model_path),
+                model_revision=server_args.speculative_draft_model_revision,
+                is_draft_model=True,
+            )
+            self.eagle_use_aux_hidden_state = True
+
+            try:
+                # get the aux layer from draft model config
+                eagle_config = getattr(
+                    draft_model_config.hf_config, "eagle_config", None
+                )
+                self.eagle_use_aux_hidden_state = eagle_config.get(
+                    "use_aux_hidden_state", True
+                )
+                self.eagle_aux_hidden_state_layer_ids = eagle_config[
+                    "eagle_aux_hidden_state_layer_ids"
+                ]
+            except:
+                # if there is no aux layer, set to None
+                self.eagle_aux_hidden_state_layer_ids = None
 
         # Apply the rank zero filter to logger
         if server_args.show_time_cost:
@@ -457,6 +485,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.start_layer = getattr(self.model, "start_layer", 0)
         self.end_layer = getattr(self.model, "end_layer", model_num_layers)
         self.num_effective_layers = self.end_layer - self.start_layer
+
+        # For LoopCoder models, each loop has its own layer_id, so we need to multiply by loop_num
+        loop_num = getattr(self.model_config.hf_config, "loop_num", 1)
+        if loop_num > 1:
+            self.num_effective_layers = self.num_effective_layers * loop_num
+
         assert (
             (not model_has_mtp_layers)
             or (self.spec_algorithm.is_none())
@@ -518,7 +552,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.configure_kv_cache_dtype()
 
         # Init memory pool and attention backends
-        self.init_memory_pool(min_per_gpu_memory, server_args)
+        self.init_memory_pool(min_per_gpu_memory)
 
         # Init max running requests
         self.max_running_requests = min(
@@ -550,49 +584,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if server_args.forward_hooks:
             register_forward_hooks(self.model, server_args.forward_hooks)
 
-        # auxiliary hidden capture mode. TODO: expose this to server args?
-        if self.spec_algorithm.is_eagle3() and not self.is_draft_worker:
-            # load draft config
-            draft_model_config = ModelConfig.from_server_args(
-                server_args,
-                model_path=(server_args.speculative_draft_model_path),
-                model_revision=server_args.speculative_draft_model_revision,
-                is_draft_model=True,
+        if self.eagle_use_aux_hidden_state:
+            self.model.set_eagle3_layers_to_capture(
+                self.eagle_aux_hidden_state_layer_ids
             )
-
-            try:
-                # get the aux layer from draft model config
-                eagle_config = getattr(
-                    draft_model_config.hf_config, "eagle_config", None
-                )
-                eagle_aux_hidden_state_layer_ids = eagle_config[
-                    "eagle_aux_hidden_state_layer_ids"
-                ]
-            except:
-                # if there is no aux layer, set to None
-                eagle_aux_hidden_state_layer_ids = None
-
-            self.model.set_eagle3_layers_to_capture(eagle_aux_hidden_state_layer_ids)
 
         # Initialize piecewise CUDA graph
         self.init_piecewise_cuda_graphs()
 
     def init_routed_experts_capturer(self):
-        # TODO: the redundant logic with TpModelWorker
-        max_running_requests = min(
-            (
-                self.max_total_num_tokens // 2
-                if self.server_args.max_running_requests is None
-                else self.server_args.max_running_requests
-                // (
-                    self.server_args.dp_size
-                    if self.server_args.enable_dp_attention
-                    else 1
-                )
-            ),
-            self.req_to_token_pool.size,
-        )
-
         if not self.server_args.disable_shared_experts_fusion and hasattr(
             self.model, "num_fused_shared_experts"
         ):
@@ -606,7 +606,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 model_config=self.model_config,
                 num_fused_shared_experts=num_fused_shared_experts,
                 num_tokens=self.max_total_num_tokens + self.page_size,
-                max_running_requests=max_running_requests,
+                max_running_requests=self.max_running_requests,
                 device=self.device,
             )
         )
@@ -737,7 +737,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if not self.is_draft_worker:
             if self.device == "cpu":
-                if _is_cpu_amx_available:
+                if _is_cpu_amx_available or _is_cpu_arm64:
                     # Bind OpenMP threads to CPU cores
                     torch.ops.sgl_kernel.init_cpu_threads_env(self.local_omp_cpuid)
 
@@ -751,7 +751,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
                 else:
                     logger.warning(
-                        "init_cpu_threads_env and shared memory based AllReduce is disabled since intel amx backend is not available"
+                        "init_cpu_threads_env and shared memory based AllReduce is disabled, only intel amx backend and arm64 are supported"
                     )
 
             # Only initialize the distributed environment on the target model worker.
@@ -768,7 +768,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 pipeline_model_parallel_size=self.pp_size,
                 expert_model_parallel_size=self.moe_ep_size,
                 duplicate_tp_group=self.server_args.enable_pdmux,
-                torch_compile=self.server_args.enable_piecewise_cuda_graph,
             )
             initialize_dp_attention(
                 server_args=self.server_args,
@@ -1442,6 +1441,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         return result
 
+    def load_lora_adapter_from_tensors(
+        self, lora_ref: LoRARef, tensors, config_dict, added_tokens_config=None
+    ):
+        logger.info(f"LoRA adapter loading from tensors starts: {lora_ref}.")
+        result = self.lora_manager.load_lora_adapter_from_tensors(
+            lora_ref, tensors, config_dict, added_tokens_config
+        )
+        logger.info(f"LoRA adapter loading from tensors completes: {lora_ref}.")
+        return result
+
     def unload_lora_adapter(self, lora_ref: LoRARef):
         """Unload a lora adapter that was previously loaded during initialization or dynamic loading."""
 
@@ -1476,6 +1485,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     @property
     def mamba2_config(self):
         config = self.model_config.hf_config
+        if isinstance(config, NemotronHConfig) and self.is_draft_worker:
+            # NemotronH MTP draft models have no Mamba layers (pattern like "*E")
+            # so they shouldn't use HybridLinearAttnBackend
+            pattern = getattr(config, "mtp_hybrid_override_pattern", None)
+            if pattern is not None and "M" not in pattern:
+                return None
         if isinstance(config, FalconH1Config | NemotronHConfig):
             return config
         if isinstance(config, NemotronH_Nano_VL_V2_Config):
@@ -1745,7 +1760,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self.server_args.enable_torch_compile:
             set_torch_compile_config()
 
-        if self.spec_algorithm.is_eagle3():
+        if self.eagle_use_aux_hidden_state:
             self.model.set_eagle3_layers_to_capture()
 
         require_mlp_tp_gather_ = require_mlp_tp_gather(self.server_args)
@@ -2162,6 +2177,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def forward_idle(
         self, forward_batch: ForwardBatch, pp_proxy_tensors=None
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
+        # In DP Attention, IDLE batches are padded (batch_size > 0) for MLP sync.
+        # in this case, we need to reinit the forward metadata, otherwise the stale
+        # metadata causes batch_size mismatch in attention kernel(e.g. NSA Indexer).
+        if forward_batch.batch_size > 0:
+            self.attn_backend.init_forward_metadata(forward_batch)
+
         kwargs = {}
         if self.support_pp:
             kwargs["pp_proxy_tensors"] = pp_proxy_tensors

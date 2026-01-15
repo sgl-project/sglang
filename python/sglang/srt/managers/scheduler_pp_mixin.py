@@ -219,8 +219,7 @@ class SchedulerPPMixin:
 
                 self.process_prefill_chunk()
                 batch = self.get_new_batch_prefill()
-                if self.require_mlp_sync:
-                    batch = self.prepare_mlp_sync_batch(batch)
+                batch = self.maybe_prepare_mlp_sync_batch_and_log_stats(batch)
                 self.mbs[mb_id] = batch
                 self.running_mbs[mb_id] = self.running_batch
 
@@ -505,6 +504,10 @@ class SchedulerPPMixin:
 
     def init_pp_loop_state(self: Scheduler):
         self.pp_loop_size: int = self.pp_size + self.server_args.pp_async_batch_depth
+        # In CP mode, attention weights are duplicated, eliminating the need for the attention TP all-gather operation.
+        self.require_attn_tp_allgather = (
+            not self.server_args.enable_nsa_prefill_context_parallel
+        )
         self.mbs = [None] * self.pp_loop_size
         self.last_mbs = [None] * self.pp_loop_size
         self.running_mbs = [
@@ -564,8 +567,8 @@ class SchedulerPPMixin:
                     sampling_params=sampling_params,
                 )
                 req.fill_ids = req.origin_input_ids
-                req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
                 req.logprob_start_len = -1
+                req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
 
                 # Prepare batch
                 batch = ScheduleBatch.init_new(
@@ -907,7 +910,9 @@ class SchedulerPPMixin:
         p2p_work.extend(
             self.pp_group.send_tensor_dict(
                 tensor_dict=tensor_dict,
-                all_gather_group=self.attn_tp_group,
+                all_gather_group=(
+                    self.attn_tp_group if self.require_attn_tp_allgather else None
+                ),
                 async_send=async_send,
             )
         )
@@ -917,7 +922,11 @@ class SchedulerPPMixin:
         pp_proxy_tensors = None
         if not self.pp_group.is_first_rank:
             pp_proxy_tensors = PPProxyTensors(
-                self.pp_group.recv_tensor_dict(all_gather_group=self.attn_tp_group)
+                self.pp_group.recv_tensor_dict(
+                    all_gather_group=(
+                        self.attn_tp_group if self.require_attn_tp_allgather else None
+                    )
+                )
             )
         return pp_proxy_tensors
 
@@ -925,7 +934,9 @@ class SchedulerPPMixin:
         self: Scheduler,
     ) -> Dict[str, torch.Tensor]:
         res = self.pp_group.recv_tensor_dict(
-            all_gather_group=self.attn_tp_group,
+            all_gather_group=(
+                self.attn_tp_group if self.require_attn_tp_allgather else None
+            ),
         )
         return res
 
@@ -1068,7 +1079,7 @@ class SchedulerPPMixin:
         """
         polls = poll_and_all_reduce(
             [req.disagg_kv_sender if is_send else req.kv_receiver for req in req_queue],
-            self.tp_worker.get_attention_tp_cpu_group(),
+            self.attn_tp_cpu_group,
         )
         rids: List = []
         for poll_statuses in poll_statuses_group:
@@ -1343,7 +1354,8 @@ class ChunkSizePredictor:
         smoothed_chunk_size = base_chunk_size + smooth_coeff * (
             calculated_chunk_size_float - base_chunk_size
         )
-        calculated_chunk_size = int(smoothed_chunk_size)
+        # Make sure the dynamic chunk size is at least 1/4 of the base chunk size
+        calculated_chunk_size = max(int(smoothed_chunk_size), base_chunk_size // 4)
 
         # Align to page_size (minimum alignment size is 64)
         alignment_size = max(page_size, 64)

@@ -17,6 +17,7 @@ from dataclasses import field
 from enum import Enum
 from typing import Any, Optional
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig, STA_Mode
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
@@ -143,13 +144,98 @@ def _sanitize_for_logging(obj: Any, key_hint: str | None = None) -> Any:
         return "<unserializable>"
 
 
+class ExecutionMode(str, Enum):
+    """
+    Enumeration for different pipeline modes.
+
+    Inherits from str to allow string comparison for backward compatibility.
+    """
+
+    INFERENCE = "inference"
+
+    @classmethod
+    def from_string(cls, value: str) -> "ExecutionMode":
+        """Convert string to ExecutionMode enum."""
+        try:
+            return cls(value.lower())
+        except ValueError:
+            raise ValueError(
+                f"Invalid mode: {value}. Must be one of: {', '.join([m.value for m in cls])}"
+            ) from None
+
+    @classmethod
+    def choices(cls) -> list[str]:
+        """Get all available choices as strings for argparse."""
+        return [mode.value for mode in cls]
+
+
+class WorkloadType(str, Enum):
+    """
+    Enumeration for different workload types.
+
+    Inherits from str to allow string comparison for backward compatibility.
+    """
+
+    I2V = "i2v"  # Image to Video
+    T2V = "t2v"  # Text to Video
+    T2I = "t2i"  # Text to Image
+    I2I = "i2i"  # Image to Image
+
+    @classmethod
+    def from_string(cls, value: str) -> "WorkloadType":
+        """Convert string to WorkloadType enum."""
+        try:
+            return cls(value.lower())
+        except ValueError:
+            raise ValueError(
+                f"Invalid workload type: {value}. Must be one of: {', '.join([m.value for m in cls])}"
+            ) from None
+
+    @classmethod
+    def choices(cls) -> list[str]:
+        """Get all available choices as strings for argparse."""
+        return [workload.value for workload in cls]
+
+
+class Backend(str, Enum):
+    """
+    Enumeration for different model backends.
+    - AUTO: Automatically select backend (prefer sglang native, fallback to diffusers)
+    - SGLANG: Use sglang's native optimized implementation
+    - DIFFUSERS: Use vanilla diffusers pipeline (supports all diffusers models)
+    """
+
+    AUTO = "auto"
+    SGLANG = "sglang"
+    DIFFUSERS = "diffusers"
+
+    @classmethod
+    def from_string(cls, value: str) -> "Backend":
+        """Convert string to Backend enum."""
+        try:
+            return cls(value.lower())
+        except ValueError:
+            raise ValueError(
+                f"Invalid backend: {value}. Must be one of: {', '.join([m.value for m in cls])}"
+            ) from None
+
+    @classmethod
+    def choices(cls) -> list[str]:
+        """Get all available choices as strings for argparse."""
+        return [backend.value for backend in cls]
+
+
 @dataclasses.dataclass
 class ServerArgs:
     # Model and path configuration (for convenience)
     model_path: str
 
+    # Model backend (sglang native or diffusers)
+    backend: Backend = Backend.AUTO
+
     # Attention
     attention_backend: str = None
+    diffusers_attention_backend: str = None  # for diffusers backend only
 
     # Distributed executor backend
     nccl_port: Optional[int] = None
@@ -179,6 +265,11 @@ class ServerArgs:
 
     pipeline_config: PipelineConfig = field(default_factory=PipelineConfig, repr=False)
 
+    # Pipeline override
+    pipeline_class_name: str | None = (
+        None  # Override pipeline class from model_index.json
+    )
+
     # LoRA parameters
     # (Wenxuan) prefer to keep it here instead of in pipeline config to not make it complicated.
     lora_path: str | None = None
@@ -199,6 +290,9 @@ class ServerArgs:
     use_fsdp_inference: bool = False
     pin_cpu_memory: bool = True
 
+    # ComfyUI integration
+    comfyui_mode: bool = False
+
     # STA (Sliding Tile Attention) parameters
     mask_strategy_file_path: str | None = None
     STA_mode: STA_Mode = STA_Mode.STA_INFERENCE
@@ -206,6 +300,10 @@ class ServerArgs:
 
     # Compilation
     enable_torch_compile: bool = False
+
+    # warmup
+    warmup: bool = False
+    warmup_resolutions: list[str] = None
 
     disable_autocast: bool | None = None
 
@@ -220,9 +318,9 @@ class ServerArgs:
     # TODO: do not hard code
     master_port: int | None = None
 
-    # http server endpoint config, would be ignored in local mode
-    host: str | None = None
-    port: int | None = None
+    # http server endpoint config
+    host: str | None = "127.0.0.1"
+    port: int | None = 30000
 
     # TODO: webui and their endpoint, check if webui_port is available.
     webui: bool = False
@@ -276,10 +374,14 @@ class ServerArgs:
             if self.vae_cpu_offload is None:
                 self.vae_cpu_offload = False
         else:
-            self.dit_cpu_offload = True
-            self.text_encoder_cpu_offload = True
-            self.image_encoder_cpu_offload = True
-            self.vae_cpu_offload = True
+            if self.dit_cpu_offload is None:
+                self.dit_cpu_offload = True
+            if self.text_encoder_cpu_offload is None:
+                self.text_encoder_cpu_offload = True
+            if self.image_encoder_cpu_offload is None:
+                self.image_encoder_cpu_offload = True
+            if self.vae_cpu_offload is None:
+                self.vae_cpu_offload = True
 
     def __post_init__(self):
         # configure logger before use
@@ -290,6 +392,17 @@ class ServerArgs:
         if self.attention_backend in ["fa3", "fa4"]:
             self.attention_backend = "fa"
 
+        # handle warmup
+        if self.warmup_resolutions is not None:
+            self.warmup = True
+
+        if self.warmup:
+            logger.info(
+                "Warmup enabled, the launch time is expected to be longer than usual"
+            )
+
+        # network initialization: port and host
+        self.port = self.settle_port(self.port)
         # Add randomization to avoid race condition when multiple servers start simultaneously
         initial_scheduler_port = self.scheduler_port + random.randint(0, 100)
         self.scheduler_port = self.settle_port(initial_scheduler_port)
@@ -306,6 +419,7 @@ class ServerArgs:
                     "Failed to load V-MoBA config from %s: %s", self.moba_config_path, e
                 )
                 raise
+
         self.check_server_args()
 
         # log clean server_args
@@ -338,6 +452,13 @@ class ServerArgs:
             default=None,
             choices=[e.name.lower() for e in AttentionBackendEnum] + ["fa3", "fa4"],
             help="The attention backend to use. If not specified, the backend is automatically selected based on hardware and installed packages.",
+        )
+        parser.add_argument(
+            "--diffusers-attention-backend",
+            type=str,
+            default=None,
+            help="Attention backend for diffusers pipelines (e.g., flash, _flash_3_hub, sage, xformers). "
+            "See: https://huggingface.co/docs/diffusers/main/en/optimization/attention_backends",
         )
 
         # HuggingFace specific parameters
@@ -453,6 +574,24 @@ class ServerArgs:
             help="Use torch.compile to speed up DiT inference."
             + "However, will likely cause precision drifts. See (https://github.com/pytorch/pytorch/issues/145213)",
         )
+
+        # warmup
+        parser.add_argument(
+            "--warmup",
+            action=StoreBoolean,
+            default=ServerArgs.warmup,
+            help="Perform some warmup after server starts (if `--warmup-resolutions` is specified) or before processing the first request (if `--warmup-resolutions` is not specified)."
+            "Recommended to enable when benchmarking to ensure fair comparison and best performance."
+            "When enabled with `--warmup-resolutions` unspecified, look for the line ending with `(with warmup excluded)` for actual processing time.",
+        )
+        parser.add_argument(
+            "--warmup-resolutions",
+            type=str,
+            nargs="+",
+            default=ServerArgs.warmup_resolutions,
+            help="Specify resolutions for server to warmup. e.g., `--warmup-resolutions 256x256, 720x720`",
+        )
+
         parser.add_argument(
             "--dit-cpu-offload",
             action=StoreBoolean,
@@ -567,6 +706,14 @@ class ServerArgs:
             default=ServerArgs.log_level,
             help="The logging level of all loggers.",
         )
+        parser.add_argument(
+            "--backend",
+            type=str,
+            choices=Backend.choices(),
+            default=ServerArgs.backend.value,
+            help="The model backend to use. 'auto' prefers sglang native and falls back to diffusers. "
+            "'sglang' uses native optimized implementation. 'diffusers' uses vanilla diffusers pipeline.",
+        )
         return parser
 
     def url(self):
@@ -575,12 +722,15 @@ class ServerArgs:
         else:
             return f"http://{self.host}:{self.port}"
 
+    @property
     def scheduler_endpoint(self):
         """
-        Internal endpoint for scheduler
-
+        Internal endpoint for scheduler.
+        Prefers the configured host but normalizes localhost -> 127.0.0.1 to avoid ZMQ issues.
         """
-        scheduler_host = self.host or "localhost"
+        scheduler_host = self.host
+        if scheduler_host is None or scheduler_host == "localhost":
+            scheduler_host = "127.0.0.1"
         return f"tcp://{scheduler_host}:{self.scheduler_port}"
 
     def settle_port(
@@ -588,17 +738,6 @@ class ServerArgs:
     ) -> int:
         """
         Find an available port with retry logic.
-
-        Args:
-            port: Initial port to check
-            port_inc: Port increment for each attempt
-            max_attempts: Maximum number of attempts to find an available port
-
-        Returns:
-            An available port number
-
-        Raises:
-            RuntimeError: If no available port is found after max_attempts
         """
         attempts = 0
         original_port = port
@@ -622,16 +761,6 @@ class ServerArgs:
             f"Failed to find available port after {max_attempts} attempts "
             f"(started from port {original_port})"
         )
-
-    def post_init_serve(self):
-        """
-        Post init when in serve mode
-        """
-        if self.host is None:
-            self.host = "localhost"
-        if self.port is None:
-            self.port = 3000
-        self.port = self.settle_port(self.port)
 
     @classmethod
     def from_cli_args(
@@ -691,6 +820,16 @@ class ServerArgs:
 
     @classmethod
     def from_kwargs(cls, **kwargs: Any) -> "ServerArgs":
+        # Convert mode string to enum if necessary
+        if "mode" in kwargs and isinstance(kwargs["mode"], str):
+            kwargs["mode"] = ExecutionMode.from_string(kwargs["mode"])
+        # Convert workload_type string to enum if necessary
+        if "workload_type" in kwargs and isinstance(kwargs["workload_type"], str):
+            kwargs["workload_type"] = WorkloadType.from_string(kwargs["workload_type"])
+        # Convert backend string to enum if necessary
+        if "backend" in kwargs and isinstance(kwargs["backend"], str):
+            kwargs["backend"] = Backend.from_string(kwargs["backend"])
+
         kwargs["pipeline_config"] = PipelineConfig.from_kwargs(kwargs)
         return cls(**kwargs)
 
@@ -751,14 +890,17 @@ class ServerArgs:
             logger.debug(f"Ring degree not set, using default value {self.ring_degree}")
 
         if self.ring_degree > 1:
-            if self.attention_backend is not None and self.attention_backend != "fa":
+            if self.attention_backend is not None and self.attention_backend not in (
+                "fa",
+                "sage_attn",
+            ):
                 raise ValueError(
-                    "Ring Attention is only supported for flash attention backend for now"
+                    "Ring Attention is only supported for flash attention or sage attention backend for now"
                 )
-            else:
+            if self.attention_backend is None:
                 self.attention_backend = "fa"
                 logger.info(
-                    "Ring Attention is currently only supported for flash attention, attention_backend has been automatically set to flash attention"
+                    "Ring Attention is currently only supported for flash attention or sage attention; attention_backend has been automatically set to flash attention"
                 )
 
         if self.sp_degree == -1:
@@ -783,9 +925,21 @@ class ServerArgs:
 
     def check_server_args(self) -> None:
         """Validate inference arguments for consistency"""
+        # layerwise offload
         if current_platform.is_mps():
             self.use_fsdp_inference = False
             self.dit_layerwise_offload = False
+
+        if not envs.SGLANG_CACHE_DIT_ENABLED:
+            # TODO: need a better way to tell this
+            if (
+                "wan" in self.pipeline_config.__class__.__name__.lower()
+                and self.dit_layerwise_offload is None
+            ):
+                logger.info(
+                    "Automatically enable dit_layerwise_offload for Wan for best performance"
+                )
+                self.dit_layerwise_offload = True
 
         if self.dit_layerwise_offload:
             if self.use_fsdp_inference:
@@ -798,7 +952,7 @@ class ServerArgs:
                     "dit_layerwise_offload is enabled, automatically disabling dit_cpu_offload."
                 )
                 self.dit_cpu_offload = False
-            if os.getenv("SGLANG_CACHE_DIT_ENABLED", "").lower() == "true":
+            if envs.SGLANG_CACHE_DIT_ENABLED:
                 raise ValueError(
                     "dit_layerwise_offload cannot be enabled together with cache-dit. "
                     "cache-dit may reuse skipped blocks whose weights have been released by layerwise offload, "
@@ -855,9 +1009,9 @@ class ServerArgs:
             has_sp = self.sp_degree > 1
             has_tp = self.tp_size > 1
             if has_sp and has_tp:
-                raise ValueError(
-                    "cache-dit does not support hybrid parallelism (SP + TP). "
-                    "Please use either sequence parallelism or tensor parallelism, not both."
+                logger.warning(
+                    "cache-dit is enabled with hybrid parallelism (SP + TP). "
+                    "Proceeding anyway (SGLang integration may support this mode)."
                 )
 
     def _set_default_attention_backend(self) -> None:
@@ -923,13 +1077,6 @@ _global_server_args = None
 def prepare_server_args(argv: list[str]) -> ServerArgs:
     """
     Prepare the inference arguments from the command line arguments.
-
-    Args:
-        argv: The command line arguments. Typically, it should be `sys.argv[1:]`
-            to ensure compatibility with `parse_args` when no arguments are passed.
-
-    Returns:
-        The inference arguments.
     """
     parser = FlexibleArgumentParser()
     ServerArgs.add_cli_args(parser)

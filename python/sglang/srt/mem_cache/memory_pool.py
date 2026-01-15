@@ -15,19 +15,6 @@ limitations under the License.
 
 from __future__ import annotations
 
-import dataclasses
-from dataclasses import dataclass
-from typing import List
-
-from sglang.srt.configs.mamba_utils import BaseLinearStateParams
-from sglang.srt.environ import envs
-from sglang.srt.layers.attention.nsa import index_buf_accessor
-from sglang.srt.layers.attention.nsa.quant_k_cache import (
-    quantize_k_cache,
-    quantize_k_cache_separate,
-)
-from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
-
 """
 Memory pool.
 
@@ -38,16 +25,26 @@ KVCache actually holds the physical kv cache.
 """
 
 import abc
+import dataclasses
 import logging
 from contextlib import contextmanager, nullcontext
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
 import triton
 import triton.language as tl
 
+from sglang.jit_kernel.kvcache import can_use_store_cache, store_cache
+from sglang.srt.configs.mamba_utils import BaseLinearStateParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
+from sglang.srt.environ import envs
+from sglang.srt.layers.attention.nsa import index_buf_accessor
+from sglang.srt.layers.attention.nsa.quant_k_cache import (
+    quantize_k_cache,
+    quantize_k_cache_separate,
+)
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.utils import (
     get_mla_kv_buffer_triton,
@@ -55,7 +52,11 @@ from sglang.srt.mem_cache.utils import (
     set_mla_kv_buffer_triton,
     set_mla_kv_scale_buffer_triton,
 )
-from sglang.srt.utils import is_cuda, is_npu, next_power_of_2
+from sglang.srt.utils import is_cuda, is_hip, is_npu, next_power_of_2
+from sglang.srt.utils.custom_op import register_custom_op
+from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+
+store_cache = register_custom_op(store_cache, mutates_args=["k_cache", "v_cache"])
 
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import LayerDoneCounter
@@ -67,12 +68,50 @@ logger = logging.getLogger(__name__)
 GB = 1024 * 1024 * 1024
 _is_cuda = is_cuda()
 _is_npu = is_npu()
+_is_hip = is_hip()
 
 
 def get_tensor_size_bytes(t: Union[torch.Tensor, List[torch.Tensor]]):
     if isinstance(t, list):
         return sum(get_tensor_size_bytes(x) for x in t)
     return np.prod(t.shape) * t.dtype.itemsize
+
+
+def _set_kv_buffer_impl(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    indices: torch.Tensor,
+    row_dim: int,  # head_num * head_dim
+    store_dtype: torch.dtype,
+    device_module: Any,
+    alt_stream: Optional[torch.cuda.Stream] = None,
+    same_kv_dim: bool = True,
+) -> None:
+    row_bytes = row_dim * store_dtype.itemsize
+    if _is_cuda and same_kv_dim and can_use_store_cache(row_bytes):
+        return store_cache(
+            k.view(-1, row_dim),
+            v.view(-1, row_dim),
+            k_cache.view(-1, row_dim),
+            v_cache.view(-1, row_dim),
+            indices,
+            row_bytes=row_bytes,
+        )
+
+    from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+
+    if get_is_capture_mode() and alt_stream is not None:
+        current_stream = device_module.current_stream()
+        alt_stream.wait_stream(current_stream)
+        k_cache[indices] = k
+        with device_module.stream(alt_stream):
+            v_cache[indices] = v
+        current_stream.wait_stream(alt_stream)
+    else:  # fallback to naive implementation
+        k_cache[indices] = k
+        v_cache[indices] = v
 
 
 class ReqToTokenPool:
@@ -271,12 +310,7 @@ class MambaPool:
 
         select_index = self.free_slots[:need_size]
         self.free_slots = self.free_slots[need_size:]
-        # clear at alloc time
-        for i in range(len(self.mamba_cache.conv)):
-            self.mamba_cache.conv[i][:, select_index] = 0
-        self.mamba_cache.temporal[:, select_index] = 0
-
-        # fill allocated slots with zeros
+        # clear at alloc time, fill allocated slots with zeros
         for i in range(len(self.mamba_cache.conv)):
             self.mamba_cache.conv[i][:, select_index] = 0
         self.mamba_cache.temporal[:, select_index] = 0
@@ -309,8 +343,17 @@ class MambaPool:
         return dst_index
 
     def get_contiguous_buf_infos(self):
+        """
+        Get buffer info for RDMA registration.
+        Only returns conv and temporal state buffers, excluding intermediate buffers
+        used for speculative decoding (intermediate_ssm, intermediate_conv_window).
+        """
         state_tensors = []
         for field in vars(self.mamba_cache):
+            # Skip intermediate buffers used only for speculative decoding
+            # These buffers have different size (spec_state_size + 1) and should not be transferred
+            if field in ("intermediate_ssm", "intermediate_conv_window"):
+                continue
             value = getattr(self.mamba_cache, field)
             if isinstance(value, list):
                 state_tensors.extend(value)
@@ -657,6 +700,10 @@ class MHATokenToKVPool(KVCache):
 
         self._finalize_allocation_log(size)
 
+        # for store_cache JIT kernel
+        self.row_dim = self.head_num * self.head_dim
+        self.same_kv_dim = self.head_dim == self.v_head_dim
+
     def _init_kv_copy_and_warmup(self):
         # Heuristics for KV copy tiling
         _KV_COPY_STRIDE_THRESHOLD_LARGE = 8192
@@ -864,8 +911,6 @@ class MHATokenToKVPool(KVCache):
         v_scale: Optional[float] = None,
         layer_id_override: Optional[int] = None,
     ):
-        from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
-
         if layer_id_override is not None:
             layer_id = layer_id_override
         else:
@@ -882,17 +927,18 @@ class MHATokenToKVPool(KVCache):
             cache_k = cache_k.view(self.store_dtype)
             cache_v = cache_v.view(self.store_dtype)
 
-        if get_is_capture_mode() and self.alt_stream is not None:
-            # Overlap the copy of K and V cache for small batch size
-            current_stream = self.device_module.current_stream()
-            self.alt_stream.wait_stream(current_stream)
-            self.k_buffer[layer_id - self.start_layer][loc] = cache_k
-            with self.device_module.stream(self.alt_stream):
-                self.v_buffer[layer_id - self.start_layer][loc] = cache_v
-            current_stream.wait_stream(self.alt_stream)
-        else:
-            self.k_buffer[layer_id - self.start_layer][loc] = cache_k
-            self.v_buffer[layer_id - self.start_layer][loc] = cache_v
+        _set_kv_buffer_impl(
+            cache_k,
+            cache_v,
+            self.k_buffer[layer_id - self.start_layer],
+            self.v_buffer[layer_id - self.start_layer],
+            loc,
+            row_dim=self.row_dim,
+            store_dtype=self.store_dtype,
+            device_module=self.device_module,
+            alt_stream=self.alt_stream,
+            same_kv_dim=self.same_kv_dim,
+        )
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         if envs.SGLANG_NATIVE_MOVE_KV_CACHE.get():
@@ -1275,189 +1321,6 @@ class HybridLinearKVPool(KVCache):
         assert self.use_mla, "get_mla_kv_buffer called when use_mla is False"
         with self._transfer_id_context(layer):
             return self.full_kv_pool.get_mla_kv_buffer(layer, loc, dst_dtype)
-
-
-class SWAKVPool(KVCache):
-    """KV cache with separate pools for full and SWA attention layers."""
-
-    def __init__(
-        self,
-        size: int,
-        size_swa: int,
-        dtype: torch.dtype,
-        head_num: int,
-        head_dim: int,
-        swa_attention_layer_ids: List[int],
-        full_attention_layer_ids: List[int],
-        enable_kvcache_transpose: bool,
-        device: str,
-        token_to_kv_pool_class: KVCache = MHATokenToKVPool,
-        **kwargs,
-    ):
-        self.size = size
-        self.size_swa = size_swa
-        self.dtype = dtype
-        self.head_num = head_num
-        self.head_dim = head_dim
-        self.device = device
-        self.swa_layer_nums = len(swa_attention_layer_ids)
-        self.full_layer_nums = len(full_attention_layer_ids)
-        self.start_layer = 0
-        self.page_size = 1
-
-        kwargs["page_size"] = 1
-        kwargs["enable_memory_saver"] = False
-        kwargs["head_num"] = head_num
-        kwargs["head_dim"] = head_dim
-        kwargs["device"] = device
-        # TODO MHATransposedTokenToKVPool if enable_kvcache_transpose is True
-        assert not enable_kvcache_transpose
-
-        # for disagg with nvlink
-        self.enable_custom_mem_pool, self.custom_mem_pool, _ = (
-            maybe_init_custom_mem_pool(device=self.device)
-        )
-
-        self.swa_kv_pool = token_to_kv_pool_class(
-            size=size_swa,
-            dtype=dtype,
-            layer_num=self.swa_layer_nums,
-            **kwargs,
-        )
-        kwargs.pop("swa_head_num", None)
-        kwargs.pop("swa_head_dim", None)
-        kwargs.pop("swa_v_head_dim", None)
-        self.full_kv_pool = token_to_kv_pool_class(
-            size=size,
-            dtype=dtype,
-            layer_num=self.full_layer_nums,
-            **kwargs,
-        )
-        # {layer_id: (index, is_swa_layer)}
-        self.layers_mapping: Dict[int, Tuple[int, bool]] = {}
-        for full_attn_layer_id, global_layer_id in enumerate(full_attention_layer_ids):
-            self.layers_mapping[global_layer_id] = (full_attn_layer_id, False)
-        for swa_layer_id, global_layer_id in enumerate(swa_attention_layer_ids):
-            self.layers_mapping[global_layer_id] = (swa_layer_id, True)
-        self.full_to_swa_index_mapping: Optional[torch.Tensor] = None
-
-        k_size, v_size = self.get_kv_size_bytes()
-        self.mem_usage = (k_size + v_size) / GB
-        logger.info(
-            f"SWAKVPool mem usage: {self.mem_usage:.2f} GB, swa size: {self.size_swa}, full size: {self.size}"
-        )
-
-    def get_kv_size_bytes(self):
-        k_size, v_size = self.full_kv_pool.get_kv_size_bytes()
-        k_size_swa, v_size_swa = self.swa_kv_pool.get_kv_size_bytes()
-        return k_size + k_size_swa, v_size + v_size_swa
-
-    def get_contiguous_buf_infos(self):
-        full_kv_data_ptrs, full_kv_data_lens, full_kv_item_lens = (
-            self.full_kv_pool.get_contiguous_buf_infos()
-        )
-
-        kv_data_ptrs = full_kv_data_ptrs
-        kv_data_lens = full_kv_data_lens
-        kv_item_lens = full_kv_item_lens
-
-        return kv_data_ptrs, kv_data_lens, kv_item_lens
-
-    def get_state_buf_infos(self):
-        swa_kv_data_ptrs, swa_kv_data_lens, swa_kv_item_lens = (
-            self.swa_kv_pool.get_contiguous_buf_infos()
-        )
-
-        return swa_kv_data_ptrs, swa_kv_data_lens, swa_kv_item_lens
-
-    def get_key_buffer(self, layer_id: int):
-        layer_id_pool, is_swa_layer = self.layers_mapping[layer_id]
-        if is_swa_layer:
-            return self.swa_kv_pool.get_key_buffer(layer_id_pool)
-        else:
-            return self.full_kv_pool.get_key_buffer(layer_id_pool)
-
-    def get_value_buffer(self, layer_id: int):
-        layer_id_pool, is_swa_layer = self.layers_mapping[layer_id]
-        if is_swa_layer:
-            return self.swa_kv_pool.get_value_buffer(layer_id_pool)
-        else:
-            return self.full_kv_pool.get_value_buffer(layer_id_pool)
-
-    def get_kv_buffer(self, layer_id: int):
-        layer_id_pool, is_swa_layer = self.layers_mapping[layer_id]
-        if is_swa_layer:
-            return self.swa_kv_pool.get_kv_buffer(layer_id_pool)
-        else:
-            return self.full_kv_pool.get_kv_buffer(layer_id_pool)
-
-    def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor):
-        assert self.full_to_swa_index_mapping is not None
-        return self.full_to_swa_index_mapping[kv_indices].to(torch.int32)
-
-    def set_kv_buffer(
-        self,
-        layer: RadixAttention,
-        loc: torch.Tensor,
-        cache_k: torch.Tensor,
-        cache_v: torch.Tensor,
-        k_scale: float = 1.0,
-        v_scale: float = 1.0,
-    ):
-
-        layer_id = layer.layer_id
-        layer_id_pool, is_swa_layer = self.layers_mapping[layer_id]
-        if is_swa_layer:
-            if self.full_to_swa_index_mapping is not None:
-                loc = self.translate_loc_from_full_to_swa(loc)
-            self.swa_kv_pool.set_kv_buffer(
-                None,
-                loc,
-                cache_k,
-                cache_v,
-                k_scale,
-                v_scale,
-                layer_id_override=layer_id_pool,
-            )
-        else:
-            self.full_kv_pool.set_kv_buffer(
-                None,
-                loc,
-                cache_k,
-                cache_v,
-                k_scale,
-                v_scale,
-                layer_id_override=layer_id_pool,
-            )
-
-    def get_cpu_copy(self, indices):
-        # For SWA, we need to copy KV cache from both full and SWA pools
-        # The indices are for the full pool, and we use mapping to get SWA indices
-        full_kv_cpu = self.full_kv_pool.get_cpu_copy(indices)
-
-        # Get SWA indices through the mapping
-        # Note: SWA allocation always creates 1:1 mapping, so no need to filter
-        if self.full_to_swa_index_mapping is not None:
-            swa_indices = self.full_to_swa_index_mapping[indices]
-            swa_kv_cpu = self.swa_kv_pool.get_cpu_copy(swa_indices)
-        else:
-            swa_kv_cpu = None
-
-        return {"full": full_kv_cpu, "swa": swa_kv_cpu}
-
-    def load_cpu_copy(self, kv_cache_cpu, indices):
-        # Load KV cache back from CPU to both full and SWA pools
-        # Note: indices here are NEW indices (newly allocated), different from get_cpu_copy indices
-        full_kv_cpu = kv_cache_cpu["full"]
-        swa_kv_cpu = kv_cache_cpu["swa"]
-
-        # Load full KV cache to the new indices
-        self.full_kv_pool.load_cpu_copy(full_kv_cpu, indices)
-
-        # Load SWA KV cache if it exists
-        if swa_kv_cpu is not None and self.full_to_swa_index_mapping is not None:
-            swa_indices = self.full_to_swa_index_mapping[indices]
-            self.swa_kv_pool.load_cpu_copy(swa_kv_cpu, swa_indices)
 
 
 class MLATokenToKVPool(KVCache):
@@ -1862,7 +1725,10 @@ class NSATokenToKVPool(MLATokenToKVPool):
         # num head == 1 and head dim == 128 for index_k in NSA
         assert index_head_dim == 128
 
-        assert self.page_size == 64
+        if _is_hip:
+            assert self.page_size == 1
+        else:
+            assert self.page_size == 64
         with (
             torch.cuda.use_mem_pool(self.custom_mem_pool)
             if self.custom_mem_pool
