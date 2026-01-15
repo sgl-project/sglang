@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
@@ -17,13 +17,24 @@ if TYPE_CHECKING:
 
 
 @cache_once
-def _jit_norm_module(head_dims: int, dtype: torch.dtype) -> Module:
-    args = make_cpp_args(head_dims, is_arch_support_pdl(), dtype)
+def _jit_qknorm_module(head_dim: int, dtype: torch.dtype) -> Module:
+    args = make_cpp_args(head_dim, is_arch_support_pdl(), dtype)
     return load_jit(
-        "norm",
+        "qknorm",
         *args,
-        cuda_files=["norm.cuh"],
+        cuda_files=["elementwise/qknorm.cuh"],
         cuda_wrappers=[("qknorm", f"QKNormKernel<{args}>::run")],
+    )
+
+
+@cache_once
+def _jit_rmsnorm_module(hidden_size: int, dtype: torch.dtype) -> Module:
+    args = make_cpp_args(hidden_size, is_arch_support_pdl(), dtype)
+    return load_jit(
+        "rmsnorm",
+        *args,
+        cuda_files=["elementwise/rmsnorm.cuh"],
+        cuda_wrappers=[("rmsnorm", f"RMSNormKernel<{args}>::run")],
     )
 
 
@@ -34,7 +45,7 @@ def can_use_fused_inplace_qknorm(head_dim: int, dtype: torch.dtype) -> bool:
         logger.warning(f"Unsupported head_dim={head_dim} for JIT QK-Norm kernel")
         return False
     try:
-        _jit_norm_module(head_dim, dtype)
+        _jit_qknorm_module(head_dim, dtype)
         return True
     except Exception as e:
         logger.warning(f"Failed to load JIT QK-Norm kernel: {e}")
@@ -51,5 +62,17 @@ def fused_inplace_qknorm(
     head_dim: int = 0,
 ) -> None:
     head_dim = head_dim or q.size(-1)
-    module = _jit_norm_module(head_dim, q.dtype)
+    module = _jit_qknorm_module(head_dim, q.dtype)
     module.qknorm(q, k, q_weight, k_weight, eps)
+
+
+def rmsnorm(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    output: Optional[torch.Tensor] = None,
+    eps: float = 1e-6,
+) -> None:
+    output = output if output is not None else input
+    hidden_size = input.size(-1)
+    module = _jit_rmsnorm_module(hidden_size, input.dtype)
+    module.rmsnorm(input, weight, output, eps)

@@ -66,7 +66,6 @@ from sglang.srt.mem_cache.common import (
     evict_from_tree_cache,
     release_kv_cache,
 )
-from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
@@ -360,6 +359,9 @@ class MultimodalInputs:
         ret.mm_items = [item for item in ret.mm_items if item.is_valid()]
 
         if envs.SGLANG_MM_BUFFER_SIZE_MB.get() > 0:
+            # Multi-modal feature hashing optimization:
+            # When SGLANG_MM_BUFFER_SIZE_MB > 0, we temporarily move feature tensors to GPU
+            # for faster hash computation, while avoiding OOM issues.
             from sglang.srt.managers.mm_utils import (
                 init_feature_buffer,
                 is_feature_buffer_initialized,
@@ -518,6 +520,7 @@ class Req:
         priority: Optional[int] = None,
         metrics_collector: Optional[SchedulerMetricsCollector] = None,
         extra_key: Optional[str] = None,
+        routing_key: Optional[str] = None,
         dimensions: Optional[int] = None,
         http_worker_ipc: Optional[str] = None,
     ):
@@ -577,6 +580,7 @@ class Req:
 
         self.extra_key = extra_key
         self.lora_id = lora_id
+        self.routing_key = routing_key
 
         # Memory pool info
         self.req_pool_idx: Optional[int] = None
@@ -714,6 +718,7 @@ class Req:
         self.embedding = None
 
         # Constrained decoding
+        self.grammar_key: Optional[str] = None
         self.grammar: Optional[BaseGrammarObject] = None
         self.grammar_wait_ct = 0
 
@@ -862,7 +867,7 @@ class Req:
                 key=RadixKey(token_ids=token_ids, extra_key=self.extra_key),
                 **(
                     {"req": self, "cow_mamba": True}
-                    if isinstance(tree_cache, MambaRadixCache)
+                    if tree_cache.supports_mamba()
                     else {}
                 ),
             )
@@ -1618,10 +1623,19 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         mamba_track_indices_cpu: List[int],
         mamba_track_seqlens_cpu: List[int],
     ):
-        MAMBA_CACHE_V2_CHUNK_SIZE = max(
-            FLA_CHUNK_SIZE, self.token_to_kv_pool_allocator.page_size
-        )
-        mask = req.extend_input_len >= MAMBA_CACHE_V2_CHUNK_SIZE
+        def _force_track_h(i: int) -> int:
+            assert i % FLA_CHUNK_SIZE == 0
+            # There are 3 cases for mamba_track_seqlen passed to mamba_track_seqlens_cpu:
+            # 1) aligned with FLA_CHUNK_SIZE-> retrieve from last_recurrent_state
+            #    a) is the last position -> retrieve from last_recurrent_state
+            #    b) is NOT the last position -> retrieve from h
+            # 2) unaligned with FLA_CHUNK_SIZE -> retrieve from h
+            # Currently, the math calculation only supports case 1a and 2. So for 1b, we need to add 1
+            # to force the math calculation to retrieve the correct mamba state from h.
+            return i + 1
+
+        mamba_cache_chunk_size = get_global_server_args().mamba_cache_chunk_size
+        mask = req.extend_input_len >= mamba_cache_chunk_size
         mamba_track_mask_cpu.append(mask)
         mamba_track_indices_cpu.append(
             req.mamba_ping_pong_track_buffer[req.mamba_next_track_idx].item()
@@ -1636,13 +1650,28 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # We need to pass the non-aligned seqlen to the calculation. Even though
             # we pass in mamba_track_seqlen, the actual tracked seqlen is mamba_last_track_seqlen.
             mamba_track_seqlen = len(req.prefix_indices) + req.extend_input_len
-            # mamba_last_track_seqlen is actual tracked seqlen. Used to pass to
+
+            # mamba_track_seqlen_aligned/mamba_last_track_seqlen is actual tracked seqlen. Used to pass to
             # mamba radix cache to track which seqlen this mamba state should store at.
             mamba_track_seqlen_aligned = (
                 len(req.prefix_indices)
-                + (req.extend_input_len // MAMBA_CACHE_V2_CHUNK_SIZE)
-                * MAMBA_CACHE_V2_CHUNK_SIZE
+                + (req.extend_input_len // mamba_cache_chunk_size)
+                * mamba_cache_chunk_size
             )
+
+            # mamba_track_fla_chunk_aligned is the aligned seqlen based on FLA_CHUNK_SIZE
+            # If mamba_track_fla_chunk_aligned != mamba_track_seqlen_aligned, which can be true when
+            # page_size > FLA_CHUNK_SIZE, we need to force the math calculation to retrieve the correct mamba state from h
+            # by _force_track_h()
+            mamba_track_fla_chunk_aligned = (
+                len(req.prefix_indices)
+                + (req.extend_input_len // FLA_CHUNK_SIZE) * FLA_CHUNK_SIZE
+            )
+            if mamba_track_fla_chunk_aligned != mamba_track_seqlen_aligned:
+                # We want to track mamba_track_seqlen_aligned, and it's not the last position,
+                # so we need to add 1 to the seqlen to retrieve the correct mamba state from h.
+                mamba_track_seqlen = _force_track_h(mamba_track_seqlen_aligned)
+
             req.mamba_next_track_idx = (
                 self.req_to_token_pool.get_mamba_ping_pong_other_idx(
                     req.mamba_next_track_idx
@@ -1653,18 +1682,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 # is within the current extend batch.
                 branching_seqlen_aligned_mask = (
                     req.mamba_branching_seqlen - len(req.prefix_indices)
-                ) % MAMBA_CACHE_V2_CHUNK_SIZE == 0
+                ) % mamba_cache_chunk_size == 0
                 if (
                     req.mamba_branching_seqlen > len(req.prefix_indices)
                     and req.mamba_branching_seqlen < mamba_track_seqlen
                     and branching_seqlen_aligned_mask
                 ):
-                    # NOTE: See the comment above for mamba_track_seqlen, the +1 is necessary
-                    # because the branching point is not the last aligned position, so we need
-                    # to retrieve its state from h. Adding 1 will give us the correct index in h,
-                    # otherwise the calculation will retrieve the state from the last_recurrent_state,
-                    # which is not correct.
-                    mamba_track_seqlen = req.mamba_branching_seqlen + 1
+                    # We want to track mamba_track_seqlen_aligned, and it's not the last position,
+                    # so we need to add 1 to the seqlen to retrieve the correct mamba state from h.
+                    # See _force_track_h() for more details.
+                    mamba_track_seqlen = _force_track_h(req.mamba_branching_seqlen)
                     mamba_track_seqlen_aligned = req.mamba_branching_seqlen
             req.mamba_last_track_seqlen = mamba_track_seqlen_aligned
         mamba_track_seqlens_cpu.append(mamba_track_seqlen)
