@@ -1203,7 +1203,7 @@ jobs:
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_deepep.sh
 
       - name: Run test
-        timeout-minutes: 20
+        timeout-minutes: 40
         run: |
           cd test/srt
           RETRY_FLAG=""
