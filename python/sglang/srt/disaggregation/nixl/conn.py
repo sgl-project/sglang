@@ -154,10 +154,6 @@ class NixlKVManager(CommonKVManager):
 
         available_plugins = self.agent.get_plugin_list()
         if backend not in available_plugins:
-            logger.error(
-                f"Requested NIXL backend '{backend}' not available. "
-                f"Available plugins: {available_plugins}"
-            )
             raise ValueError(
                 f"NIXL backend '{backend}' not found. Available: {available_plugins}. "
                 f"Please install the required NIXL plugin or choose from: {available_plugins}"
