@@ -2,6 +2,7 @@ from typing import Optional
 
 import torch
 
+from sglang.srt.server_args import get_global_server_args
 
 def sgemm_lora_a_fwd(
     inputs: torch.Tensor,
@@ -18,7 +19,7 @@ def sgemm_lora_a_fwd(
 
     num_loras, weight_out_dim, _ = weights.shape
     
-    if torch.all(weight_indices == weight_indices[0]):
+    if get_global_server_args().disable_overlap_schedule and torch.all(weight_indices == weight_indices[0]):
         idx = weight_indices[0]
         rank = lora_ranks[idx]
         scaling = scaling_tensor[idx]
@@ -82,7 +83,7 @@ def sgemm_lora_b_fwd(
         output = torch.zeros(
             total_seq_len, total_output_dim, dtype=inputs.dtype, device=inputs.device
         )
-    if torch.all(weight_indices==weight_indices[0]):
+    if get_global_server_args().disable_overlap_schedule and torch.all(weight_indices==weight_indices[0]):
         idx= weight_indices[0]
         rank = lora_ranks[idx]
         if rank > 0:
