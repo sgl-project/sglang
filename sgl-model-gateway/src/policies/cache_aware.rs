@@ -159,12 +159,17 @@ impl CacheAwarePolicy {
 
                         // Safely extract the batch from the buffer
                         {
-                            if let Ok(mut ops) = entry.value().lock() {
-                                if ops.is_empty() {
-                                    continue;
+                            let mut guard = match entry.value().lock() {
+                                Ok(guard) => guard,
+                                Err(poisoned) => {
+                                    warn!("Mutex for model {} is poisoned. Recovering.", entry.key());
+                                    poisoned.into_inner()
                                 }
-                                std::mem::swap(&mut ops_to_sync, &mut *ops);
+                            };
+                            if guard.is_empty() {
+                                continue;
                             }
+                            std::mem::swap(&mut ops_to_sync, &mut *guard);
                         }
 
                         if !ops_to_sync.is_empty() {
