@@ -26,11 +26,15 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
 )
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz, scaled_fp8_quant
 from sglang.srt.layers.quantization.fp8_utils import (
+    can_auto_enable_marlin_fp8,
     is_blackwell_supported,
     normalize_e4m3fn_to_e4m3fnuz,
 )
 from sglang.srt.layers.quantization.gptq import gptq_marlin_moe_repack
 from sglang.srt.layers.quantization.marlin_utils import marlin_moe_permute_scales
+from sglang.srt.layers.quantization.marlin_utils_fp8 import (
+    prepare_moe_fp8_layer_for_marlin,
+)
 from sglang.srt.layers.quantization.utils import (
     all_close_1d,
     per_tensor_dequantize,
@@ -517,6 +521,11 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
         self.input_quant = self.quant_config.target_scheme_map["Linear"].get(
             "input_activations"
         )
+        self.use_marlin = False
+        if _is_cuda:
+            force_marlin = get_bool_env_var("SGLANG_FORCE_FP8_MARLIN")
+            auto_enable = can_auto_enable_marlin_fp8()
+            self.use_marlin = force_marlin or auto_enable
 
         per_tensor = (
             self.weight_quant.strategy == QuantizationStrategy.TENSOR
@@ -552,6 +561,7 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
     ):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
+        layer.orig_dtype = params_dtype
         params_dtype = torch.float8_e4m3fn
 
         if self.block_quant:
@@ -773,12 +783,26 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
                     requires_grad=False,
                 )
                 torch.cuda.empty_cache()
+        if self.use_marlin:
+            if self.block_quant:
+                layer.weight_block_size = self.weight_block_size
+            prepare_moe_fp8_layer_for_marlin(layer, size_k_first=False)
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
-        self.runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
+        moe_runner_backend = get_moe_runner_backend()
+        if moe_runner_backend.is_auto():
+            moe_runner_backend = (
+                MoeRunnerBackend.MARLIN if self.use_marlin else MoeRunnerBackend.TRITON
+            )
+        if moe_runner_backend.is_triton() or moe_runner_backend.is_marlin():
+            self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
+        else:
+            raise NotImplementedError(
+                f"Unsupported runner backend: {moe_runner_backend}"
+            )
 
     def apply(
         self,
@@ -826,6 +850,22 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
                 a2_scale=layer.w2_input_scale,
             )
             return StandardCombineInput(hidden_states=output)
+        elif self.runner.runner_backend.is_marlin():
+            from sgl_kernel.scalar_type import scalar_types
+            from sglang.srt.layers.moe.moe_runner.marlin import MarlinMoeQuantInfo
+
+            quant_info = MarlinMoeQuantInfo(
+                w13_qweight=layer.w13_weight,
+                w2_qweight=layer.w2_weight,
+                w13_scales=layer.w13_weight_scale,
+                w2_scales=layer.w2_weight_scale,
+                w13_g_idx_sort_indices=None,
+                w2_g_idx_sort_indices=None,
+                weight_bits=8,
+                w13_q_type_id=scalar_types.float8_e4m3fn.id,
+                w2_q_type_id=scalar_types.float8_e4m3fn.id,
+            )
+            return self.runner.run(dispatch_output, quant_info)
         elif self.weight_quant.strategy == QuantizationStrategy.BLOCK:
             quant_info = TritonMoeQuantInfo(
                 w13_weight=layer.w13_weight,
