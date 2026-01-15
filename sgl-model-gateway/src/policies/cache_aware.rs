@@ -71,7 +71,10 @@ use super::{
 };
 use crate::{
     core::Worker,
-    mesh::{tree_ops::TreeOperation, OptionalMeshSyncManager},
+    mesh::{
+        tree_ops::{TreeInsertOp, TreeOperation, TreeRemoveOp},
+        OptionalMeshSyncManager,
+    },
 };
 
 /// Cache-aware routing policy
@@ -140,35 +143,66 @@ impl CacheAwarePolicy {
     /// Set mesh sync manager (can be called after construction)
     pub fn set_mesh_sync(&mut self, mesh_sync: OptionalMeshSyncManager) {
         self.mesh_sync = mesh_sync.clone();
-
         if let Some(ref sync_manager) = mesh_sync {
             self.restore_tree_state_from_mesh();
 
+            // Start background sync task to flush buffered operations periodically
             let pending_ops_clone = Arc::clone(&self.pending_ops);
             let sync_manager_clone = sync_manager.clone();
             let interval = self.config.mesh_sync_interval_secs;
 
-            self._sync_task = Some(PeriodicTask::spawn(interval, "MeshTreeSync", move || {
-                for entry in pending_ops_clone.iter() {
-                    let model_id = entry.key().clone();
-                    let mut ops_to_sync = Vec::new();
-                    {
-                        if let Ok(mut ops) = entry.value().lock() {
-                            if !ops.is_empty() {
+            if interval > 0 {
+                self._sync_task = Some(PeriodicTask::spawn(interval, "MeshTreeSync", move || {
+                    for entry in pending_ops_clone.iter() {
+                        let model_id = entry.key().clone();
+                        let mut ops_to_sync = Vec::new();
+
+                        // Safely extract the batch from the buffer
+                        {
+                            if let Ok(mut ops) = entry.value().lock() {
+                                if ops.is_empty() {
+                                    continue;
+                                }
                                 std::mem::swap(&mut ops_to_sync, &mut *ops);
                             }
                         }
-                    }
 
-                    if !ops_to_sync.is_empty() {
-                        if let Err(e) =
-                            sync_manager_clone.sync_tree_operations_batch(model_id, ops_to_sync)
-                        {
-                            warn!("Failed to sync batch to mesh: {}", e);
+                        if !ops_to_sync.is_empty() {
+                            // Use the batch synchronization method for performance
+                            if let Err(e) =
+                                sync_manager_clone.sync_tree_operations_batch(model_id, ops_to_sync)
+                            {
+                                warn!("Failed to sync batched tree operations: {}", e);
+                            }
                         }
                     }
+                }));
+            }
+        }
+    }
+
+    /// Flush all pending operations to the mesh stores
+    pub fn flush_mesh_sync(&self) {
+        if let Some(ref mesh_sync) = self.mesh_sync {
+            for entry in self.pending_ops.iter() {
+                let model_id = entry.key().clone();
+                let mut ops_to_sync = Vec::new();
+
+                {
+                    if let Ok(mut ops) = entry.value().lock() {
+                        if ops.is_empty() {
+                            continue;
+                        }
+                        std::mem::swap(&mut ops_to_sync, &mut *ops);
+                    }
                 }
-            }));
+
+                if !ops_to_sync.is_empty() {
+                    if let Err(e) = mesh_sync.sync_tree_operations_batch(model_id, ops_to_sync) {
+                        warn!("Failed to flush batched tree operations to mesh: {}", e);
+                    }
+                }
+            }
         }
     }
 
@@ -179,6 +213,8 @@ impl CacheAwarePolicy {
         }
 
         let mesh_model_id = Self::normalize_mesh_model_id(model_id).to_string();
+
+        // Scope the entry acquisition to fix lifetime issues with MutexGuard
         if let Ok(mut ops) = self
             .pending_ops
             .entry(mesh_model_id)
@@ -372,7 +408,6 @@ impl CacheAwarePolicy {
                 // Now we can work with the tree without holding the HashMap lock
                 tree.insert(text, worker_url);
 
-                use crate::mesh::tree_ops::TreeInsertOp;
                 let op = TreeOperation::Insert(TreeInsertOp {
                     text: text.to_string(),
                     tenant: worker_url.to_string(),
@@ -465,8 +500,6 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                 // Update the tree with this request (use worker URL directly, no allocation)
                 tree.insert(text, workers[idx].url());
 
-                // BATCHED: Queue insert operation for mesh
-                use crate::mesh::tree_ops::TreeInsertOp;
                 let op = TreeOperation::Insert(TreeInsertOp {
                     text: text.to_string(),
                     tenant: workers[idx].url().to_string(),
@@ -485,7 +518,6 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                 tree.remove_tenant(tenant_url);
                 debug!("Removed stale worker {} from cache tree", tenant_url);
 
-                use crate::mesh::tree_ops::TreeRemoveOp;
                 let op = TreeOperation::Remove(TreeRemoveOp {
                     tenant: tenant_url.to_string(),
                 });
@@ -723,7 +755,7 @@ mod tests {
 
         policy.init_workers(&workers);
 
-        // Select worker with a request - should sync to mesh
+        // Select worker with a request - should queue for mesh
         let _idx = policy
             .select_worker(
                 &workers,
@@ -733,6 +765,9 @@ mod tests {
                 },
             )
             .unwrap();
+
+        // Manually flush to mesh for testing
+        policy.flush_mesh_sync();
 
         // Verify tree operation was synced to mesh
         let tree_state = mesh_sync.get_tree_state("default");
