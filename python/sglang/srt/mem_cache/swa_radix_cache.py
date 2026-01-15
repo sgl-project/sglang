@@ -364,6 +364,9 @@ class SWARadixCache(BasePrefixCache):
     ##### Public API #####
 
     def supports_swa(self) -> bool:
+        assert (
+            self.sliding_window_size is not None
+        ), "sliding_window_size must be set for SWARadixCache"
         return True
 
     def reset(self) -> None:
@@ -685,27 +688,6 @@ class SWARadixCache(BasePrefixCache):
                 x = x_next
 
         self.update_eviction_metrics(full_num_evicted + swa_num_evicted, start_time)
-
-    def evict_swa(self, req: Req, pre_len: int) -> None:
-        # evict the swa tokens that not in the tree cache and also not in the sliding window
-        req.evicted_seqlen_local = max(
-            req.evicted_seqlen_local, req.cache_protected_len
-        )
-        new_evicted_seqlen_local = max(
-            req.evicted_seqlen_local, pre_len - self.sliding_window_size
-        )
-
-        if self.page_size > 1:
-            new_evicted_seqlen_local = (
-                new_evicted_seqlen_local // self.page_size
-            ) * self.page_size
-
-        if new_evicted_seqlen_local > req.evicted_seqlen_local:
-            free_slots = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, req.evicted_seqlen_local : new_evicted_seqlen_local
-            ]
-            self.token_to_kv_pool_allocator.free_swa(free_slots)
-            req.evicted_seqlen_local = new_evicted_seqlen_local
 
     def inc_lock_ref(self, node: TreeNode) -> Optional[int]:
         """
