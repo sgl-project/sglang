@@ -167,6 +167,7 @@ class DiffusionServerArgs:
     tp_size: int | None = None
     ulysses_degree: int | None = None
     ring_degree: int | None = None
+    cfg_parallel: bool | None = None
     # LoRA
     lora_path: str | None = (
         None  # LoRA adapter path (HF repo or local path, loaded at startup)
@@ -592,6 +593,20 @@ TWO_GPU_CASES_A = [
         DiffusionSamplingParams(
             prompt=T2V_PROMPT,
             output_size="832x480",
+        ),
+    ),
+    DiffusionTestCase(
+        "wan2_1_t2v_1.3b_cfg_parallel",
+        DiffusionServerArgs(
+            model_path="Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+            modality="video",
+            warmup=0,
+            custom_validator="video",
+            num_gpus=2,
+            cfg_parallel=True,
+        ),
+        DiffusionSamplingParams(
+            prompt=T2V_PROMPT,
         ),
     ),
 ]
