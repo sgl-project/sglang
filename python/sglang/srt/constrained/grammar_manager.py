@@ -164,7 +164,7 @@ class GrammarManager:
         for i in synced_ready_req_idxs:
             req = self.grammar_queue[i]
             return_reqs.append(req)
-            if req.finished():
+            if req.finished() or req.grammar is None:  # It is aborted by AbortReq
                 continue
 
             req.grammar = req.grammar.result()
