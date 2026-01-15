@@ -12,22 +12,22 @@ from typing import Any, Dict, List, Optional
 import torch
 from torch.nn import Module
 
-from python.sglang.srt.layers.quantization.int8_utils import (
-    apply_w8a8_block_int8_linear,
-)
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_tensor_model_parallel_world_size,
 )
-from sglang.multimodal_gen.runtime.layers.base_config import QuantizeConfigBase
-from sglang.multimodal_gen.runtime.layers.base_method import QuantizeMethodBase
 from sglang.multimodal_gen.runtime.layers.linear import (
     LinearMethodBase,
     UnquantizedLinearMethod,
+)
+from sglang.multimodal_gen.runtime.layers.quantization.base_config import (
+    QuantizationConfig,
+    QuantizeMethodBase,
 )
 from sglang.multimodal_gen.runtime.models.parameter import (
     BlockQuantScaleParameter,
     ModelWeightParameter,
 )
+from sglang.srt.layers.quantization.int8_utils import apply_w8a8_block_int8_linear
 from sglang.srt.layers.quantization.utils import is_layer_skipped
 
 ACTIVATION_SCHEMES = ["static", "dynamic"]
@@ -35,7 +35,7 @@ ACTIVATION_SCHEMES = ["static", "dynamic"]
 logger = logging.getLogger(__name__)
 
 
-class Int8Config(QuantizeConfigBase):
+class Int8Config(QuantizationConfig):
     """Configuration for INT8 quantization.
 
     Supports both weight-only and weight-activation quantization with

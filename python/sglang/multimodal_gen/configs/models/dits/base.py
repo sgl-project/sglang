@@ -5,7 +5,10 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from sglang.multimodal_gen.configs.models.base import ArchConfig, ModelConfig
-from sglang.multimodal_gen.runtime.layers.quantization import QuantizationConfig
+from sglang.multimodal_gen.runtime.layers.quantization import (
+    QuantizationConfig,
+    get_quantization_config,
+)
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 
@@ -54,6 +57,21 @@ class DiTConfig(ModelConfig):
     # sglang-diffusion DiT-specific parameters
     prefix: str = ""
     quant_config: QuantizationConfig | None = None
+    quantization_config: QuantizationConfig | None = None
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        config_dict = None
+        if self.quant_config is not None:
+            config_dict = self.quant_config
+        elif self.quantization_config is not None:
+            config_dict = self.quantization_config
+
+        if config_dict is not None and isinstance(config_dict, dict):
+            quant_method = config_dict.get("quant_method")
+            quant_config_cls = get_quantization_config(quant_method)
+            self.quant_config = quant_config_cls.from_config(config_dict)
 
     @staticmethod
     def add_cli_args(parser: Any, prefix: str = "dit-config") -> Any:
