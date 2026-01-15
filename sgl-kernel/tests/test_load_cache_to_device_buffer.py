@@ -58,7 +58,7 @@ __device__ __forceinline__ int warp_inclusive_scan(int* s_data, int lane_id, int
     return accumulator;
 }
 
-template <int BLOCK_SIZE, int NUM_TOP_K, int HOT_BUFFER_SIZE>
+template <int BLOCK_SIZE, int MAX_TOP_K, int HOT_BUFFER_SIZE>
 __global__ void load_cache_to_device_buffer(
     const uint32_t* __restrict__ top_k_tokens,
     uint32_t* __restrict__ device_buffer_tokens,
@@ -69,10 +69,13 @@ __global__ void load_cache_to_device_buffer(
     void* __restrict__ device_buffer,
     int64_t* __restrict__ top_k_device_locs,
     uint32_t max_tokens,
-    int64_t item_size_bytes) {
+    int64_t item_size_bytes,
+    int32_t actual_num_top_k) {  // Added: actual number of tokens
     
     constexpr int NUM_WARPS = BLOCK_SIZE / WARP_SIZE;
-    constexpr int NUM_CHUNKS = (NUM_TOP_K + WARP_SIZE - 1) / WARP_SIZE;
+    // Use MAX_TOP_K for shared memory sizing, actual_num_top_k for bounds
+    const int num_chunks = (actual_num_top_k + WARP_SIZE - 1) / WARP_SIZE;
+    constexpr int MAX_CHUNKS = (MAX_TOP_K + WARP_SIZE - 1) / WARP_SIZE;
 
     const int tid = threadIdx.x;
     const int warp_id = tid / WARP_SIZE;
@@ -80,10 +83,10 @@ __global__ void load_cache_to_device_buffer(
     const unsigned int lanes_before = (1u << lane_id) - 1;
 
     __shared__ bool s_protected_bitmap[HOT_BUFFER_SIZE];
-    __shared__ int32_t s_chunk_miss_offset[NUM_CHUNKS + 1];
-    __shared__ int32_t s_missed_tokens[NUM_TOP_K];
-    __shared__ int16_t s_missed_tokens_idx[NUM_TOP_K];
-    __shared__ int32_t s_evictable_slots[NUM_TOP_K];
+    __shared__ int32_t s_chunk_miss_offset[MAX_CHUNKS + 1];
+    __shared__ int32_t s_missed_tokens[MAX_TOP_K];
+    __shared__ int16_t s_missed_tokens_idx[MAX_TOP_K];
+    __shared__ int32_t s_evictable_slots[MAX_TOP_K];
     __shared__ int32_t s_total_misses;
 
     if (tid == 0) {
@@ -92,20 +95,20 @@ __global__ void load_cache_to_device_buffer(
     for (int i = tid; i < HOT_BUFFER_SIZE; i += BLOCK_SIZE) {
         s_protected_bitmap[i] = false;
     }
-    for (int i = tid; i < NUM_CHUNKS + 1; i += BLOCK_SIZE) {
+    for (int i = tid; i < num_chunks + 1; i += BLOCK_SIZE) {
         s_chunk_miss_offset[i] = 0;
     }
     __syncthreads();
 
     // ===== Phase 1: Hit and Miss Detection ====
-    constexpr int ITERATIONS_PER_WARP = (NUM_CHUNKS + NUM_WARPS - 1) / NUM_WARPS;
-    for (int iter = 0; iter < ITERATIONS_PER_WARP; iter++) {
+    const int iterations_per_warp = (num_chunks + NUM_WARPS - 1) / NUM_WARPS;
+    for (int iter = 0; iter < iterations_per_warp; iter++) {
         int chunk_idx = warp_id + iter * NUM_WARPS;
-        bool has_valid_chunk = chunk_idx < NUM_CHUNKS;
+        bool has_valid_chunk = chunk_idx < num_chunks;
 
         const int chunk_token_start = chunk_idx * WARP_SIZE;
         const int my_token_idx = chunk_token_start + lane_id;
-        const bool has_valid_token = has_valid_chunk && (my_token_idx < NUM_TOP_K);
+        const bool has_valid_token = has_valid_chunk && (my_token_idx < actual_num_top_k);
 
         int32_t my_token = 0;
         bool is_hit = false;
@@ -139,7 +142,7 @@ __global__ void load_cache_to_device_buffer(
 
         if (warp_id == 0) {
             s_total_misses = warp_inclusive_scan(
-                s_chunk_miss_offset, lane_id, iter * NUM_WARPS + 1, NUM_CHUNKS + 1, s_total_misses);
+                s_chunk_miss_offset, lane_id, iter * NUM_WARPS + 1, num_chunks + 1, s_total_misses);
         }
         __syncthreads();
 
@@ -232,7 +235,8 @@ void load_cache_launcher_64_128(
     torch::Tensor device_buffer,
     torch::Tensor top_k_device_locs,
     int64_t max_tokens,
-    int64_t item_size_bytes
+    int64_t item_size_bytes,
+    int64_t actual_num_top_k
 ) {
     load_cache_to_device_buffer<256, 64, 128><<<1, 256>>>(
         reinterpret_cast<uint32_t*>(top_k_tokens.data_ptr<int32_t>()),
@@ -244,7 +248,8 @@ void load_cache_launcher_64_128(
         device_buffer.data_ptr<uint8_t>(),
         top_k_device_locs.data_ptr<int64_t>(),
         static_cast<uint32_t>(max_tokens),
-        item_size_bytes
+        item_size_bytes,
+        static_cast<int32_t>(actual_num_top_k)
     );
 }
 
@@ -258,7 +263,8 @@ void load_cache_launcher_256_512(
     torch::Tensor device_buffer,
     torch::Tensor top_k_device_locs,
     int64_t max_tokens,
-    int64_t item_size_bytes
+    int64_t item_size_bytes,
+    int64_t actual_num_top_k
 ) {
     load_cache_to_device_buffer<256, 256, 512><<<1, 256>>>(
         reinterpret_cast<uint32_t*>(top_k_tokens.data_ptr<int32_t>()),
@@ -270,7 +276,8 @@ void load_cache_launcher_256_512(
         device_buffer.data_ptr<uint8_t>(),
         top_k_device_locs.data_ptr<int64_t>(),
         static_cast<uint32_t>(max_tokens),
-        item_size_bytes
+        item_size_bytes,
+        static_cast<int32_t>(actual_num_top_k)
     );
 }
 '''
@@ -286,7 +293,8 @@ void load_cache_launcher_64_128(
     torch::Tensor device_buffer,
     torch::Tensor top_k_device_locs,
     int64_t max_tokens,
-    int64_t item_size_bytes
+    int64_t item_size_bytes,
+    int64_t actual_num_top_k
 );
 
 void load_cache_launcher_256_512(
@@ -299,7 +307,8 @@ void load_cache_launcher_256_512(
     torch::Tensor device_buffer,
     torch::Tensor top_k_device_locs,
     int64_t max_tokens,
-    int64_t item_size_bytes
+    int64_t item_size_bytes,
+    int64_t actual_num_top_k
 );
 '''
 
@@ -434,8 +443,13 @@ class CUDAKernel:
                      device_buffer: torch.Tensor) -> torch.Tensor:
         self._ensure_compiled()
         
-        if top_k_tokens.dtype != torch.int32:
+        if not isinstance(top_k_tokens, torch.Tensor):
+            top_k_tokens = torch.tensor(top_k_tokens, dtype=torch.int32, device=self.device)
+        elif top_k_tokens.dtype != torch.int32:
             top_k_tokens = top_k_tokens.to(torch.int32)
+        
+        if top_k_tokens.device.type != 'cuda':
+            top_k_tokens = top_k_tokens.to(self.device)
         
         top_k_size = top_k_tokens.numel()
         top_k_device_locs = torch.zeros(top_k_size, dtype=torch.int64, device=self.device)
@@ -452,6 +466,7 @@ class CUDAKernel:
                 top_k_device_locs,
                 self.max_tokens,
                 self.item_size_bytes,
+                top_k_size,  # actual number of tokens
             )
         else:
             self._module.load_cache_launcher_256_512(
@@ -465,6 +480,7 @@ class CUDAKernel:
                 top_k_device_locs,
                 self.max_tokens,
                 self.item_size_bytes,
+                top_k_size,  # actual number of tokens
             )
         
         return top_k_device_locs
@@ -532,7 +548,7 @@ class TestLoadCacheToDeviceBuffer:
         ref_locs = ref.process_topk(top_k_tokens, host_cache_np, device_buffer_ref)
         
         # CUDA kernel
-        cuda_locs = cuda_kernel.process_topk(top_k_tokens, host_cache_torch, device_buffer_torch)
+        cuda_locs = cuda_kernel.process_topk(top_k_torch, host_cache_torch, device_buffer_torch)
         torch.cuda.synchronize()
         
         # Verify locations match
