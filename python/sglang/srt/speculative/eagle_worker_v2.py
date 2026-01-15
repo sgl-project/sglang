@@ -711,7 +711,7 @@ class EagleDraftWorker(BaseDraftWorker):
         probs = torch.softmax(logits_output.next_token_logits, dim=-1)
         topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
         # next_draft_input.hidden_states = logits_output.hidden_states
-        if self.speculative_num_steps > 1:
+        if self.enable_spec_overlap_reflow and self.speculative_num_steps > 1:
             topk_p = torch.cat(
                 [
                     topk_p,
@@ -885,11 +885,14 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 return batch_output
         else:
             if model_worker_batch.spec_info is None:
+                topk = self.topk
+                if self.draft_worker.enable_spec_overlap_reflow:
+                    topk *= self.speculative_num_steps
                 model_worker_batch.spec_info = EagleDraftInput.create_idle_input(
                     device=self.device,
                     hidden_size=self.target_worker.model_config.hidden_size,
                     dtype=self.target_worker.model_config.dtype,
-                    topk=self.topk * self.speculative_num_steps,
+                    topk=topk,
                     capture_hidden_mode=CaptureHiddenMode.LAST,
                 )
             with speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
