@@ -82,7 +82,6 @@ import torch.distributed
 import torch.distributed as dist
 import triton
 import zmq
-from fastapi.responses import ORJSONResponse
 from packaging import version as pkg_version
 from PIL import Image
 from starlette.routing import Mount
@@ -120,6 +119,12 @@ FP8_E4M3_MIN = -FP8_E4M3_MAX
 
 builtins.FP8_E4M3_MAX = FP8_E4M3_MAX
 builtins.FP8_E4M3_MIN = FP8_E4M3_MIN
+
+# explicitly use pure text format, with a newline at the end
+# this makes it impossible to see the animation in the progress bar
+# but will avoid messing up with ray or multiprocessing, which wraps
+# each line of output with some prefix.
+BAR_FORMAT = "{desc}: {percentage:3.0f}% Completed | {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]\n"  # noqa: E501
 
 
 @lru_cache(maxsize=1)
@@ -1131,20 +1136,6 @@ def rank0_log(msg: str):
         logger.info(msg)
 
 
-def add_api_key_middleware(app, api_key: str):
-    @app.middleware("http")
-    async def authentication(request, call_next):
-        if request.method == "OPTIONS":
-            return await call_next(request)
-        if request.url.path.startswith("/health") or request.url.path.startswith(
-            "/metrics"
-        ):
-            return await call_next(request)
-        if request.headers.get("Authorization") != "Bearer " + api_key:
-            return ORJSONResponse(content={"error": "Unauthorized"}, status_code=401)
-        return await call_next(request)
-
-
 def configure_logger(server_args, prefix: str = ""):
     if SGLANG_LOGGING_CONFIG_PATH := os.getenv("SGLANG_LOGGING_CONFIG_PATH"):
         if not os.path.exists(SGLANG_LOGGING_CONFIG_PATH):
@@ -1869,9 +1860,10 @@ def crash_on_warnings():
     return get_bool_env_var("SGLANG_IS_IN_CI")
 
 
+@functools.lru_cache(None)
 def print_warning_once(msg: str) -> None:
     # Set the stacklevel to 2 to print the caller's line info
-    logger.warning(msg, stacklevel=2)
+    logger.warning(msg)
 
 
 @functools.lru_cache(None)
@@ -3772,6 +3764,20 @@ def calc_diff(x, y):
     denominator = (x * x + y * y).sum()
     sim = 2 * (x * y).sum() / denominator
     return 1 - sim
+
+
+@contextmanager
+def temp_attr_context(obj, attr, value):
+    if obj is None:
+        yield
+        return
+
+    original_value = getattr(obj, attr)
+    setattr(obj, attr, value)
+    try:
+        yield
+    finally:
+        setattr(obj, attr, original_value)
 
 
 cached_device_index = -1

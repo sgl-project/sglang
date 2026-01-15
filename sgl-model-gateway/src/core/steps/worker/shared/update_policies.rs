@@ -1,14 +1,15 @@
 //! Unified policy update step.
 
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use tracing::{debug, warn};
 
 use crate::{
-    app_context::AppContext,
-    core::Worker,
-    workflow::{StepExecutor, StepResult, WorkflowContext, WorkflowResult},
+    core::{steps::workflow_data::WorkerRegistrationData, Worker},
+    workflow::{
+        StepExecutor, StepResult, WorkflowContext, WorkflowData, WorkflowError, WorkflowResult,
+    },
 };
 
 /// Unified step to update policy registry for registered workers.
@@ -82,11 +83,23 @@ impl UpdatePoliciesStep {
 }
 
 #[async_trait]
-impl StepExecutor for UpdatePoliciesStep {
-    async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
-        let app_context: Arc<AppContext> = context.get_or_err("app_context")?;
-        let workers: Arc<Vec<Arc<dyn Worker>>> = context.get_or_err("workers")?;
-        let labels: Arc<HashMap<String, String>> = context.get_or_err("labels")?;
+impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for UpdatePoliciesStep {
+    async fn execute(&self, context: &mut WorkflowContext<D>) -> WorkflowResult<StepResult> {
+        let app_context = context
+            .data
+            .get_app_context()
+            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?
+            .clone();
+
+        let workers = context
+            .data
+            .get_actual_workers()
+            .ok_or_else(|| WorkflowError::ContextValueNotFound("workers".to_string()))?;
+
+        let labels = context
+            .data
+            .get_labels()
+            .ok_or_else(|| WorkflowError::ContextValueNotFound("labels".to_string()))?;
 
         let policy_hint = labels.get("policy").map(|s| s.as_str());
 
@@ -139,7 +152,7 @@ impl StepExecutor for UpdatePoliciesStep {
         Ok(StepResult::Success)
     }
 
-    fn is_retryable(&self, _error: &crate::workflow::WorkflowError) -> bool {
+    fn is_retryable(&self, _error: &WorkflowError) -> bool {
         false
     }
 }

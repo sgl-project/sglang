@@ -9,6 +9,7 @@ class ImageResponseData(BaseModel):
     b64_json: Optional[str] = None
     url: Optional[str] = None
     revised_prompt: Optional[str] = None
+    file_path: Optional[str] = None
 
 
 class ImageResponse(BaseModel):
@@ -16,6 +17,7 @@ class ImageResponse(BaseModel):
     created: int = Field(default_factory=lambda: int(time.time()))
     data: List[ImageResponseData]
     peak_memory_mb: Optional[float] = None
+    inference_time_s: Optional[float] = None
 
 
 class ImageGenerationsRequest(BaseModel):
@@ -57,7 +59,9 @@ class VideoResponse(BaseModel):
     completed_at: Optional[int] = None
     expires_at: Optional[int] = None
     error: Optional[Dict[str, Any]] = None
+    file_path: Optional[str] = None
     peak_memory_mb: Optional[float] = None
+    inference_time_s: Optional[float] = None
 
 
 class VideoGenerationsRequest(BaseModel):
@@ -72,13 +76,14 @@ class VideoGenerationsRequest(BaseModel):
     generator_device: Optional[str] = "cuda"
     # SGLang extensions
     num_inference_steps: Optional[int] = None
-    guidance_scale: Optional[float] = None
+    guidance_scale: Optional[float] = 1.0
     guidance_scale_2: Optional[float] = None
     true_cfg_scale: Optional[float] = (
         None  # for CFG vs guidance distillation (e.g., QwenImage)
     )
     negative_prompt: Optional[str] = None
     enable_teacache: Optional[bool] = False
+    output_path: Optional[str] = None
     diffusers_kwargs: Optional[Dict[str, Any]] = None  # kwargs for diffusers backend
 
 
