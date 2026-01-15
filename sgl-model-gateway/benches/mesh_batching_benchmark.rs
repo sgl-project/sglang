@@ -14,7 +14,7 @@ fn bench_mesh_sync_overhead(c: &mut Criterion) {
     let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(
         BasicWorkerBuilder::new("http://worker-1:8000")
             .worker_type(WorkerType::Regular)
-            .model_id("test-model")
+            .model("test-model")
             .build(),
     )];
 
