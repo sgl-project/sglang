@@ -182,42 +182,40 @@ __global__ void load_cache_to_device_buffer(
     }
     __syncthreads();
 
-    // ===== Phase 3: Assignment + Direct Data Copy =====
-    for (int warp_iter = 0; warp_iter < (s_total_misses + NUM_WARPS - 1) / NUM_WARPS; warp_iter++) {
-        int token_idx = warp_id + warp_iter * NUM_WARPS;
-        bool has_work = token_idx < s_total_misses;
-        int64_t src_offset = 0;
-        int64_t dst_offset = 0;
+    // ===== Phase 3a: Metadata Update (all threads in parallel) =====
+    // Each thread handles one or more misses
+    for (int miss_idx = tid; miss_idx < s_total_misses; miss_idx += BLOCK_SIZE) {
+        const int32_t miss_token = s_missed_tokens[miss_idx];
+        const int evict_slot = s_evictable_slots[miss_idx];
+        const int top_k_idx = s_missed_tokens_idx[miss_idx];
+        const int32_t old_token = device_buffer_tokens[evict_slot];
         
-        if (has_work) {
-            const int32_t miss_token = s_missed_tokens[token_idx];
-            const int evict_slot = s_evictable_slots[token_idx];
-            const int top_k_idx = s_missed_tokens_idx[token_idx];
-            const int32_t old_token = device_buffer_tokens[evict_slot];
-            
-            if (old_token >= 0 && old_token < max_tokens) {
-                token_residence_mapping[old_token] = NOT_PRESENT;
-            }
-            token_residence_mapping[miss_token] = static_cast<uint16_t>(evict_slot);
-            device_buffer_tokens[evict_slot] = miss_token;
-            top_k_device_locs[top_k_idx] = device_buffer_locs[evict_slot];
-            src_offset = host_cache_locs[miss_token] * item_size_bytes;
-            dst_offset = device_buffer_locs[evict_slot] * item_size_bytes;
+        // Clear old token's residence mapping
+        if (old_token >= 0 && old_token < max_tokens) {
+            token_residence_mapping[old_token] = NOT_PRESENT;
         }
-
-        #pragma unroll
-        for (int src_lane = 0; src_lane < WARP_SIZE; src_lane++) {
-            bool should_copy = __shfl_sync(0xFFFFFFFF, has_work, src_lane);
-            if (should_copy) {
-                int64_t final_src_offset = __shfl_sync(0xFFFFFFFF, src_offset, src_lane);
-                int64_t final_dst_offset = __shfl_sync(0xFFFFFFFF, dst_offset, src_lane);
-                transfer_item_warp(
-                    lane_id,
-                    static_cast<const char*>(host_cache) + final_src_offset,
-                    static_cast<char*>(device_buffer) + final_dst_offset,
-                    item_size_bytes);
-            }
-        }
+        // Set new token's mapping
+        token_residence_mapping[miss_token] = static_cast<uint16_t>(evict_slot);
+        device_buffer_tokens[evict_slot] = miss_token;
+        top_k_device_locs[top_k_idx] = device_buffer_locs[evict_slot];
+    }
+    __syncthreads();
+    
+    // ===== Phase 3b: Data Loading (warp-cooperative) =====
+    // Each warp handles one miss at a time, all lanes cooperate on the copy
+    for (int miss_idx = warp_id; miss_idx < s_total_misses; miss_idx += NUM_WARPS) {
+        const int32_t miss_token = s_missed_tokens[miss_idx];
+        const int evict_slot = s_evictable_slots[miss_idx];
+        
+        const int64_t src_offset = host_cache_locs[miss_token] * item_size_bytes;
+        const int64_t dst_offset = device_buffer_locs[evict_slot] * item_size_bytes;
+        
+        transfer_item_warp(
+            lane_id,
+            static_cast<const char*>(host_cache) + src_offset,
+            static_cast<char*>(device_buffer) + dst_offset,
+            item_size_bytes
+        );
     }
 }
 
