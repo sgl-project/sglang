@@ -690,10 +690,7 @@ class KimiLinearAttnBackend(MambaAttnBackendBase):
         beta = b_proj(hidden_states)[0].float()
 
         g = f_b_proj(f_a_proj(hidden_states)[0])[0]
-        # g = fused_kda_gate(g, A_log, head_dim, g_bias=dt_bias)
 
-        # beta = beta.unsqueeze(0)
-        # g = g.unsqueeze(0)
         core_attn_out = fused_sigmoid_gating_delta_rule_update(
             A_log=A_log,
             dt_bias=dt_bias,
@@ -711,21 +708,6 @@ class KimiLinearAttnBackend(MambaAttnBackendBase):
             is_kda=True,
         )
 
-        # initial_state = ssm_states[cache_indices].contiguous()
-        # (
-        #     core_attn_out,
-        #     last_recurrent_state,
-        # ) = fused_recurrent_kda(
-        #     q=q,
-        #     k=k,
-        #     v=v,
-        #     g=g,
-        #     beta=beta,
-        #     initial_state=initial_state,
-        #     use_qk_l2norm_in_kernel=True,
-        #     cu_seqlens=query_start_loc,
-        # )
-        # ssm_states[cache_indices] = last_recurrent_state
         return core_attn_out
 
     def forward_extend(
