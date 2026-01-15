@@ -43,8 +43,6 @@ class EAGLEDraftCudaGraphRunner:
             self.model_runner = model_runner = eagle_worker.draft_runner
         else:
             self.model_runner = model_runner = eagle_worker.model_runner
-        # TODO(xjwei): 美化
-        self.enable_spec_overlap_reflow = getattr(self.eagle_worker, "enable_spec_overlap_reflow", False)
         self.graphs = {}
         self.output_buffers = {}
         self.enable_torch_compile = model_runner.server_args.enable_torch_compile
@@ -295,11 +293,7 @@ class EAGLEDraftCudaGraphRunner:
             output_cache_loc_backup = forward_batch.out_cache_loc
             hidden_states_backup = forward_batch.spec_info.hidden_states
 
-            # TODO(xjwei): 兼容
-            if self.enable_spec_overlap_reflow:
-                ret = self.eagle_worker.draft_forward_v2(forward_batch)
-            else:
-                ret = self.eagle_worker.draft_forward(forward_batch)
+            ret = self.eagle_worker.draft_forward(forward_batch)
 
             forward_batch.out_cache_loc = output_cache_loc_backup
             forward_batch.spec_info.hidden_states = hidden_states_backup
@@ -318,7 +312,7 @@ class EAGLEDraftCudaGraphRunner:
 
     def _postprocess_output_to_raw_bs(self, out, raw_bs):
         # Keep the variables name for readability
-        if self.enable_spec_overlap_reflow:
+        if len(out) == 2:
             ret_topk_p_list, ret_topk_index_list = (t[:raw_bs] for t in out)
             return ret_topk_p_list, ret_topk_index_list
 

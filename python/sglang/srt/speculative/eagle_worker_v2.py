@@ -475,85 +475,6 @@ class EagleDraftWorker(BaseDraftWorker):
             seq_lens_cpu=None,
         )
 
-    def draft_forward(self, forward_batch: ForwardBatch):
-        # Parse args
-        spec_info: EagleDraftInput = forward_batch.spec_info
-        out_cache_loc = forward_batch.out_cache_loc
-        topk_p, topk_index, hidden_states = (
-            spec_info.topk_p,
-            spec_info.topk_index,
-            spec_info.hidden_states,
-        )
-        if self.hot_token_id is not None:
-            topk_index = self.hot_token_id[topk_index]
-
-        out_cache_loc = out_cache_loc.reshape(
-            forward_batch.batch_size, self.topk, self.speculative_num_steps
-        )
-        out_cache_loc = out_cache_loc.permute((2, 0, 1)).reshape(
-            self.speculative_num_steps, -1
-        )
-
-        # Return values
-        score_list: List[torch.Tensor] = []
-        token_list: List[torch.Tensor] = []
-        parents_list: List[torch.Tensor] = []
-
-        # Forward multiple steps
-        scores = None
-        for i in range(self.speculative_num_steps):
-            input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
-                i, topk_p, topk_index, hidden_states, scores, self.topk
-            )
-            score_list.append(tree_info[0])
-            token_list.append(tree_info[1])
-            parents_list.append(tree_info[2])
-
-            # We don't need to run the last forward. we get 1 token from draft prefill and (#spec steps - 1) tokens here
-            if i == self.speculative_num_steps - 1:
-                break
-
-            # Set inputs
-            forward_batch.input_ids = input_ids
-            forward_batch.out_cache_loc = out_cache_loc[i]
-            forward_batch.positions.add_(1)
-            forward_batch.attn_backend = self.draft_attn_backend.attn_backends[i]
-            spec_info.hidden_states = hidden_states
-
-            # Run forward
-            logits_output = self.draft_runner.forward(
-                forward_batch, skip_attn_backend_init=True
-            ).logits_output
-            if self.server_args.enable_nan_detection:
-                detect_nan(logits_output)
-            probs = torch.softmax(logits_output.next_token_logits, dim=-1)
-            topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
-            if self.hot_token_id is not None:
-                topk_index = self.hot_token_id[topk_index]
-            hidden_states = logits_output.hidden_states
-
-        # Organize the results
-        score_list = torch.cat(score_list, dim=1).flatten(
-            1
-        )  # b, n, topk; n= 1 + (num_steps-1) * self.topk
-        ss_token_list = torch.cat(
-            token_list, dim=1
-        )  # b, (self.topk + (num_steps-1) * self.topk)
-        top_scores = torch.topk(
-            score_list, self.speculative_num_draft_tokens - 1, dim=-1
-        )
-        top_scores_index = top_scores.indices
-        top_scores_index = torch.sort(top_scores_index).values
-        draft_tokens = torch.gather(ss_token_list, index=top_scores_index, dim=1)
-
-        if len(parents_list) > 1:
-            parent_list = torch.cat(parents_list[:-1], dim=1)
-        else:
-            batch_size = parents_list[0].shape[0]
-            parent_list = torch.empty(batch_size, 0, device=parents_list[0].device)
-
-        return parent_list, top_scores_index, draft_tokens
-
     def draft_v2(self, model_worker_batch: ModelWorkerBatch, batch_result: GenerationBatchResult):
         if self.speculative_num_steps == 0:
             return
@@ -589,7 +510,7 @@ class EagleDraftWorker(BaseDraftWorker):
         else:
             if not forward_batch.forward_mode.is_idle():
                 self.draft_attn_backend.init_forward_metadata(forward_batch)
-            ret_topk_p_list, ret_topk_index_list = self.draft_forward_v2(
+            ret_topk_p_list, ret_topk_index_list = self.draft_forward(
                 forward_batch
             )
 
@@ -608,15 +529,17 @@ class EagleDraftWorker(BaseDraftWorker):
 
         model_worker_batch.seq_lens = seq_lens_bk
 
-    def draft_forward_v2(self, forward_batch: ForwardBatch):
+    def draft_forward(self, forward_batch: ForwardBatch):
         # Parse args
         spec_info: EagleDraftInput = forward_batch.spec_info
         out_cache_loc = forward_batch.out_cache_loc
-        ret_topk_p, ret_topk_index, hidden_states = (
+        topk_p, topk_index, hidden_states = (
             spec_info.topk_p,
             spec_info.topk_index,
             spec_info.hidden_states,
         )
+        if self.hot_token_id is not None:
+            topk_index = self.hot_token_id[topk_index]
 
         out_cache_loc = out_cache_loc.reshape(
             forward_batch.batch_size, self.topk, self.speculative_num_steps
@@ -626,43 +549,80 @@ class EagleDraftWorker(BaseDraftWorker):
         )
 
         # Return values
-        ret_topk_p_list = []
-        ret_topk_index_list = []
+        score_list: List[torch.Tensor] = []
+        token_list: List[torch.Tensor] = []
+        parents_list: List[torch.Tensor] = []
+        topk_p_list: List[torch.Tensor] = []
+        topk_index_list: List[torch.Tensor] = []
 
         # Forward multiple steps
         scores = None
         for i in range(self.speculative_num_steps):
+            input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
+                i, topk_p, topk_index, hidden_states, scores, self.topk
+            )
+            score_list.append(tree_info[0])
+            token_list.append(tree_info[1])
+            parents_list.append(tree_info[2])
+
+            # We don't need to run the last forward. we get 1 token from draft prefill and (#spec steps - 1) tokens here
             if i == self.speculative_num_steps - 1:
                 break
 
-            input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
-                i, ret_topk_p, ret_topk_index, hidden_states, scores, self.topk
-            )
+            # Set inputs
             forward_batch.input_ids = input_ids
             forward_batch.out_cache_loc = out_cache_loc[i]
             forward_batch.positions.add_(1)
             forward_batch.attn_backend = self.draft_attn_backend.attn_backends[i]
             spec_info.hidden_states = hidden_states
 
-            draft_logits_output = self.draft_runner.forward(
+            # Run forward
+            logits_output = self.draft_runner.forward(
                 forward_batch, skip_attn_backend_init=True
             ).logits_output
-            probs = torch.softmax(draft_logits_output.next_token_logits, dim=-1)
-            ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
-            hidden_states = draft_logits_output.hidden_states
+            if self.server_args.enable_nan_detection:
+                detect_nan(logits_output)
+            probs = torch.softmax(logits_output.next_token_logits, dim=-1)
+            topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+            if self.hot_token_id is not None:
+                topk_index = self.hot_token_id[topk_index]
+            hidden_states = logits_output.hidden_states
 
-            ret_topk_p_list.append(ret_topk_p)
-            ret_topk_index_list.append(ret_topk_index)
+            topk_p_list.append(topk_p)
+            topk_index_list.append(topk_index)
 
-        if len(ret_topk_p_list) > 1:
-            ret_topk_p_list = torch.cat(ret_topk_p_list, dim=1)
-            ret_topk_index_list = torch.cat(ret_topk_index_list, dim=1)
+        if self.enable_spec_overlap_reflow:
+            if len(topk_p_list) > 1:
+                topk_p_list = torch.cat(topk_p_list, dim=1)
+                topk_index_list = torch.cat(topk_index_list, dim=1)
+            else:
+                batch_size = topk_p_list[0].shape[0]
+                topk_p_list = torch.empty(batch_size, 0, device=topk_p_list[0].device)
+                topk_index_list = torch.empty(batch_size, 0, device=topk_index_list[0].device)
+
+            return topk_p_list, topk_index_list
+
+        # Organize the results
+        score_list = torch.cat(score_list, dim=1).flatten(
+            1
+        )  # b, n, topk; n= 1 + (num_steps-1) * self.topk
+        ss_token_list = torch.cat(
+            token_list, dim=1
+        )  # b, (self.topk + (num_steps-1) * self.topk)
+        top_scores = torch.topk(
+            score_list, self.speculative_num_draft_tokens - 1, dim=-1
+        )
+        top_scores_index = top_scores.indices
+        top_scores_index = torch.sort(top_scores_index).values
+        draft_tokens = torch.gather(ss_token_list, index=top_scores_index, dim=1)
+
+        if len(parents_list) > 1:
+            parent_list = torch.cat(parents_list[:-1], dim=1)
         else:
-            batch_size = ret_topk_p_list[0].shape[0]
-            ret_topk_p_list = torch.empty(batch_size, 0, device=ret_topk_p_list[0].device)
-            ret_topk_index_list = torch.empty(batch_size, 0, device=ret_topk_index_list[0].device)
+            batch_size = parents_list[0].shape[0]
+            parent_list = torch.empty(batch_size, 0, device=parents_list[0].device)
 
-        return ret_topk_p_list, ret_topk_index_list
+        return parent_list, top_scores_index, draft_tokens
 
     def draft_extend(self):
         pass
