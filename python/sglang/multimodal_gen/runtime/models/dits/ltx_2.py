@@ -33,6 +33,50 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
+def apply_interleaved_rotary_emb(
+    x: torch.Tensor, freqs: Tuple[torch.Tensor, torch.Tensor]
+) -> torch.Tensor:
+    cos, sin = freqs
+    x_real, x_imag = x.unflatten(2, (-1, 2)).unbind(-1)
+    x_rotated = torch.stack([-x_imag, x_real], dim=-1).flatten(2)
+    return (x.float() * cos + x_rotated.float() * sin).to(x.dtype)
+
+
+def apply_split_rotary_emb(
+    x: torch.Tensor, freqs: Tuple[torch.Tensor, torch.Tensor]
+) -> torch.Tensor:
+    cos, sin = freqs
+    x_dtype = x.dtype
+    needs_reshape = False
+    if x.ndim != 4 and cos.ndim == 4:
+        b = x.shape[0]
+        _, h, t, _ = cos.shape
+        x = x.reshape(b, t, h, -1).swapaxes(1, 2)
+        needs_reshape = True
+
+    last = x.shape[-1]
+    if last % 2 != 0:
+        raise ValueError(f"Expected x.shape[-1] to be even for split rotary, got {last}.")
+    r = last // 2
+
+    split_x = x.reshape(*x.shape[:-1], 2, r).float()
+    first_x = split_x[..., :1, :]
+    second_x = split_x[..., 1:, :]
+
+    cos_u = cos.unsqueeze(-2)
+    sin_u = sin.unsqueeze(-2)
+
+    out = split_x * cos_u
+    first_out = out[..., :1, :]
+    second_out = out[..., 1:, :]
+    first_out.addcmul_(-sin_u, second_x)
+    second_out.addcmul_(sin_u, first_x)
+
+    out = out.reshape(*out.shape[:-2], last)
+    if needs_reshape:
+        out = out.swapaxes(1, 2).reshape(b, t, -1)
+    return out.to(dtype=x_dtype)
+
 
 # ==============================================================================
 # Layers and Embeddings
@@ -139,6 +183,210 @@ def get_ltx2_audio_coords(
     
     return coords
 
+
+class LTX2AudioVideoRotaryPosEmbed(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        patch_size: int = 1,
+        patch_size_t: int = 1,
+        base_num_frames: int = 20,
+        base_height: int = 2048,
+        base_width: int = 2048,
+        sampling_rate: int = 16000,
+        hop_length: int = 160,
+        scale_factors: Tuple[int, ...] = (8, 32, 32),
+        theta: float = 10000.0,
+        causal_offset: int = 1,
+        modality: str = "video",
+        double_precision: bool = True,
+        rope_type: str = "interleaved",
+        num_attention_heads: int = 32,
+    ) -> None:
+        super().__init__()
+        self.dim = int(dim)
+        self.patch_size = int(patch_size)
+        self.patch_size_t = int(patch_size_t)
+
+        if rope_type not in ["interleaved", "split"]:
+            raise ValueError(f"{rope_type=} not supported. Choose between 'interleaved' and 'split'.")
+        self.rope_type = rope_type
+
+        self.base_num_frames = int(base_num_frames)
+        self.num_attention_heads = int(num_attention_heads)
+
+        self.base_height = int(base_height)
+        self.base_width = int(base_width)
+
+        self.sampling_rate = int(sampling_rate)
+        self.hop_length = int(hop_length)
+        self.audio_latents_per_second = (
+            float(self.sampling_rate) / float(self.hop_length) / float(scale_factors[0])
+        )
+
+        self.scale_factors = tuple(int(x) for x in scale_factors)
+        self.theta = float(theta)
+        self.causal_offset = int(causal_offset)
+
+        self.modality = modality
+        if self.modality not in ["video", "audio"]:
+            raise ValueError(
+                f"Modality {modality} is not supported. Supported modalities are `video` and `audio`."
+            )
+        self.double_precision = bool(double_precision)
+
+    def prepare_video_coords(
+        self,
+        batch_size: int,
+        num_frames: int,
+        height: int,
+        width: int,
+        device: torch.device,
+        fps: float = 24.0,
+    ) -> torch.Tensor:
+        grid_f = torch.arange(
+            start=0,
+            end=num_frames,
+            step=self.patch_size_t,
+            dtype=torch.float32,
+            device=device,
+        )
+        grid_h = torch.arange(
+            start=0,
+            end=height,
+            step=self.patch_size,
+            dtype=torch.float32,
+            device=device,
+        )
+        grid_w = torch.arange(
+            start=0,
+            end=width,
+            step=self.patch_size,
+            dtype=torch.float32,
+            device=device,
+        )
+        grid = torch.meshgrid(grid_f, grid_h, grid_w, indexing="ij")
+        grid = torch.stack(grid, dim=0)
+
+        patch_size = (self.patch_size_t, self.patch_size, self.patch_size)
+        patch_size_delta = torch.tensor(patch_size, dtype=grid.dtype, device=grid.device)
+        patch_ends = grid + patch_size_delta.view(3, 1, 1, 1)
+
+        latent_coords = torch.stack([grid, patch_ends], dim=-1)
+        latent_coords = latent_coords.flatten(1, 3)
+        latent_coords = latent_coords.unsqueeze(0).repeat(batch_size, 1, 1, 1)
+
+        scale_tensor = torch.tensor(self.scale_factors, device=latent_coords.device)
+        broadcast_shape = [1] * latent_coords.ndim
+        broadcast_shape[1] = -1
+        pixel_coords = latent_coords * scale_tensor.view(*broadcast_shape)
+        pixel_coords[:, 0, ...] = (
+            pixel_coords[:, 0, ...] + self.causal_offset - self.scale_factors[0]
+        ).clamp(min=0)
+        pixel_coords[:, 0, ...] = pixel_coords[:, 0, ...] / fps
+        return pixel_coords
+
+    def prepare_audio_coords(
+        self,
+        batch_size: int,
+        num_frames: int,
+        device: torch.device,
+        shift: int = 0,
+    ) -> torch.Tensor:
+        grid_f = torch.arange(
+            start=shift,
+            end=num_frames + shift,
+            step=self.patch_size_t,
+            dtype=torch.float32,
+            device=device,
+        )
+
+        audio_scale_factor = self.scale_factors[0]
+        grid_start_mel = grid_f * audio_scale_factor
+        grid_start_mel = (grid_start_mel + self.causal_offset - audio_scale_factor).clip(min=0)
+        grid_start_s = grid_start_mel * self.hop_length / self.sampling_rate
+
+        grid_end_mel = (grid_f + self.patch_size_t) * audio_scale_factor
+        grid_end_mel = (grid_end_mel + self.causal_offset - audio_scale_factor).clip(min=0)
+        grid_end_s = grid_end_mel * self.hop_length / self.sampling_rate
+
+        audio_coords = torch.stack([grid_start_s, grid_end_s], dim=-1)
+        audio_coords = audio_coords.unsqueeze(0).expand(batch_size, -1, -1)
+        audio_coords = audio_coords.unsqueeze(1)
+        return audio_coords
+
+    def prepare_coords(self, *args, **kwargs):
+        if self.modality == "video":
+            return self.prepare_video_coords(*args, **kwargs)
+        return self.prepare_audio_coords(*args, **kwargs)
+
+    def forward(
+        self, coords: torch.Tensor, device: Optional[Union[str, torch.device]] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        device = device or coords.device
+        num_pos_dims = coords.shape[1]
+
+        if coords.ndim == 4:
+            coords_start, coords_end = coords.chunk(2, dim=-1)
+            coords = (coords_start + coords_end) / 2.0
+            coords = coords.squeeze(-1)
+
+        if self.modality == "video":
+            max_positions = (self.base_num_frames, self.base_height, self.base_width)
+        else:
+            max_positions = (self.base_num_frames,)
+
+        grid = torch.stack(
+            [coords[:, i] / max_positions[i] for i in range(num_pos_dims)], dim=-1
+        ).to(device)
+
+        num_rope_elems = num_pos_dims * 2
+        freqs_dtype = torch.float64 if self.double_precision else torch.float32
+        pow_indices = torch.pow(
+            self.theta,
+            torch.linspace(
+                start=0.0,
+                end=1.0,
+                steps=self.dim // num_rope_elems,
+                dtype=freqs_dtype,
+                device=device,
+            ),
+        )
+        freqs = (pow_indices * torch.pi / 2.0).to(dtype=torch.float32)
+
+        freqs = (grid.unsqueeze(-1) * 2 - 1) * freqs
+        freqs = freqs.transpose(-1, -2).flatten(2)
+
+        if self.rope_type == "interleaved":
+            cos_freqs = freqs.cos().repeat_interleave(2, dim=-1)
+            sin_freqs = freqs.sin().repeat_interleave(2, dim=-1)
+
+            if self.dim % num_rope_elems != 0:
+                cos_padding = torch.ones_like(cos_freqs[:, :, : self.dim % num_rope_elems])
+                sin_padding = torch.zeros_like(cos_freqs[:, :, : self.dim % num_rope_elems])
+                cos_freqs = torch.cat([cos_padding, cos_freqs], dim=-1)
+                sin_freqs = torch.cat([sin_padding, sin_freqs], dim=-1)
+        else:
+            expected_freqs = self.dim // 2
+            current_freqs = freqs.shape[-1]
+            pad_size = expected_freqs - current_freqs
+            cos_freq = freqs.cos()
+            sin_freq = freqs.sin()
+
+            if pad_size != 0:
+                cos_padding = torch.ones_like(cos_freq[:, :, :pad_size])
+                sin_padding = torch.zeros_like(sin_freq[:, :, :pad_size])
+                cos_freq = torch.cat([cos_padding, cos_freq], dim=-1)
+                sin_freq = torch.cat([sin_padding, sin_freq], dim=-1)
+
+            b = cos_freq.shape[0]
+            t = cos_freq.shape[1]
+            cos_freq = cos_freq.reshape(b, t, self.num_attention_heads, -1)
+            sin_freq = sin_freq.reshape(b, t, self.num_attention_heads, -1)
+            cos_freqs = torch.swapaxes(cos_freq, 1, 2)
+            sin_freqs = torch.swapaxes(sin_freq, 1, 2)
+
+        return cos_freqs, sin_freqs
 
 class LTX2RotaryEmbedding(NDRotaryEmbedding):
     """
@@ -560,74 +808,19 @@ class LTX2Attention(nn.Module):
             q = self.q_norm(q)
             k = self.k_norm(k)
 
-        # [B, S, inner_dim/tp] -> [B, S, H_local, D]
-        q = q.view(*q.shape[:-1], self.local_heads, self.dim_head)
-        k = k.view(*k.shape[:-1], self.local_heads, self.dim_head)
-        v = v.view(*v.shape[:-1], self.local_heads, self.dim_head)
-
         if pe is not None:
             cos, sin = pe
             k_cos, k_sin = pe if k_pe is None else k_pe
-            
-            # Slice pe for local heads if needed
-            # We assume PE is broadcastable or matches total heads
-            # NDRotaryEmbedding returns [B, N, D/2] (after we reshaped it).
-            # We need [B, N, 1, D/2] for broadcasting across heads.
-            
-            if cos.dim() == 3: # [B, N, D/2]
-                cos = cos.unsqueeze(2)
-                sin = sin.unsqueeze(2)
-                if k_pe is not None:
-                     k_cos = k_cos.unsqueeze(2)
-                     k_sin = k_sin.unsqueeze(2)
-                else:
-                     k_cos = cos
-                     k_sin = sin
-            
-            # Apply RoPE
-            if q.is_cuda and q.shape == k.shape and k_pe is None:
-                # Optimized FlashInfer/Triton path
-                # Build a shared 2D cos/sin cache [seqlen, head_size] for all batches.
-                if cos.dim() == 4:
-                    cos_2d = cos[0, :, 0, :]
-                    sin_2d = sin[0, :, 0, :]
-                else:
-                    cos_2d = cos[0]
-                    sin_2d = sin[0]
-                cos_sin_cache = torch.cat(
-                    [
-                        cos_2d.to(dtype=torch.float32).contiguous(),
-                        sin_2d.to(dtype=torch.float32).contiguous(),
-                    ],
-                    dim=-1,
-                )
-                q, k = apply_flashinfer_rope_qk_inplace(
-                    q, k, cos_sin_cache, is_neox=False
-                )
+            if cos.dim() == 3:
+                q = apply_interleaved_rotary_emb(q, (cos, sin))
+                k = apply_interleaved_rotary_emb(k, (k_cos, k_sin))
             else:
-                bsz, q_seqlen, nheads, d = q.shape
-                _, k_seqlen, _, _ = k.shape
+                q = apply_split_rotary_emb(q, (cos, sin))
+                k = apply_split_rotary_emb(k, (k_cos, k_sin))
 
-                q_flat = q.reshape(bsz * q_seqlen, nheads, d)
-                k_flat = k.reshape(bsz * k_seqlen, nheads, d)
-
-                cos_flat = cos.squeeze(2).reshape(bsz * q_seqlen, -1)
-                sin_flat = sin.squeeze(2).reshape(bsz * q_seqlen, -1)
-                k_cos_flat = k_cos.squeeze(2).reshape(bsz * k_seqlen, -1)
-                k_sin_flat = k_sin.squeeze(2).reshape(bsz * k_seqlen, -1)
-
-                q_flat = _apply_rotary_emb(
-                    q_flat, cos_flat, sin_flat, is_neox_style=False, interleaved=True
-                )
-                k_flat = _apply_rotary_emb(
-                    k_flat,
-                    k_cos_flat,
-                    k_sin_flat,
-                    is_neox_style=False,
-                    interleaved=True,
-                )
-                q = q_flat.view(bsz, q_seqlen, nheads, d)
-                k = k_flat.view(bsz, k_seqlen, nheads, d)
+        q = q.view(*q.shape[:-1], self.local_heads, self.dim_head)
+        k = k.view(*k.shape[:-1], self.local_heads, self.dim_head)
+        v = v.view(*v.shape[:-1], self.local_heads, self.dim_head)
 
         if mask is not None:
             # Fallback to SDPA for masked attention
@@ -989,79 +1182,85 @@ class LTXModel(CachableDiT, OffloadableDiTMixin):
         self.scale_shift_table = nn.Parameter(torch.randn(2, self.hidden_size) / self.hidden_size**0.5)
         self.audio_scale_shift_table = nn.Parameter(torch.randn(2, self.audio_hidden_size) / self.audio_hidden_size**0.5)
 
-        # 4. Rotary Positional Embeddings (RoPE)
         hf_patch_size = int(hf_config.get("patch_size", 1))
         hf_patch_size_t = int(hf_config.get("patch_size_t", 1))
         self.patch_size = (hf_patch_size_t, hf_patch_size, hf_patch_size)
-        
-        # RoPE Dims split: LTX2 splits hidden_size across 3 dimensions equally?
-        # Actually LTX2 applies 3D RoPE.
-        # Check diffusers_dit.py or previous implementation.
-        # "video" modality: (T, H, W)
-        # dim is hidden_size.
-        # Diffusers: dim is head_dim? No, it's full dim.
-        # The RoPE is applied per head.
-        
-        # NDRotaryEmbedding expects rope_dim_list that sums to head_dim.
-        # LTX2 applies 3D RoPE. Each dim gets 1/3 of head_dim?
-        # In diffusers: "self.rope = RoPE(dim=dim, ...)"
-        # forward: "rope_embeds = self.rope(pos)"
-        # LTX2RotaryEmbedding above had `dim // num_rope_elems`.
-        # num_rope_elems = num_pos_dims * 2 = 6.
-        # So each of T, H, W gets `dim // 3` channels (since sin/cos take half).
-        
-        head_dim = self.hidden_size // self.num_attention_heads
-        # We assume head_dim is divisible by 3 for T, H, W
-        rope_dim_per_axis = head_dim // 3
-        # Adjust remainder if any
-        rem = head_dim - rope_dim_per_axis * 3
-        rope_dim_list = [rope_dim_per_axis, rope_dim_per_axis, rope_dim_per_axis + rem]
-        
-        # Audio scale factors (hardcoded for now as in diffusers)
-        self.audio_scale_factors = (4, )
-        self.video_scale_factors = (8, 32, 32) # vae_scale_factors
 
-        self.rope = LTX2RotaryEmbedding(
-            rope_dim_list=rope_dim_list,
-            rope_theta=float(arch.positional_embedding_theta),
-            base_sizes=tuple(arch.positional_embedding_max_pos), # (T, H, W)
-            dtype=torch.float32,
-            patch_size=self.patch_size,
+        hf_audio_patch_size = int(hf_config.get("audio_patch_size", 1))
+        hf_audio_patch_size_t = int(hf_config.get("audio_patch_size_t", 1))
+
+        rope_type = arch.rope_type.value if hasattr(arch.rope_type, "value") else str(arch.rope_type)
+        rope_double_precision = bool(getattr(arch, "double_precision_rope", True))
+        causal_offset = int(hf_config.get("causal_offset", 1))
+
+        pos_embed_max_pos = int(arch.positional_embedding_max_pos[0])
+        base_height = int(arch.positional_embedding_max_pos[1])
+        base_width = int(arch.positional_embedding_max_pos[2])
+
+        audio_pos_embed_max_pos = int(arch.audio_positional_embedding_max_pos[0])
+
+        self.video_scale_factors = (8, 32, 32)
+        self.audio_scale_factors = (4,)
+
+        self.rope = LTX2AudioVideoRotaryPosEmbed(
+            dim=self.hidden_size,
+            patch_size=hf_patch_size,
+            patch_size_t=hf_patch_size_t,
+            base_num_frames=pos_embed_max_pos,
+            base_height=base_height,
+            base_width=base_width,
             scale_factors=self.video_scale_factors,
+            theta=float(arch.positional_embedding_theta),
+            causal_offset=causal_offset,
+            modality="video",
+            double_precision=rope_double_precision,
+            rope_type=rope_type,
+            num_attention_heads=self.num_attention_heads,
+        )
+        self.audio_rope = LTX2AudioVideoRotaryPosEmbed(
+            dim=self.audio_hidden_size,
+            patch_size=hf_audio_patch_size,
+            patch_size_t=hf_audio_patch_size_t,
+            base_num_frames=audio_pos_embed_max_pos,
+            sampling_rate=16000,
+            hop_length=160,
+            scale_factors=self.audio_scale_factors,
+            theta=float(arch.positional_embedding_theta),
+            causal_offset=causal_offset,
+            modality="audio",
+            double_precision=rope_double_precision,
+            rope_type=rope_type,
+            num_attention_heads=self.audio_num_attention_heads,
         )
 
-        audio_head_dim = self.audio_hidden_size // self.audio_num_attention_heads
-        # Audio is 1D (Time)
-        self.audio_rope = LTX2RotaryEmbedding(
-            rope_dim_list=[audio_head_dim],
-            rope_theta=float(arch.positional_embedding_theta),
-            base_sizes=tuple(arch.audio_positional_embedding_max_pos), # (T,)
-            dtype=torch.float32,
+        cross_attn_pos_embed_max_pos = max(pos_embed_max_pos, audio_pos_embed_max_pos)
+        self.cross_attn_rope = LTX2AudioVideoRotaryPosEmbed(
+            dim=int(arch.audio_cross_attention_dim),
+            patch_size=hf_patch_size,
+            patch_size_t=hf_patch_size_t,
+            base_num_frames=cross_attn_pos_embed_max_pos,
+            base_height=base_height,
+            base_width=base_width,
+            theta=float(arch.positional_embedding_theta),
+            causal_offset=causal_offset,
+            modality="video",
+            double_precision=rope_double_precision,
+            rope_type=rope_type,
+            num_attention_heads=self.num_attention_heads,
         )
-
-        # Cross Attn RoPE (1D Time)
-        cross_attn_pos_embed_max_pos = max(arch.positional_embedding_max_pos[0], arch.audio_positional_embedding_max_pos[0])
-        cross_head_dim = arch.cross_attention_dim // self.num_attention_heads # Approximating head dim for cross attn
-        # Actually cross attention dim might be different.
-        # LTX2Attention: query_dim=dim (hidden_size).
-        # So RoPE is applied to Q (hidden_size) and K (context_dim/audio_dim).
-        # The RoPE must match the Head Dim of the Attention.
-        # For a2v: Q is video (head_dim), K is audio (audio_head_dim).
-        # They must match for dot product?
-        # LTX2Attention projects K to inner_dim (heads * dim_head).
-        # So K ends up with same head_dim as Q.
-        
-        self.cross_attn_rope = LTX2RotaryEmbedding(
-            rope_dim_list=[head_dim], # 1D time
-            rope_theta=float(arch.positional_embedding_theta),
-            base_sizes=(cross_attn_pos_embed_max_pos,),
-            dtype=torch.float32,
-        )
-        self.cross_attn_audio_rope = LTX2RotaryEmbedding(
-            rope_dim_list=[head_dim], # Audio Q/K projected to same head_dim
-            rope_theta=float(arch.positional_embedding_theta),
-            base_sizes=(cross_attn_pos_embed_max_pos,),
-            dtype=torch.float32,
+        self.cross_attn_audio_rope = LTX2AudioVideoRotaryPosEmbed(
+            dim=int(arch.audio_cross_attention_dim),
+            patch_size=hf_audio_patch_size,
+            patch_size_t=hf_audio_patch_size_t,
+            base_num_frames=cross_attn_pos_embed_max_pos,
+            sampling_rate=16000,
+            hop_length=160,
+            theta=float(arch.positional_embedding_theta),
+            causal_offset=causal_offset,
+            modality="audio",
+            double_precision=rope_double_precision,
+            rope_type=rope_type,
+            num_attention_heads=self.audio_num_attention_heads,
         )
 
         self.cross_pe_max_pos = cross_attn_pos_embed_max_pos
@@ -1129,187 +1328,46 @@ class LTXModel(CachableDiT, OffloadableDiTMixin):
         batch_size = hidden_states.size(0)
         audio_timestep = audio_timestep if audio_timestep is not None else timestep
 
-        # 1. Prepare RoPE positional embeddings
+        if num_frames is None or height is None or width is None:
+            raise ValueError("num_frames/height/width must be provided for RoPE coordinate generation.")
+        if audio_num_frames is None:
+            raise ValueError("audio_num_frames must be provided for RoPE coordinate generation.")
+
         if video_coords is None:
-            # If pipeline passed packed latents, it MUST pass coords or we infer from shape if 5D
-            if hidden_states.dim() == 5:
-                 _, _, num_frames, height, width = hidden_states.shape
-            
-            # Use forward_from_grid for video to match wanvideo optimization
-            # We need post-patch grid size
-            p_t, p_h, p_w = self.patch_size
-            post_t, post_h, post_w = num_frames // p_t, height // p_h, width // p_w
-            
-            # We need to account for SP if we use forward_from_grid.
-            # But wait, LTX2RotaryEmbedding.forward_from_grid handles SP internally via shard_dim.
-            # wanvideo calls it with (post_patch_num_frames * self.sp_size, ...) because it shards dim 0.
-            # If we don't use SP here (single GPU or handled elsewhere), we pass full grid.
-            # But get_tp_world_size() or sp logic?
-            # wanvideo has self.sp_size = get_sp_world_size().
-            
-            sp_size = get_tp_world_size() # Usually TP=SP in simple cases or separate.
-            # For now assume sp_size=1 or handle properly if needed.
-            # wanvideo: (post_patch_num_frames * self.sp_size, ...)
-            # This implies wanvideo expects the input grid_size to be the GLOBAL grid size,
-            # but the caller passes LOCAL size * sp_size? No.
-            # In wanvideo:
-            # post_patch_num_frames = num_frames // p_t (where num_frames is local?)
-            # If input is sharded, num_frames is local.
-            # forward_from_grid expects GLOBAL size if it does sharding?
-            # NDRotaryEmbedding logic:
-            # sizes = grid_size
-            # if sp_world_size > 1: sizes[shard_dim] % sp_world_size == 0...
-            # shard_size = sizes[shard_dim] // sp_world_size
-            # So grid_size MUST be the GLOBAL size.
-            
-            # If hidden_states is 5D [B, C, T, H, W], is T local or global?
-            # Usually in SP, the input sequence is split.
-            # If input is [B, C, T, H, W], it might be full or split.
-            # SGLang usually handles split tensors.
-            # If T is local, we must reconstruct global T.
-            # But simpler: pass local T and set sp_world_size=1 in embedding?
-            # No, user wants wanvideo style.
-            
-            # Let's assume hidden_states has LOCAL T.
-            # And we need to pass GLOBAL T to forward_from_grid.
-            # So global_t = post_t * sp_size (if sp is on T).
-            
-            # For now, let's follow wanvideo pattern exactly if possible, or just pass local and rely on shard_dim=0
-            # But if we pass local and sp_world_size > 1, forward_from_grid will divide it again!
-            # So we MUST pass global size.
-            
-            from sglang.multimodal_gen.runtime.distributed.parallel_state import get_sp_world_size
-            sp_size = get_sp_world_size()
-            
-            video_rotary_emb = self.rope.forward_from_grid(
-                grid_size=(post_t * sp_size, post_h, post_w),
-                shard_dim=0,
-                start_frame=0, # TODO: support temporal tiling/context parallelism start
-                device=hidden_states.device
+            video_coords = self.rope.prepare_video_coords(
+                batch_size=batch_size,
+                num_frames=num_frames,
+                height=height,
+                width=width,
+                device=hidden_states.device,
+                fps=fps,
             )
-            
-            # We still need coords for Cross Attn?
-            # Cross Attn uses T centers.
-            # If we used forward_from_grid, we didn't generate explicit `video_coords` tensor for Cross Attn.
-            # We need to generate T centers for Cross Attn separately or extract them.
-            # Or implement forward_from_grid for cross attn rope too.
-            
-            # For now, let's keep generating video_coords for Cross Attn logic 
-            # OR generate just the 1D time coords for Cross Attn.
-            
-            # Let's generate minimal coords for Cross Attn to avoid full 3D meshgrid
-            # Time coords: 0..T (global or local?)
-            # Cross Attn RoPE is 1D on Time.
-            # It needs normalized time [-1, 1].
-            
-            # Re-implement minimal time coord generation for Cross Attn
-            # We need the same time centers as video_rope used.
-            # video_rope used: idx = torch.arange(shard_sizes[0]) + shard_offsets[0]
-            # center = (idx + 0.5) * p_t * scale_t
-            # center = (center + causal - scale) / fps
-            # norm = (center / max_t) * 2 - 1
-            
-            # Let's calculate this 1D tensor:
-            # We need sp_rank to know offset
-            from sglang.multimodal_gen.runtime.distributed.parallel_state import get_sp_group
-            sp_group = get_sp_group()
-            sp_rank = sp_group.rank_in_group
-            
-            # T dimension
-            global_t = post_t * sp_size
-            shard_t = post_t
-            shard_offset = sp_rank * shard_t
-            
-            t_idx = torch.arange(shard_t, device=hidden_states.device, dtype=torch.float32) + shard_offset
-            
-            p_t, _, _ = self.patch_size
-            scale_t, _, _ = self.video_scale_factors
-            max_t = self.rope.base_sizes[0]
-            
-            t_center = (t_idx + 0.5) * p_t * scale_t
-            t_center = (t_center + 1 - scale_t).clamp(min=0) # causal offset=1
-            t_center = t_center / 24.0 # fps=24.0
-            
-            t_norm = (t_center / max_t) * 2.0 - 1.0
-            
-            # Repeat for spatial dims? No, Cross Attn is 1D on Time?
-            # "ca_pos_video = t_norm.unsqueeze(1) # [B, 1, N]" ?
-            # Wait, video_coords was [B, 3, N, 2].
-            # t_starts = video_coords[:, 0, :, 0] -> [B, N]
-            # In video_coords, N is total tokens T*H*W.
-            # So t_norm needs to be expanded to [T, H, W] then flattened to N.
-            
-            t_norm_expanded = t_norm.reshape(-1, 1, 1).expand(post_t, post_h, post_w).flatten()
-            # [N]
-            
-            ca_pos_video = t_norm_expanded.unsqueeze(0).unsqueeze(-1) # [1, N, 1]
-            ca_video_rotary_emb = self.cross_attn_rope(ca_pos_video)
-            
-        else:
-            # Fallback for manual coords (e.g. from pipeline)
-            # Pass coordinates directly to LTX2RotaryEmbedding.forward
-            # [B, 3, N, 2] -> permute to [B, N, 3, 2] for embedding
-            video_coords_perm = video_coords.permute(0, 2, 1, 3)
-            video_rotary_emb = self.rope(video_coords_perm)
-            
-            # Cross Attn logic for manual coords
-            t_starts = video_coords[:, 0, :, 0]
-            t_ends = video_coords[:, 0, :, 1]
-            t_centers = (t_starts + t_ends) / 2.0
-            
-            # We need to normalize manually here because we are bypassing the internal logic
-            # AND bypassing the rope() call which normalizes?
-            # Wait, self.cross_attn_rope(ca_pos_video) WILL normalize if base_sizes is set.
-            # But t_centers here are raw "seconds".
-            # cross_attn_rope has base_sizes set.
-            # So we pass RAW centers.
-            
-            ca_pos_video = t_centers.unsqueeze(-1) # [B, N, 1]
-            ca_video_rotary_emb = self.cross_attn_rope(ca_pos_video)
-        
         if audio_coords is None:
-            audio_coords = get_ltx2_audio_coords(
+            audio_coords = self.audio_rope.prepare_audio_coords(
+                batch_size=batch_size,
                 num_frames=audio_num_frames,
-                patch_size_t=1,
-                scale_factor=self.audio_scale_factors[0],
-                sampling_rate=16000,
-                hop_length=160,
-                causal_offset=1,
-                device=audio_hidden_states.device
-            ).repeat(batch_size, 1, 1, 1) # [B, 1, N, 2]
+                device=audio_hidden_states.device,
+            )
 
-        audio_coords_perm = audio_coords.permute(0, 2, 1, 3)
-        audio_rotary_emb = self.audio_rope(audio_coords_perm)
-
-        # Cross Attn RoPE Audio
-        at_starts = audio_coords[:, 0, :, 0]
-        at_ends = audio_coords[:, 0, :, 1]
-        at_centers = (at_starts + at_ends) / 2.0
-        ca_pos_audio = at_centers.unsqueeze(-1) # [B, N, 1]
-        ca_audio_rotary_emb = self.cross_attn_audio_rope(ca_pos_audio)
+        video_rotary_emb = self.rope(video_coords, device=hidden_states.device)
+        audio_rotary_emb = self.audio_rope(audio_coords, device=audio_hidden_states.device)
+        ca_video_rotary_emb = self.cross_attn_rope(
+            video_coords[:, 0:1, :], device=hidden_states.device
+        )
+        ca_audio_rotary_emb = self.cross_attn_audio_rope(
+            audio_coords[:, 0:1, :], device=audio_hidden_states.device
+        )
 
 
         # 2. Patchify input projections
-        # If input is 5D, flatten it first. If 3D, use as is.
-        if hidden_states.dim() == 5:
-            # [B, C, T, H, W] -> [B, N, C_inner]
-            # Need to reshape/permute to match patch order
-            p_t, p_h, p_w = self.patch_size
-            b, c, t, h, w = hidden_states.shape
-            hidden_states = hidden_states.reshape(b, c, t//p_t, p_t, h//p_h, p_h, w//p_w, p_w)
-            hidden_states = hidden_states.permute(0, 2, 4, 6, 1, 3, 5, 7).flatten(1, 3).flatten(2)
-        
         hidden_states, _ = self.patchify_proj(hidden_states)
-        
-        if audio_hidden_states.dim() == 5: # [B, C, T, 1, 1]
-             b, c, t, _, _ = audio_hidden_states.shape
-             audio_hidden_states = audio_hidden_states.reshape(b, c, t).permute(0, 2, 1) # [B, T, C]
-
         audio_hidden_states, _ = self.audio_patchify_proj(audio_hidden_states)
 
         # 3. Prepare timestep embeddings
-        timestep = timestep * self.timestep_scale_multiplier
-        temb, embedded_timestep = self.adaln_single(timestep.flatten())
+        # 3.1. Prepare global modality (video and audio) timestep embedding and modulation parameters
+        temb, embedded_timestep = self.adaln_single(
+            timestep.flatten(), 
+        )
         temb = temb.view(batch_size, -1, temb.size(-1))
         embedded_timestep = embedded_timestep.view(batch_size, -1, embedded_timestep.size(-1))
 
@@ -1317,7 +1375,7 @@ class LTXModel(CachableDiT, OffloadableDiTMixin):
         temb_audio = temb_audio.view(batch_size, -1, temb_audio.size(-1))
         audio_embedded_timestep = audio_embedded_timestep.view(batch_size, -1, audio_embedded_timestep.size(-1))
 
-        # Cross Attn Modulation
+        # 3.2. Prepare global modality cross attention modulation parameters
         ts_ca_mult = self.av_ca_timestep_scale_multiplier / self.timestep_scale_multiplier
         
         temb_ca_scale_shift, _ = self.av_ca_video_scale_shift_adaln_single(timestep.flatten())
@@ -1335,6 +1393,8 @@ class LTXModel(CachableDiT, OffloadableDiTMixin):
         # 4. Prepare prompt embeddings
         encoder_hidden_states = self.caption_projection(encoder_hidden_states)
         audio_encoder_hidden_states = self.audio_caption_projection(audio_encoder_hidden_states)
+
+        print(video_rotary_emb, audio_rotary_emb, ca_video_rotary_emb, ca_audio_rotary_emb, flush=True)
 
         # 5. Run blocks
         for block in self.transformer_blocks:

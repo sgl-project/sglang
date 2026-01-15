@@ -7,8 +7,6 @@ Prompt encoding stages for diffusion pipelines.
 This module contains implementations of prompt encoding stages for diffusion pipelines.
 """
 
-import os
-
 import torch
 
 from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput
@@ -270,30 +268,6 @@ class TextEncodingStage(PipelineStage):
                     output_hidden_states=True,
                     use_cache=False,
                 )
-            if batch.debug or os.environ.get("SGLANG_DEBUG_TEXT_ENCODER", "") == "1":
-                logits = getattr(outputs, "logits", None)
-                last_hidden_state = getattr(outputs, "last_hidden_state", None)
-                hs = logits if isinstance(logits, torch.Tensor) else last_hidden_state
-                if isinstance(hs, torch.Tensor):
-                    hs_f32 = hs.detach().to(dtype=torch.float32)
-                    head = hs_f32.flatten()[:16].cpu().tolist()
-                    logger.info(
-                        "text_encoder[%s] hs shape=%s dtype=%s mean=%.6f std=%.6f min=%.6f max=%.6f head=%s",
-                        i,
-                        tuple(hs.shape),
-                        str(hs.dtype),
-                        float(hs_f32.mean().item()),
-                        float(hs_f32.std(unbiased=False).item()),
-                        float(hs_f32.min().item()),
-                        float(hs_f32.max().item()),
-                        head,
-                    )
-                else:
-                    logger.info(
-                        "text_encoder[%s] outputs has no logits/last_hidden_state; type=%s",
-                        i,
-                        type(outputs),
-                    )
             prompt_embeds = postprocess_func(outputs, text_inputs)
             if dtype is not None:
                 prompt_embeds = prompt_embeds.to(dtype=dtype)

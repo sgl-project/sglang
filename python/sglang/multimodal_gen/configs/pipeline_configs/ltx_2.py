@@ -89,7 +89,7 @@ def pack_text_embeds(
     return normalized_hidden_states
 
 
-def _gemma_postprocess_video(
+def _gemma_postprocess_func(
     outputs: BaseEncoderOutput, text_inputs: dict
 ) -> torch.Tensor:
     # LTX-2 requires all hidden states concatenated for the connector
@@ -105,17 +105,6 @@ def _gemma_postprocess_video(
         raise AttributeError(
             "Unsupported text encoder output: expected `hidden_states`."
         )
-
-
-def _gemma_postprocess_audio(outputs: BaseEncoderOutput, _text_inputs) -> torch.Tensor:
-    for key in ("audio_context", "audio_encoding"):
-        if hasattr(outputs, key):
-            return getattr(outputs, key)
-    if hasattr(outputs, "last_hidden_state"):
-        return outputs.last_hidden_state
-    raise AttributeError(
-        "Unsupported text encoder output: expected `audio_context`/`audio_encoding` or `last_hidden_state`."
-    )
 
 
 @dataclasses.dataclass
@@ -183,7 +172,7 @@ class LTX2PipelineConfig(PipelineConfig):
     )
     postprocess_text_funcs: tuple[
         Callable[[BaseEncoderOutput, dict], torch.Tensor], ...
-    ] = field(default_factory=lambda: (_gemma_postprocess_video,))
+    ] = field(default_factory=lambda: (_gemma_postprocess_func,))
 
     def prepare_sigmas(self, sigmas, num_inference_steps):
         if sigmas is None:
