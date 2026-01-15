@@ -196,14 +196,19 @@ class Qwen3Detector(BaseReasoningFormatDetector):
     """
 
     def __init__(
-        self, stream_reasoning: bool = True, force_reasoning: bool = False, **kwargs
+        self,
+        stream_reasoning: bool = True,
+        force_reasoning: bool = False,
+        continue_final_message: bool = False,
+        previous_content: str = "",
     ):
         super().__init__(
             "<think>",
             "</think>",
             force_reasoning=force_reasoning,
             stream_reasoning=stream_reasoning,
-            **kwargs,
+            continue_final_message=continue_final_message,
+            previous_content=previous_content,
         )
 
 
@@ -217,14 +222,19 @@ class KimiDetector(BaseReasoningFormatDetector):
     """
 
     def __init__(
-        self, stream_reasoning: bool = True, force_reasoning: bool = False, **kwargs
+        self,
+        stream_reasoning: bool = True,
+        force_reasoning: bool = False,
+        continue_final_message: bool = False,
+        previous_content: str = "",
     ):
         super().__init__(
             "◁think▷",
             "◁/think▷",
             force_reasoning=False,
             stream_reasoning=stream_reasoning,
-            **kwargs,
+            continue_final_message=continue_final_message,
+            previous_content=previous_content,
         )
 
 
@@ -234,14 +244,19 @@ class GptOssDetector(BaseReasoningFormatDetector):
     """
 
     def __init__(
-        self, stream_reasoning: bool = True, force_reasoning: bool = True, **kwargs
+        self,
+        stream_reasoning: bool = True,
+        force_reasoning: bool = True,
+        continue_final_message: bool = False,
+        previous_content: str = "",
     ):
         super().__init__(
             "<|channel|>analysis<|message|>",
             "<|end|>",
             force_reasoning=force_reasoning,
             stream_reasoning=stream_reasoning,
-            **kwargs,
+            continue_final_message=continue_final_message,
+            previous_content=previous_content,
         )
         self.parser = HarmonyParser()
 
@@ -295,7 +310,11 @@ class MiniMaxAppendThinkDetector(BaseReasoningFormatDetector):
     """
 
     def __init__(
-        self, stream_reasoning: bool = True, force_reasoning: bool = False, **kwargs
+        self,
+        stream_reasoning: bool = True,
+        force_reasoning: bool = False,
+        continue_final_message: bool = False,
+        previous_content: str = "",
     ):
         # scheduler.py need `reasoning_parser.detector.think_end_token`
         super().__init__(
@@ -303,7 +322,8 @@ class MiniMaxAppendThinkDetector(BaseReasoningFormatDetector):
             "</think>",
             force_reasoning=force_reasoning,
             stream_reasoning=stream_reasoning,
-            **kwargs,
+            continue_final_message=continue_final_message,
+            previous_content=previous_content,
         )
         self.is_first_chunk = False
 
@@ -325,14 +345,19 @@ class NanoV3Detector(BaseReasoningFormatDetector):
     """
 
     def __init__(
-        self, stream_reasoning: bool = True, force_reasoning: bool = False, **kwargs
+        self,
+        stream_reasoning: bool = True,
+        force_reasoning: bool = False,
+        continue_final_message: bool = False,
+        previous_content: str = "",
     ):
         super().__init__(
             "<think>",
             "</think>",
             force_reasoning=force_reasoning,
             stream_reasoning=stream_reasoning,
-            **kwargs,
+            continue_final_message=continue_final_message,
+            previous_content=previous_content,
         )
 
 
