@@ -46,11 +46,6 @@ register_amd_ci(
     est_time=250,
     suite="stage-b-test-small-1-gpu-amd",
 )
-register_cuda_ci(
-    est_time=76,
-    suite="stage-b-test-small-1-gpu-5090",
-)
-
 # Test configuration constants
 LORA_BACKEND = "triton"
 DISABLE_CUDA_GRAPH = False
