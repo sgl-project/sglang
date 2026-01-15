@@ -21,6 +21,10 @@ For example, on GB200, you will need to do the following. Otherwise, it will ins
 uv pip install "sglang" --extra-index-url https://download.pytorch.org/whl/cu129
 ```
 
+On B300 (SM103), we recommend using the image at lmsysorg/sglang:dev-cu13.
+Please, do not re-install the project as editable inside the docker image, since it will override the version of
+libraries specified by the cu13 docker image.
+
 **Quick fixes to common problems**
 
 - If you encounter `OSError: CUDA_HOME environment variable is not set`. Please set it to your CUDA install root with either of the following solutions:
