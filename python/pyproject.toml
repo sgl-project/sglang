@@ -94,8 +94,7 @@ diffusion = [
   "st_attn ==0.0.7",
   "vsa==0.0.4",
   "runai_model_streamer",
-  "cache-dit==1.1.8",
-  "boto3",
+  "cache-dit==1.1.8"
 ]
 
 tracing = [

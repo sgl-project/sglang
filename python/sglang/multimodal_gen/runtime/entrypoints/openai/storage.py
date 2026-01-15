@@ -2,8 +2,6 @@ import asyncio
 import os
 from typing import Optional
 
-import boto3
-
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -13,6 +11,15 @@ class CloudStorage:
     def __init__(self):
         self.enabled = os.getenv("SGLANG_CLOUD_STORAGE_TYPE", "").lower() == "s3"
         if not self.enabled:
+            return
+
+        try:
+            import boto3
+        except ImportError:
+            logger.error(
+                "boto3 is not installed. Please install it with `pip install boto3` to use cloud storage."
+            )
+            self.enabled = False
             return
 
         self.bucket_name = os.getenv("SGLANG_S3_BUCKET_NAME")
