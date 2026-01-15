@@ -1,5 +1,3 @@
-import logging
-import os
 from typing import Optional, Union
 
 import torch
@@ -7,6 +5,7 @@ import triton
 import triton.language as tl
 from einops import rearrange
 
+from sglang.srt.environ import Envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.fla.chunk import chunk_gated_delta_rule
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
@@ -40,40 +39,31 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import is_cuda, is_npu
+from sglang.srt.utils.common import rank0_log
 
-logger = logging.getLogger(__name__)
-
-USE_CUTEDSL_GDN_DECODE = os.environ.get("SGLANG_USE_CUTEDSL_GDN_DECODE", "0") == "1"
 _cutedsl_gdn_available = None
-_cutedsl_fused_sigmoid_gating_delta_rule_update = None
+cutedsl_fused_sigmoid_gating_delta_rule_update = None
 _cutedsl_gdn_logged = False
 
 
 def _check_cutedsl_gdn_available():
     """Check if CuTe DSL GDN kernel is available and import it."""
-    global _cutedsl_gdn_available, _cutedsl_fused_sigmoid_gating_delta_rule_update
+    global _cutedsl_gdn_available, cutedsl_fused_sigmoid_gating_delta_rule_update
 
     if _cutedsl_gdn_available is not None:
         return _cutedsl_gdn_available
 
     try:
         from sglang.jit_kernel.cutedsl_gdn import (
-            cutedsl_fused_sigmoid_gating_delta_rule_update,
-            is_cutedsl_gdn_available,
+            cutedsl_fused_sigmoid_gating_delta_rule_update as _func,
         )
+        from sglang.jit_kernel.cutedsl_gdn import is_cutedsl_gdn_available
 
-        if is_cutedsl_gdn_available():
-            _cutedsl_fused_sigmoid_gating_delta_rule_update = (
-                cutedsl_fused_sigmoid_gating_delta_rule_update
-            )
-            _cutedsl_gdn_available = True
-            logger.info("CuTe DSL GDN decode kernel is available")
-        else:
-            _cutedsl_gdn_available = False
-            logger.info("CuTe DSL GDN decode kernel: cutlass/cute not installed")
-    except ImportError as e:
+        _cutedsl_gdn_available = is_cutedsl_gdn_available()
+        if _cutedsl_gdn_available:
+            cutedsl_fused_sigmoid_gating_delta_rule_update = _func
+    except ImportError:
         _cutedsl_gdn_available = False
-        logger.debug(f"CuTe DSL GDN decode kernel not available: {e}")
 
     return _cutedsl_gdn_available
 
@@ -939,14 +929,15 @@ class GDNAttnBackend(MambaAttnBackendBase):
         value = value.view(1, seq_len, value.shape[1] // head_v_dim, head_v_dim)
 
         global _cutedsl_gdn_logged
-        use_cutedsl = USE_CUTEDSL_GDN_DECODE and _check_cutedsl_gdn_available()
-        if not _cutedsl_gdn_logged and USE_CUTEDSL_GDN_DECODE:
-            logger.info(f"Using CuTe DSL GDN kernel for decode: {use_cutedsl}")
+        use_cutedsl = (
+            Envs.SGLANG_USE_CUTEDSL_GDN_DECODE.get() and _check_cutedsl_gdn_available()
+        )
+        if not _cutedsl_gdn_logged and Envs.SGLANG_USE_CUTEDSL_GDN_DECODE.get():
+            rank0_log(f"Using CuTe DSL GDN kernel for decode: {use_cutedsl}")
             _cutedsl_gdn_logged = True
 
-        # Select kernel based on use_cutedsl flag
         kernel_func = (
-            _cutedsl_fused_sigmoid_gating_delta_rule_update
+            cutedsl_fused_sigmoid_gating_delta_rule_update
             if use_cutedsl
             else fused_sigmoid_gating_delta_rule_update
         )
