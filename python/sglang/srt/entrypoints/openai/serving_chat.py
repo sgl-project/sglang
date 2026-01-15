@@ -548,6 +548,7 @@ class OpenAIServingChat(OpenAIServingBase):
         completion_tokens = {}
         cached_tokens = {}
         hidden_states = {}
+        reasoning_tokens = {}
 
         try:
             async for content in self.tokenizer_manager.generate_request(
@@ -605,6 +606,10 @@ class OpenAIServingChat(OpenAIServingBase):
                         index, delta, reasoning_parser_dict, content, request
                     )
                     if reasoning_text:
+                        num_reasoning_tokens = reasoning_tokens.get(index, 0) + len(
+                            self.tokenizer_manager.tokenizer.encode(reasoning_text)
+                        )
+                        reasoning_tokens[index] += num_reasoning_tokens
                         choice_data = ChatCompletionResponseStreamChoice(
                             index=index,
                             delta=DeltaMessage(reasoning_content=reasoning_text),
@@ -626,7 +631,9 @@ class OpenAIServingChat(OpenAIServingBase):
                                 prompt_tokens=prompt_tokens.get(index, 0),
                                 completion_tokens=completion_tokens.get(index, 0),
                             )
-
+                            chunk.usage.reasoning_tokens = reasoning_tokens.get(
+                                index, 0
+                            )
                         yield f"data: {chunk.model_dump_json()}\n\n"
 
                 # Handle tool calls
@@ -681,7 +688,9 @@ class OpenAIServingChat(OpenAIServingBase):
                                 prompt_tokens=prompt_tokens.get(index, 0),
                                 completion_tokens=completion_tokens.get(index, 0),
                             )
-
+                            chunk.usage.reasoning_tokens = reasoning_tokens.get(
+                                index, 0
+                            )
                         yield f"data: {chunk.model_dump_json()}\n\n"
 
             # Send finish_reason chunks for each index that completed
@@ -749,6 +758,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     n_choices=request.n,
                     enable_cache_report=self.tokenizer_manager.server_args.enable_cache_report,
                 )
+                usage.reasoning_tokens = sum(reasoning_tokens.values())
                 usage_chunk = ChatCompletionStreamResponse(
                     id=content["meta_info"]["id"],
                     created=int(time.time()),
@@ -797,6 +807,7 @@ class OpenAIServingChat(OpenAIServingBase):
     ) -> Union[ChatCompletionResponse, ORJSONResponse]:
         """Build chat completion response from generation results"""
         choices = []
+        num_reasoning_tokens = 0
 
         for idx, ret_item in enumerate(ret):
             # Process logprobs
@@ -825,6 +836,9 @@ class OpenAIServingChat(OpenAIServingBase):
                         force_reasoning=is_force_reasoning,
                     )
                     reasoning_text, text = parser.parse_non_stream(text)
+                    num_reasoning_tokens += len(
+                        self.tokenizer_manager.tokenizer.encode(reasoning_text)
+                    )
                 except Exception as e:
                     logger.error(f"Reasoning parsing error: {e}")
                     return self.create_error_response(
@@ -874,7 +888,7 @@ class OpenAIServingChat(OpenAIServingBase):
             n_choices=request.n,
             enable_cache_report=self.tokenizer_manager.server_args.enable_cache_report,
         )
-
+        usage.reasoning_tokens = num_reasoning_tokens
         return ChatCompletionResponse(
             id=ret[0]["meta_info"]["id"],
             created=created,
