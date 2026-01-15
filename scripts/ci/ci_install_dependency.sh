@@ -97,21 +97,31 @@ fi
 if [ "$IS_BLACKWELL" = "1" ]; then
     PYTHON_SITE_PACKAGES=$(python3 -c "import site; print(site.getsitepackages()[0])")
 
-    # Check for corrupted sgl-kernel (missing METADATA file)
-    if [ -d "${PYTHON_SITE_PACKAGES}/sgl_kernel-"*".dist-info" ] 2>/dev/null; then
+    # Check for corrupted sgl-kernel (missing METADATA or missing package files)
+    SGL_KERNEL_CORRUPTED=false
+    if ls "${PYTHON_SITE_PACKAGES}"/sgl_kernel-*.dist-info 1>/dev/null 2>&1; then
         for dist_info in "${PYTHON_SITE_PACKAGES}"/sgl_kernel-*.dist-info; do
-            if [ ! -f "${dist_info}/METADATA" ]; then
-                echo "Detected corrupted sgl-kernel installation (missing METADATA), cleaning up..."
-                rm -rf "${PYTHON_SITE_PACKAGES}"/sgl_kernel*
-                rm -rf "${PYTHON_SITE_PACKAGES}"/sgl-kernel*
+            if [ ! -f "${dist_info}/METADATA" ] || [ ! -f "${dist_info}/RECORD" ]; then
+                SGL_KERNEL_CORRUPTED=true
                 break
             fi
         done
     fi
+    # Also check if package directory exists but is incomplete
+    if [ -d "${PYTHON_SITE_PACKAGES}/sgl_kernel" ]; then
+        if [ ! -f "${PYTHON_SITE_PACKAGES}/sgl_kernel/__init__.py" ]; then
+            SGL_KERNEL_CORRUPTED=true
+        fi
+    fi
+    if [ "$SGL_KERNEL_CORRUPTED" = true ]; then
+        echo "Detected corrupted sgl-kernel installation, cleaning up..."
+        rm -rf "${PYTHON_SITE_PACKAGES}"/sgl_kernel*
+        rm -rf "${PYTHON_SITE_PACKAGES}"/sgl-kernel*
+    fi
 
     # Check for corrupted nvidia packages
     for pkg in nvidia_nvshmem_cu12 nvidia_cudnn_cu12; do
-        if [ -d "${PYTHON_SITE_PACKAGES}/${pkg}-"*".dist-info" ] 2>/dev/null; then
+        if ls "${PYTHON_SITE_PACKAGES}"/${pkg}-*.dist-info 1>/dev/null 2>&1; then
             for dist_info in "${PYTHON_SITE_PACKAGES}"/${pkg}-*.dist-info; do
                 if [ ! -f "${dist_info}/METADATA" ]; then
                     echo "Detected corrupted ${pkg} installation, cleaning up..."
