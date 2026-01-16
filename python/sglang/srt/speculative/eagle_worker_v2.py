@@ -448,8 +448,11 @@ class EagleDraftWorker(BaseDraftWorker):
         score_list: List[torch.Tensor] = []
         token_list: List[torch.Tensor] = []
         parents_list: List[torch.Tensor] = []
-        topk_p_list: List[torch.Tensor] = []
-        topk_index_list: List[torch.Tensor] = []
+
+        is_draft_v2 = self.enable_spec_overlap_reflow and not is_prepare_reflow
+        if is_draft_v2:
+            topk_p_list: List[torch.Tensor] = []
+            topk_index_list: List[torch.Tensor] = []
 
         # Forward multiple steps
         scores = None
@@ -493,10 +496,11 @@ class EagleDraftWorker(BaseDraftWorker):
                 topk_index = self.hot_token_id[topk_index]
             hidden_states = logits_output.hidden_states
 
-            topk_p_list.append(topk_p)
-            topk_index_list.append(topk_index)
+            if is_draft_v2:
+                topk_p_list.append(topk_p)
+                topk_index_list.append(topk_index)
 
-        if self.enable_spec_overlap_reflow and not is_prepare_reflow:
+        if is_draft_v2:
             if len(topk_p_list) > 1:
                 topk_p_list = torch.cat(topk_p_list, dim=1)
                 topk_index_list = torch.cat(topk_index_list, dim=1)
