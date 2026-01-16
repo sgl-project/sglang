@@ -280,7 +280,11 @@ def load_model_from_full_model_state_dict(
                 sharded_tensor = torch.empty_like(
                     meta_sharded_param, device=device, dtype=tensor_dtype
                 )
-                temp_param = nn.Parameter(sharded_tensor)
+                if tensor_dtype == torch.int8:
+                    # For int8 parameters, requires_grad must be False
+                    temp_param = nn.Parameter(sharded_tensor, requires_grad=False)
+                else:
+                    temp_param = nn.Parameter(sharded_tensor)
                 for attr in ["output_dim", "input_dim", "is_sharded_weight"]:
                     if hasattr(actual_param, attr):
                         setattr(temp_param, attr, getattr(actual_param, attr))
@@ -297,7 +301,13 @@ def load_model_from_full_model_state_dict(
             )
             if cpu_offload:
                 sharded_tensor = sharded_tensor.to("cpu")
-        sharded_sd[target_param_name] = nn.Parameter(sharded_tensor)
+        if tensor_dtype == torch.int8:
+            # For int8 parameters, requires_grad must be False
+            sharded_sd[target_param_name] = nn.Parameter(
+                sharded_tensor, requires_grad=False
+            )
+        else:
+            sharded_sd[target_param_name] = nn.Parameter(sharded_tensor)
 
     model.reverse_param_names_mapping = reverse_param_names_mapping
     unused_keys = set(meta_sd.keys()) - set(sharded_sd.keys())
