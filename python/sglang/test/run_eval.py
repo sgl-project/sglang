@@ -22,6 +22,7 @@ def get_thinking_kwargs(args):
         if thinking_mode == "deepseek-v3":
             thinking_param = "thinking"
         else:
+            # Qwen3
             thinking_param = "enable_thinking"
         return {
             "chat_template_kwargs": {thinking_param: True},
@@ -203,7 +204,7 @@ def run_eval(args):
     return metrics
 
 
-THINKING_MODE_CHOICES = ["deepseek-r1", "deepseek-v3", "qwen3"]
+THINKING_MODE_CHOICES = ["deepseek-v3", "qwen3"]
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -241,7 +242,7 @@ if __name__ == "__main__":
         default=None,
         type=str,
         choices=THINKING_MODE_CHOICES,
-        help="Enable thinking mode in Deepseek R1, V3.1/3.2, or Qwen3",
+        help="Enable thinking mode in Deepseek V3.1/3.2, or Qwen3.--reasoning-parser must be set when launching the server.",
     )
 
     # LongBench-v2 specific arguments
