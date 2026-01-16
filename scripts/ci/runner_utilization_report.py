@@ -165,6 +165,7 @@ def calculate_utilization(repo: str, hours: int = 24, runner_filter: str = None)
             if not runner_name:
                 continue
 
+            created_at = parse_time(job.get("created_at"))
             started_at = parse_time(job.get("started_at"))
             completed_at = parse_time(job.get("completed_at"))
 
@@ -172,10 +173,12 @@ def calculate_utilization(repo: str, hours: int = 24, runner_filter: str = None)
                 continue
 
             duration = (completed_at - started_at).total_seconds()
+            queue_time = (started_at - created_at).total_seconds() if created_at else 0
             job_info = {
                 "start": started_at,
                 "end": completed_at,
                 "duration": duration,
+                "queue_time": queue_time,
                 "job_name": job["name"],
                 "runner_name": runner_name,
             }
@@ -225,6 +228,11 @@ def calculate_utilization(repo: str, hours: int = 24, runner_filter: str = None)
         )
         idle_seconds = total_capacity_seconds - total_active_seconds
 
+        # Calculate queue time metrics
+        queue_times = [j["queue_time"] for j in jobs if j["queue_time"] > 0]
+        avg_queue_time = sum(queue_times) / len(queue_times) if queue_times else 0
+        max_queue_time = max(queue_times) if queue_times else 0
+
         results.append(
             {
                 "label": label,
@@ -234,6 +242,8 @@ def calculate_utilization(repo: str, hours: int = 24, runner_filter: str = None)
                 "total_idle_hours": idle_seconds / 3600,
                 "total_capacity_hours": total_capacity_seconds / 3600,
                 "utilization_pct": utilization,
+                "avg_queue_min": avg_queue_time / 60,
+                "max_queue_min": max_queue_time / 60,
             }
         )
 
@@ -250,8 +260,8 @@ def format_report(results: list[dict], hours: int) -> str:
         "",
         "## Summary by Runner Label",
         "",
-        "| Label | Runners | Jobs | Active (hrs) | Idle (hrs) | Utilization |",
-        "|-------|---------|------|--------------|------------|-------------|",
+        "| Label | Runners | Jobs | Active (hrs) | Utilization | Avg Queue | Max Queue |",
+        "|-------|---------|------|--------------|-------------|-----------|-----------|",
     ]
 
     for r in results:
@@ -260,8 +270,9 @@ def format_report(results: list[dict], hours: int) -> str:
         )
         lines.append(
             f"| {r['label']} | {r['num_runners']} | {r['num_jobs']} | "
-            f"{r['total_active_hours']:.1f} | {r['total_idle_hours']:.1f} | "
-            f"{r['utilization_pct']:.1f}% {utilization_bar} |"
+            f"{r['total_active_hours']:.1f} | "
+            f"{r['utilization_pct']:.1f}% {utilization_bar} | "
+            f"{r['avg_queue_min']:.1f}m | {r['max_queue_min']:.1f}m |"
         )
 
     return "\n".join(lines)
