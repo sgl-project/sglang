@@ -257,6 +257,7 @@ class GroupCoordinator:
                     self.cpu_group = torch.distributed.new_group(
                         ranks, backend="gloo", timeout=gloo_timeout
                     )
+                break
 
         assert self.cpu_group is not None
         assert self.device_group is not None
