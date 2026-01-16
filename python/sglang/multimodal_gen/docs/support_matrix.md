@@ -38,12 +38,16 @@ default parameters when initializing and generating videos.
 
 ### Image Generation Models
 
-| Model Name      | HuggingFace Model ID           | Resolutions    |
-|:----------------|:-------------------------------|:---------------|
-| FLUX.1-dev      | `black-forest-labs/FLUX.1-dev` | Any resolution |
-| FLUX.2-dev      | `black-forest-labs/FLUX.2-dev` | Any resolution |
-| Qwen Image      | `Qwen/Qwen-Image`              | Any resolution |
-| Qwen Image Edit | `Qwen/Qwen-Image-Edit`         | Any resolution |
+| Model Name       | HuggingFace Model ID                    | Resolutions    |
+|:-----------------|:----------------------------------------|:---------------|
+| FLUX.1-dev       | `black-forest-labs/FLUX.1-dev`          | Any resolution |
+| FLUX.2-dev       | `black-forest-labs/FLUX.2-dev`          | Any resolution |
+| FLUX.2-Klein     | `black-forest-labs/FLUX.2-klein-4B`     | Any resolution |
+| Z-Image-Turbo    | `Tongyi-MAI/Z-Image-Turbo`              | Any resolution |
+| GLM-Image        | `zai-org/GLM-Image`                     | Any resolution |
+| Qwen Image       | `Qwen/Qwen-Image`                       | Any resolution |
+| Qwen Image 2512  | `Qwen/Qwen-Image-2512`                  | Any resolution |
+| Qwen Image Edit  | `Qwen/Qwen-Image-Edit`                  | Any resolution |
 
 ## Verified LoRA Examples
 
