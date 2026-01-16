@@ -22,6 +22,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 # CPU-based unit test, runs quickly on any GPU runner
 register_cuda_ci(est_time=5, suite="stage-b-test-small-1-gpu")
 
+import random
 import time
 import unittest
 import unittest.mock
@@ -645,6 +646,36 @@ class TestRadixCache(unittest.TestCase):
             self.assertIsNotNone(node.hash_value)
             # Should have 1 page (split at page_size=2)
             self.assertEqual(len(node.hash_value), 1)
+
+    def test_memory_allocated(self):
+        keys, values = [], []
+
+        num_seqs = 10000
+        vocab_size = 1000
+        base_prefix_len = 10000
+        suffix_len = 100
+
+        torch_allocated_before = torch.cuda.memory_allocated()
+
+        # build dataset with common prefix
+        common_prefix = [random.randint(1, vocab_size) for _ in range(base_prefix_len)]
+        for _ in range(num_seqs):
+            suffix = [random.randint(1, vocab_size) for _ in range(suffix_len)]
+            seq = common_prefix + suffix
+            keys.append(seq)
+            values.append(torch.zeros(len(seq), device="cuda", dtype=torch.int32))
+
+        cache: RadixCache = RadixCache.create_simulated()
+
+        for key, value in zip(keys, values):
+            cache.insert(RadixKey(key), value)
+
+        del values
+
+        torch_allocated = torch.cuda.memory_allocated() - torch_allocated_before
+
+        # allocated torch tensor size should have proper ratio with tree total_size
+        self.assertLess(torch_allocated / cache.total_size(), 10)
 
 
 if __name__ == "__main__":
