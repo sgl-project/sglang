@@ -35,7 +35,6 @@ async fn test_l0_cache_key_collision() {
     // This SHOULD BE A MISS because the flag is different.
     let _ = cached.encode(input, false).expect("Second encode failed");
 
-    // 4. Verify via Cache Stats
     let stats = cached.cache_stats().expect("Stats should be available");
 
     println!("Cache Stats: Hits={}, Misses={}", stats.hits, stats.misses);
@@ -49,7 +48,7 @@ async fn test_l0_cache_key_collision() {
         "Expected 2 misses (one for each unique flag value)."
     );
 
-    // Third call: add_special_tokens = true (Repeat of first call)
+    // add_special_tokens = true (Repeat of first call)
     // This SHOULD BE A HIT.
     let _ = cached.encode(input, true).expect("Third encode failed");
     let stats_after = cached.cache_stats().expect("Stats should be available");
