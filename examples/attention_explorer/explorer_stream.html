@@ -1063,13 +1063,15 @@
                 const responseTokenEls = document.querySelectorAll('#responseTokens .token');
 
                 if (item.position < promptTokenEls.length) {
-                    tokenText = promptTokenEls[item.position].textContent;
+                    // Get only the first text node (not tooltip content)
+                    tokenText = promptTokenEls[item.position].childNodes[0]?.textContent || promptTokenEls[item.position].textContent;
                     // Highlight attended token
                     promptTokenEls[item.position].classList.add('attended-to');
                 } else {
                     const respIdx = item.position - promptTokenEls.length;
                     if (respIdx >= 0 && respIdx < responseTokenEls.length) {
-                        tokenText = responseTokenEls[respIdx].textContent;
+                        // Get only the first text node (not tooltip content)
+                        tokenText = responseTokenEls[respIdx].childNodes[0]?.textContent || responseTokenEls[respIdx].textContent;
                         responseTokenEls[respIdx].classList.add('attended-to');
                         // Get zone from token data
                         if (respIdx < tokens.length) {
