@@ -70,7 +70,7 @@ use super::{
     CacheAwareConfig, LoadBalancingPolicy, SelectWorkerInfo,
 };
 use crate::{
-    core::Worker,
+    core::{Worker, UNKNOWN_MODEL_ID},
     mesh::{tree_ops::TreeOperation, OptionalMeshSyncManager},
 };
 
@@ -234,10 +234,10 @@ impl CacheAwarePolicy {
     }
 
     /// Normalize model_id for mesh synchronization
-    /// Converts "unknown" or empty to "default" for consistency
+    /// Converts empty model_id to UNKNOWN_MODEL_ID for consistency
     fn normalize_mesh_model_id(model_id: &str) -> &str {
-        if model_id.is_empty() || model_id == "unknown" {
-            "default"
+        if model_id.is_empty() {
+            UNKNOWN_MODEL_ID
         } else {
             model_id
         }
@@ -698,8 +698,8 @@ mod tests {
             )
             .unwrap();
 
-        // Verify tree operation was synced to mesh
-        let tree_state = mesh_sync.get_tree_state("default");
+        // Verify tree operation was synced to mesh (under UNKNOWN_MODEL_ID since no model was specified)
+        let tree_state = mesh_sync.get_tree_state(UNKNOWN_MODEL_ID);
         assert!(tree_state.is_some());
         let tree = tree_state.unwrap();
         assert!(!tree.operations.is_empty());
