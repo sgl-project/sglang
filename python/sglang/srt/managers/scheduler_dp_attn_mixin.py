@@ -55,6 +55,20 @@ class MLPSyncBatchInfo:
             dtype=dtype,
         )
 
+    def _get_fallback_tensor(self, device, dtype=torch.int64) -> torch.Tensor:
+        return torch.tensor(
+            [
+                0,  # num_tokens
+                0,  # num_tokens_for_logprob
+                1,  # can_cuda_graph
+                0,  # is_extend_in_batch
+                1,  # local_can_run_tbo
+                ForwardMode.IDLE.value,  # local_forward_mode
+            ],
+            device=device,
+            dtype=dtype,
+        )
+
     def all_gather(self, device, group: torch.distributed.ProcessGroup):
         local_info_tensor = self._get_local_tensor(device=device)
         global_info_tensor = torch.empty(
@@ -72,11 +86,10 @@ class MLPSyncBatchInfo:
             tp_active_ranks = get_tp_group().active_ranks_cpu
         else:
             tp_active_ranks = get_tp_group().active_ranks
-        global_info_tensor.view(-1, 6)[tp_active_ranks == 0, :] = torch.tensor(
-            [0, 1, 0, 0, 1, ForwardMode.IDLE.value],
-            device=global_info_tensor.device,
-            dtype=global_info_tensor.dtype,
-        )
+
+        # Set fallback values for inactive ranks
+        tp_info = global_info_tensor.view(self.dp_size * self.tp_size, 6)
+        tp_info[tp_active_ranks == 0] = self._get_fallback_tensor(device=device)
 
         tp0_info = global_info_tensor[:, 0, :]
         self.tp0_info = tp0_info
