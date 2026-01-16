@@ -1,10 +1,3 @@
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-
-register_cuda_ci(est_time=19, suite="stage-b-test-large-2-gpu")
-register_amd_ci(
-    est_time=19, suite="stage-b-test-large-2-gpu-amd", disabled="see #11127"
-)
-
 import os
 import traceback
 import unittest
@@ -14,6 +7,12 @@ import torch
 import torch.multiprocessing as mp
 
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+
+register_amd_ci(
+    est_time=19, suite="stage-b-test-large-2-gpu-amd", disabled="see #11127"
+)
+register_cuda_ci(est_time=19, suite="stage-b-test-large-2-gpu")
 
 
 class TestReleaseMemoryOccupation(unittest.TestCase):
