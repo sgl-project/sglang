@@ -38,6 +38,7 @@ from sglang.srt.layers.quantization.base_config import (
 from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
+    get_torch_compile_disable_decorator,
     is_cuda,
     is_flashinfer_available,
     is_gfx95_supported,
@@ -595,6 +596,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         )
         self.runner = MoeRunner(backend, moe_runner_config)
 
+    @get_torch_compile_disable_decorator(_is_hip)
     def apply(
         self,
         layer: torch.nn.Module,
