@@ -129,6 +129,15 @@ def run_eval(args):
         from sglang.test.simple_eval_aime25 import AIME25Eval
 
         eval_obj = AIME25Eval(args.num_examples, args.num_threads)
+    elif args.eval_name == "gsm8k":
+        from sglang.test.simple_eval_gsm8k import GSM8KEval
+
+        eval_obj = GSM8KEval(
+            num_examples=args.num_examples,
+            num_threads=args.num_threads,
+            num_shots=getattr(args, "num_shots", 5),
+            data_path=getattr(args, "gsm8k_data_path", None),
+        )
     else:
         raise ValueError(f"Invalid eval name: {args.eval_name}")
 
@@ -267,6 +276,18 @@ if __name__ == "__main__":
         "--min-context-length",
         type=int,
         help="Minimum context length in characters for LongBench-v2",
+    )
+    parser.add_argument(
+        "--num-shots",
+        type=int,
+        default=5,
+        help="Number of few-shot examples for GSM8K (default: 5)",
+    )
+    parser.add_argument(
+        "--gsm8k-data-path",
+        type=str,
+        default=None,
+        help="Path to GSM8K data file (e.g., test.jsonl)",
     )
 
     args = parser.parse_args()
