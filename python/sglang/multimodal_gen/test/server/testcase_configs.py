@@ -149,6 +149,7 @@ class DiffusionServerArgs:
     tp_size: int | None = None
     ulysses_degree: int | None = None
     ring_degree: int | None = None
+    cfg_parallel: bool | None = None
     # LoRA
     lora_path: str | None = (
         None  # LoRA adapter path (HF repo or local path, loaded at startup)
@@ -164,6 +165,7 @@ class DiffusionServerArgs:
 
     dit_layerwise_offload: bool = False
     enable_cache_dit: bool = False
+    text_encoder_cpu_offload: bool = False
 
 
 @dataclass(frozen=True)
@@ -434,6 +436,19 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
             prompt=T2V_PROMPT,
         ),
     ),
+    DiffusionTestCase(
+        "wan2_1_t2v_1.3b_text_encoder_cpu_offload",
+        DiffusionServerArgs(
+            model_path="Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+            modality="video",
+            warmup=0,
+            custom_validator="video",
+            text_encoder_cpu_offload=True,
+        ),
+        DiffusionSamplingParams(
+            prompt=T2V_PROMPT,
+        ),
+    ),
     # LoRA test case for single transformer + merge/unmerge API test
     # Note: Uses dynamic_lora_path instead of lora_path to test LayerwiseOffload + set_lora interaction
     # Server starts WITHOUT LoRA, then set_lora is called after startup (Wan models auto-enable layerwise offload)
@@ -591,6 +606,20 @@ TWO_GPU_CASES_A = [
         DiffusionSamplingParams(
             prompt=T2V_PROMPT,
             output_size="832x480",
+        ),
+    ),
+    DiffusionTestCase(
+        "wan2_1_t2v_1.3b_cfg_parallel",
+        DiffusionServerArgs(
+            model_path="Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+            modality="video",
+            warmup=0,
+            custom_validator="video",
+            num_gpus=2,
+            cfg_parallel=True,
+        ),
+        DiffusionSamplingParams(
+            prompt=T2V_PROMPT,
         ),
     ),
 ]
