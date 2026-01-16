@@ -757,10 +757,11 @@ jobs:
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
-    runs-on: 1-gpu-runner
+    runs-on: 1-gpu-5090
     timeout-minutes: 60
     env:
-      RUNNER_LABELS: 1-gpu-runner
+      RUNNER_LABELS: 1-gpu-5090
+      IS_BLACKWELL: "1"
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -778,11 +779,13 @@ jobs:
       - name: Install dependencies
         timeout-minutes: 10
         run: |
+          source /etc/profile.d/sglang-ci.sh
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh
 
       - name: Run test
         timeout-minutes: 30
         run: |
+          source /etc/profile.d/sglang-ci.sh
           cd test/
           CONTINUE_ON_ERROR_FLAG=""
           if [[ "${{ needs.check-changes.outputs.continue_on_error }}" == "true" ]]; then
@@ -892,10 +895,11 @@ jobs:
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
-    runs-on: 1-gpu-runner
+    runs-on: 1-gpu-5090
     timeout-minutes: 60
     env:
-      RUNNER_LABELS: 1-gpu-runner
+      RUNNER_LABELS: 1-gpu-5090
+      IS_BLACKWELL: "1"
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -913,6 +917,7 @@ jobs:
       - name: Install dependencies
         timeout-minutes: 10
         run: |
+          source /etc/profile.d/sglang-ci.sh
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh
           git clone https://github.com/merrymercy/human-eval.git
           cd human-eval
@@ -921,6 +926,7 @@ jobs:
       - name: Run test
         timeout-minutes: 25
         run: |
+          source /etc/profile.d/sglang-ci.sh
           cd test/
           CONTINUE_ON_ERROR_FLAG=""
           if [[ "${{ needs.check-changes.outputs.continue_on_error }}" == "true" ]]; then
