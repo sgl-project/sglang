@@ -846,7 +846,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
             self.conv_states_shape[-1] < FLA_CHUNK_SIZE
         ), f"{self.conv_states_shape[-1]=} should be less than {FLA_CHUNK_SIZE}"
 
-        # Select kernel based on environment variable
         use_cutedsl = Envs.SGLANG_USE_CUTEDSL_GDN_DECODE.get()
         rank0_log(f"CuTe DSL GDN decode enabled: {use_cutedsl}")
         self._kernel_func = (
