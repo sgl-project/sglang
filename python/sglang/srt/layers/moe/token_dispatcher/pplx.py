@@ -91,7 +91,7 @@ class PPLXDispatcher(BaseDispatcher):
         print(f"self.dp_size = {self.dp_size}")
         print(f"self.world_size = {self.world_size}")
 
-        assert params_dtype.itemsize == 2, "!!!current only support bfloat16/fp16!!!"
+        assert params_dtype.itemsize == 2, "PPLX dispatcher currently only supports bfloat16/fp16 data types."
         # currently only for fp16
         self.hidden_dim_bytes = round_up(
             hidden_dim * params_dtype.itemsize, 16
@@ -109,7 +109,7 @@ class PPLXDispatcher(BaseDispatcher):
                 dp_size=self.dp_size,
                 hidden_dim=self.hidden_dim,
                 hidden_dim_bytes=self.hidden_dim_bytes,
-                hidden_dim_scale_bytes=self.hidden_dim_bytes,
+                hidden_dim_scale_bytes=self.hidden_dim_scale_bytes,
             )
         else:
             self.ata = pplx.AllToAll.intranode(
