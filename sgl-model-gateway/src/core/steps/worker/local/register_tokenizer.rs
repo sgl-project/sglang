@@ -1,19 +1,30 @@
 //! Tokenizer registration step for local workers.
+//!
+//! This step submits a Job::AddTokenizer to the job queue, which triggers the
+//! tokenizer_registration workflow. This ensures all tokenizer registrations
+//! go through the same workflow with consistent behavior (validation, caching).
 
 use async_trait::async_trait;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::{
-    core::steps::workflow_data::LocalWorkerWorkflowData,
-    tokenizer::{factory, TokenizerRegistry},
+    core::{
+        steps::{workflow_data::LocalWorkerWorkflowData, TokenizerConfigRequest},
+        Job,
+    },
+    tokenizer::TokenizerRegistry,
     workflow::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult},
 };
 
-/// Step 6: Register tokenizer for the worker's model (optional, non-blocking)
-pub struct RegisterTokenizerStep;
+/// Step: Submit tokenizer registration job for the worker's model
+///
+/// This step submits a Job::AddTokenizer to the job queue rather than loading
+/// the tokenizer directly. This ensures tokenizer registration goes through
+/// the unified tokenizer_registration workflow.
+pub struct SubmitTokenizerJobStep;
 
 #[async_trait]
-impl StepExecutor<LocalWorkerWorkflowData> for RegisterTokenizerStep {
+impl StepExecutor<LocalWorkerWorkflowData> for SubmitTokenizerJobStep {
     async fn execute(
         &self,
         context: &mut WorkflowContext<LocalWorkerWorkflowData>,
@@ -29,6 +40,16 @@ impl StepExecutor<LocalWorkerWorkflowData> for RegisterTokenizerStep {
             .actual_workers
             .as_ref()
             .ok_or_else(|| WorkflowError::ContextValueNotFound("workers".to_string()))?;
+
+        // Get job queue
+        let job_queue = match app_context.worker_job_queue.get() {
+            Some(queue) => queue,
+            None => {
+                warn!("Job queue not available, skipping tokenizer registration");
+                return Ok(StepResult::Success);
+            }
+        };
+
         // Get chat_template: worker config > global router config
         let chat_template = context
             .data
@@ -37,53 +58,74 @@ impl StepExecutor<LocalWorkerWorkflowData> for RegisterTokenizerStep {
             .clone()
             .or_else(|| app_context.router_config.chat_template.clone());
 
+        // Get cache config from router config
+        let cache_config = app_context.router_config.tokenizer_cache.to_option();
+
         for worker in workers.iter() {
             let model_id = worker.model_id().to_string();
-            // Get tokenizer path (prefer tokenizer_path, fallback to model_path)
-            let Some(tokenizer_path) = labels
+
+            // Get tokenizer path with fallback chain:
+            // 1. Worker labels: tokenizer_path
+            // 2. Worker labels: model_path
+            // 3. Router config (CLI args): --tokenizer-path
+            // 4. Router config (CLI args): --model-path
+            let tokenizer_path: String = if let Some(path) = labels
                 .get("tokenizer_path")
                 .or_else(|| labels.get("model_path"))
-            else {
+            {
+                path.clone()
+            } else if let Some(path) = app_context
+                .router_config
+                .tokenizer_path
+                .as_ref()
+                .or(app_context.router_config.model_path.as_ref())
+            {
+                debug!(
+                    "Using router config tokenizer path '{}' for model {}",
+                    path, model_id
+                );
+                path.clone()
+            } else {
                 warn!(
-                    "No tokenizer_path or model_path found for model {}",
+                    "No tokenizer_path or model_path found for model {} (checked worker labels and router config)",
                     model_id
                 );
-                return Ok(StepResult::Success);
+                continue;
             };
 
-            debug!(
-                "Registering tokenizer for model {} from {}",
+            // Check if tokenizer already exists for this model
+            if app_context.tokenizer_registry.contains(&model_id) {
+                debug!(
+                    "Tokenizer already registered for model {}, skipping",
+                    model_id
+                );
+                continue;
+            }
+
+            info!(
+                "Submitting tokenizer registration job for model {} from {}",
                 model_id, tokenizer_path
             );
 
-            // Generate ID for this tokenizer
-            let tokenizer_id = TokenizerRegistry::generate_id();
-            let source = tokenizer_path.clone();
+            // Create tokenizer config request
+            let config = TokenizerConfigRequest {
+                id: TokenizerRegistry::generate_id(),
+                name: model_id.clone(),
+                source: tokenizer_path,
+                chat_template_path: chat_template.clone(),
+                cache_config: cache_config.clone(),
+            };
 
-            // Load tokenizer with thread safe lock
-            let tokenizer_path_owned = tokenizer_path.clone();
-            let template = chat_template.clone();
-            if let Err(e) = app_context
-                .tokenizer_registry
-                .load(&tokenizer_id, &model_id, &source, move || {
-                    let path = tokenizer_path_owned;
-                    let tmpl = template;
-                    async move {
-                        factory::create_tokenizer_async_with_chat_template(&path, tmpl.as_deref())
-                            .await
-                            .map_err(|e| e.to_string())
-                    }
+            // Submit job (fire-and-forget, don't wait for completion)
+            if let Err(e) = job_queue
+                .submit(Job::AddTokenizer {
+                    config: Box::new(config),
                 })
                 .await
             {
                 warn!(
-                    "Failed to load tokenizer for model {} from {}: {}",
-                    model_id, source, e
-                );
-            } else {
-                debug!(
-                    "Successfully registered tokenizer for model {} from {}",
-                    model_id, source
+                    "Failed to submit tokenizer job for model {}: {}",
+                    model_id, e
                 );
             }
         }
@@ -92,6 +134,6 @@ impl StepExecutor<LocalWorkerWorkflowData> for RegisterTokenizerStep {
     }
 
     fn is_retryable(&self, _error: &WorkflowError) -> bool {
-        true // Tokenizer loading failures are retryable (network/IO issues)
+        false // Job submission failures are not retryable at this level
     }
 }

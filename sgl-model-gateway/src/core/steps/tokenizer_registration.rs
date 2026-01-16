@@ -2,6 +2,10 @@
 //!
 //! This module provides a workflow for registering tokenizers asynchronously.
 //! Tokenizers can be loaded from local paths or downloaded from HuggingFace.
+//!
+//! This is the **single source of truth** for tokenizer registration. All paths
+//! (startup, worker connection, API) should use this workflow to ensure consistent
+//! behavior (validation, caching, deduplication).
 
 use std::{sync::Arc, time::Duration};
 
@@ -12,7 +16,12 @@ use tracing::{debug, error, info};
 use super::workflow_data::TokenizerWorkflowData;
 use crate::{
     app_context::AppContext,
-    tokenizer::factory,
+    config::TokenizerCacheConfig,
+    tokenizer::{
+        cache::{CacheConfig, CachedTokenizer},
+        factory,
+        traits::Tokenizer,
+    },
     workflow::{
         BackoffStrategy, FailureAction, RetryPolicy, StepDefinition, StepExecutor, StepId,
         StepResult, WorkflowContext, WorkflowDefinition, WorkflowError, WorkflowResult,
@@ -24,12 +33,15 @@ use crate::{
 pub struct TokenizerConfigRequest {
     /// Pre-generated UUID for this tokenizer
     pub id: String,
-    /// User-provided name
+    /// User-provided name (what to register under in the registry)
     pub name: String,
     /// Source: either a local path or HuggingFace model ID
     pub source: String,
     /// Optional path to chat template file
     pub chat_template_path: Option<String>,
+    /// Optional cache configuration. If provided, wraps tokenizer with CachedTokenizer.
+    #[serde(default)]
+    pub cache_config: Option<TokenizerCacheConfig>,
 }
 
 /// Configuration for removing a tokenizer
@@ -115,8 +127,15 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
             .clone();
 
         info!(
-            "Loading tokenizer '{}' (id: {}) from source: {}",
-            config.name, config.id, config.source
+            "Loading tokenizer '{}' (id: {}) from source: {}{}",
+            config.name,
+            config.id,
+            config.source,
+            if config.cache_config.is_some() {
+                " with caching"
+            } else {
+                ""
+            }
         );
 
         // Clone needed values before async move
@@ -124,6 +143,7 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
         let name = config.name.clone();
         let source = config.source.clone();
         let chat_template = config.chat_template_path.clone();
+        let cache_config = config.cache_config.clone();
 
         // Load the tokenizer using the registry's load method (handles deduplication)
         let result = app_context
@@ -131,13 +151,31 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
             .load(&id, &name, &source, || {
                 let source = source.clone();
                 let chat_template = chat_template.clone();
+                let cache_cfg = cache_config.clone();
                 async move {
-                    factory::create_tokenizer_async_with_chat_template(
+                    // Load base tokenizer
+                    let base_tokenizer = factory::create_tokenizer_async_with_chat_template(
                         &source,
                         chat_template.as_deref(),
                     )
                     .await
-                    .map_err(|e| format!("Failed to load tokenizer: {}", e))
+                    .map_err(|e| format!("Failed to load tokenizer: {}", e))?;
+
+                    // Wrap with caching layer if configured
+                    let tokenizer: Arc<dyn Tokenizer> = match cache_cfg {
+                        Some(cfg) if cfg.enable_l0 || cfg.enable_l1 => {
+                            let cache_config = CacheConfig {
+                                enable_l0: cfg.enable_l0,
+                                l0_max_entries: cfg.l0_max_entries,
+                                enable_l1: cfg.enable_l1,
+                                l1_max_memory: cfg.l1_max_memory,
+                            };
+                            Arc::new(CachedTokenizer::new(base_tokenizer, cache_config))
+                        }
+                        _ => base_tokenizer,
+                    };
+
+                    Ok(tokenizer)
                 }
             })
             .await;
@@ -240,6 +278,7 @@ mod tests {
             name: "test-model".to_string(),
             source: "meta-llama/Llama-2-7b-hf".to_string(),
             chat_template_path: None,
+            cache_config: None,
         };
 
         let json = serde_json::to_string(&config).unwrap();
@@ -249,6 +288,32 @@ mod tests {
         assert_eq!(parsed.name, "test-model");
         assert_eq!(parsed.source, "meta-llama/Llama-2-7b-hf");
         assert!(parsed.chat_template_path.is_none());
+        assert!(parsed.cache_config.is_none());
+    }
+
+    #[test]
+    fn test_tokenizer_config_request_with_cache() {
+        let config = TokenizerConfigRequest {
+            id: "test-uuid-1234".to_string(),
+            name: "test-model".to_string(),
+            source: "meta-llama/Llama-2-7b-hf".to_string(),
+            chat_template_path: None,
+            cache_config: Some(TokenizerCacheConfig {
+                enable_l0: true,
+                l0_max_entries: 1000,
+                enable_l1: false,
+                l1_max_memory: 0,
+            }),
+        };
+
+        let json = serde_json::to_string(&config).unwrap();
+        let parsed: TokenizerConfigRequest = serde_json::from_str(&json).unwrap();
+
+        assert!(parsed.cache_config.is_some());
+        let cache = parsed.cache_config.unwrap();
+        assert!(cache.enable_l0);
+        assert_eq!(cache.l0_max_entries, 1000);
+        assert!(!cache.enable_l1);
     }
 
     #[test]

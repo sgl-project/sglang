@@ -2314,7 +2314,64 @@ def kill_itself_when_parent_died():
         logger.warning("kill_itself_when_parent_died is only supported in linux.")
 
 
-def set_uvicorn_logging_configs():
+class UvicornAccessLogFilter(logging.Filter):
+    """Filter uvicorn access logs by request path.
+
+    Notes:
+    - Uvicorn access records usually provide `request_line` like: "GET /metrics HTTP/1.1".
+    - We defensively fall back to parsing `record.getMessage()` if needed.
+    """
+
+    def __init__(self, excluded_path_prefixes=None):
+        super().__init__()
+        excluded_path_prefixes = excluded_path_prefixes or []
+        # Normalize once: drop empty prefixes, stringify, keep as tuple (fast iteration, immutable).
+        self.excluded_path_prefixes = tuple(str(p) for p in excluded_path_prefixes if p)
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        path = None
+
+        request_line = getattr(record, "request_line", None)
+        if request_line:
+            parts = str(request_line).split()
+            if len(parts) >= 2:
+                path = parts[1]
+
+        if not path:
+            # Fallback for non-standard formatters/records
+            try:
+                msg = record.getMessage()
+            except Exception:
+                msg = None
+            if msg:
+                q1 = msg.find('"')
+                q2 = msg.find('"', q1 + 1) if q1 != -1 else -1
+                if q1 != -1 and q2 != -1:
+                    rl = msg[q1 + 1 : q2]
+                    parts = rl.split()
+                    if len(parts) >= 2:
+                        path = parts[1]
+
+        if not path:
+            return True
+
+        # Strip query string for matching
+        path = str(path)
+        # Some proxies/clients may emit absolute-form request-target in logs:
+        # e.g. "GET https://example.com/metrics HTTP/1.1" -> extract "/metrics".
+        if "://" in path:
+            try:
+                path = urlparse(path).path or path
+            except Exception:
+                # If parsing fails, fall back to the raw value.
+                pass
+        path = path.split("?", 1)[0]
+        return not any(
+            path.startswith(prefix) for prefix in self.excluded_path_prefixes
+        )
+
+
+def set_uvicorn_logging_configs(server_args=None):
     from uvicorn.config import LOGGING_CONFIG
 
     LOGGING_CONFIG["formatters"]["default"][
@@ -2325,6 +2382,68 @@ def set_uvicorn_logging_configs():
         "fmt"
     ] = '[%(asctime)s] %(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s'
     LOGGING_CONFIG["formatters"]["access"]["datefmt"] = "%Y-%m-%d %H:%M:%S"
+
+    _configure_uvicorn_access_log_filter(LOGGING_CONFIG, server_args)
+
+
+def _configure_uvicorn_access_log_filter(
+    uvicorn_logging_config: dict, server_args=None
+):
+    """Configure uvicorn access log path filter into uvicorn LOGGING_CONFIG.
+
+    This optionally filters uvicorn access logs (e.g., suppress noisy /metrics polling).
+
+    Args:
+        uvicorn_logging_config: The dict-like LOGGING_CONFIG from uvicorn.
+        server_args: Parsed server args object that may contain:
+            - uvicorn_access_log_exclude_prefixes (list[str] | tuple[str] | None)
+    """
+    # Optionally filter uvicorn access logs (e.g., suppress noisy /metrics polling).
+    if server_args is None:
+        return
+
+    filter_name = "sglang_uvicorn_access_path_filter"
+
+    excluded_prefixes = getattr(
+        server_args, "uvicorn_access_log_exclude_prefixes", None
+    )
+    if not excluded_prefixes:
+        return
+
+    # Normalize: accept list/tuple; treat a single string as one prefix (not an iterable of chars).
+    if isinstance(excluded_prefixes, str):
+        excluded_prefixes = [excluded_prefixes]
+
+    # De-duplicate while keeping order; drop empty prefixes.
+    excluded_prefixes = [p for p in excluded_prefixes if p]
+    excluded_prefixes = list(dict.fromkeys(excluded_prefixes))
+    if not excluded_prefixes:
+        return
+
+    uvicorn_logging_config.setdefault("filters", {})
+    uvicorn_logging_config["filters"][filter_name] = {
+        "()": "sglang.srt.utils.common.UvicornAccessLogFilter",
+        "excluded_path_prefixes": excluded_prefixes,
+    }
+
+    # Attach filter to access handler and/or uvicorn.access logger (best-effort across uvicorn versions).
+    handlers = uvicorn_logging_config.get("handlers", {})
+    if "access" in handlers:
+        filters_list = handlers["access"].setdefault("filters", [])
+        if not isinstance(filters_list, list):
+            filters_list = list(filters_list)
+            handlers["access"]["filters"] = filters_list
+        if filter_name not in filters_list:
+            filters_list.append(filter_name)
+
+    loggers_cfg = uvicorn_logging_config.get("loggers", {})
+    if "uvicorn.access" in loggers_cfg:
+        filters_list = loggers_cfg["uvicorn.access"].setdefault("filters", [])
+        if not isinstance(filters_list, list):
+            filters_list = list(filters_list)
+            loggers_cfg["uvicorn.access"]["filters"] = filters_list
+        if filter_name not in filters_list:
+            filters_list.append(filter_name)
 
 
 def get_open_port() -> int:
@@ -2743,6 +2862,7 @@ def is_fa3_default_architecture(hf_config):
         "Olmo2ForCausalLM",
         "Gemma2ForCausalLM",
         "Gemma3ForConditionalGeneration",
+        "MixtralForCausalLM",
         "Qwen2ForCausalLM",
         "Qwen3ForCausalLM",
         "Qwen3MoeForCausalLM",
@@ -3837,7 +3957,7 @@ def is_numa_available() -> bool:
         return False
 
 
-def get_system_gpu_count() -> int:
+def get_system_nvgpu_count() -> int:
     """
     Get the total number of GPUs in the system (not affected by CUDA_VISIBLE_DEVICES).
 
@@ -3859,7 +3979,7 @@ def get_system_gpu_count() -> int:
 
 
 @lru_cache(maxsize=1)
-def get_current_device_numa_node() -> int:
+def get_current_device_numa_node_cuda() -> int:
     """
     Retrieve the NUMA node ID of the CPU socket closest to the currently active CUDA device.
 
@@ -3898,7 +4018,7 @@ def get_current_device_numa_node() -> int:
 
     # Fall back: distribute GPUs evenly across NUMA nodes
     numa_count = get_numa_node_count()
-    gpu_count = get_system_gpu_count()
+    gpu_count = get_system_nvgpu_count()
 
     if gpu_count >= numa_count:
         gpus_per_numa = gpu_count // numa_count  # >= 1
@@ -3912,11 +4032,20 @@ def get_current_device_numa_node() -> int:
     return numa_node
 
 
-def bind_to_closest_numa_node():
+def nvgpu_available() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    if torch.version.cuda is None:
+        return False
+    return True
+
+
+def bind_to_closest_numa_node_cuda():
     """
     Bind the current process to the NUMA node closest to the active CUDA device.
 
     Uses `numa` library calls via ctypes to set the CPU affinity of the process.
     """
-    node_id = get_current_device_numa_node()
-    numa_bind_to_node(node_id)
+    if is_numa_available() and nvgpu_available():
+        node_id = get_current_device_numa_node_cuda()
+        numa_bind_to_node(node_id)
