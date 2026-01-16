@@ -924,7 +924,85 @@ jobs:
         timeout-minutes: 30
         run: |
           bash scripts/ci/amd_ci_exec.sh -e SGLANG_USE_AITER_AR=0 -e SGLANG_USE_AITER=0 -e HF_HUB_ENABLE_HF_TRANSFER=0 python3 test_moe_eval_accuracy_large.py
+  
+  # =============================================== Disaggregation ====================================================
+  disagg-test-unified-8-gpu:
+    needs: [check-changes, stage-a-test-1-amd]
+    if: |
+      always() &&
+      (
+        (inputs.target_stage == 'disagg-test-unified-8-gpu') ||
+        (
+          !inputs.target_stage &&
+          (!failure() && !cancelled()) &&
+          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+        )
+      )
+    env:
+      RUNNER_LABELS: linux-mi355-gpu-8
+    
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [linux-mi355-gpu-8]
+        part: [0, 1]
+    
+    runs-on: ${{matrix.runner}}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
+      - name: Ensure VRAM is clear
+        run: bash scripts/ensure_vram_clear.sh rocm
+
+      - name: Detect RDMA Devices
+        id: rdma_detect
+        run: |
+          if [ -d "/sys/class/infiniband" ]; then
+            RDMA_DEVS=$(ls /sys/class/infiniband | paste -sd "," -)
+            echo "Detected RDMA Devices: $RDMA_DEVS"
+            echo "SGLANG_TEST_RDMA_DEVICE=$RDMA_DEVS" >> $GITHUB_ENV
+          else
+            echo "No RDMA devices found in /sys/class/infiniband"
+            echo "SGLANG_TEST_RDMA_DEVICE=" >> $GITHUB_ENV
+          fi
+
+      - name: Start Special Container
+        run: bash scripts/ci/amd_ci_start_container_disagg.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: bash scripts/ci/amd_ci_install_dependency.sh
+
+      - name: Run Aiter Op Test (RMSNorm)
+        timeout-minutes: 10
+        run: |
+          echo "Running pre-check: test_rmsnorm2d.py"
+          docker exec \
+            -e MAX_JOBS=192 \
+            ci_sglang \
+            python /sgl-workspace/aiter/op_tests/test_rmsnorm2d.py
+
+      - name: Run test_disaggregation_basic
+        timeout-minutes: 15
+        run: |
+          bash scripts/ci/amd_ci_exec.sh \
+            -e SGLANG_TEST_RDMA_DEVICE="${{ env.SGLANG_TEST_RDMA_DEVICE }}" \
+            -e HF_TOKEN="${{ env.HF_TOKEN }}" \
+            python3 -m unittest test/registered/amd/disaggregation/test_disaggregation_basic.py
+
+      - name: Run test_disaggregation_pp
+        timeout-minutes: 15
+        run: |
+          bash scripts/ci/amd_ci_exec.sh \
+            -e SGLANG_TEST_RDMA_DEVICE="${{ env.SGLANG_TEST_RDMA_DEVICE }}" \
+            -e HF_TOKEN="${{ env.HF_TOKEN }}" \
+            python3 -m unittest test/registered/amd/disaggregation/test_disaggregation_pp.py
+  
   pr-test-amd-finish:
     needs:
       [
