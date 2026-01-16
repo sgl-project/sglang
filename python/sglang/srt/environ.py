@@ -256,6 +256,8 @@ class Envs:
 
     # Hi-Cache
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
+    SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR = EnvStr(None)
+    SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR = EnvStr(None)
 
     # Mooncake KV Transfer
     SGLANG_MOONCAKE_CUSTOM_MEM_POOL = EnvStr(None)
