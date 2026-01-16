@@ -103,6 +103,7 @@ test = [
   "sentence_transformers",
   "tabulate",
 ]
+
 diffusion = [
   "diffusers @ git+https://github.com/huggingface/diffusers.git@6290fdfda40610ce7b99920146853614ba529c6e",
   "opencv-python-headless==4.10.0.84",
@@ -117,6 +118,7 @@ diffusion = [
   "vsa==0.0.4",
   "runai_model_streamer",
 ]
+checkpoint-engine = ["checkpoint-engine==0.2.1"]
 all_hip = ["sglang[srt_hip]"]
 all_npu = ["sglang[srt_npu]"]
 all_hpu = ["sglang[srt_hpu]"]
