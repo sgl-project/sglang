@@ -66,6 +66,7 @@ class TestNightlyDeepseekV32Performance(unittest.TestCase):
         cls.output_lens = tuple(_parse_int_list_env("NIGHTLY_OUTPUT_LENS", "512"))
 
         # Define variant configurations for DeepSeek-V3.2
+        # MI35x uses tilelang NSA backends
         cls.variants = [
             {
                 "name": "basic",
@@ -73,6 +74,10 @@ class TestNightlyDeepseekV32Performance(unittest.TestCase):
                     "--trust-remote-code",
                     "--tp",
                     "8",
+                    "--nsa-prefill-backend",
+                    "tilelang",
+                    "--nsa-decode-backend",
+                    "tilelang",
                     "--mem-fraction-static",
                     "0.85",
                     "--model-loader-extra-config",
@@ -85,6 +90,10 @@ class TestNightlyDeepseekV32Performance(unittest.TestCase):
                     "--trust-remote-code",
                     "--tp",
                     "8",
+                    "--nsa-prefill-backend",
+                    "tilelang",
+                    "--nsa-decode-backend",
+                    "tilelang",
                     "--speculative-algorithm",
                     "EAGLE",
                     "--speculative-num-steps",
