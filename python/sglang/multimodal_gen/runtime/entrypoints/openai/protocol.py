@@ -17,6 +17,7 @@ class ImageResponse(BaseModel):
     created: int = Field(default_factory=lambda: int(time.time()))
     data: List[ImageResponseData]
     peak_memory_mb: Optional[float] = None
+    inference_time_s: Optional[float] = None
 
 
 class ImageGenerationsRequest(BaseModel):
@@ -54,12 +55,14 @@ class VideoResponse(BaseModel):
     size: str = ""
     seconds: str = "4"
     quality: str = "standard"
+    url: Optional[str] = None
     remixed_from_video_id: Optional[str] = None
     completed_at: Optional[int] = None
     expires_at: Optional[int] = None
     error: Optional[Dict[str, Any]] = None
     file_path: Optional[str] = None
     peak_memory_mb: Optional[float] = None
+    inference_time_s: Optional[float] = None
 
 
 class VideoGenerationsRequest(BaseModel):
