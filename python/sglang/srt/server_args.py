@@ -157,6 +157,7 @@ NSA_CHOICES = [
 ]
 
 RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu"]
+MARCONI_EVICTION_POLICY_CHOICES = ["v2", "v3"]
 
 RL_ON_POLICY_TARGET_CHOICES = ["fsdp"]
 
@@ -311,6 +312,7 @@ class ServerArgs:
     disable_hybrid_swa_memory: bool = False
     radix_eviction_policy: str = "lru"
     enable_marconi: bool = False
+    marconi_eviction_policy: str = "v2"
     marconi_eff_weight: float = 0.0
     marconi_bootstrap_window_size: Optional[int] = None
     marconi_bootstrap_multiplier: int = 5
@@ -2729,6 +2731,13 @@ class ServerArgs:
             "--enable-marconi",
             action="store_true",
             help="Enable Marconi eviction and tuning for hybrid radix cache.",
+        )
+        parser.add_argument(
+            "--marconi-eviction-policy",
+            type=str,
+            choices=MARCONI_EVICTION_POLICY_CHOICES,
+            default=ServerArgs.marconi_eviction_policy,
+            help="Marconi eviction policy version. 'v2' uses fixed eff_weight, 'v3' enables tuning.",
         )
         parser.add_argument(
             "--marconi-eff-weight",

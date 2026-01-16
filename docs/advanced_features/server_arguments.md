@@ -136,6 +136,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--swa-full-tokens-ratio` | The ratio of SWA layer KV tokens / full layer KV tokens, regardless of the number of swa:full layers. It should be between 0 and 1. E.g. 0.5 means if each swa layer has 50 tokens, then each full layer has 100 tokens. | `0.8` | Type: float |
 | `--disable-hybrid-swa-memory` | Disable the hybrid SWA memory. | `False` | bool flag (set to enable) |
 | `--enable-marconi` | Enable Marconi eviction and tuning for the Mamba radix cache. | `False` | bool flag (set to enable) |
+| `--marconi-eviction-policy` | Marconi eviction policy version. `v2` uses fixed efficiency weight, `v3` enables tuning. | `v2` | `v2`, `v3` |
 | `--marconi-eff-weight` | Initial efficiency weight (alpha) for Marconi eviction scoring. | `0.0` | Type: float |
 | `--marconi-bootstrap-window-size` | Fixed bootstrap window size for Marconi tuning. | `None` | Type: int |
 | `--marconi-bootstrap-multiplier` | Multiplier for bootstrap window size when a fixed size is not provided. | `5` | Type: int |
