@@ -140,6 +140,10 @@ class AiterAttnBackend(AttentionBackend):
         self.page_table = torch.zeros(
             (max_bs, self.max_context_len // self.page_size), dtype=torch.int32, device=model_runner.device
         )
+        # Pre-compute strided indices for page_table construction (used in both CUDA Graph and non-CUDA Graph modes)
+        self.strided_indices = torch.arange(
+            0, self.max_context_len, self.page_size, device=model_runner.device
+        )
 
         # Create prefill indices updater
         if not skip_prefill:
@@ -249,23 +253,48 @@ class AiterAttnBackend(AttentionBackend):
                 qo_indptr[1 : bs + 1] = torch.cumsum(self.kv_last_page_len[:bs], dim=0)
                 kv_last_page_len = self.kv_last_page_len[:bs]
                 max_q_len = 1
-            page_table = forward_batch.req_to_token_pool.req_to_token[forward_batch.req_pool_indices, :]
+                page_table = forward_batch.req_to_token_pool.req_to_token[forward_batch.req_pool_indices, :]
 
-            self.forward_metadata = ForwardMetadata(
-                kv_indptr,
-                kv_indices,
-                qo_indptr,
-                kv_last_page_len,
-                max_q_len,
-                None,
-                page_table,
-                forward_batch.seq_lens,
-            )
-            
-            # Build pa_metadata for pa_persistent_fwd (only for non-MLA decode mode)
-            if not self.use_mla:
+                self.forward_metadata = ForwardMetadata(
+                    kv_indptr,
+                    kv_indices,
+                    qo_indptr,
+                    kv_last_page_len,
+                    max_q_len,
+                    None,
+                    page_table,
+                    forward_batch.seq_lens,
+                )
+            else:
+                # Non-MLA decode mode: use same logic as CUDA Graph mode for page_table construction
+                seq_lens_cpu = forward_batch.seq_lens_cpu
+                if seq_lens_cpu is None:
+                    seq_lens_cpu = forward_batch.seq_lens.cpu()
+                
+                # Common setup consistent with CUDA Graph mode (init_forward_metadata_replay_cuda_graph)
+                page_table_persistent = self.page_table
+                seq_lens_persistent = self.seq_lens
+                seq_lens_persistent.fill_(0)
+                page_table_persistent.fill_(0)
+                seq_lens_persistent[:bs].copy_(forward_batch.seq_lens, non_blocking=True)
+                max_seq_pages = (seq_lens_cpu.max().item() + self.page_size - 1) // self.page_size + 1
+                page_table = self.req_to_token[forward_batch.req_pool_indices[:, None], self.strided_indices[:max_seq_pages][None, :],]
+                page_table_persistent[:bs, :max_seq_pages].copy_(page_table // self.page_size, non_blocking=True)
+                
+                self.forward_metadata = ForwardMetadata(
+                    kv_indptr,
+                    kv_indices,
+                    None,  # qo_indptr not used in non-MLA mode
+                    None,  # kv_last_page_len not used in non-MLA mode
+                    1,     # max_q_len = 1 for decode mode
+                    None,
+                    page_table_persistent[:bs, :max_seq_pages],
+                    seq_lens_persistent[:bs],
+                )
+                
+                # Build pa_metadata for pa_persistent_fwd
                 self._build_pa_metadata_for_decode(bs, tp_q_head_num=self.num_head)
-
+                return  # Early return for non-MLA decode mode   
         elif forward_batch.forward_mode.is_draft_extend():
             if self.use_mla:
                 kv_indices, kv_indptr, qo_indptr, _ = (
@@ -413,13 +442,6 @@ class AiterAttnBackend(AttentionBackend):
                     None,
                     forward_batch.seq_lens,
                 )  
-        if self.page_size > 1 and self.forward_metadata.page_table is not None:
-            strided_indices = torch.arange(
-                0, self.forward_metadata.page_table.shape[1], self.page_size, device=self.device
-            )
-            self.forward_metadata.page_table = (
-                self.forward_metadata.page_table[:, strided_indices] // self.page_size
-            )
 
     def _allocate_pa_metadata_buffers(
         self,
