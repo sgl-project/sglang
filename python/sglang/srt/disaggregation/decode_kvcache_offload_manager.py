@@ -267,6 +267,14 @@ class DecodeKVCacheOffloadManager:
         else:
             prefill_len = state.get("prefill_len", 0)
             inc_len = state.get("inc_len", 0)
+        # If no incremental offload ever happened, the prefill-aligned part was never freed.
+        # Free the prefill portion on request finish to avoid leaks.
+        if prefill_len > 0 and inc_len == 0:
+            token_indices = self.req_to_token_pool.req_to_token[req.req_pool_idx]
+            self.token_to_kv_pool_allocator.free(token_indices[:prefill_len])
+            logger.info(
+                f"Finalize release: freed prefill-aligned KV for req {req.rid}, len:{prefill_len}"
+            )
         start_offset = prefill_len + inc_len
         self._release_finished_req(req, start_offset)
         start_p, end_p = req.pop_overallocated_kv_cache()
