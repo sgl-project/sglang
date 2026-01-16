@@ -1084,13 +1084,15 @@ class QuantizedRLModelLoader(DefaultModelLoader):
             # Non-stacked parameter
             # Blockwise: no transpose, direct copy (matching initial load behavior)
             # Perchannel: transpose needed (matching original behavior)
-            new_scale = scale_info.contiguous() if is_blockwise else scale_info.t().contiguous()
+            new_scale = (
+                scale_info.contiguous() if is_blockwise else scale_info.t().contiguous()
+            )
             new_scale = _get_tp_sharded_scale(new_scale)
-            
+
             # Determine which scale parameter to update
             scale_param_to_update = scale_param_inv if is_blockwise else scale_param
             scale_name = weight_scale_inv_name if is_blockwise else weight_scale_name
-            
+
             if scale_param_to_update.data.shape == new_scale.shape:
                 scale_param_to_update.data.copy_(new_scale)
             else:
@@ -1122,7 +1124,9 @@ class QuantizedRLModelLoader(DefaultModelLoader):
             # Perchannel: scale shape (M, k) -> use shape[-1]
             scale_param_to_update = scale_param_inv if is_blockwise else scale_param
             dim_idx = 0 if is_blockwise else -1
-            rows_per_shard = scale_param_to_update.data.shape[dim_idx] // max(len(shard_names), 1)
+            rows_per_shard = scale_param_to_update.data.shape[dim_idx] // max(
+                len(shard_names), 1
+            )
 
             if rows_per_shard * len(shard_names) != (
                 scale_param_to_update.data.shape[0]
@@ -1157,7 +1161,9 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                 if is_blockwise:
                     scale_param_to_update.data[start:end, :] = shard_scale.contiguous()
                 else:
-                    scale_param_to_update.data[..., start:end] = shard_scale.t().contiguous()
+                    scale_param_to_update.data[..., start:end] = (
+                        shard_scale.t().contiguous()
+                    )
 
                 offset = end
 

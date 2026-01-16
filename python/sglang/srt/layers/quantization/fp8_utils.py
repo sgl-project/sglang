@@ -1173,7 +1173,7 @@ def scaled_fp8_blockwise(
 ):
     """Quantize a 2D high-precision tensor to FP8 (E4M3) using blockwise quantization.
 
-    This function partitions the input tensor into blocks of the specified size, computes per-block scaling factors 
+    This function partitions the input tensor into blocks of the specified size, computes per-block scaling factors
     for each block, based on the maximum absolute values of the block, and casts the block to FP8 with saturation.
 
     Args:
