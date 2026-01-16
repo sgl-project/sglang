@@ -162,12 +162,12 @@ class NPUW8A8Int8DynamicMoEMethod(_NPUFusedMoEMethodBase):
         # Compressed-tensors format doesn't have this field
         if hasattr(layer, "w13_weight_offset"):
             layer.w13_weight_offset = torch.nn.Parameter(
-                layer.w13_weight_offset.data.squeeze(-1).contiguous(),
+                layer.w13_weight_offset.data.squeeze(-1),
                 requires_grad=False,
             )
         if hasattr(layer, "w2_weight_offset"):
             layer.w2_weight_offset = torch.nn.Parameter(
-                layer.w2_weight_offset.data.squeeze(-1).contiguous(),
+                layer.w2_weight_offset.data.squeeze(-1),
                 requires_grad=False,
             )
 
