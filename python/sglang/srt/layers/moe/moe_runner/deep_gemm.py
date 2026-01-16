@@ -518,25 +518,28 @@ def pre_permute_deepep_normal_to_deep_gemm(
     running_state["topk_ids"] = topk_ids
     running_state["topk_weights"] = topk_weights
 
-    input_tensor = torch.empty(
+    # Use zeros to initialize tensors to avoid garbage data affecting DeepGEMM
+    # Positions not filled by ep_scatter should have zero values
+    input_tensor = torch.zeros(
         (all_tokens, K),
         device=hidden_states.device,
         dtype=hidden_states.dtype,
     )
     if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
-        # TODO check whether need `zeros`
         input_tensor_scale = torch.zeros(
             (ceil_div(K // 128, 4), all_tokens),
             device=hidden_states.device,
             dtype=torch.int,
         ).transpose(0, 1)
     else:
-        input_tensor_scale = torch.empty(
+        input_tensor_scale = torch.zeros(
             (all_tokens, K // 128),
             device=hidden_states.device,
             dtype=torch.float32,
         )
-    m_indices = torch.empty(all_tokens, device=hidden_states.device, dtype=torch.int32)
+    # Initialize m_indices to 0 (first expert) - unfilled positions will use expert 0
+    # which is safe because the corresponding input is zero
+    m_indices = torch.zeros(all_tokens, device=hidden_states.device, dtype=torch.int32)
     output_index = torch.empty_like(topk_ids)
 
     if get_offloader().forbid_copy_engine_usage:
