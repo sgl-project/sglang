@@ -33,10 +33,11 @@ jobs:
           python-version: '3.10'
 
       - name: Generate Utilization Report
+        timeout-minutes: 10
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           python scripts/ci/runner_utilization_report.py \
             --repo ${{ github.repository }} \
-            --hours ${{ inputs.hours || '24' }} \
+            --hours ${{ inputs.hours || '6' }} \
             ${{ inputs.filter && format('--filter {0}', inputs.filter) || '' }}
