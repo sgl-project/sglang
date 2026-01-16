@@ -266,7 +266,6 @@ def load_model_from_full_model_state_dict(
                 )
                 continue
         if is_quant:
-            logger.warning("find quant config use params dtype")
             tensor_dtype = meta_sharded_param.dtype
         if not hasattr(meta_sharded_param, "device_mesh"):
             full_tensor = full_tensor.to(device=device, dtype=tensor_dtype)
