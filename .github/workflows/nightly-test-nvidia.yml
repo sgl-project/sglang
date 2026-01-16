@@ -45,11 +45,13 @@ on:
         default: 'all'
 
 concurrency:
-  group: nightly-test-nvidia-${{ github.ref }}
-  cancel-in-progress: true
+  group: nightly-test-nvidia-${{ inputs.ref || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
 
 env:
   SGLANG_IS_IN_CI: true
+  HF_HUB_DOWNLOAD_TIMEOUT: 300
+  HF_HUB_ETAG_TIMEOUT: 300
 
 jobs:
   # General tests - 1 GPU
@@ -96,6 +98,10 @@ jobs:
   nightly-test-general-8-gpu-h200:
     if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-general-8-gpu-h200')
     runs-on: 8-gpu-h200
+    strategy:
+      fail-fast: false
+      matrix:
+        partition: [0, 1, 2]
     env:
       RUNNER_LABELS: 8-gpu-h200
     steps:
@@ -118,7 +124,7 @@ jobs:
           IS_H200: "1"
         run: |
           cd test
-          python3 run_suite.py --hw cuda --suite nightly-8-gpu-common --nightly --timeout-per-file=18000 --continue-on-error
+          python3 run_suite.py --hw cuda --suite nightly-8-gpu-common --nightly --timeout-per-file=18000 --continue-on-error --auto-partition-id=${{ matrix.partition }} --auto-partition-size=3
 
       - name: Run test
         timeout-minutes: 30
@@ -154,8 +160,12 @@ jobs:
 
   # General tests - 8 GPU B200
   nightly-test-general-8-gpu-b200:
-    if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-general-8-gpu-h20')
+    if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-general-8-gpu-b200')
     runs-on: 8-gpu-b200
+    strategy:
+      fail-fast: false
+      matrix:
+        partition: [0, 1, 2]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -166,13 +176,16 @@ jobs:
         run: |
           IS_BLACKWELL=1 bash scripts/ci/ci_install_dependency.sh
 
-      - name: Run test
-        timeout-minutes: 120
+      - name: Run common 8-GPU model tests
+        if: always()
+        timeout-minutes: 300
         env:
+          TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
+          PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
           GPU_CONFIG: "8-gpu-b200"
         run: |
           cd test
-          python3 run_suite.py --hw cuda --suite nightly-8-gpu-b200 --nightly --continue-on-error --timeout-per-file 2400
+          IS_BLACKWELL=1 python3 run_suite.py --hw cuda --suite nightly-8-gpu-common --nightly --timeout-per-file=12000 --continue-on-error --auto-partition-id=${{ matrix.partition }} --auto-partition-size=3
 
   # Text model accuracy tests
   nightly-test-text-accuracy-2-gpu-runner:
@@ -361,13 +374,13 @@ jobs:
           IS_BLACKWELL=1 bash scripts/ci/ci_install_dependency.sh
 
       - name: Run test
-        timeout-minutes: 60
+        timeout-minutes: 300
         run: |
           cd test
-          python3 run_suite.py --hw cuda --suite nightly-4-gpu-b200 --nightly --continue-on-error
+          python3 run_suite.py --hw cuda --suite nightly-4-gpu-b200 --nightly --continue-on-error --timeout-per-file 12000
 
-  # B200 Performance tests - 8 GPU
-  nightly-test-perf-8-gpu-b200:
+  # Specialized B200 tests - 8 GPU, for specific backends and configs
+  nightly-test-specialized-8-gpu-b200:
     if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-perf-8-gpu-b200')
     runs-on: 8-gpu-b200
     env:
@@ -382,16 +395,13 @@ jobs:
         run: |
           IS_BLACKWELL=1 bash scripts/ci/ci_install_dependency.sh
 
-      - name: Run common 8-GPU model tests
-        if: always()
-        timeout-minutes: 200
+      - name: Run test
+        timeout-minutes: 120
         env:
-          TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
-          PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
           GPU_CONFIG: "8-gpu-b200"
         run: |
           cd test
-          IS_BLACKWELL=1 python3 run_suite.py --hw cuda --suite nightly-8-gpu-common --nightly --timeout-per-file=12000 --continue-on-error
+          python3 run_suite.py --hw cuda --suite nightly-8-gpu-b200 --nightly --continue-on-error --timeout-per-file 2400
 
   # Final check job
   check-all-jobs:
@@ -409,7 +419,7 @@ jobs:
       - nightly-test-multimodal-server-1-gpu
       - nightly-test-multimodal-server-2-gpu
       - nightly-test-perf-4-gpu-b200
-      - nightly-test-perf-8-gpu-b200
+      - nightly-test-specialized-8-gpu-b200
     runs-on: ubuntu-latest
     steps:
       - name: Check if any job failed

@@ -39,12 +39,16 @@ from sglang.srt.managers.io_struct import (
     GetInternalStateReqOutput,
     GetLoadReqInput,
     GetLoadReqOutput,
+    GetLoadsReqInput,
+    GetLoadsReqOutput,
     GetWeightsByNameReqInput,
     GetWeightsByNameReqOutput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsSendGroupForRemoteInstanceReqOutput,
     InitWeightsUpdateGroupReqInput,
     InitWeightsUpdateGroupReqOutput,
+    LoadLoRAAdapterFromTensorsReqInput,
+    LoadLoRAAdapterFromTensorsReqOutput,
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
     LoRAUpdateOutput,
@@ -216,6 +220,9 @@ class TokenizerCommunicatorMixin:
         self.get_load_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size, mode="watching"
         )
+        self.get_loads_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
 
         self._result_dispatcher += self._get_communicator_dispatcher()
 
@@ -301,6 +308,10 @@ class TokenizerCommunicatorMixin:
                 (
                     GetLoadReqOutput,
                     self.get_load_communicator.handle_recv,
+                ),
+                (
+                    GetLoadsReqOutput,
+                    self.get_loads_communicator.handle_recv,
                 ),
             ]
         )
@@ -617,6 +628,76 @@ class TokenizerCommunicatorMixin:
                 error_message=str(e),
             )
 
+    async def load_lora_adapter_from_tensors(
+        self: TokenizerManager,
+        obj: LoadLoRAAdapterFromTensorsReqInput,
+        _: Optional[fastapi.Request] = None,
+    ) -> LoadLoRAAdapterFromTensorsReqOutput:
+        self.auto_create_handle_loop()
+
+        try:
+            if not self.server_args.enable_lora:
+                raise ValueError(
+                    "LoRA is not enabled. Please set `--enable-lora` to enable LoRA."
+                )
+
+            assert (
+                self.server_args.dp_size == 1
+            ), "dp_size must be 1 for dynamic lora loading"
+            logger.info(
+                "Start load Lora adapter from tensors. Lora name=%s",
+                obj.lora_name,
+            )
+
+            async with self.lora_update_lock:
+                new_adapter = LoRARef(
+                    lora_name=obj.lora_name,
+                    lora_path="__tensor__",
+                    pinned=obj.pinned,
+                )
+                obj.lora_id = new_adapter.lora_id
+                result = (await self.update_lora_adapter_communicator(obj))[0]
+
+                if result.success:
+                    await self.lora_registry.register(new_adapter)
+                    self.lora_ref_cache[obj.lora_name] = new_adapter
+                if self.server_args.max_loaded_loras is not None:
+                    while (
+                        self.lora_registry.num_registered_loras
+                        > self.server_args.max_loaded_loras
+                    ):
+                        lru_lora_name = await self.lora_registry.lru_lora_name(
+                            exclude_pinned=True
+                        )
+                        if lru_lora_name is None:
+                            raise ValueError(
+                                "Didn't find any LoRA adapters when trying to evict LRU LoRA adapter. "
+                                f"LoRA registry is: {self.lora_registry._registry}"
+                            )
+
+                        logger.info(
+                            f"Unloading least recently used LoRA adapter '{lru_lora_name}' "
+                            f"(current number of adapters: {self.lora_registry.num_registered_loras}, "
+                            f"max allowed: {self.server_args.max_loaded_loras})"
+                        )
+
+                        unload_result = await self._unload_lora_adapter_locked(
+                            UnloadLoRAAdapterReqInput(lora_name=lru_lora_name)
+                        )
+                        if not unload_result.success:
+                            raise ValueError(
+                                f"Error while unloading LRU LoRA adapter '{lru_lora_name}': "
+                                f"{unload_result.error_message}"
+                            )
+                        del result.loaded_adapters[lru_lora_name]
+
+                return result
+        except ValueError as e:
+            return LoadLoRAAdapterFromTensorsReqOutput(
+                success=False,
+                error_message=str(e),
+            )
+
     async def unload_lora_adapter(
         self: TokenizerManager,
         obj: UnloadLoRAAdapterReqInput,
@@ -714,6 +795,33 @@ class TokenizerCommunicatorMixin:
     async def get_load(self: TokenizerManager) -> List[GetLoadReqOutput]:
         req = GetLoadReqInput()
         return await self.get_load_communicator(req)
+
+    async def get_loads(
+        self: TokenizerManager,
+        include: Optional[List[str]] = None,
+        dp_rank: Optional[int] = None,
+    ) -> List[GetLoadsReqOutput]:
+        """
+        Get comprehensive load metrics for /v1/loads endpoint.
+
+        Args:
+            include: List of sections to include. Options: core, memory, spec, lora, disagg, queues, all
+            dp_rank: Optional filter for specific DP rank
+
+        Returns:
+            List of GetLoadsReqOutput, one per scheduler (filtered by dp_rank if specified)
+        """
+        req = GetLoadsReqInput(
+            include=include if include else ["all"],
+            dp_rank=dp_rank,
+        )
+        results = await self.get_loads_communicator(req)
+
+        # Filter by dp_rank if specified
+        if dp_rank is not None:
+            results = [r for r in results if r.dp_rank == dp_rank]
+
+        return results
 
     async def open_session(
         self, obj: OpenSessionReqInput, request: Optional[fastapi.Request] = None

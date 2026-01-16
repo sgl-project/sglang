@@ -5,26 +5,34 @@
 
 use std::{fmt::Debug, sync::Arc};
 
-use crate::core::Worker;
+use crate::{
+    core::{HashRing, Worker},
+    mesh::OptionalMeshSyncManager,
+};
 
 mod bucket;
 mod cache_aware;
+mod consistent_hashing;
 mod factory;
 mod manual;
 mod power_of_two;
+mod prefix_hash;
 mod random;
 mod registry;
 mod round_robin;
 pub mod tree;
-
+pub(crate) mod utils;
 pub use bucket::BucketPolicy;
 pub use cache_aware::CacheAwarePolicy;
+pub use consistent_hashing::ConsistentHashingPolicy;
 pub use factory::PolicyFactory;
-pub use manual::ManualPolicy;
+pub use manual::{ManualConfig, ManualPolicy};
 pub use power_of_two::PowerOfTwoPolicy;
+pub use prefix_hash::{PrefixHashConfig, PrefixHashPolicy};
 pub use random::RandomPolicy;
 pub use registry::PolicyRegistry;
 pub use round_robin::RoundRobinPolicy;
+pub use tree::PrefixMatchResult;
 
 /// Core trait for load balancing policies
 ///
@@ -62,6 +70,11 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
     /// This is called periodically with current load information for load-aware policies.
     fn update_loads(&self, _loads: &std::collections::HashMap<String, isize>) {
         // Default: no-op for policies that don't use load information
+    }
+
+    /// Set mesh sync manager
+    fn set_mesh_sync(&mut self, _mesh_sync: OptionalMeshSyncManager) {
+        // Default: no-op for policies that don't use mesh sync
     }
 
     /// Reset any internal state
@@ -138,15 +151,21 @@ pub(crate) fn normalize_model_key(model_id: &str) -> &str {
 }
 
 /// Information passed to policy for worker selection
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SelectWorkerInfo<'a> {
     /// Request text for cache-aware routing
     pub request_text: Option<&'a str>,
+    /// Tokenized request for prefix-hash routing
+    /// Used by PrefixHashPolicy for token-based prefix hashing
+    pub tokens: Option<&'a [u32]>,
     /// HTTP headers for header-based routing policies
     /// Policies can extract routing information from headers like:
-    /// - X-Target-Worker: Direct routing to a specific worker by URL
-    /// - X-Routing-Key: Consistent hash routing for session affinity
+    /// - X-SMG-Target-Worker: Direct routing to a specific worker by index
+    /// - X-SMG-Routing-Key: Consistent hash routing for session affinity
     pub headers: Option<&'a http::HeaderMap>,
+    /// Pre-computed hash ring for O(log n) consistent hashing
+    /// Built and cached by WorkerRegistry, passed through to avoid per-request rebuilds
+    pub hash_ring: Option<Arc<HashRing>>,
 }
 
 #[cfg(test)]

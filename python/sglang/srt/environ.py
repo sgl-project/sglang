@@ -6,6 +6,29 @@ from enum import IntEnum
 from typing import Any
 
 
+@contextmanager
+def temp_set_env(**env_vars: dict[str, Any]):
+    """Temporarily set non-sglang environment variables, e.g. OPENAI_API_KEY"""
+    for key in env_vars:
+        if key.startswith("SGLANG_") or key.startswith("SGL_"):
+            raise ValueError("temp_set_env should not be used for sglang env vars")
+
+    backup = {key: os.environ.get(key) for key in env_vars}
+    try:
+        for key, value in env_vars.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = str(value)
+        yield
+    finally:
+        for key, value in backup.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
 class EnvField:
     _allow_set_name = True
 
@@ -140,17 +163,25 @@ class Envs:
     SGLANG_LOG_MS = EnvBool(False)
     SGLANG_DISABLE_REQUEST_LOGGING = EnvBool(False)
     SGLANG_LOG_REQUEST_EXCEEDED_MS = EnvInt(-1)
+    SGLANG_LOG_SCHEDULER_STATUS_TARGET = EnvStr("")
+    SGLANG_LOG_SCHEDULER_STATUS_INTERVAL = EnvFloat(60.0)
 
     # SGLang CI
     SGLANG_IS_IN_CI = EnvBool(False)
     SGLANG_IS_IN_CI_AMD = EnvBool(False)
     SGLANG_TEST_MAX_RETRY = EnvInt(None)
 
+    # Constrained Decoding (Grammar)
+    SGLANG_GRAMMAR_POLL_INTERVAL = EnvFloat(0.005)
+    SGLANG_GRAMMAR_MAX_POLL_ITERATIONS = EnvInt(10000)
+
     # Test & Debug
     SGLANG_DETECT_SLOW_RANK = EnvBool(False)
     SGLANG_TEST_STUCK_DETOKENIZER = EnvFloat(0)
     SGLANG_TEST_STUCK_DP_CONTROLLER = EnvFloat(0)
+    SGLANG_TEST_STUCK_SCHEDULER_INIT = EnvFloat(0)
     SGLANG_TEST_STUCK_TOKENIZER = EnvFloat(0)
+    SGLANG_TEST_CRASH_AFTER_STREAM_OUTPUTS = EnvInt(0)
     IS_BLACKWELL = EnvBool(False)
     IS_H200 = EnvBool(False)
     SGLANG_SET_CPU_AFFINITY = EnvBool(False)
@@ -190,6 +221,15 @@ class Envs:
     SGLANG_SCHEDULER_RECV_SKIPPER_WEIGHT_TARGET_VERIFY = EnvInt(1)
     SGLANG_SCHEDULER_RECV_SKIPPER_WEIGHT_NONE = EnvInt(1)
 
+    # PD Disaggregation (runtime)
+    # NOTE: For SGLANG_DISAGGREGATION_THREAD_POOL_SIZE, the effective default is
+    # computed dynamically at runtime based on cpu_count; see disaggregation backends.
+    SGLANG_DISAGGREGATION_THREAD_POOL_SIZE = EnvInt(None)
+    SGLANG_DISAGGREGATION_QUEUE_SIZE = EnvInt(4)
+    SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT = EnvInt(300)
+    SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL = EnvFloat(5.0)
+    SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE = EnvInt(2)
+    SGLANG_DISAGGREGATION_WAITING_TIMEOUT = EnvInt(300)
 
     # Scheduler: others:
     SGLANG_EMPTY_CACHE_INTERVAL = EnvFloat(-1)  # in seconds. Set if you observe high memory accumulation over a long serving period.
@@ -199,6 +239,8 @@ class Envs:
     SGLANG_DYNAMIC_CHUNKING_SMOOTH_FACTOR = EnvFloat(0.75)
     SGLANG_SCHEDULER_SKIP_ALL_GATHER = EnvBool(False)
     SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE = EnvBool(False)
+    SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES = EnvInt(30)
+    SGLANG_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK = EnvFloat(None)
     SGLANG_DATA_PARALLEL_BUDGET_INTERVAL = EnvInt(1)
 
     # Test: pd-disaggregation
@@ -208,10 +250,6 @@ class Envs:
     # Model Parallel
     SGLANG_USE_MESSAGE_QUEUE_BROADCASTER = EnvBool(True)
     SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS = EnvBool(False)
-
-    # Constrained Decoding
-    SGLANG_DISABLE_OUTLINES_DISK_CACHE = EnvBool(True)
-    SGLANG_GRAMMAR_TIMEOUT = EnvFloat(300)
 
     # Tool Calling
     SGLANG_FORWARD_UNKNOWN_TOOLS = EnvBool(False)
@@ -227,6 +265,7 @@ class Envs:
     # Mooncake Store
     SGLANG_HICACHE_MOONCAKE_CONFIG_PATH = EnvStr(None)
     MOONCAKE_MASTER = EnvStr(None)
+    MOONCAKE_CLIENT = EnvStr(None)
     MOONCAKE_LOCAL_HOSTNAME = EnvStr("localhost")
     MOONCAKE_TE_META_DATA_SERVER = EnvStr("P2PHANDSHAKE")
     MOONCAKE_GLOBAL_SEGMENT_SIZE = EnvStr("4gb")
@@ -234,6 +273,7 @@ class Envs:
     MOONCAKE_DEVICE = EnvStr("")
     MOONCAKE_MASTER_METRICS_PORT = EnvInt(9003)
     MOONCAKE_CHECK_SERVER = EnvBool(False)
+    MOONCAKE_STANDALONE_STORAGE = EnvBool(False)
 
     # AMD & ROCm
     SGLANG_USE_AITER = EnvBool(False)
@@ -243,6 +283,7 @@ class Envs:
     # NPU
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
     SGLANG_NPU_USE_MULTI_STREAM = EnvBool(False)
+    SGLANG_NPU_USE_MLAPO = EnvBool(False)
 
     # Quantization
     SGLANG_INT4_WEIGHT = EnvBool(False)
@@ -252,6 +293,7 @@ class Envs:
     SGLANG_MOE_NVFP4_DISPATCH = EnvBool(False)
     SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN = EnvBool(False)
     SGLANG_PER_TOKEN_GROUP_QUANT_8BIT_V2 = EnvBool(False)
+    SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE = EnvBool(False)
 
     # Flashinfer
     SGLANG_IS_FLASHINFER_AVAILABLE = EnvBool(True)
@@ -293,6 +335,10 @@ class Envs:
     SGLANG_DEEPEP_BF16_DISPATCH = EnvBool(False)
     SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS = EnvInt(32)
+
+    # NSA Backend
+    SGLANG_NSA_FUSE_TOPK = EnvBool(True)
+    SGLANG_NSA_ENABLE_MTP_PRECOMPUTE_METADATA = EnvBool(True)
 
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)
@@ -345,6 +391,8 @@ class Envs:
     SGLANG_MM_BUFFER_SIZE_MB = EnvInt(0)
     SGLANG_MM_PRECOMPUTE_HASH = EnvBool(False)
     SGLANG_VIT_ENABLE_CUDA_GRAPH = EnvBool(False)
+    SGLANG_MM_SKIP_COMPUTE_HASH = EnvBool(False)
+
 
     # VLM Item CUDA IPC Transport
     SGLANG_USE_CUDA_IPC_TRANSPORT = EnvBool(False)
@@ -387,6 +435,12 @@ class Envs:
     # Metrics
     SGLANG_ENABLE_METRICS_DEVICE_TIMER = EnvBool(False)
     SGLANG_ENABLE_METRICS_DP_ATTENTION = EnvBool(False)
+
+    # Tokenizer
+    SGLANG_PATCH_TOKENIZER = EnvBool(False)  # TODO enable by default
+
+    # TokenizerManager
+    SGLANG_REQUEST_STATE_WAIT_TIMEOUT = EnvInt(4)
 
     # fmt: on
 
@@ -447,6 +501,18 @@ _warn_deprecated_env_to_cli_flag(
 _warn_deprecated_env_to_cli_flag(
     "SGLANG_SUPPORT_CUTLASS_BLOCK_FP8",
     "It will be completely removed in 0.5.7. Please use '--fp8-gemm-backend=cutlass' instead.",
+)
+_warn_deprecated_env_to_cli_flag(
+    "SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE",
+    "Please use '--enable-prefill-delayer' instead.",
+)
+_warn_deprecated_env_to_cli_flag(
+    "SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES",
+    "Please use '--prefill-delayer-max-delay-passes' instead.",
+)
+_warn_deprecated_env_to_cli_flag(
+    "SGLANG_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK",
+    "Please use '--prefill-delayer-token-usage-low-watermark' instead.",
 )
 
 
