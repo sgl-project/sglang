@@ -3286,7 +3286,7 @@ class ServerArgs:
             type=str,
             default=ServerArgs.hf_chat_template_name,
             help="When the HuggingFace tokenizer has multiple chat templates (e.g., 'default', 'tool_use', 'rag'), "
-            "specify which named template to use. If not set, 'default' is used if available, otherwise the first template.",
+            "specify which named template to use. If not set, the first available template is used.",
         )
         parser.add_argument(
             "--completion-template",
