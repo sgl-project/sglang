@@ -52,6 +52,17 @@ impl Default for CacheConfig {
     }
 }
 
+impl From<crate::config::TokenizerCacheConfig> for CacheConfig {
+    fn from(cfg: crate::config::TokenizerCacheConfig) -> Self {
+        Self {
+            enable_l0: cfg.enable_l0,
+            l0_max_entries: cfg.l0_max_entries,
+            enable_l1: cfg.enable_l1,
+            l1_max_memory: cfg.l1_max_memory,
+        }
+    }
+}
+
 /// A caching wrapper around any tokenizer
 pub struct CachedTokenizer {
     /// The underlying tokenizer
