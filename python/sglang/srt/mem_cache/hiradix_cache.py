@@ -253,6 +253,31 @@ class HiRadixCache(RadixCache):
         return len(host_indices)
 
     def write_backup_storage(self, node: TreeNode):
+        # Get parent's last_hash for debug logging
+        parent_last_hash = None
+        if node.parent is not None and node.parent.hash_value is not None:
+            if len(node.parent.key) > 0 and len(node.parent.hash_value) > 0:
+                parent_last_hash = node.parent.hash_value[-1]
+
+        logger.debug(
+            f"[WRITE_BACKUP_STORAGE] node_id={node.id}, "
+            f"key_len={len(node.key)}, "
+            f"hash_value_len={len(node.hash_value) if node.hash_value else 0}, "
+            f"host_value_len={len(node.host_value) if node.host_value is not None else 0}, "
+            f"parent_id={node.parent.id if node.parent else 'None'}, "
+            f"parent_last_hash={parent_last_hash[:16] if parent_last_hash else 'None'}..."
+        )
+
+        # Log token-hash correspondence
+        if node.hash_value and len(node.hash_value) > 0:
+            first_tokens = node.key.token_ids[: min(3, len(node.key.token_ids))]
+            first_hashes = [
+                h[:16] for h in node.hash_value[: min(3, len(node.hash_value))]
+            ]
+            logger.debug(
+                f"[WRITE_BACKUP_STORAGE] first_tokens={first_tokens}, first_hashes={first_hashes}"
+            )
+
         prefix_keys = (
             node.get_prefix_hash_values(node.parent)
             if self.hicache_storage_pass_prefix_keys
@@ -924,6 +949,10 @@ class HiRadixCache(RadixCache):
             # Compute hash_value if storage is enabled
             if self.enable_storage:
                 new_node.hash_value = compute_node_hash_values(new_node, self.page_size)
+                logger.debug(
+                    f"insert: new_node created, node_id={new_node.id}, "
+                    f"key_len={len(key)}, hash_value_len={len(new_node.hash_value)}"
+                )
 
             if self.cache_controller.write_policy != "write_back":
                 self._inc_hit_count(new_node, chunked)

@@ -476,16 +476,41 @@ class MooncakeStore(HiCacheStorage):
         host_indices: torch.Tensor,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
+        # Debug log: record input keys
+        logger.debug(
+            f"[BATCH_GET] input keys_len={len(keys)}, "
+            f"first_key={keys[0][:32] if len(keys) > 0 else 'N/A'}..., "
+            f"host_indices_len={len(host_indices)}, "
+            f"extra_backend_tag={self.extra_backend_tag}"
+        )
+
         # Apply extra_backend_tag prefix if available
         if self.extra_backend_tag is not None:
             prefix = self.extra_backend_tag
             keys = [f"{prefix}_{key}" for key in keys]
 
         key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(keys, host_indices)
+
+        # Debug log: record preprocessed key_strs
+        logger.debug(
+            f"[BATCH_GET] after preprocess: key_strs_len={len(key_strs)}, "
+            f"buffer_ptrs_len={len(buffer_ptrs)}, "
+            f"first_key_str={key_strs[0] if len(key_strs) > 0 else 'N/A'}"
+        )
+
         get_results = self._get_batch_zero_copy_impl(
             key_strs, buffer_ptrs, buffer_sizes
         )
-        return self._batch_postprocess(get_results, is_set_operate=False)
+
+        # Debug log: record get results
+        results = self._batch_postprocess(get_results, is_set_operate=False)
+        success_count = sum(1 for r in results if r)
+        logger.debug(
+            f"[BATCH_GET] results: success={success_count}/{len(results)}, "
+            f"first_5_results={results[:5]}"
+        )
+
+        return results
 
     def batch_set_v1(
         self,
@@ -493,12 +518,26 @@ class MooncakeStore(HiCacheStorage):
         host_indices: torch.Tensor,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
+        # Debug log: record input keys
+        logger.debug(
+            f"[BATCH_SET] input keys_len={len(keys)}, "
+            f"first_key={keys[0][:32] if len(keys) > 0 else 'N/A'}..., "
+            f"extra_backend_tag={self.extra_backend_tag}"
+        )
+
         # Apply extra_backend_tag prefix if available
         if self.extra_backend_tag is not None:
             prefix = self.extra_backend_tag
             keys = [f"{prefix}_{key}" for key in keys]
 
         key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(keys, host_indices)
+
+        # Debug log: record preprocessed key_strs
+        logger.debug(
+            f"[BATCH_SET] after preprocess: key_strs_len={len(key_strs)}, "
+            f"first_key_str={key_strs[0] if len(key_strs) > 0 else 'N/A'}"
+        )
+
         exist_result = self._batch_exist(key_strs)
 
         set_keys = []
@@ -516,12 +555,23 @@ class MooncakeStore(HiCacheStorage):
                 set_results[i] = 0
 
         # Only set non-existing keys to storage
+        logger.debug(
+            f"[BATCH_SET] new_keys_to_write={len(set_keys)}, "
+            f"already_exist={len(key_strs) - len(set_keys)}"
+        )
+
         if len(set_keys) > 0:
             put_results = self._put_batch_zero_copy_impl(
                 set_keys, set_buffer_ptrs, set_buffer_sizes
             )
             for i in range(len(set_indices)):
                 set_results[set_indices[i]] = put_results[i]
+
+            # Debug log: record write results
+            success_count = sum(1 for r in put_results if r == 0)
+            logger.debug(
+                f"[BATCH_SET] write result: success={success_count}/{len(set_keys)}"
+            )
 
         return self._batch_postprocess(set_results, is_set_operate=True)
 
@@ -660,6 +710,26 @@ class MooncakeStore(HiCacheStorage):
             key_multiplier = 2
 
         exist_result = self._batch_exist(query_keys)
+
+        # Debug log: record query results
+        hit_count = 0
+        first_miss_idx = -1
+        for i in range(len(query_keys)):
+            if exist_result[i] != 1:
+                if first_miss_idx == -1:
+                    first_miss_idx = i
+                break
+            hit_count += 1
+
+        logger.debug(
+            f"[BATCH_EXISTS] query_keys_len={len(query_keys)}, "
+            f"hit_count={hit_count}, first_miss_idx={first_miss_idx}"
+        )
+        if len(query_keys) > 0:
+            logger.debug(f"[BATCH_EXISTS] first_query_key={query_keys[0]}")
+        if first_miss_idx >= 0 and first_miss_idx < len(query_keys):
+            logger.debug(f"[BATCH_EXISTS] first_miss_key={query_keys[first_miss_idx]}")
+
         for i in range(len(query_keys)):
             if exist_result[i] != 1:
                 return i // key_multiplier
