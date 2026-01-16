@@ -80,6 +80,7 @@ def maybe_load_fsdp_model(
     output_dtype: torch.dtype | None = None,
     pin_cpu_memory: bool = True,
     strict: bool = True,
+    is_quant: bool = False,
 ) -> torch.nn.Module:
     """
     Load the model with FSDP if is training, else load the model without FSDP.
@@ -142,6 +143,7 @@ def maybe_load_fsdp_model(
         strict=strict,
         cpu_offload=cpu_offload,
         param_names_mapping=param_names_mapping_fn,
+        is_quant=is_quant,
     )
     for n, p in chain(model.named_parameters(), model.named_buffers()):
         if p.is_meta:
@@ -225,6 +227,7 @@ def load_model_from_full_model_state_dict(
     strict: bool = False,
     cpu_offload: bool = False,
     param_names_mapping: Callable[[str], tuple[str, Any, Any]] | None = None,
+    is_quant: bool = False,
 ) -> _IncompatibleKeys:
     """
     Converting full state dict into a sharded state dict
@@ -250,6 +253,7 @@ def load_model_from_full_model_state_dict(
         full_sd_iterator, param_names_mapping
     )  # type: ignore
     for target_param_name, full_tensor in custom_param_sd.items():
+        tensor_dtype = param_dtype
         meta_sharded_param = meta_sd.get(target_param_name)
         if meta_sharded_param is None:
             if strict:
@@ -261,8 +265,11 @@ def load_model_from_full_model_state_dict(
                     f"Parameter '{target_param_name}' from checkpoint not found in model; skipping. This is expected for optional parameters."
                 )
                 continue
+        if is_quant:
+            logger.warning("find quant config use params dtype")
+            tensor_dtype = meta_sharded_param.dtype
         if not hasattr(meta_sharded_param, "device_mesh"):
-            full_tensor = full_tensor.to(device=device, dtype=param_dtype)
+            full_tensor = full_tensor.to(device=device, dtype=tensor_dtype)
             actual_param = param_dict.get(target_param_name)
             weight_loader = (
                 getattr(actual_param, "weight_loader", None)
@@ -271,7 +278,7 @@ def load_model_from_full_model_state_dict(
             )
             if weight_loader is not None:
                 sharded_tensor = torch.empty_like(
-                    meta_sharded_param, device=device, dtype=param_dtype
+                    meta_sharded_param, device=device, dtype=tensor_dtype
                 )
                 temp_param = nn.Parameter(sharded_tensor)
                 for attr in ["output_dim", "input_dim", "is_sharded_weight"]:
@@ -282,7 +289,7 @@ def load_model_from_full_model_state_dict(
             else:
                 sharded_tensor = full_tensor
         else:
-            full_tensor = full_tensor.to(device=device, dtype=param_dtype)
+            full_tensor = full_tensor.to(device=device, dtype=tensor_dtype)
             sharded_tensor = distribute_tensor(
                 full_tensor,
                 meta_sharded_param.device_mesh,

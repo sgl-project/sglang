@@ -675,19 +675,16 @@ class TransformerLoader(ComponentLoader):
             )
 
         server_args.model_paths["transformer"] = component_model_path
-        default_type_key = server_args.pipeline_config.dit_precision
 
         # Config from Diffusers supersedes sgl_diffusion's model config
         dit_config = server_args.pipeline_config.dit_config
         dit_config.update_model_arch(config)
+        is_quant = False
         if hasattr(dit_config, "update_quant_config"):
             dit_config.update_quant_config()
             quant_config = getattr(dit_config, "quant_config", None)
-            if quant_config is not None and quant_config.get_name() is not None:
-                logger.warning(
-                    f"find quant config, set dit_precision to {quant_config.get_name()}"
-                )
-                default_type_key = quant_config.get_name()
+            if quant_config is not None:
+                is_quant = True
 
         model_cls, _ = ModelRegistry.resolve_model_cls(cls_name)
 
@@ -717,7 +714,7 @@ class TransformerLoader(ComponentLoader):
                 ), "Custom initialization weights must be a safetensors file"
                 safetensors_list = [custom_weights_path]
 
-        default_dtype = PRECISION_TO_TYPE[default_type_key]
+        default_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.dit_precision]
 
         logger.info(
             "Loading %s from %s safetensors files, default_dtype: %s",
@@ -744,6 +741,7 @@ class TransformerLoader(ComponentLoader):
             reduce_dtype=torch.float32,
             output_dtype=None,
             strict=False,
+            is_quant=is_quant,
         )
 
         total_params = sum(p.numel() for p in model.parameters())
