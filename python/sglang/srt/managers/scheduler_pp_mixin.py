@@ -604,6 +604,26 @@ class SchedulerPPMixin:
 
                 pp_proxy = PPProxyTensors(proxy_tensors)
 
+                # warmup
+                if i == 0:
+                    batch.prepare_for_extend()
+                    model_worker_batch = batch.get_model_worker_batch()
+                    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+                    forward_batch = ForwardBatch.init_new(
+                        model_worker_batch, self.tp_worker.model_runner
+                    )
+                    _ = self.tp_worker.model_runner.forward(
+                        forward_batch=forward_batch, pp_proxy_tensors=pp_proxy
+                    )
+                    # Release KV cache
+                    if req.req_pool_idx is not None:
+                        kv_indices = self.req_to_token_pool.req_to_token[
+                            req.req_pool_idx, : len(req.fill_ids)
+                        ]
+                        self.token_to_kv_pool_allocator.free(kv_indices)
+                        self.req_to_token_pool.free(req.req_pool_idx)
+
                 # Measure latency with CUDA synchronization for accurate timing
                 # Synchronize before starting timing to ensure clean measurement
                 if torch.cuda.is_available():
@@ -1281,7 +1301,8 @@ class ChunkSizePredictor:
                 + self.constant_coeff_c
             )
 
-        self.target_latency = f(float(base_chunk_size)) - f(0.0)
+        # self.target_latency = f(float(base_chunk_size)) - f(0.0)
+        self.target_latency = f(float(base_chunk_size))
 
         if self.target_latency <= 0:
             raise ValueError(
@@ -1329,6 +1350,11 @@ class ChunkSizePredictor:
         A = self.quadratic_coeff_a
         B = 2 * self.quadratic_coeff_a * history_len + self.linear_coeff_b
         C = -self.target_latency
+        # A = self.quadratic_coeff_a
+        # B = self.linear_coeff_b
+        # C = -self.target_latency + self.constant_coeff_c
+
+        logger.warning(f"quadratic_coeff_a: {self.quadratic_coeff_a}, linear_coeff_b: {self.linear_coeff_b}, constant_coeff_c: {self.constant_coeff_c}, target_latency: {self.target_latency}, f(L): {self.quadratic_coeff_a * history_len * history_len + self.linear_coeff_b * history_len + self.constant_coeff_c}")
 
         discriminant = B * B - 4 * A * C
 
