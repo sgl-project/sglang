@@ -1553,43 +1553,42 @@
 
             if (Array.isArray(attentionTokens) && attentionTokens.length > 0) {
                 const firstItem = attentionTokens[0];
-                const isFingerPrintMode = firstItem.fingerprint !== undefined;
+                const hasFingerprints = firstItem.fingerprint !== undefined;
+                const hasTokenPositions = firstItem.token_positions !== undefined;
 
-                if (isFingerPrintMode) {
-                    // FINGERPRINT MODE: Store fingerprints and manifold classifications
-                    console.log('Detected fingerprint mode');
-                    attentionTokens.forEach((attnInfo, genIdx) => {
-                        const srcIdx = promptTokenCount + genIdx;
+                console.log(`Attention data: hasFingerprints=${hasFingerprints}, hasTokenPositions=${hasTokenPositions}`);
+
+                // Process each attention token - can have BOTH fingerprints AND edges
+                attentionTokens.forEach((attnInfo, genIdx) => {
+                    const srcIdx = promptTokenCount + genIdx;
+
+                    // Store fingerprints if available
+                    if (attnInfo.fingerprint) {
                         state.fingerprints.push({
                             idx: srcIdx,
                             fingerprint: attnInfo.fingerprint,
-                            manifold: attnInfo.manifold || 'unknown',
-                            step: attnInfo.step || genIdx + 1,
+                            manifold: attnInfo.manifold_zone || attnInfo.manifold || 'unknown',
+                            step: attnInfo.decode_step || attnInfo.step || genIdx + 1,
                             think_phase: attnInfo.think_phase || 'output'
                         });
 
                         // Assign manifold color to the token
                         if (srcIdx < tokens.length) {
-                            tokens[srcIdx].manifold = attnInfo.manifold;
+                            tokens[srcIdx].manifold = attnInfo.manifold_zone || attnInfo.manifold;
                             tokens[srcIdx].fingerprint = attnInfo.fingerprint;
                         }
-                    });
-                } else {
-                    // RAW TOKEN MODE: Parse into edges
-                    console.log('Detected raw token mode');
-                    attentionTokens.forEach((attnInfo, genIdx) => {
-                        const srcIdx = promptTokenCount + genIdx;
+                    }
 
-                        if (attnInfo.token_positions && attnInfo.attention_scores) {
-                            attnInfo.token_positions.forEach((dstIdx, i) => {
-                                const weight = attnInfo.attention_scores[i];
-                                if (weight > 0 && dstIdx < tokens.length) {
-                                    addEdge(srcIdx, dstIdx, weight, attnInfo.layer_id);
-                                }
-                            });
-                        }
-                    });
-                }
+                    // Parse edges from token_positions (ALWAYS, not just when no fingerprints)
+                    if (attnInfo.token_positions && attnInfo.attention_scores) {
+                        attnInfo.token_positions.forEach((dstIdx, i) => {
+                            const weight = attnInfo.attention_scores[i];
+                            if (weight > 0 && dstIdx < tokens.length) {
+                                addEdge(srcIdx, dstIdx, weight, attnInfo.layer_id || 0);
+                            }
+                        });
+                    }
+                });
             }
 
             console.log(`Parsed ${state.tokens.length} tokens, ${state.edges.length} edges, ${state.fingerprints.length} fingerprints`);
