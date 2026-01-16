@@ -156,7 +156,7 @@ from sglang.srt.managers.session_controller import Session
 from sglang.srt.managers.utils import GenerationBatchResult, validate_input_length
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import release_kv_cache
-from sglang.srt.mem_cache.marconi_config import MarconiConfig
+from sglang.srt.mem_cache.marconi_config import MarconiConfig, MarconiModelStats
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
@@ -190,6 +190,7 @@ from sglang.srt.utils import (
     set_random_seed,
     suppress_other_loggers,
 )
+from sglang.srt.utils.common import is_float4_e2m1fn_x2
 from sglang.srt.utils.hf_transformers_utils import (
     get_processor,
     get_tokenizer,
@@ -766,6 +767,67 @@ class Scheduler(
                     "Marconi is enabled but the model is not using Mamba radix cache."
                 )
             else:
+                marconi_model_stats = None
+                cache_params = None
+                hf_config = self.model_config.hf_config
+                if hasattr(hf_config, "mamba2_cache_params"):
+                    try:
+                        cache_params = hf_config.mamba2_cache_params
+                    except Exception:
+                        cache_params = None
+                if cache_params is not None:
+                    num_mamba_layers = len(cache_params.layers)
+                    mamba_state_size_bytes = int(
+                        cache_params.mamba_cache_per_req // max(num_mamba_layers, 1)
+                    )
+                    shape = cache_params.shape
+                    ssm_state_size = getattr(shape, "state_size", None) or getattr(
+                        shape, "head_dim", None
+                    )
+                    model_dim = (
+                        getattr(hf_config, "hidden_size", None)
+                        or getattr(hf_config, "d_model", None)
+                        or getattr(hf_config, "n_embd", None)
+                    )
+                    if (
+                        model_dim is None
+                        and hasattr(shape, "num_heads")
+                        and hasattr(shape, "head_dim")
+                    ):
+                        model_dim = shape.num_heads * shape.head_dim
+                    num_hidden_layers = getattr(hf_config, "num_hidden_layers", None)
+                    if hasattr(hf_config, "full_attention_layer_ids"):
+                        num_attn_layers = len(list(hf_config.full_attention_layer_ids))
+                    elif num_hidden_layers is not None:
+                        num_attn_layers = max(0, num_hidden_layers - num_mamba_layers)
+                    else:
+                        num_attn_layers = 0
+                    num_mlp_layers = num_hidden_layers or (
+                        num_mamba_layers + num_attn_layers
+                    )
+                    kv_cache_dtype = getattr(
+                        self.tp_worker.model_runner, "kv_cache_dtype", None
+                    )
+                    if kv_cache_dtype is not None:
+                        kv_cache_dtype_size = torch._utils._element_size(kv_cache_dtype)
+                        if is_float4_e2m1fn_x2(kv_cache_dtype):
+                            kv_cache_dtype_size = max(1, kv_cache_dtype_size // 2)
+                    else:
+                        kv_cache_dtype_size = 2
+                    if model_dim is not None and ssm_state_size is not None:
+                        marconi_model_stats = MarconiModelStats(
+                            model_dim=model_dim,
+                            ssm_state_size=ssm_state_size,
+                            num_mamba_layers=num_mamba_layers,
+                            num_attn_layers=num_attn_layers,
+                            num_mlp_layers=num_mlp_layers,
+                            kv_cache_dtype_size=kv_cache_dtype_size,
+                            mamba_state_size_bytes=mamba_state_size_bytes,
+                        )
+                if marconi_model_stats is None:
+                    logger.warning(
+                        "Marconi is enabled but model stats could not be derived."
+                    )
                 marconi_config = MarconiConfig(
                     enable=True,
                     eviction_policy=server_args.marconi_eviction_policy,
@@ -773,6 +835,7 @@ class Scheduler(
                     bootstrap_window_size=server_args.marconi_bootstrap_window_size,
                     bootstrap_multiplier=server_args.marconi_bootstrap_multiplier,
                     tuning_interval=server_args.marconi_tuning_interval,
+                    model_stats=marconi_model_stats,
                 )
 
         params = CacheInitParams(

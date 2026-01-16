@@ -28,6 +28,13 @@ from numpy import float64
 
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
+from sglang.srt.mem_cache.marconi_utils import (
+    get_attn_flops,
+    get_kv_cache_size_bytes,
+    get_mamba1_flops,
+    get_mlp_flops,
+    normalize,
+)
 from sglang.srt.mem_cache.radix_cache import (
     RadixKey,
     _key_match_page_size1,
@@ -53,6 +60,7 @@ class TreeNode:
         self.key: RadixKey = None
         self.value: Optional[torch.Tensor] = None
         self.mamba_value: Optional[torch.Tensor] = None
+        self.prefix_len = 0
         # invariant: for any node, if mamba_lock_ref is locked, full_lock_ref must be locked;
         # if full_lock_ref is locked, mamba_lock_ref doesn't need to be locked. So,
         # full_lock_ref is always >= mamba_lock_ref.
@@ -324,9 +332,17 @@ class MambaRadixCache(BasePrefixCache):
         self.req_to_token_pool = params.req_to_token_pool
         self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator
         self.marconi_config = params.marconi_config
+        self.marconi_model_stats = None
         self.marconi_enabled = bool(
             self.marconi_config is not None and self.marconi_config.enable
         )
+        if self.marconi_enabled:
+            self.marconi_model_stats = self.marconi_config.model_stats
+            if self.marconi_model_stats is None:
+                logger.warning(
+                    "Marconi is enabled but model stats are missing. Disabling Marconi."
+                )
+                self.marconi_enabled = False
         if self.marconi_enabled:
             self.marconi_eff_weight = self.marconi_config.eff_weight
             self.marconi_bootstrap_window_size = (
@@ -359,6 +375,7 @@ class MambaRadixCache(BasePrefixCache):
         self.root_node = TreeNode()
         self.root_node.key = []
         self.root_node.value = []
+        self.root_node.prefix_len = 0
         self.root_node.full_lock_ref = 1
         self.root_node.mamba_lock_ref = 1
         self.full_evictable_size_ = 0
@@ -598,6 +615,122 @@ class MambaRadixCache(BasePrefixCache):
     def total_size(self) -> Tuple[int, int]:
         return self._total_size_helper()
 
+    def _marconi_prepare_eviction(self) -> None:
+        if self.marconi_num_reqs_before_eviction is None:
+            self.marconi_num_reqs_before_eviction = len(self.marconi_request_history)
+            if self.marconi_bootstrap_window_size is None:
+                self.marconi_bootstrap_window_size = (
+                    self.marconi_bootstrap_multiplier
+                    * self.marconi_num_reqs_before_eviction
+                )
+
+    def _marconi_collect_leaf_nodes(self) -> List[TreeNode]:
+        nodes = []
+        for node in self._collect_leaves():
+            if node == self.root_node:
+                continue
+            if node.full_lock_ref == 0 and node.mamba_lock_ref == 0:
+                nodes.append(node)
+        return nodes
+
+    def _marconi_collect_leaf_and_single_child_nodes(self) -> List[TreeNode]:
+        nodes = []
+        stack = [self.root_node]
+        while stack:
+            node = stack.pop()
+            if node != self.root_node and len(node.children) <= 1:
+                if node.mamba_value is not None and node.mamba_lock_ref == 0:
+                    if len(node.children) == 0 and node.full_lock_ref > 0:
+                        pass
+                    else:
+                        nodes.append(node)
+            stack.extend(node.children.values())
+        return nodes
+
+    def _marconi_compute_utilities(self, nodes: List[TreeNode]) -> List[float]:
+        stats = self.marconi_model_stats
+        if stats is None:
+            return []
+        current_ts = get_last_access_time()
+        timestamps = [node.last_access_time for node in nodes]
+        recency_scores = []
+        for ts in timestamps:
+            delta = current_ts - ts
+            recency_scores.append(1.0 / delta if delta > 0 else 0.0)
+        recency_scores = normalize(recency_scores)
+
+        efficiency_scores = []
+        for node in nodes:
+            seqlen_total = node.prefix_len
+            seqlen_child = len(node.key)
+            seqlen_parent = max(seqlen_total - seqlen_child, 0)
+
+            flops_savings_mamba = stats.num_mamba_layers * get_mamba1_flops(
+                seqlen_child, stats.model_dim, stats.ssm_state_size
+            )
+            flops_savings_attn = stats.num_attn_layers * (
+                get_attn_flops(seqlen_total, stats.model_dim)
+                - get_attn_flops(seqlen_parent, stats.model_dim)
+            )
+            flops_savings_mlp = stats.num_mlp_layers * (
+                get_mlp_flops(seqlen_total, stats.model_dim)
+                - get_mlp_flops(seqlen_parent, stats.model_dim)
+            )
+            total_flops_savings = (
+                flops_savings_mamba + flops_savings_attn + flops_savings_mlp
+            )
+            total_memory = stats.num_mamba_layers * stats.mamba_state_size_bytes
+            total_memory += stats.num_attn_layers * get_kv_cache_size_bytes(
+                seqlen_total, stats.model_dim, stats.kv_cache_dtype_size
+            )
+            if total_memory > 0:
+                efficiency_scores.append(total_flops_savings / total_memory)
+            else:
+                efficiency_scores.append(0.0)
+        efficiency_scores = normalize(efficiency_scores)
+
+        return [
+            self.marconi_eff_weight * eff + recency
+            for eff, recency in zip(efficiency_scores, recency_scores)
+        ]
+
+    def _marconi_select_node(self, nodes: List[TreeNode]) -> Optional[TreeNode]:
+        utilities = self._marconi_compute_utilities(nodes)
+        if not utilities:
+            return None
+        min_idx = utilities.index(min(utilities))
+        return nodes[min_idx]
+
+    def _marconi_evict_full(self, full_num_tokens: int) -> None:
+        full_num_evicted = 0
+        while full_num_evicted < full_num_tokens:
+            candidates = self._marconi_collect_leaf_nodes()
+            if not candidates:
+                break
+            node = self._marconi_select_node(candidates)
+            if node is None:
+                break
+            full_evicted_delta, _, _, _ = self._evict_leaf_node(node, False)
+            full_num_evicted += full_evicted_delta
+
+    def _marconi_evict_mamba(self, mamba_num: int) -> None:
+        mamba_num_evicted = 0
+        while mamba_num_evicted < mamba_num:
+            candidates = self._marconi_collect_leaf_and_single_child_nodes()
+            if not candidates:
+                break
+            node = self._marconi_select_node(candidates)
+            if node is None:
+                break
+            if len(node.children) == 0:
+                _, mamba_evicted_delta, _, _ = self._evict_leaf_node(node, True)
+                mamba_num_evicted += mamba_evicted_delta
+            else:
+                self.req_to_token_pool.mamba_pool.free(node.mamba_value)
+                mamba_num_evicted += len(node.mamba_value)
+                self.mamba_lru_list.remove_node(node)
+                self._tombstone_internal_node(node)
+
     def _evict_leaf_node(
         self, x: TreeNode, is_evict_mamba: bool
     ) -> Tuple[int, int, TreeNode, TreeNode]:
@@ -631,6 +764,10 @@ class MambaRadixCache(BasePrefixCache):
     def evict_mamba(self, mamba_num: int) -> None:
         if self.disable or mamba_num <= 0:
             return
+        if self.marconi_enabled:
+            self._marconi_prepare_eviction()
+            self._marconi_evict_mamba(mamba_num)
+            return
         # get the least recently used node that is not locked, doesn't have to be a leaf
         x = self.mamba_lru_list.get_lru_no_lock()
         mamba_num_evicted = 0
@@ -662,6 +799,10 @@ class MambaRadixCache(BasePrefixCache):
 
     def evict(self, full_num_tokens: int) -> None:
         if self.disable or full_num_tokens <= 0:
+            return
+        if self.marconi_enabled:
+            self._marconi_prepare_eviction()
+            self._marconi_evict_full(full_num_tokens)
             return
 
         full_num_evicted = 0
@@ -873,6 +1014,7 @@ class MambaRadixCache(BasePrefixCache):
         new_node.mamba_lock_ref = 0
         new_node.key = child.key[:split_len]
         new_node.value = child.value[:split_len]
+        new_node.prefix_len = new_node.parent.prefix_len + len(new_node.value)
 
         # child time should be later than parent's time for mamba tombstone
         child.last_access_time = get_last_access_time()
@@ -883,6 +1025,7 @@ class MambaRadixCache(BasePrefixCache):
         child.parent = new_node
         child.key = child.key[split_len:]
         child.value = child.value[split_len:]
+        child.prefix_len = new_node.prefix_len + len(child.value)
         new_node.parent.children[self.get_child_key_fn(key)] = new_node
 
         # insert the new node and child into the lru lists, insert
@@ -995,6 +1138,7 @@ class MambaRadixCache(BasePrefixCache):
             new_node.key = key
             new_node.value = value
             new_node.mamba_value = mamba_value
+            new_node.prefix_len = node.prefix_len + len(value)
             self.full_lru_list.insert_mru(new_node)
             self.mamba_lru_list.insert_mru(new_node)
             node.children[child_key] = new_node
