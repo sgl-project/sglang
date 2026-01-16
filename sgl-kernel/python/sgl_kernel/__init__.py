@@ -32,6 +32,7 @@ from sgl_kernel.elementwise import (
     rmsnorm,
     rotary_embedding,
     silu_and_mul,
+    turbomind_rms_norm,
     timestep_embedding,
 )
 from sgl_kernel.expert_specialization import (
