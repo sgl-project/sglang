@@ -2,7 +2,7 @@
 
 import logging
 from enum import Enum
-from typing import Callable, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 
@@ -162,7 +162,6 @@ class FusedMoE(torch.nn.Module):
         with_bias=False,
         routing_method_type: Optional[RoutingMethodType] = None,
         is_gated: bool = True,
-        custom_act_fn: Optional[Callable] = None,
     ):
         super().__init__()
         if params_dtype is None:
@@ -224,7 +223,6 @@ class FusedMoE(torch.nn.Module):
             gemm1_alpha=gemm1_alpha,
             gemm1_clamp_limit=gemm1_clamp_limit,
             is_gated=is_gated,
-            custom_act_fn=custom_act_fn,
         )
 
         self.quant_method: Optional[FusedMoEMethodBase] = None

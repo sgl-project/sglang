@@ -79,9 +79,6 @@ _is_npu = is_npu()
 if _is_cuda:
     from sgl_kernel import FusedSetKVBufferArg  # noqa: F401
 
-if _is_npu:
-    from sgl_kernel_npu.activation.swiglu_oai import swiglu_oai
-
 
 class GptOssConfig(PretrainedConfig):
     model_type = "gpt_oss"
@@ -131,13 +128,7 @@ class GptOssSparseMoeBlock(nn.Module):
                 "use_weight_loader_fused": quant_config_name
                 != "mxfp4"
             }
-        custom_act_fn = None
-        if _is_npu:
-            if self.layer_id == 0:
-                logger.warning(
-                    "Warning: GPT-OSS use custom activate function on FusedMoE when using ascend backend."
-                )
-            custom_act_fn = swiglu_oai
+
         self.experts = experts_type(
             num_experts=config.num_local_experts
             + get_global_server_args().ep_num_redundant_experts,
@@ -151,7 +142,6 @@ class GptOssSparseMoeBlock(nn.Module):
             gemm1_clamp_limit=self.gemm1_clamp_limit,
             with_bias=True,
             prefix=add_prefix("experts", prefix),
-            custom_act_fn=custom_act_fn,
             **extra_kwargs,
         )
 
@@ -313,7 +303,7 @@ class GptOssAttention(nn.Module):
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         extra_args = {}
-        if _is_cuda:
+        if not _is_npu:
             extra_args = {
                 "fused_set_kv_buffer_arg": (
                     create_fused_set_kv_buffer_arg(
@@ -496,6 +486,9 @@ class GptOssModel(nn.Module):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.pp_group = get_pp_group()
+
+        if is_npu:
+            config.hidden_act = "npu_swiglu_oai"
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
