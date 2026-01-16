@@ -86,6 +86,7 @@ from sglang.srt.layers.attention.attention_registry import (
     ATTENTION_BACKENDS,
     attn_backend_wrapper,
 )
+from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
@@ -334,6 +335,7 @@ class ModelRunner:
         self.forward_pass_id = 0
         self.init_new_workspace = False
         self.draft_model_idx = draft_model_idx
+        self.enable_spec_overlap_reflow = envs.SGLANG_SPEC_ENABLE_OVERLAP_REFLOW.get()
 
         self.remote_instance_transfer_engine = None
         self.remote_instance_transfer_engine_session_id = ""
@@ -2904,15 +2906,16 @@ class ModelRunner:
             forward_batch.prepare_attn_tp_scatter_input(self)
 
         # Normalize num_token_non_padded to be local to this attention TP rank if needed.
-        # if (
-        #     forward_batch.num_token_non_padded is not None
-        #     and forward_batch.global_num_tokens_gpu is not None
-        #     and require_gathered_buffer(self.server_args)
-        #     and not is_nsa_enable_prefill_cp()
-        # ):
-        #     forward_batch.adjust_num_token_non_padded_for_attn_tp(
-        #         server_args=self.server_args,
-        #     )
+        if (
+            forward_batch.num_token_non_padded is not None
+            and forward_batch.global_num_tokens_gpu is not None
+            and require_gathered_buffer(self.server_args)
+            and not is_nsa_enable_prefill_cp()
+            and not self.enable_spec_overlap_reflow
+        ):
+            forward_batch.adjust_num_token_non_padded_for_attn_tp(
+                server_args=self.server_args,
+            )
 
         if forward_batch.forward_mode.is_decode():
             ret = self.forward_decode(

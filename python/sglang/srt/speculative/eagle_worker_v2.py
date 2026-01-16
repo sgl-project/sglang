@@ -1,6 +1,5 @@
 import contextlib
 import logging
-import os
 import time
 from typing import List, Optional, Tuple
 
@@ -105,8 +104,7 @@ class EagleDraftWorker(BaseDraftWorker):
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
-        # TODO(xjwei): too ugly!!!
-        self.enable_spec_overlap_reflow = os.environ.get("ENABLE_SPECULATIVE_OVERLAP_REFLOW", "0") == "1"
+        self.enable_spec_overlap_reflow = envs.SGLANG_SPEC_ENABLE_OVERLAP_REFLOW.get()
 
         # Set constant
         EagleDraftInput.ALLOC_LEN_PER_DECODE = max(
@@ -381,9 +379,11 @@ class EagleDraftWorker(BaseDraftWorker):
             else ForwardMode.DECODE
         )
         model_worker_batch.input_ids = batch_result.next_draft_input.topk_index
-        # TODO(xjwei): 为社么这个地方注释掉没有影响精度
-        # model_worker_batch.seq_lens = batch_result.next_draft_input.new_seq_lens
-        # model_worker_batch.seq_lens_cpu = model_worker_batch.seq_lens.cpu()
+        # TODO(xjwei): These two will break the stream, but the real question now is: how much do they impact accuracy?
+        #  (Previously, they didn't seem to make a noticeable difference).
+        if not self.enable_spec_overlap_reflow:
+            model_worker_batch.seq_lens = batch_result.next_draft_input.new_seq_lens
+            model_worker_batch.seq_lens_cpu = model_worker_batch.seq_lens.cpu()
 
         draft_input: EagleDraftInput = model_worker_batch.spec_info
         forward_batch, can_cuda_graph = draft_input.prepare_for_v2_draft(
