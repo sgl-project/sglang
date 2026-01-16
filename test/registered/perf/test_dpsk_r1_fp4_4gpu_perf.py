@@ -1,5 +1,6 @@
 import unittest
 
+from sglang.srt.environ import envs
 from sglang.test.accuracy_test_runner import AccuracyTestParams
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.performance_test_runner import PerformanceTestParams
@@ -58,16 +59,17 @@ class TestDeepseekR1FP4Unified(unittest.TestCase):
             ),
         ]
 
-        run_combined_tests(
-            models=variants,
-            test_name="DeepSeek-R1-0528-NVFP4-v2 Unified",
-            accuracy_params=AccuracyTestParams(
-                dataset="gsm8k", baseline_accuracy=0.935
-            ),
-            performance_params=PerformanceTestParams(
-                profile_dir="performance_profiles_deepseek_r1_fp4",
-            ),
-        )
+        with envs.SGLANG_ENABLE_SPEC_V2.override(True):
+            run_combined_tests(
+                models=variants,
+                test_name="DeepSeek-R1-0528-NVFP4-v2 Unified",
+                accuracy_params=AccuracyTestParams(
+                    dataset="gsm8k", baseline_accuracy=0.935
+                ),
+                performance_params=PerformanceTestParams(
+                    profile_dir="performance_profiles_deepseek_r1_fp4",
+                ),
+            )
 
 
 if __name__ == "__main__":
