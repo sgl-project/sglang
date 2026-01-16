@@ -84,7 +84,7 @@ class CommonKVManager(BaseKVManager):
         self.request_status: Dict[int, KVPoll] = {}
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            self._register_to_bootstrap()
+            self.register_to_bootstrap()
             self.transfer_infos = {}
             self.decode_kv_args_table = {}
             self.pp_group = get_pp_group()
@@ -101,7 +101,7 @@ class CommonKVManager(BaseKVManager):
                 f"Unsupported DisaggregationMode: {self.disaggregation_mode}"
             )
 
-    def _register_to_bootstrap(self):
+    def register_to_bootstrap(self):
         """Register KVSender to bootstrap server via HTTP POST."""
         if self.dist_init_addr:
             # Multi-node case: bootstrap server's host is dist_init_addr
@@ -148,7 +148,7 @@ class CommonKVManager(BaseKVManager):
                 f"Prefill instance failed to register to bootstrap server: {e}"
             )
 
-    def _register_prefill_dp_rank(self, bootstrap_room: int, bootstrap_addr: str):
+    def register_prefill_dp_rank(self, bootstrap_room: int, bootstrap_addr: str):
         """Register request's prefill dp rank to bootstrap server via HTTP POST."""
 
         url = f"http://{bootstrap_addr}/route"
@@ -237,7 +237,7 @@ class CommonKVSender(BaseKVSender):
         # TODO: do not register prefill dp rank if prefill server's load balance method is 'follow_bootstrap_room'
         # If prefill server's load balance method is not 'follow_bootstrap_room', register prefill dp rank.
         if self.kv_mgr.server_args.dp_size > 1:
-            self.kv_mgr._register_prefill_dp_rank(
+            self.kv_mgr.register_prefill_dp_rank(
                 self.bootstrap_room, self.bootstrap_server_url
             )
 
