@@ -235,6 +235,41 @@ fn resolve_and_log_chat_template(
     final_chat_template
 }
 
+/// Helper function to check if model name should use Tiktoken and try to create it
+///
+/// Returns:
+/// - Some(Ok(tokenizer)) if Tiktoken should be used and succeeds
+/// - Some(Err(e)) if Tiktoken should be used but fails
+/// - None if Tiktoken should not be used (model doesn't match patterns)
+fn try_tiktoken_tokenizer(model_name: &str) -> Option<Result<Arc<dyn traits::Tokenizer>>> {
+    // Only match specific OpenAI model patterns to avoid catching HuggingFace models like "openai/gpt-oss-20b"
+    let is_tiktoken_model = model_name.contains("gpt-4")
+        || model_name.contains("gpt-3.5")
+        || model_name.contains("gpt-3")
+        || model_name.contains("turbo")
+        || model_name.contains("davinci")
+        || model_name.contains("curie")
+        || model_name.contains("babbage")
+        || model_name.contains("ada")
+        || model_name.contains("codex");
+
+    if !is_tiktoken_model {
+        return None;
+    }
+
+    // Try tiktoken
+    match TiktokenTokenizer::from_model_name(model_name) {
+        Ok(tokenizer) => Some(Ok(Arc::new(tokenizer))),
+        Err(e) => {
+            debug!(
+                "Tiktoken failed for '{}': {}, falling back to HuggingFace",
+                model_name, e
+            );
+            Some(Err(e))
+        }
+    }
+}
+
 /// Factory function to create tokenizer from a model name or path (async version)
 pub async fn create_tokenizer_async(
     model_name_or_path: &str,
@@ -254,27 +289,11 @@ pub async fn create_tokenizer_async_with_chat_template(
     }
 
     // Check if it's a GPT model name that should use Tiktoken
-    // Only match specific OpenAI model patterns to avoid catching HuggingFace models like "openai/gpt-oss-20b"
-    if model_name_or_path.contains("gpt-4")
-        || model_name_or_path.contains("gpt-3.5")
-        || model_name_or_path.contains("gpt-3")
-        || model_name_or_path.contains("turbo")
-        || model_name_or_path.contains("davinci")
-        || model_name_or_path.contains("curie")
-        || model_name_or_path.contains("babbage")
-        || model_name_or_path.contains("ada")
-        || model_name_or_path.contains("codex")
-    {
-        // Try tiktoken first, but fall back to HuggingFace if it fails
-        match TiktokenTokenizer::from_model_name(model_name_or_path) {
-            Ok(tokenizer) => return Ok(Arc::new(tokenizer)),
-            Err(e) => {
-                debug!(
-                    "Tiktoken failed for '{}': {}, falling back to HuggingFace",
-                    model_name_or_path, e
-                );
-            }
+    if let Some(result) = try_tiktoken_tokenizer(model_name_or_path) {
+        if let Ok(tokenizer) = result {
+            return Ok(tokenizer);
         }
+        // If tiktoken failed, continue to HuggingFace download logic below
     }
 
     // Try to download tokenizer files from HuggingFace
@@ -355,14 +374,11 @@ pub fn create_tokenizer_with_chat_template_blocking(
     }
 
     // Check if it's a GPT model name that should use Tiktoken
-    if model_name_or_path.contains("gpt-")
-        || model_name_or_path.contains("davinci")
-        || model_name_or_path.contains("curie")
-        || model_name_or_path.contains("babbage")
-        || model_name_or_path.contains("ada")
-    {
-        let tokenizer = TiktokenTokenizer::from_model_name(model_name_or_path)?;
-        return Ok(Arc::new(tokenizer));
+    if let Some(result) = try_tiktoken_tokenizer(model_name_or_path) {
+        if let Ok(tokenizer) = result {
+            return Ok(tokenizer);
+        }
+        // If tiktoken failed, continue to HuggingFace download logic below
     }
 
     // Only use tokio for HuggingFace downloads
