@@ -1658,6 +1658,8 @@ class Scheduler(
                 direction * recv_req.priority < direction * candidate_req.priority
             )
             if abort_existing_req:
+                if self.enable_hierarchical_cache:
+                    self.tree_cache.terminate_prefetch(candidate_req.rid)
                 self.waiting_queue.pop(idx)
                 req_to_abort = candidate_req
                 message = "The request is aborted by a higher priority request."
@@ -1674,6 +1676,33 @@ class Scheduler(
             req_to_abort,
         )
         return req_to_abort.rid == recv_req.rid
+
+    def _abort_on_queued_timeout(self):
+        if (timeout_ms := envs.SGLANG_QUEUED_TIMEOUT_MS.get()) <= 0:
+            return
+
+        deleted_reqs = set()
+        deadline = time.perf_counter() - (timeout_ms / 1000.0)
+        for req in self.waiting_queue:
+            entry_time = req.time_stats.wait_queue_entry_time
+            if 0 < entry_time < deadline:
+                self.send_to_tokenizer.send_output(
+                    AbortReq(
+                        finished_reason={
+                            "type": "abort",
+                            "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
+                            "message": "Request queue timeout reached.",
+                        },
+                        rid=req.rid,
+                    ),
+                    req,
+                )
+                deleted_reqs.add(req)
+
+        if deleted_reqs:
+            self.waiting_queue = [
+                req for req in self.waiting_queue if req not in deleted_reqs
+            ]
 
     def handle_embedding_request(
         self,
@@ -1743,6 +1772,7 @@ class Scheduler(
             self.handle_embedding_request(tokenized_req)
 
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
+        self._abort_on_queued_timeout()
         if self.dllm_config is not None:
             if self.chunked_req is not None and self.chunked_req.finished():
                 self.chunked_req = None

@@ -93,7 +93,7 @@ diffusion = [
   "moviepy>=2.0.0",
   "opencv-python-headless==4.10.0.84",
   "remote-pdb",
-  "st_attn ==0.0.7",
+  "st_attn==0.0.7",
   "vsa==0.0.4",
   "runai_model_streamer",
   "cache-dit==1.1.8"

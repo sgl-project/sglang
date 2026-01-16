@@ -1892,7 +1892,7 @@ def launch_server(
 
     try:
         # Update logging configs
-        set_uvicorn_logging_configs()
+        set_uvicorn_logging_configs(server_args)
 
         # Listen for HTTP requests
         if server_args.tokenizer_worker_num == 1:
