@@ -54,7 +54,7 @@ def rebalance_experts(
             num_groups=num_groups,
             num_nodes=num_nodes,
             num_gpus=num_physical_experts // num_local_physical_experts,
-            enable_hierarchical=True,
+            enable_hierarchical=False,
             active_ranks=(
                 ElasticEPStateManager.instance().active_ranks
                 if ElasticEPStateManager.instance() is not None

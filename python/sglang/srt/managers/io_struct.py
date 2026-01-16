@@ -16,12 +16,16 @@ The definition of objects transferred between different
 processes (TokenizerManager, DetokenizerManager, Scheduler).
 """
 
+from __future__ import annotations
+
 import copy
 import uuid
 from abc import ABC
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Union
+
+import torch
 
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import BaseFinishReason
@@ -93,6 +97,10 @@ class RequestTimingMetricsMixin:
     # Calculated as: prefill_end_time_host - prefill_start_time_host
     prefill_launch_latency: Optional[List[Optional[float]]]
 
+    # Prefill finished time: timestamp when prefill phase completes (wall clock time).
+    # This marks when the prefill computation finishes.
+    prefill_finished_ts: Optional[List[Optional[float]]]
+
 
 @dataclass
 class SpeculativeDecodingMetricsMixin:
@@ -108,6 +116,23 @@ class SpeculativeDecodingMetricsMixin:
 
     # Accepted tokens: Number of accepted tokens during speculative decoding
     spec_accepted_tokens: List[int]
+
+
+@dataclass
+class APIServingTimingMixin:
+    # Validation step duration
+    validation_time: Optional[float] = None
+
+    # For metrics
+    received_time: Optional[float] = None
+
+    # Perf_counter equivalents for accurate time calculations
+    received_time_perf: Optional[float] = None
+
+
+_API_SERVING_TIMING_MIXIN_FIELDS = tuple(
+    APIServingTimingMixin.__dataclass_fields__.keys()
+)
 
 
 # Parameters for a session
@@ -138,7 +163,7 @@ MultimodalDataInputFormat = Union[
 
 
 @dataclass
-class GenerateReqInput(BaseReq):
+class GenerateReqInput(BaseReq, APIServingTimingMixin):
     # The input prompt. It can be a single prompt or a batch of prompts.
     text: Optional[Union[List[str], str]] = None
     # The token ids for text; one can specify either text or input_ids
@@ -175,6 +200,8 @@ class GenerateReqInput(BaseReq):
     log_metrics: bool = True
     # Whether to return hidden states
     return_hidden_states: Union[List[bool], bool] = False
+    # Whether to return captured routed experts
+    return_routed_experts: bool = False
 
     # The modalities of the image data [image, multi-images, video]
     modalities: Optional[List[str]] = None
@@ -196,9 +223,10 @@ class GenerateReqInput(BaseReq):
     bootstrap_port: Optional[Union[List[Optional[int]], int]] = None
     bootstrap_room: Optional[Union[List[int], int]] = None
     bootstrap_pair_key: Optional[Union[List[str], str]] = None
+    decode_tp_size: Optional[Union[List[Optional[int]], int]] = None
 
-    # Validation step duration
-    validation_time: Optional[float] = None
+    # Require reasoning for the request (hybrid reasoning model only)
+    require_reasoning: bool = False
 
     # For data parallel rank routing
     data_parallel_rank: Optional[int] = None
@@ -215,6 +243,9 @@ class GenerateReqInput(BaseReq):
     # Extra key for classifying the request (e.g. cache_salt)
     extra_key: Optional[Union[List[str], str]] = None
 
+    # Routing key for routing-key schedule policy
+    routing_key: Optional[str] = None
+
     # Whether to disallow logging for this request (e.g. due to ZDR)
     no_logs: bool = False
 
@@ -226,6 +257,19 @@ class GenerateReqInput(BaseReq):
 
     # Whether to return entropy
     return_entropy: bool = False
+
+    # Propagates trace context via Engine.generate/async_generate
+    external_trace_header: Optional[Dict] = None
+
+    # For EPD-disaggregated inference
+    need_wait_for_image: Optional[bool] = None
+    num_items_assigned: Optional[List] = None
+
+    # Multimodal tiling controls (extensions)
+    max_dynamic_patch: Optional[int] = None
+    min_dynamic_patch: Optional[int] = None
+    image_max_dynamic_patch: Optional[int] = None
+    video_max_dynamic_patch: Optional[int] = None
 
     def contains_mm_input(self) -> bool:
         return (
@@ -592,6 +636,7 @@ class GenerateReqInput(BaseReq):
                 if isinstance(self.return_hidden_states, list)
                 else self.return_hidden_states
             ),
+            return_routed_experts=self.return_routed_experts,
             modalities=self.modalities[i] if self.modalities else None,
             session_params=self.session_params,
             lora_path=self.lora_path[i] if self.lora_path is not None else None,
@@ -616,7 +661,9 @@ class GenerateReqInput(BaseReq):
                 if self.bootstrap_pair_key is not None
                 else None
             ),
-            validation_time=self.validation_time,
+            decode_tp_size=(
+                self.decode_tp_size[i] if self.decode_tp_size is not None else None
+            ),
             data_parallel_rank=(
                 self.data_parallel_rank if self.data_parallel_rank is not None else None
             ),
@@ -627,7 +674,12 @@ class GenerateReqInput(BaseReq):
             custom_labels=self.custom_labels,
             return_bytes=self.return_bytes,
             return_entropy=self.return_entropy,
+            external_trace_header=self.external_trace_header,
             http_worker_ipc=self.http_worker_ipc,
+            **{
+                field: getattr(self, field)
+                for field in _API_SERVING_TIMING_MIXIN_FIELDS
+            },
         )
 
 
@@ -655,6 +707,9 @@ class TokenizedGenerateReqInput(BaseReq):
     # Whether to return hidden states
     return_hidden_states: bool = False
 
+    # Whether to return captured routed experts
+    return_routed_experts: bool = False
+
     # The input embeds
     input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None
 
@@ -674,6 +729,10 @@ class TokenizedGenerateReqInput(BaseReq):
     bootstrap_port: Optional[int] = None
     bootstrap_room: Optional[int] = None
     bootstrap_pair_key: Optional[str] = None
+    decode_tp_size: Optional[int] = None
+
+    # Require reasoning for the request (hybrid reasoning model only)
+    require_reasoning: bool = False
 
     # For data parallel rank routing
     data_parallel_rank: Optional[int] = None
@@ -683,6 +742,9 @@ class TokenizedGenerateReqInput(BaseReq):
 
     # Extra key for classifying the request (e.g. cache_salt)
     extra_key: Optional[str] = None
+
+    # Routing key for routing-key schedule policy
+    routing_key: Optional[str] = None
 
     # Whether to disallow logging for this request (e.g. due to ZDR)
     no_logs: bool = False
@@ -695,6 +757,9 @@ class TokenizedGenerateReqInput(BaseReq):
 
     # Whether to return entropy
     return_entropy: bool = False
+
+    need_wait_for_image: bool = False
+    num_items_assigned: Optional[List] = None
 
 
 @dataclass
@@ -713,7 +778,7 @@ class BatchTokenizedGenerateReqInput(BaseBatchReq):
 
 
 @dataclass
-class EmbeddingReqInput(BaseReq):
+class EmbeddingReqInput(BaseReq, APIServingTimingMixin):
     # The input prompt. It can be a single prompt or a batch of prompts.
     text: Optional[Union[List[List[str]], List[str], str]] = None
     # The image input. It can be an image instance, file name, URL, or base64 encoded string.
@@ -743,12 +808,14 @@ class EmbeddingReqInput(BaseReq):
     is_cross_encoder_request: bool = False
     # Priority for the request
     priority: Optional[int] = None
+    # Routing key for routing-key schedule policy
+    routing_key: Optional[str] = None
 
     # For background responses (OpenAI responses API)
     background: bool = False
 
-    # tracing context
-    trace_context: Optional[Dict] = None
+    # Propagates trace context via Engine.encode/async_encode
+    external_trace_header: Optional[Dict] = None
 
     # The number of dimensions the resulting output embeddings should have. It is applicable for Matryoshka Embeddings.
     dimensions: Optional[int] = None
@@ -829,9 +896,13 @@ class EmbeddingReqInput(BaseReq):
             video_data=self.video_data[i] if self.video_data is not None else None,
             sampling_params=self.sampling_params[i],
             rid=self.rid[i],
-            validation_time=self.validation_time,
+            external_trace_header=self.external_trace_header,
             dimensions=self.dimensions,
             http_worker_ipc=self.http_worker_ipc,
+            **{
+                field: getattr(self, field)
+                for field in _API_SERVING_TIMING_MIXIN_FIELDS
+            },
         )
 
 
@@ -910,6 +981,9 @@ class BatchTokenIDOutput(
     # Hidden states
     output_hidden_states: List[List[float]]
 
+    # The routed experts for each output token
+    output_routed_experts: List[torch.Tensor]
+
     # The information of placeholder tokens (e.g., image token)
     # idx is the index of the token in the prompt after expansion.
     # val is the length of padded tokens after expansion.
@@ -921,6 +995,11 @@ class BatchTokenIDOutput(
 
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: List[List[int]] = None
+
+    # Load for DP balance
+    load: GetLoadReqOutput = None
+    # Customized info
+    customized_info: Optional[Dict[str, List[Any]]] = None
 
 
 @dataclass
@@ -989,6 +1068,9 @@ class BatchStrOutput(
     # Hidden states
     output_hidden_states: List[List[float]]
 
+    # The routed experts for each output token
+    output_routed_experts: List[List[int]]
+
     # The information of placeholder tokens (e.g., image token)
     # idx is the index of the token in the prompt after expansion.
     # val is the length of padded tokens after expansion.
@@ -1000,6 +1082,12 @@ class BatchStrOutput(
 
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: List[List[int]] = None
+
+    # Load for DP balance
+    load: GetLoadReqOutput = None
+
+    # Customized info
+    customized_info: Optional[Dict[str, List[Any]]] = None
 
 
 @dataclass
@@ -1429,6 +1517,7 @@ class FreezeGCReq(BaseReq):
 class ConfigureLoggingReq(BaseReq):
     log_requests: Optional[bool] = None
     log_requests_level: Optional[int] = None
+    log_requests_format: Optional[str] = None
     dump_requests_folder: Optional[str] = None
     dump_requests_threshold: Optional[int] = None
     crash_dump_folder: Optional[str] = None
@@ -1555,13 +1644,33 @@ class UnloadLoRAAdapterReqInput(BaseReq):
 
 
 @dataclass
+class LoadLoRAAdapterFromTensorsReqInput(BaseReq):
+    lora_name: str
+    config_dict: Dict[str, Any]
+    serialized_tensors: str
+    pinned: bool = False
+    added_tokens_config: Optional[Dict[str, Any]] = None
+    lora_id: Optional[str] = None
+
+    def to_ref(self) -> LoRARef:
+        return LoRARef(
+            lora_id=self.lora_id,
+            lora_name=self.lora_name,
+            lora_path="__tensor__",
+            pinned=self.pinned,
+        )
+
+
+@dataclass
 class LoRAUpdateOutput(BaseReq):
     success: bool
     error_message: Optional[str] = None
     loaded_adapters: Optional[Dict[str, LoRARef]] = None
 
 
-LoadLoRAAdapterReqOutput = UnloadLoRAAdapterReqOutput = LoRAUpdateOutput
+LoadLoRAAdapterReqOutput = UnloadLoRAAdapterReqOutput = (
+    LoadLoRAAdapterFromTensorsReqOutput
+) = LoRAUpdateOutput
 
 
 class BlockReqType(Enum):
@@ -1585,6 +1694,148 @@ class GetLoadReqOutput(BaseReq):
     num_reqs: int
     num_waiting_reqs: int
     num_tokens: int
+    ts_tic: float
+
+
+@dataclass
+class MemoryMetrics:
+    """Memory breakdown metrics."""
+
+    weight_gb: float = field(
+        metadata={"metric": ("gauge", "Model weight memory in GB")}
+    )
+    kv_cache_gb: float = field(metadata={"metric": ("gauge", "KV cache memory in GB")})
+    graph_gb: float = field(metadata={"metric": ("gauge", "CUDA graph memory in GB")})
+    token_capacity: int = field(
+        metadata={"metric": ("gauge", "Max tokens in KV cache")}
+    )
+
+
+@dataclass
+class SpeculativeMetrics:
+    """Speculative decoding metrics."""
+
+    accept_length: float = field(
+        metadata={"metric": ("gauge", "Avg accepted tokens per step")}
+    )
+    accept_rate: float = field(
+        metadata={"metric": ("gauge", "Speculative acceptance rate")}
+    )
+
+
+@dataclass
+class LoRAMetrics:
+    """LoRA adapter pool metrics."""
+
+    slots_used: int = field(metadata={"metric": ("gauge", "LoRA adapter slots in use")})
+    slots_total: int = field(metadata={"metric": ("gauge", "Total LoRA adapter slots")})
+    utilization: float = field(
+        metadata={"metric": ("gauge", "LoRA pool utilization ratio")}
+    )
+
+
+@dataclass
+class DisaggregationMetrics:
+    """PD disaggregation metrics."""
+
+    mode: str  # "prefill", "decode", or "null" - not a metric
+    prefill_prealloc_queue_reqs: int = field(
+        default=0, metadata={"metric": ("gauge", "Prefill prealloc queue requests")}
+    )
+    prefill_inflight_queue_reqs: int = field(
+        default=0, metadata={"metric": ("gauge", "Prefill inflight queue requests")}
+    )
+    decode_prealloc_queue_reqs: int = field(
+        default=0, metadata={"metric": ("gauge", "Decode prealloc queue requests")}
+    )
+    decode_transfer_queue_reqs: int = field(
+        default=0, metadata={"metric": ("gauge", "Decode transfer queue requests")}
+    )
+    decode_retracted_queue_reqs: int = field(
+        default=0, metadata={"metric": ("gauge", "Decode retracted queue requests")}
+    )
+    kv_transfer_speed_gb_s: float = field(
+        default=0.0, metadata={"metric": ("gauge", "KV transfer speed in GB/s")}
+    )
+    kv_transfer_latency_ms: float = field(
+        default=0.0, metadata={"metric": ("gauge", "KV transfer latency in ms")}
+    )
+
+
+@dataclass
+class QueueMetrics:
+    """Detailed queue breakdown."""
+
+    waiting: int = field(metadata={"metric": ("gauge", "Main waiting queue size")})
+    grammar: int = field(
+        metadata={"metric": ("gauge", "Grammar compilation queue size")}
+    )
+    paused: int = field(
+        metadata={"metric": ("gauge", "Requests paused by weight sync")}
+    )
+    retracted: int = field(metadata={"metric": ("gauge", "Retracted requests count")})
+
+
+@dataclass
+class GetLoadsReqInput(BaseReq):
+    """Request for /v1/loads endpoint."""
+
+    VALID_SECTIONS = frozenset(
+        {"core", "memory", "spec", "lora", "disagg", "queues", "all"}
+    )
+
+    include: List[str] = field(default_factory=lambda: ["all"])
+    dp_rank: Optional[int] = None
+
+    def __post_init__(self):
+        """Validate include sections."""
+        if self.include:
+            invalid = set(self.include) - self.VALID_SECTIONS
+            if invalid:
+                raise ValueError(
+                    f"Invalid include sections: {invalid}. "
+                    f"Valid options: {sorted(self.VALID_SECTIONS)}"
+                )
+
+
+@dataclass
+class GetLoadsReqOutput(BaseReq):
+    """Per-DP-rank load metrics for /v1/loads endpoint."""
+
+    dp_rank: int
+    timestamp: float
+
+    num_running_reqs: int = field(
+        metadata={"metric": ("gauge", "Number of running requests")}
+    )
+    num_waiting_reqs: int = field(
+        metadata={"metric": ("gauge", "Number of waiting requests")}
+    )
+    num_used_tokens: int = field(
+        metadata={"metric": ("gauge", "Number of tokens in use")}
+    )
+    max_total_num_tokens: int = field(
+        metadata={"metric": ("gauge", "Maximum token capacity")}
+    )
+    token_usage: float = field(metadata={"metric": ("gauge", "Token pool usage ratio")})
+    gen_throughput: float = field(
+        metadata={"metric": ("gauge", "Generation throughput tokens/sec")}
+    )
+    cache_hit_rate: float = field(
+        metadata={"metric": ("gauge", "Prefix cache hit rate")}
+    )
+    utilization: float = field(
+        metadata={"metric": ("gauge", "Overall utilization ratio")}
+    )
+    max_running_requests: int = field(
+        metadata={"metric": ("gauge", "Maximum running requests capacity")}
+    )
+
+    memory: Optional[MemoryMetrics] = None
+    speculative: Optional[SpeculativeMetrics] = None
+    lora: Optional[LoRAMetrics] = None
+    disaggregation: Optional[DisaggregationMetrics] = None
+    queues: Optional[QueueMetrics] = None
 
 
 @dataclass

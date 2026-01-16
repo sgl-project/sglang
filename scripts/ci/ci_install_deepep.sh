@@ -21,7 +21,7 @@ if python3 -c "import deep_ep" >/dev/null 2>&1; then
 fi
 
 # Install system dependencies
-apt install -y curl wget git sudo libibverbs-dev rdma-core infiniband-diags openssh-server perftest ibverbs-providers libibumad3 libibverbs1 libnl-3-200 libnl-route-3-200 librdmacm1 build-essential cmake
+apt install -y curl wget git sudo rdma-core infiniband-diags openssh-server perftest libibumad3 libibverbs-dev libibverbs1 ibverbs-providers ibverbs-utils libnl-3-200 libnl-route-3-200 librdmacm1 build-essential cmake
 
 # Install GDRCopy
 rm -rf /opt/gdrcopy && mkdir -p /opt/gdrcopy
@@ -70,7 +70,13 @@ if [ "$GRACE_BLACKWELL" = "1" ]; then
     if [ "$CUDA_VERSION" = "12.8" ]; then
         CHOSEN_TORCH_CUDA_ARCH_LIST='10.0'
     elif awk -v ver="$CUDA_VERSION" 'BEGIN {exit !(ver > 12.8)}'; then
-        CHOSEN_TORCH_CUDA_ARCH_LIST='10.0;10.3'
+        # With cuda > 12.8, the compiler supports 10.3, so we should use
+        # CHOSEN_TORCH_CUDA_ARCH_LIST='10.0;10.3'
+        #
+        # However, our CI machine has a weird setup and nvidia-smi reports wrong CUDA version in the container.
+        # The container is actually cuda 12.8, but nvidia-smi reports 13.0, leading to compilation errors. so we
+        # drop 10.3.
+        CHOSEN_TORCH_CUDA_ARCH_LIST='10.0'
     else
         echo "Unsupported CUDA version for Grace Blackwell: $CUDA_VERSION" && exit 1
     fi && \
