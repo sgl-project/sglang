@@ -181,7 +181,7 @@ impl Router {
         Metrics::record_worker_selection(
             metrics_labels::WORKER_REGULAR,
             metrics_labels::CONNECTION_HTTP,
-            model_id.unwrap_or("default"),
+            model_id.unwrap_or(UNKNOWN_MODEL_ID),
             policy.name(),
         );
 
@@ -198,7 +198,7 @@ impl Router {
         let start = Instant::now();
         let is_stream = typed_req.is_stream();
         let text = typed_req.extract_text_for_routing();
-        let model = model_id.unwrap_or("default");
+        let model = model_id.unwrap_or(UNKNOWN_MODEL_ID);
         let endpoint = route_to_endpoint(route);
 
         // Record request start (Layer 2)
@@ -286,15 +286,14 @@ impl Router {
             }
         };
 
-        // Optional load tracking for cache-aware policy
-        // Get the policy for this model to check if it's cache-aware
         let policy = match model_id {
             Some(model) => self.policy_registry.get_policy_or_default(model),
             None => self.policy_registry.get_default_policy(),
         };
 
-        let load_guard =
-            (policy.name() == "cache_aware").then(|| WorkerLoadGuard::new(worker.clone(), headers));
+        let load_guard = ["cache_aware", "manual"]
+            .contains(&policy.name())
+            .then(|| WorkerLoadGuard::new(worker.clone(), headers));
 
         // Note: Using borrowed reference avoids heap allocation
         events::RequestSentEvent { url: worker.url() }.emit();

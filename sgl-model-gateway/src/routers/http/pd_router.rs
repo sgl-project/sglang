@@ -281,7 +281,7 @@ impl PDRouter {
         let start_time = Instant::now();
 
         let route = context.route;
-        let model = context.model_id.unwrap_or("default");
+        let model = context.model_id.unwrap_or(UNKNOWN_MODEL_ID);
         let endpoint = route_to_endpoint(route);
 
         // Record request start (Layer 2)
@@ -759,7 +759,7 @@ impl PDRouter {
         )?;
 
         // Record worker selection metrics (Layer 3)
-        let model = model_id.unwrap_or("default");
+        let model = model_id.unwrap_or(UNKNOWN_MODEL_ID);
         Metrics::record_worker_selection(
             metrics_labels::WORKER_PREFILL,
             metrics_labels::CONNECTION_HTTP,
@@ -877,19 +877,17 @@ impl PDRouter {
         let stream = UnboundedReceiverStream::new(rx);
         let body = Body::from_stream(stream);
 
-        let mut response = Response::new(body);
-        *response.status_mut() = status;
-
-        // Attach load guards to response body for proper RAII lifecycle
-        // Guards are dropped when response body is consumed or client disconnects
         let guards = vec![
             WorkerLoadGuard::new(prefill, headers.as_ref()),
             WorkerLoadGuard::new(decode, headers.as_ref()),
         ];
 
-        let mut headers = headers.unwrap_or_default();
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
-        *response.headers_mut() = headers;
+        let mut response = Response::new(body);
+        *response.status_mut() = status;
+
+        let mut response_headers = headers.unwrap_or_default();
+        response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+        *response.headers_mut() = response_headers;
 
         AttachedBody::wrap_response(response, guards)
     }
