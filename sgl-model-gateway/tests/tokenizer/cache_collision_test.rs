@@ -9,7 +9,6 @@ use smg::tokenizer::{
 
 #[tokio::test]
 async fn test_l0_cache_key_collision() {
-    // 1. Setup
     let cache_dir = download_tokenizer_from_hf("Qwen/Qwen3-4B-Instruct-2507")
         .await
         .expect("Failed to download tokenizer");
@@ -29,11 +28,10 @@ async fn test_l0_cache_key_collision() {
     let cached = CachedTokenizer::new(inner.clone(), config);
     let input = "Hello";
 
-    // 2. First call: add_special_tokens = true
     // This creates a cache entry for ("Hello", true)
     let _ = cached.encode(input, true).expect("First encode failed");
 
-    // 3. Second call: add_special_tokens = false
+    // add_special_tokens = false
     // This SHOULD BE A MISS because the flag is different.
     let _ = cached.encode(input, false).expect("Second encode failed");
 
@@ -42,9 +40,6 @@ async fn test_l0_cache_key_collision() {
 
     println!("Cache Stats: Hits={}, Misses={}", stats.hits, stats.misses);
 
-    // If the fix is working:
-    // Call 1: Miss (populates key: ("Hello", true))
-    // Call 2: Miss (should NOT hit because key is ("Hello", false))
     assert_eq!(
         stats.hits, 0,
         "BUG: L0 cache HIT on the second call! This means it ignored the add_special_tokens flag."
@@ -54,7 +49,7 @@ async fn test_l0_cache_key_collision() {
         "Expected 2 misses (one for each unique flag value)."
     );
 
-    // 5. Third call: add_special_tokens = true (Repeat of first call)
+    // Third call: add_special_tokens = true (Repeat of first call)
     // This SHOULD BE A HIT.
     let _ = cached.encode(input, true).expect("Third encode failed");
     let stats_after = cached.cache_stats().expect("Stats should be available");
