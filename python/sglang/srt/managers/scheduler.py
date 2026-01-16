@@ -2213,7 +2213,10 @@ class Scheduler(
         if self.is_generation:
             if self.spec_algorithm.is_none() or self.enable_overlap:
                 # In most cases, we use the model worker batch to run the forward.
-                worker_batch_or_batch = batch.get_model_worker_batch()
+                if self.spec_algorithm.is_ngram():
+                    worker_batch_or_batch = batch
+                else:
+                    worker_batch_or_batch = batch.get_model_worker_batch()
             else:
                 # In speculative decoding v1 (non-overlap) case, we use the batch directly.
                 # TODO(lsyin): delete this branch after unifying the abstraction.

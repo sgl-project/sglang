@@ -92,9 +92,8 @@ class NGRAMWorkerV2(NGRAMWorker):
                 next_draft_input=batch.spec_info,
             )
         else:
-            verify_input: NgramVerifyInput = (
-                batch.spec_info
-            )  # prefill generates the spec_info for the first decode; 2nd round decode generates spec_info for 3rd decode
+            # prefill generates the spec_info for the first decode; 2nd round decode generates spec_info for 3rd decode
+            verify_input: NgramVerifyInput = batch.spec_info
             batch.forward_mode = ForwardMode.TARGET_VERIFY
             model_worker_batch.forward_mode = ForwardMode.TARGET_VERIFY
             batch_result = self.target_worker.forward_batch_generation(
@@ -111,9 +110,8 @@ class NGRAMWorkerV2(NGRAMWorker):
             accept_lens = verify_input.accept_length
             if batch.return_logprob:
                 add_output_logprobs_for_spec_v1(batch, verify_input, logits_output)
-            self._update_ngram_cache(
-                batch
-            )  # update previous round's ngram cache since current accepted tokens haven't been added to the outputid yet
+            # update previous round's ngram cache since current accepted tokens haven't been added to the outputid yet
+            self._update_ngram_cache(batch)
 
             self._prepare_for_speculative_decoding(batch, is_spec_v2=True)
             batch.forward_mode = ForwardMode.DECODE
@@ -124,4 +122,5 @@ class NGRAMWorkerV2(NGRAMWorker):
                 num_accepted_tokens=num_accepted_tokens,
                 can_run_cuda_graph=can_run_cuda_graph,
                 accept_lens=accept_lens,
+                next_draft_input=batch.spec_info,
             )
