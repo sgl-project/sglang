@@ -1303,7 +1303,6 @@ class ChunkSizePredictor:
                 + self.constant_coeff_c
             )
 
-        # self.target_latency = f(float(base_chunk_size)) - f(0.0)
         self.target_latency = f(float(base_chunk_size))
 
         if self.target_latency <= 0:
