@@ -59,6 +59,23 @@ use_image_processor_gpu = (
 )
 
 
+class MMError(Exception):
+    def __init__(self, message, code=500):
+        self.message = message
+        self.code = code
+        super().__init__(self.message)
+
+
+class BadRequestError(MMError):
+    def __init__(self, message):
+        super().__init__(message, code=400)
+
+
+class InternalError(MMError):
+    def __init__(self, message):
+        super().__init__(message, code=500)
+
+
 class TensorWrapper:
     """Wrapper to keep tensor alive while exposing buffer for zero-copy."""
 
@@ -293,53 +310,61 @@ class MMEncoder:
             return await asyncio.gather(*async_futures)
 
     async def _encode(self, mm_items) -> torch.Tensor:
-        images = await self._flatten_and_load_images(mm_items)
+        try:
+            images = await self._flatten_and_load_images(mm_items)
+        except Exception as e:
+            raise BadRequestError(f"Failed to load images from input: {str(e)}")
 
-        kwargs = {"device": self.device} if self.use_image_processor_gpu else {}
-        images_input = self.image_processor(images=images, **kwargs)
-        feature = images_input["pixel_values"]
-        mm_item = MultimodalDataItem.from_dict(
-            {
-                "modality": Modality.IMAGE,
-                "feature": _convert(feature),
-            }
-        )
-        for k, v in images_input.items():
-            if k == "pixel_values":
-                continue
-            mm_item.set(k, _convert(v))
+        try:
+            kwargs = {"device": self.device} if self.use_image_processor_gpu else {}
+            images_input = self.image_processor(images=images, **kwargs)
+            feature = images_input["pixel_values"]
+            mm_item = MultimodalDataItem.from_dict(
+                {
+                    "modality": Modality.IMAGE,
+                    "feature": _convert(feature),
+                }
+            )
+            for k, v in images_input.items():
+                if k == "pixel_values":
+                    continue
+                mm_item.set(k, _convert(v))
 
-        # support mm_cache
-        mm_embedding = None
-        mm_hash = None
+            # support mm_cache
+            mm_embedding = None
+            mm_hash = None
 
-        start_time = time.perf_counter()
-        if self.server_args.enable_prefix_mm_cache:
-            mm_item.set_pad_value()
-            mm_hash = MultiModalStaticCache.combine_hashes([mm_item.hash])
-            async with self.mm_cache_lock:
-                mm_cache = self.mm_cache.get([mm_item.hash])
-                if mm_cache is not None:
-                    mm_embedding = mm_cache.embedding
+            start_time = time.perf_counter()
+            if self.server_args.enable_prefix_mm_cache:
+                mm_item.set_pad_value()
+                mm_hash = MultiModalStaticCache.combine_hashes([mm_item.hash])
+                async with self.mm_cache_lock:
+                    mm_cache = self.mm_cache.get([mm_item.hash])
+                    if mm_cache is not None:
+                        mm_embedding = mm_cache.embedding
 
-        if mm_embedding is None:
-            with torch.inference_mode():
-                mm_embedding: torch.Tensor = self.model.get_image_feature([mm_item])
-                mm_embedding = mm_embedding.cpu()
-            if len(mm_embedding.shape) != 2:
-                mm_embedding = mm_embedding.reshape(-1, mm_embedding.shape[-1])
+            if mm_embedding is None:
+                with torch.inference_mode():
+                    mm_embedding: torch.Tensor = self.model.get_image_feature([mm_item])
+                    mm_embedding = mm_embedding.cpu()
+                if len(mm_embedding.shape) != 2:
+                    mm_embedding = mm_embedding.reshape(-1, mm_embedding.shape[-1])
 
-        if self.server_args.enable_prefix_mm_cache:
-            async with self.mm_cache_lock:
-                self.mm_cache.set(mm_hash, EmbeddingResult(embedding=mm_embedding))
-        end_time = time.perf_counter()
-        logger.info(
-            f"Vit time : {(end_time - start_time)*1000:.2f} ms {mm_embedding.shape = }"
-        )
-        if self.profiler is not None:
-            self.profiler.step()
+            if self.server_args.enable_prefix_mm_cache:
+                async with self.mm_cache_lock:
+                    self.mm_cache.set(mm_hash, EmbeddingResult(embedding=mm_embedding))
+            end_time = time.perf_counter()
+            logger.info(
+                f"Vit time : {(end_time - start_time)*1000:.2f} ms {mm_embedding.shape = }"
+            )
+            if self.profiler is not None:
+                self.profiler.step()
 
-        return _get_image_grid_dim(images_input), mm_embedding
+            return _get_image_grid_dim(images_input), mm_embedding
+        except BadRequestError:
+            raise
+        except Exception as e:
+            raise InternalError(f"Internal encoding error: {str(e)}")
 
     async def _send(
         self,
@@ -367,7 +392,7 @@ class MMEncoder:
             if url is not None
             else f"tcp://{prefill_host}:{embedding_port}"
         )
-        # logger.info(f"{endpoint = }")
+        logger.info(f"{endpoint = }")
         socket = get_zmq_socket(
             self.context,
             zmq.PUSH,
@@ -380,7 +405,6 @@ class MMEncoder:
         else:
             new_mm_data = mm_data.copy_without_embedding()
             if new_mm_data.error_msg is not None:
-                logger.info(f"🥵 sending to {endpoint = } {new_mm_data = }")
                 socket.send_multipart([pickle.dumps(new_mm_data)])
                 return
 
@@ -406,16 +430,25 @@ class MMEncoder:
                 mm_embedding.shape[0],
                 mm_embedding.shape[1],
                 None,
+                None,
             )
         except Exception as e:
+            error_code = getattr(e, "code", 500)
+            print(f"😅 {error_code = }")
             error_msg = str(e)
-            logger.error(f"❌ Rank {self.rank} encode failed: {error_msg}")
+            logger.error(f"Rank {self.rank} encode failed: {error_msg}")
             if self.rank == 0:
-                mm_data = EmbeddingData(req_id, num_parts, part_idx, None, None)
-                mm_data.error_msg = error_msg
+                mm_data = EmbeddingData(
+                    req_id,
+                    num_parts,
+                    part_idx,
+                    None,
+                    error_msg=error_msg,
+                    error_code=error_code,
+                )
                 self.embedding_to_send[req_id] = mm_data
                 logger.info(f"{mm_data = }")
-            return 0, 0, 0, error_msg
+            return 0, 0, 0, error_msg, error_code
 
     # For zmq_to_tokenizer zmq_to_scheduler and mooncake
     async def send(
@@ -656,11 +689,13 @@ async def handle_encode_request(request: dict):
         for socket in send_sockets:
             socket.send_pyobj(request)
 
-        nbytes, embedding_len, embedding_dim, error_msg = await encoder.encode(
-            mm_items=request["mm_items"],
-            req_id=request["req_id"],
-            num_parts=request["num_parts"],
-            part_idx=request["part_idx"],
+        nbytes, embedding_len, embedding_dim, error_msg, error_code = (
+            await encoder.encode(
+                mm_items=request["mm_items"],
+                req_id=request["req_id"],
+                num_parts=request["num_parts"],
+                part_idx=request["part_idx"],
+            )
         )
 
         if error_msg:
@@ -675,7 +710,7 @@ async def handle_encode_request(request: dict):
                             embedding_port=port,
                         )
             return ORJSONResponse(
-                status_code=500,
+                status_code=error_code,
                 content={"status": "error", "message": error_msg, "req_id": req_id},
             )
         if encoder.server_args.encoder_transfer_backend == "mooncake":

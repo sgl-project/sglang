@@ -978,6 +978,7 @@ class Scheduler(
         ):
             self.mm_receiver = MMReceiver(
                 self.server_args,
+                scheduler=self,
                 hf_config=self.model_config.hf_config,
                 tp_rank=self.tp_rank,
                 pp_rank=self.pp_rank,
@@ -1276,39 +1277,14 @@ class Scheduler(
             and self.server_args.encoder_transfer_backend == "zmq_to_scheduler"
         ):
             recv_reqs, abort_reqs = self.mm_receiver.process_waiting_requests(recv_reqs)
-            for recv_req, error_msg in abort_reqs:
-                logger.info(f"👍")
-                req = Req(
-                    recv_req.rid,
-                    recv_req.input_text,
-                    recv_req.input_ids,
-                    recv_req.sampling_params,
-                    return_logprob=recv_req.return_logprob,
-                    top_logprobs_num=recv_req.top_logprobs_num,
-                    token_ids_logprob=recv_req.token_ids_logprob,
-                    stream=recv_req.stream,
-                    lora_id=recv_req.lora_id,
-                    input_embeds=recv_req.input_embeds,
-                    custom_logit_processor=recv_req.custom_logit_processor,
-                    require_reasoning=recv_req.require_reasoning,
-                    return_hidden_states=recv_req.return_hidden_states,
-                    return_routed_experts=recv_req.return_routed_experts,
-                    eos_token_ids=self.model_config.hf_eos_token_id,
-                    bootstrap_host=recv_req.bootstrap_host,
-                    bootstrap_port=recv_req.bootstrap_port,
-                    bootstrap_room=recv_req.bootstrap_room,
-                    disagg_mode=self.disaggregation_mode,
-                    data_parallel_rank=recv_req.data_parallel_rank,
-                    vocab_size=self.model_config.vocab_size,
-                    priority=recv_req.priority,
-                    metrics_collector=(
-                        self.metrics_collector if self.enable_metrics else None
-                    ),
-                    http_worker_ipc=recv_req.http_worker_ipc,
-                    dllm_config=self.dllm_config,
+            for req, error_msg, error_code in abort_reqs:
+
+                status_code = (
+                    HTTPStatus.BAD_REQUEST
+                    if error_code == 400
+                    else HTTPStatus.INTERNAL_SERVER_ERROR
                 )
-                req.tokenizer = self.tokenizer
-                prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
+                prepare_abort(req, error_msg, status_code=status_code)
                 self.stream_output([req], req.return_logprob)
 
         if self.enable_trace:
