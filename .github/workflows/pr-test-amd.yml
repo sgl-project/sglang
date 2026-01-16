@@ -650,6 +650,7 @@ jobs:
       fail-fast: false
       matrix:
         runner: [linux-mi35x-gpu-8]
+        part: [0, 1, 2]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -671,7 +672,7 @@ jobs:
       - name: Run test
         timeout-minutes: 60
         run: |
-          bash scripts/ci/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-c-test-large-8-gpu-amd-mi35x --timeout-per-file 3600
+          bash scripts/ci/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-c-test-large-8-gpu-amd-mi35x --auto-partition-id ${{ matrix.part }} --auto-partition-size 3 --timeout-per-file 3600
 
   performance-test-1-gpu-part-1-amd:
     needs: [check-changes, stage-a-test-1-amd]
