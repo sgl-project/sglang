@@ -12,6 +12,7 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
     AttentionMetadataBuilder,
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.srt.environ import envs
 
 
 class AITerBackend(AttentionBackend):
@@ -81,6 +82,14 @@ class AITerImpl(AttentionImpl):
         """
         # aiter.flash_attn_func expects tensors in [B, H, S, D] layout,
         # which is what ring_attn provides.
+
+        # 0: rtne, 1: rtna, 2: rtz
+        if envs.SGLANG_USE_AITER_FA_ROUND_MODE.get() == True:
+            # use Aiter FA round mode
+            how_v3_bf16_cvt = 2
+        else:
+            # default value is 1
+            how_v3_bf16_cvt = 1
         output, _ = aiter.flash_attn_func(
             query,
             key,
@@ -89,5 +98,6 @@ class AITerImpl(AttentionImpl):
             causal=self.causal,
             return_attn_probs=False,
             return_lse=True,
+            how_v3_bf16_cvt=how_v3_bf16_cvt,
         )
         return output
