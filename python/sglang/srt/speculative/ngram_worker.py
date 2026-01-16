@@ -12,6 +12,7 @@ from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.cpp_ngram.ngram_cache import NgramCache
+from sglang.srt.speculative.eagle_info_v2 import assign_extend_cache_locs_func
 from sglang.srt.speculative.ngram_info import NgramVerifyInput
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
@@ -32,6 +33,7 @@ class NGRAMWorker:
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
+        self.server_args = server_args
         self.target_worker = target_worker
         self.model_runner = target_worker.model_runner
         self.tp_rank = tp_rank
@@ -121,7 +123,7 @@ class NGRAMWorker:
     def _prepare_draft_tokens(
         self, batch: ScheduleBatch
     ) -> tuple[np.ndarray, np.ndarray]:
-        bs = batch.batch_size()
+        bs = len(batch.reqs)
 
         self.ngram_cache.synchronize()
         batch_tokens = []
@@ -139,11 +141,11 @@ class NGRAMWorker:
         ), f"{total_draft_token_num=}, {bs=}, {self.draft_token_num=}"
         return req_drafts, mask
 
-    def _prepare_for_speculative_decoding(self, batch: ScheduleBatch):
+    def _prepare_for_speculative_decoding(self, batch: ScheduleBatch, is_spec_v2=False):
         if batch.forward_mode.is_extend():
             return
 
-        bs = batch.batch_size()
+        bs = len(batch.reqs)
 
         retrive_index = self.retrieve_indexes_batch[bs]
         retrive_next_token = self.retrive_next_token_batch[bs]
@@ -171,30 +173,61 @@ class NGRAMWorker:
         # Testing shows about 8% performance improvement (the effect is roughly proportional to batch size).
         if USE_FULL_MASK:
             tree_mask = []
-            mask = mask.reshape(
-                batch.batch_size(), self.draft_token_num, self.draft_token_num
-            )
+            mask = mask.reshape(bs, self.draft_token_num, self.draft_token_num)
             for i, req in enumerate(batch.reqs):
-                seq_len = len(req.origin_input_ids) + len(req.output_ids)
-                req_mask = torch.ones((self.draft_token_num, seq_len - 1)).cuda()
+                # seq_len = len(req.origin_input_ids) + len(req.output_ids)
+                # req_mask = torch.ones((self.draft_token_num, seq_len - 1)).cuda()
+                seq_len = batch.seq_lens_cpu[i]
+                req_mask = torch.ones((self.draft_token_num, seq_len - 1)).to(
+                    device=self.device, non_blocking=True
+                )
                 req_mask = torch.cat(
-                    (req_mask, torch.from_numpy(mask[i]).cuda()), dim=1
+                    (
+                        req_mask,
+                        torch.from_numpy(mask[i]).to(
+                            device=self.device, non_blocking=True
+                        ),
+                    ),
+                    dim=1,
                 ).to(torch.bool)
                 tree_mask.append(req_mask.flatten())
             tree_mask = torch.cat(tree_mask, dim=0)
 
         batch.spec_algorithm = SpeculativeAlgorithm.NGRAM
         batch.forward_mode = ForwardMode.TARGET_VERIFY
-        batch.spec_info = NgramVerifyInput(
-            draft_tokens,
-            tree_mask,
-            positions,
-            retrive_index,
-            retrive_next_token,
-            retrive_next_sibling,
-            self.draft_token_num,
-        )
-        batch.spec_info.prepare_for_verify(batch, self.page_size)
+        if is_spec_v2:
+            batch.input_ids = draft_tokens
+            batch.out_cache_loc = assign_extend_cache_locs_func(
+                req_pool_indices=batch.req_pool_indices,
+                req_to_token=batch.req_to_token_pool.req_to_token,
+                start_offset=batch.seq_lens,
+                end_offset=batch.seq_lens + self.draft_token_num,
+                batch_size=bs,
+                draft_token_num=self.draft_token_num,
+                device=self.device,
+            )
+            batch.spec_info = NgramVerifyInput(
+                server_args=self.server_args,
+                draft_token=draft_tokens,
+                custom_mask=tree_mask,
+                positions=positions,
+                retrive_index=retrive_index,
+                retrive_next_token=retrive_next_token,
+                retrive_next_sibling=retrive_next_sibling,
+                draft_token_num=self.draft_token_num,
+            )
+        else:
+            batch.spec_info = NgramVerifyInput(
+                draft_token=draft_tokens,
+                custom_mask=tree_mask,
+                positions=positions,
+                retrive_index=retrive_index,
+                retrive_next_token=retrive_next_token,
+                retrive_next_sibling=retrive_next_sibling,
+                draft_token_num=self.draft_token_num,
+            )
+            # NOTE in spec v2, slot allocation happens in scheduler and it's over-allocation
+            batch.spec_info.prepare_for_verify(batch, self.page_size)
 
     def _update_ngram_cache(self, batch: ScheduleBatch):
         batch_tokens = []

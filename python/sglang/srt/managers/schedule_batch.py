@@ -786,7 +786,11 @@ class Req:
         global_server_args = get_global_server_args()
         topk = global_server_args.speculative_eagle_topk
 
-        enable_kv_committed_len = topk is None or topk == 1
+        enable_kv_committed_len = (
+            topk is None
+            or topk == 1
+            or global_server_args.speculative_algorithm == "NGRAM"
+        )
         if enable_kv_committed_len:
             assert (
                 not self.kv_committed_freed
@@ -1935,6 +1939,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def maybe_wait_verify_done(self):
         if self.is_spec_v2:
             draft_input: EagleDraftInput = self.spec_info
+            assert draft_input is not None
             if draft_input.verify_done is not None:
                 draft_input.verify_done.synchronize()
 
@@ -2089,6 +2094,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             forward_mode=self.forward_mode,
             input_ids=self.input_ids,
             req_pool_indices=self.req_pool_indices,
+            req_to_token_pool=self.req_to_token_pool,
             seq_lens=self.seq_lens,
             orig_seq_lens=self.orig_seq_lens,
             out_cache_loc=self.out_cache_loc,
@@ -2154,6 +2160,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             return_logprob=self.return_logprob,
             decoding_reqs=self.decoding_reqs,
             spec_algorithm=self.spec_algorithm,
+            spec_info=self.spec_info,
             global_num_tokens=self.global_num_tokens,
             global_num_tokens_for_logprob=self.global_num_tokens_for_logprob,
             can_run_dp_cuda_graph=self.can_run_dp_cuda_graph,
@@ -2191,6 +2198,7 @@ class ModelWorkerBatch:
     input_ids: torch.Tensor
     # The indices of requests in the req_to_token_pool
     req_pool_indices: torch.Tensor
+    req_to_token_pool: ReqToTokenPool
     # The sequence length
     seq_lens: torch.Tensor
     # The indices of output tokens in the token_to_kv_pool_allocator

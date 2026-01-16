@@ -46,7 +46,7 @@ class SpeculativeAlgorithm(Enum):
         return self == SpeculativeAlgorithm.NGRAM
 
     def supports_spec_v2(self) -> bool:
-        return self.is_eagle() or self.is_standalone()
+        return self.is_eagle() or self.is_standalone() or self.is_ngram()
 
     def create_worker(
         self, enable_overlap: bool = False
@@ -76,9 +76,13 @@ class SpeculativeAlgorithm(Enum):
             return StandaloneWorker
         elif self.is_ngram():
             if enable_overlap:
-                raise ValueError(
-                    f"Speculative algorithm {self.name} does not support overlap worker creation."
-                )
+                # raise ValueError(
+                #     f"Speculative algorithm {self.name} does not support overlap worker creation."
+                # )
+                from sglang.srt.speculative.ngram_worker_v2 import NGRAMWorkerV2
+
+                print(f"csy enable overlap schedule")
+                return NGRAMWorkerV2
 
             from sglang.srt.speculative.ngram_worker import NGRAMWorker
 
