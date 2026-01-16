@@ -7,7 +7,7 @@ import os
 import pickle
 import time
 import traceback
-from typing import Dict, List, Optional, Set, Tuple, Union
+from typing import Dict, List, Optional, Set, Tuple
 
 import aiohttp
 import numpy as np
@@ -195,18 +195,6 @@ class MMEncoder:
                     ib_device=server_args.disaggregation_ib_device,
                 )
 
-            if getattr(self.server_args, "enable_mm_global_cache", False):
-                from sglang.srt.managers.embedding_cache_controller import (
-                    EmbeddingCacheController,
-                )
-
-                self.mm_global_cache = EmbeddingCacheController(
-                    rank, server_args.tp_size, hidden_dim=self.model_config.hidden_size
-                )
-                self.background_tasks = set()
-            else:
-                self.mm_global_cache = None
-
             self.embedding_to_send = dict()
 
         logger.info(f"rank {rank} init finish ")
@@ -311,10 +299,9 @@ class MMEncoder:
         mm_item = MultimodalDataItem.from_dict(
             {
                 "modality": Modality.IMAGE,
-                "feature": _convert(sub_feature),
+                "feature": _convert(feature),
             }
         )
-
         for k, v in images_input.items():
             if k == "pixel_values":
                 continue
@@ -394,6 +381,22 @@ class MMEncoder:
             socket.send_multipart(
                 [pickle.dumps(new_mm_data), embedding_tensor.__buffer__()]
             )
+
+    async def encode(self, mm_items, req_id, num_parts, part_idx):
+        start_time = time.time()
+        image_grid_dim, mm_embedding = await self._encode(mm_items)
+        end_time = time.time()
+        logger.info(f"🕛 encode cost = {(end_time - start_time) * 1000:.2f}ms")
+        if self.rank == 0:
+            mm_data = EmbeddingData(
+                req_id,
+                num_parts,
+                part_idx,
+                image_grid_dim,
+                mm_embedding,
+            )
+            self.embedding_to_send[mm_data.req_id] = mm_data
+        return mm_embedding.nbytes, mm_embedding.shape[0], mm_embedding.shape[1]
 
     # For zmq_to_tokenizer zmq_to_scheduler and mooncake
     async def send(
