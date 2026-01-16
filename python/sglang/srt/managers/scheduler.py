@@ -528,6 +528,8 @@ class Scheduler(
             nccl_port=self.nccl_port,
             target_worker=self.tp_worker,
             dp_rank=self.dp_rank,
+            attn_cp_rank=self.attn_cp_rank,
+            moe_cp_rank=self.moe_cp_rank,
         )
 
         if self.server_args.speculative_draft_load_format is not None:
