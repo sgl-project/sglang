@@ -926,29 +926,26 @@ jobs:
           bash scripts/ci/amd_ci_exec.sh -e SGLANG_USE_AITER_AR=0 -e SGLANG_USE_AITER=0 -e HF_HUB_ENABLE_HF_TRANSFER=0 python3 test_moe_eval_accuracy_large.py
   
   # =============================================== Disaggregation ====================================================
-  disagg-test-unified-8-gpu:
+  stage-b-test-large-2-gpu-35x-disaggregation-amd:
     needs: [check-changes, stage-a-test-1-amd]
     if: |
       always() &&
       (
-        (inputs.target_stage == 'disagg-test-unified-8-gpu') ||
+        (inputs.target_stage == 'stage-b-test-large-2-gpu-disaggregation-amd') ||
         (
           !inputs.target_stage &&
           (!failure() && !cancelled()) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
-    env:
-      RUNNER_LABELS: linux-mi355-gpu-8
-    
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi355-gpu-8]
+        runner: [linux-mi355-gpu-2]
         part: [0, 1]
-    
+
     runs-on: ${{matrix.runner}}
-    
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -987,21 +984,21 @@ jobs:
             ci_sglang \
             python /sgl-workspace/aiter/op_tests/test_rmsnorm2d.py
 
-      - name: Run test_disaggregation_basic
+      - name: Run test_disaggregation_basic and test_disaggregation_pp
         timeout-minutes: 15
         run: |
           bash scripts/ci/amd_ci_exec.sh \
             -e SGLANG_TEST_RDMA_DEVICE="${{ env.SGLANG_TEST_RDMA_DEVICE }}" \
             -e HF_TOKEN="${{ env.HF_TOKEN }}" \
-            python3 -m unittest test/registered/amd/disaggregation/test_disaggregation_basic.py
+            -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-large-2-gpu-35x-disaggregation-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --timeout-per-file 1200
 
-      - name: Run test_disaggregation_pp
-        timeout-minutes: 15
-        run: |
-          bash scripts/ci/amd_ci_exec.sh \
-            -e SGLANG_TEST_RDMA_DEVICE="${{ env.SGLANG_TEST_RDMA_DEVICE }}" \
-            -e HF_TOKEN="${{ env.HF_TOKEN }}" \
-            python3 -m unittest test/registered/amd/disaggregation/test_disaggregation_pp.py
+      # - name: Run test_disaggregation_pp
+      #   timeout-minutes: 15
+      #   run: |
+      #     bash scripts/ci/amd_ci_exec.sh \
+      #       -e SGLANG_TEST_RDMA_DEVICE="${{ env.SGLANG_TEST_RDMA_DEVICE }}" \
+      #       -e HF_TOKEN="${{ env.HF_TOKEN }}" \
+      #       python3 -m unittest test/registered/amd/disaggregation/test_disaggregation_pp.py
   
   pr-test-amd-finish:
     needs:
