@@ -203,6 +203,9 @@ suites = {
     ],
     # Nightly test suites have been moved to test/run_suite_nightly.py
     "__not_in_ci__": [
+        TestFile(
+            "hicache/hicache_utils/test_hicache_storage_performance_comparison.py"
+        ),  # interface comparison
         TestFile("test_release_memory_occupation.py", 200),  # Temporarily disabled
         TestFile("models/test_dummy_grok_models.py"),
         TestFile(
