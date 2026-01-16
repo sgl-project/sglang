@@ -1,5 +1,6 @@
 import json
 import unittest
+from typing import Any, Dict, List
 
 from sglang.srt.entrypoints.openai.protocol import Function, Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
@@ -515,6 +516,48 @@ class TestBaseFormatDetector(unittest.TestCase):
             def structure_info(self):
                 # Not used in streaming tests
                 pass
+
+            def build_structural_tag(
+                self,
+                tools: List[Tool],
+                at_least_one: bool = False,
+            ) -> Dict[str, Any]:
+                """Build structural tag for test format detector."""
+                tags = []
+                triggers = set()
+
+                for tool in tools:
+                    name = tool.function.name
+                    if not name:
+                        continue
+
+                    begin = self.bot_token + '{"name": "' + name + '", "arguments":'
+                    end = self.eot_token
+                    trigger = self.bot_token
+
+                    # Always include schema
+                    schema = tool.function.parameters or {}
+
+                    tags.append(
+                        {
+                            "begin": begin,
+                            "content": {
+                                "type": "json_schema",
+                                "json_schema": schema,
+                            },
+                            "end": end,
+                        }
+                    )
+                    triggers.add(trigger)
+
+                return {
+                    "format": {
+                        "type": "triggered_tags",
+                        "triggers": list(triggers),
+                        "tags": tags,
+                        "at_least_one": at_least_one,
+                    }
+                }
 
         self.detector = TestFormatDetector()
         self.tools = [

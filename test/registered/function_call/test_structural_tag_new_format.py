@@ -17,6 +17,9 @@ from sglang.srt.function_call.llama32_detector import Llama32Detector
 from sglang.srt.function_call.mistral_detector import MistralDetector
 from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
 from sglang.srt.function_call.qwen25_detector import Qwen25Detector
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(5.0, "default")
 
 
 class StructuralTagFormatTestCase(unittest.TestCase):
