@@ -16,6 +16,7 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
+    get_compiler_backend,
     is_cpu,
     is_cuda,
     is_hip,
@@ -115,7 +116,7 @@ class RotaryEmbedding(MultiPlatformOp):
 
         if (
             (not (_is_cuda or _is_npu) or self.head_size not in [64, 128, 256, 512])
-            and not (_is_cpu and _is_cpu_amx_available)
+            and not (_is_cpu)
             and not (_is_xpu)
         ):
             if _is_cuda or _is_hip:
@@ -293,8 +294,8 @@ class RotaryEmbedding(MultiPlatformOp):
         assert (
             fused_set_kv_buffer_arg is None
         ), "fused_set_kv_buffer_arg is not supported for npu implementation"
-
-        rotary_mode = "half"
+        if query.dtype == torch.bfloat16 and self.cos_sin_cache.dtype == torch.float:
+            return self.forward_native(positions, query, key, offsets)
         if self.is_neox_style:
             rotary_mode = "half"
         else:
@@ -2748,6 +2749,7 @@ def rotate_half(x):
     return torch.cat((-x2, x1), dim=-1)
 
 
+@torch.compile(dynamic=True, backend=get_compiler_backend())
 def apply_rotary_pos_emb_native(
     q: torch.Tensor,
     k: torch.Tensor,
