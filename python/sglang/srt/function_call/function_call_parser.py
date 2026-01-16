@@ -1,7 +1,14 @@
 import logging
-from typing import Dict, List, Literal, Optional, Tuple, Type, Union
+from typing import Dict, List, Literal, Optional, Set, Tuple, Type, Union
 
-from sglang.srt.entrypoints.openai.protocol import Tool, ToolCallConstraint, ToolChoice
+from sglang.srt.entrypoints.openai.protocol import (
+    LegacyStructuralTagResponseFormat,
+    StructuresResponseFormat,
+    Tool,
+    ToolCallConstraint,
+    ToolChoice,
+)
+from sglang.srt.environ import ToolStrictLevel, envs
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.deepseekv3_detector import DeepSeekV3Detector
@@ -64,6 +71,7 @@ class FunctionCallParser:
 
         self.detector = detector
         self.tools = tools
+        self.tool_strict_level = envs.SGLANG_TOOL_STRICT_LEVEL.get()
 
     def has_tool_call(self, text: str) -> bool:
         """
@@ -127,9 +135,47 @@ class FunctionCallParser:
 
         return final_normal_text, final_calls
 
+    def get_structure_tag(self) -> LegacyStructuralTagResponseFormat:
+        """
+        Generate a structural tag response format for all available tools.
+
+        This creates the necessary structural tags that guide the model's output format.
+        """
+        tool_structures: List[StructuresResponseFormat] = list()
+        tool_trigger_set: Set[str] = set()
+
+        get_structure_info = self.detector.structure_info()
+        for tool in self.tools:
+            function = tool.function
+            name = function.name
+            assert name is not None
+            info = get_structure_info(name)
+
+            # accept all if not strict, otherwise only accept the schema
+            is_strict = (
+                function.strict or self.tool_strict_level >= ToolStrictLevel.PARAMETER
+            )
+            schema = function.parameters if is_strict else {}
+
+            tool_structures.append(
+                StructuresResponseFormat(
+                    begin=info.begin,
+                    schema=schema or {},  # type: ignore
+                    end=info.end,
+                )
+            )
+            tool_trigger_set.add(info.trigger)
+
+        # TODO(dark): move this into new structural tag format
+        # This requires all grammar backend support the new format
+        return LegacyStructuralTagResponseFormat(
+            type="structural_tag",
+            structures=tool_structures,
+            triggers=list(tool_trigger_set),
+        )
+
     def get_structure_constraint(
-        self,
-        tool_choice: Union[ToolChoice, Literal["auto", "required"]],
+        self, tool_choice: Union[ToolChoice, Literal["auto", "required"]]
     ) -> Optional[ToolCallConstraint]:
         """
         Returns the appropriate structure constraint for tool calls based on the tool_choice.
@@ -144,13 +190,16 @@ class FunctionCallParser:
         """
         # NOTE: structural_tag only supports JSON-compatible content between the begin and end.
         # It cannot parse or validate function call Pythonic or XML-ish syntax.
-        if self.detector.supports_structural_tag() and tool_choice == "auto":
-            tag = self.detector.build_structural_tag(
-                tools=self.tools,
-                at_least_one=False,
+        if (
+            self.detector.supports_structural_tag()
+            and tool_choice == "auto"
+            and (
+                any(tool.function.strict for tool in self.tools)
+                or self.tool_strict_level >= ToolStrictLevel.FUNCTION
             )
+        ):
+            tag = self.get_structure_tag()
             return ("structural_tag", tag)
         elif tool_choice == "required" or isinstance(tool_choice, ToolChoice):
             json_schema = get_json_schema_constraint(self.tools, tool_choice)
             return ("json_schema", json_schema)
-        return None

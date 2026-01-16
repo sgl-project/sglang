@@ -25,6 +25,9 @@ class DummyDetector(BaseFormatDetector):
     def structure_info(self):
         pass
 
+    def build_structural_tag(self, tools, at_least_one=False):
+        raise NotImplementedError()
+
 
 def test_unknown_tool_name_dropped_default(caplog):
     """Test that unknown tools are dropped by default (legacy behavior)."""

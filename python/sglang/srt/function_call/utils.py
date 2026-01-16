@@ -221,7 +221,6 @@ def get_json_schema_constraint(
 
     if isinstance(tool_choice, ToolChoice):
         # For specific function choice, return the user's parameters schema directly
-        # Always maxItems: 1 for specific function choice
         fn_name = tool_choice.function.name
         for tool in tools:
             if tool.function.name == fn_name:
