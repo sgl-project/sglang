@@ -318,7 +318,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
     ):
         entry_time = time.perf_counter()
         # For Qwen3_Omni
-        self.use_audio_in_video = request_obj.use_audio_in_video
+        self.use_audio_in_video = request_obj.sampling_params.pop('use_audio_in_video', False)
         base_output = self.load_mm_data(
             prompt=input_text,
             image_data=image_data,

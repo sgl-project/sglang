@@ -519,6 +519,8 @@ class ChatCompletionRequest(BaseModel):
     separate_reasoning: bool = True
     stream_reasoning: bool = True
     chat_template_kwargs: Optional[Dict] = None
+    # For Qwen3_Omni
+    use_audio_in_video: Optional[bool] = False
 
     # SGLang multimodal tiling controls (extensions)
     max_dynamic_patch: Optional[int] = None
@@ -536,9 +538,6 @@ class ChatCompletionRequest(BaseModel):
     cache_salt: Optional[Union[List[str], str]] = None
     # Priority for the request
     priority: Optional[int] = None
-
-    # For Qwen3_Omni
-    use_audio_in_video: Optional[bool] = False
 
     # For PD disaggregation
     bootstrap_host: Optional[Union[List[str], str]] = None
@@ -668,6 +667,7 @@ class ChatCompletionRequest(BaseModel):
             "logit_bias": self.logit_bias,
             "custom_params": self.custom_params,
             "sampling_seed": self.seed,
+            "use_audio_in_video": self.use_audio_in_video
         }
 
         if self.response_format and self.response_format.type == "json_schema":

@@ -218,7 +218,6 @@ class Engine(EngineBase):
         image_data: Optional[MultimodalDataInputFormat] = None,
         audio_data: Optional[MultimodalDataInputFormat] = None,
         video_data: Optional[MultimodalDataInputFormat] = None,
-        use_audio_in_video: Optional[bool] = False,         # For Qwen3_Omni
         return_logprob: Optional[Union[List[bool], bool]] = False,
         logprob_start_len: Optional[Union[List[int], int]] = None,
         top_logprobs_num: Optional[Union[List[int], int]] = None,
@@ -256,7 +255,6 @@ class Engine(EngineBase):
             image_data=image_data,
             audio_data=audio_data,
             video_data=video_data,
-            use_audio_in_video=use_audio_in_video,      # Support Qwen3_Omni use_audio_in_video
             return_logprob=return_logprob,
             logprob_start_len=logprob_start_len,
             top_logprobs_num=top_logprobs_num,
