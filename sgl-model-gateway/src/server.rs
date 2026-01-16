@@ -852,6 +852,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
             source: tokenizer_source.clone(),
             chat_template_path: config.router_config.chat_template.clone(),
             cache_config: config.router_config.tokenizer_cache.to_option(),
+            fail_on_duplicate: false,
         };
 
         let job = Job::AddTokenizer {
