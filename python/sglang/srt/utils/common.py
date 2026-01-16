@@ -813,7 +813,7 @@ def load_audio(
     # Use soundfile here, since librosa use it under the hood,
     # and librosa will not support audio loading in the future
     import soundfile as sf
-    from scipy.signal import resample
+    import soxr
 
     if sr is None:
         sr = 16000
@@ -839,8 +839,7 @@ def load_audio(
 
     # Resample audio if the original sample rate is different from the desired sample rate
     if original_sr != sr:
-        num_samples = int(len(audio) * float(sr) / original_sr)
-        audio = resample(audio, num_samples)
+        audio = soxr.resample(audio, original_sr, sr)
 
     # Convert to mono if requested and audio is stereo
     if mono and len(audio.shape) > 1:
