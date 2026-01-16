@@ -1,35 +1,20 @@
 import argparse
 import ast
+import asyncio
 import json
 import os
 import re
 import time
+from typing import Any, Tuple
 
 import numpy as np
+import openai
+from tqdm import tqdm
 
-from sglang.lang.api import set_default_backend
-from sglang.test.test_utils import (
-    add_common_sglang_args_and_parse,
-    dump_bench_raw_result,
-    select_sglang_backend,
-)
-from sglang.utils import download_and_cache_file, dump_state_text, read_jsonl
+from sglang.test.test_utils import add_common_sglang_args_and_parse
+from sglang.utils import download_and_cache_file, read_jsonl
 
 INVALID = -9999999
-
-
-def get_one_example(lines, i, include_answer):
-    ret = "Question: " + lines[i]["question"] + "\nAnswer:"
-    if include_answer:
-        ret += " " + lines[i]["answer"]
-    return ret
-
-
-def get_few_shot_examples(lines, k):
-    ret = ""
-    for i in range(k):
-        ret += get_one_example(lines, i, True) + "\n\n"
-    return ret
 
 
 def get_answer_value(answer_str):
@@ -43,69 +28,107 @@ def get_answer_value(answer_str):
         return INVALID
 
 
-def main(args):
-    # Select backend
-    set_default_backend(select_sglang_backend(args))
+def format_few_shot_examples(lines, k):
+    messages = []
+    for i in range(k):
+        question = "Question: " + lines[i]["question"] + "\nAnswer:"
+        answer = lines[i]["answer"]
+        messages.append({"role": "user", "content": question})
+        messages.append({"role": "assistant", "content": answer})
+    return messages
 
-    # Read data
+
+async def process_sample(
+    client: Any, question: str, few_shot_examples: list, model: str
+) -> Tuple[str, int, int]:
+    messages = few_shot_examples + [{"role": "user", "content": question}]
+    response = await client.chat.completions.create(
+        model=model,
+        messages=messages,
+        temperature=0,
+        max_tokens=512,
+        stop=["Question:", "\n\nQuestion"],
+    )
+    return (
+        response.choices[0].message.content,
+        response.usage.prompt_tokens,
+        response.usage.completion_tokens,
+    )
+
+
+async def process_sample_with_semaphore(
+    semaphore: asyncio.Semaphore,
+    client: Any,
+    question: str,
+    few_shot_examples: list,
+    model: str,
+) -> Tuple[str, int, int]:
+    async with semaphore:
+        return await process_sample(client, question, few_shot_examples, model)
+
+
+async def eval_gsm8k(args) -> None:
     data_path = args.data_path
     url = "https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl"
     if not os.path.isfile(data_path):
         data_path = download_and_cache_file(url)
     lines = list(read_jsonl(data_path))
 
-    # Construct prompts
-    num_questions = args.num_questions
-    num_shots = args.num_shots
-    few_shot_examples = get_few_shot_examples(lines, num_shots)
-
+    few_shot_examples = format_few_shot_examples(lines, args.num_shots)
     questions = []
     labels = []
-    for i in range(len(lines[:num_questions])):
-        questions.append(get_one_example(lines, i, False))
-        labels.append(get_answer_value(lines[i]["answer"]))
-    assert all(l != INVALID for l in labels)
-    arguments = [{"question": q} for q in questions]
 
-    #####################################
-    ######### SGL Program Begin #########
-    #####################################
+    for i in range(args.num_questions):
+        question = "Question: " + lines[i]["question"] + "\nAnswer:"
+        label = get_answer_value(lines[i]["answer"])
+        assert label != INVALID, f"Invalid label for question {i}"
+        questions.append(question)
+        labels.append(label)
 
-    import sglang as sgl
-
-    @sgl.function
-    def few_shot_gsm8k(s, question):
-        s += few_shot_examples + question
-        s += sgl.gen(
-            "answer", max_tokens=512, stop=["Question", "Assistant:", "<|separator|>"]
+    if args.backend.startswith("gpt-"):
+        client = openai.AsyncOpenAI(timeout=20 * 60 * 60)
+        model = args.backend
+    else:
+        host = args.host.replace("http://", "").replace("https://", "")
+        client = openai.AsyncOpenAI(
+            api_key="sk", base_url=f"http://{host}:{args.port}/v1", timeout=20 * 60 * 60
         )
+        model = "default"
 
-    #####################################
-    ########## SGL Program End ##########
-    #####################################
+    start = time.perf_counter()
 
-    # Run requests
-    tic = time.perf_counter()
-    states = few_shot_gsm8k.run_batch(
-        arguments,
-        temperature=0,
-        num_threads=args.parallel,
-        progress_bar=True,
-    )
-    latency = time.perf_counter() - tic
+    if args.parallel == 1:
+        responses = []
+        prompt_tokens = []
+        completion_tokens = []
+        for question in tqdm(questions):
+            resp, pt, ct = await process_sample(
+                client, question, few_shot_examples, model
+            )
+            responses.append(resp)
+            prompt_tokens.append(pt)
+            completion_tokens.append(ct)
+    else:
+        semaphore = asyncio.Semaphore(args.parallel)
+        tasks = [
+            process_sample_with_semaphore(
+                semaphore, client, question, few_shot_examples, model
+            )
+            for question in questions
+        ]
+        from tqdm.asyncio import tqdm_asyncio
 
-    preds = []
-    for i in range(len(states)):
-        preds.append(get_answer_value(states[i]["answer"]))
+        results = await tqdm_asyncio.gather(*tasks, desc="Processing")
+        responses = [r[0] for r in results]
+        prompt_tokens = [r[1] for r in results]
+        completion_tokens = [r[2] for r in results]
 
-    # Compute accuracy
+    latency = time.perf_counter() - start
+
+    preds = [get_answer_value(r) for r in responses]
     acc = np.mean(np.array(preds) == np.array(labels))
     invalid = np.mean(np.array(preds) == INVALID)
-
-    # Compute speed
-    num_output_tokens = sum(
-        s.get_meta_info("answer")["completion_tokens"] for s in states
-    )
+    num_output_tokens = sum(completion_tokens)
     output_throughput = num_output_tokens / latency
 
     # Print results
@@ -114,15 +137,6 @@ def main(args):
     print(f"Latency: {latency:.3f} s")
     print(f"Output throughput: {output_throughput:.3f} token/s")
 
-    # Dump results
-    dump_state_text(f"tmp_output_{args.backend}.txt", states)
-    dump_bench_raw_result(
-        path=args.raw_result_file,
-        states=states,
-        preds=preds,
-        labels=labels,
-    )
-
     with open(args.result_file, "a") as fout:
         value = {
             "task": "gsm8k",
@@ -130,6 +144,7 @@ def main(args):
             "num_gpus": 1,
             "latency": round(latency, 3),
             "accuracy": round(acc, 3),
+            "invalid": round(invalid, 3),
             "num_requests": args.num_questions,
             "other": {
                 "num_questions": args.num_questions,
@@ -137,6 +152,10 @@ def main(args):
             },
         }
         fout.write(json.dumps(value) + "\n")
+
+
+def main(args):
+    asyncio.run(eval_gsm8k(args))
 
 
 if __name__ == "__main__":

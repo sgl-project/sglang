@@ -1,21 +1,19 @@
 import argparse
+import asyncio
 import json
 import os
 import time
+from typing import Any, Tuple
 
 import numpy as np
+import openai
 import pandas as pd
-import tiktoken
+from tqdm import tqdm
+from tqdm.asyncio import tqdm_asyncio
 
-from sglang.test.test_utils import (
-    add_common_sglang_args_and_parse,
-    dump_bench_raw_result,
-    select_sglang_backend,
-)
+from sglang.test.test_utils import add_common_sglang_args_and_parse
 
 choices = ["A", "B", "C", "D"]
-
-tokenizer = tiktoken.encoding_for_model("gpt-3.5-turbo")
 
 
 def format_subject(subject):
@@ -37,6 +35,55 @@ def format_example(df, idx, include_answer=True):
     return prompt
 
 
+def gen_few_shot_messages(train_df, subject, k=-1):
+    if k == -1:
+        k = train_df.shape[0]
+    messages = []
+
+    for i in range(k):
+        question = train_df.iloc[i, 0]
+        num_choices = train_df.shape[1] - 2
+        for j in range(num_choices):
+            question += "\n{}. {}".format(choices[j], train_df.iloc[i, j + 1])
+        question += "\nAnswer:"
+
+        answer = train_df.iloc[i, num_choices + 1]
+
+        messages.append({"role": "user", "content": question})
+        messages.append({"role": "assistant", "content": answer})
+
+    return messages
+
+
+async def process_sample(
+    client: Any, question: str, few_shot_examples: list, model: str
+) -> Tuple[str, int, int]:
+    messages = few_shot_examples + [{"role": "user", "content": question}]
+
+    response = await client.chat.completions.create(
+        model=model,
+        messages=messages,
+        temperature=0,
+        max_tokens=1,
+    )
+    return (
+        response.choices[0].message.content,
+        response.usage.prompt_tokens,
+        response.usage.completion_tokens,
+    )
+
+
+async def process_sample_with_semaphore(
+    semaphore: asyncio.Semaphore,
+    client: Any,
+    question: str,
+    few_shot_examples: list,
+    model: str,
+) -> Tuple[str, int, int]:
+    async with semaphore:
+        return await process_sample(client, few_shot_examples, question, model)
+
+
 def gen_prompt(train_df, subject, k=-1):
     prompt = "The following are multiple choice questions (with answers) about{}.\n\n".format(
         format_subject(subject)
@@ -48,7 +95,7 @@ def gen_prompt(train_df, subject, k=-1):
     return prompt
 
 
-def main(args):
+async def eval_mmlu(args) -> None:
     subjects = sorted(
         [
             f.split("_test.csv")[0]
@@ -57,8 +104,8 @@ def main(args):
         ]
     )
 
-    # Build prompts
-    arguments = []
+    few_shot_examples_list = []
+    questions = []
     labels = []
     num_questions = []
 
@@ -72,66 +119,57 @@ def main(args):
         num_questions.append(test_df.shape[0])
 
         k = args.ntrain
-        few_shot_examples = gen_prompt(dev_df, subject, k)
-        while len(tokenizer.encode(few_shot_examples)) > 1536:
-            k -= 1
-            few_shot_examples = gen_prompt(dev_df, subject, k)
+        few_shot_messages = gen_few_shot_messages(dev_df, subject, k)
 
         for i in range(test_df.shape[0]):
-            prompt_end = format_example(test_df, i, include_answer=False)
-
-            arguments.append(
-                {
-                    "examples": few_shot_examples,
-                    "question": prompt_end,
-                }
-            )
+            question = format_example(test_df, i, include_answer=False)
+            few_shot_examples_list.append(few_shot_messages)
+            questions.append(question)
 
             label = test_df.iloc[i, test_df.shape[1] - 1]
             labels.append(label)
 
-    #####################################
-    ######### SGL Program Begin #########
-    #####################################
-
-    import sglang as sgl
-
     if args.backend.startswith("gpt-"):
-
-        @sgl.function
-        def few_shot_mmlu(s, examples, question):
-            s += sgl.user(examples + question)
-            s += sgl.assistant(sgl.gen("answer"))
-
+        client = openai.AsyncOpenAI(timeout=20 * 60 * 60)
+        model = args.backend
     else:
+        host = args.host.replace("http://", "").replace("https://", "")
+        client = openai.AsyncOpenAI(
+            api_key="sk", base_url=f"http://{host}:{args.port}/v1", timeout=20 * 60 * 60
+        )
+        model = "default"
 
-        @sgl.function
-        def few_shot_mmlu(s, examples, question):
-            s += examples + question + sgl.gen("answer")
+    start = time.perf_counter()
 
-    #####################################
-    ########## SGL Program End ##########
-    #####################################
+    if args.parallel == 1:
+        responses = []
+        prompt_tokens = []
+        completion_tokens = []
+        for fs, q in tqdm(zip(few_shot_examples_list, questions), total=len(questions)):
+            response, pt, ct = await process_sample(client, fs, q, model)
+            responses.append(response)
+            prompt_tokens.append(pt)
+            completion_tokens.append(ct)
+    else:
+        semaphore = asyncio.Semaphore(args.parallel)
+        tasks = [
+            process_sample_with_semaphore(semaphore, client, fs, q, model)
+            for fs, q in zip(few_shot_examples_list, questions)
+        ]
 
-    # Select backend
-    backend = select_sglang_backend(args)
+        results = await tqdm_asyncio.gather(*tasks, desc="Processing")
 
-    # Run
-    tic = time.perf_counter()
-    states = few_shot_mmlu.run_batch(
-        arguments,
-        temperature=0,
-        max_new_tokens=1,
-        backend=backend,
-        num_threads=args.parallel,
-        progress_bar=True,
-    )
+        responses = [r[0] for r in results]
+        prompt_tokens = [r[1] for r in results]
+        completion_tokens = [r[2] for r in results]
+
+    latency = time.perf_counter() - start
+
     preds = [
-        s["answer"].strip()[0] if len(s["answer"].strip()) > 0 else "" for s in states
+        response.strip()[0] if len(response.strip()) > 0 else ""
+        for response in responses
     ]
-    latency = time.perf_counter() - tic
 
-    # Compute accuracy
     cors = [pred == label for pred, label in zip(preds, labels)]
 
     pt = 0
@@ -142,13 +180,6 @@ def main(args):
         pt += num_qs
     assert pt == len(cors)
     weighted_acc = np.mean(cors)
-
-    dump_bench_raw_result(
-        path=args.raw_result_file,
-        states=states,
-        preds=preds,
-        labels=labels,
-    )
 
     # Print results
     print("Total latency: {:.3f}".format(latency))
@@ -162,13 +193,17 @@ def main(args):
             "num_gpus": 1,
             "latency": round(latency, 3),
             "accuracy": round(weighted_acc, 3),
-            "num_requests": len(arguments),
+            "num_requests": len(questions),
             "other": {
                 "nsub": args.nsub,
                 "parallel": args.parallel,
             },
         }
         fout.write(json.dumps(value) + "\n")
+
+
+def main(args):
+    asyncio.run(eval_mmlu(args))
 
 
 if __name__ == "__main__":
