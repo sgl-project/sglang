@@ -9,6 +9,7 @@ use smg::tokenizer::{
 
 #[tokio::test]
 async fn test_l0_cache_key_collision() {
+    // 1. Setup
     let cache_dir = download_tokenizer_from_hf("Qwen/Qwen3-4B-Instruct-2507")
         .await
         .expect("Failed to download tokenizer");
@@ -26,19 +27,40 @@ async fn test_l0_cache_key_collision() {
         l1_max_memory: 0,
     };
     let cached = CachedTokenizer::new(inner.clone(), config);
-
     let input = "Hello";
 
-    // First call populates cache with special tokens
-    let enc1 = cached.encode(input, true).expect("First encode failed");
-    let tokens_with_special = enc1.token_ids().to_vec();
+    // 2. First call: add_special_tokens = true
+    // This creates a cache entry for ("Hello", true)
+    let _ = cached.encode(input, true).expect("First encode failed");
 
-    // Second call should return tokens WITHOUT special tokens
-    let enc2 = cached.encode(input, false).expect("Second encode failed");
-    let tokens_without_special = enc2.token_ids().to_vec();
+    // 3. Second call: add_special_tokens = false
+    // This SHOULD BE A MISS because the flag is different.
+    let _ = cached.encode(input, false).expect("Second encode failed");
 
-    assert_ne!(
-        tokens_with_special, tokens_without_special,
-        "BUG: L0 cache returned the same result for different add_special_tokens values!"
+    // 4. Verify via Cache Stats
+    let stats = cached.cache_stats().expect("Stats should be available");
+
+    println!("Cache Stats: Hits={}, Misses={}", stats.hits, stats.misses);
+
+    // If the fix is working:
+    // Call 1: Miss (populates key: ("Hello", true))
+    // Call 2: Miss (should NOT hit because key is ("Hello", false))
+    assert_eq!(
+        stats.hits, 0,
+        "BUG: L0 cache HIT on the second call! This means it ignored the add_special_tokens flag."
+    );
+    assert_eq!(
+        stats.misses, 2,
+        "Expected 2 misses (one for each unique flag value)."
+    );
+
+    // 5. Third call: add_special_tokens = true (Repeat of first call)
+    // This SHOULD BE A HIT.
+    let _ = cached.encode(input, true).expect("Third encode failed");
+    let stats_after = cached.cache_stats().expect("Stats should be available");
+
+    assert_eq!(
+        stats_after.hits, 1,
+        "Expected exactly 1 hit for the repeated call"
     );
 }
