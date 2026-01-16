@@ -375,6 +375,7 @@ class ServerArgs:
     served_model_name: Optional[str] = None
     weight_version: str = "default"
     chat_template: Optional[str] = None
+    hf_chat_template_name: Optional[str] = None
     completion_template: Optional[str] = None
     file_storage_path: str = "sglang_storage"
     enable_cache_report: bool = False
@@ -3279,6 +3280,13 @@ class ServerArgs:
             type=str,
             default=ServerArgs.chat_template,
             help="The buliltin chat template name or the path of the chat template file. This is only used for OpenAI-compatible API server.",
+        )
+        parser.add_argument(
+            "--hf-chat-template-name",
+            type=str,
+            default=ServerArgs.hf_chat_template_name,
+            help="When the HuggingFace tokenizer has multiple chat templates (e.g., 'default', 'tool_use', 'rag'), "
+            "specify which named template to use. If not set, 'default' is used if available, otherwise the first template.",
         )
         parser.add_argument(
             "--completion-template",
