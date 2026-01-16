@@ -109,47 +109,54 @@ async def stream_completion(request: web.Request, ws: web.WebSocketResponse, dat
         # Tokenize the response to get individual tokens
         # We'll use the attention_tokens array which has one entry per generated token
         if attention_tokens:
-            # Each attention_tokens entry corresponds to one generated token
-            # We need to detokenize to get the actual token text
-
-            # First, let's get all token texts via detokenize
-            token_texts = []
-
-            # Try to detokenize token by token using the content
-            # Split content into approximate tokens (this is a heuristic)
-            # Better approach: use the actual token IDs if available
-
-            # For now, send tokens based on attention_tokens count
             num_tokens = len(attention_tokens)
 
-            # Simple heuristic: split content into roughly equal parts
-            # This isn't perfect but gives a reasonable approximation
-            words = content.split()
-            tokens_per_word = max(1, num_tokens / len(words)) if words else 1
+            # Try to get actual token texts via detokenize API
+            token_texts = []
+            try:
+                # Check if attention data includes token IDs
+                first_attn = attention_tokens[0] if attention_tokens else {}
+                if "token_id" in first_attn or "token_ids" in first_attn:
+                    # Use token IDs to detokenize
+                    token_ids = [a.get("token_id") or a.get("token_ids", [0])[0] for a in attention_tokens]
+                    async with aiohttp.ClientSession() as detok_session:
+                        async with detok_session.post(
+                            f"{sglang_url}/v1/detokenize",
+                            json={"tokens": token_ids},
+                            headers={"Content-Type": "application/json"}
+                        ) as detok_response:
+                            if detok_response.status == 200:
+                                detok_data = await detok_response.json()
+                                # Some APIs return individual token texts
+                                token_texts = detok_data.get("texts", [])
+            except Exception:
+                pass  # Fall back to character-based splitting
 
-            current_word_idx = 0
+            # If we couldn't get token texts, use character-based distribution
+            if not token_texts or len(token_texts) != num_tokens:
+                # Distribute content characters proportionally across tokens
+                # This gives each token a slice of the content
+                chars_per_token = len(content) / num_tokens if num_tokens > 0 else len(content)
+                token_texts = []
+                for i in range(num_tokens):
+                    start = int(i * chars_per_token)
+                    end = int((i + 1) * chars_per_token)
+                    token_text = content[start:end]
+                    # Clean up: don't start with space unless it's the first token
+                    if i > 0 and token_text.startswith(' ') and len(token_text) > 1:
+                        pass  # Keep the space for readability
+                    token_texts.append(token_text if token_text else f"·")  # Use middle dot for empty
+
             accumulated_text = ""
-
             for i, attn in enumerate(attention_tokens):
-                # Estimate which part of content this token represents
-                # Add approximately one token's worth of content
-                if current_word_idx < len(words):
-                    token_text = words[current_word_idx]
-                    if i % int(tokens_per_word) == 0 and current_word_idx < len(words) - 1:
-                        token_text += " "
-                        current_word_idx += 1
-                    elif (i + 1) % max(1, int(tokens_per_word)) == 0:
-                        current_word_idx += 1
-                else:
-                    token_text = ""
-
-                accumulated_text = content[:int((i + 1) / num_tokens * len(content))] if num_tokens > 0 else content
+                token_text = token_texts[i] if i < len(token_texts) else ""
+                accumulated_text += token_text
 
                 # Build token message with attention
                 token_msg = {
                     "type": "token",
                     "index": i,
-                    "content": token_text if token_text else f"[tok_{i}]",
+                    "content": token_text if token_text.strip() else f"[{i}]",
                     "full_content": accumulated_text,
                     "attention": attn,
                     "zone": attn.get("manifold_zone", "unknown"),
