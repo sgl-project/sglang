@@ -157,6 +157,7 @@ NSA_CHOICES = [
 ]
 
 RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu"]
+MARCONI_EVICTION_POLICY_CHOICES = ["v2", "v3"]
 
 RL_ON_POLICY_TARGET_CHOICES = ["fsdp"]
 
@@ -310,6 +311,12 @@ class ServerArgs:
     swa_full_tokens_ratio: float = 0.8
     disable_hybrid_swa_memory: bool = False
     radix_eviction_policy: str = "lru"
+    enable_marconi: bool = False
+    marconi_eviction_policy: str = "v2"
+    marconi_eff_weight: float = 0.0
+    marconi_bootstrap_window_size: Optional[int] = None
+    marconi_bootstrap_multiplier: int = 5
+    marconi_tuning_interval: int = 500
 
     # Runtime options
     device: Optional[str] = None
@@ -2146,6 +2153,21 @@ class ServerArgs:
                 "and cannot be used at the same time. Please use only one of them."
             )
 
+        if self.enable_marconi:
+            if self.disable_radix_cache:
+                logger.warning("Marconi is disabled because radix cache is disabled.")
+                self.enable_marconi = False
+            if self.marconi_bootstrap_window_size is not None and (
+                self.marconi_bootstrap_window_size <= 0
+            ):
+                raise ValueError(
+                    "marconi_bootstrap_window_size must be positive when set."
+                )
+            if self.marconi_bootstrap_multiplier <= 0:
+                raise ValueError("marconi_bootstrap_multiplier must be positive.")
+            if self.marconi_tuning_interval <= 0:
+                raise ValueError("marconi_tuning_interval must be positive.")
+
         if self.disaggregation_decode_enable_offload_kvcache:
             if self.disaggregation_mode != "decode":
                 raise ValueError(
@@ -2704,6 +2726,42 @@ class ServerArgs:
             choices=RADIX_EVICTION_POLICY_CHOICES,
             default=ServerArgs.radix_eviction_policy,
             help="The eviction policy of radix trees. 'lru' stands for Least Recently Used, 'lfu' stands for Least Frequently Used.",
+        )
+        parser.add_argument(
+            "--enable-marconi",
+            action="store_true",
+            help="Enable Marconi eviction and tuning for hybrid radix cache.",
+        )
+        parser.add_argument(
+            "--marconi-eviction-policy",
+            type=str,
+            choices=MARCONI_EVICTION_POLICY_CHOICES,
+            default=ServerArgs.marconi_eviction_policy,
+            help="Marconi eviction policy version. 'v2' uses fixed eff_weight, 'v3' enables tuning.",
+        )
+        parser.add_argument(
+            "--marconi-eff-weight",
+            type=float,
+            default=ServerArgs.marconi_eff_weight,
+            help="Marconi efficiency weight (alpha) for eviction scoring.",
+        )
+        parser.add_argument(
+            "--marconi-bootstrap-window-size",
+            type=int,
+            default=ServerArgs.marconi_bootstrap_window_size,
+            help="Fixed bootstrap window size for Marconi tuning. If unset, uses marconi-bootstrap-multiplier.",
+        )
+        parser.add_argument(
+            "--marconi-bootstrap-multiplier",
+            type=int,
+            default=ServerArgs.marconi_bootstrap_multiplier,
+            help="Bootstrap window size multiplier when fixed window size is not set.",
+        )
+        parser.add_argument(
+            "--marconi-tuning-interval",
+            type=int,
+            default=ServerArgs.marconi_tuning_interval,
+            help="Number of requests per tuning window for Marconi.",
         )
 
         # Runtime options

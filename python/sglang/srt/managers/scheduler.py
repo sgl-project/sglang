@@ -156,6 +156,7 @@ from sglang.srt.managers.session_controller import Session
 from sglang.srt.managers.utils import GenerationBatchResult, validate_input_length
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import release_kv_cache
+from sglang.srt.mem_cache.marconi_config import MarconiConfig
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
@@ -758,6 +759,22 @@ class Scheduler(
             self.tp_worker.get_memory_pool()
         )
 
+        marconi_config = None
+        if server_args.enable_marconi:
+            if not self.is_ssm_model:
+                logger.warning(
+                    "Marconi is enabled but the model is not using Mamba radix cache."
+                )
+            else:
+                marconi_config = MarconiConfig(
+                    enable=True,
+                    eviction_policy=server_args.marconi_eviction_policy,
+                    eff_weight=server_args.marconi_eff_weight,
+                    bootstrap_window_size=server_args.marconi_bootstrap_window_size,
+                    bootstrap_multiplier=server_args.marconi_bootstrap_multiplier,
+                    tuning_interval=server_args.marconi_tuning_interval,
+                )
+
         params = CacheInitParams(
             disable=server_args.disable_radix_cache,
             req_to_token_pool=self.req_to_token_pool,
@@ -772,6 +789,7 @@ class Scheduler(
             eviction_policy=server_args.radix_eviction_policy,
             enable_metrics=self.enable_metrics,
             enable_kv_cache_events=self.enable_kv_cache_events,
+            marconi_config=marconi_config,
         )
 
         if (
