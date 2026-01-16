@@ -52,27 +52,6 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      # Prepare build args so Dockerfile can clone the ci repo/branch:
-      # - SGLANG_REPO: which repo to clone (PR uses contributor's fork, nightly/release uses official repo)
-      # - VER_SGLANG: which branch or tag to checkout (PR uses PR head_ref, nightly/schedule uses ref_name/main)
-      - name: Prepare build args
-        id: prep
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          PR_REPO: ${{ github.event.pull_request.head.repo.clone_url }}
-          PR_REF: ${{ github.head_ref }}
-          REPO_FULL: https://github.com/${{ github.repository }}.git
-          REF_NAME: ${{ github.ref_name }}
-        run: |
-          if [ "$EVENT_NAME" = "pull_request" ]; then
-            echo "SGLANG_REPO=$PR_REPO" >> $GITHUB_OUTPUT
-            echo "VER_SGLANG=$PR_REF" >> $GITHUB_OUTPUT
-          else
-            # schedule / workflow_dispatch / branch push
-            echo "SGLANG_REPO=$REPO_FULL" >> $GITHUB_OUTPUT
-            echo "VER_SGLANG=$REF_NAME" >> $GITHUB_OUTPUT
-          fi
-
       # Build and push Docker image with Buildx (don't push on PR)
       # https://github.com/docker/build-push-action
       - name: Build and push Docker image
@@ -88,8 +67,6 @@ jobs:
           push: ${{ github.repository == 'sgl-project/sglang' && github.event_name != 'pull_request' }}
           provenance: false
           build-args: |
-            SGLANG_REPO=${{ steps.prep.outputs.SGLANG_REPO }}
-            VER_SGLANG=${{ steps.prep.outputs.VER_SGLANG }}
             SGLANG_KERNEL_NPU_TAG=2025.12.31
             CANN_VERSION=${{ matrix.cann_version }}
             DEVICE_TYPE=${{ matrix.device_type }}

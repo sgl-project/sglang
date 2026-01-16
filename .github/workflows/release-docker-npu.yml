@@ -68,26 +68,6 @@ jobs:
           echo "version=v${VERSION}" >> $GITHUB_OUTPUT
           echo "TAG=lmsysorg/sglang:v${VERSION}-cann${{ matrix.cann_version }}-${{ matrix.device_type }}" >> $GITHUB_OUTPUT
 
-      # SGLANG_REPO: which repo to clone (PR uses the contributor's fork, release uses the official repo as default arg)
-      # VER_SGLANG: which branch or tag to checkout (PR uses the PR head_ref, release/tag uses ref_name)
-      - name: Prepare build args
-        id: prep
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          PR_REPO: ${{ github.event.pull_request.head.repo.clone_url }}
-          PR_REF: ${{ github.head_ref }}
-          REPO_FULL: https://github.com/${{ github.repository }}.git
-          REF_NAME: ${{ github.ref_name }}
-        run: |
-          if [ "$EVENT_NAME" = "pull_request" ]; then
-            echo "SGLANG_REPO=$PR_REPO" >> $GITHUB_OUTPUT
-            echo "VER_SGLANG=$PR_REF" >> $GITHUB_OUTPUT
-          else
-            # push tag / manual dispatch
-            echo "SGLANG_REPO=$REPO_FULL" >> $GITHUB_OUTPUT
-            echo "VER_SGLANG=$REF_NAME" >> $GITHUB_OUTPUT
-          fi
-
       - name: Build and push Docker image
         id: build-and-push
         uses: docker/build-push-action@v6
@@ -101,8 +81,6 @@ jobs:
           push: ${{ github.repository == 'sgl-project/sglang' && github.event_name != 'pull_request' }}
           provenance: false
           build-args: |
-            SGLANG_REPO=${{ steps.prep.outputs.SGLANG_REPO }}
-            VER_SGLANG=${{ steps.prep.outputs.VER_SGLANG }}
             SGLANG_KERNEL_NPU_TAG=2025.12.31
             CANN_VERSION=${{ matrix.cann_version }}
             DEVICE_TYPE=${{ matrix.device_type }}

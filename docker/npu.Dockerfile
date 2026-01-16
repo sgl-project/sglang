@@ -4,7 +4,6 @@ ARG OS=ubuntu22.04
 ARG PYTHON_VERSION=py3.11
 
 FROM quay.io/ascend/cann:$CANN_VERSION-$DEVICE_TYPE-$OS-$PYTHON_VERSION
-SHELL ["/bin/bash", "-c"]
 
 # Update pip & apt sources
 ARG PIP_INDEX_URL="https://pypi.org/simple/"
@@ -18,8 +17,6 @@ ARG BISHENG_URL="https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/sglang/tr
 ARG SGLANG_TAG=main
 ARG ASCEND_CANN_PATH=/usr/local/Ascend/ascend-toolkit
 ARG SGLANG_KERNEL_NPU_TAG=main
-ARG SGLANG_REPO=https://github.com/sgl-project/sglang.git
-ARG VER_SGLANG=main
 
 ARG PIP_INSTALL="python3 -m pip install --no-cache-dir"
 ARG DEVICE_TYPE
@@ -75,7 +72,7 @@ RUN (${PIP_INSTALL} pybind11) \
     && (${PIP_INSTALL} ${TRITON_ASCEND_URL})
 
 # Install SGLang
-RUN git clone ${SGLANG_REPO} --branch ${VER_SGLANG} sglang && \
+RUN git clone https://github.com/sgl-project/sglang.git --branch $SGLANG_TAG && \
     (cd sglang/python && rm -f pyproject.toml && mv pyproject_npu.toml pyproject.toml && ${PIP_INSTALL} -v ".[all_npu]") && \
     rm -rf sglang
 
