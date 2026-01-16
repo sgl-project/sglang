@@ -35,7 +35,8 @@ def sgemm_lora_a_fwd(
             x_seq = inputs[token_offset : token_offset + seq_len, :]
             w_seq = weights[lora_idx, : num_slices * rank, :]
 
-            result = torch.einsum("si, oi -> so", x_seq, w_seq)
+            #result = torch.einsum("si, oi -> so", x_seq, w_seq)
+            result = torch.mm(x_seq, w_seq.T)
             output[token_offset : token_offset + seq_len, : num_slices * rank] = (
                 scaling_tensor[lora_idx] * result
             )
@@ -98,11 +99,11 @@ def sgemm_lora_b_fwd(
                 lora_idx, slice_start_output:slice_end_output, :rank
             ]  # (slice_dim, rank)
 
-            result = torch.einsum("si, oi -> so", x_slice, w_slice)
+            #result = torch.einsum("si, oi -> so", x_slice, w_slice)
             output[
                 token_offset : token_offset + seq_len,
                 slice_start_output:slice_end_output,
-            ] += result
+            ].add_(torch.mm(x_slice, w_slice,T)) #+= result
 
         token_offset += seq_len
 
