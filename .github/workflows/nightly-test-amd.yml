@@ -35,7 +35,8 @@ on:
           - 'nightly-8-gpu-mi35x-grok1-int4'
           - 'nightly-8-gpu-mi35x-grok2'
           - 'nightly-8-gpu-mi35x-deepseek-r1-mxfp4'
-          - 'nightly-8-gpu-mi35x-deepseek-v32'
+          - 'nightly-accuracy-8-gpu-mi35x-deepseek-v32'
+          - 'nightly-perf-8-gpu-mi35x-deepseek-v32'
   workflow_call:
     inputs:
       ref:
@@ -573,9 +574,9 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
-  # MI35x 8-GPU DeepSeek-V3.2 (Accuracy + Performance combined)
-  nightly-8-gpu-mi35x-deepseek-v32:
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-8-gpu-mi35x-deepseek-v32')
+  # MI35x 8-GPU DeepSeek-V3.2 Accuracy Test
+  nightly-accuracy-8-gpu-mi35x-deepseek-v32:
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-accuracy-8-gpu-mi35x-deepseek-v32')
     runs-on: linux-mi35x-gpu-8
     steps:
       - name: Checkout code
@@ -606,9 +607,31 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
+  # MI35x 8-GPU DeepSeek-V3.2 Performance Test
+  nightly-perf-8-gpu-mi35x-deepseek-v32:
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-perf-8-gpu-mi35x-deepseek-v32')
+    runs-on: linux-mi35x-gpu-8
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Setup docker
+        run: |
+          touch github_summary.md
+          bash scripts/ci/amd_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/amd_ci_install_dependency.sh
+          # Install tabulate for run_suite.py (missing in MI35x container)
+          bash scripts/ci/amd_ci_exec.sh pip install tabulate
+
       - name: Performance Test MI35x (8-GPU DeepSeek-V3.2)
         timeout-minutes: 300
-        continue-on-error: true  # Perf test failure doesn't fail the job if accuracy passed
         run: |
           > github_summary.md  # Clear summary file
           bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test \
@@ -638,7 +661,8 @@ jobs:
       - nightly-8-gpu-mi35x-grok1-int4
       - nightly-8-gpu-mi35x-grok2
       - nightly-8-gpu-mi35x-deepseek-r1-mxfp4
-      - nightly-8-gpu-mi35x-deepseek-v32
+      - nightly-accuracy-8-gpu-mi35x-deepseek-v32
+      - nightly-perf-8-gpu-mi35x-deepseek-v32
     runs-on: ubuntu-latest
     steps:
       - name: Check if any job failed
