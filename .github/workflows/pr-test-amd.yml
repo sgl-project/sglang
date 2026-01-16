@@ -924,7 +924,7 @@ jobs:
         timeout-minutes: 30
         run: |
           bash scripts/ci/amd_ci_exec.sh -e SGLANG_USE_AITER_AR=0 -e SGLANG_USE_AITER=0 -e HF_HUB_ENABLE_HF_TRANSFER=0 python3 test_moe_eval_accuracy_large.py
-  
+
   # =============================================== Disaggregation ====================================================
   stage-b-test-large-2-gpu-35x-disaggregation-amd:
     needs: [check-changes, stage-a-test-1-amd]
@@ -999,7 +999,7 @@ jobs:
       #       -e SGLANG_TEST_RDMA_DEVICE="${{ env.SGLANG_TEST_RDMA_DEVICE }}" \
       #       -e HF_TOKEN="${{ env.HF_TOKEN }}" \
       #       python3 -m unittest test/registered/amd/disaggregation/test_disaggregation_pp.py
-  
+
   pr-test-amd-finish:
     needs:
       [
