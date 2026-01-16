@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import copy
 import logging
-from typing import Optional, Tuple
+from typing import ClassVar, Optional, Tuple
 
 import torch
 import triton
@@ -19,6 +19,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import apply_custom_logit_processor
+from sglang.srt.managers.overlap_utils import FutureIndices
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
@@ -26,6 +27,11 @@ from sglang.srt.mem_cache.common import (
     get_last_loc,
 )
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.eagle_info_v2 import (
+    EagleDraftInputV2Mixin,
+    EagleVerifyInputV2Mixin,
+)
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import (
     TREE_SPEC_KERNEL_AVAILABLE,
@@ -47,26 +53,48 @@ elif is_hip():
 
 
 @dataclass
-class NgramVerifyInput(SpecInput):
+class NgramVerifyInput(SpecInput, EagleDraftInputV2Mixin, EagleVerifyInputV2Mixin):
+    # Constant: alloc length per decode step
+    ALLOC_LEN_PER_DECODE: ClassVar[int] = None
+
     def __init__(
         self,
-        draft_token: torch.Tensor,
-        tree_mask: torch.Tensor,
-        positions: torch.Tensor,
-        retrive_index: torch.Tensor,
-        retrive_next_token: torch.Tensor,
-        retrive_next_sibling: torch.Tensor,
-        draft_token_num: int,
+        server_args: ServerArgs = None,
+        draft_token: torch.Tensor = None,
+        custom_mask: torch.Tensor = None,
+        positions: torch.Tensor = None,
+        retrive_index: torch.Tensor = None,
+        retrive_next_token: torch.Tensor = None,
+        retrive_next_sibling: torch.Tensor = None,
+        draft_token_num: int = 0,
+        future_indices: Optional[FutureIndices] = None,
+        new_seq_lens: Optional[torch.Tensor] = None,
+        verify_done: Optional[torch.cuda.Event] = None,
+        next_token_ids: Optional[torch.Tensor] = None,
+        accept_lens: Optional[torch.Tensor] = None,
+        is_spec_v2: Optional[bool] = False,
     ):
         super().__init__(SpecInputType.NGRAM_VERIFY)
-        self.draft_token = draft_token
-        self.custom_mask = tree_mask
-        self.positions = positions
-        self.retrive_index = retrive_index
-        self.retrive_next_token = retrive_next_token
-        self.retrive_next_sibling = retrive_next_sibling
-        self.draft_token_num = draft_token_num
-        self.device = self.custom_mask.device
+        if custom_mask is not None:
+            self.draft_token = draft_token
+            self.custom_mask = custom_mask
+            self.positions = positions
+            self.retrive_index = retrive_index
+            self.retrive_next_token = retrive_next_token
+            self.retrive_next_sibling = retrive_next_sibling
+            self.draft_token_num = draft_token_num
+
+        # Inputs for V2 overlap worker
+        self.future_indices = future_indices
+        self.new_seq_lens = new_seq_lens
+        self.verify_done = verify_done
+        self.next_token_ids = next_token_ids
+        self.accept_lens = accept_lens
+        self.is_spec_v2 = is_spec_v2
+
+        self.device = (
+            custom_mask.device if custom_mask is not None else new_seq_lens.device
+        )
 
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
         return self.draft_token_num, self.draft_token_num
@@ -443,7 +471,15 @@ class NgramVerifyInput(SpecInput):
         return logits_output, self.verified_id, num_accepted_tokens
 
     def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
-        pass
+        if self.is_spec_v2:
+            self.next_token_ids = self.next_token_ids[new_indices]
+            self.accept_lens = self.accept_lens[new_indices]
 
     def merge_batch(self, spec_info: NgramVerifyInput):
-        pass
+        if self.is_spec_v2:
+            self.next_token_ids = torch.cat(
+                (self.next_token_ids, spec_info.next_token_ids), dim=0
+            )
+            self.accept_lens = torch.cat(
+                (self.accept_lens, spec_info.accept_lens), dim=0
+            )

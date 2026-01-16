@@ -10,6 +10,7 @@ import triton.language as tl
 
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
+from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.chunk_cache import SWAChunkCache
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
@@ -109,8 +110,8 @@ class EagleDraftInputV2Mixin:
         if page_size == 1:
             out_cache_loc = alloc_token_slots(batch.tree_cache, num_needed_tokens)
         else:
-            cur_kv_lens = cur_kv_lens_cpu.to(device=batch.device)
-            nxt_kv_lens = nxt_kv_lens_cpu.to(device=batch.device)
+            cur_kv_lens = cur_kv_lens_cpu.to(device=batch.device, non_blocking=True)
+            nxt_kv_lens = nxt_kv_lens_cpu.to(device=batch.device, non_blocking=True)
             last_loc = get_last_loc(
                 batch.req_to_token_pool.req_to_token,
                 batch.req_pool_indices,
@@ -129,8 +130,8 @@ class EagleDraftInputV2Mixin:
         assign_req_to_token_pool_func(
             batch.req_pool_indices,
             batch.req_to_token_pool.req_to_token,
-            cur_kv_lens_cpu.to(device=batch.device),
-            nxt_kv_lens_cpu.to(device=batch.device),
+            cur_kv_lens_cpu.to(device=batch.device, non_blocking=True),
+            nxt_kv_lens_cpu.to(device=batch.device, non_blocking=True),
             out_cache_loc,
             bs,
         )
@@ -291,8 +292,13 @@ class EagleVerifyInputV2Mixin:
         candidates = self.draft_token.reshape(bs, self.draft_token_num)
         predict_shape = list(next_token_logits.shape)[:-1]
         predict = torch.zeros(predict_shape, dtype=torch.int32, device=device).flatten()
+        accept_index_size = (
+            self.draft_token_num
+            if batch.spec_algorithm.is_ngram()
+            else self.spec_steps + 1
+        )
         accept_index = torch.full(
-            (bs, self.spec_steps + 1), -1, dtype=torch.int32, device=device
+            (bs, accept_index_size), -1, dtype=torch.int32, device=device
         )
         accept_length = torch.empty((bs,), dtype=torch.int32, device=device)
 
@@ -309,7 +315,7 @@ class EagleVerifyInputV2Mixin:
                 retrive_next_token=self.retrive_next_token,
                 retrive_next_sibling=self.retrive_next_sibling,
                 target_predict=target_predict,
-                topk=self.topk,
+                topk=-1 if batch.spec_algorithm.is_ngram() else self.topk,
             )
         else:
             # Apply temperature and get target probs
@@ -367,7 +373,11 @@ class EagleVerifyInputV2Mixin:
                 accept_length=accept_length,  # mutable
                 simulate_acc_len=SIMULATE_ACC_LEN,
                 bs=bs,
-                spec_steps=self.spec_steps,
+                spec_steps=(
+                    self.draft_token_num
+                    if batch.spec_algorithm.is_ngram()
+                    else self.spec_steps
+                ),
             )
 
         # Include the bonus token
@@ -487,3 +497,48 @@ def assign_extend_cache_locs_func(
         )
 
         return out_cache_loc
+
+
+def move_accepted_tokens_to_target_kvcache(
+    batch: ModelWorkerBatch,
+    accept_index: torch.Tensor,
+    accept_length: torch.Tensor,
+    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
+    speculative_num_draft_tokens: int,
+):
+    """
+    Move accepted tokens to the target KV cache.
+
+    Args:
+        batch: The batch to run.
+        accept_index: The index of the accepted tokens.
+        accept_length: The length of the accepted tokens.
+    """
+    bs = len(batch.seq_lens)
+    size = bs * speculative_num_draft_tokens
+    device = batch.seq_lens.device
+
+    tgt_cache_loc = torch.zeros(
+        size,
+        dtype=torch.int64,
+        device=device,
+    )
+    accepted_out_cache_loc = torch.zeros(size, dtype=torch.int64, device=device)
+    assign_extend_cache_locs[(bs,)](
+        batch.req_pool_indices,
+        batch.req_to_token_pool.req_to_token,
+        batch.seq_lens,
+        batch.seq_lens + accept_length,
+        tgt_cache_loc,
+        batch.req_to_token_pool.req_to_token.shape[1],
+        next_power_of_2(bs),
+    )
+    fill_accepted_out_cache_loc[(size,)](
+        accept_index,
+        batch.out_cache_loc,
+        accepted_out_cache_loc,
+        next_power_of_2(size),
+    )
+    token_to_kv_pool_allocator.get_kvcache().move_kv_cache(
+        tgt_cache_loc, accepted_out_cache_loc
+    )

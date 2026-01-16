@@ -910,7 +910,7 @@ class CudaGraphRunner:
 
             spec_info = NgramVerifyInput(
                 draft_token=None,
-                tree_mask=self.buffers.custom_mask,
+                custom_mask=self.buffers.custom_mask,
                 positions=None,
                 retrive_index=None,
                 retrive_next_token=None,

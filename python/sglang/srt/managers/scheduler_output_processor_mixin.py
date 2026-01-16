@@ -418,7 +418,6 @@ class SchedulerOutputProcessorMixin:
                         release_kv_cache(req, self.tree_cache)
                 else:
                     release_kv_cache(req, self.tree_cache)
-
                 req.time_stats.completion_time = time.perf_counter()
 
             self.maybe_collect_customized_info(i, req, logits_output)

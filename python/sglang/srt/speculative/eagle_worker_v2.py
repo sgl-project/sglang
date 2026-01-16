@@ -32,11 +32,7 @@ from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
     EAGLEDraftExtendCudaGraphRunner,
 )
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
-from sglang.srt.speculative.eagle_info_v2 import (
-    assign_extend_cache_locs,
-    fill_accepted_out_cache_loc,
-    fill_new_verified_id,
-)
+from sglang.srt.speculative.eagle_info_v2 import fill_new_verified_id
 from sglang.srt.speculative.eagle_utils import TreeMaskMode, build_tree_kernel_efficient
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
@@ -53,7 +49,6 @@ from sglang.srt.utils.common import (
     get_available_gpu_memory,
     is_cuda,
     is_npu,
-    next_power_of_2,
 )
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 
@@ -773,50 +768,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
             can_run_cuda_graph=can_run_cuda_graph,
             next_draft_input=next_draft_input,
             accept_lens=accept_length,
-        )
-
-    def move_accepted_tokens_to_target_kvcache(
-        self,
-        batch: ModelWorkerBatch,
-        accept_index: torch.Tensor,
-        accept_length: torch.Tensor,
-    ):
-        """
-        Move accepted tokens to the target KV cache.
-
-        Args:
-            batch: The batch to run.
-            accept_index: The index of the accepted tokens.
-            accept_length: The length of the accepted tokens.
-        """
-        bs = len(batch.seq_lens)
-        size = bs * self.speculative_num_draft_tokens
-
-        tgt_cache_loc = torch.zeros(
-            size,
-            dtype=torch.int64,
-            device=self.device,
-        )
-        accepted_out_cache_loc = torch.zeros(
-            size, dtype=torch.int64, device=self.device
-        )
-        assign_extend_cache_locs[(bs,)](
-            batch.req_pool_indices,
-            self.req_to_token_pool.req_to_token,
-            batch.seq_lens,
-            batch.seq_lens + accept_length,
-            tgt_cache_loc,
-            self.req_to_token_pool.req_to_token.shape[1],
-            next_power_of_2(bs),
-        )
-        fill_accepted_out_cache_loc[(size,)](
-            accept_index,
-            batch.out_cache_loc,
-            accepted_out_cache_loc,
-            next_power_of_2(size),
-        )
-        self.token_to_kv_pool_allocator.get_kvcache().move_kv_cache(
-            tgt_cache_loc, accepted_out_cache_loc
         )
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
