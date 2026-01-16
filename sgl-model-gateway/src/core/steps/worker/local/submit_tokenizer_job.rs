@@ -1,8 +1,8 @@
 //! Tokenizer registration step for local workers.
 //!
 //! This step submits a Job::AddTokenizer to the job queue, which triggers the
-//! tokenizer_registration workflow. This ensures all tokenizer registrations
-//! go through the same workflow with consistent behavior (validation, caching).
+//! tokenizer_registration workflow. The workflow handles validation, deduplication,
+//! and caching - this step just submits the job.
 
 use async_trait::async_trait;
 use tracing::{debug, info, warn};
@@ -93,14 +93,9 @@ impl StepExecutor<LocalWorkerWorkflowData> for SubmitTokenizerJobStep {
                 continue;
             };
 
-            // Check if tokenizer already exists for this model
-            if app_context.tokenizer_registry.contains(&model_id) {
-                debug!(
-                    "Tokenizer already registered for model {}, skipping",
-                    model_id
-                );
-                continue;
-            }
+            // Note: We don't check if tokenizer already exists here.
+            // The registry.load() handles deduplication gracefully (returns AlreadyExists).
+            // This simplifies the code and ensures consistent behavior.
 
             info!(
                 "Submitting tokenizer registration job for model {} from {}",

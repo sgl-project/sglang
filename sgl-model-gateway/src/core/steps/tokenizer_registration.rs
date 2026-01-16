@@ -11,7 +11,7 @@ use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, error, info};
+use tracing::{error, info};
 
 use super::workflow_data::TokenizerWorkflowData;
 use crate::{
@@ -20,6 +20,7 @@ use crate::{
     tokenizer::{
         cache::{CacheConfig, CachedTokenizer},
         factory,
+        registry::LoadOutcome,
         traits::Tokenizer,
     },
     workflow::{
@@ -55,61 +56,13 @@ pub struct TokenizerRemovalRequest {
 // Workflow Steps
 // ============================================================================
 
-/// Step 1: Validate the tokenizer configuration
-pub struct ValidateTokenizerConfigStep;
-
-#[async_trait]
-impl StepExecutor<TokenizerWorkflowData> for ValidateTokenizerConfigStep {
-    async fn execute(
-        &self,
-        context: &mut WorkflowContext<TokenizerWorkflowData>,
-    ) -> WorkflowResult<StepResult> {
-        let config = &context.data.config;
-        let app_context = context
-            .data
-            .app_context
-            .as_ref()
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
-
-        debug!(
-            "Validating tokenizer config: name={}, source={}",
-            config.name, config.source
-        );
-
-        // Validate name is not empty
-        if config.name.is_empty() {
-            return Err(WorkflowError::StepFailed {
-                step_id: StepId::new("validate_config"),
-                message: "Tokenizer name cannot be empty".to_string(),
-            });
-        }
-
-        // Validate source is not empty
-        if config.source.is_empty() {
-            return Err(WorkflowError::StepFailed {
-                step_id: StepId::new("validate_config"),
-                message: "Tokenizer source cannot be empty".to_string(),
-            });
-        }
-
-        // Check if tokenizer already exists
-        if app_context.tokenizer_registry.contains(&config.name) {
-            return Err(WorkflowError::StepFailed {
-                step_id: StepId::new("validate_config"),
-                message: format!("Tokenizer '{}' already exists", config.name),
-            });
-        }
-
-        debug!("Tokenizer config validated successfully");
-        Ok(StepResult::Success)
-    }
-
-    fn is_retryable(&self, _error: &WorkflowError) -> bool {
-        false // Validation errors are not retryable
-    }
-}
-
-/// Step 2: Load the tokenizer from source (local path or HuggingFace)
+/// Load the tokenizer from source (local path or HuggingFace)
+///
+/// This step handles:
+/// - Input validation (via registry.load())
+/// - Deduplication (returns success if already exists)
+/// - Loading from local path or HuggingFace
+/// - Optional caching layer wrapping
 pub struct LoadTokenizerStep;
 
 #[async_trait]
@@ -145,7 +98,8 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
         let chat_template = config.chat_template_path.clone();
         let cache_config = config.cache_config.clone();
 
-        // Load the tokenizer using the registry's load method (handles deduplication)
+        // Load the tokenizer using the registry's load method
+        // This handles: validation, deduplication, and loading
         let result = app_context
             .tokenizer_registry
             .load(&id, &name, &source, || {
@@ -181,17 +135,29 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
             .await;
 
         match result {
-            Ok(loaded_id) => {
+            Ok(outcome) => {
+                let loaded_id = outcome.id();
+
                 // Get vocab size for logging
                 let vocab_size = app_context
                     .tokenizer_registry
-                    .get_by_id(&loaded_id)
+                    .get_by_id(loaded_id)
                     .map(|e| e.tokenizer.vocab_size());
 
-                info!(
-                    "Successfully loaded tokenizer '{}' (id: {}) with vocab_size: {:?}",
-                    name, loaded_id, vocab_size
-                );
+                match &outcome {
+                    LoadOutcome::Loaded { id } => {
+                        info!(
+                            "Successfully loaded tokenizer '{}' (id: {}) with vocab_size: {:?}",
+                            name, id, vocab_size
+                        );
+                    }
+                    LoadOutcome::AlreadyExists { id } => {
+                        info!(
+                            "Tokenizer '{}' already exists (id: {}), skipping load",
+                            name, id
+                        );
+                    }
+                }
 
                 // Store vocab size in typed data
                 if let Some(size) = vocab_size {
@@ -204,7 +170,7 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
                 error!("Failed to load tokenizer '{}': {}", name, e);
                 Err(WorkflowError::StepFailed {
                     step_id: StepId::new("load_tokenizer"),
-                    message: e,
+                    message: e.to_string(),
                 })
             }
         }
@@ -221,38 +187,29 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
 
 /// Create the tokenizer registration workflow
 ///
-/// This workflow:
-/// - Validates the tokenizer configuration
-/// - Loads the tokenizer from local path or HuggingFace
+/// This workflow loads and registers a tokenizer. The single LoadTokenizerStep handles:
+/// - Input validation (empty name/source)
+/// - Deduplication (returns success if already exists)
+/// - Loading from local path or HuggingFace
+/// - Optional caching layer wrapping
 ///
-/// Workflow configuration:
-/// - ValidateConfig: No retry, 5s timeout (fast validation)
-/// - LoadTokenizer: 3 retries, 5min timeout (may need to download from HuggingFace)
+/// Configuration:
+/// - 3 retries with 2s backoff (for network issues)
+/// - 5 minute timeout (HuggingFace downloads can be slow)
 pub fn create_tokenizer_registration_workflow() -> WorkflowDefinition<TokenizerWorkflowData> {
-    WorkflowDefinition::new("tokenizer_registration", "Tokenizer Registration")
-        .add_step(
-            StepDefinition::new(
-                "validate_config",
-                "Validate Configuration",
-                Arc::new(ValidateTokenizerConfigStep),
-            )
-            .with_timeout(Duration::from_secs(5))
-            .with_failure_action(FailureAction::FailWorkflow),
+    WorkflowDefinition::new("tokenizer_registration", "Tokenizer Registration").add_step(
+        StepDefinition::new(
+            "load_tokenizer",
+            "Load Tokenizer",
+            Arc::new(LoadTokenizerStep),
         )
-        .add_step(
-            StepDefinition::new(
-                "load_tokenizer",
-                "Load Tokenizer",
-                Arc::new(LoadTokenizerStep),
-            )
-            .with_retry(RetryPolicy {
-                max_attempts: 3,
-                backoff: BackoffStrategy::Fixed(Duration::from_secs(2)),
-            })
-            .with_timeout(Duration::from_secs(300)) // 5 min for HuggingFace downloads
-            .with_failure_action(FailureAction::FailWorkflow)
-            .depends_on(&["validate_config"]),
-        )
+        .with_retry(RetryPolicy {
+            max_attempts: 3,
+            backoff: BackoffStrategy::Fixed(Duration::from_secs(2)),
+        })
+        .with_timeout(Duration::from_secs(300)) // 5 min for HuggingFace downloads
+        .with_failure_action(FailureAction::FailWorkflow),
+    )
 }
 
 /// Helper to create initial workflow data for tokenizer registration

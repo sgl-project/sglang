@@ -19,11 +19,50 @@
 use std::sync::Arc;
 
 use dashmap::DashMap;
+use thiserror::Error;
 use tokio::sync::Mutex;
 use tracing::{debug, info};
 use uuid::Uuid;
 
 use super::traits::Tokenizer;
+
+/// Outcome of a tokenizer load operation
+#[derive(Debug, Clone)]
+pub enum LoadOutcome {
+    /// Tokenizer was newly loaded and registered
+    Loaded { id: String },
+    /// Tokenizer already existed, returning existing ID
+    AlreadyExists { id: String },
+}
+
+impl LoadOutcome {
+    /// Get the ID regardless of outcome
+    pub fn id(&self) -> &str {
+        match self {
+            LoadOutcome::Loaded { id } => id,
+            LoadOutcome::AlreadyExists { id } => id,
+        }
+    }
+
+    /// Returns true if the tokenizer was newly loaded
+    pub fn is_newly_loaded(&self) -> bool {
+        matches!(self, LoadOutcome::Loaded { .. })
+    }
+}
+
+/// Error type for tokenizer loading operations
+#[derive(Debug, Error)]
+pub enum LoadError {
+    /// Name cannot be empty
+    #[error("tokenizer name cannot be empty")]
+    EmptyName,
+    /// Source cannot be empty
+    #[error("tokenizer source cannot be empty")]
+    EmptySource,
+    /// Loading failed
+    #[error("{0}")]
+    LoadFailed(String),
+}
 
 /// Metadata and tokenizer instance for a registered tokenizer
 #[derive(Clone)]
@@ -70,34 +109,44 @@ impl TokenizerRegistry {
 
     /// Load and register a tokenizer
     ///
-    /// If the tokenizer is already loaded (by name), returns the existing ID.
-    /// Otherwise, uses the provided loader function to load it.
+    /// Validates inputs, handles deduplication, and loads the tokenizer if needed.
     /// Per-key locking ensures only one load happens per name, preventing race conditions.
     ///
     /// # Arguments
     /// * `id` - Pre-generated UUID (use `generate_id()` to create one)
-    /// * `name` - User-provided name (used for deduplication)
-    /// * `source` - Source path or HuggingFace model ID
+    /// * `name` - User-provided name (used for deduplication, must not be empty)
+    /// * `source` - Source path or HuggingFace model ID (must not be empty)
     /// * `loader` - Async function that loads the tokenizer
     ///
     /// # Returns
-    /// * `Ok(id)` - The ID of the registered tokenizer (either existing or newly registered)
-    /// * `Err(message)` - Error message if loading fails
+    /// * `Ok(LoadOutcome::Loaded { id })` - Tokenizer was newly loaded
+    /// * `Ok(LoadOutcome::AlreadyExists { id })` - Tokenizer already existed
+    /// * `Err(LoadError)` - Validation failed or loading failed
     pub async fn load<F, Fut>(
         &self,
         id: &str,
         name: &str,
         source: &str,
         loader: F,
-    ) -> Result<String, String>
+    ) -> Result<LoadOutcome, LoadError>
     where
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Result<Arc<dyn Tokenizer>, String>>,
     {
+        // Validate inputs
+        if name.is_empty() {
+            return Err(LoadError::EmptyName);
+        }
+        if source.is_empty() {
+            return Err(LoadError::EmptySource);
+        }
+
         // Fast path: already loaded by name
         if let Some(existing_id) = self.name_to_id.get(name) {
             debug!("Tokenizer already registered for name: {}", name);
-            return Ok(existing_id.clone());
+            return Ok(LoadOutcome::AlreadyExists {
+                id: existing_id.clone(),
+            });
         }
 
         debug!("Tokenizer cache miss for name: {}", name);
@@ -114,7 +163,9 @@ impl TokenizerRegistry {
         // Double-check after acquiring lock (another thread may have loaded it)
         if let Some(existing_id) = self.name_to_id.get(name) {
             debug!("Tokenizer loaded by another thread for name: {}", name);
-            return Ok(existing_id.clone());
+            return Ok(LoadOutcome::AlreadyExists {
+                id: existing_id.clone(),
+            });
         }
 
         // Load tokenizer
@@ -124,7 +175,7 @@ impl TokenizerRegistry {
         // Always clean up the lock, whether loading succeeded or failed
         self.loading_locks.remove(name);
 
-        let tokenizer = result?;
+        let tokenizer = result.map_err(LoadError::LoadFailed)?;
 
         // Create entry with provided ID
         let entry = TokenizerEntry {
@@ -143,7 +194,7 @@ impl TokenizerRegistry {
             name, id
         );
 
-        Ok(id.to_string())
+        Ok(LoadOutcome::Loaded { id: id.to_string() })
     }
 
     /// Register a preloaded tokenizer with a pre-generated ID
@@ -295,12 +346,16 @@ mod tests {
 
         // Load and register a tokenizer
         let id = TokenizerRegistry::generate_id();
-        registry
+        let outcome = registry
             .load(&id, "model1", "path/to/model", || async {
                 Ok(Arc::new(MockTokenizer::default()) as Arc<dyn Tokenizer>)
             })
             .await
             .unwrap();
+
+        // Verify LoadOutcome::Loaded
+        assert!(outcome.is_newly_loaded());
+        assert_eq!(outcome.id(), id);
 
         // Verify it's loaded
         assert!(!registry.is_empty());
@@ -317,6 +372,65 @@ mod tests {
         // Remove works
         let removed = registry.remove_by_id(&id);
         assert!(removed.is_some());
+        assert!(registry.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_load_returns_already_exists() {
+        let registry = TokenizerRegistry::new();
+        let id1 = TokenizerRegistry::generate_id();
+        let id2 = TokenizerRegistry::generate_id();
+
+        // First load should return Loaded
+        let outcome1 = registry
+            .load(&id1, "model1", "source1", || async {
+                Ok(Arc::new(MockTokenizer::default()) as Arc<dyn Tokenizer>)
+            })
+            .await
+            .unwrap();
+        assert!(outcome1.is_newly_loaded());
+        assert_eq!(outcome1.id(), id1);
+
+        // Second load with same name should return AlreadyExists with ORIGINAL id
+        let outcome2 = registry
+            .load(&id2, "model1", "source2", || async {
+                panic!("Loader should not be called for duplicate name");
+            })
+            .await
+            .unwrap();
+        assert!(!outcome2.is_newly_loaded());
+        assert_eq!(outcome2.id(), id1); // Returns the original ID, not id2
+
+        // Registry still has only one entry
+        assert_eq!(registry.len(), 1);
+
+        // Original source is preserved
+        let entry = registry.get_by_name("model1").unwrap();
+        assert_eq!(entry.source, "source1");
+    }
+
+    #[tokio::test]
+    async fn test_load_validation() {
+        let registry = TokenizerRegistry::new();
+        let id = TokenizerRegistry::generate_id();
+
+        // Empty name should fail
+        let result = registry
+            .load(&id, "", "source", || async {
+                panic!("Loader should not be called for invalid input");
+            })
+            .await;
+        assert!(matches!(result, Err(LoadError::EmptyName)));
+
+        // Empty source should fail
+        let result = registry
+            .load(&id, "model", "", || async {
+                panic!("Loader should not be called for invalid input");
+            })
+            .await;
+        assert!(matches!(result, Err(LoadError::EmptySource)));
+
+        // Registry should be empty (nothing was loaded)
         assert!(registry.is_empty());
     }
 
