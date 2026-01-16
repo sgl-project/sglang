@@ -116,6 +116,7 @@ class HiRadixCache(RadixCache):
             storage_backend_extra_config=extra_config,
             pp_rank=self.pp_rank,
             pp_size=self.pp_size,
+            is_eagle=params.is_eagle,
         )
         if self.enable_storage_metrics:
             # TODO: support pp
