@@ -1231,7 +1231,13 @@ class MooncakeKVReceiver(CommonKVReceiver):
         kv_indices: npt.NDArray[np.int32],
         aux_index: Optional[int] = None,
         state_indices: Optional[List[int]] = None,
+        prefill_dp_rank: Optional[int] = None,
     ):
+        # Dp rank for prefill server is synchronized now.
+        if self.should_notify_dp_rank:
+            self.prefill_dp_rank = prefill_dp_rank
+            self._setup_bootstrap_infos()
+
         if self.bootstrap_infos is None:
             self.kv_mgr.record_failure(
                 self.bootstrap_room,

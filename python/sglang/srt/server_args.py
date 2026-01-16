@@ -772,18 +772,6 @@ class ServerArgs:
             )
             return
 
-        # Backward compat: in PD prefill, legacy "round_robin" means `bootstrap_room` routing.
-        if (
-            self.disaggregation_mode == "prefill"
-            and self.load_balance_method == "round_robin"
-        ):
-            logger.warning(
-                "In PD-disaggregation prefill mode, the 'round_robin' load balancing method "
-                "means `bootstrap_room` routing (use 'follow_bootstrap_room' instead). "
-                "Falling back to 'follow_bootstrap_room' for backward compatibility."
-            )
-            self.load_balance_method = "follow_bootstrap_room"
-
     def _handle_deprecated_args(self):
         # Handle deprecated tool call parsers
         deprecated_tool_call_parsers = {"qwen25": "qwen", "glm45": "glm"}
