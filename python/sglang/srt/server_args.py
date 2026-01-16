@@ -403,6 +403,9 @@ class ServerArgs:
     dp_size: int = 1
     load_balance_method: str = "auto"
 
+    attn_cp_size: int = 1
+    moe_cp_size: int = 1
+    
     # Multi-node distributed serving
     dist_init_addr: Optional[str] = None
     nnodes: int = 1
@@ -724,6 +727,9 @@ class ServerArgs:
 
         # Handle data parallelism.
         self._handle_data_parallelism()
+
+        # Handle context parallelism.
+        self._handle_context_parallelism()
 
         # Handle MoE configurations.
         self._handle_moe_kernel_config()
@@ -1900,6 +1906,15 @@ class ServerArgs:
     def _handle_grammar_backend(self):
         if self.grammar_backend is None:
             self.grammar_backend = "xgrammar"
+    
+    def _handle_context_parallelism(self):
+        if self.attn_cp_size > 1:
+            assert self.tp_size % self.attn_cp_size == 0, "tp_size must be divisible by attn_cp_size"
+            assert self.dp_size * self.attn_cp_size <= self.tp_size, "dp_size * attn_cp_size must be less than or equal to tp_size"
+
+        if self.moe_cp_size > 1:
+            assert self.tp_size % self.moe_cp_size == 0, "tp_size must be divisible by moe_cp_size"
+            assert self.ep_size * self.moe_cp_size <= self.tp_size, "ep_size * moe_cp_size must be less than or equal to tp_size"
 
     def _handle_data_parallelism(self):
         if self.dp_size == 1:
@@ -2986,6 +3001,20 @@ class ServerArgs:
             type=int,
             default=ServerArgs.tp_size,
             help="The tensor parallelism size.",
+        )
+        parser.add_argument(
+            "--attention-context-parallel-size",
+            "--attn-cp-size",
+            type=int,
+            default=ServerArgs.attn_cp_size,
+            help="The attention context parallelism size.",
+        )
+        parser.add_argument(
+            "--moe-context-parallel-size",
+            "--moe-cp-size",
+            type=int,
+            default=ServerArgs.moe_cp_size,
+            help="The moe context parallelism size.",
         )
         parser.add_argument(
             "--pipeline-parallel-size",
@@ -4724,6 +4753,8 @@ class ServerArgs:
     def from_cli_args(cls, args: argparse.Namespace):
         args.tp_size = args.tensor_parallel_size
         args.pp_size = args.pipeline_parallel_size
+        args.attn_cp_size = args.attention_context_parallel_size
+        args.moe_cp_size = args.moe_context_parallel_size
         args.dp_size = args.data_parallel_size
         args.ep_size = args.expert_parallel_size
 

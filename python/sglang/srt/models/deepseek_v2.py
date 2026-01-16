@@ -75,6 +75,9 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_rank,
     get_attention_tp_size,
     is_dp_attention_enabled,
+    get_attention_cp_size,
+    get_attention_cp_rank,
+    get_attention_cp_group,
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -1107,9 +1110,7 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
             assert self.use_nsa, "CP currently only supports deepseek v3.2 model"
         # cp reuse the attn_tp comm group but need to duplicate the weights
         if self.nsa_enable_prefill_cp and self.use_nsa:
-            attn_tp_rank = 0
-            attn_tp_size = 1
-            self.cp_size = get_attention_tp_size()
+            self.cp_size = get_attention_cp_size()
         self.num_heads = num_heads
         assert num_heads % attn_tp_size == 0
         self.num_local_heads = num_heads // attn_tp_size
@@ -2512,7 +2513,7 @@ class DeepseekV2Model(nn.Module):
         self.pp_group = get_pp_group()
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
         if self.nsa_enable_prefill_cp:
-            self.cp_size = get_attention_tp_size()
+            self.cp_size = get_attention_cp_size()
         else:
             self.cp_size = None
 
@@ -2818,8 +2819,8 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
 
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
         if self.nsa_enable_prefill_cp:
-            self.cp_rank = get_attention_tp_rank()
-            self.cp_size = get_attention_tp_size()
+            self.cp_rank = get_attention_cp_rank()
+            self.cp_size = get_attention_cp_size()
         else:
             self.cp_rank = self.cp_size = None
 

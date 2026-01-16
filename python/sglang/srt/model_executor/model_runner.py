@@ -274,6 +274,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         nccl_port: int,
         server_args: ServerArgs,
         dp_rank: Optional[int] = None,
+        attn_cp_rank: Optional[int] = None,
+        moe_cp_rank: Optional[int] = None,
         is_draft_worker: bool = False,
         req_to_token_pool: Optional[ReqToTokenPool] = None,
         token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator] = None,
@@ -287,9 +289,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.tp_size = tp_size
         self.moe_ep_rank = moe_ep_rank
         self.moe_ep_size = moe_ep_size
-        self.dp_size = server_args.dp_size
+        self.dp_size = server_args.dp_size if server_args.enable_dp_attention else 1
         self.pp_rank = pp_rank
         self.pp_size = pp_size
+        self.attn_cp_rank = attn_cp_rank
+        self.attn_cp_size = server_args.attn_cp_size
+        self.moe_cp_rank = moe_cp_rank
+        self.moe_cp_size = server_args.moe_cp_size
         self.model_config = model_config
         self.dist_port = nccl_port
         self.server_args = server_args
@@ -560,7 +566,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self.max_total_num_tokens // 2
                 if server_args.max_running_requests is None
                 else server_args.max_running_requests
-                // (server_args.dp_size if server_args.enable_dp_attention else 1)
+                // (self.dp_size)
             ),
             self.req_to_token_pool.size,
         )
@@ -765,8 +771,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
             initialize_model_parallel(
                 tensor_model_parallel_size=self.tp_size,
+                attention_data_parallel_size=self.dp_size,
                 pipeline_model_parallel_size=self.pp_size,
                 expert_model_parallel_size=self.moe_ep_size,
+                attention_context_model_parallel_size=self.attn_cp_size,
+                moe_context_model_parallel_size=self.moe_cp_size,
                 duplicate_tp_group=self.server_args.enable_pdmux,
             )
             initialize_dp_attention(

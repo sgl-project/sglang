@@ -33,7 +33,10 @@ from sglang.srt.layers.attention.nsa.utils import (
     is_nsa_enable_prefill_cp,
     is_nsa_prefill_cp_in_seq_split,
 )
-from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
+from sglang.srt.distributed import (
+    get_attn_context_model_parallel_world_size,
+    get_attn_context_model_parallel_rank,
+)
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
@@ -154,8 +157,8 @@ class Indexer(MultiPlatformOp):
         self.alt_stream = alt_stream
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
         if self.nsa_enable_prefill_cp:
-            self.cp_size = get_attention_tp_size()
-            self.cp_rank = get_attention_tp_rank()
+            self.cp_size = get_attn_context_model_parallel_world_size()
+            self.cp_rank = get_attn_context_model_parallel_rank()
         else:
             self.cp_size = None
             self.cp_rank = None

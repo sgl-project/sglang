@@ -25,6 +25,7 @@ _ENABLE_METRICS_DP_ATTENTION = envs.SGLANG_ENABLE_METRICS_DP_ATTENTION.get()
 class MLPSyncBatchInfo:
     dp_size: int
     tp_size: int
+    cp_size: int
 
     num_tokens: int
     num_tokens_for_logprob: int
@@ -72,7 +73,7 @@ class MLPSyncBatchInfo:
     def all_gather(self, device, group: torch.distributed.ProcessGroup):
         local_info_tensor = self._get_local_tensor(device=device)
         global_info_tensor = torch.empty(
-            (self.dp_size, self.tp_size, 6),
+            (self.dp_size, self.tp_size * self.cp_size, 6),
             dtype=torch.int64,
             device=device,
         )
@@ -129,6 +130,7 @@ def prepare_mlp_sync_batch_raw(
     local_batch: ScheduleBatch,
     dp_size: int,
     attn_tp_size: int,
+    attn_cp_size: int,
     tp_group: GroupCoordinator,
     get_idle_batch: Callable[[], ScheduleBatch],
     disable_cuda_graph: bool,
@@ -185,6 +187,7 @@ def prepare_mlp_sync_batch_raw(
     mlp_sync_info = MLPSyncBatchInfo(
         dp_size=dp_size,
         tp_size=attn_tp_size,
+        cp_size=attn_cp_size,
         num_tokens=num_tokens,
         num_tokens_for_logprob=num_tokens_for_logprob,
         can_cuda_graph=can_cuda_graph,
@@ -226,6 +229,7 @@ class SchedulerDPAttnMixin:
             local_batch,
             dp_size=self.server_args.dp_size,
             attn_tp_size=self.attn_tp_size,
+            attn_cp_size=self.attn_cp_size,
             tp_group=self.tp_group,
             get_idle_batch=self.get_idle_batch,
             disable_cuda_graph=self.server_args.disable_cuda_graph,
