@@ -895,6 +895,13 @@ def get_dataset(args, tokenizer, model_id=None):
             prompt_suffix=args.prompt_suffix,
             apply_chat_template=args.apply_chat_template,
         )
+    elif args.dataset_name == "openai":
+        input_requests = sample_openai_requests(
+            dataset_path=args.dataset_path,
+            num_requests=args.num_prompts,
+            tokenizer=tokenizer,
+            fixed_output_len=args.sharegpt_output_len,
+        )
     else:
         raise ValueError(f"Unknown dataset: {args.dataset_name}")
     return input_requests
@@ -1295,6 +1302,59 @@ def sample_sharegpt_requests(
             )
         )
 
+    print(f"#Input tokens: {np.sum([x.prompt_len for x in filtered_dataset])}")
+    print(f"#Output tokens: {np.sum([x.output_len for x in filtered_dataset])}")
+    return filtered_dataset
+
+
+def sample_openai_requests(
+    dataset_path: str,
+    num_requests: int,
+    tokenizer: PreTrainedTokenizerBase,
+    fixed_output_len: Optional[int] = None,
+) -> List[DatasetRow]:
+    """
+    Load OpenAI-compatible chat completion requests from a JSONL file.
+
+    Each line should be a JSON object with:
+    - "messages": list of {"role": str, "content": str}
+    - "max_tokens": int (used as output_len if fixed_output_len not set)
+    - Optional: "tools", "temperature", "top_p" (passed through)
+    """
+    dataset = []
+    with open(dataset_path, "r") as f:
+        for line in f:
+            if line.strip():
+                dataset.append(json.loads(line))
+
+    if num_requests > 0:
+        dataset = dataset[:num_requests]
+
+    filtered_dataset: List[DatasetRow] = []
+    for data in dataset:
+        messages = data.get("messages", [])
+        if not messages:
+            continue
+
+        # Use max_tokens from the request, or fall back to fixed_output_len
+        output_len = fixed_output_len or data.get("max_tokens", 256)
+
+        # Calculate prompt length by applying chat template
+        prompt_text = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+        prompt_len = len(tokenizer.encode(prompt_text))
+
+        # Pass messages list directly - bench_serving handles List[Dict] prompts
+        filtered_dataset.append(
+            DatasetRow(
+                prompt=messages,
+                prompt_len=prompt_len,
+                output_len=output_len,
+            )
+        )
+
+    print(f"Loaded {len(filtered_dataset)} OpenAI-format requests")
     print(f"#Input tokens: {np.sum([x.prompt_len for x in filtered_dataset])}")
     print(f"#Output tokens: {np.sum([x.output_len for x in filtered_dataset])}")
     return filtered_dataset
@@ -2877,6 +2937,7 @@ if __name__ == "__main__":
         choices=[
             "sharegpt",
             "custom",
+            "openai",
             "random",
             "random-ids",
             "generated-shared-prefix",
