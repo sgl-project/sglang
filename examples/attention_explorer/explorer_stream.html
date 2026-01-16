@@ -287,6 +287,72 @@
         .token[data-zone="semantic_bridge"] { border-left: 3px solid var(--semantic-bridge); }
         .token[data-zone="syntax_floor"] { border-left: 3px solid var(--syntax-floor); }
         .token[data-zone="exploration"] { border-left: 3px solid var(--exploration); }
+
+        /* Enhanced token tooltip */
+        .token-tooltip {
+            position: absolute;
+            bottom: 100%;
+            left: 50%;
+            transform: translateX(-50%);
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            padding: 8px 12px;
+            font-size: 0.75rem;
+            white-space: nowrap;
+            z-index: 1000;
+            pointer-events: none;
+            opacity: 0;
+            transition: opacity 0.15s;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+        }
+
+        .token:hover .token-tooltip {
+            opacity: 1;
+        }
+
+        .token-tooltip::after {
+            content: '';
+            position: absolute;
+            top: 100%;
+            left: 50%;
+            transform: translateX(-50%);
+            border: 6px solid transparent;
+            border-top-color: var(--border);
+        }
+
+        .tooltip-row {
+            display: flex;
+            justify-content: space-between;
+            gap: 12px;
+            margin-bottom: 4px;
+        }
+
+        .tooltip-row:last-child {
+            margin-bottom: 0;
+        }
+
+        .tooltip-label {
+            color: var(--text-secondary);
+        }
+
+        .tooltip-value {
+            color: var(--text-primary);
+            font-weight: 500;
+        }
+
+        .tooltip-value.zone-semantic_bridge { color: var(--semantic-bridge); }
+        .tooltip-value.zone-syntax_floor { color: var(--syntax-floor); }
+        .tooltip-value.zone-exploration { color: var(--exploration); }
+        .tooltip-value.zone-steering { color: var(--steering); }
+
+        /* Zone badge in attention list */
+        .attention-item-zone {
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            flex-shrink: 0;
+        }
         .token[data-zone="steering"] { border-left: 3px solid var(--steering); }
 
         .detail-panel {
@@ -385,6 +451,54 @@
             font-size: 0.7rem;
             text-transform: uppercase;
             color: var(--text-secondary);
+        }
+
+        .zone-histogram {
+            margin-top: 1.5rem;
+            padding-top: 1rem;
+            border-top: 1px solid var(--border);
+        }
+
+        .zone-bar-container {
+            margin-top: 0.75rem;
+        }
+
+        .zone-bar-row {
+            display: grid;
+            grid-template-columns: 50px 1fr 40px;
+            align-items: center;
+            gap: 0.5rem;
+            margin-bottom: 0.5rem;
+        }
+
+        .zone-bar-label {
+            font-size: 0.7rem;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+        }
+
+        .zone-bar-track {
+            height: 8px;
+            background: var(--bg-tertiary);
+            border-radius: 4px;
+            overflow: hidden;
+        }
+
+        .zone-bar-fill {
+            height: 100%;
+            border-radius: 4px;
+            transition: width 0.3s ease;
+        }
+
+        .zone-bar-fill.semantic-bridge { background: var(--semantic-bridge); }
+        .zone-bar-fill.syntax-floor { background: var(--syntax-floor); }
+        .zone-bar-fill.exploration { background: var(--exploration); }
+        .zone-bar-fill.steering { background: var(--steering); }
+
+        .zone-bar-value {
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+            text-align: right;
         }
 
         .zone-legend {
@@ -521,6 +635,41 @@
                 <div class="stat">
                     <div class="stat-value" id="tps">0</div>
                     <div class="stat-label">Tok/s</div>
+                </div>
+            </div>
+
+            <!-- Zone Distribution Histogram -->
+            <div class="zone-histogram" id="zoneHistogram">
+                <div class="panel-title">Zone Distribution</div>
+                <div class="zone-bar-container">
+                    <div class="zone-bar-row">
+                        <span class="zone-bar-label">Bridge</span>
+                        <div class="zone-bar-track">
+                            <div class="zone-bar-fill semantic-bridge" id="bridgeBar" style="width: 0%"></div>
+                        </div>
+                        <span class="zone-bar-value" id="bridgePercent">0%</span>
+                    </div>
+                    <div class="zone-bar-row">
+                        <span class="zone-bar-label">Syntax</span>
+                        <div class="zone-bar-track">
+                            <div class="zone-bar-fill syntax-floor" id="syntaxBar" style="width: 0%"></div>
+                        </div>
+                        <span class="zone-bar-value" id="syntaxPercent">0%</span>
+                    </div>
+                    <div class="zone-bar-row">
+                        <span class="zone-bar-label">Explore</span>
+                        <div class="zone-bar-track">
+                            <div class="zone-bar-fill exploration" id="exploreBar" style="width: 0%"></div>
+                        </div>
+                        <span class="zone-bar-value" id="explorePercent">0%</span>
+                    </div>
+                    <div class="zone-bar-row">
+                        <span class="zone-bar-label">Steer</span>
+                        <div class="zone-bar-track">
+                            <div class="zone-bar-fill steering" id="steerBar" style="width: 0%"></div>
+                        </div>
+                        <span class="zone-bar-value" id="steerPercent">0%</span>
+                    </div>
                 </div>
             </div>
 
@@ -697,31 +846,62 @@
                 index: data.index,
                 text: data.content,
                 attention: data.attention || null,
-                zone: null
+                zone: data.zone || null,  // Server sends zone directly
+                fingerprint: null,
+                entropy: null,
+                topAttention: null
             };
 
-            // Extract zone from attention if available
-            if (data.attention && data.attention.length > 0) {
-                token.zone = data.attention[0].manifold_zone;
+            // Extract edges and fingerprint from attention data
+            // Server sends attention as single object with token_positions/attention_scores
+            const attn = data.attention;
+            if (attn && attn.token_positions && attn.attention_scores) {
+                // Get zone from attention object
+                if (!token.zone) {
+                    token.zone = attn.manifold_zone;
+                }
+
+                // Store fingerprint data for tooltip
+                if (attn.fingerprint) {
+                    token.fingerprint = attn.fingerprint;
+                    token.entropy = attn.fingerprint.entropy;
+                }
+
+                // Get top attention percentage
+                if (attn.attention_scores.length > 0) {
+                    token.topAttention = Math.round(attn.attention_scores[0] * 100);
+                }
 
                 // Store edges
-                data.attention.forEach(attn => {
-                    if (attn.token_positions && attn.attention_scores) {
-                        attn.token_positions.forEach((pos, i) => {
-                            edges.push({
-                                src: tokens.length,
-                                dst: pos,
-                                weight: attn.attention_scores[i],
-                                layer: attn.layer_id || 0
-                            });
-                        });
-                    }
+                attn.token_positions.forEach((pos, i) => {
+                    edges.push({
+                        src: tokens.length,
+                        dst: pos,
+                        weight: attn.attention_scores[i],
+                        layer: attn.layer_id || 0
+                    });
                 });
+            }
+
+            // Also handle attends_to format from server
+            if (data.attends_to && Array.isArray(data.attends_to)) {
+                data.attends_to.forEach(edge => {
+                    edges.push({
+                        src: tokens.length,
+                        dst: edge.position,
+                        weight: edge.score,
+                        layer: 0
+                    });
+                });
+                // Get top attention from attends_to if not set
+                if (!token.topAttention && data.attends_to.length > 0) {
+                    token.topAttention = Math.round(data.attends_to[0].score * 100);
+                }
             }
 
             tokens.push(token);
 
-            const el = createTokenElement(token.text, tokens.length - 1, 'response', token.zone);
+            const el = createTokenElement(token.text, tokens.length - 1, 'response', token.zone, token);
             el.classList.add('streaming');
             container.appendChild(el);
 
@@ -758,15 +938,61 @@
             document.getElementById('analyzeBtn').disabled = false;
         }
 
-        function createTokenElement(text, index, segment, zone = null) {
+        function createTokenElement(text, index, segment, zone = null, tokenData = null) {
             const el = document.createElement('span');
             el.className = 'token';
-            el.textContent = text || '⟨empty⟩';
             el.dataset.index = index;
             el.dataset.segment = segment;
 
+            // Create text node for the token content
+            const textNode = document.createTextNode(text || '⟨empty⟩');
+            el.appendChild(textNode);
+
             if (zone) {
                 el.dataset.zone = zone;
+            }
+
+            // Create enhanced tooltip for response tokens
+            if (segment === 'response' && tokenData) {
+                const tooltip = document.createElement('div');
+                tooltip.className = 'token-tooltip';
+
+                // Zone row
+                const zoneName = zone || 'unknown';
+                const zoneDisplay = zoneName.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
+                tooltip.innerHTML += `
+                    <div class="tooltip-row">
+                        <span class="tooltip-label">Zone</span>
+                        <span class="tooltip-value zone-${zoneName}">${zoneDisplay}</span>
+                    </div>`;
+
+                // Position row
+                tooltip.innerHTML += `
+                    <div class="tooltip-row">
+                        <span class="tooltip-label">Position</span>
+                        <span class="tooltip-value">${index}</span>
+                    </div>`;
+
+                // Entropy row (if available)
+                if (tokenData.entropy !== null && tokenData.entropy !== undefined) {
+                    const entropyLabel = tokenData.entropy < 1.5 ? 'focused' : tokenData.entropy < 2.5 ? 'moderate' : 'diffuse';
+                    tooltip.innerHTML += `
+                        <div class="tooltip-row">
+                            <span class="tooltip-label">Entropy</span>
+                            <span class="tooltip-value">${tokenData.entropy.toFixed(2)} (${entropyLabel})</span>
+                        </div>`;
+                }
+
+                // Top attention row (if available)
+                if (tokenData.topAttention !== null) {
+                    tooltip.innerHTML += `
+                        <div class="tooltip-row">
+                            <span class="tooltip-label">Top Attn</span>
+                            <span class="tooltip-value">${tokenData.topAttention}%</span>
+                        </div>`;
+                }
+
+                el.appendChild(tooltip);
             }
 
             el.onclick = () => selectToken(el, index, segment);
@@ -806,14 +1032,15 @@
             }
 
             const token = tokens[index];
-            if (!token.attention || token.attention.length === 0) {
+            if (!token.attention) {
                 list.innerHTML = '<div class="empty-state"><p>No attention data available</p></div>';
                 return;
             }
 
-            // Get attention from the first (or latest) attention entry
-            const attn = token.attention[0];
-            if (!attn.token_positions || !attn.attention_scores) {
+            // Handle both array and object formats for attention data
+            // Server now sends attention as object directly, not array
+            const attn = Array.isArray(token.attention) ? token.attention[0] : token.attention;
+            if (!attn || !attn.token_positions || !attn.attention_scores) {
                 list.innerHTML = '<div class="empty-state"><p>Attention data format not recognized</p></div>';
                 return;
             }
@@ -829,27 +1056,47 @@
                 const itemEl = document.createElement('div');
                 itemEl.className = 'attention-item';
 
-                // Find the token text (could be in prompt or response)
+                // Find the token text and zone (could be in prompt or response)
                 let tokenText = `[${item.position}]`;
-                const promptTokens = document.querySelectorAll('#promptTokens .token');
-                const responseTokens = document.querySelectorAll('#responseTokens .token');
+                let tokenZone = null;
+                const promptTokenEls = document.querySelectorAll('#promptTokens .token');
+                const responseTokenEls = document.querySelectorAll('#responseTokens .token');
 
-                if (item.position < promptTokens.length) {
-                    tokenText = promptTokens[item.position].textContent;
+                if (item.position < promptTokenEls.length) {
+                    tokenText = promptTokenEls[item.position].textContent;
                     // Highlight attended token
-                    promptTokens[item.position].classList.add('attended-to');
+                    promptTokenEls[item.position].classList.add('attended-to');
                 } else {
-                    const respIdx = item.position - promptTokens.length;
-                    if (respIdx >= 0 && respIdx < responseTokens.length) {
-                        tokenText = responseTokens[respIdx].textContent;
-                        responseTokens[respIdx].classList.add('attended-to');
+                    const respIdx = item.position - promptTokenEls.length;
+                    if (respIdx >= 0 && respIdx < responseTokenEls.length) {
+                        tokenText = responseTokenEls[respIdx].textContent;
+                        responseTokenEls[respIdx].classList.add('attended-to');
+                        // Get zone from token data
+                        if (respIdx < tokens.length) {
+                            tokenZone = tokens[respIdx].zone;
+                        }
                     }
                 }
 
                 const scorePercent = (item.score * 100).toFixed(1);
 
+                // Get zone color
+                let zoneColor = 'var(--text-secondary)';
+                if (tokenZone) {
+                    if (tokenZone.includes('bridge') || tokenZone.includes('semantic')) {
+                        zoneColor = 'var(--semantic-bridge)';
+                    } else if (tokenZone.includes('syntax') || tokenZone.includes('floor')) {
+                        zoneColor = 'var(--syntax-floor)';
+                    } else if (tokenZone.includes('explor') || tokenZone.includes('diffuse')) {
+                        zoneColor = 'var(--exploration)';
+                    } else if (tokenZone.includes('steer') || tokenZone.includes('ripple')) {
+                        zoneColor = 'var(--steering)';
+                    }
+                }
+
                 itemEl.innerHTML = `
                     <span class="attention-rank">${rank + 1}</span>
+                    <span class="attention-item-zone" style="background: ${zoneColor}"></span>
                     <span class="attention-token">${tokenText}</span>
                     <span class="attention-score">${scorePercent}%</span>
                     <div class="attention-bar">
@@ -917,6 +1164,54 @@
                 const tps = (tokens.length / elapsed).toFixed(1);
                 document.getElementById('tps').textContent = tps;
             }
+
+            // Update zone histogram
+            updateZoneHistogram();
+        }
+
+        function updateZoneHistogram() {
+            const zoneCounts = {
+                semantic_bridge: 0,
+                syntax_floor: 0,
+                exploration: 0,
+                steering: 0,
+                diffuse: 0,
+                unknown: 0
+            };
+
+            tokens.forEach(token => {
+                const zone = token.zone || 'unknown';
+                // Normalize zone names
+                if (zone.includes('bridge') || zone.includes('semantic')) {
+                    zoneCounts.semantic_bridge++;
+                } else if (zone.includes('syntax') || zone.includes('floor')) {
+                    zoneCounts.syntax_floor++;
+                } else if (zone.includes('explor') || zone.includes('diffuse')) {
+                    zoneCounts.exploration++;
+                } else if (zone.includes('steer') || zone.includes('ripple') || zone.includes('structure')) {
+                    zoneCounts.steering++;
+                } else {
+                    zoneCounts.unknown++;
+                }
+            });
+
+            const total = tokens.length || 1;  // Prevent division by zero
+
+            // Update bars
+            const bridgePct = Math.round((zoneCounts.semantic_bridge / total) * 100);
+            const syntaxPct = Math.round((zoneCounts.syntax_floor / total) * 100);
+            const explorePct = Math.round((zoneCounts.exploration / total) * 100);
+            const steerPct = Math.round((zoneCounts.steering / total) * 100);
+
+            document.getElementById('bridgeBar').style.width = bridgePct + '%';
+            document.getElementById('syntaxBar').style.width = syntaxPct + '%';
+            document.getElementById('exploreBar').style.width = explorePct + '%';
+            document.getElementById('steerBar').style.width = steerPct + '%';
+
+            document.getElementById('bridgePercent').textContent = bridgePct + '%';
+            document.getElementById('syntaxPercent').textContent = syntaxPct + '%';
+            document.getElementById('explorePercent').textContent = explorePct + '%';
+            document.getElementById('steerPercent').textContent = steerPct + '%';
         }
 
         // Initialize

@@ -22,32 +22,53 @@ CLIENTS: Set[web.WebSocketResponse] = weakref.WeakSet()
 
 
 async def stream_completion(request: web.Request, ws: web.WebSocketResponse, data: dict):
-    """Stream a completion request to SGLang and forward tokens to WebSocket."""
+    """Stream a completion request to SGLang and forward tokens to WebSocket WITH attention data.
+
+    Uses non-streaming API to get full attention data, then sends tokens progressively
+    to simulate streaming while providing complete attention information.
+    """
 
     sglang_url = request.app["sglang_url"]
+    stream_delay = data.get("stream_delay", 0.05)  # Delay between tokens for visual effect
 
-    # Prepare the request for SGLang
+    # Prepare the request for SGLang - NON-streaming to get attention data
     payload = {
         "model": data.get("model", "default"),
         "messages": data.get("messages", []),
         "max_tokens": data.get("max_tokens", 100),
         "temperature": data.get("temperature", 0.6),
-        "stream": True,  # Enable streaming
+        "stream": False,  # Non-streaming to get attention data
         "return_attention_tokens": True,
         "attention_tokens_top_k": data.get("attention_top_k", 10),
     }
 
+    prompt_text = data.get("messages", [])[-1].get("content", "") if data.get("messages") else ""
+
     # Send start message
     await ws.send_json({
         "type": "stream_start",
-        "prompt": data.get("messages", [])[-1].get("content", "") if data.get("messages") else ""
+        "prompt": prompt_text
     })
-
-    token_index = 0
-    full_content = ""
 
     try:
         async with aiohttp.ClientSession() as session:
+            # First, tokenize the prompt to get token count
+            tokenize_payload = {"text": prompt_text}
+            prompt_token_count = 0
+
+            try:
+                async with session.post(
+                    f"{sglang_url}/v1/tokenize",
+                    json=tokenize_payload,
+                    headers={"Content-Type": "application/json"}
+                ) as tok_response:
+                    if tok_response.status == 200:
+                        tok_data = await tok_response.json()
+                        prompt_token_count = len(tok_data.get("tokens", []))
+            except:
+                pass  # Continue without exact prompt token count
+
+            # Make the completion request
             async with session.post(
                 f"{sglang_url}/v1/chat/completions",
                 json=payload,
@@ -62,76 +83,115 @@ async def stream_completion(request: web.Request, ws: web.WebSocketResponse, dat
                     })
                     return
 
-                # Process SSE stream
-                async for line in response.content:
-                    line = line.decode('utf-8').strip()
+                result = await response.json()
 
-                    if not line or not line.startswith('data: '):
-                        continue
+        # Parse the response
+        choices = result.get("choices", [])
+        if not choices:
+            await ws.send_json({
+                "type": "error",
+                "message": "No choices in response"
+            })
+            return
 
-                    data_str = line[6:]  # Remove 'data: ' prefix
+        choice = choices[0]
+        content = choice.get("message", {}).get("content", "")
+        attention_tokens = choice.get("attention_tokens", [])
+        usage = result.get("usage", {})
 
-                    if data_str == '[DONE]':
-                        break
+        # Send prompt token count
+        await ws.send_json({
+            "type": "prompt_info",
+            "token_count": usage.get("prompt_tokens", prompt_token_count),
+            "text": prompt_text
+        })
 
-                    try:
-                        chunk = json.loads(data_str)
+        # Tokenize the response to get individual tokens
+        # We'll use the attention_tokens array which has one entry per generated token
+        if attention_tokens:
+            # Each attention_tokens entry corresponds to one generated token
+            # We need to detokenize to get the actual token text
 
-                        # Extract delta content
-                        choices = chunk.get("choices", [])
-                        if not choices:
-                            continue
+            # First, let's get all token texts via detokenize
+            token_texts = []
 
-                        choice = choices[0]
-                        delta = choice.get("delta", {})
-                        content = delta.get("content", "")
+            # Try to detokenize token by token using the content
+            # Split content into approximate tokens (this is a heuristic)
+            # Better approach: use the actual token IDs if available
 
-                        if content:
-                            full_content += content
+            # For now, send tokens based on attention_tokens count
+            num_tokens = len(attention_tokens)
 
-                            # Send token update
-                            token_msg = {
-                                "type": "token",
-                                "index": token_index,
-                                "content": content,
-                                "full_content": full_content,
-                            }
+            # Simple heuristic: split content into roughly equal parts
+            # This isn't perfect but gives a reasonable approximation
+            words = content.split()
+            tokens_per_word = max(1, num_tokens / len(words)) if words else 1
 
-                            # Include attention data if available
-                            attention = choice.get("attention_tokens")
-                            if attention:
-                                token_msg["attention"] = attention
+            current_word_idx = 0
+            accumulated_text = ""
 
-                            # Include finish reason
-                            if choice.get("finish_reason"):
-                                token_msg["finish_reason"] = choice["finish_reason"]
+            for i, attn in enumerate(attention_tokens):
+                # Estimate which part of content this token represents
+                # Add approximately one token's worth of content
+                if current_word_idx < len(words):
+                    token_text = words[current_word_idx]
+                    if i % int(tokens_per_word) == 0 and current_word_idx < len(words) - 1:
+                        token_text += " "
+                        current_word_idx += 1
+                    elif (i + 1) % max(1, int(tokens_per_word)) == 0:
+                        current_word_idx += 1
+                else:
+                    token_text = ""
 
-                            await ws.send_json(token_msg)
-                            token_index += 1
+                accumulated_text = content[:int((i + 1) / num_tokens * len(content))] if num_tokens > 0 else content
 
-                        # Check for attention-only chunks (some implementations send separately)
-                        attention_tokens = choice.get("attention_tokens")
-                        if attention_tokens and not content:
-                            await ws.send_json({
-                                "type": "attention_update",
-                                "index": token_index - 1,
-                                "attention": attention_tokens
-                            })
+                # Build token message with attention
+                token_msg = {
+                    "type": "token",
+                    "index": i,
+                    "content": token_text if token_text else f"[tok_{i}]",
+                    "full_content": accumulated_text,
+                    "attention": attn,
+                    "zone": attn.get("manifold_zone", "unknown"),
+                    "fingerprint": attn.get("fingerprint"),
+                }
 
-                    except json.JSONDecodeError:
-                        continue
+                # Extract attention edges
+                if attn.get("token_positions") and attn.get("attention_scores"):
+                    token_msg["attends_to"] = [
+                        {"position": pos, "score": score}
+                        for pos, score in zip(attn["token_positions"], attn["attention_scores"])
+                    ]
+
+                await ws.send_json(token_msg)
+
+                # Small delay for visual streaming effect
+                if stream_delay > 0:
+                    await asyncio.sleep(stream_delay)
+
+        else:
+            # No attention data - just send the content as a single message
+            await ws.send_json({
+                "type": "token",
+                "index": 0,
+                "content": content,
+                "full_content": content,
+            })
 
         # Send completion message
         await ws.send_json({
             "type": "stream_end",
-            "total_tokens": token_index,
-            "full_content": full_content
+            "total_tokens": len(attention_tokens) if attention_tokens else 1,
+            "full_content": content,
+            "usage": usage
         })
 
     except Exception as e:
+        import traceback
         await ws.send_json({
             "type": "error",
-            "message": str(e)
+            "message": str(e),
+            "traceback": traceback.format_exc()
         })
 
 
