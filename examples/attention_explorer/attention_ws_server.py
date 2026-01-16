@@ -132,20 +132,46 @@ async def stream_completion(request: web.Request, ws: web.WebSocketResponse, dat
             except Exception:
                 pass  # Fall back to character-based splitting
 
-            # If we couldn't get token texts, use character-based distribution
+            # If we couldn't get token texts, use word-aware distribution
             if not token_texts or len(token_texts) != num_tokens:
-                # Distribute content characters proportionally across tokens
-                # This gives each token a slice of the content
-                chars_per_token = len(content) / num_tokens if num_tokens > 0 else len(content)
+                # Split content into words (not preserving whitespace separately)
+                words = content.split()
+
                 token_texts = []
-                for i in range(num_tokens):
-                    start = int(i * chars_per_token)
-                    end = int((i + 1) * chars_per_token)
-                    token_text = content[start:end]
-                    # Clean up: don't start with space unless it's the first token
-                    if i > 0 and token_text.startswith(' ') and len(token_text) > 1:
-                        pass  # Keep the space for readability
-                    token_texts.append(token_text if token_text else f"·")  # Use middle dot for empty
+
+                if len(words) >= num_tokens:
+                    # More words than tokens - combine multiple words per token
+                    words_per_token = len(words) / num_tokens
+                    for i in range(num_tokens):
+                        start = int(i * words_per_token)
+                        end = int((i + 1) * words_per_token)
+                        token_text = ' '.join(words[start:end])
+                        token_texts.append(token_text if token_text else "·")
+                else:
+                    # More tokens than words - distribute words evenly
+                    # Calculate how many tokens per word
+                    tokens_per_word = num_tokens / len(words) if words else 1
+
+                    for word_idx, word in enumerate(words):
+                        # How many tokens should this word span?
+                        start_token = int(word_idx * tokens_per_word)
+                        end_token = int((word_idx + 1) * tokens_per_word)
+                        span = max(1, end_token - start_token)
+
+                        if span == 1:
+                            token_texts.append(word)
+                        else:
+                            # Split word across multiple tokens
+                            chars_per_token = len(word) / span
+                            for j in range(span):
+                                char_start = int(j * chars_per_token)
+                                char_end = int((j + 1) * chars_per_token)
+                                part = word[char_start:char_end]
+                                token_texts.append(part if part else "·")
+
+                    # If we still don't have enough, pad with markers
+                    while len(token_texts) < num_tokens:
+                        token_texts.append("…")
 
             accumulated_text = ""
             for i, attn in enumerate(attention_tokens):
@@ -156,7 +182,7 @@ async def stream_completion(request: web.Request, ws: web.WebSocketResponse, dat
                 token_msg = {
                     "type": "token",
                     "index": i,
-                    "content": token_text if token_text.strip() else f"[{i}]",
+                    "content": token_text if token_text.strip() else "·",
                     "full_content": accumulated_text,
                     "attention": attn,
                     "zone": attn.get("manifold_zone", "unknown"),
