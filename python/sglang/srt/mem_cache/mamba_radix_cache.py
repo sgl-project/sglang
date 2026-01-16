@@ -28,6 +28,11 @@ from numpy import float64
 
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
+from sglang.srt.mem_cache.marconi_shadow_cache import (
+    MarconiConfigTuner,
+    MarconiShadowCache,
+    ShadowNode,
+)
 from sglang.srt.mem_cache.marconi_utils import (
     get_attn_flops,
     get_kv_cache_size_bytes,
@@ -336,6 +341,7 @@ class MambaRadixCache(BasePrefixCache):
         self.marconi_enabled = bool(
             self.marconi_config is not None and self.marconi_config.enable
         )
+        self.marconi_tuner = None
         if self.marconi_enabled:
             self.marconi_model_stats = self.marconi_config.model_stats
             if self.marconi_model_stats is None:
@@ -350,6 +356,13 @@ class MambaRadixCache(BasePrefixCache):
             )
             self.marconi_bootstrap_multiplier = self.marconi_config.bootstrap_multiplier
             self.marconi_tuning_interval = self.marconi_config.tuning_interval
+            if self.marconi_config.eviction_policy == "v3":
+                weights = (
+                    list(self.marconi_config.tuning_weights)
+                    if self.marconi_config.tuning_weights is not None
+                    else None
+                )
+                self.marconi_tuner = MarconiConfigTuner(weights=weights)
 
         assert (
             params.page_size == 1
@@ -389,6 +402,8 @@ class MambaRadixCache(BasePrefixCache):
             self.marconi_request_history = []
             self.marconi_request_history_windowed = []
             self.marconi_num_reqs_before_eviction = None
+            if self.marconi_tuner is not None:
+                self.marconi_tuner.tree_snapshot = None
 
     def match_prefix(self, key: RadixKey, **kwargs) -> MatchResult:
         """Find the matching prefix from the radix tree.
@@ -520,12 +535,95 @@ class MambaRadixCache(BasePrefixCache):
             self.req_to_token_pool.mamba_pool.free(mamba_value)
 
     def _marconi_record_request(self, req: Req, total_tokens: int) -> None:
+        self._marconi_maybe_snapshot()
         cached_tokens = min(len(req.prefix_indices), total_tokens)
         cache_hit = cached_tokens > 0
         self.marconi_request_history.append((cache_hit, total_tokens, cached_tokens))
         self.marconi_request_history_windowed.append(
             (list(req.origin_input_ids), list(req.output_ids))
         )
+        self._marconi_maybe_tune()
+
+    def _marconi_shadow_capacity_bytes(self) -> Optional[int]:
+        stats = self.marconi_model_stats
+        if stats is None:
+            return None
+        kv_capacity_tokens = getattr(self.token_to_kv_pool_allocator, "size", None)
+        mamba_pool = getattr(self.req_to_token_pool, "mamba_pool", None)
+        mamba_capacity_states = (
+            getattr(mamba_pool, "size", None) if mamba_pool else None
+        )
+        if kv_capacity_tokens is None or mamba_capacity_states is None:
+            return None
+        kv_bytes_per_token = get_kv_cache_size_bytes(
+            1, stats.model_dim, stats.kv_cache_dtype_size
+        )
+        kv_capacity_bytes = (
+            kv_capacity_tokens * stats.num_attn_layers * kv_bytes_per_token
+        )
+        mamba_capacity_bytes = (
+            mamba_capacity_states
+            * stats.num_mamba_layers
+            * stats.mamba_state_size_bytes
+        )
+        return kv_capacity_bytes + mamba_capacity_bytes
+
+    def _marconi_copy_tree(self, src_node: TreeNode, dst_node: "ShadowNode") -> int:
+        max_ts = int(src_node.last_access_time)
+        for child in src_node.children.values():
+            key_tokens = tuple(child.key.token_ids)
+            new_node = ShadowNode(key=key_tokens, value=list(key_tokens))
+            new_node.parent = dst_node
+            new_node.last_access_time = int(child.last_access_time)
+            new_node.prefix_len = child.prefix_len
+            dst_node.children[key_tokens[0]] = new_node
+            max_ts = max(max_ts, self._marconi_copy_tree(child, new_node))
+        return max_ts
+
+    def _marconi_build_shadow_cache(self) -> Optional[MarconiShadowCache]:
+        stats = self.marconi_model_stats
+        if stats is None:
+            return None
+        capacity_bytes = self._marconi_shadow_capacity_bytes()
+        if capacity_bytes is None:
+            return None
+        shadow_cache = MarconiShadowCache(
+            model_stats=stats,
+            capacity_bytes=capacity_bytes,
+            eff_weight=self.marconi_eff_weight,
+            tuning_interval=self.marconi_tuning_interval,
+        )
+        max_ts = self._marconi_copy_tree(self.root_node, shadow_cache.root_node)
+        shadow_cache.logical_ts = max_ts
+        return shadow_cache
+
+    def _marconi_maybe_snapshot(self) -> None:
+        if self.marconi_tuner is None:
+            return
+        if self.marconi_bootstrap_window_size is None:
+            return
+        if len(self.marconi_request_history) < self.marconi_bootstrap_window_size:
+            return
+        if self.marconi_tuner.tree_snapshot is None:
+            self.marconi_tuner.tree_snapshot = self._marconi_build_shadow_cache()
+
+    def _marconi_maybe_tune(self) -> None:
+        if self.marconi_tuner is None:
+            return
+        if self.marconi_bootstrap_window_size is None:
+            return
+        if len(self.marconi_request_history) < self.marconi_bootstrap_window_size:
+            return
+        if len(self.marconi_request_history_windowed) < self.marconi_tuning_interval:
+            return
+        best_eff_weight = self.marconi_tuner.tune(
+            self.marconi_request_history_windowed,
+            self.marconi_tuning_interval,
+        )
+        if best_eff_weight is not None:
+            self.marconi_eff_weight = best_eff_weight
+        self.marconi_request_history_windowed = []
+        self.marconi_tuner.tree_snapshot = self._marconi_build_shadow_cache()
 
     def cache_unfinished_req(self, req: Req, chunked=False) -> None:
         """Cache request when it is unfinished."""
