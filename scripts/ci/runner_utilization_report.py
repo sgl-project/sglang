@@ -29,22 +29,28 @@ def run_gh_command(args: list[str]) -> dict:
 def get_workflow_runs(repo: str, hours: int = 24) -> list[dict]:
     """Get workflow runs from the last N hours."""
     since = datetime.now(timezone.utc) - timedelta(hours=hours)
-    since_str = since.strftime("%Y-%m-%dT%H:%M:%SZ")
 
     runs = []
     page = 1
     while True:
         data = run_gh_command([
-            f"repos/{repo}/actions/runs",
-            "-f", f"created=>{since_str}",
-            "-f", f"per_page=100",
-            "-f", f"page={page}",
+            f"repos/{repo}/actions/runs?per_page=100&page={page}",
         ])
-        runs.extend(data.get("workflow_runs", []))
-        if len(data.get("workflow_runs", [])) < 100:
+        page_runs = data.get("workflow_runs", [])
+
+        # Filter by time
+        for run in page_runs:
+            created_at = parse_time(run.get("created_at"))
+            if created_at and created_at >= since:
+                runs.append(run)
+            elif created_at and created_at < since:
+                # Runs are ordered by created_at desc, so we can stop
+                return runs
+
+        if len(page_runs) < 100:
             break
         page += 1
-        if page > 10:  # Safety limit
+        if page > 20:  # Safety limit
             break
     return runs
 
@@ -55,9 +61,7 @@ def get_jobs_for_run(repo: str, run_id: int) -> list[dict]:
     page = 1
     while True:
         data = run_gh_command([
-            f"repos/{repo}/actions/runs/{run_id}/jobs",
-            "-f", f"per_page=100",
-            "-f", f"page={page}",
+            f"repos/{repo}/actions/runs/{run_id}/jobs?per_page=100&page={page}",
         ])
         jobs.extend(data.get("jobs", []))
         if len(data.get("jobs", [])) < 100:
@@ -70,7 +74,7 @@ def get_jobs_for_run(repo: str, run_id: int) -> list[dict]:
 
 def get_runners(repo: str) -> list[dict]:
     """Get all self-hosted runners."""
-    data = run_gh_command([f"repos/{repo}/actions/runners", "-f", "per_page=100"])
+    data = run_gh_command([f"repos/{repo}/actions/runners?per_page=100"])
     return data.get("runners", [])
 
 
