@@ -11,6 +11,11 @@ import torch.nn.functional as F
 from sgl_kernel import fused_add_rmsnorm, rmsnorm
 
 from sglang.jit_kernel.norm import can_use_fused_inplace_qknorm, fused_inplace_qknorm
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+    get_tp_group,
+)
 from sglang.multimodal_gen.runtime.layers.custom_op import CustomOp
 from sglang.multimodal_gen.runtime.layers.triton_ops import (
     fuse_scale_shift_kernel,
@@ -445,7 +450,7 @@ def apply_qk_norm(
         q.is_cuda
         and allow_inplace
         and (q_eps == k_eps)
-        and can_use_fused_inplace_qknorm(head_dim)
+        and can_use_fused_inplace_qknorm(head_dim, q.dtype)
     ):
         fused_inplace_qknorm(
             q=q.view(batch_size, -1, head_dim),
@@ -469,3 +474,17 @@ def apply_qk_norm(
     q_out = q_norm(q.view(-1, head_dim)).view(q_shape)
     k_out = k_norm(k.view(-1, head_dim)).view(k_shape)
     return q_out, k_out
+
+
+def tensor_parallel_rms_norm(x: torch.Tensor, norm: "RMSNorm") -> torch.Tensor:
+    tp_rank = get_tensor_model_parallel_rank()
+    tp_size = get_tensor_model_parallel_world_size()
+    src_dtype = x.dtype
+    weight = norm.weight.tensor_split(tp_size)[tp_rank].float()
+    x_fp32 = x.float()
+    variance = x_fp32.pow(2).mean(dim=-1, keepdim=True)
+    variance = get_tp_group().all_reduce(
+        variance, op=torch._C._distributed_c10d.ReduceOp.AVG
+    )
+    output = x_fp32 * torch.rsqrt(variance + norm.variance_epsilon) * weight
+    return output.to(dtype=src_dtype)

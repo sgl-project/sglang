@@ -1,20 +1,22 @@
 use std::{
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, OnceLock,
+        Arc, LazyLock, OnceLock,
     },
     time::Instant,
 };
 
 use dashmap::DashMap;
 
-use super::metrics::Metrics;
+use super::gauge_histogram::{BucketBounds, GaugeHistogramHandle, GaugeHistogramVec};
 use crate::policies::utils::PeriodicTask;
 
-const AGE_BUCKET_BOUNDS: &[u64] = &[30, 60, 180, 300, 600, 1200, 3600, 7200, 14400, 28800, 86400];
-const AGE_BUCKET_LABELS: &[&str] = &[
-    "30", "60", "180", "300", "600", "1200", "3600", "7200", "14400", "28800", "86400", "+Inf",
-];
+static INFLIGHT_AGE_BOUNDS: BucketBounds<11> =
+    BucketBounds::new([30, 60, 180, 300, 600, 1200, 3600, 7200, 14400, 28800, 86400]);
+static INFLIGHT_AGE_HISTOGRAM: GaugeHistogramVec<11> =
+    GaugeHistogramVec::new("smg_http_inflight_request_age_count", &INFLIGHT_AGE_BOUNDS);
+static INFLIGHT_AGE_HANDLE: LazyLock<GaugeHistogramHandle> =
+    LazyLock::new(|| INFLIGHT_AGE_HISTOGRAM.register_no_labels());
 
 pub struct InFlightRequestTracker {
     requests: DashMap<u64, Instant>,
@@ -56,37 +58,22 @@ impl InFlightRequestTracker {
         self.requests.is_empty()
     }
 
-    pub fn compute_bucket_counts(&self) -> [usize; AGE_BUCKET_LABELS.len()] {
+    pub fn compute_bucket_counts(&self) -> Vec<usize> {
+        let ages = self.collect_ages();
+        INFLIGHT_AGE_BOUNDS.compute_counts(&ages)
+    }
+
+    fn collect_ages(&self) -> Vec<u64> {
         let now = Instant::now();
-        let inf_idx = AGE_BUCKET_LABELS.len() - 1;
-
-        let instants: Vec<Instant> = self.requests.iter().map(|entry| *entry.value()).collect();
-
-        let mut non_cumulative_counts = [0usize; AGE_BUCKET_LABELS.len()];
-        for inst in instants {
-            let age_secs = now.duration_since(inst).as_secs();
-            let bucket_idx = AGE_BUCKET_BOUNDS
-                .iter()
-                .position(|&bound| age_secs <= bound)
-                .unwrap_or(inf_idx);
-            non_cumulative_counts[bucket_idx] += 1;
-        }
-
-        let mut counts = [0usize; AGE_BUCKET_LABELS.len()];
-        let mut cumulative = 0;
-        for i in 0..counts.len() {
-            cumulative += non_cumulative_counts[i];
-            counts[i] = cumulative;
-        }
-
-        counts
+        self.requests
+            .iter()
+            .map(|entry| now.duration_since(*entry.value()).as_secs())
+            .collect()
     }
 
     fn sample_and_record(&self) {
         let counts = self.compute_bucket_counts();
-        for (i, &label) in AGE_BUCKET_LABELS.iter().enumerate() {
-            Metrics::set_inflight_request_age_count(label, counts[i]);
-        }
+        INFLIGHT_AGE_HANDLE.set_counts(&counts);
     }
 }
 
@@ -145,46 +132,29 @@ mod tests {
     }
 
     #[test]
-    fn test_empty_tracker_buckets() {
+    fn test_collect_ages_empty() {
         let tracker = InFlightRequestTracker::new();
-        let counts = tracker.compute_bucket_counts();
-        assert!(counts.iter().all(|&c| c == 0));
+        let ages = tracker.collect_ages();
+        assert!(ages.is_empty());
     }
 
     #[test]
-    fn test_cumulative_bucket_counts() {
+    fn test_collect_ages() {
         let tracker = InFlightRequestTracker::new();
         let now = Instant::now();
 
         tracker.insert_with_time(1, now);
         tracker.insert_with_time(2, now - Duration::from_secs(45));
         tracker.insert_with_time(3, now - Duration::from_secs(100));
-        tracker.insert_with_time(4, now - Duration::from_secs(250));
-        tracker.insert_with_time(5, now - Duration::from_secs(500));
-        tracker.insert_with_time(6, now - Duration::from_secs(700));
 
-        let counts = tracker.compute_bucket_counts();
-        assert_eq!(counts[0], 1, "bucket 0");
-        assert_eq!(counts[1], 2, "bucket 1");
-        assert_eq!(counts[2], 3, "bucket 2");
-        assert_eq!(counts[3], 4, "bucket 3");
-        assert_eq!(counts[4], 5, "bucket 4");
-        assert_eq!(counts[5], 6, "bucket 5");
-        assert_eq!(*counts.last().unwrap(), 6, "bucket +Inf");
-    }
-
-    #[test]
-    fn test_bucket_boundary_values() {
-        let tracker = InFlightRequestTracker::new();
-        let now = Instant::now();
-
-        tracker.insert_with_time(1, now - Duration::from_secs(30));
-        tracker.insert_with_time(2, now - Duration::from_secs(31));
-
-        let counts = tracker.compute_bucket_counts();
-        assert_eq!(counts[0], 1, "bucket 0 includes exact boundary");
-        assert_eq!(counts[1], 2, "bucket 1 includes both");
-        assert_eq!(*counts.last().unwrap(), 2, "bucket +Inf includes all");
+        let ages = tracker.collect_ages();
+        assert_eq!(ages.len(), 3);
+        // Ages should be approximately 0, 45, 100 (order may vary due to DashMap)
+        let mut sorted_ages = ages.clone();
+        sorted_ages.sort();
+        assert!(sorted_ages[0] <= 1); // ~0s
+        assert!((44..=46).contains(&sorted_ages[1])); // ~45s
+        assert!((99..=101).contains(&sorted_ages[2])); // ~100s
     }
 
     #[test]
