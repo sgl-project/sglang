@@ -25,8 +25,9 @@ use super::{
     accumulator::StreamingResponseAccumulator,
     common::{extract_output_index, get_event_type, parse_sse_block, ChunkProcessor},
     mcp::{
-        build_resume_payload, execute_streaming_tool_calls, inject_mcp_metadata_streaming,
-        prepare_mcp_tools_as_functions, send_mcp_list_tools_events, ToolLoopState,
+        build_mcp_list_tools_items_for_request, build_resume_payload, execute_streaming_tool_calls,
+        inject_mcp_metadata_streaming, prepare_mcp_tools_as_functions, send_mcp_list_tools_events,
+        ToolLoopState,
     },
     tool_handler::{StreamAction, StreamingToolHandler},
     utils::{mask_tools_as_mcp, patch_response_with_request_metadata, rewrite_streaming_block},
@@ -41,7 +42,10 @@ use crate::{
     },
     routers::{
         header_utils::{apply_request_headers, preserve_response_headers},
-        mcp_utils::{ensure_request_mcp_client, McpLoopConfig},
+        mcp_utils::{
+            build_allowed_tools_map, build_mcp_tool_lookup, build_server_label_map,
+            decode_mcp_function_name, ensure_request_mcp_client, McpLoopConfig,
+        },
         openai::context::{RequestContext, StreamingEventContext, StreamingRequest},
         persistence_utils::persist_conversation_items,
     },
@@ -129,7 +133,19 @@ pub(super) fn apply_event_transformations_inplace(
                 if let Some(item_type) = item.get("type").and_then(|v| v.as_str()) {
                     if is_function_call_type(item_type) {
                         item["type"] = json!(ItemType::MCP_CALL);
-                        item["server_label"] = json!(ctx.server_label);
+
+                        if let Some(encoded_name) = item.get("name").and_then(|v| v.as_str()) {
+                            if let Some((server_label, tool_name)) =
+                                decode_mcp_function_name(encoded_name)
+                            {
+                                item["server_label"] = json!(server_label);
+                                item["name"] = json!(tool_name);
+                            } else {
+                                item["server_label"] = json!(ctx.server_label);
+                            }
+                        } else {
+                            item["server_label"] = json!(ctx.server_label);
+                        }
 
                         // Transform ID from fc_* to mcp_*
                         if let Some(id) = item.get("id").and_then(|v| v.as_str()) {
@@ -166,17 +182,27 @@ pub(super) fn apply_event_transformations_inplace(
 /// Helper to build MCP tools value
 fn build_mcp_tools_value(original_body: &ResponsesRequest) -> Option<Value> {
     let tools = original_body.tools.as_ref()?;
-    let mcp_tool = tools
+    let tools_array: Vec<Value> = tools
         .iter()
-        .find(|t| matches!(t.r#type, ResponseToolType::Mcp) && t.server_url.is_some())?;
+        .filter(|t| matches!(t.r#type, ResponseToolType::Mcp) && t.server_url.is_some())
+        .map(|mcp_tool| {
+            json!({
+                "type": "mcp",
+                "server_label": mcp_tool.server_label,
+                "server_url": mcp_tool.server_url,
+                "server_description": mcp_tool.server_description,
+                "require_approval": mcp_tool.require_approval,
+                "allowed_tools": mcp_tool.allowed_tools,
+                "headers": mcp_tool.headers,
+            })
+        })
+        .collect();
 
-    let tools_array = vec![json!({
-        "type": "mcp",
-        "server_label": mcp_tool.server_label,
-        "server_url": mcp_tool.server_url
-    })];
-
-    Some(Value::Array(tools_array))
+    if tools_array.is_empty() {
+        None
+    } else {
+        Some(Value::Array(tools_array))
+    }
 }
 
 /// Send an SSE event to the client channel
@@ -446,7 +472,7 @@ pub(super) fn send_final_response_event(
             &mut final_response,
             state,
             mcp,
-            ctx.server_label,
+            ctx.original_request.tools.as_deref(),
             ctx.server_keys,
         );
     }
@@ -642,7 +668,12 @@ pub(super) async fn handle_streaming_with_tool_interception(
 ) -> Response {
     // Transform MCP tools to function tools in payload
     let mut payload = req.payload;
-    prepare_mcp_tools_as_functions(&mut payload, active_mcp, &server_keys);
+    prepare_mcp_tools_as_functions(
+        &mut payload,
+        active_mcp,
+        &server_keys,
+        req.original_body.tools.as_deref(),
+    );
 
     let (tx, rx) = mpsc::unbounded_channel::<Result<Bytes, io::Error>>();
     let should_store = req.original_body.store.unwrap_or(false);
@@ -687,6 +718,20 @@ pub(super) async fn handle_streaming_with_tool_interception(
             })
             .unwrap_or("mcp");
 
+        let server_labels = build_server_label_map(original_request.tools.as_deref());
+        let allowed_tools = build_allowed_tools_map(original_request.tools.as_deref());
+        let tool_lookup = build_mcp_tool_lookup(
+            &active_mcp_clone,
+            &server_keys_clone,
+            &server_labels,
+            &allowed_tools,
+        );
+
+        let list_tools_items = build_mcp_list_tools_items_for_request(
+            &active_mcp_clone,
+            &server_keys_clone,
+            original_request.tools.as_deref(),
+        );
         let streaming_ctx = StreamingEventContext {
             server_label,
             original_request: &original_request,
@@ -793,15 +838,20 @@ pub(super) async fn handle_streaming_with_tool_interception(
                                             {
                                                 seen_in_progress = true;
                                                 if !mcp_list_tools_sent {
-                                                    let list_tools_index =
-                                                        handler.allocate_synthetic_output_index();
+                                                    let mut list_tools_indexes =
+                                                        Vec::with_capacity(list_tools_items.len());
+                                                    for _ in 0..list_tools_items.len() {
+                                                        list_tools_indexes.push(
+                                                            handler
+                                                                .allocate_synthetic_output_index(),
+                                                        );
+                                                    }
+
                                                     if !send_mcp_list_tools_events(
                                                         &tx,
-                                                        &active_mcp_clone,
-                                                        server_label,
-                                                        list_tools_index,
+                                                        &list_tools_items,
+                                                        &list_tools_indexes,
                                                         &mut sequence_number,
-                                                        &server_keys_clone,
                                                     ) {
                                                         // Client disconnected
                                                         return;
@@ -876,14 +926,6 @@ pub(super) async fn handle_streaming_with_tool_interception(
                             obj.insert("id".to_string(), Value::String(id.clone()));
                         }
                     }
-                    inject_mcp_metadata_streaming(
-                        &mut response_json,
-                        &state,
-                        &active_mcp_clone,
-                        server_label,
-                        &server_keys_clone,
-                    );
-
                     mask_tools_as_mcp(&mut response_json, &original_request);
                     patch_response_with_request_metadata(
                         &mut response_json,
@@ -941,7 +983,7 @@ pub(super) async fn handle_streaming_with_tool_interception(
                 &active_mcp_clone,
                 &tx,
                 &mut state,
-                server_label,
+                &tool_lookup,
                 &mut sequence_number,
             )
             .await

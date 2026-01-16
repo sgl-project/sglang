@@ -364,6 +364,66 @@ class TestToolCallingCloud:
         final_text = text_done_events[0].text
         assert len(final_text) > 0, "Final text should not be empty"
 
+    def test_mcp_multi_server_tool_call(self, setup_backend):
+        """Test MCP tool call with multiple servers (non-streaming)."""
+        _, model, client, gateway = setup_backend
+
+        time.sleep(2)  # Avoid rate limiting
+
+        resp = client.responses.create(
+            model=model,
+            input=MCP_TEST_PROMPT,
+            tools=[BRAVE_MCP_TOOL, DEEPWIKI_MCP_TOOL],
+            stream=False,
+            reasoning={"effort": "low"},
+        )
+
+        assert resp.error is None
+        assert resp.id is not None
+        assert resp.status == "completed"
+        assert resp.output is not None
+
+        list_tools_items = [
+            item for item in resp.output if item.type == "mcp_list_tools"
+        ]
+        assert len(list_tools_items) == 2
+        labels = {item.server_label for item in list_tools_items}
+        assert labels == {"brave", "deepwiki"}
+
+        mcp_calls = [item for item in resp.output if item.type == "mcp_call"]
+        assert len(mcp_calls) > 0
+
+    def test_mcp_multi_server_tool_call_streaming(self, setup_backend):
+        """Test MCP tool call with multiple servers (streaming)."""
+        _, model, client, gateway = setup_backend
+
+        time.sleep(2)  # Avoid rate limiting
+
+        resp = client.responses.create(
+            model=model,
+            input=MCP_TEST_PROMPT,
+            tools=[BRAVE_MCP_TOOL, DEEPWIKI_MCP_TOOL],
+            stream=True,
+            reasoning={"effort": "low"},
+        )
+
+        events = list(resp)
+        assert len(events) > 0
+
+        completed_events = [e for e in events if e.type == "response.completed"]
+        assert len(completed_events) == 1
+
+        final_output = completed_events[0].response.output
+        list_tools_items = [
+            item for item in final_output if item.type == "mcp_list_tools"
+        ]
+        assert len(list_tools_items) == 2
+        labels = {item.server_label for item in list_tools_items}
+        assert labels == {"brave", "deepwiki"}
+
+        mcp_calls = [item for item in final_output if item.type == "mcp_call"]
+        assert len(mcp_calls) > 0
+
 
 # =============================================================================
 # Local Backend Tests (gRPC with Harmony model) - Tool Choice
@@ -498,6 +558,66 @@ class TestToolChoiceHarmony:
         output = resp.output
         mcp_calls = [item for item in output if item.type == "mcp_call"]
         assert len(mcp_calls) > 0, "tool_choice='auto' should allow MCP tool calls"
+
+    def test_mcp_multi_server_tool_call(self, setup_backend):
+        """Test MCP tool call with multiple servers (non-streaming)."""
+        _, model, client, gateway = setup_backend
+
+        time.sleep(2)
+
+        resp = client.responses.create(
+            model=model,
+            input=MCP_TEST_PROMPT,
+            tools=[BRAVE_MCP_TOOL, DEEPWIKI_MCP_TOOL],
+            stream=False,
+            reasoning={"effort": "low"},
+        )
+
+        assert resp.error is None
+        assert resp.id is not None
+        assert resp.status == "completed"
+        assert resp.output is not None
+
+        list_tools_items = [
+            item for item in resp.output if item.type == "mcp_list_tools"
+        ]
+        assert len(list_tools_items) == 2
+        labels = {item.server_label for item in list_tools_items}
+        assert labels == {"brave", "deepwiki"}
+
+        mcp_calls = [item for item in resp.output if item.type == "mcp_call"]
+        assert len(mcp_calls) > 0
+
+    def test_mcp_multi_server_tool_call_streaming(self, setup_backend):
+        """Test MCP tool call with multiple servers (streaming)."""
+        _, model, client, gateway = setup_backend
+
+        time.sleep(2)
+
+        resp = client.responses.create(
+            model=model,
+            input=MCP_TEST_PROMPT,
+            tools=[BRAVE_MCP_TOOL, DEEPWIKI_MCP_TOOL],
+            stream=True,
+            reasoning={"effort": "low"},
+        )
+
+        events = list(resp)
+        assert len(events) > 0
+
+        completed_events = [e for e in events if e.type == "response.completed"]
+        assert len(completed_events) == 1
+
+        final_output = completed_events[0].response.output
+        list_tools_items = [
+            item for item in final_output if item.type == "mcp_list_tools"
+        ]
+        assert len(list_tools_items) == 2
+        labels = {item.server_label for item in list_tools_items}
+        assert labels == {"brave", "deepwiki"}
+
+        mcp_calls = [item for item in final_output if item.type == "mcp_call"]
+        assert len(mcp_calls) > 0
 
     def test_tool_choice_mixed_function_and_mcp(self, setup_backend):
         """Test tool_choice with mixed function and MCP tools."""
@@ -794,6 +914,66 @@ class TestToolChoiceLocal:
         event_types = [event.type for event in events]
         assert "response.created" in event_types
         assert "response.completed" in event_types
+
+    def test_mcp_multi_server_tool_call(self, setup_backend):
+        """Test MCP tool call with multiple servers (non-streaming)."""
+        _, model, client, gateway = setup_backend
+
+        time.sleep(2)
+
+        resp = client.responses.create(
+            model=model,
+            input=MCP_TEST_PROMPT,
+            tools=[BRAVE_MCP_TOOL, DEEPWIKI_MCP_TOOL],
+            stream=False,
+            reasoning={"effort": "low"},
+        )
+
+        assert resp.error is None
+        assert resp.id is not None
+        assert resp.status == "completed"
+        assert resp.output is not None
+
+        list_tools_items = [
+            item for item in resp.output if item.type == "mcp_list_tools"
+        ]
+        assert len(list_tools_items) == 2
+        labels = {item.server_label for item in list_tools_items}
+        assert labels == {"brave", "deepwiki"}
+
+        mcp_calls = [item for item in resp.output if item.type == "mcp_call"]
+        assert len(mcp_calls) > 0
+
+    def test_mcp_multi_server_tool_call_streaming(self, setup_backend):
+        """Test MCP tool call with multiple servers (streaming)."""
+        _, model, client, gateway = setup_backend
+
+        time.sleep(2)
+
+        resp = client.responses.create(
+            model=model,
+            input=MCP_TEST_PROMPT,
+            tools=[BRAVE_MCP_TOOL, DEEPWIKI_MCP_TOOL],
+            stream=True,
+            reasoning={"effort": "low"},
+        )
+
+        events = list(resp)
+        assert len(events) > 0
+
+        completed_events = [e for e in events if e.type == "response.completed"]
+        assert len(completed_events) == 1
+
+        final_output = completed_events[0].response.output
+        list_tools_items = [
+            item for item in final_output if item.type == "mcp_list_tools"
+        ]
+        assert len(list_tools_items) == 2
+        labels = {item.server_label for item in list_tools_items}
+        assert labels == {"brave", "deepwiki"}
+
+        mcp_calls = [item for item in final_output if item.type == "mcp_call"]
+        assert len(mcp_calls) > 0
 
     def test_tool_choice_with_mcp_tools(self, setup_backend):
         """Test tool_choice parameter works with MCP tools."""

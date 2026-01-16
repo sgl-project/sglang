@@ -124,6 +124,7 @@ mod tests {
             transport: McpTransport::Sse {
                 url: "http://localhost:3000/sse".to_string(),
                 token: None,
+                headers: None,
             },
             proxy: None,
             required: false,
@@ -143,6 +144,7 @@ mod tests {
             transport: McpTransport::Sse {
                 url: "http://localhost:3000/sse".to_string(),
                 token: None,
+                headers: None,
             },
             proxy: None,
             required: false,
@@ -179,6 +181,7 @@ mod tests {
             transport: McpTransport::Sse {
                 url: "http://localhost:3000/sse".to_string(),
                 token: None,
+                headers: None,
             },
             proxy: Some(server_proxy),
             required: false,

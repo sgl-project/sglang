@@ -204,32 +204,48 @@ fn insert_optional_string(map: &mut Map<String, Value>, key: &str, value: &Optio
 
 /// Mask function tools as MCP tools in response for client
 pub(super) fn mask_tools_as_mcp(resp: &mut Value, original_body: &ResponsesRequest) {
-    let mcp_tool = original_body.tools.as_ref().and_then(|tools| {
+    let tools = original_body.tools.as_ref().map(|tools| {
         tools
             .iter()
-            .find(|t| matches!(t.r#type, ResponseToolType::Mcp) && t.server_url.is_some())
+            .filter(|t| matches!(t.r#type, ResponseToolType::Mcp) && t.server_url.is_some())
+            .map(|t| {
+                let mut m = Map::new();
+                m.insert("type".to_string(), json!("mcp"));
+                insert_optional_string(&mut m, "server_label", &t.server_label);
+                insert_optional_string(&mut m, "server_url", &t.server_url);
+                insert_optional_string(&mut m, "server_description", &t.server_description);
+                insert_optional_string(&mut m, "require_approval", &t.require_approval);
+
+                if let Some(allowed) = &t.allowed_tools {
+                    m.insert(
+                        "allowed_tools".to_string(),
+                        Value::Array(allowed.iter().map(|s| json!(s)).collect()),
+                    );
+                }
+
+                if t.authorization.is_some() {
+                    m.insert("authorization".to_string(), json!("<redacted>"));
+                }
+
+                if let Some(headers) = &t.headers {
+                    let mut redacted = Map::new();
+                    for key in headers.keys() {
+                        redacted.insert(key.clone(), json!("<redacted>"));
+                    }
+                    m.insert("headers".to_string(), Value::Object(redacted));
+                }
+
+                Value::Object(m)
+            })
+            .collect::<Vec<Value>>()
     });
 
-    let Some(t) = mcp_tool else {
+    let Some(tools) = tools.filter(|tools| !tools.is_empty()) else {
         return;
     };
 
-    let mut m = Map::new();
-    m.insert("type".to_string(), json!("mcp"));
-    insert_optional_string(&mut m, "server_label", &t.server_label);
-    insert_optional_string(&mut m, "server_url", &t.server_url);
-    insert_optional_string(&mut m, "server_description", &t.server_description);
-    insert_optional_string(&mut m, "require_approval", &t.require_approval);
-
-    if let Some(allowed) = &t.allowed_tools {
-        m.insert(
-            "allowed_tools".to_string(),
-            Value::Array(allowed.iter().map(|s| json!(s)).collect()),
-        );
-    }
-
     if let Some(obj) = resp.as_object_mut() {
-        obj.insert("tools".to_string(), json!([Value::Object(m)]));
+        obj.insert("tools".to_string(), Value::Array(tools));
         obj.entry("tool_choice").or_insert(json!("auto"));
     }
 }

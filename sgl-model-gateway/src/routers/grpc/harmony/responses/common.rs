@@ -1,11 +1,17 @@
 //! Shared helpers and state tracking for Harmony Responses
 
+use std::collections::HashMap;
+
 use axum::response::Response;
 use serde_json::{from_value, json, to_string, Value};
 use tracing::{debug, error, warn};
 use uuid::Uuid;
 
 use super::execution::ToolResult;
+pub(super) use crate::routers::mcp_utils::{
+    build_server_label_map, decode_mcp_function_name, encode_mcp_function_name,
+    filter_tools_for_server, list_tools_by_server, resolve_server_label, McpToolLookup,
+};
 use crate::{
     data_connector::ResponseId,
     mcp,
@@ -17,7 +23,9 @@ use crate::{
             ResponsesRequest, ResponsesResponse, StringOrContentParts,
         },
     },
-    routers::{error, grpc::common::responses::ResponsesContext},
+    routers::{
+        error, grpc::common::responses::ResponsesContext, mcp_utils::build_allowed_tools_map,
+    },
 };
 
 /// Record of a single MCP tool call execution
@@ -34,29 +42,25 @@ pub(super) struct McpCallRecord {
     pub arguments: String,
     /// JSON-encoded output/result
     pub output: String,
-    /// Whether execution succeeded
+    /// Whether the call was successful
     pub success: bool,
-    /// Error message if execution failed
+    /// Error message if failed
     pub error: Option<String>,
+    /// MCP server label for this tool
+    pub server_label: String,
 }
 
-/// Tracking structure for MCP tool calls across iterations
-///
-/// Accumulates all MCP tool call metadata during multi-turn conversation
-/// so we can build proper mcp_list_tools and mcp_call output items.
-#[derive(Debug, Clone)]
 pub(super) struct McpCallTracking {
-    /// MCP server label (e.g., "sglang-mcp")
-    pub server_label: String,
     /// All tool call records across all iterations
     pub tool_calls: Vec<McpCallRecord>,
+    pub tool_lookup: McpToolLookup,
 }
 
 impl McpCallTracking {
-    pub fn new(server_label: String) -> Self {
+    pub fn new(tool_lookup: McpToolLookup) -> Self {
         Self {
-            server_label,
             tool_calls: Vec::new(),
+            tool_lookup,
         }
     }
 
@@ -69,13 +73,16 @@ impl McpCallTracking {
         success: bool,
         error: Option<String>,
     ) {
+        let (server_label, raw_tool_name) = decode_mcp_function_name(&tool_name)
+            .unwrap_or_else(|| ("mcp".to_string(), tool_name.clone()));
         self.tool_calls.push(McpCallRecord {
             call_id,
-            tool_name,
+            tool_name: raw_tool_name,
             arguments,
             output,
             success,
             error,
+            server_label,
         });
     }
 
@@ -206,6 +213,25 @@ pub(super) fn build_next_request_with_tools(
     Ok(request)
 }
 
+pub(super) fn build_tool_label_map(
+    mcp_manager: &mcp::McpManager,
+    server_keys: &[String],
+    server_labels: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    let mut tool_labels = HashMap::new();
+
+    for (server_key, tools) in list_tools_by_server(mcp_manager, server_keys) {
+        let server_label = resolve_server_label(&server_key, server_labels);
+
+        for tool in tools {
+            let encoded_name = encode_mcp_function_name(&server_label, tool.name.as_ref());
+            tool_labels.insert(encoded_name, server_label.clone());
+        }
+    }
+
+    tool_labels
+}
+
 /// Inject MCP metadata into final response
 ///
 /// Adds mcp_list_tools and mcp_call output items to the response output array.
@@ -215,27 +241,39 @@ pub(super) fn build_next_request_with_tools(
 pub(super) fn inject_mcp_metadata(
     response: &mut ResponsesResponse,
     tracking: &McpCallTracking,
-    mcp_tools: &[mcp::Tool],
+    mcp_manager: &mcp::McpManager,
+    server_keys: &[String],
+    server_labels: &HashMap<String, String>,
+    tools: Option<&[ResponseTool]>,
 ) {
-    // Build mcp_list_tools item
-    let tools = mcp_tools;
-    let tools_info: Vec<McpToolInfo> = tools
-        .iter()
-        .map(|t| McpToolInfo {
-            name: t.name.to_string(),
-            description: t.description.as_ref().map(|d| d.to_string()),
-            input_schema: Value::Object((*t.input_schema).clone()),
-            annotations: Some(json!({
-                "read_only": false
-            })),
+    let allowed_tools = build_allowed_tools_map(tools);
+
+    // Build mcp_list_tools items (one per server)
+    let list_tools_items: Vec<ResponseOutputItem> = list_tools_by_server(mcp_manager, server_keys)
+        .into_iter()
+        .map(|(server_key, tools)| {
+            let server_label = resolve_server_label(&server_key, server_labels);
+            let filtered_tools = filter_tools_for_server(&tools, &server_label, &allowed_tools);
+
+            let tools_info: Vec<McpToolInfo> = filtered_tools
+                .into_iter()
+                .map(|t| McpToolInfo {
+                    name: t.name.to_string(),
+                    description: t.description.as_ref().map(|d| d.to_string()),
+                    input_schema: Value::Object((*t.input_schema).clone()),
+                    annotations: Some(json!({
+                        "read_only": false
+                    })),
+                })
+                .collect();
+
+            ResponseOutputItem::McpListTools {
+                id: format!("mcpl_{}", Uuid::new_v4()),
+                server_label,
+                tools: tools_info,
+            }
         })
         .collect();
-
-    let mcp_list_tools = ResponseOutputItem::McpListTools {
-        id: format!("mcpl_{}", Uuid::new_v4()),
-        server_label: tracking.server_label.clone(),
-        tools: tools_info,
-    };
 
     // Build mcp_call items for each tracked call
     let mcp_call_items: Vec<ResponseOutputItem> = tracking
@@ -254,16 +292,22 @@ pub(super) fn inject_mcp_metadata(
             error: record.error.clone(),
             name: record.tool_name.clone(),
             output: record.output.clone(),
-            server_label: tracking.server_label.clone(),
+            server_label: record.server_label.clone(),
         })
         .collect();
 
-    // Inject into response output:
-    // 1. Prepend mcp_list_tools at the beginning
-    response.output.insert(0, mcp_list_tools);
+    response.output.retain(|item| {
+        !matches!(
+            item,
+            ResponseOutputItem::McpListTools { .. } | ResponseOutputItem::McpCall { .. }
+        )
+    });
 
-    // 2. Append all mcp_call items at the end
+    let mut existing = Vec::new();
+    std::mem::swap(&mut existing, &mut response.output);
+    response.output.extend(list_tools_items);
     response.output.extend(mcp_call_items);
+    response.output.extend(existing);
 }
 
 /// Load previous conversation messages from storage

@@ -80,7 +80,7 @@ pub(crate) struct ResponseStreamEventEmitter {
     has_emitted_content_part_added: bool,
     // MCP call tracking
     mcp_call_accumulated_args: HashMap<String, String>,
-    pub(crate) mcp_server_label: Option<String>, // Server label for MCP tools
+    pub(crate) mcp_tool_labels: Option<HashMap<String, String>>,
     // Output item tracking
     output_items: Vec<OutputItemState>,
     next_output_index: usize,
@@ -105,7 +105,7 @@ impl ResponseStreamEventEmitter {
             has_emitted_output_item_added: false,
             has_emitted_content_part_added: false,
             mcp_call_accumulated_args: HashMap::new(),
-            mcp_server_label: None,
+            mcp_tool_labels: None,
             output_items: Vec::new(),
             next_output_index: 0,
             current_message_output_index: None,
@@ -119,9 +119,9 @@ impl ResponseStreamEventEmitter {
         self.original_request = Some(request);
     }
 
-    /// Set the MCP server label for MCP tool calls
-    pub fn set_mcp_server_label(&mut self, server_label: String) {
-        self.mcp_server_label = Some(server_label);
+    /// Set MCP tool labels for per-tool server labeling
+    pub fn set_mcp_tool_labels(&mut self, tool_labels: HashMap<String, String>) {
+        self.mcp_tool_labels = Some(tool_labels);
     }
 
     /// Update mcp_call output items with tool execution results

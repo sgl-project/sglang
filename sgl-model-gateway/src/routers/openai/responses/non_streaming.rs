@@ -71,7 +71,12 @@ pub async fn handle_non_streaming_response(mut ctx: RequestContext) -> Response 
             server_keys: server_keys.clone(),
             ..McpLoopConfig::default()
         };
-        prepare_mcp_tools_as_functions(&mut payload, mcp, &server_keys);
+        prepare_mcp_tools_as_functions(
+            &mut payload,
+            mcp,
+            &server_keys,
+            original_body.tools.as_deref(),
+        );
 
         match execute_tool_loop(
             ctx.components.client(),

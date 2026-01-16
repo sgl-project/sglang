@@ -35,6 +35,8 @@ pub struct ResponseTool {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub authorization: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub headers: Option<HashMap<String, String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub server_label: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub server_description: Option<String>,
@@ -51,6 +53,7 @@ impl Default for ResponseTool {
             function: None,
             server_url: None,
             authorization: None,
+            headers: None,
             server_label: None,
             server_description: None,
             require_approval: None,
@@ -897,7 +900,63 @@ fn validate_responses_cross_parameters(
     // 1. Validate tool_choice requires tools (enhanced)
     validate_tool_choice_with_tools(request)?;
 
-    // 2. Validate top_logprobs requires include field
+    // 2. Validate MCP server labels and URLs (Responses API)
+    if let Some(tools) = &request.tools {
+        let mut seen_labels = std::collections::HashSet::new();
+        for tool in tools {
+            if tool.r#type != ResponseToolType::Mcp {
+                continue;
+            }
+
+            if tool
+                .server_url
+                .as_ref()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .is_none()
+            {
+                let mut e = validator::ValidationError::new("mcp_server_url_required");
+                e.message = Some("MCP tool must have a non-empty 'server_url'.".into());
+                return Err(e);
+            }
+
+            let Some(label) = tool
+                .server_label
+                .as_ref()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+            else {
+                let mut e = validator::ValidationError::new("mcp_server_label_required");
+                e.message = Some(
+                    "MCP tool must have a non-empty 'server_label' when 'server_url' is provided."
+                        .into(),
+                );
+                return Err(e);
+            };
+
+            if label.contains("__") {
+                let mut e = validator::ValidationError::new("mcp_server_label_invalid");
+                e.message = Some(
+                    "MCP 'server_label' must not contain '__' to avoid tool name ambiguity.".into(),
+                );
+                return Err(e);
+            }
+
+            if !seen_labels.insert(label.to_string()) {
+                let mut e = validator::ValidationError::new("mcp_server_label_duplicate");
+                e.message = Some(
+                    format!(
+                        "Duplicate MCP 'server_label' found: '{}'. Each MCP server must have a unique label.",
+                        label
+                    )
+                    .into(),
+                );
+                return Err(e);
+            }
+        }
+    }
+
+    // 3. Validate top_logprobs requires include field
     if request.top_logprobs.is_some() {
         let has_logprobs_include = request
             .include
@@ -913,21 +972,21 @@ fn validate_responses_cross_parameters(
         }
     }
 
-    // 3. Validate background/stream conflict
+    // 4. Validate background/stream conflict
     if request.background == Some(true) && request.stream == Some(true) {
         let mut e = validator::ValidationError::new("background_conflicts_with_stream");
         e.message = Some("Cannot use background mode with streaming".into());
         return Err(e);
     }
 
-    // 4. Validate conversation and previous_response_id are mutually exclusive
+    // 5. Validate conversation and previous_response_id are mutually exclusive
     if request.conversation.is_some() && request.previous_response_id.is_some() {
         let mut e = validator::ValidationError::new("mutually_exclusive_parameters");
         e.message = Some("Mutually exclusive parameters. Ensure you are only providing one of: 'previous_response_id' or 'conversation'.".into());
         return Err(e);
     }
 
-    // 5. Validate input items structure
+    // 6. Validate input items structure
     if let ResponseInput::Items(items) = &request.input {
         // Check for at least one valid input message
         let has_valid_input = items.iter().any(|item| {
@@ -945,7 +1004,7 @@ fn validate_responses_cross_parameters(
         }
     }
 
-    // 6. Validate text format conflicts (for future structured output constraints)
+    // 7. Validate text format conflicts (for future structured output constraints)
     // Currently, Responses API doesn't have regex/ebnf like Chat API,
     // but this is here for completeness and future-proofing
 

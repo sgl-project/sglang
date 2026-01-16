@@ -1,20 +1,26 @@
 //! MCP tool execution logic for Harmony Responses
 
-use std::{sync::Arc, time::Instant};
+use std::{collections::HashMap, sync::Arc, time::Instant};
 
 use axum::response::Response;
 use serde_json::{from_str, json, to_string, to_value, Value};
 use tracing::{debug, error, warn};
 
-use super::common::McpCallTracking;
+use super::common::{
+    decode_mcp_function_name, encode_mcp_function_name, list_tools_by_server, McpCallTracking,
+    McpToolLookup,
+};
 use crate::{
-    mcp::{self, McpManager},
+    mcp::McpManager,
     observability::metrics::{metrics_labels, Metrics},
     protocols::{
         common::{Function, ToolCall},
         responses::{ResponseTool, ResponseToolType},
     },
-    routers::error,
+    routers::{
+        error,
+        mcp_utils::{build_allowed_tools_map, filter_tools_for_server, resolve_server_label},
+    },
 };
 
 /// Tool execution result
@@ -76,6 +82,21 @@ pub(super) async fn execute_mcp_tools(
             )
         })?;
 
+        let (_resolved_label, raw_tool_name) = decode_mcp_function_name(&tool_call.function.name)
+            .unwrap_or_else(|| ("mcp".to_string(), tool_call.function.name.clone()));
+
+        let server_key = tracking
+            .tool_lookup
+            .tool_servers
+            .get(&tool_call.function.name)
+            .cloned()
+            .ok_or_else(|| {
+                error::internal_error(
+                    "unknown_mcp_tool",
+                    format!("Unknown MCP tool '{}'.", tool_call.function.name),
+                )
+            })?;
+
         // Execute tool via MCP manager
         let args_map = if let Value::Object(map) = args {
             Some(map)
@@ -85,7 +106,7 @@ pub(super) async fn execute_mcp_tools(
 
         let tool_start = Instant::now();
         let tool_result = mcp_manager
-            .call_tool(&tool_call.function.name, args_map)
+            .call_tool_on_server(&server_key, &raw_tool_name, args_map)
             .await;
         let tool_duration = tool_start.elapsed();
 
@@ -125,14 +146,10 @@ pub(super) async fn execute_mcp_tools(
                 );
 
                 // Record MCP tool metrics
-                Metrics::record_mcp_tool_duration(
-                    model_id,
-                    &tool_call.function.name,
-                    tool_duration,
-                );
+                Metrics::record_mcp_tool_duration(model_id, &raw_tool_name, tool_duration);
                 Metrics::record_mcp_tool_call(
                     model_id,
-                    &tool_call.function.name,
+                    &raw_tool_name,
                     if is_error {
                         metrics_labels::RESULT_ERROR
                     } else {
@@ -202,23 +219,55 @@ pub(super) async fn execute_mcp_tools(
 ///
 /// Converts MCP Tool entries (from rmcp SDK) to ResponseTool format so the model
 /// knows about available MCP tools when making tool calls.
-pub(crate) fn convert_mcp_tools_to_response_tools(mcp_tools: &[mcp::Tool]) -> Vec<ResponseTool> {
-    mcp_tools
-        .iter()
-        .map(|tool_info| ResponseTool {
-            r#type: ResponseToolType::Mcp,
-            function: Some(Function {
-                name: tool_info.name.to_string(),
-                description: tool_info.description.as_ref().map(|d| d.to_string()),
-                parameters: Value::Object((*tool_info.input_schema).clone()),
-                strict: None,
-            }),
-            server_url: None, // MCP tools from inventory don't have individual server URLs
-            authorization: None,
-            server_label: None,
-            server_description: tool_info.description.as_ref().map(|d| d.to_string()),
-            require_approval: None,
-            allowed_tools: None,
-        })
-        .collect()
+pub(crate) fn convert_mcp_tools_to_response_tools(
+    mcp_manager: &McpManager,
+    server_keys: &[String],
+    server_labels: &HashMap<String, String>,
+    request_tools: Option<&[ResponseTool]>,
+) -> (Vec<ResponseTool>, McpToolLookup) {
+    let mut tools = Vec::new();
+    let mut lookup = McpToolLookup::default();
+    let allowed_tools = build_allowed_tools_map(request_tools);
+
+    for (server_key, tools_for_server) in list_tools_by_server(mcp_manager, server_keys) {
+        let server_label = resolve_server_label(&server_key, server_labels);
+        let filtered_tools =
+            filter_tools_for_server(&tools_for_server, &server_label, &allowed_tools);
+
+        if filtered_tools.is_empty() {
+            continue;
+        }
+
+        for tool_info in filtered_tools {
+            let encoded_name = encode_mcp_function_name(&server_label, tool_info.name.as_ref());
+            let parameters = Value::Object((*tool_info.input_schema).clone());
+
+            tools.push(ResponseTool {
+                r#type: ResponseToolType::Mcp,
+                function: Some(Function {
+                    name: encoded_name.clone(),
+                    description: tool_info.description.as_ref().map(|d| d.to_string()),
+                    parameters: parameters.clone(),
+                    strict: None,
+                }),
+                server_url: None, // MCP tools from inventory don't have individual server URLs
+                authorization: None,
+                headers: None,
+                server_label: None,
+                server_description: tool_info.description.as_ref().map(|d| d.to_string()),
+                require_approval: None,
+                allowed_tools: None,
+            });
+
+            lookup
+                .tool_servers
+                .insert(encoded_name.clone(), server_key.clone());
+            lookup
+                .tool_names
+                .insert(encoded_name.clone(), tool_info.name.to_string());
+            lookup.tool_schemas.insert(encoded_name, parameters);
+        }
+    }
+
+    (tools, lookup)
 }

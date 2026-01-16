@@ -693,7 +693,7 @@ async fn responses_handler(
                         "item": {
                             "id": call_id.clone(),
                             "type": "function_tool_call",
-                            "name": "brave_web_search",
+                            "name": "mcp__mock__brave_web_search",
                             "arguments": "",
                             "status": "in_progress"
                         }
@@ -764,7 +764,7 @@ async fn responses_handler(
                         "item": {
                             "id": call_id.clone(),
                             "type": "function_tool_call",
-                            "name": "brave_web_search",
+                            "name": "mcp__mock__brave_web_search",
                             "arguments": "{\"query\":\"SGLang router MCP integration\"}",
                             "status": "completed"
                         }
@@ -1017,7 +1017,7 @@ async fn responses_handler(
                 "output": [{
                     "type": "function_tool_call",
                     "id": "call_1",
-                    "name": "brave_web_search",
+                    "name": "mcp__mock__brave_web_search",
                     "arguments": "{\"query\":\"SGLang router MCP integration\"}",
                     "status": "in_progress"
                 }],

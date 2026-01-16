@@ -32,8 +32,8 @@ pub(crate) struct CachedResource {
 /// Provides thread-safe caching of MCP tools, prompts, and resources.
 /// Entries are refreshed periodically by background tasks.
 pub struct ToolInventory {
-    /// Map of tool_name -> cached tool
-    tools: DashMap<String, CachedTool>,
+    /// Map of (server_name, tool_name) -> cached tool
+    tools: DashMap<(String, String), CachedTool>,
 
     /// Map of prompt_name -> cached prompt
     prompts: DashMap<String, CachedPrompt>,
@@ -67,19 +67,25 @@ impl ToolInventory {
     /// Get a tool if it exists
     pub fn get_tool(&self, tool_name: &str) -> Option<(String, Tool)> {
         self.tools
-            .get(tool_name)
-            .map(|entry| (entry.server_name.clone(), entry.tool.clone()))
+            .iter()
+            .find(|entry| entry.key().1 == tool_name)
+            .map(|entry| {
+                (
+                    entry.value().server_name.clone(),
+                    entry.value().tool.clone(),
+                )
+            })
     }
 
     /// Check if tool exists
     pub fn has_tool(&self, tool_name: &str) -> bool {
-        self.tools.contains_key(tool_name)
+        self.tools.iter().any(|entry| entry.key().1 == tool_name)
     }
 
     /// Insert or update a tool
     pub fn insert_tool(&self, tool_name: String, server_name: String, tool: Tool) {
-        self.tools
-            .insert(tool_name, CachedTool { server_name, tool });
+        let key = (server_name.clone(), tool_name);
+        self.tools.insert(key, CachedTool { server_name, tool });
     }
 
     /// Get all tools
@@ -87,11 +93,11 @@ impl ToolInventory {
         self.tools
             .iter()
             .map(|entry| {
-                let (name, cached) = entry.pair();
+                let (server_name, tool_name) = entry.key();
                 (
-                    name.clone(),
-                    cached.server_name.clone(),
-                    cached.tool.clone(),
+                    tool_name.clone(),
+                    server_name.clone(),
+                    entry.value().tool.clone(),
                 )
             })
             .collect()
@@ -192,8 +198,7 @@ impl ToolInventory {
 
     /// Clear all cached items for a specific server (called when LRU evicts client)
     pub fn clear_server_tools(&self, server_name: &str) {
-        self.tools
-            .retain(|_, cached| cached.server_name != server_name);
+        self.tools.retain(|key, _| key.0 != server_name);
         self.prompts
             .retain(|_, cached| cached.server_name != server_name);
         self.resources
@@ -317,6 +322,33 @@ mod tests {
 
         let tools = inventory.list_tools();
         assert_eq!(tools.len(), 3);
+    }
+
+    #[test]
+    fn test_list_tools_with_duplicates() {
+        use std::collections::HashSet;
+
+        let inventory = ToolInventory::new();
+
+        inventory.insert_tool(
+            "tool1".to_string(),
+            "server1".to_string(),
+            create_test_tool("tool1"),
+        );
+        inventory.insert_tool(
+            "tool1".to_string(),
+            "server2".to_string(),
+            create_test_tool("tool1"),
+        );
+
+        let tools = inventory.list_tools();
+        assert_eq!(tools.len(), 2);
+
+        let servers: HashSet<String> = tools.into_iter().map(|(_, server, _)| server).collect();
+        assert_eq!(
+            servers,
+            HashSet::from(["server1".to_string(), "server2".to_string()])
+        );
     }
 
     #[test]
