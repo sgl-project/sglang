@@ -380,6 +380,7 @@ class WanTransformerBlock(nn.Module):
                 qk_norm=qk_norm,
                 eps=eps,
                 supported_attention_backends=supported_attention_backends,
+                quant_config=quant_config,
             )
         else:
             # T2V
@@ -389,6 +390,7 @@ class WanTransformerBlock(nn.Module):
                 qk_norm=qk_norm,
                 eps=eps,
                 supported_attention_backends=supported_attention_backends,
+                quant_config=quant_config,
             )
         self.cross_attn_residual_norm = ScaleResidualLayerNormScaleShift(
             dim,
