@@ -679,8 +679,8 @@ class TransformerLoader(ComponentLoader):
         # Config from Diffusers supersedes sgl_diffusion's model config
         dit_config = server_args.pipeline_config.dit_config
         dit_config.update_model_arch(config)
-        if hasattr(self, "update_quant_config"):
-            self.update_quant_config()
+        if hasattr(dit_config, "update_quant_config"):
+            dit_config.update_quant_config()
 
         model_cls, _ = ModelRegistry.resolve_model_cls(cls_name)
 
