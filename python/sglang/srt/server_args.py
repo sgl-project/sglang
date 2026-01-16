@@ -70,7 +70,7 @@ logger = logging.getLogger(__name__)
 
 # Define constants
 DEFAULT_UVICORN_ACCESS_LOG_EXCLUDE_PREFIXES = ()
-SAMPLING_BACKEND_CHOICES = {"flashinfer", "pytorch", "ascend"}
+SAMPLING_BACKEND_CHOICES = {"flashinfer", "flashinfer_python", "pytorch", "ascend"}
 LOAD_FORMAT_CHOICES = [
     "auto",
     "pt",
@@ -1173,6 +1173,12 @@ class ServerArgs:
                             self.nsa_prefill_backend = "flashmla_sparse"
                             self.nsa_decode_backend = "flashmla_sparse"
 
+                    # Logging env vars for NSA
+                    from sglang.srt.layers.attention.nsa.utils import (
+                        print_nsa_bool_env_vars,
+                    )
+
+                    print_nsa_bool_env_vars()
                 if self.enable_nsa_prefill_context_parallel:
                     assert (
                         self.disaggregation_mode != "decode"

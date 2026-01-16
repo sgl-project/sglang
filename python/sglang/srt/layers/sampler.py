@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 SYNC_TOKEN_IDS_ACROSS_TP = get_bool_env_var("SYNC_TOKEN_IDS_ACROSS_TP")
 SGLANG_RETURN_ORIGINAL_LOGPROB = get_bool_env_var("SGLANG_RETURN_ORIGINAL_LOGPROB")
 _CUSTOM_SAMPLER_FACTORIES: Dict[str, Callable[[], "Sampler"]] = {}
-_BUILT_IN_SAMPLING_BACKENDS = {"flashinfer", "pytorch", "ascend"}
+_BUILT_IN_SAMPLING_BACKENDS = {"flashinfer", "flashinfer_python", "pytorch", "ascend"}
 
 
 class Sampler(nn.Module):
@@ -134,7 +134,48 @@ class Sampler(nn.Module):
                     positions=positions,
                 )
             else:
-                if get_global_server_args().sampling_backend == "flashinfer":
+                if get_global_server_args().sampling_backend == "flashinfer_python":
+                    # flashinfer Python API (supports bf16/fp16, multi-CTA + radix top-k)
+                    try:
+                        import flashinfer.sampling as flashinfer_sampling
+                    except ImportError as exc:
+                        raise ImportError(
+                            "flashinfer is required for sampling_backend='flashinfer_python'. "
+                            "Install flashinfer or choose a different sampling_backend."
+                        ) from exc
+                    top_ks = sampling_info.top_ks
+                    if sampling_info.need_top_k_sampling and torch.any(
+                        top_ks == TOP_K_ALL
+                    ):
+                        top_ks = top_ks.clone()
+                        top_ks.masked_fill_(top_ks == TOP_K_ALL, probs.shape[1])
+                    if sampling_info.need_min_p_sampling:
+                        if sampling_info.need_top_k_sampling:
+                            probs = flashinfer_sampling.top_k_renorm_probs(
+                                probs, top_ks
+                            )
+                        probs = flashinfer_sampling.top_p_renorm_probs(
+                            probs, sampling_info.top_ps
+                        )
+                        batch_next_token_ids = min_p_sampling_from_probs(
+                            probs, sampling_info.min_ps
+                        )
+                    else:
+                        # Use separate ops to get bf16 + radix speedup on renorm step
+                        # Note: top_k_renorm_probs keeps bf16, top_p_sampling casts to fp32 internally
+                        # Still beneficial: radix speedup on renorm + less data to cast
+                        if sampling_info.need_top_k_sampling:
+                            probs = flashinfer_sampling.top_k_renorm_probs(
+                                probs, top_ks
+                            )
+                        batch_next_token_ids = (
+                            flashinfer_sampling.top_p_sampling_from_probs(
+                                probs.contiguous(),
+                                sampling_info.top_ps,
+                                check_nan=self.use_nan_detection,
+                            )
+                        )
+                elif get_global_server_args().sampling_backend == "flashinfer":
                     if sampling_info.need_min_p_sampling:
                         probs = top_k_renorm_prob(probs, sampling_info.top_ks)
                         probs = top_p_renorm_prob(probs, sampling_info.top_ps)

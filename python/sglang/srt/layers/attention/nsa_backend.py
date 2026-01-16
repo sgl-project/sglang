@@ -22,6 +22,10 @@ from sglang.srt.layers.attention.nsa.transform_index import (
     transform_index_page_table_prefill,
 )
 from sglang.srt.layers.attention.nsa.utils import (
+    NSA_ENABLE_MTP_PRECOMPUTE_METADATA,
+    NSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8,
+    NSA_FUSE_TOPK,
+    NSA_USE_FLASHINFER_TOPK,
     can_nsa_prefill_cp_round_robin_split,
     compute_nsa_seqlens,
     is_nsa_enable_prefill_cp,
@@ -58,6 +62,16 @@ if _is_hip:
         )
 else:
     from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+
+# FlashInfer radix top-k (faster for long sequences, 1.2-5x speedup)
+_flashinfer_topk_available = False
+if is_cuda() and NSA_USE_FLASHINFER_TOPK:
+    try:
+        import flashinfer
+
+        _flashinfer_topk_available = True
+    except ImportError:
+        pass
 
 
 # Reuse this workspace buffer across all NSA backend instances
@@ -230,10 +244,35 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
         else:
             page_table_size_1 = self.attn_metadata.page_table_1
 
-        if not envs.SGLANG_NSA_FUSE_TOPK.get():
+        # Use FlashInfer radix top-k when available and ks is None (decode path)
+        # FlashInfer is 1.2-5x faster for long sequences (see benchmarks)
+        # Falls back to sgl-kernel when ks is provided (extend with ragged keys)
+        use_flashinfer = _flashinfer_topk_available and ks is None and NSA_FUSE_TOPK
+
+        if not NSA_FUSE_TOPK:
             return fast_topk_v2(logits, seq_lens_topk, topk, row_starts=ks)
+        elif use_flashinfer and self.topk_transform_method == TopkTransformMethod.PAGED:
+            # FlashInfer path: fused top-k + page table transform
+            # row_to_batch=None means 1:1 mapping (row i -> batch i)
+            return flashinfer.top_k_page_table_transform(
+                input=logits,
+                src_page_table=page_table_size_1,
+                lengths=seq_lens_topk.to(torch.int32),
+                k=topk,
+                row_to_batch=None,  # Decode has 1:1 row-to-batch mapping
+            )
+        elif (
+            use_flashinfer and self.topk_transform_method == TopkTransformMethod.RAGGED
+        ):
+            # FlashInfer path: fused top-k + ragged offset transform
+            return flashinfer.top_k_ragged_transform(
+                input=logits,
+                offsets=cu_topk_indices_offset.to(torch.int32),
+                lengths=seq_lens_topk.to(torch.int32),
+                k=topk,
+            )
         elif self.topk_transform_method == TopkTransformMethod.PAGED:
-            # NOTE(dark): if fused, we return a transformed page table directly
+            # sgl-kernel path: supports row_starts for extend/prefill
             return fast_topk_transform_fused(
                 score=logits,
                 lengths=seq_lens_topk,
@@ -1221,6 +1260,11 @@ class NativeSparseAttnBackend(
         # Do absorbed multi-latent attention (MLA path)
         assert q_rope is not None
         kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        # when store in fp8 and compute in fp8, no need to convert dtype
+        if not (
+            NSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8 and self.nsa_kv_cache_store_fp8
+        ):
+            kv_cache = kv_cache.to(q.dtype)
 
         if q_rope is not None:
             q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
@@ -1239,7 +1283,7 @@ class NativeSparseAttnBackend(
 
         # NOTE(dark): here, we use page size = 1
         topk_transform_method = self.get_topk_transform_method()
-        if envs.SGLANG_NSA_FUSE_TOPK.get():
+        if NSA_FUSE_TOPK:
             page_table_1 = topk_indices
         else:
             if topk_transform_method == TopkTransformMethod.RAGGED:
@@ -1277,6 +1321,8 @@ class NativeSparseAttnBackend(
             if q_rope is not None:
                 q_all = _concat_mla_absorb_q_general(q_nope, q_rope)
 
+            # NSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8 has no effect here,
+            # because the flashmla_sparse kernel doesn't support fp8 compute
             if topk_transform_method == TopkTransformMethod.RAGGED:
                 if any(forward_batch.extend_prefix_lens_cpu):
                     page_table_1_flattened = (
@@ -1376,7 +1422,7 @@ class NativeSparseAttnBackend(
         if topk_indices is not None:
             topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
 
-        if envs.SGLANG_NSA_FUSE_TOPK.get():
+        if NSA_FUSE_TOPK:
             page_table_1 = topk_indices
         else:
             page_table_1 = transform_index_page_table_decode(
@@ -1554,7 +1600,7 @@ class NativeSparseAttnBackend(
         kv_cache = kv_cache.view(-1, self.real_page_size, 1, self.kv_cache_dim)
         assert self.real_page_size == 64, "only page size 64 is supported"
 
-        if not self.nsa_kv_cache_store_fp8:
+        if NSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8 and not self.nsa_kv_cache_store_fp8:
             # inefficiently quantize the whole cache
             kv_cache = quantize_k_cache(kv_cache)
 
@@ -1576,7 +1622,7 @@ class NativeSparseAttnBackend(
             block_table=torch.empty(
                 (q_all.shape[0], 0), dtype=torch.int32, device=q_all.device
             ),
-            is_fp8_kvcache=True,
+            is_fp8_kvcache=NSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8,
         )
         return o
 
@@ -1779,7 +1825,7 @@ class NativeSparseAttnBackend(
 
     def get_topk_transform_method(self) -> TopkTransformMethod:
         """
-        SGLANG_NSA_FUSE_TOPK controls whether to fuse the topk transform into the topk kernel.
+        NSA_FUSE_TOPK controls whether to fuse the topk transform into the topk kernel.
         This method is used to select the topk transform method which can be fused or unfused.
         """
         if (
@@ -1811,7 +1857,7 @@ class NativeSparseAttnBackend(
             num_q_tokens_per_head_k=seq_len_q * self.num_q_heads // 1,
             num_heads_k=1,
             num_heads_q=self.num_q_heads,
-            is_fp8_kvcache=True,
+            is_fp8_kvcache=NSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8,
             topk=self.nsa_index_topk,
         )
 
@@ -1863,7 +1909,7 @@ class NativeSparseAttnMultiStepBackend:
     def init_forward_metadata_replay_cuda_graph(
         self, forward_batch: ForwardBatch, bs: int
     ):
-        if envs.SGLANG_NSA_ENABLE_MTP_PRECOMPUTE_METADATA.get():
+        if NSA_ENABLE_MTP_PRECOMPUTE_METADATA:
             # Precompute metadata once (shared across all backends)
             precomputed = self.attn_backends[0]._precompute_replay_metadata(
                 bs=bs,
