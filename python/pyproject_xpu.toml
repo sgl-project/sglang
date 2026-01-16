@@ -97,6 +97,9 @@ dev = ["sglang[test]"]
 "Homepage" = "https://github.com/sgl-project/sglang"
 "Bug Tracker" = "https://github.com/sgl-project/sglang/issues"
 
+[project.scripts]
+sglang = "sglang.cli.main:main"
+
 [tool.setuptools.package-data]
 "sglang" = [
   "srt/layers/moe/fused_moe_triton/configs/*/*.json",
