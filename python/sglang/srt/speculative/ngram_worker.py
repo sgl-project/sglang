@@ -139,8 +139,8 @@ class NGRAMWorker:
         ), f"{total_draft_token_num=}, {bs=}, {self.draft_token_num=}"
         return req_drafts, mask
 
-    def _prepare_for_speculative_decoding(self, batch: ScheduleBatch):
-        if batch.forward_mode.is_extend():
+    def _prepare_for_speculative_decoding(self, batch: ScheduleBatch, is_spec_v2=False):
+        if batch.forward_mode.is_extend() and not is_spec_v2:
             return
 
         bs = batch.batch_size()
@@ -184,7 +184,10 @@ class NGRAMWorker:
             tree_mask = torch.cat(tree_mask, dim=0)
 
         batch.spec_algorithm = SpeculativeAlgorithm.NGRAM
-        batch.forward_mode = ForwardMode.TARGET_VERIFY
+        if not batch.forward_mode.is_extend():
+            batch.forward_mode = (
+                ForwardMode.DECODE if is_spec_v2 else ForwardMode.TARGET_VERIFY
+            )
         batch.spec_info = NgramVerifyInput(
             draft_tokens,
             tree_mask,

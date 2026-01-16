@@ -1853,7 +1853,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.forward_mode = ForwardMode.DECODE
         bs = len(self.reqs)
 
-        if self.is_spec_v2:
+        if self.is_spec_v2 and not self.spec_algorithm.is_ngram():
             # TODO(spec-v2): all spec v2 should go through this path
             draft_input: EagleDraftInput = self.spec_info
             draft_input.prepare_for_decode(self)
