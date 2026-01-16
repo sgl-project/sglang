@@ -1208,7 +1208,7 @@ class DllmReqs:
         for req in self.reqs:
             req.is_chunked += 1
 
-    def flush_finished_reqs(self):
+    def filter_finished_reqs(self):
         self.reqs = [req for req in self.reqs if not req.finished()]
 
     def __iter__(self):

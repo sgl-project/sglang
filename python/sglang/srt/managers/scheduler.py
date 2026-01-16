@@ -1750,7 +1750,7 @@ class Scheduler(
 
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
         if self.dllm_config is not None:
-            self.dllm_staging_reqs.flush_finished_reqs()
+            self.dllm_staging_reqs.filter_finished_reqs()
 
         # Merge the prefill batch into the running batch
         chunked_req_to_exclude = set()
