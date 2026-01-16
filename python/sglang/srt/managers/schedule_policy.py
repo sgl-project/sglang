@@ -628,7 +628,8 @@ class PrefillAdder:
                 return AddReqResult.OTHER
 
             trunc_len = None
-            if self.is_ssm_radix_cache and truncation_align_size is None:
+            branch_trunc_len = None
+            if self.is_ssm_radix_cache:
                 branching_seqlen = req.mamba_branching_seqlen
                 prefix_len = len(req.prefix_indices)
                 if (
@@ -636,9 +637,9 @@ class PrefillAdder:
                     and prefix_len < branching_seqlen
                     and branching_seqlen < len(req.fill_ids)
                 ):
-                    trunc_len = branching_seqlen - prefix_len
-                    if trunc_len <= 0:
-                        trunc_len = None
+                    branch_trunc_len = branching_seqlen - prefix_len
+                    if branch_trunc_len > 0:
+                        trunc_len = branch_trunc_len
 
             if trunc_len is None and (
                 self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens
@@ -673,7 +674,7 @@ class PrefillAdder:
                 # When truncation align size is set, we want to assert that the prefill prefix length is multiple of truncation align size
                 # A typical use case is when deterministic inference is enabled with flashinfer attention backend,
                 # we need the prefill prefix length to be multiple of attention split size
-                if truncation_align_size is not None:
+                if truncation_align_size is not None and branch_trunc_len is None:
                     if trunc_len < truncation_align_size:
                         return AddReqResult.OTHER
                     else:
