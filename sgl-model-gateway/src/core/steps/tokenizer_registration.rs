@@ -17,7 +17,11 @@ use super::workflow_data::TokenizerWorkflowData;
 use crate::{
     app_context::AppContext,
     config::TokenizerCacheConfig,
-    tokenizer::{cache::CachedTokenizer, factory, traits::Tokenizer},
+    tokenizer::{
+        cache::{CacheConfig, CachedTokenizer},
+        factory,
+        traits::Tokenizer,
+    },
     workflow::{
         BackoffStrategy, FailureAction, RetryPolicy, StepDefinition, StepExecutor, StepId,
         StepResult, WorkflowContext, WorkflowDefinition, WorkflowError, WorkflowResult,
@@ -160,7 +164,13 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
                     // Wrap with caching layer if configured
                     let tokenizer: Arc<dyn Tokenizer> = match cache_cfg {
                         Some(cfg) if cfg.enable_l0 || cfg.enable_l1 => {
-                            Arc::new(CachedTokenizer::new(base_tokenizer, cfg.into()))
+                            let cache_config = CacheConfig {
+                                enable_l0: cfg.enable_l0,
+                                l0_max_entries: cfg.l0_max_entries,
+                                enable_l1: cfg.enable_l1,
+                                l1_max_memory: cfg.l1_max_memory,
+                            };
+                            Arc::new(CachedTokenizer::new(base_tokenizer, cache_config))
                         }
                         _ => base_tokenizer,
                     };
