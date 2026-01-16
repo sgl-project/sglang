@@ -54,7 +54,7 @@ def spec_need_hidden_states(server_args: Optional[ServerArgs] = None) -> bool:
     if server_args is None:
         server_args = get_global_server_args()
 
-    # FIXME(xjwei): now it is conflict with speculative_overlap_reflow
+    # When enable speculative overlap reflow feature, we don't need to save hidden_states for next draft
     enable_spec_overlap_reflow = os.environ.get("ENABLE_SPECULATIVE_OVERLAP_REFLOW", "0") == "1"
 
     # TODO(lsyin): also skip when 1) step = 1 or 2) standalone draft model
