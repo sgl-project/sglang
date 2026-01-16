@@ -43,6 +43,11 @@ pub struct TokenizerConfigRequest {
     /// Optional cache configuration. If provided, wraps tokenizer with CachedTokenizer.
     #[serde(default)]
     pub cache_config: Option<TokenizerCacheConfig>,
+    /// If true, the workflow fails when a tokenizer with the same name already exists.
+    /// If false (default), the workflow succeeds and returns the existing tokenizer's ID.
+    /// API callers should set this to true.
+    #[serde(default)]
+    pub fail_on_duplicate: bool,
 }
 
 /// Configuration for removing a tokenizer
@@ -152,6 +157,15 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
                         );
                     }
                     LoadOutcome::AlreadyExists { id } => {
+                        if config.fail_on_duplicate {
+                            return Err(WorkflowError::StepFailed {
+                                step_id: StepId::new("load_tokenizer"),
+                                message: format!(
+                                    "Tokenizer '{}' already exists (id: {})",
+                                    name, id
+                                ),
+                            });
+                        }
                         info!(
                             "Tokenizer '{}' already exists (id: {}), skipping load",
                             name, id
@@ -236,6 +250,7 @@ mod tests {
             source: "meta-llama/Llama-2-7b-hf".to_string(),
             chat_template_path: None,
             cache_config: None,
+            fail_on_duplicate: false,
         };
 
         let json = serde_json::to_string(&config).unwrap();
@@ -246,6 +261,35 @@ mod tests {
         assert_eq!(parsed.source, "meta-llama/Llama-2-7b-hf");
         assert!(parsed.chat_template_path.is_none());
         assert!(parsed.cache_config.is_none());
+        assert!(!parsed.fail_on_duplicate);
+    }
+
+    #[test]
+    fn test_tokenizer_config_request_fail_on_duplicate_defaults_to_false() {
+        // Test that fail_on_duplicate defaults to false when not specified in JSON
+        let json = r#"{
+            "id": "test-uuid",
+            "name": "test-model",
+            "source": "/path/to/tokenizer"
+        }"#;
+        let parsed: TokenizerConfigRequest = serde_json::from_str(json).unwrap();
+        assert!(!parsed.fail_on_duplicate);
+    }
+
+    #[test]
+    fn test_tokenizer_config_request_fail_on_duplicate_true() {
+        let config = TokenizerConfigRequest {
+            id: "test-uuid-1234".to_string(),
+            name: "test-model".to_string(),
+            source: "meta-llama/Llama-2-7b-hf".to_string(),
+            chat_template_path: None,
+            cache_config: None,
+            fail_on_duplicate: true,
+        };
+
+        let json = serde_json::to_string(&config).unwrap();
+        let parsed: TokenizerConfigRequest = serde_json::from_str(&json).unwrap();
+        assert!(parsed.fail_on_duplicate);
     }
 
     #[test]
@@ -261,6 +305,7 @@ mod tests {
                 enable_l1: false,
                 l1_max_memory: 0,
             }),
+            fail_on_duplicate: false,
         };
 
         let json = serde_json::to_string(&config).unwrap();

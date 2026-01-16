@@ -109,6 +109,7 @@ impl StepExecutor<LocalWorkerWorkflowData> for SubmitTokenizerJobStep {
                 source: tokenizer_path,
                 chat_template_path: chat_template.clone(),
                 cache_config: cache_config.clone(),
+                fail_on_duplicate: false,
             };
 
             // Submit job (fire-and-forget, don't wait for completion)
