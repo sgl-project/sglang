@@ -963,14 +963,14 @@ class FourierRotaryEmbedding(nn.Module):
             cos = cos.flatten(0, 1)
             sin = sin.flatten(0, 1)
             seq_len = cos.size(0)
-            query = query.view(seq_len, -1, query.size(-1))
-            key = key.view(seq_len, -1, key.size(-1))
+            query = query.reshape(seq_len, -1, query.size(-1))
+            key = key.reshape(seq_len, -1, key.size(-1))
 
         query, key = apply_rotary_pos_emb_native(query, key, cos, sin)
 
         if need_reshape:
-            query = query.view(query_shape)
-            key = key.view(key_shape)
+            query = query.reshape(query_shape)
+            key = key.reshape(key_shape)
         return query.flatten(-2), key.flatten(-2)
 
     def extra_repr(self) -> str:

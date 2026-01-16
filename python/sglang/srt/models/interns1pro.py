@@ -1,3 +1,4 @@
+import functools
 import logging
 from typing import Any, Dict, Iterable, Optional, Tuple
 
@@ -5,6 +6,7 @@ import torch
 from transformers import PretrainedConfig
 
 from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
+from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -110,6 +112,63 @@ class InternS1ProTextDecoderLayer(Qwen3MoeDecoderLayer):
             prefix=add_prefix("self_attn", prefix),
             alt_stream=alt_stream,
         )
+        # update with group router
+        self.router_n_groups = getattr(config, "router_n_groups", -1)
+        if self.router_n_groups > 0:
+            assert (
+                config.num_experts_per_tok % self.router_n_groups == 0
+            ), f"{config.num_experts_per_tok} cannot be divided by {self.router_n_groups}"
+            self.mlp.topk = TopK(
+                top_k=config.num_experts_per_tok,
+                renormalize=config.norm_topk_prob,
+                use_grouped_topk=False,
+                layer_id=layer_id,
+                custom_routing_function=self._custom_routing_function,
+            )
+
+    @staticmethod
+    @functools.lru_cache
+    def get_group_offsets(router_n_groups: int, group_size: int, device: str):
+        group_offsets = (
+            torch.arange(router_n_groups, device=device) * group_size
+        ).view(
+            1, -1, 1
+        )  # [1, n_groups, 1]
+        return group_offsets
+
+    def _custom_routing_function(
+        self,
+        hidden_states: torch.Tensor,
+        gating_output: torch.Tensor,
+        topk: int,
+        renormalize: bool,
+    ) -> torch.Tensor:
+        """Group router"""
+        routing_weights = torch.softmax(gating_output, dim=-1, dtype=torch.float32)
+        if self.router_n_groups > 0:
+            assert (
+                routing_weights.shape[-1] % self.router_n_groups == 0
+            ), f"{routing_weights.shape[-1]} cannot be divided by {self.router_n_groups}"
+            per_group_top_k = topk // self.router_n_groups
+            group_size = routing_weights.shape[-1] // self.router_n_groups
+            group_offsets = self.get_group_offsets(
+                self.router_n_groups, group_size, routing_weights.device
+            )
+            routing_weights = routing_weights.unflatten(
+                -1, (self.router_n_groups, group_size)
+            )
+            topk_weights, topk_ids = torch.topk(
+                routing_weights, per_group_top_k, dim=-1
+            )
+            topk_ids = (topk_ids + group_offsets).flatten(-2, -1)
+            topk_weights = topk_weights.flatten(-2, -1)
+        else:
+            topk_weights, topk_ids = torch.topk(routing_weights, topk, dim=-1)
+
+        if renormalize:
+            topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+
+        return topk_weights, topk_ids
 
 
 class InternS1ProTextModel(Qwen3MoeLLMModel):
