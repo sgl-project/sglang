@@ -805,10 +805,10 @@ jobs:
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
-    runs-on: 1-gpu-runner-large
+    runs-on: 1-gpu-runner
     timeout-minutes: 60
     env:
-      RUNNER_LABELS: 1-gpu-runner-large
+      RUNNER_LABELS: 1-gpu-runner
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
