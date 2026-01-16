@@ -374,6 +374,7 @@ class FlashAttentionBackend(AttentionBackend):
 
         # If num_splits == 0, we use a heuristic to automatically determine the number of splits.
         # We set nums splits to 1 if deterministic inference is enabled.
+        # See https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/ for more details.
         # Furthermore, FA4 does not support num_splits=0 with CUDA Graph, so we set num_splits to 1 if CUDA Graph is enabled.
         self.num_splits = (
             1
@@ -1062,7 +1063,6 @@ class FlashAttentionBackend(AttentionBackend):
         k_rope: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        assert self.fa_impl_ver in [3], "Only FA3 support decoding"
         if k is not None:
             assert v is not None
             if save_kv_cache:
