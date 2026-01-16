@@ -400,8 +400,15 @@ class Scheduler(
         )
 
         # Get draft model's KV cache pool
-        draft_kv_pool = self.draft_worker.draft_model_runner.token_to_kv_pool
+        if self.enable_overlap:
+            if self.server_args.enable_multi_layer_eagle:
+                draft_runner = self.draft_worker.draft_worker.draft_runner_list[0]
+            else:
+                draft_runner = self.draft_worker.draft_worker.draft_runner
+        else:
+            draft_runner = self.draft_worker.draft_model_runner
 
+        draft_kv_pool = draft_runner.token_to_kv_pool
         # Create host KV cache pool for draft model
         if isinstance(draft_kv_pool, MHATokenToKVPool):
             draft_host_kv_pool = MHATokenToKVPoolHost(
