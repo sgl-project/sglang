@@ -4,10 +4,18 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 import sglang as sgl
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.srt.utils import is_hip
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST, CustomTestCase
 
 register_cuda_ci(est_time=55, suite="stage-b-test-small-1-gpu")
+register_amd_ci(est_time=55, suite="stage-b-test-small-1-gpu-amd")
+
+_is_hip = is_hip()
+if _is_hip:
+    import os
+
+    os.environ["SGLANG_USE_AITER"] = "0"
 
 
 class TestHiddenState(CustomTestCase):
