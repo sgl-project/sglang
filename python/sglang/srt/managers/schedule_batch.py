@@ -1159,7 +1159,7 @@ class Req:
         )
 
 
-class DllmReqs:
+class DllmStagingReqs:
     def __init__(self, dllm_config: Optional[DllmConfig] = None):
         self.dllm_config = dllm_config
         self.max_running_reqs = (
@@ -1167,10 +1167,10 @@ class DllmReqs:
         )
         self.reqs: List[Req] = []
 
-    def add_reqs(self, req: Union[Req, List[Req], "DllmReqs"]):
+    def add_reqs(self, req: Union[Req, List[Req], "DllmStagingReqs"]):
         assert self.dllm_config is not None, "Diffusion LLM config is not set."
 
-        if isinstance(req, DllmReqs):
+        if isinstance(req, DllmStagingReqs):
             reqs_to_add = req.reqs
         elif isinstance(req, list):
             reqs_to_add = req
@@ -1335,7 +1335,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     hicache_consumer_index: int = -1
 
     # Diffusion LLM
-    dllm_staging_reqs: Optional[DllmReqs] = None
+    dllm_staging_reqs: Optional[DllmStagingReqs] = None
     dllm_config: Optional[DllmConfig] = None
 
     # Metrics
@@ -1352,7 +1352,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         enable_overlap: bool,
         spec_algorithm: SpeculativeAlgorithm,
         chunked_req: Optional[Req] = None,
-        dllm_staging_reqs: Optional[DllmReqs] = None,
+        dllm_staging_reqs: Optional[DllmStagingReqs] = None,
         dllm_config: Optional[DllmConfig] = None,
     ):
         return_logprob = any(req.return_logprob for req in reqs)

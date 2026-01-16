@@ -34,7 +34,7 @@ import torch
 
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.layers.attention.nsa.utils import is_nsa_prefill_cp_in_seq_split
-from sglang.srt.managers.schedule_batch import DllmReqs, Req, ScheduleBatch
+from sglang.srt.managers.schedule_batch import DllmStagingReqs, Req, ScheduleBatch
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
@@ -426,7 +426,7 @@ class PrefillAdder:
         max_running_reqs = dllm_config.max_running_requests
 
         self.rem_dllm_tokens = max_running_reqs * self.dllm_block_size
-        self.dllm_staging_reqs = DllmReqs(dllm_config=dllm_config)
+        self.dllm_staging_reqs = DllmStagingReqs(dllm_config=dllm_config)
 
     def _get_running_request_total_token_offset(self, req: Req) -> int:
         return (

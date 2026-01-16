@@ -136,7 +136,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
-    DllmReqs,
+    DllmStagingReqs,
     PrefillAdder,
     SchedulePolicy,
 )
@@ -753,7 +753,7 @@ class Scheduler(
                 self.enable_dynamic_chunking = False
 
     def init_diffusion_llm(self):
-        self.dllm_staging_reqs = DllmReqs(dllm_config=self.dllm_config)
+        self.dllm_staging_reqs = DllmStagingReqs(dllm_config=self.dllm_config)
 
     def init_schedule_policy(self):
         # Init schedule policy and new token estimation
