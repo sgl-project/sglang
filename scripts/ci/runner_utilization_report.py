@@ -73,9 +73,13 @@ def get_jobs_for_run(repo: str, run_id: int) -> list[dict]:
 
 
 def get_runners(repo: str) -> list[dict]:
-    """Get all self-hosted runners."""
-    data = run_gh_command([f"repos/{repo}/actions/runners?per_page=100"])
-    return data.get("runners", [])
+    """Get all self-hosted runners. Returns empty if no permission."""
+    try:
+        data = run_gh_command([f"repos/{repo}/actions/runners?per_page=100"])
+        return data.get("runners", [])
+    except Exception as e:
+        print(f"Warning: Cannot access runners API (need admin): {e}")
+        return []
 
 
 def parse_time(time_str: str) -> datetime:
@@ -85,6 +89,37 @@ def parse_time(time_str: str) -> datetime:
     return datetime.fromisoformat(time_str.replace("Z", "+00:00"))
 
 
+def infer_runner_label(runner_name: str) -> str:
+    """Infer runner label from runner name."""
+    name_lower = runner_name.lower()
+    if "5090" in name_lower:
+        return "1-gpu-5090"
+    elif "h200" in name_lower:
+        return "h200"
+    elif "h20" in name_lower and "h200" not in name_lower:
+        return "h20"
+    elif "b200" in name_lower:
+        return "b200"
+    elif "mi" in name_lower or "amd" in name_lower:
+        return "amd"
+    elif "ubuntu" in name_lower or "github" in name_lower.replace("-", ""):
+        return "github-hosted"
+    else:
+        return "other"
+
+
+# Known runner counts per label (update as needed)
+KNOWN_RUNNER_COUNTS = {
+    "1-gpu-5090": 16,
+    "h200": 8,
+    "h20": 4,
+    "b200": 4,
+    "amd": 8,
+    "github-hosted": 20,  # GitHub hosted runners (variable)
+    "other": 10,
+}
+
+
 def calculate_utilization(repo: str, hours: int = 24, runner_filter: str = None):
     """Calculate runner utilization metrics."""
 
@@ -92,37 +127,34 @@ def calculate_utilization(repo: str, hours: int = 24, runner_filter: str = None)
     runs = get_workflow_runs(repo, hours)
     print(f"Found {len(runs)} workflow runs")
 
-    # Get runners and group by label
+    # Try to get runners (may fail without admin permission)
     print("Fetching runners...")
     runners = get_runners(repo)
 
-    # Group runners by label
-    label_runners = defaultdict(list)
-    for runner in runners:
-        for label in runner.get("labels", []):
-            label_name = label.get("name", "")
-            if label_name not in ["self-hosted", "Linux", "X64"]:  # Skip default labels
-                label_runners[label_name].append(runner["name"])
-
-    # Filter labels if specified
-    if runner_filter:
-        label_runners = {k: v for k, v in label_runners.items() if runner_filter in k}
-
-    print(f"Tracking {len(label_runners)} runner labels: {list(label_runners.keys())}")
+    # Group runners by label from API if available
+    label_runners = defaultdict(set)
+    if runners:
+        for runner in runners:
+            for label in runner.get("labels", []):
+                label_name = label.get("name", "")
+                if label_name not in ["self-hosted", "Linux", "X64"]:
+                    label_runners[label_name].add(runner["name"])
+        print(f"Got {len(runners)} runners from API")
+    else:
+        print("No runner API access, will infer labels from job data")
 
     # Collect job data per runner
-    runner_jobs = defaultdict(list)  # runner_name -> list of (start, end, job_name)
-    label_jobs = defaultdict(list)   # label -> list of (start, end, duration, job_name, runner_name)
+    runner_jobs = defaultdict(list)  # runner_name -> list of job_info
+    label_jobs = defaultdict(list)   # label -> list of job_info
 
     total_runs = len(runs)
     for i, run in enumerate(runs):
-        if (i + 1) % 20 == 0:
+        if (i + 1) % 50 == 0:
             print(f"Processing run {i+1}/{total_runs}...")
 
         try:
             jobs = get_jobs_for_run(repo, run["id"])
         except Exception as e:
-            print(f"  Warning: Failed to get jobs for run {run['id']}: {e}")
             continue
 
         for job in jobs:
@@ -137,28 +169,45 @@ def calculate_utilization(repo: str, hours: int = 24, runner_filter: str = None)
                 continue
 
             duration = (completed_at - started_at).total_seconds()
-            job_info = (started_at, completed_at, duration, job["name"], runner_name)
+            job_info = {
+                "start": started_at,
+                "end": completed_at,
+                "duration": duration,
+                "job_name": job["name"],
+                "runner_name": runner_name,
+            }
 
             runner_jobs[runner_name].append(job_info)
 
-            # Map to label
-            for label, runner_list in label_runners.items():
-                if runner_name in runner_list:
-                    label_jobs[label].append(job_info)
+            # Use job labels directly (available in job data)
+            job_labels = job.get("labels", [])
+            for label in job_labels:
+                # Skip generic labels
+                if label in ["self-hosted", "Linux", "X64", "ubuntu-latest", "ubuntu-22.04", "ubuntu-24.04"]:
+                    continue
+                label_runners[label].add(runner_name)
+                label_jobs[label].append(job_info)
+
+    # Filter labels if specified
+    if runner_filter:
+        label_runners = {k: v for k, v in label_runners.items() if runner_filter in k}
+
+    print(f"Tracking {len(label_runners)} runner labels: {list(label_runners.keys())}")
 
     # Calculate metrics per label
     now = datetime.now(timezone.utc)
-    window_start = now - timedelta(hours=hours)
     window_seconds = hours * 3600
 
     results = []
 
     for label in sorted(label_runners.keys()):
-        num_runners = len(label_runners[label])
+        runners_seen = label_runners[label]
+        # Use known count if available, otherwise use observed count
+        num_runners = KNOWN_RUNNER_COUNTS.get(label, len(runners_seen))
         total_capacity_seconds = window_seconds * num_runners
 
         jobs = label_jobs.get(label, [])
-        total_active_seconds = sum(j[2] for j in jobs)  # sum of durations
+        total_active_seconds = sum(j["duration"] for j in jobs)
 
         utilization = (total_active_seconds / total_capacity_seconds * 100) if total_capacity_seconds > 0 else 0
         idle_seconds = total_capacity_seconds - total_active_seconds
