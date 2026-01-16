@@ -68,20 +68,20 @@ impl TokenizerRegistry {
         Uuid::new_v4().to_string()
     }
 
-    /// Load and register a tokenizer with a pre-generated ID
+    /// Load and register a tokenizer
     ///
     /// If the tokenizer is already loaded (by name), returns the existing ID.
     /// Otherwise, uses the provided loader function to load it.
     /// Per-key locking ensures only one load happens per name, preventing race conditions.
     ///
     /// # Arguments
-    /// * `id` - Pre-generated UUID for this tokenizer
-    /// * `name` - User-provided name
+    /// * `id` - Pre-generated UUID (use `generate_id()` to create one)
+    /// * `name` - User-provided name (used for deduplication)
     /// * `source` - Source path or HuggingFace model ID
     /// * `loader` - Async function that loads the tokenizer
     ///
     /// # Returns
-    /// * `Ok(id)` - Successfully loaded and registered (returns the ID)
+    /// * `Ok(id)` - The ID of the registered tokenizer (either existing or newly registered)
     /// * `Err(message)` - Error message if loading fails
     pub async fn load<F, Fut>(
         &self,
@@ -126,7 +126,7 @@ impl TokenizerRegistry {
 
         let tokenizer = result?;
 
-        // Create entry
+        // Create entry with provided ID
         let entry = TokenizerEntry {
             id: id.to_string(),
             name: name.to_string(),
@@ -146,15 +146,18 @@ impl TokenizerRegistry {
         Ok(id.to_string())
     }
 
-    /// Register a pre-loaded tokenizer with a pre-generated ID
+    /// Register a preloaded tokenizer with a pre-generated ID
     ///
     /// Atomically inserts a tokenizer into the registry only if no tokenizer
     /// with the same name exists. Returns the ID if successful.
     ///
+    /// This is primarily used for testing. Production code should use `load()`.
+    ///
     /// # Returns
     /// * `Some(id)` - If the tokenizer was successfully registered
     /// * `None` - If a tokenizer with this name already existed
-    pub fn register(
+    #[cfg(test)]
+    pub(crate) fn register(
         &self,
         id: &str,
         name: &str,
