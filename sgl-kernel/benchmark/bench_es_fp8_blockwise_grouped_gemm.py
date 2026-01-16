@@ -43,31 +43,23 @@ def per_block_cast_to_fp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     )
 
 
-def create_unbalanced_expert_token_distribution(max_num_experts):
-    ratios = [random.random() for _ in range(max_num_experts)]
-
-    def convert_to_tokens(ratio: float):
-        if ratio <= 0.7:
-            return random.randint(1, 32)
-        elif ratio > 0.7 and ratio <= 0.85:
-            return random.randint(32, 64)
-        elif ratio > 0.85 and ratio <= 0.95:
-            return random.randint(64, 128)
-        elif ratio > 0.95:
-            return random.randint(128, 1024)
-        else:
-            return 128
-
-    group_ms = [convert_to_tokens(ratio) for ratio in ratios]
+def create_unbalanced_expert_token_distribution(
+    batch_size: int, topk: int, num_experts: int
+):
+    expert_ids = np.random.randint(0, num_experts, size=(batch_size * topk,)).tolist()
+    expert_to_count = dict()
+    for expert_id in range(num_experts):
+        expert_to_count[expert_id] = 0
+    for expert_id in expert_ids:
+        expert_to_count[expert_id] += 1
+    group_ms = []
+    for expert_id in range(num_experts):
+        group_ms.append(expert_to_count[expert_id])
     return group_ms
 
 
-group_ms = create_unbalanced_expert_token_distribution(8192)
-# group_ms = [128 for _ in range(8192)]
-# group_ms = [128 if i % 2 == 0 else 64 for i in range(8192)]
-
-
 def bench_es(
+    group_ms: List[int],
     n: int,
     k: int,
     num_groups: int,
@@ -94,12 +86,13 @@ def bench_es(
         m_g = group_ms[g]
         expert_offsets[g + 1] = expert_offsets[g] + m_g
         problem_sizes[g][:] = torch.tensor([m_g, n_g, k_g], device=device)
+        if m_g != 0:
+            a_g, a_scale = per_token_cast_to_fp8(torch.randn((m_g, k_g), device=device))
+            a_tensors.append(a_g)
+            a_scales_tensors.append(a_scale)
 
-        a_g, a_scale = per_token_cast_to_fp8(torch.randn((m_g, k_g), device=device))
         b_g, b_scale = per_block_cast_to_fp8(torch.randn((n_g, k_g), device=device).t())
-        a_tensors.append(a_g)
         b_tensors.append(b_g)
-        a_scales_tensors.append(a_scale)
         b_scales_tensors.append(b_scale)
 
     a_stack = torch.empty(
@@ -109,8 +102,11 @@ def bench_es(
         (num_groups, n_g, k_g), device=device, dtype=torch.float8_e4m3fn
     )
 
+    _aux_idx = 0
     for g in range(num_groups):
-        a_stack[expert_offsets[g] : expert_offsets[g + 1]] = a_tensors[g]
+        if group_ms[g] != 0:
+            a_stack[expert_offsets[g] : expert_offsets[g + 1]] = a_tensors[_aux_idx]
+            _aux_idx += 1
         b_stack[g] = b_tensors[g].t()
     b_stack = b_stack.transpose(1, 2)
 
@@ -121,11 +117,17 @@ def bench_es(
         (num_groups, n_g // 128, k_g // 128), device=device, dtype=torch.float32
     )
 
+    _aux_idx = 0
     for g in range(num_groups):
-        a_scale_stack[expert_offsets[g] : expert_offsets[g + 1]] = a_scales_tensors[g]
+        if group_ms[g] != 0:
+            a_scale_stack[expert_offsets[g] : expert_offsets[g + 1]] = a_scales_tensors[
+                _aux_idx
+            ]
+            _aux_idx += 1
         b_scale_stack[g] = b_scales_tensors[g].t()
     b_scale_stack = b_scale_stack.transpose(1, 2)
 
+    workspace = torch.empty((1024 * 1024 * 1024), device=device, dtype=torch.uint8)
     c_out = torch.empty((expert_offsets[-1], n_g), device=device, dtype=out_dtype)
     a_strides = torch.full(
         (num_groups,), a_stack.stride(0), device=device, dtype=torch.int64
@@ -133,7 +135,6 @@ def bench_es(
     d_strides = torch.full(
         (num_groups,), c_out.stride(0), device=device, dtype=torch.int64
     )
-    workspace = torch.empty((1024 * 1024 * 1024), device=device, dtype=torch.uint8)
 
     def run_cutlass():
         es_fp8_blockwise_scaled_grouped_mm(
@@ -171,6 +172,7 @@ def bench_es(
 
 
 def bench_sgl(
+    group_ms: List[int],
     n: int,
     k: int,
     num_groups: int,
@@ -197,12 +199,13 @@ def bench_sgl(
         m_g = group_ms[g]
         expert_offsets[g + 1] = expert_offsets[g] + m_g
         problem_sizes[g][:] = torch.tensor([m_g, n_g, k_g], device=device)
+        if m_g != 0:
+            a_g, a_scale = per_token_cast_to_fp8(torch.randn((m_g, k_g), device=device))
+            a_tensors.append(a_g)
+            a_scales_tensors.append(a_scale)
 
-        a_g, a_scale = per_token_cast_to_fp8(torch.randn((m_g, k_g), device=device))
         b_g, b_scale = per_block_cast_to_fp8(torch.randn((n_g, k_g), device=device).t())
-        a_tensors.append(a_g)
         b_tensors.append(b_g)
-        a_scales_tensors.append(a_scale)
         b_scales_tensors.append(b_scale)
 
     a_stack = torch.empty(
@@ -212,8 +215,11 @@ def bench_sgl(
         (num_groups, n_g, k_g), device=device, dtype=torch.float8_e4m3fn
     )
 
+    _aux_idx = 0
     for g in range(num_groups):
-        a_stack[expert_offsets[g] : expert_offsets[g + 1]] = a_tensors[g]
+        if group_ms[g] != 0:
+            a_stack[expert_offsets[g] : expert_offsets[g + 1]] = a_tensors[_aux_idx]
+            _aux_idx += 1
         b_stack[g] = b_tensors[g].t()
     b_stack = b_stack.transpose(1, 2)
 
@@ -224,8 +230,13 @@ def bench_sgl(
         (num_groups, n_g // 128, k_g // 128), device=device, dtype=torch.float32
     )
 
+    _aux_idx = 0
     for g in range(num_groups):
-        a_scale_stack[expert_offsets[g] : expert_offsets[g + 1]] = a_scales_tensors[g]
+        if group_ms[g] != 0:
+            a_scale_stack[expert_offsets[g] : expert_offsets[g + 1]] = a_scales_tensors[
+                _aux_idx
+            ]
+            _aux_idx += 1
         b_scale_stack[g] = b_scales_tensors[g].t()
     b_scale_stack = b_scale_stack.transpose(1, 2)
 
@@ -300,16 +311,36 @@ def benchmark_one_shape(
     num_run: int,
 ):
     for shape in shape_args:
-        print(f"\nBenchmark: n={shape.n}, k={shape.k}, num_groups={shape.num_groups}")
-        for kernel_name, kernel_func in benchmark_kernels.items():
-            average_time, m = kernel_func(
-                shape.n,
-                shape.k,
-                shape.num_groups,
-                num_warmup,
-                num_run,
+        for batch_size in [
+            128,
+            256,
+            384,
+            512,
+            640,
+            768,
+            896,
+            1024,
+            1280,
+            1536,
+            2048,
+            3072,
+        ]:
+            group_ms = create_unbalanced_expert_token_distribution(
+                batch_size, 8, shape.num_groups
             )
-            print(f"{kernel_name}: {average_time} us")
+            print(
+                f"\nBenchmark: batch_size={batch_size}, n={shape.n}, k={shape.k}, num_groups={shape.num_groups}"
+            )
+            for kernel_name, kernel_func in benchmark_kernels.items():
+                average_time, m = kernel_func(
+                    group_ms,
+                    shape.n,
+                    shape.k,
+                    shape.num_groups,
+                    num_warmup,
+                    num_run,
+                )
+                print(f"{kernel_name}: {average_time} us")
 
 
 def main():
@@ -317,18 +348,22 @@ def main():
     parser.add_argument("--num-warmup", type=int, default=3)
     parser.add_argument("--num-run", type=int, default=20)
     shape_args = [
-        # Prefill, DeepSeek-R1, gateup, chunk_size = 4096, TP = 8
+        # DeepSeek-R1, gateup, TP = 8
         ShapeArg(n=512, k=7168, num_groups=256),
-        # Prefill, DeepSeek-R1, down, chunk_size = 4096, TP = 8
+        # DeepSeek-R1, down, TP = 8
         ShapeArg(n=7168, k=256, num_groups=256),
-        # Prefill, Qwen3-235B-A22B-FP8, gateup, TP = 4
+        # DeepSeek-R1, gateup, TP = 4
+        ShapeArg(n=1024, k=7168, num_groups=256),
+        # DeepSeek-R1, down, TP = 4
+        ShapeArg(n=7168, k=512, num_groups=256),
+        # Qwen3-235B-A22B-FP8, gateup, TP = 4
         ShapeArg(n=768, k=4096, num_groups=128),
-        # Prefill, Qwen3-235B-A22B-FP8, down, TP = 4
+        # Qwen3-235B-A22B-FP8, down, TP = 4
         ShapeArg(n=4096, k=384, num_groups=128),
-        # Decode, DeepSeek-R1, gateup, bs = 128, EP = 8
-        ShapeArg(n=4096, k=7168, num_groups=32),
-        # Decode, DeepSeek-R1, gateup, bs = 256, EP = 16
-        ShapeArg(n=4096, k=7168, num_groups=16),
+        # Qwen3-235B-A22B-FP8, gateup, TP = 2
+        ShapeArg(n=1536, k=4096, num_groups=128),
+        # Qwen3-235B-A22B-FP8, down, TP = 2
+        ShapeArg(n=4096, k=768, num_groups=128),
     ]
     args = parser.parse_args()
     benchmark_one_shape(shape_args, args.num_warmup, args.num_run)
