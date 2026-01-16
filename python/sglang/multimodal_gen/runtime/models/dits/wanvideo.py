@@ -132,6 +132,7 @@ class WanSelfAttention(nn.Module):
         eps=1e-6,
         parallel_attention=False,
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
+        quant_config: QuantizationConfig = None,
     ) -> None:
         assert dim % num_heads == 0
         super().__init__()
@@ -145,10 +146,18 @@ class WanSelfAttention(nn.Module):
         self.tp_size = get_tensor_model_parallel_world_size()
 
         # layers
-        self.to_q = ColumnParallelLinear(dim, dim, gather_output=False)
-        self.to_k = ColumnParallelLinear(dim, dim, gather_output=False)
-        self.to_v = ColumnParallelLinear(dim, dim, gather_output=False)
-        self.to_out = RowParallelLinear(dim, dim, input_is_parallel=True)
+        self.to_q = ColumnParallelLinear(
+            dim, dim, gather_output=False, quant_config=quant_config
+        )
+        self.to_k = ColumnParallelLinear(
+            dim, dim, gather_output=False, quant_config=quant_config
+        )
+        self.to_v = ColumnParallelLinear(
+            dim, dim, gather_output=False, quant_config=quant_config
+        )
+        self.to_out = RowParallelLinear(
+            dim, dim, input_is_parallel=True, quant_config=quant_config
+        )
         self.norm_q = RMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = RMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.tp_rmsnorm = self.tp_size > 1 and qk_norm
@@ -222,6 +231,7 @@ class WanI2VCrossAttention(WanSelfAttention):
         qk_norm=True,
         eps=1e-6,
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
+        quant_config: QuantizationConfig = None,
     ) -> None:
         # VSA should not be in supported_attention_backends
         super().__init__(
@@ -231,6 +241,7 @@ class WanI2VCrossAttention(WanSelfAttention):
             qk_norm,
             eps,
             supported_attention_backends=supported_attention_backends,
+            quant_config=quant_config,
         )
 
         self.add_k_proj = ColumnParallelLinear(dim, dim, gather_output=False)

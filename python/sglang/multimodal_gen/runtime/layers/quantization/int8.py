@@ -109,7 +109,7 @@ class Int8Config(QuantizationConfig):
         layer: torch.nn.Module,
         prefix: str,
     ) -> Optional[QuantizeMethodBase]:
-        from python.sglang.multimodal_gen.runtime.layers.linear import LinearBase
+        from sglang.multimodal_gen.runtime.layers.linear import LinearBase
 
         if isinstance(layer, LinearBase):
             if is_layer_skipped(prefix, self.ignored_layers):
