@@ -301,6 +301,18 @@ impl Router {
         let load_guard =
             (policy.name() == "cache_aware").then(|| WorkerLoadGuard::new(worker.clone()));
 
+        // For least_load policy with streaming, use a guard to delay on_request_complete
+        // until stream actually completes, not just when it starts
+        let completion_guard = if is_stream && policy.name() == "least_load" {
+            Some(crate::policies::LeastLoadCompletionGuard::new(
+                policy.clone(),
+                worker_url.clone(),
+                request_id.clone(),
+            ))
+        } else {
+            None
+        };
+
         // Note: Using borrowed reference avoids heap allocation
         events::RequestSentEvent { url: worker.url() }.emit();
         let mut headers_with_trace = headers.cloned().unwrap_or_default();
@@ -315,6 +327,7 @@ impl Router {
                 worker.url(),
                 is_stream,
                 load_guard,
+                completion_guard,
             )
             .await;
 
@@ -324,7 +337,10 @@ impl Router {
         worker.record_outcome(status.is_success());
 
         // Notify policy that request completed (for stateful policies like LeastLoad)
-        policy.on_request_complete(&worker_url, request_id.as_deref(), status.is_success());
+        // Skip for streaming least_load requests since completion_guard handles it
+        if !(is_stream && policy.name() == "least_load") {
+            policy.on_request_complete(&worker_url, request_id.as_deref(), status.is_success());
+        }
 
         // Record worker errors for server errors (5xx)
         if status.is_server_error() {
@@ -494,6 +510,7 @@ impl Router {
         worker_url: &str,
         is_stream: bool,
         load_guard: Option<WorkerLoadGuard>,
+        completion_guard: Option<crate::policies::LeastLoadCompletionGuard>,
     ) -> Response {
         // Get the worker once and reuse for API key and load tracking
         let worker = self.worker_registry.get_by_url(worker_url);
@@ -637,6 +654,12 @@ impl Router {
             // Attach load guard to response body for proper RAII lifecycle
             // Guard is dropped when response body is consumed or client disconnects
             if let Some(guard) = load_guard {
+                response = AttachedBody::wrap_response(response, guard);
+            }
+
+            // Attach completion guard for least_load policy
+            // This ensures on_request_complete is called when stream ends, not when it starts
+            if let Some(guard) = completion_guard {
                 response = AttachedBody::wrap_response(response, guard);
             }
             response

@@ -1,18 +1,51 @@
 //! Least load balancing policy
 
-use std::{
-    collections::HashMap,
-    sync::{Arc, Mutex},
-};
+use std::{collections::HashMap, sync::Arc};
 
-use tracing::{debug, warn};
+
+use parking_lot::Mutex;
+use tracing::debug;
 
 use super::{get_healthy_worker_indices, LoadBalancingPolicy, SelectWorkerInfo};
 use crate::core::Worker;
 
+/// Guard that calls on_request_complete when dropped
+/// Used to properly track load for streaming requests
+pub struct LeastLoadCompletionGuard {
+    policy: Arc<dyn LoadBalancingPolicy>,
+    worker_url: String,
+    request_id: Option<String>,
+}
+
+impl LeastLoadCompletionGuard {
+    pub fn new(
+        policy: Arc<dyn LoadBalancingPolicy>,
+        worker_url: String,
+        request_id: Option<String>,
+    ) -> Self {
+        Self {
+            policy,
+            worker_url,
+            request_id,
+        }
+    }
+}
+
+impl Drop for LeastLoadCompletionGuard {
+    fn drop(&mut self) {
+        self.policy.on_request_complete(
+            &self.worker_url,
+            self.request_id.as_deref(),
+            true, // Assume success - if stream failed, body would be dropped anyway
+        );
+    }
+}
+
 /// Calculate request load based on request text length
 pub fn calculate_request_load(info: &SelectWorkerInfo) -> isize {
-    info.request_text.map(|t| t.len() as isize).unwrap_or(1)
+    let request_length = info.request_text.map(|t| t.len() / 1024).unwrap_or(1);
+    let load = request_length * request_length + request_length;
+    load as isize
 }
 
 /// Per-worker load state
@@ -54,7 +87,7 @@ impl LoadBalancingPolicy for LeastLoadPolicy {
         }
 
         let request_load = calculate_request_load(info);
-        let mut state = self.state.lock().ok()?;
+        let mut state = self.state.lock();
 
         // Find worker with minimum load
         let mut min_load = isize::MAX;
@@ -79,7 +112,7 @@ impl LoadBalancingPolicy for LeastLoadPolicy {
         if let Some(req_id) = info.request_id {
             worker_state.pending.insert(req_id.to_string(), request_load);
         } else {
-            warn!(
+            debug!(
                 "LeastLoad: no request_id provided, load tracking may be inaccurate. \
                  Set X-Request-ID header for precise load balancing."
             );
@@ -90,6 +123,17 @@ impl LoadBalancingPolicy for LeastLoadPolicy {
             url, min_load, request_load
         );
 
+        // Debug: print all worker loads
+        let all_loads: Vec<(String, isize)> = healthy_indices
+            .iter()
+            .map(|&idx| {
+                let url = workers[idx].url();
+                let load = state.get(url).map(|s| s.load).unwrap_or(0);
+                (url.to_string(), load)
+            })
+            .collect();
+        debug!("All worker loads: {:?}", all_loads);
+
         drop(state);
         workers[selected_idx].increment_processed();
 
@@ -98,25 +142,24 @@ impl LoadBalancingPolicy for LeastLoadPolicy {
 
     fn on_request_complete(&self, worker_url: &str, request_id: Option<&str>, _success: bool) {
         if request_id.is_none() {
-            warn!(
+            debug!(
                 "LeastLoad: on_request_complete called without request_id for {}, \
                  falling back to default load decrement",
                 worker_url
             );
         }
 
-        if let Ok(mut state) = self.state.lock() {
-            if let Some(worker_state) = state.get_mut(worker_url) {
-                let load_to_remove = request_id
-                    .and_then(|id| worker_state.pending.remove(id))
-                    .unwrap_or(1);
-                worker_state.load = (worker_state.load - load_to_remove).max(0);
+        let mut state = self.state.lock();
+        if let Some(worker_state) = state.get_mut(worker_url) {
+            let load_to_remove = request_id
+                .and_then(|id| worker_state.pending.remove(id))
+                .unwrap_or(1);
+            worker_state.load = (worker_state.load - load_to_remove).max(0);
 
-                debug!(
-                    "Least load complete: {} released {}, new load {}",
-                    worker_url, load_to_remove, worker_state.load
-                );
-            }
+            debug!(
+                "Least load complete: {} released {}, new load {}",
+                worker_url, load_to_remove, worker_state.load
+            );
         }
     }
 
@@ -129,17 +172,15 @@ impl LoadBalancingPolicy for LeastLoadPolicy {
     }
 
     fn update_loads(&self, loads: &HashMap<String, isize>) {
-        if let Ok(mut state) = self.state.lock() {
-            for (url, load) in loads {
-                state.entry(url.clone()).or_default().load = *load;
-            }
+        let mut state = self.state.lock();
+        for (url, load) in loads {
+            state.entry(url.clone()).or_default().load = *load;
         }
     }
 
     fn reset(&self) {
-        if let Ok(mut state) = self.state.lock() {
-            state.clear();
-        }
+        let mut state = self.state.lock();
+        state.clear();
     }
 
     fn as_any(&self) -> &dyn std::any::Any {

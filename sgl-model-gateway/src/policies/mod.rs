@@ -24,7 +24,7 @@ pub use bucket::BucketPolicy;
 pub use cache_aware::CacheAwarePolicy;
 pub use consistent_hashing::ConsistentHashingPolicy;
 pub use factory::PolicyFactory;
-pub use least_load::LeastLoadPolicy;
+pub use least_load::{LeastLoadCompletionGuard, LeastLoadPolicy};
 pub use manual::{ManualConfig, ManualPolicy};
 pub use power_of_two::PowerOfTwoPolicy;
 pub use prefix_hash::{PrefixHashConfig, PrefixHashPolicy};
