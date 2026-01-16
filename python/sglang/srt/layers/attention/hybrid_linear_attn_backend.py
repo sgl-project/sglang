@@ -42,9 +42,6 @@ from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import is_cuda, is_npu
 from sglang.srt.utils.common import rank0_log
 
-_cutedsl_gdn_logged = False
-
-
 if is_cuda():
     from sglang.srt.layers.attention.mamba.causal_conv1d import (
         causal_conv1d_fn as causal_conv1d_fn_cuda,
@@ -849,6 +846,15 @@ class GDNAttnBackend(MambaAttnBackendBase):
             self.conv_states_shape[-1] < FLA_CHUNK_SIZE
         ), f"{self.conv_states_shape[-1]=} should be less than {FLA_CHUNK_SIZE}"
 
+        # Select kernel based on environment variable
+        use_cutedsl = Envs.SGLANG_USE_CUTEDSL_GDN_DECODE.get()
+        rank0_log(f"CuTe DSL GDN decode enabled: {use_cutedsl}")
+        self._kernel_func = (
+            cutedsl_fused_sigmoid_gating_delta_rule_update
+            if use_cutedsl
+            else fused_sigmoid_gating_delta_rule_update
+        )
+
     def forward_decode(
         self,
         q: torch.Tensor,
@@ -905,18 +911,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         key = key.view(1, seq_len, num_heads, head_k_dim)
         value = value.view(1, seq_len, value.shape[1] // head_v_dim, head_v_dim)
 
-        global _cutedsl_gdn_logged
-        use_cutedsl = Envs.SGLANG_USE_CUTEDSL_GDN_DECODE.get()
-        if not _cutedsl_gdn_logged:
-            rank0_log(f"CuTe DSL GDN decode enabled: {use_cutedsl}")
-            _cutedsl_gdn_logged = True
-
-        kernel_func = (
-            cutedsl_fused_sigmoid_gating_delta_rule_update
-            if use_cutedsl
-            else fused_sigmoid_gating_delta_rule_update
-        )
-        core_attn_out = kernel_func(
+        core_attn_out = self._kernel_func(
             A_log=A_log,
             dt_bias=dt_bias,
             q=query,

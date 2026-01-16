@@ -132,16 +132,6 @@ from sgl_kernel.top_k import (
 )
 from sgl_kernel.version import __version__
 
-# CuTe DSL GDN kernel (optional - requires cutlass/cute)
-try:
-    from sgl_kernel.cutedsl_gdn import (
-        cutedsl_fused_sigmoid_gating_delta_rule_update,
-        is_cutedsl_gdn_available,
-    )
-except ImportError:
-    # cutlass/cute not available
-    pass
-
 if torch.version.hip is not None:
     from sgl_kernel.elementwise import gelu_quick
 
