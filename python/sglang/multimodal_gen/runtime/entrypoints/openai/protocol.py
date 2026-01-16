@@ -55,6 +55,7 @@ class VideoResponse(BaseModel):
     size: str = ""
     seconds: str = "4"
     quality: str = "standard"
+    url: Optional[str] = None
     remixed_from_video_id: Optional[str] = None
     completed_at: Optional[int] = None
     expires_at: Optional[int] = None

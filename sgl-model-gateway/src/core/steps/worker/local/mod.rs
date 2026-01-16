@@ -27,7 +27,7 @@ pub use discover_dp::{get_dp_info, DiscoverDPInfoStep, DpInfo};
 pub use discover_metadata::DiscoverMetadataStep;
 pub use find_worker_to_update::FindWorkerToUpdateStep;
 pub use find_workers_to_remove::{FindWorkersToRemoveStep, WorkerRemovalRequest};
-pub use register_tokenizer::RegisterTokenizerStep;
+pub use register_tokenizer::SubmitTokenizerJobStep;
 pub use remove_from_policy_registry::RemoveFromPolicyRegistryStep;
 pub use remove_from_worker_registry::RemoveFromWorkerRegistryStep;
 pub use update_policies_for_worker::UpdatePoliciesForWorkerStep;
@@ -159,15 +159,11 @@ pub fn create_local_worker_workflow(
         )
         .add_step(
             StepDefinition::new(
-                "register_tokenizer",
-                "Register Tokenizer",
-                Arc::new(RegisterTokenizerStep),
+                "submit_tokenizer_job",
+                "Submit Tokenizer Job",
+                Arc::new(SubmitTokenizerJobStep),
             )
-            .with_retry(RetryPolicy {
-                max_attempts: 3,
-                backoff: BackoffStrategy::Fixed(Duration::from_secs(1)),
-            })
-            .with_timeout(Duration::from_secs(10))
+            .with_timeout(Duration::from_secs(5))
             .with_failure_action(FailureAction::ContinueNextStep)
             .depends_on(&["register_workers"]),
         )

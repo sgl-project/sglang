@@ -328,7 +328,7 @@ class ServerArgs:
 
     scheduler_port: int = 5555
 
-    output_path: str | None = None
+    output_path: str | None = "outputs/"
 
     # Prompt text file for batch processing
     prompt_file_path: str | None = None
