@@ -16,7 +16,7 @@ from sglang.test.test_utils import (
     write_results_to_json,
 )
 
-register_cuda_ci(est_time=185, suite="stage-b-test-small-1-gpu")
+register_cuda_ci(est_time=185, suite="stage-b-test-large-1-gpu")
 
 MODEL_SCORE_THRESHOLDS = {
     "hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4": 0.825,
