@@ -17,6 +17,7 @@ import logging
 import math
 import os
 from enum import Enum, IntEnum, auto
+from pathlib import Path
 from typing import Any, List, Optional, Set, Union
 
 import torch
@@ -632,6 +633,18 @@ class ModelConfig:
                 quant_cfg = self._parse_modelopt_quant_config(quant_config_dict)
         return quant_cfg
 
+    def _find_quant_modelslim_config(self):
+        quant_config_file = Path(self.model_path, "quant_model_description.json")
+        quant_cfg = None
+        if quant_config_file.is_file():
+            with open(quant_config_file) as f:
+                quant_cfg = json.load(f)
+            # This field is required for flagless model loading but is not present in
+            # modelslim model description, so we're adding it here manually.
+            quant_cfg["quant_method"] = "modelslim"
+
+        return quant_cfg
+
     def _parse_modelopt_quant_config(self, quant_config_dict: dict) -> Optional[dict]:
         """Parse ModelOpt quantization config and return the appropriate quant_method."""
         json_quant_configs = quant_config_dict["quantization"]
@@ -744,6 +757,7 @@ class ModelConfig:
             "w4afp8",
             "petit_nvfp4",
             "quark",
+            "modelslim",
         ]
         compatible_quantization_methods = {
             "modelopt_fp8": ["modelopt"],
@@ -755,8 +769,19 @@ class ModelConfig:
         if self.quantization is not None:
             self.quantization = self.quantization.lower()
 
-        # Parse quantization method from the HF model config, if available.
-        quant_cfg = self._parse_quant_hf_config()
+        # Parse quantization method from the HF and ModelSlim model config, if available.
+        # Only one function should return config, other should return None.
+        cfg_list = []
+        cfg_list.append(self._parse_quant_hf_config())
+        cfg_list.append(self._find_quant_modelslim_config())
+
+        # Filter out None values
+        cfg_list = [item for item in cfg_list if item is not None]
+        if len(cfg_list) > 1:
+            raise ValueError(
+                "Config list contains configs from 2 methods, must be only 1"
+            )
+        quant_cfg = cfg_list[0] if cfg_list else None
 
         if quant_cfg is not None:
             quant_method = quant_cfg.get(
