@@ -54,7 +54,7 @@ from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.moe.utils import RoutingMethodType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.rotary_embedding import MRotaryEmbedding, get_rope
+from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
 from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
@@ -69,8 +69,10 @@ from sglang.srt.models.utils import (
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     add_prefix,
+    get_bool_env_var,
     is_cuda,
     is_flashinfer_available,
+    is_hip,
     is_non_idle_and_non_empty,
     is_npu,
 )
@@ -89,6 +91,12 @@ _is_flashinfer_available = is_flashinfer_available()
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 _is_npu = is_npu()
+_is_hip = is_hip()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+if _use_aiter:
+    from aiter.rotary_embedding import AiterFusedSetKVBufferArg, get_rope
+else:
+    from sglang.srt.layers.rotary_embedding import get_rope
 
 if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
@@ -465,6 +473,9 @@ class Qwen3MoeAttention(nn.Module):
             prefix=add_prefix("o_proj", prefix),
         )
 
+        if _use_aiter:
+            rope_scaling = dict(rope_scaling) if rope_scaling else {}
+            rope_scaling["aiter_rope_fused_qknorm"] = True
         self.rotary_emb = get_rope(
             self.head_dim,
             rotary_dim=self.head_dim,
@@ -549,7 +560,42 @@ class Qwen3MoeAttention(nn.Module):
         inner_state = q, k, v, forward_batch
         return None, forward_batch, inner_state
 
+    def _apply_qk_norm_rope_aiter(self, qkv, positions, forward_batch):
+        """ROCm aiter: QK norm + RoPE + set KV buffer + Quant + Shuffle"""
+        assert self.k_norm.variance_epsilon == self.q_norm.variance_epsilon
+        layer_id = self.attn.layer_id
+        aiter_fused_set_kv_buffer_arg = AiterFusedSetKVBufferArg(
+            kv_cache=forward_batch.token_to_kv_pool.get_kv_buffer(layer_id),
+            cache_loc=forward_batch.out_cache_loc,
+            # for shuffle and quant kv buffer
+            # we will open when new aiter pa and mha ops are integrated
+            k_scale=1.0,
+            v_scale=1.0,
+            return_kv=False,
+            use_shuffle_layout=False,
+            block_size=0,
+            x=0,
+        )
+
+        q, k, v = self.rotary_emb(
+            qkv,
+            self.q_norm.weight,
+            self.k_norm.weight,
+            positions,
+            self.num_heads,
+            self.num_kv_heads,
+            self.k_norm.variance_epsilon,
+            fused_set_kv_buffer_arg=aiter_fused_set_kv_buffer_arg,
+        )
+        return q, k, v
+
     def apply_qk_norm_rope(self, qkv, positions, forward_batch):
+        """
+        Apply QK normalization and rotary position embedding
+        """
+        if _use_aiter:
+            return self._apply_qk_norm_rope_aiter(qkv, positions, forward_batch)
+
         use_fused = self.use_fused_qk_norm_rope and qkv.dtype == torch.bfloat16
         if use_fused:
             theta = getattr(self.config, "rope_theta", 10000.0)
@@ -633,11 +679,15 @@ class Qwen3MoeAttention(nn.Module):
 
         q, k, v, fb = inner_state
 
-        must_save_kv = self._used_fused_qk_norm_rope_last_call
-        save_kv_cache = must_save_kv or not (
-            enable_fused_set_kv_buffer(forward_batch)
-            and self.compatible_with_fused_kv_buffer
-        )
+        if _use_aiter:
+            save_kv_cache = False
+        else:
+            must_save_kv = self._used_fused_qk_norm_rope_last_call
+            save_kv_cache = must_save_kv or not (
+                enable_fused_set_kv_buffer(forward_batch)
+                and self.compatible_with_fused_kv_buffer
+            )
+
         attn_output = self.attn(
             q,
             k,
