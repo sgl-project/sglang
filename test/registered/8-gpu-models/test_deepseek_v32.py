@@ -6,7 +6,7 @@ from sglang.test.performance_test_runner import PerformanceTestParams
 from sglang.test.run_combined_tests import run_combined_tests
 from sglang.test.test_utils import ModelLaunchSettings, is_blackwell_system
 
-register_cuda_ci(est_time=18000, suite="nightly-8-gpu-common", nightly=True)
+register_cuda_ci(est_time=5400, suite="nightly-8-gpu-common", nightly=True)
 
 DEEPSEEK_V32_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2"
 

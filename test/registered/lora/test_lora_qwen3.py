@@ -20,15 +20,14 @@ from sglang.test.lora_utils import (
     LORA_MODELS_QWEN3,
     run_lora_multiple_batch_on_model_cases,
 )
+from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=97, suite="nightly-1-gpu", nightly=True)
 register_amd_ci(
     est_time=30,
     suite="stage-b-test-small-1-gpu-amd",
     disabled="see https://github.com/sgl-project/sglang/issues/13107",
 )
-
-from sglang.test.test_utils import CustomTestCase
+register_cuda_ci(est_time=97, suite="nightly-1-gpu", nightly=True)
 
 
 class TestLoRAQwen3(CustomTestCase):
