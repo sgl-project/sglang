@@ -543,8 +543,6 @@ def _register_configs():
         hf_model_paths=[
             "black-forest-labs/FLUX.2-klein-4B",
             "black-forest-labs/FLUX.2-klein-9B",
-            "black-forest-labs/FLUX.2-klein-base-4B",
-            "black-forest-labs/FLUX.2-klein-base-9B",
         ],
         model_detectors=[
             lambda hf_id: "flux.2-klein" in hf_id.lower()
