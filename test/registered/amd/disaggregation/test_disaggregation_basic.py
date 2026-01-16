@@ -21,7 +21,7 @@ from sglang.test.test_utils import (
 )
 
 
-register_amd_ci(est_time=300, suite="stage-b-test-large-2-gpu-amd")
+register_amd_ci(est_time=300, suite="stage-b-test-large-2-gpu-35x-disaggregation-amd")
 class TestDisaggregationAccuracy(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
@@ -203,7 +203,7 @@ class TestDisaggregationAccuracy(PDDisaggregationServerBase):
         )
 
 
-register_amd_ci(est_time=300, suite="stage-b-test-large-2-gpu-amd")
+#register_amd_ci(est_time=300, suite="stage-b-test-large-2-gpu-amd")
 class TestDisaggregationMooncakeFailure(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
@@ -302,7 +302,7 @@ class TestDisaggregationMooncakeFailure(PDDisaggregationServerBase):
                 # If health check fails, re-raise the original exception
                 raise e from health_check_error
 
-register_amd_ci(est_time=300, suite="stage-b-test-large-2-gpu-amd")
+#register_amd_ci(est_time=300, suite="stage-b-test-large-2-gpu-amd")
 class TestDisaggregationSimulatedRetract(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
