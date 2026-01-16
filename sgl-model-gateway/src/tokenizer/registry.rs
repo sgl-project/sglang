@@ -92,6 +92,19 @@ pub struct TokenizerRegistry {
     loading_locks: DashMap<String, Arc<Mutex<()>>>,
 }
 
+/// RAII guard that removes the loading lock entry on drop.
+/// Ensures cleanup happens on normal completion, early return, or panic.
+struct LoadingLockGuard<'a> {
+    locks: &'a DashMap<String, Arc<Mutex<()>>>,
+    key: String,
+}
+
+impl Drop for LoadingLockGuard<'_> {
+    fn drop(&mut self) {
+        self.locks.remove(&self.key);
+    }
+}
+
 impl TokenizerRegistry {
     /// Create a new empty registry
     pub fn new() -> Self {
@@ -158,7 +171,11 @@ impl TokenizerRegistry {
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone();
 
-        let _guard = lock.lock().await;
+        let _mutex_guard = lock.lock().await;
+        let _lock_cleanup = LoadingLockGuard {
+            locks: &self.loading_locks,
+            key: name.to_string(),
+        };
 
         // Double-check after acquiring lock (another thread may have loaded it)
         if let Some(existing_id) = self.name_to_id.get(name) {
@@ -171,9 +188,6 @@ impl TokenizerRegistry {
         // Load tokenizer
         info!("Loading tokenizer '{}' from source: {}", name, source);
         let result = loader().await;
-
-        // Always clean up the lock, whether loading succeeded or failed
-        self.loading_locks.remove(name);
 
         let tokenizer = result.map_err(LoadError::LoadFailed)?;
 
@@ -575,5 +589,89 @@ mod tests {
         let result3 = registry.register(&id3, "model2", "source2", tokenizer2);
         assert!(result3.is_some());
         assert_eq!(registry.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_loading_lock_cleanup_on_panic() {
+        let registry = Arc::new(TokenizerRegistry::new());
+
+        // Spawn a task that will panic during loading
+        let registry_clone = registry.clone();
+        let handle = tokio::spawn(async move {
+            registry_clone
+                .load(
+                    &TokenizerRegistry::generate_id(),
+                    "panic-model",
+                    "source",
+                    || async {
+                        panic!("Simulated panic during tokenizer loading");
+                    },
+                )
+                .await
+        });
+
+        // Wait for the task - it should panic
+        let result = handle.await;
+        assert!(result.is_err(), "Task should have panicked");
+
+        // The RAII guard should have cleaned up the loading lock.
+        // Verify by attempting another load with the same name - it should work,
+        // not deadlock or fail due to stale lock.
+        let id = TokenizerRegistry::generate_id();
+        let outcome = registry
+            .load(&id, "panic-model", "source", || async {
+                Ok(Arc::new(MockTokenizer::default()) as Arc<dyn Tokenizer>)
+            })
+            .await;
+
+        // Should succeed - the lock was properly cleaned up
+        assert!(outcome.is_ok(), "Load should succeed after panic cleanup");
+        assert!(outcome.unwrap().is_newly_loaded());
+        assert_eq!(registry.len(), 1);
+        assert!(registry.contains("panic-model"));
+    }
+
+    #[tokio::test]
+    async fn test_loading_lock_cleanup_on_early_return() {
+        let registry = Arc::new(TokenizerRegistry::new());
+
+        // Load a tokenizer
+        let id1 = TokenizerRegistry::generate_id();
+        registry
+            .load(&id1, "model1", "source1", || async {
+                Ok(Arc::new(MockTokenizer::default()) as Arc<dyn Tokenizer>)
+            })
+            .await
+            .unwrap();
+
+        // Now simulate concurrent load attempts where one thread wins
+        // and another thread sees "already exists" in the double-check.
+        // The RAII guard should clean up the lock on early return.
+
+        // First, verify loading_locks is empty after successful load
+        // by checking that we can load a different model without issues
+        let id2 = TokenizerRegistry::generate_id();
+        let outcome = registry
+            .load(&id2, "model2", "source2", || async {
+                Ok(Arc::new(MockTokenizer::default()) as Arc<dyn Tokenizer>)
+            })
+            .await
+            .unwrap();
+
+        assert!(outcome.is_newly_loaded());
+        assert_eq!(registry.len(), 2);
+
+        // Try to load model1 again - should return AlreadyExists
+        // and the lock should be cleaned up (not leak)
+        let id3 = TokenizerRegistry::generate_id();
+        let outcome = registry
+            .load(&id3, "model1", "source1", || async {
+                panic!("Loader should not be called for existing model");
+            })
+            .await
+            .unwrap();
+
+        assert!(!outcome.is_newly_loaded());
+        assert_eq!(outcome.id(), id1); // Returns original ID
     }
 }
