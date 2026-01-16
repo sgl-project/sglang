@@ -1,6 +1,9 @@
 name: Nightly Test (AMD)
 
 on:
+  pull_request:  # TODO: Remove before merging - temporary trigger for PR testing
+    branches:
+      - main
   schedule:
     - cron: '0 0 * * *'
   push:
