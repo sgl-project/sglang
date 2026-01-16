@@ -1,13 +1,13 @@
-import time
 import os
+import time
 import unittest
 from types import SimpleNamespace
 
+from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.few_shot_gsm8k import run_eval
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
-from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -15,8 +15,9 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
+register_amd_ci(est_time=1200, suite="stage-b-test-large-2-gpu-35x-disaggregation-amd")
 
-register_amd_ci(est_time=200, suite="stage-b-test-large-2-gpu-35x-disaggregation-amd")
+
 class TestDisaggregationPrefillPPAccuracy(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
@@ -55,7 +56,8 @@ class TestDisaggregationPrefillPPAccuracy(PDDisaggregationServerBase):
             "--pp-size",
             "2",
             "--disable-overlap-schedule",
-            "--attention-backend", "aiter",
+            "--attention-backend",
+            "aiter",
         ]
         prefill_args += cls.transfer_backend + cls.rdma_devices
         cls.process_prefill = popen_launch_pd_server(
@@ -75,7 +77,8 @@ class TestDisaggregationPrefillPPAccuracy(PDDisaggregationServerBase):
             "2",
             "--base-gpu-id",
             "4",
-            "--attention-backend", "aiter",
+            "--attention-backend",
+            "aiter",
         ]
         decode_args += cls.transfer_backend + cls.rdma_devices
         cls.process_decode = popen_launch_pd_server(
@@ -103,7 +106,7 @@ class TestDisaggregationPrefillPPAccuracy(PDDisaggregationServerBase):
         time.sleep(5)
 
 
-#register_amd_ci(est_time=200, suite="stage-c-test-large-8-gpu-amd")
+# register_amd_ci(est_time=200, suite="stage-c-test-large-8-gpu-amd")
 class TestDisaggregationPrefillPPDynamicChunkAccuracy(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
@@ -119,7 +122,7 @@ class TestDisaggregationPrefillPPDynamicChunkAccuracy(PDDisaggregationServerBase
             cls.rdma_devices = []
 
         super().setUpClass()
-        #cls.model = try_cached_model(DEFAULT_MODEL_NAME_FOR_TEST)
+        # cls.model = try_cached_model(DEFAULT_MODEL_NAME_FOR_TEST)
         cls.model = "/huggingface/hub/models--amd--Llama-3.1-8B-Instruct-FP8-KV/snapshots/fa42f9a9105c545755fea25cf69f49ac8c8b40e1/"
 
         # Non blocking start servers
@@ -144,7 +147,8 @@ class TestDisaggregationPrefillPPDynamicChunkAccuracy(PDDisaggregationServerBase
             "2",
             "--disable-overlap-schedule",
             "--enable-dynamic-chunking",
-            "--attention-backend", "aiter",
+            "--attention-backend",
+            "aiter",
         ]
         prefill_args += cls.transfer_backend + cls.rdma_devices
         cls.process_prefill = popen_launch_pd_server(
@@ -164,7 +168,8 @@ class TestDisaggregationPrefillPPDynamicChunkAccuracy(PDDisaggregationServerBase
             "2",
             "--base-gpu-id",
             "4",
-            "--attention-backend", "aiter",
+            "--attention-backend",
+            "aiter",
         ]
         decode_args += cls.transfer_backend + cls.rdma_devices
         cls.process_decode = popen_launch_pd_server(
@@ -192,7 +197,7 @@ class TestDisaggregationPrefillPPDynamicChunkAccuracy(PDDisaggregationServerBase
         time.sleep(5)
 
 
-#register_amd_ci(est_time=200, suite="stage-c-test-large-8-gpu-amd")
+# register_amd_ci(est_time=200, suite="stage-c-test-large-8-gpu-amd")
 class TestDisaggregationDecodePPAccuracy(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
@@ -208,7 +213,7 @@ class TestDisaggregationDecodePPAccuracy(PDDisaggregationServerBase):
             cls.rdma_devices = []
 
         super().setUpClass()
-        #cls.model = try_cached_model(DEFAULT_MODEL_NAME_FOR_TEST)
+        # cls.model = try_cached_model(DEFAULT_MODEL_NAME_FOR_TEST)
         cls.model = "/huggingface/hub/models--amd--Llama-3.1-8B-Instruct-FP8-KV/snapshots/fa42f9a9105c545755fea25cf69f49ac8c8b40e1/"
 
         # Non blocking start servers
@@ -232,7 +237,8 @@ class TestDisaggregationDecodePPAccuracy(PDDisaggregationServerBase):
             "--pp-size",
             "2",
             "--disable-overlap-schedule",
-            "--attention-backend", "aiter",
+            "--attention-backend",
+            "aiter",
         ]
         prefill_args += cls.transfer_backend + cls.rdma_devices
         cls.process_prefill = popen_launch_pd_server(
@@ -254,7 +260,8 @@ class TestDisaggregationDecodePPAccuracy(PDDisaggregationServerBase):
             "2",
             "--base-gpu-id",
             "4",
-            "--attention-backend", "aiter",
+            "--attention-backend",
+            "aiter",
         ]
         decode_args += cls.transfer_backend + cls.rdma_devices
         cls.process_decode = popen_launch_pd_server(
