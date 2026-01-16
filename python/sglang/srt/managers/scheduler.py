@@ -1559,10 +1559,25 @@ class Scheduler(
     def _prefetch_kvcache(self, req: Req):
         if self.enable_hicache_storage:
             req.init_next_round_input(self.tree_cache)
-            if req.last_node.backuped:
-                # only to initiate the prefetch if the last node is backuped
-                # otherwise, the allocated GPU memory must be locked for integrity
-                last_hash = req.last_host_node.get_last_hash_value()
+            # Modified condition: even if last_node is not backuped (e.g., root node),
+            # we should still try to prefetch from storage backend since there might be
+            # matching KV cache in remote storage (e.g., Mooncake Store from other pods).
+            # This enables cross-pod KV cache sharing in distributed deployments.
+            should_prefetch = req.last_node.backuped or (
+                req.last_node.id == 0 and len(req.fill_ids) > 0
+            )
+            logger.debug(
+                f"[PREFETCH_DEBUG] rid={req.rid}, last_node.id={req.last_node.id}, "
+                f"last_node.backuped={req.last_node.backuped}, fill_ids_len={len(req.fill_ids)}, "
+                f"should_prefetch={should_prefetch}"
+            )
+            if should_prefetch:
+                # For root node (id=0), use None as last_hash since it has no hash value
+                last_hash = (
+                    req.last_host_node.get_last_hash_value()
+                    if req.last_node.backuped
+                    else None
+                )
                 matched_len = len(req.prefix_indices) + req.host_hit_length
                 new_input_tokens = req.fill_ids[matched_len:]
 
