@@ -172,8 +172,8 @@ class Envs:
     SGLANG_TEST_MAX_RETRY = EnvInt(None)
 
     # Constrained Decoding (Grammar)
-    SGLANG_GRAMMAR_SIMULATE_TIMEOUT = EnvFloat(-1)
-    SGLANG_GRAMMAR_POLL_INTERVAL = EnvFloat(0.03)
+    SGLANG_GRAMMAR_POLL_INTERVAL = EnvFloat(0.005)
+    SGLANG_GRAMMAR_MAX_POLL_ITERATIONS = EnvInt(10000)
 
     # Test & Debug
     SGLANG_DETECT_SLOW_RANK = EnvBool(False)
@@ -221,6 +221,15 @@ class Envs:
     SGLANG_SCHEDULER_RECV_SKIPPER_WEIGHT_TARGET_VERIFY = EnvInt(1)
     SGLANG_SCHEDULER_RECV_SKIPPER_WEIGHT_NONE = EnvInt(1)
 
+    # PD Disaggregation (runtime)
+    # NOTE: For SGLANG_DISAGGREGATION_THREAD_POOL_SIZE, the effective default is
+    # computed dynamically at runtime based on cpu_count; see disaggregation backends.
+    SGLANG_DISAGGREGATION_THREAD_POOL_SIZE = EnvInt(None)
+    SGLANG_DISAGGREGATION_QUEUE_SIZE = EnvInt(4)
+    SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT = EnvInt(300)
+    SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL = EnvFloat(5.0)
+    SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE = EnvInt(2)
+    SGLANG_DISAGGREGATION_WAITING_TIMEOUT = EnvInt(300)
 
     # Scheduler: others:
     SGLANG_EMPTY_CACHE_INTERVAL = EnvFloat(-1)  # in seconds. Set if you observe high memory accumulation over a long serving period.
@@ -242,10 +251,6 @@ class Envs:
     # Model Parallel
     SGLANG_USE_MESSAGE_QUEUE_BROADCASTER = EnvBool(True)
     SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS = EnvBool(False)
-
-    # Constrained Decoding
-    SGLANG_DISABLE_OUTLINES_DISK_CACHE = EnvBool(True)
-    SGLANG_GRAMMAR_TIMEOUT = EnvFloat(300)
 
     # Tool Calling
     SGLANG_FORWARD_UNKNOWN_TOOLS = EnvBool(False)
