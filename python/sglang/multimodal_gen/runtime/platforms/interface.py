@@ -33,6 +33,7 @@ class AttentionBackendEnum(enum.Enum):
     VIDEO_SPARSE_ATTN = enum.auto()
     VMOBA_ATTN = enum.auto()
     AITER = enum.auto()
+    SLA_ATTN = enum.auto()
     NO_ATTENTION = enum.auto()
 
     def __str__(self):
@@ -45,6 +46,7 @@ class PlatformEnum(enum.Enum):
     TPU = enum.auto()
     CPU = enum.auto()
     MPS = enum.auto()
+    MUSA = enum.auto()
     OOT = enum.auto()
     UNSPECIFIED = enum.auto()
 
@@ -116,6 +118,13 @@ class Platform:
 
     @classmethod
     @lru_cache(maxsize=1)
+    def is_hopper(cls):
+        if not cls.is_cuda_static():
+            return False
+        return torch.cuda.get_device_capability() == (9, 0)
+
+    @classmethod
+    @lru_cache(maxsize=1)
     def is_sm120(cls):
         if not cls.is_cuda_static():
             return False
@@ -147,7 +156,7 @@ class Platform:
     @lru_cache(maxsize=1)
     def is_cuda_alike(self) -> bool:
         """Stateless version of :func:`torch.cuda.is_available`."""
-        return self._enum in (PlatformEnum.CUDA, PlatformEnum.ROCM)
+        return self._enum in (PlatformEnum.CUDA, PlatformEnum.ROCM, PlatformEnum.MUSA)
 
     @lru_cache(maxsize=1)
     def is_mps(self) -> bool:
