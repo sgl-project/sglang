@@ -264,18 +264,6 @@ def format_report(results: list[dict], hours: int) -> str:
             f"{r['utilization_pct']:.1f}% {utilization_bar} |"
         )
 
-    # Add interpretation
-    lines.extend(
-        [
-            "",
-            "## Interpretation",
-            "",
-            "- **High utilization (>80%)**: Consider adding more runners",
-            "- **Low utilization (<20%)**: Runners may be over-provisioned",
-            "- **Idle time**: Time when runners were available but no jobs were queued",
-        ]
-    )
-
     return "\n".join(lines)
 
 
