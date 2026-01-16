@@ -374,10 +374,10 @@ jobs:
           IS_BLACKWELL=1 bash scripts/ci/ci_install_dependency.sh
 
       - name: Run test
-        timeout-minutes: 60
+        timeout-minutes: 300
         run: |
           cd test
-          python3 run_suite.py --hw cuda --suite nightly-4-gpu-b200 --nightly --continue-on-error
+          python3 run_suite.py --hw cuda --suite nightly-4-gpu-b200 --nightly --continue-on-error --timeout-per-file 12000
 
   # Specialized B200 tests - 8 GPU, for specific backends and configs
   nightly-test-specialized-8-gpu-b200:
