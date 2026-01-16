@@ -28,10 +28,13 @@ def merger():
 
 
 @contextmanager
-def temp_yaml_config(config_data, suffix=".yaml"):
-    """Context manager for creating temporary YAML config files."""
+def temp_config(config_data, suffix=".yaml"):
+    """Context manager for creating temporary config files (YAML or JSON)."""
     with tempfile.NamedTemporaryFile(mode="w", suffix=suffix, delete=False) as f:
-        yaml.dump(config_data, f)
+        if suffix == ".json":
+            json.dump(config_data, f)
+        else:
+            yaml.dump(config_data, f)
         config_file = f.name
     try:
         yield config_file
@@ -82,7 +85,7 @@ class TestConfigArgumentMerger:
             "log-requests-target": ["path1", "path2"],
             "quantization-param-path": "path3",
         }
-        with temp_yaml_config(config) as f:
+        with temp_config(config) as f:
             result = merger.parse_config(["--config", f])
             assert result["model_path"] == "microsoft/DialoGPT-medium"
             assert result["max_running_requests"] == 128
@@ -102,7 +105,7 @@ class TestConfigArgumentMerger:
     def test_invalid_choice_raises_error(self, merger):
         """Test invalid choice raises ValueError."""
         config = {"model-path": "test", "quantization": "invalid_method"}
-        with temp_yaml_config(config) as f:
+        with temp_config(config) as f:
             with pytest.raises(ValueError, match="Invalid value"):
                 merger.parse_config(["--config", f])
 
@@ -117,7 +120,7 @@ class TestPrepareServerArgs:
             "port": 30000,
             "tensor-parallel-size": 1,
         }
-        with temp_yaml_config(config) as f:
+        with temp_config(config) as f:
             args = prepare_server_args(["--config", f])
             assert args.model_path == "microsoft/DialoGPT-medium"
             assert args.port == 30000
@@ -126,19 +129,15 @@ class TestPrepareServerArgs:
     def test_json_config_loading(self):
         """Test JSON config file loading."""
         config = {"model-path": "microsoft/DialoGPT-medium", "port": 30000}
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
-            json.dump(config, f)
-            try:
-                args = prepare_server_args(["--config", f.name])
-                assert args.model_path == "microsoft/DialoGPT-medium"
-                assert args.port == 30000
-            finally:
-                os.unlink(f.name)
+        with temp_config(config, suffix=".json") as f:
+            args = prepare_server_args(["--config", f])
+            assert args.model_path == "microsoft/DialoGPT-medium"
+            assert args.port == 30000
 
     def test_cli_overrides_config(self):
         """Test CLI arguments override config values."""
         config = {"model-path": "microsoft/DialoGPT-medium", "port": 30000}
-        with temp_yaml_config(config) as f:
+        with temp_config(config) as f:
             args = prepare_server_args(["--config", f, "--port", "40000"])
             assert args.model_path == "microsoft/DialoGPT-medium"  # from config
             assert args.port == 40000  # CLI override
@@ -166,6 +165,7 @@ class TestErrorHandling:
         """Test unsupported extension error."""
         with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as f:
             f.write(b"key: value")
+            f.flush()
             try:
                 with pytest.raises(ValueError, match="YAML or JSON format"):
                     prepare_server_args(["--config", f.name])
@@ -174,9 +174,9 @@ class TestErrorHandling:
 
     def test_rejected_options_in_config(self, merger):
         """Test that config/help/h cannot be specified in config file."""
-        for option in ["config", "help", "h", "hybrid-kvcache-ratio", "lora-path"]:
+        for option in ["config", "help", "h", "hybrid-kvcache-ratio", "lora-paths"]:
             config = {"model-path": "test", option: "value"}
-            with temp_yaml_config(config) as f:
+            with temp_config(config) as f:
                 with pytest.raises(ValueError, match="cannot be specified in config"):
                     merger.parse_config(["--config", f])
 
@@ -188,28 +188,28 @@ class TestTypeValidation:
         """Test store_true rejects non-boolean values."""
         for bad_value in [1, "hello"]:
             config = {"model-path": "test", "trust-remote-code": bad_value}
-            with temp_yaml_config(config) as f:
+            with temp_config(config) as f:
                 with pytest.raises(ValueError, match="Expected boolean"):
                     merger.parse_config(["--config", f])
 
     def test_type_conversion_failure(self, merger):
         """Test invalid type conversion raises error."""
         config = {"model-path": "test", "port": "not_a_number"}
-        with temp_yaml_config(config) as f:
+        with temp_config(config) as f:
             with pytest.raises(ValueError, match="Type conversion failed"):
                 merger.parse_config(["--config", f])
 
     def test_null_passthrough(self, merger):
         """Test null values pass through."""
         config = {"model-path": "test", "quantization-param-path": None}
-        with temp_yaml_config(config) as f:
+        with temp_config(config) as f:
             result = merger.parse_config(["--config", f])
             assert result["quantization_param_path"] is None
 
     def test_dict_skips_json_conversion(self, merger):
         """Test dict values skip json.loads."""
         config = {"model-path": "test", "mm-process-config": {"image": {"resize": 224}}}
-        with temp_yaml_config(config) as f:
+        with temp_config(config) as f:
             result = merger.parse_config(["--config", f])
             assert result["mm_process_config"] == {"image": {"resize": 224}}
 
@@ -220,7 +220,7 @@ class TestEdgeCases:
     def test_empty_config(self, merger):
         """Test empty config file."""
         with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
-            f.write("")
+            f.flush()
             try:
                 assert merger._parse_config_file(f.name) == {}
             finally:
@@ -233,14 +233,14 @@ class TestEdgeCases:
     def test_yml_extension(self, merger):
         """Test .yml extension works."""
         config = {"model-path": "test"}
-        with temp_yaml_config(config, suffix=".yml") as f:
+        with temp_config(config, suffix=".yml") as f:
             result = merger._parse_config_file(f)
             assert result["model-path"] == "test"
 
     def test_unknown_option_ignored_with_warning(self, merger):
         """Test unknown config options are ignored with warning."""
         config = {"model-path": "test", "unknown-option-xyz": "value"}
-        with temp_yaml_config(config) as f:
+        with temp_config(config) as f:
             # Should not raise, just log warning
             result = merger.parse_config(["--config", f])
             assert "unknown_option_xyz" not in result
@@ -250,6 +250,7 @@ class TestEdgeCases:
         """Test non-dict root config raises error."""
         with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
             f.write("- item1\n- item2")
+            f.flush()
             try:
                 with pytest.raises(ValueError, match="dictionary at root level"):
                     merger._parse_config_file(f.name)
@@ -259,7 +260,7 @@ class TestEdgeCases:
     def test_nullable_str_with_numeric_value(self, merger):
         """Test nullable_str converts numeric values to string."""
         config = {"model-path": "test", "quantization-param-path": 12345}
-        with temp_yaml_config(config) as f:
+        with temp_config(config) as f:
             result = merger.parse_config(["--config", f])
             # Should be converted to string "12345"
             assert result["quantization_param_path"] == "12345"
