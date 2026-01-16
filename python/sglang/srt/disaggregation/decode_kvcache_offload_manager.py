@@ -107,9 +107,7 @@ class DecodeKVCacheOffloadManager:
             prefill_hashes = self._compute_prefix_hash(
                 req.origin_input_ids[:prefill_offloaded_len]
             )
-            last_prefill_hash = (
-                prefill_hashes[-1] if prefill_offloaded_len > 0 else ""
-            )
+            last_prefill_hash = prefill_hashes[-1] if prefill_offloaded_len > 0 else ""
             state = {
                 "prefill_len": prefill_offloaded_len,
                 "inc_len": 0,
@@ -131,9 +129,7 @@ class DecodeKVCacheOffloadManager:
 
         # Early free prefill-offloaded GPU memory (NSA-aware)
         if state["prefill_len"] > 0 and state["inc_len"] == 0:
-            self.token_to_kv_pool_allocator.free(
-                token_indices[: state["prefill_len"]]
-            )
+            self.token_to_kv_pool_allocator.free(token_indices[: state["prefill_len"]])
 
         # Asynchronously offload incremental KV cache from device to host
         self.request_counter += 1
@@ -279,7 +275,9 @@ class DecodeKVCacheOffloadManager:
         self._release_finished_req(req, start_offset)
         start_p, end_p = req.pop_overallocated_kv_cache()
         if self.page_size > 1:
-            start_p = ((start_p + self.page_size - 1) // self.page_size) * self.page_size
+            start_p = (
+                (start_p + self.page_size - 1) // self.page_size
+            ) * self.page_size
         if start_p < end_p:
             indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, start_p:end_p
