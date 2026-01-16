@@ -35,10 +35,8 @@ import torch
 from sglang.srt.layers.attention.nsa.utils import is_nsa_prefill_cp_in_seq_split
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
-from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
-from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
@@ -407,7 +405,7 @@ class PrefillAdder:
         self.is_hybrid_swa = isinstance(
             self.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator
         )
-        self.is_hybrid_ssm_cache = isinstance(self.tree_cache, MambaRadixCache)
+        self.is_hybrid_ssm_cache = self.tree_cache.supports_mamba()
 
         self.priority_scheduling_preemption_threshold = (
             priority_scheduling_preemption_threshold
@@ -523,11 +521,14 @@ class PrefillAdder:
     @contextmanager
     def _lock_node(self, last_node: TreeNode):
         try:
-            ret = self.tree_cache.inc_lock_ref(last_node)
+            if self.tree_cache.supports_swa() and self.tree_cache.is_tree_cache():
+                swa_uuid_for_lock = self.tree_cache.inc_lock_ref(last_node)
+            else:
+                self.tree_cache.inc_lock_ref(last_node)
             yield None
         finally:
-            if isinstance(self.tree_cache, SWARadixCache):
-                self.tree_cache.dec_lock_ref(last_node, ret)
+            if self.tree_cache.supports_swa() and self.tree_cache.is_tree_cache():
+                self.tree_cache.dec_lock_ref(last_node, swa_uuid_for_lock)
             else:
                 self.tree_cache.dec_lock_ref(last_node)
 

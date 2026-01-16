@@ -316,7 +316,7 @@ def prepare_extend_inputs_for_correctness_test(
         req.fill_ids += input_ids[i][bench_args.cut_len :]
         req.prefix_indices = model_runner.req_to_token_pool.req_to_token[
             i, : bench_args.cut_len
-        ]
+        ].to(req.prefix_indices.dtype)
         req.logprob_start_len = -1
         req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
     return reqs
@@ -351,10 +351,24 @@ def prepare_synthetic_inputs_for_latency_test(
     return reqs
 
 
+class TreeCacheNamespace(SimpleNamespace):
+    def supports_swa(self) -> bool:
+        return False
+
+    def supports_mamba(self) -> bool:
+        return False
+
+    def is_chunk_cache(self) -> bool:
+        return False
+
+    def is_tree_cache(self) -> bool:
+        return not self.is_chunk_cache()
+
+
 @torch.no_grad
 def extend(reqs, model_runner):
     # Create dummy tree_cache for benchmarks (no prefix caching, just allocation)
-    dummy_tree_cache = SimpleNamespace(
+    dummy_tree_cache = TreeCacheNamespace(
         page_size=model_runner.server_args.page_size,
         device=model_runner.device,
         token_to_kv_pool_allocator=model_runner.token_to_kv_pool_allocator,
