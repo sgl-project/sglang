@@ -188,7 +188,9 @@ class BaseTpWorker(ABC):
         # and slice_lora_b_weights methods (see lora/layers.py:46-49, mem_pool.py:437-440).
         # but resource_share is a single-use handle (see multiprocessing/resource_sharer.py)
         # so we must copy tensor meta when tp_size > 1
-        tensors = MultiprocessingSerializer.deserialize(recv_req.serialized_tensors[self.tp_rank])
+        tensors = MultiprocessingSerializer.deserialize(
+            recv_req.serialized_tensors[self.tp_rank]
+        )
         result = self.model_runner.load_lora_adapter_from_tensors(
             recv_req.to_ref(),
             tensors,
