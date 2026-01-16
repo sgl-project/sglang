@@ -575,7 +575,7 @@ class MambaRadixCache(BasePrefixCache):
             new_node = ShadowNode(key=key_tokens, value=list(key_tokens))
             new_node.parent = dst_node
             new_node.last_access_time = int(child.last_access_time)
-            new_node.prefix_len = child.prefix_len
+            new_node.prefix_len = dst_node.prefix_len + len(new_node.value)
             dst_node.children[key_tokens[0]] = new_node
             max_ts = max(max_ts, self._marconi_copy_tree(child, new_node))
         return max_ts
@@ -715,7 +715,9 @@ class MambaRadixCache(BasePrefixCache):
 
     def _marconi_prepare_eviction(self) -> None:
         if self.marconi_num_reqs_before_eviction is None:
-            self.marconi_num_reqs_before_eviction = len(self.marconi_request_history)
+            self.marconi_num_reqs_before_eviction = max(
+                1, len(self.marconi_request_history)
+            )
             if self.marconi_bootstrap_window_size is None:
                 self.marconi_bootstrap_window_size = (
                     self.marconi_bootstrap_multiplier
@@ -738,10 +740,13 @@ class MambaRadixCache(BasePrefixCache):
             node = stack.pop()
             if node != self.root_node and len(node.children) <= 1:
                 if node.mamba_value is not None and node.mamba_lock_ref == 0:
+                    # For leaf nodes (no children), evicting them frees both KV and Mamba,
+                    # so we need both full_lock_ref == 0 and mamba_lock_ref == 0.
+                    # For internal nodes (one child), we only tombstone the Mamba state,
+                    # so only mamba_lock_ref == 0 is required.
                     if len(node.children) == 0 and node.full_lock_ref > 0:
-                        pass
-                    else:
-                        nodes.append(node)
+                        continue
+                    nodes.append(node)
             stack.extend(node.children.values())
         return nodes
 
@@ -836,7 +841,9 @@ class MambaRadixCache(BasePrefixCache):
             x.full_lock_ref == 0 and x.mamba_lock_ref == 0
         ), f"evict leaf node invalid with {x.id=} {x.full_lock_ref=} {x.mamba_lock_ref=}"
 
-        assert x.mamba_value is not None, f"leaf node mamba value is not None, {x.id=}"
+        assert (
+            x.mamba_value is not None
+        ), f"leaf node mamba value must not be None, {x.id=}"
         # 1. a leaf node, free full tokens and mamba
         self.token_to_kv_pool_allocator.free(x.value)
         full_num_evicted = len(x.value)
