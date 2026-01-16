@@ -318,6 +318,12 @@ class SamplingParams:
 
         self.data_type = server_args.pipeline_config.task_type.data_type()
 
+        if server_args.output_path is not None:
+            self.output_path = server_args.output_path
+            logger.debug(
+                f"Overriding output_path with server configuration: {self.output_path}"
+            )
+
         # Process negative prompt
         if self.negative_prompt is not None and not self.negative_prompt.isspace():
             # avoid stripping default negative prompt: ' ' for qwen-image
@@ -346,11 +352,10 @@ class SamplingParams:
                         [f"{w}x{h}" for w, h in self.supported_resolutions]
                     )
                     error_msg = (
-                        f"Unsupported resolution: {self.width}x{self.height}. "
+                        f"Unsupported resolution: {self.width}x{self.height}, output quality may suffer. "
                         f"Supported resolutions: {supported_str}"
                     )
-                    logger.error(error_msg)
-                    raise ValueError(error_msg)
+                    logger.warning(error_msg)
 
         if pipeline_config.task_type.is_image_gen():
             # settle num_frames
@@ -533,12 +538,6 @@ class SamplingParams:
             type=str,
             default=SamplingParams.prompt_path,
             help="Path to a text file containing the prompt",
-        )
-        parser.add_argument(
-            "--output-path",
-            type=str,
-            default=SamplingParams.output_path,
-            help="Path to save the generated image/video",
         )
         parser.add_argument(
             "--output-file-name",
