@@ -12,14 +12,6 @@
 namespace host::norm {
 
 /**
- * \brief Norm type selector for fused norm kernels.
- */
-enum NormEnum : int {
-  LayerNorm = 0,
-  RMSNorm = 1,
-};
-
-/**
  * \brief Check if the given configuration is supported.
  * \tparam T Element type (only fp16_t/bf16_t is supported)
  * \tparam kDim Dimension size (usually hidden size)
@@ -60,6 +52,14 @@ inline constexpr uint32_t get_cta_threads() {
   return (kDim / 256) * device::kWarpThreads;
 }
 
+/**
+ * \brief Norm type selector for fused norm kernels.
+ */
+enum NormEnum : int {
+  LayerNorm = 0,
+  RMSNorm = 1,
+};
+
 }  // namespace host::norm
 
 namespace device::norm {
@@ -68,34 +68,59 @@ using host::norm::NormEnum;
 
 namespace details {
 
-/**
- * \brief Unified norm implementation supporting both RMSNorm and LayerNorm.
- * \tparam kDim Dimension size
- * \tparam kUseCTA Whether to use CTA-level reduction
- * \tparam norm_enum Norm type (RMSNorm or LayerNorm)
- * \tparam PackedFloat Packed float type (fp16x2_t or bf16x2_t)
- * \tparam N Number of packed elements per thread
- */
-template <int64_t kDim, bool kUseCTA, NormEnum norm_enum, typename PackedFloat, std::size_t N>
-SGL_DEVICE AlignedVector<PackedFloat, N> apply_norm_impl(
+template <int64_t kDim, bool kUseCTA, typename PackedFloat, std::size_t N>
+SGL_DEVICE AlignedVector<PackedFloat, N> apply_rmsnorm_impl(
     const AlignedVector<PackedFloat, N> input,
     const AlignedVector<PackedFloat, N> weight,
-    [[maybe_unused]] const AlignedVector<PackedFloat, N> bias,
     const float eps,
     [[maybe_unused]] float* smem_buffer) {
-  float local_sum = 0.0f;
-  float mean = 0.0f;
-  float norm_factor;
+  float sum_of_squares = 0.0f;
 
-  // ========== Pass 1: Compute sum (LayerNorm) or sum_of_squares (RMSNorm) ==========
 #pragma unroll
   for (auto i = 0u; i < N; ++i) {
     const auto fp32_input = cast<fp32x2_t>(input[i]);
-    if constexpr (norm_enum == NormEnum::LayerNorm) {
-      local_sum += fp32_input.x + fp32_input.y;
-    } else {
-      local_sum += fp32_input.x * fp32_input.x + fp32_input.y * fp32_input.y;
-    }
+    sum_of_squares += fp32_input.x * fp32_input.x;
+    sum_of_squares += fp32_input.y * fp32_input.y;
+  }
+
+  if constexpr (kUseCTA) {
+    cta::reduce_sum(sum_of_squares, smem_buffer);
+    __syncthreads();
+    sum_of_squares = smem_buffer[0];
+  } else {
+    sum_of_squares = warp::reduce_sum(sum_of_squares);
+  }
+  float norm_factor = math::rsqrt(sum_of_squares / kDim + eps);
+
+  AlignedVector<PackedFloat, N> output;
+
+#pragma unroll
+  for (auto i = 0u; i < N; ++i) {
+    const auto fp32_input = cast<fp32x2_t>(input[i]);
+    const auto fp32_weight = cast<fp32x2_t>(weight[i]);
+    output[i] = cast<PackedFloat, fp32x2_t>({
+        fp32_input.x * norm_factor * fp32_weight.x,
+        fp32_input.y * norm_factor * fp32_weight.y,
+    });
+  }
+
+  return output;
+}
+
+template <int64_t kDim, bool kUseCTA, typename PackedFloat, std::size_t N>
+SGL_DEVICE AlignedVector<PackedFloat, N> apply_layernorm_impl(
+    const AlignedVector<PackedFloat, N> input,
+    const AlignedVector<PackedFloat, N> weight,
+    const AlignedVector<PackedFloat, N> bias,
+    const float eps,
+    [[maybe_unused]] float* smem_buffer) {
+  float local_sum = 0.0f;
+
+  // ========== Pass 1: Compute mean ==========
+#pragma unroll
+  for (auto i = 0u; i < N; ++i) {
+    const auto fp32_input = cast<fp32x2_t>(input[i]);
+    local_sum += fp32_input.x + fp32_input.y;
   }
 
   // Reduce
@@ -106,31 +131,27 @@ SGL_DEVICE AlignedVector<PackedFloat, N> apply_norm_impl(
   } else {
     local_sum = warp::reduce_sum(local_sum);
   }
-  mean = local_sum / kDim;
+  float mean = local_sum / kDim;
 
-  // ========== Pass 2 (LayerNorm only): Compute variance ==========
-  if constexpr (norm_enum == NormEnum::LayerNorm) {
-    float variance_sum = 0.0f;
+  // ========== Pass 2: Compute variance ==========
+  float variance_sum = 0.0f;
 #pragma unroll
-    for (auto i = 0u; i < N; ++i) {
-      const auto fp32_input = cast<fp32x2_t>(input[i]);
-      float diff_x = fp32_input.x - mean;
-      float diff_y = fp32_input.y - mean;
-      variance_sum += diff_x * diff_x + diff_y * diff_y;
-    }
-    // Reduce variance
-    if constexpr (kUseCTA) {
-      cta::reduce_sum(variance_sum, smem_buffer);
-      __syncthreads();
-      variance_sum = smem_buffer[0];
-    } else {
-      variance_sum = warp::reduce_sum(variance_sum);
-    }
-    norm_factor = math::rsqrt(variance_sum / kDim + eps);
-  } else {
-    // RMSNorm: local_sum already contains sum_of_squares, mean = mean(x^2)
-    norm_factor = math::rsqrt(mean + eps);
+  for (auto i = 0u; i < N; ++i) {
+    const auto fp32_input = cast<fp32x2_t>(input[i]);
+    float diff_x = fp32_input.x - mean;
+    float diff_y = fp32_input.y - mean;
+    variance_sum += diff_x * diff_x + diff_y * diff_y;
   }
+
+  // Reduce variance
+  if constexpr (kUseCTA) {
+    cta::reduce_sum(variance_sum, smem_buffer);
+    __syncthreads();
+    variance_sum = smem_buffer[0];
+  } else {
+    variance_sum = warp::reduce_sum(variance_sum);
+  }
+  float norm_factor = math::rsqrt(variance_sum / kDim + eps);
 
   // ========== Pass 3: Apply normalization ==========
   AlignedVector<PackedFloat, N> output;
@@ -139,24 +160,13 @@ SGL_DEVICE AlignedVector<PackedFloat, N> apply_norm_impl(
   for (auto i = 0u; i < N; ++i) {
     const auto fp32_input = cast<fp32x2_t>(input[i]);
     const auto fp32_weight = cast<fp32x2_t>(weight[i]);
+    const auto fp32_bias = cast<fp32x2_t>(bias[i]);
 
-    float norm_x, norm_y;
-    if constexpr (norm_enum == NormEnum::LayerNorm) {
-      norm_x = (fp32_input.x - mean) * norm_factor;
-      norm_y = (fp32_input.y - mean) * norm_factor;
-    } else {
-      norm_x = fp32_input.x * norm_factor;
-      norm_y = fp32_input.y * norm_factor;
-    }
+    float norm_x = (fp32_input.x - mean) * norm_factor;
+    float norm_y = (fp32_input.y - mean) * norm_factor;
 
-    float out_x = norm_x * fp32_weight.x;
-    float out_y = norm_y * fp32_weight.y;
-
-    if constexpr (norm_enum == NormEnum::LayerNorm) {
-      const auto fp32_bias = cast<fp32x2_t>(bias[i]);
-      out_x += fp32_bias.x;
-      out_y += fp32_bias.y;
-    }
+    float out_x = norm_x * fp32_weight.x + fp32_bias.x;
+    float out_y = norm_y * fp32_weight.y + fp32_bias.y;
 
     output[i] = cast<PackedFloat, fp32x2_t>({out_x, out_y});
   }
@@ -165,6 +175,70 @@ SGL_DEVICE AlignedVector<PackedFloat, N> apply_norm_impl(
 }
 
 }  // namespace details
+
+/**
+ * \brief Apply RMSNorm using warp-level implementation.
+ * \tparam kDim Dimension size
+ * \tparam T Element type (fp16_t or bf16_t)
+ * \param input Input vector
+ * \param weight Weight vector
+ * \param eps Epsilon value for numerical stability
+ * \return Normalized output vector
+ */
+template <int64_t kDim, typename T>
+SGL_DEVICE T apply_rmsnorm_warp(const T& input, const T& weight, float eps) {
+  static_assert(kDim <= 256, "Warp norm only supports dim <= 256");
+  return details::apply_rmsnorm_impl<kDim, false>(input, weight, eps, nullptr);
+}
+
+/**
+ * \brief Apply RMSNorm using CTA-level implementation.
+ * \tparam kDim Dimension size
+ * \tparam T Element type (fp16_t or bf16_t)
+ * \param input Input vector
+ * \param weight Weight vector
+ * \param eps Epsilon value for numerical stability
+ * \param smem Shared memory buffer
+ * \return Normalized output vector
+ */
+template <int64_t kDim, typename T>
+SGL_DEVICE T apply_rmsnorm_cta(const T& input, const T& weight, float eps, float* smem) {
+  static_assert(kDim > 256, "CTA norm only supports dim > 256");
+  return details::apply_rmsnorm_impl<kDim, true>(input, weight, eps, smem);
+}
+
+/**
+ * \brief Apply LayerNorm using warp-level implementation.
+ * \tparam kDim Dimension size
+ * \tparam T Element type (fp16_t or bf16_t)
+ * \param input Input vector
+ * \param weight Weight vector (gamma)
+ * \param bias Bias vector (beta)
+ * \param eps Epsilon value for numerical stability
+ * \return Normalized output vector
+ */
+template <int64_t kDim, typename T>
+SGL_DEVICE T apply_layernorm_warp(const T& input, const T& weight, const T& bias, float eps) {
+  static_assert(kDim <= 256, "Warp norm only supports dim <= 256");
+  return details::apply_layernorm_impl<kDim, false>(input, weight, bias, eps, nullptr);
+}
+
+/**
+ * \brief Apply LayerNorm using CTA-level implementation.
+ * \tparam kDim Dimension size
+ * \tparam T Element type (fp16_t or bf16_t)
+ * \param input Input vector
+ * \param weight Weight vector (gamma)
+ * \param bias Bias vector (beta)
+ * \param eps Epsilon value for numerical stability
+ * \param smem Shared memory buffer
+ * \return Normalized output vector
+ */
+template <int64_t kDim, typename T>
+SGL_DEVICE T apply_layernorm_cta(const T& input, const T& weight, const T& bias, float eps, float* smem) {
+  static_assert(kDim > 256, "CTA norm only supports dim > 256");
+  return details::apply_layernorm_impl<kDim, true>(input, weight, bias, eps, smem);
+}
 
 /**
  * \brief Apply norm (RMSNorm or LayerNorm) using warp-level implementation.
@@ -178,9 +252,13 @@ SGL_DEVICE AlignedVector<PackedFloat, N> apply_norm_impl(
  * \return Normalized output vector
  */
 template <NormEnum norm_enum, int64_t kDim, typename T>
-SGL_DEVICE T apply_norm_warp(const T& input, const T& weight, const T& bias, float eps) {
+SGL_DEVICE T apply_norm_warp(const T& input, const T& weight, [[maybe_unused]] const T& bias, float eps) {
   static_assert(kDim <= 256, "Warp norm only supports dim <= 256");
-  return details::apply_norm_impl<kDim, false, norm_enum>(input, weight, bias, eps, nullptr);
+  if constexpr (norm_enum == NormEnum::LayerNorm) {
+    return apply_layernorm_warp<kDim>(input, weight, bias, eps);
+  } else {
+    return apply_rmsnorm_warp<kDim>(input, weight, eps);
+  }
 }
 
 /**
@@ -196,9 +274,13 @@ SGL_DEVICE T apply_norm_warp(const T& input, const T& weight, const T& bias, flo
  * \return Normalized output vector
  */
 template <NormEnum norm_enum, int64_t kDim, typename T>
-SGL_DEVICE T apply_norm_cta(const T& input, const T& weight, const T& bias, float eps, float* smem) {
+SGL_DEVICE T apply_norm_cta(const T& input, const T& weight, [[maybe_unused]] const T& bias, float eps, float* smem) {
   static_assert(kDim > 256, "CTA norm only supports dim > 256");
-  return details::apply_norm_impl<kDim, true, norm_enum>(input, weight, bias, eps, smem);
+  if constexpr (norm_enum == NormEnum::LayerNorm) {
+    return apply_layernorm_cta<kDim>(input, weight, bias, eps, smem);
+  } else {
+    return apply_rmsnorm_cta<kDim>(input, weight, eps, smem);
+  }
 }
 
 /**

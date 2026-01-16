@@ -108,7 +108,7 @@ using host::norm_fusion::IndexEnum;
  *        given IndexEnum.
  */
 template <IndexEnum index_enum>
-__always_inline __device__ int get_offset(int S, int F, int b_id, int s_id) {
+SGL_DEVICE int get_offset(int S, int F, int b_id, int s_id) {
   if constexpr (index_enum == IndexEnum::NotATensor || index_enum == IndexEnum::Scalar) {
     return 0;
   } else if constexpr (index_enum == IndexEnum::NoBroadcast) {
