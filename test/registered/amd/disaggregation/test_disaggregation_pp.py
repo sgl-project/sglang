@@ -212,8 +212,7 @@ class TestDisaggregationDecodePPAccuracy(PDDisaggregationServerBase):
             cls.rdma_devices = []
 
         super().setUpClass()
-        # cls.model = try_cached_model(DEFAULT_MODEL_NAME_FOR_TEST)
-        cls.model = "/huggingface/hub/models--amd--Llama-3.1-8B-Instruct-FP8-KV/snapshots/fa42f9a9105c545755fea25cf69f49ac8c8b40e1/"
+        cls.model = try_cached_model(DEFAULT_MODEL_NAME_FOR_TEST)
 
         # Non blocking start servers
         cls.start_prefill()
