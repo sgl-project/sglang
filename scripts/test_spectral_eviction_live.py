@@ -107,8 +107,13 @@ def test_fingerprint_capture(base_url: str, verbose: bool = False) -> bool:
             return False
 
         data = response.json()
-        meta_info = data["choices"][0].get("meta_info", {})
-        attention_tokens = meta_info.get("attention_tokens", [])
+        # attention_tokens can be directly on choices[0] or in meta_info
+        choice = data["choices"][0]
+        attention_tokens = choice.get("attention_tokens", [])
+        if not attention_tokens:
+            # Fallback to meta_info location
+            meta_info = choice.get("meta_info", {})
+            attention_tokens = meta_info.get("attention_tokens", [])
 
         if not attention_tokens:
             print("FAILED: No attention_tokens in response")
@@ -189,9 +194,10 @@ def test_fingerprint_zone_distribution(base_url: str, verbose: bool = False) -> 
                 continue
 
             data = response.json()
-            attention_tokens = (
-                data["choices"][0].get("meta_info", {}).get("attention_tokens", [])
-            )
+            choice = data["choices"][0]
+            attention_tokens = choice.get("attention_tokens", [])
+            if not attention_tokens:
+                attention_tokens = choice.get("meta_info", {}).get("attention_tokens", [])
 
             for record in attention_tokens:
                 zone = record.get("manifold", "unknown")
@@ -243,9 +249,10 @@ def test_fingerprint_consistency(base_url: str, verbose: bool = False) -> bool:
                 return False
 
             data = response.json()
-            attention_tokens = (
-                data["choices"][0].get("meta_info", {}).get("attention_tokens", [])
-            )
+            choice = data["choices"][0]
+            attention_tokens = choice.get("attention_tokens", [])
+            if not attention_tokens:
+                attention_tokens = choice.get("meta_info", {}).get("attention_tokens", [])
 
             if attention_tokens:
                 fingerprints.append(np.array(attention_tokens[0]["fingerprint"]))
