@@ -29,6 +29,13 @@ impl StepExecutor<LocalWorkerWorkflowData> for RegisterTokenizerStep {
             .actual_workers
             .as_ref()
             .ok_or_else(|| WorkflowError::ContextValueNotFound("workers".to_string()))?;
+        // Get chat_template: worker config > global router config
+        let chat_template = context
+            .data
+            .config
+            .chat_template
+            .clone()
+            .or_else(|| app_context.router_config.chat_template.clone());
 
         for worker in workers.iter() {
             let model_id = worker.model_id().to_string();
@@ -55,12 +62,17 @@ impl StepExecutor<LocalWorkerWorkflowData> for RegisterTokenizerStep {
 
             // Load tokenizer with thread safe lock
             let tokenizer_path_owned = tokenizer_path.clone();
+            let template = chat_template.clone();
             if let Err(e) = app_context
                 .tokenizer_registry
-                .load(&tokenizer_id, &model_id, &source, || async move {
-                    factory::create_tokenizer_async(&tokenizer_path_owned)
-                        .await
-                        .map_err(|e| e.to_string())
+                .load(&tokenizer_id, &model_id, &source, move || {
+                    let path = tokenizer_path_owned;
+                    let tmpl = template;
+                    async move {
+                        factory::create_tokenizer_async_with_chat_template(&path, tmpl.as_deref())
+                            .await
+                            .map_err(|e| e.to_string())
+                    }
                 })
                 .await
             {
