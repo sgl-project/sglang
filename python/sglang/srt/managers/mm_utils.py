@@ -3,12 +3,12 @@ Multi-modality utils
 """
 
 import copy
-import hashlib
 import pickle
 from abc import abstractmethod
 from collections import defaultdict
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 
+import blake3
 import numpy as np
 import torch
 from torch import nn
@@ -25,7 +25,12 @@ from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalSta
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.multimodal.evs import EVSEmbeddingResult
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import flatten_nested_list, is_npu, print_warning_once
+from sglang.srt.utils import (
+    flatten_nested_list,
+    is_cuda_alike,
+    is_npu,
+    print_warning_once,
+)
 from sglang.utils import logger
 
 _is_npu = is_npu()
@@ -1197,7 +1202,7 @@ def get_multimodal_data_bounds(
 
 
 def data_hash(data) -> int:
-    hash_bytes = hashlib.sha256(data).digest()[:8]
+    hash_bytes = blake3.blake3(data).digest()[:8]
     return int.from_bytes(hash_bytes, byteorder="big", signed=False)
 
 
@@ -1208,11 +1213,15 @@ def tensor_hash(tensor_list) -> int:
     tensor = tensor_list
     if isinstance(tensor_list, list):
         tensor_list = flatten_nested_list(tensor_list)
-        tensor_list = [
-            x.flatten() if isinstance(x, torch.Tensor) else x for x in tensor_list
-        ]
+        if len(tensor_list) == 1:
+            tensor = tensor_list[0]
+        else:
+            tensor_list = [
+                x.flatten() if isinstance(x, torch.Tensor) else x for x in tensor_list
+            ]
+            tensor = torch.concat(tensor_list)
         tensor = torch.concat(tensor_list)
-    if tensor.is_cuda:
+    if is_cuda_alike(tensor):
         return gpu_tensor_hash(tensor.cuda())
     tensor = tensor.detach().contiguous()
 
