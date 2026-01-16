@@ -281,7 +281,7 @@ impl PDRouter {
         let start_time = Instant::now();
 
         let route = context.route;
-        let model = context.model_id.unwrap_or("default");
+        let model = context.model_id.unwrap_or(UNKNOWN_MODEL_ID);
         let endpoint = route_to_endpoint(route);
 
         // Record request start (Layer 2)
@@ -539,8 +539,10 @@ impl PDRouter {
     ) -> Response {
         // For non-streaming: use guard for automatic load management
         // For streaming: load will be managed in create_streaming_response
-        let _prefill_guard = (!context.is_stream).then(|| WorkerLoadGuard::new(prefill.clone()));
-        let _decode_guard = (!context.is_stream).then(|| WorkerLoadGuard::new(decode.clone()));
+        let _prefill_guard =
+            (!context.is_stream).then(|| WorkerLoadGuard::new(prefill.clone(), headers));
+        let _decode_guard =
+            (!context.is_stream).then(|| WorkerLoadGuard::new(decode.clone(), headers));
 
         let mut headers_with_trace = headers.cloned().unwrap_or_default();
         inject_trace_context_http(&mut headers_with_trace);
@@ -757,7 +759,7 @@ impl PDRouter {
         )?;
 
         // Record worker selection metrics (Layer 3)
-        let model = model_id.unwrap_or("default");
+        let model = model_id.unwrap_or(UNKNOWN_MODEL_ID);
         Metrics::record_worker_selection(
             metrics_labels::WORKER_PREFILL,
             metrics_labels::CONNECTION_HTTP,
@@ -835,7 +837,7 @@ impl PDRouter {
         prefill: Arc<dyn Worker>,
         decode: Arc<dyn Worker>,
     ) -> Response {
-        use crate::core::attach_guards_to_response;
+        use crate::core::AttachedBody;
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -875,17 +877,19 @@ impl PDRouter {
         let stream = UnboundedReceiverStream::new(rx);
         let body = Body::from_stream(stream);
 
+        let guards = vec![
+            WorkerLoadGuard::new(prefill, headers.as_ref()),
+            WorkerLoadGuard::new(decode, headers.as_ref()),
+        ];
+
         let mut response = Response::new(body);
         *response.status_mut() = status;
 
-        let mut headers = headers.unwrap_or_default();
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
-        *response.headers_mut() = headers;
+        let mut response_headers = headers.unwrap_or_default();
+        response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+        *response.headers_mut() = response_headers;
 
-        // Attach load guards to response body for proper RAII lifecycle
-        // Guards are dropped when response body is consumed or client disconnects
-        let guards = vec![WorkerLoadGuard::new(prefill), WorkerLoadGuard::new(decode)];
-        attach_guards_to_response(guards, response)
+        AttachedBody::wrap_response(response, guards)
     }
 
     // Helper to process non-streaming decode response with logprob merging
@@ -1460,8 +1464,8 @@ mod tests {
             true,
         ));
 
-        let _prefill_guard = WorkerLoadGuard::new(prefill_worker.clone());
-        let _decode_guard = WorkerLoadGuard::new(decode_worker.clone());
+        let _prefill_guard = WorkerLoadGuard::new(prefill_worker.clone(), None);
+        let _decode_guard = WorkerLoadGuard::new(decode_worker.clone(), None);
 
         assert_eq!(prefill_worker.load(), 1);
         assert_eq!(decode_worker.load(), 1);

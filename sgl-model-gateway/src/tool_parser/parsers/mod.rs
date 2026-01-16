@@ -13,6 +13,7 @@ pub mod mistral;
 pub mod passthrough;
 pub mod pythonic;
 pub mod qwen;
+pub mod qwen_coder;
 pub mod step3;
 
 // Shared helpers and utilities
@@ -29,4 +30,5 @@ pub use mistral::MistralParser;
 pub(crate) use passthrough::PassthroughParser;
 pub use pythonic::PythonicParser;
 pub use qwen::QwenParser;
+pub use qwen_coder::QwenCoderParser;
 pub use step3::Step3Parser;
