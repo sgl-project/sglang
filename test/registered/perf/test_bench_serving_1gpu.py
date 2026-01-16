@@ -23,7 +23,7 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
-register_cuda_ci(est_time=600, suite="stage-b-test-small-1-gpu-performance")
+register_cuda_ci(est_time=600, suite="stage-b-test-large-1-gpu-performance")
 
 
 class TestBenchServing1GPU(CustomTestCase):
