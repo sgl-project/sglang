@@ -17,22 +17,31 @@ logger = logging.getLogger(__name__)
 class ConfigArgumentMerger:
     """Handles merging of configuration file arguments with command-line arguments."""
 
-    def __init__(self, parser: argparse.ArgumentParser):
+    def __init__(
+        self, parser: argparse.ArgumentParser = None, boolean_actions: List[str] = None
+    ):
         """Initialize with list of store_true action names."""
         # NOTE: The current code does not support actions other than "store_true" and "store".
-        self.parser = parser
-        self.store_true_actions = [
-            action.dest
-            for action in parser._actions
-            if isinstance(action, argparse._StoreTrueAction)
-        ]
-
-        self.rejected_options = {"config", "help", "h"} | {
-            a.dest
-            for a in parser._actions
-            if not isinstance(a, argparse._StoreTrueAction)
-            and not isinstance(a, argparse._StoreAction)
-        }
+        if parser is not None:
+            self.parser = parser
+            self.store_true_actions = [
+                action.dest
+                for action in parser._actions
+                if isinstance(action, argparse._StoreTrueAction)
+            ]
+            self.rejected_options = {"config", "help", "h"} | {
+                a.dest
+                for a in parser._actions
+                if not isinstance(a, argparse._StoreTrueAction)
+                and not isinstance(a, argparse._StoreAction)
+            }
+        elif boolean_actions is not None:
+            # Legacy interface for compatibility
+            self.store_true_actions = boolean_actions
+            self.rejected_options = {"config", "help", "h"}
+        else:
+            self.store_true_actions = []
+            self.rejected_options = {"config", "help", "h"}
 
     def parse_config(self, cli_args: List[str]) -> Dict[str, Any]:
         config_file_path = self._extract_config_file_path(cli_args)
