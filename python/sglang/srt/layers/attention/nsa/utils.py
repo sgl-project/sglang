@@ -13,6 +13,9 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_group,
     get_attention_tp_rank,
     get_attention_tp_size,
+    get_attention_cp_size,
+    get_attention_cp_rank,
+    get_attention_cp_group,
 )
 from sglang.srt.server_args import get_global_server_args
 
@@ -45,7 +48,7 @@ def is_nsa_prefill_cp_round_robin_split():
 def can_nsa_prefill_cp_round_robin_split(forward_batch: "ForwardBatch"):
     if not forward_batch.forward_mode.is_context_parallel_extend():
         return False
-    cp_size = get_attention_tp_size()
+    cp_size = get_attention_cp_size()
     seq_len = sum(forward_batch.extend_seq_lens_cpu)
     return is_nsa_prefill_cp_round_robin_split() and seq_len > 0 and cp_size > 1
 
@@ -63,8 +66,8 @@ def nsa_cp_round_robin_split_data(input_: Union[torch.Tensor, List]):
     | dp_atten_tp3: token3, token7, token11, token15, token19, ... |
     |   +-------------------------+
     """
-    cp_size = get_attention_tp_size()
-    cp_rank = get_attention_tp_rank()
+    cp_size = get_attention_cp_size()
+    cp_rank = get_attention_cp_rank()
     if isinstance(input_, (tuple, list)):
         indices = range(cp_rank, len(input_), cp_size)
         return input_[indices]
@@ -142,7 +145,7 @@ def can_cp_split(seq_len: int, cp_size: int, use_nsa: bool, forward_batch):
 
 def cp_split_and_rebuild_data(forward_batch, input_: torch.Tensor):
     if is_nsa_prefill_cp_round_robin_split():
-        cp_size = get_attention_tp_size()
+        cp_size = get_attention_cp_size()
         assert (
             input_.shape[0] % cp_size == 0
         ), f"Expect input shape 0 can divided by cp size, but got input shape {input_.shape}, cp size {cp_size}"
@@ -159,7 +162,7 @@ def cp_split_and_rebuild_data(forward_batch, input_: torch.Tensor):
 
 def cp_split_and_rebuild_position(forward_batch, positions: torch.Tensor):
     if is_nsa_prefill_cp_round_robin_split():
-        cp_size = get_attention_tp_size()
+        cp_size = get_attention_cp_size()
         assert positions.shape[0] % cp_size == 0, (
             f"Expect positions shape 0 can divided by cp size, but got positions shape {positions.shape}, "
             f"cp size {cp_size}"
@@ -199,8 +202,8 @@ def nsa_cp_round_robin_split_q_seqs_kernel(
 
 
 def nsa_cp_round_robin_split_q_seqs_cpu(extend_seqs):
-    cp_size = get_attention_tp_size()
-    cp_rank = get_attention_tp_rank()
+    cp_size = get_attention_cp_size()
+    cp_rank = get_attention_cp_rank()
     extra_seq = 0
     q_seqs = []
     for bs, cur_len in enumerate(extend_seqs):
@@ -225,8 +228,8 @@ def nsa_cp_round_robin_split_q_seqs(
     bs_idx_cpu(List) and bs_idx(torch.Tensor): marks which sequences are ultimately selected,
         i.e., those with a partitioned length greater than zero.
     """
-    cp_size = get_attention_tp_size()
-    cp_rank = get_attention_tp_rank()
+    cp_size = get_attention_cp_size()
+    cp_rank = get_attention_cp_rank()
     # len(ret_q_lens_cpu) == len(bs_idx_cpu)
     ret_q_lens_cpu, bs_idx_cpu = nsa_cp_round_robin_split_q_seqs_cpu(extend_seqs_cpu)
     ret_q_lens = torch.empty(
@@ -277,7 +280,7 @@ def cp_attn_tp_all_gather_reorganazied_into_tensor(
         dtype=input_.dtype,
     )
     # step2
-    get_attention_tp_group().cp_all_gather_into_tensor_async(
+    get_attention_cp_group().cp_all_gather_into_tensor_async(
         input_tensor_all, input_, stream_op
     )
     # step3
