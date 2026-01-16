@@ -70,6 +70,50 @@ class FutureMap:
 
     def _lazy_init_buf(self, draft_input: EagleDraftInput):
         self.buf_initialized = True
+        # if self.spec_algo.is_ngram():
+        #     draft_token = draft_input.draft_token
+        #     custom_mask = draft_input.custom_mask
+        #     positions = draft_input.positions
+        #     retrive_index0 = draft_input.retrive_index[0]
+        #     retrive_next_token0 = draft_input.retrive_next_token[0]
+        #     retrive_next_sibling0 = draft_input.retrive_next_sibling[0]
+        #     draft_token_num = draft_input.draft_token_num
+        #     self.draft_token_buf = torch.empty(
+        #         (self.future_buffer_len, *draft_token.shape),
+        #         dtype=draft_token.dtype,
+        #         device=self.device,
+        #     )
+        #     self.custom_mask_buf = torch.empty(
+        #         (self.future_buffer_len, *custom_mask.shape),
+        #         dtype=custom_mask.dtype,
+        #         device=self.device,
+        #     )
+        #     self.positions_buf = torch.empty(
+        #         (self.future_buffer_len, *positions.shape),
+        #         dtype=positions.dtype,
+        #         device=self.device,
+        #     )
+        #     self.retrive_index0_buf = torch.empty(
+        #         (self.future_buffer_len, *retrive_index0.shape),
+        #         dtype=retrive_index0.dtype,
+        #         device=self.device,
+        #     )
+        #     self.retrive_next_token0_buf = torch.empty(
+        #         (self.future_buffer_len, *retrive_next_token0.shape),
+        #         dtype=retrive_next_token0.dtype,
+        #         device=self.device,
+        #     )
+        #     self.retrive_next_sibling0_buf = torch.empty(
+        #         (self.future_buffer_len, *retrive_next_sibling0.shape),
+        #         dtype=retrive_next_sibling0.dtype,
+        #         device=self.device,
+        #     )
+        #     self.draft_token_num_buf = torch.empty(
+        #         (self.future_buffer_len,),
+        #         dtype=torch.int64,
+        #         device=self.device,
+        #     )
+        #     return
 
         # Get a reference for each tensor
         topk_p0 = draft_input.topk_p[0]
@@ -115,15 +159,33 @@ class FutureMap:
         indices = torch.arange(start, end, dtype=torch.int64, device=self.device)
         return FutureIndices(indices=indices, interval=slice(start, end))
 
+    # def set_draft_input_ngram(
+    #     self, draft_input: NgramVerifyInput, future_indices: FutureIndices
+    # ):
+    #     draft_input.draft_token = self.draft_token_buf[future_indices.indices]
+    #     draft_input.custom_mask = self.custom_mask_buf[future_indices.indices]
+    #     draft_input.positions = self.positions_buf[future_indices.indices]
+    #     draft_input.retrive_index = self.retrive_index0_buf[future_indices.indices]
+    #     draft_input.retrive_next_token = self.retrive_next_token0_buf[
+    #         future_indices.indices
+    #     ]
+    #     draft_input.retrive_next_sibling = self.retrive_next_sibling0_buf[
+    #         future_indices.indices
+    #     ]
+    #     draft_input.draft_token_num = self.draft_token_num_buf[future_indices.indices]
+
     def resolve_future(self, model_worker_batch: ModelWorkerBatch):
         if self.spec_algo.is_none():
             _resolve_future_token_ids(model_worker_batch.input_ids, self.token_ids_buf)
         else:
             # TODO(lsyin): write future indices into spec_info.future_indices
             draft_input: EagleDraftInput = model_worker_batch.spec_info
-            if draft_input is None:
+            if draft_input is None or self.spec_algo.is_ngram():
                 # FIXME(lsyin): No future exists, only for prefill batch, not compatible with mixed mode
                 return
+            # if self.spec_algo.is_ngram():
+            #     self.set_draft_input_ngram(draft_input)
+            #     return
             indices = draft_input.future_indices.indices
             draft_input.topk_p = self.topk_p_buf[indices]
             draft_input.topk_index = self.topk_index_buf[indices]
@@ -142,6 +204,8 @@ class FutureMap:
     def store_to_map(
         self, future_indices: FutureIndices, batch_result: GenerationBatchResult
     ):
+        if self.spec_algo.is_ngram():
+            return
         if self.spec_algo.is_none():
             intv = future_indices.interval
             self.token_ids_buf[intv] = batch_result.next_token_ids
@@ -159,6 +223,16 @@ class FutureMap:
 
         if not self.buf_initialized:
             self._lazy_init_buf(draft_input)
+
+        # if self.spec_algo.is_ngram():
+        #     self.draft_token_buf[intv] = draft_input.draft_token
+        #     self.custom_mask_buf[intv] = draft_input.custom_mask
+        #     self.positions_buf[intv] = draft_input.positions
+        #     self.retrive_index0_buf[intv] = draft_input.retrive_index
+        #     self.retrive_next_token0_buf[intv] = draft_input.retrive_next_token
+        #     self.retrive_next_sibling0_buf[intv] = draft_input.retrive_next_sibling
+        #     self.draft_token_num_buf[intv] = draft_input.draft_token_num
+        #     return
 
         self.topk_p_buf[intv] = draft_input.topk_p
         self.topk_index_buf[intv] = draft_input.topk_index

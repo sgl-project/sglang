@@ -165,6 +165,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTen
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import PortArgs, ServerArgs, get_global_server_args
+from sglang.srt.speculative.ngram_worker_v2 import NgramVerifyInputV2
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.tracing.trace import (
     process_tracing_init,
@@ -2100,6 +2101,27 @@ class Scheduler(
         """Update the current running decoding batch."""
         initial_bs = batch.batch_size()
 
+        if batch.is_spec_v2 and batch.spec_algorithm.is_ngram():
+            tmp_batch, tmp_result = self.result_queue.popleft()
+            if tmp_batch.forward_mode != ForwardMode.EXTEND:  # TODO csy idle???
+                # if the last batch is decode, then no new req will be merged into batch, i.e. batch is the same as tmp_batch
+                # TODO support chunk prefill and mixed-chunk
+                verify_input: NgramVerifyInputV2 = batch.spec_info
+                logits_output, next_token_ids, num_accepted_tokens = (
+                    verify_input.fill_requests_and_free_cache(
+                        batch, batch.logits_output, self.page_size
+                    )
+                )
+                self.model_worker._update_ngram_cache(batch)
+                # update result_queue using the new result, token ids do not need to store in future map since all output ids are updated in speculative module
+                tmp_result.logits_output = logits_output
+                tmp_result.next_token_ids = next_token_ids
+                tmp_result.num_accepted_tokens = num_accepted_tokens
+                tmp_result.copy_to_cpu(return_logprob=tmp_batch.return_logprob)
+                self.result_queue.appendleft((batch.copy(), tmp_result))
+            else:
+                self.result_queue.appendleft((tmp_batch, tmp_result))
+
         batch.filter_batch(v1_spec_info_filtered=True)
         if batch.is_empty():
             batch.batch_is_full = False
@@ -2213,7 +2235,10 @@ class Scheduler(
         if self.is_generation:
             if self.spec_algorithm.is_none() or self.enable_overlap:
                 # In most cases, we use the model worker batch to run the forward.
-                worker_batch_or_batch = batch.get_model_worker_batch()
+                if self.spec_algorithm.is_ngram():
+                    worker_batch_or_batch = batch
+                else:
+                    worker_batch_or_batch = batch.get_model_worker_batch()
             else:
                 # In speculative decoding v1 (non-overlap) case, we use the batch directly.
                 # TODO(lsyin): delete this branch after unifying the abstraction.
@@ -2223,10 +2248,11 @@ class Scheduler(
                 model_worker_batch = worker_batch_or_batch
                 self.record_batch_in_overlap(model_worker_batch)
 
-                # Sampling info will be modified during forward, so we store a copy.
-                model_worker_batch.sampling_info = (
-                    model_worker_batch.sampling_info.copy_for_forward()
-                )
+                # TODO csy unify model_worker_batch and schedule_batc, why here schedule_batch's sampling_info has no penalizer???
+                # # Sampling info will be modified during forward, so we store a copy.
+                # model_worker_batch.sampling_info = (
+                #     model_worker_batch.sampling_info.copy_for_forward()
+                # )
 
                 bs = len(model_worker_batch.seq_lens)
                 future_indices = self.future_map.alloc_future_indices(bs)
@@ -2242,8 +2268,21 @@ class Scheduler(
                     # FIXME(lsyin): maybe move this to forward_batch_generation
                     batch_result.copy_done = self.device_module.Event()
                     if batch_result.delay_sample_func is None:
-                        self.future_map.store_to_map(future_indices, batch_result)
-                        batch_result.copy_to_cpu(return_logprob=batch.return_logprob)
+                        if (
+                            not batch.is_spec_v2
+                            or (
+                                batch.is_spec_v2
+                                and not batch.forward_mode.is_decode()
+                                and batch.spec_algorithm.is_ngram()
+                            )
+                            or (
+                                batch.is_spec_v2 and not batch.spec_algorithm.is_ngram()
+                            )
+                        ):
+                            self.future_map.store_to_map(future_indices, batch_result)
+                            batch_result.copy_to_cpu(
+                                return_logprob=batch.return_logprob
+                            )
                     else:
                         batch_result.future_indices = future_indices
 
@@ -2255,16 +2294,17 @@ class Scheduler(
                     # We only keep future indices for next draft input
 
                     batch.spec_info = batch_result.next_draft_input
-                    batch.spec_info.future_indices = future_indices
+                    if not batch.spec_algorithm.is_ngram():
+                        batch.spec_info.future_indices = future_indices
 
-                    # batch.spec_info = EagleDraftInput(
-                    #     future_indices=future_indices,
-                    #     verify_done=batch_result.next_draft_input.verify_done,
-                    # )
+                        # batch.spec_info = EagleDraftInput(
+                        #     future_indices=future_indices,
+                        #     verify_done=batch_result.next_draft_input.verify_done,
+                        # )
 
-                    # The future value, usually for next batch preparation
-                    # Current implementation strictly synchronizes the seq_lens
-                    batch.seq_lens = batch_result.next_draft_input.new_seq_lens
+                        # The future value, usually for next batch preparation
+                        # Current implementation strictly synchronizes the seq_lens
+                        batch.seq_lens = batch_result.next_draft_input.new_seq_lens
             elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
                 batch_result = self.tp_worker.forward_batch_split_prefill(batch)
                 future_indices_or_next_token_ids = batch_result.next_token_ids
