@@ -608,7 +608,9 @@ class SchedulerPPMixin:
                 if i == 0:
                     batch.prepare_for_extend()
                     model_worker_batch = batch.get_model_worker_batch()
-                    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+                    from sglang.srt.model_executor.forward_batch_info import (
+                        ForwardBatch,
+                    )
 
                     forward_batch = ForwardBatch.init_new(
                         model_worker_batch, self.tp_worker.model_runner
@@ -1350,11 +1352,6 @@ class ChunkSizePredictor:
         A = self.quadratic_coeff_a
         B = 2 * self.quadratic_coeff_a * history_len + self.linear_coeff_b
         C = -self.target_latency
-        # A = self.quadratic_coeff_a
-        # B = self.linear_coeff_b
-        # C = -self.target_latency + self.constant_coeff_c
-
-        logger.warning(f"quadratic_coeff_a: {self.quadratic_coeff_a}, linear_coeff_b: {self.linear_coeff_b}, constant_coeff_c: {self.constant_coeff_c}, target_latency: {self.target_latency}, f(L): {self.quadratic_coeff_a * history_len * history_len + self.linear_coeff_b * history_len + self.constant_coeff_c}")
 
         discriminant = B * B - 4 * A * C
 
