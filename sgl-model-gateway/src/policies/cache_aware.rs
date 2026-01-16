@@ -75,7 +75,6 @@ use crate::{
         tree_ops::{TreeInsertOp, TreeOperation, TreeRemoveOp},
         OptionalMeshSyncManager,
     },
-
 };
 
 /// Cache-aware routing policy
@@ -777,10 +776,9 @@ mod tests {
             )
             .unwrap();
 
-
         // Manually flush to mesh for testing
         policy.flush_mesh_sync();
-        
+
         // Verify tree operation was synced to mesh (under UNKNOWN_MODEL_ID since no model was specified)
         let tree_state = mesh_sync.get_tree_state(UNKNOWN_MODEL_ID);
 
