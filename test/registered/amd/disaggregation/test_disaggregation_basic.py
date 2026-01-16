@@ -7,21 +7,20 @@ import openai
 import requests
 from transformers import AutoTokenizer
 
+from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
-from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import (
-    DEFAULT_DRAFT_MODEL_EAGLE,
     DEFAULT_MODEL_NAME_FOR_TEST,
-    DEFAULT_TARGET_MODEL_EAGLE,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     popen_launch_pd_server,
 )
 
+register_amd_ci(est_time=1200, suite="stage-b-test-large-2-gpu-35x-disaggregation-amd")
 
-register_amd_ci(est_time=300, suite="stage-b-test-large-2-gpu-35x-disaggregation-amd")
+
 class TestDisaggregationAccuracy(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
@@ -38,7 +37,7 @@ class TestDisaggregationAccuracy(PDDisaggregationServerBase):
 
         super().setUpClass()
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
-        #DEFAULT_MODEL_NAME_FOR_TEST
+        # DEFAULT_MODEL_NAME_FOR_TEST
 
         # Non blocking start servers
         cls.start_prefill()
@@ -54,10 +53,14 @@ class TestDisaggregationAccuracy(PDDisaggregationServerBase):
     def start_prefill(cls):
         prefill_args = [
             "--trust-remote-code",
-            "--disaggregation-mode", "prefill",
-            "--tp", "1",
-            "--attention-backend", "aiter",
-            "--log-level", "debug",
+            "--disaggregation-mode",
+            "prefill",
+            "--tp",
+            "1",
+            "--attention-backend",
+            "aiter",
+            "--log-level",
+            "debug",
         ]
         prefill_args += cls.transfer_backend + cls.rdma_devices
         cls.process_prefill = popen_launch_pd_server(
@@ -71,12 +74,18 @@ class TestDisaggregationAccuracy(PDDisaggregationServerBase):
     def start_decode(cls):
         decode_args = [
             "--trust-remote-code",
-            "--disaggregation-mode", "decode",
-            "--tp", "1",
-            "--base-gpu-id", "1",  
-            "--attention-backend", "aiter",
-            "--mem-fraction-static", "0.8",
-            "--log-level", "debug",
+            "--disaggregation-mode",
+            "decode",
+            "--tp",
+            "1",
+            "--base-gpu-id",
+            "1",
+            "--attention-backend",
+            "aiter",
+            "--mem-fraction-static",
+            "0.8",
+            "--log-level",
+            "debug",
         ]
         decode_args += cls.transfer_backend + cls.rdma_devices
         print("Debug")
@@ -203,7 +212,7 @@ class TestDisaggregationAccuracy(PDDisaggregationServerBase):
         )
 
 
-#register_amd_ci(est_time=300, suite="stage-b-test-large-2-gpu-amd")
+# register_amd_ci(est_time=300, suite="stage-b-test-large-2-gpu-amd")
 class TestDisaggregationMooncakeFailure(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
@@ -243,10 +252,14 @@ class TestDisaggregationMooncakeFailure(PDDisaggregationServerBase):
     def start_prefill(cls):
         prefill_args = [
             "--trust-remote-code",
-            "--disaggregation-mode", "prefill",
-            "--tp", "1",
-            "--attention-backend", "aiter",
-            "--log-level", "debug",
+            "--disaggregation-mode",
+            "prefill",
+            "--tp",
+            "1",
+            "--attention-backend",
+            "aiter",
+            "--log-level",
+            "debug",
         ]
         prefill_args += cls.transfer_backend + cls.rdma_devices
         cls.process_prefill = popen_launch_pd_server(
@@ -260,12 +273,18 @@ class TestDisaggregationMooncakeFailure(PDDisaggregationServerBase):
     def start_decode(cls):
         decode_args = [
             "--trust-remote-code",
-            "--disaggregation-mode", "decode",
-            "--tp", "1",
-            "--base-gpu-id", "1",
-            "--attention-backend", "aiter",
-            "--mem-fraction-static", "0.8",
-            "--log-level", "debug",
+            "--disaggregation-mode",
+            "decode",
+            "--tp",
+            "1",
+            "--base-gpu-id",
+            "1",
+            "--attention-backend",
+            "aiter",
+            "--mem-fraction-static",
+            "0.8",
+            "--log-level",
+            "debug",
         ]
         decode_args += cls.transfer_backend + cls.rdma_devices
         cls.process_decode = popen_launch_pd_server(
@@ -302,7 +321,8 @@ class TestDisaggregationMooncakeFailure(PDDisaggregationServerBase):
                 # If health check fails, re-raise the original exception
                 raise e from health_check_error
 
-#register_amd_ci(est_time=300, suite="stage-b-test-large-2-gpu-amd")
+
+# register_amd_ci(est_time=300, suite="stage-b-test-large-2-gpu-amd")
 class TestDisaggregationSimulatedRetract(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
@@ -340,10 +360,14 @@ class TestDisaggregationSimulatedRetract(PDDisaggregationServerBase):
     def start_prefill(cls):
         prefill_args = [
             "--trust-remote-code",
-            "--disaggregation-mode", "prefill",
-            "--tp", "1",
-            "--attention-backend", "aiter",
-            "--log-level", "debug",
+            "--disaggregation-mode",
+            "prefill",
+            "--tp",
+            "1",
+            "--attention-backend",
+            "aiter",
+            "--log-level",
+            "debug",
         ]
         prefill_args += cls.transfer_backend + cls.rdma_devices
         cls.process_prefill = popen_launch_pd_server(
@@ -357,12 +381,18 @@ class TestDisaggregationSimulatedRetract(PDDisaggregationServerBase):
     def start_decode(cls):
         decode_args = [
             "--trust-remote-code",
-            "--disaggregation-mode", "decode",
-            "--tp", "1",
-            "--base-gpu-id", "1",
-            "--attention-backend", "aiter",
-            "--mem-fraction-static", "0.8",
-            "--log-level", "debug",
+            "--disaggregation-mode",
+            "decode",
+            "--tp",
+            "1",
+            "--base-gpu-id",
+            "1",
+            "--attention-backend",
+            "aiter",
+            "--mem-fraction-static",
+            "0.8",
+            "--log-level",
+            "debug",
         ]
         decode_args += cls.transfer_backend + cls.rdma_devices
         cls.process_decode = popen_launch_pd_server(
