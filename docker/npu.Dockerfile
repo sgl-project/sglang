@@ -76,10 +76,7 @@ RUN (${PIP_INSTALL} pybind11) \
 
 # Install SGLang
 RUN git clone ${SGLANG_REPO} --branch ${VER_SGLANG} sglang && \
-    cd sglang/python && \
-    rm -f pyproject.toml && \
-    mv pyproject_npu.toml pyproject.toml && \
-    ${PIP_INSTALL} -v ".[all_npu]" && \
+    (cd sglang/python && rm -f pyproject.toml && mv pyproject_npu.toml pyproject.toml && ${PIP_INSTALL} -v ".[all_npu]") && \
     rm -rf sglang
 
 # Install Deep-ep
