@@ -1,7 +1,3 @@
-from sglang.test.ci.ci_register import register_cuda_ci
-
-register_cuda_ci(est_time=447, suite="stage-b-test-small-1-gpu")
-
 import json
 import unittest
 from io import BytesIO
@@ -22,6 +18,8 @@ from transformers import (
     Qwen2_5_VLForConditionalGeneration,
 )
 
+from sglang.test.ci.ci_register import register_cuda_ci
+
 if not hasattr(_hf_activations, "PytorchGELUTanh"):
 
     class PytorchGELUTanh(torch.nn.Module):
@@ -37,6 +35,8 @@ if not hasattr(_hf_activations, "PytorchGELUTanh"):
 from sglang import Engine
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 from sglang.srt.parser.conversation import generate_chat_conv
+
+register_cuda_ci(est_time=447, suite="stage-b-test-large-1-gpu")
 
 IMAGE_MAN_IRONING_URL = "https://raw.githubusercontent.com/sgl-project/sgl-test-files/refs/heads/main/images/man_ironing_on_back_of_suv.png"
 IMAGE_SGL_LOGO_URL = "https://raw.githubusercontent.com/sgl-project/sgl-test-files/refs/heads/main/images/sgl_logo.png"

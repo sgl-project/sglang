@@ -191,12 +191,11 @@ class NemotronHMoE(nn.Module):
             self.shared_experts = None
 
         if self.use_latent_moe:
-            self.fc1_latent_proj = ColumnParallelLinear(
+            self.fc1_latent_proj = ReplicatedLinear(
                 input_size=config.hidden_size,
                 output_size=self.moe_hidden_size,
                 bias=config.mlp_bias,
                 quant_config=quant_config,
-                gather_output=True,
                 prefix=f"{prefix}.fc1_latent_proj",
             )
             self.fc2_latent_proj = ReplicatedLinear(
@@ -728,7 +727,20 @@ class NemotronHForCausalLM(nn.Module):
     def get_seqlen_agnostic_capture_inputs(self, batch_size: int):
         return self.mamba_cache.get_seqlen_agnostic_capture_inputs(batch_size)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> None:
+    def get_embed_and_head(self):
+        return self.model.embed_tokens.weight, self.lm_head.weight
+
+    def set_embed_and_head(self, embed, head):
+        del self.model.embed_tokens.weight
+        del self.lm_head.weight
+        self.model.embed_tokens.weight = embed
+        self.lm_head.weight = head
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+    def load_weights(
+        self, weights: Iterable[tuple[str, torch.Tensor]], is_mtp: bool = False
+    ) -> None:
         updated_weights = []
         for name, loaded_weight in weights:
             name = replace_prefix(name, self.remap_prefix)
@@ -749,6 +761,20 @@ class NemotronHForCausalLM(nn.Module):
         params_dict = dict(self.named_parameters())
 
         for name, loaded_weight in updated_weights:
+            if is_mtp:
+                if "mtp" not in name:
+                    continue
+
+                name = name.replace("mtp.layers.", "model.layers.")
+
+                if "embeddings" in name:
+                    name = name.replace("embeddings", "model.embed_tokens")
+                    if name.startswith("backbone."):
+                        name = name.replace("backbone.", "")
+
+            if not is_mtp and "mtp" in name:
+                continue
+
             if "scale" in name:
                 name = maybe_remap_kv_scale_name(name, params_dict)
                 if name is None:

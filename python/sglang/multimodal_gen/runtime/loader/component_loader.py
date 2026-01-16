@@ -422,7 +422,7 @@ class TextEncoderLoader(ComponentLoader):
         )
         model_config = get_diffusers_component_config(model_path=component_model_path)
         _clean_hf_config_inplace(model_config)
-        logger.info("HF model config: %s", model_config)
+        logger.debug("HF model config: %s", model_config)
 
         def is_not_first_encoder(module_name):
             return "2" in module_name
@@ -459,8 +459,14 @@ class TextEncoderLoader(ComponentLoader):
 
         local_torch_device = get_local_torch_device()
         should_offload = self.should_offload(server_args, model_config)
+
+        if should_offload and not current_platform.is_mps():
+            model_device = torch.device("cpu")
+        else:
+            model_device = local_torch_device
+
         with set_default_torch_dtype(PRECISION_TO_TYPE[dtype]):
-            with local_torch_device, skip_init_modules():
+            with model_device, skip_init_modules():
                 architectures = getattr(model_config, "architectures", [])
                 model_cls, _ = ModelRegistry.resolve_model_cls(architectures)
                 enable_image_understanding = (
@@ -478,15 +484,13 @@ class TextEncoderLoader(ComponentLoader):
                 self._get_all_weights(model, model_path, to_cpu=should_offload)
             )
 
-            # Explicitly move model to target device after loading weights
-            model = model.to(local_torch_device)
-
             if should_offload:
                 # Disable FSDP for MPS as it's not compatible
                 if current_platform.is_mps():
                     logger.info(
                         "Disabling FSDP sharding for MPS platform as it's not compatible"
                     )
+                    model = model.to(local_torch_device)
                 else:
                     mesh = init_device_mesh(
                         current_platform.device_type,
@@ -502,6 +506,8 @@ class TextEncoderLoader(ComponentLoader):
                         or getattr(model, "_fsdp_shard_conditions", None),
                         pin_cpu_memory=server_args.pin_cpu_memory,
                     )
+            else:
+                model = model.to(local_torch_device)
             # We only enable strict check for non-quantized models
             # that have loaded weights tracking currently.
             # if loaded_weights is not None:
@@ -543,7 +549,7 @@ class ImageEncoderLoader(TextEncoderLoader):
         with open(os.path.join(component_model_path, "config.json")) as f:
             model_config = json.load(f)
         _clean_hf_config_inplace(model_config)
-        logger.info("HF model config: %s", model_config)
+        logger.debug("HF model config: %s", model_config)
 
         encoder_config = server_args.pipeline_config.image_encoder_config
         encoder_config.update_model_arch(model_config)
@@ -609,7 +615,7 @@ class VAELoader(ComponentLoader):
 
         server_args.model_paths["vae"] = component_model_path
 
-        logger.info("HF model config: %s", config)
+        logger.debug("HF model config: %s", config)
         vae_config = server_args.pipeline_config.vae_config
         vae_config.update_model_arch(config)
 

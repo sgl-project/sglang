@@ -1,8 +1,3 @@
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-
-register_cuda_ci(est_time=80, suite="stage-b-test-small-1-gpu")
-register_amd_ci(est_time=30, suite="stage-b-test-small-1-gpu-amd")
-
 import unittest
 
 import torch
@@ -15,7 +10,11 @@ from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.quantization.fp8_utils import normalize_e4m3fn_to_e4m3fnuz
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.srt.utils import is_hip
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
+
+register_cuda_ci(est_time=80, suite="stage-b-test-large-1-gpu")
+register_amd_ci(est_time=30, suite="stage-b-test-small-1-gpu-amd")
 
 _is_hip = is_hip()
 _is_fp8_fnuz = is_fp8_fnuz()

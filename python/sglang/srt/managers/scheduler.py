@@ -87,6 +87,7 @@ from sglang.srt.managers.io_struct import (
     GetInternalStateReq,
     GetInternalStateReqOutput,
     GetLoadReqInput,
+    GetLoadsReqInput,
     GetWeightsByNameReqInput,
     HealthCheckOutput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
@@ -1046,6 +1047,7 @@ class Scheduler(
                 ),
                 (UnloadLoRAAdapterReqInput, self.unload_lora_adapter),
                 (GetLoadReqInput, self.get_load),
+                (GetLoadsReqInput, self.get_loads),
                 (PauseGenerationReqInput, self.pause_generation),
                 (ContinueGenerationReqInput, self.continue_generation),
             ]
@@ -1470,7 +1472,9 @@ class Scheduler(
         else:
             # Create a new request from a previous session
             session = self.sessions[recv_req.session_params.id]
-            req = session.create_req(recv_req, self.tokenizer)
+            req = session.create_req(
+                recv_req, self.tokenizer, self.model_config.vocab_size
+            )
             if isinstance(req.finished_reason, FINISH_ABORT):
                 self.init_req_max_new_tokens(req)
                 self._add_request_to_queue(req)
@@ -1648,6 +1652,8 @@ class Scheduler(
                 direction * recv_req.priority < direction * candidate_req.priority
             )
             if abort_existing_req:
+                if self.enable_hierarchical_cache:
+                    self.tree_cache.terminate_prefetch(candidate_req.rid)
                 self.waiting_queue.pop(idx)
                 req_to_abort = candidate_req
                 message = "The request is aborted by a higher priority request."

@@ -138,6 +138,7 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 | Argument                | Defaults  | Options                        |                    A2                    |                    A3                    |
 |-------------------------|-----------|--------------------------------|:----------------------------------------:|:----------------------------------------:|
 | `--api-key`             | `None`    | Type: str                      | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| `--admin-api-key`       | `None`    | Type: str                      | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | `--served-model-name`   | `None`    | Type: str                      | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | `--weight-version`      | `default` | Type: str                      | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | `--chat-template`       | `None`    | Type: str                      | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |

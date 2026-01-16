@@ -27,6 +27,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     VideoListResponse,
     VideoResponse,
 )
+from sglang.multimodal_gen.runtime.entrypoints.openai.storage import cloud_storage
 from sglang.multimodal_gen.runtime.entrypoints.openai.stores import VIDEO_STORE
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     _parse_size,
@@ -127,11 +128,19 @@ async def _dispatch_job_async(job_id: str, batch: Req) -> None:
     from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 
     try:
-        _, result = await process_generation_batch(async_scheduler_client, batch)
+        save_file_path_list, result = await process_generation_batch(
+            async_scheduler_client, batch
+        )
+        save_file_path = save_file_path_list[0]
+
+        cloud_url = await cloud_storage.upload_and_cleanup(save_file_path)
+
         update_fields = {
             "status": "completed",
             "progress": 100,
             "completed_at": int(time.time()),
+            "url": cloud_url,
+            "file_path": save_file_path if not cloud_url else None,
         }
         update_fields = add_common_data_to_response(
             update_fields, request_id=job_id, result=result
@@ -333,6 +342,12 @@ async def download_video_content(
     job = await VIDEO_STORE.get(video_id)
     if not job:
         raise HTTPException(status_code=404, detail="Video not found")
+
+    if job.get("url"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Video has been uploaded to cloud storage. Please use the cloud URL: {job.get('url')}",
+        )
 
     file_path = job.get("file_path")
     if not file_path or not os.path.exists(file_path):

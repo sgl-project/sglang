@@ -26,6 +26,9 @@ service SglangScheduler {
   // Get server information
   rpc GetServerInfo(GetServerInfoRequest) returns (GetServerInfoResponse);
 
+  // Get comprehensive load metrics
+  rpc GetLoads(GetLoadsRequest) returns (GetLoadsResponse);
+
 }
 
 // =====================
@@ -463,4 +466,101 @@ message GetServerInfoResponse {
   // Scheduler-side metrics (memory usage, throughput) require
   // bidirectional communicator infrastructure not available in gRPC.
   // Use HTTP /get_server_info if scheduler internal state is needed.
+}
+
+// =====================
+// Load Metrics (v1/loads)
+// =====================
+
+message GetLoadsRequest {
+  // Optional: filter to specific DP rank
+  optional int32 dp_rank = 1;
+
+  // Sections to include: core, memory, spec, lora, disagg, queues, all
+  repeated string include = 2;
+}
+
+message GetLoadsResponse {
+  // ISO 8601 timestamp
+  string timestamp = 1;
+
+  // SGLang version
+  string version = 2;
+
+  // Number of DP ranks
+  int32 dp_rank_count = 3;
+
+  // Per-DP-rank load metrics
+  repeated SchedulerLoad loads = 4;
+
+  // Aggregate metrics across all DP ranks
+  AggregateMetrics aggregate = 5;
+}
+
+message SchedulerLoad {
+  int32 dp_rank = 1;
+
+  // Core metrics (always included)
+  int32 num_running_reqs = 2;
+  int32 num_waiting_reqs = 3;
+  int32 num_total_reqs = 4;
+  int32 num_used_tokens = 5;
+  int32 max_total_num_tokens = 6;
+  double token_usage = 7;
+  double gen_throughput = 8;
+  double cache_hit_rate = 9;
+  double utilization = 10;
+  int32 max_running_requests = 11;
+
+  // Optional sections
+  optional MemoryMetrics memory = 12;
+  optional SpeculativeMetrics speculative = 13;
+  optional LoRAMetrics lora = 14;
+  optional DisaggregationMetrics disaggregation = 15;
+  optional QueueMetrics queues = 16;
+}
+
+message MemoryMetrics {
+  double weight_gb = 1;
+  double kv_cache_gb = 2;
+  double graph_gb = 3;
+  int32 token_capacity = 4;
+}
+
+message SpeculativeMetrics {
+  double accept_length = 1;
+  double accept_rate = 2;
+}
+
+message LoRAMetrics {
+  int32 slots_used = 1;
+  int32 slots_total = 2;
+  double utilization = 3;
+}
+
+message DisaggregationMetrics {
+  string mode = 1;  // "prefill", "decode", or "null"
+  int32 prefill_prealloc_queue_reqs = 2;
+  int32 prefill_inflight_queue_reqs = 3;
+  int32 decode_prealloc_queue_reqs = 4;
+  int32 decode_transfer_queue_reqs = 5;
+  int32 decode_retracted_queue_reqs = 6;
+  double kv_transfer_speed_gb_s = 7;
+  double kv_transfer_latency_ms = 8;
+}
+
+message QueueMetrics {
+  int32 waiting = 1;
+  int32 grammar = 2;
+  int32 paused = 3;
+  int32 retracted = 4;
+}
+
+message AggregateMetrics {
+  int32 total_running_reqs = 1;
+  int32 total_waiting_reqs = 2;
+  int32 total_reqs = 3;
+  double avg_token_usage = 4;
+  double avg_throughput = 5;
+  double avg_utilization = 6;
 }
