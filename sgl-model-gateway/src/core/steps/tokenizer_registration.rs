@@ -17,11 +17,7 @@ use super::workflow_data::TokenizerWorkflowData;
 use crate::{
     app_context::AppContext,
     config::TokenizerCacheConfig,
-    tokenizer::{
-        cache::CachedTokenizer,
-        factory,
-        traits::Tokenizer,
-    },
+    tokenizer::{cache::CachedTokenizer, factory, traits::Tokenizer},
     workflow::{
         BackoffStrategy, FailureAction, RetryPolicy, StepDefinition, StepExecutor, StepId,
         StepResult, WorkflowContext, WorkflowDefinition, WorkflowError, WorkflowResult,
