@@ -4,6 +4,7 @@ from aiter.ops.triton.fused_qk_concat import fused_qk_rope_cat
 from aiter.ops.triton.gemm_a16w16 import gemm_a16w16
 from aiter.ops.triton.gemm_a16w16_atomic import gemm_a16w16_atomic
 
+from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
 from sglang.srt.utils import BumpAllocator
 
 __all__ = ["fused_qk_rope_cat", "fused_qk_rope_cat_and_cache_mla"]
@@ -43,3 +44,52 @@ def get_dsv3_gemm_output_zero_allocator_size(
     per_layer_size = 256 * (allocate_size + n_routed_experts)
 
     return num_moe_layers * per_layer_size
+
+
+@torch._dynamo.disable()
+def mutate_kv_cache(
+    mla_inst,
+    q_nope_out,
+    q_pe,
+    k_nope,
+    k_pe,
+    positions,
+    forward_batch,
+    topk_indices,
+) -> torch.Tensor:
+
+    kv_cache_dtype = (
+        fp8_dtype if mla_inst.kv_cache_dtype == "fp8_e4m3" else q_nope_out.dtype
+    )
+
+    k = forward_batch.token_to_kv_pool.get_key_buffer(
+        mla_inst.attn_mqa.layer_id
+    )
+
+    q = fused_qk_rope_cat_and_cache_mla(
+        q_nope_out,
+        q_pe,
+        k_nope,
+        k_pe,
+        k,
+        forward_batch.out_cache_loc,
+        positions,
+        mla_inst.rotary_emb.cos_cache,
+        mla_inst.rotary_emb.sin_cache,
+        mla_inst.attn_mqa.k_scale,
+        mla_inst.rotary_emb.is_neox_style,
+        q_out_dtype=kv_cache_dtype,
+    )[0]
+
+    save_kv_cache = False
+
+    attn_output = mla_inst.attn_mqa(
+        q,
+        k,
+        k_nope,
+        forward_batch,
+        save_kv_cache=False,
+        **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
+    )
+
+    return attn_output

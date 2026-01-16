@@ -191,6 +191,7 @@ if _use_aiter_gfx95:
         aiter_dsv3_router_gemm,
         fused_qk_rope_cat_and_cache_mla,
         get_dsv3_gemm_output_zero_allocator_size,
+        mutate_kv_cache,
     )
 
 if _is_cuda:
@@ -2007,8 +2008,6 @@ class DeepseekV2AttentionMLA(nn.Module):
         topk_indices,
         llama_4_scaling,
     ):
-        save_kv_cache = True
-
         if self.current_attention_backend in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
             extra_args = {}
             if self._fuse_rope_for_trtllm_mla(forward_batch):
@@ -2030,31 +2029,17 @@ class DeepseekV2AttentionMLA(nn.Module):
             )
         else:
             if _use_aiter_gfx95:
-                cos = self.rotary_emb.cos_cache
-                sin = self.rotary_emb.sin_cache
-
-                kv_cache_dtype = (
-                    fp8_dtype if self.kv_cache_dtype == "fp8_e4m3" else q_nope_out.dtype
-                )
-
-                q, _, _, k = fused_qk_rope_cat_and_cache_mla(
+                attn_output = mutate_kv_cache(
+                    self,
                     q_nope_out,
                     q_pe,
                     k_nope,
                     k_pe,
-                    forward_batch.token_to_kv_pool.get_key_buffer(
-                        self.attn_mqa.layer_id
-                    ),
-                    forward_batch.out_cache_loc,
                     positions,
-                    cos,
-                    sin,
-                    self.attn_mqa.k_scale,
-                    self.rotary_emb.is_neox_style,
-                    q_out_dtype=kv_cache_dtype,
+                    forward_batch,
+                    topk_indices,
                 )
 
-                save_kv_cache = False
             else:
                 q = torch.cat([q_nope_out, q_pe], dim=-1)
                 k = torch.cat([k_nope, k_pe], dim=-1)
@@ -2063,14 +2048,16 @@ class DeepseekV2AttentionMLA(nn.Module):
             if llama_4_scaling is not None:
                 q *= llama_4_scaling
 
-            attn_output = self.attn_mqa(
-                q,
-                k,
-                k_nope,
-                forward_batch,
-                save_kv_cache=save_kv_cache,
-                **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
-            )
+            if not _use_aiter_gfx95:
+                attn_output = self.attn_mqa(
+                    q,
+                    forward_batch.token_to_kv_pool.get_key_buffer(self.attn_mqa.layer_id),#k,
+                    k_nope,
+                    forward_batch,
+                    save_kv_cache=True,
+                    **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
+                )
+
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 
         if self.use_deep_gemm_bmm:
