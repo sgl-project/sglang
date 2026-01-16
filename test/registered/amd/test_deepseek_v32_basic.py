@@ -16,6 +16,9 @@ from sglang.test.test_utils import (
 )
 
 register_amd_ci(est_time=3600, suite="stage-c-test-large-8-gpu-amd-mi35x")
+register_amd_ci(
+    est_time=3600, suite="nightly-amd-8-gpu-mi35x-deepseek-v32", nightly=True
+)
 DEEPSEEK_V32_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2-Exp"
 
 
