@@ -24,7 +24,7 @@ from sglang.srt.utils import (
     is_npu,
     is_xpu,
     load_audio,
-    load_image,
+    load_image_tensor,
     load_video,
     logger,
 )
@@ -430,10 +430,8 @@ class BaseMultimodalProcessor(ABC):
                 return data
         try:
             if modality == Modality.IMAGE:
-                img, _ = load_image(data)
-                if discard_alpha_channel and img.mode != "RGB":
-                    img = img.convert("RGB")
-                return img
+                img_tensor, _ = load_image_tensor(data, discard_alpha_channel)
+                return img_tensor
             elif modality == Modality.VIDEO:
                 return load_video(data, frame_count_limit)
             elif modality == Modality.AUDIO:
