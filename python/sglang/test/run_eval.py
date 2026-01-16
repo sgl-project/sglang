@@ -22,6 +22,7 @@ def get_thinking_kwargs(args):
         if thinking_mode == "deepseek-v3":
             thinking_param = "thinking"
         else:
+            # Qwen3
             thinking_param = "enable_thinking"
         return {
             "chat_template_kwargs": {thinking_param: True},
@@ -36,6 +37,7 @@ def run_eval_once(args, base_url: str, eval_obj: Eval) -> dict:
     sampler = ChatCompletionSampler(
         model=args.model,
         max_tokens=getattr(args, "max_tokens", 2048),
+        top_p=getattr(args, "top_p", 1.0),
         base_url=base_url,
         temperature=getattr(args, "temperature", 0.0),
         reasoning_effort=getattr(args, "reasoning_effort", None),
@@ -202,7 +204,7 @@ def run_eval(args):
     return metrics
 
 
-THINKING_MODE_CHOICES = ["deepseek-r1", "deepseek-v3", "qwen3"]
+THINKING_MODE_CHOICES = ["deepseek-v3", "qwen3"]
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -233,13 +235,14 @@ if __name__ == "__main__":
     parser.add_argument("--num-threads", type=int, default=512)
     parser.add_argument("--max-tokens", type=int, default=2048)
     parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument("--reasoning-effort", type=str)
     parser.add_argument(
         "--thinking-mode",
         default=None,
         type=str,
         choices=THINKING_MODE_CHOICES,
-        help="Enable thinking mode in Deepseek R1, V3.1/3.2, or Qwen3",
+        help="Enable thinking mode in Deepseek V3.1/3.2, or Qwen3.--reasoning-parser must be set when launching the server.",
     )
 
     # LongBench-v2 specific arguments
