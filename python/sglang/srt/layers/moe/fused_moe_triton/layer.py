@@ -518,6 +518,37 @@ class FusedMoE(torch.nn.Module):
         num_local_routed_experts = (
             self.num_local_experts - self.num_fused_shared_experts
         )
+
+        # DeepEP Waterfill expands num_experts by `moe_ep_size` (one extra slot per rank)
+        # so the runtime expert layout becomes:
+        #   [routed_0..routed_{old_epr-1}, shared] per rank, where old_epr = old_num_experts / moe_ep_size.
+        #
+        # However, checkpoints still store routed expert weights with ORIGINAL global IDs
+        # [0 .. old_num_experts-1] (e.g. 0..255). If we use the expanded layout
+        # (num_local_routed_experts = 33) to map these checkpoint IDs, experts from rank>=2
+        # will be loaded onto the wrong EP ranks (e.g. expert 64 would incorrectly map to rank1).
+        #
+        # So, when Waterfill is enabled, we must map checkpoint expert_id using the
+        # ORIGINAL experts_per_rank (old_epr), not the expanded one.
+        if (
+            get_global_server_args().enable_deepep_waterfill
+            and get_moe_a2a_backend().is_deepep()
+            and self.num_fused_shared_experts == 0
+        ):
+            old_num_global_routed_experts = num_global_routed_experts - self.moe_ep_size
+            if (
+                old_num_global_routed_experts > 0
+                and old_num_global_routed_experts % self.moe_ep_size == 0
+            ):
+                old_num_local_routed_experts = (
+                    old_num_global_routed_experts // self.moe_ep_size
+                )
+                start_idx = self.moe_ep_rank * old_num_local_routed_experts
+                end_idx = (self.moe_ep_rank + 1) * old_num_local_routed_experts
+                if start_idx <= expert_id < end_idx:
+                    return expert_id - start_idx
+                return -1
+
         start_idx = self.moe_ep_rank * num_local_routed_experts
         end_idx = (self.moe_ep_rank + 1) * num_local_routed_experts
         if start_idx <= expert_id < end_idx:

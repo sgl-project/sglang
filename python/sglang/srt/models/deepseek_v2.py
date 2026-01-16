@@ -172,6 +172,53 @@ _is_gfx95_supported = is_gfx95_supported()
 
 _use_aiter_gfx95 = _use_aiter and _is_gfx95_supported
 
+# Global step counter for MoE debug logging
+_moe_debug_step = 0
+_MOE_DEBUG_ENABLED = os.environ.get("SGLANG_MOE_DEBUG", "0") == "1"
+
+
+def _log_moe_tensor(
+    name: str,
+    tensor: torch.Tensor,
+    layer_id: int,
+    mode: str,
+    step: int,
+    waterfill: bool = False,
+):
+    """Log tensor statistics for MoE debugging. Only logs on rank 0."""
+    from sglang.srt.distributed import get_tensor_model_parallel_rank
+
+    if not _MOE_DEBUG_ENABLED:
+        return
+
+    rank = get_tensor_model_parallel_rank()
+    if rank != 0:
+        return
+
+    # Get tensor stats
+    if tensor is None:
+        stats = "None"
+    elif tensor.numel() == 0:
+        stats = f"shape={list(tensor.shape)}, empty"
+    else:
+        t_float = tensor.float()
+        stats = (
+            f"shape={list(tensor.shape)}, dtype={tensor.dtype}, "
+            f"norm={t_float.norm().item():.4f}, mean={t_float.mean().item():.6f}, "
+            f"min={t_float.min().item():.4f}, max={t_float.max().item():.4f}"
+        )
+
+    wf_tag = "[WF]" if waterfill else "[BL]"
+    print(f"{wf_tag}[L{layer_id}][{mode}][S{step}] {name}: {stats}", flush=True)
+
+
+def _increment_moe_step():
+    """Increment global step counter."""
+    global _moe_debug_step
+    _moe_debug_step += 1
+    return _moe_debug_step
+
+
 if _use_aiter_gfx95:
 
     from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (
@@ -657,12 +704,33 @@ class DeepseekV2MoE(nn.Module):
             # with fused_shared_experts
             fused_shared_experts_scaling_factor = 1.0 / float(self.moe_ep_size)
 
+        # Check if DeepEP Waterfill will be enabled (need to know before creating experts)
+        # Waterfill fuses shared expert as a real routed expert, expanding num_experts
+        self._will_enable_deepep_waterfill = (
+            get_global_server_args().enable_deepep_waterfill
+            and get_moe_a2a_backend().is_deepep()
+            and self.num_fused_shared_experts == 0
+            and config.n_shared_experts is not None
+            and config.n_shared_experts > 0
+        )
+
+        # Waterfill: expand num_experts to include shared expert per rank
+        # New layout: each rank has (n_routed_experts // ep_size) + 1 experts
+        if self._will_enable_deepep_waterfill:
+            # Each rank gets one extra expert slot for shared expert
+            num_experts_for_moe = config.n_routed_experts + self.moe_ep_size
+            top_k_for_moe = config.num_experts_per_tok + 1  # +1 for shared expert
+        else:
+            num_experts_for_moe = (
+                config.n_routed_experts + self.num_fused_shared_experts
+            )
+            top_k_for_moe = config.num_experts_per_tok + self.num_fused_shared_experts
+
         self.experts = get_moe_impl_class(quant_config)(
-            num_experts=config.n_routed_experts
-            + self.num_fused_shared_experts
+            num_experts=num_experts_for_moe
             + get_global_server_args().ep_num_redundant_experts,
             num_fused_shared_experts=self.num_fused_shared_experts,
-            top_k=config.num_experts_per_tok + self.num_fused_shared_experts,
+            top_k=top_k_for_moe,
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
             layer_id=self.layer_id,
@@ -674,6 +742,8 @@ class DeepseekV2MoE(nn.Module):
             prefix=add_prefix("experts", prefix),
         )
 
+        # Note: For Waterfill mode, TopK still selects only routed experts (8)
+        # The 9th column (shared expert) is added by prepare_dispatch
         self.topk = TopK(
             top_k=config.num_experts_per_tok + self.num_fused_shared_experts,
             layer_id=self.layer_id,
@@ -781,24 +851,334 @@ class DeepseekV2MoE(nn.Module):
         self._fuse_shared_experts_inside_sbo = SboFlags.fuse_shared_experts_inside_sbo()
 
         # Initialize DeepEP Waterfill balancer if enabled
-        self._enable_deepep_waterfill = (
-            get_global_server_args().enable_deepep_waterfill
-            and get_moe_a2a_backend().is_deepep()
-            and self.num_fused_shared_experts == 0
-            and config.n_shared_experts is not None
-            and config.n_shared_experts > 0
-        )
+        self._enable_deepep_waterfill = self._will_enable_deepep_waterfill
         self.deepep_waterfill_balancer = None
         if self._enable_deepep_waterfill:
             from sglang.srt.distributed import get_moe_expert_parallel_rank
             from sglang.srt.layers.moe.deepep_waterfill import DeepEPWaterfillBalancer
 
             self.deepep_waterfill_balancer = DeepEPWaterfillBalancer(
-                num_experts=config.n_routed_experts,
+                num_routed_experts=config.n_routed_experts,
                 world_size=self.moe_ep_size,
                 rank=get_moe_expert_parallel_rank(),  # Use EP rank, not TP rank!
                 routed_scaling_factor=self.routed_scaling_factor,
             )
+
+            # Store old_experts_per_rank for weight copying later
+            self._old_experts_per_rank = config.n_routed_experts // self.moe_ep_size
+
+    def _copy_shared_expert_weights_to_moe(self):
+        """
+        Copy shared expert weights to the MoE layer's expert weights.
+
+        In Waterfill mode, shared expert is fused as a real routed expert.
+        Each rank has (old_experts_per_rank + 1) experts:
+        - [0, old_experts_per_rank-1]: routed experts
+        - [old_experts_per_rank]: shared expert (copied from self.shared_experts)
+
+        This should be called after model weights are loaded.
+        """
+        from sglang.srt.distributed import get_tensor_model_parallel_rank
+
+        rank = get_tensor_model_parallel_rank()
+
+        if not self._enable_deepep_waterfill:
+            return
+
+        if not hasattr(self, "shared_experts"):
+            if rank == 0:
+                print(
+                    f"[Waterfill][L{self.layer_id}] Skipping weight copy: no shared_experts attribute",
+                    flush=True,
+                )
+            return
+
+        # Local shared expert index = old_experts_per_rank (e.g., 32)
+        local_shared_idx = self._old_experts_per_rank
+        if rank == 0:
+            print(
+                f"[Waterfill][L{self.layer_id}] Copying shared expert weights to MoE layer at index {local_shared_idx}",
+                flush=True,
+            )
+            print(
+                f"[Waterfill][L{self.layer_id}] shared_experts_is_fp8={self.shared_experts_is_fp8}",
+                flush=True,
+            )
+
+        # Copy w13 (gate_up) weights and scales
+        if hasattr(self.experts, "w13_weight") and hasattr(
+            self.shared_experts, "gate_up_proj"
+        ):
+            src_weight = self.shared_experts.gate_up_proj.weight.data
+            dst_weight = self.experts.w13_weight.data[local_shared_idx]
+
+            if rank == 0:
+                print(
+                    f"[Waterfill][L{self.layer_id}] w13: src_shape={src_weight.shape}, src_dtype={src_weight.dtype}, dst_shape={dst_weight.shape}, dst_dtype={dst_weight.dtype}",
+                    flush=True,
+                )
+
+            if src_weight.shape != dst_weight.shape:
+                if rank == 0:
+                    print(
+                        f"[Waterfill][L{self.layer_id}] ERROR: w13 shape mismatch! src={src_weight.shape}, dst={dst_weight.shape}",
+                        flush=True,
+                    )
+                return
+
+            if src_weight.dtype != dst_weight.dtype:
+                if rank == 0:
+                    print(
+                        f"[Waterfill][L{self.layer_id}] WARNING: w13 dtype mismatch! src={src_weight.dtype}, dst={dst_weight.dtype}",
+                        flush=True,
+                    )
+                # Continue anyway - PyTorch will handle the conversion
+
+            self.experts.w13_weight.data[local_shared_idx].copy_(src_weight)
+            if rank == 0:
+                print(f"[Waterfill][L{self.layer_id}] Copied w13_weight", flush=True)
+
+            # Debug: compare norms of different experts
+            expert0_w13_norm = self.experts.w13_weight.data[0].float().norm().item()
+            expert32_w13_norm = (
+                self.experts.w13_weight.data[local_shared_idx].float().norm().item()
+            )
+            src_w13_norm = src_weight.float().norm().item()
+            if rank == 0:
+                print(
+                    f"[Waterfill][L{self.layer_id}] w13 norms: expert0={expert0_w13_norm:.2f}, expert{local_shared_idx}={expert32_w13_norm:.2f}, src={src_w13_norm:.2f}",
+                    flush=True,
+                )
+
+            # Copy FP8 scale if present (for FP8 models)
+            if hasattr(self.experts, "w13_weight_scale_inv") and hasattr(
+                self.shared_experts.gate_up_proj, "weight_scale_inv"
+            ):
+                src_scale = self.shared_experts.gate_up_proj.weight_scale_inv.data
+                dst_scale = self.experts.w13_weight_scale_inv.data[local_shared_idx]
+                if rank == 0:
+                    print(
+                        f"[Waterfill][L{self.layer_id}] w13_scale_inv: src_shape={src_scale.shape}, dst_shape={dst_scale.shape}",
+                        flush=True,
+                    )
+                if src_scale.shape != dst_scale.shape:
+                    if rank == 0:
+                        print(
+                            f"[Waterfill][L{self.layer_id}] ERROR: w13_scale_inv shape mismatch! src={src_scale.shape}, dst={dst_scale.shape}",
+                            flush=True,
+                        )
+                else:
+                    self.experts.w13_weight_scale_inv.data[local_shared_idx].copy_(
+                        src_scale
+                    )
+                    if rank == 0:
+                        print(
+                            f"[Waterfill][L{self.layer_id}] Copied w13_weight_scale_inv",
+                            flush=True,
+                        )
+            elif hasattr(self.experts, "w13_weight_scale") and hasattr(
+                self.shared_experts.gate_up_proj, "weight_scale"
+            ):
+                # Per-tensor scale
+                src_scale = self.shared_experts.gate_up_proj.weight_scale.data
+                self.experts.w13_weight_scale.data[local_shared_idx].copy_(src_scale)
+                if rank == 0:
+                    print(
+                        f"[Waterfill][L{self.layer_id}] Copied w13_weight_scale",
+                        flush=True,
+                    )
+
+        # Copy w2 (down) weights and scales
+        if hasattr(self.experts, "w2_weight") and hasattr(
+            self.shared_experts, "down_proj"
+        ):
+            src_weight = self.shared_experts.down_proj.weight.data
+            dst_weight = self.experts.w2_weight.data[local_shared_idx]
+
+            if rank == 0:
+                print(
+                    f"[Waterfill][L{self.layer_id}] w2: src_shape={src_weight.shape}, src_dtype={src_weight.dtype}, dst_shape={dst_weight.shape}, dst_dtype={dst_weight.dtype}",
+                    flush=True,
+                )
+
+            if src_weight.shape != dst_weight.shape:
+                if rank == 0:
+                    print(
+                        f"[Waterfill][L{self.layer_id}] ERROR: w2 shape mismatch! src={src_weight.shape}, dst={dst_weight.shape}",
+                        flush=True,
+                    )
+                return
+
+            if src_weight.dtype != dst_weight.dtype:
+                if rank == 0:
+                    print(
+                        f"[Waterfill][L{self.layer_id}] WARNING: w2 dtype mismatch! src={src_weight.dtype}, dst={dst_weight.dtype}",
+                        flush=True,
+                    )
+                # Continue anyway
+
+            self.experts.w2_weight.data[local_shared_idx].copy_(src_weight)
+            if rank == 0:
+                print(f"[Waterfill][L{self.layer_id}] Copied w2_weight", flush=True)
+
+            # Debug: compare norms of different experts
+            expert0_w2_norm = self.experts.w2_weight.data[0].float().norm().item()
+            expert32_w2_norm = (
+                self.experts.w2_weight.data[local_shared_idx].float().norm().item()
+            )
+            src_w2_norm = src_weight.float().norm().item()
+            if rank == 0:
+                print(
+                    f"[Waterfill][L{self.layer_id}] w2 norms: expert0={expert0_w2_norm:.2f}, expert{local_shared_idx}={expert32_w2_norm:.2f}, src={src_w2_norm:.2f}",
+                    flush=True,
+                )
+
+            # Copy FP8 scale if present
+            if hasattr(self.experts, "w2_weight_scale_inv") and hasattr(
+                self.shared_experts.down_proj, "weight_scale_inv"
+            ):
+                src_scale = self.shared_experts.down_proj.weight_scale_inv.data
+                dst_scale = self.experts.w2_weight_scale_inv.data[local_shared_idx]
+                if rank == 0:
+                    print(
+                        f"[Waterfill][L{self.layer_id}] w2_scale_inv: src_shape={src_scale.shape}, dst_shape={dst_scale.shape}",
+                        flush=True,
+                    )
+                if src_scale.shape != dst_scale.shape:
+                    if rank == 0:
+                        print(
+                            f"[Waterfill][L{self.layer_id}] ERROR: w2_scale_inv shape mismatch! src={src_scale.shape}, dst={dst_scale.shape}",
+                            flush=True,
+                        )
+                else:
+                    self.experts.w2_weight_scale_inv.data[local_shared_idx].copy_(
+                        src_scale
+                    )
+                    if rank == 0:
+                        print(
+                            f"[Waterfill][L{self.layer_id}] Copied w2_weight_scale_inv",
+                            flush=True,
+                        )
+            elif hasattr(self.experts, "w2_weight_scale") and hasattr(
+                self.shared_experts.down_proj, "weight_scale"
+            ):
+                src_scale = self.shared_experts.down_proj.weight_scale.data
+                self.experts.w2_weight_scale.data[local_shared_idx].copy_(src_scale)
+                if rank == 0:
+                    print(
+                        f"[Waterfill][L{self.layer_id}] Copied w2_weight_scale",
+                        flush=True,
+                    )
+
+        # After copying weights, check if we need to requant to ue8m0 format
+        # This is needed because process_weights_after_loading() has already
+        # requanted other experts to ue8m0, but our copied weights might be
+        # in a different format.
+        if hasattr(self.experts, "w13_weight_scale_inv"):
+            moe_scale_inv = self.experts.w13_weight_scale_inv
+            moe_is_ue8m0 = (
+                hasattr(moe_scale_inv, "format_ue8m0") and moe_scale_inv.format_ue8m0
+            )
+
+            # Check if shared_experts scale is already ue8m0
+            shared_is_ue8m0 = False
+            if hasattr(self.shared_experts.gate_up_proj, "weight_scale_inv"):
+                shared_scale = self.shared_experts.gate_up_proj.weight_scale_inv
+                shared_is_ue8m0 = (
+                    hasattr(shared_scale, "format_ue8m0") and shared_scale.format_ue8m0
+                )
+
+            if rank == 0:
+                print(
+                    f"[Waterfill][L{self.layer_id}] MoE scale is ue8m0: {moe_is_ue8m0}, Shared scale is ue8m0: {shared_is_ue8m0}",
+                    flush=True,
+                )
+
+            # Only requant if MoE is ue8m0 but shared is not
+            if moe_is_ue8m0 and not shared_is_ue8m0:
+                if rank == 0:
+                    print(
+                        f"[Waterfill][L{self.layer_id}] Requanting expert {local_shared_idx} weights to ue8m0 format",
+                        flush=True,
+                    )
+                from sglang.srt.layers.quantization.fp8_utils import (
+                    requant_weight_ue8m0,
+                )
+
+                # Get block size from quant_config
+                weight_block_size = [128, 128]  # Default
+                if (
+                    hasattr(self.experts, "quant_config")
+                    and self.experts.quant_config is not None
+                ):
+                    if hasattr(self.experts.quant_config, "weight_block_size"):
+                        weight_block_size = self.experts.quant_config.weight_block_size
+                elif (
+                    hasattr(self.experts, "quant_method")
+                    and self.experts.quant_method is not None
+                ):
+                    if (
+                        hasattr(self.experts.quant_method, "quant_config")
+                        and self.experts.quant_method.quant_config is not None
+                    ):
+                        if hasattr(
+                            self.experts.quant_method.quant_config, "weight_block_size"
+                        ):
+                            weight_block_size = (
+                                self.experts.quant_method.quant_config.weight_block_size
+                            )
+
+                if rank == 0:
+                    print(
+                        f"[Waterfill][L{self.layer_id}] Using weight_block_size={weight_block_size}",
+                        flush=True,
+                    )
+
+                # Requant w13 for expert at local_shared_idx
+                w13_weight_expert = self.experts.w13_weight.data[local_shared_idx]
+                w13_scale_expert = self.experts.w13_weight_scale_inv.data[
+                    local_shared_idx
+                ]
+                new_w13_weight, new_w13_scale = requant_weight_ue8m0(
+                    w13_weight_expert.unsqueeze(0),
+                    w13_scale_expert.unsqueeze(0),
+                    weight_block_size,
+                )
+                self.experts.w13_weight.data[local_shared_idx].copy_(
+                    new_w13_weight.squeeze(0)
+                )
+                self.experts.w13_weight_scale_inv.data[local_shared_idx].copy_(
+                    new_w13_scale.squeeze(0)
+                )
+
+                # Requant w2 for expert at local_shared_idx
+                w2_weight_expert = self.experts.w2_weight.data[local_shared_idx]
+                w2_scale_expert = self.experts.w2_weight_scale_inv.data[
+                    local_shared_idx
+                ]
+                new_w2_weight, new_w2_scale = requant_weight_ue8m0(
+                    w2_weight_expert.unsqueeze(0),
+                    w2_scale_expert.unsqueeze(0),
+                    weight_block_size,
+                )
+                self.experts.w2_weight.data[local_shared_idx].copy_(
+                    new_w2_weight.squeeze(0)
+                )
+                self.experts.w2_weight_scale_inv.data[local_shared_idx].copy_(
+                    new_w2_scale.squeeze(0)
+                )
+
+                if rank == 0:
+                    print(
+                        f"[Waterfill][L{self.layer_id}] Requanted expert {local_shared_idx} to ue8m0 format",
+                        flush=True,
+                    )
+            elif moe_is_ue8m0 and shared_is_ue8m0:
+                if rank == 0:
+                    print(
+                        f"[Waterfill][L{self.layer_id}] Both MoE and shared are ue8m0, no requant needed",
+                        flush=True,
+                    )
 
     def get_moe_weights(self):
         return [
@@ -1017,6 +1397,15 @@ class DeepseekV2MoE(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
+        # Determine mode for logging
+        mode = "prefill" if forward_batch.forward_mode.is_prefill() else "decode"
+        step = _increment_moe_step() if self.layer_id == 3 else _moe_debug_step
+
+        # Log input
+        _log_moe_tensor(
+            "input_hidden", hidden_states, self.layer_id, mode, step, waterfill=False
+        )
+
         shared_output = None
         sbo_enabled_flag = self._fuse_shared_experts_inside_sbo and not self.is_nextn
         sbo_overlap_dispatch_flag = (
@@ -1029,6 +1418,15 @@ class DeepseekV2MoE(nn.Module):
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states, forward_batch=forward_batch)
+            _log_moe_tensor(
+                "router_logits",
+                router_logits,
+                self.layer_id,
+                mode,
+                step,
+                waterfill=False,
+            )
+
             if not sbo_enabled_flag:
                 if self.alt_stream is not None:
                     self.alt_stream.wait_stream(torch.cuda.current_stream())
@@ -1038,6 +1436,15 @@ class DeepseekV2MoE(nn.Module):
                         shared_event = self.alt_stream.record_event()
                 else:
                     shared_output = self._forward_shared_experts(hidden_states)
+                _log_moe_tensor(
+                    "shared_output",
+                    shared_output,
+                    self.layer_id,
+                    mode,
+                    step,
+                    waterfill=False,
+                )
+
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
@@ -1045,6 +1452,22 @@ class DeepseekV2MoE(nn.Module):
                 expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
                     layer_id=self.layer_id,
                 ),
+            )
+            _log_moe_tensor(
+                "topk_ids",
+                topk_output.topk_ids,
+                self.layer_id,
+                mode,
+                step,
+                waterfill=False,
+            )
+            _log_moe_tensor(
+                "topk_weights",
+                topk_output.topk_weights,
+                self.layer_id,
+                mode,
+                step,
+                waterfill=False,
             )
         else:
             topk_output = self.topk.empty_topk_output(hidden_states.device)
@@ -1121,6 +1544,54 @@ class DeepseekV2MoE(nn.Module):
 
                 nonlocal shared_output
 
+                # === BASELINE COMBINE DEBUG: Before combine ===
+                if _MOE_DEBUG_ENABLED and self.layer_id == 3:
+                    from sglang.srt.distributed import get_tensor_model_parallel_rank
+
+                    if get_tensor_model_parallel_rank() == 0:
+                        ci_hidden = combine_input.hidden_states
+                        ci_topk_ids = combine_input.topk_ids
+                        ci_topk_weights = combine_input.topk_weights
+
+                        print(
+                            f"[BL][L{self.layer_id}][{mode}][S{step}] === BEFORE COMBINE ===",
+                            flush=True,
+                        )
+                        print(
+                            f"[BL][L{self.layer_id}][{mode}][S{step}] combine_input.hidden_states: shape={ci_hidden.shape}, dtype={ci_hidden.dtype}",
+                            flush=True,
+                        )
+                        print(
+                            f"[BL][L{self.layer_id}][{mode}][S{step}]   norm={ci_hidden.float().norm().item():.4f}, mean={ci_hidden.float().mean().item():.6f}",
+                            flush=True,
+                        )
+                        print(
+                            f"[BL][L{self.layer_id}][{mode}][S{step}]   min={ci_hidden.float().min().item():.4f}, max={ci_hidden.float().max().item():.4f}",
+                            flush=True,
+                        )
+
+                        print(
+                            f"[BL][L{self.layer_id}][{mode}][S{step}] combine_input.topk_ids: shape={ci_topk_ids.shape}",
+                            flush=True,
+                        )
+                        print(
+                            f"[BL][L{self.layer_id}][{mode}][S{step}]   unique values: {ci_topk_ids.unique().tolist()}",
+                            flush=True,
+                        )
+
+                        print(
+                            f"[BL][L{self.layer_id}][{mode}][S{step}] combine_input.topk_weights: shape={ci_topk_weights.shape}",
+                            flush=True,
+                        )
+                        print(
+                            f"[BL][L{self.layer_id}][{mode}][S{step}]   sum_per_row={ci_topk_weights.sum(dim=1).tolist()}",
+                            flush=True,
+                        )
+                        print(
+                            f"[BL][L{self.layer_id}][{mode}][S{step}]   total_sum={ci_topk_weights.sum().item():.4f}",
+                            flush=True,
+                        )
+
                 if (
                     e := dispatcher.meta_overlap_args.get("record_event_after_down")
                 ) is not None:
@@ -1135,8 +1606,45 @@ class DeepseekV2MoE(nn.Module):
                 pre_combine_hook_handle.remove()
 
             def _post_combine_hook(
-                dispatcher: BaseDispatcher, hidden_states: torch.Tensor
+                dispatcher: BaseDispatcher, combined_hs: torch.Tensor
             ):
+                # === BASELINE COMBINE DEBUG: After combine ===
+                if _MOE_DEBUG_ENABLED and self.layer_id == 3:
+                    from sglang.srt.distributed import get_tensor_model_parallel_rank
+
+                    if get_tensor_model_parallel_rank() == 0:
+                        print(
+                            f"[BL][L{self.layer_id}][{mode}][S{step}] === AFTER COMBINE ===",
+                            flush=True,
+                        )
+                        print(
+                            f"[BL][L{self.layer_id}][{mode}][S{step}] combined_hidden_states: shape={combined_hs.shape}, dtype={combined_hs.dtype}",
+                            flush=True,
+                        )
+                        print(
+                            f"[BL][L{self.layer_id}][{mode}][S{step}]   norm={combined_hs.float().norm().item():.4f}, mean={combined_hs.float().mean().item():.6f}",
+                            flush=True,
+                        )
+                        print(
+                            f"[BL][L{self.layer_id}][{mode}][S{step}]   min={combined_hs.float().min().item():.4f}, max={combined_hs.float().max().item():.4f}",
+                            flush=True,
+                        )
+
+                        # Compare with original input
+                        input_hidden_norm = (
+                            hidden_states.float().norm().item()
+                            if hidden_states.shape[0] > 0
+                            else 0
+                        )
+                        co_norm = combined_hs.float().norm().item()
+                        output_input_ratio = (
+                            co_norm / input_hidden_norm if input_hidden_norm > 0 else 0
+                        )
+                        print(
+                            f"[BL][L{self.layer_id}][{mode}][S{step}] combine_output_norm / original_input_norm = {output_input_ratio:.4f}",
+                            flush=True,
+                        )
+
                 dispatcher.clear_overlap_args()
                 self.experts.clear_overlap_args()
                 post_combine_hook_handle.remove()
@@ -1154,6 +1662,14 @@ class DeepseekV2MoE(nn.Module):
         final_hidden_states = self.experts(
             hidden_states=hidden_states,
             topk_output=topk_output,
+        )
+        _log_moe_tensor(
+            "moe_output",
+            final_hidden_states,
+            self.layer_id,
+            mode,
+            step,
+            waterfill=False,
         )
 
         if (
@@ -1173,17 +1689,268 @@ class DeepseekV2MoE(nn.Module):
             if not self.experts.should_fuse_routed_scaling_factor_in_topk:
                 final_hidden_states *= self.routed_scaling_factor
 
+        _log_moe_tensor(
+            "final_output",
+            final_hidden_states,
+            self.layer_id,
+            mode,
+            step,
+            waterfill=False,
+        )
         return final_hidden_states
 
     def _forward_shared_experts(
         self, hidden_states, gemm_output_zero_allocator: BumpAllocator = None
     ):
+        import os
+
+        DEBUG_SHARED = os.environ.get("SGLANG_DEEPEP_WATERFILL_DEBUG", "0") == "1"
         if (hidden_states.shape[0] > 0) and (self.num_fused_shared_experts == 0):
-            return self.shared_experts(
+            if DEBUG_SHARED and self.layer_id == 3:
+                print(
+                    f"[Shared Expert] Layer {self.layer_id}: input norm={hidden_states.float().norm().item():.4f}",
+                    flush=True,
+                )
+            output = self.shared_experts(
                 hidden_states, gemm_output_zero_allocator=gemm_output_zero_allocator
             )
+            if DEBUG_SHARED and self.layer_id == 3:
+                print(
+                    f"[Shared Expert] Layer {self.layer_id}: output norm={output.float().norm().item():.4f}",
+                    flush=True,
+                )
+            return output
         else:
             return None
+
+    def _verify_moe_calculation(self, dispatch_output, combine_input, mode, step):
+        """
+        Verify MoE calculation by actually computing GEMM and comparing with real output.
+
+        MoE computation:
+        1. gate_proj = hidden @ w1.T  (w1 is first half of w13)
+        2. up_proj = hidden @ w3.T   (w3 is second half of w13)
+        3. intermediate = silu(gate_proj) * up_proj
+        4. output = intermediate @ w2.T
+        5. final = weighted sum of outputs from all experts
+        """
+        from sglang.srt.distributed import get_tensor_model_parallel_rank
+
+        rank = get_tensor_model_parallel_rank()
+
+        # Get dispatch data
+        dispatch_hidden = dispatch_output.hidden_states  # [num_recv_tokens, hidden_dim]
+        dispatch_topk_ids = dispatch_output.topk_ids  # [num_original_tokens, topk]
+        dispatch_topk_weights = (
+            dispatch_output.topk_weights
+        )  # [num_original_tokens, topk]
+        num_recv_tokens_per_expert = dispatch_output.num_recv_tokens_per_expert
+
+        # Get combine_input (after ep_gather) - this is the actual output
+        actual_output = combine_input.hidden_states  # [num_original_tokens, hidden_dim]
+
+        # Get MoE weights
+        num_local_experts = self.experts.num_local_experts
+        w13_weight = (
+            self.experts.w13_weight
+        )  # [num_local_experts, 2*intermediate_size, hidden_size]
+        w2_weight = (
+            self.experts.w2_weight
+        )  # [num_local_experts, hidden_size, intermediate_size]
+
+        # Get scales if FP8
+        w13_scale = getattr(self.experts, "w13_weight_scale_inv", None)
+        w2_scale = getattr(self.experts, "w2_weight_scale_inv", None)
+
+        print(
+            f"\n[MOE_VERIFY][Rank {rank}][L{self.layer_id}][{mode}][S{step}] === MoE GEMM Verification ===",
+            flush=True,
+        )
+        print(
+            f"[MOE_VERIFY][Rank {rank}] dispatch_hidden: shape={dispatch_hidden.shape}, dtype={dispatch_hidden.dtype}",
+            flush=True,
+        )
+        print(
+            f"[MOE_VERIFY][Rank {rank}] num_recv_tokens_per_expert: {num_recv_tokens_per_expert}",
+            flush=True,
+        )
+        print(
+            f"[MOE_VERIFY][Rank {rank}] w13_weight: shape={w13_weight.shape}, dtype={w13_weight.dtype}",
+            flush=True,
+        )
+        print(
+            f"[MOE_VERIFY][Rank {rank}] w2_weight: shape={w2_weight.shape}, dtype={w2_weight.dtype}",
+            flush=True,
+        )
+        if w13_scale is not None:
+            print(
+                f"[MOE_VERIFY][Rank {rank}] w13_scale: shape={w13_scale.shape}",
+                flush=True,
+            )
+
+        # Skip if no tokens received
+        total_recv = (
+            sum(num_recv_tokens_per_expert)
+            if isinstance(num_recv_tokens_per_expert, list)
+            else 0
+        )
+        if total_recv == 0 or dispatch_hidden.numel() == 0:
+            print(
+                f"[MOE_VERIFY][Rank {rank}] No tokens received, skipping GEMM verification",
+                flush=True,
+            )
+            return
+
+        # === Manually compute MoE output ===
+        # dispatch_hidden contains tokens for multiple experts, concatenated
+        # We need to split by expert and compute each expert's output
+
+        hidden_dim = dispatch_hidden.shape[-1]
+        intermediate_size = w13_weight.shape[1] // 2
+
+        print(
+            f"[MOE_VERIFY][Rank {rank}] hidden_dim={hidden_dim}, intermediate_size={intermediate_size}",
+            flush=True,
+        )
+        print(
+            f"[MOE_VERIFY][Rank {rank}] dispatch_hidden norm={dispatch_hidden.float().norm().item():.4f}",
+            flush=True,
+        )
+
+        # Convert weights to float32 for computation
+        # Note: For FP8 weights, we need to dequantize
+        try:
+            if w13_weight.dtype == torch.float8_e4m3fn:
+                # FP8 weights - need to handle scales
+                print(
+                    f"[MOE_VERIFY][Rank {rank}] FP8 weights detected, computing with scales",
+                    flush=True,
+                )
+                # For simplicity, just compute one expert's output as a sanity check
+                expert_id = 0
+                for eid in range(num_local_experts):
+                    if num_recv_tokens_per_expert[eid] > 0:
+                        expert_id = eid
+                        break
+
+                # Get tokens for this expert
+                start_idx = sum(num_recv_tokens_per_expert[:expert_id])
+                num_tokens = num_recv_tokens_per_expert[expert_id]
+                if num_tokens > 0:
+                    expert_hidden = dispatch_hidden[
+                        start_idx : start_idx + num_tokens
+                    ].float()
+
+                    # Get expert weights and dequantize
+                    w13_e = w13_weight[expert_id].float()  # [2*intermediate, hidden]
+                    w2_e = w2_weight[expert_id].float()  # [hidden, intermediate]
+
+                    # Apply scales if available
+                    if w13_scale is not None and w13_scale.numel() > 0:
+                        # Scale shape depends on quantization scheme
+                        print(
+                            f"[MOE_VERIFY][Rank {rank}] w13_scale shape: {w13_scale.shape}",
+                            flush=True,
+                        )
+
+                    # Compute gate and up projections
+                    w1 = w13_e[:intermediate_size]  # [intermediate, hidden]
+                    w3 = w13_e[intermediate_size:]  # [intermediate, hidden]
+
+                    gate = torch.matmul(
+                        expert_hidden, w1.T
+                    )  # [num_tokens, intermediate]
+                    up = torch.matmul(expert_hidden, w3.T)  # [num_tokens, intermediate]
+
+                    # SiLU activation
+                    intermediate_out = torch.nn.functional.silu(gate) * up
+
+                    # Down projection
+                    expert_output = torch.matmul(
+                        intermediate_out, w2_e.T
+                    )  # [num_tokens, hidden]
+
+                    print(
+                        f"[MOE_VERIFY][Rank {rank}] Expert {expert_id} manual computation:",
+                        flush=True,
+                    )
+                    print(
+                        f"[MOE_VERIFY][Rank {rank}]   input norm: {expert_hidden.norm().item():.4f}",
+                        flush=True,
+                    )
+                    print(
+                        f"[MOE_VERIFY][Rank {rank}]   gate norm: {gate.norm().item():.4f}",
+                        flush=True,
+                    )
+                    print(
+                        f"[MOE_VERIFY][Rank {rank}]   up norm: {up.norm().item():.4f}",
+                        flush=True,
+                    )
+                    print(
+                        f"[MOE_VERIFY][Rank {rank}]   intermediate norm: {intermediate_out.norm().item():.4f}",
+                        flush=True,
+                    )
+                    print(
+                        f"[MOE_VERIFY][Rank {rank}]   output norm: {expert_output.norm().item():.4f}",
+                        flush=True,
+                    )
+            else:
+                # BF16/FP32 weights
+                print(f"[MOE_VERIFY][Rank {rank}] BF16/FP32 weights", flush=True)
+
+                # Find first expert with tokens
+                expert_id = 0
+                for eid in range(num_local_experts):
+                    if num_recv_tokens_per_expert[eid] > 0:
+                        expert_id = eid
+                        break
+
+                start_idx = sum(num_recv_tokens_per_expert[:expert_id])
+                num_tokens = num_recv_tokens_per_expert[expert_id]
+                if num_tokens > 0:
+                    expert_hidden = dispatch_hidden[
+                        start_idx : start_idx + num_tokens
+                    ].float()
+
+                    w13_e = w13_weight[expert_id].float()
+                    w2_e = w2_weight[expert_id].float()
+
+                    w1 = w13_e[:intermediate_size]
+                    w3 = w13_e[intermediate_size:]
+
+                    gate = torch.matmul(expert_hidden, w1.T)
+                    up = torch.matmul(expert_hidden, w3.T)
+                    intermediate_out = torch.nn.functional.silu(gate) * up
+                    expert_output = torch.matmul(intermediate_out, w2_e.T)
+
+                    print(
+                        f"[MOE_VERIFY][Rank {rank}] Expert {expert_id} manual computation:",
+                        flush=True,
+                    )
+                    print(
+                        f"[MOE_VERIFY][Rank {rank}]   input norm: {expert_hidden.norm().item():.4f}",
+                        flush=True,
+                    )
+                    print(
+                        f"[MOE_VERIFY][Rank {rank}]   output norm: {expert_output.norm().item():.4f}",
+                        flush=True,
+                    )
+
+        except Exception as e:
+            print(
+                f"[MOE_VERIFY][Rank {rank}] Error in manual computation: {e}",
+                flush=True,
+            )
+            import traceback
+
+            traceback.print_exc()
+
+        # Compare with actual output
+        print(
+            f"[MOE_VERIFY][Rank {rank}] actual_output: shape={actual_output.shape}, norm={actual_output.float().norm().item():.4f}",
+            flush=True,
+        )
+        print(f"[MOE_VERIFY][Rank {rank}] === End GEMM Verification ===\n", flush=True)
 
     def forward_deepep_waterfill(
         self,
@@ -1192,41 +1959,20 @@ class DeepseekV2MoE(nn.Module):
     ) -> torch.Tensor:
         """
         Forward pass with DeepEP-based waterfill load balancing for shared expert.
-
-        Shared expert is treated as the 9th routed expert and dispatched through
-        DeepEP to achieve load balancing without extra communication.
-
-        Key Design:
-        - Each token's shared expert is assigned to a rank it already routes to
-          (or source rank), selected by waterfill algorithm
-        - LOCAL_SHARED_MARKER (-1): compute locally on source rank (not dispatched)
-        - Virtual expert ID = target_rank * experts_per_rank (routes to target_rank)
-        - Receiver identifies shared expert tokens and computes them separately
-        - Shared expert weight = 1/routed_scaling_factor for correct final scaling
-        - Small batch optimization: if tokens < MIN_BATCH, all shared experts local
-
-        Flow:
-        1. Compute router logits and get topk (8 routed experts)
-        2. AllReduce to get global routed counts per rank
-        3. Waterfill assigns shared expert destination for each token
-        4. Expand topk to 9 columns (LOCAL_SHARED_MARKER or virtual ID)
-        5. Start local shared expert on alt_stream (parallel with dispatch)
-        6. DeepEP dispatch with topk=9
-        7. Receiver: identify remote shared tokens, compute routed + shared separately
-        8. Merge outputs and DeepEP combine
-        9. Add local shared expert output
-        10. Apply final scaling
         """
-        from sglang.srt.distributed import get_moe_expert_parallel_rank
-        from sglang.srt.layers.moe.deepep_waterfill import (
-            compute_local_shared_expert,
-            identify_shared_expert_tokens,
+        from sglang.srt.layers.moe.topk import StandardTopKOutput
+
+        # Determine mode for logging
+        mode = "prefill" if forward_batch.forward_mode.is_prefill() else "decode"
+        step = _increment_moe_step() if self.layer_id == 3 else _moe_debug_step
+
+        # Log input
+        _log_moe_tensor(
+            "input_hidden", hidden_states, self.layer_id, mode, step, waterfill=True
         )
-        from sglang.srt.layers.moe.topk import TopKOutput
 
         num_tokens = hidden_states.shape[0]
         device = hidden_states.device
-        current_rank = get_moe_expert_parallel_rank()
 
         if num_tokens == 0:
             topk_output = self.topk.empty_topk_output(device)
@@ -1234,10 +1980,15 @@ class DeepseekV2MoE(nn.Module):
 
         # Step 1: Compute router logits and get topk for routed experts
         router_logits = self.gate(hidden_states, forward_batch=forward_batch)
+        _log_moe_tensor(
+            "router_logits", router_logits, self.layer_id, mode, step, waterfill=True
+        )
+
+        # Note: Pass None for num_token_non_padded to avoid masking topk_ids to -1
         topk_output = self.topk(
             hidden_states,
             router_logits,
-            num_token_non_padded=forward_batch.num_token_non_padded,
+            num_token_non_padded=None,  # Don't mask topk_ids
             expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
                 layer_id=self.layer_id,
             ),
@@ -1245,11 +1996,26 @@ class DeepseekV2MoE(nn.Module):
         topk_ids = topk_output.topk_ids  # [N, 8]
         topk_weights = topk_output.topk_weights  # [N, 8]
 
+        _log_moe_tensor("topk_ids", topk_ids, self.layer_id, mode, step, waterfill=True)
+        _log_moe_tensor(
+            "topk_weights", topk_weights, self.layer_id, mode, step, waterfill=True
+        )
+
         # Step 2: Count local routed tokens and AllReduce for global counts
-        local_routed_counts = self.deepep_waterfill_balancer.count_local_routed(topk_ids)
+        local_routed_counts = self.deepep_waterfill_balancer.count_local_routed(
+            topk_ids
+        )
         global_routed_counts = local_routed_counts.clone()
         torch.distributed.all_reduce(
             global_routed_counts, op=torch.distributed.ReduceOp.SUM
+        )
+        _log_moe_tensor(
+            "global_routed_counts",
+            global_routed_counts,
+            self.layer_id,
+            mode,
+            step,
+            waterfill=True,
         )
 
         # Step 3 & 4: Waterfill assignment and expand topk to 9 columns
@@ -1258,154 +2024,306 @@ class DeepseekV2MoE(nn.Module):
                 topk_ids, topk_weights, global_routed_counts
             )
         )
-
-        # Step 5: Start local shared expert computation on alt_stream (parallel)
-        local_shared_output = None
-        local_shared_indices = None
-        local_shared_event = None
-        
-        if local_shared_mask.any() and self.alt_stream is not None:
-            self.alt_stream.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(self.alt_stream):
-                # Local shared expert: no weight applied here, will be added after rsf
-                local_shared_output, local_shared_indices = compute_local_shared_expert(
-                    hidden_states,
-                    local_shared_mask,
-                    self._forward_shared_experts,
-                )
-                if local_shared_output is not None:
-                    local_shared_output.record_stream(self.alt_stream)
-                local_shared_event = self.alt_stream.record_event()
-        elif local_shared_mask.any():
-            # No alt_stream, compute synchronously
-            # Local shared expert: no weight applied here, will be added after rsf
-            local_shared_output, local_shared_indices = compute_local_shared_expert(
-                hidden_states,
-                local_shared_mask,
-                self._forward_shared_experts,
-            )
-
-        # Create expanded TopKOutput for dispatch
-        expanded_topk_output = TopKOutput(
-            topk_weights=expanded_topk_weights,
-            topk_ids=expanded_topk_ids,
-            token_expert_indices=None,
+        _log_moe_tensor(
+            "expanded_topk_ids",
+            expanded_topk_ids,
+            self.layer_id,
+            mode,
+            step,
+            waterfill=True,
+        )
+        _log_moe_tensor(
+            "expanded_topk_weights",
+            expanded_topk_weights,
+            self.layer_id,
+            mode,
+            step,
+            waterfill=True,
         )
 
-        # Step 6: DeepEP dispatch with topk=9
+        # Create expanded TopKOutput for dispatch
+        expanded_topk_output = StandardTopKOutput(
+            topk_weights=expanded_topk_weights,
+            topk_ids=expanded_topk_ids,
+            router_logits=topk_output.router_logits,
+        )
+
+        # Step 5: DeepEP dispatch with topk=9
         dispatcher = self.experts.dispatcher
+
+        # Debug: log dispatcher config
+        if _MOE_DEBUG_ENABLED and self.layer_id == 3:
+            from sglang.srt.distributed import get_tensor_model_parallel_rank
+
+            if get_tensor_model_parallel_rank() == 0:
+                # Try different ways to access num_experts and router_topk
+                num_experts_val = "N/A"
+                router_topk_val = "N/A"
+                if hasattr(dispatcher, "_inners") and len(dispatcher._inners) > 0:
+                    inner = dispatcher._inners[0]
+                    if hasattr(inner, "_normal_dispatcher"):
+                        if hasattr(inner._normal_dispatcher, "num_experts"):
+                            num_experts_val = inner._normal_dispatcher.num_experts
+                        if hasattr(inner._normal_dispatcher, "router_topk"):
+                            router_topk_val = inner._normal_dispatcher.router_topk
+                    elif hasattr(inner, "num_experts"):
+                        num_experts_val = inner.num_experts
+                        if hasattr(inner, "router_topk"):
+                            router_topk_val = inner.router_topk
+                elif hasattr(dispatcher, "_normal_dispatcher"):
+                    if hasattr(dispatcher._normal_dispatcher, "num_experts"):
+                        num_experts_val = dispatcher._normal_dispatcher.num_experts
+                    if hasattr(dispatcher._normal_dispatcher, "router_topk"):
+                        router_topk_val = dispatcher._normal_dispatcher.router_topk
+                print(
+                    f"[WF][L{self.layer_id}][{mode}][S{step}] dispatcher.num_experts={num_experts_val}, router_topk={router_topk_val}, self.experts.num_local_experts={self.experts.num_local_experts}",
+                    flush=True,
+                )
+
         dispatcher.dispatch_a(
             hidden_states=hidden_states,
             topk_output=expanded_topk_output,
         )
         dispatch_output = dispatcher.dispatch_b()
 
-        # Step 7: Process received tokens
-        recv_hidden = dispatch_output.hidden_states
-        recv_topk_ids = dispatch_output.topk_ids  # [M, 9]
-        recv_topk_weights = dispatch_output.topk_weights  # [M, 9]
-
-        # Identify tokens that need shared expert computation on this rank (remote)
-        # These are tokens sent from OTHER ranks with virtual ID mapping to this rank
-        remote_shared_indices = identify_shared_expert_tokens(
-            recv_topk_ids,
-            self.deepep_waterfill_balancer.num_experts,
-            self.deepep_waterfill_balancer.world_size,
-            current_rank,
+        _log_moe_tensor(
+            "dispatch_hidden",
+            dispatch_output.hidden_states,
+            self.layer_id,
+            mode,
+            step,
+            waterfill=True,
         )
-
-        # Create dispatch_output with only first 8 columns for MoE computation
-        from sglang.srt.layers.moe.token_dispatcher.deepep import (
-            DeepEPLLCombineInput,
-            DeepEPLLDispatchOutput,
-            DeepEPNormalCombineInput,
-            DeepEPNormalDispatchOutput,
+        _log_moe_tensor(
+            "dispatch_topk_ids",
+            dispatch_output.topk_ids,
+            self.layer_id,
+            mode,
+            step,
+            waterfill=True,
         )
-
-        routed_topk_ids = recv_topk_ids[:, :-1]  # [M, 8]
-        routed_topk_weights = recv_topk_weights[:, :-1]  # [M, 8]
-
-        if isinstance(dispatch_output, DeepEPNormalDispatchOutput):
-            routed_dispatch_output = DeepEPNormalDispatchOutput(
-                hidden_states=recv_hidden,
-                hidden_states_scale=dispatch_output.hidden_states_scale,
-                topk_ids=routed_topk_ids,
-                topk_weights=routed_topk_weights,
-                num_recv_tokens_per_expert=dispatch_output.num_recv_tokens_per_expert,
-            )
-        else:
-            routed_dispatch_output = DeepEPLLDispatchOutput(
-                hidden_states=recv_hidden,
-                hidden_states_scale=dispatch_output.hidden_states_scale,
-                topk_ids=routed_topk_ids,
-                topk_weights=routed_topk_weights,
-                masked_m=dispatch_output.masked_m,
-                expected_m=dispatch_output.expected_m,
+        _log_moe_tensor(
+            "dispatch_topk_weights",
+            dispatch_output.topk_weights,
+            self.layer_id,
+            mode,
+            step,
+            waterfill=True,
+        )
+        if (
+            hasattr(dispatch_output, "hidden_states_scale")
+            and dispatch_output.hidden_states_scale is not None
+        ):
+            _log_moe_tensor(
+                "dispatch_scale",
+                dispatch_output.hidden_states_scale,
+                self.layer_id,
+                mode,
+                step,
+                waterfill=True,
             )
 
-        # Run MoE computation for routed experts (8 columns)
-        combine_input = self.experts.run_moe_core(dispatch_output=routed_dispatch_output)
-        routed_output = combine_input.hidden_states
+        # Log num_recv_tokens_per_expert
+        if _MOE_DEBUG_ENABLED and hasattr(
+            dispatch_output, "num_recv_tokens_per_expert"
+        ):
+            from sglang.srt.distributed import get_tensor_model_parallel_rank
 
-        # Determine if we're in Normal mode or Low Latency mode
-        # - Normal mode: run_moe_core already applied topk_weights, combine does NOT apply weights
-        # - Low Latency mode: run_moe_core did NOT apply weights, combine WILL apply weights
-        is_normal_mode = isinstance(dispatch_output, DeepEPNormalDispatchOutput)
-
-        # Compute shared expert for remote tokens and add to output
-        if remote_shared_indices.numel() > 0:
-            remote_shared_hidden = recv_hidden[remote_shared_indices]
-            remote_shared_expert_output = self._forward_shared_experts(remote_shared_hidden)
-
-            if is_normal_mode:
-                # Normal mode: combine does NOT apply weights, so we must apply weight here
-                # Weight = 1/rsf so that after final rsf multiplication: output * rsf = original
-                remote_shared_weights = recv_topk_weights[remote_shared_indices, -1].unsqueeze(-1)
-                routed_output.index_add_(
-                    0,
-                    remote_shared_indices,
-                    remote_shared_expert_output * remote_shared_weights,
-                )
-            else:
-                # Low Latency mode: combine WILL apply weights from topk_weights
-                # Just add raw output, combine will multiply by weight (1/rsf)
-                routed_output.index_add_(
-                    0,
-                    remote_shared_indices,
-                    remote_shared_expert_output,
+            if get_tensor_model_parallel_rank() == 0:
+                nrte = dispatch_output.num_recv_tokens_per_expert
+                print(
+                    f"[WF][L{self.layer_id}][{mode}][S{step}] num_recv_tokens_per_expert: {nrte}",
+                    flush=True,
                 )
 
-        # Step 8: DeepEP combine with original topk=9
-        if isinstance(dispatch_output, DeepEPNormalDispatchOutput):
-            final_combine_input = DeepEPNormalCombineInput(
-                hidden_states=routed_output,
-                topk_ids=recv_topk_ids,
-                topk_weights=recv_topk_weights,
-            )
-        else:
-            final_combine_input = DeepEPLLCombineInput(
-                hidden_states=routed_output,
-                topk_ids=recv_topk_ids,
-                topk_weights=recv_topk_weights,
-            )
-        combined_hidden_states = dispatcher.combine(final_combine_input)
+        # Step 6: MoE computation for ALL 9 columns
+        combine_input = self.experts.run_moe_core(dispatch_output=dispatch_output)
+        _log_moe_tensor(
+            "moe_output",
+            combine_input.hidden_states,
+            self.layer_id,
+            mode,
+            step,
+            waterfill=True,
+        )
 
-        # Step 9: Apply routed scaling factor FIRST (only affects routed experts)
-        # This must happen BEFORE adding shared expert output
+        # === MoE Calculation Verification ===
+        # Verify that the MoE output matches theoretical calculation
+        _MOE_VERIFY = os.environ.get("SGLANG_MOE_VERIFY", "0") == "1"
+        if _MOE_VERIFY and self.layer_id == 3 and mode == "prefill":
+            self._verify_moe_calculation(dispatch_output, combine_input, mode, step)
+
+        # Debug: log combine_input details
+        if _MOE_DEBUG_ENABLED and self.layer_id == 3:
+            from sglang.srt.distributed import get_tensor_model_parallel_rank
+
+            if get_tensor_model_parallel_rank() == 0:
+                print(
+                    f"[WF][L{self.layer_id}][{mode}][S{step}] combine_input type={type(combine_input).__name__}",
+                    flush=True,
+                )
+                print(
+                    f"[WF][L{self.layer_id}][{mode}][S{step}] combine_input.hidden_states shape={combine_input.hidden_states.shape}",
+                    flush=True,
+                )
+                print(
+                    f"[WF][L{self.layer_id}][{mode}][S{step}] combine_input.topk_ids shape={combine_input.topk_ids.shape}, range=[{combine_input.topk_ids.min().item()}, {combine_input.topk_ids.max().item()}]",
+                    flush=True,
+                )
+                print(
+                    f"[WF][L{self.layer_id}][{mode}][S{step}] combine_input.topk_weights sum_per_row={combine_input.topk_weights.sum(dim=1).tolist()}",
+                    flush=True,
+                )
+
+        # Step 7: DeepEP combine
+        # Note: combine_input from run_moe_core already contains the correct
+        # topk_ids and topk_weights (after ep_gather). Use it directly.
+
+        # === COMBINE DEBUG: Before combine ===
+        if _MOE_DEBUG_ENABLED and self.layer_id == 3:
+            from sglang.srt.distributed import get_tensor_model_parallel_rank
+
+            if get_tensor_model_parallel_rank() == 0:
+                ci_hidden = combine_input.hidden_states
+                ci_topk_ids = combine_input.topk_ids
+                ci_topk_weights = combine_input.topk_weights
+
+                print(
+                    f"[WF][L{self.layer_id}][{mode}][S{step}] === BEFORE COMBINE ===",
+                    flush=True,
+                )
+                print(
+                    f"[WF][L{self.layer_id}][{mode}][S{step}] combine_input.hidden_states: shape={ci_hidden.shape}, dtype={ci_hidden.dtype}",
+                    flush=True,
+                )
+                print(
+                    f"[WF][L{self.layer_id}][{mode}][S{step}]   norm={ci_hidden.float().norm().item():.4f}, mean={ci_hidden.float().mean().item():.6f}",
+                    flush=True,
+                )
+                print(
+                    f"[WF][L{self.layer_id}][{mode}][S{step}]   min={ci_hidden.float().min().item():.4f}, max={ci_hidden.float().max().item():.4f}",
+                    flush=True,
+                )
+
+                print(
+                    f"[WF][L{self.layer_id}][{mode}][S{step}] combine_input.topk_ids: shape={ci_topk_ids.shape}",
+                    flush=True,
+                )
+                print(
+                    f"[WF][L{self.layer_id}][{mode}][S{step}]   unique values: {ci_topk_ids.unique().tolist()}",
+                    flush=True,
+                )
+
+                print(
+                    f"[WF][L{self.layer_id}][{mode}][S{step}] combine_input.topk_weights: shape={ci_topk_weights.shape}",
+                    flush=True,
+                )
+                print(
+                    f"[WF][L{self.layer_id}][{mode}][S{step}]   sum_per_row={ci_topk_weights.sum(dim=1).tolist()}",
+                    flush=True,
+                )
+                print(
+                    f"[WF][L{self.layer_id}][{mode}][S{step}]   total_sum={ci_topk_weights.sum().item():.4f}",
+                    flush=True,
+                )
+
+                # Calculate expected output norm
+                # Expected: each token's contribution is weighted by its topk_weights sum
+                # For original N tokens, if all properly routed, expected norm ≈ input_norm
+                expected_norm_factor = ci_topk_weights.sum(dim=1).mean().item()
+                print(
+                    f"[WF][L{self.layer_id}][{mode}][S{step}]   expected_norm_factor (avg weight sum)={expected_norm_factor:.4f}",
+                    flush=True,
+                )
+
+        combined_hidden_states = dispatcher.combine(combine_input=combine_input)
+
+        # === COMBINE DEBUG: After combine ===
+        if _MOE_DEBUG_ENABLED and self.layer_id == 3:
+            from sglang.srt.distributed import get_tensor_model_parallel_rank
+
+            if get_tensor_model_parallel_rank() == 0:
+                print(
+                    f"[WF][L{self.layer_id}][{mode}][S{step}] === AFTER COMBINE ===",
+                    flush=True,
+                )
+                print(
+                    f"[WF][L{self.layer_id}][{mode}][S{step}] combined_hidden_states: shape={combined_hidden_states.shape}, dtype={combined_hidden_states.dtype}",
+                    flush=True,
+                )
+                print(
+                    f"[WF][L{self.layer_id}][{mode}][S{step}]   norm={combined_hidden_states.float().norm().item():.4f}, mean={combined_hidden_states.float().mean().item():.6f}",
+                    flush=True,
+                )
+                print(
+                    f"[WF][L{self.layer_id}][{mode}][S{step}]   min={combined_hidden_states.float().min().item():.4f}, max={combined_hidden_states.float().max().item():.4f}",
+                    flush=True,
+                )
+
+                # Compare with input to combine
+                ci_norm = ci_hidden.float().norm().item()
+                co_norm = combined_hidden_states.float().norm().item()
+                ratio = co_norm / ci_norm if ci_norm > 0 else 0
+                print(
+                    f"[WF][L{self.layer_id}][{mode}][S{step}] combine_output_norm / combine_input_norm = {ratio:.4f}",
+                    flush=True,
+                )
+
+                # Compare with expected
+                input_hidden_norm = (
+                    hidden_states.float().norm().item()
+                    if hidden_states.shape[0] > 0
+                    else 0
+                )
+                output_input_ratio = (
+                    co_norm / input_hidden_norm if input_hidden_norm > 0 else 0
+                )
+                print(
+                    f"[WF][L{self.layer_id}][{mode}][S{step}] combine_output_norm / original_input_norm = {output_input_ratio:.4f}",
+                    flush=True,
+                )
+                print(
+                    f"[WF][L{self.layer_id}][{mode}][S{step}] expected ratio (based on weights) ≈ {expected_norm_factor:.4f}",
+                    flush=True,
+                )
+
+        _log_moe_tensor(
+            "combine_output",
+            combined_hidden_states,
+            self.layer_id,
+            mode,
+            step,
+            waterfill=True,
+        )
+
+        # Step 8: Apply routed scaling factor
         if not self.experts.should_fuse_routed_scaling_factor_in_topk:
             combined_hidden_states *= self.routed_scaling_factor
 
-        # Step 10: Wait for local shared expert and add to result (NOT scaled by rsf)
-        if local_shared_event is not None:
-            torch.cuda.current_stream().wait_event(local_shared_event)
-        
-        if local_shared_output is not None and local_shared_indices is not None:
-            # Add local shared expert output at original token positions
-            # Note: local_shared_output is NOT multiplied by rsf
-            combined_hidden_states.index_add_(
-                0,
-                local_shared_indices,
-                local_shared_output,
+        _log_moe_tensor(
+            "final_output",
+            combined_hidden_states,
+            self.layer_id,
+            mode,
+            step,
+            waterfill=True,
+        )
+
+        # Step 9: Match FusedMoE.forward_impl tail (optional TP/EP all-reduce)
+        if getattr(self.experts, "reduce_results", False) and (
+            getattr(self.experts, "moe_tp_size", 1) > 1
+            or getattr(self.experts, "moe_ep_size", 1) > 1
+        ):
+            combined_hidden_states = tensor_model_parallel_all_reduce(
+                combined_hidden_states
+            )
+            _log_moe_tensor(
+                "final_output_allreduced",
+                combined_hidden_states,
+                self.layer_id,
+                mode,
+                step,
+                waterfill=True,
             )
 
         return combined_hidden_states
@@ -3877,6 +4795,15 @@ class DeepseekV2ForCausalLM(nn.Module):
                 )
                 self_attn.w_vc = bind_or_assign(self_attn.w_vc, w_vc.contiguous())
                 self_attn.use_deep_gemm_bmm = True
+
+        # Copy shared expert weights to MoE layer for Waterfill mode
+        if not is_nextn:
+            for layer_id in range(self.model.start_layer, self.model.end_layer):
+                layer = self.model.layers[layer_id]
+                if hasattr(layer, "mlp") and hasattr(
+                    layer.mlp, "_copy_shared_expert_weights_to_moe"
+                ):
+                    layer.mlp._copy_shared_expert_weights_to_moe()
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
 
