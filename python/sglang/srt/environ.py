@@ -172,8 +172,8 @@ class Envs:
     SGLANG_TEST_MAX_RETRY = EnvInt(None)
 
     # Constrained Decoding (Grammar)
-    SGLANG_GRAMMAR_SIMULATE_TIMEOUT = EnvFloat(-1)
-    SGLANG_GRAMMAR_POLL_INTERVAL = EnvFloat(0.03)
+    SGLANG_GRAMMAR_POLL_INTERVAL = EnvFloat(0.005)
+    SGLANG_GRAMMAR_MAX_POLL_ITERATIONS = EnvInt(10000)
 
     # CuTe DSL GDN Decode
     SGLANG_USE_CUTEDSL_GDN_DECODE = EnvBool(False)
@@ -253,10 +253,6 @@ class Envs:
     # Model Parallel
     SGLANG_USE_MESSAGE_QUEUE_BROADCASTER = EnvBool(True)
     SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS = EnvBool(False)
-
-    # Constrained Decoding
-    SGLANG_DISABLE_OUTLINES_DISK_CACHE = EnvBool(True)
-    SGLANG_GRAMMAR_TIMEOUT = EnvFloat(300)
 
     # Tool Calling
     SGLANG_FORWARD_UNKNOWN_TOOLS = EnvBool(False)
