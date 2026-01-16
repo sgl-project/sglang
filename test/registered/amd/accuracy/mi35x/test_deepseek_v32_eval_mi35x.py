@@ -35,7 +35,7 @@ from sglang.utils import download_and_cache_file, read_jsonl
 # Register for AMD CI - MI35x DeepSeek-V3.2 accuracy test (~60 min for basic only)
 register_amd_ci(
     est_time=3600,
-    suite="nightly-amd-accuracy-8-gpu-mi35x-deepseek-v32",
+    suite="nightly-amd-8-gpu-mi35x-deepseek-v32",
     nightly=True,
 )
 
