@@ -36,11 +36,11 @@ class PrefixCacheTrait(Protocol):
 class MatchPrefixParams:
     """Unified parameters for match_prefix across different cache types"""
 
-    key: "RadixKey"
+    key: RadixKey
 
     # Mamba specific
     cow_mamba: bool = False
-    req: Optional["Req"] = None
+    req: Optional[Req] = None
 
 
 class MatchResult(NamedTuple):
