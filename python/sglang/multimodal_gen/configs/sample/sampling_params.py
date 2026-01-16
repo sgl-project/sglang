@@ -16,7 +16,6 @@ from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Any
 
-from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import StoreBoolean
 
@@ -101,11 +100,11 @@ class SamplingParams:
 
     # Batch info
     num_outputs_per_prompt: int = 1
-    seed: int = 1024
+    seed: int = 42
     generator_device: str = "cuda"  # Device for random generator: "cuda" or "cpu"
 
     # Original dimensions (before VAE scaling)
-    num_frames: int = 125
+    num_frames: int = 1  # Default for image models
     num_frames_round_down: bool = (
         False  # Whether to round down num_frames if it's not divisible by num_gpus
     )
@@ -123,8 +122,9 @@ class SamplingParams:
 
     # Denoising parameters
     num_inference_steps: int = None
-    guidance_scale: float = None
+    guidance_scale: float = 1.0
     guidance_scale_2: float = None
+    true_cfg_scale: float = None  # for CFG vs guidance distillation (e.g., QwenImage)
     guidance_rescale: float = 0.0
     boundary_ratio: float | None = None
 
@@ -208,20 +208,90 @@ class SamplingParams:
         if env_steps is not None and self.num_inference_steps is not None:
             self.num_inference_steps = int(env_steps)
 
-        # Auto-enable stage logging if dump path is provided
-        if self.perf_dump_path:
-            envs.SGLANG_DIFFUSION_STAGE_LOGGING = True
-
     def _validate(self):
         """
         check if the sampling params is correct by itself
         """
         if self.prompt_path and not self.prompt_path.endswith(".txt"):
-            raise ValueError("prompt_path must be a txt file")
+            raise ValueError(
+                f"prompt_path must be a txt file, got {self.prompt_path!r}"
+            )
+
+        # These are always required to be sane regardless of pipeline.
+        if (
+            not isinstance(self.num_outputs_per_prompt, int)
+            or self.num_outputs_per_prompt <= 0
+        ):
+            raise ValueError(
+                f"num_outputs_per_prompt must be a positive int, got {self.num_outputs_per_prompt!r}"
+            )
+
+        # Used by seconds() and video writer; fps <= 0 is always invalid.
+        if not isinstance(self.fps, int) or self.fps <= 0:
+            raise ValueError(f"fps must be a positive int, got {self.fps!r}")
+
+        # num_frames is already asserted in __post_init__, but keep a friendly error here too
+        # (e.g., when validation is triggered from other code paths).
+        if not isinstance(self.num_frames, int) or self.num_frames <= 0:
+            raise ValueError(
+                f"num_frames must be a positive int, got {self.num_frames!r}"
+            )
+
+        if self.num_inference_steps is not None:
+            if (
+                not isinstance(self.num_inference_steps, int)
+                or self.num_inference_steps <= 0
+            ):
+                raise ValueError(
+                    f"num_inference_steps must be a positive int, got {self.num_inference_steps!r}"
+                )
+
+        # Numeric hyperparams should not be NaN/Inf and should be within basic ranges.
+        # Note: bool is a subclass of int; reject it explicitly to avoid silent surprises.
+        def _finite_non_negative_float(
+            name: str, value: Any, allow_none: bool = True
+        ) -> None:
+            if value is None and allow_none:
+                return
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(f"{name} must be a number, got {value!r}")
+            if not math.isfinite(float(value)):
+                raise ValueError(f"{name} must be finite, got {value!r}")
+            if float(value) < 0.0:
+                raise ValueError(f"{name} must be non-negative, got {value!r}")
+
+        _finite_non_negative_float(
+            "guidance_scale", self.guidance_scale, allow_none=True
+        )
+        _finite_non_negative_float(
+            "guidance_scale_2", self.guidance_scale_2, allow_none=True
+        )
+        _finite_non_negative_float(
+            "true_cfg_scale", self.true_cfg_scale, allow_none=True
+        )
+        _finite_non_negative_float(
+            "guidance_rescale", self.guidance_rescale, allow_none=False
+        )
+
+        if self.boundary_ratio is not None:
+            if isinstance(self.boundary_ratio, bool) or not isinstance(
+                self.boundary_ratio, (int, float)
+            ):
+                raise ValueError(
+                    f"boundary_ratio must be a number, got {self.boundary_ratio!r}"
+                )
+            if not math.isfinite(float(self.boundary_ratio)):
+                raise ValueError(
+                    f"boundary_ratio must be finite, got {self.boundary_ratio!r}"
+                )
+            if not (0.0 <= float(self.boundary_ratio) <= 1.0):
+                raise ValueError(
+                    f"boundary_ratio must be within [0, 1], got {self.boundary_ratio!r}"
+                )
 
     def check_sampling_param(self):
-        if self.prompt_path and not self.prompt_path.endswith(".txt"):
-            raise ValueError("prompt_path must be a txt file")
+        # Keep backward-compatibility for old call sites.
+        self._validate()
 
     def _validate_with_pipeline_config(self, pipeline_config):
         """
@@ -276,11 +346,10 @@ class SamplingParams:
                         [f"{w}x{h}" for w, h in self.supported_resolutions]
                     )
                     error_msg = (
-                        f"Unsupported resolution: {self.width}x{self.height}. "
+                        f"Unsupported resolution: {self.width}x{self.height}, output quality may suffer. "
                         f"Supported resolutions: {supported_str}"
                     )
-                    logger.error(error_msg)
-                    raise ValueError(error_msg)
+                    logger.warning(error_msg)
 
         if pipeline_config.task_type.is_image_gen():
             # settle num_frames
@@ -335,7 +404,8 @@ class SamplingParams:
                 )
                 self.num_frames = new_num_frames
 
-        self._set_output_file_name()
+        if not server_args.comfyui_mode:
+            self._set_output_file_name()
 
     @classmethod
     def from_pretrained(cls, model_path: str, **kwargs) -> "SamplingParams":
@@ -347,7 +417,45 @@ class SamplingParams:
 
     @staticmethod
     def from_user_sampling_params_args(model_path: str, server_args, *args, **kwargs):
-        sampling_params = SamplingParams.from_pretrained(model_path)
+        try:
+            sampling_params = SamplingParams.from_pretrained(model_path)
+        except (AttributeError, ValueError) as e:
+            # Handle safetensors files or other cases where model_index.json is not available
+            # Use appropriate SamplingParams based on pipeline_class_name from registry
+            if os.path.isfile(model_path) and model_path.endswith(".safetensors"):
+                # Determine which sampling params to use based on pipeline_class_name
+                pipeline_class_name = getattr(server_args, "pipeline_class_name", None)
+
+                # Try to get SamplingParams from registry
+                from sglang.multimodal_gen.registry import get_pipeline_config_classes
+
+                config_classes = (
+                    get_pipeline_config_classes(pipeline_class_name)
+                    if pipeline_class_name
+                    else None
+                )
+
+                if config_classes is not None:
+                    _, sampling_params_cls = config_classes
+                    try:
+                        sampling_params = sampling_params_cls()
+                        logger.info(
+                            f"Using {sampling_params_cls.__name__} for {pipeline_class_name} safetensors file (no model_index.json): %s",
+                            model_path,
+                        )
+                    except Exception as import_error:
+                        logger.warning(
+                            f"Failed to instantiate {sampling_params_cls.__name__}: {import_error}. "
+                            "Using default SamplingParams"
+                        )
+                        sampling_params = SamplingParams()
+                else:
+                    raise ValueError(
+                        f"Could not get pipeline config classes for {pipeline_class_name}"
+                    )
+            else:
+                # Re-raise if it's not a safetensors file issue
+                raise
 
         user_sampling_params = SamplingParams(*args, **kwargs)
         # TODO: refactor
@@ -584,6 +692,13 @@ class SamplingParams:
             action="store_true",
             default=SamplingParams.return_trajectory_decoded,
             help="Whether to return the decoded trajectory",
+        )
+        parser.add_argument(
+            "--diffusers-kwargs",
+            type=str,
+            default=None,
+            help="JSON string of extra kwargs to pass to diffusers pipeline. "
+            'Example: \'{"output_type": "latent", "clip_skip": 2}\'',
         )
         parser.add_argument(
             "--no-override-protected-fields",

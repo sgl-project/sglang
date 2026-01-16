@@ -5,7 +5,10 @@
 
 use std::{fmt::Debug, sync::Arc};
 
-use crate::core::{HashRing, Worker};
+use crate::{
+    core::{HashRing, Worker},
+    mesh::OptionalMeshSyncManager,
+};
 
 mod bucket;
 mod cache_aware;
@@ -23,7 +26,7 @@ pub use bucket::BucketPolicy;
 pub use cache_aware::CacheAwarePolicy;
 pub use consistent_hashing::ConsistentHashingPolicy;
 pub use factory::PolicyFactory;
-pub use manual::ManualPolicy;
+pub use manual::{ManualConfig, ManualPolicy};
 pub use power_of_two::PowerOfTwoPolicy;
 pub use prefix_hash::{PrefixHashConfig, PrefixHashPolicy};
 pub use random::RandomPolicy;
@@ -67,6 +70,11 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
     /// This is called periodically with current load information for load-aware policies.
     fn update_loads(&self, _loads: &std::collections::HashMap<String, isize>) {
         // Default: no-op for policies that don't use load information
+    }
+
+    /// Set mesh sync manager
+    fn set_mesh_sync(&mut self, _mesh_sync: OptionalMeshSyncManager) {
+        // Default: no-op for policies that don't use mesh sync
     }
 
     /// Reset any internal state

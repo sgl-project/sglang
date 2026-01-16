@@ -22,8 +22,39 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      # SECURITY: This workflow runs on issue_comment trigger with elevated permissions
+      # (pull-requests: write, actions: write). For non-fork PRs, we can safely checkout
+      # the PR branch to allow testing changes to this handler. For fork PRs, we MUST
+      # stay on main to prevent untrusted code execution with these elevated permissions.
+      - name: Get PR details
+        id: pr
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PR_DATA=$(gh pr view ${{ github.event.issue.number }} --repo ${{ github.repository }} --json headRefName,headRepositoryOwner) || {
+            echo "::error::Failed to fetch PR data"
+            exit 1
+          }
+          # Use 'empty' filter to handle null/missing values (e.g., deleted forks)
+          HEAD_OWNER=$(echo "$PR_DATA" | jq -r '.headRepositoryOwner.login // empty')
+          REPO_OWNER="${{ github.repository_owner }}"
+          # Treat missing/null owner as fork for security (fail-safe)
+          if [[ -z "$HEAD_OWNER" || "$HEAD_OWNER" != "$REPO_OWNER" ]]; then
+            IS_FORK="true"
+          else
+            IS_FORK="false"
+          fi
+          echo "is_fork=$IS_FORK" >> $GITHUB_OUTPUT
+          echo "ref=$(echo "$PR_DATA" | jq -r '.headRefName')" >> $GITHUB_OUTPUT
+          echo "PR owner: $HEAD_OWNER, Repo owner: $REPO_OWNER, Is fork: $IS_FORK"
+
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          # For non-fork PRs, checkout PR branch to allow testing handler changes
+          # For fork PRs, stay on main for security (don't run untrusted code with elevated permissions)
+          ref: ${{ steps.pr.outputs.is_fork == 'false' && steps.pr.outputs.ref || '' }}
 
       - name: Set up Python
         uses: actions/setup-python@v5

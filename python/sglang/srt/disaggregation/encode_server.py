@@ -1,4 +1,5 @@
 import asyncio
+import concurrent.futures
 import ctypes
 import logging
 import multiprocessing as mp
@@ -17,7 +18,6 @@ import zmq.asyncio
 from fastapi import FastAPI
 from fastapi.responses import ORJSONResponse, Response
 from transformers import AutoImageProcessor
-from transformers.image_utils import load_images
 
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
@@ -29,21 +29,33 @@ from sglang.srt.distributed.parallel_state import (
     initialize_model_parallel,
 )
 from sglang.srt.layers.dp_attention import initialize_dp_attention
+from sglang.srt.managers.io_struct import ProfileReq, ProfileReqInput, ProfileReqType
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
-from sglang.srt.mem_cache.multimodal_cache import MultiModalStaticCache
+from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
 from sglang.srt.model_loader import get_model
 from sglang.srt.server_args import (
     PortArgs,
     ServerArgs,
     set_global_server_args_for_scheduler,
 )
-from sglang.srt.utils import get_local_ip_auto, get_zmq_socket, random_uuid
+from sglang.srt.utils import (
+    get_local_ip_auto,
+    get_zmq_socket,
+    load_audio,
+    load_image,
+    load_video,
+    random_uuid,
+)
 
 logger = logging.getLogger(__name__)
 
 rid_lock = asyncio.Lock()
 rid_to_receive_endpoint: Dict[str, List[str]] = dict()
 rid_to_receive_count: Dict[str, int] = dict()
+
+use_image_processor_gpu = (
+    int(os.getenv("SGLANG_ENCODER_IMAGE_PROCESSOR_USE_GPU", "0")) == 1
+)
 
 
 class TensorWrapper:
@@ -106,6 +118,7 @@ class MMEncoder:
         self.server_args = server_args
         set_global_server_args_for_scheduler(server_args)
         self.rank = rank
+        self.profiler = EncoderProfiler(rank)
 
         self.image_processor = AutoImageProcessor.from_pretrained(
             server_args.model_path,
@@ -136,6 +149,8 @@ class MMEncoder:
 
         torch.get_device_module(self.device).set_device(self.gpu_id)
 
+        self.use_image_processor_gpu = use_image_processor_gpu
+
         init_distributed_environment(
             world_size=server_args.tp_size,
             rank=rank,
@@ -156,6 +171,10 @@ class MMEncoder:
         embedding_cache_size = int(os.environ.get("SGLANG_VLM_CACHE_SIZE_MB", "4096"))
         self.mm_cache = MultiModalStaticCache(embedding_cache_size * 1024 * 1024)
         self.mm_cache_lock = asyncio.Lock()
+
+        self.io_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=int(os.environ.get("SGLANG_ENCODER_MM_LOAD_WORKERS", 4))
+        )
 
         if schedule_path is not None:
             self.schedule_socket = get_zmq_socket(
@@ -192,63 +211,103 @@ class MMEncoder:
 
         logger.info(f"rank {rank} init finish ")
 
-    def get_num_patches(self, grid: Union[torch.Tensor, List[int]]) -> int:
-        """Calculate number of raw patches (before 2x2 merge). Used for pixel_values slicing."""
-        return int(grid[0] * grid[1] * grid[2])
+    def _load_single_item(
+        self,
+        data,
+        modality: Modality,
+        frame_count_limit=None,
+        audio_sample_rate: Optional[int] = None,
+        discard_alpha_channel=True,
+    ):
+        """
+        Load a single multimodal data.
+        If data is precomputed, returns directly.
+        Static method that can be pickled for multiprocessing"""
+        if isinstance(data, dict):
+            return data
+        try:
+            if modality == Modality.IMAGE:
+                img, _ = load_image(data)
+                if discard_alpha_channel and img.mode != "RGB":
+                    img = img.convert("RGB")
+                return img
+            elif modality == Modality.VIDEO:
+                return load_video(data, frame_count_limit)
+            elif modality == Modality.AUDIO:
+                return load_audio(data, audio_sample_rate)
 
-    def get_num_tokens(self, grid: Union[torch.Tensor, List[int]]) -> int:
-        """Calculate number of tokens (after 2x2 merge). Used for mm_embedding slicing."""
-        merge_size = getattr(self.image_processor, "merge_size", 2)
-        return self.get_num_patches(grid) // (merge_size**2)
+        except Exception as e:
+            raise RuntimeError(f"Error while loading data {data}: {e}")
 
-    def slice_embedding(
-        self, mm_embedding: torch.Tensor, grid_thw: List
-    ) -> List[torch.Tensor]:
-        """Slice a concatenated embedding tensor into individual image embeddings."""
-        slices, offset = [], 0
-        for grid in grid_thw:
-            count = self.get_num_tokens(grid)
-            slices.append(mm_embedding[offset : offset + count])
-            offset += count
-        return slices
+    def submit_data_loading_tasks(self, items, modalities):
+        futures = []
+        task_info = []
 
-    def _calculate_hashes_from_features(
-        self, pixel_values: torch.Tensor, grid_thw: List
-    ) -> List[str]:
-        """CPU Task: Compute hashes based on processed feature patches (pixel_values)."""
-        hashes, offset = [], 0
-        for grid in grid_thw:
-            num_patches = self.get_num_patches(grid)
-            feature_slice = pixel_values[offset : offset + num_patches]
-            tmp_item = MultimodalDataItem(
-                modality=Modality.IMAGE, feature=feature_slice
+        for data, modality in zip(items, modalities):
+            if modality is not None:
+                futures.append(
+                    self.io_executor.submit(
+                        self._load_single_item,
+                        data,
+                        modality,
+                    )
+                )
+                task_info.append((modality, data))
+        return futures, task_info
+
+    async def _flatten_and_load_images(self, mm_items):
+        """
+        Flatten mm_items structure, load images concurrently, and restore original structure.
+
+        Returns:
+            Same structure as load_images would return
+        """
+        # Handle single image (not a list)
+        if not isinstance(mm_items, (list, tuple)):
+            futures, _ = self.submit_data_loading_tasks([mm_items], [Modality.IMAGE])
+            return await asyncio.wrap_future(futures[0])
+
+        # Handle nested list (list of lists)
+        if len(mm_items) > 0 and isinstance(mm_items[0], (list, tuple)):
+            # Flatten nested structure
+            flat_data = []
+            flat_indices = []  # Track which group each item belongs to
+            for group_idx, image_group in enumerate(mm_items):
+                for item in image_group:
+                    flat_data.append(item)
+                    flat_indices.append(group_idx)
+
+            # Submit all tasks concurrently
+            futures, _ = self.submit_data_loading_tasks(
+                flat_data, [Modality.IMAGE] * len(flat_data)
             )
-            tmp_item.set_pad_value()
-            hashes.append(tmp_item.hash)
-            offset += num_patches
-        return hashes
 
-    async def _encode(
-        self, pixel_values: torch.Tensor, images_input: dict, indices: List[int]
-    ) -> List[torch.Tensor]:
-        """
-        GPU Task: Run ViT inference ONLY on the subset of images missing from the cache.
-        """
-        grid_thw = images_input["image_grid_thw"]
+            # Wait for all tasks to complete asynchronously
+            async_futures = [asyncio.wrap_future(f) for f in futures]
+            results = await asyncio.gather(*async_futures)
 
-        # 1. Slice pixel_values to get only the patches for missing images
-        sub_pixel_list = []
-        offsets = [0]
-        curr = 0
-        for g in grid_thw:
-            curr += self.get_num_patches(g)
-            offsets.append(curr)
+            # Restore nested structure
+            nested_results = [[] for _ in range(len(mm_items))]
+            for idx, result in zip(flat_indices, results):
+                nested_results[idx].append(result)
 
-        for idx in indices:
-            sub_pixel_list.append(pixel_values[offsets[idx] : offsets[idx + 1]])
+            return nested_results
 
-        sub_feature = torch.cat(sub_pixel_list, dim=0)
+        # Handle simple list
+        else:
+            futures, _ = self.submit_data_loading_tasks(
+                mm_items, [Modality.IMAGE] * len(mm_items)
+            )
+            # Wait for all tasks to complete asynchronously
+            async_futures = [asyncio.wrap_future(f) for f in futures]
+            return await asyncio.gather(*async_futures)
 
+    async def _encode(self, mm_items) -> torch.Tensor:
+        images = await self._flatten_and_load_images(mm_items)
+
+        kwargs = {"device": self.device} if self.use_image_processor_gpu else {}
+        images_input = self.image_processor(images=images, **kwargs)
+        feature = images_input["pixel_values"]
         mm_item = MultimodalDataItem.from_dict(
             {
                 "modality": Modality.IMAGE,
@@ -259,94 +318,39 @@ class MMEncoder:
         for k, v in images_input.items():
             if k == "pixel_values":
                 continue
-            val = _convert(v)
-            if k in _image_grid_attrs:
-                mm_item.set(k, val[indices])
-            else:
-                mm_item.set(k, val)
+            mm_item.set(k, _convert(v))
 
-        with torch.inference_mode():
-            new_embeddings = self.model.get_image_feature([mm_item]).cpu()
-            if new_embeddings.ndim != 2:
-                new_embeddings = new_embeddings.reshape(-1, new_embeddings.shape[-1])
+        # support mm_cache
+        mm_embedding = None
+        mm_hash = None
 
-        sub_grids = [grid_thw[i] for i in indices]
-        return self.slice_embedding(new_embeddings, sub_grids)
+        start_time = time.perf_counter()
+        if self.server_args.enable_prefix_mm_cache:
+            mm_item.set_pad_value()
+            mm_hash = MultiModalStaticCache.combine_hashes([mm_item.hash])
+            async with self.mm_cache_lock:
+                mm_cache = self.mm_cache.get([mm_item.hash])
+                if mm_cache is not None:
+                    mm_embedding = mm_cache.embedding
 
-    async def encode(
-        self,
-        mm_items: List[str],
-        req_id: str,
-        num_parts: int,
-        part_idx: int,
-        hashes: Optional[List[str]] = None,
-    ):
-        images = await asyncio.to_thread(load_images, mm_items)
-        images_input = self.image_processor(images=images)
-        pixel_values = _convert(images_input["pixel_values"])
-        grid_thw = images_input["image_grid_thw"]
+        if mm_embedding is None:
+            with torch.inference_mode():
+                mm_embedding: torch.Tensor = self.model.get_image_feature([mm_item])
+                mm_embedding = mm_embedding.cpu()
+            if len(mm_embedding.shape) != 2:
+                mm_embedding = mm_embedding.reshape(-1, mm_embedding.shape[-1])
 
-        if hashes is None:
-            image_hashes = self._calculate_hashes_from_features(pixel_values, grid_thw)
-        else:
-            image_hashes = hashes
-
-        if self.mm_global_cache:
-            exist_mask = await self.mm_global_cache.batch_is_exist(image_hashes)
-        else:
-            exist_mask = [False] * len(image_hashes)
-
-        missing_indices = [i for i, exist in enumerate(exist_mask) if not exist]
-        hit_indices = [i for i, exist in enumerate(exist_mask) if exist]
-
-        gpu_task = None
-        if missing_indices:
-            gpu_task = asyncio.create_task(
-                self._encode(pixel_values, images_input, missing_indices)
-            )
-
-        if hit_indices and self.mm_global_cache:
-            hit_hashes = [image_hashes[i] for i in hit_indices]
-            hit_tokens = [self.get_num_tokens(grid_thw[i]) for i in hit_indices]
-            self.mm_global_cache.prefetch(req_id, hit_hashes, hit_tokens)
-
-        new_slices = await gpu_task if gpu_task else []
-
-        if hit_indices and self.mm_global_cache:
-            while not self.mm_global_cache.check_prefetch_progress(req_id):
-                await asyncio.sleep(0.001)
-
-        cached_slices = (
-            self.mm_global_cache.get_embeddings([image_hashes[i] for i in hit_indices])
-            if hit_indices
-            else []
+        if self.server_args.enable_prefix_mm_cache:
+            async with self.mm_cache_lock:
+                self.mm_cache.set(mm_hash, EmbeddingResult(embedding=mm_embedding))
+        end_time = time.perf_counter()
+        logger.info(
+            f"Vit time : {(end_time - start_time)*1000:.2f} ms {mm_embedding.shape = }"
         )
+        if self.profiler is not None:
+            self.profiler.step()
 
-        final_slices = [None] * len(image_hashes)
-        for i, idx in enumerate(missing_indices):
-            final_slices[idx] = new_slices[i]
-        for i, idx in enumerate(hit_indices):
-            final_slices[idx] = cached_slices[i]
-
-        mm_embedding = torch.cat(final_slices, dim=0)
-        if self.mm_global_cache and missing_indices:
-            new_hashes = [image_hashes[i] for i in missing_indices]
-
-            async def _background_insert():
-                await asyncio.to_thread(
-                    self.mm_global_cache.insert_batch, new_hashes, new_slices
-                )
-
-            task = asyncio.create_task(_background_insert())
-            self.background_tasks.add(task)
-            task.add_done_callback(self.background_tasks.discard)
-
-        if self.rank == 0:
-            self.embedding_to_send[req_id] = EmbeddingData(
-                req_id, num_parts, part_idx, grid_thw, mm_embedding
-            )
-
-        return mm_embedding.nbytes, mm_embedding.shape[0], mm_embedding.shape[1]
+        return _get_image_grid_dim(images_input), mm_embedding
 
     async def _send(
         self,
@@ -490,6 +494,71 @@ class MMEncoder:
             return response_json["embedding_port"]
 
 
+class EncoderProfiler:
+    def __init__(self, rank: int):
+        self.rank = rank
+        self.profiler = None
+        self.steps_left = None
+        self.output_dir = None
+        self.prefix = None
+        self.profile_id = None
+
+    def start(self, obj: ProfileReq):
+        if self.profiler is not None:
+            return False, "profiling already running"
+
+        output_dir = obj.output_dir or os.getenv("SGLANG_TORCH_PROFILER_DIR", "/tmp")
+        os.makedirs(output_dir, exist_ok=True)
+        self.output_dir = output_dir
+        self.prefix = obj.profile_prefix or "encoder"
+        self.profile_id = str(time.time())
+
+        activities = obj.activities or ["CPU", "GPU"]
+        torch_activities = []
+        if "CPU" in activities:
+            torch_activities.append(torch.profiler.ProfilerActivity.CPU)
+        if "GPU" in activities:
+            torch_activities.append(torch.profiler.ProfilerActivity.CUDA)
+
+        profile_memory = "MEM" in activities
+        if not torch_activities and not profile_memory:
+            return False, "no supported activities"
+
+        self.profiler = torch.profiler.profile(
+            activities=torch_activities,
+            with_stack=True if obj.with_stack is None else obj.with_stack,
+            record_shapes=False if obj.record_shapes is None else obj.record_shapes,
+            profile_memory=profile_memory,
+        )
+        self.profiler.start()
+        self.steps_left = obj.num_steps
+        logger.info(
+            f"Encoder profiling started. output_dir={self.output_dir} profile_id={self.profile_id}"
+        )
+        return True, None
+
+    def step(self):
+        if self.profiler is None:
+            return
+        self.profiler.step()
+        if self.steps_left is not None:
+            self.steps_left -= 1
+            if self.steps_left <= 0:
+                self.stop()
+
+    def stop(self):
+        if self.profiler is None:
+            return False, "profiling not running"
+        self.profiler.stop()
+        filename = f"{self.prefix}-rank{self.rank}-{self.profile_id}.trace.json"
+        trace_path = os.path.join(self.output_dir, filename)
+        self.profiler.export_chrome_trace(trace_path)
+        logger.info("Encoder profiling saved to: %s", trace_path)
+        self.profiler = None
+        self.steps_left = None
+        return True, None
+
+
 app = FastAPI()
 encoder: Optional[MMEncoder] = None
 send_sockets: List[zmq.Socket] = []
@@ -501,12 +570,20 @@ async def run_encoder(
     encoder = MMEncoder(server_args, schedule_path, dist_init_method, rank)
     while True:
         request = await encoder.schedule_socket.recv_pyobj()
-        await encoder.encode(
-            mm_items=request["mm_items"],
-            req_id=request["req_id"],
-            num_parts=request["num_parts"],
-            part_idx=request["part_idx"],
-        )
+        if isinstance(request, ProfileReq):
+            if request.type == ProfileReqType.START_PROFILE:
+                if encoder.profiler is None:
+                    encoder.profiler = EncoderProfiler(encoder.rank)
+                encoder.profiler.start(request)
+            else:
+                encoder.profiler.stop()
+        else:
+            await encoder.encode(
+                mm_items=request["mm_items"],
+                req_id=request["req_id"],
+                num_parts=request["num_parts"],
+                part_idx=request["part_idx"],
+            )
 
 
 def launch_encoder(server_args, schedule_path, dist_init_method, rank):
@@ -631,3 +708,54 @@ async def health_generate():
     if encoder is None:
         return Response(status_code=503)
     return Response(status_code=200)
+
+
+@app.api_route("/start_profile", methods=["GET", "POST"])
+async def start_profile_async(obj: Optional[ProfileReqInput] = None):
+    if encoder is None:
+        return Response(content="encoder not ready\n", status_code=503)
+    req = None
+    if obj is None:
+        req = ProfileReq(ProfileReqType.START_PROFILE)
+    else:
+        req = ProfileReq(
+            type=ProfileReqType.START_PROFILE,
+            output_dir=obj.output_dir,
+            start_step=obj.start_step,
+            num_steps=obj.num_steps,
+            activities=obj.activities,
+            with_stack=obj.with_stack,
+            record_shapes=obj.record_shapes,
+            profile_by_stage=obj.profile_by_stage,
+            profile_id=str(time.time()),
+            merge_profiles=obj.merge_profiles,
+            profile_prefix=obj.profile_prefix,
+            profile_stages=obj.profile_stages,
+        )
+    for socket in send_sockets:
+        socket.send_pyobj(req)
+    if encoder.profiler is None:
+        encoder.profiler = EncoderProfiler(encoder.rank)
+    ok, msg = encoder.profiler.start(req)
+    if ok:
+        detail = (
+            f"Start profiling. output_dir={encoder.profiler.output_dir} "
+            f"profile_id={encoder.profiler.profile_id}\n"
+        )
+        return Response(content=detail, status_code=200)
+    return Response(content=(msg or "Start profiling failed.\n"), status_code=400)
+
+
+@app.api_route("/stop_profile", methods=["GET", "POST"])
+async def stop_profile_async():
+    if encoder is None:
+        return Response(content="encoder not ready\n", status_code=503)
+    if encoder.profiler is None:
+        return Response(content="profiling not initialized\n", status_code=400)
+    req = ProfileReq(ProfileReqType.STOP_PROFILE)
+    for socket in send_sockets:
+        socket.send_pyobj(req)
+    ok, msg = encoder.profiler.stop()
+    if ok:
+        return Response(content="Stop profiling.\n", status_code=200)
+    return Response(content=(msg or "Stop profiling failed.\n"), status_code=400)
