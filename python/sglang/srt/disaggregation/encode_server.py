@@ -434,9 +434,8 @@ class MMEncoder:
             )
         except Exception as e:
             error_code = getattr(e, "code", 500)
-            print(f"😅 {error_code = }")
             error_msg = str(e)
-            logger.error(f"Rank {self.rank} encode failed: {error_msg}")
+            logger.error(f"Rank {self.rank} encode failed: {error_msg} {error_code = }")
             if self.rank == 0:
                 mm_data = EmbeddingData(
                     req_id,
@@ -447,7 +446,7 @@ class MMEncoder:
                     error_code=error_code,
                 )
                 self.embedding_to_send[req_id] = mm_data
-                logger.info(f"{mm_data = }")
+                logger.debug(f"Created error EmbeddingData: {mm_data}")
             return 0, 0, 0, error_msg, error_code
 
     # For zmq_to_tokenizer zmq_to_scheduler and mooncake
@@ -753,7 +752,7 @@ async def handle_encode_request(request: dict):
             return ORJSONResponse(content=None)
     except Exception as e:
         error_msg = str(e)
-        logger.info(f"❌ Encoder logic failed for {req_id}: {error_msg}")
+        logger.error(f"Unexpected error in encoder logic for {req_id}: {error_msg}")
         rid_to_err_msg[req_id] = error_msg
         return ORJSONResponse(
             status_code=500,
