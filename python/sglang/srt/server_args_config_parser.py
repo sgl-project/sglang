@@ -18,7 +18,9 @@ class ConfigArgumentMerger:
     """Handles merging of configuration file arguments with command-line arguments."""
 
     def __init__(
-        self, parser: argparse.ArgumentParser = None, boolean_actions: List[str] = None
+        self,
+        parser: argparse.ArgumentParser = None,
+        boolean_actions: List[str] = None,
     ):
         """Initialize with list of store_true action names."""
         # NOTE: The current code does not support actions other than "store_true" and "store".
