@@ -59,6 +59,16 @@ class BaseKVManager(ABC):
         is_mla_backend: Optional[bool] = False,
     ): ...
 
+    @abstractmethod
+    def _register_to_bootstrap(self):
+        """Register to the bootstrap server."""
+        ...
+
+    @abstractmethod
+    def _register_prefill_dp_rank(self):
+        """Register to the prefill dp rank."""
+        ...
+
 
 class BaseKVSender(ABC):
 
