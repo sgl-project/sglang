@@ -906,6 +906,7 @@ class MambaRadixCache(BasePrefixCache):
 
         total_prefix_length = 0
         branch_state_attached = False
+        mamba_value_attached = False
         while len(key) > 0 and child_key in node.children.keys():
             node = node.children[child_key]
             node.last_access_time = get_last_access_time()
@@ -918,6 +919,8 @@ class MambaRadixCache(BasePrefixCache):
             value = value[prefix_len:]
 
             if prefix_len < len(node.key):
+                if branchoff_mamba_value is not None:
+                    mamba_value_attached = True
                 new_node = self._split_node(
                     node.key, node, prefix_len, branchoff_mamba_value
                 )
@@ -942,6 +945,7 @@ class MambaRadixCache(BasePrefixCache):
                 self.mamba_evictable_size_ += len(node.mamba_value)
                 node.last_access_time = get_last_access_time()
                 branch_state_attached = True
+                mamba_value_attached = True
 
         if (
             branch_checkpoint_len is not None
@@ -958,11 +962,8 @@ class MambaRadixCache(BasePrefixCache):
             self.mamba_evictable_size_ += len(node.mamba_value)
             node.last_access_time = get_last_access_time()
             branch_state_attached = True
+            mamba_value_attached = True
 
-        node_had_mamba_before = (
-            node.mamba_value is not None and not branch_state_attached
-        )
-        mamba_value_exist = False
         if len(key):
             new_node = TreeNode()
             new_node.parent = node
@@ -974,12 +975,12 @@ class MambaRadixCache(BasePrefixCache):
             node.children[child_key] = new_node
             self.full_evictable_size_ += len(value)
             self.mamba_evictable_size_ += len(mamba_value)
-            return total_prefix_length, (mamba_value_exist or node_had_mamba_before)
+            return total_prefix_length, False
 
         # len(key) == 0
-        mamba_value_exist = node_had_mamba_before
+        mamba_value_exist = node.mamba_value is not None and not mamba_value_attached
         if not mamba_value_exist:
-            if not branch_state_attached:
+            if not mamba_value_attached:
                 node.mamba_value = mamba_value
                 self.mamba_lru_list.insert_mru(node)
                 self.mamba_evictable_size_ += len(mamba_value)
@@ -991,7 +992,7 @@ class MambaRadixCache(BasePrefixCache):
             node.last_access_time = get_last_access_time()
 
         self.full_lru_list.reset_node_mru(node)
-        return 0, mamba_value_exist
+        return total_prefix_length, mamba_value_exist
 
     def _iteratively_delete_tombstone_leaf(
         self, node: TreeNode
