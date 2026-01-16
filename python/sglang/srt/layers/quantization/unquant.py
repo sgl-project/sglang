@@ -506,6 +506,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 quant_mode=-1,
             )
         )
+        expert_tokens = expert_tokens.to(torch.int64)
 
         # gmm1: gate_up_proj
         hidden_states = torch_npu.npu_grouped_matmul(
