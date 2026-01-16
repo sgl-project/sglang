@@ -1,7 +1,8 @@
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 # Generation model tests (CUDA only)
-register_cuda_ci(est_time=103, suite="stage-b-test-small-1-gpu")
+register_cuda_ci(est_time=103, suite="stage-b-test-large-1-gpu")
+register_amd_ci(est_time=106, suite="stage-b-test-small-1-gpu-amd")
 
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -28,10 +29,11 @@ import dataclasses
 import multiprocessing as mp
 import os
 import unittest
-from typing import List
+from typing import List, Optional
 
 import torch
 
+from sglang.srt.utils import is_hip
 from sglang.test.runners import (
     DEFAULT_PROMPTS,
     HFRunner,
@@ -50,12 +52,13 @@ class ModelCase:
     rouge_l_tolerance: float = 1
     skip_long_prompt: bool = False
     trust_remote_code: bool = False
+    attention_backend: Optional[str] = None
 
 
 # Popular models that run on the CI
 CI_MODELS = [
     ModelCase("meta-llama/Llama-3.1-8B-Instruct"),
-    ModelCase("google/gemma-2-2b"),
+    ModelCase("google/gemma-2-2b", attention_backend="triton" if is_hip() else None),
 ]
 
 # the complete set of models to test sglang's generation model
@@ -145,6 +148,7 @@ class TestGenerationModels(CustomTestCase):
             torch_dtype=torch_dtype,
             model_type="generation",
             trust_remote_code=model_case.trust_remote_code,
+            attention_backend=model_case.attention_backend,
         ) as srt_runner:
             srt_outputs = srt_runner.forward(prompts, max_new_tokens=max_new_tokens)
 

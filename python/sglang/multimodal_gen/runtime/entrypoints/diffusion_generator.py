@@ -87,12 +87,6 @@ class DiffGenerator:
         """
         Create a DiffGenerator from a pretrained model.
 
-        Args:
-            **kwargs: Additional arguments to customize model loading, set any ServerArgs or PipelineConfig attributes here.
-
-        Returns:
-            The created DiffGenerator
-
         Priority level: Default pipeline config < User's pipeline config < User's kwargs
         """
         # If users also provide some kwargs, it will override the ServerArgs and PipelineConfig.
