@@ -69,6 +69,7 @@ from sglang.utils import is_in_ci
 logger = logging.getLogger(__name__)
 
 # Define constants
+DEFAULT_UVICORN_ACCESS_LOG_EXCLUDE_PREFIXES = ()
 SAMPLING_BACKEND_CHOICES = {"flashinfer", "pytorch", "ascend"}
 LOAD_FORMAT_CHOICES = [
     "auto",
@@ -346,6 +347,9 @@ class ServerArgs:
     log_requests_level: int = 2
     log_requests_format: str = "text"
     log_requests_target: Optional[List[str]] = None
+    uvicorn_access_log_exclude_prefixes: List[str] = dataclasses.field(
+        default_factory=lambda: list(DEFAULT_UVICORN_ACCESS_LOG_EXCLUDE_PREFIXES)
+    )
     crash_dump_folder: Optional[str] = None
     show_time_cost: bool = False
     enable_metrics: bool = False
@@ -3111,6 +3115,15 @@ class ServerArgs:
             default=ServerArgs.log_requests_target,
             help="Target(s) for request logging: 'stdout' and/or directory path(s) for file output. "
             "Can specify multiple targets, e.g., '--log-requests-target stdout /my/path'. ",
+        )
+        parser.add_argument(
+            "--uvicorn-access-log-exclude-prefixes",
+            type=str,
+            nargs="*",
+            default=list(DEFAULT_UVICORN_ACCESS_LOG_EXCLUDE_PREFIXES),
+            help="Exclude uvicorn access logs whose request path starts with any of these prefixes. "
+            "Defaults to empty (disabled). "
+            "Example: --uvicorn-access-log-exclude-prefixes /metrics /health",
         )
         parser.add_argument(
             "--crash-dump-folder",
