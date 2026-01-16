@@ -3,16 +3,15 @@
 import logging
 from typing import Dict, Optional, Tuple
 
+import cuda.bindings.driver as cuda
+import cutlass
+import cutlass.cute as cute
 import torch
+from cutlass.cute.nvgpu import cpasync
+from cutlass.cute.runtime import from_dlpack
 
 logger = logging.getLogger(__name__)
 
-_cutlass_available = None
-_cute = None
-_cutlass = None
-_cpasync = None
-_from_dlpack = None
-_cuda = None
 _compiled_kernels: Dict[Tuple, object] = {}
 _cu_seqlens_cache: Dict[Tuple, torch.Tensor] = {}
 TILE_K = 128
@@ -31,44 +30,8 @@ NUM_K_ITERS = TILE_K // ROWS_PER_ITER
 SMALL_BATCH_THRESHOLD = 32
 
 
-def _check_cutlass_available():
-    """Check if cutlass/cute is available and import if needed."""
-    global _cutlass_available, _cute, _cutlass, _cpasync, _from_dlpack, _cuda
-
-    if _cutlass_available is not None:
-        return _cutlass_available
-
-    try:
-        import cuda.bindings.driver as cuda
-        import cutlass
-        import cutlass.cute as cute
-        from cutlass.cute.nvgpu import cpasync
-        from cutlass.cute.runtime import from_dlpack
-
-        _cutlass = cutlass
-        _cute = cute
-        _cpasync = cpasync
-        _from_dlpack = from_dlpack
-        _cuda = cuda
-        _cutlass_available = True
-        logger.info("CuTe DSL GDN kernel: cutlass/cute available")
-    except ImportError as e:
-        _cutlass_available = False
-        logger.warning(f"CuTe DSL GDN kernel: cutlass/cute not available: {e}")
-
-    return _cutlass_available
-
-
-def is_cutedsl_gdn_available() -> bool:
-    """Check if CuTe DSL GDN kernel is available."""
-    return _check_cutlass_available()
-
-
 def _define_kernels():
     """Define CuTe DSL kernels for normal and varlen decode modes."""
-    cute = _cute
-    cutlass = _cutlass
-    cpasync = _cpasync
 
     # Small batch constants (follow large batch style)
     NUM_WARPS_SMALL = 4  # 128 threads / 32
@@ -996,10 +959,6 @@ def _define_kernels():
 
 def _create_jit_functions():
     """Create JIT-compiled launcher functions for all kernel variants."""
-    cute = _cute
-    cutlass = _cutlass
-    cpasync = _cpasync
-    cuda = _cuda
 
     gdn_small, gdn_small_varlen, gdn_large, gdn_large_varlen = _define_kernels()
 
@@ -1329,18 +1288,11 @@ def _get_jit_functions():
 
 def _get_compiled_kernel(N, H, HV, K, V, pool_size, use_small_batch, is_varlen_decode):
     """Get or compile the kernel for given dimensions."""
-    if not _check_cutlass_available():
-        raise RuntimeError("CuTe DSL GDN kernel requires cutlass/cute")
-
     global _compiled_kernels
 
     key = (N, H, HV, K, V, pool_size, use_small_batch, is_varlen_decode)
     if key in _compiled_kernels:
         return _compiled_kernels[key]
-
-    cute = _cute
-    cuda = _cuda
-    from_dlpack = _from_dlpack
 
     cu_seqlens = torch.zeros(N + 1, dtype=torch.int32, device="cuda")
 
@@ -1446,11 +1398,6 @@ def cutedsl_fused_sigmoid_gating_delta_rule_update(
     softplus_threshold: float = 20.0,
 ) -> torch.Tensor:
     """CuTe DSL implementation of fused sigmoid gating delta rule update."""
-    if not _check_cutlass_available():
-        raise RuntimeError("CuTe DSL GDN kernel requires cutlass/cute to be installed")
-
-    from_dlpack = _from_dlpack
-    cuda = _cuda
 
     B_q, T_q, H, K = q.shape
     HV = v.shape[2]

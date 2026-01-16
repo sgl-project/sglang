@@ -5,6 +5,7 @@ import triton
 import triton.language as tl
 from einops import rearrange
 
+from sglang.jit_kernel.cutedsl_gdn import cutedsl_fused_sigmoid_gating_delta_rule_update
 from sglang.srt.environ import Envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.fla.chunk import chunk_gated_delta_rule
@@ -41,29 +42,7 @@ from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import is_cuda, is_npu
 from sglang.srt.utils.common import rank0_log
 
-_cutedsl_gdn_available = None
-cutedsl_fused_sigmoid_gating_delta_rule_update = None
 _cutedsl_gdn_logged = False
-
-
-def _check_cutedsl_gdn_available():
-    """Check if CuTe DSL GDN kernel is available by detecting cutlass dependency."""
-    global _cutedsl_gdn_available, cutedsl_fused_sigmoid_gating_delta_rule_update
-
-    if _cutedsl_gdn_available is not None:
-        return _cutedsl_gdn_available
-
-    try:
-        from sglang.jit_kernel.cutedsl_gdn import (
-            cutedsl_fused_sigmoid_gating_delta_rule_update as _func,
-        )
-
-        cutedsl_fused_sigmoid_gating_delta_rule_update = _func
-        _cutedsl_gdn_available = True
-    except ImportError:
-        _cutedsl_gdn_available = False
-
-    return _cutedsl_gdn_available
 
 
 if is_cuda():
@@ -927,14 +906,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
         value = value.view(1, seq_len, value.shape[1] // head_v_dim, head_v_dim)
 
         global _cutedsl_gdn_logged
-        env_enabled = Envs.SGLANG_USE_CUTEDSL_GDN_DECODE.get()
-        kernel_available = _check_cutedsl_gdn_available() if env_enabled else False
-        use_cutedsl = env_enabled and kernel_available
+        use_cutedsl = Envs.SGLANG_USE_CUTEDSL_GDN_DECODE.get()
         if not _cutedsl_gdn_logged:
-            rank0_log(
-                f"CuTe DSL GDN decode: env_enabled={env_enabled}, "
-                f"kernel_available={kernel_available}, use_cutedsl={use_cutedsl}"
-            )
+            rank0_log(f"CuTe DSL GDN decode enabled: {use_cutedsl}")
             _cutedsl_gdn_logged = True
 
         kernel_func = (
