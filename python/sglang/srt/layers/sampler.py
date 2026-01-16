@@ -15,7 +15,13 @@ from sglang.srt.layers.utils.logprob import get_token_ids_logprobs, get_top_logp
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import crash_on_warnings, get_bool_env_var, is_cuda, is_npu
+from sglang.srt.utils import (
+    crash_on_warnings,
+    get_bool_env_var,
+    is_cuda,
+    is_hip,
+    is_npu,
+)
 
 if is_cuda():
     from sgl_kernel import (
@@ -28,12 +34,36 @@ if is_cuda():
 if is_npu():
     import torch_npu
 
+
+def _load_aiter_ops():
+    global _aiter_ops, _aiter_module
+    if _aiter_ops is not None and _aiter_module is not None:
+        return _aiter_ops
+
+    import aiter as _aiter
+    import aiter.ops.sampling
+
+    _aiter_ops = torch.ops.aiter
+    _aiter_module = _aiter
+    logger.info("Using AITER sampler")
+    return _aiter_ops
+
+
+_aiter_ops = None
+_aiter_module = None
+_AITER_MIN_P_WARNING_EMITTED = False
 logger = logging.getLogger(__name__)
 
 SYNC_TOKEN_IDS_ACROSS_TP = get_bool_env_var("SYNC_TOKEN_IDS_ACROSS_TP")
 SGLANG_RETURN_ORIGINAL_LOGPROB = get_bool_env_var("SGLANG_RETURN_ORIGINAL_LOGPROB")
 _CUSTOM_SAMPLER_FACTORIES: Dict[str, Callable[[], "Sampler"]] = {}
-_BUILT_IN_SAMPLING_BACKENDS = {"flashinfer", "pytorch", "ascend"}
+_BUILT_IN_SAMPLING_BACKENDS = {"flashinfer", "pytorch", "ascend", "aiter"}
+
+
+def _to_tensor_scalar_tuple(x):
+    if isinstance(x, torch.Tensor):
+        return (x, 0)
+    return (None, x)
 
 
 class Sampler(nn.Module):
@@ -44,6 +74,110 @@ class Sampler(nn.Module):
 
         if is_dp_attention_enabled():
             self.tp_sync_group = get_attention_tp_group().device_group
+
+    def _aiter_greedy_sample(self, logits: torch.Tensor) -> torch.Tensor:
+        try:
+            _load_aiter_ops()
+            # Ensure logits are contiguous and in the correct format for AITER
+            logits_for_aiter = logits.contiguous()
+            # Initialize output tensor to zeros instead of uninitialized memory
+            out = torch.zeros(logits.size(0), dtype=torch.int32, device=logits.device)
+            _aiter_module.greedy_sample(out, logits_for_aiter)
+            return out.to(torch.long)
+        except Exception as e:
+            logger.warning(
+                f"AITER greedy_sample failed with error: {e}. Falling back to PyTorch torch.argmax."
+            )
+            return torch.argmax(logits, -1)
+
+    def _aiter_sample(
+        self,
+        probs: torch.Tensor,
+        sampling_info: SamplingBatchInfo,
+        positions: torch.Tensor,
+    ) -> torch.Tensor:
+        try:
+            ops = _load_aiter_ops()
+
+            if sampling_info.need_min_p_sampling:
+                global _AITER_MIN_P_WARNING_EMITTED
+                if not _AITER_MIN_P_WARNING_EMITTED:
+                    logger.warning(
+                        "AITER sampling backend does not support min_p; falling back to PyTorch implementation."
+                    )
+                    _AITER_MIN_P_WARNING_EMITTED = True
+                return top_k_top_p_min_p_sampling_from_probs_torch(
+                    probs,
+                    sampling_info.top_ks,
+                    sampling_info.top_ps,
+                    sampling_info.min_ps,
+                    sampling_info.need_min_p_sampling,
+                    sampling_info.sampling_seed,
+                    positions,
+                )
+
+            probs_for_ops = probs.float().contiguous()
+
+            use_top_k = sampling_info.need_top_k_sampling
+            use_top_p = sampling_info.need_top_p_sampling
+
+            # Proactive protection: AITER's top_p_sampling_from_probs kernel has a known bug
+            # on ROCm/HIP that corrupts GPU state, causing crashes in subsequent operations.
+            # The combined top_k_top_p_sampling_from_probs works fine, so we only need to
+            # fall back for top-p-only sampling.
+            if use_top_p and not use_top_k and is_hip():
+                logger.warning(
+                    "AITER top-p-only sampling has known GPU crash issues on ROCm/HIP. "
+                    "Falling back to PyTorch implementation. "
+                    "Combined top-k+top-p works fine with AITER."
+                )
+                return top_k_top_p_min_p_sampling_from_probs_torch(
+                    probs,
+                    sampling_info.top_ks,
+                    sampling_info.top_ps,
+                    sampling_info.min_ps,
+                    sampling_info.need_min_p_sampling,
+                    sampling_info.sampling_seed,
+                    positions,
+                )
+
+            if use_top_k and use_top_p:
+                next_token_ids = ops.top_k_top_p_sampling_from_probs(
+                    probs_for_ops,
+                    None,
+                    *_to_tensor_scalar_tuple(sampling_info.top_ks),
+                    *_to_tensor_scalar_tuple(sampling_info.top_ps),
+                )
+                return next_token_ids.view(-1).to(torch.long)
+            elif use_top_p:
+                next_token_ids = ops.top_p_sampling_from_probs(
+                    probs_for_ops,
+                    None,
+                    *_to_tensor_scalar_tuple(sampling_info.top_ps),
+                )
+                return next_token_ids.view(-1).to(torch.long)
+            elif use_top_k:
+                renorm_probs = ops.top_k_renorm_probs(
+                    probs_for_ops,
+                    *_to_tensor_scalar_tuple(sampling_info.top_ks),
+                )
+                return torch.multinomial(renorm_probs, num_samples=1).view(-1)
+            else:
+                return torch.multinomial(probs_for_ops, num_samples=1).view(-1)
+        except Exception as e:
+            logger.warning(
+                f"AITER sampling operation failed with error: {e}. Falling back to PyTorch implementation."
+            )
+            # Fallback to PyTorch implementation
+            return top_k_top_p_min_p_sampling_from_probs_torch(
+                probs,
+                sampling_info.top_ks,
+                sampling_info.top_ps,
+                sampling_info.min_ps,
+                sampling_info.need_min_p_sampling,
+                sampling_info.sampling_seed,
+                positions,
+            )
 
     def _preprocess_logits(
         self, logits: torch.Tensor, sampling_info: SamplingBatchInfo
@@ -94,7 +228,10 @@ class Sampler(nn.Module):
 
         if sampling_info.is_all_greedy:
             # Use torch.argmax if all requests use greedy sampling
-            batch_next_token_ids = torch.argmax(logits, -1)
+            if get_global_server_args().sampling_backend == "aiter":
+                batch_next_token_ids = self._aiter_greedy_sample(logits)
+            else:
+                batch_next_token_ids = torch.argmax(logits, -1)
             if return_logprob:
                 logprobs = torch.nn.functional.log_softmax(logits, dim=-1)
         else:
@@ -127,7 +264,7 @@ class Sampler(nn.Module):
             del logits
 
             if can_sample_directly_from_probs:
-                # when we don't need top-k, top-p, or min-p sampling, we can directly sample from the probs
+                # When we don't need top-k, top-p, or min-p sampling, we can directly sample from the probs.
                 batch_next_token_ids = sampling_from_probs_torch(
                     probs,
                     sampling_seed=sampling_info.sampling_seed,
@@ -167,6 +304,10 @@ class Sampler(nn.Module):
                         sampling_info.top_ps,
                         sampling_info.min_ps,
                         sampling_info.need_min_p_sampling,
+                    )
+                elif get_global_server_args().sampling_backend == "aiter":
+                    batch_next_token_ids = self._aiter_sample(
+                        probs, sampling_info, positions
                     )
                 else:
                     raise ValueError(
