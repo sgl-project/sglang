@@ -70,6 +70,8 @@ def _normalize_module_type(module_type: str) -> str:
     """Normalize module types like 'text_encoder_2' -> 'text_encoder'."""
     if module_type.endswith("_2"):
         return module_type[:-2]
+    if module_type.endswith("dit2"):
+        return module_type[:-1]
     return module_type
 
 
@@ -261,6 +263,11 @@ class ComponentLoader(ABC):
             "scheduler": (SchedulerLoader, "diffusers"),
             "transformer": (TransformerLoader, "diffusers"),
             "vae": (VAELoader, "diffusers"),
+            "video_vae": (VAELoader, "diffusers"),
+            "audio_vae": (AudioVAELoader, "diffusers"),
+            "video_dit": (MovaDiTLoader, "diffusers"),
+            "audio_dit": (MovaDiTLoader, "diffusers"),
+            "dual_tower_bridge": (BridgeLoader, "diffusers"),
             "text_encoder": (TextEncoderLoader, "transformers"),
             "tokenizer": (TokenizerLoader, "transformers"),
             "image_processor": (ImageProcessorLoader, "transformers"),
@@ -268,13 +275,31 @@ class ComponentLoader(ABC):
             "processor": (AutoProcessorLoader, "transformers"),
             "vision_language_encoder": (VisionLanguageEncoderLoader, "transformers"),
         }
+        custom_library_allowed = {
+            "scheduler",
+            "audio_vae",
+            "video_dit",
+            "audio_dit",
+            "dual_tower_bridge",
+        }
 
         if module_type in module_loaders:
             loader_cls, expected_library = module_loaders[module_type]
             # Assert that the library matches what's expected for this module type
-            assert (
-                transformers_or_diffusers == expected_library
-            ), f"{module_type} must be loaded from {expected_library}, got {transformers_or_diffusers}"
+            if transformers_or_diffusers != expected_library:
+                if (
+                    module_type in custom_library_allowed
+                    and expected_library == "diffusers"
+                ):
+                    logger.info(
+                        "Allowing custom library %s for module type %s",
+                        transformers_or_diffusers,
+                        module_type,
+                    )
+                else:
+                    raise AssertionError(
+                        f"{module_type} must be loaded from {expected_library}, got {transformers_or_diffusers}"
+                    )
             return loader_cls()
 
         # For unknown module types, use a generic loader
@@ -604,7 +629,10 @@ class VAELoader(ComponentLoader):
         return server_args.vae_cpu_offload
 
     def load_customized(
-        self, component_model_path: str, server_args: ServerArgs, *args
+        self,
+        component_model_path: str,
+        server_args: ServerArgs,
+        module_name: str | None = None,
     ):
         """Load the VAE based on the model path, and inference args."""
         config = get_diffusers_component_config(model_path=component_model_path)
@@ -613,7 +641,10 @@ class VAELoader(ComponentLoader):
             class_name is not None
         ), "Model config does not contain a _class_name attribute. Only diffusers format is supported."
 
-        server_args.model_paths["vae"] = component_model_path
+        module_key = "vae"
+        if module_name in ("video_vae", "vae"):
+            module_key = module_name
+        server_args.model_paths[module_key] = component_model_path
 
         logger.debug("HF model config: %s", config)
         vae_config = server_args.pipeline_config.vae_config
@@ -662,6 +693,94 @@ class VAELoader(ComponentLoader):
         loaded = safetensors_load_file(safetensors_list[0])
         vae.load_state_dict(loaded, strict=False)
         return vae.eval()
+
+
+class AudioVAELoader(ComponentLoader):
+    """Loader for MoVA audio VAE (DAC/oobleck)."""
+
+    def should_offload(
+        self, server_args: ServerArgs, model_config: ModelConfig | None = None
+    ):
+        return server_args.vae_cpu_offload
+
+    def load_customized(
+        self, component_model_path: str, server_args: ServerArgs, module_name: str
+    ):
+        from sglang.multimodal_gen.runtime.models.vaes.dac import DAC
+
+        server_args.model_paths[module_name] = component_model_path
+        # Prefer diffusers-style directory if present
+        config_path = os.path.join(component_model_path, "config.json")
+        if os.path.isfile(config_path):
+            audio_vae = DAC.from_pretrained(component_model_path)
+            return audio_vae.eval()
+
+        # Fallback: load from a single checkpoint file
+        if os.path.isfile(component_model_path):
+            if component_model_path.endswith(".dac"):
+                return DAC.load(component_model_path).eval()
+            state_dict = torch.load(component_model_path, map_location="cpu")
+            audio_vae = DAC()
+            audio_vae.load_state_dict(state_dict, strict=False)
+            return audio_vae.eval()
+
+        # Attempt to load any supported file in directory
+        for candidate in ("model.safetensors", "pytorch_model.bin", "model.pth"):
+            candidate_path = os.path.join(component_model_path, candidate)
+            if os.path.isfile(candidate_path):
+                if candidate_path.endswith(".safetensors"):
+                    state_dict = safetensors_load_file(candidate_path)
+                else:
+                    state_dict = torch.load(candidate_path, map_location="cpu")
+                audio_vae = DAC()
+                audio_vae.load_state_dict(state_dict, strict=False)
+                return audio_vae.eval()
+        raise FileNotFoundError(
+            f"Cannot locate audio VAE weights in {component_model_path}"
+        )
+
+
+class MovaDiTLoader(ComponentLoader):
+    """Loader for MoVA video/audio DiT modules (diffusers-style)."""
+
+    def load_customized(
+        self, component_model_path: str, server_args: ServerArgs, module_name: str
+    ):
+        config = get_diffusers_component_config(model_path=component_model_path)
+        class_name = config.pop("_class_name", None)
+        if class_name is None:
+            raise ValueError(
+                "Model config does not contain a _class_name attribute. "
+                "Only diffusers format is supported."
+            )
+
+        server_args.model_paths[module_name] = component_model_path
+        model_cls, _ = ModelRegistry.resolve_model_cls(class_name)
+        torch_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.dit_precision]
+        model = model_cls.from_pretrained(component_model_path, torch_dtype=torch_dtype)
+        model = model.to(device=get_local_torch_device(), dtype=torch_dtype)
+        return model.eval()
+
+
+class BridgeLoader(ComponentLoader):
+    """Loader for MoVA dual tower bridge."""
+
+    def load_customized(
+        self, component_model_path: str, server_args: ServerArgs, module_name: str
+    ):
+        config = get_diffusers_component_config(model_path=component_model_path)
+        class_name = config.pop("_class_name", None)
+        if class_name is None:
+            raise ValueError(
+                "Model config does not contain a _class_name attribute. "
+                "Only diffusers format is supported."
+            )
+        server_args.model_paths[module_name] = component_model_path
+        model_cls, _ = ModelRegistry.resolve_model_cls(class_name)
+        torch_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.dit_precision]
+        model = model_cls.from_pretrained(component_model_path, torch_dtype=torch_dtype)
+        model = model.to(device=get_local_torch_device(), dtype=torch_dtype)
+        return model.eval()
 
 
 class TransformerLoader(ComponentLoader):

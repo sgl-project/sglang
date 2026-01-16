@@ -84,6 +84,9 @@ class Req:
 
     # Latent tensors
     latents: torch.Tensor | None = None
+    audio_latents: torch.Tensor | None = None
+    audio_noise: torch.Tensor | None = None
+    y: torch.Tensor | None = None
     # Flux-2
     latent_ids: torch.Tensor | None = None
 
@@ -99,6 +102,7 @@ class Req:
 
     # Timesteps
     timesteps: torch.Tensor | None = None
+    paired_timesteps: torch.Tensor | None = None
     timestep: torch.Tensor | float | int | None = None
     step_index: int | None = None
 
@@ -106,6 +110,8 @@ class Req:
     sigmas: list[float] | None = None
 
     n_tokens: int | None = None
+
+    audio_num_samples: int | None = None
 
     # Other parameters that may be needed by specific schedulers
     extra_step_kwargs: dict[str, Any] = field(default_factory=dict)

@@ -98,6 +98,9 @@ class GPUWorker:
                 [
                     self.pipeline.get_module("transformer"),
                     self.pipeline.get_module("transformer_2"),
+                    self.pipeline.get_module("video_dit"),
+                    self.pipeline.get_module("video_dit2"),
+                    self.pipeline.get_module("audio_dit"),
                 ],
             ):
                 if isinstance(dit, OffloadableDiTMixin):

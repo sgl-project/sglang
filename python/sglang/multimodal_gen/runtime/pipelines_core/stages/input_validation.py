@@ -252,6 +252,29 @@ class InputValidationStage(PipelineStage):
                 batch, server_args, condition_image_width, condition_image_height
             )
 
+        if isinstance(server_args.pipeline_config, MovaPipelineConfig):
+            if batch.condition_image is None:
+                raise ValueError("MoVA requires an input reference image")
+
+            image = batch.condition_image
+            if isinstance(image, list):
+                image = image[0]
+            if not isinstance(image, Image.Image):
+                raise TypeError(f"Expected PIL.Image for MoVA, got {type(image)}")
+
+            if batch.height is None or batch.width is None:
+                batch.height = image.height
+                batch.width = image.width
+
+            image, (final_w, final_h) = (
+                server_args.pipeline_config.preprocess_condition_image(
+                    image, batch.width, batch.height, self.vae_image_processor
+                )
+            )
+            batch.condition_image = image
+            batch.width = final_w
+            batch.height = final_h
+
         # if height or width is not specified at this point, set default to 720p
         default_height = 720
         default_width = 1280
