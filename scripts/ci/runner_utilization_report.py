@@ -7,11 +7,15 @@ Reports idle time, active time, and utilization percentage per runner label.
 """
 
 import argparse
+import json
 import os
 import subprocess
-import json
-from datetime import datetime, timedelta, timezone
 from collections import defaultdict
+from datetime import datetime, timedelta, timezone
+
+# Labels to skip when grouping runners (GitHub default labels)
+DEFAULT_LABELS_TO_IGNORE = {"self-hosted", "Linux", "X64", "ARM64"}
+GITHUB_HOSTED_LABELS = {"ubuntu-latest", "ubuntu-22.04", "ubuntu-24.04"}
 
 
 def run_gh_command(args: list[str]) -> dict:
@@ -33,9 +37,11 @@ def get_workflow_runs(repo: str, hours: int = 24) -> list[dict]:
     runs = []
     page = 1
     while True:
-        data = run_gh_command([
-            f"repos/{repo}/actions/runs?per_page=100&page={page}",
-        ])
+        data = run_gh_command(
+            [
+                f"repos/{repo}/actions/runs?per_page=100&page={page}",
+            ]
+        )
         page_runs = data.get("workflow_runs", [])
 
         # Filter by time
@@ -60,9 +66,11 @@ def get_jobs_for_run(repo: str, run_id: int) -> list[dict]:
     jobs = []
     page = 1
     while True:
-        data = run_gh_command([
-            f"repos/{repo}/actions/runs/{run_id}/jobs?per_page=100&page={page}",
-        ])
+        data = run_gh_command(
+            [
+                f"repos/{repo}/actions/runs/{run_id}/jobs?per_page=100&page={page}",
+            ]
+        )
         jobs.extend(data.get("jobs", []))
         if len(data.get("jobs", [])) < 100:
             break
@@ -72,11 +80,25 @@ def get_jobs_for_run(repo: str, run_id: int) -> list[dict]:
     return jobs
 
 
-def get_runners(repo: str) -> list[dict]:
-    """Get all self-hosted runners. Returns empty if no permission."""
+def get_runners(repo: str, online_only: bool = True) -> list[dict]:
+    """Get all self-hosted runners with pagination. Returns empty if no permission."""
     try:
-        data = run_gh_command([f"repos/{repo}/actions/runners?per_page=100"])
-        return data.get("runners", [])
+        all_runners = []
+        page = 1
+        while True:
+            data = run_gh_command(
+                [f"repos/{repo}/actions/runners?per_page=100&page={page}"]
+            )
+            runners = data.get("runners", [])
+            all_runners.extend(runners)
+            if len(runners) < 100:
+                break
+            page += 1
+            if page > 10:  # Safety limit
+                break
+        if online_only:
+            all_runners = [r for r in all_runners if r.get("status") == "online"]
+        return all_runners
     except Exception as e:
         print(f"Warning: Cannot access runners API (need admin): {e}")
         return []
@@ -89,26 +111,7 @@ def parse_time(time_str: str) -> datetime:
     return datetime.fromisoformat(time_str.replace("Z", "+00:00"))
 
 
-def infer_runner_label(runner_name: str) -> str:
-    """Infer runner label from runner name."""
-    name_lower = runner_name.lower()
-    if "5090" in name_lower:
-        return "1-gpu-5090"
-    elif "h200" in name_lower:
-        return "h200"
-    elif "h20" in name_lower and "h200" not in name_lower:
-        return "h20"
-    elif "b200" in name_lower:
-        return "b200"
-    elif "mi" in name_lower or "amd" in name_lower:
-        return "amd"
-    elif "ubuntu" in name_lower or "github" in name_lower.replace("-", ""):
-        return "github-hosted"
-    else:
-        return "other"
-
-
-# Known runner counts per label (update as needed)
+# Known runner counts per label (fallback when API unavailable)
 KNOWN_RUNNER_COUNTS = {
     "1-gpu-5090": 16,
     "h200": 8,
@@ -127,25 +130,25 @@ def calculate_utilization(repo: str, hours: int = 24, runner_filter: str = None)
     runs = get_workflow_runs(repo, hours)
     print(f"Found {len(runs)} workflow runs")
 
-    # Try to get runners (may fail without admin permission)
-    print("Fetching runners...")
-    runners = get_runners(repo)
+    # Try to get online runners from API
+    print("Fetching online runners...")
+    runners = get_runners(repo, online_only=True)
 
-    # Group runners by label from API if available
-    label_runners = defaultdict(set)
+    # Build label -> set of online runner names from API
+    api_label_runners = defaultdict(set)
     if runners:
         for runner in runners:
             for label in runner.get("labels", []):
                 label_name = label.get("name", "")
-                if label_name not in ["self-hosted", "Linux", "X64"]:
-                    label_runners[label_name].add(runner["name"])
-        print(f"Got {len(runners)} runners from API")
+                if label_name not in DEFAULT_LABELS_TO_IGNORE:
+                    api_label_runners[label_name].add(runner["name"])
+        print(f"Got {len(runners)} online runners from API")
     else:
-        print("No runner API access, will infer labels from job data")
+        print("No runner API access, will use observed runners from job data")
 
-    # Collect job data per runner
-    runner_jobs = defaultdict(list)  # runner_name -> list of job_info
-    label_jobs = defaultdict(list)   # label -> list of job_info
+    # Track runners seen in jobs (for labels not in API or when API unavailable)
+    job_label_runners = defaultdict(set)
+    label_jobs = defaultdict(list)  # label -> list of job_info
 
     total_runs = len(runs)
     for i, run in enumerate(runs):
@@ -154,7 +157,7 @@ def calculate_utilization(repo: str, hours: int = 24, runner_filter: str = None)
 
         try:
             jobs = get_jobs_for_run(repo, run["id"])
-        except Exception as e:
+        except Exception:
             continue
 
         for job in jobs:
@@ -177,50 +180,62 @@ def calculate_utilization(repo: str, hours: int = 24, runner_filter: str = None)
                 "runner_name": runner_name,
             }
 
-            runner_jobs[runner_name].append(job_info)
-
             # Use job labels directly (available in job data)
             job_labels = job.get("labels", [])
             for label in job_labels:
                 # Skip generic labels
-                if label in ["self-hosted", "Linux", "X64", "ubuntu-latest", "ubuntu-22.04", "ubuntu-24.04"]:
+                if label in DEFAULT_LABELS_TO_IGNORE | GITHUB_HOSTED_LABELS:
                     continue
-                label_runners[label].add(runner_name)
+                job_label_runners[label].add(runner_name)
                 label_jobs[label].append(job_info)
+
+    # Merge API runners and job-observed runners
+    # Prefer API count (online runners) when available
+    all_labels = set(api_label_runners.keys()) | set(job_label_runners.keys())
 
     # Filter labels if specified
     if runner_filter:
-        label_runners = {k: v for k, v in label_runners.items() if runner_filter in k}
+        all_labels = {lbl for lbl in all_labels if runner_filter in lbl}
 
-    print(f"Tracking {len(label_runners)} runner labels: {list(label_runners.keys())}")
+    print(f"Tracking {len(all_labels)} runner labels: {sorted(all_labels)}")
 
     # Calculate metrics per label
-    now = datetime.now(timezone.utc)
     window_seconds = hours * 3600
 
     results = []
 
-    for label in sorted(label_runners.keys()):
-        runners_seen = label_runners[label]
-        # Use known count if available, otherwise use observed count
-        num_runners = KNOWN_RUNNER_COUNTS.get(label, len(runners_seen))
+    for label in sorted(all_labels):
+        # Use API runner count if available, otherwise use job-observed count
+        if label in api_label_runners and api_label_runners[label]:
+            num_runners = len(api_label_runners[label])
+        elif label in job_label_runners:
+            num_runners = len(job_label_runners[label])
+        else:
+            num_runners = KNOWN_RUNNER_COUNTS.get(label, 1)
+
         total_capacity_seconds = window_seconds * num_runners
 
         jobs = label_jobs.get(label, [])
         total_active_seconds = sum(j["duration"] for j in jobs)
 
-        utilization = (total_active_seconds / total_capacity_seconds * 100) if total_capacity_seconds > 0 else 0
+        utilization = (
+            (total_active_seconds / total_capacity_seconds * 100)
+            if total_capacity_seconds > 0
+            else 0
+        )
         idle_seconds = total_capacity_seconds - total_active_seconds
 
-        results.append({
-            "label": label,
-            "num_runners": num_runners,
-            "num_jobs": len(jobs),
-            "total_active_hours": total_active_seconds / 3600,
-            "total_idle_hours": idle_seconds / 3600,
-            "total_capacity_hours": total_capacity_seconds / 3600,
-            "utilization_pct": utilization,
-        })
+        results.append(
+            {
+                "label": label,
+                "num_runners": num_runners,
+                "num_jobs": len(jobs),
+                "total_active_hours": total_active_seconds / 3600,
+                "total_idle_hours": idle_seconds / 3600,
+                "total_capacity_hours": total_capacity_seconds / 3600,
+                "utilization_pct": utilization,
+            }
+        )
 
     return results
 
@@ -228,19 +243,21 @@ def calculate_utilization(repo: str, hours: int = 24, runner_filter: str = None)
 def format_report(results: list[dict], hours: int) -> str:
     """Format results as markdown report."""
     lines = [
-        f"# Runner Utilization Report",
-        f"",
+        "# Runner Utilization Report",
+        "",
         f"**Time window:** Last {hours} hours",
         f"**Generated:** {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}",
-        f"",
-        f"## Summary by Runner Label",
-        f"",
-        f"| Label | Runners | Jobs | Active (hrs) | Idle (hrs) | Utilization |",
-        f"|-------|---------|------|--------------|------------|-------------|",
+        "",
+        "## Summary by Runner Label",
+        "",
+        "| Label | Runners | Jobs | Active (hrs) | Idle (hrs) | Utilization |",
+        "|-------|---------|------|--------------|------------|-------------|",
     ]
 
     for r in results:
-        utilization_bar = "█" * int(r["utilization_pct"] / 10) + "░" * (10 - int(r["utilization_pct"] / 10))
+        utilization_bar = "█" * int(r["utilization_pct"] / 10) + "░" * (
+            10 - int(r["utilization_pct"] / 10)
+        )
         lines.append(
             f"| {r['label']} | {r['num_runners']} | {r['num_jobs']} | "
             f"{r['total_active_hours']:.1f} | {r['total_idle_hours']:.1f} | "
@@ -248,14 +265,16 @@ def format_report(results: list[dict], hours: int) -> str:
         )
 
     # Add interpretation
-    lines.extend([
-        f"",
-        f"## Interpretation",
-        f"",
-        f"- **High utilization (>80%)**: Consider adding more runners",
-        f"- **Low utilization (<20%)**: Runners may be over-provisioned",
-        f"- **Idle time**: Time when runners were available but no jobs were queued",
-    ])
+    lines.extend(
+        [
+            "",
+            "## Interpretation",
+            "",
+            "- **High utilization (>80%)**: Consider adding more runners",
+            "- **Low utilization (<20%)**: Runners may be over-provisioned",
+            "- **Idle time**: Time when runners were available but no jobs were queued",
+        ]
+    )
 
     return "\n".join(lines)
 
@@ -264,7 +283,9 @@ def main():
     parser = argparse.ArgumentParser(description="Generate runner utilization report")
     parser.add_argument("--repo", default="sgl-project/sglang", help="GitHub repo")
     parser.add_argument("--hours", type=int, default=24, help="Time window in hours")
-    parser.add_argument("--filter", type=str, help="Filter runner labels (e.g., '5090', 'h200')")
+    parser.add_argument(
+        "--filter", type=str, help="Filter runner labels (e.g., '5090', 'h200')"
+    )
     parser.add_argument("--output", type=str, help="Output file (default: stdout)")
     args = parser.parse_args()
 
