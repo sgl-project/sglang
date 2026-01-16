@@ -78,16 +78,7 @@ def modulate(
     shift: torch.Tensor | None = None,
     scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """modulate by shift and scale
-
-    Args:
-        x (torch.Tensor): input tensor.
-        shift (torch.Tensor, optional): shift tensor. Defaults to None.
-        scale (torch.Tensor, optional): scale tensor. Defaults to None.
-
-    Returns:
-        torch.Tensor: the output tensor after modulate.
-    """
+    """modulate by shift and scale"""
     if scale is None and shift is None:
         return x
     elif shift is None:

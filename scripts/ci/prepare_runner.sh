@@ -11,4 +11,9 @@ echo ""
 python3 "${SCRIPT_DIR}/cleanup_hf_cache.py"
 echo ""
 
+# Pre-validate cached models and write markers for offline mode
+# This allows tests to run with HF_HUB_OFFLINE=1 for models that are fully cached
+python3 "${SCRIPT_DIR}/prevalidate_cached_models.py"
+echo ""
+
 echo "CI runner preparation complete!"

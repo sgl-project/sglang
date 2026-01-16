@@ -67,6 +67,8 @@ Besides profiler traces, you can also dump a lightweight JSON report that contai
 
 This is useful to quickly identify which stage dominates end-to-end latency, and whether denoising steps have uniform runtimes (and if not, which step has an abnormal spike).
 
+The dumped JSON contains a `denoise_steps_ms` field formatted as an array of objects, each with a `step` key (the step index) and a `duration_ms` key.
+
 Example:
 
 ```bash
@@ -128,3 +130,7 @@ nsys profile \
 - **Reduce trace size**: Use `--num-profiled-timesteps` with smaller values or `--delay`/`--duration` with Nsight Systems
 - **Stage-specific analysis**: Use `--profile` alone for denoising stage, add `--profile-all-stages` for full pipeline
 - **Multiple runs**: Profile with different prompts and resolutions to identify bottlenecks across workloads
+
+## FAQ
+
+- If you are profiling `sglang generate` with Nsight Systems and find that the generated profiler file did not capture any CUDA kernels, you can resolve this issue by increasing the model's inference steps to extend the execution time.

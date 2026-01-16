@@ -1,26 +1,16 @@
 from __future__ import annotations
 
 import logging
-import signal
-import sys
-import threading
 import time
 import warnings
 from typing import TYPE_CHECKING
 
-import psutil
-
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
-from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
-from sglang.srt.utils.common import (
-    ceil_align,
-    disable_request_logging,
-    pyspy_dump_schedulers,
-    raise_error_or_warn,
-)
+from sglang.srt.utils.common import ceil_align, raise_error_or_warn
+from sglang.srt.utils.request_logger import disable_request_logging
+from sglang.srt.utils.watchdog import WatchdogRaw
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
@@ -37,14 +27,16 @@ class SchedulerRuntimeCheckerMixin:
         return num_used, token_usage, available_size, evictable_size
 
     def _get_mamba_token_info(self: Scheduler):
-        is_radix_tree = isinstance(self.tree_cache, MambaRadixCache)
+        is_mamba_radix_cache = (
+            self.tree_cache.supports_mamba() and self.tree_cache.is_tree_cache()
+        )
         full_available_size = self.token_to_kv_pool_allocator.available_size()
         full_evictable_size = (
-            self.tree_cache.full_evictable_size() if is_radix_tree else 0
+            self.tree_cache.full_evictable_size() if is_mamba_radix_cache else 0
         )
         mamba_available_size = self.req_to_token_pool.mamba_pool.available_size()
         mamba_evictable_size = (
-            self.tree_cache.mamba_evictable_size() if is_radix_tree else 0
+            self.tree_cache.mamba_evictable_size() if is_mamba_radix_cache else 0
         )
         full_num_used = self.token_to_kv_pool_allocator.size - (
             full_available_size + full_evictable_size
@@ -242,7 +234,7 @@ class SchedulerRuntimeCheckerMixin:
     def check_memory(self: Scheduler):
         if self.is_hybrid_swa:
             memory_leak, token_msg = self._check_hybrid_memory()
-        elif self.is_hybrid_ssm and isinstance(self.tree_cache, MambaRadixCache):
+        elif self.is_hybrid_ssm and self.tree_cache.supports_mamba():
             memory_leak, token_msg = self._check_mamba_memory()
         else:
             memory_leak, token_msg = self._check_radix_cache_memory()
@@ -296,7 +288,7 @@ class SchedulerRuntimeCheckerMixin:
             self.stats.token_usage = round(token_usage, 2)
             self.stats.gen_throughput = 0
             self.stats.num_queue_reqs = len(self.waiting_queue)
-            self.stats.num_grammar_queue_reqs = len(self.grammar_queue)
+            self.stats.num_grammar_queue_reqs = len(self.grammar_manager)
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 self.stats.num_prefill_prealloc_queue_reqs = len(
                     self.disagg_prefill_bootstrap_queue.queue
@@ -315,8 +307,10 @@ class SchedulerRuntimeCheckerMixin:
         self._publish_kv_events()
 
     def check_tree_cache(self: Scheduler):
-        if (self.is_hybrid_swa and isinstance(self.tree_cache, SWARadixCache)) or (
-            self.is_hybrid_ssm and isinstance(self.tree_cache, MambaRadixCache)
+        if (
+            self.tree_cache.is_tree_cache()
+            and (self.is_hybrid_swa and self.tree_cache.supports_swa())
+            or (self.is_hybrid_ssm and self.tree_cache.supports_mamba())
         ):
             self.tree_cache.sanity_check()
 
@@ -341,62 +335,30 @@ class SchedulerRuntimeCheckerMixin:
         self.maybe_sleep_on_idle()
 
 
-class SchedulerWatchdog:
-    """A watch dog thread that will try to kill the server itself if one forward batch takes too long."""
+def create_scheduler_watchdog(
+    scheduler: Scheduler, watchdog_timeout: float, soft: bool = False
+) -> WatchdogRaw:
+    def dump_info() -> str:
+        if scheduler.is_initializing or disable_request_logging():
+            return ""
+        if scheduler.is_hybrid_swa:
+            _, info_msg = scheduler._check_hybrid_memory()
+        elif scheduler.is_hybrid_ssm and scheduler.tree_cache.supports_mamba():
+            _, info_msg = scheduler._check_mamba_memory()
+        else:
+            _, info_msg = scheduler._check_radix_cache_memory()
+        return (
+            f"{scheduler.cur_batch.batch_size()=}\n"
+            f"{scheduler.cur_batch.reqs=}\n"
+            f"{info_msg}"
+        )
 
-    def __init__(
-        self, scheduler: Scheduler, watchdog_timeout: float, soft: bool = False
-    ):
-        self.scheduler = scheduler
-        self.soft = soft
-
-        self.watchdog_timeout = watchdog_timeout
-        t = threading.Thread(target=self._watchdog_thread, daemon=True)
-        t.start()
-        self.parent_process = psutil.Process().parent()
-
-    def _watchdog_thread(self):
-        while True:
-            self._watchdog_once()
-
-    def _watchdog_once(self):
-        watchdog_last_forward_ct = 0
-        watchdog_last_time = time.perf_counter()
-
-        while True:
-            current = time.perf_counter()
-            if self.scheduler.cur_batch is not None:
-                if watchdog_last_forward_ct == self.scheduler.forward_ct:
-                    if current > watchdog_last_time + self.watchdog_timeout:
-                        break
-                else:
-                    watchdog_last_forward_ct = self.scheduler.forward_ct
-                    watchdog_last_time = current
-            time.sleep(self.watchdog_timeout // 2)
-
-        if not disable_request_logging():
-            # TODO extract this duplicated logic w/ another place
-            # Print batch size and memory pool info to check whether there are de-sync issues.
-            if self.scheduler.is_hybrid_swa:
-                _, info_msg = self.scheduler._check_hybrid_memory()
-            elif self.scheduler.is_hybrid_ssm and isinstance(
-                self.scheduler.tree_cache, MambaRadixCache
-            ):
-                _, info_msg = self.scheduler._check_mamba_memory()
-            else:
-                _, info_msg = self.scheduler._check_radix_cache_memory()
-            logger.error(
-                f"{self.scheduler.cur_batch.batch_size()=}\n"
-                f"{self.scheduler.cur_batch.reqs=}\n"
-                f"{info_msg}"
-            )
-
-        pyspy_dump_schedulers()
-        logger.error(f"Watchdog timeout ({self.watchdog_timeout=}, {self.soft=})")
-        print(file=sys.stderr, flush=True)
-        print(file=sys.stdout, flush=True)
-
-        if not self.soft:
-            # Wait for some time so that the parent process can print the error.
-            time.sleep(5)
-            self.parent_process.send_signal(signal.SIGQUIT)
+    return WatchdogRaw(
+        debug_name="Scheduler",
+        get_counter=lambda: getattr(scheduler, "forward_ct", 0),
+        is_active=lambda: scheduler.is_initializing
+        or getattr(scheduler, "cur_batch", None) is not None,
+        watchdog_timeout=watchdog_timeout,
+        soft=soft,
+        dump_info=dump_info,
+    )
