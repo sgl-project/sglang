@@ -32,8 +32,6 @@ class TestAscendDeepSeekMTP(CustomTestCase):
             "--trust-remote-code",
             "--attention-backend",
             "ascend",
-            "--quantization",
-            "modelslim",
             "--mem-fraction-static",
             0.8,
             "--disable-radix-cache",
@@ -66,7 +64,7 @@ class TestAscendDeepSeekMTP(CustomTestCase):
                 process = popen_launch_server(
                     model,
                     self.base_url,
-                    timeout=1500,
+                    timeout=2400,
                     other_args=[
                         *self.common_args,
                     ],

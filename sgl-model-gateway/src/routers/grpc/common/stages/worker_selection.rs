@@ -18,13 +18,13 @@ use crate::{
 };
 
 /// Worker selection stage: Select appropriate worker(s) based on routing mode
-pub struct WorkerSelectionStage {
+pub(crate) struct WorkerSelectionStage {
     worker_registry: Arc<WorkerRegistry>,
     policy_registry: Arc<PolicyRegistry>,
     mode: WorkerSelectionMode,
 }
 
-pub enum WorkerSelectionMode {
+pub(crate) enum WorkerSelectionMode {
     /// Regular mode: select single worker
     Regular,
     /// PD mode: select prefill + decode workers
@@ -86,15 +86,16 @@ impl PipelineStage for WorkerSelectionStage {
                 ) {
                     Some(w) => WorkerSelection::Single { worker: w },
                     None => {
+                        let model = ctx.input.model_id.as_deref().unwrap_or(UNKNOWN_MODEL_ID);
                         error!(
                             function = "WorkerSelectionStage::execute",
                             mode = "Regular",
-                            model_id = ?ctx.input.model_id,
+                            model_id = %model,
                             "No available workers for model"
                         );
                         return Err(error::service_unavailable(
                             "no_available_workers",
-                            format!("No available workers for model: {:?}", ctx.input.model_id),
+                            format!("No available workers for model: {}", model),
                         ));
                     }
                 }
@@ -103,18 +104,16 @@ impl PipelineStage for WorkerSelectionStage {
                 match self.select_pd_pair(ctx.input.model_id.as_deref(), text, tokens, headers) {
                     Some((prefill, decode)) => WorkerSelection::Dual { prefill, decode },
                     None => {
+                        let model = ctx.input.model_id.as_deref().unwrap_or(UNKNOWN_MODEL_ID);
                         error!(
                             function = "WorkerSelectionStage::execute",
                             mode = "PrefillDecode",
-                            model_id = ?ctx.input.model_id,
+                            model_id = %model,
                             "No available PD worker pairs for model"
                         );
                         return Err(error::service_unavailable(
                             "no_available_pd_worker_pairs",
-                            format!(
-                                "No available PD worker pairs for model: {:?}",
-                                ctx.input.model_id
-                            ),
+                            format!("No available PD worker pairs for model: {}", model),
                         ));
                     }
                 }
@@ -182,7 +181,7 @@ impl WorkerSelectionStage {
         Metrics::record_worker_selection(
             metrics_labels::WORKER_REGULAR,
             metrics_labels::CONNECTION_GRPC,
-            model_id.unwrap_or("default"),
+            model_id.unwrap_or(UNKNOWN_MODEL_ID),
             policy.name(),
         );
 
@@ -248,7 +247,7 @@ impl WorkerSelectionStage {
         let prefill_idx = policy.select_worker(&available_prefill, &info)?;
         let decode_idx = policy.select_worker(&available_decode, &info)?;
 
-        let model = model_id.unwrap_or("default");
+        let model = model_id.unwrap_or(UNKNOWN_MODEL_ID);
         let policy_name = policy.name();
 
         // Record worker selection metrics for both prefill and decode

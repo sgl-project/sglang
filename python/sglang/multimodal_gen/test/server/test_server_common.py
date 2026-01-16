@@ -76,6 +76,9 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
     if server_args.dit_layerwise_offload:
         extra_args += f" --dit-layerwise-offload true"
 
+    if server_args.text_encoder_cpu_offload:
+        extra_args += f" --text-encoder-cpu-offload"
+
     if server_args.ring_degree is not None:
         extra_args += f" --ring-degree {server_args.ring_degree}"
 
@@ -83,12 +86,21 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
     if server_args.lora_path:
         extra_args += f" --lora-path {server_args.lora_path}"
 
+    if server_args.enable_warmup:
+        extra_args += f" --enable-warmup"
+
+    # Build custom environment variables
+    env_vars = {}
+    if server_args.enable_cache_dit:
+        env_vars["SGLANG_CACHE_DIT_ENABLED"] = "true"
+
     # start server
     manager = ServerManager(
         model=server_args.model_path,
         port=port,
         wait_deadline=float(os.environ.get("SGLANG_TEST_WAIT_SECS", "1200")),
         extra_args=extra_args,
+        env_vars=env_vars,
     )
     ctx = manager.start()
 
@@ -103,35 +115,36 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
             model=server_args.model_path,
             prompt=sampling_params.prompt or "A colorful raccoon icon",
             output_size=output_size,
+            output_format=sampling_params.output_format,
         )
-        warmup.run_text_warmups(server_args.warmup_text)
+        if server_args.warmup > 0:
+            if sampling_params.image_path and case.sampling_params.prompt:
+                # Handle URL or local path
+                image_path_list = sampling_params.image_path
+                if not isinstance(image_path_list, list):
+                    image_path_list = [image_path_list]
 
-        if (
-            case.server_args.warmup_edit > 0
-            and case.sampling_params.prompt
-            and sampling_params.image_path
-        ):
-            # Handle URL or local path
-            image_path_list = sampling_params.image_path
-            if not isinstance(image_path_list, list):
-                image_path_list = [image_path_list]
+                new_image_path_list = []
+                for image_path in image_path_list:
+                    if is_image_url(image_path):
+                        new_image_path_list.append(
+                            download_image_from_url(str(image_path))
+                        )
+                    else:
+                        path_obj = Path(image_path)
+                        if not path_obj.exists():
+                            pytest.skip(f"{case.id}: file missing: {image_path}")
+                        new_image_path_list.append(path_obj)
 
-            new_image_path_list = []
-            for image_path in image_path_list:
-                if is_image_url(image_path):
-                    new_image_path_list.append(download_image_from_url(str(image_path)))
-                else:
-                    new_image_path_list.append(Path(image_path))
-                    if not image_path.exists():
-                        pytest.skip(f"{case.id}: file missing: {image_path}")
+                image_path_list = new_image_path_list
 
-            image_path_list = new_image_path_list
-
-            warmup.run_edit_warmups(
-                count=server_args.warmup_edit,
-                edit_prompt=sampling_params.prompt,
-                image_path=image_path_list,
-            )
+                warmup.run_edit_warmups(
+                    count=server_args.warmup,
+                    edit_prompt=sampling_params.prompt,
+                    image_path=image_path_list,
+                )
+            else:
+                warmup.run_text_warmups(server_args.warmup)
     except Exception as exc:
         logger.error("Warm-up failed for %s: %s", case.id, exc)
         ctx.cleanup()
@@ -440,6 +453,21 @@ Consider updating perf_baselines.json with the snippets below:
         assert output_after_set is not None, "Generation after set_lora failed"
         logger.info("[LoRA E2E] Generation after set_lora succeeded")
 
+        # Test 4: list_loras - API should return the expected list of LoRA adapters
+        logger.info("[LoRA E2E] Testing list_loras for %s", case.id)
+        resp = requests.get(f"{base_url}/list_loras")
+        assert resp.status_code == 200, f"list_loras failed: {resp.text}"
+        lora_info = resp.json()
+        logger.info("[LoRA E2E] list_loras returned %s", lora_info)
+        assert (
+            isinstance(lora_info["loaded_adapters"], list)
+            and len(lora_info["loaded_adapters"]) > 0
+        ), "loaded_adapters should be a non-empty list"
+        assert any(
+            a.get("nickname") == "default" for a in lora_info["loaded_adapters"]
+        ), f"nickname 'default' not found in loaded_adapters: {lora_info['loaded_adapters']}"
+        logger.info("[LoRA E2E] list_loras returned expected LoRA adapters")
+
         logger.info("[LoRA E2E] All LoRA API E2E tests passed for %s", case.id)
 
     def _test_lora_dynamic_switch_e2e(
@@ -503,6 +531,192 @@ Consider updating perf_baselines.json with the snippets below:
             "[LoRA Switch E2E] All dynamic switch E2E tests passed for %s", case.id
         )
 
+    def _test_dynamic_lora_loading(
+        self,
+        ctx: ServerContext,
+        case: DiffusionTestCase,
+    ) -> None:
+        """
+        Test dynamic LoRA loading after server startup.
+
+        This test reproduces the LayerwiseOffload + set_lora issue:
+        - Server starts WITHOUT lora_path (LayerwiseOffloadManager initializes first)
+        - Then set_lora is called via API to load LoRA dynamically
+        - This tests the interaction between layerwise offload and dynamic LoRA loading
+        """
+        base_url = f"http://localhost:{ctx.port}/v1"
+        dynamic_lora_path = case.server_args.dynamic_lora_path
+
+        # Call set_lora to load LoRA dynamically after server startup
+        logger.info(
+            "[Dynamic LoRA] Loading LoRA dynamically via set_lora API for %s", case.id
+        )
+        logger.info("[Dynamic LoRA] LoRA path: %s", dynamic_lora_path)
+        resp = requests.post(
+            f"{base_url}/set_lora",
+            json={"lora_nickname": "default", "lora_path": dynamic_lora_path},
+        )
+        assert resp.status_code == 200, f"Dynamic set_lora failed: {resp.text}"
+        logger.info("[Dynamic LoRA] set_lora succeeded for %s", case.id)
+
+    def _test_multi_lora_e2e(
+        self,
+        ctx: ServerContext,
+        case: DiffusionTestCase,
+        generate_fn: Callable[[str, openai.Client], str],
+        first_lora_path: str,
+        second_lora_path: str,
+    ) -> None:
+        """
+        Test multiple LoRA adapters with different set_lora input scenarios.
+        Tests: basic multi-LoRA, different strengths, cached adapters, switch back to single.
+        """
+        base_url = f"http://localhost:{ctx.port}/v1"
+        client = OpenAI(base_url=base_url, api_key="dummy")
+
+        # Test 1: Basic multi-LoRA with list format
+        resp = requests.post(
+            f"{base_url}/set_lora",
+            json={
+                "lora_nickname": ["default", "lora2"],
+                "lora_path": [first_lora_path, second_lora_path],
+                "target": "all",
+                "strength": [1.0, 1.0],
+            },
+        )
+        assert (
+            resp.status_code == 200
+        ), f"set_lora with multiple adapters failed: {resp.text}"
+        assert generate_fn(case.id, client) is not None
+
+        # Test 2: Different strengths
+        resp = requests.post(
+            f"{base_url}/set_lora",
+            json={
+                "lora_nickname": ["default", "lora2"],
+                "lora_path": [first_lora_path, second_lora_path],
+                "target": "all",
+                "strength": [0.8, 0.5],
+            },
+        )
+        assert (
+            resp.status_code == 200
+        ), f"set_lora with different strengths failed: {resp.text}"
+        assert generate_fn(case.id, client) is not None
+
+        # Test 3: Different targets
+        requests.post(f"{base_url}/set_lora", json={"lora_nickname": "default"})
+        resp = requests.post(
+            f"{base_url}/set_lora",
+            json={
+                "lora_nickname": ["default", "lora2"],
+                "lora_path": [first_lora_path, second_lora_path],
+                "target": ["transformer", "transformer_2"],
+                "strength": [0.8, 0.5],
+            },
+        )
+        assert (
+            resp.status_code == 200
+        ), f"set_lora with cached adapters failed: {resp.text}"
+        assert generate_fn(case.id, client) is not None
+
+        # Test 4: Switch back to single LoRA
+        resp = requests.post(f"{base_url}/set_lora", json={"lora_nickname": "default"})
+        assert (
+            resp.status_code == 200
+        ), f"set_lora back to single adapter failed: {resp.text}"
+        assert generate_fn(case.id, client) is not None
+
+        logger.info("[Multi-LoRA] All multi-LoRA tests passed for %s", case.id)
+
+    def _test_v1_models_endpoint(
+        self, ctx: ServerContext, case: DiffusionTestCase
+    ) -> None:
+        """
+        Test /v1/models endpoint returns OpenAI-compatible response.
+        This endpoint is required for sgl-model-gateway router compatibility.
+        """
+        base_url = f"http://localhost:{ctx.port}"
+
+        # Test GET /v1/models
+        logger.info("[Models API] Testing GET /v1/models for %s", case.id)
+        resp = requests.get(f"{base_url}/v1/models")
+        assert resp.status_code == 200, f"/v1/models failed: {resp.text}"
+
+        data = resp.json()
+        assert (
+            data["object"] == "list"
+        ), f"Expected object='list', got {data.get('object')}"
+        assert len(data["data"]) >= 1, "Expected at least one model in response"
+
+        model = data["data"][0]
+        assert "id" in model, "Model missing 'id' field"
+        assert (
+            model["object"] == "model"
+        ), f"Expected object='model', got {model.get('object')}"
+        assert (
+            model["id"] == case.server_args.model_path
+        ), f"Model ID mismatch: expected {case.server_args.model_path}, got {model['id']}"
+
+        # Verify extended diffusion-specific fields
+        assert "num_gpus" in model, "Model missing 'num_gpus' field"
+        assert "task_type" in model, "Model missing 'task_type' field"
+        assert "dit_precision" in model, "Model missing 'dit_precision' field"
+        assert "vae_precision" in model, "Model missing 'vae_precision' field"
+        assert (
+            model["num_gpus"] == case.server_args.num_gpus
+        ), f"num_gpus mismatch: expected {case.server_args.num_gpus}, got {model['num_gpus']}"
+        # Verify task_type is consistent with the modality specified in the test config.
+        # We can't access pipeline_config from test config, but we can validate against modality.
+        modality_to_valid_task_types = {
+            "image": {"T2I", "I2I", "TI2I"},
+            "video": {"T2V", "I2V", "TI2V"},
+        }
+        valid_task_types = modality_to_valid_task_types.get(
+            case.server_args.modality, set()
+        )
+        assert model["task_type"] in valid_task_types, (
+            f"task_type '{model['task_type']}' not valid for modality "
+            f"'{case.server_args.modality}'. Expected one of: {valid_task_types}"
+        )
+        logger.info(
+            "[Models API] GET /v1/models returned valid response with extended fields"
+        )
+
+        # Test GET /v1/models/{model_path}
+        model_path = model["id"]
+        logger.info("[Models API] Testing GET /v1/models/%s", model_path)
+        resp = requests.get(f"{base_url}/v1/models/{model_path}")
+        assert resp.status_code == 200, f"/v1/models/{model_path} failed: {resp.text}"
+
+        single_model = resp.json()
+        assert single_model["id"] == model_path, "Single model ID mismatch"
+        assert single_model["object"] == "model", "Single model object type mismatch"
+
+        # Verify extended fields on single model endpoint too
+        assert "num_gpus" in single_model, "Single model missing 'num_gpus' field"
+        assert "task_type" in single_model, "Single model missing 'task_type' field"
+        assert single_model["task_type"] in valid_task_types, (
+            f"Single model task_type '{single_model['task_type']}' not valid for modality "
+            f"'{case.server_args.modality}'. Expected one of: {valid_task_types}"
+        )
+        logger.info(
+            "[Models API] GET /v1/models/{model_path} returned valid response with extended fields"
+        )
+
+        # Test GET /v1/models/{non_existent_model} returns 404
+        logger.info("[Models API] Testing GET /v1/models/non_existent_model")
+        resp = requests.get(f"{base_url}/v1/models/non_existent_model")
+        assert resp.status_code == 404, f"Expected 404, got {resp.status_code}"
+        error_data = resp.json()
+        assert "error" in error_data, "404 response missing 'error' field"
+        assert (
+            error_data["error"]["code"] == "model_not_found"
+        ), f"Incorrect error code: {error_data['error'].get('code')}"
+        logger.info("[Models API] GET /v1/models/non_existent returns 404 as expected")
+
+        logger.info("[Models API] All /v1/models tests passed for %s", case.id)
+
     def test_diffusion_perf(
         self,
         case: DiffusionTestCase,
@@ -516,6 +730,11 @@ Consider updating perf_baselines.json with the snippets below:
         - test_diffusion_perf[qwen_image_edit]
         - etc.
         """
+        # Dynamic LoRA loading test - tests LayerwiseOffload + set_lora interaction
+        # Server starts WITHOUT lora_path, then set_lora is called after startup
+        if case.server_args.dynamic_lora_path:
+            self._test_dynamic_lora_loading(diffusion_server, case)
+
         generate_fn = get_generate_fn(
             model_path=case.server_args.model_path,
             modality=case.server_args.modality,
@@ -529,6 +748,27 @@ Consider updating perf_baselines.json with the snippets below:
 
         self._validate_and_record(case, perf_record)
 
+        # Test /v1/models endpoint for router compatibility
+        self._test_v1_models_endpoint(diffusion_server, case)
+
         # LoRA API functionality test with E2E validation (only for LoRA-enabled cases)
-        if case.server_args.lora_path:
+        if case.server_args.lora_path or case.server_args.dynamic_lora_path:
             self._test_lora_api_functionality(diffusion_server, case, generate_fn)
+
+            # Test dynamic LoRA switching (requires a second LoRA adapter)
+            if case.server_args.second_lora_path:
+                self._test_lora_dynamic_switch_e2e(
+                    diffusion_server,
+                    case,
+                    generate_fn,
+                    case.server_args.second_lora_path,
+                )
+
+                # Test multi-LoRA functionality
+                self._test_multi_lora_e2e(
+                    diffusion_server,
+                    case,
+                    generate_fn,
+                    case.server_args.lora_path,
+                    case.server_args.second_lora_path,
+                )

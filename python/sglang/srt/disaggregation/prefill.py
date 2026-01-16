@@ -49,11 +49,8 @@ from sglang.srt.managers.schedule_batch import (
     ScheduleBatch,
 )
 from sglang.srt.mem_cache.common import release_kv_cache
-from sglang.srt.mem_cache.memory_pool import (
-    HybridLinearKVPool,
-    NSATokenToKVPool,
-    SWAKVPool,
-)
+from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, NSATokenToKVPool
+from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.tracing.trace import trace_event_batch, trace_slice, trace_slice_end
 
 if TYPE_CHECKING:
@@ -276,6 +273,9 @@ class PrefillBootstrapQueue:
                 failed_reqs.append(req)
                 if self.scheduler.enable_metrics:
                     self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
+                if self.scheduler.enable_hicache_storage:
+                    # to release prefetch events associated with the request
+                    self.scheduler.tree_cache.release_aborted_request(req.rid)
                 continue
 
             # KV.WaitingForInput - init here
@@ -325,13 +325,10 @@ class SchedulerDisaggregationPrefillMixin:
         self.process_prefill_chunk()
 
         batch = self.get_new_batch_prefill()
-        if self.require_mlp_sync:
-            batch = self.prepare_mlp_sync_batch(batch)
+        batch = self.maybe_prepare_mlp_sync_batch_and_log_stats(batch)
 
         if batch:
             trace_event_batch("schedule", batch.reqs)
-
-        self.log_prefill_stats_late(batch)
 
         return batch
 
@@ -523,7 +520,6 @@ class SchedulerDisaggregationPrefillMixin:
                 )
 
         self.maybe_send_health_check_signal()
-        self.log_prefill_stats_late(batch)
 
     def process_disagg_prefill_inflight_queue(
         self: Scheduler, rids_to_check: Optional[List[str]] = None
@@ -607,7 +603,7 @@ class SchedulerDisaggregationPrefillMixin:
         """
         polls = poll_and_all_reduce(
             [req.disagg_kv_sender for req in self.disagg_prefill_inflight_queue],
-            self.tp_worker.get_attention_tp_cpu_group(),
+            self.attn_tp_cpu_group,
         )
 
         transferred_rids: List[str] = []

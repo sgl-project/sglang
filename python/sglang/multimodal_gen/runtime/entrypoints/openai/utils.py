@@ -9,6 +9,7 @@ from typing import Any, List, Optional, Union
 import httpx
 from fastapi import UploadFile
 
+from sglang.multimodal_gen.configs.sample.sampling_params import DataType
 from sglang.multimodal_gen.runtime.entrypoints.utils import post_process_sample
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.scheduler_client import AsyncSchedulerClient
@@ -23,10 +24,10 @@ logger = init_logger(__name__)
 
 @dataclasses.dataclass
 class SetLoraReq:
-    lora_nickname: str
-    lora_path: Optional[str] = None
-    target: str = "all"  # "all", "transformer", "transformer_2", "critic"
-    strength: float = 1.0  # LoRA strength for merge, default 1.0
+    lora_nickname: Union[str, List[str]]
+    lora_path: Optional[Union[str, List[Optional[str]]]] = None
+    target: Union[str, List[str]] = "all"
+    strength: Union[float, List[float]] = 1.0  # LoRA strength for merge, default 1.0
 
 
 @dataclasses.dataclass
@@ -38,6 +39,37 @@ class MergeLoraWeightsReq:
 @dataclasses.dataclass
 class UnmergeLoraWeightsReq:
     target: str = "all"  # "all", "transformer", "transformer_2", "critic"
+
+
+@dataclasses.dataclass
+class ListLorasReq:
+    # Empty payload; used only as a type marker for listing LoRA status
+    pass
+
+
+def format_lora_message(
+    lora_nickname: Union[str, List[str]],
+    target: Union[str, List[str]],
+    strength: Union[float, List[float]],
+) -> tuple[str, str, str]:
+    """Format success message for single or multiple LoRAs"""
+    if isinstance(lora_nickname, list):
+        nickname_str = ", ".join(lora_nickname)
+        target_str = ", ".join(target) if isinstance(target, list) else target
+        strength_str = (
+            ", ".join(f"{s:.2f}" for s in strength)
+            if isinstance(strength, list)
+            else f"{strength:.2f}"
+        )
+    else:
+        nickname_str = lora_nickname
+        target_str = target if isinstance(target, str) else ", ".join(target)
+        strength_str = (
+            f"{strength:.2f}"
+            if isinstance(strength, (int, float))
+            else ", ".join(f"{s:.2f}" for s in strength)
+        )
+    return nickname_str, target_str, strength_str
 
 
 def _parse_size(size: str) -> tuple[int, int] | tuple[None, None]:
@@ -183,15 +215,35 @@ async def process_generation_batch(
             raise RuntimeError(
                 f"Model generation returned no output. Error from scheduler: {error_msg}"
             )
-
-        save_file_path = str(os.path.join(batch.output_path, batch.output_file_name))
-        post_process_sample(
-            result.output[0],
-            batch.data_type,
-            batch.fps,
-            batch.save_output,
-            save_file_path,
-        )
+        save_file_path_list = []
+        if batch.data_type == DataType.VIDEO:
+            for idx, output in enumerate(result.output):
+                save_file_path = str(
+                    os.path.join(batch.output_path, batch.output_file_name)
+                )
+                post_process_sample(
+                    result.output[idx],
+                    batch.data_type,
+                    batch.fps,
+                    batch.save_output,
+                    save_file_path,
+                )
+                save_file_path_list.append(save_file_path)
+        else:
+            for idx, output in enumerate(result.output):
+                save_file_path = str(
+                    os.path.join(
+                        batch.output_path, f"sample_{idx}_" + batch.output_file_name
+                    )
+                )
+                post_process_sample(
+                    output,
+                    batch.data_type,
+                    batch.fps,
+                    batch.save_output,
+                    save_file_path,
+                )
+                save_file_path_list.append(save_file_path)
 
     total_time = time.perf_counter() - total_start_time
     log_batch_completion(logger, 1, total_time)
@@ -199,7 +251,7 @@ async def process_generation_batch(
     if result.peak_memory_mb and result.peak_memory_mb > 0:
         logger.info(f"Peak memory usage: {result.peak_memory_mb:.2f} MB")
 
-    return save_file_path, result
+    return save_file_path_list, result
 
 
 def merge_image_input_list(*inputs: Union[List, Any, None]) -> List:
@@ -235,6 +287,9 @@ def add_common_data_to_response(
 ) -> dict:
     if result.peak_memory_mb and result.peak_memory_mb > 0:
         response["peak_memory_mb"] = result.peak_memory_mb
+
+    if result.timings and result.timings.total_duration_s > 0:
+        response["inference_time_s"] = result.timings.total_duration_s
 
     response["id"] = request_id
 

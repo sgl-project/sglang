@@ -30,7 +30,6 @@ python3 -m sglang.launch_server \
     --trust-remote-code \
     --attention-backend ascend \
     --device npu \
-    --quantization modelslim \
     --watchdog-timeout 9000 \
     --cuda-graph-bs 8 16 24 28 32 \
     --mem-fraction-static 0.68 \
@@ -88,7 +87,6 @@ python -m sglang.launch_server \
     --mem-fraction-static 0.6 \
     --attention-backend ascend \
     --device npu \
-    --quantization modelslim \
     --max-running-requests 8 \
     --context-length 8192 \
     --disable-radix-cache \
@@ -144,7 +142,6 @@ python -m sglang.launch_server \
     --max-running-requests 352 \
     --attention-backend ascend \
     --device npu \
-    --quantization modelslim \
     --moe-a2a-backend deepep \
     --enable-dp-attention \
     --deepep-mode low_latency \
@@ -157,7 +154,6 @@ python -m sglang.launch_server \
     --speculative-num-steps 3 \
     --speculative-eagle-topk 1 \
     --speculative-num-draft-tokens 4 \
-    --prefill-round-robin-balance \
     --disable-shared-experts-fusion \
     --dtype bfloat16 \
     --tokenizer-worker-num 4
@@ -217,7 +213,6 @@ do
       --mem-fraction-static 0.81 \
       --attention-backend ascend \
       --device npu \
-      --quantization modelslim \
       --max-running-requests 8 \
       --context-length 8192 \
       --disable-radix-cache \
@@ -280,7 +275,6 @@ do
       --max-running-requests 832 \
       --attention-backend ascend \
       --device npu \
-      --quantization modelslim \
       --moe-a2a-backend deepep \
       --enable-dp-attention \
       --deepep-mode low_latency \
@@ -293,7 +287,6 @@ do
       --speculative-eagle-topk 1 \
       --speculative-num-draft-tokens 3  \
       --tokenizer-worker-num 4 \
-      --prefill-round-robin-balance \
       --disable-shared-experts-fusion \
       --dtype bfloat16
 done
