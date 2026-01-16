@@ -979,17 +979,20 @@ class SWARadixCache(BasePrefixCache):
                     elif swa_evicted_seqlen < total_prefix_length + prefix_len:
                         swa_evicted_len = swa_evicted_seqlen - total_prefix_length
                         self.token_to_kv_pool_allocator.free(
-                            node.value[first_diff_idx:]
+                            node.value[swa_evicted_len:]
                         )
                         self._split_node(node.key, node, swa_evicted_len)
                         node.value = value[swa_evicted_len:prefix_len]
+                        self.token_to_kv_pool_allocator.free(
+                            value[first_diff_idx:swa_evicted_len]
+                        )
                         node.swa_tombstone = False
                         # insert the node into the lru lists
                         self.swa_lru_list.insert_mru(node)
                         self.swa_evictable_size_ += len(node.value)
                     else:
                         self.token_to_kv_pool_allocator.free(
-                            node.value[first_diff_idx:prefix_len]
+                            value[first_diff_idx:prefix_len]
                         )
                 else:
                     self.token_to_kv_pool_allocator.free(
