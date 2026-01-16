@@ -33,11 +33,10 @@ SMALL_BATCH_THRESHOLD = 32
 def _define_kernels():
     """Define CuTe DSL kernels for normal and varlen decode modes."""
 
-    # Small batch constants (follow large batch style)
-    NUM_WARPS_SMALL = 4  # 128 threads / 32
-    V_PER_WARP_SMALL = TILE_V_SMALL // NUM_WARPS_SMALL  # 16 / 4 = 4
-    ROWS_PER_ITER_SMALL = 32 // V_PER_WARP_SMALL  # 8
-    NUM_K_ITERS_SMALL = TILE_K // ROWS_PER_ITER_SMALL  # 16
+    NUM_WARPS_SMALL = 4
+    V_PER_WARP_SMALL = TILE_V_SMALL // NUM_WARPS_SMALL
+    ROWS_PER_ITER_SMALL = 32 // V_PER_WARP_SMALL
+    NUM_K_ITERS_SMALL = TILE_K // ROWS_PER_ITER_SMALL
 
     @cute.kernel
     def gdn_kernel_small_batch(
@@ -312,31 +311,25 @@ def _define_kernels():
 
         pool_idx = h0_indices[i_n]
 
-        # Only process valid indices (skip padding slots in CUDA graph replay)
         if pool_idx >= 0:
-            # Thread mapping (follow large batch style)
-            k_local = in_warp_tid // V_PER_WARP_SMALL  # 0-7
-            v_local = in_warp_tid % V_PER_WARP_SMALL  # 0-3
+            k_local = in_warp_tid // V_PER_WARP_SMALL
+            v_local = in_warp_tid % V_PER_WARP_SMALL
             v_base = warp_idx * V_PER_WARP_SMALL
-            v_idx = v_base + v_local  # 0-15
+            v_idx = v_base + v_local
 
             smem = cutlass.utils.SmemAllocator()
             sData = smem.allocate_tensor(cutlass.Float32, smem_layout_staged, 128)
-            # smem_o for l2norm cross-warp reduction (need 4 + 4 = 8 slots)
             smem_o_layout = cute.make_layout((TILE_V_SMALL,), stride=(1,))
             smem_o = smem.allocate_tensor(cutlass.Float32, smem_o_layout, 128)
-            # sK and sQ in shared memory (follow large batch)
             smem_k_layout = cute.make_layout((TILE_K,), stride=(1,))
             smem_q_layout = cute.make_layout((TILE_K,), stride=(1,))
             sK = smem.allocate_tensor(cutlass.Float32, smem_k_layout, 128)
             sQ = smem.allocate_tensor(cutlass.Float32, smem_q_layout, 128)
 
-            # Load q/k to shared memory (follow large batch)
             if tidx < TILE_K:
                 sK[tidx] = cutlass.Float32(k[0, i_n, i_h, tidx])
                 sQ[tidx] = cutlass.Float32(q[0, i_n, i_h, tidx])
 
-            # Setup h0 prefetch
             gSrc_batch = h0_source[(pool_idx, i_hv, None, None)]
             gSrc = cute.local_tile(gSrc_batch, (TILE_K, TILE_V_SMALL), (0, None))
             thr_copy_load = tiled_copy_load.get_slice(tidx)
@@ -605,7 +598,6 @@ def _define_kernels():
             r_g = cute.arch.shuffle_sync(r_g, 0)
             r_beta = cute.arch.shuffle_sync(r_beta, 0)
 
-            # barrier for q/k shared memory (moved from after q/k load to overlap with prefetch + gate)
             cute.arch.barrier()
 
             if use_qk_l2norm:
@@ -824,7 +816,6 @@ def _define_kernels():
             r_g = cute.arch.shuffle_sync(r_g, 0)
             r_beta = cute.arch.shuffle_sync(r_beta, 0)
 
-            # barrier for q/k shared memory (moved from after q/k load to overlap with prefetch + gate)
             cute.arch.barrier()
 
             if use_qk_l2norm:
@@ -1297,7 +1288,6 @@ def _get_compiled_kernel(N, H, HV, K, V, pool_size, use_small_batch, is_varlen_d
     cu_seqlens = torch.zeros(N + 1, dtype=torch.int32, device="cuda")
 
     if is_varlen_decode:
-        # Varlen decode: (1, N, H, K), a/b are 2D (N, HV)
         q = torch.zeros(1, N, H, K, dtype=torch.bfloat16, device="cuda")
         k = torch.zeros(1, N, H, K, dtype=torch.bfloat16, device="cuda")
         v = torch.zeros(1, N, HV, V, dtype=torch.bfloat16, device="cuda")
@@ -1305,7 +1295,6 @@ def _get_compiled_kernel(N, H, HV, K, V, pool_size, use_small_batch, is_varlen_d
         b = torch.zeros(N, HV, dtype=torch.bfloat16, device="cuda")
         o = torch.zeros(1, N, HV, V, dtype=torch.bfloat16, device="cuda")
     else:
-        # Normal: (N, 1, H, K), a/b are 3D (N, 1, HV)
         q = torch.zeros(N, 1, H, K, dtype=torch.bfloat16, device="cuda")
         k = torch.zeros(N, 1, H, K, dtype=torch.bfloat16, device="cuda")
         v = torch.zeros(N, 1, HV, V, dtype=torch.bfloat16, device="cuda")
@@ -1422,21 +1411,18 @@ def cutedsl_fused_sigmoid_gating_delta_rule_update(
         )
 
     if is_varlen_decode:
-        # Varlen kernel expects a/b as 2D (N, HV)
         if a.dim() == 3:
-            a = a.squeeze(0)  # (1, N, HV) -> (N, HV)
+            a = a.squeeze(0)
         if b.dim() == 3:
             b = b.squeeze(0)
         o = q.new_empty(1, N, HV, V, dtype=torch.bfloat16)
     else:
-        # Non-varlen kernel expects a/b as 3D (N, 1, HV)
         if a.dim() == 2:
-            a = a.unsqueeze(1)  # (N, HV) -> (N, 1, HV)
+            a = a.unsqueeze(1)
         if b.dim() == 2:
             b = b.unsqueeze(1)
         o = q.new_empty(N, 1, HV, V, dtype=torch.bfloat16)
 
-    # Ensure contiguous tensors for CuTe kernel
     q, k, v = [t.contiguous() for t in (q, k, v)]
 
     global _cu_seqlens_cache

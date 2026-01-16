@@ -22,7 +22,7 @@ try:
 except ImportError:
     TRITON_KERNEL_AVAILABLE = False
 
-# Import cutedsl_gdn module from parent directory
+
 cutedsl_gdn_module = None
 if CUTEDSL_AVAILABLE:
     try:
@@ -272,7 +272,7 @@ def test_cutedsl_gdn_performance(B: int):
 
     scale = K**-0.5
     use_small_batch = N < 32
-    is_varlen_decode = True  # Test varlen version, consistent with end-to-end model
+    is_varlen_decode = True
     warmup_iters = 10
     bench_iters = 100
     run_iters = 10
@@ -310,13 +310,11 @@ def test_cutedsl_gdn_performance(B: int):
     for ri in range(run_iters):
         torch.manual_seed(2025 + ri)
         if is_varlen_decode:
-            # Varlen decode format: (1, N, H, K), a/b are 2D (N, HV)
             q_i = torch.randn(1, N, H, K, dtype=torch.bfloat16, device="cuda")
             k_i = torch.randn(1, N, H, K, dtype=torch.bfloat16, device="cuda")
             v_i = torch.randn(1, N, HV, V, dtype=torch.bfloat16, device="cuda")
             a_i = torch.randn(N, HV, dtype=torch.bfloat16, device="cuda")
             b_i = torch.randn(N, HV, dtype=torch.bfloat16, device="cuda")
-            # Triton format: (N, 1, H, K)
             q_triton_list.append(q_i.transpose(0, 1).contiguous())
             k_triton_list.append(k_i.transpose(0, 1).contiguous())
             v_triton_list.append(v_i.transpose(0, 1).contiguous())
@@ -554,7 +552,7 @@ def run_benchmark(
 
     scale = K**-0.5
     use_small_batch = N < 32
-    is_varlen_decode = True  # Test varlen version, consistent with end-to-end model
+    is_varlen_decode = True
 
     A_log = torch.randn(HV, dtype=torch.float32, device="cuda")
     dt_bias = torch.randn(HV, dtype=torch.bfloat16, device="cuda")
@@ -589,13 +587,11 @@ def run_benchmark(
     for ri in range(run_iters):
         torch.manual_seed(2025 + ri)
         if is_varlen_decode:
-            # Varlen decode format: (1, N, H, K), a/b are 2D (N, HV)
             q_i = torch.randn(1, N, H, K, dtype=torch.bfloat16, device="cuda")
             k_i = torch.randn(1, N, H, K, dtype=torch.bfloat16, device="cuda")
             v_i = torch.randn(1, N, HV, V, dtype=torch.bfloat16, device="cuda")
             a_i = torch.randn(N, HV, dtype=torch.bfloat16, device="cuda")
             b_i = torch.randn(N, HV, dtype=torch.bfloat16, device="cuda")
-            # Triton format: (N, 1, H, K)
             q_triton_list.append(q_i.transpose(0, 1).contiguous())
             k_triton_list.append(k_i.transpose(0, 1).contiguous())
             v_triton_list.append(v_i.transpose(0, 1).contiguous())
@@ -914,7 +910,6 @@ Examples:
     args = parser.parse_args()
 
     if args.bench:
-        # Run standalone benchmark
         print(f"\nCuTe DSL GDN Benchmark")
         print(f"Batch sizes: {args.B}")
         print(
@@ -937,9 +932,7 @@ Examples:
         print_final_summary(all_results)
 
     elif args.precision:
-        # Run precision tests via pytest
         pytest.main([__file__, "-v", "-k", "precision"])
 
     else:
-        # Run pytest by default
         pytest.main([__file__, "-v"])
