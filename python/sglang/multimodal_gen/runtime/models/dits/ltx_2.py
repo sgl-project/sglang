@@ -1125,7 +1125,7 @@ class LTX2TransformerBlock(nn.Module):
         return hidden_states, audio_hidden_states
 
 
-class LTXModel(CachableDiT, OffloadableDiTMixin):
+class LTX2VideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
     _fsdp_shard_conditions = LTX2ArchConfig()._fsdp_shard_conditions
     _compile_conditions = LTX2ArchConfig()._compile_conditions
     _supported_attention_backends = LTX2ArchConfig()._supported_attention_backends
@@ -1397,10 +1397,13 @@ class LTXModel(CachableDiT, OffloadableDiTMixin):
         # 5. Run blocks
         for block in self.transformer_blocks:
             hidden_states, audio_hidden_states = block(
-                hidden_states=hidden_states,
-                audio_hidden_states=audio_hidden_states,
-                encoder_hidden_states=encoder_hidden_states,
-                audio_encoder_hidden_states=audio_encoder_hidden_states,
+                hidden_states,
+                audio_hidden_states,
+                encoder_hidden_states,
+                audio_encoder_hidden_states,
+                # Keep the first 4 args positional to stay compatible with cache-dit's
+                # LTX2 adapter, which treats `audio_hidden_states` as `encoder_hidden_states`
+                # under ForwardPattern.Pattern_0.
                 temb=temb,
                 temb_audio=temb_audio,
                 temb_ca_scale_shift=temb_ca_scale_shift,
@@ -1460,5 +1463,7 @@ class LTXModel(CachableDiT, OffloadableDiTMixin):
                 
         return hidden_states, audio_hidden_states
 
-LTX2VideoTransformer3DModel = LTXModel
+
+# Backward-compatible alias (older internal name).
+LTXModel = LTX2VideoTransformer3DModel
 EntryClass = LTX2VideoTransformer3DModel
