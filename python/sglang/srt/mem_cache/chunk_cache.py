@@ -30,6 +30,9 @@ class ChunkCache(BasePrefixCache):
 
         self.protected_size_ = 0
 
+    def is_chunk_cache(self) -> bool:
+        return True
+
     # NOTE (csy): this is to determine if a cache has prefix matching feature.
     # Chunk cache always return True to indicate no prefix matching.
     # TODO (csy): Using a prefix cache trait to replace this
@@ -102,6 +105,12 @@ class SWAChunkCache(ChunkCache):
 
         self.sliding_window_size = params.sliding_window_size
         self.attention_chunk_size = params.attention_chunk_size
+        self.window_size = self.sliding_window_size or self.attention_chunk_size
+
+        self.chunked_prefill_size = params.chunked_prefill_size
+
+    def supports_swa(self) -> bool:
+        return True
 
     def evict_swa(
         self,
@@ -119,6 +128,11 @@ class SWAChunkCache(ChunkCache):
                 req.evicted_seqlen_local,
                 prelen // self.attention_chunk_size * self.attention_chunk_size,
             )
+
+        if self.page_size > 1:
+            new_evicted_seqlen_local = (
+                new_evicted_seqlen_local // self.page_size
+            ) * self.page_size
 
         if new_evicted_seqlen_local > req.evicted_seqlen_local:
             free_slots = self.req_to_token_pool.req_to_token[

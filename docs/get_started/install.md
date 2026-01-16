@@ -12,7 +12,13 @@ It is recommended to use uv for faster installation:
 ```bash
 pip install --upgrade pip
 pip install uv
-uv pip install "sglang" --prerelease=allow
+uv pip install "sglang"
+```
+
+For different CUDA versions, you can try to add `--extra-index-url` to find the correct [PyTorch](https://pytorch.org/get-started/locally/) wheel.
+For example, on GB200, you will need to do the following. Otherwise, it will install the CPU version of PyTorch.
+```
+uv pip install "sglang" --extra-index-url https://download.pytorch.org/whl/cu129
 ```
 
 **Quick fixes to common problems**
@@ -67,6 +73,10 @@ docker run --gpus all \
 ```
 
 You can also find the nightly docker images [here](https://hub.docker.com/r/lmsysorg/sglang/tags?name=nightly).
+
+On B300 (SM103) or Cuda 13 environment, we recommend using the nightly image at `lmsysorg/sglang:dev-cu13` or stable image at `lmsysorg/sglang:latest-cu130-runtime`.
+Please, do not re-install the project as editable inside the docker image, since it will override the version of
+libraries specified by the cu13 docker image.
 
 ## Method 4: Using Kubernetes
 
@@ -148,6 +158,8 @@ sky status --endpoint 30000 sglang
 
 To deploy on SGLang on AWS SageMaker, check out [AWS SageMaker Inference](https://aws.amazon.com/sagemaker/ai/deploy)
 
+Amazon Web Services provide supports for SGLang containers along with routine security patching. For available SGLang containers, check out [AWS SGLang DLCs](https://github.com/aws/deep-learning-containers/blob/master/available_images.md#sglang-containers)
+
 To host a model with your own container, follow the following steps:
 
 1. Build a docker container with [sagemaker.Dockerfile](https://github.com/sgl-project/sglang/blob/main/docker/sagemaker.Dockerfile) alongside the [serve](https://github.com/sgl-project/sglang/blob/main/docker/serve) script.
@@ -196,3 +208,4 @@ echo "Build and push completed successfully!"
 
 - [FlashInfer](https://github.com/flashinfer-ai/flashinfer) is the default attention kernel backend. It only supports sm75 and above. If you encounter any FlashInfer-related issues on sm75+ devices (e.g., T4, A10, A100, L4, L40S, H100), please switch to other kernels by adding `--attention-backend triton --sampling-backend pytorch` and open an issue on GitHub.
 - To reinstall flashinfer locally, use the following command: `pip3 install --upgrade flashinfer-python --force-reinstall --no-deps` and then delete the cache with `rm -rf ~/.cache/flashinfer`.
+- When encountering `ptxas fatal   : Value 'sm_103a' is not defined for option 'gpu-name'` in Cuda 13 image, please use this command  `rm -f /usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin/ptxas && ln -s /usr/local/cuda/bin/ptxas /usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin/ptxas` to fix the triton ptxas path.

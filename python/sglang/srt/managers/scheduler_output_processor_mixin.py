@@ -470,12 +470,9 @@ class SchedulerOutputProcessorMixin:
         self.token_to_kv_pool_allocator.free_group_end()
 
         self.forward_ct_decode = (self.forward_ct_decode + 1) % (1 << 30)
-        if (
-            self.current_scheduler_metrics_enabled
-            and self.forward_ct_decode % self.server_args.decode_log_interval == 0
-        ):
-            self.log_decode_stats(can_run_cuda_graph, running_batch=batch)
-        if self.enable_metrics:
+        if self.current_scheduler_metrics_enabled:
+            if self.forward_ct_decode % self.server_args.decode_log_interval == 0:
+                self.log_decode_stats(can_run_cuda_graph, running_batch=batch)
             self.log_decode_stats_every_iteration(
                 batch, num_accepted_tokens=result.num_accepted_tokens
             )
