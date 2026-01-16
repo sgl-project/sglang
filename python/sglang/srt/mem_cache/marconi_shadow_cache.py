@@ -18,8 +18,9 @@ from sglang.srt.mem_cache.marconi_utils import (
 class ShadowNode:
     key: Tuple[int, ...]
     value: List[int]
+    extra_key: Optional[str] = None
     parent: Optional["ShadowNode"] = None
-    children: Optional[dict[int, "ShadowNode"]] = None
+    children: Optional[dict[object, "ShadowNode"]] = None
     last_access_time: int = 0
     prefix_len: int = 0
 
@@ -51,6 +52,10 @@ class MarconiShadowCache:
         self.logical_ts += 1
         return self.logical_ts
 
+    def _child_key(self, extra_key: Optional[str], key: Tuple[int, ...]):
+        token = key[0]
+        return token if extra_key is None else (extra_key, token)
+
     def _key_match(self, key0: Tuple[int, ...], key1: Tuple[int, ...]) -> int:
         i = 0
         for k0, k1 in zip(key0, key1):
@@ -59,7 +64,12 @@ class MarconiShadowCache:
             i += 1
         return i
 
-    def match_prefix(self, input_token_ids: List[int], record_request: bool = True):
+    def match_prefix(
+        self,
+        input_token_ids: List[int],
+        extra_key: Optional[str] = None,
+        record_request: bool = True,
+    ):
         self._tick()
         prefix_token_ids: List[List[int]] = []
         nodes_accessed = [self.root_node]
@@ -68,6 +78,7 @@ class MarconiShadowCache:
             tuple(input_token_ids),
             prefix_token_ids,
             nodes_accessed,
+            extra_key,
         )
         prefix_token_ids = [t for part in prefix_token_ids for t in part]
         num_tokens_skipped = len(prefix_token_ids)
@@ -82,9 +93,9 @@ class MarconiShadowCache:
             nodes_accessed[-1].last_access_time = self.logical_ts
         return prefix_token_ids, branchoff_required, prefix_len
 
-    def insert(self, token_ids: List[int]) -> None:
+    def insert(self, token_ids: List[int], extra_key: Optional[str] = None) -> None:
         _, branchoff_required, prefix_len = self.match_prefix(
-            token_ids, record_request=False
+            token_ids, extra_key=extra_key, record_request=False
         )
         num_extra_tokens = len(token_ids) - prefix_len
         num_extra_mamba_states = 2 if branchoff_required else 1
@@ -102,7 +113,12 @@ class MarconiShadowCache:
         if self.get_tree_size() + bytes_needed > self.capacity_bytes:
             bytes_to_remove = self.get_tree_size() + bytes_needed - self.capacity_bytes
             self.evict(bytes_to_remove)
-        self._insert_helper(node=self.root_node, key=tuple(token_ids), value=token_ids)
+        self._insert_helper(
+            node=self.root_node,
+            key=tuple(token_ids),
+            value=token_ids,
+            extra_key=extra_key,
+        )
 
     def get_tree_size(self) -> int:
         num_cached_mamba_states, num_cached_kv_tokens = self._count_cached_tokens(
@@ -248,20 +264,22 @@ class MarconiShadowCache:
         key: Tuple[int, ...],
         value: List[List[int]],
         nodes_accessed: List[ShadowNode],
+        extra_key: Optional[str],
     ) -> int:
         if len(key) == 0:
             return 0
-        if key[0] in node.children:
-            child = node.children[key[0]]
+        child_key = self._child_key(extra_key, key)
+        if child_key in node.children:
+            child = node.children[child_key]
             prefix_len = self._key_match(child.key, key)
             if prefix_len < len(child.key):
                 return prefix_len + self._match_prefix_helper(
-                    child, key[prefix_len:], value, nodes_accessed
+                    child, key[prefix_len:], value, nodes_accessed, extra_key
                 )
             value.append(child.value)
             nodes_accessed.append(child)
             return prefix_len + self._match_prefix_helper(
-                child, key[prefix_len:], value, nodes_accessed
+                child, key[prefix_len:], value, nodes_accessed, extra_key
             )
         return 0
 
@@ -270,52 +288,61 @@ class MarconiShadowCache:
         node: ShadowNode,
         key: Tuple[int, ...],
         value: List[int],
+        extra_key: Optional[str],
     ) -> int:
         if len(key) == 0:
             return 0
 
-        if key[0] in node.children:
-            child = node.children[key[0]]
+        child_key = self._child_key(extra_key, key)
+        if child_key in node.children:
+            child = node.children[child_key]
             prefix_len = self._key_match(child.key, key)
             if prefix_len == len(child.key):
                 if prefix_len == len(key):
                     return prefix_len
                 key = key[prefix_len:]
                 value = value[prefix_len:]
-                return prefix_len + self._insert_helper(child, key, value)
+                return prefix_len + self._insert_helper(child, key, value, extra_key)
 
-            new_node = self._split_node(child.key, child, prefix_len)
+            new_node = self._split_node(child.key, child, prefix_len, extra_key)
             return prefix_len + self._insert_helper(
-                new_node, key[prefix_len:], value[prefix_len:]
+                new_node, key[prefix_len:], value[prefix_len:], extra_key
             )
 
         if len(key):
-            new_node = ShadowNode(key=key, value=value, parent=node)
+            new_node = ShadowNode(
+                key=key, value=value, parent=node, extra_key=extra_key
+            )
             new_node.prefix_len = node.prefix_len + len(value)
-            node.children[key[0]] = new_node
+            node.children[self._child_key(extra_key, key)] = new_node
         return 0
 
     def _split_node(
-        self, key: Tuple[int, ...], child: ShadowNode, split_len: int
+        self,
+        key: Tuple[int, ...],
+        child: ShadowNode,
+        split_len: int,
+        extra_key: Optional[str],
     ) -> ShadowNode:
         new_node = ShadowNode(
             key=child.key[:split_len],
             value=child.value[:split_len],
             parent=child.parent,
+            extra_key=extra_key,
         )
         new_node.prefix_len = new_node.parent.prefix_len + len(new_node.value)
-        new_node.children = {key[split_len:][0]: child}
+        new_node.children = {self._child_key(extra_key, key[split_len:]): child}
         child.parent = new_node
         child.key = child.key[split_len:]
         child.value = child.value[split_len:]
         child.prefix_len = new_node.prefix_len + len(child.value)
-        new_node.parent.children[key[:split_len][0]] = new_node
+        new_node.parent.children[self._child_key(extra_key, new_node.key)] = new_node
         return new_node
 
     def _delete_leaf(self, node: ShadowNode) -> None:
         if node.parent is None:
             return
-        node.parent.children.pop(node.key[0], None)
+        node.parent.children.pop(self._child_key(node.extra_key, node.key), None)
 
     def _evict_intermediate_node(self, node: ShadowNode) -> None:
         if len(node.children) != 1 or node.parent is None:
@@ -325,10 +352,15 @@ class MarconiShadowCache:
             key=tuple(node.value + child.value),
             value=node.value + child.value,
             parent=node.parent,
+            extra_key=node.extra_key,
         )
         new_node.prefix_len = node.parent.prefix_len + len(new_node.value)
         new_node.children = child.children
-        node.parent.children[new_node.key[0]] = new_node
+        for grandchild in new_node.children.values():
+            grandchild.parent = new_node
+        node.parent.children[self._child_key(new_node.extra_key, new_node.key)] = (
+            new_node
+        )
 
     def _collect_leaf_and_single_child_nodes(
         self, node: ShadowNode
@@ -385,7 +417,7 @@ class MarconiConfigTuner:
 
     def tune(
         self,
-        request_history_windowed: List[Tuple[List[int], List[int]]],
+        request_history_windowed: List[Tuple[Optional[str], List[int], List[int]]],
         tuning_interval: int,
     ) -> Optional[float]:
         if self.tree_snapshot is None:
@@ -394,9 +426,11 @@ class MarconiConfigTuner:
         for weight in self.weights:
             shadow_cache = self.tree_snapshot.clone()
             shadow_cache.eff_weight = weight
-            for input_ids, output_ids in request_history_windowed:
-                shadow_cache.match_prefix(input_ids, record_request=True)
-                shadow_cache.insert(input_ids + output_ids)
+            for extra_key, input_ids, output_ids in request_history_windowed:
+                shadow_cache.match_prefix(
+                    input_ids, extra_key=extra_key, record_request=True
+                )
+                shadow_cache.insert(input_ids + output_ids, extra_key=extra_key)
             _, _, total_flops_saved = shadow_cache.get_cache_stats(
                 last_n=tuning_interval
             )

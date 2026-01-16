@@ -356,13 +356,12 @@ class MambaRadixCache(BasePrefixCache):
             )
             self.marconi_bootstrap_multiplier = self.marconi_config.bootstrap_multiplier
             self.marconi_tuning_interval = self.marconi_config.tuning_interval
-            if self.marconi_config.eviction_policy == "v3":
-                weights = (
-                    list(self.marconi_config.tuning_weights)
-                    if self.marconi_config.tuning_weights is not None
-                    else None
-                )
-                self.marconi_tuner = MarconiConfigTuner(weights=weights)
+            weights = (
+                list(self.marconi_config.tuning_weights)
+                if self.marconi_config.tuning_weights is not None
+                else None
+            )
+            self.marconi_tuner = MarconiConfigTuner(weights=weights)
 
         assert (
             params.page_size == 1
@@ -497,7 +496,7 @@ class MambaRadixCache(BasePrefixCache):
             self.token_to_kv_pool_allocator.free(kv_indices)
             self.req_to_token_pool.free(req.req_pool_idx)
             return
-        if self.marconi_enabled and kv_committed_len > 0:
+        if self.marconi_enabled and kv_committed_len > 0 and is_insert:
             self._marconi_record_request(req, kv_committed_len)
 
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
@@ -536,11 +535,16 @@ class MambaRadixCache(BasePrefixCache):
 
     def _marconi_record_request(self, req: Req, total_tokens: int) -> None:
         self._marconi_maybe_snapshot()
+        input_ids = list(req.origin_input_ids)
+        output_ids = list(req.output_ids)
+        committed_output_len = max(total_tokens - len(input_ids), 0)
+        if committed_output_len < len(output_ids):
+            output_ids = output_ids[:committed_output_len]
         cached_tokens = min(len(req.prefix_indices), total_tokens)
         cache_hit = cached_tokens > 0
         self.marconi_request_history.append((cache_hit, total_tokens, cached_tokens))
         self.marconi_request_history_windowed.append(
-            (list(req.origin_input_ids), list(req.output_ids))
+            (req.extra_key, input_ids, output_ids)
         )
         self._marconi_maybe_tune()
 
@@ -572,11 +576,15 @@ class MambaRadixCache(BasePrefixCache):
         max_ts = int(src_node.last_access_time)
         for child in src_node.children.values():
             key_tokens = tuple(child.key.token_ids)
-            new_node = ShadowNode(key=key_tokens, value=list(key_tokens))
+            new_node = ShadowNode(
+                key=key_tokens,
+                value=list(key_tokens),
+                extra_key=child.key.extra_key,
+            )
             new_node.parent = dst_node
             new_node.last_access_time = int(child.last_access_time)
             new_node.prefix_len = dst_node.prefix_len + len(new_node.value)
-            dst_node.children[key_tokens[0]] = new_node
+            dst_node.children[get_child_key(child.key)] = new_node
             max_ts = max(max_ts, self._marconi_copy_tree(child, new_node))
         return max_ts
 
@@ -606,6 +614,8 @@ class MambaRadixCache(BasePrefixCache):
             return
         if self.marconi_tuner.tree_snapshot is None:
             self.marconi_tuner.tree_snapshot = self._marconi_build_shadow_cache()
+            if self.marconi_tuner.tree_snapshot is not None:
+                self.marconi_request_history_windowed = []
 
     def _marconi_maybe_tune(self) -> None:
         if self.marconi_tuner is None:
