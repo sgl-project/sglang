@@ -38,7 +38,10 @@ from sglang.multimodal_gen.configs.pipeline_configs import (
     ZImagePipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
-from sglang.multimodal_gen.configs.pipeline_configs.flux import Flux2PipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.flux import (
+    Flux2KleinPipelineConfig,
+    Flux2PipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.glm_image import (
     GlmImagePipelineConfig,
 )
@@ -536,11 +539,25 @@ def _register_configs():
     )
     register_configs(
         sampling_param_cls=FluxSamplingParams,
+        pipeline_config_cls=Flux2KleinPipelineConfig,
+        hf_model_paths=[
+            "black-forest-labs/FLUX.2-klein-4B",
+            "black-forest-labs/FLUX.2-klein-9B",
+        ],
+        model_detectors=[
+            lambda hf_id: "flux.2-klein" in hf_id.lower()
+            or "flux2-klein" in hf_id.lower()
+        ],
+    )
+    register_configs(
+        sampling_param_cls=FluxSamplingParams,
         pipeline_config_cls=Flux2PipelineConfig,
         hf_model_paths=[
             "black-forest-labs/FLUX.2-dev",
         ],
-        model_detectors=[lambda hf_id: "flux.2" in hf_id.lower()],
+        model_detectors=[
+            lambda hf_id: "flux.2" in hf_id.lower() and "klein" not in hf_id.lower()
+        ],
     )
     register_configs(
         sampling_param_cls=ZImageSamplingParams,
