@@ -58,7 +58,7 @@ class DiTConfig(ModelConfig):
     prefix: str = ""
     quant_config: QuantizationConfig | None = None
 
-    def __post_init__(self):
+    def update_quant_config(self):
         if self.quant_config is not None and isinstance(
             self.quant_config, QuantizationConfig
         ):
@@ -71,11 +71,6 @@ class DiTConfig(ModelConfig):
                 config_dict = self.arch_config.extra_attrs["quant_config"]
             elif "quantization_config" in self.arch_config.extra_attrs:
                 config_dict = self.arch_config.extra_attrs["quantization_config"]
-
-        if self.quant_config is not None:
-            config_dict = self.quant_config
-        elif self.quantization_config is not None:
-            config_dict = self.quantization_config
 
         if config_dict is not None and isinstance(config_dict, dict):
             quant_method = config_dict.get("quant_method")
