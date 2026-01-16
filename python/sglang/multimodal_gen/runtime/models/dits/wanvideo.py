@@ -18,7 +18,6 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
 )
 from sglang.multimodal_gen.runtime.layers.attention import (
     MinimalA2AAttnOp,
-    SparseLinearAttention,
     UlyssesAttention_VSA,
     USPAttention,
 )
@@ -334,9 +333,11 @@ class WanTransformerBlock(nn.Module):
         )
         if attention_type == "sla":
             self.attn1 = MinimalA2AAttnOp(
-                SparseLinearAttention(
-                    dim // num_heads, topk=sla_topk, BLKQ=128, BLKK=64
-                )
+                num_heads=divide(num_heads, get_tensor_model_parallel_world_size()),
+                head_size=dim // num_heads,
+                attention_type=attention_type,
+                topk=sla_topk,
+                supported_attention_backends={AttentionBackendEnum.SLA_ATTN},
             )
         else:
             self.attn1 = USPAttention(
