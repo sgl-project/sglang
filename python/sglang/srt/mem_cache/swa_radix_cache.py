@@ -957,9 +957,6 @@ class SWARadixCache(BasePrefixCache):
             # the prefill prefix matching will stuck.
             if update_kv_after_len < total_prefix_length + prefix_len:
                 first_diff_idx = max(0, update_kv_after_len - total_prefix_length)
-                assert (
-                    first_diff_idx == 0
-                ), f"first_diff_idx should be 0, {first_diff_idx=}, {update_kv_after_len=}, {total_prefix_length=}, {prefix_len=}"
                 if node.swa_tombstone:
                     assert (
                         node.swa_lock_ref == 0
@@ -977,14 +974,16 @@ class SWARadixCache(BasePrefixCache):
                         self.swa_lru_list.insert_mru(node)
                         self.swa_evictable_size_ += len(node.value)
                     elif swa_evicted_seqlen < total_prefix_length + prefix_len:
-                        swa_evicted_len = swa_evicted_seqlen - total_prefix_length
-                        self.token_to_kv_pool_allocator.free(
-                            node.value[swa_evicted_len:]
+                        start_update_idx = max(
+                            first_diff_idx, swa_evicted_seqlen - total_prefix_length
                         )
-                        self._split_node(node.key, node, swa_evicted_len)
-                        node.value = value[swa_evicted_len:prefix_len]
                         self.token_to_kv_pool_allocator.free(
-                            value[first_diff_idx:swa_evicted_len]
+                            node.value[start_update_idx:]
+                        )
+                        self._split_node(node.key, node, start_update_idx)
+                        node.value = value[start_update_idx:prefix_len]
+                        self.token_to_kv_pool_allocator.free(
+                            value[first_diff_idx:start_update_idx]
                         )
                         node.swa_tombstone = False
                         # insert the node into the lru lists
