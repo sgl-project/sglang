@@ -53,13 +53,6 @@ class TextEncodingStage(PipelineStage):
     ) -> Req:
         """
         Encode the prompt into text encoder hidden states.
-
-        Args:
-            batch: The current batch information.
-            server_args: The inference arguments.
-
-        Returns:
-            The batch with encoded prompt embeddings.
         """
         assert len(self.tokenizers) == len(self.text_encoders)
         assert len(self.text_encoders) == len(
