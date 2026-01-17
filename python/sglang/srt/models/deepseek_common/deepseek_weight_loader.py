@@ -80,6 +80,7 @@ class DeepseekV2WeightLoaderMixin:
         weights: Iterable[Tuple[str, torch.Tensor]],
         is_nextn: bool = False,
     ):
+        self.a = 1
         """Load model weights from checkpoint.
 
         Args:
