@@ -4,6 +4,7 @@ import dataclasses
 import os
 import re
 import time
+from pathlib import Path
 from typing import Any, List, Optional, Union
 
 import httpx
@@ -83,15 +84,50 @@ def _parse_size(size: str) -> tuple[int, int] | tuple[None, None]:
         return None, None
 
 
-async def save_image_to_path(image: Union[UploadFile, str], target_path: str) -> str:
-    input_path = await _maybe_url_image(image, target_path)
+def sanitize_upload_filename(filename: str, fallback: str) -> str:
+    name = os.path.basename(filename or "")
+    if not name or name in {".", ".."}:
+        name = fallback
+
+    stem, ext = os.path.splitext(name)
+    safe_stem = re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("._")
+    safe_ext = re.sub(r"[^A-Za-z0-9.]+", "", ext)
+    if not safe_stem:
+        safe_stem = re.sub(r"[^A-Za-z0-9._-]+", "_", fallback).strip("._") or "upload"
+    return f"{safe_stem}{safe_ext}"
+
+
+def ensure_path_within_root(target_path: str, root_dir: str) -> str:
+    root_path = Path(root_dir).resolve()
+    candidate = Path(target_path).resolve()
+    if root_path != candidate and root_path not in candidate.parents:
+        raise ValueError("Upload path escapes the uploads root")
+    return str(candidate)
+
+
+async def save_image_to_path(
+    image: Union[UploadFile, str],
+    target_path: str,
+    uploads_root: str | None = None,
+) -> str:
+    if uploads_root:
+        target_path = ensure_path_within_root(target_path, uploads_root)
+    input_path = await _maybe_url_image(image, target_path, uploads_root=uploads_root)
     if input_path is None:
-        input_path = await _save_upload_to_path(image, target_path)
+        input_path = await _save_upload_to_path(
+            image, target_path, uploads_root=uploads_root
+        )
     return input_path
 
 
 # Helpers
-async def _save_upload_to_path(upload: UploadFile, target_path: str) -> str:
+async def _save_upload_to_path(
+    upload: UploadFile,
+    target_path: str,
+    uploads_root: str | None = None,
+) -> str:
+    if uploads_root:
+        target_path = ensure_path_within_root(target_path, uploads_root)
     os.makedirs(os.path.dirname(target_path), exist_ok=True)
     content = await upload.read()
     with open(target_path, "wb") as f:
@@ -99,23 +135,34 @@ async def _save_upload_to_path(upload: UploadFile, target_path: str) -> str:
     return target_path
 
 
-async def _maybe_url_image(img_url: str, target_path: str) -> str | None:
+async def _maybe_url_image(
+    img_url: str,
+    target_path: str,
+    uploads_root: str | None = None,
+) -> str | None:
     if not isinstance(img_url, str):
         return None
 
     if img_url.lower().startswith(("http://", "https://")):
-        # Download image from URL
-        input_path = await _save_url_image_to_path(img_url, target_path)
+        input_path = await _save_url_image_to_path(
+            img_url, target_path, uploads_root=uploads_root
+        )
         return input_path
     elif img_url.startswith("data:image"):
         # encode image base64 url
-        input_path = await _save_base64_image_to_path(img_url, target_path)
+        input_path = await _save_base64_image_to_path(
+            img_url, target_path, uploads_root=uploads_root
+        )
         return input_path
     else:
         raise ValueError("Unsupported image url format")
 
 
-async def _save_url_image_to_path(image_url: str, target_path: str) -> str:
+async def _save_url_image_to_path(
+    image_url: str,
+    target_path: str,
+    uploads_root: str | None = None,
+) -> str:
     """Download image from URL and save to target path."""
 
     os.makedirs(os.path.dirname(target_path), exist_ok=True)
@@ -153,6 +200,9 @@ async def _save_url_image_to_path(image_url: str, target_path: str) -> str:
                     )
                 target_path = f"{target_path}{ext}"
 
+            if uploads_root:
+                target_path = ensure_path_within_root(target_path, uploads_root)
+
             with open(target_path, "wb") as f:
                 f.write(response.content)
 
@@ -161,7 +211,11 @@ async def _save_url_image_to_path(image_url: str, target_path: str) -> str:
         raise Exception(f"Failed to download image from URL: {str(e)}")
 
 
-async def _save_base64_image_to_path(base64_data: str, target_path: str) -> str:
+async def _save_base64_image_to_path(
+    base64_data: str,
+    target_path: str,
+    uploads_root: str | None = None,
+) -> str:
     """Decode base64 image data and save to target path."""
 
     # split `data:[<media-type>][;base64],<data>` to media-type base64 data
@@ -190,6 +244,8 @@ async def _save_base64_image_to_path(base64_data: str, target_path: str) -> str:
     else:
         ext = "jpg"
     target_path = f"{target_path}.{ext}"
+    if uploads_root:
+        target_path = ensure_path_within_root(target_path, uploads_root)
     os.makedirs(os.path.dirname(target_path), exist_ok=True)
 
     try:

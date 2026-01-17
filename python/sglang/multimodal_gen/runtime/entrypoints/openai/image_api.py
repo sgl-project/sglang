@@ -22,8 +22,10 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.stores import IMAGE_STORE
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     _parse_size,
     add_common_data_to_response,
+    ensure_path_within_root,
     merge_image_input_list,
     process_generation_batch,
+    sanitize_upload_filename,
     save_image_to_path,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
@@ -239,8 +241,13 @@ async def edits(
     try:
         for idx, img in enumerate(image_list):
             filename = img.filename if hasattr(img, "filename") else f"image_{idx}"
+            safe_name = sanitize_upload_filename(filename, f"image_{idx}")
+            target_path = ensure_path_within_root(
+                os.path.join(uploads_dir, f"{request_id}_{idx}_{safe_name}"),
+                uploads_dir,
+            )
             input_path = await save_image_to_path(
-                img, os.path.join(uploads_dir, f"{request_id}_{idx}_{filename}")
+                img, target_path, uploads_root=uploads_dir
             )
             input_paths.append(input_path)
     except Exception as e:
