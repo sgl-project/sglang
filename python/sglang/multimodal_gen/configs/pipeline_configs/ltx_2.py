@@ -287,8 +287,11 @@ class LTX2PipelineConfig(PipelineConfig):
         return int(latent_num_frames), int(tokens_per_frame)
 
     def shard_latents_for_sp(self, batch, latents):
-        """
-        Shard packed token latents across SP ranks by time (frame) dimension.
+        """Shard packed token latents across SP ranks by time (frame) dimension.
+
+        This enables Wan-style behavior: when `--sp-degree > 1`, each rank only
+        sees its local time-sharded latents, and RoPE can apply a time offset to
+        align positions globally.
         """
         sp_world_size = get_sp_world_size()
         if sp_world_size <= 1:
