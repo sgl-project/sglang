@@ -443,6 +443,15 @@ def apply_qk_norm(
     """
 
     batch_size = q.size(0)
+    q_shape = q.shape
+    k_shape = k.shape
+
+    # Ensure contiguous for view operation
+    if not q.is_contiguous():
+        q = q.contiguous()
+    if not k.is_contiguous():
+        k = k.contiguous()
+
     q_eps = q_norm.variance_epsilon
     k_eps = k_norm.variance_epsilon
     # Only try fused path on CUDA and when it won't introduce implicit copies.
@@ -452,13 +461,6 @@ def apply_qk_norm(
         and (q_eps == k_eps)
         and can_use_fused_inplace_qknorm(head_dim, q.dtype)
     ):
-        # Handle 4D tensors [B, L, H, D] - need contiguous for view as [B, L*H, D]
-        q_shape = q.shape
-        k_shape = k.shape
-        if not q.is_contiguous():
-            q = q.contiguous()
-        if not k.is_contiguous():
-            k = k.contiguous()
         fused_inplace_qknorm(
             q=q.view(batch_size, -1, head_dim),
             k=k.view(batch_size, -1, head_dim),
@@ -477,8 +479,6 @@ def apply_qk_norm(
         "Fused QK-norm not available, using RMSNorm fallback",
         stacklevel=2,
     )
-    q_shape = q.shape
-    k_shape = k.shape
     q_out = q_norm(q.view(-1, head_dim)).view(q_shape)
     k_out = k_norm(k.view(-1, head_dim)).view(k_shape)
     return q_out, k_out
