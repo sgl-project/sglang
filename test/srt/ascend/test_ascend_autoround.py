@@ -36,7 +36,6 @@ class TestAscendAutoRound(CustomTestCase):
             "ascend",
             "--quantization",
             "auto-round",
-            "--tp", "1",
         ]
 
     def test_a_gsm8k(self):
