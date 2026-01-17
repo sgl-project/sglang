@@ -1,5 +1,8 @@
 import time
-from typing import Any, Dict, List, Optional
+import uuid
+from abc import ABC
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Union
 
 from pydantic import BaseModel, Field
 
@@ -55,6 +58,7 @@ class VideoResponse(BaseModel):
     size: str = ""
     seconds: str = "4"
     quality: str = "standard"
+    url: Optional[str] = None
     remixed_from_video_id: Optional[str] = None
     completed_at: Optional[int] = None
     expires_at: Optional[int] = None
@@ -94,3 +98,23 @@ class VideoListResponse(BaseModel):
 
 class VideoRemixRequest(BaseModel):
     prompt: str
+
+
+@dataclass
+class BaseReq(ABC):
+    rid: Optional[Union[str, List[str]]] = field(default=None, kw_only=True)
+    http_worker_ipc: Optional[str] = field(default=None, kw_only=True)
+
+    def regenerate_rid(self):
+        """Generate a new request ID and return it."""
+        if isinstance(self.rid, list):
+            self.rid = [uuid.uuid4().hex for _ in range(len(self.rid))]
+        else:
+            self.rid = uuid.uuid4().hex
+        return self.rid
+
+
+@dataclass
+class VertexGenerateReqInput(BaseReq):
+    instances: List[dict]
+    parameters: Optional[dict] = None

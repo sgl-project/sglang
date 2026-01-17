@@ -42,6 +42,7 @@ from sglang.srt.utils.common import (
     get_device_memory_capacity,
     get_device_name,
     get_device_sm,
+    get_quantization_config,
     is_blackwell_supported,
     is_cuda,
     is_fa3_default_architecture,
@@ -69,6 +70,7 @@ from sglang.utils import is_in_ci
 logger = logging.getLogger(__name__)
 
 # Define constants
+DEFAULT_UVICORN_ACCESS_LOG_EXCLUDE_PREFIXES = ()
 SAMPLING_BACKEND_CHOICES = {"flashinfer", "pytorch", "ascend"}
 LOAD_FORMAT_CHOICES = [
     "auto",
@@ -346,6 +348,9 @@ class ServerArgs:
     log_requests_level: int = 2
     log_requests_format: str = "text"
     log_requests_target: Optional[List[str]] = None
+    uvicorn_access_log_exclude_prefixes: List[str] = dataclasses.field(
+        default_factory=lambda: list(DEFAULT_UVICORN_ACCESS_LOG_EXCLUDE_PREFIXES)
+    )
     crash_dump_folder: Optional[str] = None
     show_time_cost: bool = False
     enable_metrics: bool = False
@@ -1192,12 +1197,7 @@ class ServerArgs:
 
             # Set moe backend for DeepSeek
             if is_sm100_supported():
-                quantization_config = getattr(hf_config, "quantization_config", None)
-                quant_method = (
-                    quantization_config.get("quant_method")
-                    if quantization_config is not None
-                    else None
-                )
+                quant_method = get_quantization_config(hf_config)
                 if self.quantization is None:
                     # Default DeepSeek V3/R1 native FP8 when not explicitly set,
                     # Because we need this condition for an assertion in
@@ -1261,11 +1261,8 @@ class ServerArgs:
                 f"- Decode: {decode_attn_backend}\n"
             )
 
-            quantization_config = getattr(hf_config, "quantization_config", None)
-            is_mxfp4_quant_format = (
-                quantization_config is not None
-                and quantization_config.get("quant_method") == "mxfp4"
-            )
+            quant_method = get_quantization_config(hf_config)
+            is_mxfp4_quant_format = quant_method == "mxfp4"
             if is_mxfp4_quant_format:
                 # use bf16 for mxfp4 triton kernels
                 self.dtype = "bfloat16"
@@ -1441,16 +1438,14 @@ class ServerArgs:
             "Qwen3VLMoeForConditionalGeneration",
         ]:
             if is_sm100_supported():
-                quantization_config = getattr(hf_config, "quantization_config", None)
-                quant_method = (
-                    quantization_config.get("quant_method")
-                    if quantization_config is not None
-                    else None
-                )
+                quant_method = get_quantization_config(hf_config)
                 if self.quantization is None and quant_method is not None:
                     self.quantization = quant_method
                 if (
-                    self.quantization in ("fp8", "modelopt_fp4")
+                    (
+                        self.quantization in ("fp8", "modelopt_fp4")
+                        or self.quantization is None
+                    )
                     and self.moe_a2a_backend == "none"
                     and self.moe_runner_backend == "auto"
                 ):
@@ -1461,16 +1456,14 @@ class ServerArgs:
                     )
         elif model_arch in ["Qwen3NextForCausalLM"]:
             if is_sm100_supported():
-                quantization_config = getattr(hf_config, "quantization_config", None)
-                quant_method = (
-                    quantization_config.get("quant_method")
-                    if quantization_config is not None
-                    else None
-                )
+                quant_method = get_quantization_config(hf_config)
                 if self.quantization is None and quant_method is not None:
                     self.quantization = quant_method
                 if (
-                    (self.quantization == "fp8" or self.quantization == "modelopt_fp4")
+                    (
+                        self.quantization in ("fp8", "modelopt_fp4")
+                        or self.quantization is None
+                    )
                     and self.moe_a2a_backend == "none"
                     and self.moe_runner_backend == "auto"
                 ):
@@ -3111,6 +3104,15 @@ class ServerArgs:
             default=ServerArgs.log_requests_target,
             help="Target(s) for request logging: 'stdout' and/or directory path(s) for file output. "
             "Can specify multiple targets, e.g., '--log-requests-target stdout /my/path'. ",
+        )
+        parser.add_argument(
+            "--uvicorn-access-log-exclude-prefixes",
+            type=str,
+            nargs="*",
+            default=list(DEFAULT_UVICORN_ACCESS_LOG_EXCLUDE_PREFIXES),
+            help="Exclude uvicorn access logs whose request path starts with any of these prefixes. "
+            "Defaults to empty (disabled). "
+            "Example: --uvicorn-access-log-exclude-prefixes /metrics /health",
         )
         parser.add_argument(
             "--crash-dump-folder",

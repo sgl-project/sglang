@@ -4,10 +4,10 @@ set -euxo pipefail
 # Check if sudo is available
 if command -v sudo >/dev/null 2>&1; then
     sudo apt-get update
-    sudo apt-get install -y libssl-dev pkg-config protobuf-compiler
+    sudo apt-get install -y libssl-dev pkg-config protobuf-compiler redis-server
 else
     apt-get update
-    apt-get install -y libssl-dev pkg-config protobuf-compiler
+    apt-get install -y libssl-dev pkg-config protobuf-compiler redis-server
 fi
 
 # Install rustup (Rust installer and version manager)
