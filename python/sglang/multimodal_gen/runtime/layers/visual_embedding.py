@@ -19,12 +19,10 @@ from diffusers.models.embeddings import (
 )
 
 try:
-    from sglang.jit_kernel.timestep_embedding import (
-        timestep_embedding as timestep_embedding_cuda,
-    )
+    from sgl_kernel.elementwise import timestep_embedding as timestep_embedding_cuda
 except Exception as _e:
     # Fallback to diffusers implementation so downstream code can still run
-    # even if `jit_kernel` is not available.
+    # even if `sgl_kernel` is not installed/available.
     timestep_embedding_cuda = _get_timestep_embedding
 
 from sglang.multimodal_gen.runtime.layers.activation import get_act_fn
@@ -88,13 +86,14 @@ class PatchEmbed(nn.Module):
 
 class Timesteps(_Timesteps):
     def forward(self, timesteps: torch.Tensor) -> torch.Tensor:
-        return timestep_embedding_cuda(
+        t_emb = timestep_embedding_cuda(
             timesteps,
             self.num_channels,
             flip_sin_to_cos=self.flip_sin_to_cos,
             downscale_freq_shift=self.downscale_freq_shift,
             scale=self.scale,
         )
+        return t_emb
 
 
 class CombinedTimestepGuidanceTextProjEmbeddings(
