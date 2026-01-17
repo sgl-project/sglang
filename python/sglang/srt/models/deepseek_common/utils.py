@@ -68,18 +68,6 @@ def enable_nextn_moe_bf16_cast_to_fp8(
     )
 
 
-def add_forward_absorb_core_attention_backend(backend_name: str) -> None:
-    """
-    Register a new attention backend that supports forward absorb core attention.
-
-    Args:
-        backend_name: Name of the attention backend to register.
-    """
-    if backend_name not in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
-        FORWARD_ABSORB_CORE_ATTENTION_BACKENDS.append(backend_name)
-        logger.info(f"Added {backend_name} to FORWARD_ABSORB_CORE_ATTENTION_BACKENDS.")
-
-
 def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
     """
     Calculate YaRN (Yet another RoPE extensioN method) attention scaling factor.
