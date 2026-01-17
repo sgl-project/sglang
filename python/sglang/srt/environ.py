@@ -454,6 +454,7 @@ class Envs:
 
     # TokenizerManager
     SGLANG_REQUEST_STATE_WAIT_TIMEOUT = EnvInt(4)
+    SGLANG_REASONING_OFF_BY_DEFAULT = EnvBool(False)
 
     # Symmetric Memory
     SGLANG_SYMM_MEM_PREALLOC_GB_SIZE = EnvInt(-1)
