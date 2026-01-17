@@ -61,6 +61,7 @@
 
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use dashmap::DashMap;
 use rand::Rng;
 use tracing::{debug, warn};
@@ -347,8 +348,13 @@ impl CacheAwarePolicy {
     }
 }
 
+#[async_trait]
 impl LoadBalancingPolicy for CacheAwarePolicy {
-    fn select_worker(&self, workers: &[Arc<dyn Worker>], info: &SelectWorkerInfo) -> Option<usize> {
+    async fn select_worker(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo<'_>,
+    ) -> Option<usize> {
         let request_text = info.request_text;
         let healthy_indices = get_healthy_worker_indices(workers);
 
@@ -508,8 +514,8 @@ mod tests {
     use super::*;
     use crate::core::{BasicWorkerBuilder, WorkerType};
 
-    #[test]
-    fn test_cache_aware_with_balanced_load() {
+    #[tokio::test]
+    async fn test_cache_aware_with_balanced_load() {
         // Create policy without eviction thread for testing
         let config = CacheAwareConfig {
             eviction_interval_secs: 0, // Disable eviction thread
@@ -543,6 +549,7 @@ mod tests {
                     ..Default::default()
                 },
             )
+            .await
             .unwrap();
 
         // Same request should go to same worker (cache hit)
@@ -554,6 +561,7 @@ mod tests {
                     ..Default::default()
                 },
             )
+            .await
             .unwrap();
         assert_eq!(idx1, idx2);
 
@@ -566,12 +574,13 @@ mod tests {
                     ..Default::default()
                 },
             )
+            .await
             .unwrap();
         assert_eq!(idx1, idx3);
     }
 
-    #[test]
-    fn test_cache_aware_with_imbalanced_load() {
+    #[tokio::test]
+    async fn test_cache_aware_with_imbalanced_load() {
         let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
             cache_threshold: 0.5,
             balance_abs_threshold: 5,
@@ -602,13 +611,13 @@ mod tests {
             ..Default::default()
         };
         for _ in 0..5 {
-            let idx = policy.select_worker(&workers, &info).unwrap();
+            let idx = policy.select_worker(&workers, &info).await.unwrap();
             assert_eq!(idx, 1); // Should always pick worker2
         }
     }
 
-    #[test]
-    fn test_cache_aware_worker_removal() {
+    #[tokio::test]
+    async fn test_cache_aware_worker_removal() {
         let config = CacheAwareConfig {
             eviction_interval_secs: 0, // Disable eviction thread
             ..Default::default()
@@ -630,20 +639,24 @@ mod tests {
         policy.init_workers(&workers);
 
         // Route some requests
-        policy.select_worker(
-            &workers,
-            &SelectWorkerInfo {
-                request_text: Some("test1"),
-                ..Default::default()
-            },
-        );
-        policy.select_worker(
-            &workers,
-            &SelectWorkerInfo {
-                request_text: Some("test2"),
-                ..Default::default()
-            },
-        );
+        policy
+            .select_worker(
+                &workers,
+                &SelectWorkerInfo {
+                    request_text: Some("test1"),
+                    ..Default::default()
+                },
+            )
+            .await;
+        policy
+            .select_worker(
+                &workers,
+                &SelectWorkerInfo {
+                    request_text: Some("test2"),
+                    ..Default::default()
+                },
+            )
+            .await;
 
         // Remove a worker
         policy.remove_worker_by_url("http://w1:8000");
@@ -658,12 +671,13 @@ mod tests {
                     ..Default::default()
                 },
             )
+            .await
             .unwrap();
         assert_eq!(idx, 1);
     }
 
-    #[test]
-    fn test_cache_aware_sync_tree_operation_to_mesh() {
+    #[tokio::test]
+    async fn test_cache_aware_sync_tree_operation_to_mesh() {
         use std::sync::Arc;
 
         use crate::mesh::{stores::StateStores, sync::MeshSyncManager};
@@ -696,6 +710,7 @@ mod tests {
                     ..Default::default()
                 },
             )
+            .await
             .unwrap();
 
         // Verify tree operation was synced to mesh (under UNKNOWN_MODEL_ID since no model was specified)
@@ -841,8 +856,8 @@ mod tests {
         let _ = tree_state;
     }
 
-    #[test]
-    fn test_cache_aware_without_mesh() {
+    #[tokio::test]
+    async fn test_cache_aware_without_mesh() {
         let config = CacheAwareConfig {
             eviction_interval_secs: 0,
             ..Default::default()
@@ -867,6 +882,7 @@ mod tests {
                     ..Default::default()
                 },
             )
+            .await
             .unwrap();
         assert_eq!(idx, 0);
     }
