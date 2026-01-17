@@ -261,7 +261,7 @@ def _initialize_model(
     hf_to_sglang_mapper = getattr(model_class, "hf_to_sglang_mapper", None)
     # pass mappings by reference to quant_config
     if hf_to_sglang_mapper is not None and quant_config is not None:
-        quant_config.apply_sglang_mapper(hf_to_sglang_mapper)
+        quant_config.apply_weight_name_mapper(hf_to_sglang_mapper)
 
     # Build kwargs conditionally
     kwargs = {
@@ -422,6 +422,13 @@ class DefaultModelLoader(BaseModelLoader):
         else:
             hf_folder = model_name_or_path
 
+        server_args = get_global_server_args()
+        if server_args and server_args.model_checksum is not None:
+            from sglang.srt.utils.model_file_verifier import verify
+
+            checksums_source = server_args.model_checksum or model_name_or_path
+            verify(model_path=hf_folder, checksums_source=checksums_source)
+
         hf_weights_files: List[str] = []
         for pattern in allow_patterns:
             hf_weights_files += glob.glob(os.path.join(hf_folder, pattern))
@@ -559,7 +566,9 @@ class DefaultModelLoader(BaseModelLoader):
             )
 
         hf_config = AutoConfig.from_pretrained(
-            model_config.model_path, trust_remote_code=True
+            model_config.model_path,
+            trust_remote_code=True,
+            local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
         )
         with init_empty_weights():
             torch_dtype = getattr(hf_config, "torch_dtype", torch.float16)
@@ -592,6 +601,7 @@ class DefaultModelLoader(BaseModelLoader):
             device_map=device_map,
             **model_kwargs,
             trust_remote_code=True,
+            local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
         )
         # Handle both legacy modelopt_quant and unified quantization flags
         if hasattr(model_config, "modelopt_quant") and model_config.modelopt_quant:

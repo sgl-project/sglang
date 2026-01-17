@@ -281,7 +281,7 @@ impl PDRouter {
         let start_time = Instant::now();
 
         let route = context.route;
-        let model = context.model_id.unwrap_or("default");
+        let model = context.model_id.unwrap_or(UNKNOWN_MODEL_ID);
         let endpoint = route_to_endpoint(route);
 
         // Record request start (Layer 2)
@@ -537,6 +537,8 @@ impl PDRouter {
         decode: Arc<dyn Worker>,
         _start_time: Instant,
     ) -> Response {
+        // For non-streaming: use guard for automatic load management
+        // For streaming: load will be managed in create_streaming_response
         let _prefill_guard =
             (!context.is_stream).then(|| WorkerLoadGuard::new(prefill.clone(), headers));
         let _decode_guard =
@@ -759,7 +761,7 @@ impl PDRouter {
         .await?;
 
         // Record worker selection metrics (Layer 3)
-        let model = model_id.unwrap_or("default");
+        let model = model_id.unwrap_or(UNKNOWN_MODEL_ID);
         Metrics::record_worker_selection(
             metrics_labels::WORKER_PREFILL,
             metrics_labels::CONNECTION_HTTP,

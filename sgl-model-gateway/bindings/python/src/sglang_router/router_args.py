@@ -88,6 +88,7 @@ class RouterArgs:
     health_check_timeout_secs: int = 5
     health_check_interval_secs: int = 60
     health_check_endpoint: str = "/health"
+    disable_health_check: bool = False
     # Circuit breaker configuration
     cb_failure_threshold: int = 10
     cb_success_threshold: int = 3
@@ -120,6 +121,9 @@ class RouterArgs:
     oracle_pool_timeout_secs: int = 30
     postgres_db_url: Optional[str] = None
     postgres_pool_max: int = 16
+    redis_url: Optional[str] = None
+    redis_pool_max: int = 16
+    redis_retention_days: int = 30
     # mTLS configuration for worker communication
     client_cert_path: Optional[str] = None
     client_key_path: Optional[str] = None
@@ -202,6 +206,9 @@ class RouterArgs:
         )
         postgres_group = parser.add_argument_group(
             "PostgreSQL Database", "PostgreSQL database backend configuration"
+        )
+        redis_group = parser.add_argument_group(
+            "Redis Database", "Redis database backend configuration"
         )
         tls_group = parser.add_argument_group(
             "TLS/mTLS Security", "TLS certificates for server and worker communication"
@@ -607,6 +614,12 @@ class RouterArgs:
             default=RouterArgs.health_check_endpoint,
             help="Health check endpoint path",
         )
+        health_group.add_argument(
+            f"--{prefix}disable-health-check",
+            action="store_true",
+            default=RouterArgs.disable_health_check,
+            help="Disable all worker health checks at startup",
+        )
         # Tokenizer configuration
         tokenizer_group.add_argument(
             f"--{prefix}model-path",
@@ -685,7 +698,7 @@ class RouterArgs:
             f"--{prefix}history-backend",
             type=str,
             default=RouterArgs.history_backend,
-            choices=["memory", "none", "oracle", "postgres"],
+            choices=["memory", "none", "oracle", "postgres", "redis"],
             help="History storage backend for conversations and responses (default: memory)",
         )
 
@@ -753,6 +766,28 @@ class RouterArgs:
             type=int,
             default=int(os.getenv("POSTGRES_POOL_MAX", RouterArgs.postgres_pool_max)),
             help="Maximum PostgreSQL connection pool size (default: 16, env: POSTGRES_POOL_MAX)",
+        )
+
+        # Redis configuration
+        redis_group.add_argument(
+            f"--{prefix}redis-url",
+            type=str,
+            default=os.getenv("REDIS_URL"),
+            help="Redis connection URL (env: REDIS_URL)",
+        )
+        redis_group.add_argument(
+            f"--{prefix}redis-pool-max",
+            type=int,
+            default=int(os.getenv("REDIS_POOL_MAX", RouterArgs.redis_pool_max)),
+            help="Maximum Redis connection pool size (default: 16, env: REDIS_POOL_MAX)",
+        )
+        redis_group.add_argument(
+            f"--{prefix}redis-retention-days",
+            type=int,
+            default=int(
+                os.getenv("REDIS_RETENTION_DAYS", RouterArgs.redis_retention_days)
+            ),
+            help="Redis data retention in days (-1 for persistent, default: 30, env: REDIS_RETENTION_DAYS)",
         )
 
         # TLS/mTLS configuration
