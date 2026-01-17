@@ -492,7 +492,7 @@ class SWARadixCache(BasePrefixCache):
                 RadixKey(token_ids[:page_aligned_token_len], req.extra_key),
                 page_aligned_kv_indices,
                 old_prefix_len,
-                req.evicted_seqlen_local,
+                req.swa_evicted_seqlen,
             )
         else:
             self.token_to_kv_pool_allocator.free(

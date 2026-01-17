@@ -549,8 +549,12 @@ class Req:
         # for corss-endoder model
         self.token_type_ids = token_type_ids
 
-        # The length of KV that have been removed in swa chunk cache
-        self.evicted_seqlen_local = 0
+        # The length of KV that have been removed in swa cache.
+        # SWA KV cache eviction behavior differs by cache type:
+        # - Radix cache: KV in range [cache_protected_len, swa_evicted_seqlen) is freed manually in
+        #   `ScheduleBatch.maybe_evict_swa`; KV in range [0, cache_protected_len) is freed during radix cache eviction.
+        # - Chunk cache: KV in range [0, swa_evicted_seqlen) is freed manually in `ScheduleBatch.maybe_evict_swa`.
+        self.swa_evicted_seqlen = 0
 
         # The index of the extend / decode batch
         self.extend_batch_idx = 0
@@ -2240,25 +2244,23 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         assert (
             req.cache_protected_len % self.tree_cache.page_size == 0
         ), "cache_protected_len must be page aligned"
-        req.evicted_seqlen_local = max(
-            req.evicted_seqlen_local, req.cache_protected_len
-        )
+        req.swa_evicted_seqlen = max(req.swa_evicted_seqlen, req.cache_protected_len)
 
-        new_evicted_seqlen_local = max(
-            req.evicted_seqlen_local, pre_len - sliding_window_size
+        new_swa_evicted_seqlen = max(
+            req.swa_evicted_seqlen, pre_len - sliding_window_size
         )
 
         if self.tree_cache.page_size > 1:
-            new_evicted_seqlen_local = (
-                new_evicted_seqlen_local // self.tree_cache.page_size
+            new_swa_evicted_seqlen = (
+                new_swa_evicted_seqlen // self.tree_cache.page_size
             ) * self.tree_cache.page_size
 
-        if new_evicted_seqlen_local > req.evicted_seqlen_local:
+        if new_swa_evicted_seqlen > req.swa_evicted_seqlen:
             free_slots = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, req.evicted_seqlen_local : new_evicted_seqlen_local
+                req.req_pool_idx, req.swa_evicted_seqlen : new_swa_evicted_seqlen
             ]
             self.token_to_kv_pool_allocator.free_swa(free_slots)
-            req.evicted_seqlen_local = new_evicted_seqlen_local
+            req.swa_evicted_seqlen = new_swa_evicted_seqlen
 
     def _is_available_size_sufficient(self, num_tokens: int) -> bool:
         if self.is_hybrid_swa:
