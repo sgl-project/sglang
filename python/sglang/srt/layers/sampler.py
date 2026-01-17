@@ -1,8 +1,4 @@
-import json
 import logging
-import os
-import threading
-import time
 from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
@@ -39,37 +35,6 @@ SYNC_TOKEN_IDS_ACROSS_TP = get_bool_env_var("SYNC_TOKEN_IDS_ACROSS_TP")
 SGLANG_RETURN_ORIGINAL_LOGPROB = get_bool_env_var("SGLANG_RETURN_ORIGINAL_LOGPROB")
 _CUSTOM_SAMPLER_FACTORIES: Dict[str, Callable[[], "Sampler"]] = {}
 _BUILT_IN_SAMPLING_BACKENDS = {"flashinfer", "flashinfer_python", "pytorch", "ascend"}
-
-# Debug logging for flashinfer_python sampling validation
-# Set SGLANG_DEBUG_FLASHINFER_SAMPLING=1 to enable
-# Logs written to /tmp/sglang_debug_flashinfer_sampling_{timestamp}.jsonl
-_DEBUG_FLASHINFER_SAMPLING = (
-    os.environ.get("SGLANG_DEBUG_FLASHINFER_SAMPLING", "0") == "1"
-)
-_sampling_debug_log_file = None
-_sampling_debug_log_lock = threading.Lock()
-
-
-def _get_sampling_debug_log_file():
-    global _sampling_debug_log_file
-    if _sampling_debug_log_file is None:
-        timestamp = int(time.time() * 1000)
-        _sampling_debug_log_file = open(
-            f"/tmp/sglang_debug_flashinfer_sampling_{timestamp}.jsonl", "a"
-        )
-    return _sampling_debug_log_file
-
-
-def _async_log_sampling_metadata(metadata: dict):
-    """Async write sampling metadata to JSON log file."""
-
-    def _write():
-        with _sampling_debug_log_lock:
-            f = _get_sampling_debug_log_file()
-            f.write(json.dumps(metadata) + "\n")
-            f.flush()
-
-    threading.Thread(target=_write, daemon=True).start()
 
 
 class Sampler(nn.Module):
@@ -201,61 +166,14 @@ class Sampler(nn.Module):
                         if sampling_info.need_top_k_sampling:
                             # Path A: top_k + min_p
                             # flashinfer.sampling.top_k_renorm_probs(probs, top_ks)
-                            if _DEBUG_FLASHINFER_SAMPLING:
-                                _async_log_sampling_metadata(
-                                    {
-                                        "path": "A_minp_topk",
-                                        "op": "top_k_renorm_probs",
-                                        "source": "flashinfer.sampling",
-                                        "probs_shape": list(probs.shape),
-                                        "probs_dtype": str(probs.dtype),
-                                        "top_ks_shape": list(top_ks.shape),
-                                        "top_ks_dtype": str(top_ks.dtype),
-                                        "timestamp": time.time(),
-                                    }
-                                )
                             probs = flashinfer_sampling.top_k_renorm_probs(
                                 probs, top_ks
                             )
                         # flashinfer.sampling.top_p_renorm_probs(probs, top_ps)
-                        if _DEBUG_FLASHINFER_SAMPLING:
-                            _async_log_sampling_metadata(
-                                {
-                                    "path": (
-                                        "A_minp_topk"
-                                        if sampling_info.need_top_k_sampling
-                                        else "B_minp_only"
-                                    ),
-                                    "op": "top_p_renorm_probs",
-                                    "source": "flashinfer.sampling",
-                                    "probs_shape": list(probs.shape),
-                                    "probs_dtype": str(probs.dtype),
-                                    "top_ps_shape": list(sampling_info.top_ps.shape),
-                                    "top_ps_dtype": str(sampling_info.top_ps.dtype),
-                                    "timestamp": time.time(),
-                                }
-                            )
                         probs = flashinfer_sampling.top_p_renorm_probs(
                             probs, sampling_info.top_ps
                         )
                         # sgl_kernel.min_p_sampling_from_probs(probs, min_ps)
-                        if _DEBUG_FLASHINFER_SAMPLING:
-                            _async_log_sampling_metadata(
-                                {
-                                    "path": (
-                                        "A_minp_topk"
-                                        if sampling_info.need_top_k_sampling
-                                        else "B_minp_only"
-                                    ),
-                                    "op": "min_p_sampling_from_probs",
-                                    "source": "sgl_kernel",
-                                    "probs_shape": list(probs.shape),
-                                    "probs_dtype": str(probs.dtype),
-                                    "min_ps_shape": list(sampling_info.min_ps.shape),
-                                    "min_ps_dtype": str(sampling_info.min_ps.dtype),
-                                    "timestamp": time.time(),
-                                }
-                            )
                         batch_next_token_ids = min_p_sampling_from_probs(
                             probs, sampling_info.min_ps
                         )
@@ -267,41 +185,10 @@ class Sampler(nn.Module):
                         if sampling_info.need_top_k_sampling:
                             # Path C: top_k + top_p
                             # flashinfer.sampling.top_k_renorm_probs(probs, top_ks)
-                            if _DEBUG_FLASHINFER_SAMPLING:
-                                _async_log_sampling_metadata(
-                                    {
-                                        "path": "C_topk_topp",
-                                        "op": "top_k_renorm_probs",
-                                        "source": "flashinfer.sampling",
-                                        "probs_shape": list(probs.shape),
-                                        "probs_dtype": str(probs.dtype),
-                                        "top_ks_shape": list(top_ks.shape),
-                                        "top_ks_dtype": str(top_ks.dtype),
-                                        "timestamp": time.time(),
-                                    }
-                                )
                             probs = flashinfer_sampling.top_k_renorm_probs(
                                 probs, top_ks
                             )
                         # Path C or D: flashinfer.sampling.top_p_sampling_from_probs
-                        if _DEBUG_FLASHINFER_SAMPLING:
-                            _async_log_sampling_metadata(
-                                {
-                                    "path": (
-                                        "C_topk_topp"
-                                        if sampling_info.need_top_k_sampling
-                                        else "D_topp_only"
-                                    ),
-                                    "op": "top_p_sampling_from_probs",
-                                    "source": "flashinfer.sampling",
-                                    "probs_shape": list(probs.shape),
-                                    "probs_dtype": str(probs.dtype),
-                                    "top_ps_shape": list(sampling_info.top_ps.shape),
-                                    "top_ps_dtype": str(sampling_info.top_ps.dtype),
-                                    "check_nan": self.use_nan_detection,
-                                    "timestamp": time.time(),
-                                }
-                            )
                         batch_next_token_ids = (
                             flashinfer_sampling.top_p_sampling_from_probs(
                                 probs.contiguous(),

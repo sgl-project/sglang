@@ -7,16 +7,8 @@ providing 3-100x speedup for large vocabularies (>10k).
 Used by:
 - logprob.py: get_top_logprobs_raw() for top logprobs computation
 - (Note: nsa_backend.py has its own flashinfer top-k integration, not using this op)
-
-Debug logging:
-- Set SGLANG_DEBUG_FLASHINFER_TOPK=1 to enable async JSON logging of tensor metadata
-- Logs written to /tmp/sglang_debug_flashinfer_topk_{timestamp}.jsonl
 """
 
-import json
-import os
-import threading
-import time
 from typing import Tuple
 
 import torch
@@ -26,33 +18,6 @@ from sglang.srt.utils import is_cuda
 
 # Threshold: flashinfer.top_k is faster for vocab > 10k
 FLASHINFER_TOPK_THRESHOLD = 10000
-
-# Debug logging for validation
-_DEBUG_FLASHINFER_TOPK = os.environ.get("SGLANG_DEBUG_FLASHINFER_TOPK", "0") == "1"
-_debug_log_file = None
-_debug_log_lock = threading.Lock()
-
-
-def _get_debug_log_file():
-    global _debug_log_file
-    if _debug_log_file is None:
-        timestamp = int(time.time() * 1000)
-        _debug_log_file = open(
-            f"/tmp/sglang_debug_flashinfer_topk_{timestamp}.jsonl", "a"
-        )
-    return _debug_log_file
-
-
-def _async_log_topk_metadata(metadata: dict):
-    """Async write metadata to JSON log file."""
-
-    def _write():
-        with _debug_log_lock:
-            f = _get_debug_log_file()
-            f.write(json.dumps(metadata) + "\n")
-            f.flush()
-
-    threading.Thread(target=_write, daemon=True).start()
 
 
 _flashinfer_available = False
@@ -120,50 +85,7 @@ class FlashinferTopK(MultiPlatformOp):
         )
 
         if use_fallback:
-            if _DEBUG_FLASHINFER_TOPK:
-                _async_log_topk_metadata(
-                    {
-                        "op": "FlashinferTopK.forward_cuda",
-                        "backend": "torch.topk (fallback)",
-                        "input_shape": list(input.shape),
-                        "input_dtype": str(input.dtype),
-                        "k": k,
-                        "dim": dim,
-                        "fallback_reason": (
-                            "flashinfer_unavailable"
-                            if not _flashinfer_available
-                            else (
-                                "dim_not_-1"
-                                if dim != -1
-                                else (
-                                    "not_2d"
-                                    if input.dim() != 2
-                                    else (
-                                        "largest_false"
-                                        if not largest
-                                        else "below_threshold"
-                                    )
-                                )
-                            )
-                        ),
-                        "threshold": self.threshold,
-                        "timestamp": time.time(),
-                    }
-                )
             return torch.topk(input, k, dim=dim, largest=largest, sorted=sorted)
-
-        if _DEBUG_FLASHINFER_TOPK:
-            _async_log_topk_metadata(
-                {
-                    "op": "FlashinferTopK.forward_cuda",
-                    "backend": "flashinfer.top_k",
-                    "input_shape": list(input.shape),
-                    "input_dtype": str(input.dtype),
-                    "k": k,
-                    "sorted": sorted,
-                    "timestamp": time.time(),
-                }
-            )
 
         values, indices = flashinfer.top_k(input, k, sorted=sorted)
         return values, indices
