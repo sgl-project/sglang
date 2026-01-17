@@ -1009,33 +1009,33 @@ class SWARadixCache(BasePrefixCache):
                 swa_evicted_seqlen > total_prefix_length
                 and swa_evicted_seqlen < total_prefix_length + len(key)
             ):
-                swa_evicted_len = swa_evicted_seqlen - total_prefix_length
+                swa_tombstone_len = swa_evicted_seqlen - total_prefix_length
                 node = self._add_new_node(
                     node,
-                    key[:swa_evicted_len],
-                    value[:swa_evicted_len],
+                    key[:swa_tombstone_len],
+                    value[:swa_tombstone_len],
                     swa_tombstone=True,
                 )
-                key = key[swa_evicted_len:]
-                value = value[swa_evicted_len:]
+                key = key[swa_tombstone_len:]
+                value = value[swa_tombstone_len:]
 
             self._add_new_node(node, key, value, swa_tombstone=False)
         return total_prefix_length
 
     def _add_new_node(
         self,
-        node: TreeNode,
+        parent: TreeNode,
         key: RadixKey,
         value: torch.Tensor,
         swa_tombstone: bool = False,
     ) -> TreeNode:
         assert len(key) > 0, f"key should not be empty"
         new_node = TreeNode()
-        new_node.parent = node
+        new_node.parent = parent
         new_node.key = key
         new_node.value = value
         new_node.swa_tombstone = swa_tombstone
-        node.children[self.get_child_key_fn(key)] = new_node
+        parent.children[self.get_child_key_fn(key)] = new_node
         self.full_lru_list.insert_mru(new_node)
         self.full_evictable_size_ += len(value)
         if not swa_tombstone:
