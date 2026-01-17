@@ -295,6 +295,8 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         should_allreduce_fusion: bool = False,
         use_reduce_scatter: bool = False,
     ) -> torch.Tensor:
+        if isinstance(hidden_states, tuple):
+            hidden_states = hidden_states[0]
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 

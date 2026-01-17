@@ -280,25 +280,47 @@ class RMSNorm(MultiPlatformOp):
         self,
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
+        quant_format: str = "",
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
         Forward method with allreduce fusion, prioritizing flashinfer fused operations
         """
         if residual is not None:
             from sglang.srt.distributed import get_tensor_model_parallel_world_size
-            from sglang.srt.layers.flashinfer_comm_fusion import (
-                flashinfer_allreduce_residual_rmsnorm,
-            )
 
-            if get_tensor_model_parallel_world_size() > 1:
-                fused_result = flashinfer_allreduce_residual_rmsnorm(
-                    input_tensor=x,
-                    residual=residual,
-                    weight=self.weight,
-                    eps=self.variance_epsilon,
+            if _use_aiter:
+                from sglang.srt.layers.aiter_comm_fusion import (
+                    aiter_allreduce_residual_rmsnorm,
                 )
-                if fused_result[0] is not None:
-                    return fused_result
+
+                if get_tensor_model_parallel_world_size() > 1:
+                    # TODO: aiter ar fuse only support fp8_e4m3fnuz for now
+                    fp8_out = "fp8_e4m3fnuz" in quant_format
+                    fused_result = aiter_allreduce_residual_rmsnorm(
+                        allreduce_in=x,
+                        residual_in=residual,
+                        rms_weight=self.weight,
+                        eps=self.variance_epsilon,
+                        fp8_out=fp8_out,
+                    )
+                    residual_out, norm_out, scale_out = fused_result
+                    # If fp8 quantization is applied, return quantized output with scale
+                    if fp8_out and norm_out is not None:
+                        return (norm_out, scale_out), residual_out
+            else:
+                from sglang.srt.layers.flashinfer_comm_fusion import (
+                    flashinfer_allreduce_residual_rmsnorm,
+                )
+
+                if get_tensor_model_parallel_world_size() > 1:
+                    fused_result = flashinfer_allreduce_residual_rmsnorm(
+                        input_tensor=x,
+                        residual=residual,
+                        weight=self.weight,
+                        eps=self.variance_epsilon,
+                    )
+                    if fused_result[0] is not None:
+                        return fused_result
 
         return self.forward(x, residual)
 
