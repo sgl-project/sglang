@@ -14,7 +14,7 @@ from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=10, suite="stage-b-test-small-1-gpu")
-register_amd_ci(est_time=10, suite="stage-b-test-small-1-gpu")
+register_amd_ci(est_time=10, suite="stage-b-test-small-1-gpu-amd")
 
 
 class _MockTemplateManager:
@@ -155,6 +155,31 @@ class ServingCompletionTestCase(unittest.TestCase):
         # Should not have json_schema or structural_tag from response_format
         # (but might have json_schema from the legacy json_schema field)
         self.assertIsNone(sampling_params.get("structural_tag"))
+
+    def test_logprobs_false_non_streaming(self):
+        """Test that logprobs=False doesn't cause KeyError in non-streaming response."""
+        req = CompletionRequest(
+            model="x", prompt="Hello", max_tokens=10, logprobs=False
+        )
+
+        mock_ret = [
+            {
+                "text": " world",
+                "meta_info": {
+                    "id": "test-id",
+                    "prompt_tokens": 1,
+                    "completion_tokens": 2,
+                    "finish_reason": {"type": "stop"},
+                    "weight_version": "v1",
+                },
+            }
+        ]
+
+        response = self.sc._build_completion_response(req, mock_ret, 1234567890)
+
+        self.assertEqual(len(response.choices), 1)
+        self.assertEqual(response.choices[0].text, " world")
+        self.assertEqual(len(response.choices[0].logprobs.top_logprobs), 0)
 
 
 if __name__ == "__main__":
