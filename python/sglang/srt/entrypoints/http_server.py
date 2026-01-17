@@ -733,6 +733,25 @@ async def clear_hicache_storage_backend():
     )
 
 
+# FIXME: In theory we should configure ADMIN_FORCE here, but that would cause
+# all endpoints to go through add_api_key_middleware (even when neither api-key
+# nor admin-api-key is configured).
+# So for now we simulate ADMIN_FORCE by checking the admin API key parameter,
+# and we plan to switch to using ADMIN_FORCE after a few more iterations.
+def _admin_api_key_missing_response(
+    status_code: HTTPStatus = HTTPStatus.BAD_REQUEST,
+) -> ORJSONResponse:
+    return ORJSONResponse(
+        content={
+            "error": (
+                "This endpoint requires admin API key, but this server was started "
+                "without one (admin-api-key). Restart with --admin-api-key to enable."
+            )
+        },
+        status_code=status_code,
+    )
+
+
 # example usage:
 # curl -s -X POST http://127.0.0.1:30000/attach_hicache_storage_backend \
 #  -H 'Content-Type: application/json' \
@@ -743,12 +762,15 @@ async def clear_hicache_storage_backend():
 #     "hicache_write_policy": "write_through"
 #   }'
 @app.api_route("/attach_hicache_storage_backend", methods=["POST"])
-@auth_level(AuthLevel.ADMIN_FORCE)
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def attach_hicache_storage_backend(obj: AttachHiCacheStorageReqInput):
     """Attach (enable) HiCache storage backend at runtime.
 
     Only allowed when there are NO running / queued requests.
     """
+    if not _global_state.tokenizer_manager.server_args.admin_api_key:
+        return _admin_api_key_missing_response()
+
     ret = await _global_state.tokenizer_manager.attach_hicache_storage(
         hicache_storage_backend=obj.hicache_storage_backend,
         hicache_storage_backend_extra_config_json=obj.hicache_storage_backend_extra_config_json,
@@ -772,12 +794,15 @@ async def attach_hicache_storage_backend(obj: AttachHiCacheStorageReqInput):
 # example usage:
 # curl -s -X POST http://127.0.0.1:30000/detach_hicache_storage_backend
 @app.api_route("/detach_hicache_storage_backend", methods=["POST"])
-@auth_level(AuthLevel.ADMIN_FORCE)
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def detach_hicache_storage_backend():
     """Detach (disable) HiCache storage backend at runtime.
 
     Only allowed when there are NO running / queued requests.
     """
+    if not _global_state.tokenizer_manager.server_args.admin_api_key:
+        return _admin_api_key_missing_response()
+
     ret = await _global_state.tokenizer_manager.detach_hicache_storage()
     msg = getattr(ret, "message", "")
     return Response(
@@ -796,9 +821,12 @@ async def detach_hicache_storage_backend():
 # example usage:
 # curl -s http://127.0.0.1:30000/info_from_hicache_storage_backend
 @app.get("/info_from_hicache_storage_backend")
-@auth_level(AuthLevel.ADMIN_FORCE)
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def hicache_storage_backend_status():
     """Get current HiCache storage backend status (tokenizer-side view)."""
+    if not _global_state.tokenizer_manager.server_args.admin_api_key:
+        return _admin_api_key_missing_response()
+
     return {
         "hicache_storage_backend": _global_state.tokenizer_manager.server_args.hicache_storage_backend,
         "hicache_storage_backend_extra_config": _global_state.tokenizer_manager.server_args.hicache_storage_backend_extra_config,

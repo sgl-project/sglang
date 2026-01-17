@@ -177,15 +177,15 @@ class TestHiCacheStorageRuntimeAttachDetach(CustomTestCase):
             code_info, _body_info = self._http_get(
                 f"{self.base_url}/info_from_hicache_storage_backend", timeout=10
             )
-            self.assertEqual(code_info, 403)
+            self.assertEqual(code_info, 400)
             code_attach_no_admin, _body_attach_no_admin = self._attach_backend(
                 base_url=self.base_url, backend="file", extra_cfg={}
             )
-            self.assertEqual(code_attach_no_admin, 403)
+            self.assertEqual(code_attach_no_admin, 400)
             code_detach_no_admin, _body_detach_no_admin = self._detach_backend(
                 self.base_url
             )
-            self.assertEqual(code_detach_no_admin, 403)
+            self.assertEqual(code_detach_no_admin, 400)
         finally:
             kill_process_tree(process1.pid)
             time.sleep(2)
