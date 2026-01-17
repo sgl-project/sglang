@@ -1,6 +1,9 @@
 name: Nightly Test (AMD)
 
 on:
+  pull_request:  # TODO: Remove before merging - temporary trigger for PR testing
+    branches:
+      - main
   schedule:
     - cron: '0 0 * * *'
   push:
@@ -22,6 +25,8 @@ on:
           # MI30x Accuracy Tests (GSM8K / MMMU)
           - 'nightly-accuracy-2-gpu'
           - 'nightly-accuracy-2-gpu-vlm'
+          - 'nightly-perf-2-gpu-text'
+          - 'nightly-perf-2-gpu-vlm'
           - 'nightly-accuracy-8-gpu'
           - 'nightly-accuracy-8-gpu-deepseek-r1'
           # MI30x Accuracy + Performance Tests (combined)
@@ -139,6 +144,66 @@ jobs:
           bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
             python3 run_suite.py --hw amd --suite nightly-amd-accuracy-2-gpu-vlm --nightly --timeout-per-file 7200 || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+  # 2-GPU Text Models Performance Tests
+  nightly-perf-2-gpu-text:
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-perf-2-gpu-text')
+    runs-on: linux-mi325-gpu-2
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Setup docker
+        run: |
+          touch github_summary.md
+          bash scripts/ci/amd_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: bash scripts/ci/amd_ci_install_dependency.sh
+
+      - name: Performance Test (2-GPU Text Models)
+        timeout-minutes: 120
+        run: |
+          bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e SGLANG_USE_AITER=1 \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-amd-perf-text-2-gpu --nightly --timeout-per-file 3600 || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+  # 2-GPU VLM Performance Tests
+  nightly-perf-2-gpu-vlm:
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-perf-2-gpu-vlm')
+    runs-on: linux-mi325-gpu-2
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Setup docker
+        run: |
+          touch github_summary.md
+          bash scripts/ci/amd_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: bash scripts/ci/amd_ci_install_dependency.sh
+
+      - name: Performance Test (2-GPU VLM Models)
+        timeout-minutes: 180
+        run: |
+          bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e SGLANG_USE_AITER=1 \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-amd-perf-vlm-2-gpu --nightly --timeout-per-file 7200 || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
@@ -615,6 +680,9 @@ jobs:
       # MI30x Accuracy Tests
       - nightly-accuracy-2-gpu
       - nightly-accuracy-2-gpu-vlm
+      # MI30x Performance Tests
+      - nightly-perf-2-gpu-text
+      - nightly-perf-2-gpu-vlm
       - nightly-accuracy-8-gpu
       - nightly-accuracy-8-gpu-deepseek-r1
       # MI30x Combined Accuracy + Performance Tests
