@@ -1395,6 +1395,16 @@ class Scheduler(
         else:
             return MultimodalInputs.from_dict(mm_inputs_dict)
 
+
+    def _maybe_clear_mm_inputs(self, batch: ScheduleBatch) -> None:
+        for req in batch.reqs:
+            if not req.finished() or not (mm_inputs := req.multimodal_inputs):
+                continue
+            for item in mm_inputs.mm_items:
+                item.feature = None
+            req.multimodal_inputs = None
+
+
     def handle_generate_request(
         self,
         recv_req: TokenizedGenerateReqInput,
@@ -2343,6 +2353,7 @@ class Scheduler(
             self.process_batch_result_idle(batch, result)
 
         self.log_batch_result_stats(batch, result)
+        self._maybe_clear_mm_inputs(batch)
         self.maybe_send_health_check_signal()
 
     def maybe_send_health_check_signal(self):
