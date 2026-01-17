@@ -594,6 +594,12 @@ def _try_enable_offline_mode_if_cache_complete(
 
     other_args = other_args or []
 
+    # Skip offline mode for LoRA scenarios (dynamic adapter loading may need online access)
+    is_lora_enabled = "--enable-lora" in other_args or "--lora-paths" in other_args
+    if is_lora_enabled:
+        print(f"CI_OFFLINE: LoRA enabled, skip offline mode - {model_name_or_path}")
+        return None
+
     # Fast-path: If subprocess env already has HF_HUB_OFFLINE=1, skip
     if env.get("HF_HUB_OFFLINE") == "1":
         print(
