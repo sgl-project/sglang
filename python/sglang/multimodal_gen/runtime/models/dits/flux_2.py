@@ -196,7 +196,6 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
         key = key.unflatten(-1, (self.heads, -1))
         value = value.unflatten(-1, (self.heads, -1))
 
-        # Fused QK norm (2 RMSNorm ops -> 1 fused kernel)
         query, key = apply_qk_norm(query, key, self.norm_q, self.norm_k, self.head_dim)
 
         if self.added_kv_proj_dim is not None:
@@ -340,7 +339,6 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
         key = key.unflatten(-1, (self.heads, -1))
         value = value.unflatten(-1, (self.heads, -1))
 
-        # Fused QK norm (2 RMSNorm ops -> 1 fused kernel)
         query, key = apply_qk_norm(query, key, self.norm_q, self.norm_k, self.head_dim)
 
         if freqs_cis is not None:
