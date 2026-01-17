@@ -112,6 +112,7 @@ jobs:
 
       - name: Nightly Test (2-GPU)
         run: |
+          > github_summary.md  # Clear summary file
           bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
             python3 run_suite.py --hw amd --suite nightly-amd --nightly --timeout-per-file 7200 || TEST_EXIT_CODE=$?
@@ -141,6 +142,7 @@ jobs:
       - name: Nightly Accuracy Test (2-GPU VLM MMMU)
         timeout-minutes: 180
         run: |
+          > github_summary.md  # Clear summary file
           bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
             python3 run_suite.py --hw amd --suite nightly-amd-accuracy-2-gpu-vlm --nightly --timeout-per-file 7200 || TEST_EXIT_CODE=$?
@@ -170,6 +172,7 @@ jobs:
       - name: Performance Test (2-GPU Text Models)
         timeout-minutes: 120
         run: |
+          > github_summary.md  # Clear summary file
           bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test \
             -e SGLANG_USE_AITER=1 \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
@@ -200,6 +203,7 @@ jobs:
       - name: Performance Test (2-GPU VLM Models)
         timeout-minutes: 180
         run: |
+          > github_summary.md  # Clear summary file
           bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test \
             -e SGLANG_USE_AITER=1 \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \

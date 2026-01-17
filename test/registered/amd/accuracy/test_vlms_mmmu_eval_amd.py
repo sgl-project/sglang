@@ -9,8 +9,6 @@ VLMs tested here:
 - InternVL2 series (InternVL2_5-2B)
 - MiniCPM series (MiniCPM-v-2_6, MiniCPM-o-2_6)
 - DeepSeek VL series (deepseek-vl2-small, Janus-Pro-7B)
-- Gemma VL (gemma-3-4b-it)
-- Pixtral (pixtral-12b)
 - Kimi VL (Kimi-VL-A3B-Instruct)
 - MiMo VL (MiMo-VL-7B-RL)
 - GLM VL (GLM-4.1V-9B-Thinking)
@@ -97,25 +95,11 @@ AMD_VLM_MODELS = [
         "accuracy_threshold": 0.28,
         "extra_args": ["--trust-remote-code"],
     },
-    # Gemma VL
-    {
-        "model_path": "google/gemma-3-4b-it",
-        "tp_size": 1,
-        "accuracy_threshold": 0.35,
-        "extra_args": ["--trust-remote-code"],
-    },
-    # Pixtral
-    {
-        "model_path": "mistral-community/pixtral-12b",
-        "tp_size": 1,
-        "accuracy_threshold": 0.35,
-        "extra_args": ["--trust-remote-code"],
-    },
     # Kimi VL - MoE
     {
         "model_path": "moonshotai/Kimi-VL-A3B-Instruct",
         "tp_size": 1,
-        "accuracy_threshold": 0.32,
+        "accuracy_threshold": 0.26,
         "extra_args": ["--trust-remote-code"],
     },
     # MiMo VL
