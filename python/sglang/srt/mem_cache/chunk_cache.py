@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, Optional
 import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
+from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -86,6 +87,7 @@ class SWAChunkCache(ChunkCache):
     """ChunkCache with support for sliding window attention."""
 
     def __init__(self, params: CacheInitParams, sliding_window_size: int):
+        assert isinstance(params.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator)
         super().__init__(params)
 
         self.sliding_window_size = sliding_window_size

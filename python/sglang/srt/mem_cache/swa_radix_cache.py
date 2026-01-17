@@ -358,7 +358,6 @@ class SWARadixCache(BasePrefixCache):
             self.init_metrics_collector()
 
         self.sliding_window_size = sliding_window_size
-        self.window_size = self.sliding_window_size
         self.reset()
 
     ##### Public API #####
