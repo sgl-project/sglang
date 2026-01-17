@@ -176,12 +176,12 @@ class FutureMap:
         draft_input.draft_token_num = self.draft_token_num_buf[future_indices.indices]
 
     def resolve_future(self, model_worker_batch: ModelWorkerBatch):
-        if self.spec_algo.is_none() or self.spec_algo.is_ngram():
+        if self.spec_algo.is_none():
             _resolve_future_token_ids(model_worker_batch.input_ids, self.token_ids_buf)
         else:
             # TODO(lsyin): write future indices into spec_info.future_indices
             draft_input: EagleDraftInput = model_worker_batch.spec_info
-            if draft_input is None:
+            if draft_input is None or self.spec_algo.is_ngram():
                 # FIXME(lsyin): No future exists, only for prefill batch, not compatible with mixed mode
                 return
             # if self.spec_algo.is_ngram():
@@ -205,7 +205,9 @@ class FutureMap:
     def store_to_map(
         self, future_indices: FutureIndices, batch_result: GenerationBatchResult
     ):
-        if self.spec_algo.is_none() or self.spec_algo.is_ngram():
+        if self.spec_algo.is_ngram():
+            return
+        if self.spec_algo.is_none():
             intv = future_indices.interval
             self.token_ids_buf[intv] = batch_result.next_token_ids
         else:

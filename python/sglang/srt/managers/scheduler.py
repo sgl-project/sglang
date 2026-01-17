@@ -2108,13 +2108,13 @@ class Scheduler(
                     batch, batch.logits_output, self.page_size
                 )
             )
-            # TODO update result_queue using the new result, and store next_token_ids in the future map
+            # TODO update result_queue using the new result, token ids do not need to store in future map since all output ids are updated in speculative module
             tmp_batch, tmp_result = self.result_queue.popleft()
             tmp_result.logits_output = logits_output
             tmp_result.next_token_ids = next_token_ids
             tmp_result.num_accepted_tokens = num_accepted_tokens
+            tmp_result.copy_to_cpu(return_logprob=tmp_batch.return_logprob)
             self.result_queue.appendleft((tmp_batch, tmp_result))
-            self.future_map.store_to_map(tmp_batch.spec_info.future_indices, tmp_result)
 
         batch.filter_batch(v1_spec_info_filtered=True)
         if batch.is_empty():
@@ -2261,15 +2261,20 @@ class Scheduler(
                     # FIXME(lsyin): maybe move this to forward_batch_generation
                     batch_result.copy_done = self.device_module.Event()
                     if batch_result.delay_sample_func is None:
-                        self.future_map.store_to_map(future_indices, batch_result)
-                        batch_result.copy_to_cpu(return_logprob=batch.return_logprob)
+                        if not batch.is_spec_v2 or (
+                            batch.is_spec_v2 and not batch.spec_algorithm.is_ngram()
+                        ):
+                            self.future_map.store_to_map(future_indices, batch_result)
+                            batch_result.copy_to_cpu(
+                                return_logprob=batch.return_logprob
+                            )
                     else:
                         batch_result.future_indices = future_indices
 
                 # FIXME(lsyin): move this assignment elsewhere
                 future_indices_or_next_token_ids = -future_indices.indices
 
-                if batch.is_spec_v2:
+                if batch.is_spec_v2 and not batch.spec_algorithm.is_ngram():
                     # FIXME(lsyin): tmp code for spec v2
                     # We only keep future indices for next draft input
 
