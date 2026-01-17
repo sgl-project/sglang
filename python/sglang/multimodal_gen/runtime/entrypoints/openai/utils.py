@@ -177,9 +177,21 @@ def _get_openai_media_url_policy() -> dict[str, Any]:
         "SGLANG_OPENAI_MEDIA_URL_ALLOWED_SCHEMES", "https,http"
     )
     allowlist_raw = os.getenv("SGLANG_OPENAI_MEDIA_URL_ALLOWLIST", "")
-    max_bytes = int(os.getenv("SGLANG_OPENAI_MEDIA_URL_MAX_BYTES", str(50 * 1024 * 1024)))
-    max_redirects = int(os.getenv("SGLANG_OPENAI_MEDIA_URL_MAX_REDIRECTS", "5"))
-    timeout = float(os.getenv("SGLANG_OPENAI_MEDIA_URL_TIMEOUT", "10"))
+    default_max_bytes = 50 * 1024 * 1024
+    default_max_redirects = 5
+    default_timeout = 10.0
+    try:
+        max_bytes = int(os.getenv("SGLANG_OPENAI_MEDIA_URL_MAX_BYTES", str(default_max_bytes)))
+    except (TypeError, ValueError):
+        max_bytes = default_max_bytes
+    try:
+        max_redirects = int(os.getenv("SGLANG_OPENAI_MEDIA_URL_MAX_REDIRECTS", str(default_max_redirects)))
+    except (TypeError, ValueError):
+        max_redirects = default_max_redirects
+    try:
+        timeout = float(os.getenv("SGLANG_OPENAI_MEDIA_URL_TIMEOUT", str(default_timeout)))
+    except (TypeError, ValueError):
+        timeout = default_timeout
 
     schemes = {scheme.strip().lower() for scheme in allowed_schemes.split(",") if scheme.strip()}
     if not schemes:
