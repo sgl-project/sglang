@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import inspect
-from typing import Any, Callable, List, Optional, TypeVar, Union, overload
+from typing import Callable, List, Optional, TypeVar, Union, overload
 
-import torch
 
 F = TypeVar("F", bound=Callable)
 
@@ -48,5 +46,3 @@ def register_custom_op(
     fake_impl: Optional[Callable],
     eager: bool = True,
 ) -> Callable[[F], F]: ...
-
-

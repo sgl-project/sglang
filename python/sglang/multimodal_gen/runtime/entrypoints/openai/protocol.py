@@ -7,7 +7,6 @@ from typing import Any, Dict, List, Optional, Union
 from pydantic import BaseModel, Field
 
 
-
 # Image API protocol models
 class ImageResponseData(BaseModel):
     b64_json: Optional[str] = None
@@ -119,4 +118,3 @@ class BaseReq(ABC):
 class VertexGenerateReqInput(BaseReq):
     instances: List[dict]
     parameters: Optional[dict] = None
-

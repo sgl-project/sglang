@@ -2,11 +2,9 @@
 import dataclasses
 import json
 import os
-import subprocess
 import sys
 import time
 from datetime import datetime
-from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -70,8 +68,6 @@ def get_diffusion_perf_log_dir() -> str:
         target_path = (sglang_path.parent / "../../.cache/logs").resolve()
         return str(target_path)
     return ""
-
-
 
 
 @dataclasses.dataclass

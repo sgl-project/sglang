@@ -3,10 +3,11 @@
 import inspect
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Any, List, Optional, Tuple, Callable
+from typing import Any, Callable, List, Optional, Tuple
 
 import torch
 from torch.library import Library
+
 from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
@@ -167,9 +168,7 @@ def flash_attn_varlen_func_fake_out_lse(
     return out, lse
 
 
-
 sglang_lib = Library("sglang", "FRAGMENT")  # noqa
-
 
 
 def direct_register_custom_op(
@@ -226,7 +225,9 @@ def direct_register_custom_op(
 
     try:
         my_lib.define(op_name + schema_str)
-        my_lib.impl(op_name, op_func, "CUDA" if not current_platform.is_npu() else "PrivateUse1")
+        my_lib.impl(
+            op_name, op_func, "CUDA" if not current_platform.is_npu() else "PrivateUse1"
+        )
         if fake_impl is not None:
             my_lib._register_fake(op_name, fake_impl)
     except RuntimeError as error:
@@ -242,7 +243,6 @@ def direct_register_custom_op(
     except AttributeError as error:
         # Always re-raise AttributeError as it indicates missing dependencies
         raise error
-
 
 
 class CustomOpWrapper:
