@@ -23,6 +23,7 @@ RESOLUTION_PRESETS = {
 }
 
 ASPECT_RATIO_MAP = {16 / 9: "16:9", 9 / 16: "9:16", 1.0: "1:1"}
+ASPECT_RATIO_TOLERANCE = 0.01
 
 
 def isotropic_crop_resize_pil(
@@ -33,7 +34,7 @@ def isotropic_crop_resize_pil(
     target_ratio = target_height / target_width
     orig_ratio = orig_height / orig_width
 
-    if abs(orig_ratio - target_ratio) < 0.01:
+    if abs(orig_ratio - target_ratio) < ASPECT_RATIO_TOLERANCE:
         return image.resize((target_width, target_height), Image.LANCZOS)
 
     if orig_ratio > target_ratio:
