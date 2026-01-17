@@ -28,9 +28,12 @@ from sglang.multimodal_gen.configs.pipeline_configs.wan import (
 from sglang.multimodal_gen.runtime.distributed import (
     cfg_model_parallel_all_reduce,
     get_local_torch_device,
+    get_sp_group,
     get_sp_parallel_rank,
     get_sp_world_size,
+    get_tp_group,
     get_world_group,
+    get_world_size,
 )
 from sglang.multimodal_gen.runtime.distributed.communication_op import (
     sequence_model_parallel_all_gather,
@@ -62,6 +65,14 @@ from sglang.multimodal_gen.runtime.platforms import (
     current_platform,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.cache_dit_integration import (
+    CacheDitConfig,
+    enable_cache_on_dual_transformer,
+    enable_cache_on_transformer,
+    get_scm_mask,
+    refresh_context_on_dual_transformer,
+    refresh_context_on_transformer,
+)
 from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
@@ -153,11 +164,6 @@ class DenoisingStage(PipelineStage):
 
         # NOTE: When a new request arrives, we need to refresh the cache-dit context.
         if self._cache_dit_enabled:
-            from sglang.multimodal_gen.runtime.utils.cache_dit_integration import (
-                refresh_context_on_dual_transformer,
-                refresh_context_on_transformer,
-            )
-
             if isinstance(num_inference_steps, tuple):
                 refresh_context_on_dual_transformer(
                     self.transformer,
@@ -172,18 +178,6 @@ class DenoisingStage(PipelineStage):
         # check if cache-dit is enabled in config
         if not envs.SGLANG_CACHE_DIT_ENABLED or batch.is_warmup:
             return
-
-        from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
-            CacheDitConfig,
-            enable_cache_on_dual_transformer,
-            enable_cache_on_transformer,
-            get_scm_mask,
-        )
-        from sglang.multimodal_gen.runtime.distributed import (
-            get_sp_group,
-            get_tp_group,
-            get_world_size,
-        )
 
         world_size = get_world_size()
         parallelized = world_size > 1
@@ -523,10 +517,7 @@ class DenoisingStage(PipelineStage):
 
         if self.transformer_2 is not None:
             assert boundary_timestep is not None, "boundary_timestep must be provided"
-            num_high_noise_steps = 0
-            for t in timesteps:
-                if t >= boundary_timestep:
-                    num_high_noise_steps += 1
+            num_high_noise_steps = (timesteps >= boundary_timestep).sum().item()
             num_low_noise_steps = num_inference_steps - num_high_noise_steps
             cache_dit_num_inference_steps = (num_high_noise_steps, num_low_noise_steps)
         else:
