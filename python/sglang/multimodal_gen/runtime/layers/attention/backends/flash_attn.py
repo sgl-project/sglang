@@ -6,12 +6,12 @@ from typing import Any, List, Optional, Tuple
 
 import torch
 
+from sglang.multimodal_gen.runtime.layers.utils import register_custom_op
 from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
 )
-from sglang.srt.utils.custom_op import register_custom_op
 
 try:
     from sgl_kernel.flash_attn import flash_attn_varlen_func
