@@ -1,6 +1,6 @@
 """MI35x DeepSeek-V3.2 GSM8K Completion Evaluation Test (8-GPU)
 
-Tests DeepSeek-V3.2-Exp with basic configuration using few-shot completion
+Tests DeepSeek-V3.2 with basic configuration using few-shot completion
 benchmark on MI35x.
 
 Registry: nightly-amd-accuracy-8-gpu-mi35x-deepseek-v32 suite
@@ -69,9 +69,9 @@ class ModelConfig:
 # DeepSeek-V3.2 models for MI35x - only basic variant for nightly
 # DP variant removed due to barrier deadlock during model loading
 MI35X_DEEPSEEK_V32_MODELS = [
-    # DeepSeek-V3.2-Exp basic (TP=8 only)
+    # DeepSeek-V3.2 basic (TP=8 only)
     ModelConfig(
-        model_path="deepseek-ai/DeepSeek-V3.2-Exp",
+        model_path="deepseek-ai/DeepSeek-V3.2",
         tp_size=8,
         accuracy_threshold=0.93,
         timeout=3600,
