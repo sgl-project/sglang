@@ -50,9 +50,10 @@ For PRs that impact **latency**, **throughput**, or **memory usage**, you **shou
 Consider adding tests to the `pr-test` or `nightly-test` suites to safeguard your changes, especially for PRs that:
 
 - support a new model
-  1. add a testcase for this new model to `testcase_configs.py`
-  2. run this testcase, add your baseline to `perf_baselines.json` by following the instruction in console
+    - add a testcase for this new model to `testcase_configs.py`
 - support or fix important features
 - significantly improve performance
+
+Please add your updated/added baseline to `perf_baselines.json` by following the instruction in console.
 
 See [test](https://github.com/sgl-project/sglang/tree/main/python/sglang/multimodal_gen/test) for examples
