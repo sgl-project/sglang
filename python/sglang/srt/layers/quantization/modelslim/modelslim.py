@@ -43,6 +43,7 @@ def npu_wrapper_rmsnorm_forward(func):
         self,
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
+        post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         from sgl_kernel_npu.norm.add_rmsnorm_bias import add_rmsnorm_bias
 
