@@ -122,6 +122,7 @@ git clone https://github.com/sgl-project/sglang.git
 cd sglang/docker
 
 # Build the docker image
+# If there are network errors, please modify the Dockerfile to use offline dependencies or use a proxy
 docker build -t <image_name> -f npu.Dockerfile .
 ```
 
