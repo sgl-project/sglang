@@ -8,17 +8,14 @@ except ImportError:
         __version_tuple__ = tuple(__version__.split("."))
     except Exception:
         try:
-            import subprocess
+            from setuptools_scm import get_version
+            import pathlib
 
-            __version__ = (
-                subprocess.check_output(
-                    ["git", "describe", "--tags", "--always"], stderr=subprocess.STDOUT
-                )
-                .decode("utf-8")
-                .strip()
-            )
-            if __version__.startswith("v"):
-                __version__ = __version__[1:]
+            # The root of the project is two levels up from this file's directory (python/sglang/version.py -> python/)
+            # But according to pyproject.toml, the scm root is ".." (the repo root).
+            # So we point to the directory containing pyproject.toml.
+            project_root = pathlib.Path(__file__).parent.parent.parent
+            __version__ = get_version(root=str(project_root), fallback_version="0.0.0.dev0")
             __version_tuple__ = tuple(__version__.split("."))
         except Exception:
             # Fallback for development without build
