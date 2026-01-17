@@ -12,7 +12,9 @@ from fastapi.responses import ORJSONResponse
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.entrypoints.openai import image_api, video_api
-from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import VertexGenerateReqInput
+from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
+    VertexGenerateReqInput,
+)
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
     post_process_sample,
     prepare_request,
