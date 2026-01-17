@@ -111,8 +111,8 @@ impl ToolParser for PythonicParser {
                     }
                 }
                 Err(e) => {
-                    // Log warning and return entire text as fallback
-                    tracing::warn!("Failed to parse pythonic tool calls: {}", e);
+                    // Log and return entire text as fallback
+                    tracing::debug!("Failed to parse pythonic tool calls: {}", e);
                     Ok((text.to_string(), vec![]))
                 }
             }
@@ -156,7 +156,7 @@ impl ToolParser for PythonicParser {
                             .enumerate()
                             .filter_map(|(idx, tool)| {
                                 if !tool_indices.contains_key(&tool.function.name) {
-                                    tracing::warn!(
+                                    tracing::debug!(
                                         "Invalid tool name '{}' - skipping",
                                         tool.function.name
                                     );
@@ -177,7 +177,7 @@ impl ToolParser for PythonicParser {
                         });
                     }
                     Err(e) => {
-                        tracing::warn!("Failed to parse pythonic tool call: {}", e);
+                        tracing::debug!("Failed to parse pythonic tool call: {}", e);
                         // Clear buffer on error
                         self.buffer.clear();
                         return Ok(StreamingParseResult::default());
