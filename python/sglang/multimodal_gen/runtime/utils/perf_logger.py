@@ -2,9 +2,11 @@
 import dataclasses
 import json
 import os
+import subprocess
 import sys
 import time
 from datetime import datetime
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -67,6 +69,25 @@ def get_diffusion_perf_log_dir() -> str:
         target_path = (sglang_path.parent / "../../.cache/logs").resolve()
         return str(target_path)
     return ""
+
+
+@lru_cache(maxsize=1)
+def get_git_commit_hash() -> str:
+    try:
+        commit_hash = os.environ.get("SGLANG_GIT_COMMIT")
+        if not commit_hash:
+            commit_hash = (
+                subprocess.check_output(
+                    ["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL
+                )
+                .strip()
+                .decode("utf-8")
+            )
+        _CACHED_COMMIT_HASH = commit_hash
+        return commit_hash
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        _CACHED_COMMIT_HASH = "N/A"
+        return "N/A"
 
 
 @dataclasses.dataclass
