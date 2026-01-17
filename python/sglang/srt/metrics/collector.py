@@ -849,6 +849,16 @@ class SchedulerMetricsCollector:
             ],
         )
 
+        # This is a work-around Info metric since Info metrics are not supported in Prometheus.
+        # Similar to vLLM, https://github.com/vllm-project/vllm/blob/main/vllm/v1/metrics/loggers.py
+        # If more Info metrics are needed, we can create a common _log_info function.
+        self.cache_config_info = Gauge(
+            name="sglang:cache_config_info",
+            documentation="Cache configuration information.",
+            labelnames=["page_size", "num_pages"],
+            multiprocess_mode="mostrecent",
+        )
+
     def _log_gauge(self, gauge, data: Union[int, float]) -> None:
         # Convenience function for logging to gauge.
         gauge.labels(**self.labels).set(data)
@@ -1065,6 +1075,9 @@ class SchedulerMetricsCollector:
                 grammar_stats.num_timeout
             )
         self.num_grammar_total.labels(**self.labels).inc(1)
+
+    def emit_cache_config_info(self, page_size: int, num_pages: int) -> None:
+        self.cache_config_info.labels(page_size=page_size, num_pages=num_pages).set(1)
 
 
 class TokenizerMetricsCollector:
