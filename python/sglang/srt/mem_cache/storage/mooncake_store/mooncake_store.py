@@ -649,6 +649,11 @@ class MooncakeStore(HiCacheStorage):
     def batch_exists(
         self, keys, extra_info: Optional[HiCacheStorageExtraInfo] = None
     ) -> int:
+        # Apply extra_backend_tag prefix if available
+        if self.extra_backend_tag is not None:
+            prefix = self.extra_backend_tag
+            keys = [f"{prefix}_{key}" for key in keys]
+
         if self.is_mla_backend:
             query_keys = [f"{key}_{self.mla_suffix}_k" for key in keys]
             key_multiplier = 1
