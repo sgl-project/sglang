@@ -90,7 +90,8 @@ jobs:
           filters: |
             main_package:
               - "python/sglang/!(multimodal_gen)/**"
-              - "python/*.toml"
+              - "python/pyproject_rocm.toml"
+              - "python/pyproject_other.toml"
               - "scripts/ci/**"
               - "test/**"
               - ".github/workflows/pr-test-amd.yml"
@@ -99,7 +100,8 @@ jobs:
             multimodal_gen:
               - "python/sglang/multimodal_gen/**"
               - "python/sglang/cli/**"
-              - "python/*.toml"
+              - "python/pyproject_rocm.toml"
+              - "python/pyproject_other.toml"
 
   # =============================================== sgl-kernel ====================================================
   sgl-kernel-unit-test-amd:
