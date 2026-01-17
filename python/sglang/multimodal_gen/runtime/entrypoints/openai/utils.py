@@ -1,11 +1,14 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 import base64
 import dataclasses
+import ipaddress
 import os
 import re
+import socket
 import time
 from pathlib import Path
 from typing import Any, List, Optional, Union
+from urllib.parse import urljoin, urlparse
 
 import httpx
 from fastapi import UploadFile
@@ -14,6 +17,7 @@ from sglang.multimodal_gen.configs.sample.sampling_params import DataType
 from sglang.multimodal_gen.runtime.entrypoints.utils import post_process_sample
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.scheduler_client import AsyncSchedulerClient
+from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     init_logger,
     log_batch_completion,
@@ -105,6 +109,123 @@ def ensure_path_within_root(target_path: str, root_dir: str) -> str:
     return str(candidate)
 
 
+def _parse_allowlist(raw_value: str) -> tuple[set[str], list[ipaddress._BaseNetwork]]:
+    hosts: set[str] = set()
+    networks: list[ipaddress._BaseNetwork] = []
+    for entry in (raw_value or "").split(","):
+        item = entry.strip()
+        if not item:
+            continue
+        if "/" in item:
+            try:
+                networks.append(ipaddress.ip_network(item, strict=False))
+            except ValueError:
+                continue
+        else:
+            hosts.add(item.lower())
+    return hosts, networks
+
+
+def _resolve_host_ips(hostname: str) -> list[ipaddress._BaseAddress]:
+    try:
+        ip = ipaddress.ip_address(hostname)
+        return [ip]
+    except ValueError:
+        pass
+
+    ips: list[ipaddress._BaseAddress] = []
+    try:
+        for family, _, _, _, sockaddr in socket.getaddrinfo(hostname, None):
+            address = sockaddr[0]
+            try:
+                ips.append(ipaddress.ip_address(address))
+            except ValueError:
+                continue
+    except socket.gaierror:
+        return []
+    return ips
+
+
+def _is_ip_blocked(ip: ipaddress._BaseAddress) -> bool:
+    return (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_reserved
+        or ip.is_multicast
+        or ip.is_unspecified
+    )
+
+
+def _is_host_allowlisted(
+    hostname: str,
+    ips: list[ipaddress._BaseAddress],
+    allow_hosts: set[str],
+    allow_nets: list[ipaddress._BaseNetwork],
+) -> bool:
+    if hostname in allow_hosts:
+        return True
+    for ip in ips:
+        if any(ip in net for net in allow_nets):
+            return True
+    return False
+
+
+def _get_openai_media_url_policy() -> dict[str, Any]:
+    enabled = get_bool_env_var("SGLANG_OPENAI_MEDIA_URL_FETCH_ENABLED", "true")
+    allowed_schemes = os.getenv(
+        "SGLANG_OPENAI_MEDIA_URL_ALLOWED_SCHEMES", "https,http"
+    )
+    allowlist_raw = os.getenv("SGLANG_OPENAI_MEDIA_URL_ALLOWLIST", "")
+    max_bytes = int(os.getenv("SGLANG_OPENAI_MEDIA_URL_MAX_BYTES", str(50 * 1024 * 1024)))
+    max_redirects = int(os.getenv("SGLANG_OPENAI_MEDIA_URL_MAX_REDIRECTS", "5"))
+    timeout = float(os.getenv("SGLANG_OPENAI_MEDIA_URL_TIMEOUT", "10"))
+
+    schemes = {scheme.strip().lower() for scheme in allowed_schemes.split(",") if scheme.strip()}
+    if not schemes:
+        schemes = {"https"}
+    allow_hosts, allow_nets = _parse_allowlist(allowlist_raw)
+    return {
+        "enabled": enabled,
+        "schemes": schemes,
+        "allow_hosts": allow_hosts,
+        "allow_nets": allow_nets,
+        "max_bytes": max_bytes,
+        "max_redirects": max_redirects,
+        "timeout": timeout,
+    }
+
+
+def _validate_media_url_with_policy(url: str, policy: dict[str, Any]) -> None:
+    parsed = urlparse(url)
+    scheme = (parsed.scheme or "").lower()
+    hostname = (parsed.hostname or "").lower()
+    if scheme not in policy["schemes"]:
+        raise ValueError(f"URL scheme '{scheme}' is not allowed")
+    if not hostname:
+        raise ValueError("URL host is missing")
+    if hostname == "localhost" or hostname.endswith(".localhost"):
+        if hostname not in policy["allow_hosts"]:
+            raise ValueError("Localhost URLs are not allowed")
+
+    ips = _resolve_host_ips(hostname)
+    if not ips:
+        raise ValueError("Failed to resolve URL host")
+    if _is_host_allowlisted(hostname, ips, policy["allow_hosts"], policy["allow_nets"]):
+        return
+    for ip in ips:
+        if _is_ip_blocked(ip):
+            raise ValueError("URL resolves to a private or reserved IP")
+
+
+def validate_openai_media_url(url: str) -> dict[str, Any]:
+    policy = _get_openai_media_url_policy()
+    if not policy["enabled"]:
+        raise ValueError("Remote media URL fetching is disabled by configuration")
+    _validate_media_url_with_policy(url, policy)
+    return policy
+
+
 async def save_image_to_path(
     image: Union[UploadFile, str],
     target_path: str,
@@ -144,8 +265,9 @@ async def _maybe_url_image(
         return None
 
     if img_url.lower().startswith(("http://", "https://")):
+        policy = validate_openai_media_url(img_url)
         input_path = await _save_url_image_to_path(
-            img_url, target_path, uploads_root=uploads_root
+            img_url, target_path, policy, uploads_root=uploads_root
         )
         return input_path
     elif img_url.startswith("data:image"):
@@ -161,52 +283,75 @@ async def _maybe_url_image(
 async def _save_url_image_to_path(
     image_url: str,
     target_path: str,
+    policy: dict[str, Any] | None = None,
     uploads_root: str | None = None,
 ) -> str:
     """Download image from URL and save to target path."""
-
-    os.makedirs(os.path.dirname(target_path), exist_ok=True)
-
     try:
-        async with httpx.AsyncClient(follow_redirects=True) as client:
-            response = await client.get(image_url, timeout=10.0)
-            response.raise_for_status()
+        policy = policy or validate_openai_media_url(image_url)
+        current_url = image_url
 
-            # Determine file extension from content type or URL after downloading
-            if not os.path.splitext(target_path)[1]:
-                content_type = response.headers.get("content-type", "").lower()
+        async with httpx.AsyncClient(follow_redirects=False) as client:
+            for _ in range(policy["max_redirects"] + 1):
+                _validate_media_url_with_policy(current_url, policy)
+                async with client.stream(
+                    "GET", current_url, timeout=policy["timeout"]
+                ) as response:
+                    if response.status_code in {301, 302, 303, 307, 308}:
+                        location = response.headers.get("location")
+                        if not location:
+                            raise ValueError("Redirect response missing location header")
+                        current_url = urljoin(current_url, location)
+                        continue
 
-                url_path = image_url.split("?")[0]
-                _, url_ext = os.path.splitext(url_path)
-                url_ext = url_ext.lower()
+                    response.raise_for_status()
 
-                if url_ext in {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"}:
-                    ext = ".jpg" if url_ext == ".jpeg" else url_ext
-                elif content_type.startswith("image/"):
-                    if "jpeg" in content_type or "jpg" in content_type:
-                        ext = ".jpg"
-                    elif "png" in content_type:
-                        ext = ".png"
-                    elif "webp" in content_type:
-                        ext = ".webp"
-                    else:
-                        ext = ".jpg"  # Default to jpg
-                elif content_type == "application/octet-stream":
-                    # for octet-stream, if we couldn't get it from URL, default to jpg
-                    ext = ".jpg"
-                else:
-                    raise ValueError(
-                        f"URL does not point to an image. Content-Type: {content_type}"
-                    )
-                target_path = f"{target_path}{ext}"
+                    # Determine file extension from content type or URL after downloading
+                    if not os.path.splitext(target_path)[1]:
+                        content_type = response.headers.get("content-type", "").lower()
 
-            if uploads_root:
-                target_path = ensure_path_within_root(target_path, uploads_root)
+                        url_path = current_url.split("?")[0]
+                        _, url_ext = os.path.splitext(url_path)
+                        url_ext = url_ext.lower()
 
-            with open(target_path, "wb") as f:
-                f.write(response.content)
+                        if url_ext in {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"}:
+                            ext = ".jpg" if url_ext == ".jpeg" else url_ext
+                        elif content_type.startswith("image/"):
+                            if "jpeg" in content_type or "jpg" in content_type:
+                                ext = ".jpg"
+                            elif "png" in content_type:
+                                ext = ".png"
+                            elif "webp" in content_type:
+                                ext = ".webp"
+                            else:
+                                ext = ".jpg"
+                        elif content_type == "application/octet-stream":
+                            ext = ".jpg"
+                        else:
+                            raise ValueError(
+                                f"URL does not point to an image. Content-Type: {content_type}"
+                            )
+                        target_path = f"{target_path}{ext}"
 
-            return target_path
+                    if uploads_root:
+                        target_path = ensure_path_within_root(target_path, uploads_root)
+
+                    os.makedirs(os.path.dirname(target_path), exist_ok=True)
+
+                    content_length = response.headers.get("content-length")
+                    if content_length and int(content_length) > policy["max_bytes"]:
+                        raise ValueError("Remote content exceeds max size limit")
+
+                    total = 0
+                    with open(target_path, "wb") as f:
+                        async for chunk in response.aiter_bytes():
+                            total += len(chunk)
+                            if total > policy["max_bytes"]:
+                                raise ValueError("Remote content exceeds max size limit")
+                            f.write(chunk)
+                    return target_path
+
+            raise ValueError("Too many redirects when fetching media URL")
     except Exception as e:
         raise Exception(f"Failed to download image from URL: {str(e)}")
 
