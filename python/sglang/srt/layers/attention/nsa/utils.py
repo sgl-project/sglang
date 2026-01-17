@@ -28,6 +28,10 @@ def is_nsa_enable_prefill_cp():
     return get_global_server_args().enable_nsa_prefill_context_parallel
 
 
+def is_enable_o_proj_tp():
+    return get_global_server_args().enable_o_proj_tensor_parallel
+
+
 def is_nsa_prefill_cp_in_seq_split():
     return (
         is_nsa_enable_prefill_cp()
