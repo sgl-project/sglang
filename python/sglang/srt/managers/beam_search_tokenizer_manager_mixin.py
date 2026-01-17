@@ -88,7 +88,7 @@ class BeamSearchTokenizerManagerMixin:
 
         return beam_results
 
-    def handle_beam_search_output(
+    def maybe_handle_beam_search_output(
         self,
         recv_obj: Union[
             BatchStrOutput,

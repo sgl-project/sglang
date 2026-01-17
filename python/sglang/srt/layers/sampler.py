@@ -91,6 +91,7 @@ class Sampler(nn.Module):
         logits = logits_output.next_token_logits
 
         if is_beam_search:
+            # For beam search, only compute logprobs here. Sampling is handled externally.
             logprobs = torch.nn.functional.log_softmax(logits, dim=-1)
             logits_output.logprobs = logprobs
             return None

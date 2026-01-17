@@ -1532,7 +1532,7 @@ class TokenizerManager(
                     recv_obj, "prefill_finished_ts", meta_info, i
                 )
 
-            if self.handle_beam_search_output(recv_obj, i, rid, state, meta_info):
+            if self.maybe_handle_beam_search_output(recv_obj, i, rid, state, meta_info):
                 continue
 
             if getattr(state.obj, "return_logprob", False):

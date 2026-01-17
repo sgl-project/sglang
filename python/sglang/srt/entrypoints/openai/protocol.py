@@ -288,7 +288,7 @@ class CompletionResponseChoice(BaseModel):
     finish_reason: Optional[Literal["stop", "length", "content_filter", "abort"]] = None
     matched_stop: Union[None, int, str] = None
     hidden_states: Optional[object] = None
-    sequence_score: Optional[float] = None
+    sequence_score: Optional[float] = None  # Score for this sequence in beam search
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
@@ -317,8 +317,7 @@ class CompletionResponseStreamChoice(BaseModel):
     finish_reason: Optional[Literal["stop", "length", "content_filter", "abort"]] = None
     matched_stop: Union[None, int, str] = None
     hidden_states: Optional[object] = None
-    # For beam search results
-    sequence_score: Optional[float] = None
+    sequence_score: Optional[float] = None  # Score for this sequence in beam search
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
@@ -732,8 +731,7 @@ class ChatCompletionResponseChoice(BaseModel):
     ] = None
     matched_stop: Union[None, int, str] = None
     hidden_states: Optional[object] = None
-    # For beam search results
-    sequence_score: Optional[float] = None
+    sequence_score: Optional[float] = None  # Score for this sequence in beam search
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
@@ -780,7 +778,7 @@ class ChatCompletionResponseStreamChoice(BaseModel):
         ]
     ] = None
     matched_stop: Union[None, int, str] = None
-    sequence_score: Optional[float] = None
+    sequence_score: Optional[float] = None  # Score for this sequence in beam search
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):

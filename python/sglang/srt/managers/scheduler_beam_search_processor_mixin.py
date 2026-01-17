@@ -545,7 +545,7 @@ class SchedulerBeamSearchProcessorMixin:
             Optional[torch.Tensor]: If KV cache processing needed, returns last_batch_slot_indices
                                    (positions of surviving beams in batch), otherwise None
         """
-        # 【beam_width, 1] + [beam_width, topK] -> [beam_width, topK]
+        # [beam_width, 1] + [beam_width, topK] -> [beam_width, topK]
         all_cum_logprobs = req.beam_list.cum_logprobs.unsqueeze(1) + top_logprobs
 
         all_cum_logprobs_flat = all_cum_logprobs.flatten()
@@ -885,6 +885,7 @@ class SchedulerBeamSearchProcessorMixin:
             ... )
             # Returns unique KV indices from ranges [5:10], [8:15], [6:12]
         """
+        # TODO(cswuyg) broadcast maybe better than expand?
         num_reqs = len(pool_indices)
         if prefix_lens is None:
             prefix_lens = torch.zeros(num_reqs, dtype=torch.int64, device=device)
