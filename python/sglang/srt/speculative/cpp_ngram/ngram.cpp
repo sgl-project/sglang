@@ -28,7 +28,7 @@ Ngram::Result fillResult(int last_token, int draft_token_num, std::vector<Node>&
   info.token.emplace_back(last_token);
   prevs.emplace_back(-1);
 
-  for (auto [token, next] : tree[root].next) {
+  for (auto const& [token, next] : tree[root].next) {
     queue.emplace(token, next, 0);
   }
   while (queue.size()) {
@@ -36,8 +36,10 @@ Ngram::Result fillResult(int last_token, int draft_token_num, std::vector<Node>&
     queue.pop();
     info.token.emplace_back(token);
     prevs.emplace_back(prev);
-    for (auto [t, n] : tree[next].next) {
-      queue.emplace(t, n, info.token.size() - 1);
+    for (auto const& [t, n] : tree[next].next) {
+      if (info.token.size() < draft_token_num) {
+        queue.emplace(t, n, (int)info.token.size() - 1);
+      }
     }
   }
 
@@ -47,7 +49,7 @@ Ngram::Result fillResult(int last_token, int draft_token_num, std::vector<Node>&
     prevs.emplace_back(0);
   }
 
-  int n = info.token.size();
+  int n = (int)info.token.size();
   info.mask.resize(n * n, 0);
   info.mask[0] = 1;
   for (int i = 0; i < n; ++i) {
@@ -135,157 +137,173 @@ Ngram::~Ngram() {
   insert_worker_.join();
 }
 
-std::vector<std::pair<TrieNode*, int32_t>> Ngram::match(const std::vector<int32_t>& tokens, size_t batch_size) const {
-  auto draft_token_num = param_.get_draft_token_num(batch_size);
-  auto min_match_window_size = param_.get_min_match_window_size(batch_size);
-  auto max_match_window_size = param_.max_match_window_size;
-  std::vector<std::pair<TrieNode*, int32_t>> result;
-  result.reserve(param_.max_match_window_size - param_.min_match_window_size);
-  for (int32_t match_window_size = std::min(tokens.size(), param_.max_match_window_size);
-       match_window_size >= param_.min_match_window_size;
-       --match_window_size) {
-    auto start = tokens.data() + tokens.size() - match_window_size;
-    auto end = start + match_window_size;
-    auto cursor = root_;
-    while (start != end) {
-      auto iter = cursor->child.find(*start);
-      if (iter == cursor->child.end()) {
-        cursor = nullptr;
-        break;
-      }
-      ++start;
-      cursor = iter->second;
+std::vector<std::pair<SAMNode*, int32_t>> Ngram::match(const std::vector<int32_t>& tokens, size_t batch_size) const {
+  if (tokens.empty()) return {};
+  size_t max_k = std::min(tokens.size(), param_.max_match_window_size);
+  size_t min_k = param_.get_min_match_window_size(batch_size);
+
+  SAMNode* curr = root_;
+  int matched_len = 0;
+  for (size_t i = tokens.size() - max_k; i < tokens.size(); ++i) {
+    int32_t t = tokens[i];
+    while (curr != root_ && !curr->next.count(t)) {
+      curr = curr->fail;
+      matched_len = curr->len;
     }
-    if (cursor) {
-      result.emplace_back(std::make_pair(cursor, match_window_size));
+    if (curr->next.count(t)) {
+      curr = curr->next.at(t).target;
+      matched_len++;
     }
   }
-  return result;
+
+  std::vector<std::pair<SAMNode*, int32_t>> results;
+  SAMNode* temp = curr;
+  int current_len = matched_len;
+
+  while (temp && current_len >= (int)min_k) {
+    int next_len = temp->fail ? temp->fail->len : 0;
+    for (int l = current_len; l > next_len; --l) {
+      if (l >= (int)min_k && l <= (int)max_k) {
+        results.push_back({temp, l});
+      }
+    }
+    temp = temp->fail;
+    current_len = next_len;
+  }
+  return results;
 }
 
 void Ngram::squeeze(size_t count) {
-  if (!(node_pool_.size() >= free_node_count_ + count)) {
-    throw std::runtime_error(
-        "Insufficient node size to release required nodes. "
-        "available to release: " +
-        std::to_string(node_pool_.size() - free_node_count_) + ", required to release: " + std::to_string(count));
-  }
-  while (count--) {
-    auto last = global_lru_.back();
-    global_lru_.pop_back();
-
-    if (!last->child.empty()) {
-      throw std::runtime_error("The node to be released still has child nodes and cannot be released. ");
-    }
-
-    last->parent->lru.erase(last->parent_lru_pos);
-    last->parent->sorted_children.erase(last);
-    last->parent->child.erase(last->token);
-
-    node_pool_[free_node_count_++] = last;
-  }
+  reset();
 }
 
-void Ngram::synchronize() const {
-  while (!insert_queue_.empty()) {
-    std::this_thread::sleep_for(std::chrono::microseconds(10));
+void Ngram::extend(int32_t t, SAMNode*& last) {
+  SAMNode* old_last = last;
+  SAMNode* p = last;
+
+  if (p->next.count(t)) {
+    SAMNode* q = p->next[t].target;
+    if (p->len + 1 == q->len) {
+      last = q;
+    } else {
+      SAMNode* clone = getNode();
+      clone->len = p->len + 1;
+      clone->next = q->next;
+      clone->fail = q->fail;
+      clone->token = q->token;
+      clone->lru = q->lru;
+      for (int32_t tid : clone->lru) {
+        clone->next[tid].lru_it = std::find(clone->lru.begin(), clone->lru.end(), tid);
+        clone->sorted_children.insert(tid);
+      }
+      while (p && p->next.count(t) && p->next[t].target == q) {
+        p->next[t].target = clone;
+        p = p->fail;
+      }
+      q->fail = clone;
+      last = clone;
+    }
+  } else {
+    SAMNode* cur = getNode();
+    cur->len = last->len + 1;
+    cur->token = t;
+    while (p && !p->next.count(t)) {
+      p->lru.push_front(t);
+      p->next[t] = {cur, 0, p->lru.begin()};
+      p->sorted_children.insert(t);
+      p = p->fail;
+    }
+    if (!p) {
+      cur->fail = root_;
+    } else {
+      SAMNode* q = p->next[t].target;
+      if (p->len + 1 == q->len) {
+        cur->fail = q;
+      } else {
+        SAMNode* clone = getNode();
+        clone->len = p->len + 1;
+        clone->next = q->next;
+        clone->fail = q->fail;
+        clone->token = q->token;
+        clone->lru = q->lru;
+        for (int32_t tid : clone->lru) {
+          clone->next[tid].lru_it = std::find(clone->lru.begin(), clone->lru.end(), tid);
+          clone->sorted_children.insert(tid);
+        }
+        while (p && p->next.count(t) && p->next[t].target == q) {
+          p->next[t].target = clone;
+          p = p->fail;
+        }
+        q->fail = cur->fail = clone;
+      }
+    }
+    last = cur;
+  }
+
+  SAMNode* path_ptr = old_last;
+  int steps = 0;
+  while (path_ptr && steps < (int)param_.branch_length) {
+    path_ptr->update_freq(t, 1);
+    path_ptr = path_ptr->fail;
+    steps++;
   }
 }
 
 void Ngram::insert() {
   while (!quit_flag_) {
     std::vector<int32_t> data;
-    if (!insert_queue_.dequeue(data)) {
-      continue;
-    }
-    const auto* token = data.data();
-    size_t size = data.size();
+    if (!insert_queue_.dequeue(data)) continue;
     std::unique_lock<std::mutex> lock(mutex_);
 
-    for (size_t i = 0; i + param_.min_match_window_size < size; ++i) {
-      auto start = token + i;
-      auto end = start + std::min(size - i, param_.branch_length);
-
-      if (end - start > free_node_count_) {
-        squeeze(end - start - free_node_count_);
+    SAMNode* last = root_;
+    for (int32_t t : data) {
+      if (free_node_count_ < 10) {
+        lock.unlock();
+        reset();
+        lock.lock();
+        last = root_;
       }
-
-      TrieNode* cursor = root_;
-      path_.clear();
-      while (start != end) {
-        auto token = *start;
-        auto iter = cursor->child.find(token);
-        if (iter == cursor->child.end()) {
-          iter = cursor->child.insert({token, getNode()}).first;
-          auto node = iter->second;
-
-          cursor->lru.emplace_front(node);
-          global_lru_.emplace_back(node);
-
-          node->token = token;
-          node->parent = cursor;
-          node->parent_lru_pos = cursor->lru.begin();
-          node->global_lru_pos = --global_lru_.end();
-          node->freq = 1;
-          cursor->sorted_children.insert(node);
-        } else {
-          auto node = iter->second;
-          cursor->sorted_children.erase(node);
-          node->freq++;
-          cursor->sorted_children.insert(node);
-          cursor->lru.splice(cursor->lru.begin(), cursor->lru, node->parent_lru_pos);
-        }
-        cursor = iter->second;
-        path_.emplace_back(cursor);
-        ++start;
-      }
-
-      for (auto it = path_.rbegin(); it != path_.rend(); ++it) {
-        TrieNode* node = *it;
-        global_lru_.splice(global_lru_.begin(), global_lru_, node->global_lru_pos);
-      }
+      extend(t, last);
     }
   }
+}
+
+void Ngram::synchronize() const {
+  while (!insert_queue_.empty())
+    std::this_thread::sleep_for(std::chrono::microseconds(10));
 }
 
 void Ngram::asyncInsert(std::vector<std::vector<int32_t>>&& tokens) {
-  for (auto&& token : tokens) {
-    insert_queue_.enqueue(std::move(token));
-  }
+  for (auto&& t : tokens)
+    insert_queue_.enqueue(std::move(t));
 }
 
 Ngram::Result Ngram::matchBFS(const std::vector<int32_t>& tokens, size_t batch_size) const {
-  std::vector<std::pair<TrieNode*, int32_t>> nodes = match(tokens, batch_size);
-
+  auto draft_token_num = param_.get_draft_token_num(batch_size);
+  std::vector<std::pair<SAMNode*, int32_t>> nodes = match(tokens, batch_size);
   double bfs_breadth_scale = double(param_.max_bfs_breadth - param_.min_bfs_breadth) /
                              (param_.max_match_window_size - param_.min_match_window_size + 1);
 
-  auto draft_token_num = param_.get_draft_token_num(batch_size);
   std::vector<Node> tree(draft_token_num + 1);
-  int root = 0;
-  int cursor = 1;
+  int root = 0, cursor = 1;
 
   for (auto [node, depth] : nodes) {
-    std::queue<std::tuple<int32_t, double, const TrieNode*>> queue;  // parent, bfs_breadth, node
+    std::queue<std::tuple<int32_t, double, const SAMNode*>> queue;
     queue.push({root, (param_.max_match_window_size - depth) * bfs_breadth_scale + param_.min_bfs_breadth, node});
-    while (queue.size() && cursor <= draft_token_num) {
-      auto front = queue.front();
+    while (!queue.empty() && cursor <= draft_token_num) {
+      auto [parent, cur_breadth, sam_node] = queue.front();
       queue.pop();
-
-      auto parent = std::get<0>(front);
-      auto cur_breadth = std::get<1>(front);
-      auto iter = std::get<2>(front)->lru.begin();
-
-      auto breadth = std::max(1, int32_t(cur_breadth));
-      for (int i = 0; i < breadth && iter != std::get<2>(front)->lru.end() && cursor <= draft_token_num; ++i, ++iter) {
-        auto token = (*iter)->token;
-        auto pos = -1;
-        if (auto tit = tree[parent].next.find(token); tit != tree[parent].next.end()) {
-          pos = tit->second;
-        } else {
-          pos = tree[parent].next.insert(std::make_pair(token, cursor++)).first->second;
-        }
-        queue.emplace(pos, cur_breadth - bfs_breadth_scale, *iter);
+      int breadth = std::max(1, (int)cur_breadth);
+      int count = 0;
+      auto iter = sam_node->lru.begin();
+      for (; count < breadth && iter != sam_node->lru.end() && cursor <= draft_token_num; ++count, ++iter) {
+        int32_t t_id = *iter;
+        int pos;
+        if (tree[parent].next.count(t_id))
+          pos = tree[parent].next[t_id];
+        else
+          pos = tree[parent].next[t_id] = cursor++;
+        queue.emplace(pos, cur_breadth - bfs_breadth_scale, sam_node->next.at(t_id).target);
       }
     }
   }
@@ -294,61 +312,48 @@ Ngram::Result Ngram::matchBFS(const std::vector<int32_t>& tokens, size_t batch_s
 }
 
 Ngram::Result Ngram::matchProb(const std::vector<int32_t>& tokens, size_t batch_size) const {
-  std::vector<std::pair<TrieNode*, int32_t>> nodes = match(tokens, batch_size);
   auto draft_token_num = param_.get_draft_token_num(batch_size);
-
-  struct CompareByLastDouble {
-    bool operator()(
-        const std::tuple<double, const TrieNode*, double>& a,  // parent_pos,  node, final_prob
-        const std::tuple<double, const TrieNode*, double>& b) const {
-      return std::get<2>(a) < std::get<2>(b);
+  std::vector<std::pair<SAMNode*, int32_t>> nodes = match(tokens, batch_size);
+  struct HeapNode {
+    int parent;
+    const SAMNode* sam_node;
+    double prob;
+    bool operator<(const HeapNode& o) const {
+      return prob < o.prob;
     }
   };
-
-  std::priority_queue<
-      std::tuple<double, const TrieNode*, double>,
-      std::vector<std::tuple<double, const TrieNode*, double>>,
-      CompareByLastDouble>
-      heap;
-
   std::vector<Node> tree(draft_token_num + 1);
+  int root = 0, cursor = 1, top_k = (int)param_.max_bfs_breadth;
 
-  int root = 0;
-  int cursor = 1;
-  int top_k = param_.max_bfs_breadth;
-
-  auto addToHeap = [&heap, &top_k](int parent, const TrieNode* trie_node, double prob) -> void {
-    double sum_freq = 0.0;
-    int count = 0;
-    std::list<std::pair<TrieNode*, int32_t>> topk_children;
-    for (auto* child : trie_node->sorted_children) {
-      sum_freq += static_cast<double>(child->freq);
-      topk_children.emplace_back(child, child->freq);
-      if (++count >= top_k) break;
+  auto addToHeap = [&](std::priority_queue<HeapNode>& heap, int parent, const SAMNode* sam_node, double prob) {
+    double sum_freq = 0;
+    int count_sum = 0;
+    std::vector<int32_t> topk_tokens;
+    for (int32_t tid : sam_node->sorted_children) {
+      sum_freq += sam_node->next.at(tid).freq;
+      topk_tokens.push_back(tid);
+      if (++count_sum >= top_k) break;
     }
-    if (sum_freq <= 0) sum_freq = 1.0;
-    for (const auto& [child, freq] : topk_children) {
-      double norm_freq = static_cast<double>(freq) / sum_freq * prob;
-      heap.emplace(parent, child, norm_freq);
+    if (sum_freq <= 0) return;
+    for (int32_t tid : topk_tokens) {
+      double norm_freq = (double)sam_node->next.at(tid).freq / sum_freq * prob;
+      heap.push({parent, sam_node->next.at(tid).target, norm_freq});
     }
   };
 
-  for (auto [node, _] : nodes) {
-    addToHeap(root, node, 1.0);
-
+  for (auto const& res : nodes) {
+    std::priority_queue<HeapNode> heap;
+    addToHeap(heap, root, res.first, 1.0);
     while (!heap.empty() && cursor <= draft_token_num) {
-      auto [parent, trie_node, prob] = heap.top();  // parent_pos, node, final_prob
+      HeapNode top = heap.top();
       heap.pop();
-      auto token = trie_node->token;
-      int pos = -1;
-      auto tit = tree[parent].next.find(token);
-      if (tit != tree[parent].next.end()) {
-        pos = tit->second;
-      } else {
-        pos = cursor++;
-        tree[parent].next[token] = pos;
-      }
-      addToHeap(pos, trie_node, prob);
+      int32_t t_id = top.sam_node->token;
+      int pos;
+      if (tree[top.parent].next.count(t_id))
+        pos = tree[top.parent].next[t_id];
+      else
+        pos = tree[top.parent].next[t_id] = cursor++;
+      addToHeap(heap, pos, top.sam_node, top.prob);
     }
   }
 
@@ -369,10 +374,9 @@ Ngram::Result Ngram::batchMatch(const std::vector<std::vector<int32_t>>& tokens)
 
 void Ngram::Result::truncate(size_t n) {
   if (n < token.size()) {
-    int full_n = token.size();
-    for (int i = 1; i < n; ++i) {
+    int full_n = (int)token.size();
+    for (int i = 1; i < n; ++i)
       memcpy(&mask[i * n], &mask[i * full_n], sizeof(mask[0]) * n);
-    }
     token.resize(n);
     mask.resize(n * n);
   }
