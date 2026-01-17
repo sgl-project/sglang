@@ -192,9 +192,9 @@ void Ngram::extend(int32_t t, SAMNode*& last) {
       clone->fail = q->fail;
       clone->token = q->token;
       clone->lru = q->lru;
-      for (int32_t tid : clone->lru) {
-        clone->next[tid].lru_it = std::find(clone->lru.begin(), clone->lru.end(), tid);
-        clone->sorted_children.insert(tid);
+      for (auto it = clone->lru.begin(); it != clone->lru.end(); ++it) {
+        clone->next[*it].lru_it = it;
+        clone->sorted_children.insert(*it);
       }
       while (p && p->next.count(t) && p->next[t].target == q) {
         p->next[t].target = clone;
@@ -226,8 +226,9 @@ void Ngram::extend(int32_t t, SAMNode*& last) {
         clone->fail = q->fail;
         clone->token = q->token;
         clone->lru = q->lru;
-        for (int32_t tid : clone->lru) {
-          clone->next[tid].lru_it = std::find(clone->lru.begin(), clone->lru.end(), tid);
+        for (auto it = clone->lru.begin(); it != clone->lru.end(); ++it) {
+          int32_t tid = *it;
+          clone->next[tid].lru_it = it;
           clone->sorted_children.insert(tid);
         }
         while (p && p->next.count(t) && p->next[t].target == q) {
@@ -293,16 +294,17 @@ Ngram::Result Ngram::matchBFS(const std::vector<int32_t>& tokens, size_t batch_s
     while (!queue.empty() && cursor <= draft_token_num) {
       auto [parent, cur_breadth, sam_node] = queue.front();
       queue.pop();
-      int breadth = std::max(1, cur_breadth);
+      int breadth = std::max(1, (int)cur_breadth);
       int count = 0;
       auto iter = sam_node->lru.begin();
       for (; count < breadth && iter != sam_node->lru.end() && cursor <= draft_token_num; ++count, ++iter) {
         int32_t t_id = *iter;
         int pos;
-        if (tree[parent].next.count(t_id))
+        if (tree[parent].next.count(t_id)) {
           pos = tree[parent].next[t_id];
-        else
+        } else {
           pos = tree[parent].next[t_id] = cursor++;
+        }
         queue.emplace(pos, cur_breadth - bfs_breadth_scale, sam_node->next.at(t_id).target);
       }
     }
@@ -323,7 +325,7 @@ Ngram::Result Ngram::matchProb(const std::vector<int32_t>& tokens, size_t batch_
     }
   };
   std::vector<Node> tree(draft_token_num + 1);
-  int root = 0, cursor = 1, top_k = param_.max_bfs_breadth;
+  int root = 0, cursor = 1, top_k = (int)param_.max_bfs_breadth;
 
   auto addToHeap = [&](std::priority_queue<HeapNode>& heap, int parent, const SAMNode* sam_node, double prob) {
     double sum_freq = 0;
@@ -341,22 +343,23 @@ Ngram::Result Ngram::matchProb(const std::vector<int32_t>& tokens, size_t batch_
     }
   };
 
+  std::priority_queue<HeapNode> heap;
   for (auto const& res : nodes) {
-    std::priority_queue<HeapNode> heap;
     addToHeap(heap, root, res.first, 1.0);
-    while (!heap.empty() && cursor <= draft_token_num) {
-      HeapNode top = heap.top();
-      heap.pop();
-      int32_t t_id = top.sam_node->token;
-      int pos;
-      if (tree[top.parent].next.count(t_id))
-        pos = tree[top.parent].next[t_id];
-      else
-        pos = tree[top.parent].next[t_id] = cursor++;
-      addToHeap(heap, pos, top.sam_node, top.prob);
-    }
   }
 
+  while (!heap.empty() && cursor <= draft_token_num) {
+    HeapNode top = heap.top();
+    heap.pop();
+    int32_t t_id = top.sam_node->token;
+    int pos;
+    if (tree[top.parent].next.count(t_id)) {
+      pos = tree[top.parent].next[t_id];
+    } else {
+      pos = tree[top.parent].next[t_id] = cursor++;
+    }
+    addToHeap(heap, pos, top.sam_node, top.prob);
+  }
   return fillResult(tokens.back(), draft_token_num + 1, tree, root);
 }
 
