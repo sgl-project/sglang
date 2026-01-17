@@ -22,7 +22,7 @@ from diffusers.models.normalization import AdaLayerNormContinuous
 
 from sglang.multimodal_gen.configs.models.dits.flux import FluxConfig
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
-from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
+from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm, apply_qk_norm
 from sglang.multimodal_gen.runtime.layers.linear import ColumnParallelLinear
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     NDRotaryEmbedding,
@@ -196,8 +196,8 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
         key = key.unflatten(-1, (self.heads, -1))
         value = value.unflatten(-1, (self.heads, -1))
 
-        query = self.norm_q(query)
-        key = self.norm_k(key)
+        # Fused QK norm (2 RMSNorm ops -> 1 fused kernel)
+        query, key = apply_qk_norm(query, key, self.norm_q, self.norm_k, self.head_dim)
 
         if self.added_kv_proj_dim is not None:
             encoder_query = encoder_query.unflatten(-1, (self.heads, -1))
@@ -340,8 +340,8 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
         key = key.unflatten(-1, (self.heads, -1))
         value = value.unflatten(-1, (self.heads, -1))
 
-        query = self.norm_q(query)
-        key = self.norm_k(key)
+        # Fused QK norm (2 RMSNorm ops -> 1 fused kernel)
+        query, key = apply_qk_norm(query, key, self.norm_q, self.norm_k, self.head_dim)
 
         if freqs_cis is not None:
             cos, sin = freqs_cis

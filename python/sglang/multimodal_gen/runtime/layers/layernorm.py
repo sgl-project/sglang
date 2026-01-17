@@ -452,6 +452,13 @@ def apply_qk_norm(
         and (q_eps == k_eps)
         and can_use_fused_inplace_qknorm(head_dim, q.dtype)
     ):
+        # Handle 4D tensors [B, L, H, D] - need contiguous for view as [B, L*H, D]
+        q_shape = q.shape
+        k_shape = k.shape
+        if not q.is_contiguous():
+            q = q.contiguous()
+        if not k.is_contiguous():
+            k = k.contiguous()
         fused_inplace_qknorm(
             q=q.view(batch_size, -1, head_dim),
             k=k.view(batch_size, -1, head_dim),
@@ -460,7 +467,8 @@ def apply_qk_norm(
             head_dim=head_dim,
             eps=q_eps,
         )
-        return q, k
+        # Inplace kernel modifies q, k - return with original shape
+        return q.view(q_shape), k.view(k_shape)
 
     # Fallback for AMD/ROCm: apply RMSNorm separately to q and k
     import warnings
