@@ -15,6 +15,7 @@ from dateutil.tz import UTC
 
 import sglang
 import sglang.multimodal_gen.envs as envs
+from sglang.cli.utils import get_git_commit_hash
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     _SGLDiffusionLogger,
     get_is_main_process,
@@ -71,23 +72,6 @@ def get_diffusion_perf_log_dir() -> str:
     return ""
 
 
-@lru_cache(maxsize=1)
-def get_git_commit_hash() -> str:
-    try:
-        commit_hash = os.environ.get("SGLANG_GIT_COMMIT")
-        if not commit_hash:
-            commit_hash = (
-                subprocess.check_output(
-                    ["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL
-                )
-                .strip()
-                .decode("utf-8")
-            )
-        _CACHED_COMMIT_HASH = commit_hash
-        return commit_hash
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        _CACHED_COMMIT_HASH = "N/A"
-        return "N/A"
 
 
 @dataclasses.dataclass
