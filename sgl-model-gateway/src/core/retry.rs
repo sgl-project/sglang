@@ -46,8 +46,6 @@ impl BackoffCalculator {
 
 #[derive(Debug, thiserror::Error)]
 pub enum RetryError {
-    #[error("no available workers")]
-    NoAvailableWorkers,
     #[error("maximum retry attempts exceeded")]
     MaxRetriesExceeded,
 }

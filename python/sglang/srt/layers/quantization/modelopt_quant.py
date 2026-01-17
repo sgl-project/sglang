@@ -784,7 +784,6 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
                         else 1.0
                     ),
                     use_routing_scales_on_input=use_routing_scales_on_input,
-                    tile_tokens_dim=None,
                     routing_method_type=routing_method_type,
                     tune_max_num_tokens=next_power_of_2(x.shape[0]),
                 )
@@ -1512,10 +1511,13 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                     weight_scale.shape[-1] == expected_blocks[name]
                 ), f"Expected {name}_weight_scale.dim(2) == {expected_blocks[name]}, got {weight_scale.shape[-1]}"
             else:
-                # For other backends, ensure the per-input block dimension is aligned to 16.
-                assert (
-                    weight_scale.shape[assert_dim] % block_size == 0
-                ), f"Expected {name}_weight_scale.dim({assert_dim}) to be divisible by {block_size}"
+                if weight_scale.shape[assert_dim] % 4 != 0:
+                    logger.warning(
+                        "NVFP4 %s_weight_scale K' not multiple of 4: shape=%s, group_size=%s",
+                        name,
+                        tuple(weight_scale.shape),
+                        getattr(self.quant_config, "group_size", None),
+                    )
             assert (
                 weight_scale.dtype == torch.float8_e4m3fn
             ), f"{name} Weight Blockscale must be represented as FP8-E4M3"

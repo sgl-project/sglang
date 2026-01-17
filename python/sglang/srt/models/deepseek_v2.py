@@ -21,7 +21,6 @@ import concurrent.futures
 import logging
 import os
 from contextlib import nullcontext
-from enum import IntEnum, auto
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
@@ -57,7 +56,6 @@ from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.amx_utils import PackWeightMethod
-from sglang.srt.layers.attention.nsa.dequant_k_cache import dequantize_k_cache_paged
 from sglang.srt.layers.attention.nsa.nsa_indexer import Indexer
 from sglang.srt.layers.attention.nsa.utils import (
     can_cp_split,
@@ -68,8 +66,6 @@ from sglang.srt.layers.attention.nsa.utils import (
     nsa_use_prefill_cp,
     prepare_input_dp_with_cp_dsa,
 )
-from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
-from sglang.srt.layers.attention.utils import concat_and_cast_mha_k_triton
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
@@ -104,12 +100,14 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
     DispatchOutput,
 )
 from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
-from sglang.srt.layers.moe.utils import RoutingMethodType
+from sglang.srt.layers.moe.utils import (
+    RoutingMethodType,
+    filter_moe_weight_param_global_expert,
+)
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.fp8_kernel import (
     fp8_dtype,
-    is_fp8_fnuz,
     per_tensor_quant_mla_fp8,
     per_token_group_quant_mla_deep_gemm_masked_fp8,
 )
@@ -138,6 +136,25 @@ from sglang.srt.model_loader.utils import (
     should_deepgemm_weight_requant_ue8m0,
 )
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.deepseek_common.attention_backend_handler import (
+    AttentionBackendRegistry,
+)
+from sglang.srt.models.deepseek_common.attention_forward_methods import (
+    AttnForwardMethod,
+    DeepseekMHAForwardMixin,
+)
+from sglang.srt.models.deepseek_common.utils import (
+    _device_sm,
+    _is_cpu,
+    _is_cpu_amx_available,
+    _is_cuda,
+    _is_fp8_fnuz,
+    _is_gfx95_supported,
+    _is_hip,
+    _is_npu,
+    _use_aiter,
+    _use_aiter_gfx95,
+)
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
@@ -145,32 +162,13 @@ from sglang.srt.utils import (
     LazyValue,
     add_prefix,
     bind_or_assign,
-    cpu_has_amx_support,
     get_bool_env_var,
-    get_device_sm,
-    is_cpu,
-    is_cuda,
-    is_gfx95_supported,
-    is_hip,
     is_non_idle_and_non_empty,
-    is_npu,
     is_nvidia_cublas_cu12_version_ge_12_9,
     log_info_on_rank0,
     make_layers,
     use_intel_amx_backend,
 )
-
-_is_hip = is_hip()
-_is_cuda = is_cuda()
-_is_npu = is_npu()
-_is_fp8_fnuz = is_fp8_fnuz()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
-_is_cpu_amx_available = cpu_has_amx_support()
-_is_cpu = is_cpu()
-_device_sm = get_device_sm()
-_is_gfx95_supported = is_gfx95_supported()
-
-_use_aiter_gfx95 = _use_aiter and _is_gfx95_supported
 
 if _use_aiter_gfx95:
 
@@ -195,14 +193,7 @@ if _use_aiter_gfx95:
     )
 
 if _is_cuda:
-    from sgl_kernel import (
-        awq_dequantize,
-        bmm_fp8,
-        concat_mla_k,
-        dsv3_fused_a_gemm,
-        dsv3_router_gemm,
-        merge_state_v2,
-    )
+    from sgl_kernel import awq_dequantize, bmm_fp8, dsv3_fused_a_gemm, dsv3_router_gemm
 elif _is_cpu and _is_cpu_amx_available:
     pass
 elif _is_hip:
@@ -253,207 +244,6 @@ FORWARD_ABSORB_CORE_ATTENTION_BACKENDS = [
     "trtllm_mla",
     "ascend",
 ]
-
-
-def add_forward_absorb_core_attention_backend(backend_name):
-    if backend_name not in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
-        FORWARD_ABSORB_CORE_ATTENTION_BACKENDS.append(backend_name)
-        logger.info(f"Added {backend_name} to FORWARD_ABSORB_CORE_ATTENTION_BACKENDS.")
-
-
-class AttnForwardMethod(IntEnum):
-    # Use multi-head attention
-    MHA = auto()
-
-    # Use absorbed multi-latent attention
-    MLA = auto()
-
-    # Use multi-head attention, but with KV cache chunked.
-    # This method can avoid OOM when prefix lengths are long.
-    MHA_CHUNKED_KV = auto()
-
-    # Use multi-head attention, execute the MHA for prefix and extended kv in one shot
-    # when the sequence lengths are below the threshold.
-    MHA_ONE_SHOT = auto()
-
-    # Use MLA but with fused RoPE
-    MLA_FUSED_ROPE = auto()
-
-    # Use MLA with fused RoPE kernel for CPU
-    MLA_FUSED_ROPE_CPU = auto()
-
-    # Use multi-head attention for NPU
-    MHA_NPU = auto()
-
-    # Use absorbed multi-latent attention for NPU
-    MLA_NPU = auto()
-
-    # Use Deepseek V3.2 sparse multi-latent attention for NPU
-    DSA_NPU = auto()
-
-
-def _dispatch_mla_subtype(attn, forward_batch):
-    if _is_hip:
-        if attn.rocm_fused_decode_mla and forward_batch.forward_mode.is_decode():
-            return AttnForwardMethod.MLA_FUSED_ROPE
-        else:
-            return AttnForwardMethod.MLA
-    else:
-        if hasattr(attn, "fused_qkv_a_proj_with_mqa") and use_intel_amx_backend(attn):
-            return AttnForwardMethod.MLA_FUSED_ROPE_CPU
-        else:
-            return AttnForwardMethod.MLA
-
-
-class AttentionBackendRegistry:
-    _handlers = {}
-
-    @classmethod
-    def register(cls, backend_name, handler_func):
-        cls._handlers[backend_name] = handler_func
-
-    @classmethod
-    def get_handler(cls, backend_name):
-        return cls._handlers.get(backend_name, cls._handlers.get("triton"))
-
-
-def handle_attention_ascend(attn, forward_batch):
-    if (
-        forward_batch.forward_mode.is_extend()
-        and not forward_batch.forward_mode.is_target_verify()
-        and not forward_batch.forward_mode.is_draft_extend()
-        and not forward_batch.forward_mode.is_draft_extend_v2()
-    ):
-        if hasattr(attn, "indexer"):
-            return AttnForwardMethod.DSA_NPU
-        else:
-            return AttnForwardMethod.MHA_NPU
-    else:
-        if hasattr(attn, "indexer"):
-            return AttnForwardMethod.DSA_NPU
-        else:
-            return AttnForwardMethod.MLA_NPU
-
-
-def _get_sum_extend_prefix_lens(forward_batch):
-    return (
-        sum(forward_batch.extend_prefix_lens_cpu)
-        if forward_batch.extend_prefix_lens_cpu is not None
-        else 0
-    )
-
-
-def _support_mha_one_shot(attn: DeepseekV2AttentionMLA, forward_batch, backend_name):
-    attn_supported = backend_name in ["fa3", "flashinfer", "flashmla"]
-    sum_seq_lens = (
-        sum(forward_batch.seq_lens_cpu) if forward_batch.seq_lens_cpu is not None else 0
-    )
-    return attn_supported and sum_seq_lens <= forward_batch.get_max_chunk_capacity()
-
-
-def _handle_attention_backend(
-    attn: DeepseekV2AttentionMLA, forward_batch, backend_name
-):
-    if is_in_piecewise_cuda_graph():
-        return AttnForwardMethod.MLA
-
-    sum_extend_prefix_lens = _get_sum_extend_prefix_lens(forward_batch)
-    disable_ragged = (
-        backend_name in ["flashinfer", "flashmla"]
-    ) and attn.flashinfer_mla_disable_ragged
-
-    if (
-        not disable_ragged
-        and forward_batch.forward_mode.is_extend_without_speculative()
-        and (
-            (
-                sum_extend_prefix_lens >= attn.chunked_prefix_cache_threshold
-                and not attn.disable_chunked_prefix_cache
-            )
-            or sum_extend_prefix_lens == 0
-        )
-    ):
-        if _support_mha_one_shot(attn, forward_batch, backend_name):
-            return AttnForwardMethod.MHA_ONE_SHOT
-        return AttnForwardMethod.MHA_CHUNKED_KV
-    else:
-        return _dispatch_mla_subtype(attn, forward_batch)
-
-
-def handle_attention_flashinfer(attn, forward_batch):
-    return _handle_attention_backend(attn, forward_batch, "flashinfer")
-
-
-def handle_attention_fa3(attn, forward_batch):
-    # when deterministic inference is enabled, use MLA
-    if get_global_server_args().enable_deterministic_inference:
-        return _dispatch_mla_subtype(attn, forward_batch)
-    else:
-        return _handle_attention_backend(attn, forward_batch, "fa3")
-
-
-def handle_attention_flashmla(attn, forward_batch):
-    return _handle_attention_backend(attn, forward_batch, "flashmla")
-
-
-def handle_attention_cutlass_mla(attn, forward_batch):
-    return _handle_attention_backend(attn, forward_batch, "cutlass_mla")
-
-
-def handle_attention_fa4(attn, forward_batch):
-    # TODO(cicirori): use FA4 MHA for DeepSeekV3 for now
-    return AttnForwardMethod.MHA_CHUNKED_KV
-
-
-def handle_attention_trtllm_mla(attn, forward_batch):
-    if is_in_piecewise_cuda_graph():
-        return AttnForwardMethod.MLA
-
-    sum_extend_prefix_lens = _get_sum_extend_prefix_lens(forward_batch)
-    if forward_batch.forward_mode.is_extend_without_speculative() and (
-        not attn.disable_chunked_prefix_cache or sum_extend_prefix_lens == 0
-    ):
-        return AttnForwardMethod.MHA_CHUNKED_KV
-    else:
-        return _dispatch_mla_subtype(attn, forward_batch)
-
-
-def handle_attention_aiter(attn, forward_batch):
-    if forward_batch.forward_mode.is_extend_without_speculative():
-        return AttnForwardMethod.MHA
-    else:
-        return AttnForwardMethod.MLA
-
-
-def handle_attention_nsa(attn, forward_batch):
-    """
-    Dispatch logic is centralized in NativeSparseAttnBackend.set_nsa_prefill_impl and executed
-    in init_forward_metadata. Read the decision from backend.use_mha.
-    """
-
-    backend = forward_batch.attn_backend
-    if isinstance(backend, TboAttnBackend):  # if enable tbo, get primary backend
-        backend = backend.primary
-    if hasattr(backend, "use_mha") and backend.use_mha:
-        return AttnForwardMethod.MHA_ONE_SHOT
-    return AttnForwardMethod.MLA
-
-
-def handle_attention_triton(attn, forward_batch):
-    if is_in_piecewise_cuda_graph():
-        return AttnForwardMethod.MLA
-
-    # when deterministic inference is enabled, use MLA
-    if get_global_server_args().enable_deterministic_inference:
-        return _dispatch_mla_subtype(attn, forward_batch)
-
-    if (
-        forward_batch.forward_mode.is_extend_without_speculative()
-        and sum(forward_batch.extend_prefix_lens_cpu) == 0
-    ):
-        return AttnForwardMethod.MHA
-    else:
-        return _dispatch_mla_subtype(attn, forward_batch)
 
 
 class DeepseekV2MLP(nn.Module):
@@ -787,6 +577,9 @@ class DeepseekV2MoE(nn.Module):
             x.data
             for name, x in self.experts.named_parameters()
             if name not in ["correction_bias"]
+            and filter_moe_weight_param_global_expert(
+                name, x, self.experts.num_local_experts
+            )
         ]
 
     def forward(
@@ -1268,7 +1061,7 @@ def _get_llama_4_scaling(
     return scaling[..., None, None]
 
 
-class DeepseekV2AttentionMLA(nn.Module):
+class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
 
     def __init__(
         self,
@@ -1458,20 +1251,12 @@ class DeepseekV2AttentionMLA(nn.Module):
         self.flashinfer_mla_disable_ragged = (
             get_global_server_args().flashinfer_mla_disable_ragged
         )
-        self.disable_chunked_prefix_cache = (
-            get_global_server_args().disable_chunked_prefix_cache
-        )
 
         self.current_attention_backend = (
             None  # Attention backend used by current forward batch
         )
         self.rocm_fused_decode_mla = get_bool_env_var(
             "SGLANG_ROCM_FUSED_DECODE_MLA", "false"
-        )
-
-        # TODO: Design a finer way to determine the threshold
-        self.chunked_prefix_cache_threshold = (
-            envs.SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD.get()
         )
 
         # If we have self.fused_qkv_a_proj_with_mqa and we're running on CPU, we will choose the torch.ops.sgl_kernel.qkv_proj_with_rope_fused_weight kernel
@@ -1527,6 +1312,8 @@ class DeepseekV2AttentionMLA(nn.Module):
                 self.weight_block_size = (
                     self.fused_qkv_a_proj_with_mqa.quant_method.quant_config.weight_block_size
                 )
+
+        self.init_mha_forward()
 
     def dispatch_attn_forward_method(
         self, forward_batch: ForwardBatch
@@ -1697,137 +1484,6 @@ class DeepseekV2AttentionMLA(nn.Module):
             qkv_latent = self.fused_qkv_a_proj_with_mqa(hidden_states)[0]
         return qkv_latent
 
-    def forward_normal_prepare(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        forward_batch: ForwardBatch,
-        zero_allocator: BumpAllocator,
-    ):
-        if self.q_lora_rank is not None:
-            q, latent_cache = (
-                get_attn_tp_context()
-                .fetch_qkv_latent()
-                .split(
-                    [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
-                    dim=-1,
-                )
-            )
-
-            # NSA Indexer: cache quantized keys, auto-skip topk for sequences <= nsa_index_topk
-
-            if self.use_nsa:
-                q_lora = self.q_a_layernorm(q)
-                q = self.q_b_proj(q_lora)[0].view(
-                    -1, self.num_local_heads, self.qk_head_dim
-                )
-                _ = self.indexer(
-                    x=hidden_states,
-                    q_lora=q_lora,
-                    positions=positions,
-                    forward_batch=forward_batch,
-                    layer_id=self.layer_id,
-                    return_indices=False,
-                )
-            elif _use_aiter_gfx95 and self.q_b_proj.weight.dtype == torch.uint8:
-                # MXFP4: fused RMSNorm + quant
-                q, _, _, _ = fused_rms_mxfp4_quant(
-                    q,
-                    self.q_a_layernorm.weight,
-                    self.q_a_layernorm.variance_epsilon,
-                    None,
-                    None,
-                    None,
-                )
-                q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
-            elif _use_aiter_gfx95 and self.q_b_proj.weight.dtype == torch.float8_e4m3fn:
-
-                q, _, _, _ = fused_rms_fp8_group_quant(
-                    q,
-                    self.q_a_layernorm.weight,
-                    self.q_a_layernorm.variance_epsilon,
-                    None,
-                    None,
-                    None,
-                    group_size=128,
-                    dtype_quant=torch.float8_e4m3fn,
-                    res1=None,
-                    output_unquantized_inp1=False,
-                )
-                q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
-            else:
-                q = self.q_a_layernorm(q)
-                q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
-
-        else:
-            q = self.q_proj(hidden_states)[0].view(
-                -1, self.num_local_heads, self.qk_head_dim
-            )
-            latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
-
-        _, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-        kv_a, _ = latent_cache.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-        latent_cache = latent_cache.unsqueeze(1)
-
-        if _use_aiter_gfx95 and self.kv_b_proj.weight.dtype == torch.float8_e4m3fn:
-
-            kv_a_quanted, kv_a, _, _ = fused_rms_fp8_group_quant(
-                kv_a,
-                self.kv_a_layernorm.weight,
-                self.kv_a_layernorm.variance_epsilon,
-                None,
-                None,
-                None,
-                group_size=128,
-                dtype_quant=torch.float8_e4m3fn,
-                res1=None,
-                output_unquantized_inp1=True,  # return unqaunt kv_a
-            )
-
-        else:
-            kv_a = self.kv_a_layernorm(kv_a)
-
-        # kv_a = self.kv_a_layernorm(kv_a)
-
-        k_pe = latent_cache[:, :, self.kv_lora_rank :]
-        if self.rotary_emb is not None:
-            q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
-        q[..., self.qk_nope_head_dim :] = q_pe
-
-        self._set_mla_kv_buffer(latent_cache, kv_a, k_pe, forward_batch)
-        if (
-            forward_batch.mha_one_shot
-            and sum(forward_batch.extend_prefix_lens_cpu) != 0
-        ):
-            if self.use_nsa and self.kv_cache_dtype == "fp8_e4m3":
-                # FP8 path: dequantize NSA-specific FP8 format to BF16
-                kv_a, k_pe = self._get_mla_kv_buffer_from_fp8(forward_batch)
-            else:
-                # BF16/FP16 path: directly fetch from cache
-                kv_a, k_pe = self._get_mla_kv_buffer(
-                    forward_batch.fetch_mha_one_shot_kv_indices(),
-                    q.dtype,
-                    forward_batch,
-                )
-        if _use_aiter_gfx95 and self.kv_b_proj.weight.dtype == torch.float8_e4m3fn:
-            kv = self.kv_b_proj(
-                kv_a_quanted,
-            )[0]
-        else:
-            kv = self.kv_b_proj(kv_a)[0]
-        kv = kv.view(-1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim)
-        k_nope = kv[..., : self.qk_nope_head_dim]
-        v = kv[..., self.qk_nope_head_dim :]
-
-        k = self._concat_and_cast_mha_k(k_nope, k_pe, forward_batch)
-        return q, k, v, forward_batch
-
-    def forward_normal_core(self, q, k, v, forward_batch):
-        attn_output = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
-        attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
-        output, _ = self.o_proj(attn_output)
-        return output
-
     def _fuse_rope_for_trtllm_mla(self, forward_batch: ForwardBatch) -> bool:
         """
         Check if we should skip rope and do fused rope+quantize for TRTLLM MLA decode in fp8_e4m3 path.
@@ -1866,6 +1522,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 
         q_lora = None
+        topk_indices = None
         if self.q_lora_rank is not None:
             q, latent_cache = (
                 get_attn_tp_context()
@@ -1896,23 +1553,38 @@ class DeepseekV2AttentionMLA(nn.Module):
                         self.kv_a_layernorm.variance_epsilon,
                     )
                 else:
+                    q_lora = None
                     if (
                         _use_aiter_gfx95
                         and self.q_b_proj.weight.dtype == torch.float8_e4m3fn
                     ):
-
-                        q, _, k_nope, _ = fused_rms_fp8_group_quant(
-                            q,
-                            self.q_a_layernorm.weight,
-                            self.q_a_layernorm.variance_epsilon,
-                            k_nope,
-                            self.kv_a_layernorm.weight,
-                            self.kv_a_layernorm.variance_epsilon,
-                            group_size=128,
-                            dtype_quant=torch.float8_e4m3fn,
-                            res1=None,
-                            output_unquantized_inp1=False,
-                        )
+                        if self.use_nsa:
+                            q_quanted, q_lora, k_nope, _ = fused_rms_fp8_group_quant(
+                                q,
+                                self.q_a_layernorm.weight,
+                                self.q_a_layernorm.variance_epsilon,
+                                k_nope,
+                                self.kv_a_layernorm.weight,
+                                self.kv_a_layernorm.variance_epsilon,
+                                group_size=128,
+                                dtype_quant=torch.float8_e4m3fn,
+                                res1=None,
+                                output_unquantized_inp1=True,
+                            )
+                            q = q_quanted
+                        else:
+                            q, _, k_nope, _ = fused_rms_fp8_group_quant(
+                                q,
+                                self.q_a_layernorm.weight,
+                                self.q_a_layernorm.variance_epsilon,
+                                k_nope,
+                                self.kv_a_layernorm.weight,
+                                self.kv_a_layernorm.variance_epsilon,
+                                group_size=128,
+                                dtype_quant=torch.float8_e4m3fn,
+                                res1=None,
+                                output_unquantized_inp1=False,
+                            )
 
                     else:
                         q = self.q_a_layernorm(q)
@@ -1920,10 +1592,42 @@ class DeepseekV2AttentionMLA(nn.Module):
 
             # q_lora needed by indexer
             if self.use_nsa:
-                q_lora = q
+                if q_lora is None:
+                    q_lora = q
 
-            k_nope = k_nope.unsqueeze(1)
-            q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+            # overlap q_b_proj and indexer during decode
+            if (
+                self.alt_stream is not None
+                and get_is_capture_mode()
+                and forward_batch.forward_mode.is_decode_or_idle()
+                and q_lora is not None
+            ):
+                current_stream = torch.cuda.current_stream()
+                self.alt_stream.wait_stream(current_stream)
+                with torch.cuda.stream(self.alt_stream):
+                    k_nope = k_nope.unsqueeze(1)
+                    q = self.q_b_proj(q)[0].view(
+                        -1, self.num_local_heads, self.qk_head_dim
+                    )
+                topk_indices = self.indexer(
+                    x=hidden_states,
+                    q_lora=q_lora,
+                    positions=positions,
+                    forward_batch=forward_batch,
+                    layer_id=self.layer_id,
+                )
+                current_stream.wait_stream(self.alt_stream)
+            else:
+                k_nope = k_nope.unsqueeze(1)
+                q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+                if q_lora is not None:
+                    topk_indices = self.indexer(
+                        x=hidden_states,
+                        q_lora=q_lora,
+                        positions=positions,
+                        forward_batch=forward_batch,
+                        layer_id=self.layer_id,
+                    )
         else:
             q = self.q_proj(hidden_states)[0].view(
                 -1, self.num_local_heads, self.qk_head_dim
@@ -2017,15 +1721,6 @@ class DeepseekV2AttentionMLA(nn.Module):
             # support allgather+rerrange
             k_nope, k_pe = self.rebuild_cp_kv_cache(
                 latent_cache, forward_batch, k_nope, k_pe
-            )
-        topk_indices = None
-        if q_lora is not None:
-            topk_indices = self.indexer(
-                x=hidden_states,
-                q_lora=q_lora,
-                positions=positions,
-                forward_batch=forward_batch,
-                layer_id=self.layer_id,
             )
 
         return (
@@ -2236,8 +1931,15 @@ class DeepseekV2AttentionMLA(nn.Module):
         enable_rope_fusion = (
             os.getenv("SGLANG_FUSED_MLA_ENABLE_ROPE_FUSION", "1") == "1"
         )
-        q_len = hidden_states.shape[0]
-        q_input = hidden_states.new_empty(
+        # NOTE: hidden_states can be a tuple for some quantization paths.
+        # For shape/device/dtype, use the first tensor; still pass the original
+        # hidden_states through linear ops which may accept tuple inputs.
+        hidden_states_tensor = (
+            hidden_states[0] if isinstance(hidden_states, tuple) else hidden_states
+        )
+
+        q_len = hidden_states_tensor.shape[0]
+        q_input = hidden_states_tensor.new_empty(
             q_len, self.num_local_heads, self.kv_lora_rank + self.qk_rope_head_dim
         )
         if self.q_lora_rank is not None:
@@ -2500,231 +2202,6 @@ class DeepseekV2AttentionMLA(nn.Module):
         output, _ = self.o_proj(attn_output)
 
         return output
-
-    def _chunked_prefix_attn_mha(
-        self,
-        q: torch.Tensor,
-        accum_output: torch.Tensor,
-        accum_lse: torch.Tensor,
-        forward_batch: ForwardBatch,
-    ) -> torch.Tensor:
-
-        assert forward_batch.num_prefix_chunks is not None
-        for i in range(forward_batch.num_prefix_chunks):
-            forward_batch.set_prefix_chunk_idx(i)
-
-            kv_indices = forward_batch.prefix_chunk_kv_indices[i]
-            # Fetch latent cache from memory pool with precomputed chunked kv indices
-            kv_a_normed, k_pe = self._get_mla_kv_buffer(
-                kv_indices, q.dtype, forward_batch
-            )
-            kv = self.kv_b_proj(kv_a_normed)[0]
-            kv = kv.view(
-                -1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim
-            )
-            v = kv[..., self.qk_nope_head_dim :]
-            k_nope = kv[..., : self.qk_nope_head_dim]
-
-            k = torch.empty(
-                (
-                    k_nope.shape[0],
-                    self.num_local_heads,
-                    self.qk_nope_head_dim + self.qk_rope_head_dim,
-                ),
-                dtype=v.dtype,
-                device=v.device,
-            )
-            k[..., : self.qk_nope_head_dim] = k_nope
-            k[..., self.qk_nope_head_dim :] = k_pe
-
-            output, lse = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
-            tmp_output = torch.empty_like(accum_output)
-            tmp_lse = torch.empty_like(accum_lse)
-            merge_state_v2(output, lse, accum_output, accum_lse, tmp_output, tmp_lse)
-            accum_output, accum_lse = tmp_output, tmp_lse
-            del kv, k, v, output, lse, tmp_output, tmp_lse
-
-        return accum_output
-
-    def forward_normal_chunked_kv_prepare(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        forward_batch: ForwardBatch,
-        zero_allocator: BumpAllocator,
-    ):
-        # In normal mha, the k and v tensors will become overly large when the prefix length is long.
-        # To avoid this, we split the kv cache into chunks and process them one after another.
-        # Since mha is compute friendly, the for loop induced here will not introduce significant overhead.
-        # The top comments in https://github.com/vllm-project/vllm/blob/main/vllm/v1/attention/backends/mla/common.py
-        # will be helpful for understanding the purpose of this function.
-
-        # First do normal mha forward to get output for extended part
-        return self.forward_normal_prepare(
-            positions, hidden_states, forward_batch, zero_allocator
-        )
-
-    def forward_normal_chunked_kv_core(self, q, k, v, forward_batch):
-        has_extend_prefix = forward_batch.extend_prefix_lens_cpu is not None and any(
-            forward_batch.extend_prefix_lens_cpu
-        )
-        # Only initialize the info once
-        if has_extend_prefix and forward_batch.num_prefix_chunks is None:
-            forward_batch.prepare_chunked_prefix_cache_info(q.device)
-            if hasattr(forward_batch.attn_backend, "init_mha_chunk_metadata"):
-                forward_batch.attn_backend.init_mha_chunk_metadata(forward_batch)
-
-        forward_batch.mha_return_lse = has_extend_prefix
-        # Do mha for extended part without prefix
-        forward_batch.set_attn_attend_prefix_cache(False)
-        attn_output = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
-
-        # Do mha attention with chunked prefix cache if there are any sequence with prefix
-        if has_extend_prefix:
-            attn_output, lse = attn_output
-            forward_batch.set_attn_attend_prefix_cache(True)
-            attn_output = self._chunked_prefix_attn_mha(
-                q=q,
-                accum_output=attn_output,
-                accum_lse=lse,
-                forward_batch=forward_batch,
-            )
-
-        attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
-        output, _ = self.o_proj(attn_output)
-        return output
-
-    def forward_normal_one_shot_prepare(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        forward_batch: ForwardBatch,
-        zero_allocator: BumpAllocator,
-    ):
-        forward_batch.mha_one_shot = True
-        return self.forward_normal_prepare(
-            positions, hidden_states, forward_batch, zero_allocator
-        )
-
-    def forward_normal_one_shot_core(self, q, k, v, forward_batch):
-        has_extend_prefix = any(forward_batch.extend_prefix_lens_cpu)
-        # Only initialize the info once
-        if has_extend_prefix and forward_batch.num_prefix_chunks is None:
-            forward_batch.num_prefix_chunks = 0
-            if hasattr(forward_batch.attn_backend, "init_mha_chunk_metadata"):
-                forward_batch.attn_backend.init_mha_chunk_metadata(forward_batch)
-        forward_batch.mha_return_lse = False
-        # Do mha for extended part without prefix
-        forward_batch.set_attn_attend_prefix_cache(False)
-        return self.forward_normal_core(q, k, v, forward_batch)
-
-    def _set_mla_kv_buffer(
-        self,
-        latent_cache: torch.Tensor,
-        kv_a: torch.Tensor,
-        k_pe: torch.Tensor,
-        forward_batch: ForwardBatch,
-    ):
-        if _is_cuda or _use_aiter_gfx95:
-            # Save latent cache
-            forward_batch.token_to_kv_pool.set_mla_kv_buffer(
-                self.attn_mha, forward_batch.out_cache_loc, kv_a.unsqueeze(1), k_pe
-            )
-        elif _is_npu:
-            # To reduce a time-costing split operation
-            forward_batch.token_to_kv_pool.set_kv_buffer(
-                self.attn_mha, forward_batch.out_cache_loc, kv_a.unsqueeze(1), k_pe
-            )
-        else:
-            latent_cache[:, :, : self.kv_lora_rank] = kv_a.unsqueeze(1)
-            latent_cache[:, :, self.kv_lora_rank :] = k_pe
-
-            # Save latent cache
-            forward_batch.token_to_kv_pool.set_kv_buffer(
-                self.attn_mha, forward_batch.out_cache_loc, latent_cache, None
-            )
-
-    def _get_mla_kv_buffer(
-        self,
-        kv_indices: torch.Tensor,
-        dst_dtype: torch.dtype,
-        forward_batch: ForwardBatch,
-    ):
-        if _is_cuda or _use_aiter_gfx95:
-            kv_a, k_pe = forward_batch.token_to_kv_pool.get_mla_kv_buffer(
-                self.attn_mha, kv_indices, dst_dtype
-            )
-            kv_a = kv_a.squeeze(1)
-        else:
-            latent_cache_buf = forward_batch.token_to_kv_pool.get_key_buffer(
-                self.attn_mha.layer_id
-            )
-            latent_cache = latent_cache_buf[kv_indices].contiguous().to(dst_dtype)
-
-            kv_a, k_pe = latent_cache.split(
-                [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
-            )
-            kv_a = kv_a.squeeze(1).contiguous()
-        return kv_a, k_pe
-
-    def _get_mla_kv_buffer_from_fp8(
-        self,
-        forward_batch: ForwardBatch,
-    ):
-        """
-        Dequantize FP8 KV cache to BF16 for MLA attention (NSA-specific format).
-
-        Returns: (kv_a, k_pe) both in BF16
-        """
-        backend = forward_batch.attn_backend
-        if isinstance(backend, TboAttnBackend):  # if enable tbo, get primary backend
-            backend = backend.primary
-        kv_indices = backend.forward_metadata.page_table_1_flattened
-        assert (
-            kv_indices is not None
-        ), "page_table_1_flattened should have been generated for FP8 MHA path"
-
-        kv_cache_fp8 = forward_batch.token_to_kv_pool.get_key_buffer(
-            self.attn_mha.layer_id
-        )
-
-        kv_latent_bf16 = dequantize_k_cache_paged(kv_cache_fp8, kv_indices)
-
-        kv_a = kv_latent_bf16[:, :, : self.kv_lora_rank].squeeze(1).contiguous()
-        k_pe = kv_latent_bf16[:, :, self.kv_lora_rank :]
-
-        return kv_a, k_pe
-
-    def _concat_and_cast_mha_k(self, k_nope, k_pe, forward_batch):
-        # Temporary for DeepSeek V3/R1 only, but can generalize if needed
-        k_shape = (k_nope.shape[0], self.num_local_heads, self.qk_head_dim)
-        if (
-            _is_cuda
-            and (self.num_local_heads == 128)
-            and (self.qk_nope_head_dim == 128)
-            and (self.qk_rope_head_dim == 64)
-        ):
-            k = k_nope.new_empty(*k_shape)
-            concat_mla_k(k=k, k_nope=k_nope, k_rope=k_pe)
-        elif _is_cuda:
-            # fa3 mha support fp8 inputs
-            if (
-                self.current_attention_backend == "fa3"
-                and self.kv_cache_dtype != "auto"
-            ):
-                attn_dtype = forward_batch.token_to_kv_pool.dtype
-            else:
-                attn_dtype = k_nope.dtype
-            k = k_nope.new_empty(*k_shape, dtype=attn_dtype)
-            concat_and_cast_mha_k_triton(k, k_nope, k_pe)
-        elif _is_hip and self.current_attention_backend == "aiter":
-            k = k_nope.new_empty(*k_shape)
-            concat_and_cast_mha_k_triton(k, k_nope, k_pe)
-        else:
-            k = k_nope.new_empty(*k_shape)
-            k[..., : self.qk_nope_head_dim] = k_nope
-            k[..., self.qk_nope_head_dim :] = k_pe
-        return k
 
     @staticmethod
     def _get_q_b_proj_quant_config(quant_config):
@@ -4015,18 +3492,6 @@ class DeepseekV2ForCausalLM(nn.Module):
             self._mark_nextn_moe_weights_as_ue8m0()
 
         return list(weights_dict.items())
-
-
-AttentionBackendRegistry.register("ascend", handle_attention_ascend)
-AttentionBackendRegistry.register("flashinfer", handle_attention_flashinfer)
-AttentionBackendRegistry.register("fa3", handle_attention_fa3)
-AttentionBackendRegistry.register("flashmla", handle_attention_flashmla)
-AttentionBackendRegistry.register("cutlass_mla", handle_attention_cutlass_mla)
-AttentionBackendRegistry.register("fa4", handle_attention_fa4)
-AttentionBackendRegistry.register("trtllm_mla", handle_attention_trtllm_mla)
-AttentionBackendRegistry.register("aiter", handle_attention_aiter)
-AttentionBackendRegistry.register("nsa", handle_attention_nsa)
-AttentionBackendRegistry.register("triton", handle_attention_triton)
 
 
 class DeepseekV3ForCausalLM(DeepseekV2ForCausalLM):

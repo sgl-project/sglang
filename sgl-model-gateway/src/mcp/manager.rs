@@ -768,9 +768,8 @@ impl McpManager {
         }
     }
 
-    /// Generate a unique key for a server config
+    /// Generate a unique key for a server config based on its transport
     pub fn server_key(config: &McpServerConfig) -> String {
-        // Extract URL from transport or use name
         match &config.transport {
             McpTransport::Streamable { url, .. } => url.clone(),
             McpTransport::Sse { url, .. } => url.clone(),
