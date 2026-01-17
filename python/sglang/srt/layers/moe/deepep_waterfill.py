@@ -1187,6 +1187,23 @@ class DeepEPWaterfillBalancer:
                 torch.empty(0, dtype=torch.bool, device=device),
             )
 
+        # Ablation: force shared expert to be computed locally on the source rank (no load balancing).
+        # This keeps the Waterfill "shared-as-9th-expert" fusion path, but removes the destination
+        # selection algorithm as a factor.
+        if os.environ.get("SGLANG_DEEPEP_WATERFILL_FIXED_LOCAL", "0") == "1":
+            shared_destination = torch.full(
+                (num_tokens,), self.rank, dtype=torch.int64, device=device
+            )
+            return expand_topk_with_shared_expert(
+                topk_ids,
+                topk_weights,
+                shared_destination,
+                self.num_routed_experts,
+                self.world_size,
+                self.rank,
+                self.shared_weight,
+            )
+
         # Small batch optimization: all shared experts compute locally
         if num_tokens < self.MIN_BATCH_FOR_BALANCE:
             if DEEPEP_WATERFILL_DEBUG:
