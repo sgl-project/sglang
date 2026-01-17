@@ -6,19 +6,22 @@ use async_trait::async_trait;
 use axum::response::Response;
 use tracing::error;
 
-use crate::routers::{
-    error,
-    grpc::{
-        common::stages::PipelineStage,
-        context::{FinalResponse, RequestContext},
-        regular::{processor, streaming},
+use crate::{
+    core::AttachedBody,
+    routers::{
+        error,
+        grpc::{
+            common::stages::PipelineStage,
+            context::{FinalResponse, RequestContext},
+            regular::{processor, streaming},
+        },
     },
 };
 
 /// Generate response processing stage
 ///
 /// Extracts generate-specific response processing logic from the old unified ResponseProcessingStage.
-pub struct GenerateResponseProcessingStage {
+pub(crate) struct GenerateResponseProcessingStage {
     processor: processor::ResponseProcessor,
     streaming_processor: Arc<streaming::StreamingProcessor>,
 }
@@ -77,15 +80,34 @@ impl GenerateResponseProcessingStage {
             })?
             .clone();
 
+        // Get cached tokenizer (resolved once in preparation stage)
+        let tokenizer = ctx.tokenizer_arc().ok_or_else(|| {
+            error!(
+                function = "GenerateResponseProcessingStage::process_generate_response",
+                "Tokenizer not cached in context"
+            );
+            error::internal_error(
+                "tokenizer_not_cached",
+                "Tokenizer not cached in context - preparation stage may have been skipped",
+            )
+        })?;
+
         if is_streaming {
-            // Streaming: Use StreamingProcessor and return SSE response (done)
-            return Ok(Some(
-                self.streaming_processor.clone().process_streaming_generate(
-                    execution_result,
-                    ctx.generate_request_arc(), // Cheap Arc clone (8 bytes)
-                    dispatch,
-                ),
-            ));
+            // Streaming: Use StreamingProcessor and return SSE response
+            let response = self.streaming_processor.clone().process_streaming_generate(
+                execution_result,
+                ctx.generate_request_arc(), // Cheap Arc clone (8 bytes)
+                dispatch,
+                tokenizer,
+            );
+
+            // Attach load guards to response body for proper RAII lifecycle
+            let response = match ctx.state.load_guards.take() {
+                Some(guards) => AttachedBody::wrap_response(response, guards),
+                None => response,
+            };
+
+            return Ok(Some(response));
         }
 
         // Non-streaming: Delegate to ResponseProcessor

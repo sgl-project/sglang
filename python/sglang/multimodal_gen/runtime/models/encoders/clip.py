@@ -33,7 +33,10 @@ from sglang.multimodal_gen.runtime.models.encoders.base import ImageEncoder, Tex
 from sglang.multimodal_gen.runtime.models.encoders.vision import (
     resolve_visual_encoder_outputs,
 )
-from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -227,26 +230,41 @@ class CLIPAttention(nn.Module):
             key_states = key_states.transpose(1, 2)
             value_states = value_states.transpose(1, 2)
 
-            if attention_mask is not None:
-                # SDPA requires [B, 1, 1, S] or [B, S, S] format mask
-                if attention_mask.dim() == 2:
-                    attn_mask = attention_mask[:, None, None, :].to(
-                        dtype=query_states.dtype
-                    )
-                    attn_mask = (1.0 - attn_mask) * torch.finfo(query_states.dtype).min
-                else:
-                    attn_mask = attention_mask
+            if current_platform.is_rocm():
+                # ROCm: Using both is_causal=True and attn_mask causes NaN.
+                # Use is_causal=True alone (padding mask not needed for CLIP
+                # since pooler_output comes from EOS token before padding).
+                attn_output = torch.nn.functional.scaled_dot_product_attention(
+                    query_states,
+                    key_states,
+                    value_states,
+                    attn_mask=None,
+                    is_causal=True,
+                    scale=self.scale,
+                )
             else:
-                attn_mask = None
+                if attention_mask is not None:
+                    # SDPA requires [B, 1, 1, S] or [B, S, S] format mask
+                    if attention_mask.dim() == 2:
+                        attn_mask = attention_mask[:, None, None, :].to(
+                            dtype=query_states.dtype
+                        )
+                        attn_mask = (1.0 - attn_mask) * torch.finfo(
+                            query_states.dtype
+                        ).min
+                    else:
+                        attn_mask = attention_mask
+                else:
+                    attn_mask = None
 
-            attn_output = torch.nn.functional.scaled_dot_product_attention(
-                query_states,
-                key_states,
-                value_states,
-                attn_mask=attn_mask,
-                is_causal=True,
-                scale=self.scale,
-            )
+                attn_output = torch.nn.functional.scaled_dot_product_attention(
+                    query_states,
+                    key_states,
+                    value_states,
+                    attn_mask=attn_mask,
+                    is_causal=True,
+                    scale=self.scale,
+                )
             attn_output = attn_output.transpose(1, 2)
         else:
             # Use LocalAttention (doesn't support attention_mask, but maintains compatibility)
@@ -429,10 +447,6 @@ class CLIPTextTransformer(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         output_hidden_states: bool | None = None,
     ) -> BaseEncoderOutput:
-        r"""
-        Returns:
-
-        """
         output_hidden_states = (
             output_hidden_states
             if output_hidden_states is not None

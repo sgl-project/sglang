@@ -45,6 +45,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsW8A8Int8,
     CompressedTensorsW8A16Fp8,
     CompressedTensorsWNA16,
+    NPUCompressedTensorsW8A8Int8,
 )
 from sglang.srt.layers.quantization.compressed_tensors.utils import (
     find_matched_target,
@@ -53,6 +54,10 @@ from sglang.srt.layers.quantization.compressed_tensors.utils import (
 )
 from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+from sglang.srt.utils import is_cuda, is_npu
+
+_is_cuda = is_cuda()
+_is_npu = is_npu()
 
 if TYPE_CHECKING:
     from sglang.srt.models.utils import WeightsMapper
@@ -123,7 +128,7 @@ class CompressedTensorsConfig(QuantizationConfig):
     def get_scaled_act_names(self) -> List[str]:
         return []
 
-    def apply_sglang_mapper(self, hf_to_sglang_mapper: "WeightsMapper"):
+    def apply_weight_name_mapper(self, hf_to_sglang_mapper: "WeightsMapper"):
         self.target_scheme_map = hf_to_sglang_mapper.apply_dict(self.target_scheme_map)
         self.ignore = hf_to_sglang_mapper.apply_list(self.ignore)
         self.sparsity_scheme_map = hf_to_sglang_mapper.apply_dict(
@@ -305,6 +310,28 @@ class CompressedTensorsConfig(QuantizationConfig):
         else:
             return False
 
+    def _is_dynamic_token_w4a8(
+        self, weight_quant: BaseModel, input_quant: BaseModel
+    ) -> bool:
+        is_weight_4_bits = weight_quant.num_bits == 4
+        is_activation_8_bits = input_quant.num_bits == 8
+        weight_strategy = (
+            weight_quant.strategy == QuantizationStrategy.GROUP.value
+            or weight_quant.strategy == QuantizationStrategy.CHANNEL.value
+        )
+        is_token = (
+            weight_strategy and input_quant.strategy == QuantizationStrategy.TOKEN.value
+        )
+        is_dynamic = not weight_quant.dynamic and input_quant.dynamic
+
+        return (
+            is_weight_4_bits
+            and is_activation_8_bits
+            and is_token
+            and weight_quant.symmetric
+            and is_dynamic
+        )
+
     def _is_static_tensor_w8a8(
         self, weight_quant: BaseModel, input_quant: BaseModel
     ) -> bool:
@@ -444,6 +471,29 @@ class CompressedTensorsConfig(QuantizationConfig):
 
         return is_channel_group and input_quant_none and is_symmetric and is_static
 
+    def _is_dynamic_token_w4(
+        self, weight_quant: BaseModel, input_quant: BaseModel
+    ) -> bool:
+        is_w4 = weight_quant.num_bits == 4
+        weight_strategy = (
+            weight_quant.strategy == QuantizationStrategy.TENSOR.value
+            or weight_quant.strategy == QuantizationStrategy.CHANNEL.value
+            or weight_quant.strategy == QuantizationStrategy.GROUP.value
+        )
+        if input_quant is not None:
+            is_token = (
+                weight_strategy
+                and input_quant.strategy == QuantizationStrategy.TOKEN.value
+            )
+            is_dynamic = not weight_quant.dynamic and input_quant.dynamic
+        else:
+            is_token = weight_strategy
+            is_dynamic = not weight_quant.dynamic
+
+        # Both symmetric and asymmetric input quantization supported.
+        # Only symmetric weight quantization supported.
+        return is_w4 and weight_quant.symmetric and is_token and is_dynamic
+
     def _get_scheme_from_parts(
         self, weight_quant: BaseModel, input_quant: BaseModel
     ) -> CompressedTensorsScheme:
@@ -505,18 +555,32 @@ class CompressedTensorsConfig(QuantizationConfig):
                 )
 
             if self._is_static_tensor_w8a8(weight_quant, input_quant):
-                return CompressedTensorsW8A8Int8(
-                    strategy=weight_quant.strategy,
-                    is_static_input_scheme=True,
-                    input_symmetric=input_quant.symmetric,
-                )
+                if not _is_npu:
+                    return CompressedTensorsW8A8Int8(
+                        strategy=weight_quant.strategy,
+                        is_static_input_scheme=True,
+                        input_symmetric=input_quant.symmetric,
+                    )
+                else:
+                    return NPUCompressedTensorsW8A8Int8(
+                        strategy=weight_quant.strategy,
+                        is_static_input_scheme=True,
+                        input_symmetric=input_quant.symmetric,
+                    )
 
             if self._is_dynamic_token_w8a8(weight_quant, input_quant):
-                return CompressedTensorsW8A8Int8(
-                    strategy=weight_quant.strategy,
-                    is_static_input_scheme=False,
-                    input_symmetric=input_quant.symmetric,
-                )
+                if not _is_npu:
+                    return CompressedTensorsW8A8Int8(
+                        strategy=weight_quant.strategy,
+                        is_static_input_scheme=False,
+                        input_symmetric=input_quant.symmetric,
+                    )
+                else:
+                    return NPUCompressedTensorsW8A8Int8(
+                        strategy=weight_quant.strategy,
+                        is_static_input_scheme=False,
+                        input_symmetric=input_quant.symmetric,
+                    )
 
         raise NotImplementedError("No compressed-tensors compatible scheme was found.")
 
@@ -594,7 +658,9 @@ class CompressedTensorsConfig(QuantizationConfig):
 
         # Raise error if device does not support the scheme
         # (e.g. fp8 needs ada lovelace)
-        self._check_scheme_supported(scheme.get_min_capability())
+        # Note: NPU devices do not support min_capability function
+        if not _is_npu:
+            self._check_scheme_supported(scheme.get_min_capability())
         logger.debug("Using scheme: %s for %s", scheme.__class__.__name__, layer_name)
         return scheme
 
