@@ -57,13 +57,18 @@ def _cleanup_mmmu_dataset_cache():
 def _run_lmms_eval_with_retry(cmd: list[str], timeout: int = 3600) -> None:
     """Run lmms_eval command with automatic retry on MMMU parquet corruption."""
     try:
-        subprocess.run(
+        result = subprocess.run(
             cmd,
             check=True,
             timeout=timeout,
             capture_output=True,
             text=True,
         )
+        # Print captured output to maintain visibility of successful runs
+        if result.stdout:
+            print(result.stdout, end="")
+        if result.stderr:
+            print(result.stderr, end="")
     except subprocess.CalledProcessError as e:
         error_output = e.stderr + e.stdout
         if _is_mmmu_parquet_corruption(error_output):
@@ -76,8 +81,14 @@ def _run_lmms_eval_with_retry(cmd: list[str], timeout: int = 3600) -> None:
                 ):
                     subprocess.run(cmd, check=True, timeout=timeout)
             else:
+                print(
+                    f"Failed to cleanup corrupted MMMU cache. Error from lmms_eval:\nStdout:\n{e.stdout}\nStderr:\n{e.stderr}"
+                )
                 raise
         else:
+            print(
+                f"lmms_eval failed with an unhandled error.\nStdout:\n{e.stdout}\nStderr:\n{e.stderr}"
+            )
             raise
 
 
