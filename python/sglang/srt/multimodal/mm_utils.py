@@ -34,7 +34,6 @@ import re
 from io import BytesIO
 from typing import Literal
 
-import fitz
 import numpy as np
 import pybase64
 import requests
@@ -363,6 +362,10 @@ def load_pdf_as_images(pdf_path, dpi=144, image_format="PNG"):
     """
     Convert PDF to a list of images
     """
+    try:
+        import fitz
+    except ImportError as e:
+        raise ImportError("PyMuPDF is required for PDF input support. ") from e
     images = []
     response = requests.get(pdf_path)
     response.raise_for_status()
