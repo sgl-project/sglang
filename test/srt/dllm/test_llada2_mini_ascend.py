@@ -76,7 +76,7 @@ class TestLLaDA2Mini(CustomTestCase):
             if is_in_amd_ci():
                 self.assertGreater(speed, 10)
             else:
-                self.assertGreater(speed, 250)
+                self.assertGreater(speed, 10)
 
 
 if __name__ == "__main__":

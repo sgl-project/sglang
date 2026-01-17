@@ -247,7 +247,6 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
             # num_fused_shared_experts=self.num_fused_shared_experts,
             topk_group=self.topk_group,
             correction_bias=self.correction_bias,
-            # routed_scaling_factor=self.routed_scaling_factor,
         )
 
         self.experts = get_moe_impl_class(quant_config)(
@@ -257,7 +256,6 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
             quant_config=quant_config,
-            # routed_scaling_factor=self.routed_scaling_factor,
             prefix=add_prefix("experts", prefix),
         )
         # shared expert
