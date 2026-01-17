@@ -315,7 +315,7 @@ def run_evaluation(args):
     print(f"WER: {wer_score:.4f}")
     print(f"Average Latency: {mean(latencies):.4f}s")
     print(f"Median Latency: {median(latencies):.4f}s")
-    print(f"95th Latency: {sorted(latencies)[int(len(latencies)*0.95)-1]:.4f}s")
+    print(f"95th Latency: {np.percentile(latencies, 95):.4f}s")
     print(f"Throughput: {len(results) / total_test_time:.2f} req/s")
     print(f"Token Throughput: {total_tokens / total_test_time:.2f} tok/s")
     print(f"Total Test Time: {total_test_time:.4f}s")
