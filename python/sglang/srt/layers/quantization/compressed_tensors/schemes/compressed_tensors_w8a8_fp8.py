@@ -223,11 +223,17 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
             )
 
         if _use_aiter and self.strategy == QuantizationStrategy.CHANNEL:
+            if isinstance(x, tuple):
+                input = x[0]
+                input_scale = x[1]
+            else:
+                input = x
+                input_scale = layer.input_scale
             return apply_fp8_ptpc_linear(
-                input=x,
+                input=input,
                 weight=layer.weight,
                 weight_scale=layer.weight_scale,
-                input_scale=layer.input_scale,
+                input_scale=input_scale,
                 bias=bias,
                 use_per_token_if_dynamic=True,
                 compressed_tensor_quant=True,

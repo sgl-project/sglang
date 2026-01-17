@@ -1086,7 +1086,12 @@ def apply_fp8_ptpc_linear(
     # weight is transposed (K, N)
     output_shape = [*input.shape[:-1], weight.shape[1]]
 
-    q_input, x_scale = aiter.per_token_quant_hip(input_2d, quant_dtype=aiter.dtypes.fp8)
+    if input_scale is not None:
+        q_input, x_scale = input_2d, input_scale
+    else:
+        q_input, x_scale = aiter.per_token_quant_hip(
+            input_2d, quant_dtype=aiter.dtypes.fp8
+        )
 
     per_tensor_weights = (weight_scale.numel() == 1) and weight_scale.dim() < 2
     per_tensor_activations = (x_scale.numel() == 1) and x_scale.dim() < 2
@@ -1096,7 +1101,12 @@ def apply_fp8_ptpc_linear(
         output_shape = [*input.shape[:-1], weight.shape[0]]
 
     output = aiter.gemm_a8w8_bpreshuffle(
-        q_input, weight, x_scale, weight_scale, None, input.dtype
+        q_input,
+        weight,
+        x_scale,
+        weight_scale,
+        None,
+        dtype=torch.bfloat16 if input_scale is not None else input.dtype,
     )
     if bias is not None:
         output = output + bias
