@@ -43,7 +43,8 @@ SGLang provides built-in scripts to evaluate common benchmarks.
 python -m sglang.test.run_eval \
   --eval-name mmlu \
   --port 30000 \
-  --num-examples 1000
+  --num-examples 1000 \
+  --max-tokens 8192
 ```
 
 **GSM8K**
