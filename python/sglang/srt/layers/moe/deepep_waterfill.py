@@ -18,46 +18,35 @@ This module implements waterfill load balancing where shared expert is treated
 as the 9th routed expert and dispatched through DeepEP.
 
 Key Design:
-1. Each token's shared expert can ONLY be sent to:
-   - A rank it already routes to (no extra communication)
-   - Or source rank (local computation, marked with LOCAL_SHARED_MARKER)
+1. Treat shared expert as an extra expert slot per EP rank and include it as
+   the 9th expert in DeepEP dispatch (topk=9).
 
-2. Virtual expert ID = target_rank * experts_per_rank
-   - This ensures DeepEP routes to the correct rank
-   - LOCAL_SHARED_MARKER (-1) means compute locally, don't dispatch
+2. Each token's shared expert destination is chosen among ranks it already
+   routes to (based on routed experts), optionally allowing local execution on
+   source rank. This avoids introducing new communication peers.
 
-3. On receiver side:
-   - Identify tokens whose 9th expert is for this rank
-   - Compute shared expert separately from routed experts
-   - Merge outputs before combine
+3. Remap expert IDs to keep a uniform per-rank layout, and use shared expert
+   ID = dest_rank * new_experts_per_rank + old_experts_per_rank.
 
-4. Shared expert weight = 1.0 / routed_scaling_factor
+4. Shared expert weight = 1.0 / routed_scaling_factor.
 
 5. Small batch optimization:
    - If batch size < MIN_BATCH_FOR_BALANCE, all shared experts compute locally
    - Avoids fragmented computation across ranks
 """
 
-import os
-from typing import Optional, Tuple
+from typing import Tuple
 
 import torch
 from torch import Tensor
 
-DEEPEP_WATERFILL_DEBUG = os.environ.get("SGLANG_DEEPEP_WATERFILL_DEBUG", "0") == "1"
-
-# Marker for local shared expert computation (won't be dispatched)
+# Marker value reserved for "no expert" (DeepEP treats expert_id < 0 as invalid).
+# Kept for kernel signature compatibility; the current waterfill path should not emit it.
 LOCAL_SHARED_MARKER = -1
 
-# Global counter for periodic logging
-_waterfill_log_counter = [0]
-_WATERFILL_LOG_INTERVAL = 100  # Log every N calls
-
-# Local preference factor: only send to remote if remote_count * factor < local_count
-# This avoids unnecessary remote communication when load is balanced
-# Set to 1.0 to disable local preference (original behavior)
-# Set to 1.2 to prefer local unless remote is 20% less loaded
-LOCAL_PREFERENCE_FACTOR = 1.2
+# Local preference factor used by waterfill assignment.
+# Set to 1.0 to disable the bias and use pure argmin over routed_counts.
+LOCAL_PREFERENCE_FACTOR = 1.0
 
 # Try to import Triton for GPU-optimized kernels
 try:
@@ -551,6 +540,7 @@ if HAS_TRITON:
         topk_plus_one,
         old_experts_per_rank,  # Original experts per rank (e.g., 32)
         new_experts_per_rank,  # New experts per rank (e.g., 33)
+        world_size,
         source_rank,
         min_tokens_per_rank,
         local_marker,
@@ -580,13 +570,17 @@ if HAS_TRITON:
         dest_rank = tl.where(
             is_local, src_rank_vec, shared_expert_id // new_experts_per_rank
         )
-        dest_rank = tl.minimum(tl.maximum(dest_rank, 0), 7)
+        dest_rank = tl.minimum(tl.maximum(dest_rank, 0), world_size - 1)
 
         dest_count = tl.load(dest_counts_ptr + dest_rank, mask=mask, other=0)
         is_sparse_remote = (dest_count < min_tokens_per_rank) & ~is_local
 
-        local_marker_vec = tl.full([BLOCK_SIZE], local_marker, dtype=tl.int64)
-        new_shared_id = tl.where(is_sparse_remote, local_marker_vec, shared_expert_id)
+        # Redirect sparse remote destinations to local shared expert ID.
+        local_shared_id = source_rank * new_experts_per_rank + old_experts_per_rank
+        local_shared_id_vec = tl.full([BLOCK_SIZE], local_shared_id, dtype=tl.int64)
+        new_shared_id = tl.where(
+            is_sparse_remote, local_shared_id_vec, shared_expert_id
+        )
         new_is_local = is_local | is_sparse_remote
 
         tl.store(
@@ -684,6 +678,7 @@ if HAS_TRITON:
                 topk + 1,
                 old_experts_per_rank,
                 new_experts_per_rank,
+                world_size,
                 source_rank,
                 min_tokens_per_rank,
                 LOCAL_SHARED_MARKER,
@@ -1171,7 +1166,7 @@ class DeepEPWaterfillBalancer:
         3. If a remote rank would receive < MIN_TOKENS_PER_RANK, compute locally instead
 
         Returns:
-            expanded_topk_ids: [N, 9] with virtual expert ID or LOCAL_SHARED_MARKER
+            expanded_topk_ids: [N, 9] with remapped expert IDs (shared expert as 9th)
             expanded_topk_weights: [N, 9] with shared_weight in 9th column
             local_shared_mask: [N] boolean mask for tokens with local shared expert
         """
@@ -1187,31 +1182,8 @@ class DeepEPWaterfillBalancer:
                 torch.empty(0, dtype=torch.bool, device=device),
             )
 
-        # Ablation: force shared expert to be computed locally on the source rank (no load balancing).
-        # This keeps the Waterfill "shared-as-9th-expert" fusion path, but removes the destination
-        # selection algorithm as a factor.
-        if os.environ.get("SGLANG_DEEPEP_WATERFILL_FIXED_LOCAL", "0") == "1":
-            shared_destination = torch.full(
-                (num_tokens,), self.rank, dtype=torch.int64, device=device
-            )
-            return expand_topk_with_shared_expert(
-                topk_ids,
-                topk_weights,
-                shared_destination,
-                self.num_routed_experts,
-                self.world_size,
-                self.rank,
-                self.shared_weight,
-            )
-
         # Small batch optimization: all shared experts compute locally
         if num_tokens < self.MIN_BATCH_FOR_BALANCE:
-            if DEEPEP_WATERFILL_DEBUG:
-                print(
-                    f"[DeepEP Waterfill] rank={self.rank} "
-                    f"tokens={num_tokens} < MIN_BATCH={self.MIN_BATCH_FOR_BALANCE}, "
-                    f"all shared experts computed locally"
-                )
             # Fast path: all local, no waterfill needed
             # Still need to remap expert IDs to new layout
             expanded_topk_ids = torch.empty(
@@ -1303,213 +1275,4 @@ class DeepEPWaterfillBalancer:
                 )
                 local_shared_mask = local_shared_mask | token_goes_to_sparse
 
-        # Periodic logging (only when DEBUG enabled to avoid sync)
-        if DEEPEP_WATERFILL_DEBUG:
-            global _waterfill_log_counter
-            _waterfill_log_counter[0] += 1
-            if _waterfill_log_counter[0] % _WATERFILL_LOG_INTERVAL == 1:
-                num_local = local_shared_mask.sum().item()
-                num_remote = num_tokens - num_local
-                print(
-                    f"[DeepEP Waterfill] rank={self.rank} "
-                    f"call={_waterfill_log_counter[0]} "
-                    f"tokens={num_tokens} "
-                    f"local={num_local} remote={num_remote}"
-                )
-
         return expanded_topk_ids, expanded_topk_weights, local_shared_mask
-
-
-def identify_shared_expert_tokens(
-    recv_topk_ids: Tensor,
-    num_experts: int,
-    world_size: int,
-    current_rank: int,
-    return_mask: bool = False,
-) -> Tensor:
-    """
-    Identify which received tokens need shared expert computation on this rank.
-
-    A token needs shared expert here if its 9th column (virtual expert ID)
-    maps to current_rank. Tokens with LOCAL_SHARED_MARKER (-1) are skipped
-    (they were computed locally on source rank).
-
-    Uses Triton kernel on GPU for better performance, falls back to PyTorch on CPU.
-
-    Args:
-        recv_topk_ids: [N, 9] received topk IDs with virtual expert in 9th column
-        num_experts: total number of experts
-        world_size: number of ranks
-        current_rank: this rank's ID
-        return_mask: if True, return boolean mask instead of indices (avoids nonzero)
-
-    Returns:
-        If return_mask=False: shared_indices - indices of tokens needing shared expert
-        If return_mask=True: shared_mask - boolean mask for shared expert tokens
-    """
-    # Use Triton kernel on GPU for mask computation
-    if HAS_TRITON and recv_topk_ids.is_cuda:
-        shared_mask = identify_shared_expert_tokens_triton(
-            recv_topk_ids, num_experts, world_size, current_rank
-        )
-        if return_mask:
-            return shared_mask
-        return shared_mask.nonzero(as_tuple=True)[0]
-
-    # PyTorch fallback
-    experts_per_rank = num_experts // world_size
-
-    # 9th column contains virtual expert ID or LOCAL_SHARED_MARKER
-    virtual_expert_ids = recv_topk_ids[:, -1]
-
-    # Skip LOCAL_SHARED_MARKER tokens (they stay on source rank)
-    valid_mask = virtual_expert_ids >= 0
-
-    # Check if virtual ID maps to current rank
-    target_ranks = virtual_expert_ids // experts_per_rank
-    shared_mask = valid_mask & (target_ranks == current_rank)
-
-    if return_mask:
-        return shared_mask
-
-    shared_indices = shared_mask.nonzero(as_tuple=True)[0]
-
-    return shared_indices
-
-
-def compute_local_shared_expert(
-    hidden_states: Tensor,
-    local_shared_mask: Tensor,
-    shared_expert_fn,
-) -> Tuple[Optional[Tensor], Optional[Tensor]]:
-    """
-    Compute shared expert locally for tokens marked as local.
-
-    Uses boolean indexing for efficient token selection.
-
-    Local shared expert output is NOT weighted by 1/rsf because it will be
-    added AFTER the routed_scaling_factor multiplication.
-
-    Args:
-        hidden_states: [N, H] input hidden states
-        local_shared_mask: [N] boolean mask for local shared expert tokens
-        shared_expert_fn: function to compute shared expert
-
-    Returns:
-        local_shared_output: [num_local, H] output (or None if no local tokens)
-        local_indices: [num_local] indices of local tokens (or None)
-    """
-    # Boolean indexing for efficient token selection
-    local_hidden = hidden_states[local_shared_mask]
-
-    # Early exit if no local tokens (shape check, no CPU-GPU sync)
-    if local_hidden.shape[0] == 0:
-        return None, None
-
-    local_output = shared_expert_fn(local_hidden)
-
-    # Compute indices for index_add_ in caller
-    local_indices = local_shared_mask.nonzero(as_tuple=True)[0]
-
-    return local_output, local_indices
-
-
-def compute_local_shared_expert_inplace(
-    hidden_states: Tensor,
-    local_shared_mask: Tensor,
-    shared_expert_fn,
-    output: Tensor,
-) -> bool:
-    """
-    Compute shared expert locally and add to output in-place.
-
-    Uses index_add_ which is faster than boolean indexing for scatter.
-    The nonzero call is unavoidable for index_add_, but we skip the .any() check.
-
-    Args:
-        hidden_states: [N, H] input hidden states
-        local_shared_mask: [N] boolean mask for local shared expert tokens
-        shared_expert_fn: function to compute shared expert
-        output: [N, H] output tensor to add results to (modified in-place)
-
-    Returns:
-        has_local: True if there were local tokens to process
-    """
-    # Boolean indexing for gather (efficient)
-    local_hidden = hidden_states[local_shared_mask]
-
-    if local_hidden.shape[0] == 0:
-        return False
-
-    local_output = shared_expert_fn(local_hidden)
-
-    # Use index_add_ which is faster than boolean scatter
-    local_indices = local_shared_mask.nonzero(as_tuple=True)[0]
-    output.index_add_(0, local_indices, local_output)
-
-    return True
-
-
-def compute_remote_shared_expert_inplace(
-    recv_hidden: Tensor,
-    recv_topk_ids: Tensor,
-    recv_topk_weights: Tensor,
-    num_experts: int,
-    world_size: int,
-    current_rank: int,
-    shared_expert_fn,
-    output: Tensor,
-    apply_weight: bool = True,
-) -> bool:
-    """
-    Identify and compute remote shared expert tokens in-place.
-
-    Combines identify + compute + scatter into one function to reduce overhead.
-    Uses index_add_ for efficient scatter.
-
-    Args:
-        recv_hidden: [M, H] received hidden states
-        recv_topk_ids: [M, 9] received topk IDs with virtual expert in 9th column
-        recv_topk_weights: [M, 9] received topk weights
-        num_experts: total number of experts
-        world_size: number of ranks
-        current_rank: this rank's ID
-        shared_expert_fn: function to compute shared expert
-        output: [M, H] output tensor to add results to (modified in-place)
-        apply_weight: whether to apply the weight from 9th column
-
-    Returns:
-        has_remote: True if there were remote shared tokens to process
-    """
-    if recv_hidden.shape[0] == 0:
-        return False
-
-    experts_per_rank = num_experts // world_size
-
-    # Compute shared_mask directly
-    virtual_expert_ids = recv_topk_ids[:, -1]
-    valid_mask = virtual_expert_ids >= 0
-    target_ranks = virtual_expert_ids // experts_per_rank
-    shared_mask = valid_mask & (target_ranks == current_rank)
-
-    # Get indices for index_add_
-    shared_indices = shared_mask.nonzero(as_tuple=True)[0]
-
-    if shared_indices.shape[0] == 0:
-        return False
-
-    # Gather hidden states
-    remote_hidden = recv_hidden[shared_indices]
-
-    # Compute shared expert
-    remote_output = shared_expert_fn(remote_hidden)
-
-    # Apply weight if needed
-    if apply_weight:
-        weights = recv_topk_weights[shared_indices, -1].unsqueeze(-1)
-        remote_output = remote_output * weights
-
-    # Use index_add_ for efficient scatter
-    output.index_add_(0, shared_indices, remote_output)
-
-    return True
