@@ -89,11 +89,7 @@ class OpenAIServingTranscription(OpenAIServingBase):
             import soundfile as sf
 
             audio_array, sr = sf.read(io.BytesIO(audio_data))
-            # Handle stereo audio (take first channel length)
-            if len(audio_array.shape) > 1:
-                duration = len(audio_array) / sr
-            else:
-                duration = len(audio_array) / sr
+            duration = len(audio_array) / sr
             return duration
         except Exception as e:
             logger.warning(f"Could not calculate audio duration: {e}")
