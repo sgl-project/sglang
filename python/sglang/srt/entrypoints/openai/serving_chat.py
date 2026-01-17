@@ -950,7 +950,7 @@ class OpenAIServingChat(OpenAIServingBase):
             # Align with Kimi-K2 format: functions.{name}:{index}
             # Kimi-K2 allows multiple tool_calls in one message; SGLang sets call_item.tool_index to the *local* position inside that message.
             # Therefore, the index must be corrected by using `history_tool_calls_cnt + call_item.tool_index` to ensure globally unique and properly ordered.
-            tool_call_id = f"functions.{call_item.name}:{history_tool_calls_cnt+call_item.tool_index}"
+            tool_call_id = f"functions.{call_item.name}:{history_tool_calls_cnt + call_item.tool_index}"
             logger.debug(
                 f"Process tool call idx, parser: {self.tool_call_parser}, tool_call_id: {tool_call_id}, history_cnt: {history_tool_calls_cnt}"
             )
@@ -1097,6 +1097,10 @@ class OpenAIServingChat(OpenAIServingBase):
         """Judge whether the request needs reasoning"""
         if not self.reasoning_parser:
             return False
+
+        # If reasoning_off_by_default is set, reasoning is off unless explicitly requested
+        reasoning_off_by_default = envs.SGLANG_REASONING_OFF_BY_DEFAULT.get()
+
         if self.reasoning_parser in ["deepseek-v3"]:
             return (
                 request.chat_template_kwargs is not None
@@ -1104,9 +1108,21 @@ class OpenAIServingChat(OpenAIServingBase):
             )
         if self.reasoning_parser in ["qwen3", "glm45", "nano_v3", "interns1"]:
             # qwen3, glm45, nano_v3, and interns1 are reasoning by default
+            if reasoning_off_by_default:
+                return (
+                    request.chat_template_kwargs is not None
+                    and request.chat_template_kwargs.get("enable_thinking") is True
+                )
+            else:
+                return (
+                    not request.chat_template_kwargs
+                    or request.chat_template_kwargs.get("enable_thinking", True) is True
+                )
+
+        if reasoning_off_by_default:
             return (
-                not request.chat_template_kwargs
-                or request.chat_template_kwargs.get("enable_thinking", True) is True
+                request.chat_template_kwargs is not None
+                and request.chat_template_kwargs.get("enable_thinking") is True
             )
         return True  # default
 
