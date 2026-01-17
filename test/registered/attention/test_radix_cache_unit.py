@@ -673,9 +673,12 @@ class TestRadixCache(unittest.TestCase):
         del values
 
         torch_allocated = torch.cuda.memory_allocated() - torch_allocated_before
+        cache_size_bytes = cache.total_size() * 4
+        print(f"\nCache size (MB): {cache_size_bytes / (1024 * 1024)}")
+        print(f"Torch allocated (MB): {torch_allocated / (1024 * 1024)}")
 
-        # allocated torch tensor size should have proper ratio with tree total_size
-        self.assertLess(torch_allocated / cache.total_size(), 10)
+        # The cache size should be within reasonable bounds of the actual allocated memory.
+        self.assertLess(torch_allocated, cache_size_bytes * 2)
 
 
 if __name__ == "__main__":
