@@ -793,6 +793,13 @@ class FlashInferAttnBackend(AttentionBackend):
                 v_scale=layer.v_scale_float,
             )
         else:
+            # If `k`/`v` are not explicitly provided, fall back to the KV cache stored in
+            # `forward_batch.token_to_kv_pool` for this layer. This enables attention over
+            # previously cached context without re-materializing KV tensors (e.g., the
+            # IQuestLoopCoder path uses token_to_kv_pool as the KV source).
+            if k is None and v is None:
+                k = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)[0]
+                v = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)[1]
             causal = True
             if (
                 layer.is_cross_attention
