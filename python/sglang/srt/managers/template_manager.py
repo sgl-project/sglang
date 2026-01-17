@@ -122,7 +122,7 @@ class TemplateManager:
                 if hf_template:
                     # override the chat template
                     tokenizer = tokenizer_manager.tokenizer
-                    if tokenizer is not None:
+                    if tokenizer is not None and hasattr(tokenizer, "chat_template"):
                         tokenizer.chat_template = hf_template
                     self._jinja_template_content_format = (
                         detect_jinja_template_content_format(hf_template)
@@ -140,9 +140,9 @@ class TemplateManager:
         # Detect reasoning pattern from chat template
         tokenizer = tokenizer_manager.tokenizer
         if tokenizer is not None:
-            self._force_reasoning = self._detect_reasoning_pattern(
-                tokenizer.chat_template
-            )
+            chat_template = getattr(tokenizer, "chat_template", None)
+            if chat_template:
+                self._force_reasoning = self._detect_reasoning_pattern(chat_template)
 
     def _load_explicit_chat_template(
         self, tokenizer_manager, chat_template_arg: str
