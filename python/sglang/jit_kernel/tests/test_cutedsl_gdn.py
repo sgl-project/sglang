@@ -354,7 +354,6 @@ def test_cutedsl_gdn_performance(B: int):
     evict_buf = torch.randn(32 * 1024 * 1024, dtype=torch.float32, device="cuda")
 
     print(f"\nPre-compiling kernels...")
-    cutedsl_gdn_module._check_cutlass_available()
     compiled_kernel = cutedsl_gdn_module._get_compiled_kernel(
         N, H, HV, K, V, pool_size, use_small_batch, is_varlen_decode
     )
@@ -640,7 +639,6 @@ def run_benchmark(
     )
 
     print(f"\nPre-compiling kernels...")
-    cutedsl_gdn_module._check_cutlass_available()
     compiled_kernel = cutedsl_gdn_module._get_compiled_kernel(
         N, H, HV, K, V, pool_size, use_small_batch, is_varlen_decode
     )
