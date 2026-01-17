@@ -1,24 +1,27 @@
 """Flashinfer-accelerated top-k for large vocabulary sizes.
 
-This module provides FlashinferTopK, a MultiPlatformOp that uses flashinfer.top_k
-for radix-based top-k selection on CUDA. This is O(n) vs O(n log k) for heap-based,
-providing 3-100x speedup for large vocabularies (>10k).
+Provides flashinfer_topk() - a drop-in replacement for torch.topk that uses
+flashinfer.top_k for radix-based selection on CUDA when available.
+This is O(n) vs O(n log k) for heap-based, providing 3-100x speedup for
+large vocabularies (>10k).
+
+Automatically dispatches to:
+- flashinfer.top_k on CUDA (when available and conditions met)
+- torch.topk as fallback (CPU, NPU, or when flashinfer unavailable)
 
 Used by:
 - logprob.py: get_top_logprobs_raw() for top logprobs computation
-- (Note: nsa_backend.py has its own flashinfer top-k integration, not using this op)
+- (Note: nsa_backend.py has its own flashinfer top-k integration)
 """
 
 from typing import Tuple
 
 import torch
 
-from sglang.srt.layers.utils.multi_platform import MultiPlatformOp
 from sglang.srt.utils import is_cuda
 
 # Threshold: flashinfer.top_k is faster for vocab > 10k
 FLASHINFER_TOPK_THRESHOLD = 10000
-
 
 _flashinfer_available = False
 if is_cuda():
@@ -30,92 +33,6 @@ if is_cuda():
         pass
 
 
-class FlashinferTopK(MultiPlatformOp):
-    """
-    Multi-platform top-k op that uses flashinfer on CUDA for large vocab.
-
-    Uses radix-based top-k selection which is O(n) vs O(n log k) for heap-based,
-    providing 3-100x speedup for large vocabularies (>10k).
-
-    Usage:
-        topk_op = FlashinferTopK()
-        values, indices = topk_op(tensor, k)
-    """
-
-    def __init__(self, threshold: int = FLASHINFER_TOPK_THRESHOLD):
-        super().__init__()
-        self.threshold = threshold
-
-    def forward_native(
-        self,
-        input: torch.Tensor,
-        k: int,
-        dim: int = -1,
-        largest: bool = True,
-        sorted: bool = True,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """PyTorch native implementation."""
-        return torch.topk(input, k, dim=dim, largest=largest, sorted=sorted)
-
-    def forward_cuda(
-        self,
-        input: torch.Tensor,
-        k: int,
-        dim: int = -1,
-        largest: bool = True,
-        sorted: bool = True,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        CUDA implementation using flashinfer radix top-k.
-
-        Falls back to torch.topk when:
-        - flashinfer not available
-        - dim != -1 or input is not 2D (flashinfer limitation)
-        - largest=False (flashinfer only supports largest)
-        - vocab_size < threshold (torch.topk faster for small vocab)
-
-        API used: flashinfer.top_k(input, k, sorted) -> (values, indices)
-        """
-        use_fallback = (
-            not _flashinfer_available
-            or dim != -1
-            or input.dim() != 2
-            or not largest
-            or input.size(-1) < self.threshold
-        )
-
-        if use_fallback:
-            return torch.topk(input, k, dim=dim, largest=largest, sorted=sorted)
-
-        values, indices = flashinfer.top_k(input, k, sorted=sorted)
-        return values, indices
-
-    def forward_npu(
-        self,
-        input: torch.Tensor,
-        k: int,
-        dim: int = -1,
-        largest: bool = True,
-        sorted: bool = True,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """NPU implementation - fallback to native."""
-        return self.forward_native(input, k, dim, largest, sorted)
-
-
-# Global singleton instance for convenience
-_default_topk_op = None
-
-
-def get_flashinfer_topk_op(
-    threshold: int = FLASHINFER_TOPK_THRESHOLD,
-) -> FlashinferTopK:
-    """Get or create the default FlashinferTopK instance."""
-    global _default_topk_op
-    if _default_topk_op is None:
-        _default_topk_op = FlashinferTopK(threshold=threshold)
-    return _default_topk_op
-
-
 def flashinfer_topk(
     input: torch.Tensor,
     k: int,
@@ -124,17 +41,26 @@ def flashinfer_topk(
     sorted: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Convenience function - drop-in replacement for torch.topk.
+    Drop-in replacement for torch.topk with flashinfer acceleration on CUDA.
 
-    Dispatches to flashinfer on CUDA (for large vocab), torch.topk otherwise.
+    Automatically dispatches to flashinfer.top_k when:
+    - flashinfer is available
+    - device is CUDA
+    - input is 2D
+    - dim == -1 (required by flashinfer)
+    - largest == True (required by flashinfer)
+    - vocab_size (input.size(-1)) > FLASHINFER_TOPK_THRESHOLD
+
+    Falls back to torch.topk otherwise.
+
     Uses radix-based selection which is O(n) vs O(n log k), providing
     3-100x speedup for large vocabularies.
 
     Parameters
     ----------
     input : torch.Tensor
-        Input tensor of shape (batch_size, d) for flashinfer acceleration,
-        or any shape for torch.topk fallback.
+        Input tensor of shape (batch_size, vocab_size) or any shape.
+        flashinfer optimization works best with (batch_size, large_vocab_size).
     k : int
         Number of top elements to select.
     dim : int, optional
@@ -153,4 +79,19 @@ def flashinfer_topk(
     indices : torch.Tensor
         Indices of top-k values.
     """
-    return get_flashinfer_topk_op()(input, k, dim, largest, sorted)
+    # Check if we can use flashinfer
+    use_flashinfer = (
+        _flashinfer_available
+        and input.is_cuda
+        and input.dim() == 2
+        and dim == -1
+        and largest
+        and input.size(-1) > FLASHINFER_TOPK_THRESHOLD
+    )
+
+    if use_flashinfer:
+        # flashinfer.top_k(input, k, sorted) -> (values, indices)
+        return flashinfer.top_k(input, k, sorted=sorted)
+
+    # Fallback to torch.topk
+    return torch.topk(input, k, dim=dim, largest=largest, sorted=sorted)

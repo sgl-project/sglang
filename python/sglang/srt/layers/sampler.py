@@ -141,10 +141,10 @@ class Sampler(nn.Module):
                     # Benefits: bf16/fp16 support, multi-CTA kernels, radix top-k
                     #
                     # Functions used:
-                    # - flashinfer.sampling.top_k_renorm_probs: top-k renormalization (flashinfer)
-                    # - flashinfer.sampling.top_p_renorm_probs: top-p renormalization (flashinfer)
-                    # - flashinfer.sampling.top_p_sampling_from_probs: top-p sampling (flashinfer)
-                    # - min_p_sampling_from_probs: min-p sampling (sgl_kernel, not flashinfer)
+                    # - flashinfer.sampling.top_k_renorm_probs: top-k renormalization
+                    # - flashinfer.sampling.top_p_renorm_probs: top-p renormalization
+                    # - flashinfer.sampling.top_p_sampling_from_probs: top-p sampling
+                    # - sgl_kernel.min_p_sampling_from_probs: min-p sampling (not in flashinfer)
                     # ============================================================
                     try:
                         import flashinfer.sampling as flashinfer_sampling
