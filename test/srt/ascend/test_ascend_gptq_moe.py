@@ -33,7 +33,6 @@ class TestAscendGPTQMoEInt4(CustomTestCase):
             "ascend",
             "--quantization",
             "gptq",
-            "--tp", "1",
         ]
 
     def test_a_gsm8k(self):
