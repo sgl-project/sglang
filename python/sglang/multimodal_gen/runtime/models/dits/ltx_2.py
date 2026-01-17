@@ -11,7 +11,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from sglang.multimodal_gen.configs.models.dits.ltx_2 import LTX2ArchConfig, LTX2Config
-from sglang.multimodal_gen.runtime.distributed import get_tp_rank, get_tp_world_size
+from sglang.multimodal_gen.runtime.distributed import (
+    get_sp_parallel_rank,
+    get_sp_world_size,
+    get_tp_rank,
+    get_tp_world_size,
+    model_parallel_is_initialized,
+)
 from sglang.multimodal_gen.runtime.distributed.communication_op import (
     tensor_model_parallel_all_reduce,
 )
@@ -21,7 +27,6 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     RowParallelLinear,
 )
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
-    NDRotaryEmbedding,
     _apply_rotary_emb,
     apply_flashinfer_rope_qk_inplace,
 )
@@ -82,108 +87,6 @@ def apply_split_rotary_emb(
 # Layers and Embeddings
 # ==============================================================================
 
-def get_ltx2_video_coords(
-    num_frames: int,
-    height: int,
-    width: int,
-    patch_size: Tuple[int, int, int],
-    scale_factors: Tuple[int, ...],
-    fps: float,
-    causal_offset: int,
-    device: torch.device,
-) -> torch.Tensor:
-    """
-    Prepare video coordinates [B, 3, N, 2] where the last dim is [start, end).
-    """
-    p_t, p_h, p_w = patch_size
-    post_t = num_frames // p_t
-    post_h = height // p_h
-    post_w = width // p_w
-
-    # Generate grid coordinates (starts)
-    # indexing="ij" -> (t, h, w) order
-    grid_coords = torch.meshgrid(
-        torch.arange(start=0, end=post_t * p_t, step=p_t, device=device),
-        torch.arange(start=0, end=post_h * p_h, step=p_h, device=device),
-        torch.arange(start=0, end=post_w * p_w, step=p_w, device=device),
-        indexing="ij",
-    )
-    
-    # [3, num_tokens]
-    patch_starts = (
-        torch.stack(grid_coords, dim=0).reshape(3, -1).to(dtype=torch.float32)
-    )
-    
-    # [3, 1]
-    patch_size_delta = torch.tensor(
-        (p_t, p_h, p_w), device=device, dtype=torch.float32
-    ).view(3, 1)
-    
-    patch_ends = patch_starts + patch_size_delta
-    
-    # [3, num_tokens, 2]
-    coords = torch.stack([patch_starts, patch_ends], dim=-1)
-    
-    # Calculate pixel space coords
-    # scale_factors: (t, h, w)
-    scale_tensor = torch.tensor(scale_factors, device=device, dtype=torch.float32).view(3, 1, 1)
-    
-    pixel_coords = coords * scale_tensor
-    
-    # Causal offset correction for temporal dim (idx 0)
-    pixel_coords[0, ...] = (pixel_coords[0, ...] + causal_offset - scale_factors[0]).clamp(min=0)
-    
-    # Scale by FPS for temporal dim
-    pixel_coords[0, ...] = pixel_coords[0, ...] / fps
-    
-    # [3, N, 2] -> [B, 3, N, 2] (will be broadcasted later or repeated here)
-    # Returning [3, N, 2] to be flexible
-    return pixel_coords
-
-def get_ltx2_audio_coords(
-    num_frames: int,
-    patch_size_t: int,
-    scale_factor: int,
-    sampling_rate: int,
-    hop_length: int,
-    causal_offset: int,
-    device: torch.device,
-    shift: int = 0,
-) -> torch.Tensor:
-    """
-    Prepare audio coordinates [1, N, 2] (temporal only).
-    """
-    # Generate temporal starts
-    starts = torch.arange(
-        start=shift, end=num_frames + shift, step=patch_size_t, device=device, dtype=torch.float32
-    )
-    ends = starts + float(patch_size_t)
-    
-    # [num_tokens, 2]
-    coords_t = torch.stack([starts, ends], dim=-1)
-    
-    # Convert to Mel scale then Seconds
-    audio_scale_factor = scale_factor
-    
-    # Start
-    grid_start_mel = coords_t[:, 0] * audio_scale_factor
-    grid_start_mel = (grid_start_mel + causal_offset - audio_scale_factor).clip(min=0)
-    grid_start_s = grid_start_mel * hop_length / sampling_rate
-    
-    # End
-    grid_end_mel = coords_t[:, 1] * audio_scale_factor
-    grid_end_mel = (grid_end_mel + causal_offset - audio_scale_factor).clip(min=0)
-    grid_end_s = grid_end_mel * hop_length / sampling_rate
-    
-    # [num_tokens, 2]
-    coords = torch.stack([grid_start_s, grid_end_s], dim=-1)
-    
-    # [1, num_tokens, 2]
-    coords = coords.unsqueeze(0)
-    
-    return coords
-
-
 class LTX2AudioVideoRotaryPosEmbed(nn.Module):
     def __init__(
         self,
@@ -243,10 +146,12 @@ class LTX2AudioVideoRotaryPosEmbed(nn.Module):
         width: int,
         device: torch.device,
         fps: float = 24.0,
+        *,
+        start_frame: int = 0,
     ) -> torch.Tensor:
         grid_f = torch.arange(
-            start=0,
-            end=num_frames,
+            start=int(start_frame),
+            end=int(num_frames) + int(start_frame),
             step=self.patch_size_t,
             dtype=torch.float32,
             device=device,
@@ -291,11 +196,12 @@ class LTX2AudioVideoRotaryPosEmbed(nn.Module):
         batch_size: int,
         num_frames: int,
         device: torch.device,
-        shift: int = 0,
+        *,
+        start_frame: int = 0,
     ) -> torch.Tensor:
         grid_f = torch.arange(
-            start=shift,
-            end=num_frames + shift,
+            start=int(start_frame),
+            end=int(num_frames) + int(start_frame),
             step=self.patch_size_t,
             dtype=torch.float32,
             device=device,
@@ -387,217 +293,6 @@ class LTX2AudioVideoRotaryPosEmbed(nn.Module):
             sin_freqs = torch.swapaxes(sin_freq, 1, 2)
 
         return cos_freqs, sin_freqs
-
-class LTX2RotaryEmbedding(NDRotaryEmbedding):
-    """
-    LTX-2 specific NDRotaryEmbedding.
-    Inherits from NDRotaryEmbedding but overrides forward to use LTX-2 specific
-    frequency calculation and coordinate normalization.
-    """
-    def __init__(
-        self,
-        rope_dim_list: list[int],
-        rope_theta: float,
-        base_sizes: Optional[Tuple[int, ...]] = None, # (T, H, W) max sizes for normalization
-        **kwargs
-    ):
-        self.patch_size = kwargs.pop("patch_size", None)
-        self.scale_factors = kwargs.pop("scale_factors", None)
-        self.fps = kwargs.pop("fps", 24.0)
-        self.causal_offset = kwargs.pop("causal_offset", 1)
-
-        super().__init__(rope_dim_list, rope_theta, **kwargs)
-        self.base_sizes = base_sizes
-        
-        # Cache for frequencies
-        self.freqs_cache = {}
-
-    def _get_freqs(self, index: int, dim: int, device: torch.device) -> torch.Tensor:
-        # Check cache
-        cache_key = (index, dim, device)
-        if cache_key in self.freqs_cache:
-            return self.freqs_cache[cache_key]
-            
-        # Compute frequencies
-        # LTX-2 uses: (theta ** linspace(0, 1)) * (pi/2)
-        num_freqs = dim // 2
-        # Use float64 for precision during calculation
-        freqs = torch.pow(
-            self.rope_theta,
-            torch.linspace(start=0.0, end=1.0, steps=num_freqs, dtype=torch.float64, device=device)
-        )
-        freqs = (freqs * torch.pi / 2.0).to(dtype=torch.float32)
-        
-        self.freqs_cache[cache_key] = freqs
-        return freqs
-
-    def forward_from_grid(
-        self,
-        grid_size: tuple[int, ...],
-        shard_dim: int = 0,
-        start_frame: int = 0,
-        device: torch.device | str | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Generate LTX-2 rotary embeddings for a grid.
-        Handles Sequence Parallelism internally via shard_dim.
-        """
-        device = torch.device(device or "cpu")
-        sp_group = get_tp_rank() # Wait, get_tp_rank is for Tensor Parallel. We need Sequence Parallel.
-        # But in sglang DITs, often tp_rank is used for SP if SP group is not separate?
-        # Let's check imports. get_tp_rank is imported.
-        # But wanvideo uses get_sp_world_size.
-        # I need to check if get_sp_group is available or if I should use get_tp_rank logic.
-        # Assuming single node for now or relying on caller to handle sharding if not using standard SP.
-        # Standard NDRotaryEmbedding uses get_sp_group().
-        # Let's import get_sp_group from parallel_state.
-        
-        from sglang.multimodal_gen.runtime.distributed.parallel_state import get_sp_group
-        sp_group = get_sp_group()
-        sp_rank = sp_group.rank_in_group
-        sp_world_size = sp_group.world_size
-
-        sizes = grid_size
-        ndim = len(sizes)
-        
-        # Apply SP sharding
-        shard_sizes = list(sizes)
-        shard_offsets = [0] * ndim
-        if sp_world_size > 1:
-             assert sizes[shard_dim] % sp_world_size == 0
-             shard_size = sizes[shard_dim] // sp_world_size
-             shard_offsets[shard_dim] = sp_rank * shard_size
-             shard_sizes[shard_dim] = shard_size
-        
-        # Generate coordinates
-        # We need to generate 3D coordinates for the current shard
-        # And apply LTX-2 scaling/normalization
-        
-        # grid_size is (post_t, post_h, post_w)
-        # We need to reconstruct full coords logic from get_ltx2_video_coords
-        
-        assert self.patch_size is not None
-        assert self.scale_factors is not None
-        
-        p_t, p_h, p_w = self.patch_size
-        scale_t, scale_h, scale_w = self.scale_factors
-        
-        # Generate 1D coords for each dimension
-        coords_list = []
-        for i in range(ndim):
-             size_i = shard_sizes[i]
-             base_offset = shard_offsets[i]
-             if i == 0: base_offset += start_frame # Frame offset
-             
-             # Patch index: 0, 1, 2...
-             # Pixel start: idx * patch_size
-             # Pixel center: (idx * patch_size) + patch_size / 2
-             # Or simply: (idx + 0.5) * patch_size
-             
-             idx = torch.arange(size_i, device=device, dtype=torch.float32) + base_offset
-             
-             patch_dim = self.patch_size[i]
-             scale_dim = self.scale_factors[i]
-             max_dim = self.base_sizes[i]
-             
-             # Calculate pixel center in latent space (before VAE scale?)
-             # get_ltx2_video_coords logic:
-             # starts = 0, p, 2p...
-             # ends = p, 2p, 3p...
-             # center = 0.5p, 1.5p... = (idx + 0.5) * p
-             
-             center = (idx + 0.5) * patch_dim
-             
-             # Scale to "physical" units (pixels/seconds?)
-             # LTX2 logic: pixel_coords = coords * scale_tensor
-             val = center * scale_dim
-             
-             # Special handling for Time (dim 0)
-             if i == 0:
-                 # Causal offset
-                 val = (val + self.causal_offset - scale_dim).clamp(min=0)
-                 # FPS scaling
-                 val = val / self.fps
-            
-             # Normalize to [-1, 1] using base_sizes
-             val_norm = (val / max_dim) * 2.0 - 1.0
-             coords_list.append(val_norm)
-             
-        # Create meshgrid
-        # indexing='ij'
-        grid = torch.meshgrid(*coords_list, indexing='ij')
-        # Stack to [..., ndim]
-        positions = torch.stack(grid, dim=-1) # [T_shard, H, W, 3]
-        
-        # Call forward (which expects normalized positions)
-        # But forward expects [B, N, ndim]. 
-        # Here we have [T_shard, H, W, 3].
-        # Flatten to [1, N, 3]
-        num_tokens = positions.numel() // ndim
-        positions_flat = positions.reshape(1, num_tokens, ndim)
-        
-        return self.forward(positions_flat)
-
-    def forward(self, positions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Args:
-            positions: [B, N, ndim] or [B, N, ndim, 2]
-        """
-        device = positions.device
-        # 1. Preprocess positions
-        if positions.ndim == 4: # [B, N, ndim, 2] -> [B, N, ndim]
-             positions = positions.mean(dim=-1)
-        
-        # 2. Normalize positions: (pos / base_size) * 2 - 1
-        if self.base_sizes is not None:
-             norm_positions = []
-             for i in range(self.ndim):
-                 p = positions[..., i]
-                 max_p = self.base_sizes[i]
-                 p_norm = (p / max_p) * 2.0 - 1.0
-                 norm_positions.append(p_norm)
-             positions = torch.stack(norm_positions, dim=-1)
-        
-        # 3. Compute Cos/Sin
-        # Flatten batch dimensions
-        orig_shape = positions.shape[:-1] # [B, N]
-        positions_flat = positions.reshape(-1, self.ndim) # [B*N, ndim]
-        num_tokens = positions_flat.shape[0]
-        
-        head_dim_half = sum(self.rope_dim_list) // 2
-        cos = torch.empty((num_tokens, head_dim_half), device=device, dtype=self.dtype)
-        sin = torch.empty((num_tokens, head_dim_half), device=device, dtype=self.dtype)
-        
-        col_offset = 0
-        for i in range(self.ndim):
-            dim_i = self.rope_dim_list[i]
-            freqs = self._get_freqs(i, dim_i, device) # [dim // 2]
-            
-            # Extract position coordinates for the current dimension
-            pos_i = positions_flat[:, i].to(freqs.dtype) # [B*N]
-            
-            # LTX-2 Math: (pos * 2 - 1) * freqs
-            # Note: We already normalized pos to [-1, 1] in step 2.
-            # But wait, LTX-2 logic in diffusers/original:
-            # grid = coords / max_pos
-            # freqs = (grid * 2 - 1) * freqs_base
-            # So if we already normalized to [-1, 1], we just multiply by freqs_base.
-            
-            # Calculate angles
-            angles = torch.outer(pos_i, freqs) # [B*N, dim//2]
-            
-            cos_1d = angles.cos()
-            sin_1d = angles.sin()
-            slice_width = cos_1d.shape[1]
-            cos[:, col_offset : col_offset + slice_width] = cos_1d
-            sin[:, col_offset : col_offset + slice_width] = sin_1d
-            col_offset += slice_width
-            
-        # Reshape back
-        cos = cos.view(*orig_shape, -1)
-        sin = sin.view(*orig_shape, -1)
-        
-        return cos, sin
 
 
 def rms_norm(x: torch.Tensor, eps: float) -> torch.Tensor:
@@ -1334,6 +1029,18 @@ class LTX2VideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
             raise ValueError("audio_num_frames must be provided for RoPE coordinate generation.")
 
         if video_coords is None:
+            # Wan-style SP-RoPE: when SP is enabled, each rank runs on its local
+            # time shard but RoPE positions must be offset to global time.
+            #
+            # We assume equal time sharding across SP ranks.
+            if model_parallel_is_initialized():
+                sp_world_size = get_sp_world_size()
+                sp_rank = get_sp_parallel_rank()
+            else:
+                sp_world_size = 1
+                sp_rank = 0
+
+            video_shift = int(sp_rank) * int(num_frames) if sp_world_size > 1 else 0
             video_coords = self.rope.prepare_video_coords(
                 batch_size=batch_size,
                 num_frames=num_frames,
@@ -1341,6 +1048,7 @@ class LTX2VideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
                 width=width,
                 device=hidden_states.device,
                 fps=fps,
+                start_frame=video_shift,
             )
         if audio_coords is None:
             audio_coords = self.audio_rope.prepare_audio_coords(

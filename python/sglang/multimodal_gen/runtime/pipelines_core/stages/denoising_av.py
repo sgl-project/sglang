@@ -32,10 +32,59 @@ class LTX2AVDenoisingStage(DenoisingStage):
         )
         self.audio_vae = audio_vae
 
+    @staticmethod
+    def _get_video_latent_num_frames_for_model(
+        batch: Req, server_args: ServerArgs, latents: torch.Tensor
+    ) -> int:
+        """Return the latent-frame length the DiT model should see.
+
+        - If video latents were time-sharded for SP and are packed as token latents
+          ([B, S, D]), the model only sees the local shard and must use the local
+          latent-frame count (stored on the batch during SP sharding).
+        - Otherwise, fall back to the global latent-frame count inferred from the
+          requested output frames and the VAE temporal compression ratio.
+        """
+        did_sp_shard = bool(getattr(batch, "did_sp_shard_latents", False))
+        is_token_latents = isinstance(latents, torch.Tensor) and latents.ndim == 3
+
+        if did_sp_shard and is_token_latents:
+            if not hasattr(batch, "sp_video_latent_num_frames"):
+                raise ValueError(
+                    "SP-sharded LTX2 token latents require `batch.sp_video_latent_num_frames` "
+                    "to be set by `LTX2PipelineConfig.shard_latents_for_sp()`."
+                )
+            return int(batch.sp_video_latent_num_frames)
+
+        pc = server_args.pipeline_config
+        return int((batch.num_frames - 1) // int(pc.vae_temporal_compression) + 1)
+
+    @staticmethod
+    def _truncate_sp_padded_token_latents(
+        batch: Req, latents: torch.Tensor
+    ) -> torch.Tensor:
+        """Remove token padding introduced by SP time-sharding (if applicable)."""
+        did_sp_shard = bool(getattr(batch, "did_sp_shard_latents", False))
+        if not did_sp_shard or not (isinstance(latents, torch.Tensor) and latents.ndim == 3):
+            return latents
+
+        raw_shape = getattr(batch, "raw_latent_shape", None)
+        if not (isinstance(raw_shape, tuple) and len(raw_shape) == 3):
+            return latents
+
+        orig_s = int(raw_shape[1])
+        cur_s = int(latents.shape[1])
+        if cur_s == orig_s:
+            return latents
+        if cur_s < orig_s:
+            raise ValueError(
+                f"Unexpected gathered token-latents seq_len {cur_s} < original seq_len {orig_s}."
+            )
+        return latents[:, :orig_s, :].contiguous()
+
     @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         """
-         Run the denoising loop.
+        Run the denoising loop.
 
         Args:
             batch: The current batch information.
@@ -65,6 +114,15 @@ class LTX2AVDenoisingStage(DenoisingStage):
 
         audio_latents = batch.audio_latents
         audio_scheduler = copy.deepcopy(self.scheduler)
+
+        # For LTX-2 packed token latents, SP sharding happens on the time dimension
+        # (frames). The model must see local latent frames (RoPE offset is applied
+        # inside the model using SP rank).
+        latent_num_frames_for_model = self._get_video_latent_num_frames_for_model(
+            batch=batch, server_args=server_args, latents=latents
+        )
+        latent_height = batch.height // server_args.pipeline_config.vae_scale_factor
+        latent_width = batch.width // server_args.pipeline_config.vae_scale_factor
 
         # Initialize lists for ODE trajectory
         trajectory_timesteps: list[torch.Tensor] = []
@@ -135,17 +193,7 @@ class LTX2AVDenoisingStage(DenoisingStage):
                         audio_latent_model_input = audio_latents.to(target_dtype)
 
                         # Re-calculate coordinates and dimensions
-                        latent_num_frames = (
-                            (batch.num_frames - 1)
-                            // server_args.pipeline_config.vae_temporal_compression
-                            + 1
-                        )
-                        latent_height = (
-                            batch.height // server_args.pipeline_config.vae_scale_factor
-                        )
-                        latent_width = (
-                            batch.width // server_args.pipeline_config.vae_scale_factor
-                        )
+                        latent_num_frames = latent_num_frames_for_model
 
                         # Audio latent dims
                         if audio_latent_model_input.ndim == 3:
@@ -358,6 +406,10 @@ class LTX2AVDenoisingStage(DenoisingStage):
         latents, trajectory_tensor = self._postprocess_sp_latents(
             batch, latents, trajectory_tensor
         )
+
+        # If SP time-sharding padded whole frames worth of tokens, remove padding
+        # after gather and before unpacking.
+        latents = self._truncate_sp_padded_token_latents(batch, latents)
 
         if trajectory_tensor is not None and trajectory_timesteps_tensor is not None:
             batch.trajectory_timesteps = trajectory_timesteps_tensor.cpu()
