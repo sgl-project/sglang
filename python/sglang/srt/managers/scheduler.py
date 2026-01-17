@@ -136,6 +136,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
+    DllmStagingReqs,
     PrefillAdder,
     SchedulePolicy,
 )
@@ -350,6 +351,9 @@ class Scheduler(
 
         # Init chunked prefill
         self.init_chunked_prefill()
+
+        # Init diffusion LLM
+        self.init_diffusion_llm()
 
         # Init schedule policy and new token estimation
         self.init_schedule_policy()
@@ -726,10 +730,6 @@ class Scheduler(
     def init_chunked_prefill(self):
         # Init chunked prefill
         self.chunked_prefill_size = self.server_args.chunked_prefill_size
-        if self.dllm_config is not None:
-            # We currently leverage chunked prefill to implement block diffusion
-            # for diffusion LLM.
-            self.chunked_prefill_size = self.dllm_config.block_size
         if self.chunked_prefill_size <= 0:  # -1 means disable
             self.chunked_prefill_size = None
         self.chunked_req = None
@@ -751,6 +751,9 @@ class Scheduler(
                     "Dynamic chunking will be disabled."
                 )
                 self.enable_dynamic_chunking = False
+
+    def init_diffusion_llm(self):
+        self.dllm_staging_reqs = DllmStagingReqs(dllm_config=self.dllm_config)
 
     def init_schedule_policy(self):
         # Init schedule policy and new token estimation
@@ -1297,6 +1300,7 @@ class Scheduler(
             # If it is a health check generation request and there are running requests, ignore it.
             if is_health_check_generate_req(recv_req) and (
                 self.chunked_req is not None
+                or self.dllm_staging_reqs.non_empty()
                 or not self.running_batch.is_empty()
                 or len(self.offload_tags) > 0
             ):
@@ -1765,33 +1769,46 @@ class Scheduler(
         for tokenized_req in recv_req:
             self.handle_embedding_request(tokenized_req)
 
+    def stash_chunked_request(self, req: Req):
+        self.tree_cache.cache_unfinished_req(req, chunked=True)
+        # Chunked request keeps its rid but will get a new req_pool_idx
+        if self.tp_worker.model_runner.mambaish_config is not None:
+            self.req_to_token_pool.free(req.req_pool_idx, free_mamba_cache=False)
+        else:
+            self.req_to_token_pool.free(req.req_pool_idx)
+
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
         self._abort_on_queued_timeout()
         if self.dllm_config is not None:
-            if self.chunked_req is not None and self.chunked_req.finished():
-                self.chunked_req = None
+            self.dllm_staging_reqs.filter_finished_reqs()
 
         # Merge the prefill batch into the running batch
         chunked_req_to_exclude = set()
-        if self.chunked_req:
+
+        if self.dllm_config is not None:
+            assert (
+                self.chunked_req is None
+            ), "chunked_req should be None when dllm_config is set"
+
+            if self.dllm_staging_reqs.non_empty():
+                chunked_req_to_exclude.update(self.dllm_staging_reqs)
+                for req in self.dllm_staging_reqs:
+                    self.stash_chunked_request(req)
+
+        if self.chunked_req is not None:
             # Move the chunked request out of the batch so that we can merge
             # only finished requests to running_batch.
             chunked_req_to_exclude.add(self.chunked_req)
-            self.tree_cache.cache_unfinished_req(self.chunked_req, chunked=True)
-
-            # chunked request keeps its rid but will get a new req_pool_idx
-            if self.tp_worker.model_runner.mambaish_config is not None:
-                self.req_to_token_pool.free(
-                    self.chunked_req.req_pool_idx, free_mamba_cache=False
-                )
-            else:
-                self.req_to_token_pool.free(self.chunked_req.req_pool_idx)
+            self.stash_chunked_request(self.chunked_req)
 
         if self.last_batch and self.last_batch.forward_mode.is_extend():
             if self.last_batch.chunked_req is not None:
                 # In the context pipeline parallelism, after the last chunk, the current microbatch still track outdated chunked_req.
                 # We need to discard it.
                 chunked_req_to_exclude.add(self.last_batch.chunked_req)
+
+            if self.last_batch.dllm_staging_reqs.non_empty():
+                chunked_req_to_exclude.update(self.last_batch.dllm_staging_reqs)
 
             # Filter batch
             last_bs = self.last_batch.batch_size()
@@ -1880,20 +1897,20 @@ class Scheduler(
             # Reset batch_is_full to try preemption with a prefill adder.
             self.running_batch.batch_is_full = False
 
-        if (
-            self.running_batch.batch_is_full or len(self.waiting_queue) == 0
-        ) and self.chunked_req is None:
+        if (self.running_batch.batch_is_full or len(self.waiting_queue) == 0) and (
+            not self.dllm_staging_reqs.non_empty() and self.chunked_req is None
+        ):
             return None
 
         running_bs = len(self.running_batch.reqs)
         # Ignore the check if self.chunked_req is not None.
         # In the non-PP case, when self.chunked_req is not None, num_allocatable_reqs should always be greater than 0,
-        # as the space for the chunked request has just been released.
-        # In PP case, a chunked req can start in one microbatch and end in another microbatch, so the max_running_requests per microbatch should not be strict.
-        # Instead, we should always allow chunked request to be added, otherwise, there will be a memory leak.
+        # as the space for the chunked requests has just been released.
+        # In PP case, chunked requests (or dllm requests) can start in one microbatch and end in another microbatch, so the max_running_requests per microbatch should not be strict.
+        # Instead, we should always allow chunked requests to be added, otherwise, there will be a memory leak.
         if (
             self.get_num_allocatable_reqs(running_bs) <= 0
-            and not self.chunked_req
+            and (self.dllm_staging_reqs.empty() or self.chunked_req is not None)
             and not self.try_preemption
         ):
             self.running_batch.batch_is_full = True
@@ -1932,7 +1949,19 @@ class Scheduler(
             self.priority_scheduling_preemption_threshold,
             prefill_max_requests=self.server_args.prefill_max_requests,
             prefill_delayer_single_pass=prefill_delayer_single_pass,
+            dllm_config=self.dllm_config,
         )
+
+        if self.dllm_config is not None:
+            assert (
+                self.chunked_req is None
+            ), "chunked_req should be None when dllm_config is set"
+
+            if self.dllm_staging_reqs.non_empty():
+                self.dllm_staging_reqs.init_next_round()
+                for req in self.dllm_staging_reqs:
+                    adder.add_chunked_req(req)
+                self.dllm_staging_reqs.add_reqs(adder.dllm_staging_reqs)
 
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
@@ -1981,7 +2010,9 @@ class Scheduler(
             req.init_next_round_input(self.tree_cache)
             res = adder.add_one_req(
                 req,
-                has_chunked_req=(self.chunked_req is not None),
+                has_chunked_req=(
+                    self.dllm_staging_reqs.non_empty() or self.chunked_req is not None
+                ),
                 truncation_align_size=self.truncation_align_size,
             )
 
@@ -2013,13 +2044,24 @@ class Scheduler(
             for req in adder.preempt_list:
                 self._add_request_to_queue(req)
 
-        # Update chunked prefill
+        if self.dllm_config is not None:
+            assert (
+                self.chunked_req is None
+            ), "chunked_req should be None when dllm_config is set"
+
+            if adder.dllm_staging_reqs.non_empty():
+                self.dllm_staging_reqs.add_reqs(adder.dllm_staging_reqs)
+
         if adder.new_chunked_req is not None:
+            # Update chunked prefill
             assert self.chunked_req is None
             self.chunked_req = adder.new_chunked_req
 
-        if self.chunked_req:
+        if self.chunked_req is not None:
             self.chunked_req.is_chunked += 1
+
+        if self.dllm_staging_reqs.non_empty():
+            self.dllm_staging_reqs.update_chunked_status()
 
         # Print stats
         if self.current_scheduler_metrics_enabled:
@@ -2049,6 +2091,7 @@ class Scheduler(
             self.enable_overlap,
             self.spec_algorithm,
             chunked_req=self.chunked_req,
+            dllm_staging_reqs=self.dllm_staging_reqs,
             dllm_config=self.dllm_config,
         )
         if self.enable_hierarchical_cache:
