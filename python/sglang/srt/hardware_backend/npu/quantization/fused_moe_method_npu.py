@@ -3,6 +3,11 @@ from typing import TYPE_CHECKING, Optional
 import numpy as np
 import torch
 
+try:
+    import torch_npu
+except ImportError:
+    torch_npu = None
+
 from sglang.srt.hardware_backend.npu.utils import npu_format_cast
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 
@@ -403,7 +408,8 @@ class NPUW4A8Int8DynamicMoEMethod(_NPUFusedMoEMethodBase):
         global_num_experts = layer.num_experts
 
         # Check if device supports npu_moe_init_routing_v2 (not supported on 910B)
-        import torch_npu
+        if torch_npu is None:
+            raise ImportError("torch_npu is required for NPU MoE operations")
         device_name = torch_npu.npu.get_device_name(hidden_states.device.index or 0)
         use_v2_api = "910b" not in device_name.lower()
 
@@ -480,7 +486,7 @@ class NPUW4A8Int8DynamicMoEMethod(_NPUFusedMoEMethodBase):
         )[0]
 
         assert original_shape is not None
-        
+
         if use_v2_api:
             # Use v2 unpermute for v2 API
             final_hidden_states = torch.ops.npu.npu_moe_token_unpermute(
@@ -499,7 +505,7 @@ class NPUW4A8Int8DynamicMoEMethod(_NPUFusedMoEMethodBase):
                 expanded_src_to_dst_row=expanded_row_idx,
                 export_for_source_row=topk_ids,
             )
-        
+
         if len(original_shape) == 3:
             final_hidden_states = final_hidden_states.view(original_shape)
 
