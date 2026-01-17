@@ -492,8 +492,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         )
 
         expert_tokens = expert_tokens.to(torch.int64)
-        w13_bias = layer.w13_weight_bias
-        w2_bias = layer.w2_weight_bias
+        w13_bias = [layer.w13_weight_bias] if self.with_bias else None
+        w2_bias = [layer.w2_weight_bias] if self.with_bias else None
         if layer.w13_weight.shape[-1] == layer.hidden_size:
             w13 = layer.w13_weight.transpose(1, 2)
             w2 = layer.w2_weight.transpose(1, 2)
@@ -502,7 +502,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         hidden_states = torch_npu.npu_grouped_matmul(
             x=[hidden_states],
             weight=[w13],
-            bias=[w13_bias],
+            bias=w13_bias,
             split_item=2,
             group_list_type=0,
             group_type=0,
@@ -526,7 +526,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         hidden_states = torch_npu.npu_grouped_matmul(
             x=[hidden_states],
             weight=[w2],
-            bias=[w2_bias],
+            bias=w2_bias,
             split_item=2,
             group_list_type=0,
             group_type=0,
