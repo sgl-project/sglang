@@ -1,8 +1,10 @@
 import glob
 import json
 import os
+import shutil
 import subprocess
 import tempfile
+from pathlib import Path
 from types import SimpleNamespace
 
 from sglang.srt.environ import temp_set_env
@@ -16,6 +18,42 @@ from sglang.test.test_utils import (
 
 # Set default mem_fraction_static to 0.8
 DEFAULT_MEM_FRACTION_STATIC = 0.8
+
+
+def _is_mmmu_parquet_corruption(error_output: str) -> bool:
+    """Check if error is due to MMMU parquet file corruption."""
+    return (
+        "ArrowInvalid" in error_output
+        and "Parquet magic bytes not found" in error_output
+        and ("MMMU" in error_output or "lmms-lab--MMMU" in error_output)
+    )
+
+
+def _cleanup_mmmu_dataset_cache():
+    """Clean up corrupted MMMU dataset cache to allow fresh download."""
+    # Priority 1: Check CI convention path /hf_home first (used in Docker containers)
+    ci_hf_home = Path("/hf_home/hub/datasets--lmms-lab--MMMU")
+    if ci_hf_home.exists():
+        mmmu_cache_path = ci_hf_home
+    else:
+        # Priority 2: Use HF_HOME env var or default user cache
+        hf_home = os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
+        mmmu_cache_path = Path(hf_home) / "hub" / "datasets--lmms-lab--MMMU"
+
+    if mmmu_cache_path.exists():
+        print(
+            f"Detected corrupted MMMU parquet cache. Cleaning up: {mmmu_cache_path}"
+        )
+        try:
+            shutil.rmtree(mmmu_cache_path)
+            print(f"Successfully removed corrupted cache: {mmmu_cache_path}")
+            return True
+        except Exception as e:
+            print(f"Warning: Failed to remove cache {mmmu_cache_path}: {e}")
+            return False
+    else:
+        print(f"MMMU cache not found at {mmmu_cache_path}, skipping cleanup")
+        return False
 
 
 class MMMUMixin:
@@ -81,11 +119,40 @@ class MMMUMixin:
             OPENAI_API_KEY=self.api_key,
             OPENAI_API_BASE=f"{self.base_url}/v1",
         ):
-            subprocess.run(
-                cmd,
-                check=True,
-                timeout=3600,
-            )
+            try:
+                subprocess.run(
+                    cmd,
+                    check=True,
+                    timeout=3600,
+                    capture_output=True,
+                    text=True,
+                )
+            except subprocess.CalledProcessError as e:
+                # Check if this is a MMMU parquet corruption error
+                error_output = e.stderr + e.stdout
+                if _is_mmmu_parquet_corruption(error_output):
+                    print(
+                        "Detected MMMU parquet corruption error. Attempting recovery..."
+                    )
+                    # Clean up corrupted cache
+                    if _cleanup_mmmu_dataset_cache():
+                        print("Retrying lmms_eval with fresh download...")
+                        # Retry once: force online mode and redownload
+                        with temp_set_env(
+                            HF_HUB_OFFLINE="0",
+                            HF_DATASETS_DOWNLOAD_MODE="force_redownload",
+                        ):
+                            subprocess.run(
+                                cmd,
+                                check=True,
+                                timeout=3600,
+                            )
+                    else:
+                        # Re-raise original error if cleanup failed
+                        raise
+                else:
+                    # Re-raise if not a parquet corruption error
+                    raise
 
     def test_mmmu(self: CustomTestCase):
         """Run MMMU evaluation test."""
@@ -209,11 +276,38 @@ class MMMUMultiModelTestBase(CustomTestCase):
             *self.mmmu_args,
         ]
 
-        subprocess.run(
-            cmd,
-            check=True,
-            timeout=3600,
-        )
+        try:
+            subprocess.run(
+                cmd,
+                check=True,
+                timeout=3600,
+                capture_output=True,
+                text=True,
+            )
+        except subprocess.CalledProcessError as e:
+            # Check if this is a MMMU parquet corruption error
+            error_output = e.stderr + e.stdout
+            if _is_mmmu_parquet_corruption(error_output):
+                print("Detected MMMU parquet corruption error. Attempting recovery...")
+                # Clean up corrupted cache
+                if _cleanup_mmmu_dataset_cache():
+                    print("Retrying lmms_eval with fresh download...")
+                    # Retry once: force online mode and redownload
+                    with temp_set_env(
+                        HF_HUB_OFFLINE="0",
+                        HF_DATASETS_DOWNLOAD_MODE="force_redownload",
+                    ):
+                        subprocess.run(
+                            cmd,
+                            check=True,
+                            timeout=3600,
+                        )
+                else:
+                    # Re-raise original error if cleanup failed
+                    raise
+            else:
+                # Re-raise if not a parquet corruption error
+                raise
 
     def _run_vlm_mmmu_test(
         self,
