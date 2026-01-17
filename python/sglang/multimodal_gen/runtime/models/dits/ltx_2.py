@@ -403,6 +403,9 @@ class LTX2TPRMSNormAcrossHeads(nn.Module):
         setattr(self.weight, "weight_loader", _weight_loader)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Keep track of the original dtype. We do the statistics in fp32 for
+        # numerical stability, but cast the output back to the input dtype to
+        orig_dtype = x.dtype
         if get_tp_world_size() == 1:
             var = x.float().pow(2).mean(dim=-1, keepdim=True)
         else:
@@ -410,8 +413,9 @@ class LTX2TPRMSNormAcrossHeads(nn.Module):
             global_sumsq = tensor_model_parallel_all_reduce(local_sumsq)
             var = global_sumsq / float(self.full_hidden_size)
 
-        y = x * torch.rsqrt(var + self.eps)
-        return y * self.weight.to(dtype=y.dtype)
+        inv_rms_fp32 = torch.rsqrt(var + self.eps)
+        y = (x.float() * inv_rms_fp32).to(dtype=orig_dtype)
+        return y * self.weight.to(dtype=orig_dtype)
 
 
 class LTX2Attention(nn.Module):
@@ -437,6 +441,19 @@ class LTX2Attention(nn.Module):
         self.qk_norm = bool(qk_norm)
 
         tp_size = get_tp_world_size()
+        if tp_size <= 0:
+            raise ValueError(f"Invalid {tp_size=}. Expected tp_size >= 1.")
+        if self.heads % tp_size != 0:
+            raise ValueError(
+                f"LTX2Attention requires heads divisible by tp_size, got "
+                f"{self.heads=} {tp_size=}."
+            )
+        if self.inner_dim % tp_size != 0:
+            # This should follow from heads % tp_size, but keep explicit for clarity.
+            raise ValueError(
+                f"LTX2Attention requires inner_dim divisible by tp_size, got "
+                f"{self.inner_dim=} {tp_size=}."
+            )
         self.local_heads = self.heads // tp_size
 
         self.to_q = ColumnParallelLinear(
@@ -506,6 +523,13 @@ class LTX2Attention(nn.Module):
         if pe is not None:
             cos, sin = pe
             k_cos, k_sin = pe if k_pe is None else k_pe
+            tp_size = get_tp_world_size()
+            if tp_size > 1:
+                tp_rank = get_tp_rank()
+                cos, sin = self._slice_rope_for_tp(cos, sin, tp_rank=tp_rank, tp_size=tp_size)
+                k_cos, k_sin = self._slice_rope_for_tp(
+                    k_cos, k_sin, tp_rank=tp_rank, tp_size=tp_size
+                )
             if cos.dim() == 3:
                 q = apply_interleaved_rotary_emb(q, (cos, sin))
                 k = apply_interleaved_rotary_emb(k, (k_cos, k_sin))
@@ -547,6 +571,36 @@ class LTX2Attention(nn.Module):
         out = out.flatten(2)
         out, _ = self.to_out[0](out)
         return out
+
+    def _slice_rope_for_tp(
+        self,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        *,
+        tp_rank: int,
+        tp_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Slice RoPE tensors to the local TP shard.
+
+        - split-rope: cos/sin are shaped [B, H, T, R] (head-major), slice by heads.
+        - interleaved-rope: cos/sin are shaped [B, T, D], where D matches the projected
+          feature dimension and is sharded by TP.
+        """
+        if cos.ndim == 4:
+            # [B, H, T, R]
+            start = tp_rank * self.local_heads
+            end = start + self.local_heads
+            return cos[:, start:end, :, :], sin[:, start:end, :, :]
+        elif cos.ndim == 3:
+            # [B, T, D]
+            d = cos.shape[-1]
+            if d % tp_size != 0:
+                raise ValueError(f"RoPE dim must be divisible by tp_size, got {d=} {tp_size=}.")
+            local_d = d // tp_size
+            start = tp_rank * local_d
+            end = start + local_d
+            return cos[:, :, start:end], sin[:, :, start:end]
+        raise ValueError(f"Unexpected RoPE tensor rank: {cos.ndim}. Expected 3 or 4.")
 
 
 class LTX2FeedForward(nn.Module):
@@ -828,6 +882,56 @@ class LTX2VideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
     reverse_param_names_mapping = LTX2ArchConfig().reverse_param_names_mapping
     lora_param_names_mapping = LTX2ArchConfig().lora_param_names_mapping
 
+    def _validate_tp_config(self, *, arch: LTX2ArchConfig, tp_size: int) -> None:
+        """Validate TP-related dimension constraints (fail-fast)."""
+        if tp_size < 1:
+            raise ValueError(f"Invalid tp_size={tp_size}. Expected tp_size >= 1.")
+
+        if self.hidden_size % self.num_attention_heads != 0:
+            raise ValueError(
+                "video hidden_size must be divisible by num_attention_heads, got "
+                f"{self.hidden_size=} {self.num_attention_heads=}."
+            )
+        if self.audio_hidden_size % self.audio_num_attention_heads != 0:
+            raise ValueError(
+                "audio_hidden_size must be divisible by audio_num_attention_heads, got "
+                f"{self.audio_hidden_size=} {self.audio_num_attention_heads=}."
+            )
+
+        if tp_size == 1:
+            return
+
+        if self.num_attention_heads % tp_size != 0:
+            raise ValueError(
+                "num_attention_heads must be divisible by tp_size, got "
+                f"{self.num_attention_heads=} {tp_size=}."
+            )
+        if self.audio_num_attention_heads % tp_size != 0:
+            raise ValueError(
+                "audio_num_attention_heads must be divisible by tp_size, got "
+                f"{self.audio_num_attention_heads=} {tp_size=}."
+            )
+        if self.hidden_size % tp_size != 0:
+            raise ValueError(
+                "hidden_size must be divisible by tp_size for TP-sharded projections, got "
+                f"{self.hidden_size=} {tp_size=}."
+            )
+        if self.audio_hidden_size % tp_size != 0:
+            raise ValueError(
+                "audio_hidden_size must be divisible by tp_size for TP-sharded projections, got "
+                f"{self.audio_hidden_size=} {tp_size=}."
+            )
+        if int(arch.out_channels) % tp_size != 0:
+            raise ValueError(
+                "out_channels must be divisible by tp_size for TP-sharded output projection, got "
+                f"{arch.out_channels=} {tp_size=}."
+            )
+        if int(arch.audio_out_channels) % tp_size != 0:
+            raise ValueError(
+                "audio_out_channels must be divisible by tp_size for TP-sharded output projection, got "
+                f"{arch.audio_out_channels=} {tp_size=}."
+            )
+
     def __init__(self, config: LTX2Config, hf_config: dict[str, Any]) -> None:
         super().__init__(config=config, hf_config=hf_config)
         
@@ -837,6 +941,9 @@ class LTX2VideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         self.audio_hidden_size = arch.audio_hidden_size
         self.audio_num_attention_heads = arch.audio_num_attention_heads
         self.norm_eps = arch.norm_eps
+
+        tp_size = get_tp_world_size()
+        self._validate_tp_config(arch=arch, tp_size=tp_size)
 
         # 1. Patchification input projections
         # Matches LTX2Config().param_names_mapping

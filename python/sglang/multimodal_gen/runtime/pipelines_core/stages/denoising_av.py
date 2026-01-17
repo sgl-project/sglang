@@ -84,7 +84,7 @@ class LTX2AVDenoisingStage(DenoisingStage):
     @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         """
-        Run the denoising loop.
+         Run the denoising loop.
 
         Args:
             batch: The current batch information.
