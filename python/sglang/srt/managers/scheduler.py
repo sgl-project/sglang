@@ -1395,7 +1395,6 @@ class Scheduler(
         else:
             return MultimodalInputs.from_dict(mm_inputs_dict)
 
-
     def _maybe_clear_mm_inputs(self, batch: ScheduleBatch) -> None:
         for req in batch.reqs:
             if not req.finished() or not (mm_inputs := req.multimodal_inputs):
@@ -1403,7 +1402,6 @@ class Scheduler(
             for item in mm_inputs.mm_items:
                 item.feature = None
             req.multimodal_inputs = None
-
 
     def handle_generate_request(
         self,
