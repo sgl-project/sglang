@@ -414,6 +414,12 @@ class Envs:
 
     # Tool-Call behavior
     SGLANG_TOOL_STRICT_LEVEL = EnvInt(ToolStrictLevel.OFF)
+    # Token ID to bias when tool_choice is "none" (e.g., tool start token)
+    SGLANG_TOOL_START_TOKEN = EnvInt(None)
+    # Whether to apply logit bias to SGLANG_TOOL_START_TOKEN when tool_choice is "none"
+    SGLANG_BIAS_TOOL_WHEN_NONE = EnvBool(False)
+    # System message to insert before user query when tool_choice is "none" (empty string disables)
+    SGLANG_INSERT_TOOL_PROHIBIT_WHEN_NONE = EnvStr("")
 
     # Ngram
     SGLANG_NGRAM_FORCE_GREEDY_VERIFY = EnvBool(False)
