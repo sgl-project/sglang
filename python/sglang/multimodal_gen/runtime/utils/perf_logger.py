@@ -13,7 +13,6 @@ from dateutil.tz import UTC
 
 import sglang
 import sglang.multimodal_gen.envs as envs
-from sglang.cli.utils import get_git_commit_hash
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     _SGLDiffusionLogger,
     get_is_main_process,
