@@ -247,8 +247,6 @@ async def _save_upload_to_path(
     target_path: str,
     uploads_root: str | None = None,
 ) -> str:
-    if uploads_root:
-        target_path = ensure_path_within_root(target_path, uploads_root)
     os.makedirs(os.path.dirname(target_path), exist_ok=True)
     content = await upload.read()
     with open(target_path, "wb") as f:
