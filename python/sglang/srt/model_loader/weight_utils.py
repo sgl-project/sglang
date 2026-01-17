@@ -40,31 +40,24 @@ from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
     ModelOptFp8Config,
 )
-from sglang.srt.utils import find_local_repo_dir, log_info_on_rank0, print_warning_once
+from sglang.srt.model_loader.ci_weight_validation import (
+    ci_download_with_validation_and_retry,
+    ci_validate_and_cleanup_local_snapshot,
+)
+from sglang.srt.utils import (
+    BAR_FORMAT,
+    find_local_repo_dir,
+    log_info_on_rank0,
+    print_warning_once,
+)
 from sglang.utils import is_in_ci
 
 try:
     from fastsafetensors import SafeTensorsFileLoader, SingleGroup
-except ImportError:
-
-    class PlaceholderModule:
-        def __init__(self, name):
-            self.name = name
-
-        def __getattr__(self, name):
-            raise ImportError(f"Please install {self.name}")
-
-    fastsafetensors = PlaceholderModule("fastsafetensors")
-    SafeTensorsFileLoader = None
-    SingleGroup = None
+except ImportError as e:
+    SafeTensorsFileLoader = SingleGroup = None
 
 logger = logging.getLogger(__name__)
-
-# use system-level temp directory for file locks, so that multiple users
-# can share the same lock without error.
-# lock files in the temp directory will be automatically deleted when the
-# system reboots, so users will not complain about annoying lock files
-temp_dir = tempfile.gettempdir()
 
 
 def enable_hf_transfer():
@@ -82,10 +75,11 @@ def enable_hf_transfer():
 enable_hf_transfer()
 
 
-class DisabledTqdm(tqdm):
-    def __init__(self, *args, **kwargs):
-        kwargs["disable"] = True
-        super().__init__(*args, **kwargs)
+# use system-level temp directory for file locks, so that multiple users
+# can share the same lock without error.
+# lock files in the temp directory will be automatically deleted when the
+# system reboots, so users will not complain about annoying lock files
+temp_dir = tempfile.gettempdir()
 
 
 def get_lock(
@@ -169,6 +163,12 @@ def replace_substrings(key: str, substring_mapping: dict[str, str]) -> str:
     return key
 
 
+class DisabledTqdm(tqdm):
+    def __init__(self, *args, **kwargs):
+        kwargs["disable"] = True
+        super().__init__(*args, **kwargs)
+
+
 # TODO(woosuk): Move this to other place.
 def get_quant_config(
     model_config: ModelConfig,
@@ -194,6 +194,7 @@ def get_quant_config(
     if hf_quant_config is not None:
         hf_quant_config["packed_modules_mapping"] = packed_modules_mapping
         return quant_cls.from_config(hf_quant_config)
+
     # In case of bitsandbytes/QLoRA, get quant config from the adapter model.
     if model_config.quantization == "bitsandbytes":
         if (
@@ -204,9 +205,9 @@ def get_quant_config(
         model_name_or_path = load_config.model_loader_extra_config[
             "qlora_adapter_name_or_path"
         ]
-
     else:
         model_name_or_path = model_config.model_path
+
     is_local = os.path.isdir(model_name_or_path)
     if not is_local:
         # Download the config files.
@@ -271,6 +272,54 @@ def get_quant_config(
             elif "FP4" in quant_algo:
                 return ModelOptFp4Config.from_config(config)
         return quant_cls.from_config(config)
+
+
+def _check_index_files_exist(snapshot_dir: str) -> Tuple[bool, Optional[str]]:
+    """
+    Check if all files listed in safetensors index files actually exist on disk.
+
+    This catches cases where the snapshot directory exists but files are missing
+    (e.g., due to incomplete downloads or corrupted cache).
+
+    Args:
+        snapshot_dir: Path to the model snapshot directory
+
+    Returns:
+        Tuple of (all_exist, error_message)
+    """
+    index_files = [
+        f for f in os.listdir(snapshot_dir) if f.endswith(".safetensors.index.json")
+    ]
+
+    if not index_files:
+        return True, None  # Not a sharded model
+
+    for index_file in index_files:
+        index_path = os.path.join(snapshot_dir, index_file)
+        if not os.path.exists(index_path):
+            continue
+        try:
+            with open(index_path) as f:
+                weight_map = json.load(f).get("weight_map", {})
+            if not weight_map:
+                continue
+            required_files = set(weight_map.values())
+            missing_files = [
+                fn
+                for fn in required_files
+                if not os.path.exists(os.path.join(snapshot_dir, fn))
+            ]
+            if missing_files:
+                return (
+                    False,
+                    f"Missing {len(missing_files)} file(s) from index {index_file}: "
+                    f"{missing_files[:3]}{'...' if len(missing_files) > 3 else ''}",
+                )
+        except Exception as e:
+            logger.warning("Failed to read index file %s: %s", index_file, e)
+            continue
+
+    return True, None
 
 
 def _find_local_hf_snapshot_dir_unlocked(
@@ -354,13 +403,21 @@ def _find_local_hf_snapshot_dir_unlocked(
         )
         local_weight_files = []
 
+    # Check for missing files from index (lightweight, for all users)
+    # This catches incomplete downloads before they cause cryptic load errors
+    if local_weight_files:
+        is_complete, error_msg = _check_index_files_exist(found_local_snapshot_dir)
+        if not is_complete:
+            log_info_on_rank0(
+                logger,
+                f"Local snapshot incomplete for {model_name_or_path}: {error_msg}. "
+                f"Will download missing files.",
+            )
+            return None  # Triggers snapshot_download() which handles partial downloads
+
     # Only perform cache validation and cleanup in CI to avoid
     # unnecessary overhead for regular users
     if is_in_ci() and local_weight_files:
-        from sglang.srt.model_loader.ci_weight_validation import (
-            ci_validate_and_cleanup_local_snapshot,
-        )
-
         is_valid = ci_validate_and_cleanup_local_snapshot(
             model_name_or_path, found_local_snapshot_dir, local_weight_files
         )
@@ -443,23 +500,10 @@ def download_weights_from_hf(
                     allow_patterns = [pattern]
                     break
 
-        # Only perform validation and retry in CI to avoid overhead for regular users
-        if is_in_ci():
-            from sglang.srt.model_loader.ci_weight_validation import (
-                ci_download_with_validation_and_retry,
-            )
+        log_info_on_rank0(logger, f"Using model weights format {allow_patterns}")
 
-            return ci_download_with_validation_and_retry(
-                model_name_or_path=model_name_or_path,
-                allow_patterns=allow_patterns,
-                ignore_patterns=ignore_patterns,
-                cache_dir=cache_dir,
-                revision=revision,
-                max_retries=max_retries,
-            )
-        else:
+        if not is_in_ci():
             # Simple download without validation for non-CI environments
-            log_info_on_rank0(logger, f"Using model weights format {allow_patterns}")
             hf_folder = snapshot_download(
                 model_name_or_path,
                 allow_patterns=allow_patterns,
@@ -470,6 +514,16 @@ def download_weights_from_hf(
                 local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
             )
             return hf_folder
+        else:
+            # Only perform validation and retry in CI to avoid overhead for regular users
+            return ci_download_with_validation_and_retry(
+                model_name_or_path=model_name_or_path,
+                allow_patterns=allow_patterns,
+                ignore_patterns=ignore_patterns,
+                cache_dir=cache_dir,
+                revision=revision,
+                max_retries=max_retries,
+            )
 
 
 def download_safetensors_index_file_from_hf(
@@ -559,13 +613,6 @@ def filter_files_not_needed_for_inference(hf_weights_files: List[str]) -> List[s
     return hf_weights_files
 
 
-# explicitly use pure text format, with a newline at the end
-# this makes it impossible to see the animation in the progress bar
-# but will avoid messing up with ray or multiprocessing, which wraps
-# each line of output with some prefix.
-_BAR_FORMAT = "{desc}: {percentage:3.0f}% Completed | {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]\n"  # noqa: E501
-
-
 def np_cache_weights_iterator(
     model_name_or_path: str,
     cache_dir: Optional[str],
@@ -593,7 +640,8 @@ def np_cache_weights_iterator(
                 hf_weights_files,
                 desc="Loading np_cache checkpoint shards",
                 disable=not enable_tqdm,
-                bar_format=_BAR_FORMAT,
+                bar_format=BAR_FORMAT,
+                position=tqdm._get_free_pos(),
             ):
                 state = torch.load(bin_file, map_location="cpu", weights_only=True)
                 for name, param in state.items():
@@ -650,7 +698,8 @@ def safetensors_weights_iterator(
         hf_weights_files,
         desc="Loading safetensors checkpoint shards",
         disable=not enable_tqdm,
-        bar_format=_BAR_FORMAT,
+        bar_format=BAR_FORMAT,
+        position=tqdm._get_free_pos(),
     ):
         if disable_mmap:
             with open(st_file, "rb") as f:
@@ -762,7 +811,7 @@ def multi_thread_safetensors_weights_iterator(
                 total=len(hf_weights_files),
                 desc="Multi-thread loading shards",
                 disable=not enable_tqdm,
-                bar_format=_BAR_FORMAT,
+                bar_format=BAR_FORMAT,
             )
         else:
             futures_iter = concurrent.futures.as_completed(futures)
@@ -771,6 +820,26 @@ def multi_thread_safetensors_weights_iterator(
             state_dict = future.result()
             for name, param in state_dict.items():
                 yield name, param
+
+
+def _load_pt_file(bin_file: str) -> dict:
+    """Load a PyTorch checkpoint file, handling legacy tar format.
+
+    PyTorch 2.6 changed the default of weights_only from False to True.
+    Legacy tar format files cannot be loaded with weights_only=True.
+    This function tries weights_only=True first, then falls back to False
+    for legacy tar format files from trusted sources (HuggingFace Hub).
+    """
+    try:
+        return torch.load(bin_file, map_location="cpu", weights_only=True)
+    except RuntimeError as e:
+        if "legacy .tar format" in str(e):
+            logger.warning(
+                "Loading %s with weights_only=False (legacy tar format)",
+                os.path.basename(bin_file),
+            )
+            return torch.load(bin_file, map_location="cpu", weights_only=False)
+        raise
 
 
 def pt_weights_iterator(
@@ -784,9 +853,10 @@ def pt_weights_iterator(
         hf_weights_files,
         desc="Loading pt checkpoint shards",
         disable=not enable_tqdm,
-        bar_format=_BAR_FORMAT,
+        bar_format=BAR_FORMAT,
+        position=tqdm._get_free_pos(),
     ):
-        state = torch.load(bin_file, map_location="cpu", weights_only=True)
+        state = _load_pt_file(bin_file)
         yield from state.items()
         del state
 
@@ -800,12 +870,9 @@ def multi_thread_pt_weights_iterator(
         not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
     )
 
-    def _load_file(bin_file: str):
-        return torch.load(bin_file, map_location="cpu", weights_only=True)
-
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [
-            executor.submit(_load_file, bin_file) for bin_file in hf_weights_files
+            executor.submit(_load_pt_file, bin_file) for bin_file in hf_weights_files
         ]
 
         if enable_tqdm:
@@ -814,7 +881,7 @@ def multi_thread_pt_weights_iterator(
                 total=len(hf_weights_files),
                 desc="Multi-thread loading pt checkpoint shards",
                 disable=not enable_tqdm,
-                bar_format=_BAR_FORMAT,
+                bar_format=BAR_FORMAT,
             )
         else:
             futures_iter = concurrent.futures.as_completed(futures)
@@ -967,7 +1034,8 @@ def runai_safetensors_weights_iterator(
             hf_weights_files,
             desc="Loading safetensors using Runai Model Streamer",
             disable=not enable_tqdm,
-            bar_format=_BAR_FORMAT,
+            bar_format=BAR_FORMAT,
+            position=tqdm._get_free_pos(),
         ):
             streamer.stream_file(st_file)
             yield from streamer.get_tensors()

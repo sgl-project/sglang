@@ -7,12 +7,12 @@ from sglang.test.run_combined_tests import run_combined_tests
 from sglang.test.test_utils import ModelLaunchSettings
 
 # Runs on both H200 and B200 via nightly-8-gpu-common suite
-register_cuda_ci(est_time=12000, suite="nightly-8-gpu-common", nightly=True)
+register_cuda_ci(est_time=1800, suite="nightly-8-gpu-common", nightly=True)
 
 GLM_4_6_MODEL_PATH = "zai-org/GLM-4.6"
 
 
-class TestGLM46Unified(unittest.TestCase):
+class TestGLM46(unittest.TestCase):
     """Unified test class for GLM-4.6 performance and accuracy.
 
     Single variant with simple TP=8 configuration.
@@ -34,6 +34,7 @@ class TestGLM46Unified(unittest.TestCase):
                 GLM_4_6_MODEL_PATH,
                 tp_size=8,
                 extra_args=base_args,
+                variant="TP8",
             ),
         ]
 

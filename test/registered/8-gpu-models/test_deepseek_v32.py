@@ -6,7 +6,7 @@ from sglang.test.performance_test_runner import PerformanceTestParams
 from sglang.test.run_combined_tests import run_combined_tests
 from sglang.test.test_utils import ModelLaunchSettings, is_blackwell_system
 
-register_cuda_ci(est_time=18000, suite="nightly-8-gpu-common", nightly=True)
+register_cuda_ci(est_time=5400, suite="nightly-8-gpu-common", nightly=True)
 
 DEEPSEEK_V32_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2"
 
@@ -27,7 +27,7 @@ GSM8K_BASELINE = 0.935
 GPQA_BASELINE = 0.835
 
 
-class TestDeepseekV32Unified(unittest.TestCase):
+class TestDeepseekV32(unittest.TestCase):
     """Unified test class for DeepSeek V3.2 performance and accuracy.
 
     Tests multiple variants with both performance and accuracy tests:
@@ -55,24 +55,28 @@ class TestDeepseekV32Unified(unittest.TestCase):
                 DEEPSEEK_V32_MODEL_PATH,
                 tp_size=8,
                 extra_args=BASE_ARGS + DP_ARGS,
+                variant="DP8",
             ),
             # Variant: "dp+mtp" - DP + EAGLE speculative decoding
             ModelLaunchSettings(
                 DEEPSEEK_V32_MODEL_PATH,
                 tp_size=8,
                 extra_args=BASE_ARGS + DP_ARGS + MTP_ARGS,
+                variant="DP8+MTP",
             ),
             # Variant: "tp" - Pure TP=8 only
             ModelLaunchSettings(
                 DEEPSEEK_V32_MODEL_PATH,
                 tp_size=8,
                 extra_args=BASE_ARGS + TP_ARGS,
+                variant="TP8",
             ),
             # Variant: "tp+mtp" - Pure TP=8 + EAGLE speculative decoding
             ModelLaunchSettings(
                 DEEPSEEK_V32_MODEL_PATH,
                 tp_size=8,
                 extra_args=BASE_ARGS + TP_ARGS + MTP_ARGS,
+                variant="TP8+MTP",
             ),
         ]
 
