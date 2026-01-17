@@ -733,6 +733,9 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         self.num_deepstack_embeddings = len(self.deepstack_visual_indexes)
         self.use_deepstack = {Modality.IMAGE: True, Modality.VIDEO: True}
 
+        # For EAGLE3 support
+        self.capture_aux_hidden_states = False
+
     def separate_deepstack_embeds(self, embedding):
         assert (
             embedding.shape[-1] % (1 + self.num_deepstack_embeddings) == 0
@@ -920,6 +923,10 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             pp_proxy_tensors=pp_proxy_tensors,
         )
 
+        aux_hidden_states = None
+        if self.capture_aux_hidden_states:
+            hidden_states, aux_hidden_states = hidden_states
+
         if self.pp_group.is_last_rank:
             if not get_embedding:
                 return self.logits_processor(
@@ -927,6 +934,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                     hidden_states,
                     self.lm_head,
                     forward_batch,
+                    aux_hidden_states,
                 )
             else:
                 return self.pooler(hidden_states, forward_batch)
@@ -1011,6 +1019,30 @@ class Qwen3VLForConditionalGeneration(nn.Module):
 
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
+
+    def get_embed_and_head(self):
+        return self.model.embed_tokens.weight, self.lm_head.weight
+
+    def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
+        """Configure layers for EAGLE3 auxiliary hidden state capture."""
+        self.capture_aux_hidden_states = True
+        self.model.capture_aux_hidden_states = True
+        # NOTE: there's a +1 offset because sglang captures input to layer (output of previous)
+        if layer_ids is None:
+            # Qwen3VL uses config directly, text_config is only for Qwen3Omni
+            if hasattr(self.config, "text_config") and self.config.text_config is not None:
+                num_layers = self.config.text_config.num_hidden_layers
+            else:
+                num_layers = self.config.num_hidden_layers
+            # Qwen3VL uses deepstack at decoder layers 0, 1, 2
+            # Start at layer 4 to capture output of layer 3 (avoids deepstack timing mismatch)
+            self.model.layers_to_capture = [
+                4,
+                num_layers // 2,
+                num_layers - 3,
+            ]
+        else:
+            self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
 
 EntryClass = Qwen3VLForConditionalGeneration
