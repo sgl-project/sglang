@@ -362,9 +362,9 @@ class DeepseekV2WeightLoaderMixin:
             for future in concurrent.futures.as_completed(futures):
                 future.result()
 
-        self._post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
+        self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
 
-    def _post_load_weights(
+    def post_load_weights(
         self: nn.Module,
         is_nextn: bool = False,
         weight_names: Optional[Iterable[str]] = None,
