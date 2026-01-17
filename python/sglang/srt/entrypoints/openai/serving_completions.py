@@ -118,6 +118,20 @@ class OpenAIServingCompletion(OpenAIServingBase):
             bootstrap_room=request.bootstrap_room,
             data_parallel_rank=request.data_parallel_rank,
             return_hidden_states=request.return_hidden_states,
+            return_attention_tokens=request.return_attention_tokens,
+            top_k_attention=request.top_k_attention,
+            attention_capture_layer_id=request.attention_capture_layer_id,
+            attention_capture_layer_ids=request.attention_capture_layer_ids,
+            attention_sketch_mode=request.attention_sketch_mode,
+            attention_fingerprint_mode=request.attention_fingerprint_mode,
+            attention_fingerprint_only=request.attention_fingerprint_only,
+            attention_mask_prefix=request.attention_mask_prefix,
+            include_prompt_attention=request.include_prompt_attention,
+            attention_capture_head_ids=request.attention_capture_head_ids,
+            attention_biases=self._convert_attention_biases(request.attention_biases),
+            return_moe_routing=request.return_moe_routing,
+            moe_routing_top_k=request.moe_routing_top_k,
+            moe_capture_layer_ids=request.moe_capture_layer_ids,
             rid=request.rid,
             extra_key=self._compute_extra_key(request),
             priority=request.priority,
@@ -127,6 +141,19 @@ class OpenAIServingCompletion(OpenAIServingBase):
         )
 
         return adapted_request, request
+
+    def _convert_attention_biases(
+        self, biases: Optional[Dict[str, Dict[str, float]]]
+    ) -> Optional[Dict[int, Dict[int, float]]]:
+        """Convert string-keyed attention biases from API to int-keyed internal format."""
+        if biases is None:
+            return None
+        return {
+            int(layer_id): {
+                int(token_pos): bias for token_pos, bias in token_biases.items()
+            }
+            for layer_id, token_biases in biases.items()
+        }
 
     def _build_sampling_params(self, request: CompletionRequest) -> Dict[str, Any]:
         """Build sampling parameters for the request"""
@@ -203,6 +230,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
         completion_tokens = {}
         cached_tokens = {}
         hidden_states = {}
+        attention_tokens = {}
 
         try:
             async for content in self.tokenizer_manager.generate_request(
@@ -215,6 +243,9 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 completion_tokens[index] = content["meta_info"]["completion_tokens"]
                 cached_tokens[index] = content["meta_info"].get("cached_tokens", 0)
                 hidden_states[index] = content["meta_info"].get("hidden_states", None)
+                attention_tokens[index] = content["meta_info"].get(
+                    "attention_tokens", None
+                )
 
                 stream_buffer = stream_buffers.get(index, "")
                 # Handle echo for first chunk
@@ -310,6 +341,26 @@ class OpenAIServingCompletion(OpenAIServingBase):
                             model=request.model,
                         )
                         yield f"data: {hidden_states_chunk.model_dump_json()}\n\n"
+
+            # Send attention tokens if requested (for interpretability)
+            if request.return_attention_tokens and attention_tokens:
+                for index, choice_attention_tokens in attention_tokens.items():
+                    if choice_attention_tokens:
+                        attention_tokens_chunk = CompletionStreamResponse(
+                            id=content["meta_info"]["id"],
+                            created=created,
+                            object="text_completion",
+                            choices=[
+                                CompletionResponseStreamChoice(
+                                    index=index,
+                                    text="",
+                                    attention_tokens=choice_attention_tokens,
+                                    finish_reason=None,
+                                )
+                            ],
+                            model=request.model,
+                        )
+                        yield f"data: {attention_tokens_chunk.model_dump_json()}\n\n"
 
             # Handle final usage chunk
             if request.stream_options and request.stream_options.include_usage:
@@ -410,6 +461,11 @@ class OpenAIServingCompletion(OpenAIServingBase):
             # Handle hidden states
             hidden_states = process_hidden_states_from_ret(ret_item, request)
 
+            # Handle attention tokens (interpretability)
+            attention_tokens = None
+            if request.return_attention_tokens:
+                attention_tokens = ret_item["meta_info"].get("attention_tokens")
+
             finish_reason = ret_item["meta_info"]["finish_reason"]
 
             choice_data = CompletionResponseChoice(
@@ -423,6 +479,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                     else None
                 ),
                 hidden_states=hidden_states,
+                attention_tokens=attention_tokens,
             )
             choices.append(choice_data)
 

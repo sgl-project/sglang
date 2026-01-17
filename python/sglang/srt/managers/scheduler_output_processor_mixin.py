@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import logging
+import math
 import time
-from typing import TYPE_CHECKING, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import torch
 
@@ -36,6 +37,326 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 DEFAULT_FORCE_STREAM_INTERVAL = 50
+
+# Sketch configuration
+SKETCH_TOP_HUBS_K = 32  # Number of top positions to track by attention mass
+SKETCH_DIST_BINS = 16  # Number of bins for distance histogram (log scale)
+SKETCH_DIST_MAX = 20  # Max log2 distance for binning (covers 1M+ tokens)
+
+# Fingerprint configuration (matches client-side types.ts)
+FINGERPRINT_HISTOGRAM_BINS = 16
+FINGERPRINT_LOCAL_THRESHOLD = 16  # Tokens within 16 = local
+FINGERPRINT_MID_THRESHOLD = 256  # Tokens within 256 = mid-range
+
+
+def compute_fingerprint_from_raw(
+    token_positions: List[int],
+    attention_scores: List[float],
+    current_pos: int,
+    layers_data: Optional[Dict[int, Dict]] = None,
+) -> Dict:
+    """
+    Compute a fingerprint from raw attention data (server-side).
+
+    This ensures fingerprints are computed from UNMASKED data before privacy
+    masking is applied. The fingerprint can then be sent to the client alongside
+    masked attention data, preventing the security issue where clients would
+    compute incomplete fingerprints from masked data.
+
+    The fingerprint format matches the client-side extractFingerprint() function
+    in types.ts for consistency.
+
+    Args:
+        token_positions: Top-k attended positions
+        attention_scores: Corresponding attention scores
+        current_pos: Current decode position (for distance calculation)
+        layers_data: Optional multi-layer data for consensus calculation
+
+    Returns:
+        Fingerprint dictionary with histogram, mass metrics, entropy, hubness, consensus
+    """
+    if not token_positions or not attention_scores:
+        return {
+            "histogram": [0.0] * FINGERPRINT_HISTOGRAM_BINS,
+            "local_mass": 0.0,
+            "mid_mass": 0.0,
+            "long_mass": 0.0,
+            "entropy": 0.0,
+            "hubness": 0.0,
+            "consensus": 0.0,
+        }
+
+    # Compute distance histogram (log2-binned) and mass by distance
+    histogram = [0.0] * FINGERPRINT_HISTOGRAM_BINS
+    local_mass = 0.0
+    mid_mass = 0.0
+    long_mass = 0.0
+    total_mass = 0.0
+
+    for pos, score in zip(token_positions, attention_scores):
+        distance = max(0, current_pos - pos)
+        total_mass += score
+
+        # Mass by distance category
+        if distance <= FINGERPRINT_LOCAL_THRESHOLD:
+            local_mass += score
+        elif distance <= FINGERPRINT_MID_THRESHOLD:
+            mid_mass += score
+        else:
+            long_mass += score
+
+        # Log-scale histogram bin
+        bin_idx = min(FINGERPRINT_HISTOGRAM_BINS - 1, int(math.log2(max(1, distance))))
+        histogram[bin_idx] += score
+
+    # Normalize
+    if total_mass > 0:
+        local_mass /= total_mass
+        mid_mass /= total_mass
+        long_mass /= total_mass
+        histogram = [h / total_mass for h in histogram]
+
+    # Compute entropy from score distribution
+    entropy = 0.0
+    for score in attention_scores:
+        if score > 0 and total_mass > 0:
+            p = score / total_mass
+            if p > 0:
+                entropy -= p * math.log2(p)
+
+    # Compute hubness (concentration on top positions)
+    sorted_scores = sorted(attention_scores, reverse=True)
+    top3_mass = sum(sorted_scores[:3])
+    hubness = top3_mass / total_mass if total_mass > 0 else 0.0
+
+    # Compute consensus (cross-layer agreement) if multi-layer data available
+    consensus = 0.0
+    if layers_data and len(layers_data) > 1:
+        layer_topk = [
+            set(layer.get("token_positions", [])[:5]) for layer in layers_data.values()
+        ]
+        if len(layer_topk) >= 2:
+            overlaps = 0
+            comparisons = 0
+            for i in range(len(layer_topk)):
+                for j in range(i + 1, len(layer_topk)):
+                    intersection = len(layer_topk[i] & layer_topk[j])
+                    overlaps += intersection / 5.0
+                    comparisons += 1
+            consensus = overlaps / comparisons if comparisons > 0 else 0.0
+
+    return {
+        "histogram": [round(h, 6) for h in histogram],
+        "local_mass": round(local_mass, 4),
+        "mid_mass": round(mid_mass, 4),
+        "long_mass": round(long_mass, 4),
+        "entropy": round(entropy, 4),
+        "hubness": round(hubness, 4),
+        "consensus": round(consensus, 4),
+    }
+
+
+def classify_manifold_zone(fingerprint: Dict) -> str:
+    """
+    Classify the manifold zone based on fingerprint metrics.
+
+    Matches the client-side classifyManifold() function in types.ts.
+
+    Returns one of: syntax_floor, semantic_bridge, long_range, structure_ripple, diffuse
+    """
+    local_mass = fingerprint.get("local_mass", 0)
+    mid_mass = fingerprint.get("mid_mass", 0)
+    long_mass = fingerprint.get("long_mass", 0)
+    fft_low = fingerprint.get("fft_low")
+
+    if local_mass > 0.5:
+        return "syntax_floor"
+    if mid_mass > 0.5:
+        return "semantic_bridge"
+    if long_mass > 0.5:
+        return "long_range"
+    if fft_low is not None and fft_low > 0.6:
+        return "structure_ripple"
+    return "diffuse"
+
+
+def apply_attention_privacy_mask(
+    token_positions: List[int],
+    attention_scores: List[float],
+    mask_prefix: int,
+    topk_logits: Optional[List[float]] = None,
+) -> Tuple[List[int], List[float], Optional[List[float]]]:
+    """
+    Apply privacy mask to attention data.
+
+    Filters out attention to positions < mask_prefix (e.g., system prompt tokens).
+    This prevents leaking system prompt structure/length through attention patterns.
+
+    Args:
+        token_positions: List of attended token positions
+        attention_scores: Corresponding attention scores
+        mask_prefix: Number of prefix tokens to mask (positions < this are hidden)
+        topk_logits: Optional raw logits (masked in parallel)
+
+    Returns:
+        Tuple of (masked_positions, masked_scores, masked_logits)
+        Positions are offset by mask_prefix so masked region appears as position 0.
+    """
+    if mask_prefix <= 0:
+        return token_positions, attention_scores, topk_logits
+
+    masked_positions = []
+    masked_scores = []
+    masked_logits = [] if topk_logits is not None else None
+
+    for i, pos in enumerate(token_positions):
+        if pos >= mask_prefix:
+            # Offset position so system prompt region is hidden
+            masked_positions.append(pos - mask_prefix)
+            masked_scores.append(
+                attention_scores[i] if i < len(attention_scores) else 0.0
+            )
+            if masked_logits is not None and topk_logits is not None:
+                masked_logits.append(topk_logits[i] if i < len(topk_logits) else 0.0)
+
+    return masked_positions, masked_scores, masked_logits
+
+
+def compute_attention_sketch(
+    token_positions: List[int],
+    attention_scores: List[float],
+    topk_logits: Optional[List[float]],
+    logsumexp: Optional[float],
+    current_pos: int,
+) -> Dict:
+    """
+    Compute a compact sketch from attention data for a single decode step.
+
+    The sketch contains:
+    - top_hubs: List of (position, score) for highest-attention positions
+    - dist_hist: Log-distance histogram showing attention distribution
+    - entropy: Estimated attention entropy
+    - mass_captured: Total probability mass captured by top-k
+
+    This is bandwidth-efficient: ~500 bytes per layer vs ~200 bytes per top-k position.
+    For long outputs (86k+ tokens), sketch mode saves 100x+ bandwidth.
+
+    Args:
+        token_positions: Top-k attended positions
+        attention_scores: Softmax scores (normalized over top-k only)
+        topk_logits: Raw attention logits (for true probability calculation)
+        logsumexp: Logsumexp over all tokens (for true probability)
+        current_pos: Current decode position (for distance calculation)
+
+    Returns:
+        Sketch dictionary with top_hubs, dist_hist, entropy, mass_captured
+    """
+    if not token_positions or not attention_scores:
+        return {
+            "top_hubs": [],
+            "dist_hist": [0.0] * SKETCH_DIST_BINS,
+            "entropy": 0.0,
+            "mass_captured": 0.0,
+        }
+
+    # Compute true probabilities if logsumexp is available
+    if topk_logits is not None and logsumexp is not None:
+        true_probs = [math.exp(logit - logsumexp) for logit in topk_logits]
+        mass_captured = sum(true_probs)
+    else:
+        # Fall back to top-k normalized scores
+        true_probs = attention_scores
+        mass_captured = 1.0  # By definition for softmax-normalized scores
+
+    # Top hubs: positions with highest attention scores
+    # Keep as (position, score) pairs for hub tracking across steps
+    hub_pairs = list(zip(token_positions, true_probs))
+    hub_pairs.sort(key=lambda x: -x[1])
+    top_hubs = hub_pairs[:SKETCH_TOP_HUBS_K]
+
+    # Distance histogram: bin attention mass by log2(distance)
+    # Bin i covers distances [2^i, 2^(i+1))
+    # Bin 0 is special: covers distance 0 (self-attention) and 1
+    dist_hist = [0.0] * SKETCH_DIST_BINS
+    for pos, prob in zip(token_positions, true_probs):
+        dist = current_pos - pos
+        if dist <= 0:
+            # Self or future attention (shouldn't happen in causal, but handle it)
+            bin_idx = 0
+        elif dist == 1:
+            bin_idx = 0
+        else:
+            # log2(dist), clamped to valid bin range
+            bin_idx = min(int(math.log2(dist)), SKETCH_DIST_BINS - 1)
+        dist_hist[bin_idx] += prob
+
+    # Entropy estimate from top-k probabilities
+    # This is a lower bound since we're missing the tail
+    entropy = 0.0
+    for prob in true_probs:
+        if prob > 1e-10:
+            entropy -= prob * math.log2(prob)
+
+    return {
+        "top_hubs": [(pos, round(score, 6)) for pos, score in top_hubs],
+        "dist_hist": [round(x, 6) for x in dist_hist],
+        "entropy": round(entropy, 4),
+        "mass_captured": round(mass_captured, 4),
+    }
+
+
+def merge_sketches(sketches: List[Dict]) -> Dict:
+    """
+    Merge multiple sketches into an aggregate summary.
+
+    This is useful for:
+    - Aggregating across decode steps (server-side before streaming)
+    - Aggregating across layers (cross-layer hub analysis)
+
+    Args:
+        sketches: List of sketch dictionaries
+
+    Returns:
+        Merged sketch with aggregated statistics
+    """
+    if not sketches:
+        return {
+            "top_hubs": [],
+            "dist_hist": [0.0] * SKETCH_DIST_BINS,
+            "avg_entropy": 0.0,
+            "avg_mass_captured": 0.0,
+            "num_steps": 0,
+        }
+
+    # Aggregate hub scores across all steps
+    hub_scores: Dict[int, float] = {}
+    for sketch in sketches:
+        for pos, score in sketch.get("top_hubs", []):
+            hub_scores[pos] = hub_scores.get(pos, 0.0) + score
+
+    # Get top hubs by cumulative score
+    top_hubs = sorted(hub_scores.items(), key=lambda x: -x[1])[:SKETCH_TOP_HUBS_K]
+
+    # Aggregate distance histograms (average)
+    dist_hist = [0.0] * SKETCH_DIST_BINS
+    for sketch in sketches:
+        for i, val in enumerate(sketch.get("dist_hist", [])):
+            if i < SKETCH_DIST_BINS:
+                dist_hist[i] += val
+    n = len(sketches)
+    dist_hist = [round(x / n, 6) for x in dist_hist]
+
+    # Average entropy and mass
+    avg_entropy = sum(s.get("entropy", 0.0) for s in sketches) / n
+    avg_mass = sum(s.get("mass_captured", 0.0) for s in sketches) / n
+
+    return {
+        "top_hubs": [(pos, round(score, 6)) for pos, score in top_hubs],
+        "dist_hist": dist_hist,
+        "avg_entropy": round(avg_entropy, 4),
+        "avg_mass_captured": round(avg_mass, 4),
+        "num_steps": n,
+    }
 
 
 class SchedulerOutputProcessorMixin:
@@ -368,6 +689,16 @@ class SchedulerOutputProcessorMixin:
             result.can_run_cuda_graph,
         )
 
+        # Pre-transfer fingerprint tensors to CPU (bulk transfer optimization)
+        # This avoids N separate GPU->CPU transfers in the per-request loop
+        fingerprints_cpu = None
+        if (
+            getattr(self.server_args, "attention_fingerprint_mode", False)
+            and logits_output is not None
+            and logits_output.attention_fingerprint is not None
+        ):
+            fingerprints_cpu = logits_output.attention_fingerprint.cpu()
+
         if batch.spec_algorithm.is_none():
             next_token_ids = next_token_ids.tolist()
             if batch.return_logprob:
@@ -406,6 +737,27 @@ class SchedulerOutputProcessorMixin:
 
             # Update Mamba last track seqlen
             self._mamba_prefix_cache_update(req, batch, result, i)
+
+            # Track think phase transitions for attention segmentation
+            # Detects <think> and </think> tokens to segment attention data
+            if (
+                req.return_attention_tokens
+                and hasattr(self, "tokenizer")
+                and self.tokenizer
+            ):
+                think_start_id = getattr(self.tokenizer, "think_start_id", None)
+                think_end_id = getattr(self.tokenizer, "think_end_id", None)
+
+                # Handle single token or list of tokens (speculative decoding)
+                tokens_to_check = (
+                    [next_token_id] if isinstance(next_token_id, int) else next_token_id
+                )
+                for tok in tokens_to_check:
+                    if think_start_id is not None and tok == think_start_id:
+                        req.attention_think_phase = "think"
+                    elif think_end_id is not None and tok == think_end_id:
+                        req.attention_think_phase = "output"
+                        req.attention_think_boundary = req.attention_tokens_decode_step
 
             req.check_finished(new_accepted_len)
 
@@ -446,6 +798,490 @@ class SchedulerOutputProcessorMixin:
                 req.hidden_states.append(
                     logits_output.hidden_states[i].cpu().clone().tolist()
                 )
+
+            # Process attention token info for interpretability
+            # Three modes:
+            # 1. Debug Mode: Export raw indices/scores (for visualization)
+            # 2. Fingerprint Mode: Stream 20D feature vector to sidecar (production)
+            # 3. Sketch Mode: Per-layer summaries (top_hubs, dist_hist, entropy) for long outputs
+            #
+            # COMPUTE-GATED STRIDE: The stride/max check is done BEFORE GPU compute
+            # in schedule_batch.py. If we have results here, we should always store them.
+            # The step counter is always incremented to track decode progress.
+            fingerprint_mode = getattr(
+                self.server_args, "attention_fingerprint_mode", False
+            )
+            sketch_mode = getattr(self.server_args, "attention_sketch_mode", False)
+
+            # Always increment step counter for attention-enabled requests
+            # This ensures stride calculation is correct even when we skip compute
+            if req.return_attention_tokens:
+                req.attention_tokens_decode_step += 1
+
+            if fingerprint_mode and fingerprints_cpu is not None:
+                # FINGERPRINT MODE: Stream compressed fingerprint to sidecar
+                # This is the production path - 64 bytes vs ~200KB per step
+                if req.return_attention_tokens:
+                    # Store fingerprint info (much smaller than raw indices)
+                    # Use pre-transferred CPU tensor (bulk transfer optimization)
+                    fingerprint_info = {
+                        "schema_version": 1,  # Version for UI compatibility
+                        "mode": "fingerprint",
+                        "fingerprint": fingerprints_cpu[i].tolist(),
+                        "manifold": (
+                            logits_output.attention_manifold[i]
+                            if logits_output.attention_manifold
+                            else "unknown"
+                        ),
+                        "step": req.attention_tokens_decode_step,
+                        "think_phase": req.attention_think_phase,
+                    }
+
+                    # Add MoE telemetry if available (for hybrid models like Qwen3-Next)
+                    if logits_output.moe_routing_buffer:
+                        moe_telemetry = self._compute_moe_telemetry(
+                            logits_output.moe_routing_buffer, i, req
+                        )
+                        if moe_telemetry:
+                            fingerprint_info["moe"] = moe_telemetry
+
+                    # Stream to sidecar if configured
+                    sidecar_url = getattr(self.server_args, "attention_sidecar_url", "")
+                    if sidecar_url:
+                        self._stream_fingerprint_to_sidecar(
+                            request_id=req.rid,
+                            fingerprint=fingerprint_info["fingerprint"],
+                            manifold=fingerprint_info["manifold"],
+                            moe_telemetry=fingerprint_info.get("moe"),
+                        )
+
+                    # Also store locally for API response (optional, for debugging)
+                    req.attention_tokens.append(fingerprint_info)
+
+            elif (
+                (sketch_mode or getattr(req, "attention_sketch_mode", False))
+                and req.return_attention_tokens
+                and logits_output.attention_token_positions is not None
+            ):
+                # SKETCH MODE: Per-layer summary sketches for bandwidth efficiency
+                # Can be enabled server-wide (--attention-sketch-mode) or per-request
+                # Computes top_hubs, dist_hist, entropy per layer
+                # ~500 bytes per layer vs ~200KB for raw edges
+                req_top_k = getattr(req, "top_k_attention", 5)
+                current_pos = len(req.origin_input_ids) + len(req.output_ids) - 1
+
+                # Privacy mask for sketch mode
+                sketch_mask_prefix = getattr(req, "attention_mask_prefix", None)
+                if sketch_mask_prefix is None:
+                    sketch_mask_prefix = getattr(batch, "attention_mask_prefix", 0)
+                if sketch_mask_prefix is None:
+                    sketch_mask_prefix = 0
+
+                if logits_output.attention_multi_layer:
+                    # Multi-layer: compute sketch for each layer
+                    layer_sketches = {}
+                    for layer_id, (
+                        positions,
+                        scores,
+                        logits,
+                        logsumexp,
+                    ) in logits_output.attention_multi_layer.items():
+                        pos_list = positions[i].cpu().tolist()[:req_top_k]
+                        score_list = scores[i].cpu().tolist()[:req_top_k]
+                        logit_list = (
+                            logits[i].cpu().tolist()[:req_top_k]
+                            if logits is not None
+                            else None
+                        )
+                        lse_val = (
+                            logsumexp[i].cpu().item() if logsumexp is not None else None
+                        )
+
+                        # Apply privacy mask
+                        if sketch_mask_prefix > 0:
+                            pos_list, score_list, logit_list = (
+                                apply_attention_privacy_mask(
+                                    pos_list, score_list, sketch_mask_prefix, logit_list
+                                )
+                            )
+                            # Adjust current_pos for distance calculations
+                            adjusted_current_pos = current_pos - sketch_mask_prefix
+                        else:
+                            adjusted_current_pos = current_pos
+
+                        layer_sketches[layer_id] = compute_attention_sketch(
+                            pos_list,
+                            score_list,
+                            logit_list,
+                            lse_val,
+                            adjusted_current_pos,
+                        )
+
+                    attention_info = {
+                        "schema_version": 1,
+                        "mode": "sketch",
+                        "layer_sketches": layer_sketches,
+                        "decode_step": req.attention_tokens_decode_step,
+                        "think_phase": req.attention_think_phase,
+                    }
+                else:
+                    # Single layer: compute one sketch
+                    pos_list = (
+                        logits_output.attention_token_positions[i]
+                        .cpu()
+                        .tolist()[:req_top_k]
+                    )
+                    score_list = (
+                        logits_output.attention_token_scores[i]
+                        .cpu()
+                        .tolist()[:req_top_k]
+                    )
+                    logit_list = (
+                        logits_output.attention_topk_logits[i]
+                        .cpu()
+                        .tolist()[:req_top_k]
+                        if logits_output.attention_topk_logits is not None
+                        else None
+                    )
+                    lse_val = (
+                        logits_output.attention_logsumexp_candidates[i].cpu().item()
+                        if logits_output.attention_logsumexp_candidates is not None
+                        else None
+                    )
+
+                    # Apply privacy mask
+                    if sketch_mask_prefix > 0:
+                        pos_list, score_list, logit_list = apply_attention_privacy_mask(
+                            pos_list, score_list, sketch_mask_prefix, logit_list
+                        )
+                        adjusted_current_pos = current_pos - sketch_mask_prefix
+                    else:
+                        adjusted_current_pos = current_pos
+
+                    sketch = compute_attention_sketch(
+                        pos_list, score_list, logit_list, lse_val, adjusted_current_pos
+                    )
+                    attention_info = {
+                        "schema_version": 1,
+                        "mode": "sketch",
+                        "sketch": sketch,
+                        "layer_id": getattr(logits_output, "attention_layer_id", -1),
+                        "decode_step": req.attention_tokens_decode_step,
+                        "think_phase": req.attention_think_phase,
+                    }
+
+                req.attention_tokens.append(attention_info)
+
+            elif (
+                req.return_attention_tokens
+                and logits_output.attention_token_positions is not None
+            ):
+                # DEBUG MODE: Export raw indices/scores
+                # WARNING: This is bandwidth-intensive, use fingerprint mode for production
+                #
+                # NOTE: Stride/max gating is done upstream in schedule_batch.py (compute-gated stride).
+                # If we have results here, it means we passed the stride/max check, so always store.
+
+                # Slice to this request's actual top_k (batch may use max across requests)
+                req_top_k = getattr(req, "top_k_attention", 5)
+
+                # Privacy mask: hide attention to system prompt tokens
+                # Priority: per-request > batch default > server default
+                mask_prefix = getattr(req, "attention_mask_prefix", None)
+                if mask_prefix is None:
+                    mask_prefix = getattr(batch, "attention_mask_prefix", 0)
+                if mask_prefix is None:
+                    mask_prefix = 0
+
+                # SECURITY: Fingerprint-only mode (never send raw positions/scores to client)
+                # Auto-enabled when mask_prefix > 0 to prevent privacy leakage
+                fingerprint_only = getattr(req, "attention_fingerprint_only", None)
+                if fingerprint_only is None:
+                    # Auto-enable secure mode when privacy masking is active
+                    fingerprint_only = mask_prefix > 0
+
+                # Current position for distance calculations
+                current_pos = len(req.origin_input_ids) + len(req.output_ids) - 1
+
+                # Check for multi-layer attention data
+                if logits_output.attention_multi_layer:
+                    # Multi-layer capture: create entry with all layers
+                    layers_data = {}
+
+                    # First pass: extract UNMASKED data for fingerprint computation
+                    # This ensures fingerprints are computed from complete data before privacy masking
+                    unmasked_layers_data = {}
+                    for layer_id, (
+                        positions,
+                        scores,
+                        logits,
+                        logsumexp,
+                    ) in logits_output.attention_multi_layer.items():
+                        unmasked_pos = positions[i].cpu().tolist()[:req_top_k]
+                        unmasked_scores = scores[i].cpu().tolist()[:req_top_k]
+                        unmasked_layers_data[layer_id] = {
+                            "token_positions": unmasked_pos,
+                            "attention_scores": unmasked_scores,
+                        }
+
+                    # Compute fingerprint from UNMASKED data (security fix)
+                    # Use last layer positions/scores for main fingerprint
+                    last_layer_id = max(unmasked_layers_data.keys())
+                    last_layer_data = unmasked_layers_data[last_layer_id]
+                    server_fingerprint = compute_fingerprint_from_raw(
+                        last_layer_data["token_positions"],
+                        last_layer_data["attention_scores"],
+                        current_pos,
+                        unmasked_layers_data,
+                    )
+                    manifold_zone = classify_manifold_zone(server_fingerprint)
+
+                    # Second pass: apply privacy mask and build response
+                    for layer_id, (
+                        positions,
+                        scores,
+                        logits,
+                        logsumexp,
+                    ) in logits_output.attention_multi_layer.items():
+                        pos_list = positions[i].cpu().tolist()[:req_top_k]
+                        score_list = scores[i].cpu().tolist()[:req_top_k]
+                        logit_list = (
+                            logits[i].cpu().tolist()[:req_top_k]
+                            if logits is not None
+                            else None
+                        )
+
+                        # Apply privacy mask
+                        if mask_prefix > 0:
+                            pos_list, score_list, logit_list = (
+                                apply_attention_privacy_mask(
+                                    pos_list, score_list, mask_prefix, logit_list
+                                )
+                            )
+
+                        layer_entry = {
+                            "token_positions": pos_list,
+                            "attention_scores": score_list,
+                        }
+                        if logit_list is not None:
+                            layer_entry["topk_logits"] = logit_list
+                        if logsumexp is not None:
+                            lse_val = logsumexp[i].cpu().item()
+                            layer_entry["logsumexp_candidates"] = lse_val
+                            # Compute topk_mass: fraction of attention captured by top-k
+                            # topk_mass = sum(exp(logit - logsumexp)) for each top-k entry
+                            # Vectorized computation for efficiency
+                            if logits is not None:
+                                logits_tensor = logits[i][:req_top_k]
+                                topk_mass = (
+                                    torch.exp(logits_tensor - lse_val)
+                                    .sum()
+                                    .clamp(max=1.0)
+                                    .item()
+                                )
+                                layer_entry["topk_mass"] = topk_mass
+                        layers_data[layer_id] = layer_entry
+
+                    # SECURITY: In fingerprint_only mode, only return fingerprint (no raw data)
+                    if fingerprint_only:
+                        attention_info = {
+                            "schema_version": 1,
+                            "mode": "fingerprint_only",
+                            "layer_id": getattr(
+                                logits_output, "attention_layer_id", -1
+                            ),
+                            # Server-side fingerprint (computed from unmasked data)
+                            "fingerprint": server_fingerprint,
+                            "manifold_zone": manifold_zone,
+                        }
+                    else:
+                        attention_info = {
+                            "schema_version": 1,
+                            "mode": "raw",
+                            "layers": layers_data,
+                            # Also include last layer at top level for backward compatibility
+                            "layer_id": getattr(
+                                logits_output, "attention_layer_id", -1
+                            ),
+                            # Server-side fingerprint (computed from unmasked data)
+                            "fingerprint": server_fingerprint,
+                            "manifold_zone": manifold_zone,
+                        }
+                        # Copy last layer data to top level for backward compatibility
+                        if logits_output.attention_token_positions is not None:
+                            top_pos = (
+                                logits_output.attention_token_positions[i]
+                                .cpu()
+                                .tolist()[:req_top_k]
+                            )
+                            top_scores = (
+                                logits_output.attention_token_scores[i]
+                                .cpu()
+                                .tolist()[:req_top_k]
+                            )
+                            top_logits = (
+                                logits_output.attention_topk_logits[i]
+                                .cpu()
+                                .tolist()[:req_top_k]
+                                if logits_output.attention_topk_logits is not None
+                                else None
+                            )
+                            # Apply privacy mask to top-level data
+                            if mask_prefix > 0:
+                                top_pos, top_scores, top_logits = (
+                                    apply_attention_privacy_mask(
+                                        top_pos, top_scores, mask_prefix, top_logits
+                                    )
+                                )
+                            attention_info["token_positions"] = top_pos
+                            attention_info["attention_scores"] = top_scores
+                            if top_logits is not None:
+                                attention_info["topk_logits"] = top_logits
+                        if logits_output.attention_logsumexp_candidates is not None:
+                            lse_val = (
+                                logits_output.attention_logsumexp_candidates[i]
+                                .cpu()
+                                .item()
+                            )
+                            attention_info["logsumexp_candidates"] = lse_val
+                            # Compute topk_mass for top-level (backward compat)
+                            # Use vectorized torch ops (not Python loop)
+                            if logits_output.attention_topk_logits is not None:
+                                logits_tensor = logits_output.attention_topk_logits[i][
+                                    :req_top_k
+                                ]
+                                topk_mass = (
+                                    torch.exp(logits_tensor - lse_val)
+                                    .sum()
+                                    .clamp(max=1.0)
+                                    .item()
+                                )
+                                attention_info["topk_mass"] = topk_mass
+                else:
+                    # Single-layer capture (backward compatible format)
+                    # First extract UNMASKED data for fingerprint computation
+                    unmasked_pos = (
+                        logits_output.attention_token_positions[i]
+                        .cpu()
+                        .tolist()[:req_top_k]
+                    )
+                    unmasked_scores = (
+                        logits_output.attention_token_scores[i]
+                        .cpu()
+                        .tolist()[:req_top_k]
+                    )
+
+                    # Compute fingerprint from UNMASKED data (security fix)
+                    server_fingerprint = compute_fingerprint_from_raw(
+                        unmasked_pos,
+                        unmasked_scores,
+                        current_pos,
+                        None,  # No multi-layer data for consensus
+                    )
+                    manifold_zone = classify_manifold_zone(server_fingerprint)
+
+                    # SECURITY: In fingerprint_only mode, only return fingerprint (no raw data)
+                    if fingerprint_only:
+                        attention_info = {
+                            "schema_version": 1,
+                            "mode": "fingerprint_only",
+                            "layer_id": getattr(
+                                logits_output, "attention_layer_id", -1
+                            ),
+                            # Server-side fingerprint (computed from unmasked data)
+                            "fingerprint": server_fingerprint,
+                            "manifold_zone": manifold_zone,
+                        }
+                    else:
+                        # Now apply privacy mask if needed
+                        single_pos = unmasked_pos
+                        single_scores = unmasked_scores
+                        single_logits = (
+                            logits_output.attention_topk_logits[i]
+                            .cpu()
+                            .tolist()[:req_top_k]
+                            if logits_output.attention_topk_logits is not None
+                            else None
+                        )
+
+                        # Apply privacy mask
+                        if mask_prefix > 0:
+                            single_pos, single_scores, single_logits = (
+                                apply_attention_privacy_mask(
+                                    single_pos,
+                                    single_scores,
+                                    mask_prefix,
+                                    single_logits,
+                                )
+                            )
+
+                        attention_info = {
+                            "schema_version": 1,
+                            "mode": "raw",
+                            "token_positions": single_pos,
+                            "attention_scores": single_scores,
+                            "layer_id": getattr(
+                                logits_output, "attention_layer_id", -1
+                            ),
+                            # Server-side fingerprint (computed from unmasked data)
+                            "fingerprint": server_fingerprint,
+                            "manifold_zone": manifold_zone,
+                        }
+                        # Add true probability info if available
+                        if single_logits is not None:
+                            attention_info["topk_logits"] = single_logits
+                        if logits_output.attention_logsumexp_candidates is not None:
+                            lse_val = (
+                                logits_output.attention_logsumexp_candidates[i]
+                                .cpu()
+                                .item()
+                            )
+                            attention_info["logsumexp_candidates"] = lse_val
+                            # Compute topk_mass: fraction of attention captured by top-k
+                            # Vectorized computation for efficiency
+                            if logits_output.attention_topk_logits is not None:
+                                logits_tensor = logits_output.attention_topk_logits[i][
+                                    :req_top_k
+                                ]
+                                topk_mass = (
+                                    torch.exp(logits_tensor - lse_val)
+                                    .sum()
+                                    .clamp(max=1.0)
+                                    .item()
+                                )
+                                attention_info["topk_mass"] = topk_mass
+
+                # Add decode_step and think phase to the attention info
+                attention_info["decode_step"] = req.attention_tokens_decode_step
+                attention_info["think_phase"] = req.attention_think_phase
+                req.attention_tokens.append(attention_info)
+
+            # Process MoE routing capture
+            if req.return_moe_routing and logits_output.moe_routing_buffer:
+                # Extract routing info for this request (token index i in decode mode)
+                moe_routing_info = {}
+                for (
+                    layer_id,
+                    topk_ids,
+                    topk_weights,
+                ) in logits_output.moe_routing_buffer:
+                    # In decode mode, each token corresponds to one request
+                    # topk_ids: [batch, top_k], topk_weights: [batch, top_k]
+                    if i < topk_ids.shape[0]:
+                        layer_routing = {
+                            "expert_ids": topk_ids[i].tolist(),
+                        }
+                        if topk_weights is not None:
+                            layer_routing["expert_weights"] = topk_weights[i].tolist()
+                        moe_routing_info[layer_id] = layer_routing
+
+                if moe_routing_info:
+                    req.moe_routing.append(
+                        {
+                            "decode_step": len(req.output_ids),
+                            "layers": moe_routing_info,
+                        }
+                    )
 
             if req.grammar is not None:
                 # FIXME: this try-except block is for handling unexpected xgrammar issue.
@@ -854,6 +1690,9 @@ class SchedulerOutputProcessorMixin:
         load = self.get_load()
         output_routed_experts = None
         customized_info = {}
+        output_attention_tokens = None
+        output_moe_routing = None
+        output_logit_lens = None
 
         queue_times = []
         forward_entry_times = []
@@ -1059,6 +1898,21 @@ class SchedulerOutputProcessorMixin:
                             customized_info[k] = []
                         customized_info[k].append(v)
 
+                if req.return_attention_tokens:
+                    if output_attention_tokens is None:
+                        output_attention_tokens = []
+                    output_attention_tokens.append(req.attention_tokens)
+
+                if req.return_moe_routing:
+                    if output_moe_routing is None:
+                        output_moe_routing = []
+                    output_moe_routing.append(req.moe_routing)
+
+                if getattr(req, "return_logit_lens", False):
+                    if output_logit_lens is None:
+                        output_logit_lens = []
+                    output_logit_lens.append(getattr(req, "logit_lens", None))
+
             if (
                 req.finished()
                 and self.attn_tp_rank == 0
@@ -1109,6 +1963,9 @@ class SchedulerOutputProcessorMixin:
                     output_hidden_states=output_hidden_states,
                     output_routed_experts=output_routed_experts,
                     customized_info=customized_info,
+                    output_attention_tokens=output_attention_tokens,
+                    output_moe_routing=output_moe_routing,
+                    output_logit_lens=output_logit_lens,
                     placeholder_tokens_idx=None,
                     placeholder_tokens_val=None,
                     retraction_counts=retraction_counts,
@@ -1168,3 +2025,430 @@ class SchedulerOutputProcessorMixin:
                 retraction_counts=retraction_counts,
             )
         )
+
+    # =========================================================================
+    # ATTENTION FINGERPRINT STREAMING (Production Mode)
+    # =========================================================================
+
+    def _init_fingerprint_publisher(self: "Scheduler"):
+        """
+        Initialize ZMQ publisher for streaming fingerprints to sidecar.
+
+        Called lazily on first use if attention_sidecar_url is configured.
+        """
+        sidecar_url = getattr(self.server_args, "attention_sidecar_url", "")
+        if not sidecar_url:
+            return
+
+        try:
+            import zmq
+
+            self._zmq_context = zmq.Context()
+            self._fingerprint_publisher = self._zmq_context.socket(zmq.PUSH)
+            self._fingerprint_publisher.connect(sidecar_url)
+            self._fingerprint_publisher.setsockopt(zmq.SNDHWM, 1000)  # High water mark
+            self._fingerprint_publisher.setsockopt(
+                zmq.LINGER, 0
+            )  # Don't hang on shutdown
+            logger.info(f"Connected fingerprint publisher to {sidecar_url}")
+        except ImportError:
+            logger.warning("ZMQ not available, fingerprint streaming disabled")
+            self._fingerprint_publisher = None
+        except Exception as e:
+            logger.warning(f"Failed to connect fingerprint publisher: {e}")
+            self._fingerprint_publisher = None
+
+    def _compute_moe_telemetry(
+        self: "Scheduler",
+        moe_routing_buffer: list,
+        batch_idx: int,
+        req,
+    ) -> dict:
+        """
+        Compute MoE telemetry signals for fingerprinting.
+
+        For hybrid models like Qwen3-Next, MoE routing is often a cleaner
+        semantic signature than attention patterns alone.
+
+        Returns:
+            dict with:
+            - top_experts: {layer_id: [expert_ids]} - top-k experts per layer
+            - entropy: {layer_id: float} - routing entropy (decisiveness)
+            - expert_churn: float - how often top expert changes vs previous step
+            - hubness: {layer_id: float} - expert concentration (0=uniform, 1=single expert)
+            - top_hubs: {layer_id: [expert_id, count]} - most frequently selected expert
+        """
+        import math
+
+        telemetry = {
+            "top_experts": {},
+            "entropy": {},
+        }
+
+        # Track previous top experts for churn calculation
+        prev_top_experts = getattr(req, "_moe_prev_top_experts", {})
+        current_top_experts = {}
+        churn_count = 0
+        layer_count = 0
+
+        # Initialize hubness tracking if not present
+        if not hasattr(req, "_moe_expert_hubness") or req._moe_expert_hubness is None:
+            req._moe_expert_hubness = {}
+        if not hasattr(req, "_moe_total_steps"):
+            req._moe_total_steps = 0
+
+        for layer_id, topk_ids, topk_weights in moe_routing_buffer:
+            if batch_idx >= topk_ids.shape[0]:
+                continue
+
+            # Top expert IDs for this layer
+            expert_ids = topk_ids[batch_idx].tolist()
+            telemetry["top_experts"][layer_id] = expert_ids
+            current_top_experts[layer_id] = expert_ids[0] if expert_ids else -1
+
+            # Update hubness tracking - count top-1 expert selections
+            if layer_id not in req._moe_expert_hubness:
+                req._moe_expert_hubness[layer_id] = {}
+            if expert_ids:
+                top_expert = expert_ids[0]
+                req._moe_expert_hubness[layer_id][top_expert] = (
+                    req._moe_expert_hubness[layer_id].get(top_expert, 0) + 1
+                )
+
+            # Compute entropy from weights if available
+            if topk_weights is not None:
+                weights = topk_weights[batch_idx].tolist()
+                # Normalize weights and compute entropy
+                total = sum(w for w in weights if w > 0)
+                if total > 0:
+                    entropy = 0.0
+                    for w in weights:
+                        if w > 0:
+                            p = w / total
+                            entropy -= p * math.log2(p + 1e-10)
+                    telemetry["entropy"][layer_id] = round(entropy, 3)
+
+            # Check for expert churn
+            if layer_id in prev_top_experts:
+                if prev_top_experts[layer_id] != current_top_experts[layer_id]:
+                    churn_count += 1
+            layer_count += 1
+
+        # Store current top experts for next step
+        req._moe_prev_top_experts = current_top_experts
+        req._moe_total_steps += 1
+
+        # Compute overall churn rate
+        if layer_count > 0 and prev_top_experts:
+            telemetry["expert_churn"] = round(churn_count / layer_count, 3)
+
+        # Compute hubness metrics (accumulated over all steps)
+        # Hubness = 1 - (num_unique_experts / total_steps) - higher = more concentrated
+        if req._moe_total_steps > 0 and req._moe_expert_hubness:
+            hubness = {}
+            top_hubs = {}
+            for layer_id, expert_counts in req._moe_expert_hubness.items():
+                if expert_counts:
+                    # Find the most frequent expert (top hub)
+                    top_expert = max(expert_counts, key=expert_counts.get)
+                    top_count = expert_counts[top_expert]
+                    top_hubs[layer_id] = [top_expert, top_count]
+
+                    # Compute concentration (Gini-like)
+                    # 1 = all selections go to one expert, 0 = uniform across all
+                    total_selections = sum(expert_counts.values())
+                    num_unique = len(expert_counts)
+                    if total_selections > 0:
+                        # Max concentration = top expert gets all
+                        concentration = top_count / total_selections
+                        hubness[layer_id] = round(concentration, 3)
+
+            if hubness:
+                telemetry["hubness"] = hubness
+            if top_hubs:
+                telemetry["top_hubs"] = top_hubs
+
+        return telemetry if telemetry["top_experts"] else {}
+
+    def _stream_fingerprint_to_sidecar(
+        self: "Scheduler",
+        request_id: str,
+        fingerprint: list,
+        manifold: str,
+        moe_telemetry: dict = None,
+    ):
+        """
+        Stream a single fingerprint to the sidecar for clustering.
+
+        This is non-blocking - fingerprints are dropped if sidecar is slow.
+        """
+        if not hasattr(self, "_fingerprint_publisher"):
+            self._init_fingerprint_publisher()
+
+        if self._fingerprint_publisher is None:
+            return
+
+        try:
+            import json
+
+            payload = {
+                "request_id": request_id,
+                "vector": fingerprint,
+                "manifold": manifold,
+            }
+            # Include MoE telemetry for hybrid models
+            if moe_telemetry:
+                payload["moe"] = moe_telemetry
+
+            message = json.dumps(payload).encode()
+            # Non-blocking send - drop if buffer full
+            self._fingerprint_publisher.send(message, flags=1)  # zmq.NOBLOCK
+        except Exception:
+            pass  # Silently drop on failure - don't block inference
+
+    # =========================================================================
+    # SIDECAR FEEDBACK CHANNEL (Routing Loop)
+    # =========================================================================
+
+    def _parse_feedback_url(self, sidecar_url: str) -> str:
+        """
+        Derive feedback URL from sidecar URL by incrementing port by 1.
+
+        Handles:
+        - tcp://host:port -> tcp://host:port+1
+        - tcp://[ipv6]:port -> tcp://[ipv6]:port+1
+        - ipc:// -> returns empty (use explicit --attention-feedback-url)
+
+        Returns empty string if parsing fails.
+        """
+        if not sidecar_url:
+            return ""
+
+        # IPC sockets don't have ports - require explicit feedback URL
+        if sidecar_url.startswith("ipc://"):
+            logger.warning("IPC sidecar URL detected - use --attention-feedback-url")
+            return ""
+
+        # Handle IPv6: tcp://[::1]:9001 or tcp://[2001:db8::1]:9001
+        if "]:" in sidecar_url:
+            # IPv6 with port
+            bracket_pos = sidecar_url.rfind("]:")
+            base = sidecar_url[: bracket_pos + 1]
+            port_str = sidecar_url[bracket_pos + 2 :]
+            try:
+                port = int(port_str)
+                return f"{base}:{port + 1}"
+            except ValueError:
+                return ""
+
+        # Standard tcp://host:port
+        last_colon = sidecar_url.rfind(":")
+        if last_colon == -1:
+            return ""
+
+        # Make sure we're not splitting the scheme (tcp:)
+        base = sidecar_url[:last_colon]
+        port_str = sidecar_url[last_colon + 1 :]
+
+        # Validate it looks like a port number
+        if not port_str.isdigit():
+            return ""
+
+        try:
+            port = int(port_str)
+            return f"{base}:{port + 1}"
+        except ValueError:
+            return ""
+
+    def _init_feedback_subscriber(self: "Scheduler"):
+        """
+        Initialize ZMQ subscriber for receiving feedback from sidecar.
+
+        Called lazily on first use. Connects to sidecar's feedback PUSH socket.
+        The feedback URL is derived from sidecar URL by adding 1 to the port,
+        or can be explicitly set via --attention-feedback-url.
+        """
+        sidecar_url = getattr(self.server_args, "attention_sidecar_url", "")
+        if not sidecar_url:
+            self._feedback_subscriber = None
+            return
+
+        try:
+            import zmq
+
+            # Use explicit feedback URL if provided, otherwise derive from sidecar URL
+            feedback_url = getattr(self.server_args, "attention_feedback_url", "")
+            if not feedback_url:
+                feedback_url = self._parse_feedback_url(sidecar_url)
+                if not feedback_url:
+                    logger.warning(
+                        f"Could not derive feedback URL from {sidecar_url}. "
+                        "Use --attention-feedback-url to specify explicitly."
+                    )
+                    self._feedback_subscriber = None
+                    return
+
+            # Reuse existing ZMQ context or create new one
+            if not hasattr(self, "_zmq_context") or self._zmq_context is None:
+                self._zmq_context = zmq.Context()
+
+            self._feedback_subscriber = self._zmq_context.socket(zmq.PULL)
+            self._feedback_subscriber.connect(
+                feedback_url
+            )  # Connect to sidecar's PUSH socket
+            self._feedback_subscriber.setsockopt(zmq.RCVHWM, 1000)  # High water mark
+            self._feedback_subscriber.setsockopt(
+                zmq.LINGER, 0
+            )  # Don't hang on shutdown
+            self._feedback_subscriber.setsockopt(zmq.RCVTIMEO, 0)  # Non-blocking
+            logger.info(f"Connected to sidecar feedback on {feedback_url}")
+
+            # Track last seen sequence per request for ordering
+            self._feedback_last_seq: dict = {}
+
+        except ImportError:
+            logger.warning("ZMQ not available, feedback channel disabled")
+            self._feedback_subscriber = None
+        except Exception as e:
+            logger.warning(f"Failed to initialize feedback subscriber: {e}")
+            self._feedback_subscriber = None
+
+    # Supported feedback schema versions
+    _FEEDBACK_SCHEMA_VERSIONS = {1}
+
+    def _process_sidecar_feedback(self: "Scheduler"):
+        """
+        Non-blocking poll for sidecar feedback and update request semantic memory.
+
+        This should be called each scheduler iteration. Messages are processed
+        without blocking - if no feedback is available, returns immediately.
+
+        Expected feedback message format (v1):
+        {
+            "schema_version": 1,
+            "request_id": "abc123",
+            "seq": 7,                    # Monotonic per request, for ordering
+            "ts_ms": 1736000000000,      # Timestamp for observability
+            "manifold": {
+                "cluster_id": 12,
+                "cluster_conf": 0.82,
+                "zone": "semantic_bridge"
+            },
+            "control": {
+                "next_capture_layer_ids": [7, 15, 23, 31],
+                "attention_stride": 8,
+                "max_attention_steps": 256,
+                "attention_biases": {"12": {"42": 0.3}}
+            }
+        }
+
+        Legacy format (no schema_version) is also accepted for backwards compatibility.
+        """
+        if not hasattr(self, "_feedback_subscriber"):
+            self._init_feedback_subscriber()
+
+        if self._feedback_subscriber is None:
+            return
+
+        import json
+
+        import zmq
+
+        # Initialize sequence tracking if needed
+        if not hasattr(self, "_feedback_last_seq"):
+            self._feedback_last_seq = {}
+
+        # Process all available feedback messages (non-blocking)
+        messages_processed = 0
+        max_messages_per_iteration = 100  # Prevent infinite loop on high traffic
+
+        while messages_processed < max_messages_per_iteration:
+            try:
+                message = self._feedback_subscriber.recv(flags=zmq.NOBLOCK)
+                messages_processed += 1
+
+            except zmq.Again:
+                # No more messages available - normal exit
+                break
+            except zmq.ZMQError as e:
+                logger.warning(f"ZMQ error receiving feedback: {e}")
+                break
+
+            # Parse message
+            try:
+                feedback = json.loads(message.decode())
+            except json.JSONDecodeError as e:
+                logger.warning(f"Invalid JSON in feedback message: {e}")
+                continue
+            except UnicodeDecodeError as e:
+                logger.warning(f"Invalid encoding in feedback message: {e}")
+                continue
+
+            # Validate request_id
+            request_id = feedback.get("request_id")
+            if not request_id:
+                logger.debug("Feedback missing request_id, skipping")
+                continue
+
+            # Check schema version (accept legacy format without version)
+            schema_version = feedback.get("schema_version", 1)
+            if schema_version not in self._FEEDBACK_SCHEMA_VERSIONS:
+                logger.warning(
+                    f"Unsupported feedback schema version {schema_version}, "
+                    f"supported: {self._FEEDBACK_SCHEMA_VERSIONS}"
+                )
+                continue
+
+            # Check sequence ordering (ignore out-of-order messages)
+            seq = feedback.get("seq")
+            if seq is not None:
+                last_seq = self._feedback_last_seq.get(request_id, -1)
+                if seq <= last_seq:
+                    logger.debug(
+                        f"Out-of-order feedback for {request_id}: "
+                        f"seq={seq} <= last_seq={last_seq}"
+                    )
+                    continue
+                self._feedback_last_seq[request_id] = seq
+
+            # Find the request in running batch
+            req = self._find_request_by_id(request_id)
+            if req is None:
+                # Request may have completed - clean up sequence tracking
+                self._feedback_last_seq.pop(request_id, None)
+                continue
+
+            # Update semantic memory with sidecar response
+            try:
+                semantic_memory = getattr(req, "semantic_memory", None)
+                if semantic_memory is not None:
+                    semantic_memory.update_from_sidecar(feedback)
+            except Exception as e:
+                logger.warning(f"Error updating semantic memory for {request_id}: {e}")
+
+    def _find_request_by_id(self: "Scheduler", request_id: str):
+        """
+        Find a request by its ID across running and waiting batches.
+
+        Returns the Req object if found, None otherwise.
+        """
+        # Check running batch
+        if hasattr(self, "running_batch") and self.running_batch is not None:
+            for req in self.running_batch.reqs:
+                if req.rid == request_id:
+                    return req
+
+        # Check current batch if different
+        if hasattr(self, "cur_batch") and self.cur_batch is not None:
+            if self.cur_batch is not self.running_batch:
+                for req in self.cur_batch.reqs:
+                    if req.rid == request_id:
+                        return req
+
+        # Check waiting queue
+        if hasattr(self, "waiting_queue"):
+            for req in self.waiting_queue:
+                if req.rid == request_id:
+                    return req
+
+        return None

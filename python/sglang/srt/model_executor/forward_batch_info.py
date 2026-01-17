@@ -29,6 +29,7 @@ ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import total_ordering
@@ -59,6 +60,7 @@ from sglang.srt.utils.common import ceil_align
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+    from sglang.srt.logit_lens.types import LogitLensOutput
     from sglang.srt.managers.schedule_batch import ModelWorkerBatch, MultimodalInputs
     from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -66,6 +68,11 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 
 _is_npu = is_npu()
+
+logger = logging.getLogger(__name__)
+
+# Attention capture warning tracker (to avoid repeated warnings)
+_attention_backend_warned = False
 
 
 class ForwardMode(IntEnum):
@@ -226,6 +233,24 @@ def compute_local_num_token_non_padded(
         0,
         tokens_per_rank,
     )
+
+
+@dataclass
+class AttentionTokenInfo:
+    """Container for top-k attention token information for interpretability."""
+
+    # Top-k token positions with highest attention scores [batch, top_k]
+    token_positions: torch.Tensor
+    # Corresponding normalized attention scores [batch, top_k] (softmax over top-k only)
+    attention_scores: torch.Tensor
+    # Which layer this came from (-1 = aggregated across layers)
+    layer_id: int = -1
+    # Raw attention logits before softmax [batch, top_k] (for probability calculation)
+    topk_logits: Optional[torch.Tensor] = None
+    # Logsumexp over candidate attention scores [batch] (approximate normalizer)
+    # Note: For chunked computation, this is computed over top chunks only, not all tokens.
+    # Use for approximate probability: approx_prob = exp(topk_logit - logsumexp_candidates)
+    logsumexp_candidates: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -400,6 +425,61 @@ class ForwardBatch:
     # For hidden states before normal
     return_hidden_states_before_norm: bool = False
 
+    # For attention token capture (interpretability/visualization)
+    capture_attention_tokens: bool = False
+    attention_top_k: int = 5
+    attention_window: int = 0  # Context window for capture (0 = all tokens)
+    attention_chunk_size: int = 2048  # Chunk size for extraction kernel
+    # Multi-layer capture: dict of layer_id -> AttentionTokenInfo
+    attention_token_infos: Optional[Dict[int, "AttentionTokenInfo"]] = None
+    # Legacy single-layer field (for backward compatibility)
+    attention_token_info: Optional["AttentionTokenInfo"] = None
+    # Layer IDs to capture attention from (empty = use attention_capture_layer_ids from init)
+    attention_capture_layer_ids: Optional[List[int]] = None
+    # Head IDs to average over when computing top-k (None = all heads)
+    attention_capture_head_ids: Optional[List[int]] = None
+    # Fingerprint mode: compute in-kernel histogram instead of raw indices
+    # Production mode - 64 bytes vs ~200KB per step
+    attention_fingerprint_mode: bool = False
+    attention_fingerprint: Optional["torch.Tensor"] = None  # [batch, 20] feature vector
+    attention_manifold: Optional[List[str]] = None  # Manifold classification
+
+    # For attention steering (semantic routing loop)
+    # Sparse representation: (layer_id, batch_idx, token_pos, bias_value) tensors
+    # Applied as additive bias to attention logits before softmax
+    attention_bias_indices: Optional[torch.Tensor] = (
+        None  # [num_biases, 3] (layer_id, batch_idx, token_pos)
+    )
+    attention_bias_values: Optional[torch.Tensor] = None  # [num_biases] bias values
+    attention_bias_layers: Optional[List[int]] = None  # Which layers have biases
+    # CSR-style per-layer indexing for efficient lookup
+    attention_bias_layer_indptr: Optional[torch.Tensor] = (
+        None  # [num_layers+1] CSR indptr
+    )
+
+    # For MoE routing capture (interpretability/semantic telemetry)
+    # Captures which experts were selected and with what weights
+    capture_moe_routing: bool = False
+    moe_routing_top_k: int = 2  # How many top experts to capture per token
+    # Buffer for captured routing: List[(layer_id, topk_ids, topk_weights)]
+    # topk_ids: [num_tokens, top_k], topk_weights: [num_tokens, top_k]
+    moe_routing_buffer: Optional[List[Tuple[int, torch.Tensor, torch.Tensor]]] = None
+    # Layers to capture MoE routing from (None = all MoE layers)
+    moe_capture_layer_ids: Optional[List[int]] = None
+    # Stride and max limits for MoE routing capture
+    moe_routing_stride: int = 1  # Capture every Nth token (1 = all)
+    moe_routing_max_steps: int = 0  # Max decode steps to capture (0 = unlimited)
+    moe_routing_current_step: int = 0  # Current decode step counter
+
+    # For logit lens (interpretability) - project intermediate layers to vocab
+    capture_logit_lens: bool = False
+    logit_lens_top_k: int = 5  # Number of top token candidates per layer
+    logit_lens_layer_ids: Optional[List[int]] = (
+        None  # Which layers to probe (None = auto-select ~4)
+    )
+    # Captured logit lens output (populated after forward pass)
+    logit_lens_output: Optional["LogitLensOutput"] = None
+
     @classmethod
     def init_new(
         cls,
@@ -465,9 +545,10 @@ class ForwardBatch:
             # process global_num_tokens and global_num_tokens_for_logprob
             if batch.spec_info is not None:
                 spec_info: SpecInput = batch.spec_info
-                global_num_tokens, global_num_tokens_for_logprob = (
-                    spec_info.get_spec_adjusted_global_num_tokens(batch)
-                )
+                (
+                    global_num_tokens,
+                    global_num_tokens_for_logprob,
+                ) = spec_info.get_spec_adjusted_global_num_tokens(batch)
             else:
                 global_num_tokens = batch.global_num_tokens
                 global_num_tokens_for_logprob = batch.global_num_tokens_for_logprob
@@ -545,7 +626,345 @@ class ForwardBatch:
         if model_runner.server_args.enable_lora:
             model_runner.lora_manager.prepare_lora_batch(ret)
 
+        # Init attention token capture - single linear predicate for clarity
+        # Attention capture is produced only for decode steps; prefill is skipped by design.
+        #
+        # Requirements: feature requested AND decode mode AND triton backend
+        global _attention_backend_warned
+
+        # Compute predicates once
+        _capture_requested = (
+            model_runner.server_args.return_attention_tokens
+            and batch.capture_attention_tokens
+        )
+        _is_decode = ret.forward_mode.is_decode()
+
+        # Determine decode backend
+        decode_backend = getattr(model_runner, "decode_attention_backend_str", None)
+        if decode_backend is None:
+            decode_backend = model_runner.server_args.attention_backend
+        _is_triton = decode_backend == "triton"
+
+        # Single linear predicate: all conditions must hold
+        _should_capture_attention = _capture_requested and _is_decode and _is_triton
+
+        # Warn once if backend incompatible (but capture was otherwise requested)
+        if _capture_requested and _is_decode and not _is_triton:
+            if not _attention_backend_warned:
+                logger.warning(
+                    f"Attention capture requires --attention-backend triton. "
+                    f"Current backend: {decode_backend}. Skipping capture."
+                )
+                _attention_backend_warned = True
+
+        if _should_capture_attention:
+            ret.capture_attention_tokens = True
+            ret.attention_top_k = batch.attention_top_k
+            ret.attention_window = model_runner.server_args.attention_tokens_window
+            ret.attention_chunk_size = model_runner.server_args.attention_chunk_size
+            ret.attention_token_infos = {}  # Initialize multi-layer storage
+
+            # Check if fingerprint mode is enabled (production path)
+            ret.attention_fingerprint_mode = getattr(
+                model_runner.server_args, "attention_fingerprint_mode", False
+            )
+
+            # Determine which layers to capture
+            # Priority: 1) per-request override, 2) server arg layer ID, 3) server arg layers config
+            num_layers = model_runner.model_config.num_hidden_layers
+            layers_config = model_runner.server_args.attention_capture_layers
+            server_layer_id = getattr(
+                model_runner.server_args, "attention_capture_layer_id", None
+            )
+
+            # Per-request layer override takes highest precedence
+            if batch.attention_capture_layer_id is not None:
+                layer_override = batch.attention_capture_layer_id
+                # Handle both int and List[int] formats
+                if isinstance(layer_override, list):
+                    # Handle -1 as "last layer" for each element
+                    layer_ids = [
+                        l if l >= 0 else num_layers + l for l in layer_override
+                    ]
+                else:
+                    # Single int
+                    layer_id = layer_override
+                    if layer_id < 0:
+                        layer_id = num_layers + layer_id
+                    layer_ids = [layer_id]
+            # Server arg specific layer ID takes second precedence
+            elif server_layer_id is not None:
+                layer_id = server_layer_id
+                # Handle -1 as "last layer"
+                if layer_id < 0:
+                    layer_id = num_layers + layer_id
+                layer_ids = [layer_id]
+            elif layers_config == "last":
+                # Just the last layer (mostly syntax/format repair patterns)
+                if (
+                    hasattr(model_runner, "attention_layers")
+                    and model_runner.attention_layers
+                ):
+                    layer_ids = [model_runner.attention_layers[-1].layer_id]
+                else:
+                    layer_ids = [num_layers - 1]
+            elif layers_config in ("mid", "mid_full"):
+                # Mid-depth layer for semantic discovery (~60-80% depth)
+                # This is better for semantic manifold discovery than last layer
+                # For hybrid models, selects mid-depth full attention layer
+                full_attn_layers = getattr(
+                    model_runner.model_config, "full_attention_layer_ids", None
+                )
+
+                if full_attn_layers and len(full_attn_layers) > 0:
+                    # HYBRID MODEL: Select mid-depth full attention layer
+                    n_full = len(full_attn_layers)
+                    # Target ~60-70% depth for semantic bridge patterns
+                    mid_idx = (2 * n_full) // 3
+                    layer_ids = [full_attn_layers[mid_idx]]
+                else:
+                    # STANDARD MODEL: Select layer at ~70% depth
+                    layer_ids = [(7 * num_layers) // 10]
+            elif layers_config == "auto":
+                # Automatically select ~4 layers spread across depth for semantic manifold coverage
+                # For hybrid models (Qwen3-Next, Llama4, etc.), only use full attention layers
+                # since sliding window layers don't provide the same semantic information
+                full_attn_layers = getattr(
+                    model_runner.model_config, "full_attention_layer_ids", None
+                )
+
+                if full_attn_layers and len(full_attn_layers) > 0:
+                    # HYBRID MODEL: Select ~4 layers spread across full attention layers
+                    # This ensures we only capture from semantically meaningful layers
+                    n_full = len(full_attn_layers)
+                    if n_full <= 4:
+                        # Use all full attention layers if <= 4
+                        layer_ids = list(full_attn_layers)
+                    else:
+                        # Select 4 layers spread across the full attention layers
+                        # [0, n/3, 2n/3, n-1] indices into full_attn_layers
+                        indices = [
+                            0,
+                            n_full // 3,
+                            (2 * n_full) // 3,
+                            n_full - 1,
+                        ]
+                        layer_ids = [full_attn_layers[i] for i in sorted(set(indices))]
+                else:
+                    # STANDARD MODEL: Use generic layer selection
+                    # [L/4, L/2, 3L/4, L-1] for semantic manifold coverage
+                    layer_ids = [
+                        num_layers // 4,
+                        num_layers // 2,
+                        (3 * num_layers) // 4,
+                        num_layers - 1,
+                    ]
+                # Remove duplicates and sort
+                layer_ids = sorted(set(layer_ids))
+            else:
+                # Parse comma-separated layer indices
+                try:
+                    layer_ids = [int(x.strip()) for x in layers_config.split(",")]
+                    # Validate layer indices
+                    layer_ids = [l if l >= 0 else num_layers + l for l in layer_ids]
+                    layer_ids = [l for l in layer_ids if 0 <= l < num_layers]
+                except ValueError:
+                    # Fallback to last layer on parse error
+                    layer_ids = [num_layers - 1]
+
+            ret.attention_capture_layer_ids = layer_ids
+
+            # Get head selection filter if specified
+            ret.attention_capture_head_ids = batch.attention_capture_head_ids
+
+        # Init attention biases for steering (semantic routing loop)
+        if batch.attention_biases is not None:
+            # Convert sparse dict format to GPU tensors with CSR-style per-layer indexing
+            # batch.attention_biases: Dict[layer_id -> List[Dict[token_pos -> bias]]]
+            layer_ids = []
+            batch_indices = []
+            token_positions = []
+            bias_values = []
+            layer_ids_with_biases = sorted(batch.attention_biases.keys())
+
+            # Build CSR-style indptr for per-layer lookup
+            layer_indptr = [0]
+
+            for layer_id in layer_ids_with_biases:
+                per_request_biases = batch.attention_biases[layer_id]
+                layer_start_count = len(bias_values)
+                for batch_idx, token_biases in enumerate(per_request_biases):
+                    for token_pos, bias in token_biases.items():
+                        layer_ids.append(layer_id)
+                        batch_indices.append(batch_idx)
+                        token_positions.append(token_pos)
+                        bias_values.append(bias)
+                layer_indptr.append(len(bias_values))
+
+            if bias_values:
+                ret.attention_bias_indices = torch.tensor(
+                    [
+                        [l, b, t]
+                        for l, b, t in zip(layer_ids, batch_indices, token_positions)
+                    ],
+                    dtype=torch.int64,
+                    device=model_runner.device,
+                )
+                ret.attention_bias_values = torch.tensor(
+                    bias_values,
+                    dtype=torch.float32,
+                    device=model_runner.device,
+                )
+                ret.attention_bias_layers = layer_ids_with_biases
+                ret.attention_bias_layer_indptr = torch.tensor(
+                    layer_indptr,
+                    dtype=torch.int64,
+                    device=model_runner.device,
+                )
+
+        # Init MoE routing capture with stride/max limits from server_args
+        if batch.capture_moe_routing:
+            ret.capture_moe_routing = True
+            ret.moe_routing_top_k = batch.moe_routing_top_k
+            ret.moe_routing_buffer = (
+                []
+            )  # Initialize empty list to accumulate routing data
+            # Get limits from server_args
+            ret.moe_routing_stride = getattr(
+                model_runner.server_args, "moe_routing_stride", 1
+            )
+            ret.moe_routing_max_steps = getattr(
+                model_runner.server_args, "moe_routing_max_steps", 0
+            )
+            ret.moe_routing_current_step = 0
+
+            # Validate moe_capture_layer_ids against model configuration
+            num_layers = model_runner.model_config.num_hidden_layers
+            if batch.moe_capture_layer_ids is not None:
+                # Filter out invalid layer IDs (out of range or negative)
+                valid_layer_ids = [
+                    lid for lid in batch.moe_capture_layer_ids if 0 <= lid < num_layers
+                ]
+                if valid_layer_ids:
+                    ret.moe_capture_layer_ids = valid_layer_ids
+                else:
+                    # All layer IDs were invalid, capture all MoE layers
+                    ret.moe_capture_layer_ids = None
+            else:
+                ret.moe_capture_layer_ids = None
+
+        # Init logit lens capture (experimental interpretability feature)
+        if batch.capture_logit_lens:
+            ret.capture_logit_lens = True
+            ret.logit_lens_top_k = batch.logit_lens_top_k
+            # Validate layer IDs if provided
+            num_layers = model_runner.model_config.num_hidden_layers
+            if batch.logit_lens_layer_ids is not None:
+                valid_layer_ids = [
+                    lid if lid >= 0 else num_layers + lid
+                    for lid in batch.logit_lens_layer_ids
+                ]
+                valid_layer_ids = [
+                    lid for lid in valid_layer_ids if 0 <= lid < num_layers
+                ]
+                ret.logit_lens_layer_ids = valid_layer_ids if valid_layer_ids else None
+            else:
+                ret.logit_lens_layer_ids = None  # Auto-select layers
+
         return ret
+
+    def has_attention_biases_for_layer(self, layer_id: int) -> bool:
+        """Check if this layer has attention biases to apply."""
+        if self.attention_bias_layers is None:
+            return False
+        return layer_id in self.attention_bias_layers
+
+    def get_attention_bias_tensor(
+        self, layer_id: int, max_seq_len: int
+    ) -> Optional[torch.Tensor]:
+        """
+        Get attention bias tensor for a specific layer.
+
+        Returns a (batch_size, max_seq_len) tensor with bias values.
+        Positions without biases have value 0.
+        Returns None if no biases for this layer.
+        """
+        if not self.has_attention_biases_for_layer(layer_id):
+            return None
+
+        # Find layer index in our sorted list
+        try:
+            layer_idx = self.attention_bias_layers.index(layer_id)
+        except ValueError:
+            return None
+
+        # Use CSR indptr to get bias entries for this layer
+        start_idx = self.attention_bias_layer_indptr[layer_idx].item()
+        end_idx = self.attention_bias_layer_indptr[layer_idx + 1].item()
+
+        if start_idx == end_idx:
+            return None  # No biases for this layer
+
+        # Create dense bias tensor
+        bias_tensor = torch.zeros(
+            (self.batch_size, max_seq_len),
+            dtype=self.attention_bias_values.dtype,
+            device=self.attention_bias_values.device,
+        )
+
+        # Get only this layer's biases using CSR indexing
+        layer_indices = self.attention_bias_indices[start_idx:end_idx]
+        layer_values = self.attention_bias_values[start_idx:end_idx]
+
+        # Extract batch and token positions (indices are [layer_id, batch_idx, token_pos])
+        batch_indices = layer_indices[:, 1]
+        token_positions = layer_indices[:, 2]
+
+        # Mask for valid positions (within max_seq_len)
+        valid_mask = token_positions < max_seq_len
+        if valid_mask.any():
+            bias_tensor[batch_indices[valid_mask], token_positions[valid_mask]] = (
+                layer_values[valid_mask]
+            )
+
+        return bias_tensor
+
+    def get_sparse_attention_biases(
+        self, layer_id: int
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """
+        Get sparse attention biases for a specific layer.
+
+        Returns (batch_indices, token_positions, bias_values) tensors for this layer only.
+        Returns None if no biases for this layer.
+
+        This is more efficient than get_attention_bias_tensor for sparse bias correction.
+        """
+        if not self.has_attention_biases_for_layer(layer_id):
+            return None
+
+        # Find layer index in our sorted list
+        try:
+            layer_idx = self.attention_bias_layers.index(layer_id)
+        except ValueError:
+            return None
+
+        # Use CSR indptr to get bias entries for this layer
+        start_idx = self.attention_bias_layer_indptr[layer_idx].item()
+        end_idx = self.attention_bias_layer_indptr[layer_idx + 1].item()
+
+        if start_idx == end_idx:
+            return None  # No biases for this layer
+
+        # Get only this layer's biases using CSR indexing
+        layer_indices = self.attention_bias_indices[start_idx:end_idx]
+        layer_values = self.attention_bias_values[start_idx:end_idx]
+
+        # Extract batch and token positions (indices are [layer_id, batch_idx, token_pos])
+        batch_indices = layer_indices[:, 1]
+        token_positions = layer_indices[:, 2]
+
+        return batch_indices, token_positions, layer_values
 
     def adjust_num_token_non_padded_for_attn_tp(self, server_args) -> None:
         """Make num_token_non_padded local to this attention-TP rank."""
@@ -1062,12 +1481,13 @@ class ForwardBatch:
         ) // self.prefix_chunk_len
 
         # Here we compute chunk lens twice to avoid stream sync, once on gpu and once on cpu.
-        prefix_chunk_starts_cuda, prefix_chunk_seq_lens_cuda = (
-            self.get_prefix_chunk_seq_lens(
-                self.extend_prefix_lens,
-                self.num_prefix_chunks,
-                self.prefix_chunk_len,
-            )
+        (
+            prefix_chunk_starts_cuda,
+            prefix_chunk_seq_lens_cuda,
+        ) = self.get_prefix_chunk_seq_lens(
+            self.extend_prefix_lens,
+            self.num_prefix_chunks,
+            self.prefix_chunk_len,
         )
         _, prefix_chunk_seq_lens_cpu = self.get_prefix_chunk_seq_lens(
             torch.tensor(self.extend_prefix_lens_cpu),

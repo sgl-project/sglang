@@ -1,0 +1,1225 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SGLang Attention Explorer - Real-Time Stream</title>
+    <style>
+        :root {
+            --bg-primary: #0d1117;
+            --bg-secondary: #161b22;
+            --bg-tertiary: #21262d;
+            --border: #30363d;
+            --text-primary: #c9d1d9;
+            --text-secondary: #8b949e;
+            --accent: #00d4ff;
+            --accent-dim: rgba(0, 212, 255, 0.2);
+            --success: #238636;
+            --warning: #d29922;
+            --error: #da3633;
+            --semantic-bridge: #00d4ff;
+            --syntax-floor: #ffd700;
+            --exploration: #ff6b9d;
+            --steering: #7ee787;
+        }
+
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            min-height: 100vh;
+        }
+
+        .container {
+            display: grid;
+            grid-template-columns: 350px 1fr 350px;
+            grid-template-rows: auto 1fr;
+            height: 100vh;
+            gap: 1px;
+            background: var(--border);
+        }
+
+        header {
+            grid-column: 1 / -1;
+            background: var(--bg-secondary);
+            padding: 1rem 1.5rem;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .logo {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+        }
+
+        .logo-icon {
+            width: 36px;
+            height: 36px;
+            background: conic-gradient(from 0deg, var(--accent), var(--semantic-bridge), var(--syntax-floor), var(--accent));
+            border-radius: 50%;
+            animation: spin 10s linear infinite;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        h1 {
+            font-size: 1.25rem;
+            font-weight: 600;
+            color: var(--accent);
+        }
+
+        .subtitle {
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+            letter-spacing: 0.1em;
+        }
+
+        .connection-status {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            padding: 0.5rem 1rem;
+            background: var(--bg-tertiary);
+            border-radius: 20px;
+            font-size: 0.85rem;
+        }
+
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: var(--error);
+        }
+
+        .status-dot.connected { background: var(--success); }
+        .status-dot.connecting { background: var(--warning); animation: pulse 1s infinite; }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+
+        .panel {
+            background: var(--bg-secondary);
+            padding: 1.5rem;
+            overflow-y: auto;
+        }
+
+        .panel-title {
+            font-size: 0.75rem;
+            text-transform: uppercase;
+            letter-spacing: 0.1em;
+            color: var(--text-secondary);
+            margin-bottom: 1rem;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .panel-title::before {
+            content: '';
+            width: 6px;
+            height: 6px;
+            background: var(--accent);
+            border-radius: 50%;
+        }
+
+        textarea {
+            width: 100%;
+            height: 150px;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 1rem;
+            color: var(--text-primary);
+            font-family: inherit;
+            font-size: 0.9rem;
+            resize: vertical;
+        }
+
+        textarea:focus {
+            outline: none;
+            border-color: var(--accent);
+        }
+
+        .btn {
+            padding: 0.75rem 1.5rem;
+            border: none;
+            border-radius: 6px;
+            font-size: 0.9rem;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .btn-primary {
+            background: var(--accent);
+            color: var(--bg-primary);
+        }
+
+        .btn-primary:hover:not(:disabled) {
+            filter: brightness(1.1);
+        }
+
+        .btn-primary:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .btn-secondary {
+            background: var(--bg-tertiary);
+            color: var(--text-primary);
+            border: 1px solid var(--border);
+        }
+
+        .button-group {
+            display: flex;
+            gap: 0.5rem;
+            margin-top: 1rem;
+        }
+
+        .config-group {
+            margin-top: 1.5rem;
+        }
+
+        .config-row {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 1rem;
+            margin-bottom: 1rem;
+        }
+
+        .config-item label {
+            display: block;
+            font-size: 0.8rem;
+            color: var(--text-secondary);
+            margin-bottom: 0.25rem;
+        }
+
+        .config-item input {
+            width: 100%;
+            padding: 0.5rem;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            color: var(--text-primary);
+            font-size: 0.9rem;
+        }
+
+        .main-view {
+            background: var(--bg-primary);
+            padding: 1.5rem;
+            overflow-y: auto;
+        }
+
+        .stream-container {
+            min-height: 200px;
+        }
+
+        .segment {
+            margin-bottom: 1.5rem;
+        }
+
+        .segment-header {
+            font-size: 0.75rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: var(--accent);
+            margin-bottom: 0.75rem;
+            padding-bottom: 0.5rem;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .token-container {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 4px;
+            line-height: 2;
+        }
+
+        .token {
+            display: inline-block;
+            padding: 2px 6px;
+            background: var(--bg-tertiary);
+            border: 1px solid transparent;
+            border-radius: 4px;
+            font-family: 'SF Mono', Monaco, monospace;
+            font-size: 0.85rem;
+            cursor: pointer;
+            transition: all 0.15s;
+            position: relative;
+        }
+
+        .token:hover {
+            border-color: var(--accent);
+            background: var(--accent-dim);
+        }
+
+        .token.selected {
+            border-color: var(--accent);
+            background: var(--accent-dim);
+            box-shadow: 0 0 8px var(--accent-dim);
+        }
+
+        .token.attended-to {
+            border-color: var(--semantic-bridge);
+            background: rgba(0, 212, 255, 0.3);
+        }
+
+        .token.streaming {
+            animation: streamPulse 0.5s ease-out;
+        }
+
+        @keyframes streamPulse {
+            0% { background: var(--accent); color: var(--bg-primary); transform: scale(1.1); }
+            100% { background: var(--bg-tertiary); color: var(--text-primary); transform: scale(1); }
+        }
+
+        /* Manifold zone colors */
+        .token[data-zone="semantic_bridge"] { border-left: 3px solid var(--semantic-bridge); }
+        .token[data-zone="syntax_floor"] { border-left: 3px solid var(--syntax-floor); }
+        .token[data-zone="exploration"] { border-left: 3px solid var(--exploration); }
+
+        /* Enhanced token tooltip */
+        .token-tooltip {
+            position: absolute;
+            bottom: 100%;
+            left: 50%;
+            transform: translateX(-50%);
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            padding: 8px 12px;
+            font-size: 0.75rem;
+            white-space: nowrap;
+            z-index: 1000;
+            pointer-events: none;
+            opacity: 0;
+            transition: opacity 0.15s;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+        }
+
+        .token:hover .token-tooltip {
+            opacity: 1;
+        }
+
+        .token-tooltip::after {
+            content: '';
+            position: absolute;
+            top: 100%;
+            left: 50%;
+            transform: translateX(-50%);
+            border: 6px solid transparent;
+            border-top-color: var(--border);
+        }
+
+        .tooltip-row {
+            display: flex;
+            justify-content: space-between;
+            gap: 12px;
+            margin-bottom: 4px;
+        }
+
+        .tooltip-row:last-child {
+            margin-bottom: 0;
+        }
+
+        .tooltip-label {
+            color: var(--text-secondary);
+        }
+
+        .tooltip-value {
+            color: var(--text-primary);
+            font-weight: 500;
+        }
+
+        .tooltip-value.zone-semantic_bridge { color: var(--semantic-bridge); }
+        .tooltip-value.zone-syntax_floor { color: var(--syntax-floor); }
+        .tooltip-value.zone-exploration { color: var(--exploration); }
+        .tooltip-value.zone-steering { color: var(--steering); }
+
+        /* Zone badge in attention list */
+        .attention-item-zone {
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            flex-shrink: 0;
+        }
+        .token[data-zone="steering"] { border-left: 3px solid var(--steering); }
+
+        .detail-panel {
+            background: var(--bg-secondary);
+        }
+
+        .selected-token-info {
+            text-align: center;
+            padding: 1rem;
+            margin-bottom: 1rem;
+        }
+
+        .selected-token-text {
+            font-size: 1.5rem;
+            font-family: 'SF Mono', Monaco, monospace;
+            color: var(--accent);
+            margin-bottom: 0.5rem;
+        }
+
+        .selected-token-meta {
+            font-size: 0.8rem;
+            color: var(--text-secondary);
+        }
+
+        .attention-list {
+            max-height: 400px;
+            overflow-y: auto;
+        }
+
+        .attention-item {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            padding: 0.75rem;
+            border-bottom: 1px solid var(--border);
+            cursor: pointer;
+            transition: background 0.15s;
+        }
+
+        .attention-item:hover {
+            background: var(--bg-tertiary);
+        }
+
+        .attention-rank {
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+            width: 20px;
+        }
+
+        .attention-token {
+            font-family: 'SF Mono', Monaco, monospace;
+            font-size: 0.9rem;
+            flex: 1;
+        }
+
+        .attention-score {
+            font-size: 0.85rem;
+            font-weight: 600;
+            color: var(--accent);
+        }
+
+        .attention-bar {
+            width: 60px;
+            height: 4px;
+            background: var(--bg-tertiary);
+            border-radius: 2px;
+            overflow: hidden;
+        }
+
+        .attention-bar-fill {
+            height: 100%;
+            background: var(--accent);
+            border-radius: 2px;
+        }
+
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 1rem;
+            margin-top: 1.5rem;
+            padding-top: 1rem;
+            border-top: 1px solid var(--border);
+        }
+
+        .stat {
+            text-align: center;
+        }
+
+        .stat-value {
+            font-size: 1.5rem;
+            font-weight: 600;
+            color: var(--accent);
+        }
+
+        .stat-label {
+            font-size: 0.7rem;
+            text-transform: uppercase;
+            color: var(--text-secondary);
+        }
+
+        .zone-histogram {
+            margin-top: 1.5rem;
+            padding-top: 1rem;
+            border-top: 1px solid var(--border);
+        }
+
+        .zone-bar-container {
+            margin-top: 0.75rem;
+        }
+
+        .zone-bar-row {
+            display: grid;
+            grid-template-columns: 50px 1fr 40px;
+            align-items: center;
+            gap: 0.5rem;
+            margin-bottom: 0.5rem;
+        }
+
+        .zone-bar-label {
+            font-size: 0.7rem;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+        }
+
+        .zone-bar-track {
+            height: 8px;
+            background: var(--bg-tertiary);
+            border-radius: 4px;
+            overflow: hidden;
+        }
+
+        .zone-bar-fill {
+            height: 100%;
+            border-radius: 4px;
+            transition: width 0.3s ease;
+        }
+
+        .zone-bar-fill.semantic-bridge { background: var(--semantic-bridge); }
+        .zone-bar-fill.syntax-floor { background: var(--syntax-floor); }
+        .zone-bar-fill.exploration { background: var(--exploration); }
+        .zone-bar-fill.steering { background: var(--steering); }
+
+        .zone-bar-value {
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+            text-align: right;
+        }
+
+        .zone-legend {
+            margin-top: 1.5rem;
+            padding-top: 1rem;
+            border-top: 1px solid var(--border);
+        }
+
+        .zone-item {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            margin-bottom: 0.5rem;
+            font-size: 0.8rem;
+        }
+
+        .zone-color {
+            width: 12px;
+            height: 12px;
+            border-radius: 2px;
+        }
+
+        .empty-state {
+            text-align: center;
+            padding: 3rem;
+            color: var(--text-secondary);
+        }
+
+        .empty-state-icon {
+            font-size: 3rem;
+            margin-bottom: 1rem;
+            opacity: 0.5;
+        }
+
+        .stream-status {
+            padding: 0.5rem 1rem;
+            background: var(--bg-tertiary);
+            border-radius: 4px;
+            font-size: 0.85rem;
+            margin-bottom: 1rem;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .stream-status.active {
+            background: rgba(0, 212, 255, 0.1);
+            border: 1px solid var(--accent);
+        }
+
+        .typing-indicator {
+            display: inline-flex;
+            gap: 3px;
+        }
+
+        .typing-indicator span {
+            width: 6px;
+            height: 6px;
+            background: var(--accent);
+            border-radius: 50%;
+            animation: typing 1.2s infinite;
+        }
+
+        .typing-indicator span:nth-child(2) { animation-delay: 0.2s; }
+        .typing-indicator span:nth-child(3) { animation-delay: 0.4s; }
+
+        @keyframes typing {
+            0%, 60%, 100% { transform: translateY(0); }
+            30% { transform: translateY(-4px); }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <div class="logo">
+                <div class="logo-icon"></div>
+                <div>
+                    <h1>SGLang Attention Explorer</h1>
+                    <div class="subtitle">Real-Time Streaming</div>
+                </div>
+            </div>
+            <div class="connection-status">
+                <div class="status-dot" id="statusDot"></div>
+                <span id="statusText">Disconnected</span>
+            </div>
+        </header>
+
+        <div class="panel">
+            <div class="panel-title">Input</div>
+            <textarea id="inputText" placeholder="Enter your prompt here...">What is the capital of France?</textarea>
+
+            <div class="button-group">
+                <button class="btn btn-primary" id="analyzeBtn" onclick="startStream()">
+                    Stream
+                </button>
+                <button class="btn btn-secondary" onclick="stopStream()">Stop</button>
+                <button class="btn btn-secondary" onclick="clearAll()">Clear</button>
+            </div>
+
+            <div class="config-group">
+                <div class="panel-title">Configuration</div>
+                <div class="config-row">
+                    <div class="config-item">
+                        <label>Max Tokens</label>
+                        <input type="number" id="maxTokens" value="100" min="1" max="2048">
+                    </div>
+                    <div class="config-item">
+                        <label>Attention Top-K</label>
+                        <input type="number" id="topK" value="10" min="1" max="50">
+                    </div>
+                </div>
+                <div class="config-row">
+                    <div class="config-item">
+                        <label>Temperature</label>
+                        <input type="number" id="temperature" value="0.6" min="0" max="2" step="0.1">
+                    </div>
+                    <div class="config-item">
+                        <label>WebSocket Port</label>
+                        <input type="number" id="wsPort" value="8765">
+                    </div>
+                </div>
+            </div>
+
+            <div class="stats">
+                <div class="stat">
+                    <div class="stat-value" id="tokenCount">0</div>
+                    <div class="stat-label">Tokens</div>
+                </div>
+                <div class="stat">
+                    <div class="stat-value" id="edgeCount">0</div>
+                    <div class="stat-label">Edges</div>
+                </div>
+                <div class="stat">
+                    <div class="stat-value" id="tps">0</div>
+                    <div class="stat-label">Tok/s</div>
+                </div>
+            </div>
+
+            <!-- Zone Distribution Histogram -->
+            <div class="zone-histogram" id="zoneHistogram">
+                <div class="panel-title">Zone Distribution</div>
+                <div class="zone-bar-container">
+                    <div class="zone-bar-row">
+                        <span class="zone-bar-label">Bridge</span>
+                        <div class="zone-bar-track">
+                            <div class="zone-bar-fill semantic-bridge" id="bridgeBar" style="width: 0%"></div>
+                        </div>
+                        <span class="zone-bar-value" id="bridgePercent">0%</span>
+                    </div>
+                    <div class="zone-bar-row">
+                        <span class="zone-bar-label">Syntax</span>
+                        <div class="zone-bar-track">
+                            <div class="zone-bar-fill syntax-floor" id="syntaxBar" style="width: 0%"></div>
+                        </div>
+                        <span class="zone-bar-value" id="syntaxPercent">0%</span>
+                    </div>
+                    <div class="zone-bar-row">
+                        <span class="zone-bar-label">Explore</span>
+                        <div class="zone-bar-track">
+                            <div class="zone-bar-fill exploration" id="exploreBar" style="width: 0%"></div>
+                        </div>
+                        <span class="zone-bar-value" id="explorePercent">0%</span>
+                    </div>
+                    <div class="zone-bar-row">
+                        <span class="zone-bar-label">Steer</span>
+                        <div class="zone-bar-track">
+                            <div class="zone-bar-fill steering" id="steerBar" style="width: 0%"></div>
+                        </div>
+                        <span class="zone-bar-value" id="steerPercent">0%</span>
+                    </div>
+                </div>
+            </div>
+
+            <div class="zone-legend">
+                <div class="panel-title">Attention Zones</div>
+                <div class="zone-item">
+                    <div class="zone-color" style="background: var(--semantic-bridge)"></div>
+                    <span>Semantic Bridge</span>
+                </div>
+                <div class="zone-item">
+                    <div class="zone-color" style="background: var(--syntax-floor)"></div>
+                    <span>Syntax Floor</span>
+                </div>
+                <div class="zone-item">
+                    <div class="zone-color" style="background: var(--exploration)"></div>
+                    <span>Exploration</span>
+                </div>
+                <div class="zone-item">
+                    <div class="zone-color" style="background: var(--steering)"></div>
+                    <span>Steering</span>
+                </div>
+            </div>
+        </div>
+
+        <div class="main-view">
+            <div id="streamStatus" class="stream-status" style="display: none;">
+                <div class="typing-indicator">
+                    <span></span><span></span><span></span>
+                </div>
+                <span>Generating...</span>
+            </div>
+
+            <div class="stream-container">
+                <div class="segment" id="promptSegment" style="display: none;">
+                    <div class="segment-header">Prompt</div>
+                    <div class="token-container" id="promptTokens"></div>
+                </div>
+
+                <div class="segment" id="responseSegment" style="display: none;">
+                    <div class="segment-header">Response (Streaming)</div>
+                    <div class="token-container" id="responseTokens"></div>
+                </div>
+
+                <div class="empty-state" id="emptyState">
+                    <div class="empty-state-icon">⚡</div>
+                    <p>Enter a prompt and click "Stream" to see real-time attention visualization</p>
+                </div>
+            </div>
+        </div>
+
+        <div class="panel detail-panel">
+            <div class="panel-title">Token Details</div>
+
+            <div id="tokenDetail" style="display: none;">
+                <div class="selected-token-info">
+                    <div class="selected-token-text" id="selectedTokenText"></div>
+                    <div class="selected-token-meta" id="selectedTokenMeta"></div>
+                </div>
+
+                <div class="panel-title">Attends To</div>
+                <div class="attention-list" id="attendsToList"></div>
+            </div>
+
+            <div class="empty-state" id="detailEmpty">
+                <p>Click a token to see its attention pattern</p>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // State
+        let ws = null;
+        let tokens = [];
+        let edges = [];
+        let selectedToken = null;
+        let streamStartTime = null;
+        let isStreaming = false;
+
+        // WebSocket connection
+        function connect() {
+            const port = document.getElementById('wsPort').value;
+            const url = `ws://localhost:${port}/ws`;
+
+            updateStatus('connecting', 'Connecting...');
+
+            ws = new WebSocket(url);
+
+            ws.onopen = () => {
+                updateStatus('connected', 'Connected');
+                console.log('WebSocket connected');
+            };
+
+            ws.onclose = () => {
+                updateStatus('disconnected', 'Disconnected');
+                console.log('WebSocket closed');
+                // Reconnect after 2 seconds
+                setTimeout(connect, 2000);
+            };
+
+            ws.onerror = (error) => {
+                console.error('WebSocket error:', error);
+                updateStatus('disconnected', 'Error');
+            };
+
+            ws.onmessage = (event) => {
+                const data = JSON.parse(event.data);
+                handleMessage(data);
+            };
+        }
+
+        function updateStatus(state, text) {
+            const dot = document.getElementById('statusDot');
+            const statusText = document.getElementById('statusText');
+
+            dot.className = 'status-dot ' + state;
+            statusText.textContent = text;
+        }
+
+        function handleMessage(data) {
+            switch (data.type) {
+                case 'stream_start':
+                    onStreamStart(data);
+                    break;
+                case 'token':
+                    onToken(data);
+                    break;
+                case 'attention_update':
+                    onAttentionUpdate(data);
+                    break;
+                case 'stream_end':
+                    onStreamEnd(data);
+                    break;
+                case 'error':
+                    onError(data);
+                    break;
+                case 'pong':
+                    console.log('Pong received');
+                    break;
+            }
+        }
+
+        function onStreamStart(data) {
+            isStreaming = true;
+            streamStartTime = Date.now();
+            tokens = [];
+            edges = [];
+
+            document.getElementById('emptyState').style.display = 'none';
+            document.getElementById('promptSegment').style.display = 'block';
+            document.getElementById('responseSegment').style.display = 'block';
+            document.getElementById('streamStatus').style.display = 'flex';
+
+            // Show prompt tokens
+            const promptContainer = document.getElementById('promptTokens');
+            promptContainer.innerHTML = '';
+            const promptText = data.prompt || document.getElementById('inputText').value;
+            const words = promptText.split(/(\s+)/);
+            words.forEach((word, i) => {
+                if (word.trim()) {
+                    const el = createTokenElement(word, i, 'prompt');
+                    promptContainer.appendChild(el);
+                }
+            });
+
+            document.getElementById('responseTokens').innerHTML = '';
+            updateStats();
+        }
+
+        function onToken(data) {
+            const container = document.getElementById('responseTokens');
+
+            // Create token element
+            const token = {
+                index: data.index,
+                text: data.content,
+                attention: data.attention || null,
+                zone: data.zone || null,  // Server sends zone directly
+                fingerprint: null,
+                entropy: null,
+                topAttention: null
+            };
+
+            // Extract edges and fingerprint from attention data
+            // Server sends attention as single object with token_positions/attention_scores
+            const attn = data.attention;
+            if (attn && attn.token_positions && attn.attention_scores) {
+                // Get zone from attention object
+                if (!token.zone) {
+                    token.zone = attn.manifold_zone;
+                }
+
+                // Store fingerprint data for tooltip
+                if (attn.fingerprint) {
+                    token.fingerprint = attn.fingerprint;
+                    token.entropy = attn.fingerprint.entropy;
+                }
+
+                // Get top attention percentage
+                if (attn.attention_scores.length > 0) {
+                    token.topAttention = Math.round(attn.attention_scores[0] * 100);
+                }
+
+                // Store edges
+                attn.token_positions.forEach((pos, i) => {
+                    edges.push({
+                        src: tokens.length,
+                        dst: pos,
+                        weight: attn.attention_scores[i],
+                        layer: attn.layer_id || 0
+                    });
+                });
+            }
+
+            // Also handle attends_to format from server
+            if (data.attends_to && Array.isArray(data.attends_to)) {
+                data.attends_to.forEach(edge => {
+                    edges.push({
+                        src: tokens.length,
+                        dst: edge.position,
+                        weight: edge.score,
+                        layer: 0
+                    });
+                });
+                // Get top attention from attends_to if not set
+                if (!token.topAttention && data.attends_to.length > 0) {
+                    token.topAttention = Math.round(data.attends_to[0].score * 100);
+                }
+            }
+
+            tokens.push(token);
+
+            const el = createTokenElement(token.text, tokens.length - 1, 'response', token.zone, token);
+            el.classList.add('streaming');
+            container.appendChild(el);
+
+            // Remove streaming animation after it plays
+            setTimeout(() => el.classList.remove('streaming'), 500);
+
+            updateStats();
+
+            // Auto-scroll
+            container.scrollTop = container.scrollHeight;
+        }
+
+        function onAttentionUpdate(data) {
+            // Update attention for existing token
+            if (data.index < tokens.length) {
+                tokens[data.index].attention = data.attention;
+            }
+        }
+
+        function onStreamEnd(data) {
+            isStreaming = false;
+            document.getElementById('streamStatus').style.display = 'none';
+            document.getElementById('analyzeBtn').disabled = false;
+
+            console.log(`Stream complete: ${data.total_tokens} tokens`);
+            updateStats();
+        }
+
+        function onError(data) {
+            console.error('Server error:', data.message);
+            alert('Error: ' + data.message);
+            isStreaming = false;
+            document.getElementById('streamStatus').style.display = 'none';
+            document.getElementById('analyzeBtn').disabled = false;
+        }
+
+        function createTokenElement(text, index, segment, zone = null, tokenData = null) {
+            const el = document.createElement('span');
+            el.className = 'token';
+            el.dataset.index = index;
+            el.dataset.segment = segment;
+
+            // Create text node for the token content
+            const textNode = document.createTextNode(text || '⟨empty⟩');
+            el.appendChild(textNode);
+
+            if (zone) {
+                el.dataset.zone = zone;
+            }
+
+            // Create enhanced tooltip for response tokens
+            if (segment === 'response' && tokenData) {
+                const tooltip = document.createElement('div');
+                tooltip.className = 'token-tooltip';
+
+                // Zone row
+                const zoneName = zone || 'unknown';
+                const zoneDisplay = zoneName.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
+                tooltip.innerHTML += `
+                    <div class="tooltip-row">
+                        <span class="tooltip-label">Zone</span>
+                        <span class="tooltip-value zone-${zoneName}">${zoneDisplay}</span>
+                    </div>`;
+
+                // Position row
+                tooltip.innerHTML += `
+                    <div class="tooltip-row">
+                        <span class="tooltip-label">Position</span>
+                        <span class="tooltip-value">${index}</span>
+                    </div>`;
+
+                // Entropy row (if available)
+                if (tokenData.entropy !== null && tokenData.entropy !== undefined) {
+                    const entropyLabel = tokenData.entropy < 1.5 ? 'focused' : tokenData.entropy < 2.5 ? 'moderate' : 'diffuse';
+                    tooltip.innerHTML += `
+                        <div class="tooltip-row">
+                            <span class="tooltip-label">Entropy</span>
+                            <span class="tooltip-value">${tokenData.entropy.toFixed(2)} (${entropyLabel})</span>
+                        </div>`;
+                }
+
+                // Top attention row (if available)
+                if (tokenData.topAttention !== null) {
+                    tooltip.innerHTML += `
+                        <div class="tooltip-row">
+                            <span class="tooltip-label">Top Attn</span>
+                            <span class="tooltip-value">${tokenData.topAttention}%</span>
+                        </div>`;
+                }
+
+                el.appendChild(tooltip);
+            }
+
+            el.onclick = () => selectToken(el, index, segment);
+
+            return el;
+        }
+
+        function selectToken(el, index, segment) {
+            // Clear previous selection
+            document.querySelectorAll('.token.selected, .token.attended-to').forEach(t => {
+                t.classList.remove('selected', 'attended-to');
+            });
+
+            el.classList.add('selected');
+            selectedToken = { index, segment };
+
+            // Show details
+            document.getElementById('tokenDetail').style.display = 'block';
+            document.getElementById('detailEmpty').style.display = 'none';
+
+            const token = segment === 'response' ? tokens[index] : { text: el.textContent };
+            document.getElementById('selectedTokenText').textContent = token.text;
+            document.getElementById('selectedTokenMeta').textContent =
+                `Position: ${index} | Segment: ${segment}${token.zone ? ` | Zone: ${token.zone}` : ''}`;
+
+            // Show attention
+            renderAttention(index, segment);
+        }
+
+        function renderAttention(index, segment) {
+            const list = document.getElementById('attendsToList');
+            list.innerHTML = '';
+
+            if (segment !== 'response' || index >= tokens.length) {
+                list.innerHTML = '<div class="empty-state"><p>No attention data for prompt tokens</p></div>';
+                return;
+            }
+
+            const token = tokens[index];
+            if (!token.attention) {
+                list.innerHTML = '<div class="empty-state"><p>No attention data available</p></div>';
+                return;
+            }
+
+            // Handle both array and object formats for attention data
+            // Server now sends attention as object directly, not array
+            const attn = Array.isArray(token.attention) ? token.attention[0] : token.attention;
+            if (!attn || !attn.token_positions || !attn.attention_scores) {
+                list.innerHTML = '<div class="empty-state"><p>Attention data format not recognized</p></div>';
+                return;
+            }
+
+            // Build list of attended tokens
+            const attended = attn.token_positions.map((pos, i) => ({
+                position: pos,
+                score: attn.attention_scores[i]
+            })).sort((a, b) => b.score - a.score);
+
+            // Render top attended tokens
+            attended.slice(0, 10).forEach((item, rank) => {
+                const itemEl = document.createElement('div');
+                itemEl.className = 'attention-item';
+
+                // Find the token text and zone (could be in prompt or response)
+                let tokenText = `[${item.position}]`;
+                let tokenZone = null;
+                const promptTokenEls = document.querySelectorAll('#promptTokens .token');
+                const responseTokenEls = document.querySelectorAll('#responseTokens .token');
+
+                if (item.position < promptTokenEls.length) {
+                    // Get only the first text node (not tooltip content)
+                    tokenText = promptTokenEls[item.position].childNodes[0]?.textContent || promptTokenEls[item.position].textContent;
+                    // Highlight attended token
+                    promptTokenEls[item.position].classList.add('attended-to');
+                } else {
+                    const respIdx = item.position - promptTokenEls.length;
+                    if (respIdx >= 0 && respIdx < responseTokenEls.length) {
+                        // Get only the first text node (not tooltip content)
+                        tokenText = responseTokenEls[respIdx].childNodes[0]?.textContent || responseTokenEls[respIdx].textContent;
+                        responseTokenEls[respIdx].classList.add('attended-to');
+                        // Get zone from token data
+                        if (respIdx < tokens.length) {
+                            tokenZone = tokens[respIdx].zone;
+                        }
+                    }
+                }
+
+                const scorePercent = (item.score * 100).toFixed(1);
+
+                // Get zone color
+                let zoneColor = 'var(--text-secondary)';
+                if (tokenZone) {
+                    if (tokenZone.includes('bridge') || tokenZone.includes('semantic')) {
+                        zoneColor = 'var(--semantic-bridge)';
+                    } else if (tokenZone.includes('syntax') || tokenZone.includes('floor')) {
+                        zoneColor = 'var(--syntax-floor)';
+                    } else if (tokenZone.includes('explor') || tokenZone.includes('diffuse')) {
+                        zoneColor = 'var(--exploration)';
+                    } else if (tokenZone.includes('steer') || tokenZone.includes('ripple')) {
+                        zoneColor = 'var(--steering)';
+                    }
+                }
+
+                itemEl.innerHTML = `
+                    <span class="attention-rank">${rank + 1}</span>
+                    <span class="attention-item-zone" style="background: ${zoneColor}"></span>
+                    <span class="attention-token">${tokenText}</span>
+                    <span class="attention-score">${scorePercent}%</span>
+                    <div class="attention-bar">
+                        <div class="attention-bar-fill" style="width: ${Math.min(100, item.score * 100)}%"></div>
+                    </div>
+                `;
+
+                list.appendChild(itemEl);
+            });
+        }
+
+        function startStream() {
+            if (!ws || ws.readyState !== WebSocket.OPEN) {
+                alert('Not connected to WebSocket server. Please wait...');
+                return;
+            }
+
+            const text = document.getElementById('inputText').value.trim();
+            if (!text) {
+                alert('Please enter a prompt');
+                return;
+            }
+
+            document.getElementById('analyzeBtn').disabled = true;
+
+            ws.send(JSON.stringify({
+                action: 'analyze',
+                messages: [{ role: 'user', content: text }],
+                max_tokens: parseInt(document.getElementById('maxTokens').value),
+                temperature: parseFloat(document.getElementById('temperature').value),
+                attention_top_k: parseInt(document.getElementById('topK').value)
+            }));
+        }
+
+        function stopStream() {
+            // TODO: Implement cancel on server side
+            isStreaming = false;
+            document.getElementById('streamStatus').style.display = 'none';
+            document.getElementById('analyzeBtn').disabled = false;
+        }
+
+        function clearAll() {
+            tokens = [];
+            edges = [];
+            selectedToken = null;
+
+            document.getElementById('promptTokens').innerHTML = '';
+            document.getElementById('responseTokens').innerHTML = '';
+            document.getElementById('promptSegment').style.display = 'none';
+            document.getElementById('responseSegment').style.display = 'none';
+            document.getElementById('emptyState').style.display = 'block';
+            document.getElementById('tokenDetail').style.display = 'none';
+            document.getElementById('detailEmpty').style.display = 'block';
+            document.getElementById('streamStatus').style.display = 'none';
+
+            updateStats();
+        }
+
+        function updateStats() {
+            document.getElementById('tokenCount').textContent = tokens.length;
+            document.getElementById('edgeCount').textContent = edges.length;
+
+            if (streamStartTime && tokens.length > 0) {
+                const elapsed = (Date.now() - streamStartTime) / 1000;
+                const tps = (tokens.length / elapsed).toFixed(1);
+                document.getElementById('tps').textContent = tps;
+            }
+
+            // Update zone histogram
+            updateZoneHistogram();
+        }
+
+        function updateZoneHistogram() {
+            const zoneCounts = {
+                semantic_bridge: 0,
+                syntax_floor: 0,
+                exploration: 0,
+                steering: 0,
+                diffuse: 0,
+                unknown: 0
+            };
+
+            tokens.forEach(token => {
+                const zone = token.zone || 'unknown';
+                // Normalize zone names
+                if (zone.includes('bridge') || zone.includes('semantic')) {
+                    zoneCounts.semantic_bridge++;
+                } else if (zone.includes('syntax') || zone.includes('floor')) {
+                    zoneCounts.syntax_floor++;
+                } else if (zone.includes('explor') || zone.includes('diffuse')) {
+                    zoneCounts.exploration++;
+                } else if (zone.includes('steer') || zone.includes('ripple') || zone.includes('structure')) {
+                    zoneCounts.steering++;
+                } else {
+                    zoneCounts.unknown++;
+                }
+            });
+
+            const total = tokens.length || 1;  // Prevent division by zero
+
+            // Update bars
+            const bridgePct = Math.round((zoneCounts.semantic_bridge / total) * 100);
+            const syntaxPct = Math.round((zoneCounts.syntax_floor / total) * 100);
+            const explorePct = Math.round((zoneCounts.exploration / total) * 100);
+            const steerPct = Math.round((zoneCounts.steering / total) * 100);
+
+            document.getElementById('bridgeBar').style.width = bridgePct + '%';
+            document.getElementById('syntaxBar').style.width = syntaxPct + '%';
+            document.getElementById('exploreBar').style.width = explorePct + '%';
+            document.getElementById('steerBar').style.width = steerPct + '%';
+
+            document.getElementById('bridgePercent').textContent = bridgePct + '%';
+            document.getElementById('syntaxPercent').textContent = syntaxPct + '%';
+            document.getElementById('explorePercent').textContent = explorePct + '%';
+            document.getElementById('steerPercent').textContent = steerPct + '%';
+        }
+
+        // Initialize
+        document.addEventListener('DOMContentLoaded', () => {
+            connect();
+        });
+    </script>
+</body>
+</html>

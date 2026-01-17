@@ -934,6 +934,25 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 require_reasoning=obj.require_reasoning,
                 return_hidden_states=obj.return_hidden_states,
                 return_routed_experts=obj.return_routed_experts,
+                return_attention_tokens=obj.return_attention_tokens,
+                top_k_attention=obj.top_k_attention,
+                attention_capture_layer_id=obj.attention_capture_layer_id,
+                attention_capture_layer_ids=obj.attention_capture_layer_ids,
+                attention_sketch_mode=obj.attention_sketch_mode,
+                attention_fingerprint_mode=getattr(
+                    obj, "attention_fingerprint_mode", None
+                ),
+                attention_fingerprint_only=getattr(
+                    obj, "attention_fingerprint_only", None
+                ),
+                attention_mask_prefix=getattr(obj, "attention_mask_prefix", None),
+                include_prompt_attention=getattr(obj, "include_prompt_attention", True),
+                attention_capture_head_ids=getattr(
+                    obj, "attention_capture_head_ids", None
+                ),
+                return_logit_lens=getattr(obj, "return_logit_lens", False),
+                logit_lens_top_k=getattr(obj, "logit_lens_top_k", 5),
+                logit_lens_layer_ids=getattr(obj, "logit_lens_layer_ids", None),
                 data_parallel_rank=obj.data_parallel_rank,
                 priority=obj.priority,
                 extra_key=obj.extra_key,
@@ -1534,6 +1553,21 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             if getattr(recv_obj, "customized_info", None):
                 for k, v in recv_obj.customized_info.items():
                     meta_info[k] = v[i]
+
+            # Handle attention tokens for interpretability
+            if getattr(recv_obj, "output_attention_tokens", None):
+                if recv_obj.output_attention_tokens[i] is not None:
+                    meta_info["attention_tokens"] = recv_obj.output_attention_tokens[i]
+
+            # Handle logit lens for interpretability
+            if getattr(recv_obj, "output_logit_lens", None):
+                if recv_obj.output_logit_lens[i] is not None:
+                    meta_info["logit_lens"] = recv_obj.output_logit_lens[i]
+
+            # Handle MoE routing for interpretability
+            if getattr(recv_obj, "output_moe_routing", None):
+                if recv_obj.output_moe_routing[i] is not None:
+                    meta_info["moe_routing"] = recv_obj.output_moe_routing[i]
 
             if isinstance(recv_obj, BatchStrOutput):
                 state.text += recv_obj.output_strs[i]

@@ -3,7 +3,6 @@
 Simple RCCL test for multi-GPU communication.
 This test verifies that RCCL can initialize and communicate across multiple GPUs.
 """
-import os
 import sys
 
 import torch

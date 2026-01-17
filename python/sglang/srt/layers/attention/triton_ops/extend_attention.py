@@ -60,6 +60,11 @@ def _get_block_sizes_for_extend_attention(Lq: int, Lv: int):
     BLOCK_DV = triton.next_power_of_2(Lv)
 
     # Determine BLOCK_M, BLOCK_N, and num_warps based on hardware
+    # SM120 (Blackwell Workstation) has reduced shared memory - force smaller blocks
+    if _is_cuda and torch.cuda.get_device_capability()[0] >= 12:
+        BLOCK_M, BLOCK_N = (64, 64)
+        num_warps = 4
+        return BLOCK_DMODEL, BLOCK_DPE, BLOCK_DV, BLOCK_M, BLOCK_N, num_warps
     if _is_hip:
         BLOCK_M, BLOCK_N = (64, 64)
         num_warps = 4
@@ -67,20 +72,17 @@ def _get_block_sizes_for_extend_attention(Lq: int, Lv: int):
         if _is_cuda and CUDA_CAPABILITY[0] >= 9:
             # Hopper architecture (H100, etc.)
             if Lq <= 256:
-                BLOCK_M, BLOCK_N = (128, 64)
+                BLOCK_M, BLOCK_N = (64, 64)
             else:
                 BLOCK_M, BLOCK_N = (32, 64)
         elif _is_cuda and CUDA_CAPABILITY[0] >= 8:
             # Ampere architecture (A100, etc.)
             # sm86/sm89 has a much smaller shared memory size (100K) than sm80 (160K)
             if CUDA_CAPABILITY[1] == 9 or CUDA_CAPABILITY[1] == 6:
-                if Lq <= 128:
-                    BLOCK_M, BLOCK_N = (64, 128)
-                elif Lq <= 256:
-                    BLOCK_M, BLOCK_N = (64, 64)
-                else:
-                    BLOCK_M, BLOCK_N = (32, 32)
+                # sm86/sm89: use conservative (64, 64) blocks due to limited shared memory
+                BLOCK_M, BLOCK_N = (64, 64)
             else:
+                # sm80 (A100): can use larger blocks
                 if Lq <= 128:
                     BLOCK_M, BLOCK_N = (128, 128)
                 elif Lq <= 256:

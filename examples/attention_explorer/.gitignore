@@ -1,0 +1,21 @@
+# Generated outputs
+exploration_*_outputs/
+exploration_*.db
+exploration_*.db-shm
+exploration_*.db-wal
+spectral_comparison/
+spectral_analysis/
+
+# UI build artifacts
+ui/node_modules/
+ui/dist/
+ui/test-results/
+
+# Router artifacts (keep metadata.json, ignore pickles)
+router_*/spectral_router.pkl
+router_*/spectral_router.spectral.pkl
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo

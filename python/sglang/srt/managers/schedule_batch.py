@@ -44,7 +44,7 @@ import time
 from enum import Enum, auto
 from http import HTTPStatus
 from itertools import chain
-from typing import TYPE_CHECKING, Any, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import torch
@@ -487,6 +487,217 @@ class RequestStage(str, enum.Enum):
     DECODE_QUICK_FINISH = "quick_finish"
 
 
+class SemanticMemory:
+    """Memory structure for semantic routing and steering.
+
+    This class enables the "Semantic Discovery Routing Loop" where attention
+    analysis results can influence future decode steps. It provides:
+
+    1. Attention biases: Additive logit biases to steer attention toward/away
+       from specific token positions (applied before softmax)
+    2. Activation injections: Steering vectors to add to hidden states at
+       specific layers (for representation engineering)
+    3. Dynamic layer capture: Allow sidecar to request different layers
+       for the next decode step
+    4. Semantic anchors: Track important token positions identified by
+       the clustering sidecar
+
+    The memory persists across decode steps within a request, enabling
+    real-time feedback from the analysis sidecar to the model.
+    """
+
+    def __init__(self):
+        # Attention biases: layer_id -> {token_pos: bias_value}
+        # Applied as additive bias to attention logits before softmax
+        # Positive values increase attention, negative values decrease
+        self.attention_biases: Dict[int, Dict[int, float]] = {}
+
+        # Activation injections: layer_id -> steering vector tensor
+        # Added to hidden states at the specified layer
+        # Used for representation engineering / activation steering
+        self.activation_injections: Dict[int, torch.Tensor] = {}
+
+        # Dynamic layer capture: which layers to probe next step
+        # If set, overrides the request's default capture layers
+        # Allows sidecar to dynamically adjust based on observations
+        self.next_capture_layers: Optional[List[int]] = None
+
+        # Semantic anchors: token positions identified as important
+        # Maps position -> (label, importance_score)
+        # e.g., {42: ("system_constraint", 0.95), 128: ("entity_ref", 0.87)}
+        self.semantic_anchors: Dict[int, Tuple[str, float]] = {}
+
+        # Hub tokens: high-cardinality nodes from attention graph
+        # Updated by sidecar based on cross-layer consensus
+        self.hub_tokens: List[int] = []
+
+        # Manifold state: current cluster/zone classification
+        # Updated by sidecar after fingerprint analysis
+        self.manifold_zone: Optional[str] = (
+            None  # e.g., "semantic_bridge", "syntax_floor"
+        )
+        self.manifold_confidence: float = 0.0
+        self.cluster_id: Optional[int] = None  # Cluster assignment from sidecar
+
+        # Dynamic capture control from sidecar (per-request overrides)
+        # These override batch-level defaults from server_args
+        self.attention_stride: Optional[int] = None  # Override stride for next steps
+        self.max_attention_steps: Optional[int] = None  # Override max steps
+        self.fingerprint_mode: Optional[bool] = None  # Override fingerprint mode
+        self.fingerprint_max_steps: Optional[int] = (
+            None  # Override fingerprint early exit
+        )
+
+        # Steering history: track applied modifications for debugging
+        self.steering_history: List[Dict] = []
+
+    def add_attention_bias(self, layer_id: int, token_pos: int, bias: float):
+        """Add an attention bias for a specific layer and token position."""
+        if layer_id not in self.attention_biases:
+            self.attention_biases[layer_id] = {}
+        self.attention_biases[layer_id][token_pos] = bias
+        self.steering_history.append(
+            {
+                "type": "attention_bias",
+                "layer": layer_id,
+                "pos": token_pos,
+                "bias": bias,
+            }
+        )
+
+    def add_activation_injection(self, layer_id: int, vector: torch.Tensor):
+        """Add a steering vector to inject at a specific layer."""
+        self.activation_injections[layer_id] = vector
+        self.steering_history.append(
+            {
+                "type": "activation_injection",
+                "layer": layer_id,
+                "norm": vector.norm().item(),
+            }
+        )
+
+    def set_semantic_anchor(self, token_pos: int, label: str, importance: float):
+        """Mark a token position as a semantic anchor."""
+        self.semantic_anchors[token_pos] = (label, importance)
+
+    def update_from_sidecar(self, sidecar_response: Dict):
+        """Update memory state from sidecar analysis response.
+
+        Supports both legacy format and schema v1:
+
+        Legacy format:
+        {
+            "manifold_zone": "semantic_bridge",
+            "manifold_confidence": 0.92,
+            "hub_tokens": [42, 128, 256],
+            "suggested_biases": {layer_id: {pos: bias}},
+            "next_capture_layers": [8, 16, 24],
+            "anchors": {pos: (label, score)},
+        }
+
+        Schema v1 format:
+        {
+            "schema_version": 1,
+            "manifold": {
+                "zone": "semantic_bridge",
+                "cluster_id": 12,
+                "cluster_conf": 0.92
+            },
+            "control": {
+                "next_capture_layer_ids": [8, 16, 24],
+                "attention_stride": 4,
+                "max_attention_steps": 256,
+                "fingerprint_mode": true,
+                "fingerprint_max_steps": 128,
+                "attention_biases": {layer_id: {pos: bias}},
+                "hub_tokens": [42, 128, 256]
+            }
+        }
+        """
+        # Detect schema version
+        schema_version = sidecar_response.get("schema_version", 0)
+
+        if schema_version >= 1:
+            # Schema v1: nested manifold and control objects
+            manifold = sidecar_response.get("manifold", {})
+            control = sidecar_response.get("control", {})
+
+            # Manifold state
+            if "zone" in manifold:
+                self.manifold_zone = manifold["zone"]
+            if "cluster_conf" in manifold:
+                self.manifold_confidence = manifold["cluster_conf"]
+            if "cluster_id" in manifold:
+                self.cluster_id = manifold["cluster_id"]
+
+            # Control signals
+            if "next_capture_layer_ids" in control:
+                self.next_capture_layers = control["next_capture_layer_ids"]
+            if "attention_stride" in control:
+                self.attention_stride = control["attention_stride"]
+            if "max_attention_steps" in control:
+                self.max_attention_steps = control["max_attention_steps"]
+            if "fingerprint_mode" in control:
+                self.fingerprint_mode = control["fingerprint_mode"]
+            if "fingerprint_max_steps" in control:
+                self.fingerprint_max_steps = control["fingerprint_max_steps"]
+            if "hub_tokens" in control:
+                self.hub_tokens = control["hub_tokens"]
+            if "attention_biases" in control:
+                for layer_id, pos_biases in control["attention_biases"].items():
+                    for pos, bias in pos_biases.items():
+                        self.add_attention_bias(int(layer_id), int(pos), float(bias))
+
+        else:
+            # Legacy format: flat structure
+            if "manifold_zone" in sidecar_response:
+                self.manifold_zone = sidecar_response["manifold_zone"]
+            if "manifold_confidence" in sidecar_response:
+                self.manifold_confidence = sidecar_response["manifold_confidence"]
+            if "hub_tokens" in sidecar_response:
+                self.hub_tokens = sidecar_response["hub_tokens"]
+            if "next_capture_layers" in sidecar_response:
+                self.next_capture_layers = sidecar_response["next_capture_layers"]
+            if "suggested_biases" in sidecar_response:
+                for layer_id, pos_biases in sidecar_response[
+                    "suggested_biases"
+                ].items():
+                    for pos, bias in pos_biases.items():
+                        self.add_attention_bias(int(layer_id), int(pos), float(bias))
+            if "anchors" in sidecar_response:
+                for pos, (label, score) in sidecar_response["anchors"].items():
+                    self.set_semantic_anchor(int(pos), label, float(score))
+
+    def get_layer_biases(self, layer_id: int) -> Dict[int, float]:
+        """Get attention biases for a specific layer."""
+        return self.attention_biases.get(layer_id, {})
+
+    def get_layer_injection(self, layer_id: int) -> Optional[torch.Tensor]:
+        """Get activation injection vector for a specific layer."""
+        return self.activation_injections.get(layer_id)
+
+    def clear_steering(self):
+        """Clear all steering modifications (biases and injections)."""
+        self.attention_biases.clear()
+        self.activation_injections.clear()
+        self.next_capture_layers = None
+
+    def to_dict(self) -> Dict:
+        """Serialize memory state for debugging/logging."""
+        return {
+            "attention_biases": self.attention_biases,
+            "activation_injections": {
+                k: v.shape for k, v in self.activation_injections.items()
+            },
+            "next_capture_layers": self.next_capture_layers,
+            "semantic_anchors": self.semantic_anchors,
+            "hub_tokens": self.hub_tokens,
+            "manifold_zone": self.manifold_zone,
+            "manifold_confidence": self.manifold_confidence,
+            "steering_history_len": len(self.steering_history),
+        }
+
+
 class Req:
     """The input and output status of a request."""
 
@@ -510,6 +721,19 @@ class Req:
         require_reasoning: bool = False,
         return_hidden_states: bool = False,
         return_routed_experts: bool = False,
+        return_attention_tokens: bool = False,
+        top_k_attention: int = 10,
+        attention_capture_layer_id: Optional[int] = None,
+        attention_capture_layer_ids: Optional[List[int]] = None,
+        attention_sketch_mode: bool = False,
+        attention_fingerprint_mode: Optional[bool] = None,
+        attention_fingerprint_only: Optional[bool] = None,
+        attention_mask_prefix: Optional[int] = None,
+        include_prompt_attention: bool = True,
+        attention_capture_head_ids: Optional[List[int]] = None,
+        return_moe_routing: bool = False,
+        moe_routing_top_k: int = 2,
+        moe_capture_layer_ids: Optional[List[int]] = None,
         eos_token_ids: Optional[Set[int]] = None,
         bootstrap_host: Optional[str] = None,
         bootstrap_port: Optional[int] = None,
@@ -571,6 +795,51 @@ class Req:
         self.sampling_params = sampling_params
         self.custom_logit_processor = custom_logit_processor
         self.return_hidden_states = return_hidden_states
+        self.return_attention_tokens = return_attention_tokens
+        self.top_k_attention = top_k_attention
+        self.attention_capture_layer_id = attention_capture_layer_id
+        self.attention_capture_layer_ids = attention_capture_layer_ids
+        self.attention_sketch_mode = attention_sketch_mode
+        self.attention_tokens: List[Dict] = []  # Per-token attention info
+        self.attention_tokens_decode_step: int = 0  # Counter for stride calculation
+        # Per-request capture control (None = use batch defaults from server_args)
+        # These can be set via API or overridden by sidecar feedback
+        self.attention_fingerprint_mode: Optional[bool] = attention_fingerprint_mode
+        self.attention_fingerprint_only: Optional[bool] = (
+            attention_fingerprint_only  # SECURE: Only return fingerprint, not raw data
+        )
+        self.attention_mask_prefix: Optional[int] = (
+            attention_mask_prefix  # Privacy: mask first N tokens
+        )
+        self.include_prompt_attention: bool = (
+            include_prompt_attention  # Capture first decode step regardless of stride
+        )
+        self.attention_capture_head_ids: Optional[List[int]] = (
+            attention_capture_head_ids  # Only average over these heads
+        )
+        self.attention_fingerprint_max_steps: Optional[int] = None
+        self.attention_stride: Optional[int] = None  # Override stride for this request
+        self.attention_max_tokens: Optional[int] = (
+            None  # Override max tokens for this request
+        )
+        # MoE routing capture
+        self.return_moe_routing = return_moe_routing
+        self.moe_routing_top_k = moe_routing_top_k
+        self.moe_capture_layer_ids = moe_capture_layer_ids
+        self.moe_routing: List[Dict] = []  # Per-token MoE routing info
+        # MoE sketch fingerprint: accumulated hubness tracking per layer
+        # hubness[layer_id] = {expert_id: count} - tracks expert selection frequency
+        self._moe_expert_hubness: Dict[int, Dict[int, int]] = {}
+        self._moe_total_steps: int = 0  # Total decode steps for hubness normalization
+        # Think phase tracking for attention segmentation (reasoning models)
+        # Phase: "think" = inside <think>...</think>, "output" = after </think>
+        self.attention_think_phase: str = "output"  # Current phase
+        self.attention_think_boundary: int = (
+            -1
+        )  # Decode step when phase changed to "output"
+
+        # Semantic memory for routing loop feedback (steering, anchors, manifold state)
+        self.semantic_memory = SemanticMemory()
 
         # extra key for classifying the request (e.g. cache_salt)
         if lora_id is not None:
@@ -1283,6 +1552,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # Metrics
     dp_cooperation_info: Optional[DPCooperationInfo] = None
+
+    # Attention token capture gating (compute-gated stride)
+    # These are set from server_args and used to skip GPU compute on non-probe steps
+    attention_tokens_stride: int = 1  # Only capture every Nth decode step
+    attention_tokens_max: int = 0  # Max tokens to capture (0 = unlimited)
+    attention_fingerprint_mode: bool = (
+        False  # Fingerprint mode: 64 bytes vs 200KB per step
+    )
+    attention_fingerprint_max_steps: int = 256  # Early exit: stop after N steps
+    attention_mask_prefix: int = 0  # Privacy: mask first N tokens (from server_args)
 
     @classmethod
     def init_new(
@@ -2103,6 +2382,66 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.spec_info:
             self.spec_info.merge_batch(other.spec_info)
 
+    @staticmethod
+    def _resolve_capture_layers(req) -> Optional[List[int]]:
+        """Normalize attention layer selection to a canonical form.
+
+        Priority (highest to lowest):
+        1. semantic_memory.next_capture_layers (dynamic sidecar override)
+        2. attention_capture_layer_ids (per-request explicit list)
+        3. attention_capture_layer_id (per-request single layer)
+        4. None (use server default)
+
+        Returns: List[int] if specified, None otherwise (default policy)
+
+        Layer ID Semantics (IMPORTANT for hybrid models):
+        ------------------------------------------------
+        All layer IDs in this system are "MODEL layer IDs" (0 to num_hidden_layers-1),
+        NOT "KV-cache layer indices". For hybrid models like Qwen3-Next:
+
+        - Model layer ID: The actual transformer layer index (e.g., 0-31 for 32-layer)
+        - KV layer index: Index into the KV-cache (may differ for sliding-window/hybrid)
+
+        For hybrid models with mixed full-attention and sliding-window layers:
+        - Only "full attention" layers support proper attention capture
+        - Use model config's `full_attention_layers` to identify valid capture layers
+        - The ForwardBatchInfo layer validation will filter invalid layer IDs
+
+        The translation from model layer ID to KV layer index is handled internally
+        by ForwardBatchInfo when building the capture request.
+
+        API Layer Specification:
+        - --attention-capture-layer-id N      : Model layer ID (0-indexed)
+        - --attention-capture-layer-ids 0,10  : List of model layer IDs
+        - Sidecar control.next_capture_layer_ids: Model layer IDs
+
+        For semantic discovery, prefer mid-depth full-attention layers (~60-80% depth)
+        rather than last layer, which often reflects syntax repair patterns.
+        """
+        # 1. Check semantic_memory for dynamic sidecar override (highest priority)
+        # This allows the routing loop to dynamically adjust capture layers
+        semantic_memory = getattr(req, "semantic_memory", None)
+        if semantic_memory is not None:
+            next_layers = getattr(semantic_memory, "next_capture_layers", None)
+            if next_layers is not None:
+                return (
+                    list(next_layers)
+                    if not isinstance(next_layers, list)
+                    else next_layers
+                )
+
+        # 2. Try explicit list from request
+        layer_ids = getattr(req, "attention_capture_layer_ids", None)
+        if layer_ids is not None:
+            return list(layer_ids) if not isinstance(layer_ids, list) else layer_ids
+
+        # 3. Try single layer legacy field (wrap in list for uniform handling)
+        layer_id = getattr(req, "attention_capture_layer_id", None)
+        if layer_id is not None:
+            return [int(layer_id)]
+
+        return None
+
     def get_model_worker_batch(
         self, seq_lens_cpu_cache: Optional[torch.Tensor] = None
     ) -> ModelWorkerBatch:
@@ -2122,6 +2461,164 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         seq_lens_cpu = (
             seq_lens_cpu_cache if seq_lens_cpu_cache is not None else self.seq_lens_cpu
         )
+
+        # Check if any request in the batch wants attention tokens (per-request gating)
+        # COMPUTE-GATED STRIDE: Only enable capture if at least one request needs it THIS step
+        # This skips GPU work entirely on non-probe steps (stride=8 means 7/8 steps skip compute)
+        capture_attention_tokens = False
+        attention_top_k = 5
+        capture_layers: Optional[List[int]] = None  # Normalized layer selection
+        capture_head_ids: Optional[List[int]] = None  # Head selection filter
+
+        # Default stride/max from batch settings
+        default_stride = self.attention_tokens_stride
+        default_max_tokens = self.attention_tokens_max
+
+        for req in self.reqs:
+            if not getattr(req, "return_attention_tokens", False):
+                continue
+
+            # Resolve per-request capture settings with priority:
+            # 1. Request-level fields (from API)
+            # 2. SemanticMemory fields (from sidecar feedback)
+            # 3. Batch-level defaults (from server_args)
+            semantic_memory = getattr(req, "semantic_memory", None)
+
+            # Stride: req.attention_stride > semantic_memory.attention_stride > batch default
+            stride = default_stride
+            req_stride = getattr(req, "attention_stride", None)
+            if req_stride is not None:
+                stride = req_stride
+            elif semantic_memory is not None:
+                sm_stride = getattr(semantic_memory, "attention_stride", None)
+                if sm_stride is not None:
+                    stride = sm_stride
+
+            # Max tokens: req > semantic_memory > batch default
+            max_tokens = default_max_tokens
+            req_max = getattr(req, "attention_max_tokens", None)
+            if req_max is not None:
+                max_tokens = req_max
+            elif semantic_memory is not None:
+                sm_max = getattr(semantic_memory, "max_attention_steps", None)
+                if sm_max is not None:
+                    max_tokens = sm_max
+
+            # Fingerprint mode: req > semantic_memory > batch default
+            fingerprint_mode = self.attention_fingerprint_mode
+            req_fp_mode = getattr(req, "attention_fingerprint_mode", None)
+            if req_fp_mode is not None:
+                fingerprint_mode = req_fp_mode
+            elif semantic_memory is not None:
+                sm_fp_mode = getattr(semantic_memory, "fingerprint_mode", None)
+                if sm_fp_mode is not None:
+                    fingerprint_mode = sm_fp_mode
+
+            # Fingerprint max steps: req > semantic_memory > batch default
+            fingerprint_max_steps = self.attention_fingerprint_max_steps
+            req_fp_max = getattr(req, "attention_fingerprint_max_steps", None)
+            if req_fp_max is not None:
+                fingerprint_max_steps = req_fp_max
+            elif semantic_memory is not None:
+                sm_fp_max = getattr(semantic_memory, "fingerprint_max_steps", None)
+                if sm_fp_max is not None:
+                    fingerprint_max_steps = sm_fp_max
+
+            # Check if this request needs capture on its NEXT decode step
+            # (we pre-check here, step will be incremented in output processor)
+            next_step = req.attention_tokens_decode_step + 1
+
+            # Apply stride: only capture every Nth step
+            # Exception: always capture step 1 if include_prompt_attention is True
+            # (step 1 shows what in the prompt the model attends to for first token)
+            is_prompt_step = next_step == 1 and req.include_prompt_attention
+            if stride > 1 and (next_step % stride != 0) and not is_prompt_step:
+                continue
+
+            # Apply max: stop if we've hit the cap
+            if max_tokens > 0 and len(req.attention_tokens) >= max_tokens:
+                continue
+
+            # Early exit for fingerprint mode: stop after N decode steps
+            # The attention manifold typically stabilizes early (within ~256 steps)
+            if (
+                fingerprint_mode
+                and fingerprint_max_steps > 0
+                and next_step > fingerprint_max_steps
+            ):
+                continue
+
+            # This request needs capture this step - enable GPU compute
+            capture_attention_tokens = True
+
+            # Track the max top_k needed
+            req_top_k = getattr(req, "top_k_attention", 5)
+            if req_top_k > attention_top_k:
+                attention_top_k = req_top_k
+
+            # Get layer override from first request that specifies one
+            # Normalize to List[int] | None internally (layer_ids takes precedence)
+            if capture_layers is None:
+                capture_layers = self._resolve_capture_layers(req)
+
+            # Get head filter from first request that specifies one
+            if capture_head_ids is None:
+                req_head_ids = getattr(req, "attention_capture_head_ids", None)
+                if req_head_ids is not None:
+                    capture_head_ids = list(req_head_ids)
+
+        # Collect attention biases from semantic_memory (for steering)
+        # Format: Dict[layer_id -> List[Dict[token_pos -> bias]]]
+        attention_biases: Optional[Dict[int, List[Dict[int, float]]]] = None
+        for batch_idx, req in enumerate(self.reqs):
+            semantic_memory = getattr(req, "semantic_memory", None)
+            if semantic_memory is None:
+                continue
+            req_biases = getattr(semantic_memory, "attention_biases", None)
+            if not req_biases:
+                continue
+            # req_biases is Dict[layer_id -> Dict[token_pos -> bias]]
+            for layer_id, token_biases in req_biases.items():
+                if not token_biases:
+                    continue
+                if attention_biases is None:
+                    attention_biases = {}
+                if layer_id not in attention_biases:
+                    # Initialize with empty dicts for all requests
+                    attention_biases[layer_id] = [{} for _ in range(len(self.reqs))]
+                attention_biases[layer_id][batch_idx] = token_biases
+
+        # Check if any request wants MoE routing capture
+        capture_moe_routing = False
+        moe_routing_top_k = 2
+        moe_capture_layer_ids: Optional[List[int]] = None
+
+        for req in self.reqs:
+            if getattr(req, "return_moe_routing", False):
+                capture_moe_routing = True
+                # Use the max top_k from any request
+                req_top_k = getattr(req, "moe_routing_top_k", 2)
+                if req_top_k > moe_routing_top_k:
+                    moe_routing_top_k = req_top_k
+                # Use layer IDs from first request that specifies them
+                if moe_capture_layer_ids is None:
+                    moe_capture_layer_ids = getattr(req, "moe_capture_layer_ids", None)
+
+        # Check if any request wants logit lens capture (experimental interpretability)
+        capture_logit_lens = False
+        logit_lens_top_k = 5
+        logit_lens_layer_ids: Optional[List[int]] = None
+
+        for req in self.reqs:
+            if getattr(req, "return_logit_lens", False):
+                capture_logit_lens = True
+                # Use the max top_k from any request
+                req_top_k = getattr(req, "logit_lens_top_k", 5)
+                if req_top_k > logit_lens_top_k:
+                    logit_lens_top_k = req_top_k
+                # Use layer IDs from first request that specifies them
+                if logit_lens_layer_ids is None:
+                    logit_lens_layer_ids = getattr(req, "logit_lens_layer_ids", None)
 
         return ModelWorkerBatch(
             forward_mode=self.forward_mode,
@@ -2178,6 +2675,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_indices=self.mamba_track_indices,
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,
+            capture_attention_tokens=capture_attention_tokens,
+            attention_top_k=attention_top_k,
+            attention_capture_layer_id=capture_layers,  # Pass normalized List[int] | None
+            attention_capture_head_ids=capture_head_ids,  # Head selection filter
+            attention_biases=attention_biases,  # Steering biases from semantic_memory
+            capture_moe_routing=capture_moe_routing,
+            moe_routing_top_k=moe_routing_top_k,
+            moe_capture_layer_ids=moe_capture_layer_ids,
+            capture_logit_lens=capture_logit_lens,
+            logit_lens_top_k=logit_lens_top_k,
+            logit_lens_layer_ids=logit_lens_layer_ids,
         )
 
     def copy(self):
@@ -2312,3 +2820,35 @@ class ModelWorkerBatch:
     mamba_track_indices: Optional[torch.Tensor] = None  # shape: [b], int64
     mamba_track_mask: Optional[torch.Tensor] = None  # shape: [b], bool
     mamba_track_seqlens: Optional[torch.Tensor] = None  # shape: [b], int64
+
+    # For attention token capture (interpretability)
+    # True only if at least one request in the batch requested attention tokens
+    capture_attention_tokens: bool = False
+    attention_top_k: int = 5
+    attention_capture_layer_id: Optional[Union[int, List[int]]] = (
+        None  # Per-request layer override (single int or list)
+    )
+    attention_capture_head_ids: Optional[List[int]] = (
+        None  # Only average over these heads (None = all)
+    )
+
+    # For attention steering (semantic routing loop)
+    # Dict[layer_id -> List[Dict[token_pos -> bias_value]]] (one dict per request in batch)
+    # Biases are added to attention logits before softmax
+    attention_biases: Optional[Dict[int, List[Dict[int, float]]]] = None
+
+    # For MoE routing capture (interpretability/semantic telemetry)
+    # Captures which experts were selected for each token
+    capture_moe_routing: bool = False
+    moe_routing_top_k: int = 2  # How many top experts to capture
+    moe_capture_layer_ids: Optional[List[int]] = (
+        None  # Which layers to capture (None = all)
+    )
+
+    # For logit lens (interpretability) - project intermediate layers to vocab
+    # Shows how token predictions evolve through model layers
+    capture_logit_lens: bool = False
+    logit_lens_top_k: int = 5  # Number of top token candidates per layer
+    logit_lens_layer_ids: Optional[List[int]] = (
+        None  # Which layers to probe (None = auto-select ~4)
+    )

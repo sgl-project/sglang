@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 
 import argparse
-import base64
 import json
 import os
 import re
 import sys
 import time
-from collections import Counter, defaultdict
+from collections import defaultdict
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 

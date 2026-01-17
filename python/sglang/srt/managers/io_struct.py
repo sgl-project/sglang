@@ -202,6 +202,39 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
     return_hidden_states: Union[List[bool], bool] = False
     # Whether to return captured routed experts
     return_routed_experts: bool = False
+    # Whether to return top-k attention tokens for interpretability
+    return_attention_tokens: Union[List[bool], bool] = False
+    # Number of top attention tokens to capture per output token
+    top_k_attention: Union[List[int], int] = 10
+    # Layer to capture attention from (-1 = last layer, None = use server default)
+    attention_capture_layer_id: Optional[Union[List[int], int]] = None
+    # Specific layers to capture (overrides attention_capture_layer_id)
+    attention_capture_layer_ids: Optional[Union[List[List[int]], List[int]]] = None
+    # Return per-layer sketches instead of raw edges (bandwidth efficient for long outputs)
+    attention_sketch_mode: Union[List[bool], bool] = False
+    # Override server fingerprint mode per-request (None = use server default, False = raw mode)
+    attention_fingerprint_mode: Optional[Union[List[bool], bool]] = None
+    # Privacy: mask attention to first N tokens (hide system prompt structure)
+    attention_mask_prefix: Optional[Union[List[int], int]] = None
+    # SECURE MODE: Only return fingerprint, never raw positions/scores (auto-enabled when mask_prefix > 0)
+    attention_fingerprint_only: Optional[Union[List[bool], bool]] = None
+    # Capture first decode step (prompt attention) regardless of stride
+    include_prompt_attention: Union[List[bool], bool] = True
+    # Only average over these attention heads (None = all heads)
+    attention_capture_head_ids: Optional[Union[List[List[int]], List[int]]] = None
+    # Attention biases for steering: Dict[layer_id -> Dict[token_pos -> bias]]
+    attention_biases: Optional[
+        Union[List[Dict[int, Dict[int, float]]], Dict[int, Dict[int, float]]]
+    ] = None
+    # MoE routing capture: which experts were selected for each token
+    return_moe_routing: Union[List[bool], bool] = False
+    moe_routing_top_k: Union[List[int], int] = 2
+    moe_capture_layer_ids: Optional[Union[List[List[int]], List[int]]] = None
+
+    # Logit lens: project hidden states through unembedding matrix
+    return_logit_lens: Union[List[bool], bool] = False
+    logit_lens_top_k: Union[List[int], int] = 5
+    logit_lens_layer_ids: Optional[Union[List[List[int]], List[int]]] = None
 
     # The modalities of the image data [image, multi-images, video]
     modalities: Optional[List[str]] = None
@@ -675,6 +708,11 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
             return_bytes=self.return_bytes,
             return_entropy=self.return_entropy,
             external_trace_header=self.external_trace_header,
+            return_attention_tokens=(
+                self.return_attention_tokens[i]
+                if isinstance(self.return_attention_tokens, list)
+                else self.return_attention_tokens
+            ),
             http_worker_ipc=self.http_worker_ipc,
             **{
                 field: getattr(self, field)
@@ -760,6 +798,38 @@ class TokenizedGenerateReqInput(BaseReq):
 
     need_wait_for_image: bool = False
     num_items_assigned: Optional[List] = None
+
+    # Whether to return top-k attention tokens for interpretability
+    return_attention_tokens: bool = False
+    # Number of top attention tokens to capture per output token
+    top_k_attention: int = 10
+    # Layer to capture attention from (-1 = last layer, None = use server default)
+    attention_capture_layer_id: Optional[int] = None
+    # Specific layers to capture (overrides attention_capture_layer_id)
+    attention_capture_layer_ids: Optional[List[int]] = None
+    # Return per-layer sketches instead of raw edges (bandwidth efficient)
+    attention_sketch_mode: bool = False
+    # Override server fingerprint mode per-request (None = use server default, False = raw mode)
+    attention_fingerprint_mode: Optional[bool] = None
+    # Privacy: mask attention to first N tokens (hide system prompt structure)
+    attention_mask_prefix: Optional[int] = None
+    # SECURE MODE: Only return fingerprint, never raw positions/scores (auto-enabled when mask_prefix > 0)
+    attention_fingerprint_only: Optional[bool] = None
+    # Capture first decode step (prompt attention) regardless of stride
+    include_prompt_attention: bool = True
+    # Only average over these attention heads (None = all heads)
+    attention_capture_head_ids: Optional[List[int]] = None
+    # Attention biases for steering: Dict[layer_id -> Dict[token_pos -> bias]]
+    attention_biases: Optional[Dict[int, Dict[int, float]]] = None
+    # MoE routing capture: which experts were selected for each token
+    return_moe_routing: bool = False
+    moe_routing_top_k: int = 2
+    moe_capture_layer_ids: Optional[List[int]] = None
+
+    # Logit lens: project hidden states through unembedding matrix
+    return_logit_lens: bool = False
+    logit_lens_top_k: int = 5
+    logit_lens_layer_ids: Optional[List[int]] = None
 
 
 @dataclass
@@ -945,6 +1015,8 @@ class BatchTokenizedEmbeddingReqInput(BaseBatchReq):
 class BatchTokenIDOutput(
     BaseBatchReq, RequestTimingMetricsMixin, SpeculativeDecodingMetricsMixin
 ):
+    """Output batch for token ID mode processing."""
+
     # The finish reason
     finished_reasons: List[BaseFinishReason]
     # For incremental decoding
@@ -992,6 +1064,15 @@ class BatchTokenIDOutput(
 
     # Number of times each request was retracted.
     retraction_counts: List[int]
+
+    # Attention token info for interpretability (top-k positions and scores per token)
+    output_attention_tokens: Optional[List[List[Dict]]] = None
+
+    # MoE routing info for interpretability (which experts were selected per token)
+    output_moe_routing: Optional[List[List[Dict]]] = None
+
+    # Logit lens info for interpretability (intermediate layer predictions)
+    output_logit_lens: Optional[List[Dict]] = None
 
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: List[List[int]] = None
@@ -1079,6 +1160,15 @@ class BatchStrOutput(
 
     # Number of times each request was retracted.
     retraction_counts: List[int]
+
+    # Attention token info for interpretability (top-k positions and scores per token)
+    output_attention_tokens: Optional[List[List[Dict]]] = None
+
+    # MoE routing info for interpretability (which experts were selected per token)
+    output_moe_routing: Optional[List[List[Dict]]] = None
+
+    # Logit lens info for interpretability (intermediate layer predictions)
+    output_logit_lens: Optional[List[Dict]] = None
 
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: List[List[int]] = None

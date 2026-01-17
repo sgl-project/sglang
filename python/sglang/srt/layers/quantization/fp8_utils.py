@@ -38,6 +38,7 @@ from sglang.srt.utils import (
     is_flashinfer_available,
     is_hip,
     is_sm90_supported,
+    is_sm120_supported,
     offloader,
 )
 
@@ -240,14 +241,20 @@ def _dispatch_auto_backend() -> Callable:
     """Auto-select the best backend based on hardware capabilities."""
     # Priority order for auto selection:
     # 1. DeepGEMM (if enabled and available)
-    # 2. FlashInfer TRTLLM (if Blackwell GPU and FlashInfer available)
+    # 2. FlashInfer TRTLLM (if SM100 Blackwell GPU and FlashInfer available)
+    #    Note: SM120 (Blackwell RTX PRO 6000) is NOT supported by flashinfer's trtllm backend
     # 3. CUTLASS (if Hopper+ GPU and CUDA 12.0+)
     # 4. AITER (if AMD GPU with AITER enabled)
     # 5. Triton (fallback)
 
     if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
         return deepgemm_w8a8_block_fp8_linear_with_fallback
-    elif is_blackwell_supported() and is_flashinfer_available():
+    elif (
+        is_blackwell_supported()
+        and not is_sm120_supported()
+        and is_flashinfer_available()
+    ):
+        # Only use flashinfer for SM100, not SM120 (trtllm backend doesn't support SM120)
         return flashinfer_gemm_w8a8_block_fp8_linear_with_fallback
     elif _check_cutlass_block_fp8_hardware_support():
         return cutlass_w8a8_block_fp8_linear_with_fallback
@@ -308,8 +315,10 @@ def flashinfer_gemm_w8a8_block_fp8_linear_with_fallback(
     input_2d = input.view(-1, input.shape[-1])
     k_dim = input_2d.shape[1]  # K dimension
 
-    if k_dim < 256:
-        # Fallback to Triton for shapes that don't meet TRTLLM constraint.
+    # SM120 (Blackwell RTX PRO 6000) is not supported by flashinfer's trtllm backend
+    # Fallback to triton for SM120
+    if is_sm120_supported() or k_dim < 256:
+        # Fallback to Triton for SM120 or shapes that don't meet TRTLLM constraint.
         return triton_w8a8_block_fp8_linear(
             input, weight, block_size, weight_scale, input_scale, bias
         )

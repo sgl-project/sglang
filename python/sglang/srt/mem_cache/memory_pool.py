@@ -213,9 +213,11 @@ class MambaPool:
         self.device = device
 
         # for disagg with nvlink
-        self.enable_custom_mem_pool, self.custom_mem_pool, _ = (
-            maybe_init_custom_mem_pool(device=self.device)
-        )
+        (
+            self.enable_custom_mem_pool,
+            self.custom_mem_pool,
+            _,
+        ) = maybe_init_custom_mem_pool(device=self.device)
 
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE), (
             torch.cuda.use_mem_pool(self.custom_mem_pool)
@@ -588,9 +590,11 @@ class KVCache(abc.ABC):
         self.layer_transfer_counter = None
 
         # for disagg with nvlink
-        self.enable_custom_mem_pool, self.custom_mem_pool, _ = (
-            maybe_init_custom_mem_pool(device=self.device)
-        )
+        (
+            self.enable_custom_mem_pool,
+            self.custom_mem_pool,
+            _,
+        ) = maybe_init_custom_mem_pool(device=self.device)
 
     def _finalize_allocation_log(self, num_tokens: int):
         """Common logging and mem_usage computation for KV cache allocation.
@@ -648,7 +652,6 @@ class KVCache(abc.ABC):
 
 
 class MHATokenToKVPool(KVCache):
-
     def __init__(
         self,
         size: int,
@@ -790,7 +793,7 @@ class MHATokenToKVPool(KVCache):
         self.data_ptrs = torch.cat([self.k_data_ptrs, self.v_data_ptrs], dim=0)
         self.data_strides = torch.tensor(
             [
-                np.prod(x.shape[1:]) * x.dtype.itemsize
+                int(np.prod(x.shape[1:])) * x.dtype.itemsize
                 for x in self.k_buffer + self.v_buffer
             ],
             device=self.device,
@@ -991,7 +994,6 @@ class MHATokenToKVPool(KVCache):
 
 
 class MHATokenToKVPoolFP4(MHATokenToKVPool):
-
     def _create_buffers(self):
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             with (
@@ -1224,9 +1226,11 @@ class HybridLinearKVPool(KVCache):
         return self.full_kv_pool.get_contiguous_buf_infos()
 
     def get_state_buf_infos(self):
-        mamba_data_ptrs, mamba_data_lens, mamba_item_lens = (
-            self.mamba_pool.get_contiguous_buf_infos()
-        )
+        (
+            mamba_data_ptrs,
+            mamba_data_lens,
+            mamba_item_lens,
+        ) = self.mamba_pool.get_contiguous_buf_infos()
         return mamba_data_ptrs, mamba_data_lens, mamba_item_lens
 
     def maybe_get_custom_mem_pool(self):
@@ -1253,7 +1257,6 @@ class HybridLinearKVPool(KVCache):
 
     @contextmanager
     def _transfer_id_context(self, layer: RadixAttention):
-
         @contextmanager
         def _patch_layer_id(layer):
             original_layer_id = layer.layer_id
@@ -1545,7 +1548,6 @@ class MLATokenToKVPool(KVCache):
 
 
 class MLATokenToKVPoolFP4(MLATokenToKVPool):
-
     def _create_buffers(self):
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             with (
@@ -1648,12 +1650,14 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
                     KVFP4QuantizeUtil,
                 )
 
-                cache_k_nope_fp4, cache_k_nope_fp4_sf = (
-                    KVFP4QuantizeUtil.batched_quantize(cache_k_nope)
-                )
-                cache_k_rope_fp4, cache_k_rope_fp4_sf = (
-                    KVFP4QuantizeUtil.batched_quantize(cache_k_rope)
-                )
+                (
+                    cache_k_nope_fp4,
+                    cache_k_nope_fp4_sf,
+                ) = KVFP4QuantizeUtil.batched_quantize(cache_k_nope)
+                (
+                    cache_k_rope_fp4,
+                    cache_k_rope_fp4_sf,
+                ) = KVFP4QuantizeUtil.batched_quantize(cache_k_rope)
 
             if self.store_dtype != self.dtype:
                 cache_k_nope = cache_k_nope.view(self.store_dtype)

@@ -1,0 +1,187 @@
+import { useState, useCallback, useRef, useEffect } from 'react';
+import { useSessionStore } from '../stores/useSessionStore';
+import { useUIStore } from '../stores/useUIStore';
+import { useTraceStore } from '../stores/useTraceStore';
+import { AttentionStreamClient } from '../api/client';
+import { extractFingerprint } from '../api/types';
+
+export function useAttentionStream() {
+  // Get baseUrl and model from store - these are configurable
+  const baseUrl = useUIStore((state) => state.baseUrl);
+  const modelName = useUIStore((state) => state.modelName);
+
+  // Use 'default' as model fallback - SGLang accepts this to use the loaded model
+  const model = modelName && modelName !== 'Not connected' ? modelName : 'default';
+
+  const [isStreaming, setIsStreaming] = useState(false);
+  const [error, setError] = useState<Error | null>(null);
+
+  const program = useUIStore((state) => state.program);
+  const setConnected = useUIStore((state) => state.setConnected);
+  const setModelName = useUIStore((state) => state.setModelName);
+  const startStreamStats = useUIStore((state) => state.startStreamStats);
+  const recordAttentionEntry = useUIStore((state) => state.recordAttentionEntry);
+  const incrementTokenCount = useUIStore((state) => state.incrementTokenCount);
+  const addMessage = useSessionStore((state) => state.addMessage);
+  const appendToken = useSessionStore((state) => state.appendToken);
+  const appendAttention = useSessionStore((state) => state.appendAttention);
+  const appendMoE = useSessionStore((state) => state.appendMoE);
+  const setFingerprint = useSessionStore((state) => state.setFingerprint);
+  const startStreaming = useSessionStore((state) => state.startStreaming);
+  const finishStreaming = useSessionStore((state) => state.finishStreaming);
+  const initTrace = useTraceStore((state) => state.initTrace);
+
+  const clientRef = useRef<AttentionStreamClient | null>(null);
+
+  // Check server health and fetch model info
+  useEffect(() => {
+    let cancelled = false;
+
+    const checkConnection = async () => {
+      try {
+        // Check health endpoint
+        const healthRes = await fetch(`${baseUrl}/health`, { method: 'GET' });
+        if (!healthRes.ok) throw new Error('Server not healthy');
+
+        // Get model info
+        const modelsRes = await fetch(`${baseUrl}/v1/models`, { method: 'GET' });
+        if (modelsRes.ok) {
+          const data = await modelsRes.json();
+          if (data.data?.[0]?.id && !cancelled) {
+            setModelName(data.data[0].id);
+          }
+        }
+
+        if (!cancelled) {
+          setConnected(true);
+        }
+      } catch (err) {
+        console.warn('Server connection check failed:', err);
+        if (!cancelled) {
+          setConnected(false);
+          setModelName('Not connected');
+        }
+      }
+    };
+
+    checkConnection();
+    // Re-check every 10 seconds
+    const interval = setInterval(checkConnection, 10000);
+
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [baseUrl, setConnected, setModelName]);
+
+  useEffect(() => {
+    const client = new AttentionStreamClient({
+      baseUrl,
+      model,
+      program,
+      onToken: (token) => {
+        appendToken(token);
+        incrementTokenCount();
+      },
+      onAttention: (entry) => {
+        appendAttention(entry);
+
+        // Extract fingerprint from any mode (raw, sketch, or fingerprint)
+        // This enables Manifold/Router views with raw attention data
+        const fp = extractFingerprint(entry);
+        if (fp) setFingerprint(fp);
+
+        // Record overhead stats based on mode
+        // Estimated bytes per entry: raw ~200B, sketch ~500B/layer, fingerprint ~64B
+        const mode = entry.mode as 'raw' | 'sketch' | 'fingerprint';
+        let bytes = 64; // default fingerprint size
+        if (mode === 'raw') {
+          bytes = 200 + (entry as any).layers ? Object.keys((entry as any).layers).length * 150 : 0;
+        } else if (mode === 'sketch') {
+          const layerCount = (entry as any).layer_sketches ? Object.keys((entry as any).layer_sketches).length : 1;
+          bytes = 500 * layerCount;
+        }
+        recordAttentionEntry(bytes, mode);
+      },
+      onMoE: (entry) => {
+        appendMoE(entry);
+      },
+      onFinish: () => {
+        finishStreaming();
+        setIsStreaming(false);
+      },
+      onError: (err) => {
+        setError(err);
+        finishStreaming();
+        setIsStreaming(false);
+      },
+    });
+
+    clientRef.current = client;
+
+    return () => {
+      client.abort();
+    };
+  }, [baseUrl, model, program, appendToken, appendAttention, appendMoE, setFingerprint, finishStreaming, incrementTokenCount, recordAttentionEntry]);
+
+  useEffect(() => {
+    clientRef.current?.setProgram(program);
+  }, [program]);
+
+  const sendMessage = useCallback(
+    async (content: string) => {
+      if (!clientRef.current) return;
+
+      // Initialize trace if not exists
+      const traceStore = useTraceStore.getState();
+      if (!traceStore.currentTrace) {
+        const modelName = useUIStore.getState().modelName;
+        initTrace(modelName);
+      }
+
+      setIsStreaming(true);
+      setError(null);
+
+      // Start overhead stats tracking for this stream
+      startStreamStats();
+
+      // Add user message (will sync to TraceStore)
+      addMessage({
+        id: `user-${Date.now()}`,
+        role: 'user',
+        content,
+        timestamp: Date.now(),
+      });
+
+      // Start streaming (notifies TraceStore)
+      startStreaming();
+
+      const messages = useSessionStore.getState().messages.map((m) => ({
+        role: m.role,
+        content: m.content,
+      }));
+
+      try {
+        await clientRef.current.stream(messages);
+      } catch (err) {
+        setError(err as Error);
+        finishStreaming();
+        setIsStreaming(false);
+      }
+    },
+    [addMessage, initTrace, startStreaming, finishStreaming, startStreamStats]
+  );
+
+  const abort = useCallback(() => {
+    clientRef.current?.abort();
+    finishStreaming();
+    setIsStreaming(false);
+  }, [finishStreaming]);
+
+  return {
+    sendMessage,
+    abort,
+    isStreaming,
+    error,
+  };
+}

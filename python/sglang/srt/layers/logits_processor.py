@@ -15,9 +15,12 @@
 
 import dataclasses
 import logging
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import torch
+
+if TYPE_CHECKING:
+    from sglang.srt.logit_lens.types import LogitLensOutput
 import triton
 import triton.language as tl
 from torch import nn
@@ -71,6 +74,28 @@ class LogitsProcessorOutput:
     # Used by speculative decoding (EAGLE)
     # The last hidden layers
     hidden_states: Optional[torch.Tensor] = None
+    # Top-k attention token info for interpretability [batch, top_k] positions and scores
+    attention_token_positions: Optional[torch.Tensor] = None
+    attention_token_scores: Optional[torch.Tensor] = None
+    attention_layer_id: int = (
+        -1
+    )  # Which layer the attention came from (-1 = aggregated)
+    # Raw attention logits and logsumexp for approximate probability calculation
+    attention_topk_logits: Optional[torch.Tensor] = None  # [batch, top_k]
+    attention_logsumexp_candidates: Optional[torch.Tensor] = (
+        None  # [batch] (approx, from top chunks)
+    )
+    # Multi-layer attention capture: dict of layer_id -> (positions, scores, logits, logsumexp)
+    attention_multi_layer: Optional[Dict[int, tuple]] = None
+    # In-kernel fingerprint: compressed attention pattern (20D feature vector)
+    # Production mode - replaces raw indices for high-throughput routing
+    attention_fingerprint: Optional[torch.Tensor] = None  # [batch, 20]
+    attention_manifold: Optional[List[str]] = None  # Manifold classification per batch
+    # MoE routing capture: List[(layer_id, topk_ids, topk_weights)]
+    # topk_ids: [num_tokens, top_k], topk_weights: [num_tokens, top_k]
+    moe_routing_buffer: Optional[List[tuple]] = None
+    # Logit lens: intermediate layer predictions projected to vocabulary
+    logit_lens_output: Optional["LogitLensOutput"] = None
 
     ## Part 2: This part will be assigned in python/sglang/srt/layers/sampler.py::Sampler
     # he log probs of output tokens, if SGLANG_RETURN_ORIGINAL_LOGPROB = True, will get the log probs before applying temperature. If False, will get the log probs before applying temperature.
@@ -385,7 +410,64 @@ class LogitsProcessor(nn.Module):
         aux_hidden_states: Optional[torch.Tensor] = None,
         hidden_states_before_norm: Optional[torch.Tensor] = None,
     ) -> LogitsProcessorOutput:
+        # Extract attention token info before converting ForwardBatch
+        attention_token_positions = None
+        attention_token_scores = None
+        attention_layer_id = -1
+        attention_topk_logits = None
+        attention_logsumexp_candidates = None
+        attention_multi_layer = None
+        attention_fingerprint = None
+        attention_manifold = None
+        moe_routing_buffer = None
         if isinstance(logits_metadata, ForwardBatch):
+            if logits_metadata.capture_attention_tokens:
+                # Extract multi-layer attention info
+                if logits_metadata.attention_token_infos:
+                    attention_multi_layer = {}
+                    for layer_id, info in logits_metadata.attention_token_infos.items():
+                        attention_multi_layer[layer_id] = (
+                            info.token_positions,
+                            info.attention_scores,
+                            info.topk_logits,
+                            info.logsumexp_candidates,
+                        )
+
+                # Also extract single-layer info for backward compatibility
+                if logits_metadata.attention_token_info is not None:
+                    attention_token_positions = (
+                        logits_metadata.attention_token_info.token_positions
+                    )
+                    attention_token_scores = (
+                        logits_metadata.attention_token_info.attention_scores
+                    )
+                    attention_layer_id = logits_metadata.attention_token_info.layer_id
+                    attention_topk_logits = (
+                        logits_metadata.attention_token_info.topk_logits
+                    )
+                    attention_logsumexp_candidates = (
+                        logits_metadata.attention_token_info.logsumexp_candidates
+                    )
+
+                # Extract fingerprint if available (production mode)
+                if (
+                    hasattr(logits_metadata, "attention_fingerprint")
+                    and logits_metadata.attention_fingerprint is not None
+                ):
+                    attention_fingerprint = logits_metadata.attention_fingerprint
+                if (
+                    hasattr(logits_metadata, "attention_manifold")
+                    and logits_metadata.attention_manifold is not None
+                ):
+                    attention_manifold = logits_metadata.attention_manifold
+
+            # Extract MoE routing buffer if captured
+            if (
+                logits_metadata.capture_moe_routing
+                and logits_metadata.moe_routing_buffer
+            ):
+                moe_routing_buffer = logits_metadata.moe_routing_buffer
+
             logits_metadata = LogitsMetadata.from_forward_batch(logits_metadata)
 
         # Check if multi-item scoring is enabled via server args (only for prefill-only requests)
@@ -584,6 +666,15 @@ class LogitsProcessor(nn.Module):
                 full_logits=full_logits,
                 next_token_logits=sampled_logits,
                 hidden_states=hidden_states_to_store,
+                attention_token_positions=attention_token_positions,
+                attention_token_scores=attention_token_scores,
+                attention_layer_id=attention_layer_id,
+                attention_topk_logits=attention_topk_logits,
+                attention_logsumexp_candidates=attention_logsumexp_candidates,
+                attention_multi_layer=attention_multi_layer,
+                attention_fingerprint=attention_fingerprint,
+                attention_manifold=attention_manifold,
+                moe_routing_buffer=moe_routing_buffer,
             )
 
         # Start to process input logprobs
@@ -639,6 +730,15 @@ class LogitsProcessor(nn.Module):
             full_logits=full_logits,
             next_token_logits=sampled_logits,
             hidden_states=hidden_states_to_store,
+            attention_token_positions=attention_token_positions,
+            attention_token_scores=attention_token_scores,
+            attention_layer_id=attention_layer_id,
+            attention_topk_logits=attention_topk_logits,
+            attention_logsumexp_candidates=attention_logsumexp_candidates,
+            attention_multi_layer=attention_multi_layer,
+            attention_fingerprint=attention_fingerprint,
+            attention_manifold=attention_manifold,
+            moe_routing_buffer=moe_routing_buffer,
             input_token_logprobs=logprobs_result.input_token_logprobs,
             input_top_logprobs_val=logprobs_result.input_top_logprobs_val,
             input_top_logprobs_idx=logprobs_result.input_top_logprobs_idx,

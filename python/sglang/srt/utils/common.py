@@ -581,7 +581,6 @@ def is_pin_memory_available() -> bool:
 
 
 class LayerFn(Protocol):
-
     def __call__(self, idx: int, prefix: str) -> torch.nn.Module: ...
 
 
@@ -1211,8 +1210,9 @@ def broadcast_pyobj(
             serialized_data = pickle.dumps(data)
             size = len(serialized_data)
 
+            # np.frombuffer returns readonly array; copy for torch compatibility
             tensor_data = torch.ByteTensor(
-                np.frombuffer(serialized_data, dtype=np.uint8)
+                np.frombuffer(serialized_data, dtype=np.uint8).copy()
             ).to(device)
             tensor_size = torch.tensor([size], dtype=torch.long, device=device)
 

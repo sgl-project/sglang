@@ -1,9 +1,16 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
+
+logger = logging.getLogger(__name__)
+
+# Note: Sparse bias correction is used instead of dense PyTorch fallback
+# This allows attention steering to work efficiently at any sequence length
+import torch.nn.functional as F
 import triton
 import triton.language as tl
 
@@ -1013,6 +1020,14 @@ class TritonAttnBackend(AttentionBackend):
             kv_indptr = self.forward_metadata.kv_indptr
             kv_indices = self.forward_metadata.kv_indices
 
+        # Check if this layer has attention biases for steering
+        has_sparse_biases = forward_batch.has_attention_biases_for_layer(layer.layer_id)
+        sparse_biases = None
+        if has_sparse_biases:
+            sparse_biases = forward_batch.get_sparse_attention_biases(layer.layer_id)
+
+        # Always run the fast Triton kernel first
+        # If sparse biases exist, we'll apply correction afterward
         self.decode_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
@@ -1029,7 +1044,438 @@ class TritonAttnBackend(AttentionBackend):
             sinks=sinks,
             xai_temperature_len=layer.xai_temperature_len,
         )
+
+        # Apply sparse bias correction if biases exist
+        # This is O(|S| * head_dim) where |S| is number of biased positions
+        # Much faster than the old dense PyTorch fallback for sparse biases
+        if sparse_biases is not None:
+            batch_indices, token_positions, bias_values = sparse_biases
+            self._apply_sparse_bias_correction(
+                q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
+                forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
+                o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                kv_indptr,
+                kv_indices,
+                layer.scaling,
+                self.forward_metadata.attn_lse,
+                self.forward_metadata.num_kv_splits,
+                batch_indices,
+                token_positions,
+                bias_values,
+                logit_cap=logits_soft_cap,
+            )
+
+        # Compute top-k attention tokens for interpretability
+        # Multi-layer capture: compute on all specified layers
+        if (
+            forward_batch.capture_attention_tokens
+            and forward_batch.attention_capture_layer_ids
+            and layer.layer_id in forward_batch.attention_capture_layer_ids
+        ):
+            self._compute_attention_token_info(
+                q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
+                kv_indptr,
+                kv_indices,
+                layer.scaling,
+                forward_batch,
+                layer.layer_id,
+            )
+
         return o
+
+    def _apply_sparse_bias_correction(
+        self,
+        q: torch.Tensor,
+        k_buffer: torch.Tensor,
+        v_buffer: torch.Tensor,
+        o: torch.Tensor,
+        kv_indptr: torch.Tensor,
+        kv_indices: torch.Tensor,
+        sm_scale: float,
+        attn_lse: torch.Tensor,
+        num_kv_splits: torch.Tensor,
+        batch_indices: torch.Tensor,
+        token_positions: torch.Tensor,
+        bias_values: torch.Tensor,
+        logit_cap: float = 0.0,
+    ):
+        """
+        Apply sparse bias correction to unbiased attention output.
+
+        This is much more efficient than the dense PyTorch fallback for sparse biases.
+        Math: Given unbiased output O0 with LSE0, and sparse biases b_j for j∈S:
+          - Z0 = exp(LSE0)
+          - Z = Z0 + Σ_{j∈S} exp(l_j) * (exp(b_j)-1)
+          - O = (O0*Z0 + Σ_{j∈S} exp(l_j) * v_j * (exp(b_j)-1)) / Z
+
+        Complexity: O(|S| * head_dim) per head per token, where |S| is number of biased positions.
+
+        Args:
+            q: [batch, num_heads, head_dim] query
+            k_buffer: [max_tokens, num_kv_heads, head_dim] key cache
+            v_buffer: [max_tokens, num_kv_heads, head_dim] value cache
+            o: [batch, num_heads, head_dim] output tensor (modified in-place)
+            kv_indptr: [batch + 1] CSR format indptr for KV cache
+            kv_indices: [total_kv_tokens] KV cache locations
+            sm_scale: attention scale factor
+            attn_lse: [batch, num_heads, max_kv_splits] log-sum-exp from Triton kernel
+            num_kv_splits: [batch] number of splits per batch element
+            batch_indices: [num_biases] batch index for each bias
+            token_positions: [num_biases] token position for each bias
+            bias_values: [num_biases] bias values
+            logit_cap: optional logit capping value (0 = disabled)
+        """
+        batch_size = q.shape[0]
+        num_heads = q.shape[1]
+        num_kv_heads = k_buffer.shape[1]
+        head_dim = q.shape[2]
+        v_head_dim = v_buffer.shape[2]
+
+        # GQA: heads per KV head
+        heads_per_kv = num_heads // num_kv_heads
+
+        # Compute final LSE by reducing across splits (log-sum-exp reduction)
+        # attn_lse: [batch, num_heads, max_kv_splits]
+        # We need to reduce to [batch, num_heads]
+        max_splits = attn_lse.shape[2]
+        final_lse = torch.full(
+            (batch_size, num_heads),
+            float("-inf"),
+            dtype=attn_lse.dtype,
+            device=attn_lse.device,
+        )
+        for b in range(batch_size):
+            n_splits = num_kv_splits[b].item()
+            if n_splits > 0:
+                # Log-sum-exp reduction: LSE = log(sum(exp(lse_i)))
+                final_lse[b] = torch.logsumexp(attn_lse[b, :, :n_splits], dim=-1)
+
+        # Z0 = exp(LSE0) - the normalization constant
+        z0 = torch.exp(final_lse)  # [batch, num_heads]
+
+        # Group biases by batch index for efficient processing
+        unique_batches = batch_indices.unique()
+
+        for b_idx in unique_batches:
+            b = b_idx.item()
+
+            # Get biases for this batch element
+            mask = batch_indices == b_idx
+            positions = token_positions[mask]
+            biases = bias_values[mask]
+
+            if len(positions) == 0:
+                continue
+
+            # Get KV cache range for this batch
+            kv_start = kv_indptr[b].item()
+            kv_end = kv_indptr[b + 1].item()
+            seq_len = kv_end - kv_start
+
+            if seq_len == 0:
+                continue
+
+            # Filter positions that are within sequence length
+            valid_mask = positions < seq_len
+            if not valid_mask.any():
+                continue
+
+            positions = positions[valid_mask]
+            biases = biases[valid_mask]
+
+            # Get KV cache locations for biased positions
+            kv_locs = kv_indices[kv_start:kv_end]
+            biased_kv_locs = kv_locs[positions]
+
+            # Gather K, V for biased positions only
+            k_biased = k_buffer[biased_kv_locs]  # [num_biased, num_kv_heads, head_dim]
+            v_biased = v_buffer[
+                biased_kv_locs
+            ]  # [num_biased, num_kv_heads, v_head_dim]
+
+            # Get query for this batch
+            q_b = q[b]  # [num_heads, head_dim]
+
+            # exp(b_j) - 1 for each biased position
+            exp_bias_minus_1 = torch.exp(biases) - 1  # [num_biased]
+
+            # Process each KV head group
+            for kv_h in range(num_kv_heads):
+                k_h = k_biased[:, kv_h, :]  # [num_biased, head_dim]
+                v_h = v_biased[:, kv_h, :]  # [num_biased, v_head_dim]
+
+                # Process all heads that share this KV head
+                for h_offset in range(heads_per_kv):
+                    h = kv_h * heads_per_kv + h_offset
+                    q_h = q_b[h]  # [head_dim]
+
+                    # Compute logits for biased positions: l_j = q @ k_j * scale
+                    logits = torch.matmul(k_h, q_h) * sm_scale  # [num_biased]
+
+                    # Apply logit capping if enabled
+                    if logit_cap > 0:
+                        logits = logit_cap * torch.tanh(logits / logit_cap)
+
+                    # exp(l_j) for biased positions
+                    exp_logits = torch.exp(logits)  # [num_biased]
+
+                    # Correction terms:
+                    # weight_delta_j = exp(l_j) * (exp(b_j) - 1)
+                    weight_delta = exp_logits * exp_bias_minus_1  # [num_biased]
+
+                    # Z_delta = sum of weight deltas
+                    z_delta = weight_delta.sum()
+
+                    # Value correction: sum of weight_delta_j * v_j
+                    # [num_biased] @ [num_biased, v_head_dim] -> [v_head_dim]
+                    v_correction = torch.matmul(weight_delta, v_h)
+
+                    # Apply correction: O = (O0 * Z0 + v_correction) / (Z0 + Z_delta)
+                    z0_h = z0[b, h]
+                    o0_h = o[b, h].clone()
+
+                    # New output
+                    o[b, h] = (o0_h * z0_h + v_correction) / (z0_h + z_delta)
+
+    def _decode_attention_with_bias_pytorch(
+        self,
+        q: torch.Tensor,
+        k_buffer: torch.Tensor,
+        v_buffer: torch.Tensor,
+        o: torch.Tensor,
+        kv_indptr: torch.Tensor,
+        kv_indices: torch.Tensor,
+        sm_scale: float,
+        attention_bias: torch.Tensor,
+        logit_cap: float = 0.0,
+    ):
+        """
+        PyTorch fallback for decode attention with attention bias.
+
+        DEPRECATED: Use _apply_sparse_bias_correction instead for better performance.
+        This is kept for backwards compatibility and very dense bias patterns.
+
+        Args:
+            q: [batch, num_heads, head_dim]
+            k_buffer: [max_tokens, num_kv_heads, head_dim]
+            v_buffer: [max_tokens, num_kv_heads, head_dim]
+            o: [batch, num_heads, head_dim] output tensor
+            kv_indptr: [batch + 1] CSR format indptr
+            kv_indices: [total_kv_tokens] KV cache locations
+            sm_scale: attention scale factor
+            attention_bias: [batch, max_seq_len] additive bias tensor
+            logit_cap: optional logit capping value (0 = disabled)
+        """
+        batch_size = q.shape[0]
+        num_heads = q.shape[1]
+        num_kv_heads = k_buffer.shape[1]
+        head_dim = q.shape[2]
+
+        # GQA: heads per KV head
+        heads_per_kv = num_heads // num_kv_heads
+
+        for b in range(batch_size):
+            # Get KV cache indices for this batch element
+            kv_start = kv_indptr[b].item()
+            kv_end = kv_indptr[b + 1].item()
+            seq_len = kv_end - kv_start
+
+            if seq_len == 0:
+                continue
+
+            # Gather K, V from cache
+            kv_locs = kv_indices[kv_start:kv_end]
+            k = k_buffer[kv_locs]  # [seq_len, num_kv_heads, head_dim]
+            v = v_buffer[kv_locs]  # [seq_len, num_kv_heads, head_dim]
+
+            # Get query for this batch element
+            q_b = q[b]  # [num_heads, head_dim]
+
+            # Get bias for this batch element (truncate to seq_len)
+            bias_b = attention_bias[b, :seq_len]  # [seq_len]
+
+            # Compute attention per head (or per KV head group for GQA)
+            for kv_h in range(num_kv_heads):
+                k_h = k[:, kv_h, :]  # [seq_len, head_dim]
+                v_h = v[:, kv_h, :]  # [seq_len, head_dim]
+
+                # Process all heads that share this KV head
+                for h_offset in range(heads_per_kv):
+                    h = kv_h * heads_per_kv + h_offset
+                    q_h = q_b[h]  # [head_dim]
+
+                    # Compute attention logits: q @ k^T
+                    attn_logits = torch.matmul(q_h, k_h.t()) * sm_scale  # [seq_len]
+
+                    # Apply logit capping if enabled
+                    if logit_cap > 0:
+                        attn_logits = logit_cap * torch.tanh(attn_logits / logit_cap)
+
+                    # Add steering bias before softmax
+                    attn_logits = attn_logits + bias_b
+
+                    # Softmax
+                    attn_weights = F.softmax(attn_logits, dim=-1)  # [seq_len]
+
+                    # Compute output: weights @ v
+                    o[b, h, :] = torch.matmul(attn_weights, v_h)  # [head_dim]
+
+    def _compute_attention_token_info(
+        self,
+        q: torch.Tensor,
+        k_buffer: torch.Tensor,
+        kv_indptr: torch.Tensor,
+        kv_indices: torch.Tensor,
+        sm_scale: float,
+        forward_batch,
+        layer_id: int,
+    ):
+        """
+        Compute top-k attention tokens for interpretability.
+
+        Supports two modes:
+        1. Debug Mode: Returns raw indices/scores (for visualization)
+        2. Fingerprint Mode: Returns 20D feature vector (for production routing)
+
+        Uses memory-efficient chunked approach:
+        - For small sequences (<2K tokens): Direct PyTorch computation
+        - For large sequences: Chunked Triton kernel
+
+        Memory usage: O(batch × heads × num_chunks) instead of O(batch × heads × seq_len)
+        For 1M context: ~125KB vs ~256MB
+        """
+        from sglang.srt.layers.attention.triton_ops.decode_attention_with_topk import (
+            classify_manifold_gpu,
+            compute_fingerprint_features,
+            compute_fingerprint_gpu,
+            compute_topk_attention_chunked,
+        )
+        from sglang.srt.model_executor.forward_batch_info import AttentionTokenInfo
+
+        try:
+            # Validate inputs to prevent CUDA device-side asserts
+            batch_size = q.shape[0]
+            if batch_size == 0:
+                return  # Nothing to do for empty batch
+
+            # Synchronize to catch any pending CUDA errors before we start
+            import torch
+
+            torch.cuda.synchronize()
+
+            # Check kv_indptr has correct size
+            if kv_indptr.shape[0] != batch_size + 1:
+                import logging
+
+                logging.getLogger(__name__).warning(
+                    f"Skipping attention capture: kv_indptr size mismatch "
+                    f"(expected {batch_size + 1}, got {kv_indptr.shape[0]})"
+                )
+                return
+
+            # Validate kv_indices bounds to prevent out-of-bounds access
+            max_kv_idx = kv_indptr[-1].item()
+            if max_kv_idx > 0 and kv_indices.shape[0] > 0:
+                if max_kv_idx > kv_indices.shape[0]:
+                    import logging
+
+                    logging.getLogger(__name__).warning(
+                        f"Skipping attention capture: kv_indptr max ({max_kv_idx}) > "
+                        f"kv_indices size ({kv_indices.shape[0]})"
+                    )
+                    return
+
+                # Check kv_indices values are within k_buffer bounds (sync first to get accurate values)
+                indices_to_check = kv_indices[:max_kv_idx]
+                max_idx = indices_to_check.max().item()
+                min_idx = indices_to_check.min().item()
+                if max_idx >= k_buffer.shape[0] or min_idx < 0:
+                    import logging
+
+                    logging.getLogger(__name__).warning(
+                        f"Skipping attention capture: kv_indices out of bounds "
+                        f"(min={min_idx}, max={max_idx}, k_buffer_size={k_buffer.shape[0]})"
+                    )
+                    return
+
+            topk_scores, topk_indices, topk_logits, logsumexp_candidates = (
+                compute_topk_attention_chunked(
+                    q,
+                    k_buffer,
+                    kv_indptr,
+                    kv_indices,
+                    sm_scale,
+                    top_k=forward_batch.attention_top_k,
+                    chunk_size=forward_batch.attention_chunk_size,
+                    window=forward_batch.attention_window,
+                    head_ids=forward_batch.attention_capture_head_ids,
+                )
+            )
+
+            # Compute fingerprint if fingerprint mode is enabled (production path)
+            # This computes the 20D feature vector ON GPU, avoiding CPU export bottleneck
+            if getattr(forward_batch, "attention_fingerprint_mode", False):
+                # Get current positions for fingerprint computation
+                # Use seq_lens as current positions (decode position)
+                current_pos = forward_batch.seq_lens.clone()
+
+                # Compute fingerprint: 16-bin log-distance histogram
+                fingerprint = compute_fingerprint_gpu(
+                    topk_indices, topk_scores, current_pos
+                )
+                # Extract 20D feature vector for clustering
+                features = compute_fingerprint_features(fingerprint)
+                # Classify manifold zone
+                manifolds, _ = classify_manifold_gpu(fingerprint)
+
+                # Store fingerprint (replaces raw indices in production)
+                # Only store once (last layer typically) to avoid redundancy
+                if forward_batch.attention_fingerprint is None:
+                    forward_batch.attention_fingerprint = features
+                    forward_batch.attention_manifold = manifolds
+
+            # Store raw attention info (for debug mode / backward compatibility)
+            info = AttentionTokenInfo(
+                token_positions=topk_indices,
+                attention_scores=topk_scores,
+                topk_logits=topk_logits,
+                logsumexp_candidates=logsumexp_candidates,
+                layer_id=layer_id,
+            )
+
+            # Store in multi-layer dict
+            if forward_batch.attention_token_infos is not None:
+                forward_batch.attention_token_infos[layer_id] = info
+
+            # Also set single-layer field for backward compatibility
+            # (keeps the last layer's info, which is typically the most useful)
+            forward_batch.attention_token_info = info
+
+            # Synchronize to catch any CUDA errors before they propagate
+            torch.cuda.synchronize()
+
+        except (RuntimeError, torch.cuda.CudaError) as e:
+            # Catch CUDA errors specifically - they can be fatal
+            import logging
+
+            logging.getLogger(__name__).error(
+                f"CUDA error during attention capture (disabling for this request): {e}"
+            )
+            # Try to recover by clearing CUDA error state
+            try:
+                torch.cuda.synchronize()
+            except:
+                pass
+        except Exception as e:
+            # Don't let attention capture errors break inference
+            import logging
+            import traceback
+
+            logging.getLogger(__name__).warning(
+                f"Failed to compute attention tokens: {e}\n{traceback.format_exc()}"
+            )
 
 
 class TritonMultiStepDraftBackend:

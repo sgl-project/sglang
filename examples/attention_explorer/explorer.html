@@ -1,0 +1,2684 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SGLang Attention Explorer</title>
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500;600;700&family=Outfit:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --void: #030308;
+            --abyss: #08080f;
+            --deep: #0c0c14;
+            --surface: #12121c;
+            --elevated: #1a1a28;
+            --border: #252538;
+            --border-glow: #3a3a55;
+
+            --cyan: #00e5ff;
+            --magenta: #ff0099;
+            --lime: #b4ff00;
+            --amber: #ffaa00;
+            --violet: #aa00ff;
+
+            --text: #e8e8f4;
+            --text-dim: #707090;
+            --text-muted: #50506a;
+        }
+
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        html, body {
+            font-family: 'IBM Plex Mono', monospace;
+            background: var(--void);
+            color: var(--text);
+            height: 100vh;
+            overflow: hidden;
+        }
+
+        /* Layout */
+        .app {
+            display: grid;
+            grid-template-rows: 60px 1fr;
+            grid-template-columns: 380px 1fr 320px;
+            height: 100vh;
+        }
+
+        /* Header */
+        .header {
+            grid-column: 1 / -1;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 0 24px;
+            background: var(--abyss);
+            border-bottom: 1px solid var(--border);
+        }
+
+        .logo {
+            display: flex;
+            align-items: center;
+            gap: 14px;
+        }
+
+        .logo-icon {
+            width: 38px;
+            height: 38px;
+            background: linear-gradient(135deg, var(--cyan), var(--magenta));
+            border-radius: 10px;
+            display: grid;
+            place-items: center;
+            font-weight: 800;
+            font-size: 18px;
+            color: var(--void);
+        }
+
+        .logo h1 {
+            font-family: 'Outfit', sans-serif;
+            font-size: 18px;
+            font-weight: 700;
+            background: linear-gradient(90deg, var(--text), var(--cyan));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
+        .logo span {
+            font-size: 10px;
+            color: var(--text-dim);
+            text-transform: uppercase;
+            letter-spacing: 2px;
+        }
+
+        .header-actions {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+        }
+
+        .status-badge {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 16px;
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 100px;
+            font-size: 11px;
+        }
+
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: var(--lime);
+            box-shadow: 0 0 8px var(--lime);
+        }
+
+        .status-dot.error { background: var(--magenta); box-shadow: 0 0 8px var(--magenta); }
+        .status-dot.loading { background: var(--amber); animation: blink 1s infinite; }
+
+        @keyframes blink { 50% { opacity: 0.4; } }
+
+        /* Left Panel - Input */
+        .panel-left {
+            background: var(--abyss);
+            border-right: 1px solid var(--border);
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        .panel-section {
+            padding: 20px;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .panel-section:last-child { border-bottom: none; }
+
+        .section-title {
+            font-family: 'Outfit', sans-serif;
+            font-size: 11px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 1.5px;
+            color: var(--text-dim);
+            margin-bottom: 14px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .section-title::before {
+            content: '';
+            width: 4px;
+            height: 4px;
+            background: var(--cyan);
+            border-radius: 1px;
+        }
+
+        textarea {
+            width: 100%;
+            height: 160px;
+            background: var(--deep);
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            padding: 14px;
+            color: var(--text);
+            font-family: inherit;
+            font-size: 12px;
+            line-height: 1.6;
+            resize: none;
+        }
+
+        textarea:focus {
+            outline: none;
+            border-color: var(--cyan);
+            box-shadow: 0 0 0 3px rgba(0, 229, 255, 0.1);
+        }
+
+        .btn-row {
+            display: flex;
+            gap: 10px;
+            margin-top: 14px;
+        }
+
+        .btn {
+            flex: 1;
+            padding: 12px;
+            border: none;
+            border-radius: 8px;
+            font-family: inherit;
+            font-size: 11px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .btn-primary {
+            background: linear-gradient(135deg, var(--cyan), #00b8d4);
+            color: var(--void);
+        }
+
+        .btn-primary:hover:not(:disabled) {
+            box-shadow: 0 0 30px rgba(0, 229, 255, 0.4);
+            transform: translateY(-1px);
+        }
+
+        .btn-primary:disabled { opacity: 0.4; cursor: not-allowed; }
+
+        .btn-small {
+            padding: 6px 10px;
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            background: var(--surface);
+            color: var(--text);
+            font-size: 12px;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .btn-small:hover {
+            background: var(--hover);
+            border-color: var(--cyan);
+        }
+
+        /* Layer Heatmap Modal */
+        .modal-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0, 0, 0, 0.8);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            z-index: 1000;
+        }
+
+        .modal-content {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 24px;
+            max-width: 800px;
+            max-height: 80vh;
+            overflow: auto;
+        }
+
+        .modal-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+        }
+
+        .modal-title {
+            font-size: 16px;
+            font-weight: 600;
+            color: var(--text);
+        }
+
+        .modal-close {
+            background: none;
+            border: none;
+            font-size: 24px;
+            color: var(--text-dim);
+            cursor: pointer;
+        }
+
+        .layer-heatmap {
+            display: grid;
+            gap: 4px;
+        }
+
+        .layer-row {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .layer-label {
+            width: 80px;
+            font-size: 11px;
+            color: var(--text-dim);
+            text-align: right;
+        }
+
+        .layer-bar {
+            flex: 1;
+            height: 24px;
+            background: var(--void);
+            border-radius: 4px;
+            overflow: hidden;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .layer-bar:hover {
+            transform: scaleY(1.2);
+        }
+
+        .layer-fill {
+            height: 100%;
+            background: linear-gradient(90deg, var(--cyan), var(--magenta));
+            transition: width 0.3s;
+        }
+
+        .layer-value {
+            width: 60px;
+            font-size: 11px;
+            color: var(--text);
+        }
+
+        .btn-ghost {
+            background: transparent;
+            color: var(--text-dim);
+            border: 1px solid var(--border);
+        }
+
+        .btn-ghost:hover { border-color: var(--magenta); color: var(--magenta); }
+
+        /* Settings */
+        .settings-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 10px;
+        }
+
+        .setting {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+        }
+
+        .setting.full { grid-column: span 2; }
+
+        .setting label {
+            font-size: 10px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            color: var(--text-muted);
+        }
+
+        .setting input, .setting select {
+            background: var(--deep);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            padding: 10px;
+            color: var(--text);
+            font-family: inherit;
+            font-size: 12px;
+        }
+
+        .setting input:focus, .setting select:focus {
+            outline: none;
+            border-color: var(--cyan);
+        }
+
+        /* Stats */
+        .stats-row {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 10px;
+        }
+
+        .stat {
+            background: var(--deep);
+            border-radius: 10px;
+            padding: 14px;
+            text-align: center;
+        }
+
+        .stat-value {
+            font-family: 'Outfit', sans-serif;
+            font-size: 22px;
+            font-weight: 700;
+            color: var(--cyan);
+        }
+
+        .stat-label {
+            font-size: 9px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            color: var(--text-muted);
+            margin-top: 4px;
+        }
+
+        /* Main Canvas Area */
+        .main-view {
+            background: var(--deep);
+            position: relative;
+            overflow: hidden;
+        }
+
+        .canvas-container {
+            position: absolute;
+            inset: 0;
+        }
+
+        #edgeCanvas {
+            position: absolute;
+            inset: 0;
+            pointer-events: none;
+        }
+
+        .token-viewport {
+            position: absolute;
+            inset: 0;
+            overflow: auto;
+            padding: 24px;
+        }
+
+        /* Token Display */
+        .token-segments {
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+        }
+
+        .segment {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            overflow: hidden;
+        }
+
+        .segment-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 12px 16px;
+            background: var(--elevated);
+            border-bottom: 1px solid var(--border);
+            font-size: 11px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+
+        .segment-header.prompt { color: var(--cyan); }
+        .segment-header.think { color: var(--amber); }
+        .segment-header.output { color: var(--lime); }
+
+        .segment-toggle {
+            background: none;
+            border: none;
+            color: inherit;
+            cursor: pointer;
+            font-size: 14px;
+        }
+
+        .segment-body {
+            padding: 16px;
+        }
+
+        .token-flow {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 4px;
+        }
+
+        .token {
+            position: relative;
+            padding: 6px 10px;
+            background: var(--elevated);
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            font-size: 12px;
+            cursor: pointer;
+            transition: all 0.15s;
+            white-space: pre;
+        }
+
+        .token:hover {
+            border-color: var(--cyan);
+            background: var(--surface);
+            z-index: 10;
+        }
+
+        .token.selected {
+            border-color: var(--magenta);
+            box-shadow: 0 0 20px rgba(255, 0, 153, 0.3);
+            z-index: 20;
+        }
+
+        .token.attended-to {
+            border-color: var(--cyan);
+            background: rgba(0, 229, 255, 0.15);
+        }
+
+        .token.attends-from {
+            border-color: var(--lime);
+            background: rgba(180, 255, 0, 0.15);
+        }
+
+        /* Manifold colors for fingerprint mode */
+        .token.manifold-semantic-bridge {
+            border-color: var(--cyan);
+            background: rgba(0, 229, 255, 0.2);
+            box-shadow: 0 0 8px rgba(0, 229, 255, 0.3);
+        }
+
+        .token.manifold-syntax-floor {
+            border-color: var(--amber);
+            background: rgba(255, 170, 0, 0.2);
+            box-shadow: 0 0 8px rgba(255, 170, 0, 0.3);
+        }
+
+        .token.manifold-exploration {
+            border-color: var(--magenta);
+            background: rgba(255, 0, 153, 0.2);
+            box-shadow: 0 0 8px rgba(255, 0, 153, 0.3);
+        }
+
+        .token.manifold-steering {
+            border-color: var(--lime);
+            background: rgba(180, 255, 0, 0.2);
+            box-shadow: 0 0 8px rgba(180, 255, 0, 0.3);
+        }
+
+        .token.manifold-unknown {
+            border-color: var(--border-glow);
+            background: rgba(58, 58, 85, 0.2);
+        }
+
+        .token[data-idx]::before {
+            content: attr(data-idx);
+            position: absolute;
+            top: -6px;
+            right: -4px;
+            font-size: 8px;
+            padding: 1px 4px;
+            background: var(--border);
+            border-radius: 3px;
+            color: var(--text-muted);
+            opacity: 0;
+            transition: opacity 0.15s;
+        }
+
+        .token:hover::before { opacity: 1; }
+
+        /* Right Panel - Details */
+        .panel-right {
+            background: var(--abyss);
+            border-left: 1px solid var(--border);
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        .detail-header {
+            padding: 20px;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .selected-token {
+            font-family: 'Outfit', sans-serif;
+            font-size: 28px;
+            font-weight: 700;
+            color: var(--magenta);
+            word-break: break-all;
+        }
+
+        .selected-meta {
+            font-size: 11px;
+            color: var(--text-dim);
+            margin-top: 6px;
+        }
+
+        .detail-tabs {
+            display: flex;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .detail-tab {
+            flex: 1;
+            padding: 12px;
+            background: none;
+            border: none;
+            color: var(--text-dim);
+            font-family: inherit;
+            font-size: 10px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            cursor: pointer;
+            border-bottom: 2px solid transparent;
+            transition: all 0.2s;
+        }
+
+        .detail-tab:hover { color: var(--text); }
+        .detail-tab.active {
+            color: var(--cyan);
+            border-bottom-color: var(--cyan);
+        }
+
+        .detail-content {
+            flex: 1;
+            overflow-y: auto;
+            padding: 16px;
+        }
+
+        .attention-list {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+
+        .attention-item {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            padding: 12px;
+            background: var(--deep);
+            border-radius: 8px;
+            cursor: pointer;
+            transition: all 0.15s;
+        }
+
+        .attention-item:hover {
+            background: var(--surface);
+        }
+
+        .attn-rank {
+            width: 24px;
+            height: 24px;
+            background: var(--surface);
+            border-radius: 6px;
+            display: grid;
+            place-items: center;
+            font-size: 10px;
+            font-weight: 700;
+            color: var(--text-dim);
+        }
+
+        .attn-token {
+            flex: 1;
+            font-weight: 500;
+            min-width: 0;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .attn-score {
+            font-size: 11px;
+            color: var(--cyan);
+            font-weight: 600;
+        }
+
+        .attn-bar {
+            width: 60px;
+            height: 4px;
+            background: var(--surface);
+            border-radius: 2px;
+            overflow: hidden;
+        }
+
+        .attn-bar-fill {
+            height: 100%;
+            background: linear-gradient(90deg, var(--cyan), var(--lime));
+            border-radius: 2px;
+        }
+
+        /* Empty/Loading States */
+        .state-empty, .state-loading {
+            position: absolute;
+            inset: 0;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            gap: 20px;
+        }
+
+        .state-icon {
+            font-size: 64px;
+            opacity: 0.2;
+        }
+
+        .state-text {
+            color: var(--text-dim);
+            font-size: 13px;
+            text-align: center;
+            max-width: 300px;
+            line-height: 1.6;
+        }
+
+        .spinner {
+            width: 48px;
+            height: 48px;
+            border: 3px solid var(--border);
+            border-top-color: var(--cyan);
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+
+        @keyframes spin { to { transform: rotate(360deg); } }
+
+        /* Scrollbar */
+        ::-webkit-scrollbar { width: 6px; height: 6px; }
+        ::-webkit-scrollbar-track { background: var(--abyss); }
+        ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+        ::-webkit-scrollbar-thumb:hover { background: var(--border-glow); }
+
+        /* Toggle */
+        .toggle-row {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 10px 12px;
+            background: var(--deep);
+            border-radius: 8px;
+            margin-top: 10px;
+            cursor: pointer;
+        }
+
+        .toggle {
+            width: 36px;
+            height: 20px;
+            background: var(--border);
+            border-radius: 100px;
+            position: relative;
+            transition: all 0.2s;
+        }
+
+        .toggle::after {
+            content: '';
+            position: absolute;
+            top: 3px;
+            left: 3px;
+            width: 14px;
+            height: 14px;
+            background: var(--text);
+            border-radius: 50%;
+            transition: all 0.2s;
+        }
+
+        .toggle.active { background: var(--cyan); }
+        .toggle.active::after { left: 19px; }
+
+        .toggle-label { font-size: 11px; }
+
+        /* Tooltip System */
+        .tooltip-container {
+            position: relative;
+            display: inline-flex;
+            align-items: center;
+        }
+
+        .info-icon {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 14px;
+            height: 14px;
+            background: var(--border);
+            border-radius: 50%;
+            font-size: 9px;
+            color: var(--text-dim);
+            cursor: help;
+            margin-left: 4px;
+            flex-shrink: 0;
+        }
+
+        .info-icon:hover {
+            background: var(--cyan);
+            color: var(--void);
+        }
+
+        .tooltip {
+            position: absolute;
+            bottom: 100%;
+            left: 50%;
+            transform: translateX(-50%);
+            background: var(--elevated);
+            border: 1px solid var(--border-glow);
+            border-radius: 8px;
+            padding: 10px 12px;
+            font-size: 11px;
+            color: var(--text);
+            white-space: normal;
+            width: 240px;
+            z-index: 1000;
+            opacity: 0;
+            visibility: hidden;
+            transition: all 0.2s;
+            pointer-events: none;
+            line-height: 1.5;
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4);
+            margin-bottom: 8px;
+        }
+
+        .tooltip::after {
+            content: '';
+            position: absolute;
+            top: 100%;
+            left: 50%;
+            transform: translateX(-50%);
+            border: 6px solid transparent;
+            border-top-color: var(--border-glow);
+        }
+
+        .tooltip-container:hover .tooltip {
+            opacity: 1;
+            visibility: visible;
+        }
+
+        .tooltip strong {
+            color: var(--cyan);
+        }
+
+        .tooltip code {
+            background: var(--deep);
+            padding: 1px 4px;
+            border-radius: 3px;
+            font-size: 10px;
+        }
+
+        /* Help Modal Styles */
+        .help-modal .modal-content {
+            max-width: 900px;
+            max-height: 85vh;
+        }
+
+        .help-section {
+            margin-bottom: 28px;
+        }
+
+        .help-section:last-child {
+            margin-bottom: 0;
+        }
+
+        .help-section-title {
+            font-family: 'Outfit', sans-serif;
+            font-size: 14px;
+            font-weight: 600;
+            color: var(--cyan);
+            margin-bottom: 14px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .help-section-title::before {
+            content: '';
+            width: 3px;
+            height: 16px;
+            background: var(--cyan);
+            border-radius: 2px;
+        }
+
+        .help-grid {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 12px;
+        }
+
+        @media (max-width: 600px) {
+            .help-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        .help-item {
+            background: var(--deep);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 14px;
+        }
+
+        .help-item-header {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 8px;
+        }
+
+        .help-item-icon {
+            width: 24px;
+            height: 24px;
+            border-radius: 6px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 12px;
+            flex-shrink: 0;
+        }
+
+        .help-item-name {
+            font-weight: 600;
+            font-size: 12px;
+            color: var(--text);
+        }
+
+        .help-item-desc {
+            font-size: 11px;
+            color: var(--text-dim);
+            line-height: 1.5;
+        }
+
+        .help-item-formula {
+            margin-top: 8px;
+            padding: 6px 10px;
+            background: var(--void);
+            border-radius: 4px;
+            font-family: 'IBM Plex Mono', monospace;
+            font-size: 10px;
+            color: var(--lime);
+        }
+
+        .help-btn {
+            padding: 8px 14px;
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            color: var(--text-dim);
+            font-family: inherit;
+            font-size: 11px;
+            cursor: pointer;
+            transition: all 0.2s;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .help-btn:hover {
+            border-color: var(--cyan);
+            color: var(--cyan);
+        }
+    </style>
+</head>
+<body>
+    <div class="app">
+        <header class="header">
+            <div class="logo">
+                <div class="logo-icon">⬡</div>
+                <div>
+                    <h1>SGLang Attention Explorer</h1>
+                    <span>Real Attention Token Visualization</span>
+                </div>
+            </div>
+            <div class="header-actions">
+                <button class="help-btn" onclick="showHelpModal()">
+                    <span>?</span>
+                    <span>Glossary & Help</span>
+                </button>
+                <div class="status-badge tooltip-container">
+                    <div class="status-dot" id="statusDot"></div>
+                    <span id="statusText">Connecting...</span>
+                    <span class="tooltip" style="width: 280px; right: 0; left: auto; transform: none;">
+                        <strong style="color: var(--lime);">What is this?</strong><br>
+                        Shows if we can talk to the AI server.<br><br>
+                        <strong style="color: var(--cyan);">Status colors:</strong><br>
+                        • <strong style="color: var(--lime);">Green</strong> = Connected, ready to use<br>
+                        • <strong style="color: var(--amber);">Yellow</strong> = Connecting...<br>
+                        • <strong style="color: var(--magenta);">Red</strong> = Can't connect (server may be offline)
+                    </span>
+                </div>
+            </div>
+        </header>
+
+        <aside class="panel-left">
+            <div class="panel-section">
+                <div class="section-title">
+                    Input Text
+                    <span class="tooltip-container">
+                        <span class="info-icon">?</span>
+                        <span class="tooltip" style="width: 300px;">
+                            <strong style="color: var(--lime);">What to enter here:</strong><br>
+                            Type any question or text you want the AI to respond to. For example: "What is the capital of France?" or "Explain how cars work."<br><br>
+                            <strong style="color: var(--cyan);">What happens next:</strong><br>
+                            The AI will answer your question, and we'll show you <em>which words it looked at</em> while writing each word of its answer. This is called "attention" - it's literally where the AI pays attention.
+                        </span>
+                    </span>
+                </div>
+                <textarea id="inputText" placeholder="Enter text to analyze attention patterns...">What is the capital of France?</textarea>
+                <div class="btn-row">
+                    <button class="btn btn-primary" id="analyzeBtn" onclick="analyze()">Analyze</button>
+                    <button class="btn btn-ghost" onclick="clearAll()">Clear</button>
+                </div>
+            </div>
+
+            <div class="panel-section">
+                <div class="section-title">
+                    Configuration
+                    <span class="tooltip-container">
+                        <span class="info-icon">?</span>
+                        <span class="tooltip">Configure how attention patterns are captured and displayed. These settings control both the model generation and the visualization.</span>
+                    </span>
+                </div>
+                <div class="settings-grid">
+                    <div class="setting">
+                        <label class="tooltip-container">
+                            Max Tokens
+                            <span class="info-icon">?</span>
+                            <span class="tooltip" style="width: 280px;">
+                                <strong style="color: var(--lime);">What is a Token?</strong><br>
+                                A token is a piece of text - usually a word or part of a word. "Hello" is 1 token, "unhappiness" might be 3 tokens (un-happi-ness).<br><br>
+                                <strong style="color: var(--cyan);">What this setting does:</strong><br>
+                                Controls how long the AI's response can be. Set to 100 = response up to ~75 words. Set to 500 = longer responses.
+                            </span>
+                        </label>
+                        <input type="number" id="maxTokens" value="100" min="1" max="4096">
+                    </div>
+                    <div class="setting">
+                        <label class="tooltip-container">
+                            Attention Top-K
+                            <span class="info-icon">?</span>
+                            <span class="tooltip" style="width: 280px;">
+                                <strong style="color: var(--lime);">What is Top-K?</strong><br>
+                                "K" means a number you choose. "Top-K" means "show me the top K most important items."<br><br>
+                                <strong style="color: var(--cyan);">What this setting does:</strong><br>
+                                When the AI generates a word, it looks at previous words. This setting says "show me the top 5 (or 10, etc.) words it looked at most." Higher = more detail, but messier visualization.
+                            </span>
+                        </label>
+                        <input type="number" id="attentionTopK" value="5" min="1" max="64">
+                    </div>
+                    <div class="setting">
+                        <label class="tooltip-container">
+                            Temperature
+                            <span class="info-icon">?</span>
+                            <span class="tooltip" style="width: 280px;">
+                                <strong style="color: var(--lime);">What is Temperature?</strong><br>
+                                Think of it like creativity level. Like how "hot" or "cold" the AI's imagination is.<br><br>
+                                <strong style="color: var(--cyan);">What the values mean:</strong><br>
+                                • <strong>0.0</strong> = Very predictable, always picks the "safest" word<br>
+                                • <strong>0.6</strong> = Balanced (recommended)<br>
+                                • <strong>1.0+</strong> = Creative, sometimes surprising<br>
+                                • <strong>2.0</strong> = Wild, may be nonsensical
+                            </span>
+                        </label>
+                        <input type="number" id="temperature" value="0.6" min="0" max="2" step="0.1">
+                    </div>
+                    <div class="setting">
+                        <label class="tooltip-container">
+                            Edge Threshold
+                            <span class="info-icon">?</span>
+                            <span class="tooltip" style="width: 280px;">
+                                <strong style="color: var(--lime);">What is an Edge?</strong><br>
+                                An "edge" is a line connecting two tokens, showing the AI looked from one word to another.<br><br>
+                                <strong style="color: var(--lime);">What is a Threshold?</strong><br>
+                                A minimum cutoff. "Only show me connections stronger than this."<br><br>
+                                <strong style="color: var(--cyan);">What this setting does:</strong><br>
+                                • <strong>0.05</strong> = Show all connections (busy but complete)<br>
+                                • <strong>0.2+</strong> = Show only strong connections (cleaner)
+                            </span>
+                        </label>
+                        <input type="number" id="edgeThreshold" value="0.05" min="0" max="1" step="0.01">
+                    </div>
+                    <div class="toggle-row setting full tooltip-container" onclick="toggleWordMode()">
+                        <div class="toggle" id="wordModeToggle"></div>
+                        <span class="toggle-label">Aggregate to word-level</span>
+                        <span class="tooltip" style="bottom: auto; top: 100%; margin-top: 8px; left: 0; transform: none; width: 280px;">
+                            <strong style="color: var(--lime);">What does this do?</strong><br>
+                            AI breaks words into pieces: "unhappiness" → "un" + "happi" + "ness". This toggle combines them back into readable words.<br><br>
+                            <strong style="color: var(--cyan);">When to use:</strong><br>
+                            Turn ON for easier reading. Turn OFF to see exactly what the AI sees internally.
+                        </span>
+                    </div>
+                    <div class="setting full" id="layerControlSection" style="display: none;">
+                        <label class="tooltip-container">
+                            Layer Filter
+                            <span class="info-icon">?</span>
+                            <span class="tooltip" style="width: 300px;">
+                                <strong style="color: var(--lime);">What are Layers?</strong><br>
+                                The AI processes text through multiple "layers" - like an assembly line. Each layer transforms the understanding.<br><br>
+                                <strong style="color: var(--cyan);">What different layers do:</strong><br>
+                                • <strong>Early layers (1-8)</strong>: Handle basic stuff - grammar, word shapes<br>
+                                • <strong>Middle layers</strong>: Build phrases, local meaning<br>
+                                • <strong>Later layers (24-32)</strong>: Deep understanding, reasoning<br><br>
+                                <strong>Tip:</strong> Filter to see how attention changes at different depths!
+                            </span>
+                        </label>
+                        <div style="display: flex; align-items: center; gap: 10px;">
+                            <select id="layerSelect" onchange="filterByLayer()">
+                                <option value="all">All Layers</option>
+                            </select>
+                            <button class="btn-small tooltip-container" onclick="showLayerHeatmap()" title="Show layer heatmap">
+                                📊
+                                <span class="tooltip" style="width: 200px;">
+                                    <strong style="color: var(--lime);">Layer Heatmap</strong><br>
+                                    See a bar chart of attention across all layers. Find which layers are most active!
+                                </span>
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="panel-section">
+                <div class="section-title">
+                    Statistics
+                    <span class="tooltip-container">
+                        <span class="info-icon">?</span>
+                        <span class="tooltip" style="width: 260px;">
+                            <strong style="color: var(--lime);">What are these numbers?</strong><br>
+                            A quick summary of what was analyzed. Think of it like a receipt showing how much data we captured.
+                        </span>
+                    </span>
+                </div>
+                <div class="stats-row">
+                    <div class="stat tooltip-container">
+                        <div class="stat-value" id="statTokens">0</div>
+                        <div class="stat-label">Tokens</div>
+                        <span class="tooltip" style="bottom: auto; top: 100%; margin-top: 8px; width: 240px;">
+                            <strong style="color: var(--lime);">Total word pieces</strong><br>
+                            Your input + AI's response, broken into tokens. "Hello world" = 2 tokens. A paragraph might be 50+ tokens.
+                        </span>
+                    </div>
+                    <div class="stat tooltip-container">
+                        <div class="stat-value" id="statEdges">0</div>
+                        <div class="stat-label">Edges</div>
+                        <span class="tooltip" style="bottom: auto; top: 100%; margin-top: 8px; width: 240px;">
+                            <strong style="color: var(--lime);">Connection lines</strong><br>
+                            How many "looked at" connections we found. More edges = the AI referenced more context while writing.
+                        </span>
+                    </div>
+                    <div class="stat tooltip-container">
+                        <div class="stat-value" id="statLayers">0</div>
+                        <div class="stat-label">Layers</div>
+                        <span class="tooltip" style="bottom: auto; top: 100%; margin-top: 8px; width: 260px;">
+                            <strong style="color: var(--lime);">Processing stages</strong><br>
+                            The AI has multiple "layers" like floors in a building. Early layers handle grammar, later layers handle meaning. We show attention from the final layer (most meaningful).
+                        </span>
+                    </div>
+                </div>
+            </div>
+
+            <div class="panel-section" id="manifoldLegend" style="display: none;">
+                <div class="section-title">
+                    Attention Zones
+                    <span class="tooltip-container">
+                        <span class="info-icon">?</span>
+                        <span class="tooltip" style="width: 280px;">
+                            <strong style="color: var(--lime);">What are Attention Zones?</strong><br>
+                            We color-code each token based on <em>where</em> the AI was looking when it wrote that word. It's like a heat map of the AI's focus.<br><br>
+                            <strong style="color: var(--cyan);">Why does this matter?</strong><br>
+                            It reveals what the AI was "thinking about" - was it focused on nearby words (grammar) or looking far back (recalling information)?
+                        </span>
+                    </span>
+                </div>
+                <div style="display: flex; flex-direction: column; gap: 8px;">
+                    <div class="tooltip-container" style="display: flex; align-items: center; gap: 10px;">
+                        <div style="width: 12px; height: 12px; border-radius: 3px; background: var(--cyan);"></div>
+                        <span style="font-size: 11px; color: var(--text-dim);">Semantic Bridge</span>
+                        <span class="tooltip" style="width: 280px;">
+                            <strong style="color: var(--cyan);">Meaning: "Connecting ideas"</strong><br>
+                            The AI is linking concepts from different parts of the text. Like when answering "What is the capital?" it connects "capital" to the country mentioned earlier.<br><br>
+                            <strong>When you see this:</strong> The AI is doing reasoning or retrieving related information.
+                        </span>
+                    </div>
+                    <div class="tooltip-container" style="display: flex; align-items: center; gap: 10px;">
+                        <div style="width: 12px; height: 12px; border-radius: 3px; background: var(--amber);"></div>
+                        <span style="font-size: 11px; color: var(--text-dim);">Syntax Floor</span>
+                        <span class="tooltip" style="width: 280px;">
+                            <strong style="color: var(--amber);">Meaning: "Following grammar"</strong><br>
+                            The AI is focused on nearby words to get grammar right. Like making sure "the cat" is followed by "is" not "are".<br><br>
+                            <strong>When you see this:</strong> The AI is doing routine language construction, not deep thinking.
+                        </span>
+                    </div>
+                    <div class="tooltip-container" style="display: flex; align-items: center; gap: 10px;">
+                        <div style="width: 12px; height: 12px; border-radius: 3px; background: var(--magenta);"></div>
+                        <span style="font-size: 11px; color: var(--text-dim);">Exploration</span>
+                        <span class="tooltip" style="width: 280px;">
+                            <strong style="color: var(--magenta);">Meaning: "Unsure, exploring options"</strong><br>
+                            The AI's attention is scattered - it's not sure what to write next and is considering multiple possibilities.<br><br>
+                            <strong>When you see this:</strong> Decision points, creative moments, or potential confusion.
+                        </span>
+                    </div>
+                    <div class="tooltip-container" style="display: flex; align-items: center; gap: 10px;">
+                        <div style="width: 12px; height: 12px; border-radius: 3px; background: var(--lime);"></div>
+                        <span style="font-size: 11px; color: var(--text-dim);">Steering</span>
+                        <span class="tooltip" style="width: 280px;">
+                            <strong style="color: var(--lime);">Meaning: "Following instructions"</strong><br>
+                            The AI is looking way back at the original instructions or system prompt. It's checking what it was asked to do.<br><br>
+                            <strong>When you see this:</strong> The AI is staying on task, following your request.
+                        </span>
+                    </div>
+                </div>
+            </div>
+        </aside>
+
+        <main class="main-view" id="mainView">
+            <div class="state-empty" id="emptyState">
+                <div class="state-icon">⬡</div>
+                <div class="state-text">
+                    Enter text and click <strong>Analyze</strong> to visualize real attention patterns from the model.
+                </div>
+            </div>
+
+            <div class="state-loading" id="loadingState" style="display: none;">
+                <div class="spinner"></div>
+                <div class="state-text" id="loadingText">Generating with attention capture...</div>
+            </div>
+
+            <div class="canvas-container" id="canvasContainer" style="display: none;">
+                <canvas id="edgeCanvas"></canvas>
+                <div class="token-viewport" id="tokenViewport">
+                    <div class="token-segments" id="tokenSegments"></div>
+                </div>
+            </div>
+        </main>
+
+        <aside class="panel-right">
+            <div class="detail-header">
+                <div class="selected-token" id="selectedTokenText">Select a token</div>
+                <div class="selected-meta" id="selectedTokenMeta">Click any token to see its attention patterns</div>
+            </div>
+
+            <div class="detail-tabs">
+                <button class="detail-tab active tooltip-container" data-tab="attends" onclick="switchDetailTab('attends')">
+                    Attends To
+                    <span class="tooltip" style="width: 260px;">
+                        <strong style="color: var(--cyan);">← What did THIS word look at?</strong><br><br>
+                        When the AI wrote this word, which earlier words did it reference? Like when writing "Paris", it looked at "France" and "capital".<br><br>
+                        <strong>The bars show:</strong> Strength of connection (100% = looked at this word a lot)
+                    </span>
+                </button>
+                <button class="detail-tab tooltip-container" data-tab="attendedBy" onclick="switchDetailTab('attendedBy')">
+                    Attended By
+                    <span class="tooltip" style="width: 260px;">
+                        <strong style="color: var(--lime);">→ What words looked at THIS word?</strong><br><br>
+                        Which later words referenced this one? Shows the "influence" of this word on what came after.<br><br>
+                        <strong>High influence:</strong> Important words that shaped the rest of the response.
+                    </span>
+                </button>
+            </div>
+
+            <div class="detail-content" id="detailContent">
+                <div class="attention-list" id="attentionList">
+                    <div style="color: var(--text-dim); font-size: 12px; text-align: center; padding: 40px;">
+                        Select a token to view attention details
+                    </div>
+                </div>
+            </div>
+        </aside>
+    </div>
+
+    <script>
+        // Configuration - UPDATE THIS TO YOUR ENDPOINT
+        const CONFIG = {
+            apiBase: 'http://localhost:8000',
+            modelId: 'default',  // Will be auto-detected from server
+            chatTemplate: 'auto' // 'auto', 'qwen3', 'llama3', 'chatml', 'raw'
+        };
+
+        // Chat template formats for different model families
+        const CHAT_TEMPLATES = {
+            qwen3: {
+                userStart: '<|im_start|>user\n',
+                userEnd: '<|im_end|>\n',
+                assistantStart: '<|im_start|>assistant\n',
+                assistantEnd: '<|im_end|>',
+            },
+            llama3: {
+                userStart: '<|start_header_id|>user<|end_header_id|>\n\n',
+                userEnd: '<|eot_id|>',
+                assistantStart: '<|start_header_id|>assistant<|end_header_id|>\n\n',
+                assistantEnd: '<|eot_id|>',
+            },
+            chatml: {
+                userStart: '<|im_start|>user\n',
+                userEnd: '<|im_end|>\n',
+                assistantStart: '<|im_start|>assistant\n',
+                assistantEnd: '<|im_end|>',
+            },
+            raw: {
+                userStart: 'User: ',
+                userEnd: '\n',
+                assistantStart: 'Assistant: ',
+                assistantEnd: '',
+            }
+        };
+
+        // Detect chat template from model name
+        function detectChatTemplate(modelName) {
+            const lower = modelName.toLowerCase();
+            if (lower.includes('qwen')) return 'qwen3';
+            if (lower.includes('llama-3') || lower.includes('llama3')) return 'llama3';
+            if (lower.includes('mistral') || lower.includes('mixtral')) return 'chatml';
+            if (lower.includes('phi')) return 'chatml';
+            if (lower.includes('gemma')) return 'raw';
+            return 'chatml'; // Default fallback
+        }
+
+        function buildChatPrompt(text, templateName) {
+            const tmpl = CHAT_TEMPLATES[templateName] || CHAT_TEMPLATES.chatml;
+            return `${tmpl.userStart}${text}${tmpl.userEnd}${tmpl.assistantStart}`;
+        }
+
+        // State
+        const state = {
+            tokens: [],
+            edges: [],
+            adjacencyOut: {},
+            adjacencyIn: {},
+            selectedToken: null,
+            detailTab: 'attends',
+            wordMode: false,
+        };
+
+        // Initialization
+        async function init() {
+            await checkConnection();
+            setupCanvas();
+            window.addEventListener('resize', () => {
+                setupCanvas();
+                if (state.tokens.length) renderEdges();
+            });
+        }
+
+        async function checkConnection() {
+            const dot = document.getElementById('statusDot');
+            const text = document.getElementById('statusText');
+
+            try {
+                const res = await fetch(`${CONFIG.apiBase}/v1/models`);
+                const data = await res.json();
+                dot.classList.remove('error', 'loading');
+
+                // Auto-detect model ID and chat template
+                const modelData = data.data[0];
+                if (modelData) {
+                    CONFIG.modelId = modelData.id;
+                    if (CONFIG.chatTemplate === 'auto') {
+                        CONFIG.chatTemplate = detectChatTemplate(modelData.id);
+                    }
+                    console.log(`Detected model: ${CONFIG.modelId}, template: ${CONFIG.chatTemplate}`);
+                }
+
+                text.textContent = modelData?.id?.split('/').pop() || 'Connected';
+            } catch (e) {
+                dot.classList.add('error');
+                text.textContent = 'Connection failed';
+            }
+        }
+
+        function setupCanvas() {
+            const canvas = document.getElementById('edgeCanvas');
+            const container = document.getElementById('canvasContainer');
+            canvas.width = container.clientWidth;
+            canvas.height = container.clientHeight;
+        }
+
+        // Get prompt token texts by tokenizing the chat-formatted prompt
+        async function getPromptTokenTexts(text) {
+            try {
+                // Build chat template using detected template type
+                const chatPrompt = buildChatPrompt(text, CONFIG.chatTemplate);
+                console.log(`Using chat template: ${CONFIG.chatTemplate}`);
+
+                // First tokenize the full prompt with chat template
+                const tokenizeRes = await fetch(`${CONFIG.apiBase}/v1/tokenize`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ model: CONFIG.modelId, prompt: chatPrompt })
+                });
+                if (!tokenizeRes.ok) return null;
+                const tokenData = await tokenizeRes.json();
+
+                // Batch detokenize: send all tokens at once, then split by individual decoding
+                // This is much more efficient than per-token API calls
+                const tokenTexts = [];
+                const batchSize = 50; // Process in batches to avoid URL length limits
+
+                for (let i = 0; i < tokenData.tokens.length; i += batchSize) {
+                    const batch = tokenData.tokens.slice(i, i + batchSize);
+
+                    // Detokenize each token in this batch concurrently
+                    const batchPromises = batch.map(tokenId =>
+                        fetch(`${CONFIG.apiBase}/v1/detokenize`, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ model: CONFIG.modelId, tokens: [tokenId] })
+                        }).then(res => res.ok ? res.json() : null)
+                    );
+
+                    const batchResults = await Promise.all(batchPromises);
+                    batchResults.forEach((result, idx) => {
+                        if (result) {
+                            tokenTexts.push(result.text);
+                        } else {
+                            tokenTexts.push(`[${batch[idx]}]`);
+                        }
+                    });
+                }
+
+                return tokenTexts;
+            } catch (e) {
+                console.warn('Could not get prompt token texts:', e);
+                return null;
+            }
+        }
+
+        // Analysis
+        async function analyze() {
+            const text = document.getElementById('inputText').value.trim();
+            if (!text) return;
+
+            const maxTokens = parseInt(document.getElementById('maxTokens').value);
+            const temperature = parseFloat(document.getElementById('temperature').value);
+
+            showLoading('Sending request with attention capture...');
+            document.getElementById('analyzeBtn').disabled = true;
+
+            try {
+                // Get prompt token texts in parallel with the main request
+                const promptTokensPromise = getPromptTokenTexts(text);
+
+                const response = await fetch(`${CONFIG.apiBase}/v1/chat/completions`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        model: CONFIG.modelId,
+                        messages: [{ role: 'user', content: text }],
+                        max_tokens: maxTokens,
+                        temperature: temperature,
+                        return_attention_tokens: true,
+                        logprobs: true,
+                        top_logprobs: 1,
+                    })
+                });
+
+                if (!response.ok) throw new Error(`API error: ${response.status}`);
+
+                const data = await response.json();
+                console.log('API Response:', data);
+
+                // Wait for prompt tokens
+                const promptTokenTexts = await promptTokensPromise;
+                console.log('Prompt token texts:', promptTokenTexts);
+
+                showLoading('Parsing attention data...');
+                parseResponse(data, text, promptTokenTexts);
+
+                showLoading('Rendering visualization...');
+                render();
+
+                hideLoading();
+                updateStats();
+                updateLayerControls();
+
+            } catch (error) {
+                console.error('Analysis error:', error);
+                alert(`Error: ${error.message}`);
+                hideLoading();
+            }
+
+            document.getElementById('analyzeBtn').disabled = false;
+        }
+
+        function parseResponse(data, originalText, promptTokenTexts = null) {
+            const choice = data.choices?.[0];
+            if (!choice) throw new Error('No response choice');
+
+            state.tokens = [];
+            state.edges = [];
+            state.adjacencyOut = {};
+            state.adjacencyIn = {};
+            state.selectedToken = null;
+
+            const generatedText = choice.message?.content || '';
+            const attentionTokens = choice.attention_tokens || [];
+            const logprobs = choice.logprobs?.content || [];
+            const usage = data.usage || {};
+
+            // Get actual token count from API
+            const promptTokenCount = usage.prompt_tokens || 0;
+            const completionTokenCount = usage.completion_tokens || 0;
+
+            let tokens = [];
+
+            // Create prompt tokens - use actual token texts if available
+            // Note: There may be a mismatch between our tokenized count and the API's prompt_tokens
+            // because the API may add BOS token or apply different template processing
+            const tokenOffset = promptTokenTexts ? Math.max(0, promptTokenCount - promptTokenTexts.length) : 0;
+
+            for (let i = 0; i < promptTokenCount; i++) {
+                let tokenText;
+                const adjustedIdx = i - tokenOffset;
+                if (promptTokenTexts && adjustedIdx >= 0 && adjustedIdx < promptTokenTexts.length) {
+                    tokenText = promptTokenTexts[adjustedIdx];
+                    // Clean up special tokens for display
+                    if (tokenText === '') tokenText = '⟨special⟩';
+                    else if (tokenText === '\n') tokenText = '⏎';
+                } else if (i < tokenOffset) {
+                    tokenText = '⟨bos⟩';  // Likely BOS or prepended tokens
+                } else {
+                    tokenText = i === 0 ? `[P:${originalText.substring(0, 15)}...]` : `[P${i}]`;
+                }
+                tokens.push({
+                    idx: i,
+                    text: tokenText,
+                    segment: 'prompt',
+                    isPlaceholder: !promptTokenTexts
+                });
+            }
+
+            // If we have logprobs, use actual token text for output
+            if (logprobs.length > 0) {
+                let inThinkMode = false;
+                logprobs.forEach((lp, i) => {
+                    let tokenText = lp.token || `[T${i}]`;
+                    // Detect thinking tokens
+                    if (tokenText.includes('<think>')) inThinkMode = true;
+                    if (tokenText.includes('</think>')) inThinkMode = false;
+
+                    // Clean up display
+                    let displayText = tokenText;
+                    if (displayText === '\n') displayText = '⏎';
+                    else if (displayText === '') displayText = '⟨empty⟩';
+
+                    tokens.push({
+                        idx: promptTokenCount + i,
+                        text: displayText,
+                        rawText: tokenText,
+                        segment: inThinkMode ? 'think' : 'output'
+                    });
+                });
+            } else {
+                // Fallback: split generated text on whitespace
+                let inThink = false;
+                const genParts = generatedText.split(/(<think>|<\/think>)/);
+                let genIdx = 0;
+
+                genParts.forEach(part => {
+                    if (part === '<think>') { inThink = true; return; }
+                    if (part === '</think>') { inThink = false; return; }
+                    if (!part) return;
+
+                    const partTokens = part.split(/(\s+)/);
+                    partTokens.forEach(t => {
+                        if (t) {
+                            tokens.push({
+                                idx: promptTokenCount + genIdx++,
+                                text: t,
+                                segment: inThink ? 'think' : 'output'
+                            });
+                        }
+                    });
+                });
+            }
+
+            state.tokens = tokens;
+
+            // Parse attention_tokens into edges OR fingerprints
+            // Supports two modes:
+            // 1. Raw token mode: token_positions + attention_scores (for debugging)
+            // 2. Fingerprint mode: fingerprint + manifold (for production)
+            state.fingerprints = [];  // Store fingerprints for visualization
+
+            if (Array.isArray(attentionTokens) && attentionTokens.length > 0) {
+                const firstItem = attentionTokens[0];
+                const hasFingerprints = firstItem.fingerprint !== undefined;
+                const hasTokenPositions = firstItem.token_positions !== undefined;
+
+                console.log(`Attention data: hasFingerprints=${hasFingerprints}, hasTokenPositions=${hasTokenPositions}`);
+
+                // Process each attention token - can have BOTH fingerprints AND edges
+                attentionTokens.forEach((attnInfo, genIdx) => {
+                    const srcIdx = promptTokenCount + genIdx;
+
+                    // Store fingerprints if available
+                    if (attnInfo.fingerprint) {
+                        state.fingerprints.push({
+                            idx: srcIdx,
+                            fingerprint: attnInfo.fingerprint,
+                            manifold: attnInfo.manifold_zone || attnInfo.manifold || 'unknown',
+                            step: attnInfo.decode_step || attnInfo.step || genIdx + 1,
+                            think_phase: attnInfo.think_phase || 'output'
+                        });
+
+                        // Assign manifold color to the token
+                        if (srcIdx < tokens.length) {
+                            tokens[srcIdx].manifold = attnInfo.manifold_zone || attnInfo.manifold;
+                            tokens[srcIdx].fingerprint = attnInfo.fingerprint;
+                        }
+                    }
+
+                    // Parse edges from token_positions (ALWAYS, not just when no fingerprints)
+                    if (attnInfo.token_positions && attnInfo.attention_scores) {
+                        attnInfo.token_positions.forEach((dstIdx, i) => {
+                            const weight = attnInfo.attention_scores[i];
+                            if (weight > 0 && dstIdx < tokens.length) {
+                                addEdge(srcIdx, dstIdx, weight, attnInfo.layer_id || 0);
+                            }
+                        });
+                    }
+                });
+            }
+
+            console.log(`Parsed ${state.tokens.length} tokens, ${state.edges.length} edges, ${state.fingerprints.length} fingerprints`);
+        }
+
+        function addEdge(src, dst, weight, layer = 0) {
+            const edge = { src, dst, weight, layer };
+            state.edges.push(edge);
+
+            if (!state.adjacencyOut[src]) state.adjacencyOut[src] = [];
+            state.adjacencyOut[src].push(edge);
+
+            if (!state.adjacencyIn[dst]) state.adjacencyIn[dst] = [];
+            state.adjacencyIn[dst].push(edge);
+        }
+
+        // Rendering
+        function render() {
+            renderTokens();
+            renderEdges();
+        }
+
+        function renderTokens() {
+            const container = document.getElementById('tokenSegments');
+            container.innerHTML = '';
+
+            // Apply word aggregation if enabled
+            const displayTokens = aggregateToWords(state.tokens);
+
+            const segments = {
+                prompt: displayTokens.filter(t => t.segment === 'prompt'),
+                think: displayTokens.filter(t => t.segment === 'think'),
+                output: displayTokens.filter(t => t.segment === 'output')
+            };
+
+            const segmentNames = {
+                prompt: 'Prompt (Input)',
+                think: 'Thinking (Hidden)',
+                output: 'Response (Output)'
+            };
+
+            const unitLabel = state.wordMode ? 'words' : 'tokens';
+
+            ['prompt', 'think', 'output'].forEach(seg => {
+                if (segments[seg].length === 0) return;
+
+                const segEl = document.createElement('div');
+                segEl.className = 'segment';
+                segEl.innerHTML = `
+                    <div class="segment-header ${seg}">
+                        <span>${segmentNames[seg]} (${segments[seg].length} ${unitLabel})</span>
+                        <button class="segment-toggle" onclick="toggleSegment(this)">-</button>
+                    </div>
+                    <div class="segment-body">
+                        <div class="token-flow" id="segment-${seg}"></div>
+                    </div>
+                `;
+                container.appendChild(segEl);
+
+                const flowEl = segEl.querySelector('.token-flow');
+                segments[seg].forEach(token => {
+                    const tokenEl = document.createElement('span');
+                    tokenEl.className = 'token';
+                    tokenEl.dataset.idx = token.idx;
+
+                    // For word mode, store all token indices
+                    if (token.tokenIndices) {
+                        tokenEl.dataset.tokenIndices = token.tokenIndices.join(',');
+                    }
+
+                    tokenEl.textContent = token.text;
+                    tokenEl.onclick = () => selectToken(token.idx, token.tokenIndices);
+
+                    // Apply manifold color if in fingerprint mode
+                    if (token.manifold) {
+                        tokenEl.classList.add(`manifold-${token.manifold.replace(/_/g, '-')}`);
+                        tokenEl.title = state.wordMode
+                            ? `Word: "${token.text}" | Tokens: ${token.tokenIndices?.length || 1} | Zone: ${token.manifold}`
+                            : `Manifold: ${token.manifold}`;
+                    } else if (state.wordMode && token.tokenIndices) {
+                        tokenEl.title = `Word: "${token.text}" | Tokens: ${token.tokenIndices.length}`;
+                    }
+
+                    flowEl.appendChild(tokenEl);
+                });
+            });
+        }
+
+        function renderEdges() {
+            const canvas = document.getElementById('edgeCanvas');
+            const ctx = canvas.getContext('2d');
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+            if (state.selectedToken === null) return;
+
+            const threshold = parseFloat(document.getElementById('edgeThreshold').value);
+
+            const getTokenPos = (idx) => {
+                const el = document.querySelector(`.token[data-idx="${idx}"]`);
+                if (!el) return null;
+                const rect = el.getBoundingClientRect();
+                const containerRect = canvas.getBoundingClientRect();
+                return {
+                    x: rect.left - containerRect.left + rect.width / 2,
+                    y: rect.top - containerRect.top + rect.height / 2
+                };
+            };
+
+            const srcPos = getTokenPos(state.selectedToken);
+            if (!srcPos) return;
+
+            // Draw edges this token attends to (cyan)
+            // Apply layer filter if set
+            const layerFilter = state.selectedLayer === 'all' ? null : parseInt(state.selectedLayer);
+            const outEdges = (state.adjacencyOut[state.selectedToken] || [])
+                .filter(e => layerFilter === null || e.layer === layerFilter);
+            outEdges.filter(e => e.weight >= threshold).forEach(edge => {
+                const dstPos = getTokenPos(edge.dst);
+                if (!dstPos) return;
+
+                ctx.beginPath();
+                ctx.moveTo(srcPos.x, srcPos.y);
+                const midX = (srcPos.x + dstPos.x) / 2;
+                const midY = Math.min(srcPos.y, dstPos.y) - 30;
+                ctx.quadraticCurveTo(midX, midY, dstPos.x, dstPos.y);
+                ctx.strokeStyle = `rgba(0, 229, 255, ${edge.weight})`;
+                ctx.lineWidth = 1 + edge.weight * 3;
+                ctx.stroke();
+
+                ctx.beginPath();
+                ctx.arc(dstPos.x, dstPos.y, 4, 0, Math.PI * 2);
+                ctx.fillStyle = `rgba(0, 229, 255, ${edge.weight})`;
+                ctx.fill();
+            });
+
+            // Draw edges that attend to this token (lime)
+            // Apply layer filter to incoming edges as well
+            const inEdges = (state.adjacencyIn[state.selectedToken] || [])
+                .filter(e => layerFilter === null || e.layer === layerFilter);
+            inEdges.filter(e => e.weight >= threshold).forEach(edge => {
+                const dstPos = getTokenPos(edge.src);
+                if (!dstPos) return;
+
+                ctx.beginPath();
+                ctx.moveTo(srcPos.x, srcPos.y);
+                const midX = (srcPos.x + dstPos.x) / 2;
+                const midY = Math.max(srcPos.y, dstPos.y) + 30;
+                ctx.quadraticCurveTo(midX, midY, dstPos.x, dstPos.y);
+                ctx.strokeStyle = `rgba(180, 255, 0, ${edge.weight})`;
+                ctx.lineWidth = 1 + edge.weight * 3;
+                ctx.stroke();
+
+                ctx.beginPath();
+                ctx.arc(dstPos.x, dstPos.y, 4, 0, Math.PI * 2);
+                ctx.fillStyle = `rgba(180, 255, 0, ${edge.weight})`;
+                ctx.fill();
+            });
+        }
+
+        function selectToken(idx, tokenIndices = null) {
+            document.querySelectorAll('.token').forEach(el => {
+                el.classList.remove('selected', 'attended-to', 'attends-from');
+            });
+
+            state.selectedToken = idx;
+            state.selectedTokenIndices = tokenIndices || [idx]; // For word mode
+
+            // Find the display token (may be aggregated word)
+            const displayTokens = aggregateToWords(state.tokens);
+            const displayToken = displayTokens.find(t => t.idx === idx);
+            const rawToken = state.tokens.find(t => t.idx === idx);
+
+            const selectedEl = document.querySelector(`.token[data-idx="${idx}"]`);
+            if (selectedEl) selectedEl.classList.add('selected');
+
+            // Aggregate edges for all tokens in the word (if in word mode)
+            // Apply layer filter if set
+            const layerFilter = state.selectedLayer === 'all' ? null : parseInt(state.selectedLayer);
+            let outEdges = [];
+            let inEdges = [];
+            state.selectedTokenIndices.forEach(tokenIdx => {
+                const out = (state.adjacencyOut[tokenIdx] || [])
+                    .filter(e => layerFilter === null || e.layer === layerFilter);
+                const inn = (state.adjacencyIn[tokenIdx] || [])
+                    .filter(e => layerFilter === null || e.layer === layerFilter);
+                outEdges = outEdges.concat(out);
+                inEdges = inEdges.concat(inn);
+            });
+
+            // Deduplicate and aggregate by destination/source
+            if (state.wordMode && outEdges.length > 0) {
+                outEdges = aggregateEdges(outEdges, 'dst');
+            }
+            if (state.wordMode && inEdges.length > 0) {
+                inEdges = aggregateEdges(inEdges, 'src');
+            }
+
+            outEdges.forEach(edge => {
+                const el = document.querySelector(`.token[data-idx="${edge.dst}"]`);
+                if (el) el.classList.add('attended-to');
+            });
+
+            inEdges.forEach(edge => {
+                const el = document.querySelector(`.token[data-idx="${edge.src}"]`);
+                if (el) el.classList.add('attends-from');
+            });
+
+            const token = displayToken || rawToken;
+            document.getElementById('selectedTokenText').textContent = token ? token.text : '';
+
+            // Build meta text - include manifold info if available
+            let metaText = state.wordMode && state.selectedTokenIndices.length > 1
+                ? `Tokens: ${state.selectedTokenIndices.join(', ')} | Segment: ${token?.segment || ''}`
+                : `Position: ${idx} | Segment: ${token?.segment || ''}`;
+
+            if (token?.manifold) {
+                metaText += ` | Zone: ${token.manifold}`;
+            }
+            if (outEdges.length > 0 || inEdges.length > 0) {
+                metaText += ` | Out: ${outEdges.length} | In: ${inEdges.length}`;
+            }
+            document.getElementById('selectedTokenMeta').textContent = metaText;
+
+            renderDetailList();
+            renderEdges();
+        }
+
+        // Aggregate edges by target field, summing weights
+        function aggregateEdges(edges, targetField) {
+            const aggregated = {};
+            edges.forEach(edge => {
+                const key = edge[targetField];
+                if (!aggregated[key]) {
+                    aggregated[key] = { ...edge, weight: 0 };
+                }
+                aggregated[key].weight += edge.weight;
+            });
+            // Normalize weights if they exceed 1
+            const maxWeight = Math.max(...Object.values(aggregated).map(e => e.weight));
+            if (maxWeight > 1) {
+                Object.values(aggregated).forEach(e => e.weight /= maxWeight);
+            }
+            return Object.values(aggregated);
+        }
+
+        function renderDetailList() {
+            const list = document.getElementById('attentionList');
+            list.innerHTML = '';
+
+            if (state.selectedToken === null) {
+                list.innerHTML = '<div style="color: var(--text-dim); font-size: 12px; text-align: center; padding: 40px;">Select a token</div>';
+                return;
+            }
+
+            const token = state.tokens.find(t => t.idx === state.selectedToken);
+
+            // Apply layer filter if set
+            const layerFilter = state.selectedLayer === 'all' ? null : parseInt(state.selectedLayer);
+            const rawEdges = state.detailTab === 'attends'
+                ? (state.adjacencyOut[state.selectedToken] || [])
+                : (state.adjacencyIn[state.selectedToken] || []);
+            const edges = layerFilter === null
+                ? rawEdges
+                : rawEdges.filter(e => e.layer === layerFilter);
+
+            const sorted = [...edges].sort((a, b) => b.weight - a.weight);
+
+            // In fingerprint mode with no edges, show fingerprint visualization
+            if (sorted.length === 0 && token?.fingerprint) {
+                list.innerHTML = renderFingerprintView(token);
+                return;
+            }
+
+            if (sorted.length === 0) {
+                const msg = state.fingerprints.length > 0
+                    ? 'Fingerprint mode: no edge data (manifold colors show attention patterns)'
+                    : 'No attention edges';
+                list.innerHTML = `<div style="color: var(--text-dim); font-size: 12px; text-align: center; padding: 40px;">${msg}</div>`;
+                return;
+            }
+
+            // Add summary section showing the attention pattern
+            const summaryDiv = document.createElement('div');
+            summaryDiv.style.cssText = 'padding: 12px; background: var(--deep); border-radius: 8px; margin-bottom: 12px;';
+
+            const topTokens = sorted.slice(0, 3).map(edge => {
+                const targetIdx = state.detailTab === 'attends' ? edge.dst : edge.src;
+                const t = state.tokens.find(tok => tok.idx === targetIdx);
+                return `<strong style="color: var(--cyan);">"${t?.text || '[?]'}"</strong>`;
+            }).join(', ');
+
+            const directionText = state.detailTab === 'attends'
+                ? `When generating <strong style="color: var(--lime);">"${token?.text}"</strong>, the model looked at: ${topTokens}`
+                : `<strong style="color: var(--lime);">"${token?.text}"</strong> influenced these later tokens: ${topTokens}`;
+
+            summaryDiv.innerHTML = `
+                <div style="font-size: 11px; color: var(--text); line-height: 1.5;">
+                    ${directionText}
+                </div>
+            `;
+            list.appendChild(summaryDiv);
+
+            // Add section header
+            const headerDiv = document.createElement('div');
+            headerDiv.style.cssText = 'font-size: 10px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px; padding: 0 4px;';
+            headerDiv.textContent = state.detailTab === 'attends' ? 'Top Attended Tokens (click to scroll)' : 'Tokens That Attend Here';
+            list.appendChild(headerDiv);
+
+            sorted.forEach((edge, i) => {
+                const targetIdx = state.detailTab === 'attends' ? edge.dst : edge.src;
+                const targetToken = state.tokens.find(t => t.idx === targetIdx);
+
+                // Calculate distance and context
+                const distance = Math.abs(state.selectedToken - targetIdx);
+                const direction = targetIdx < state.selectedToken ? '←' : '→';
+                const distanceLabel = distance === 0 ? 'self' :
+                    distance <= 5 ? `${distance} ${direction}` :
+                    distance <= 20 ? `${distance} ${direction}` :
+                    `${distance} ${direction}`;
+
+                // Get surrounding context
+                const contextTokens = [];
+                for (let j = Math.max(0, targetIdx - 1); j <= Math.min(state.tokens.length - 1, targetIdx + 1); j++) {
+                    const t = state.tokens.find(tok => tok.idx === j);
+                    if (t) {
+                        const highlight = j === targetIdx ? 'font-weight: 700; color: var(--cyan);' : 'color: var(--text-dim);';
+                        contextTokens.push(`<span style="${highlight}">${t.text}</span>`);
+                    }
+                }
+
+                const item = document.createElement('div');
+                item.className = 'attention-item';
+                item.style.cursor = 'pointer';
+                item.innerHTML = `
+                    <div style="display: flex; align-items: center; gap: 8px; flex: 1;">
+                        <span class="attn-rank">${i + 1}</span>
+                        <div style="flex: 1; min-width: 0;">
+                            <div style="display: flex; align-items: center; gap: 6px;">
+                                <span class="attn-token">${targetToken?.text || `[${targetIdx}]`}</span>
+                                <span style="font-size: 10px; color: var(--text-muted);">${distanceLabel}</span>
+                            </div>
+                            <div style="font-size: 10px; color: var(--text-muted); margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">
+                                ...${contextTokens.join('')}...
+                            </div>
+                        </div>
+                    </div>
+                    <div style="display: flex; flex-direction: column; align-items: flex-end; gap: 2px;">
+                        <span class="attn-score">${(edge.weight * 100).toFixed(1)}%</span>
+                        <div class="attn-bar" style="width: 60px;">
+                            <div class="attn-bar-fill" style="width: ${edge.weight * 100}%"></div>
+                        </div>
+                    </div>
+                `;
+                item.onclick = () => {
+                    const el = document.querySelector(`.token[data-idx="${targetIdx}"]`);
+                    if (el) {
+                        el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                        // Flash highlight
+                        el.style.transition = 'box-shadow 0.2s';
+                        el.style.boxShadow = '0 0 12px var(--cyan)';
+                        setTimeout(() => el.style.boxShadow = '', 500);
+                    }
+                };
+                list.appendChild(item);
+            });
+        }
+
+        // Render fingerprint visualization for a token
+        function renderFingerprintView(token) {
+            if (!token.fingerprint) return '<div>No fingerprint data</div>';
+
+            const fp = token.fingerprint;
+            const manifold = token.manifold || 'unknown';
+
+            // Manifold color map
+            const manifoldColors = {
+                'semantic_bridge': 'var(--cyan)',
+                'syntax_floor': 'var(--amber)',
+                'exploration': 'var(--magenta)',
+                'steering': 'var(--lime)',
+                'unknown': 'var(--text-dim)'
+            };
+
+            const color = manifoldColors[manifold] || manifoldColors.unknown;
+
+            // First 8 values are distance bins, rest are derived features
+            const distBins = fp.slice(0, 8);
+            const features = fp.slice(8);
+
+            // Create sparkline for distance distribution
+            const maxDist = Math.max(...distBins, 0.01);
+            const sparkline = distBins.map((v, i) => {
+                const height = Math.round((v / maxDist) * 100);
+                return `<div style="width: 12px; height: ${height}%; background: ${color}; border-radius: 2px;" title="Bin ${i}: ${(v * 100).toFixed(1)}%"></div>`;
+            }).join('');
+
+            return `
+                <div style="padding: 16px;">
+                    <div style="margin-bottom: 16px;">
+                        <div style="font-size: 11px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px;">Attention Zone</div>
+                        <div style="display: flex; align-items: center; gap: 10px;">
+                            <div style="width: 16px; height: 16px; border-radius: 4px; background: ${color};"></div>
+                            <span style="font-size: 14px; font-weight: 600; color: ${color};">${manifold.replace(/_/g, ' ')}</span>
+                        </div>
+                    </div>
+
+                    <div style="margin-bottom: 16px;">
+                        <div style="font-size: 11px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px;">
+                            Distance Distribution
+                            <span style="font-size: 9px; font-weight: normal; color: var(--text-muted); margin-left: 4px;" title="Shows how far back the model looks: left = recent tokens, right = earlier tokens">ⓘ</span>
+                        </div>
+                        <div style="display: flex; align-items: flex-end; gap: 4px; height: 60px; padding: 8px; background: var(--deep); border-radius: 8px;">
+                            ${sparkline}
+                        </div>
+                        <div style="display: flex; justify-content: space-between; font-size: 9px; color: var(--text-muted); margin-top: 4px;">
+                            <span>1-8 tokens back</span>
+                            <span>64+ tokens back</span>
+                        </div>
+                        <div style="font-size: 10px; color: var(--text-muted); margin-top: 8px; line-height: 1.4;">
+                            ${getDistanceExplanation(distBins)}
+                        </div>
+                    </div>
+
+                    <div>
+                        <div style="font-size: 11px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px;">Interpretation</div>
+                        <div style="font-size: 12px; color: var(--text-dim); line-height: 1.5;">
+                            ${getManifoldDescription(manifold)}
+                        </div>
+                    </div>
+                </div>
+            `;
+        }
+
+        function getManifoldDescription(manifold) {
+            const descriptions = {
+                'semantic_bridge': 'Model is attending to semantically related tokens across the context. Typical during reasoning or concept retrieval.',
+                'syntax_floor': 'Attention focused on nearby tokens. Typical during structured output or syntax-constrained generation.',
+                'exploration': 'Diffuse attention pattern. Model exploring multiple possibilities or uncertain about next token.',
+                'steering': 'Focused attention on steering/instruction tokens. Model following explicit directives.',
+                'unknown': 'Attention pattern does not match known manifolds.'
+            };
+            return descriptions[manifold] || descriptions.unknown;
+        }
+
+        function getDistanceExplanation(distBins) {
+            if (!distBins || distBins.length < 2) return '';
+
+            // Find the peak bin
+            const maxVal = Math.max(...distBins);
+            const peakIdx = distBins.indexOf(maxVal);
+            const nearSum = distBins.slice(0, 3).reduce((a, b) => a + b, 0);
+            const farSum = distBins.slice(5).reduce((a, b) => a + b, 0);
+
+            // Distance ranges for each bin (0: 1-8, 1: 9-16, 2: 17-24, 3: 25-32, 4: 33-40, 5: 41-48, 6: 49-56, 7: 57-64+)
+            const binLabels = ['1-8', '9-16', '17-24', '25-32', '33-40', '41-48', '49-56', '57+'];
+
+            if (nearSum > 0.7) {
+                return `📍 Local focus: ${Math.round(nearSum * 100)}% attention within 24 tokens. Model is building on recent context.`;
+            } else if (farSum > 0.5) {
+                return `🔭 Long-range: ${Math.round(farSum * 100)}% attention to tokens 40+ back. Model recalling earlier context.`;
+            } else if (maxVal > 0.4) {
+                return `🎯 Peak at ${binLabels[peakIdx]} tokens back (${Math.round(maxVal * 100)}%). Focused retrieval.`;
+            } else {
+                return `🌐 Distributed: attention spread across context. Model integrating multiple sources.`;
+            }
+        }
+
+        function switchDetailTab(tab) {
+            state.detailTab = tab;
+            document.querySelectorAll('.detail-tab').forEach(t => {
+                t.classList.toggle('active', t.dataset.tab === tab);
+            });
+            renderDetailList();
+        }
+
+        function toggleSegment(btn) {
+            const body = btn.closest('.segment').querySelector('.segment-body');
+            const isHidden = body.style.display === 'none';
+            body.style.display = isHidden ? 'block' : 'none';
+            btn.textContent = isHidden ? '-' : '+';
+            setTimeout(renderEdges, 100);
+        }
+
+        function toggleWordMode() {
+            state.wordMode = !state.wordMode;
+            document.getElementById('wordModeToggle').classList.toggle('active', state.wordMode);
+
+            // Re-render with word aggregation if we have tokens
+            if (state.tokens.length > 0) {
+                render();
+                updateStats();
+            }
+        }
+
+        // Aggregate tokens into words based on whitespace boundaries
+        function aggregateToWords(tokens) {
+            if (!state.wordMode || tokens.length === 0) return tokens;
+
+            const words = [];
+            let currentWord = null;
+
+            tokens.forEach(token => {
+                const text = token.text || '';
+                // Check if this token starts a new word (starts with space, newline, or is after special token)
+                const startsNewWord = text.startsWith(' ') ||
+                                      text.startsWith('Ġ') ||  // GPT-2/RoBERTa style
+                                      text === '⏎' ||
+                                      text.includes('⟨') ||
+                                      currentWord === null;
+
+                if (startsNewWord && currentWord !== null) {
+                    words.push(currentWord);
+                    currentWord = null;
+                }
+
+                if (currentWord === null) {
+                    currentWord = {
+                        idx: token.idx,
+                        text: text.replace(/^[Ġ\s]/, ''), // Remove leading space/Ġ
+                        segment: token.segment,
+                        tokenIndices: [token.idx],
+                        manifold: token.manifold,
+                        fingerprint: token.fingerprint,
+                    };
+                } else {
+                    currentWord.text += text;
+                    currentWord.tokenIndices.push(token.idx);
+                    // Keep the most significant manifold
+                    if (token.manifold && !currentWord.manifold) {
+                        currentWord.manifold = token.manifold;
+                    }
+                }
+            });
+
+            if (currentWord !== null) {
+                words.push(currentWord);
+            }
+
+            return words;
+        }
+
+        // Layer filtering and visualization
+        state.selectedLayer = 'all';
+        state.layerStats = {};
+
+        function updateLayerControls() {
+            const layers = new Set(state.edges.map(e => e.layer));
+            const select = document.getElementById('layerSelect');
+            const section = document.getElementById('layerControlSection');
+
+            if (layers.size <= 1) {
+                section.style.display = 'none';
+                return;
+            }
+
+            section.style.display = 'block';
+
+            // Build layer options
+            const sortedLayers = Array.from(layers).sort((a, b) => a - b);
+            select.innerHTML = '<option value="all">All Layers (' + layers.size + ')</option>';
+            sortedLayers.forEach(layer => {
+                const edgeCount = state.edges.filter(e => e.layer === layer).length;
+                select.innerHTML += `<option value="${layer}">Layer ${layer} (${edgeCount} edges)</option>`;
+            });
+
+            // Compute layer statistics
+            state.layerStats = {};
+            sortedLayers.forEach(layer => {
+                const layerEdges = state.edges.filter(e => e.layer === layer);
+                const totalWeight = layerEdges.reduce((sum, e) => sum + e.weight, 0);
+                const avgWeight = layerEdges.length > 0 ? totalWeight / layerEdges.length : 0;
+                state.layerStats[layer] = {
+                    edgeCount: layerEdges.length,
+                    totalWeight: totalWeight,
+                    avgWeight: avgWeight,
+                    maxWeight: Math.max(...layerEdges.map(e => e.weight), 0)
+                };
+            });
+        }
+
+        function filterByLayer() {
+            const select = document.getElementById('layerSelect');
+            state.selectedLayer = select.value;
+
+            // Re-render with layer filter
+            renderEdges();
+
+            // Update token highlighting based on filtered edges
+            document.querySelectorAll('.token').forEach(el => {
+                el.classList.remove('attended-to', 'attends-from');
+            });
+
+            if (state.selectedToken !== null) {
+                selectToken(state.selectedToken, state.selectedTokenIndices);
+            }
+        }
+
+        function getFilteredEdges() {
+            if (state.selectedLayer === 'all') {
+                return state.edges;
+            }
+            return state.edges.filter(e => e.layer === parseInt(state.selectedLayer));
+        }
+
+        function showLayerHeatmap() {
+            const layers = Object.keys(state.layerStats).sort((a, b) => a - b);
+            if (layers.length === 0) {
+                alert('No layer data available. Generate some attention first.');
+                return;
+            }
+
+            const maxEdges = Math.max(...layers.map(l => state.layerStats[l].edgeCount));
+            const maxWeight = Math.max(...layers.map(l => state.layerStats[l].totalWeight));
+
+            const modal = document.createElement('div');
+            modal.className = 'modal-overlay';
+            modal.onclick = (e) => { if (e.target === modal) modal.remove(); };
+
+            let heatmapHtml = '';
+            layers.forEach(layer => {
+                const stats = state.layerStats[layer];
+                const edgePct = (stats.edgeCount / maxEdges * 100).toFixed(0);
+                const weightPct = (stats.totalWeight / maxWeight * 100).toFixed(0);
+
+                heatmapHtml += `
+                    <div class="layer-row" onclick="selectLayerFromHeatmap(${layer})">
+                        <div class="layer-label">Layer ${layer}</div>
+                        <div class="layer-bar" title="Click to filter">
+                            <div class="layer-fill" style="width: ${weightPct}%"></div>
+                        </div>
+                        <div class="layer-value">${stats.edgeCount} edges</div>
+                    </div>
+                `;
+            });
+
+            modal.innerHTML = `
+                <div class="modal-content">
+                    <div class="modal-header">
+                        <div class="modal-title">Layer-by-Layer Attention Distribution</div>
+                        <button class="modal-close" onclick="this.closest('.modal-overlay').remove()">&times;</button>
+                    </div>
+                    <div style="margin-bottom: 16px; color: var(--text-dim); font-size: 12px;">
+                        Bar width shows relative attention weight per layer. Click a layer to filter.
+                    </div>
+                    <div class="layer-heatmap">
+                        ${heatmapHtml}
+                    </div>
+                    <div style="margin-top: 20px; display: flex; gap: 10px;">
+                        <button class="btn-small" onclick="document.getElementById('layerSelect').value='all'; filterByLayer(); this.closest('.modal-overlay').remove();">
+                            Show All Layers
+                        </button>
+                    </div>
+                </div>
+            `;
+
+            document.body.appendChild(modal);
+        }
+
+        function selectLayerFromHeatmap(layer) {
+            document.getElementById('layerSelect').value = layer.toString();
+            filterByLayer();
+            document.querySelector('.modal-overlay')?.remove();
+        }
+
+        // UI Helpers
+        function showLoading(text) {
+            document.getElementById('emptyState').style.display = 'none';
+            document.getElementById('loadingState').style.display = 'flex';
+            document.getElementById('loadingText').textContent = text;
+            document.getElementById('canvasContainer').style.display = 'none';
+        }
+
+        function hideLoading() {
+            document.getElementById('loadingState').style.display = 'none';
+            document.getElementById('canvasContainer').style.display = 'block';
+        }
+
+        function updateStats() {
+            document.getElementById('statTokens').textContent = state.tokens.length;
+            // Show fingerprint count if in fingerprint mode, otherwise show edges
+            document.getElementById('statEdges').textContent =
+                state.fingerprints.length > 0 ? state.fingerprints.length : state.edges.length;
+            const layers = new Set(state.edges.map(e => e.layer));
+            document.getElementById('statLayers').textContent = layers.size || 1;
+
+            // Show manifold legend if in fingerprint mode
+            const legend = document.getElementById('manifoldLegend');
+            if (legend) {
+                legend.style.display = state.fingerprints.length > 0 ? 'block' : 'none';
+            }
+        }
+
+        function clearAll() {
+            document.getElementById('inputText').value = '';
+            state.tokens = [];
+            state.edges = [];
+            state.fingerprints = [];
+            state.adjacencyOut = {};
+            state.adjacencyIn = {};
+            state.selectedToken = null;
+            state.selectedLayer = 'all';
+            state.layerStats = {};
+
+            document.getElementById('canvasContainer').style.display = 'none';
+            document.getElementById('emptyState').style.display = 'flex';
+            document.getElementById('selectedTokenText').textContent = 'Select a token';
+            document.getElementById('selectedTokenMeta').textContent = 'Click any token to see its attention patterns';
+            document.getElementById('attentionList').innerHTML = '';
+            document.getElementById('layerControlSection').style.display = 'none';
+            updateStats();
+        }
+
+        // Initialize
+        init();
+
+        document.getElementById('tokenViewport').addEventListener('scroll', () => {
+            if (state.selectedToken !== null) renderEdges();
+        });
+
+        // Help Modal
+        function showHelpModal() {
+            const modal = document.createElement('div');
+            modal.className = 'modal-overlay help-modal';
+            modal.onclick = (e) => { if (e.target === modal) modal.remove(); };
+
+            modal.innerHTML = `
+                <div class="modal-content">
+                    <div class="modal-header">
+                        <div class="modal-title">Attention Explorer - Complete Guide</div>
+                        <button class="modal-close" onclick="this.closest('.modal-overlay').remove()">&times;</button>
+                    </div>
+
+                    <!-- BEGINNER INTRO -->
+                    <div class="help-section">
+                        <div class="help-section-title">What is This Tool?</div>
+                        <div style="background: linear-gradient(135deg, rgba(0,229,255,0.1), rgba(255,0,153,0.1)); padding: 16px; border-radius: 8px; margin-bottom: 16px;">
+                            <div style="font-size: 13px; color: var(--text); line-height: 1.8;">
+                                <strong style="color: var(--cyan);">This tool lets you see inside an AI's "brain" while it writes.</strong><br><br>
+                                When you ask an AI a question, it doesn't think like a human. Instead, it reads your words, then writes its answer
+                                <em>one word at a time</em>. For each word it writes, it "looks back" at previous words to decide what to write next.<br><br>
+                                <strong style="color: var(--lime);">This tool shows you exactly which words it looked at.</strong>
+                                That's called "attention" - literally where the AI pays attention.
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- BASIC CONCEPTS -->
+                    <div class="help-section">
+                        <div class="help-section-title">Basic Concepts (No Jargon)</div>
+                        <div class="help-grid">
+                            <div class="help-item">
+                                <div class="help-item-header">
+                                    <div class="help-item-icon" style="background: var(--cyan); color: var(--void);">T</div>
+                                    <span class="help-item-name">Token</span>
+                                </div>
+                                <div class="help-item-desc">
+                                    <strong>A piece of text.</strong> Usually a word, but sometimes part of a word.<br><br>
+                                    <em>Example:</em> "Hello" = 1 token. "unhappiness" = 3 tokens: "un" + "happi" + "ness"<br><br>
+                                    <strong>Why?</strong> AI doesn't read letters - it reads these chunks called tokens.
+                                </div>
+                            </div>
+                            <div class="help-item">
+                                <div class="help-item-header">
+                                    <div class="help-item-icon" style="background: var(--magenta); color: var(--void);">A</div>
+                                    <span class="help-item-name">Attention</span>
+                                </div>
+                                <div class="help-item-desc">
+                                    <strong>Where the AI "looks" when writing each word.</strong><br><br>
+                                    <em>Example:</em> When writing "Paris" after "What is the capital of France?", the AI looks strongly at "France" and "capital".<br><br>
+                                    <strong>Why?</strong> This reveals what information the AI used to make its decision.
+                                </div>
+                            </div>
+                            <div class="help-item">
+                                <div class="help-item-header">
+                                    <div class="help-item-icon" style="background: var(--amber); color: var(--void);">E</div>
+                                    <span class="help-item-name">Edge</span>
+                                </div>
+                                <div class="help-item-desc">
+                                    <strong>A line connecting two tokens.</strong><br><br>
+                                    If you see a line from word A to word B, it means "when writing A, the AI looked at B".<br><br>
+                                    <strong>Thicker line = stronger attention</strong> (looked at it more).
+                                </div>
+                            </div>
+                            <div class="help-item">
+                                <div class="help-item-header">
+                                    <div class="help-item-icon" style="background: var(--lime); color: var(--void);">L</div>
+                                    <span class="help-item-name">Layer</span>
+                                </div>
+                                <div class="help-item-desc">
+                                    <strong>A processing stage inside the AI.</strong><br><br>
+                                    Like floors in a factory: early layers (ground floor) handle simple stuff like grammar. Later layers (top floor) handle meaning and reasoning.<br><br>
+                                    <strong>We show the final layer</strong> - the deepest understanding.
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- SETTINGS EXPLAINED -->
+                    <div class="help-section">
+                        <div class="help-section-title">What Do the Settings Mean?</div>
+                        <div class="help-grid">
+                            <div class="help-item">
+                                <div class="help-item-header">
+                                    <span class="help-item-name">Max Tokens</span>
+                                </div>
+                                <div class="help-item-desc">
+                                    <strong>How long can the AI's response be?</strong><br><br>
+                                    100 tokens ≈ 75 words (short answer)<br>
+                                    500 tokens ≈ 375 words (paragraph)<br>
+                                    2000 tokens ≈ 1500 words (essay)<br><br>
+                                    <em>Tip:</em> Start small (100) to see patterns quickly.
+                                </div>
+                            </div>
+                            <div class="help-item">
+                                <div class="help-item-header">
+                                    <span class="help-item-name">Top-K</span>
+                                </div>
+                                <div class="help-item-desc">
+                                    <strong>"K" = a number. "Top-K" = show me the top K things.</strong><br><br>
+                                    Top-5 = For each word the AI writes, show the 5 words it looked at most.<br><br>
+                                    <em>Higher K</em> = more detail, but messier visualization.<br>
+                                    <em>Recommendation:</em> 5-10 is usually best.
+                                </div>
+                            </div>
+                            <div class="help-item">
+                                <div class="help-item-header">
+                                    <span class="help-item-name">Temperature</span>
+                                </div>
+                                <div class="help-item-desc">
+                                    <strong>How creative/random is the AI?</strong><br><br>
+                                    Think of it like a dial from "boring but safe" to "creative but risky":<br><br>
+                                    <span style="color: var(--cyan);">0.0</span> = Always picks the "safest" word (predictable)<br>
+                                    <span style="color: var(--lime);">0.6</span> = Balanced (recommended)<br>
+                                    <span style="color: var(--amber);">1.0</span> = Creative, varied responses<br>
+                                    <span style="color: var(--magenta);">2.0</span> = Very random (may be weird)
+                                </div>
+                            </div>
+                            <div class="help-item">
+                                <div class="help-item-header">
+                                    <span class="help-item-name">Edge Threshold</span>
+                                </div>
+                                <div class="help-item-desc">
+                                    <strong>Filter out weak connections.</strong><br><br>
+                                    "Only show me connections stronger than X%"<br><br>
+                                    <span style="color: var(--cyan);">0.05 (5%)</span> = Show all significant connections<br>
+                                    <span style="color: var(--lime);">0.10 (10%)</span> = Cleaner view<br>
+                                    <span style="color: var(--amber);">0.20 (20%)</span> = Only strong connections<br><br>
+                                    <em>Tip:</em> Increase if visualization looks too busy.
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- ATTENTION ZONES -->
+                    <div class="help-section">
+                        <div class="help-section-title">What Do the Colors Mean? (Attention Zones)</div>
+                        <p style="font-size: 12px; color: var(--text-dim); margin-bottom: 14px; line-height: 1.6;">
+                            We color-code each token based on <em>how far back</em> the AI was looking when it wrote that word.
+                            This reveals what the AI was "thinking about."
+                        </p>
+                        <div class="help-grid">
+                            <div class="help-item">
+                                <div class="help-item-header">
+                                    <div class="help-item-icon" style="background: rgba(0, 229, 255, 0.3); color: var(--cyan);">🔗</div>
+                                    <span class="help-item-name" style="color: var(--cyan);">Semantic Bridge</span>
+                                </div>
+                                <div class="help-item-desc">
+                                    <strong>The AI is connecting ideas.</strong><br><br>
+                                    Looking at words 2-4 sentences back to link concepts together. Like when answering "What is the capital?" by connecting "capital" → "France" → "Paris".<br><br>
+                                    <em>When you see this:</em> The AI is doing reasoning or retrieval.
+                                </div>
+                            </div>
+                            <div class="help-item">
+                                <div class="help-item-header">
+                                    <div class="help-item-icon" style="background: rgba(255, 170, 0, 0.3); color: var(--amber);">📝</div>
+                                    <span class="help-item-name" style="color: var(--amber);">Syntax Floor</span>
+                                </div>
+                                <div class="help-item-desc">
+                                    <strong>The AI is handling grammar.</strong><br><br>
+                                    Looking at very recent words (last 1-2 sentences) to get grammar right. Like making sure "the cat" → "is" (not "are").<br><br>
+                                    <em>When you see this:</em> Routine language construction, not deep thinking.
+                                </div>
+                            </div>
+                            <div class="help-item">
+                                <div class="help-item-header">
+                                    <div class="help-item-icon" style="background: rgba(255, 0, 153, 0.3); color: var(--magenta);">❓</div>
+                                    <span class="help-item-name" style="color: var(--magenta);">Exploration</span>
+                                </div>
+                                <div class="help-item-desc">
+                                    <strong>The AI is uncertain.</strong><br><br>
+                                    Attention is scattered everywhere - the AI isn't sure what to write next and is considering many options.<br><br>
+                                    <em>When you see this:</em> Decision points, creative moments, or confusion.
+                                </div>
+                            </div>
+                            <div class="help-item">
+                                <div class="help-item-header">
+                                    <div class="help-item-icon" style="background: rgba(180, 255, 0, 0.3); color: var(--lime);">📋</div>
+                                    <span class="help-item-name" style="color: var(--lime);">Steering</span>
+                                </div>
+                                <div class="help-item-desc">
+                                    <strong>The AI is following instructions.</strong><br><br>
+                                    Looking way back at your original question or instructions to stay on task.<br><br>
+                                    <em>When you see this:</em> The AI is checking what you asked for.
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- INTERPRET WITH LLM -->
+                    <div class="help-section">
+                        <div class="help-section-title">💡 Pro Tip: Ask the AI to Explain Its Own Attention!</div>
+                        <div style="background: linear-gradient(135deg, rgba(180,255,0,0.15), rgba(0,229,255,0.15)); padding: 16px; border-radius: 8px; border: 1px solid var(--border);">
+                            <div style="font-size: 12px; color: var(--text); line-height: 1.8;">
+                                <strong style="color: var(--lime);">You can copy attention patterns and ask the same AI to interpret them!</strong><br><br>
+
+                                <strong>Example prompts you can use:</strong><br><br>
+
+                                <div style="background: var(--void); padding: 12px; border-radius: 6px; margin: 8px 0; font-family: monospace; font-size: 11px;">
+                                "When generating the word 'Paris', the AI looked at these words with these weights:<br>
+                                - 'France' (45%)<br>
+                                - 'capital' (32%)<br>
+                                - 'the' (12%)<br>
+                                What does this tell us about how the AI reasoned?"
+                                </div>
+
+                                <div style="background: var(--void); padding: 12px; border-radius: 6px; margin: 8px 0; font-family: monospace; font-size: 11px;">
+                                "I see tokens colored as 'Semantic Bridge' in this response. What does that suggest about the AI's reasoning process?"
+                                </div>
+
+                                <div style="background: var(--void); padding: 12px; border-radius: 6px; margin: 8px 0; font-family: monospace; font-size: 11px;">
+                                "The entropy for this token was 3.2 (high) - attention was scattered. Why might the model be uncertain at this point?"
+                                </div>
+
+                                <br><strong style="color: var(--cyan);">The AI can help you understand what you're seeing!</strong>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- HOW LAYERS BUILD ATTENTION -->
+                    <div class="help-section">
+                        <div class="help-section-title">🏗️ How Layers Build Attention (Visual Guide)</div>
+                        <div style="background: var(--deep); padding: 20px; border-radius: 12px; margin-bottom: 16px;">
+                            <div style="font-size: 12px; color: var(--text); line-height: 1.8;">
+                                <strong style="color: var(--cyan); font-size: 14px;">The AI is like a 32-story building. Each floor (layer) does different work:</strong>
+                            </div>
+
+                            <!-- Visual Layer Diagram -->
+                            <div style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; background: var(--void); padding: 16px; border-radius: 8px; margin: 16px 0; overflow-x: auto;">
+                                <div style="color: var(--text-dim);">
+<pre style="margin: 0; line-height: 1.6;">
+YOUR INPUT: "What is the capital of France?"
+     │
+     ▼
+┌─────────────────────────────────────────────────────────────┐
+│  <span style="color: #00e5ff;">LAYER 1-4: TOKENIZATION &amp; BASIC PATTERNS</span>                  │
+│  ─────────────────────────────────────────────────────────  │
+│  • Breaks text into tokens: ["What", "is", "the", ...]     │
+│  • Learns word shapes, punctuation, basic grammar          │
+│  • Attention: mostly LOCAL (nearby words)                  │
+│  • <span style="color: #ffaa00;">This is where "Syntax Floor" patterns dominate</span>          │
+└─────────────────────────────────────────────────────────────┘
+     │
+     ▼
+┌─────────────────────────────────────────────────────────────┐
+│  <span style="color: #ff0099;">LAYER 5-12: PHRASE &amp; SENTENCE STRUCTURE</span>                   │
+│  ─────────────────────────────────────────────────────────  │
+│  • Groups words into phrases: "the capital" → noun phrase  │
+│  • Understands sentence structure (subject, verb, object)  │
+│  • Attention: LOCAL + some MID-RANGE                       │
+│  • Starts connecting related concepts                      │
+└─────────────────────────────────────────────────────────────┘
+     │
+     ▼
+┌─────────────────────────────────────────────────────────────┐
+│  <span style="color: #b4ff00;">LAYER 13-24: SEMANTIC UNDERSTANDING</span>                       │
+│  ─────────────────────────────────────────────────────────  │
+│  • Understands MEANING, not just grammar                   │
+│  • Connects "capital" ↔ "France" ↔ "city" ↔ "Paris"       │
+│  • Attention: strong MID-RANGE (semantic bridges!)         │
+│  • <span style="color: #00e5ff;">This is where "Semantic Bridge" patterns emerge</span>         │
+└─────────────────────────────────────────────────────────────┘
+     │
+     ▼
+┌─────────────────────────────────────────────────────────────┐
+│  <span style="color: #a855f7;">LAYER 25-32: REASONING &amp; DECISION MAKING</span>                  │
+│  ─────────────────────────────────────────────────────────  │
+│  • Final reasoning: "France's capital = Paris"             │
+│  • Checks instructions (LONG-RANGE attention)              │
+│  • Makes final token prediction                            │
+│  • <span style="color: #b4ff00;">This is where "Steering" patterns appear</span>                │
+└─────────────────────────────────────────────────────────────┘
+     │
+     ▼
+OUTPUT: "Paris"
+</pre>
+                                </div>
+                            </div>
+
+                            <div style="font-size: 12px; color: var(--text-dim); line-height: 1.8; margin-top: 16px;">
+                                <strong style="color: var(--lime);">What we show you:</strong><br>
+                                We capture attention from the <strong style="color: var(--text);">FINAL layer</strong> (the "penthouse" - deepest understanding).
+                                This reveals what the AI <em>really</em> used to make its decision, not just grammar processing.
+                            </div>
+                        </div>
+
+                        <!-- Attention Flow Diagram -->
+                        <div style="background: var(--surface); padding: 16px; border-radius: 8px; border: 1px solid var(--border);">
+                            <div style="font-size: 13px; color: var(--cyan); font-weight: 600; margin-bottom: 12px;">How Attention Flows (Single Layer)</div>
+                            <div style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; background: var(--void); padding: 12px; border-radius: 6px;">
+<pre style="margin: 0; color: var(--text-dim); line-height: 1.5;">
+Token: "Paris"  ──────────────────────────────────────────────────────────
+
+   STEP 1: Create Query                STEP 2: Match with Keys
+   ┌───────────────┐                   ┌─────────────────────────────┐
+   │ "Paris" → Q   │                   │  Q · K("France") = <span style="color: #00e5ff;">0.85</span> ✓  │
+   │ (what am I    │     ─────────►    │  Q · K("capital") = <span style="color: #00e5ff;">0.72</span> ✓ │
+   │  looking for?)│                   │  Q · K("the") = <span style="color: #666;">0.12</span>        │
+   └───────────────┘                   │  Q · K("is") = <span style="color: #666;">0.08</span>         │
+                                       └─────────────────────────────┘
+                                                    │
+   STEP 4: Output                      STEP 3: Softmax (normalize)
+   ┌───────────────┐                   ┌─────────────────────────────┐
+   │ Weighted mix  │                   │  "France": <span style="color: #00e5ff;">45%</span>              │
+   │ of Values     │     ◄─────────    │  "capital": <span style="color: #00e5ff;">32%</span>             │
+   │ = "Paris"     │                   │  "the": <span style="color: #666;">12%</span>                 │
+   │  context      │                   │  "is": <span style="color: #666;">8%</span>                   │
+   └───────────────┘                   └─────────────────────────────┘
+
+   <span style="color: #b4ff00;">These percentages ARE the attention weights we visualize!</span>
+</pre>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- HOW IT WORKS TECHNICALLY -->
+                    <div class="help-section">
+                        <div class="help-section-title">🔬 Technical Deep Dive (Optional)</div>
+                        <details style="cursor: pointer;">
+                            <summary style="color: var(--cyan); font-weight: 500; padding: 8px 0;">Click to expand technical details...</summary>
+                            <div style="margin-top: 12px; padding: 16px; background: var(--deep); border-radius: 8px;">
+                                <div style="font-size: 12px; color: var(--text-dim); line-height: 1.7;">
+                                    <strong style="color: var(--violet);">How Attention Works in Transformers:</strong><br><br>
+
+                                    1. Each token gets converted to three vectors: <strong>Query (Q)</strong>, <strong>Key (K)</strong>, <strong>Value (V)</strong><br><br>
+
+                                    2. To decide what token X should "look at", we compute:<br>
+                                    <code style="background: var(--void); padding: 4px 8px; border-radius: 4px; margin: 4px 0; display: inline-block;">
+                                    Attention = softmax(Q<sub>x</sub> · K<sub>all</sub><sup>T</sup> / √d)
+                                    </code><br><br>
+
+                                    3. This gives us a probability distribution: "how much should X look at each previous token?"<br><br>
+
+                                    4. We capture these attention weights and display them as edges.<br><br>
+
+                                    <strong style="color: var(--violet);">Where Zones Come From:</strong><br>
+                                    • <strong>Local Mass</strong>: Sum of attention to tokens 1-16 back<br>
+                                    • <strong>Mid Mass</strong>: Sum of attention to tokens 17-48 back<br>
+                                    • <strong>Long Mass</strong>: Sum of attention to tokens 49+ back<br>
+                                    • <strong>Entropy</strong>: How spread out the attention is (-Σp·log(p))<br><br>
+
+                                    Zones are classified by combining these metrics with rules like:<br>
+                                    • Semantic Bridge: mid_mass > 0.4 AND entropy > 0.5<br>
+                                    • Syntax Floor: local_mass > 0.6 AND entropy < 2.5
+                                </div>
+                            </div>
+                        </details>
+                    </div>
+
+                    <!-- QUICK START -->
+                    <div class="help-section">
+                        <div class="help-section-title">Quick Start Guide</div>
+                        <div style="font-size: 13px; color: var(--text-dim); line-height: 2;">
+                            <ol style="padding-left: 24px; margin: 0;">
+                                <li>Type a question in the text box (e.g., "What is the capital of France?")</li>
+                                <li>Click <strong style="color: var(--cyan);">Analyze</strong> and wait for the AI to respond</li>
+                                <li>Look at the <strong style="color: var(--text);">colored tokens</strong> - each color tells you what the AI was "thinking"</li>
+                                <li><strong style="color: var(--text);">Click any token</strong> to see exactly which words it looked at</li>
+                                <li>Use the <strong style="color: var(--text);">Attends To / Attended By</strong> tabs to explore connections</li>
+                            </ol>
+                        </div>
+                    </div>
+
+                    <div style="margin-top: 20px; padding-top: 16px; border-top: 1px solid var(--border); font-size: 11px; color: var(--text-muted); text-align: center;">
+                        <strong>SGLang Attention Explorer</strong> - See inside the AI's decision-making process
+                    </div>
+                </div>
+            `;
+
+            document.body.appendChild(modal);
+        }
+    </script>
+</body>
+</html>

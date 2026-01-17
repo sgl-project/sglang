@@ -1,0 +1,32 @@
+{
+  "disabled": {
+    "mode": "disabled",
+    "requests_completed": 30,
+    "total_tokens": 1500,
+    "tokens_per_sec": 94.58536495485501,
+    "p50_latency_ms": 527.9754250077531,
+    "p99_latency_ms": 533.933277009055,
+    "avg_latency_ms": 528.463645093143,
+    "errors": 0
+  },
+  "fingerprint": {
+    "mode": "fingerprint",
+    "requests_completed": 30,
+    "total_tokens": 1500,
+    "tokens_per_sec": 94.51033692468418,
+    "p50_latency_ms": 528.1348869903013,
+    "p99_latency_ms": 536.7558799916878,
+    "avg_latency_ms": 528.8952738977969,
+    "errors": 0
+  },
+  "raw": {
+    "mode": "raw",
+    "requests_completed": 30,
+    "total_tokens": 1500,
+    "tokens_per_sec": 93.50725292773457,
+    "p50_latency_ms": 533.7530220858753,
+    "p99_latency_ms": 554.4474039925262,
+    "avg_latency_ms": 534.5808320911601,
+    "errors": 0
+  }
+}

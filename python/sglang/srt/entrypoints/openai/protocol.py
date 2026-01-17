@@ -272,6 +272,57 @@ class CompletionRequest(BaseModel):
     # For custom metric labels
     custom_labels: Optional[Dict[str, str]] = None
 
+    # For attention token capture (interpretability)
+    return_attention_tokens: bool = False
+    top_k_attention: int = (
+        10  # Number of top attended tokens to return per output token
+    )
+    attention_capture_layer_id: Optional[int] = (
+        None  # Layer to capture attention from (-1 = last, None = default)
+    )
+    attention_capture_layer_ids: Optional[List[int]] = (
+        None  # Specific layers to capture (overrides attention_capture_layer_id)
+    )
+    attention_sketch_mode: bool = (
+        False  # Return per-layer sketches instead of raw edges (bandwidth efficient)
+    )
+    attention_fingerprint_mode: Optional[bool] = (
+        None  # Override server fingerprint mode (None = use server default)
+    )
+    attention_mask_prefix: Optional[int] = (
+        None  # Mask attention to first N tokens (privacy: hide system prompt structure)
+    )
+    attention_fingerprint_only: Optional[bool] = (
+        None  # SECURE MODE: Only return fingerprint, never raw positions/scores (auto-enabled when mask_prefix > 0)
+    )
+    include_prompt_attention: bool = (
+        True  # Capture first decode step (prompt attention) regardless of stride
+    )
+    attention_capture_head_ids: Optional[List[int]] = (
+        None  # Only average over these heads (None = all heads)
+    )
+
+    # For attention steering (semantic routing loop)
+    # Format: {"layer_id": {"token_pos": bias_value, ...}, ...}
+    # Biases are added to attention logits before softmax
+    attention_biases: Optional[Dict[str, Dict[str, float]]] = None
+
+    # For MoE routing capture (interpretability/semantic telemetry)
+    # Returns which experts were selected for each token
+    return_moe_routing: bool = False
+    moe_routing_top_k: int = 2  # How many top experts to capture per token
+    moe_capture_layer_ids: Optional[List[int]] = (
+        None  # Which layers to capture (None = all MoE layers)
+    )
+
+    # For logit lens (interpretability) - project intermediate layers to vocab
+    # Shows how token predictions evolve through the model
+    return_logit_lens: bool = False  # Enable logit lens capture (experimental)
+    logit_lens_top_k: int = 5  # Number of top token candidates per layer
+    logit_lens_layer_ids: Optional[List[int]] = (
+        None  # Which layers to probe (None = auto-select ~4 layers)
+    )
+
     @field_validator("max_tokens")
     @classmethod
     def validate_max_tokens_positive(cls, v):
@@ -287,6 +338,8 @@ class CompletionResponseChoice(BaseModel):
     finish_reason: Optional[Literal["stop", "length", "content_filter", "abort"]] = None
     matched_stop: Union[None, int, str] = None
     hidden_states: Optional[object] = None
+    # Top-k attention tokens per generated token for interpretability
+    attention_tokens: Optional[List[Dict]] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
@@ -313,12 +366,16 @@ class CompletionResponseStreamChoice(BaseModel):
     finish_reason: Optional[Literal["stop", "length", "content_filter", "abort"]] = None
     matched_stop: Union[None, int, str] = None
     hidden_states: Optional[object] = None
+    # Top-k attention tokens per generated token for interpretability
+    attention_tokens: Optional[List[Dict]] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
         if self.hidden_states is None:
             data.pop("hidden_states", None)
+        if self.attention_tokens is None:
+            data.pop("attention_tokens", None)
         return data
 
 
@@ -502,6 +559,57 @@ class ChatCompletionRequest(BaseModel):
         default="auto", examples=["none"]
     )  # noqa
     return_hidden_states: bool = False
+    # For attention token capture (interpretability)
+    return_attention_tokens: bool = False
+    top_k_attention: int = (
+        10  # Number of top attended tokens to return per output token
+    )
+    attention_capture_layer_id: Optional[int] = (
+        None  # Layer to capture attention from (-1 = last, None = default)
+    )
+    attention_capture_layer_ids: Optional[List[int]] = (
+        None  # Specific layers to capture (overrides attention_capture_layer_id)
+    )
+    attention_sketch_mode: bool = (
+        False  # Return per-layer sketches instead of raw edges (bandwidth efficient)
+    )
+    attention_fingerprint_mode: Optional[bool] = (
+        None  # Override server fingerprint mode (None = use server default)
+    )
+    attention_mask_prefix: Optional[int] = (
+        None  # Mask attention to first N tokens (privacy: hide system prompt structure)
+    )
+    attention_fingerprint_only: Optional[bool] = (
+        None  # SECURE MODE: Only return fingerprint, never raw positions/scores (auto-enabled when mask_prefix > 0)
+    )
+    include_prompt_attention: bool = (
+        True  # Capture first decode step (prompt attention) regardless of stride
+    )
+    attention_capture_head_ids: Optional[List[int]] = (
+        None  # Only average over these heads (None = all heads)
+    )
+
+    # For attention steering (semantic routing loop)
+    # Format: {"layer_id": {"token_pos": bias_value, ...}, ...}
+    # Biases are added to attention logits before softmax
+    attention_biases: Optional[Dict[str, Dict[str, float]]] = None
+
+    # For MoE routing capture (interpretability/semantic telemetry)
+    # Returns which experts were selected for each token
+    return_moe_routing: bool = False
+    moe_routing_top_k: int = 2  # How many top experts to capture per token
+    moe_capture_layer_ids: Optional[List[int]] = (
+        None  # Which layers to capture (None = all MoE layers)
+    )
+
+    # For logit lens (interpretability) - project intermediate layers to vocab
+    # Shows how token predictions evolve through the model
+    return_logit_lens: bool = False  # Enable logit lens capture (experimental)
+    logit_lens_top_k: int = 5  # Number of top token candidates per layer
+    logit_lens_layer_ids: Optional[List[int]] = (
+        None  # Which layers to probe (None = auto-select ~4 layers)
+    )
+
     reasoning_effort: Optional[Literal["low", "medium", "high"]] = Field(
         default="medium",
         description="Constrains effort on reasoning for reasoning models. "
@@ -731,12 +839,20 @@ class ChatCompletionResponseChoice(BaseModel):
     ] = None
     matched_stop: Union[None, int, str] = None
     hidden_states: Optional[object] = None
+    # Top-k attention tokens per generated token for interpretability
+    attention_tokens: Optional[List[Dict]] = None
+    # Logit lens: intermediate layer predictions (experimental)
+    logit_lens: Optional[Dict] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
         if self.hidden_states is None:
             data.pop("hidden_states", None)
+        if self.attention_tokens is None:
+            data.pop("attention_tokens", None)
+        if self.logit_lens is None:
+            data.pop("logit_lens", None)
         return data
 
 
@@ -756,12 +872,20 @@ class DeltaMessage(BaseModel):
     reasoning_content: Optional[str] = None
     tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
     hidden_states: Optional[object] = None
+    # Top-k attention tokens per generated token for interpretability
+    attention_tokens: Optional[List[Dict]] = None
+    # Logit lens: intermediate layer predictions (experimental)
+    logit_lens: Optional[Dict] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
         if self.hidden_states is None:
             data.pop("hidden_states", None)
+        if self.attention_tokens is None:
+            data.pop("attention_tokens", None)
+        if self.logit_lens is None:
+            data.pop("logit_lens", None)
         return data
 
 
@@ -946,6 +1070,11 @@ class TokenizeRequest(BaseModel):
         default=True,
         description="whether to add model-specific special tokens (e.g. BOS/EOS) during encoding.",
     )
+    return_texts: bool = Field(
+        default=False,
+        description="If True, also return the text representation of each token. "
+        "Useful for attention visualization where token texts are needed.",
+    )
 
 
 class TokenizeResponse(BaseModel):
@@ -954,6 +1083,10 @@ class TokenizeResponse(BaseModel):
     tokens: Union[List[int], List[List[int]]]
     count: Union[int, List[int]]
     max_model_len: int
+    texts: Optional[Union[List[str], List[List[str]]]] = Field(
+        default=None,
+        description="Text representation of each token. Only returned if return_texts=True.",
+    )
 
 
 class DetokenizeRequest(BaseModel):
