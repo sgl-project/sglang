@@ -146,7 +146,7 @@ std::vector<std::pair<SAMNode*, int32_t>> Ngram::match(const std::vector<int32_t
   int matched_len = 0;
   for (size_t i = tokens.size() - max_k; i < tokens.size(); ++i) {
     int32_t t = tokens[i];
-    while (curr != root_ && !curr->child.count(t)) {
+    while (curr != root_ && !curr->next.count(t)) {
       curr = curr->fail;
       matched_len = curr->len;
     }
