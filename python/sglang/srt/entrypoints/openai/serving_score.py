@@ -40,6 +40,11 @@ class OpenAIServingScore(OpenAIServingBase):
         raw_request: Request,
     ) -> Union[ScoringResponse, ErrorResponse]:
         """Handle the scoring request"""
+        # Validate request
+        error_msg = self._validate_request(request)
+        if error_msg:
+            return self.create_error_response(error_msg)
+
         try:
             # Use tokenizer_manager's score_request method directly
             scores = await self.tokenizer_manager.score_request(

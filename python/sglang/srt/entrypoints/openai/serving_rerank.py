@@ -221,6 +221,9 @@ class OpenAIServingRerank(OpenAIServingBase):
 
     def _validate_request(self, request: V1RerankReqInput) -> Optional[str]:
         """Validate rerank request format and content"""
+        if error_msg := super()._validate_request(request):
+            return error_msg
+
         if not request.query:
             return "Query cannot be empty"
 

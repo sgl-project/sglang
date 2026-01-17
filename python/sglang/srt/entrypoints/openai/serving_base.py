@@ -216,9 +216,20 @@ class OpenAIServingBase(ABC):
             status_code=501,
         )
 
-    def _validate_request(self, _: OpenAIServingRequest) -> Optional[str]:
+    def _validate_request(self, request: OpenAIServingRequest) -> Optional[str]:
         """Validate request"""
-        pass
+        if (
+            not self.tokenizer_manager.server_args.skip_server_warmup
+            and request.model
+            and self.tokenizer_manager.server_args.served_model_name
+        ):
+            base_model, _ = self._parse_model_parameter(request.model)
+            if base_model != self.tokenizer_manager.server_args.served_model_name:
+                return (
+                    f"The model `{request.model}` does not exist. "
+                    f"The served model name is `{self.tokenizer_manager.server_args.served_model_name}`."
+                )
+        return None
 
     def create_error_response(
         self,

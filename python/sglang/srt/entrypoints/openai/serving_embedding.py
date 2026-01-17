@@ -38,6 +38,9 @@ class OpenAIServingEmbedding(OpenAIServingBase):
 
     def _validate_request(self, request: EmbeddingRequest) -> Optional[str]:
         """Validate that the input is not empty or whitespace only."""
+        if error_msg := super()._validate_request(request):
+            return error_msg
+
         if not (input := request.input):
             return "Input cannot be empty"
 

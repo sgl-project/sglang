@@ -33,6 +33,11 @@ class OpenAIServingTokenize(OpenAIServingBase):
         request: TokenizeRequest,
         raw_request: Request,
     ) -> Union[TokenizeResponse, ErrorResponse]:
+        # Validate request
+        error_msg = self._validate_request(request)
+        if error_msg:
+            return self.create_error_response(error_msg)
+
         try:
             tokenizer = self.tokenizer_manager.tokenizer
             max_model_len = getattr(tokenizer, "model_max_length", -1)
@@ -87,6 +92,11 @@ class OpenAIServingDetokenize(OpenAIServingBase):
         request: DetokenizeRequest,
         raw_request: Request,
     ) -> Union[DetokenizeResponse, ErrorResponse]:
+        # Validate request
+        error_msg = self._validate_request(request)
+        if error_msg:
+            return self.create_error_response(error_msg)
+
         try:
             tokenizer = self.tokenizer_manager.tokenizer
 
