@@ -268,6 +268,18 @@ class GPUWorker:
         return OutputBatch(output=status)
 
 
+OOM_MSG = f"""
+OOM detected. Possible solutions:
+  - If the OOM occurs during loading:
+    1. Enable CPU offload for memory-intensive components, or use `--dit-layerwise-offload` for DiT
+  - If the OOM occurs during runtime:
+    1. Reduce the number of output tokens by lowering resolution or decreasing `--num-frames`
+    2. Enable SP and/or TP
+    3. Enable a sparse-attention backend
+  Or, open an issue on GitHub https://github.com/sgl-project/sglang/issues/new/choose
+"""
+
+
 def run_scheduler_process(
     local_rank: int,
     rank: int,
@@ -299,18 +311,23 @@ def run_scheduler_process(
     assert result_pipes_from_slaves is not None
     from sglang.multimodal_gen.runtime.managers.scheduler import Scheduler
 
-    scheduler = Scheduler(
-        server_args,
-        gpu_id=rank,
-        port_args=port_args,
-        task_pipes_to_slaves=task_pipes_to_slaves,
-        result_pipes_from_slaves=result_pipes_from_slaves,
-    )
-    logger.info(f"Worker {rank}: Scheduler loop started.")
-    pipe_writer.send(
-        {
-            "status": "ready",
-        }
-    )
-    scheduler.event_loop()
-    logger.info(f"Worker {rank}: Shutdown complete.")
+    try:
+        scheduler = Scheduler(
+            server_args,
+            gpu_id=rank,
+            port_args=port_args,
+            task_pipes_to_slaves=task_pipes_to_slaves,
+            result_pipes_from_slaves=result_pipes_from_slaves,
+        )
+        logger.info(f"Worker {rank}: Scheduler loop started.")
+        pipe_writer.send(
+            {
+                "status": "ready",
+            }
+        )
+        scheduler.event_loop()
+    except torch.OutOfMemoryError as _e:
+        print(OOM_MSG)
+        raise
+    finally:
+        logger.info(f"Worker {rank}: Shutdown complete.")
