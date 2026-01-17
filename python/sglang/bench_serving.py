@@ -1041,6 +1041,7 @@ class DatasetRow:
     image_data: Optional[List[str]] = None
     timestamp: Optional[float] = None
     routing_key: Optional[str] = None
+    is_openai_format: bool = False  # True if prompt is pre-formatted OpenAI messages
 
     def __post_init__(self):
         if self.text_prompt_len is None:
@@ -1351,6 +1352,7 @@ def sample_openai_requests(
                 prompt=messages,
                 prompt_len=prompt_len,
                 output_len=output_len,
+                is_openai_format=True,  # Mark as pre-formatted OpenAI messages
             )
         )
 
@@ -2243,7 +2245,9 @@ async def benchmark(
     else:
         raise ValueError(f"Unknown backend: {backend}")
 
-    is_multi_turn = isinstance(input_requests[0].prompt, list)
+    # Check for multi-turn: prompt is a list BUT not pre-formatted OpenAI messages
+    is_openai_format = getattr(input_requests[0], "is_openai_format", False)
+    is_multi_turn = isinstance(input_requests[0].prompt, list) and not is_openai_format
     if is_multi_turn:
         request_func = wrap_multi_turn_request_func(request_func, backend=backend)
 
