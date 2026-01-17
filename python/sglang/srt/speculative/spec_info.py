@@ -79,7 +79,10 @@ class SpeculativeAlgorithm(Enum):
                 # raise ValueError(
                 #     f"Speculative algorithm {self.name} does not support overlap worker creation."
                 # )
+                from sglang.srt.speculative.ngram_worker_v2 import NGRAMWorkerV2
+
                 print(f"csy enable overlap schedule")
+                return NGRAMWorkerV2
 
             from sglang.srt.speculative.ngram_worker import NGRAMWorker
 

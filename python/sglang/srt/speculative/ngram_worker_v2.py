@@ -2,7 +2,6 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.layers.utils.logprob import add_output_logprobs_for_spec_v1
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -40,6 +39,19 @@ class NgramVerifyInputV2(NgramVerifyInput):
         self.retrive_next_sibling = retrive_next_sibling
         self.draft_token_num = draft_token_num
         self.device = self.custom_mask.device
+        self.verify_done: Optional[torch.cuda.Event] = None
+
+    # def verify(
+    #     self,
+    #     batch: ScheduleBatch,
+    #     logits_output: LogitsProcessorOutput,
+    #     page_size: int,
+    #     vocab_mask: Optional[torch.Tensor] = None,  # For grammar
+    #     is_spec_v2: bool = True,
+    # ):
+    #     return super().verify(
+    #         batch, logits_output, page_size, vocab_mask, is_spec_v2=True
+    #     )
 
 
 class NGRAMWorkerV2(NGRAMWorker):
@@ -64,11 +76,36 @@ class NGRAMWorkerV2(NGRAMWorker):
         )
 
     def forward_batch_generation(self, batch: ScheduleBatch) -> GenerationBatchResult:
+        self._update_ngram_cache(
+            batch
+        )  # here the output_id in req is not updated yet, this round's output id will be updated in the end of next round
+        self._prepare_for_speculative_decoding(batch)
         model_worker_batch = batch.get_model_worker_batch()
         num_accepted_tokens = 0
         accept_lens = None
 
-        if model_worker_batch.forward_mode.is_extend():
+        if model_worker_batch.forward_mode.is_target_verify():
+            batch_result = self.target_worker.forward_batch_generation(
+                model_worker_batch, is_verify=True
+            )
+            logits_output, can_run_cuda_graph = (
+                batch_result.logits_output,
+                batch_result.can_run_cuda_graph,
+            )
+            verify_input: NgramVerifyInputV2 = model_worker_batch.spec_info
+            logits_output, next_token_ids, num_accepted_tokens = verify_input.verify(
+                batch, logits_output, self.page_size, is_spec_v2=True
+            )
+            # Store accept_lens for per-request metrics
+            accept_lens = verify_input.accept_length
+            # TODO ngram v2 logprob not supported yet
+            # if batch.return_logprob:
+            #     add_output_logprobs_for_spec_v1(batch, verify_input, logits_output)
+
+            batch.forward_mode = ForwardMode.DECODE
+            batch.logits_output = logits_output
+
+        else:
             batch_result = self.target_worker.forward_batch_generation(
                 model_worker_batch
             )
@@ -77,50 +114,11 @@ class NGRAMWorkerV2(NGRAMWorker):
                 batch_result.next_token_ids,
                 batch_result.can_run_cuda_graph,
             )
-            batch.seq_lens += 1
-            batch.seq_lens_cpu += 1
-            batch.seq_lens_sum += 1
 
-            self._prepare_for_speculative_decoding(batch, is_spec_v2=True)
-
-            return GenerationBatchResult(
-                logits_output=logits_output,
-                next_token_ids=next_token_ids,
-                num_accepted_tokens=num_accepted_tokens,
-                can_run_cuda_graph=can_run_cuda_graph,
-                accept_lens=accept_lens,
-                next_draft_input=batch.spec_info,
-            )
-        else:
-            # prefill generates the spec_info for the first decode; 2nd round decode generates spec_info for 3rd decode
-            verify_input: NgramVerifyInput = batch.spec_info
-            batch.forward_mode = ForwardMode.TARGET_VERIFY
-            model_worker_batch.forward_mode = ForwardMode.TARGET_VERIFY
-            batch_result = self.target_worker.forward_batch_generation(
-                model_worker_batch, is_verify=True
-            )
-            logits_output, can_run_cuda_graph = (
-                batch_result.logits_output,
-                batch_result.can_run_cuda_graph,
-            )
-            logits_output, next_token_ids, num_accepted_tokens = verify_input.verify(
-                batch, logits_output, self.page_size
-            )
-
-            accept_lens = verify_input.accept_length
-            if batch.return_logprob:
-                add_output_logprobs_for_spec_v1(batch, verify_input, logits_output)
-            # update previous round's ngram cache since current accepted tokens haven't been added to the outputid yet
-            self._update_ngram_cache(batch)
-
-            self._prepare_for_speculative_decoding(batch, is_spec_v2=True)
-            batch.forward_mode = ForwardMode.DECODE
-
-            return GenerationBatchResult(
-                logits_output=logits_output,
-                next_token_ids=next_token_ids,
-                num_accepted_tokens=num_accepted_tokens,
-                can_run_cuda_graph=can_run_cuda_graph,
-                accept_lens=accept_lens,
-                next_draft_input=batch.spec_info,
-            )
+        return GenerationBatchResult(
+            logits_output=logits_output,
+            next_token_ids=next_token_ids,
+            num_accepted_tokens=num_accepted_tokens,
+            can_run_cuda_graph=can_run_cuda_graph,
+            accept_lens=accept_lens,
+        )

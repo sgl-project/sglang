@@ -165,6 +165,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTen
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import PortArgs, ServerArgs, get_global_server_args
+from sglang.srt.speculative.ngram_worker_v2 import NgramVerifyInputV2
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.tracing.trace import (
     process_tracing_init,
@@ -2099,6 +2100,21 @@ class Scheduler(
     def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
         """Update the current running decoding batch."""
         initial_bs = batch.batch_size()
+
+        if batch.is_spec_v2 and batch.spec_algorithm.is_ngram():
+            verify_input: NgramVerifyInputV2 = batch.spec_info
+            logits_output, next_token_ids, num_accepted_tokens = (
+                verify_input.fill_requests_and_free_cache(
+                    batch, batch.logits_output, self.page_size
+                )
+            )
+            # TODO update result_queue using the new result, and store next_token_ids in the future map
+            tmp_batch, tmp_result = self.result_queue.popleft()
+            tmp_result.logits_output = logits_output
+            tmp_result.next_token_ids = next_token_ids
+            tmp_result.num_accepted_tokens = num_accepted_tokens
+            self.result_queue.appendleft((tmp_batch, tmp_result))
+            self.future_map.store_to_map(tmp_batch.spec_info.future_indices, tmp_result)
 
         batch.filter_batch(v1_spec_info_filtered=True)
         if batch.is_empty():
