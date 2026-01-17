@@ -121,8 +121,9 @@ class TemplateManager:
                 hf_template = self._resolve_hf_chat_template(tokenizer_manager)
                 if hf_template:
                     # override the chat template
-                    if tokenizer_manager.tokenizer:
-                        tokenizer_manager.tokenizer.chat_template = hf_template
+                    tokenizer = tokenizer_manager.tokenizer
+                    if tokenizer is not None:
+                        tokenizer.chat_template = hf_template
                     self._jinja_template_content_format = (
                         detect_jinja_template_content_format(hf_template)
                     )
@@ -137,9 +138,10 @@ class TemplateManager:
                     )
 
         # Detect reasoning pattern from chat template
-        if tokenizer_manager.tokenizer:
+        tokenizer = tokenizer_manager.tokenizer
+        if tokenizer is not None:
             self._force_reasoning = self._detect_reasoning_pattern(
-                tokenizer_manager.tokenizer.chat_template
+                tokenizer.chat_template
             )
 
     def _load_explicit_chat_template(
@@ -294,15 +296,16 @@ class TemplateManager:
 
         Returns the chat template string if found, None otherwise.
         """
-        try:
-            if processor := tokenizer_manager.processor:
-                if hasattr(processor, "chat_template") and processor.chat_template:
-                    return processor.chat_template
-            if tokenizer := tokenizer_manager.tokenizer:
-                if hasattr(tokenizer, "chat_template") and tokenizer.chat_template:
-                    return tokenizer.chat_template
-        except Exception as e:
-            logger.debug(f"Error getting chat template: {e}")
+        processor = tokenizer_manager.processor
+        if processor is not None:
+            chat_template = getattr(processor, "chat_template", None)
+            if chat_template:
+                return chat_template
+        tokenizer = tokenizer_manager.tokenizer
+        if tokenizer is not None:
+            chat_template = getattr(tokenizer, "chat_template", None)
+            if chat_template:
+                return chat_template
 
         logger.debug("No HuggingFace chat template found")
         return None
