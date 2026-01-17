@@ -149,7 +149,7 @@ class ComponentLoader(ABC):
         """
         gpu_mem_before_loading = current_platform.get_available_gpu_memory()
         logger.info(
-            "Loading %s. avail mem: %.2f GB",
+            "Loading %s from %s. avail mem: %.2f GB",
             module_name,
             component_model_path,
             gpu_mem_before_loading,
@@ -192,9 +192,10 @@ class ComponentLoader(ABC):
             if consumed is None or consumed == 0.0:
                 consumed = gpu_mem_before_loading - current_gpu_mem
             logger.info(
-                f"Loaded %s: %s ({source} version). model size: %.2f GB, avail mem: %.2f GB",
+                "Loaded %s: %s (%s version). model size: %.2f GB, avail mem: %.2f GB",
                 module_name,
                 component.__class__.__name__,
+                source,
                 consumed,
                 current_gpu_mem,
             )
