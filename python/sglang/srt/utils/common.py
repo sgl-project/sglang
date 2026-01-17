@@ -941,9 +941,13 @@ def _get_vlm_media_url_policy(default_timeout: float) -> dict[str, Any]:
     max_redirects = get_int_env_var("SGLANG_VLM_MEDIA_URL_MAX_REDIRECTS", 5)
     timeout = get_float_env_var("SGLANG_VLM_MEDIA_URL_TIMEOUT", default_timeout)
 
-    schemes = {scheme.strip().lower() for scheme in allowed_schemes.split(",") if scheme.strip()}
-    if not schemes:
-        schemes = {"https"}
+    schemes = {"https"}
+    if allowed_schemes:
+        schemes = {
+            scheme.strip().lower()
+            for scheme in allowed_schemes.split(",")
+            if scheme.strip()
+        }
     allow_hosts, allow_nets = _parse_media_allowlist(allowlist_raw)
     return {
         "enabled": enabled,
@@ -1084,22 +1088,23 @@ def load_video(video_file: Union[str, bytes], use_gpu: bool = True):
                 timeout = int(os.getenv("REQUEST_TIMEOUT", "10"))
                 policy = validate_vlm_media_url(video_file, float(timeout))
                 response = _requests_get_with_policy(video_file, policy)
-                content_length = response.headers.get("content-length")
-                if content_length and int(content_length) > policy["max_bytes"]:
-                    response.close()
-                    raise ValueError("Remote content exceeds max size limit")
-                tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-                total = 0
-                for chunk in response.iter_content(chunk_size=8192):
-                    total += len(chunk)
-                    if total > policy["max_bytes"]:
-                        tmp_file.close()
-                        response.close()
+                try:
+                    content_length = response.headers.get("content-length")
+                    if content_length and int(content_length) > policy["max_bytes"]:
                         raise ValueError("Remote content exceeds max size limit")
-                    tmp_file.write(chunk)
-                tmp_file.close()
-                response.close()
-                vr = VideoReader(tmp_file.name, ctx=ctx)
+                    tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+                    try:
+                        total = 0
+                        for chunk in response.iter_content(chunk_size=8192):
+                            total += len(chunk)
+                            if total > policy["max_bytes"]:
+                                raise ValueError("Remote content exceeds max size limit")
+                            tmp_file.write(chunk)
+                    finally:
+                        tmp_file.close()
+                    vr = VideoReader(tmp_file.name, ctx=ctx)
+                finally:
+                    response.close()
             elif video_file.startswith("data:"):
                 _, encoded = video_file.split(",", 1)
                 video_bytes = pybase64.b64decode(encoded, validate=True)
