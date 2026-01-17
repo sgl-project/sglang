@@ -14,9 +14,8 @@ from sglang.test.test_utils import (
     popen_launch_pd_server,
 )
 
-# 
-# register_cuda_ci(est_time=120, suite="stage-b-test-large-2-gpu")
-register_cuda_ci(est_time=120, suite="stage-a-test-1")
+register_cuda_ci(est_time=200, suite="stage-b-test-large-2-gpu")
+
 
 class TestDisaggregationMetadataCorruptionE2E(PDDisaggregationServerBase):
     @classmethod
@@ -83,12 +82,8 @@ class TestDisaggregationMetadataCorruptionE2E(PDDisaggregationServerBase):
 
         token_a = tokenizer.encode(" world", add_special_tokens=False)[0]
         token_b = tokenizer.encode(" friend", add_special_tokens=False)[0]
-        expected_a = tokenizer.decode(
-            [token_a], clean_up_tokenization_spaces=False
-        )
-        expected_b = tokenizer.decode(
-            [token_b], clean_up_tokenization_spaces=False
-        )
+        expected_a = tokenizer.decode([token_a], clean_up_tokenization_spaces=False)
+        expected_b = tokenizer.decode([token_b], clean_up_tokenization_spaces=False)
 
         def _run(prompt: str, token_id: int):
             res = client.completions.create(
@@ -101,10 +96,9 @@ class TestDisaggregationMetadataCorruptionE2E(PDDisaggregationServerBase):
             return res["choices"][0]["text"]
 
         num_requests_per_prompt = 20
-        requests = (
-            [("Hello", token_a, expected_a)] * num_requests_per_prompt
-            + [("Goodbye", token_b, expected_b)] * num_requests_per_prompt
-        )
+        requests = [("Hello", token_a, expected_a)] * num_requests_per_prompt + [
+            ("Goodbye", token_b, expected_b)
+        ] * num_requests_per_prompt
 
         with ThreadPoolExecutor(max_workers=20) as executor:
             futures = [
