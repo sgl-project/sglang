@@ -86,7 +86,7 @@ METADATA_COOKIE_SLOT = 1
 
 def metadata_cookie_from_rid(rid: str) -> int:
     """Return a stable int32 cookie for detecting stale metadata buffers."""
-    return np.int32(zlib.crc32(rid.encode("utf-8"))).item()
+    return np.uint32(zlib.crc32(rid.encode("utf-8"))).view(np.int32).item()
 
 
 class MetadataBuffers:
