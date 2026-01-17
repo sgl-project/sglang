@@ -141,7 +141,6 @@ from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.tracing.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.utils import (
-    add_api_key_middleware,
     add_prometheus_middleware,
     add_prometheus_track_response_middleware,
     delete_directory,
@@ -149,6 +148,7 @@ from sglang.srt.utils import (
     kill_process_tree,
     set_uvicorn_logging_configs,
 )
+from sglang.srt.utils.auth import AuthLevel, app_has_admin_force_endpoints, auth_level
 from sglang.utils import get_exception_traceback
 from sglang.version import __version__
 
@@ -283,7 +283,7 @@ async def lifespan(fast_api_app: FastAPI):
         _global_state.tokenizer_manager
     )
     fast_api_app.state.openai_serving_rerank = OpenAIServingRerank(
-        _global_state.tokenizer_manager
+        _global_state.tokenizer_manager, _global_state.template_manager
     )
     fast_api_app.state.openai_serving_tokenize = OpenAIServingTokenize(
         _global_state.tokenizer_manager
@@ -358,6 +358,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Include routers
+from sglang.srt.entrypoints.v1_loads import router as v1_loads_router
+
+app.include_router(v1_loads_router)
 
 
 @app.exception_handler(HTTPException)
@@ -601,12 +606,18 @@ async def server_info():
 
 @app.get("/get_load")
 async def get_load():
+    """Get load metrics (deprecated - use /v1/loads instead)."""
+    logger.warning(
+        "Endpoint '/get_load' is deprecated and will be removed in a future version. "
+        "Please use '/v1/loads' instead."
+    )
     return await _global_state.tokenizer_manager.get_load()
 
 
 # example usage:
 # curl -s -X POST http://localhost:30000/set_internal_state -H "Content-Type: application/json" -d '{"server_args": {"pp_max_micro_batch_size": 8}}'
 @app.api_route("/set_internal_state", methods=["POST", "PUT"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def set_internal_state(obj: SetInternalStateReq, request: Request):
     res = await _global_state.tokenizer_manager.set_internal_state(obj)
     return res
@@ -699,6 +710,7 @@ async def classify_request(obj: EmbeddingReqInput, request: Request):
 
 
 @app.api_route("/flush_cache", methods=["GET", "POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def flush_cache():
     """Flush the radix cache."""
     ret = await _global_state.tokenizer_manager.flush_cache()
@@ -710,6 +722,7 @@ async def flush_cache():
 
 
 @app.api_route("/clear_hicache_storage_backend", methods=["GET", "POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def clear_hicache_storage_backend():
     """Clear the hierarchical cache storage backend."""
     ret = await _global_state.tokenizer_manager.clear_hicache_storage()
@@ -720,6 +733,7 @@ async def clear_hicache_storage_backend():
 
 
 @app.api_route("/start_profile", methods=["GET", "POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def start_profile_async(obj: Optional[ProfileReqInput] = None):
     """Start profiling."""
     if obj is None:
@@ -744,6 +758,7 @@ async def start_profile_async(obj: Optional[ProfileReqInput] = None):
 
 
 @app.api_route("/stop_profile", methods=["GET", "POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def stop_profile_async():
     """Stop profiling."""
     await _global_state.tokenizer_manager.stop_profile()
@@ -754,6 +769,7 @@ async def stop_profile_async():
 
 
 @app.api_route("/freeze_gc", methods=["GET", "POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def freeze_gc_async():
     """
     See engine.freeze_gc for more details.
@@ -766,6 +782,7 @@ async def freeze_gc_async():
 
 
 @app.api_route("/start_expert_distribution_record", methods=["GET", "POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def start_expert_distribution_record_async():
     """Start recording the expert distribution. Clear the previous record if any."""
     await _global_state.tokenizer_manager.start_expert_distribution_record()
@@ -776,6 +793,7 @@ async def start_expert_distribution_record_async():
 
 
 @app.api_route("/stop_expert_distribution_record", methods=["GET", "POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def stop_expert_distribution_record_async():
     """Stop recording the expert distribution."""
     await _global_state.tokenizer_manager.stop_expert_distribution_record()
@@ -786,6 +804,7 @@ async def stop_expert_distribution_record_async():
 
 
 @app.api_route("/dump_expert_distribution_record", methods=["GET", "POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def dump_expert_distribution_record_async():
     """Dump expert distribution record."""
     await _global_state.tokenizer_manager.dump_expert_distribution_record()
@@ -796,6 +815,7 @@ async def dump_expert_distribution_record_async():
 
 
 @app.post("/update_weights_from_disk")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def update_weights_from_disk(obj: UpdateWeightFromDiskReqInput, request: Request):
     """Update the weights from disk inplace without re-launching the server."""
     success, message, num_paused_requests = (
@@ -820,6 +840,7 @@ async def update_weights_from_disk(obj: UpdateWeightFromDiskReqInput, request: R
 
 
 @app.post("/init_weights_send_group_for_remote_instance")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def init_weights_send_group_for_remote_instance(
     obj: InitWeightsSendGroupForRemoteInstanceReqInput, request: Request
 ):
@@ -836,6 +857,7 @@ async def init_weights_send_group_for_remote_instance(
 
 
 @app.post("/send_weights_to_remote_instance")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def send_weights_to_remote_instance(
     obj: SendWeightsToRemoteInstanceReqInput, request: Request
 ):
@@ -852,6 +874,7 @@ async def send_weights_to_remote_instance(
 
 
 @app.get("/get_remote_instance_transfer_engine_info")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def get_remote_instance_transfer_engine_info(rank: int = None):
     if rank is None or rank < 0:
         return Response(status_code=HTTPStatus.BAD_REQUEST)
@@ -876,6 +899,7 @@ async def get_remote_instance_transfer_engine_info(rank: int = None):
 
 
 @app.post("/init_weights_update_group")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def init_weights_update_group(
     obj: InitWeightsUpdateGroupReqInput, request: Request
 ):
@@ -891,6 +915,7 @@ async def init_weights_update_group(
 
 
 @app.post("/destroy_weights_update_group")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def destroy_weights_update_group(
     obj: DestroyWeightsUpdateGroupReqInput, request: Request
 ):
@@ -905,6 +930,7 @@ async def destroy_weights_update_group(
 
 
 @app.post("/update_weights_from_tensor")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def update_weights_from_tensor(
     obj: UpdateWeightsFromTensorReqInput, request: Request
 ):
@@ -926,6 +952,7 @@ async def update_weights_from_tensor(
 
 
 @app.post("/update_weights_from_distributed")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def update_weights_from_distributed(
     obj: UpdateWeightsFromDistributedReqInput, request: Request
 ):
@@ -944,6 +971,7 @@ async def update_weights_from_distributed(
 
 
 @app.post("/update_weights_from_ipc")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def update_weights_from_ipc(obj: UpdateWeightsFromIPCReqInput, request: Request):
     """Update the weights from IPC (Inter-Process Communication) for checkpoint-engine integration."""
     success, message = await _global_state.tokenizer_manager.update_weights_from_ipc(
@@ -960,6 +988,7 @@ async def update_weights_from_ipc(obj: UpdateWeightsFromIPCReqInput, request: Re
 
 
 @app.post("/update_weight_version")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def update_weight_version(obj: UpdateWeightVersionReqInput, request: Request):
     """Update the weight version. This operation requires no active requests."""
     if obj.abort_all_requests:
@@ -990,6 +1019,7 @@ async def update_weight_version(obj: UpdateWeightVersionReqInput, request: Reque
 
 
 @app.api_route("/get_weights_by_name", methods=["GET", "POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def get_weights_by_name(obj: GetWeightsByNameReqInput, request: Request):
     """Get model parameter by name."""
     try:
@@ -1003,6 +1033,7 @@ async def get_weights_by_name(obj: GetWeightsByNameReqInput, request: Request):
 
 
 @app.api_route("/release_memory_occupation", methods=["GET", "POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def release_memory_occupation(
     obj: ReleaseMemoryOccupationReqInput, request: Request
 ):
@@ -1014,6 +1045,7 @@ async def release_memory_occupation(
 
 
 @app.api_route("/resume_memory_occupation", methods=["GET", "POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def resume_memory_occupation(
     obj: ResumeMemoryOccupationReqInput, request: Request
 ):
@@ -1025,6 +1057,7 @@ async def resume_memory_occupation(
 
 
 @app.post("/weights_checker")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def check_weights(obj: CheckWeightsReqInput, request: Request):
     success, message = await _global_state.tokenizer_manager.check_weights(obj, request)
     return ORJSONResponse(
@@ -1034,6 +1067,7 @@ async def check_weights(obj: CheckWeightsReqInput, request: Request):
 
 
 @app.api_route("/slow_down", methods=["GET", "POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def slow_down(obj: SlowDownReqInput, request: Request):
     """Slow down the system deliberately. Only for testing. Example scenario:
     when we want to test performance of D in large-scale PD disaggregation and have no enough nodes for P,
@@ -1047,6 +1081,7 @@ async def slow_down(obj: SlowDownReqInput, request: Request):
 
 
 @app.api_route("/load_lora_adapter", methods=["POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def load_lora_adapter(obj: LoadLoRAAdapterReqInput, request: Request):
     """Load a new LoRA adapter without re-launching the server."""
     result = await _global_state.tokenizer_manager.load_lora_adapter(obj, request)
@@ -1079,6 +1114,7 @@ async def load_lora_adapter_from_tensors(
 
 
 @app.api_route("/unload_lora_adapter", methods=["POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def unload_lora_adapter(obj: UnloadLoRAAdapterReqInput, request: Request):
     """Load a new LoRA adapter without re-launching the server."""
     result = await _global_state.tokenizer_manager.unload_lora_adapter(obj, request)
@@ -1120,6 +1156,7 @@ async def close_session(obj: CloseSessionReqInput, request: Request):
 
 
 @app.api_route("/configure_logging", methods=["GET", "POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def configure_logging(obj: ConfigureLoggingReq, request: Request):
     """Configure the request logging options."""
     _global_state.tokenizer_manager.configure_logging(obj)
@@ -1127,6 +1164,7 @@ async def configure_logging(obj: ConfigureLoggingReq, request: Request):
 
 
 @app.post("/abort_request")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def abort_request(obj: AbortReq, request: Request):
     """Abort a request."""
     try:
@@ -1181,6 +1219,7 @@ async def separate_reasoning_request(obj: SeparateReasoningReqInput, request: Re
 
 
 @app.post("/pause_generation")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def pause_generation(obj: PauseGenerationReqInput, request: Request):
     """Pause generation."""
     await _global_state.tokenizer_manager.pause_generation(obj)
@@ -1191,6 +1230,7 @@ async def pause_generation(obj: PauseGenerationReqInput, request: Request):
 
 
 @app.post("/continue_generation")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def continue_generation(obj: ContinueGenerationReqInput, request: Request):
     """Continue generation."""
     await _global_state.tokenizer_manager.continue_generation(obj)
@@ -1750,8 +1790,23 @@ def launch_server(
 
         # Add api key authorization
         # This is only supported in single tokenizer mode.
-        if server_args.api_key:
-            add_api_key_middleware(app, server_args.api_key)
+        #
+        # Backward compatibility:
+        # - api_key only: behavior matches legacy (all endpoints require api_key)
+        # - no keys: legacy had no restriction; ADMIN_FORCE endpoints must still be rejected when
+        #   admin_api_key is not configured.
+        if (
+            server_args.api_key
+            or server_args.admin_api_key
+            or app_has_admin_force_endpoints(app)
+        ):
+            from sglang.srt.utils.auth import add_api_key_middleware
+
+            add_api_key_middleware(
+                app,
+                api_key=server_args.api_key,
+                admin_api_key=server_args.admin_api_key,
+            )
     else:
         # If it is multi-tokenizer mode, we need to write the arguments to shared memory
         # for other worker processes to read.
@@ -1762,7 +1817,7 @@ def launch_server(
 
     try:
         # Update logging configs
-        set_uvicorn_logging_configs()
+        set_uvicorn_logging_configs(server_args)
 
         # Listen for HTTP requests
         if server_args.tokenizer_worker_num == 1:

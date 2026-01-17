@@ -141,13 +141,19 @@ impl L1Cache {
             return None;
         }
 
-        // Search backwards from the longest boundary to find the best match
-        for &boundary_pos in boundaries.iter().rev() {
-            let prefix = &input[0..boundary_pos];
-            let prefix_bytes = prefix.as_bytes();
-            let hash = blake3::hash(prefix_bytes);
-            let hash_bytes: Blake3Hash = *hash.as_bytes();
+        // Build all prefix hashes incrementally O(N)
+        let mut hasher = blake3::Hasher::new();
+        let mut prefix_hashes = Vec::with_capacity(boundaries.len());
+        let mut last_pos = 0;
+        let bytes = input.as_bytes();
+        for &boundary_pos in &boundaries {
+            hasher.update(&bytes[last_pos..boundary_pos]);
+            prefix_hashes.push((boundary_pos, *hasher.clone().finalize().as_bytes()));
+            last_pos = boundary_pos;
+        }
 
+        // Search from the longest boundary to find the best match
+        for (boundary_pos, hash_bytes) in prefix_hashes.into_iter().rev() {
             let shard_idx = hash_bytes[0] as usize % NUM_SHARDS;
 
             if let Some(entry) = self.shards[shard_idx].get(&hash_bytes) {
@@ -167,8 +173,7 @@ impl L1Cache {
 
     /// Insert prefix entries at ALL special token boundaries
     ///
-    /// Re-tokenizes each prefix to ensure correctness (BPE tokenization is not prefix-stable).
-    /// This is more expensive on cache misses but provides correct tokens for cache hits.
+    /// Uses incremental hashing and tokenization for O(N) performance.
     ///
     /// Optimized for workloads with high prefix reuse (e.g., chat templates with repeated system prompts).
     pub fn insert_at_boundaries<E: super::super::traits::Encoder + ?Sized>(
@@ -184,25 +189,33 @@ impl L1Cache {
             return Ok(());
         }
 
-        // Calculate how much memory we need and tokenize each prefix
+        let mut hasher = blake3::Hasher::new();
+        let mut running_tokens = Vec::new();
+        let mut last_pos = 0;
         let mut entries_to_insert = Vec::with_capacity(boundaries.len());
-        for &boundary_pos in &boundaries {
-            // Extract prefix up to this special token boundary
-            let prefix = &input[0..boundary_pos];
-            let prefix_bytes = prefix.as_bytes();
-            let hash = blake3::hash(prefix_bytes);
-            let hash_bytes: Blake3Hash = *hash.as_bytes();
+        let bytes = input.as_bytes();
+        for (i, &boundary_pos) in boundaries.iter().enumerate() {
+            let delta_text = &input[last_pos..boundary_pos];
 
-            // Re-tokenize the prefix for guaranteed correctness
-            // This is the only way to know the exact token boundaries
-            let prefix_encoding = tokenizer.encode(prefix, add_special_tokens)?;
-            // Convert to Arc<[TokenIdType]> for zero-copy sharing
-            let prefix_tokens: Arc<[TokenIdType]> = prefix_encoding.token_ids().into();
+            // 1. Incremental Hash update
+            hasher.update(&bytes[last_pos..boundary_pos]);
+            let hash_bytes: Blake3Hash = *hasher.clone().finalize().as_bytes();
+
+            // 2. Incremental Tokenization
+            // Only add special tokens (like BOS) for the very first segment to avoid duplicates
+            let segment_encoding = tokenizer.encode(delta_text, (i == 0) && add_special_tokens)?;
+            running_tokens.extend_from_slice(segment_encoding.token_ids());
+
+            // 3. Prepare entry
+            // Convert current tokens to Arc<[TokenIdType]> for sharing
+            let prefix_tokens: Arc<[TokenIdType]> = running_tokens.as_slice().into();
 
             // Size = text bytes + token storage
             let size_bytes = boundary_pos + prefix_tokens.len() * size_of::<TokenIdType>();
 
             entries_to_insert.push((hash_bytes, prefix_tokens, size_bytes));
+
+            last_pos = boundary_pos;
         }
 
         if entries_to_insert.is_empty() {
