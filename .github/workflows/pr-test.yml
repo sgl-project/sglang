@@ -809,6 +809,10 @@ jobs:
     timeout-minutes: 60
     env:
       RUNNER_LABELS: 1-gpu-runner
+    strategy:
+      fail-fast: false
+      matrix:
+        partition: [0, 1]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -836,7 +840,7 @@ jobs:
           if [[ "${{ needs.check-changes.outputs.continue_on_error }}" == "true" ]]; then
             CONTINUE_ON_ERROR_FLAG="--continue-on-error"
           fi
-          python3 run_suite.py --hw cuda --suite stage-b-test-large-1-gpu-performance --timeout-per-file 1800 $CONTINUE_ON_ERROR_FLAG
+          python3 run_suite.py --hw cuda --suite stage-b-test-large-1-gpu-performance --auto-partition-id ${{ matrix.partition }} --auto-partition-size 2 --timeout-per-file 1800 $CONTINUE_ON_ERROR_FLAG
 
   stage-b-test-large-2-gpu-performance:
     needs: [check-changes, call-gate, stage-a-test-1, sgl-kernel-build-wheels]
