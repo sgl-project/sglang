@@ -38,11 +38,13 @@ from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     KVClassType,
     MetadataBuffers,
+    METADATA_COOKIE_SLOT,
     ReqToMetadataIdxAllocator,
     TransferBackend,
     get_kv_class,
     is_mla_backend,
     kv_to_page_indices,
+    metadata_cookie_from_rid,
     poll_and_all_reduce,
     prepare_abort,
 )
@@ -725,7 +727,7 @@ class DecodeTransferQueue:
     def extend(self, decode_reqs: List[DecodeRequest]) -> None:
         self.queue.extend(decode_reqs)
 
-    def _commit_transfer_to_req(self, decode_req: DecodeRequest) -> None:
+    def _commit_transfer_to_req(self, decode_req: DecodeRequest) -> bool:
         idx = decode_req.metadata_buffer_index
         (
             output_id,
@@ -738,6 +740,16 @@ class DecodeTransferQueue:
             output_topk_index,
             output_hidden_states,
         ) = self.metadata_buffers.get_buf(idx)
+
+        expected_cookie = metadata_cookie_from_rid(decode_req.req.rid)
+        if output_id[METADATA_COOKIE_SLOT].item() != expected_cookie:
+            logger.debug(
+                "Decode metadata cookie mismatch for rid=%s (expected=%s, got=%s)",
+                decode_req.req.rid,
+                expected_cookie,
+                output_id[METADATA_COOKIE_SLOT].item(),
+            )
+            return False
 
         decode_req.req.output_ids.append(output_id[0].item())
         decode_req.req.cached_tokens = cached_tokens[0].item()
@@ -768,6 +780,7 @@ class DecodeTransferQueue:
             auto_next_anon=True,
         )
         decode_req.req.time_stats.wait_queue_entry_time = time.perf_counter()
+        return True
 
     def pop_transferred(self, rids_to_check: Optional[List[str]] = None) -> List[Req]:
         if not self.queue:
@@ -803,9 +816,9 @@ class DecodeTransferQueue:
                     self.scheduler.metrics_collector.increment_transfer_failed_reqs()
                 continue
             elif poll == KVPoll.Success:
-                self._commit_transfer_to_req(decode_req)
-                indices_to_remove.add(i)
-                transferred_reqs.append(decode_req.req)
+                if self._commit_transfer_to_req(decode_req):
+                    indices_to_remove.add(i)
+                    transferred_reqs.append(decode_req.req)
             elif poll in [
                 KVPoll.Bootstrapping,
                 KVPoll.WaitingForInput,

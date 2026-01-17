@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import random
+import zlib
 from collections import deque
 from contextlib import nullcontext
 from enum import Enum
@@ -78,6 +79,14 @@ class ReqToMetadataIdxAllocator:
 
     def free(self, free_index: int):
         self.free_slots.append(free_index)
+
+
+METADATA_COOKIE_SLOT = 1
+
+
+def metadata_cookie_from_rid(rid: str) -> int:
+    """Return a stable int32 cookie for detecting stale metadata buffers."""
+    return np.int32(zlib.crc32(rid.encode("utf-8"))).item()
 
 
 class MetadataBuffers:
@@ -185,6 +194,9 @@ class MetadataBuffers:
     def set_buf(self, req: Req):
 
         self.output_ids[req.metadata_buffer_index][0] = req.output_ids[0]
+        self.output_ids[req.metadata_buffer_index][METADATA_COOKIE_SLOT] = (
+            metadata_cookie_from_rid(req.rid)
+        )
         self.cached_tokens[req.metadata_buffer_index][0] = req.cached_tokens
         if req.return_logprob:
             if req.output_token_logprobs_val:  # not none or empty list
