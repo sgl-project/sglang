@@ -54,6 +54,6 @@ Consider adding tests to the `pr-test` or `nightly-test` suites to safeguard you
 - support or fix important features
 - significantly improve performance
 
-Please run the according testcase, then update/add the baseline to `perf_baselines.json` by following the instruction in console.
+Please run the according testcase, then update/add the baseline to `perf_baselines.json` by following the instruction in console if applicable.
 
 See [test](https://github.com/sgl-project/sglang/tree/main/python/sglang/multimodal_gen/test) for examples
