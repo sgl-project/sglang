@@ -3,11 +3,13 @@ try:
 except ImportError:
     try:
         import importlib.metadata
+
         __version__ = importlib.metadata.version("sglang")
         __version_tuple__ = tuple(__version__.split("."))
     except Exception:
         try:
             import subprocess
+
             __version__ = (
                 subprocess.check_output(
                     ["git", "describe", "--tags", "--always"], stderr=subprocess.STDOUT

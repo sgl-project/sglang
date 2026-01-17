@@ -153,6 +153,7 @@ def get_model_path(extra_argv):
             )
     return model_path
 
+
 @lru_cache(maxsize=1)
 def get_git_commit_hash() -> str:
     try:
