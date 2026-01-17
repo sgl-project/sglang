@@ -1,5 +1,7 @@
 //! Tool parser integration tests
 
+pub mod test_constraints;
+pub mod test_structural_tag;
 pub mod tool_parser_deepseek;
 pub mod tool_parser_edge_cases;
 pub mod tool_parser_fallback;

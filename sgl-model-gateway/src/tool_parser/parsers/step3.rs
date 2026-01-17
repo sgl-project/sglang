@@ -573,4 +573,9 @@ impl ToolParser for Step3Parser {
         self.in_tool_call = false;
         self.function_name_sent = false;
     }
+
+    fn get_format_info(&self, _tool_name: &str) -> (String, String, String) {
+        // Step3 uses custom XML format, not structural tag compatible
+        (String::new(), String::new(), String::new())
+    }
 }

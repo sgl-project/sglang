@@ -345,4 +345,11 @@ impl ToolParser for KimiK2Parser {
         self.streamed_args_for_tool.clear();
         self.last_arguments.clear();
     }
+
+    fn get_format_info(&self, tool_name: &str) -> (String, String, String) {
+        let begin = format!(r#"{{"name":"{}", "arguments":"#, tool_name);
+        let end = "\"}".to_string();
+        let trigger = "<|tool_calls_section_begin|>".to_string();
+        (begin, end, trigger)
+    }
 }
