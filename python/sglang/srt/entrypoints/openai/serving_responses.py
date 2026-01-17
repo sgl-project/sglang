@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Adapted from vLLM's OpenAIServingResponses
 """Handler for /v1/responses requests"""
+
 from __future__ import annotations
 
 import asyncio
@@ -165,6 +166,10 @@ class OpenAIServingResponses(OpenAIServingChat):
         request: ResponsesRequest,
         raw_request: Optional[Request] = None,
     ) -> Union[AsyncGenerator[str, None], ResponsesResponse, ORJSONResponse]:
+        # Validate request
+        if error_msg := self._validate_request(request):
+            return self.create_error_response(error_msg)
+
         # Validate model
         if not self.tokenizer_manager:
             return self.create_error_response("Model not loaded")
@@ -216,8 +221,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             )
         ):
             return self.create_error_response(
-                "MCP tool server is not supported in background mode and "
-                "streaming mode"
+                "MCP tool server is not supported in background mode and streaming mode"
             )
 
         # Schedule the request and get the result generator
@@ -350,16 +354,16 @@ class OpenAIServingResponses(OpenAIServingChat):
                     request_metadata,
                 )
             try:
-                result: Union[ORJSONResponse, ResponsesResponse] = (
-                    await self.responses_full_generator(
-                        request,
-                        sampling_params,
-                        result_generator,
-                        context,
-                        model_name,
-                        tokenizer,
-                        request_metadata,
-                    )
+                result: Union[
+                    ORJSONResponse, ResponsesResponse
+                ] = await self.responses_full_generator(
+                    request,
+                    sampling_params,
+                    result_generator,
+                    context,
+                    model_name,
+                    tokenizer,
+                    request_metadata,
                 )
                 return result
             except Exception as e:
@@ -417,7 +421,7 @@ class OpenAIServingResponses(OpenAIServingChat):
     ):
         if request.tool_choice != "auto":
             raise NotImplementedError(
-                "Only 'auto' tool_choice is supported in " "response API"
+                "Only 'auto' tool_choice is supported in response API"
             )
         messages = self._construct_input_messages_with_harmony(request, prev_response)
         prompt_token_ids = render_for_completion(messages)
@@ -678,9 +682,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 recent_turn_msgs = prev_msgs[prev_final_msg_idx + 1 :]
                 del prev_msgs[prev_final_msg_idx + 1 :]
                 for msg in recent_turn_msgs:
-                    if (
-                        hasattr(msg, "channel") and msg.channel != "analysis"
-                    ):  # type: ignore[union-attr]
+                    if hasattr(msg, "channel") and msg.channel != "analysis":  # type: ignore[union-attr]
                         prev_msgs.append(msg)
             messages.extend(prev_msgs)
         # Append the new input.
@@ -835,8 +837,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             # Get event type from the event's type field if it exists
             event_type = getattr(event, "type", "unknown")
             return (
-                f"event: {event_type}\n"
-                f"data: {event.model_dump_json(indent=None)}\n\n"
+                f"event: {event_type}\ndata: {event.model_dump_json(indent=None)}\n\n"
             )
 
         current_content_index = 0
@@ -869,7 +870,6 @@ class OpenAIServingResponses(OpenAIServingChat):
         )
 
         async for ctx in result_generator:
-
             # Only process context objects that implement the `is_expecting_start()` method,
             # which indicates they support per-turn streaming (e.g., StreamingHarmonyContext).
             # Contexts without this method are skipped, as they do not represent a new turn
