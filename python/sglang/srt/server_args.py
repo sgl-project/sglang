@@ -85,6 +85,7 @@ LOAD_FORMAT_CHOICES = [
     "flash_rl",
     "remote",
     "remote_instance",
+    "serverless_llm",
     "fastsafetensors",
     "private",
 ]
