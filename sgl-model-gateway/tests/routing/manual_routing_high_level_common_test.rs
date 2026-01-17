@@ -188,7 +188,8 @@ async fn test_min_group_concurrent_distribution_impl(cfg: TestManualConfig, base
             assert!(
                 *count >= 1 && *count <= 5,
                 "Worker {} should have 1-5 keys due to racing, got {}",
-                worker, count
+                worker,
+                count
             );
         }
     } else {

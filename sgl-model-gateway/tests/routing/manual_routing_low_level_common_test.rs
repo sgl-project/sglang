@@ -332,7 +332,10 @@ async fn test_min_group_distributes_evenly_impl(cfg: TestManualConfig) {
         });
     assert_eq!(distribution.len(), 3, "Should use all 3 workers");
     for count in distribution.values() {
-        assert_eq!(*count, 3, "Each worker should have exactly 3 routing keys in storage");
+        assert_eq!(
+            *count, 3,
+            "Each worker should have exactly 3 routing keys in storage"
+        );
     }
 }
 
@@ -416,7 +419,10 @@ async fn test_min_group_sticky_after_assignment_impl(cfg: TestManualConfig) {
 
     let first_result = policy.select_worker(&workers, &info).await;
     let first_idx = first_result.unwrap();
-    assert_eq!(first_idx, 0, "Should initially select worker 0 (fewer keys)");
+    assert_eq!(
+        first_idx, 0,
+        "Should initially select worker 0 (fewer keys)"
+    );
 
     workers[0].worker_routing_key_load().increment("key-3");
     workers[0].worker_routing_key_load().increment("key-4");

@@ -170,7 +170,9 @@ async fn test_redis_concurrent_different_keys() {
 
 #[tokio::test]
 async fn test_redis_ttl_expiry() {
-    let policy = TestManualConfig::redis("test_ttl").with_ttl(2).build_policy();
+    let policy = TestManualConfig::redis("test_ttl")
+        .with_ttl(2)
+        .build_policy();
     let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
 
     let headers = headers_with_routing_key("ttl-test");
