@@ -21,6 +21,7 @@ Life cycle of a request in the decode server
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -35,10 +36,10 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.disaggregation.base import BaseKVManager, BaseKVReceiver, KVPoll
 from sglang.srt.disaggregation.utils import (
     FAKE_BOOTSTRAP_HOST,
+    METADATA_COOKIE_SLOT,
     DisaggregationMode,
     KVClassType,
     MetadataBuffers,
-    METADATA_COOKIE_SLOT,
     ReqToMetadataIdxAllocator,
     TransferBackend,
     get_kv_class,
@@ -720,6 +721,13 @@ class DecodeTransferQueue:
         self.scheduler = scheduler
         self.tree_cache = tree_cache
         self.spec_algorithm = scheduler.spec_algorithm
+        self._test_inject_metadata_corruption = get_int_env_var(
+            "SGLANG_PD_TEST_INJECT_METADATA_CORRUPTION", 0
+        )
+        self._test_inject_restore_delay_ms = get_int_env_var(
+            "SGLANG_PD_TEST_INJECT_METADATA_RESTORE_DELAY_MS", 0
+        )
+        self._metadata_corruption_injected = set()
 
     def add(self, decode_req: DecodeRequest) -> None:
         self.queue.append(decode_req)
@@ -740,6 +748,24 @@ class DecodeTransferQueue:
             output_topk_index,
             output_hidden_states,
         ) = self.metadata_buffers.get_buf(idx)
+
+        if (
+            self._test_inject_metadata_corruption
+            and decode_req.req.rid not in self._metadata_corruption_injected
+        ):
+            original_token = int(output_id[0].item())
+            original_cookie = int(output_id[METADATA_COOKIE_SLOT].item())
+            output_id[0] = original_token ^ 1
+            output_id[METADATA_COOKIE_SLOT] = original_cookie ^ 0x7FFFFFFF
+            self._metadata_corruption_injected.add(decode_req.req.rid)
+
+            def _restore():
+                if self._test_inject_restore_delay_ms > 0:
+                    time.sleep(self._test_inject_restore_delay_ms / 1000.0)
+                output_id[0] = original_token
+                output_id[METADATA_COOKIE_SLOT] = original_cookie
+
+            threading.Thread(target=_restore, daemon=True).start()
 
         expected_cookie = metadata_cookie_from_rid(decode_req.req.rid)
         if output_id[METADATA_COOKIE_SLOT].item() != expected_cookie:
