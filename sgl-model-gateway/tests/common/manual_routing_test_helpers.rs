@@ -92,8 +92,10 @@ pub fn headers_with_routing_key(key: &str) -> http::HeaderMap {
 }
 
 pub fn random_prefix(test_name: &str) -> String {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::{
+        sync::atomic::{AtomicU64, Ordering},
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 

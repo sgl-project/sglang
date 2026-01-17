@@ -156,7 +156,9 @@ impl ManualPolicy {
     }
 
     /// Iterate over all stored candidate URLs. Used for testing.
-    pub async fn iter_urls(&self) -> Result<Vec<Vec<String>>, Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn iter_urls(
+        &self,
+    ) -> Result<Vec<Vec<String>>, Box<dyn std::error::Error + Send + Sync>> {
         self.backend.iter_urls().await
     }
 }
@@ -196,8 +198,14 @@ enum Backend {
 impl Backend {
     fn from_config(config: &ManualConfig) -> Self {
         if let Some(redis_url) = &config.redis_url {
-            let key_prefix = format!("{}:{REDIS_KEY_MIDFIX_DEFAULT}", config.redis_key_prefix.as_deref().unwrap_or(""));
-            info!("ManualPolicy creating Redis backend: url={}, key_prefix={}", redis_url, key_prefix);
+            let key_prefix = format!(
+                "{}:{REDIS_KEY_MIDFIX_DEFAULT}",
+                config.redis_key_prefix.as_deref().unwrap_or("")
+            );
+            info!(
+                "ManualPolicy creating Redis backend: url={}, key_prefix={}",
+                redis_url, key_prefix
+            );
             let backend = RedisBackend::new(redis_url, config.max_idle_secs, key_prefix)
                 .expect("redis_url is set but failed to connect to Redis");
             Backend::Redis(backend)
@@ -242,7 +250,9 @@ impl Backend {
         }
     }
 
-    async fn iter_urls(&self) -> Result<Vec<Vec<String>>, Box<dyn std::error::Error + Send + Sync>> {
+    async fn iter_urls(
+        &self,
+    ) -> Result<Vec<Vec<String>>, Box<dyn std::error::Error + Send + Sync>> {
         match self {
             Backend::Local(b) => Ok(b.iter_urls()),
             Backend::Redis(b) => b.iter_urls().await,
@@ -514,7 +524,10 @@ impl RedisBackend {
                 (Some(selected_idx), branch)
             }
             Ok(false) => {
-                debug!("CAS race: key={}, old_data={:?}, new_data={}", key, old_data, new_data);
+                debug!(
+                    "CAS race: key={}, old_data={:?}, new_data={}",
+                    key, old_data, new_data
+                );
                 (None, ExecutionBranch::RedisCasRace)
             }
             Err(e) => {
@@ -524,7 +537,9 @@ impl RedisBackend {
         }
     }
 
-    async fn iter_urls(&self) -> Result<Vec<Vec<String>>, Box<dyn std::error::Error + Send + Sync>> {
+    async fn iter_urls(
+        &self,
+    ) -> Result<Vec<Vec<String>>, Box<dyn std::error::Error + Send + Sync>> {
         let mut conn = self.pool.get().await?;
         let pattern = format!("{}*", self.key_prefix);
         let keys: Vec<String> = conn.keys(&pattern).await?;
