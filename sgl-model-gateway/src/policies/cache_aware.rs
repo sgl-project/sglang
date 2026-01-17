@@ -676,8 +676,8 @@ mod tests {
         assert_eq!(idx, 1);
     }
 
-    #[test]
-    fn test_cache_aware_sync_tree_operation_to_mesh() {
+    #[tokio::test]
+    async fn test_cache_aware_sync_tree_operation_to_mesh() {
         use std::sync::Arc;
 
         use crate::mesh::{stores::StateStores, sync::MeshSyncManager};
@@ -710,6 +710,7 @@ mod tests {
                     ..Default::default()
                 },
             )
+            .await
             .unwrap();
 
         // Verify tree operation was synced to mesh (under UNKNOWN_MODEL_ID since no model was specified)
@@ -855,8 +856,8 @@ mod tests {
         let _ = tree_state;
     }
 
-    #[test]
-    fn test_cache_aware_without_mesh() {
+    #[tokio::test]
+    async fn test_cache_aware_without_mesh() {
         let config = CacheAwareConfig {
             eviction_interval_secs: 0,
             ..Default::default()
@@ -881,6 +882,7 @@ mod tests {
                     ..Default::default()
                 },
             )
+            .await
             .unwrap();
         assert_eq!(idx, 0);
     }
