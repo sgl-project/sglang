@@ -537,7 +537,6 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
             local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
             local_num_experts=layer.num_local_experts,
             routed_scaling_factor=routed_scaling_factor,
-            tile_tokens_dim=None,
             routing_method_type=layer.routing_method_type,
             do_finalize=True,
             tune_max_num_tokens=next_power_of_2(hs_fp4.shape[0]),
