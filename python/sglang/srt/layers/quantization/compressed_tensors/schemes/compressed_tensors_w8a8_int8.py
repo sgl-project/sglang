@@ -169,11 +169,17 @@ class CompressedTensorsW8A8Int8(CompressedTensorsScheme):
         self, layer: torch.nn.Module, x: torch.Tensor, bias: Optional[torch.Tensor]
     ) -> torch.Tensor:
         # TODO: add cutlass_scaled_mm_azp support
-        x_q, x_scale = per_token_quant_int8(x)
-
-        return int8_scaled_mm(
+        # View input as 2D matrix for int8 methods (similar to fp8_utils.py)
+        x_2d = x.view(-1, x.shape[-1])
+        x_q, x_scale = per_token_quant_int8(x_2d)
+        output = int8_scaled_mm(
             x_q, layer.weight, x_scale, layer.weight_scale, out_dtype=x.dtype, bias=bias
         )
+        # Reshape output back to original shape (except last dimension)
+        if x.dim() > 2:
+            output = output.view(*x.shape[:-1], output.shape[-1])
+
+        return output
 
 
 class NPUCompressedTensorsW8A8Int8(CompressedTensorsW8A8Int8):
