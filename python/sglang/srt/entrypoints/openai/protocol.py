@@ -681,9 +681,8 @@ class ChatCompletionRequest(BaseModel):
         if (
             self.tool_choice == "none"
             and envs.SGLANG_BIAS_TOOL_WHEN_NONE.get()
-            and envs.SGLANG_TOOL_START_TOKEN.get() is not None
+            and (tool_token_id := envs.SGLANG_TOOL_START_TOKEN.get()) is not None
         ):
-            tool_token_id = envs.SGLANG_TOOL_START_TOKEN.get()
             existing_bias = sampling_params["logit_bias"] or {}
             # Use string key for token ID as per OpenAI convention
             token_key = str(tool_token_id)
