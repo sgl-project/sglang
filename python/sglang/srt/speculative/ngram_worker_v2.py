@@ -103,7 +103,7 @@ class NGRAMWorkerV2(NGRAMWorker):
             #     add_output_logprobs_for_spec_v1(batch, verify_input, logits_output)
 
             batch.forward_mode = ForwardMode.DECODE
-            batch.logits_output = logits_output
+            batch.logits_output = logits_output  # to be used as parameter in scheduler update_running_batch
 
         else:
             batch_result = self.target_worker.forward_batch_generation(
@@ -121,4 +121,5 @@ class NGRAMWorkerV2(NGRAMWorker):
             num_accepted_tokens=num_accepted_tokens,
             can_run_cuda_graph=can_run_cuda_graph,
             accept_lens=accept_lens,
+            next_draft_input=batch.spec_info,
         )

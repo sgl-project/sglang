@@ -2102,19 +2102,22 @@ class Scheduler(
         initial_bs = batch.batch_size()
 
         if batch.is_spec_v2 and batch.spec_algorithm.is_ngram():
-            verify_input: NgramVerifyInputV2 = batch.spec_info
-            logits_output, next_token_ids, num_accepted_tokens = (
-                verify_input.fill_requests_and_free_cache(
-                    batch, batch.logits_output, self.page_size
-                )
-            )
-            # TODO update result_queue using the new result, token ids do not need to store in future map since all output ids are updated in speculative module
             tmp_batch, tmp_result = self.result_queue.popleft()
-            tmp_result.logits_output = logits_output
-            tmp_result.next_token_ids = next_token_ids
-            tmp_result.num_accepted_tokens = num_accepted_tokens
-            tmp_result.copy_to_cpu(return_logprob=tmp_batch.return_logprob)
-            self.result_queue.appendleft((tmp_batch, tmp_result))
+            if not tmp_batch.forward_mode.is_extend():
+                # if the last batch is decode, then no new req will be merged into batch, i.e. batch is the same as tmp_batch
+                # TODO support chunk prefill and mixed-chunk
+                verify_input: NgramVerifyInputV2 = batch.spec_info
+                logits_output, next_token_ids, num_accepted_tokens = (
+                    verify_input.fill_requests_and_free_cache(
+                        batch, batch.logits_output, self.page_size
+                    )
+                )
+                # update result_queue using the new result, token ids do not need to store in future map since all output ids are updated in speculative module
+                tmp_result.logits_output = logits_output
+                tmp_result.next_token_ids = next_token_ids
+                tmp_result.num_accepted_tokens = num_accepted_tokens
+                tmp_result.copy_to_cpu(return_logprob=tmp_batch.return_logprob)
+                self.result_queue.appendleft((batch.copy(), tmp_result))
 
         batch.filter_batch(v1_spec_info_filtered=True)
         if batch.is_empty():
@@ -2274,21 +2277,22 @@ class Scheduler(
                 # FIXME(lsyin): move this assignment elsewhere
                 future_indices_or_next_token_ids = -future_indices.indices
 
-                if batch.is_spec_v2 and not batch.spec_algorithm.is_ngram():
+                if batch.is_spec_v2:
                     # FIXME(lsyin): tmp code for spec v2
                     # We only keep future indices for next draft input
 
                     batch.spec_info = batch_result.next_draft_input
-                    batch.spec_info.future_indices = future_indices
+                    if not batch.spec_algorithm.is_ngram():
+                        batch.spec_info.future_indices = future_indices
 
-                    # batch.spec_info = EagleDraftInput(
-                    #     future_indices=future_indices,
-                    #     verify_done=batch_result.next_draft_input.verify_done,
-                    # )
+                        # batch.spec_info = EagleDraftInput(
+                        #     future_indices=future_indices,
+                        #     verify_done=batch_result.next_draft_input.verify_done,
+                        # )
 
-                    # The future value, usually for next batch preparation
-                    # Current implementation strictly synchronizes the seq_lens
-                    batch.seq_lens = batch_result.next_draft_input.new_seq_lens
+                        # The future value, usually for next batch preparation
+                        # Current implementation strictly synchronizes the seq_lens
+                        batch.seq_lens = batch_result.next_draft_input.new_seq_lens
             elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
                 batch_result = self.tp_worker.forward_batch_split_prefill(batch)
                 future_indices_or_next_token_ids = batch_result.next_token_ids
