@@ -680,12 +680,32 @@ async def async_request_profile(api_url: str) -> RequestFuncOutput:
     async with _create_bench_client_session() as session:
         output = RequestFuncOutput()
         try:
-            body = {
-                "activities": getattr(args, "profile_activities", []),
-                "num_steps": getattr(args, "profile_num_steps", None),
-                "profile_by_stage": getattr(args, "profile_by_stage", None),
-                "profile_stages": getattr(args, "profile_stages", None),
-            }
+            if api_url.endswith("/start_profile"):
+                num_steps = getattr(args, "profile_num_steps", None)
+                profile_by_stage = getattr(args, "profile_by_stage", None)
+                if profile_by_stage and num_steps is None:
+                    num_steps = 5
+
+                output_dir = getattr(args, "profile_output_dir", None)
+                if output_dir is None:
+                    output_dir = os.getenv("SGLANG_TORCH_PROFILER_DIR", "/tmp")
+                output_dir = Path(os.path.abspath(os.path.normpath(output_dir))) / str(
+                    time.time()
+                )
+                output_dir.mkdir(exist_ok=True, parents=True)
+                output_dir = str(output_dir)
+
+                body = {
+                    "activities": getattr(args, "profile_activities", []),
+                    "num_steps": num_steps,
+                    "profile_by_stage": profile_by_stage,
+                    "profile_stages": getattr(args, "profile_stages", None),
+                    "output_dir": output_dir,
+                    "profile_prefix": getattr(args, "profile_prefix", None),
+                }
+            else:
+                # stop_profile doesn't need any parameters
+                body = {}
             print(f"async_request_profile {api_url=} {body=}")
             async with session.post(url=api_url, json=body) as response:
                 if response.status == 200:
@@ -3068,6 +3088,18 @@ if __name__ == "__main__":
     parser.add_argument("--profile-num-steps", type=int, default=None)
     parser.add_argument("--profile-by-stage", action="store_true", default=False)
     parser.add_argument("--profile-stages", nargs="+", default=None)
+    parser.add_argument(
+        "--profile-output-dir",
+        type=str,
+        default=None,
+        help="Output directory for profile traces.",
+    )
+    parser.add_argument(
+        "--profile-prefix",
+        type=str,
+        default=None,
+        help="Prefix for profile trace filenames.",
+    )
     parser.add_argument(
         "--lora-name",
         type=str,
