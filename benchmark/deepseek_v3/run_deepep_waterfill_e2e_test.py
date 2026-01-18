@@ -159,6 +159,7 @@ def start_server(
         str(ep),
         "--moe-a2a-backend",
         "deepep",
+        "--disable-radix-cache",
         "--host",
         bind_host,
         "--port",
