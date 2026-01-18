@@ -138,6 +138,17 @@ class ModelConfig:
             **kwargs,
         )
 
+        if (
+            getattr(self.hf_config, "architectures", None) is None
+            and getattr(self.hf_config, "auto_map", None) is not None
+        ):
+            if self.hf_config.auto_map.get("AutoModelForCausalLM", None) is not None:
+                pattern = r"."
+                auto_architecture = self.hf_config.auto_map[
+                    "AutoModelForCausalLM"
+                ].split(pattern)[-1]
+                self.hf_config.architectures = [auto_architecture]
+
         # Set enable_multimodal
         if enable_multimodal is None:
             mm_disabled_models = [
