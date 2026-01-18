@@ -1231,9 +1231,8 @@ class OpenAIServingChat(OpenAIServingBase):
         # If reasoning_off_by_default is set, reasoning is off unless explicitly requested
         reasoning_off_by_default = envs.SGLANG_REASONING_OFF_BY_DEFAULT.get()
 
-        if self.reasoning_parser in ["deepseek-v3"]:
-        if self.reasoning_parser in ["deepseek-v3"]:
-            # deepseek-v3 uses enable_thinking parameter (like qwen3)
+        if self.reasoning_parser in ["deepseek-v3", "qwen3", "glm45", "nano_v3", "interns1"]:
+            # These models use enable_thinking parameter
             if reasoning_off_by_default:
                 return (
                     request.chat_template_kwargs is not None
@@ -1251,8 +1250,6 @@ class OpenAIServingChat(OpenAIServingBase):
                 or request.chat_template_kwargs.get("thinking") is not False
             )
 
-        if self.reasoning_parser in ["qwen3", "glm45", "nano_v3", "interns1"]:
-            # qwen3, glm45, nano_v3, and interns1 are reasoning by default
             if reasoning_off_by_default:
                 return (
                     request.chat_template_kwargs is not None
