@@ -1107,6 +1107,7 @@ def rms_norm_fn(
         residual_out,
     )
 
+
 # Adapted from https://github.com/ModelTC/LightX2V/blob/main/lightx2v/common/ops/norm/triton_ops.py#L905-L956
 @triton.jit
 def _rms_norm_tiled_onepass(
@@ -1146,12 +1147,10 @@ def triton_one_pass_rms_norm(x: torch.Tensor, w: torch.Tensor, eps: float = 1e-6
     S, D = x_view.shape
 
     BLOCK_SIZE_SEQ = min(16, triton.next_power_of_2(max(1, S // 512)))
-    grid = triton.cdiv(S, BLOCK_SIZE_SEQ),
+    grid = (triton.cdiv(S, BLOCK_SIZE_SEQ),)
 
     with torch.cuda.device(x.device):
-        torch.library.wrap_triton(
-            _rms_norm_tiled_onepass
-        )[grid](
+        torch.library.wrap_triton(_rms_norm_tiled_onepass)[grid](
             y_view,
             x_view,
             w,

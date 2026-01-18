@@ -371,7 +371,7 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
         query = query.unflatten(-1, (self.heads, -1))
         key = key.unflatten(-1, (self.heads, -1))
         value = value.unflatten(-1, (self.heads, -1))
-        
+
         query = self.norm_q(query)
         key = self.norm_k(key)
 
