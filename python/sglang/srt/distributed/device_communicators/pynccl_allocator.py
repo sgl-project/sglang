@@ -68,7 +68,7 @@ void nccl_free_plug(void* ptr, size_t size, int device, void* stream) {
 """
 
 _allocator = None
-_mem_pool = None
+_mem_pool_map = {}
 _graph_pool_id = None
 _cur_device = None
 _active_symmetric_memory_context = None
@@ -99,9 +99,9 @@ def restore_symmetric_memory_context(saved_context):
         saved_context.__enter__()
 
 
-def get_nccl_mem_pool():
-    global _allocator, _mem_pool, _cur_device
-    if _mem_pool is None:
+def init_pynccl_allocator():
+    global _allocator, _cur_device
+    if _allocator is None:
         import torch.utils.cpp_extension
 
         out_dir = tempfile.gettempdir()
@@ -120,9 +120,16 @@ def get_nccl_mem_pool():
             "nccl_alloc_plug",
             "nccl_free_plug",
         ).allocator()
-        _mem_pool = torch.cuda.MemPool(_allocator)
         _cur_device = torch.cuda.current_device()
-    return _mem_pool
+
+
+def get_nccl_mem_pool(group_coordinator: GroupCoordinator):
+    global _allocator, _mem_pool_map
+    if group_coordinator.unique_name not in _mem_pool_map:
+        init_pynccl_allocator()
+        _mem_pool = torch.cuda.MemPool(_allocator)
+        _mem_pool_map[group_coordinator.unique_name] = _mem_pool
+    return _mem_pool_map[group_coordinator.unique_name]
 
 
 class SymmetricMemoryContext:
@@ -140,7 +147,9 @@ class SymmetricMemoryContext:
         group_coordinator: GroupCoordinator,
     ):
         self.group_coordinator = group_coordinator
-        self._mem_pool_ctx = torch.cuda.use_mem_pool(get_nccl_mem_pool())
+        self._mem_pool_ctx = torch.cuda.use_mem_pool(
+            get_nccl_mem_pool(self.group_coordinator)
+        )
         self.is_graph_capture = torch.cuda.is_current_stream_capturing()
         self.exited = False
 
@@ -163,7 +172,9 @@ class SymmetricMemoryContext:
 
         if self.exited:
             # mempool ctx (@contextlib.contextmanager) is not re-entrant
-            self._mem_pool_ctx = torch.cuda.use_mem_pool(get_nccl_mem_pool())
+            self._mem_pool_ctx = torch.cuda.use_mem_pool(
+                get_nccl_mem_pool(self.group_coordinator)
+            )
             self.exited = False
         self._mem_pool_ctx.__enter__()
 
