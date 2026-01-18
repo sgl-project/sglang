@@ -8,7 +8,7 @@ from typing import Optional, Tuple, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from sgl_kernel import fused_add_rmsnorm
+from sgl_kernel import fused_add_rmsnorm, rmsnorm
 
 from sglang.jit_kernel.norm import can_use_fused_inplace_qknorm, fused_inplace_qknorm
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
@@ -77,7 +77,12 @@ class RMSNorm(CustomOp):
             fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
             return x.view(shape), residual.view(residual_shape)
         else:
-            out = triton_one_pass_rms_norm(x, self.weight.data, self.variance_epsilon)
+            if x.shape[-1] <= 128:
+                out = triton_one_pass_rms_norm(
+                    x, self.weight.data, self.variance_epsilon
+                )
+            else:
+                out = rmsnorm(x, self.weight.data, self.variance_epsilon)
         out = out.view(shape)
         return out
 
