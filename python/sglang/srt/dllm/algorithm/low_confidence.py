@@ -39,6 +39,10 @@ class LowConfidence(DllmAlgorithm):
             next_token_ids = []
             return logits_output, next_token_ids, can_run_cuda_graph
 
+        # Initialize step_maps if needed
+        if forward_batch.return_step_maps:
+            step_maps = torch.full_like(forward_batch.input_ids, -1)
+
         # Calculate start positions for each block
         for block_id in range(batch_size):
             block_start = block_id * self.block_size
@@ -89,6 +93,19 @@ class LowConfidence(DllmAlgorithm):
 
                 block_input_ids[transfer_index] = x[transfer_index]
 
+            if forward_batch.return_step_maps:
+                mask_index_next = forward_batch.input_ids == self.mask_id
+                changed_mask = mask_index & (~mask_index_next)
+                changed_batch_index = changed_mask.view(batch_size, -1).sum(dim=1) > 0
+                forward_batch.diffusion_steps[changed_batch_index] += 1
+
+                step_values_expanded = forward_batch.diffusion_steps.repeat_interleave(
+                    self.block_size
+                ).to(dtype=step_maps.dtype)
+                step_maps[changed_mask] = step_values_expanded[changed_mask]
+
+                mask_index = mask_index_next
+
         out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
         logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
         # Here next token ids is tricky to implement the dynamic lengths,
@@ -97,6 +114,14 @@ class LowConfidence(DllmAlgorithm):
         next_token_ids_list = [
             next_token_ids[i, start_list[i] :] for i in range(batch_size)
         ]
+
+        if forward_batch.return_step_maps:
+            logits_output.diffusion_steps = forward_batch.diffusion_steps
+            step_maps_reshaped = torch.reshape(step_maps, (batch_size, -1))
+            new_step_maps = [
+                step_maps_reshaped[i, start_list[i] :] for i in range(batch_size)
+            ]
+            logits_output.step_maps = new_step_maps
 
         return logits_output, next_token_ids_list, can_run_cuda_graph
 

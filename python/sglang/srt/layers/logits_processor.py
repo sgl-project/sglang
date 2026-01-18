@@ -100,6 +100,8 @@ class LogitsProcessorOutput:
 
     ## Part 4: Diffusion LLM only.
     full_logits: Optional[torch.Tensor] = None
+    step_maps: Optional[List[torch.Tensor]] = None
+    diffusion_steps: Optional[torch.Tensor] = None
 
     ## Part 5: Customized Info
     customized_info: Optional[Dict[str, List[Any]]] = None
@@ -626,7 +628,7 @@ class LogitsProcessor(nn.Module):
 
             logprobs_result = self.process_input_logprobs(input_logits, logits_metadata)
         else:
-            (logprobs_result, sampled_logits) = self.process_input_logprobs_by_chunk(
+            logprobs_result, sampled_logits = self.process_input_logprobs_by_chunk(
                 pruned_states,
                 sample_indices,
                 input_logprob_indices,

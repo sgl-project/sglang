@@ -203,6 +203,9 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
     # Whether to return captured routed experts
     return_routed_experts: bool = False
 
+    # Whether to return diffusion LLM step maps
+    return_step_maps: bool = False
+
     # The modalities of the image data [image, multi-images, video]
     modalities: Optional[List[str]] = None
     # Session info for continual prompting
@@ -545,6 +548,11 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
             self.top_logprobs_num, 0, "top_logprobs_num"
         )
 
+        # Normalize return_step_maps
+        self.return_step_maps = normalize_param(
+            self.return_step_maps, False, "return_step_maps"
+        )
+
         # Handle token_ids_logprob specially due to its nested structure
         if not self.token_ids_logprob:  # covers both None and []
             self.token_ids_logprob = [None] * num
@@ -674,6 +682,11 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
             custom_labels=self.custom_labels,
             return_bytes=self.return_bytes,
             return_entropy=self.return_entropy,
+            return_step_maps=(
+                self.return_step_maps[i]
+                if isinstance(self.return_step_maps, list)
+                else self.return_step_maps
+            ),
             external_trace_header=self.external_trace_header,
             http_worker_ipc=self.http_worker_ipc,
             **{
@@ -760,6 +773,7 @@ class TokenizedGenerateReqInput(BaseReq):
 
     need_wait_for_image: bool = False
     num_items_assigned: Optional[List] = None
+    return_step_maps: bool = False
 
 
 @dataclass
@@ -993,6 +1007,9 @@ class BatchTokenIDOutput(
     # Number of times each request was retracted.
     retraction_counts: List[int]
 
+    # Diffusion LLM step maps
+    step_maps: Optional[List[List[int]]] = None
+
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: List[List[int]] = None
 
@@ -1082,6 +1099,9 @@ class BatchStrOutput(
 
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: List[List[int]] = None
+
+    # Diffusion LLM step maps
+    step_maps: Optional[List[List[int]]] = None
 
     # Load for DP balance
     load: GetLoadReqOutput = None
