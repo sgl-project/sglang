@@ -111,6 +111,7 @@ if HAS_TRITON:
         source_count = tl.load(routed_counts_ptr + source_rank)
         best_count = tl.where(mask, source_count, 2**30)
         best_rank = tl.full([BLOCK_SIZE], source_rank, dtype=tl.int64)
+        has_valid = tl.zeros([BLOCK_SIZE], dtype=tl.int1)
 
         # Check each routed expert and update if better
         for k in range(topk):
@@ -119,6 +120,7 @@ if HAS_TRITON:
                 topk_ids_ptr + token_idx * topk + k, mask=mask, other=-1
             ).to(tl.int64)
             valid = expert_id >= 0
+            has_valid = has_valid | valid
 
             # Compute target rank from ORIGINAL expert ID
             target_rank = expert_id // old_experts_per_rank
@@ -155,6 +157,12 @@ if HAS_TRITON:
             tl.full([BLOCK_SIZE], local_shared_id, dtype=tl.int64),
             remote_shared_id,
         ).to(tl.int64)
+        # Padded / invalid tokens (all routed experts are -1) should not dispatch shared expert.
+        shared_expert_id = tl.where(
+            has_valid,
+            shared_expert_id,
+            tl.full([BLOCK_SIZE], local_marker, dtype=tl.int64),
+        )
 
         # ===== Step 3: Copy and remap topk_ids, copy topk_weights =====
         # Remap: old_id -> old_id + (old_id // old_experts_per_rank)
@@ -173,6 +181,11 @@ if HAS_TRITON:
         # Copy topk_weights columns
         for k in range(topk):
             val = tl.load(topk_weights_ptr + token_idx * topk + k, mask=mask, other=0.0)
+            # For invalid expert IDs, force weight to 0 to avoid any accidental contribution.
+            expert_id = tl.load(
+                topk_ids_ptr + token_idx * topk + k, mask=mask, other=-1
+            ).to(tl.int64)
+            val = tl.where(expert_id >= 0, val, 0.0)
             tl.store(expanded_weights_ptr + token_idx * (topk + 1) + k, val, mask=mask)
 
         # ===== Step 4: Write 9th column (shared expert) =====
@@ -183,7 +196,7 @@ if HAS_TRITON:
         )
         tl.store(
             expanded_weights_ptr + token_idx * (topk + 1) + topk,
-            shared_weight,
+            tl.where(has_valid, shared_weight, 0.0),
             mask=mask,
         )
 
@@ -451,12 +464,14 @@ if HAS_TRITON:
         source_count = tl.load(routed_counts_ptr + source_rank)
         best_count = tl.where(mask, source_count, 2**30)
         best_rank = tl.full([BLOCK_SIZE], source_rank, dtype=tl.int64)
+        has_valid = tl.zeros([BLOCK_SIZE], dtype=tl.int1)
 
         for k in range(topk):
             expert_id = tl.load(
                 topk_ids_ptr + token_idx * topk + k, mask=mask, other=-1
             ).to(tl.int64)
             valid = expert_id >= 0
+            has_valid = has_valid | valid
 
             # Use OLD experts_per_rank for rank calculation from original expert IDs
             target_rank = expert_id // old_experts_per_rank
@@ -488,6 +503,12 @@ if HAS_TRITON:
             tl.full([BLOCK_SIZE], local_shared_id, dtype=tl.int64),
             remote_shared_id,
         ).to(tl.int64)
+        # Padded / invalid tokens (all routed experts are -1) should not dispatch shared expert.
+        shared_expert_id = tl.where(
+            has_valid,
+            shared_expert_id,
+            tl.full([BLOCK_SIZE], local_marker, dtype=tl.int64),
+        )
 
         dest_rank = tl.where(is_local, source_rank, best_rank).to(tl.int32)
 
@@ -507,6 +528,10 @@ if HAS_TRITON:
 
         for k in range(topk):
             val = tl.load(topk_weights_ptr + token_idx * topk + k, mask=mask, other=0.0)
+            expert_id = tl.load(
+                topk_ids_ptr + token_idx * topk + k, mask=mask, other=-1
+            ).to(tl.int64)
+            val = tl.where(expert_id >= 0, val, 0.0)
             tl.store(expanded_weights_ptr + token_idx * (topk + 1) + k, val, mask=mask)
 
         # ===== Step 4: Write 9th column (shared expert) =====
@@ -517,7 +542,7 @@ if HAS_TRITON:
         )
         tl.store(
             expanded_weights_ptr + token_idx * (topk + 1) + topk,
-            shared_weight,
+            tl.where(has_valid, shared_weight, 0.0),
             mask=mask,
         )
 
@@ -527,7 +552,7 @@ if HAS_TRITON:
         # ===== Step 6: Block-level histogram with minimal atomics =====
         # Count destinations per rank within this block using sum reduction
         for r in range(world_size):
-            rank_count = tl.sum(tl.where(mask & (dest_rank == r), 1, 0))
+            rank_count = tl.sum(tl.where(mask & has_valid & (dest_rank == r), 1, 0))
             if rank_count > 0:
                 tl.atomic_add(dest_counts_ptr + r, rank_count)
 
@@ -1001,6 +1026,8 @@ def expand_topk_with_shared_expert(
 
     # Identify local vs remote shared expert
     local_shared_mask = shared_destination == source_rank
+    # Tokens with no valid routed experts (e.g. padded region) should NOT dispatch shared expert.
+    has_any_valid = (topk_ids >= 0).any(dim=1)
 
     # OPTIMIZED: Pre-allocate output tensors
     expanded_topk_ids = torch.empty(
@@ -1024,14 +1051,32 @@ def expand_topk_with_shared_expert(
     # Compute real shared expert IDs: target_rank * new_experts_per_rank + old_experts_per_rank
     # This places shared expert at the end of each rank's expert range
     shared_expert_ids = shared_destination * new_experts_per_rank + old_experts_per_rank
-    expanded_topk_ids[:, topk] = shared_expert_ids.to(topk_ids.dtype)
+    expanded_topk_ids[:, topk] = torch.where(
+        has_any_valid,
+        shared_expert_ids.to(topk_ids.dtype),
+        torch.full(
+            (num_tokens,), LOCAL_SHARED_MARKER, dtype=topk_ids.dtype, device=device
+        ),
+    )
 
     # OPTIMIZED: Pre-allocate weights tensor
     expanded_topk_weights = torch.empty(
         num_tokens, topk + 1, dtype=topk_weights.dtype, device=device
     )
     expanded_topk_weights[:, :topk] = topk_weights
-    expanded_topk_weights[:, topk] = shared_weight
+    expanded_topk_weights[:, topk] = torch.where(
+        has_any_valid,
+        torch.full(
+            (num_tokens,), float(shared_weight), dtype=topk_weights.dtype, device=device
+        ),
+        torch.zeros((num_tokens,), dtype=topk_weights.dtype, device=device),
+    )
+    # For invalid tokens, force all weights to 0 for safety.
+    if (~has_any_valid).any():
+        expanded_topk_weights[~has_any_valid, :topk] = 0.0
+
+    # Local shared mask is only meaningful for tokens that actually dispatch shared expert.
+    local_shared_mask = local_shared_mask & has_any_valid
 
     return expanded_topk_ids, expanded_topk_weights, local_shared_mask
 
@@ -1184,33 +1229,20 @@ class DeepEPWaterfillBalancer:
 
         # Small batch optimization: all shared experts compute locally
         if num_tokens < self.MIN_BATCH_FOR_BALANCE:
-            # Fast path: all local, no waterfill needed
-            # Still need to remap expert IDs to new layout
-            expanded_topk_ids = torch.empty(
-                num_tokens, topk + 1, dtype=topk_ids.dtype, device=device
+            # Fast path: all local, no waterfill needed.
+            # Still need to remap expert IDs to new layout and handle padded/invalid tokens.
+            shared_destination = torch.full(
+                (num_tokens,), self.rank, dtype=torch.int64, device=device
             )
-
-            # Remap routed expert IDs: old_id -> old_id + (old_id // old_experts_per_rank)
-            valid_mask = topk_ids >= 0
-            old_ranks = torch.where(
-                valid_mask,
-                topk_ids // self.old_experts_per_rank,
-                torch.zeros_like(topk_ids),
+            return expand_topk_with_shared_expert(
+                topk_ids,
+                topk_weights,
+                shared_destination,
+                self.num_routed_experts,
+                self.world_size,
+                self.rank,
+                self.shared_weight,
             )
-            remapped_ids = torch.where(valid_mask, topk_ids + old_ranks, topk_ids)
-            expanded_topk_ids[:, :topk] = remapped_ids
-
-            # Local shared expert ID
-            expanded_topk_ids[:, topk] = self.my_shared_expert_id
-
-            expanded_topk_weights = torch.empty(
-                num_tokens, topk + 1, dtype=topk_weights.dtype, device=device
-            )
-            expanded_topk_weights[:, :topk] = topk_weights
-            expanded_topk_weights[:, topk] = self.shared_weight
-
-            local_shared_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
-            return expanded_topk_ids, expanded_topk_weights, local_shared_mask
 
         # ===== Use Fully Fused Triton Kernel on GPU =====
         # This combines waterfill + expand + sparse handling in minimal kernel launches

@@ -1450,11 +1450,22 @@ class DeepseekV2MoE(nn.Module):
 
         router_logits = self.gate(hidden_states, forward_batch=forward_batch)
 
-        # Note: Pass None for num_token_non_padded to avoid masking topk_ids to -1
+        # If this forward uses padded tokens (e.g. CUDA-graph padding), pass num_token_non_padded
+        # so TopK masks padded region to -1. Otherwise, keep it as None to avoid extra overhead.
+        num_token_non_padded = None
+        num_token_non_padded_cpu = getattr(
+            forward_batch, "num_token_non_padded_cpu", None
+        )
+        if (
+            num_token_non_padded_cpu is not None
+            and isinstance(num_token_non_padded_cpu, int)
+            and num_token_non_padded_cpu < num_tokens
+        ):
+            num_token_non_padded = forward_batch.num_token_non_padded
         topk_output = self.topk(
             hidden_states,
             router_logits,
-            num_token_non_padded=None,
+            num_token_non_padded=num_token_non_padded,
             expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
                 layer_id=self.layer_id,
             ),
