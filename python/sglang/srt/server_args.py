@@ -179,6 +179,7 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "flashinfer_mxfp4",
     "flashinfer_cutedsl",
     "cutlass",
+    "sonic_moe",
 ]
 
 MOE_A2A_BACKEND_CHOICES = ["none", "deepep", "mooncake", "ascend_fuseep"]
