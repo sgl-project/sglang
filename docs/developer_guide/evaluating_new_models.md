@@ -104,7 +104,7 @@ python benchmark/mmmu/bench_sglang.py \
 > [!TIP]
 > You can set max tokens by passing `--extra-request-body '{"max_tokens": 4096}'`.
 
-We also encourage evaluating on `Video-MME`, `DocVQA`, and other relevant benchmarks if your model supports them.
+For models capable of processing video, we recommend extending the evaluation to include `VideoMME`, `MVBench`, and other relevant benchmarks.
 
 ## Performance Evaluation
 
@@ -158,48 +158,10 @@ You can run more granular benchmarks:
 - **Medium Concurrency**: `--num-prompts 80 --max-concurrency 16`
 - **High Concurrency**: `--num-prompts 500 --max-concurrency 100`
 
-### VLMs
-
-**Latency-Sensitive Benchmark**
-
-This simulates a scenario with low concurrency (e.g., single user) to measure latency.
-
-```bash
-python -m sglang.bench_serving \
-  --backend sglang-oai-chat \
-  --host 0.0.0.0 \
-  --port 30000 \
-  --dataset-name image \
-  --image-count 2 \
-  --image-resolution 720p \
-  --random-input-len 128 \
-  --random-output-len 1024 \
-  --num-prompts 10 \
-  --max-concurrency 1
-```
-
-**Throughput-Sensitive Benchmark**
-
-This simulates a high-traffic scenario to measure maximum system throughput.
-
-```bash
-python -m sglang.bench_serving \
-  --backend sglang-oai-chat \
-  --host 0.0.0.0 \
-  --port 30000 \
-  --dataset-name image \
-  --image-count 2 \
-  --image-resolution 720p \
-  --random-input-len 128 \
-  --random-output-len 1024 \
-  --num-prompts 1000 \
-  --max-concurrency 100
-```
-
 ## Reporting Results
 
 For each evaluation, please report:
-1.  **Metric Score**: Accuracy %, Latency (ms), Throughput (tok/s).
+1.  **Metric Score**: Accuracy % (LLMs and VLMs); Latency (ms) and Throughput (tok/s) (LLMs only).
 2.  **Environment settings**: GPU type/count, SGLang commit hash.
 3.  **Launch configuration**: Model path, TP size, and any special flags.
 4.  **Evaluation parameters**: Number of shots, examples, max tokens.
