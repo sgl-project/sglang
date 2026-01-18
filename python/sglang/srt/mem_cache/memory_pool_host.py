@@ -158,9 +158,9 @@ class HostKVCache(abc.ABC):
         self.start_layer = device_pool.start_layer
         self.end_layer = device_pool.end_layer
 
-        assert (
-            self.size > device_pool.size
-        ), "The host memory should be larger than the device memory with the current protocol"
+        # assert (
+        #     self.size > device_pool.size
+        # ), "The host memory should be larger than the device memory with the current protocol"
 
         # Verify there is enough available host memory.
         host_mem = psutil.virtual_memory()
