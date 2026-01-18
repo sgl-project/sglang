@@ -1504,6 +1504,8 @@ class ServerArgs:
                 else:
                     self.quantization = model_config.quantization
                 self.moe_runner_backend = "flashinfer_cutlass"
+            if hasattr(model_config.hf_config, "mamba_chunk_size"):
+                self._mamba_chunk_size = model_config.hf_config.mamba_chunk_size
         elif model_arch in [
             "Qwen3MoeForCausalLM",
             "Qwen3VLMoeForConditionalGeneration",
@@ -4890,9 +4892,11 @@ class ServerArgs:
 
     @property
     def mamba_cache_chunk_size(self) -> int:
-        # For mamba cache with extra buffer, the chunk size is the max of FLA_CHUNK_SIZE and page_size.
+        # For mamba cache with extra buffer, the chunk size is the max of FLA_CHUNK_SIZE
+        # (or mamba_chunk_size if it is defined in the model's config) and page_size.
         # It is used to determine the caching point in a sequence during prefill.
-        return max(FLA_CHUNK_SIZE, self.page_size)
+        chunk_size = getattr(self, "_mamba_chunk_size", FLA_CHUNK_SIZE)
+        return max(chunk_size, self.page_size)
 
     def check_server_args(self):
         # Check parallel size constraints
