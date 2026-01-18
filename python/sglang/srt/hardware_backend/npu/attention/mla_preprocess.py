@@ -347,8 +347,7 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
             v_cache = v_cache.view(
                 num_blocks, num_heads * self.qk_rope_head_dim // 16, block_size, 16
             )
-        # TODO: dummy inputs to be removed
-        # https://github.com/sgl-project/sgl-kernel-npu/issues/78
+
         if hasattr(self.q_a_layernorm, "bias"):
             q_a_layernorm_bias = self.q_a_layernorm.bias
         else:
@@ -356,8 +355,6 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
 
         torch.ops.npu.mla_preprocess(
             hidden_states,
-            self.dummy,
-            self.dummy,
             self.qkv_a_proj_weight_nz,
             self.qkv_a_proj_deq_scale_kvq,
             self.q_a_layernorm.weight,
