@@ -643,7 +643,6 @@ class Scheduler(
 
                 self.tree_cache = SWAChunkCache(params)
         else:
-
             if envs.SGLANG_EXPERIMENTAL_CPP_RADIX_TREE.get():
                 # lazy import to avoid JIT overhead
                 from sglang.srt.mem_cache.radix_cache_cpp import RadixCacheCpp
@@ -1972,7 +1971,6 @@ class Scheduler(
 
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
-
             if self.enable_lora:
                 new_lora_set = (
                     lora_set
