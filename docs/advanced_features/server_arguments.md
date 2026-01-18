@@ -56,7 +56,7 @@ You can find all arguments by `python3 -m sglang.launch_server --help`
 - To enable fp8 weight quantization, add `--quantization fp8` on a fp16 checkpoint or directly load a fp8 checkpoint without specifying any arguments.
 - To enable fp8 kv cache quantization, add `--kv-cache-dtype fp8_e5m2`.
 - To enable deterministic inference and batch invariant operations, add `--enable-deterministic-inference`. More details can be found in [deterministic inference document](../advanced_features/deterministic_inference.md).
-- If the model does not have a chat template in the Hugging Face tokenizer, you can specify a [custom chat template](../references/custom_chat_template.md).
+- If the model does not have a chat template in the Hugging Face tokenizer, you can specify a [custom chat template](../references/custom_chat_template.md). If the tokenizer has multiple named templates (e.g., 'default', 'tool_use'), you can select one using `--hf-chat-template-name tool_use`.
 - To run tensor parallelism on multiple nodes, add `--nnodes 2`. If you have two nodes with two GPUs on each node and want to run TP=4, let `sgl-dev-0` be the hostname of the first node and `50000` be an available port, you can use the following commands. If you meet deadlock, please try to add `--disable-cuda-graph`
 
   ```bash
@@ -182,6 +182,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--log-requests-level` | 0: Log metadata (no sampling parameters). 1: Log metadata and sampling parameters. 2: Log metadata, sampling parameters and partial input/output. 3: Log every input/output. | `2` | `0`, `1`, `2`, `3` |
 | `--log-requests-format` | Format for request logging: 'text' (human-readable) or 'json' (structured) | `text` | `text`, `json` |
 | `--log-requests-target` | Target(s) for request logging: 'stdout' and/or directory path(s) for file output. Can specify multiple targets, e.g., '--log-requests-target stdout /my/path'. | `None` | List[str] |
+| `--uvicorn-access-log-exclude-prefixes` | Exclude uvicorn access logs whose request path starts with any of these prefixes. Defaults to empty (disabled). | `[]` | List[str] |
 | `--crash-dump-folder` | Folder path to dump requests from the last 5 min before a crash (if any). If not specified, crash dumping is disabled. | `None` | Type: str |
 | `--show-time-cost` | Show time cost of custom marks. | `False` | bool flag (set to enable) |
 | `--enable-metrics` | Enable log prometheus metrics. | `False` | bool flag (set to enable) |
@@ -215,6 +216,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--served-model-name` | Override the model name returned by the v1/models endpoint in OpenAI API server. | `None` | Type: str |
 | `--weight-version` | Version identifier for the model weights. Defaults to 'default' if not specified. | `default` | Type: str |
 | `--chat-template` | The buliltin chat template name or the path of the chat template file. This is only used for OpenAI-compatible API server. | `None` | Type: str |
+| `--hf-chat-template-name` | When the HuggingFace tokenizer has multiple chat templates (e.g., 'default', 'tool_use', 'rag'), specify which named template to use. If not set, the first available template is used. | `None` | Type: str |
 | `--completion-template` | The buliltin completion template name or the path of the completion template file. This is only used for OpenAI-compatible API server. only for code completion currently. | `None` | Type: str |
 | `--file-storage-path` | The path of the file storage in backend. | `sglang_storage` | Type: str |
 | `--enable-cache-report` | Return number of cached tokens in usage.prompt_tokens_details for each openai request. | `False` | bool flag (set to enable) |

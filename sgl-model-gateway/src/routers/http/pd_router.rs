@@ -281,7 +281,7 @@ impl PDRouter {
         let start_time = Instant::now();
 
         let route = context.route;
-        let model = context.model_id.unwrap_or("default");
+        let model = context.model_id.unwrap_or(UNKNOWN_MODEL_ID);
         let endpoint = route_to_endpoint(route);
 
         // Record request start (Layer 2)
@@ -747,7 +747,8 @@ impl PDRouter {
             headers,
             hash_ring.clone(),
             "prefill",
-        )?;
+        )
+        .await?;
 
         let decode = Self::pick_worker_by_policy_arc(
             &decode_workers,
@@ -756,10 +757,11 @@ impl PDRouter {
             headers,
             hash_ring,
             "decode",
-        )?;
+        )
+        .await?;
 
         // Record worker selection metrics (Layer 3)
-        let model = model_id.unwrap_or("default");
+        let model = model_id.unwrap_or(UNKNOWN_MODEL_ID);
         Metrics::record_worker_selection(
             metrics_labels::WORKER_PREFILL,
             metrics_labels::CONNECTION_HTTP,
@@ -776,7 +778,7 @@ impl PDRouter {
         Ok((prefill, decode))
     }
 
-    fn pick_worker_by_policy_arc(
+    async fn pick_worker_by_policy_arc(
         workers: &[Arc<dyn Worker>],
         policy: &dyn LoadBalancingPolicy,
         request_text: Option<&str>,
@@ -814,6 +816,7 @@ impl PDRouter {
                     hash_ring,
                 },
             )
+            .await
             .ok_or_else(|| {
                 format!(
                     "Policy {} failed to select a {} worker",
