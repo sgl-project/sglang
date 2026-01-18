@@ -57,7 +57,7 @@ ENV LC_ALL=en_US.UTF-8
 
 
 ### Install MemFabric
-RUN ${PIP_INSTALL} mf-adapter==1.0.0
+RUN ${PIP_INSTALL} memfabric-hybrid==1.0.0
 ### Install SGLang Model Gateway
 RUN ${PIP_INSTALL} sglang-router
 

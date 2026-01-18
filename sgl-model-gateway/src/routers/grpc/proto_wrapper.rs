@@ -20,20 +20,7 @@ pub enum ProtoRequest {
 }
 
 impl ProtoRequest {
-    pub fn as_generate(&self) -> &ProtoGenerateRequest {
-        match self {
-            Self::Generate(req) => req,
-            _ => panic!("Expected Generate request"),
-        }
-    }
-
-    pub fn as_embed(&self) -> &ProtoEmbedRequest {
-        match self {
-            Self::Embed(req) => req,
-            _ => panic!("Expected Embed request"),
-        }
-    }
-
+    /// Get request ID from either variant
     pub fn request_id(&self) -> &str {
         match self {
             Self::Generate(req) => req.request_id(),
@@ -108,7 +95,7 @@ impl ProtoGenerateRequest {
 
 /// Unified GenerateResponse from stream
 pub enum ProtoGenerateResponse {
-    Sglang(sglang::GenerateResponse),
+    Sglang(Box<sglang::GenerateResponse>),
     Vllm(vllm::GenerateResponse),
 }
 
@@ -137,9 +124,7 @@ impl ProtoGenerateResponse {
                 Some(vllm::generate_response::Response::Complete(complete)) => {
                     ProtoResponseVariant::Complete(ProtoGenerateComplete::Vllm(complete))
                 }
-                Some(vllm::generate_response::Response::Error(error)) => {
-                    ProtoResponseVariant::Error(ProtoGenerateError::Vllm(error))
-                }
+                // Note: vLLM proto no longer has Error variant in GenerateResponse
                 None => ProtoResponseVariant::None,
             },
         }
@@ -217,7 +202,7 @@ impl ProtoGenerateStreamChunk {
     pub fn prompt_tokens(&self) -> i32 {
         match self {
             Self::Sglang(c) => c.prompt_tokens,
-            Self::Vllm(c) => c.prompt_tokens,
+            Self::Vllm(c) => c.prompt_tokens as i32,
         }
     }
 
@@ -225,7 +210,7 @@ impl ProtoGenerateStreamChunk {
     pub fn completion_tokens(&self) -> i32 {
         match self {
             Self::Sglang(c) => c.completion_tokens,
-            Self::Vllm(c) => c.completion_tokens,
+            Self::Vllm(c) => c.completion_tokens as i32,
         }
     }
 
@@ -233,7 +218,7 @@ impl ProtoGenerateStreamChunk {
     pub fn cached_tokens(&self) -> i32 {
         match self {
             Self::Sglang(c) => c.cached_tokens,
-            Self::Vllm(c) => c.cached_tokens,
+            Self::Vllm(c) => c.cached_tokens as i32,
         }
     }
 }
@@ -292,7 +277,7 @@ impl ProtoGenerateComplete {
     pub fn prompt_tokens(&self) -> i32 {
         match self {
             Self::Sglang(c) => c.prompt_tokens,
-            Self::Vllm(c) => c.prompt_tokens,
+            Self::Vllm(c) => c.prompt_tokens as i32,
         }
     }
 
@@ -300,7 +285,7 @@ impl ProtoGenerateComplete {
     pub fn completion_tokens(&self) -> i32 {
         match self {
             Self::Sglang(c) => c.completion_tokens,
-            Self::Vllm(c) => c.completion_tokens,
+            Self::Vllm(c) => c.completion_tokens as i32,
         }
     }
 
@@ -342,7 +327,7 @@ impl ProtoGenerateComplete {
     pub fn cached_tokens(&self) -> i32 {
         match self {
             Self::Sglang(c) => c.cached_tokens,
-            Self::Vllm(_) => 0, // vLLM doesn't have cached_tokens field
+            Self::Vllm(c) => c.cached_tokens as i32,
         }
     }
 
@@ -364,10 +349,10 @@ impl ProtoGenerateComplete {
 }
 
 /// Unified GenerateError
+/// Note: vLLM proto no longer has GenerateError - errors are returned via gRPC status
 #[derive(Clone)]
 pub enum ProtoGenerateError {
     Sglang(sglang::GenerateError),
-    Vllm(vllm::GenerateError),
 }
 
 impl ProtoGenerateError {
@@ -375,7 +360,6 @@ impl ProtoGenerateError {
     pub fn message(&self) -> &str {
         match self {
             Self::Sglang(e) => &e.message,
-            Self::Vllm(e) => &e.message,
         }
     }
 }
@@ -393,7 +377,7 @@ impl ProtoStream {
             Self::Sglang(stream) => stream
                 .next()
                 .await
-                .map(|result| result.map(ProtoGenerateResponse::Sglang)),
+                .map(|result| result.map(|r| ProtoGenerateResponse::Sglang(Box::new(r)))),
             Self::Vllm(stream) => stream
                 .next()
                 .await

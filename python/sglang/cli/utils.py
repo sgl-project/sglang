@@ -2,7 +2,9 @@ import hashlib
 import json
 import logging
 import os
+import subprocess
 import tempfile
+from functools import lru_cache
 from typing import Optional
 
 import filelock
@@ -150,3 +152,22 @@ def get_model_path(extra_argv):
                 "Please provide the path to the model."
             )
     return model_path
+
+
+@lru_cache(maxsize=1)
+def get_git_commit_hash() -> str:
+    try:
+        commit_hash = os.environ.get("SGLANG_GIT_COMMIT")
+        if not commit_hash:
+            commit_hash = (
+                subprocess.check_output(
+                    ["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL
+                )
+                .strip()
+                .decode("utf-8")
+            )
+        _CACHED_COMMIT_HASH = commit_hash
+        return commit_hash
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        _CACHED_COMMIT_HASH = "N/A"
+        return "N/A"

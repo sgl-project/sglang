@@ -28,13 +28,9 @@ fn error_response(status: StatusCode, message: &str) -> Response {
 
 /// Parse function calls from model output text
 pub async fn parse_function_call(
-    context: Option<&Arc<AppContext>>,
+    ctx: &Arc<AppContext>,
     req: &ParseFunctionCallRequest,
 ) -> Response {
-    let Some(ctx) = context else {
-        return error_response(StatusCode::SERVICE_UNAVAILABLE, "Context not initialized");
-    };
-
     let Some(factory) = &ctx.tool_parser_factory else {
         return error_response(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -71,14 +67,7 @@ pub async fn parse_function_call(
 }
 
 /// Parse and separate reasoning from normal text
-pub async fn parse_reasoning(
-    context: Option<&Arc<AppContext>>,
-    req: &SeparateReasoningRequest,
-) -> Response {
-    let Some(ctx) = context else {
-        return error_response(StatusCode::SERVICE_UNAVAILABLE, "Context not initialized");
-    };
-
+pub async fn parse_reasoning(ctx: &Arc<AppContext>, req: &SeparateReasoningRequest) -> Response {
     let Some(factory) = &ctx.reasoning_parser_factory else {
         return error_response(
             StatusCode::SERVICE_UNAVAILABLE,

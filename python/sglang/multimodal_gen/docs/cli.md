@@ -14,6 +14,8 @@ The SGLang-diffusion CLI provides a quick way to access the inference pipeline f
 
 - `--model-path {MODEL_PATH}`: Path to the model or model ID
 - `--vae-path {VAE_PATH}`: Path to a custom VAE model or HuggingFace model ID (e.g., `fal/FLUX.2-Tiny-AutoEncoder`). If not specified, the VAE will be loaded from the main model path.
+- `--lora-path {LORA_PATH}`: Path to a LoRA adapter (local path or HuggingFace model ID). If not specified, LoRA will not be applied.
+- `--lora-nickname {NAME}`: Nickname for the LoRA adapter. (default: `default`).
 - `--num-gpus {NUM_GPUS}`: Number of GPUs to use
 - `--tp-size {TP_SIZE}`: Tensor parallelism size (only for the encoder; should not be larger than 1 if text encoder offload is enabled, as layer-wise offload plus prefetch is faster)
 - `--sp-degree {SP_SIZE}`: Sequence parallelism size (typically should match the number of GPUs)
@@ -152,6 +154,32 @@ sglang serve "${SERVER_ARGS[@]}"
 
 For detailed API usage, including Image, Video Generation and LoRA management, please refer to the [OpenAI API Documentation](openai_api.md).
 
+### Cloud Storage Support
+
+SGLang diffusion supports automatically uploading generated images and videos to S3-compatible cloud storage (e.g., AWS S3, MinIO, Alibaba Cloud OSS, Tencent Cloud COS).
+
+When enabled, the server follows a **Generate -> Upload -> Delete** workflow:
+1. The artifact is generated to a temporary local file.
+2. The file is immediately uploaded to the configured S3 bucket in a background thread.
+3. Upon successful upload, the local file is deleted.
+4. The API response returns the public URL of the uploaded object.
+
+#### Configuration
+
+Cloud storage is enabled via environment variables. Note that `boto3` must be installed separately (`pip install boto3`) to use this feature.
+
+```bash
+# Enable S3 storage
+export SGLANG_CLOUD_STORAGE_TYPE=s3
+export SGLANG_S3_BUCKET_NAME=my-bucket
+export SGLANG_S3_ACCESS_KEY_ID=your-access-key
+export SGLANG_S3_SECRET_ACCESS_KEY=your-secret-key
+
+# Optional: Custom endpoint for MinIO/OSS/COS
+export SGLANG_S3_ENDPOINT_URL=https://minio.example.com
+```
+
+See [Environment Variables Documentation](environment_variables.md) for more details.
 
 ## Generate
 
@@ -186,3 +214,57 @@ Once the generation task has finished, the server will shut down automatically.
 
 > [!NOTE]
 > The HTTP server-related arguments are ignored in this subcommand.
+
+## Diffusers Backend
+
+SGLang diffusion supports a **diffusers backend** that allows you to run any diffusers-compatible model through SGLang's infrastructure using vanilla diffusers pipelines. This is useful for running models without native SGLang implementations or models with custom pipeline classes.
+
+### Arguments
+
+| Argument | Values | Description |
+|----------|--------|-------------|
+| `--backend` | `auto` (default), `sglang`, `diffusers` | `auto`: prefer native SGLang, fallback to diffusers. `sglang`: force native (fails if unavailable). `diffusers`: force vanilla diffusers pipeline. |
+| `--diffusers-attention-backend` | `flash`, `_flash_3_hub`, `sage`, `xformers`, `native` | Attention backend for diffusers pipelines. See [diffusers attention backends](https://huggingface.co/docs/diffusers/main/en/optimization/attention_backends). |
+| `--trust-remote-code` | flag | Required for models with custom pipeline classes (e.g., Ovis). |
+| `--vae-tiling` | flag | Enable VAE tiling for large image support (decodes tile-by-tile). |
+| `--vae-slicing` | flag | Enable VAE slicing for lower memory usage (decodes slice-by-slice). |
+| `--dit-precision` | `fp16`, `bf16`, `fp32` | Precision for the diffusion transformer. |
+| `--vae-precision` | `fp16`, `bf16`, `fp32` | Precision for the VAE. |
+
+### Example: Running Ovis-Image-7B
+
+[Ovis-Image-7B](https://huggingface.co/AIDC-AI/Ovis-Image-7B) is a 7B text-to-image model optimized for high-quality text rendering.
+
+```bash
+sglang generate \
+  --model-path AIDC-AI/Ovis-Image-7B \
+  --backend diffusers \
+  --trust-remote-code \
+  --diffusers-attention-backend flash \
+  --prompt "A serene Japanese garden with cherry blossoms" \
+  --height 1024 \
+  --width 1024 \
+  --num-inference-steps 30 \
+  --save-output \
+  --output-path outputs \
+  --output-file-name ovis_garden.png
+```
+
+### Extra Diffusers Arguments
+
+For pipeline-specific parameters not exposed via CLI, use `diffusers_kwargs` in a config file:
+
+```json
+{
+    "model_path": "AIDC-AI/Ovis-Image-7B",
+    "backend": "diffusers",
+    "prompt": "A beautiful landscape",
+    "diffusers_kwargs": {
+        "cross_attention_kwargs": {"scale": 0.5}
+    }
+}
+```
+
+```bash
+sglang generate --config config.json
+```

@@ -719,6 +719,140 @@ class TestBaseFormatDetector(unittest.TestCase):
             self.detector._buffer, "", "Buffer should be cleared for invalid tool"
         )
 
+    def test_chinese_characters_not_double_escaped(self):
+        """Test that Chinese characters in tool call parameters are not double-escaped."""
+        # Test with Chinese city name "杭州" (Hangzhou)
+        chunks = [
+            "<tool_call>",
+            '{"name": "get_weather", ',
+            '"arguments": {"city": "杭州"}}',
+            "</tool_call>",
+        ]
+
+        accumulated_parameters = {}
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            if result.calls:
+                for call in result.calls:
+                    if call.parameters:
+                        tool_idx = call.tool_index if call.tool_index is not None else 0
+                        if tool_idx not in accumulated_parameters:
+                            accumulated_parameters[tool_idx] = ""
+                        accumulated_parameters[tool_idx] += call.parameters
+
+        # Verify that Chinese characters are preserved (not escaped as \uXXXX)
+        self.assertGreater(
+            len(accumulated_parameters), 0, "Should have parsed parameters"
+        )
+        final_params_str = accumulated_parameters[0]
+
+        # The parameters string should contain the actual Chinese characters, not escaped Unicode
+        self.assertIn(
+            "杭州", final_params_str, "Should contain actual Chinese characters"
+        )
+        self.assertNotIn(
+            "\\u676d", final_params_str, "Should not contain escaped Unicode sequences"
+        )
+        self.assertNotIn(
+            "\\u5dde", final_params_str, "Should not contain escaped Unicode sequences"
+        )
+
+        # Verify the JSON can be parsed and contains the correct value
+        params = json.loads(final_params_str)
+        self.assertEqual(
+            params["city"], "杭州", "Should correctly parse Chinese city name"
+        )
+
+    def test_chinese_characters_incremental_streaming(self):
+        """Test that Chinese characters work correctly with incremental streaming."""
+        # Test incremental streaming with Chinese characters
+        chunks = [
+            "<tool_call>",
+            '{"name": "get_weather", ',
+            '"arguments": {"city": "',
+            "杭州",
+            '"}}',
+            "</tool_call>",
+        ]
+
+        accumulated_parameters = {}
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            if result.calls:
+                for call in result.calls:
+                    if call.parameters:
+                        tool_idx = call.tool_index if call.tool_index is not None else 0
+                        if tool_idx not in accumulated_parameters:
+                            accumulated_parameters[tool_idx] = ""
+                        accumulated_parameters[tool_idx] += call.parameters
+
+        # Verify Chinese characters are preserved throughout streaming
+        self.assertGreater(
+            len(accumulated_parameters), 0, "Should have parsed parameters"
+        )
+        final_params_str = accumulated_parameters[0]
+
+        # Should contain actual Chinese characters, not escaped
+        self.assertIn(
+            "杭州", final_params_str, "Should contain actual Chinese characters"
+        )
+
+        # Parse and verify
+        params = json.loads(final_params_str)
+        self.assertEqual(
+            params["city"], "杭州", "Should correctly parse Chinese city name"
+        )
+
+    def test_multiple_chinese_parameters(self):
+        """Test multiple tool calls with Chinese parameters."""
+        # Test with multiple tool calls containing Chinese characters
+        chunks = [
+            "<tool_call>",
+            '{"name": "get_weather", "arguments": {"city": "北京"}}, ',
+            '{"name": "get_tourist_attractions", "arguments": {"city": "上海"}}',
+            "</tool_call>",
+        ]
+
+        accumulated_parameters = {}
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            if result.calls:
+                for call in result.calls:
+                    if call.parameters:
+                        tool_idx = call.tool_index if call.tool_index is not None else 0
+                        if tool_idx not in accumulated_parameters:
+                            accumulated_parameters[tool_idx] = ""
+                        accumulated_parameters[tool_idx] += call.parameters
+
+        # Verify both tool calls have correct Chinese characters
+        self.assertGreaterEqual(
+            len(accumulated_parameters), 1, "Should have parsed parameters"
+        )
+
+        # Check first tool call (北京 - Beijing)
+        if 0 in accumulated_parameters:
+            params0 = json.loads(accumulated_parameters[0])
+            self.assertIn(
+                "北京",
+                accumulated_parameters[0],
+                "Should contain actual Chinese characters",
+            )
+            self.assertEqual(
+                params0["city"], "北京", "Should correctly parse first Chinese city"
+            )
+
+        # Check second tool call (上海 - Shanghai) if present
+        if 1 in accumulated_parameters:
+            params1 = json.loads(accumulated_parameters[1])
+            self.assertIn(
+                "上海",
+                accumulated_parameters[1],
+                "Should contain actual Chinese characters",
+            )
+            self.assertEqual(
+                params1["city"], "上海", "Should correctly parse second Chinese city"
+            )
+
 
 class TestLlama32Detector(unittest.TestCase):
     def setUp(self):
@@ -1159,6 +1293,10 @@ class TestDeepSeekV32Detector(unittest.TestCase):
             ),
         ]
         self.detector = DeepSeekV32Detector()
+        from transformers import AutoTokenizer
+
+        self.tokenizer = AutoTokenizer.from_pretrained("deepseek-ai/DeepSeek-V3.2")
+        self.interval = 1
 
     def test_detect_and_parse_xml_format(self):
         """Test parsing standard XML format (DSML)"""
@@ -1236,12 +1374,19 @@ class TestDeepSeekV32Detector(unittest.TestCase):
         text = """<｜DSML｜function_calls>
             <｜DSML｜invoke name="get_favorite_tourist_spot">
                 <｜DSML｜parameter name="city" string="true">San Francisco</｜DSML｜parameter>
+                <｜DSML｜parameter name="another_city" string="true">London</｜DSML｜parameter>
+                <｜DSML｜parameter name="topn" string="false">10</｜DSML｜parameter>
+                <｜DSML｜parameter name="obj" string="false">{"name": "John", "age": 30}</｜DSML｜parameter>
             </｜DSML｜invoke>
         </｜DSML｜function_calls>"""
 
-        chunks = [text[i : i + 5] for i in range(0, len(text), 5)]
+        input_ids = self.tokenizer.encode(text, add_special_tokens=False)
+        chunk_ids = [
+            input_ids[i : i + self.interval]
+            for i in range(0, len(input_ids), self.interval)
+        ]
+        chunks = [self.tokenizer.decode(chunk_id) for chunk_id in chunk_ids]
 
-        accumulated_calls = []
         tool_calls_by_index = {}
 
         for chunk in chunks:
@@ -1263,15 +1408,12 @@ class TestDeepSeekV32Detector(unittest.TestCase):
 
         self.assertEqual(len(tool_calls_by_index), 1)
         self.assertEqual(tool_calls_by_index[0]["name"], "get_favorite_tourist_spot")
-        # Note: The detector might accumulate partial JSON string which is valid,
-        # but for XML format it constructs JSON at the end.
-        # Let's check if the final parameters parse correctly.
-        try:
-            params = json.loads(tool_calls_by_index[0]["parameters"])
-            self.assertEqual(params["city"], "San Francisco")
-        except json.JSONDecodeError:
-            # In streaming XML, parameters might be constructed differently or incrementally
-            pass
+        params = json.loads(tool_calls_by_index[0]["parameters"])
+        self.assertEqual(params["city"], "San Francisco")
+        self.assertEqual(params["another_city"], "London")
+        self.assertEqual(params["topn"], 10)
+        self.assertEqual(params["obj"]["name"], "John")
+        self.assertEqual(params["obj"]["age"], 30)
 
     def test_streaming_json_format(self):
         """Test streaming parsing of JSON format"""
@@ -1283,7 +1425,12 @@ class TestDeepSeekV32Detector(unittest.TestCase):
             </｜DSML｜invoke>
         </｜DSML｜function_calls>"""
 
-        chunks = [text[i : i + 5] for i in range(0, len(text), 5)]
+        input_ids = self.tokenizer.encode(text, add_special_tokens=False)
+        chunk_ids = [
+            input_ids[i : i + self.interval]
+            for i in range(0, len(input_ids), self.interval)
+        ]
+        chunks = [self.tokenizer.decode(chunk_id) for chunk_id in chunk_ids]
 
         tool_calls_by_index = {}
 
@@ -1370,7 +1517,12 @@ class TestDeepSeekV32Detector(unittest.TestCase):
         self.detector = DeepSeekV32Detector()
 
         # Simulate streaming by splitting into small chunks
-        chunks = [text[i : i + 5] for i in range(0, len(text), 5)]
+        input_ids = self.tokenizer.encode(text, add_special_tokens=False)
+        chunk_ids = [
+            input_ids[i : i + self.interval]
+            for i in range(0, len(input_ids), self.interval)
+        ]
+        chunks = [self.tokenizer.decode(chunk_id) for chunk_id in chunk_ids]
 
         tool_calls_by_index = {}
 
@@ -1425,7 +1577,12 @@ class TestDeepSeekV32Detector(unittest.TestCase):
         # Reset detector state
         self.detector = DeepSeekV32Detector()
 
-        chunks = [text[i : i + 5] for i in range(0, len(text), 5)]
+        input_ids = self.tokenizer.encode(text, add_special_tokens=False)
+        chunk_ids = [
+            input_ids[i : i + self.interval]
+            for i in range(0, len(input_ids), self.interval)
+        ]
+        chunks = [self.tokenizer.decode(chunk_id) for chunk_id in chunk_ids]
 
         tool_calls_by_index = {}
 
@@ -2233,6 +2390,21 @@ class TestGlm4MoeDetector(unittest.TestCase):
             tools_with_array,
         )
         check_single_todos(result, expected_output)
+
+    def test_empty_function_name_handling(self):
+        """Test that empty function name is handled gracefully without assertion error."""
+        # This test simulates the issue where the model outputs only the start token without a function name
+        chunks = [
+            "<tool_call>",  # Start token only, no function name yet
+            "\n",  # More content without function name
+        ]
+
+        for chunk in chunks:
+            # Should not raise AssertionError: func_name should not be empty
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            # Should return empty calls without error
+            self.assertIsInstance(result, StreamingParseResult)
+            self.assertEqual(result.calls, [])
 
 
 class TestGlm47MoeDetector(unittest.TestCase):

@@ -11,6 +11,7 @@ from sglang.multimodal_gen.configs.models.encoders.clip import (
     CLIPVisionConfig,
 )
 from sglang.multimodal_gen.configs.models.encoders.llama import LlamaConfig
+from sglang.multimodal_gen.configs.models.encoders.qwen3 import Qwen3TextConfig
 from sglang.multimodal_gen.configs.models.encoders.t5 import T5Config
 
 __all__ = [
@@ -21,5 +22,6 @@ __all__ = [
     "CLIPTextConfig",
     "CLIPVisionConfig",
     "LlamaConfig",
+    "Qwen3TextConfig",
     "T5Config",
 ]

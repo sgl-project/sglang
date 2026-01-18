@@ -29,7 +29,7 @@ jobs:
 
       - name: Build and Push
         run: |
-          version=$(cat sgl-model-gateway/bindings/python/sglang_router/version.py | cut -d'"' -f2)
+          version=$(cat sgl-model-gateway/bindings/python/src/sglang_router/version.py | cut -d'"' -f2)
           tag=v${version}
 
           docker buildx build . -f docker/gateway.Dockerfile \

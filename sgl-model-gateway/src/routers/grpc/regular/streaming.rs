@@ -38,7 +38,7 @@ use crate::{
 
 /// Shared streaming processor for both single and dual dispatch modes
 #[derive(Clone)]
-pub struct StreamingProcessor {
+pub(crate) struct StreamingProcessor {
     tool_parser_factory: ToolParserFactory,
     reasoning_parser_factory: ReasoningParserFactory,
     configured_tool_parser: Option<String>,
@@ -1324,7 +1324,9 @@ impl StreamingProcessor {
 }
 
 /// Build SSE response with proper headers
-pub fn build_sse_response(rx: mpsc::UnboundedReceiver<Result<Bytes, io::Error>>) -> Response {
+pub(crate) fn build_sse_response(
+    rx: mpsc::UnboundedReceiver<Result<Bytes, io::Error>>,
+) -> Response {
     let stream = UnboundedReceiverStream::new(rx);
     let mut response = Response::new(Body::from_stream(stream));
     *response.status_mut() = StatusCode::OK;

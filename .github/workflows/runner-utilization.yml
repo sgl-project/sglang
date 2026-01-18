@@ -1,0 +1,43 @@
+name: Runner Utilization Report
+
+on:
+  schedule:
+    - cron: '0 8 * * *'  # Daily at 8 AM UTC
+  pull_request:
+    paths:
+      - '.github/workflows/runner-utilization.yml'
+      - 'scripts/ci/runner_utilization_report.py'
+  workflow_dispatch:
+    inputs:
+      hours:
+        description: 'Time window in hours'
+        required: false
+        default: '24'
+        type: string
+      filter:
+        description: 'Filter runner labels (e.g., 5090, h200)'
+        required: false
+        type: string
+
+jobs:
+  report:
+    name: Generate Report
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Generate Utilization Report
+        timeout-minutes: 30
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python scripts/ci/runner_utilization_report.py \
+            --repo ${{ github.repository }} \
+            --hours ${{ inputs.hours || '6' }} \
+            ${{ inputs.filter && format('--filter {0}', inputs.filter) || '' }}

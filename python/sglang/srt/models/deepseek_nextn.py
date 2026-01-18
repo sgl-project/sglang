@@ -28,8 +28,8 @@ from sglang.srt.layers.attention.nsa.utils import (
     can_cp_split,
     cp_all_gather_rerange_output,
     cp_split_and_rebuild_data,
-    enable_prefill_cp,
     is_nsa_enable_prefill_cp,
+    nsa_use_prefill_cp,
     prepare_input_dp_with_cp_dsa,
 )
 from sglang.srt.layers.dp_attention import (
@@ -71,12 +71,12 @@ class DeepseekModelNextN(nn.Module):
         super().__init__()
         if enable_nextn_moe_bf16_cast_to_fp8(quant_config):
             # refer to real DeepSeek V3 quant config
-            moe_quant_config = Fp8Config(
+            moe_quant_config_override = Fp8Config(
                 is_checkpoint_fp8_serialized=True,
                 weight_block_size=[128, 128],
             )
         else:
-            moe_quant_config = None
+            moe_quant_config_override = None
 
         if quant_config is not None and quant_config.get_name() == "modelopt_fp4":
             logger.warning(
@@ -115,7 +115,7 @@ class DeepseekModelNextN(nn.Module):
             config,
             0,
             quant_config=quant_config,
-            moe_quant_config=moe_quant_config,
+            moe_quant_config_override=moe_quant_config_override,
             is_nextn=True,
             prefix=add_prefix(layer_name, prefix),
             alt_stream=self.alt_stream,
@@ -160,7 +160,7 @@ class DeepseekModelNextN(nn.Module):
                 )
             )
 
-        if enable_prefill_cp(forward_batch, self.nsa_enable_prefill_cp):
+        if nsa_use_prefill_cp(forward_batch, self.nsa_enable_prefill_cp):
             hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
         residual = None
         with get_global_expert_distribution_recorder().disable_this_region():
@@ -178,7 +178,7 @@ class DeepseekModelNextN(nn.Module):
             else:
                 hidden_states = self.shared_head.norm(hidden_states)
 
-            if enable_prefill_cp(forward_batch, self.nsa_enable_prefill_cp):
+            if nsa_use_prefill_cp(forward_batch, self.nsa_enable_prefill_cp):
                 # allgather + rerrange
                 hidden_states = cp_all_gather_rerange_output(
                     hidden_states,
@@ -235,10 +235,9 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
     ) -> torch.Tensor:
         # TODO current just support prefill batch=1 and len(input_ids) > self.cp_size * 2
         if self.nsa_enable_prefill_cp:
-            cur_cp_seq_len = len(input_ids) // (self.cp_size * 2)
-            if can_cp_split(cur_cp_seq_len, self.cp_size, self.use_nsa, forward_batch):
+            if can_cp_split(len(input_ids), self.cp_size, self.use_nsa, forward_batch):
                 forward_batch.nsa_cp_metadata = prepare_input_dp_with_cp_dsa(
-                    torch.tensor(len(input_ids)),
+                    len(input_ids),
                     self.cp_rank,
                     self.cp_size,
                     forward_batch.seq_lens_cpu.tolist(),

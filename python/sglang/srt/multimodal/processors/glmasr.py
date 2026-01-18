@@ -1,14 +1,14 @@
 import re
 
-from sglang.srt.models.glmasr import GlmasrForConditionalGeneration
+from sglang.srt.models.glmasr import GlmAsrForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,
 )
 
 
-class GlmasrProcessor(BaseMultimodalProcessor):
-    models = [GlmasrForConditionalGeneration]
+class GlmAsrProcessor(BaseMultimodalProcessor):
+    models = [GlmAsrForConditionalGeneration]
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)

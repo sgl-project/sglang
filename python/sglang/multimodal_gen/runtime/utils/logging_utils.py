@@ -18,8 +18,6 @@ from typing import Any, cast
 
 import sglang.multimodal_gen.envs as envs
 
-SGLANG_DIFFUSION_CONFIGURE_LOGGING = envs.SGLANG_DIFFUSION_CONFIGURE_LOGGING
-SGLANG_DIFFUSION_LOGGING_CONFIG_PATH = envs.SGLANG_DIFFUSION_LOGGING_CONFIG_PATH
 SGLANG_DIFFUSION_LOGGING_LEVEL = envs.SGLANG_DIFFUSION_LOGGING_LEVEL
 SGLANG_DIFFUSION_LOGGING_PREFIX = envs.SGLANG_DIFFUSION_LOGGING_PREFIX
 
@@ -468,7 +466,10 @@ def log_generation_timer(
         yield timer
         timer.end_time = time.perf_counter()
         timer.duration = timer.end_time - timer.start_time
-        logger.info("Pixel data generated successfully in %.2f seconds", timer.duration)
+        logger.info(
+            f"Pixel data generated successfully in {GREEN}%.2f{RESET} seconds",
+            timer.duration,
+        )
     except Exception as e:
         if request_idx is not None:
             logger.error(
@@ -489,7 +490,7 @@ def log_batch_completion(
     logger: logging.Logger, num_outputs: int, total_time: float
 ) -> None:
     logger.info(
-        "Completed batch processing. Generated %d outputs in %.2f seconds.",
+        f"Completed batch processing. Generated %d outputs in {GREEN}%.2f{RESET} seconds",
         num_outputs,
         total_time,
     )

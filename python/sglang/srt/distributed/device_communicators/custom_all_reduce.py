@@ -433,6 +433,25 @@ def dispatch_custom_allreduce():
     On AMD with 1-stage AR enabled, use sglang's CustomAllreduce (has deterministic_all_reduce method).
     Otherwise use AiterCustomAllreduce if available.
     """
+    if _is_cuda:
+        return CustomAllreduce
+
+    assert _is_hip
+
+    if envs.SGLANG_USE_1STAGE_ALLREDUCE.is_set():
+        if envs.SGLANG_USE_1STAGE_ALLREDUCE.get():
+            logger.debug(
+                "[AR] All-reduce: 1-stage kernel (SGLANG_USE_1STAGE_ALLREDUCE=1)"
+            )
+        else:
+            logger.debug("[AR] All-reduce: default (SGLANG_USE_1STAGE_ALLREDUCE=0)")
+    elif envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get():
+        logger.debug(
+            "[AR] All-reduce: 1-stage kernel (deterministic inference enabled)"
+        )
+    else:
+        logger.debug("[AR] All-reduce: default")
+
     # Check if 1-stage AR should be used
     if envs.SGLANG_USE_1STAGE_ALLREDUCE.is_set():
         use_1stage = envs.SGLANG_USE_1STAGE_ALLREDUCE.get()
@@ -441,11 +460,10 @@ def dispatch_custom_allreduce():
 
     # On AMD with 1-stage AR, use sglang's CustomAllreduce
     # (AiterCustomAllreduce doesn't have deterministic_all_reduce method)
-    if is_hip() and use_1stage:
-        logger.info("[AR] Using sglang CustomAllreduce (1-stage kernel)")
+    if use_1stage:
         return CustomAllreduce
 
-    if is_hip() and get_bool_env_var("SGLANG_USE_AITER_AR", default="true"):
+    if get_bool_env_var("SGLANG_USE_AITER_AR", default="true"):
         try:
             from aiter.dist.device_communicators.custom_all_reduce import (
                 CustomAllreduce as AiterCustomAllreduce,
@@ -460,5 +478,5 @@ def dispatch_custom_allreduce():
                 e,
             )
             return CustomAllreduce
-    logger.info("[AR] Using sglang CustomAllreduce")
+
     return CustomAllreduce

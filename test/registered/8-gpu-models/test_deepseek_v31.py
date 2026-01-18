@@ -4,16 +4,15 @@ from sglang.test.accuracy_test_runner import AccuracyTestParams
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.performance_test_runner import PerformanceTestParams
 from sglang.test.run_combined_tests import run_combined_tests
-from sglang.test.test_utils import ModelLaunchSettings, is_blackwell_system
+from sglang.test.test_utils import ModelLaunchSettings
 
 # Runs on both H200 and B200 via nightly-8-gpu-common suite
-register_cuda_ci(est_time=12000, suite="nightly-8-gpu-common", nightly=True)
+register_cuda_ci(est_time=5400, suite="nightly-8-gpu-common", nightly=True)
 
 DEEPSEEK_V31_MODEL_PATH = "deepseek-ai/DeepSeek-V3.1"
 
 
-@unittest.skipIf(not is_blackwell_system(), "Requires B200")
-class TestDeepseekV31Unified(unittest.TestCase):
+class TestDeepseekV31(unittest.TestCase):
     """Unified test class for DeepSeek-V3.1 performance and accuracy.
 
     Two variants:
@@ -48,12 +47,14 @@ class TestDeepseekV31Unified(unittest.TestCase):
                 DEEPSEEK_V31_MODEL_PATH,
                 tp_size=8,
                 extra_args=base_args,
+                variant="TP8",
             ),
             # Variant: "mtp" - TP=8 + EAGLE speculative decoding
             ModelLaunchSettings(
                 DEEPSEEK_V31_MODEL_PATH,
                 tp_size=8,
                 extra_args=base_args + mtp_args,
+                variant="TP8+MTP",
             ),
         ]
 

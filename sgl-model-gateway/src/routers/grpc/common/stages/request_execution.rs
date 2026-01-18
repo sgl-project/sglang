@@ -19,12 +19,12 @@ use crate::routers::{
 type StreamResult = Result<ProtoStream, Box<dyn std::error::Error + Send + Sync>>;
 
 /// Request execution stage: Execute gRPC requests (single or dual dispatch)
-pub struct RequestExecutionStage {
+pub(crate) struct RequestExecutionStage {
     mode: ExecutionMode,
 }
 
 #[derive(Debug, Clone, Copy)]
-pub enum ExecutionMode {
+pub(crate) enum ExecutionMode {
     /// Regular mode: single worker execution
     Single,
     /// PD mode: dual dispatch to prefill + decode workers
@@ -72,7 +72,7 @@ impl PipelineStage for RequestExecutionStage {
             )
         })?;
 
-        ctx.state.load_guards = Some(LoadGuards::from(workers));
+        ctx.state.load_guards = Some(LoadGuards::new(workers, ctx.input.headers.as_ref()));
 
         // Extract dispatch metadata for tracing span
         let request_id = ctx
@@ -90,7 +90,7 @@ impl PipelineStage for RequestExecutionStage {
 
         // Create OTEL span for gRPC request execution
         let span = info_span!(
-            target: "sgl_model_gateway::otel-trace",
+            target: "smg::otel-trace",
             "grpc_generate",
             request_id = %request_id,
             model = %model,

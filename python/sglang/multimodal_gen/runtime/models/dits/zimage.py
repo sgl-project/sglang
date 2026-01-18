@@ -4,14 +4,25 @@ from typing import Any, List, Optional, Tuple
 import torch
 import torch.nn as nn
 
+from sglang.jit_kernel.norm import can_use_fused_inplace_qknorm
 from sglang.multimodal_gen.configs.models.dits.zimage import ZImageDitConfig
+from sglang.multimodal_gen.runtime.distributed import get_tp_world_size
 from sglang.multimodal_gen.runtime.layers.activation import SiluAndMul
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
-from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
-from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
-from sglang.multimodal_gen.runtime.layers.rotary_embedding import _apply_rotary_emb
+from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm, apply_qk_norm
+from sglang.multimodal_gen.runtime.layers.linear import (
+    ColumnParallelLinear,
+    MergedColumnParallelLinear,
+    ReplicatedLinear,
+    RowParallelLinear,
+)
+from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
+    _apply_rotary_emb,
+    apply_flashinfer_rope_qk_inplace,
+)
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -36,9 +47,13 @@ class TimestepEmbedder(nn.Module):
 
         self.mlp = nn.ModuleList(
             [
-                ReplicatedLinear(frequency_embedding_size, mid_size, bias=True),
+                ColumnParallelLinear(
+                    frequency_embedding_size, mid_size, bias=True, gather_output=False
+                ),
                 nn.SiLU(),
-                ReplicatedLinear(mid_size, out_size, bias=True),
+                RowParallelLinear(
+                    mid_size, out_size, bias=True, input_is_parallel=True
+                ),
             ]
         )
 
@@ -74,9 +89,11 @@ class TimestepEmbedder(nn.Module):
 class FeedForward(nn.Module):
     def __init__(self, dim: int, hidden_dim: int):
         super().__init__()
-        # Use ReplicatedLinear for gate and up projection (fused)
-        self.w13 = ReplicatedLinear(dim, hidden_dim * 2, bias=False)
-        self.w2 = ReplicatedLinear(hidden_dim, dim, bias=False)
+        # Use MergedColumnParallelLinear for gate and up projection (fused)
+        self.w13 = MergedColumnParallelLinear(
+            dim, [hidden_dim, hidden_dim], bias=False, gather_output=False
+        )
+        self.w2 = RowParallelLinear(hidden_dim, dim, bias=False, input_is_parallel=True)
         self.act = SiluAndMul()
 
     def forward(self, x):
@@ -97,14 +114,28 @@ class ZImageAttention(nn.Module):
     ) -> None:
         super().__init__()
         self.dim = dim
+        self.head_dim = dim // num_heads
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
-        self.head_dim = dim // num_heads
         self.qk_norm = qk_norm
 
-        # Use ReplicatedLinear for QKV projection (fused)
-        qkv_dim = dim + 2 * (num_kv_heads * self.head_dim)
-        self.to_qkv = ReplicatedLinear(dim, qkv_dim, bias=False)
+        tp_size = get_tp_world_size()
+        assert (
+            num_heads % tp_size == 0
+        ), f"num_heads {num_heads} must be divisible by tp world size {tp_size}"
+        assert (
+            num_kv_heads % tp_size == 0
+        ), f"num_kv_heads {num_kv_heads} must be divisible by tp world size {tp_size}"
+        self.local_num_heads = num_heads // tp_size
+        self.local_num_kv_heads = num_kv_heads // tp_size
+
+        self.to_q = ColumnParallelLinear(dim, dim, bias=False, gather_output=False)
+        self.to_k = ColumnParallelLinear(
+            dim, self.head_dim * num_kv_heads, bias=False, gather_output=False
+        )
+        self.to_v = ColumnParallelLinear(
+            dim, self.head_dim * num_kv_heads, bias=False, gather_output=False
+        )
 
         if self.qk_norm:
             self.norm_q = RMSNorm(self.head_dim, eps=eps)
@@ -113,12 +144,14 @@ class ZImageAttention(nn.Module):
             self.norm_q = None
             self.norm_k = None
 
-        self.to_out = nn.ModuleList([ReplicatedLinear(dim, dim, bias=False)])
+        self.to_out = nn.ModuleList(
+            [RowParallelLinear(dim, dim, bias=False, input_is_parallel=True)]
+        )
 
         self.attn = USPAttention(
-            num_heads=num_heads,
+            num_heads=self.local_num_heads,
             head_size=self.head_dim,
-            num_kv_heads=num_kv_heads,
+            num_kv_heads=self.local_num_kv_heads,
             dropout_rate=0,
             softmax_scale=None,
             causal=False,
@@ -129,31 +162,47 @@ class ZImageAttention(nn.Module):
         hidden_states: torch.Tensor,
         freqs_cis: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ):
-        qkv, _ = self.to_qkv(hidden_states)
-        kv_dim = self.head_dim * self.num_kv_heads
-        q, k, v = torch.split(qkv, [self.dim, kv_dim, kv_dim], dim=-1)
+        q, _ = self.to_q(hidden_states)
+        k, _ = self.to_k(hidden_states)
+        v, _ = self.to_v(hidden_states)
+        q = q.view(*q.shape[:-1], self.local_num_heads, self.head_dim)
+        k = k.view(*k.shape[:-1], self.local_num_kv_heads, self.head_dim)
+        v = v.view(*v.shape[:-1], self.local_num_kv_heads, self.head_dim)
 
-        q = q.view(*q.shape[:-1], self.num_heads, self.head_dim)
-        k = k.view(*k.shape[:-1], self.num_kv_heads, self.head_dim)
-        v = v.view(*v.shape[:-1], self.num_kv_heads, self.head_dim)
-
-        if self.norm_q is not None:
-            q = self.norm_q(q)
-        if self.norm_k is not None:
-            k = self.norm_k(k)
-
-        # Apply RoPE
-        def apply_rotary_emb(
-            x_in: torch.Tensor,
-            freqs_cis: torch.Tensor,
-        ) -> Tuple[torch.Tensor, torch.Tensor]:
-            cos, sin = freqs_cis
-            x_out = _apply_rotary_emb(x_in, cos, sin, is_neox_style=False)
-            return x_out
+        if self.qk_norm:
+            if (
+                q.is_cuda
+                and (self.norm_q.variance_epsilon == self.norm_k.variance_epsilon)
+                and can_use_fused_inplace_qknorm(self.head_dim, q.dtype)
+            ):
+                q, k = apply_qk_norm(
+                    q=q,
+                    k=k,
+                    q_norm=self.norm_q,
+                    k_norm=self.norm_k,
+                    head_dim=self.head_dim,
+                    allow_inplace=True,
+                )
+            else:
+                q = self.norm_q(q)
+                k = self.norm_k(k)
 
         if freqs_cis is not None:
-            q = apply_rotary_emb(q, freqs_cis)
-            k = apply_rotary_emb(k, freqs_cis)
+            cos, sin = freqs_cis
+            if q.is_cuda and q.shape == k.shape:
+                cos_sin_cache = torch.cat(
+                    [
+                        cos.to(dtype=torch.float32).contiguous(),
+                        sin.to(dtype=torch.float32).contiguous(),
+                    ],
+                    dim=-1,
+                )
+                q, k = apply_flashinfer_rope_qk_inplace(
+                    q, k, cos_sin_cache, is_neox=False
+                )
+            else:
+                q = _apply_rotary_emb(q, cos, sin, is_neox_style=False)
+                k = _apply_rotary_emb(k, cos, sin, is_neox_style=False)
 
         hidden_states = self.attn(q, k, v)
         hidden_states = hidden_states.flatten(2)
@@ -251,7 +300,9 @@ class FinalLayer(nn.Module):
     def __init__(self, hidden_size, out_channels):
         super().__init__()
         self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.linear = ReplicatedLinear(hidden_size, out_channels, bias=True)
+        self.linear = ColumnParallelLinear(
+            hidden_size, out_channels, bias=True, gather_output=True
+        )
 
         self.act = nn.SiLU()
         self.adaLN_modulation = nn.Sequential(
@@ -335,7 +386,7 @@ class RopeEmbedder:
         return torch.cat(cos_out, dim=-1), torch.cat(sin_out, dim=-1)
 
 
-class ZImageTransformer2DModel(CachableDiT):
+class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
     _supports_gradient_checkpointing = True
     _no_split_modules = ["ZImageTransformerBlock"]
     param_names_mapping = ZImageDitConfig().arch_config.param_names_mapping
@@ -373,10 +424,11 @@ class ZImageTransformer2DModel(CachableDiT):
         for patch_idx, (patch_size, f_patch_size) in enumerate(
             zip(self.all_patch_size, self.all_f_patch_size)
         ):
-            x_embedder = ReplicatedLinear(
+            x_embedder = ColumnParallelLinear(
                 f_patch_size * patch_size * patch_size * self.in_channels,
                 self.dim,
                 bias=True,
+                gather_output=True,
             )
             all_x_embedder[f"{patch_size}-{f_patch_size}"] = x_embedder
 
@@ -449,6 +501,7 @@ class ZImageTransformer2DModel(CachableDiT):
         self.rotary_emb = RopeEmbedder(
             theta=self.rope_theta, axes_dims=self.axes_dims, axes_lens=self.axes_lens
         )
+        self.layer_names = ["layers"]
 
     def unpatchify(
         self, x: List[torch.Tensor], size: List[Tuple], patch_size, f_patch_size

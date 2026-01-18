@@ -11,22 +11,21 @@ use super::{
     common::responses::{
         handlers::{cancel_response_impl, get_response_impl},
         utils::validate_worker_availability,
+        ResponsesContext,
     },
     context::SharedComponents,
-    harmony::{
-        serve_harmony_responses, serve_harmony_responses_stream, HarmonyDetector,
-        HarmonyResponsesContext,
-    },
+    harmony::{serve_harmony_responses, serve_harmony_responses_stream, HarmonyDetector},
     pipeline::RequestPipeline,
     regular::responses,
 };
 use crate::{
     app_context::AppContext,
     config::types::RetryConfig,
-    core::{is_retryable_status, RetryExecutor, WorkerRegistry},
+    core::{is_retryable_status, RetryExecutor, WorkerRegistry, UNKNOWN_MODEL_ID},
     observability::metrics::{metrics_labels, Metrics},
     protocols::{
         chat::ChatCompletionRequest,
+        classify::ClassifyRequest,
         embedding::EmbeddingRequest,
         generate::GenerateRequest,
         responses::{ResponsesGetParams, ResponsesRequest},
@@ -36,15 +35,15 @@ use crate::{
 
 /// gRPC router implementation for SGLang
 #[derive(Clone)]
-#[allow(dead_code)]
 pub struct GrpcRouter {
     worker_registry: Arc<WorkerRegistry>,
     pipeline: RequestPipeline,
     harmony_pipeline: RequestPipeline,
-    embedding_pipeline: RequestPipeline, // New field for embedding pipeline
+    embedding_pipeline: RequestPipeline,
+    classify_pipeline: RequestPipeline,
     shared_components: Arc<SharedComponents>,
-    responses_context: responses::ResponsesContext,
-    harmony_responses_context: responses::ResponsesContext,
+    responses_context: ResponsesContext,
+    harmony_responses_context: ResponsesContext,
     retry_config: RetryConfig,
 }
 
@@ -99,6 +98,10 @@ impl GrpcRouter {
         let embedding_pipeline =
             RequestPipeline::new_embeddings(worker_registry.clone(), _policy_registry.clone());
 
+        // Create Classify pipeline
+        let classify_pipeline =
+            RequestPipeline::new_classify(worker_registry.clone(), _policy_registry.clone());
+
         // Extract shared dependencies for responses contexts
         let mcp_manager = ctx
             .mcp_manager
@@ -108,10 +111,9 @@ impl GrpcRouter {
 
         // Helper closure to create responses context with a given pipeline
         let create_responses_context = |pipeline: &RequestPipeline| {
-            responses::ResponsesContext::new(
+            ResponsesContext::new(
                 Arc::new(pipeline.clone()),
                 shared_components.clone(),
-                worker_registry.clone(),
                 ctx.response_storage.clone(),
                 ctx.conversation_storage.clone(),
                 ctx.conversation_item_storage.clone(),
@@ -128,6 +130,7 @@ impl GrpcRouter {
             pipeline,
             harmony_pipeline,
             embedding_pipeline,
+            classify_pipeline,
             shared_components,
             responses_context,
             harmony_responses_context,
@@ -147,8 +150,9 @@ impl GrpcRouter {
             HarmonyDetector::is_harmony_model_in_registry(&self.worker_registry, &body.model);
 
         debug!(
-            "Processing chat completion request for model: {:?}, using_harmony={}",
-            model_id, is_harmony
+            "Processing chat completion request for model: {}, using_harmony={}",
+            model_id.unwrap_or(UNKNOWN_MODEL_ID),
+            is_harmony
         );
 
         let pipeline = if is_harmony {
@@ -205,7 +209,10 @@ impl GrpcRouter {
         body: &GenerateRequest,
         model_id: Option<&str>,
     ) -> Response {
-        debug!("Processing generate request for model: {:?}", model_id);
+        debug!(
+            "Processing generate request for model: {}",
+            model_id.unwrap_or(UNKNOWN_MODEL_ID)
+        );
 
         // Clone values needed for retry closure
         let request = Arc::new(body.clone());
@@ -273,18 +280,19 @@ impl GrpcRouter {
 
         if is_harmony {
             debug!(
-                "Processing Harmony responses request for model: {:?}, streaming: {:?}",
-                model_id, body.stream
+                "Processing Harmony responses request for model: {}, streaming: {}",
+                model_id.unwrap_or(UNKNOWN_MODEL_ID),
+                body.stream.unwrap_or(false)
             );
-            let harmony_ctx = HarmonyResponsesContext::new(
+            let harmony_ctx = ResponsesContext::new(
                 Arc::new(self.harmony_pipeline.clone()),
                 self.shared_components.clone(),
-                self.harmony_responses_context.mcp_manager.clone(),
                 self.harmony_responses_context.response_storage.clone(),
                 self.harmony_responses_context.conversation_storage.clone(),
                 self.harmony_responses_context
                     .conversation_item_storage
                     .clone(),
+                self.harmony_responses_context.mcp_manager.clone(),
             );
 
             if body.stream.unwrap_or(false) {
@@ -313,10 +321,35 @@ impl GrpcRouter {
         body: &EmbeddingRequest,
         model_id: Option<&str>,
     ) -> Response {
-        debug!("Processing embedding request for model: {:?}", model_id);
+        debug!(
+            "Processing embedding request for model: {}",
+            model_id.unwrap_or(UNKNOWN_MODEL_ID)
+        );
 
         self.embedding_pipeline
             .execute_embeddings(
+                Arc::new(body.clone()),
+                headers.cloned(),
+                model_id.map(|s| s.to_string()),
+                self.shared_components.clone(),
+            )
+            .await
+    }
+
+    /// Main route_classify implementation
+    async fn route_classify_impl(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &ClassifyRequest,
+        model_id: Option<&str>,
+    ) -> Response {
+        debug!(
+            "Processing classify request for model: {}",
+            model_id.unwrap_or(UNKNOWN_MODEL_ID)
+        );
+
+        self.classify_pipeline
+            .execute_classify(
                 Arc::new(body.clone()),
                 headers.cloned(),
                 model_id.map(|s| s.to_string()),
@@ -388,6 +421,15 @@ impl RouterTrait for GrpcRouter {
         model_id: Option<&str>,
     ) -> Response {
         self.route_embeddings_impl(headers, body, model_id).await
+    }
+
+    async fn route_classify(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &ClassifyRequest,
+        model_id: Option<&str>,
+    ) -> Response {
+        self.route_classify_impl(headers, body, model_id).await
     }
 
     fn router_type(&self) -> &'static str {

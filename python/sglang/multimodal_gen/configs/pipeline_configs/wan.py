@@ -93,6 +93,16 @@ class WanT2V480PConfig(PipelineConfig):
 
 
 @dataclass
+class TurboWanT2V480PConfig(WanT2V480PConfig):
+    """Base configuration for Wan T2V 1.3B pipeline architecture."""
+
+    flow_shift: float | None = 8.0
+    dmd_denoising_steps: list[int] | None = field(
+        default_factory=lambda: [988, 932, 852, 608]
+    )
+
+
+@dataclass
 class WanT2V720PConfig(WanT2V480PConfig):
     """Base configuration for Wan T2V 14B 720P pipeline architecture."""
 
@@ -136,6 +146,18 @@ class WanI2V720PConfig(WanI2V480PConfig):
 
     # Denoising stage
     flow_shift: float | None = 5.0
+
+
+@dataclass
+class TurboWanI2V720Config(WanI2V720PConfig):
+    flow_shift: float | None = 8.0
+    dmd_denoising_steps: list[int] | None = field(
+        default_factory=lambda: [996, 932, 852, 608]
+    )
+    boundary_ratio: float | None = 0.9
+
+    def __post_init__(self) -> None:
+        self.dit_config.boundary_ratio = self.boundary_ratio
 
 
 @dataclass

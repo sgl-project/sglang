@@ -13,7 +13,7 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: router-tests-${{ github.ref }}
+  group: gateway-tests-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -21,11 +21,62 @@ env:
   SCCACHE_GHA_ENABLED: "true"
 
 jobs:
-  maturin-build-test:
+  build-wheel:
     if: |
       github.event_name != 'pull_request' ||
       (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'run-ci')) ||
       (github.event.action == 'labeled' && github.event.label.name == 'run-ci')
+    runs-on: 4-gpu-a10
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install rust dependencies
+        run: |
+          bash scripts/ci/ci_install_gateway_dependencies.sh
+
+      - name: Configure sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+        with:
+          version: "v0.12.0"
+          disable_annotations: true
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: sgl-model-gateway
+          shared-key: "rust-cache"
+          cache-all-crates: true
+          cache-on-failure: true
+          save-if: true
+
+      - name: Build python binding
+        run: |
+          source "$HOME/.cargo/env"
+          export RUSTC_WRAPPER=sccache
+          cd sgl-model-gateway/bindings/python
+          python3 -m pip install --upgrade pip maturin
+          maturin build --profile ci --features vendored-openssl --out dist
+
+      - name: List built wheel
+        run: ls -lh sgl-model-gateway/bindings/python/dist/
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: smg-wheel
+          path: sgl-model-gateway/bindings/python/dist/*.whl
+          retention-days: 1
+
+      - name: Test wheel install
+        run: |
+          pip install sgl-model-gateway/bindings/python/dist/*.whl
+          python3 -c "import sglang_router; print('Python package: OK')"
+          python3 -c "from sglang_router.sglang_router_rs import Router; print('Rust extension: OK')"
+          python3 -m sglang_router.launch_router --help > /dev/null && echo "Entry point: OK"
+
+  python-unit-tests:
+    needs: build-wheel
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -42,48 +93,22 @@ jobs:
         with:
           python-version: "3.13"
 
-      - name: Install protoc and dependencies
+      - name: Download wheel artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: smg-wheel
+          path: dist/
+
+      - name: Install wheel
+        run: pip install dist/*.whl
+
+      - name: Run Python unit tests
         run: |
-          sudo apt-get update
-          sudo apt-get install -y wget unzip gcc g++ perl make
-          cd /tmp
-          wget https://github.com/protocolbuffers/protobuf/releases/download/v32.0/protoc-32.0-linux-x86_64.zip
-          sudo unzip protoc-32.0-linux-x86_64.zip -d /usr/local
-          rm protoc-32.0-linux-x86_64.zip
-          protoc --version
+          cd bindings/python
+          python3 -m pip install pytest pytest-cov pytest-xdist
+          pytest -q tests --cov=sglang_router --cov-config=.coveragerc --cov-report=term-missing --cov-fail-under=80
 
-      - name: Configure sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
-        with:
-          version: "v0.12.0"
-
-      - name: Rust cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: "."
-          shared-key: "rust-cache"
-          cache-all-crates: true
-          cache-on-failure: true
-          save-if: true
-
-      - name: Test maturin build
-        uses: PyO3/maturin-action@v1
-        with:
-          working-directory: bindings/python
-          args: --release --out dist --features vendored-openssl
-          rust-toolchain: stable
-          sccache: true
-
-      - name: List built wheel
-        run: ls -lh bindings/python/dist/
-
-      - name: Test wheel install
-        run: |
-          pip install bindings/python/dist/*.whl
-          python -c "import sglang_router; print('Python package: OK')"
-          python -c "from sglang_router.sglang_router_rs import Router; print('Rust extension: OK')"
-          python -m sglang_router.launch_router --help > /dev/null && echo "Entry point: OK"
-  router-unit-tests:
+  unit-tests:
     if: |
       github.event_name != 'pull_request' ||
       (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'run-ci')) ||
@@ -95,12 +120,13 @@ jobs:
 
       - name: Install dependencies
         run: |
-          bash scripts/ci/ci_install_rust.sh
+          bash scripts/ci/ci_install_gateway_dependencies.sh
 
       - name: Configure sccache
         uses: mozilla-actions/sccache-action@v0.0.9
         with:
           version: "v0.12.0"
+          disable_annotations: true
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
@@ -146,114 +172,60 @@ jobs:
         if: always()
         run: sccache --show-stats
 
-  router-http-tests:
+  gateway-e2e:
+    name: ${{ matrix.name }}
+    needs: build-wheel
     if: |
       github.event_name != 'pull_request' ||
       (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'run-ci')) ||
       (github.event.action == 'labeled' && github.event.label.name == 'run-ci')
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: benchmarks
+            timeout: 32
+            test_dirs: "e2e_test/benchmarks"
+            extra_deps: "genai-bench==0.0.3"
+            env_vars: ""
+            reruns: ""
+            upload_benchmarks: true
+            parallel_opts: ""  # No parallel for benchmarks (performance measurement)
+          - name: responses
+            timeout: 45
+            test_dirs: "e2e_test/responses"
+            extra_deps: ""
+            env_vars: "SHOW_WORKER_LOGS=0 SHOW_ROUTER_LOGS=1"
+            reruns: "--reruns 2 --reruns-delay 5"
+            setup_oracle: true
+            setup_brave: true
+            parallel_opts: ""  # Cloud backend tests not compatible with parallel execution
+          - name: e2e
+            timeout: 45
+            test_dirs: "e2e_test/router e2e_test/embeddings"
+            extra_deps: "pytest-parallel py"  # py is required for pytest-parallel with newer pytest
+            env_vars: "SHOW_WORKER_LOGS=0 SHOW_ROUTER_LOGS=1"
+            reruns: "--reruns 2 --reruns-delay 5"
+            parallel_opts: "--workers 1 --tests-per-worker 4"  # Thread-based parallelism
+          - name: chat-completions
+            timeout: 45
+            test_dirs: "e2e_test/chat_completions"
+            extra_deps: ""
+            env_vars: "SHOW_WORKER_LOGS=0 SHOW_ROUTER_LOGS=1"
+            reruns: "--reruns 2 --reruns-delay 5"
+            parallel_opts: ""
     runs-on: 4-gpu-a10
-    timeout-minutes: 32
+    timeout-minutes: ${{ matrix.timeout }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
-      - name: Install rust dependencies
-        run: |
-          bash scripts/ci/ci_install_rust.sh
-
-      - name: Configure sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
-        with:
-          version: "v0.12.0"
-
-      - name: Rust cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: sgl-model-gateway
-          shared-key: "rust-cache"
-          cache-all-crates: true
-          cache-on-failure: true
-          save-if: true
-
-      - name: Install SGLang dependencies
-        run: |
-          sudo --preserve-env=PATH bash scripts/ci/ci_install_dependency.sh
-
-      - name: Build python binding
-        run: |
-          source "$HOME/.cargo/env"
-          export RUSTC_WRAPPER=sccache
-          cd sgl-model-gateway/bindings/python
-          python3 -m pip install --upgrade pip maturin
-          pip uninstall -y sglang-router
-          maturin build --profile ci --features vendored-openssl --out dist
-          pip install dist/*.whl
-
-      - name: Run Python unit tests
-        run: |
-          cd sgl-model-gateway
-          source "$HOME/.cargo/env"
-          python3 -m pip install pytest pytest-cov pytest-xdist
-          pytest -q py_test/unit --cov=sglang_router --cov-config=bindings/python/.coveragerc --cov-report=term-missing --cov-fail-under=80
-
-      - name: Run Python integration tests
-        run: |
-          cd sgl-model-gateway
-          source "$HOME/.cargo/env"
-          # Integration tests use FastAPI/uvicorn for mock workers
-          python3 -m pip install fastapi uvicorn orjson
-          pytest -q py_test/integration_mock
-
-      - name: Run Python E2E tests
-        run: |
-          bash scripts/killall_sglang.sh "nuk_gpus"
-          cd sgl-model-gateway
-          source "$HOME/.cargo/env"
-          python3 -m pip --no-cache-dir install --upgrade --ignore-installed blinker
-          python3 -m pip --no-cache-dir install --upgrade genai-bench==0.0.2
-          pytest py_test/e2e_http -s  -vv -o log_cli=true --log-cli-level=INFO
-
-      - name: Upload benchmark results
-        if: success()
-        uses: actions/upload-artifact@v4
-        with:
-          name: genai-bench-results-all-policies
-          path: sgl-model-gateway/benchmark_**/
-
-  router-grpc-response-api-tests:
-    if: |
-      github.event_name != 'pull_request' ||
-      (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'run-ci')) ||
-      (github.event.action == 'labeled' && github.event.label.name == 'run-ci')
-    runs-on: 4-gpu-a10
-    timeout-minutes: 32
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Install rust dependencies
-        run: |
-          bash scripts/ci/ci_install_rust.sh
-
-      - name: Configure sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
-        with:
-          version: "v0.12.0"
-
-      - name: Rust cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: sgl-model-gateway
-          shared-key: "rust-cache"
-          cache-all-crates: true
-          cache-on-failure: true
-          save-if: true
 
       - name: Install SGLang dependencies
         run: |
           sudo --preserve-env=PATH bash scripts/ci/ci_install_dependency.sh
 
       - name: Setup Oracle Instant Client
+        if: matrix.setup_oracle
         run: |
           sudo apt-get install -y unzip
           INSTANT_CLIENT_DIR="/home/ubuntu/instant-client"
@@ -273,6 +245,7 @@ jobs:
           echo "LD_LIBRARY_PATH=/home/ubuntu/instant-client/instantclient_23_9:\$LD_LIBRARY_PATH" >> $GITHUB_ENV
 
       - name: Start Oracle Database
+        if: matrix.setup_oracle
         run: |
           docker run -d -p 1521:1521 -e ORACLE_PASSWORD=oracle --name oracle-db gvenzl/oracle-xe:21-slim
           echo "Starting Oracle DB..."
@@ -283,6 +256,7 @@ jobs:
           echo "ATP_DSN=localhost:1521/XEPDB1" >> $GITHUB_ENV
 
       - name: Start Brave MCP Server
+        if: matrix.setup_brave
         run: |
           docker run -d --rm \
             -p 8001:8080 \
@@ -293,43 +267,48 @@ jobs:
           sleep 2
           curl -f --max-time 1 http://localhost:8001/sse > /dev/null 2>&1 && echo "Brave MCP Server is healthy!" || echo "Brave MCP Server responded"
 
-      - name: Build python binding
-        run: |
-          source "$HOME/.cargo/env"
-          export RUSTC_WRAPPER=sccache
-          cd sgl-model-gateway/bindings/python
-          python3 -m pip install --upgrade pip maturin
-          pip uninstall -y sglang-router
-          maturin build --profile ci --features vendored-openssl --out dist
-          pip install dist/*.whl
+      - name: Download wheel artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: smg-wheel
+          path: wheel/
 
-      - name: Run Python E2E response API tests
+      - name: Install wheel
         run: |
-          python3 -m pip install pytest-rerunfailures
+          pip uninstall -y sglang-router || true
+          pip install wheel/*.whl
+
+      - name: Install e2e test dependencies
+        run: |
+          python3 -m pip install pytest pytest-rerunfailures httpx openai grpcio grpcio-health-checking numpy
+          if [ -n "${{ matrix.extra_deps }}" ]; then
+            python3 -m pip --no-cache-dir install --upgrade ${{ matrix.extra_deps }}
+          fi
+
+      - name: Run E2E tests
+        run: |
           bash scripts/killall_sglang.sh "nuk_gpus"
           cd sgl-model-gateway
-          source "$HOME/.cargo/env"
-          SHOW_ROUTER_LOGS=1 pytest --reruns 3 --reruns-delay 2 py_test/e2e_response_api -s -vv -o log_cli=true --log-cli-level=INFO
+          ${{ matrix.env_vars }} ROUTER_LOCAL_MODEL_PATH="/home/ubuntu/models" pytest ${{ matrix.reruns }} ${{ matrix.parallel_opts }} ${{ matrix.test_dirs }} -s -vv -o log_cli=true --log-cli-level=INFO
 
-      - name: Run Python E2E gRPC tests
-        run: |
-          bash scripts/killall_sglang.sh "nuk_gpus"
-          cd sgl-model-gateway
-          source "$HOME/.cargo/env"
-          SHOW_ROUTER_LOGS=1 ROUTER_LOCAL_MODEL_PATH="/home/ubuntu/models" pytest py_test/e2e_grpc -s -vv -o log_cli=true --log-cli-level=INFO
+      - name: Upload benchmark results
+        if: matrix.upload_benchmarks && success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: genai-bench-results-all-policies
+          path: sgl-model-gateway/benchmark_**/
 
       - name: Cleanup Brave MCP Server
-        if: always()
+        if: always() && matrix.setup_brave
         run: |
           docker stop brave-search-server || true
           docker rm brave-search-server || true
 
       - name: Cleanup Oracle Database
-        if: always()
+        if: always() && matrix.setup_oracle
         run: |
           docker stop oracle-db || true
           docker rm oracle-db || true
-
 
   docker-build-test:
     if: |
@@ -355,98 +334,25 @@ jobs:
           cache-to: type=gha,mode=max
 
   finish:
-    needs: [maturin-build-test, router-unit-tests, router-http-tests, router-grpc-response-api-tests, docker-build-test]
+    needs: [build-wheel, python-unit-tests, unit-tests, gateway-e2e, docker-build-test]
     runs-on: ubuntu-latest
     steps:
       - name: Finish
         run: echo "This is an empty step to ensure that all jobs are completed."
 
   summarize-benchmarks:
-    needs: router-http-tests
+    needs: gateway-e2e
     runs-on: ubuntu-latest
     if: success()
 
     steps:
-    - name: Install jq
-      run: sudo apt-get update && sudo apt-get install -y jq bc
+    - name: Checkout code
+      uses: actions/checkout@v4
 
     - name: Download benchmark results
       uses: actions/download-artifact@v4
       with:
         name: genai-bench-results-all-policies
 
-    - name: List downloaded contents
-      run: |
-        echo "Contents after download:"
-        ls -la
-        find . -name "benchmark_*" -type d
-        echo "JSON files found:"
-        find . -name "*.json" | head -10
-
     - name: Create benchmark summary
-      run: |
-        echo "=== DEBUG: Creating benchmark summary ==="
-        echo "Available benchmark directories:"
-        find . -name "benchmark_*" -type d || true
-        echo "=========================================="
-
-        echo "## Router E2E Genai-Bench Results Summary" >> $GITHUB_STEP_SUMMARY
-        echo "" >> $GITHUB_STEP_SUMMARY
-        echo "Results captured from E2E tests for two scenarios: regular router (2 workers, dp=2) and PD router (2 prefill + 2 decode)." >> $GITHUB_STEP_SUMMARY
-        echo "" >> $GITHUB_STEP_SUMMARY
-        echo "| Scenario | Status | TTFT (s) | E2E Latency (s) | Input Throughput (tok/s) | Output Throughput (tok/s) |" >> $GITHUB_STEP_SUMMARY
-        echo "|----------|--------|----------|-----------------|--------------------------|---------------------------|" >> $GITHUB_STEP_SUMMARY
-
-        scenarios=$'Regular (dp=2, round_robin)|benchmark_round_robin_regular\nPD (2 prefill + 2 decode, round_robin)|benchmark_round_robin_pd'
-
-        echo "$scenarios" | sed 's/^\s*//' | while IFS='|' read -r label pattern; do
-          [ -z "$label" ] && continue
-          # Find the result folder (handle different extraction layouts)
-          result_folder=$(find . -maxdepth 3 \( -name "$pattern" -o -path "*${pattern}*" \) -type d | head -1)
-
-          if [ -n "$result_folder" ] && [ -d "$result_folder" ]; then
-            json_file=$(find "$result_folder" -name "*.json" -not -name "experiment_metadata.json" | head -1)
-
-            if [ -n "$json_file" ] && [ -f "$json_file" ]; then
-              ttft_mean=$(jq -r '.aggregated_metrics.stats.ttft.mean' "$json_file")
-              e2e_latency_mean=$(jq -r '.aggregated_metrics.stats.e2e_latency.mean' "$json_file")
-              input_throughput_mean=$(jq -r '.aggregated_metrics.stats.input_throughput.mean' "$json_file")
-              output_throughput_mean=$(jq -r '.aggregated_metrics.stats.output_throughput.mean' "$json_file")
-
-              ttft_display=$(printf "%.2f" "$ttft_mean" 2>/dev/null || echo "$ttft_mean")
-              e2e_display=$(printf "%.2f" "$e2e_latency_mean" 2>/dev/null || echo "$e2e_latency_mean")
-              input_display=$(printf "%.0f" "$input_throughput_mean" 2>/dev/null || echo "$input_throughput_mean")
-              output_display=$(printf "%.0f" "$output_throughput_mean" 2>/dev/null || echo "$output_throughput_mean")
-
-              echo "| ${label} | ✅ Success | $ttft_display | $e2e_display | $input_display | $output_display |" >> $GITHUB_STEP_SUMMARY
-
-              # Optional GPU utilization table if monitor output exists
-              gpu_json="$result_folder/gpu_utilization.json"
-              if [ -f "$gpu_json" ]; then
-                overall_mean=$(jq -r '.overall.mean // 0' "$gpu_json")
-                printf "\n#### GPU Utilization — %s\n\n" "$label" >> $GITHUB_STEP_SUMMARY
-                printf "Overall mean: %.2f%%\n\n" "$overall_mean" >> $GITHUB_STEP_SUMMARY
-                echo "| GPU | Mean (%) | p5 | p10 | p25 | p50 | p75 | p90 | p95 |" >> $GITHUB_STEP_SUMMARY
-                echo "|-----|----------|----|-----|-----|-----|-----|-----|-----|" >> $GITHUB_STEP_SUMMARY
-                jq -r '
-                  .per_gpu
-                  | to_entries[]
-                  | [ .key,
-                      (.value.mean // 0),
-                      (.value.p5 // 0),
-                      (.value.p10 // 0),
-                      (.value.p25 // 0),
-                      (.value.p50 // 0),
-                      (.value.p75 // 0),
-                      (.value.p90 // 0),
-                      (.value.p95 // 0)
-                    ]
-                  | @tsv' "$gpu_json" \
-                  | while IFS=$'\t' read -r gpu m p5 p10 p25 p50 p75 p90 p95; do
-                      printf "| %s | %.2f | %.2f | %.2f | %.2f | %.2f | %.2f | %.2f | %.2f |\n" "$gpu" "$m" "$p5" "$p10" "$p25" "$p50" "$p75" "$p90" "$p95" >> $GITHUB_STEP_SUMMARY
-                    done
-                echo "" >> $GITHUB_STEP_SUMMARY
-              fi
-            fi
-          fi
-        done
+      run: python3 sgl-model-gateway/e2e_test/benchmarks/summarize.py .

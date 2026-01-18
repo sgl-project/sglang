@@ -36,6 +36,8 @@ class TestDeepseekV3MTP(CustomTestCase):
             "1",
             "--speculative-num-draft-tokens",
             "4",
+            "--model-loader-extra-config",
+            '{"enable_multithread_load": true, "num_threads": 64}',
         ]
         if not is_in_amd_ci():
             other_args += ["--mem-frac", "0.7"]

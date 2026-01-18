@@ -1,10 +1,35 @@
 //! Core workflow types and definitions
 
-use std::{collections::HashMap, fmt, sync::Arc, time::Duration};
+use std::{collections::HashMap, fmt, time::Duration};
 
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use uuid::Uuid;
+
+/// Trait for workflow data that can be passed through workflow steps.
+///
+/// Implementing this trait allows your data type to be used as the typed
+/// context for a workflow. The data must be serializable for state persistence.
+///
+/// # Example
+///
+/// ```ignore
+/// #[derive(Debug, Clone, Serialize, Deserialize)]
+/// pub struct MyWorkflowData {
+///     pub config: MyConfig,
+///     pub result: Option<MyResult>,
+///     #[serde(skip, default)]
+///     pub app_context: Option<Arc<AppContext>>,
+/// }
+///
+/// impl WorkflowData for MyWorkflowData {
+///     fn workflow_type() -> &'static str { "my_workflow" }
+/// }
+/// ```
+pub trait WorkflowData: Serialize + DeserializeOwned + Send + Sync + Clone + 'static {
+    /// Human-readable name for logging and identification
+    fn workflow_type() -> &'static str;
+}
 
 /// Unique identifier for a workflow definition
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -147,19 +172,23 @@ impl Default for StepState {
 
 /// Workflow instance state
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorkflowState {
+#[serde(bound(
+    serialize = "D: Serialize",
+    deserialize = "D: serde::de::DeserializeOwned"
+))]
+pub struct WorkflowState<D: WorkflowData> {
     pub instance_id: WorkflowInstanceId,
     pub definition_id: WorkflowId,
     pub status: WorkflowStatus,
     pub current_step: Option<StepId>,
     pub step_states: HashMap<StepId, StepState>,
-    pub context: WorkflowContext,
+    pub context: WorkflowContext<D>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
 
-impl WorkflowState {
-    pub fn new(instance_id: WorkflowInstanceId, definition_id: WorkflowId) -> Self {
+impl<D: WorkflowData> WorkflowState<D> {
+    pub fn new(instance_id: WorkflowInstanceId, definition_id: WorkflowId, data: D) -> Self {
         let now = Utc::now();
         Self {
             instance_id,
@@ -167,71 +196,36 @@ impl WorkflowState {
             status: WorkflowStatus::Pending,
             current_step: None,
             step_states: HashMap::new(),
-            context: WorkflowContext::new(instance_id),
+            context: WorkflowContext::new(instance_id, data),
             created_at: now,
             updated_at: now,
         }
     }
 }
 
-/// Shared context passed between workflow steps
+/// Shared context passed between workflow steps.
 ///
-/// # Serialization Warning
+/// The context contains typed workflow data that is fully serializable,
+/// enabling state persistence and workflow recovery.
 ///
-/// The `data` field contains type-erased values that cannot be serialized.
-/// This means workflow context is **not preserved** across:
-/// - Process restarts
-/// - State persistence to disk
-/// - Network serialization
+/// # Type Parameter
 ///
-/// The workflow engine only supports **in-memory execution**. If you need
-/// durable workflows, consider implementing a custom serializable context type.
+/// `D` - The workflow-specific data type implementing `WorkflowData`.
+/// This type holds all the state needed by workflow steps and must be
+/// serializable (except for fields marked with `#[serde(skip)]`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorkflowContext {
+#[serde(bound(
+    serialize = "D: Serialize",
+    deserialize = "D: serde::de::DeserializeOwned"
+))]
+pub struct WorkflowContext<D: WorkflowData> {
     pub instance_id: WorkflowInstanceId,
-    #[serde(skip)]
-    data: HashMap<String, Arc<dyn std::any::Any + Send + Sync>>,
+    pub data: D,
 }
 
-impl WorkflowContext {
-    pub fn new(instance_id: WorkflowInstanceId) -> Self {
-        Self {
-            instance_id,
-            data: HashMap::new(),
-        }
-    }
-
-    /// Store a value in the context (will be wrapped in Arc)
-    pub fn set<T: Send + Sync + 'static>(&mut self, key: impl Into<String>, value: T) {
-        self.data.insert(key.into(), Arc::new(value));
-    }
-
-    /// Store an Arc directly without double-wrapping
-    pub fn set_arc<T: Send + Sync + 'static>(&mut self, key: impl Into<String>, value: Arc<T>) {
-        self.data.insert(key.into(), value);
-    }
-
-    /// Retrieve a value from the context
-    pub fn get<T: Send + Sync + 'static>(&self, key: &str) -> Option<Arc<T>> {
-        self.data
-            .get(key)
-            .and_then(|v| v.clone().downcast::<T>().ok())
-    }
-
-    /// Retrieve a value from the context, returning an error if not found
-    pub fn get_or_err<T: Send + Sync + 'static>(&self, key: &str) -> Result<Arc<T>, WorkflowError> {
-        self.get::<T>(key)
-            .ok_or_else(|| WorkflowError::ContextValueNotFound(key.to_string()))
-    }
-
-    /// Check if the context has any data that would be lost during serialization
-    pub fn has_unserializable_data(&self) -> bool {
-        !self.data.is_empty()
-    }
-
-    /// Get the number of context entries (useful for debugging)
-    pub fn data_len(&self) -> usize {
-        self.data.len()
+impl<D: WorkflowData> WorkflowContext<D> {
+    pub fn new(instance_id: WorkflowInstanceId, data: D) -> Self {
+        Self { instance_id, data }
     }
 }
 
@@ -244,7 +238,7 @@ pub enum StepResult {
 }
 
 /// Error kinds for workflow operations
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum WorkflowError {
     #[error("Workflow not found: {0}")]
     NotFound(WorkflowInstanceId),
@@ -269,6 +263,15 @@ pub enum WorkflowError {
 
     #[error("Context value not found: {0}")]
     ContextValueNotFound(String),
+
+    #[error("Type mismatch: expected {expected}, got {actual}")]
+    TypeMismatch {
+        expected: &'static str,
+        actual: &'static str,
+    },
+
+    #[error("Engine is shutting down, not accepting new workflows")]
+    ShuttingDown,
 }
 
 pub type WorkflowResult<T> = Result<T, WorkflowError>;

@@ -9,14 +9,14 @@ from sglang.test.test_utils import ModelLaunchSettings, is_blackwell_system
 
 # Runs on both H200 and B200 via nightly-8-gpu-common suite
 # Note: trtllm_mla backend may have hardware-specific behavior
-register_cuda_ci(est_time=12000, suite="nightly-8-gpu-common", nightly=True)
+register_cuda_ci(est_time=1800, suite="nightly-8-gpu-common", nightly=True)
 
 MISTRAL_LARGE3_MODEL_PATH = "mistralai/Mistral-Large-3-675B-Instruct-2512"
 MISTRAL_LARGE3_EAGLE_MODEL_PATH = "mistralai/Mistral-Large-3-675B-Instruct-2512-Eagle"
 
 
 @unittest.skipIf(not is_blackwell_system(), "Requires B200")
-class TestMistralLarge3Unified(unittest.TestCase):
+class TestMistralLarge3(unittest.TestCase):
     """Unified test class for Mistral-Large-3 performance and accuracy.
 
     Two variants:
@@ -63,12 +63,14 @@ class TestMistralLarge3Unified(unittest.TestCase):
                 MISTRAL_LARGE3_MODEL_PATH,
                 tp_size=8,
                 extra_args=base_args,
+                variant="TP8",
             ),
             # Variant: "eagle" - TP=8 + trtllm_mla + EAGLE with draft model
             ModelLaunchSettings(
                 MISTRAL_LARGE3_MODEL_PATH,
                 tp_size=8,
                 extra_args=base_args + eagle_args,
+                variant="TP8+MTP",
             ),
         ]
 

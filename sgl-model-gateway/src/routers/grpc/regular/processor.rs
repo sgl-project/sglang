@@ -34,7 +34,7 @@ use crate::{
 
 /// Unified response processor for both routers
 #[derive(Clone)]
-pub struct ResponseProcessor {
+pub(crate) struct ResponseProcessor {
     pub tool_parser_factory: ToolParserFactory,
     pub reasoning_parser_factory: ReasoningParserFactory,
     pub configured_tool_parser: Option<String>,

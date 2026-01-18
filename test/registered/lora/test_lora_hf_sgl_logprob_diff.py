@@ -34,18 +34,18 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import torch
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.runners import HFRunner, SRTRunner
-
-register_cuda_ci(
-    est_time=300,
-    suite="nightly-1-gpu",
-    nightly=True,
-    disabled="Temporarily disabled, will be fixed later",
-)
-
 from sglang.test.test_utils import DEFAULT_PORT_FOR_SRT_TEST_RUNNER, CustomTestCase
 
+register_cuda_ci(
+    est_time=150,
+    suite="stage-b-test-small-1-gpu",
+)
+register_amd_ci(
+    est_time=250,
+    suite="stage-b-test-small-1-gpu-amd",
+)
 # Test configuration constants
 LORA_BACKEND = "triton"
 DISABLE_CUDA_GRAPH = False
@@ -56,7 +56,7 @@ LOGPROB_THRESHOLD = 1e-01
 DEFAULT_TEST_PROMPTS = [
     "SGL is a",
     "AI is a field of computer science focused on",
-    "Computer science is the study of",
+    "Write a long story.",
     "Write a short story.",
     "What are the main components of a computer?",
 ]

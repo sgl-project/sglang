@@ -1,7 +1,7 @@
 use super::{
     CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, HealthCheckConfig,
-    HistoryBackend, MetricsConfig, OracleConfig, PolicyConfig, PostgresConfig, RetryConfig,
-    RouterConfig, RoutingMode, TokenizerCacheConfig, TraceConfig,
+    HistoryBackend, MetricsConfig, OracleConfig, PolicyConfig, PostgresConfig, RedisConfig,
+    RetryConfig, RouterConfig, RoutingMode, TokenizerCacheConfig, TraceConfig,
 };
 use crate::{core::ConnectionMode, mcp::McpConfig};
 
@@ -395,6 +395,12 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn redis_history(mut self, redis_config: RedisConfig) -> Self {
+        self.config.history_backend = HistoryBackend::Redis;
+        self.config.redis = Some(redis_config);
+        self
+    }
+
     // ==================== Parsers ====================
 
     pub fn reasoning_parser<S: Into<String>>(mut self, parser: S) -> Self {
@@ -535,6 +541,14 @@ impl RouterConfigBuilder {
         if let Some(cfg) = postgres {
             self.config.history_backend = HistoryBackend::Postgres;
             self.config.postgres = Some(cfg);
+        }
+        self
+    }
+
+    pub fn maybe_redis(mut self, redis: Option<RedisConfig>) -> Self {
+        if let Some(cfg) = redis {
+            self.config.history_backend = HistoryBackend::Redis;
+            self.config.redis = Some(cfg);
         }
         self
     }

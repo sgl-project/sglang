@@ -14,8 +14,13 @@
 """Sampling parameters for text generation."""
 
 import logging
-import sre_parse
 from typing import Any, Dict, List, Optional, Union
+
+# sre_parse is deprecated in Python 3.11+, use re._parser instead
+try:
+    import re._parser as sre_parse
+except ImportError:
+    import sre_parse  # Python < 3.11
 
 _SAMPLING_EPS = 1e-6
 TOP_K_ALL = 1 << 30

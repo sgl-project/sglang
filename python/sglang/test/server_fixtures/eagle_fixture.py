@@ -6,8 +6,8 @@ import requests
 
 from sglang.srt.utils.common import kill_process_tree
 from sglang.test.test_utils import (
-    DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST,
-    DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
+    DEFAULT_DRAFT_MODEL_EAGLE,
+    DEFAULT_TARGET_MODEL_EAGLE,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -24,8 +24,8 @@ PROMPTS = [
 
 
 class EagleServerBase(CustomTestCase):
-    target_model = DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST
-    draft_model = DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST
+    target_model = DEFAULT_TARGET_MODEL_EAGLE
+    draft_model = DEFAULT_DRAFT_MODEL_EAGLE
     spec_algo = "EAGLE"
     spec_steps = 5
     spec_topk = 8

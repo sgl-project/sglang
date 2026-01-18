@@ -25,10 +25,26 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Required for git describe to find tags
 
       - name: "Set Date"
         run: |
           echo "DATE=$(date +%Y%m%d)" >> $GITHUB_ENV
+
+      - name: Get version from latest tag
+        id: version
+        run: |
+          # Get the latest version tag sorted by version number (e.g., v0.5.7 -> 0.5.7)
+          VERSION=$(git tag -l 'v[0-9]*' --sort=-v:refname | head -1 | sed 's/^v//')
+
+          if [ -z "$VERSION" ]; then
+            echo "::error::Could not determine version from git tags"
+            exit 1
+          fi
+
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "Detected version: ${VERSION}"
 
       - name: Login to Docker Hub
         uses: docker/login-action@v2
@@ -38,7 +54,7 @@ jobs:
 
       - name: Build and Push
         run: |
-          version=$(cat python/sglang/version.py | cut -d'"' -f2)
+          version=${{ steps.version.outputs.version }}
           echo "Version: ${version}"
 
           if [ "${{ matrix.gpu_arch }}" = "gfx942" ]; then
@@ -57,8 +73,10 @@ jobs:
           docker build . -f docker/rocm.Dockerfile --build-arg BUILD_TYPE=${{ matrix.build_type }} --build-arg GPU_ARCH=${{ matrix.gpu_arch }} -t rocm/sgl-dev:${tag}-${{ env.DATE }} --no-cache
           docker push rocm/sgl-dev:${tag}-${{ env.DATE }}
 
+  # Temporarily disable docker cache seeding until performant storage is in place
   cache:
-    if: always() && github.repository == 'sgl-project/sglang'
+    if: false
+    # if: always() && github.repository == 'sgl-project/sglang'
     runs-on: linux-mi300-gpu-1
     environment: 'prod'
     needs: publish
@@ -70,10 +88,26 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Required for git describe to find tags
 
       - name: "Set Date"
         run: |
           echo "DATE=$(date +%Y%m%d)" >> $GITHUB_ENV
+
+      - name: Get version from latest tag
+        id: version
+        run: |
+          # Get the latest version tag sorted by version number (e.g., v0.5.7 -> 0.5.7)
+          VERSION=$(git tag -l 'v[0-9]*' --sort=-v:refname | head -1 | sed 's/^v//')
+
+          if [ -z "$VERSION" ]; then
+            echo "::error::Could not determine version from git tags"
+            exit 1
+          fi
+
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "Detected version: ${VERSION}"
 
       - name: Login to Docker Hub
         uses: docker/login-action@v2
@@ -85,7 +119,7 @@ jobs:
         run: |
           set -euxo pipefail
 
-          version=$(cat python/sglang/version.py | cut -d'"' -f2)
+          version=${{ steps.version.outputs.version }}
           echo "Version: ${version}"
 
           if [ "${{ matrix.gpu_arch }}" = "gfx942" ]; then

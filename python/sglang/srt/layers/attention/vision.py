@@ -11,8 +11,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
+from sglang.jit_kernel.norm import can_use_fused_inplace_qknorm as can_use_jit_qk_norm
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
+from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.utils import (
     get_bool_env_var,
     get_device_capability,
@@ -21,6 +23,10 @@ from sglang.srt.utils import (
     is_hip,
     is_npu,
     print_info_once,
+)
+from sglang.srt.utils.multi_stream_utils import (
+    maybe_execute_in_parallel,
+    with_multi_stream,
 )
 
 _is_cuda = is_cuda()
@@ -464,7 +470,7 @@ class VisionAscendAttention(nn.Module):
         Returns:
              [b * s, h, head_size]
         """
-        cu_seqlens = resolve_seqlens(cu_seqlens, bsz, seq_len, device=q.device)
+        cu_seqlens = resolve_seqlens(cu_seqlens, bsz, seq_len, device="cpu")
 
         seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
         if seq_lens.is_npu:
@@ -532,6 +538,7 @@ class VisionAttention(nn.Module):
             [torch.Tensor, torch.Tensor, Any, Any], Tuple[torch.Tensor, torch.Tensor]
         ] = None,
         use_data_parallel: bool = False,
+        aux_stream: Optional[torch.cuda.Stream] = None,
         **kwargs,
     ):
         super().__init__()
@@ -558,11 +565,25 @@ class VisionAttention(nn.Module):
         self.dummy_dim = (num_dummy_heads + num_heads) * self.head_size
 
         if self.qk_normalization:
+            norm_kwargs = (
+                dict(
+                    weight_dtype=torch.float32,
+                    cast_x_before_out_mul=True,
+                )
+                if get_global_server_args().rl_on_policy_target is not None
+                else {}
+            )
             self.q_norm = RMSNorm(
-                self.dummy_dim, eps=layer_norm_eps, var_hidden_size=embed_dim
+                self.dummy_dim,
+                eps=layer_norm_eps,
+                var_hidden_size=embed_dim,
+                **norm_kwargs,
             )
             self.k_norm = RMSNorm(
-                self.dummy_dim, eps=layer_norm_eps, var_hidden_size=embed_dim
+                self.dummy_dim,
+                eps=layer_norm_eps,
+                var_hidden_size=embed_dim,
+                **norm_kwargs,
             )
 
         # Select attention backend via a unified method
@@ -620,6 +641,8 @@ class VisionAttention(nn.Module):
             tp_size=self.tp_size,
             prefix=add_prefix("proj", prefix),
         )
+        self.aux_stream = aux_stream
+        self.ln_events = [torch.cuda.Event(), torch.cuda.Event()] if aux_stream else []
 
     def _determine_attention_backend(self, passed_backend: Optional[str]) -> str:
         """Decide the multimodal attention backend string.
@@ -655,20 +678,40 @@ class VisionAttention(nn.Module):
 
     def _apply_qk_norm(self, q: torch.Tensor, k: torch.Tensor):
         """apply qk norm for internvl vit attn"""
-        q = q.flatten(1, 2)
-        k = k.flatten(1, 2)
 
-        if self.tp_size > 1:
-            q = tensor_model_parallel_all_gather(q.contiguous())
-            k = tensor_model_parallel_all_gather(k.contiguous())
-        q = self.q_norm(q)
-        k = self.k_norm(k)
-        if self.tp_size > 1:
-            splitter = partial(split_tensor_along_last_dim, num_partitions=self.tp_size)
-            q = splitter(q)[self.tp_rank]
-            k = splitter(k)[self.tp_rank]
-        q = q.unflatten(-1, (-1, self.head_size))
-        k = k.unflatten(-1, (-1, self.head_size))
+        def q_l2norm():
+            q_ = q.flatten(1, 2)
+            if self.tp_size > 1:
+                q_ = tensor_model_parallel_all_gather(q_.contiguous())
+            q_ = self.q_norm(q_)
+            if self.tp_size > 1:
+                splitter = partial(
+                    split_tensor_along_last_dim, num_partitions=self.tp_size
+                )
+                q_ = splitter(q_)[self.tp_rank]
+            q_ = q_.unflatten(-1, (-1, self.head_size))
+            return q_
+
+        def k_l2norm():
+            k_ = k.flatten(1, 2)
+            if self.tp_size > 1:
+                k_ = tensor_model_parallel_all_gather(k_.contiguous())
+            k_ = self.k_norm(k_)
+            if self.tp_size > 1:
+                splitter = partial(
+                    split_tensor_along_last_dim, num_partitions=self.tp_size
+                )
+                k_ = splitter(k_)[self.tp_rank]
+            k_ = k_.unflatten(-1, (-1, self.head_size))
+            return k_
+
+        with with_multi_stream(True):
+            q, k = maybe_execute_in_parallel(
+                q_l2norm,
+                k_l2norm,
+                self.ln_events,
+                self.aux_stream,
+            )
         return q, k
 
     def forward(
@@ -691,6 +734,15 @@ class VisionAttention(nn.Module):
         if x.dim() == 2:
             x = x.unsqueeze(0)
         assert x.dim() == 3, x.shape
+        if (
+            get_global_server_args().rl_on_policy_target is not None
+            and position_embeddings is not None
+        ):
+            assert isinstance(position_embeddings, tuple), (
+                "expected position_embeddings to be a tuple of two tensors,\n"
+                f"but got {type(position_embeddings)}, change if needed"
+            )
+            position_embeddings = tuple(p.to(x.dtype) for p in position_embeddings)
         x_shape = x.shape
         bsz, s, _ = x_shape
         head = self.num_attention_heads_per_partition
@@ -772,7 +824,23 @@ class VisionAttention(nn.Module):
 
         # internvl
         if self.qk_normalization:
-            q, k = self._apply_qk_norm(q, k)
+            # jit kernel
+            if can_use_jit_qk_norm(self.head_size, q.dtype):
+
+                # q: [tokens, head, head_size]  ->  [tokens, embed_dim]
+                head_dim_for_norm = head * self.head_size
+
+                q, k = apply_qk_norm(
+                    q=q,
+                    k=k,
+                    q_norm=self.q_norm,
+                    k_norm=self.k_norm,
+                    head_dim=head_dim_for_norm,
+                    alt_stream=self.aux_stream,
+                )
+
+            else:
+                q, k = self._apply_qk_norm(q, k)
 
         output = self.qkv_backend.forward(
             q=q,

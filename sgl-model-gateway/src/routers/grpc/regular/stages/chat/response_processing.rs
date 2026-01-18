@@ -9,19 +9,20 @@ use async_trait::async_trait;
 use axum::response::Response;
 use tracing::error;
 
-use crate::routers::{
-    error,
-    grpc::{
-        common::stages::PipelineStage,
-        context::{FinalResponse, RequestContext},
-        regular::{processor, streaming},
+use crate::{
+    core::AttachedBody,
+    routers::{
+        error,
+        grpc::{
+            common::stages::PipelineStage,
+            context::{FinalResponse, RequestContext},
+            regular::{processor, streaming},
+        },
     },
 };
 
 /// Chat response processing stage
-///
-/// Extracts chat-specific response processing logic from the old unified ResponseProcessingStage.
-pub struct ChatResponseProcessingStage {
+pub(crate) struct ChatResponseProcessingStage {
     processor: processor::ResponseProcessor,
     streaming_processor: Arc<streaming::StreamingProcessor>,
 }
@@ -102,7 +103,7 @@ impl ChatResponseProcessingStage {
 
             // Attach load guards to response body for proper RAII lifecycle
             let response = match ctx.state.load_guards.take() {
-                Some(guards) => guards.attach_to_response(response),
+                Some(guards) => AttachedBody::wrap_response(response, guards),
                 None => response,
             };
 

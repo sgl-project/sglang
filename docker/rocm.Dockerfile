@@ -21,7 +21,6 @@ ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
 ENV AITER_COMMIT="v0.1.4"
-ENV NO_DEPS_FLAG=""
 
 # ===============================
 # Base image 942 and args
@@ -31,8 +30,7 @@ ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT="v0.1.7.post5"
-ENV NO_DEPS_FLAG=""
+ENV AITER_COMMIT="v0.1.9.post1"
 
 # ===============================
 # Base image 950 and args
@@ -42,8 +40,7 @@ ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="0"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT="v0.1.7.post5"
-ENV NO_DEPS_FLAG=""
+ENV AITER_COMMIT="v0.1.9.post1"
 # ===============================
 # Chosen arch and args
 FROM ${GPU_ARCH}
@@ -187,9 +184,9 @@ RUN git clone ${SGL_REPO} \
     && cd .. \
     && rm -rf python/pyproject.toml && mv python/pyproject_other.toml python/pyproject.toml \
     && if [ "$BUILD_TYPE" = "srt" ]; then \
-         python -m pip --no-cache-dir install -e "python[srt_hip,diffusion]" ${NO_DEPS_FLAG}; \
+         python -m pip --no-cache-dir install -e "python[srt_hip,diffusion_hip]"; \
        else \
-         python -m pip --no-cache-dir install -e "python[all_hip,diffusion]" ${NO_DEPS_FLAG}; \
+         python -m pip --no-cache-dir install -e "python[all_hip,diffusion_hip]"; \
        fi
 
 RUN python -m pip cache purge

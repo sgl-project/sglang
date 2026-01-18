@@ -2,17 +2,12 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.layers.attention.nsa.utils import NSA_DEQUANT_K_CACHE_FAST
-
 
 def dequantize_k_cache(quant_k_cache):
-    if NSA_DEQUANT_K_CACHE_FAST:
-        return _dequantize_k_cache_fast_wrapped(quant_k_cache)
-    else:
-        return _dequantize_k_cache_slow(quant_k_cache)
+    return _dequantize_k_cache_fast_wrapped(quant_k_cache)
 
 
-def _dequantize_k_cache_slow(
+def _dequantize_k_cache_ref(
     quant_k_cache: torch.Tensor,  # (num_blocks, block_size, 1, bytes_per_token)
     dv: int = 512,
     tile_size: int = 128,

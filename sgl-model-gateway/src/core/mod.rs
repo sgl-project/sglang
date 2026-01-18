@@ -9,11 +9,8 @@
 //! - Workflow steps for multi-step operations
 //! - Common utilities
 
-/// Default model identifier used when no model is specified.
-///
-/// This constant should be used instead of hardcoded "unknown" strings
-/// throughout the codebase for consistency.
-pub const UNKNOWN_MODEL_ID: &str = "unknown";
+// Re-export UNKNOWN_MODEL_ID from protocols for use throughout core
+pub use crate::protocols::UNKNOWN_MODEL_ID;
 
 pub mod circuit_breaker;
 pub mod error;
@@ -30,19 +27,17 @@ pub mod worker_manager;
 pub mod worker_registry;
 pub mod worker_service;
 
-pub use circuit_breaker::{
-    CircuitBreaker, CircuitBreakerConfig, CircuitBreakerStats, CircuitState,
-};
+// Re-export commonly used types for convenience
+pub use circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
 pub use error::{WorkerError, WorkerResult};
 pub use job_queue::{Job, JobQueue, JobQueueConfig};
 pub use model_card::{ModelCard, ProviderType};
-pub use model_type::{Endpoint, ModelType};
-pub use retry::{is_retryable_status, BackoffCalculator, RetryError, RetryExecutor};
+pub use retry::{is_retryable_status, RetryExecutor};
 pub use worker::{
-    attach_guards_to_response, worker_to_info, BasicWorker, ConnectionMode, DPAwareWorker,
-    HealthChecker, HealthConfig, RuntimeType, Worker, WorkerFactory, WorkerLoadGuard, WorkerType,
+    AttachedBody, BasicWorker, ConnectionMode, HealthConfig, RuntimeType, Worker, WorkerLoadGuard,
+    WorkerType,
 };
 pub use worker_builder::{BasicWorkerBuilder, DPAwareWorkerBuilder};
 pub use worker_manager::{LoadMonitor, WorkerManager};
-pub use worker_registry::{WorkerId, WorkerRegistry, WorkerRegistryStats};
-pub use worker_service::{WorkerService, WorkerServiceError};
+pub use worker_registry::{HashRing, WorkerRegistry};
+pub use worker_service::WorkerService;

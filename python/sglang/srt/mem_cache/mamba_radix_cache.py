@@ -41,6 +41,7 @@ from sglang.srt.mem_cache.radix_cache import (
     _key_match_paged,
     get_child_key,
 )
+from sglang.srt.server_args import get_global_server_args
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -395,6 +396,9 @@ class MambaRadixCache(BasePrefixCache):
         self.reset()
 
     ##### Public API #####
+
+    def supports_mamba(self) -> bool:
+        return True
 
     def reset(self) -> None:
         self.root_node = TreeNode()
@@ -955,11 +959,14 @@ class MambaRadixCache(BasePrefixCache):
         # Calculate the branching point. It is defined as the last aligned position that
         # does not have a mamba value.
         if len(value) > best_value_len:
-            fla_chunk_aligned_seqlen = (
-                sum(len(v) for v in value) // FLA_CHUNK_SIZE
-            ) * FLA_CHUNK_SIZE
+            mamba_cache_chunk_size = get_global_server_args().mamba_cache_chunk_size
+            mamba_cache_chunk_aligned_seqlen = (
+                sum(len(v) for v in value) // mamba_cache_chunk_size
+            ) * mamba_cache_chunk_size
             mamba_branching_seqlen = (
-                fla_chunk_aligned_seqlen if fla_chunk_aligned_seqlen > 0 else None
+                mamba_cache_chunk_aligned_seqlen
+                if mamba_cache_chunk_aligned_seqlen > 0
+                else None
             )
         else:
             mamba_branching_seqlen = None
@@ -975,7 +982,7 @@ class MambaRadixCache(BasePrefixCache):
         new_node.full_lock_ref = child.full_lock_ref
         new_node.mamba_lock_ref = 0
         new_node.key = child.key[:split_len]
-        new_node.value = child.value[:split_len]
+        new_node.value = child.value[:split_len].clone()
 
         # child time should be later than parent's time for mamba tombstone
         child.last_access_time = get_last_access_time()
@@ -985,7 +992,7 @@ class MambaRadixCache(BasePrefixCache):
             self.mamba_lru_list.remove_node(child)
         child.parent = new_node
         child.key = child.key[split_len:]
-        child.value = child.value[split_len:]
+        child.value = child.value[split_len:].clone()
         new_node.parent.children[self.get_child_key_fn(key)] = new_node
 
         # insert the new node and child into the lru lists, insert

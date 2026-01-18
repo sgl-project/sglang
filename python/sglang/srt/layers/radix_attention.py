@@ -20,8 +20,9 @@ from typing import TYPE_CHECKING, Optional
 import torch
 from torch import nn
 
+from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.compilation.piecewise_context_manager import get_forward_context
-from sglang.srt.utils import direct_register_custom_op
+from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -115,7 +116,7 @@ class RadixAttention(nn.Module):
                 output = q.new_empty((q.shape[0], self.tp_q_head_num * self.v_head_dim))
             else:
                 output = torch.empty_like(q)
-            torch.ops.sglang.unified_attention_with_output(
+            unified_attention_with_output(
                 q, k, v, output, save_kv_cache, self.layer_id, **kwargs
             )
             return output
@@ -131,6 +132,8 @@ class RadixAttention(nn.Module):
             )
 
 
+@register_custom_op(mutates_args=["output"])
+@register_split_op()
 def unified_attention_with_output(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -165,26 +168,3 @@ def unified_attention_with_output(
 
     output.view(ret.shape).copy_(ret)
     return
-
-
-def unified_attention_with_output_fake(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    output: torch.Tensor,
-    save_kv_cache: bool,
-    layer_id: int,
-    *,
-    q_rope: Optional[torch.Tensor] = None,
-    k_rope: Optional[torch.Tensor] = None,
-    sinks: Optional[torch.Tensor] = None,
-) -> None:
-    return
-
-
-direct_register_custom_op(
-    op_name="unified_attention_with_output",
-    op_func=unified_attention_with_output,
-    mutates_args=["output"],
-    fake_impl=unified_attention_with_output_fake,
-)

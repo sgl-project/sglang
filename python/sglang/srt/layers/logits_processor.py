@@ -15,7 +15,7 @@
 
 import dataclasses
 import logging
-from typing import List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import triton
@@ -100,6 +100,9 @@ class LogitsProcessorOutput:
 
     ## Part 4: Diffusion LLM only.
     full_logits: Optional[torch.Tensor] = None
+
+    ## Part 5: Customized Info
+    customized_info: Optional[Dict[str, List[Any]]] = None
 
 
 @dataclasses.dataclass

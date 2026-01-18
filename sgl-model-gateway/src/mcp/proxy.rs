@@ -4,7 +4,10 @@
 
 use std::time::Duration;
 
-use crate::mcp::{McpError, McpProxyConfig, McpResult, McpServerConfig};
+use crate::mcp::{
+    config::{McpProxyConfig, McpServerConfig},
+    error::{McpError, McpResult},
+};
 
 /// Resolve proxy configuration for a server
 /// Priority: server.proxy > global.proxy > None
@@ -15,7 +18,7 @@ use crate::mcp::{McpError, McpProxyConfig, McpResult, McpServerConfig};
 ///
 /// # Returns
 /// The resolved proxy configuration, or None for direct connection
-pub fn resolve_proxy_config<'a>(
+pub(crate) fn resolve_proxy_config<'a>(
     server_config: &'a McpServerConfig,
     global_proxy: Option<&'a McpProxyConfig>,
 ) -> Option<&'a McpProxyConfig> {
@@ -42,7 +45,7 @@ pub fn resolve_proxy_config<'a>(
 ///
 /// # Returns
 /// The configured builder or error
-pub fn apply_proxy_to_builder(
+pub(super) fn apply_proxy_to_builder(
     mut builder: reqwest::ClientBuilder,
     proxy_cfg: &McpProxyConfig,
 ) -> McpResult<reqwest::ClientBuilder> {
@@ -94,7 +97,9 @@ pub fn apply_proxy_to_builder(
 ///
 /// # Returns
 /// A configured reqwest::Client or error
-pub fn create_http_client(proxy_config: Option<&McpProxyConfig>) -> McpResult<reqwest::Client> {
+pub(crate) fn create_http_client(
+    proxy_config: Option<&McpProxyConfig>,
+) -> McpResult<reqwest::Client> {
     let mut builder = reqwest::Client::builder().connect_timeout(Duration::from_secs(10));
 
     // Apply MCP-specific proxy if configured
@@ -110,7 +115,7 @@ pub fn create_http_client(proxy_config: Option<&McpProxyConfig>) -> McpResult<re
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mcp::McpTransport;
+    use crate::mcp::config::McpTransport;
 
     #[test]
     fn test_resolve_proxy_no_config() {

@@ -45,6 +45,7 @@ RUN source $HOME/.local/bin/env && \
     cp pyproject_cpu.toml pyproject.toml && \
     uv pip install . && \
     uv pip install torch==${VER_TORCH} torchvision==${VER_TORCHVISION} triton==${VER_TRITON} --force-reinstall && \
+    uv pip install tabulate && \
     cd ../sgl-kernel && \
     cp pyproject_cpu.toml pyproject.toml && \
     uv pip install .
