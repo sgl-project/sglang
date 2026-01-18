@@ -206,10 +206,10 @@ class TransformersForCausalLM(nn.Module):
         forward_signature = signature(self.model.forward)
         self._forward_params = set(forward_signature.parameters.keys())
         self._input_ids_param = (
-            "input_ids"
-            if "input_ids" in self._forward_params
-            else "text_input_ids"
+            "text_input_ids"
             if "text_input_ids" in self._forward_params
+            else "input_ids"
+            if "input_ids" in self._forward_params
             else None
         )
         self._forward_accepts_kwargs = any(
