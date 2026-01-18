@@ -35,7 +35,7 @@ class TestSWARadixCacheKL(CustomTestCase):
                 "--tp-size",
                 "1",
                 "--mem-fraction-static",
-                "0.8",
+                "0.75",
             ],
         )
 
