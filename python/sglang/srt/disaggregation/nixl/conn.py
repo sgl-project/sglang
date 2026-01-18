@@ -605,6 +605,7 @@ class NixlKVManager(CommonKVManager):
     ):
         """Transfer Mamba states via RDMA."""
         assert len(prefill_state_indices) == 1, "Mamba should have single state index"
+        assert len(dst_state_indices) == len(prefill_state_indices), "State indices count mismatch between Prefill and Decode"
 
         src_addrs = []
         dst_addrs = []
