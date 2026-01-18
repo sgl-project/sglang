@@ -173,27 +173,37 @@ def _is_host_allowlisted(
 
 def _get_openai_media_url_policy() -> dict[str, Any]:
     enabled = get_bool_env_var("SGLANG_OPENAI_MEDIA_URL_FETCH_ENABLED", "true")
-    allowed_schemes = os.getenv(
-        "SGLANG_OPENAI_MEDIA_URL_ALLOWED_SCHEMES", "https,http"
-    )
+    allowed_schemes = os.getenv("SGLANG_OPENAI_MEDIA_URL_ALLOWED_SCHEMES", "https,http")
     allowlist_raw = os.getenv("SGLANG_OPENAI_MEDIA_URL_ALLOWLIST", "")
     default_max_bytes = 50 * 1024 * 1024
     default_max_redirects = 5
     default_timeout = 10.0
     try:
-        max_bytes = int(os.getenv("SGLANG_OPENAI_MEDIA_URL_MAX_BYTES", str(default_max_bytes)))
+        max_bytes = int(
+            os.getenv("SGLANG_OPENAI_MEDIA_URL_MAX_BYTES", str(default_max_bytes))
+        )
     except (TypeError, ValueError):
         max_bytes = default_max_bytes
     try:
-        max_redirects = int(os.getenv("SGLANG_OPENAI_MEDIA_URL_MAX_REDIRECTS", str(default_max_redirects)))
+        max_redirects = int(
+            os.getenv(
+                "SGLANG_OPENAI_MEDIA_URL_MAX_REDIRECTS", str(default_max_redirects)
+            )
+        )
     except (TypeError, ValueError):
         max_redirects = default_max_redirects
     try:
-        timeout = float(os.getenv("SGLANG_OPENAI_MEDIA_URL_TIMEOUT", str(default_timeout)))
+        timeout = float(
+            os.getenv("SGLANG_OPENAI_MEDIA_URL_TIMEOUT", str(default_timeout))
+        )
     except (TypeError, ValueError):
         timeout = default_timeout
 
-    schemes = {scheme.strip().lower() for scheme in allowed_schemes.split(",") if scheme.strip()}
+    schemes = {
+        scheme.strip().lower()
+        for scheme in allowed_schemes.split(",")
+        if scheme.strip()
+    }
     if not schemes:
         schemes = {"https"}
     allow_hosts, allow_nets = _parse_allowlist(allowlist_raw)
@@ -310,7 +320,9 @@ async def _save_url_image_to_path(
                     if response.status_code in {301, 302, 303, 307, 308}:
                         location = response.headers.get("location")
                         if not location:
-                            raise ValueError("Redirect response missing location header")
+                            raise ValueError(
+                                "Redirect response missing location header"
+                            )
                         current_url = urljoin(current_url, location)
                         continue
 
@@ -324,7 +336,14 @@ async def _save_url_image_to_path(
                         _, url_ext = os.path.splitext(url_path)
                         url_ext = url_ext.lower()
 
-                        if url_ext in {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"}:
+                        if url_ext in {
+                            ".jpg",
+                            ".jpeg",
+                            ".png",
+                            ".webp",
+                            ".gif",
+                            ".bmp",
+                        }:
                             ext = ".jpg" if url_ext == ".jpeg" else url_ext
                         elif content_type.startswith("image/"):
                             if "jpeg" in content_type or "jpg" in content_type:
@@ -357,7 +376,9 @@ async def _save_url_image_to_path(
                         async for chunk in response.aiter_bytes():
                             total += len(chunk)
                             if total > policy["max_bytes"]:
-                                raise ValueError("Remote content exceeds max size limit")
+                                raise ValueError(
+                                    "Remote content exceeds max size limit"
+                                )
                             f.write(chunk)
                     return target_path
 
