@@ -3,6 +3,11 @@ FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu24.04 AS base
 
 ARG TARGETARCH
 ARG BUILD_TYPE=all
+# Control whether to install vLLM via pip during the image build.
+# Set to "true" to install; defaults to "false".
+ARG INSTALL_VLLM=false
+# Optional: pin a specific vLLM version, e.g., "0.6.4". Leave empty for latest.
+ARG VLLM_VERSION=""
 ARG BRANCH_TYPE=remote
 ARG GRACE_BLACKWELL=0
 ARG HOPPER_SBO=0
@@ -161,6 +166,9 @@ COPY . /src
 FROM base AS framework
 
 ARG BRANCH_TYPE
+
+ARG INSTALL_VLLM
+ARG VLLM_VERSION
 ARG BUILD_TYPE
 ARG CUDA_VERSION
 ARG BUILD_AND_DOWNLOAD_PARALLEL
@@ -200,6 +208,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         13.0.1) CUINDEX=130 ;; \
         *) echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 ;; \
     esac \
+
     && if [ "$CUDA_VERSION" = "12.6.1" ]; then \
         python3 -m pip install https://${GITHUB_ARTIFACTORY}/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sgl_kernel-${SGL_KERNEL_VERSION}+cu124-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps \
     ; \
@@ -217,7 +226,14 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     && if [ "$INSTALL_FLASHINFER_JIT_CACHE" = "1" ]; then \
         python3 -m pip install flashinfer-jit-cache==${FLASHINFER_VERSION} --index-url https://flashinfer.ai/whl/cu${CUINDEX} ; \
     fi \
-    && FLASHINFER_CUBIN_DOWNLOAD_THREADS=${BUILD_AND_DOWNLOAD_PARALLEL} FLASHINFER_LOGGING_LEVEL=warning python3 -m flashinfer --download-cubin
+    && FLASHINFER_CUBIN_DOWNLOAD_THREADS=${BUILD_AND_DOWNLOAD_PARALLEL} FLASHINFER_LOGGING_LEVEL=warning python3 -m flashinfer --download-cubin \
+    && if [ "${INSTALL_VLLM}" = "true" ]; then \
+          if [ -n "${VLLM_VERSION}" ]; then \
+            python3 -m pip install --no-cache-dir vllm==${VLLM_VERSION}; \
+          else \
+            python3 -m pip install --no-cache-dir vllm; \
+          fi; \
+        fi
 
 # DeepEP
 # We use Tom's DeepEP fork for GB200 for now; the 1fd57b0276311d035d16176bb0076426166e52f3 commit is https://github.com/fzyzcjy/DeepEP/tree/gb200_blog_part_2
