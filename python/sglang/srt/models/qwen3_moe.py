@@ -61,6 +61,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2_moe import Qwen2MoeMLP as Qwen3MoeMLP
 from sglang.srt.models.qwen2_moe import Qwen2MoeModel
+from sglang.srt.models.stacked_params_mixin import StackedParamsMixin
 from sglang.srt.models.utils import (
     apply_qk_norm,
     create_fused_set_kv_buffer_arg,
@@ -880,7 +881,7 @@ class Qwen3MoeModel(Qwen2MoeModel):
         )
 
 
-class Qwen3MoeForCausalLM(nn.Module):
+class Qwen3MoeForCausalLM(nn.Module, StackedParamsMixin):
     fall_back_to_pt_during_load = False
 
     def __init__(
@@ -904,6 +905,19 @@ class Qwen3MoeForCausalLM(nn.Module):
             use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
+
+        # Stacked params mapping for unified weight loading API
+        self.stacked_params_mapping = [
+            # (param_name, shard_name, shard_id)
+            ("qkv_proj", "q_proj", "q"),
+            ("qkv_proj", "k_proj", "k"),
+            ("qkv_proj", "v_proj", "v"),
+            ("gate_up_proj", "gate_proj", 0),
+            ("gate_up_proj", "up_proj", 1),
+        ]
+        # Expert params mapping initialized as empty, populated during load_weights
+        self.expert_params_mapping = []
+
         self.capture_aux_hidden_states = False
 
     def get_input_embeddings(self) -> nn.Embedding:

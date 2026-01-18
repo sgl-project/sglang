@@ -138,6 +138,7 @@ from sglang.srt.model_loader.utils import (
     should_deepgemm_weight_requant_ue8m0,
 )
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.stacked_params_mixin import StackedParamsMixin
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
@@ -3273,7 +3274,7 @@ class DeepseekV2Model(nn.Module):
         return hidden_states, aux_hidden_states
 
 
-class DeepseekV2ForCausalLM(nn.Module):
+class DeepseekV2ForCausalLM(nn.Module, StackedParamsMixin):
     # for quark model load
     packed_modules_mapping = {}
 
@@ -3319,6 +3320,15 @@ class DeepseekV2ForCausalLM(nn.Module):
             # ranks other than the last rank will have a placeholder layer
             self.lm_head = PPMissingLayer()
         self.logits_processor = LogitsProcessor(config)
+
+        # Stacked params mapping for unified weight loading API
+        self.stacked_params_mapping = [
+            # (param_name, shard_name, shard_id)
+            ("gate_up_proj", "gate_proj", 0),
+            ("gate_up_proj", "up_proj", 1),
+        ]
+        # Expert params mapping initialized as empty, populated during load_weights
+        self.expert_params_mapping = []
 
         self._routed_experts_weights_of_layer = LazyValue(
             lambda: {

@@ -75,6 +75,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.stacked_params_mixin import StackedParamsMixin
 from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
@@ -988,7 +989,7 @@ class Glm4MoeModel(nn.Module):
         return hidden_states, aux_hidden_states
 
 
-class Glm4MoeForCausalLM(nn.Module):
+class Glm4MoeForCausalLM(nn.Module, StackedParamsMixin):
     def __init__(
         self,
         config: PretrainedConfig,
@@ -1013,6 +1014,18 @@ class Glm4MoeForCausalLM(nn.Module):
             use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
+
+        # Stacked params mapping for unified weight loading API
+        self.stacked_params_mapping = [
+            # (param_name, shard_name, shard_id)
+            ("qkv_proj", "q_proj", "q"),
+            ("qkv_proj", "k_proj", "k"),
+            ("qkv_proj", "v_proj", "v"),
+            ("gate_up_proj", "gate_proj", 0),
+            ("gate_up_proj", "up_proj", 1),
+        ]
+        # Expert params mapping initialized as empty, populated during load_weights
+        self.expert_params_mapping = []
 
         # For EAGLE3 support
         self.capture_aux_hidden_states = False
