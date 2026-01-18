@@ -2226,6 +2226,7 @@ class SafeUnpickler(pickle.Unpickler):
         "sglang.srt.model_executor.model_runner.",
         "sglang.srt.layers.",
         "sglang.srt.utils.",
+        "torch_npu.",
     }
 
     DENY_CLASSES = {
