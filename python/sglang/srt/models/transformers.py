@@ -205,6 +205,13 @@ class TransformersForCausalLM(nn.Module):
         self.logits_processor = LogitsProcessor(config)
         forward_signature = signature(self.model.forward)
         self._forward_params = set(forward_signature.parameters.keys())
+        self._input_ids_param = (
+            "input_ids"
+            if "input_ids" in self._forward_params
+            else "text_input_ids"
+            if "text_input_ids" in self._forward_params
+            else None
+        )
         self._forward_accepts_kwargs = any(
             param.kind == Parameter.VAR_KEYWORD
             for param in forward_signature.parameters.values()
@@ -275,7 +282,11 @@ class TransformersForCausalLM(nn.Module):
             model_kwargs["forward_batch"] = forward_batch
         if self._forward_accepts_kwargs or "attention_instances" in self._forward_params:
             model_kwargs["attention_instances"] = self.attention_instances
-        hidden_states = self.model(input_ids[None, ...], **model_kwargs)[0][0, ...]
+        if self._input_ids_param:
+            model_kwargs[self._input_ids_param] = input_ids[None, ...]
+            hidden_states = self.model(**model_kwargs)[0][0, ...]
+        else:
+            hidden_states = self.model(input_ids[None, ...], **model_kwargs)[0][0, ...]
 
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
