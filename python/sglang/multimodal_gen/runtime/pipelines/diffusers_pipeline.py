@@ -32,6 +32,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.executors.sync_executor import
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages import PipelineStage
+from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_model
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -502,7 +503,7 @@ class DiffusersPipeline(ComposedPipelineBase):
         See: https://huggingface.co/docs/diffusers/main/en/optimization/attention_backends
         Available backends: flash, _flash_3_hub, sage, xformers, native, etc.
         """
-        backend = getattr(server_args, "diffusers_attention_backend", None)
+        backend = getattr(server_args, "attention_backend", None)
 
         if backend is None:
             config = getattr(server_args, "pipeline_config", None)
@@ -510,6 +511,20 @@ class DiffusersPipeline(ComposedPipelineBase):
                 backend = getattr(config, "diffusers_attention_backend", None)
 
         if backend is None:
+            return
+
+        backend = backend.lower()
+        sglang_backends = {e.name.lower() for e in AttentionBackendEnum} | {
+            "fa3",
+            "fa4",
+        }
+        if backend in sglang_backends:
+            logger.debug(
+                "Skipping diffusers attention backend '%s' because it matches a "
+                "SGLang backend name. Use diffusers backend names when running "
+                "the diffusers backend.",
+                backend,
+            )
             return
 
         for component_name in ["transformer", "unet"]:
@@ -542,14 +557,19 @@ class DiffusersPipeline(ComposedPipelineBase):
                 "Install it with `pip install cache-dit`."
             ) from e
 
-        cache_options = self._load_cache_dit_options(cache_dit, cache_dit_config)
-        parallelism_config = cache_options.get("parallelism_config")
-        if parallelism_config is not None:
-            self._resolve_cache_dit_extra_parallel_modules(
-                pipe,
-                parallelism_config,
-                cache_dit,
+        if not hasattr(cache_dit, "load_configs"):
+            raise RuntimeError(
+                "cache-dit>=1.2.0 is required for --cache-dit-config. "
+                "Please upgrade cache-dit."
             )
+
+        try:
+            cache_options = cache_dit.load_configs(cache_dit_config)
+        except Exception as e:
+            raise ValueError(
+                "Failed to load cache-dit config. Provide a YAML/JSON path (or a dict "
+                "supported by cache-dit>=1.2.0)."
+            ) from e
 
         try:
             pipe = cache_dit.enable_cache(pipe, **cache_options)
@@ -560,100 +580,6 @@ class DiffusersPipeline(ComposedPipelineBase):
 
         logger.info("Enabled cache-dit for diffusers pipeline")
         return pipe
-
-    def _load_cache_dit_options(self, cache_dit: Any, cache_dit_config: Any) -> dict:
-        """Load cache-dit options from a path or dict."""
-        if isinstance(cache_dit_config, str):
-            config_dict = ServerArgs.load_config_file(cache_dit_config)
-        elif isinstance(cache_dit_config, dict):
-            config_dict = cache_dit_config
-        else:
-            raise ValueError(
-                "cache_dit_config must be a file path or a dict, got "
-                f"{type(cache_dit_config).__name__}"
-            )
-
-        if not isinstance(config_dict, dict):
-            raise ValueError(
-                "cache_dit_config must resolve to a dict, got "
-                f"{type(config_dict).__name__}"
-            )
-
-        if "cache_config" in config_dict:
-            cache_options = cache_dit.load_options(config_dict["cache_config"])
-            parallelism_config = config_dict.get("parallelism_config")
-            if parallelism_config is not None:
-                cache_options["parallelism_config"] = cache_dit.ParallelismConfig(
-                    **parallelism_config
-                )
-            return cache_options
-
-        return cache_dit.load_options(config_dict)
-
-    def _resolve_cache_dit_extra_parallel_modules(
-        self,
-        pipe: Any,
-        parallelism_config: Any,
-        cache_dit: Any,
-    ) -> None:
-        parallel_kwargs = getattr(parallelism_config, "parallel_kwargs", None)
-        if not isinstance(parallel_kwargs, dict):
-            return
-
-        extra_modules = parallel_kwargs.get("extra_parallel_modules")
-        if not extra_modules:
-            return
-
-        resolved_modules = []
-        for module in extra_modules:
-            if isinstance(module, str):
-                resolved = self._lookup_parallel_module(pipe, module, cache_dit)
-                if resolved is None:
-                    logger.warning(
-                        "cache-dit extra_parallel_modules entry '%s' could not be resolved",
-                        module,
-                    )
-                    continue
-                resolved_modules.append(resolved)
-            else:
-                resolved_modules.append(module)
-
-        parallel_kwargs["extra_parallel_modules"] = resolved_modules
-
-    def _lookup_parallel_module(
-        self,
-        pipe: Any,
-        name: str,
-        cache_dit: Any,
-    ) -> Any | None:
-        if name == "text_encoder":
-            return self._get_default_text_encoder(pipe, cache_dit)
-
-        if hasattr(pipe, name):
-            return getattr(pipe, name)
-
-        return None
-
-    def _get_default_text_encoder(self, pipe: Any, cache_dit: Any) -> Any | None:
-        try:
-            from cache_dit.serve.utils import get_text_encoder_from_pipe
-
-            encoder, _ = get_text_encoder_from_pipe(pipe)
-            if encoder is not None:
-                return encoder
-        except Exception:
-            logger.debug(
-                "cache-dit get_text_encoder_from_pipe failed; falling back to attribute lookup",
-                exc_info=True,
-            )
-
-        for attr in ["text_encoder_2", "text_encoder_3", "text_encoder"]:
-            if hasattr(pipe, attr):
-                encoder = getattr(pipe, attr)
-                if encoder is not None:
-                    return encoder
-
-        return None
 
     def _get_device_map(self, server_args: ServerArgs) -> str | None:
         """
