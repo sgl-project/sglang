@@ -371,23 +371,9 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
         query = query.unflatten(-1, (self.heads, -1))
         key = key.unflatten(-1, (self.heads, -1))
         value = value.unflatten(-1, (self.heads, -1))
-
-        if (
-            query.is_cuda
-            and (self.norm_q.variance_epsilon == self.norm_k.variance_epsilon)
-            and can_use_fused_inplace_qknorm(self.head_dim, query.dtype)
-        ):
-            query, key = apply_qk_norm(
-                q=query,
-                k=key,
-                q_norm=self.norm_q,
-                k_norm=self.norm_k,
-                head_dim=self.head_dim,
-                allow_inplace=True,
-            )
-        else:
-            query = self.norm_q(query)
-            key = self.norm_k(key)
+        
+        query = self.norm_q(query)
+        key = self.norm_k(key)
 
         if freqs_cis is not None:
             cos, sin = freqs_cis
