@@ -192,6 +192,13 @@ FP8_GEMM_RUNNER_BACKEND_CHOICES = [
     "aiter",
 ]
 
+FP4_GEMM_RUNNER_BACKEND_CHOICES = [
+    "auto",
+    "cudnn",
+    "cutlass",
+    "trtllm",
+]
+
 MAMBA_SSM_DTYPE_CHOICES = ["float32", "bfloat16"]
 
 MAMBA_SCHEDULER_STRATEGY_CHOICES = ["auto", "no_buffer", "extra_buffer"]
@@ -224,6 +231,10 @@ def add_moe_runner_backend_choices(choices):
 
 def add_fp8_gemm_runner_backend_choices(choices):
     FP8_GEMM_RUNNER_BACKEND_CHOICES.extend(choices)
+
+
+def add_fp4_gemm_runner_backend_choices(choices):
+    FP4_GEMM_RUNNER_BACKEND_CHOICES.extend(choices)
 
 
 def add_deterministic_attention_backend_choices(choices):
@@ -423,6 +434,7 @@ class ServerArgs:
     grammar_backend: Optional[str] = None
     mm_attention_backend: Optional[str] = None
     fp8_gemm_runner_backend: str = "auto"
+    fp4_gemm_runner_backend: str = "auto"
     nsa_prefill_backend: str = "flashmla_sparse"
     nsa_decode_backend: str = "fa3"
     disable_flashinfer_autotune: bool = False
@@ -3537,6 +3549,20 @@ class ServerArgs:
             "'aiter' (ROCm only). "
             "NOTE: This replaces the deprecated environment variables "
             "SGLANG_ENABLE_FLASHINFER_FP8_GEMM and SGLANG_SUPPORT_CUTLASS_BLOCK_FP8.",
+        )
+        parser.add_argument(
+            "--fp4-gemm-backend",
+            type=str,
+            choices=FP4_GEMM_RUNNER_BACKEND_CHOICES,
+            default=ServerArgs.fp4_gemm_runner_backend,
+            dest="fp4_gemm_runner_backend",
+            help="Choose the runner backend for NVFP4 GEMM operations. "
+            "Options: 'auto' (default, selects between cudnn/cutlass based on CUDA/cuDNN version), "
+            "'cudnn' (cuDNN backend, optimal on CUDA 13+ with cuDNN 9.15+), "
+            "'cutlass' (CUTLASS backend, optimal on CUDA 12), "
+            "'trtllm' (TensorRT-LLM backend, requires different weight preparation with shuffling). "
+            "NOTE: This replaces the deprecated environment variable "
+            "SGLANG_FLASHINFER_FP4_GEMM_BACKEND.",
         )
         parser.add_argument(
             "--disable-flashinfer-autotune",

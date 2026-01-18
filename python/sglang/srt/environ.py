@@ -504,6 +504,10 @@ _warn_deprecated_env_to_cli_flag(
     "It will be completely removed in 0.5.7. Please use '--fp8-gemm-backend=cutlass' instead.",
 )
 _warn_deprecated_env_to_cli_flag(
+    "SGLANG_FLASHINFER_FP4_GEMM_BACKEND",
+    "It will be completely removed in 0.5.9. Please use '--fp4-gemm-backend' instead.",
+)
+_warn_deprecated_env_to_cli_flag(
     "SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE",
     "Please use '--enable-prefill-delayer' instead.",
 )
