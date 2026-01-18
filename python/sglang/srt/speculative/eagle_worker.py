@@ -60,7 +60,7 @@ from sglang.srt.speculative.spec_utils import (
 from sglang.srt.utils import (
     MultiprocessingSerializer,
     empty_context,
-    get_available_gpu_memory,
+    get_available_device_memory,
     is_cuda,
     is_npu,
     next_power_of_2,
@@ -240,14 +240,14 @@ class EAGLEWorker(TpModelWorker):
         # Capture draft
         if self.speculative_num_steps > 1:
             tic = time.perf_counter()
-            before_mem = get_available_gpu_memory(self.device, self.gpu_id)
+            before_mem = get_available_device_memory(self.device, self.gpu_id)
             logger.info(
                 f"Capture draft cuda graph begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
             )
             self.cuda_graph_runner = Device2DraftCudaGraphRunner[
                 self.target_worker.device
             ](self)
-            after_mem = get_available_gpu_memory(self.device, self.gpu_id)
+            after_mem = get_available_device_memory(self.device, self.gpu_id)
             logger.info(
                 f"Capture draft cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB."
             )
@@ -255,14 +255,14 @@ class EAGLEWorker(TpModelWorker):
         # Capture extend
         if self.draft_extend_attn_backend and not _is_npu:
             tic = time.perf_counter()
-            before_mem = get_available_gpu_memory(self.device, self.gpu_id)
+            before_mem = get_available_device_memory(self.device, self.gpu_id)
             logger.info(
                 f"Capture draft extend cuda graph begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
             )
             self.cuda_graph_runner_for_draft_extend = EAGLEDraftExtendCudaGraphRunner(
                 self
             )
-            after_mem = get_available_gpu_memory(self.device, self.gpu_id)
+            after_mem = get_available_device_memory(self.device, self.gpu_id)
             logger.info(
                 f"Capture draft extend cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB."
             )
