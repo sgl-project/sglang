@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
-from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+from sglang.jit_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 from sgl_kernel.sparse_flash_attn import (
     convert_vertical_slash_indexes,
     convert_vertical_slash_indexes_mergehead,

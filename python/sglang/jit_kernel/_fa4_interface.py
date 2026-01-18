@@ -20,16 +20,18 @@ import cutlass
 import cutlass.cute as cute
 import torch
 from cutlass.cute.runtime import from_dlpack
-from flash_attn_origin.cute import utils
-from flash_attn_origin.cute.block_sparsity import (
+from sglang.jit_kernel.flash_attn_origin.cute import utils
+from sglang.jit_kernel.flash_attn_origin.cute.block_sparsity import (
     BlockSparseTensorsTorch,
     get_block_sparse_expected_shapes,
     normalize_block_sparse_tensors,
     to_cute_block_sparse_tensors,
 )
-from flash_attn_origin.cute.flash_fwd import FlashAttentionForwardSm90
-from flash_attn_origin.cute.flash_fwd_combine import FlashAttentionForwardCombine
-from flash_attn_origin.cute.flash_fwd_sm100 import FlashAttentionForwardSm100
+from sglang.jit_kernel.flash_attn_origin.cute.flash_fwd import FlashAttentionForwardSm90
+from sglang.jit_kernel.flash_attn_origin.cute.flash_fwd_combine import (
+    FlashAttentionForwardCombine,
+)
+from sglang.jit_kernel.flash_attn_origin.cute.flash_fwd_sm100 import FlashAttentionForwardSm100
 
 
 @lru_cache(maxsize=None)

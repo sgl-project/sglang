@@ -16,8 +16,8 @@ try:
 except ImportError:
     apply_rotary_emb = None
 
-from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
-from sgl_kernel.testing.rotary_embedding import _apply_rotary_emb as apply_rotary_emb
+from sglang.jit_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+from sglang.jit_kernel.testing.rotary_embedding import _apply_rotary_emb as apply_rotary_emb
 
 # from utils import is_hopper  # Not used in this test
 
