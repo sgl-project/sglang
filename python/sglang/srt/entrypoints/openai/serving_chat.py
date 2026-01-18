@@ -15,6 +15,7 @@ from jsonschema import Draft202012Validator, SchemaError
 
 from sglang.srt.entrypoints.openai.encoding_dsv32 import encode_messages
 from sglang.srt.entrypoints.openai.protocol import (
+    ChatCompletionMessageGenericParam,
     ChatCompletionRequest,
     ChatCompletionResponse,
     ChatCompletionResponseChoice,
@@ -39,6 +40,7 @@ from sglang.srt.entrypoints.openai.utils import (
     process_hidden_states_from_ret,
     to_openai_style_logprobs,
 )
+from sglang.srt.environ import envs
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
@@ -267,6 +269,31 @@ class OpenAIServingChat(OpenAIServingBase):
         # GptOss model needs to keep special tokens for harmony parsing
         if self.is_gpt_oss:
             request.skip_special_tokens = False
+
+        # Insert tool prohibition system message when tool_choice is "none"
+        # and SGLANG_INSERT_TOOL_PROHIBIT_WHEN_NONE is set to a non-empty string
+        tool_prohibit_msg = envs.SGLANG_INSERT_TOOL_PROHIBIT_WHEN_NONE.get()
+        if request.tool_choice == "none" and tool_prohibit_msg:
+            # Find the index of the first user message
+            first_user_idx = None
+            for i, msg in enumerate(request.messages):
+                if msg.role == "user":
+                    first_user_idx = i
+                    break
+
+            # Insert a system message right before the first user message
+            if first_user_idx is not None:
+                prohibition_msg = ChatCompletionMessageGenericParam(
+                    role="system",
+                    content=tool_prohibit_msg,
+                )
+                # Create a new messages list with the prohibition message inserted
+                new_messages = list(request.messages)
+                new_messages.insert(first_user_idx, prohibition_msg)
+                request.messages = new_messages
+                logger.debug(
+                    f"Inserted tool prohibition system message for tool_choice=none"
+                )
 
         tool_call_constraint = None
 
