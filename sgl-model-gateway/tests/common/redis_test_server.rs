@@ -10,6 +10,9 @@ use tracing::{info, warn};
 static SHARED_SERVER: OnceLock<RedisTestServer> = OnceLock::new();
 
 pub fn get_shared_server() -> &'static RedisTestServer {
+    // TODO improve
+    super::init_test_tracing();
+
     let server = SHARED_SERVER
         .get_or_init(|| RedisTestServer::start().expect("Failed to start shared Redis server"));
     server.wait_ready();
@@ -39,6 +42,18 @@ impl RedisTestServer {
             "--daemonize",
             "no",
         ]);
+
+        // TODO handle
+        // #[cfg(target_os = "linux")]
+        // {
+        //     use std::os::unix::process::CommandExt;
+        //     unsafe {
+        //         cmd.pre_exec(|| {
+        //             libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+        //             Ok(())
+        //         });
+        //     }
+        // }
 
         info!("Starting redis server... cmd={cmd:?}");
         let process = cmd.spawn().map_err(|e| {

@@ -177,6 +177,10 @@ struct CliArgs {
     #[arg(long, default_value = "random", value_parser = ["random", "min_load", "min_group"], help_heading = "Routing Policy")]
     assignment_mode: String,
 
+    /// Redis URL for manual policy (enables distributed routing table)
+    #[arg(long, help_heading = "Routing Policy")]
+    redis_url: Option<String>,
+
     /// Number of prefix tokens to use for prefix_hash policy
     #[arg(long, default_value_t = 256, help_heading = "Routing Policy")]
     prefix_token_count: usize,
@@ -741,6 +745,8 @@ impl CliArgs {
                     "min_group" => ManualAssignmentMode::MinGroup,
                     other => panic!("Unknown assignment mode: {}", other),
                 },
+                redis_url: self.redis_url.clone(),
+                redis_key_prefix: None,
             },
             _ => PolicyConfig::RoundRobin,
         }

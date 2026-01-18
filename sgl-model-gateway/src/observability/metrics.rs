@@ -891,6 +891,14 @@ impl Metrics {
         gauge!("smg_manual_policy_cache_entries").set(count as f64);
     }
 
+    pub fn record_manual_policy_attempt_error(branch: &'static str) {
+        counter!(
+            "smg_manual_policy_attempt_error_total",
+            "branch" => branch
+        )
+        .increment(1);
+    }
+
     /// Record consistent hashing policy execution branch for routing decisions
     pub fn record_worker_consistent_hashing_policy_branch(branch: &'static str) {
         counter!(

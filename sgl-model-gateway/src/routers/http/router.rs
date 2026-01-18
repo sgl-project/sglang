@@ -213,7 +213,7 @@ impl Router {
             bool_to_static_str(is_stream),
         );
 
-        let response = RetryExecutor::execute_response_with_retry(
+        let response = RetryExecutor::execute_with_retry_or_last(
             &self.retry_config,
             // operation per attempt
             |_: u32| async {
@@ -233,7 +233,7 @@ impl Router {
             // should_retry predicate
             |res, _attempt| is_retryable_status(res.status()),
             // on_backoff hook
-            |delay, attempt| {
+            |_output, delay, attempt| {
                 // Layer 3 worker metrics
                 Metrics::record_worker_retry(metrics_labels::WORKER_REGULAR, endpoint);
                 Metrics::record_worker_retry_backoff(attempt, delay);
@@ -562,6 +562,13 @@ impl Router {
             }
         }
 
+        if !is_stream && crate::routers::offline_hack::is_offline_mode(headers) {
+            return crate::routers::offline_hack::spawn_offline_request(
+                request_builder,
+                load_guard,
+            );
+        }
+
         let res = match request_builder.send().await {
             Ok(res) => res,
             Err(e) => {
@@ -578,7 +585,6 @@ impl Router {
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
 
         if !is_stream {
-            // For non-streaming requests, preserve headers
             let response_headers = header_utils::preserve_response_headers(res.headers());
 
             let response = match res.bytes().await {
