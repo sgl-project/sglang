@@ -1,3 +1,5 @@
+from test.utils import sym_quantize_tensor
+
 import pytest
 import torch
 from sgl_kernel import qserve_w4a8_per_chn_gemm
@@ -63,13 +65,6 @@ def asym_quantize_tensor(tensor):
         torch.round(tensor / tensor_scale) + tensor_zero, q_min, q_max
     ).to(torch.int8)
     return tensor_q, tensor_scale.to(torch.float16), tensor_zero.to(torch.int8)
-
-
-# INT8 Quantization
-def sym_quantize_tensor(tensor):
-    tensor_scale = tensor.abs().max(dim=-1, keepdim=True)[0] / 127
-    tensor_q = torch.clamp(torch.round(tensor / tensor_scale), -128, 127).to(torch.int8)
-    return tensor_q, tensor_scale.to(torch.float16)
 
 
 def torch_w4a8_per_chn_gemm(a, b, a_scale, b_scale, b_zero, out_dtype):

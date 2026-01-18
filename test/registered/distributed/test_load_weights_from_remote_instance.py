@@ -18,7 +18,6 @@ import os
 import random
 import unittest
 
-import numpy as np
 import requests
 import torch
 import torch.multiprocessing as mp
@@ -33,6 +32,7 @@ from sglang.test.test_utils import (
     CustomTestCase,
     is_in_ci,
     popen_launch_server,
+    verify_params_close,
 )
 from sglang.utils import terminate_process
 
@@ -40,17 +40,6 @@ mp.set_start_method("spawn", force=True)
 
 register_cuda_ci(est_time=72, suite="stage-b-test-large-2-gpu")
 register_amd_ci(est_time=72, suite="stage-b-test-large-2-gpu-amd")
-
-
-def verify_params_close(params1, params2, error_msg):
-    """Verify if two parameter arrays are close enough."""
-    try:
-        assert np.allclose(np.array(params1), np.array(params2)), error_msg
-    except Exception as e:
-        print(f"Parameters not close for {error_msg}")
-        print("Params1:", np.array(params1))
-        print("Params2:", np.array(params2))
-        raise e
 
 
 def init_process(

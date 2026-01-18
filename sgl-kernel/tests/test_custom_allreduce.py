@@ -1,6 +1,5 @@
 import ctypes
 import multiprocessing as mp
-import random
 import socket
 import unittest
 from typing import Any, List, Optional
@@ -9,6 +8,7 @@ import sgl_kernel.allreduce as custom_ops
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
+from utils import multi_process_parallel
 
 from sglang.srt.distributed.device_communicators.cuda_wrapper import CudaRTLibrary
 
@@ -64,37 +64,6 @@ def _run_correctness_worker(world_size, rank, distributed_init_port, test_sizes)
             TestCustomAllReduce.free_shared_buffer(meta_ptrs, group)
 
         dist.destroy_process_group(group=group)
-
-
-def get_open_port() -> int:
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.bind(("127.0.0.1", 0))
-            return s.getsockname()[1]
-    except OSError:
-        with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as s:
-            s.bind(("::1", 0))
-            return s.getsockname()[1]
-
-
-def multi_process_parallel(
-    world_size: int, test_target: Any, target_args: tuple = ()
-) -> None:
-    mp.set_start_method("spawn", force=True)
-
-    procs = []
-    distributed_init_port = get_open_port()
-    for i in range(world_size):
-        proc_args = (world_size, i, distributed_init_port) + target_args
-        proc = mp.Process(target=test_target, args=proc_args, name=f"Worker-{i}")
-        proc.start()
-        procs.append(proc)
-
-    for i in range(world_size):
-        procs[i].join()
-        assert (
-            procs[i].exitcode == 0
-        ), f"Process {i} failed with exit code {procs[i].exitcode}"
 
 
 class TestCustomAllReduce(unittest.TestCase):

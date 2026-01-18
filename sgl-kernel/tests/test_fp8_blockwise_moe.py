@@ -1,4 +1,5 @@
 import random
+from test.utils import is_sm90_supported
 from typing import Tuple
 
 import pytest
@@ -59,42 +60,9 @@ def per_block_cast_to_fp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     )
 
 
-def baseline_scaled_mm(
-    a: torch.Tensor,
-    b: torch.Tensor,
-    scale_a: torch.Tensor,
-    scale_b: torch.Tensor,
-    out_dtype: type[torch.dtype],
-) -> torch.Tensor:
-
-    def group_broadcast(t, shape):
-        for i, s in enumerate(shape):
-            if t.shape[i] != s and t.shape[i] != 1:
-                assert s % t.shape[i] == 0
-                t = (
-                    t.unsqueeze(i + 1)
-                    .expand(*t.shape[: i + 1], s // t.shape[i], *t.shape[i + 1 :])
-                    .flatten(i, i + 1)
-                )
-        return t
-
-    scale_a = group_broadcast(scale_a, a.shape)
-    scale_b = group_broadcast(scale_b, b.shape)
-
-    return torch.mm(
-        (scale_a * a.to(dtype=torch.float32)), (scale_b * b.to(dtype=torch.float32))
-    ).to(out_dtype)
-
-
 def is_blackwell_supported(device=None) -> bool:
     return (torch.cuda.get_device_capability(device)[0] in [10, 12]) and (
         torch.version.cuda >= "12.8"
-    )
-
-
-def is_sm90_supported(device=None) -> bool:
-    return (torch.cuda.get_device_capability(device)[0] == 9) and (
-        torch.version.cuda >= "12.3"
     )
 
 

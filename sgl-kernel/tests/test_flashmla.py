@@ -10,6 +10,7 @@ from sgl_kernel.flash_mla import (
     flash_mla_with_kvcache,
     get_mla_metadata,
 )
+from utils.test import is_sm90_supported
 
 # ================ prefill usage ================ #
 S_Q_PREFILL = [1, 62]
@@ -36,12 +37,6 @@ S_K_DECODE = [20, 140, 4096]
 IS_VARLEN = [False, True]
 CAUSAL_TOPK = [(True, None), (False, None), (False, 128), (False, 2048)]
 DTYPE = [torch.float16, torch.bfloat16]
-
-
-def is_sm90_supported(device=None) -> bool:
-    return (torch.cuda.get_device_capability(device)[0] == 9) and (
-        torch.version.cuda >= "12.3"
-    )
 
 
 def quantize_k_cache(

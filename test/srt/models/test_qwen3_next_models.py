@@ -14,6 +14,7 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
+    send_request_helper,
 )
 
 QWEN3_NEXT_MODEL = "Qwen/Qwen3-Next-80B-A3B-Instruct"
@@ -21,19 +22,6 @@ QWEN3_NEXT_MODEL = "Qwen/Qwen3-Next-80B-A3B-Instruct"
 ACC_THRESHOLDS = {
     QWEN3_NEXT_MODEL: {"kl_div": 0.0025, "gsm8k": 0.93},
 }
-
-
-def send_request_helper(base_url: str, text: str):
-    response = requests.post(
-        base_url + "/generate",
-        json={
-            "text": text,
-            "sampling_params": {
-                "max_new_tokens": 1,
-            },
-        },
-    )
-    return response.json()
 
 
 class TestQwen3Next(CustomTestCase):

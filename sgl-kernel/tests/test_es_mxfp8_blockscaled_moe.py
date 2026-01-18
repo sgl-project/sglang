@@ -1,4 +1,5 @@
 import random
+from test.utils import is_sm100_supported
 
 import pytest
 import torch
@@ -23,12 +24,6 @@ def calc_diff(x, y):
     denominator = (x * x + y * y).sum()
     sim = 2 * (x * y).sum() / denominator
     return 1 - sim
-
-
-def is_sm100_supported(device=None) -> bool:
-    return (torch.cuda.get_device_capability(device)[0] == 10) and (
-        torch.version.cuda >= "12.8"
-    )
 
 
 @pytest.mark.skipif(

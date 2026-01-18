@@ -1,9 +1,11 @@
 import random
+from test.utils import is_sm90_supported
 from typing import Tuple
 
 import pytest
 import torch
 from sgl_kernel import es_fp8_blockwise_scaled_grouped_mm
+from utils.test import is_sm100_supported
 
 
 def cdiv(a: int, b: int) -> int:
@@ -56,45 +58,6 @@ def per_block_cast_to_fp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     x_scaled = (x_view * (448.0 / x_amax)).to(torch.float8_e4m3fn)
     return x_scaled.view_as(x_padded)[:m, :n].contiguous(), (x_amax / 448.0).view(
         x_view.size(0), x_view.size(2)
-    )
-
-
-def baseline_scaled_mm(
-    a: torch.Tensor,
-    b: torch.Tensor,
-    scale_a: torch.Tensor,
-    scale_b: torch.Tensor,
-    out_dtype: type[torch.dtype],
-) -> torch.Tensor:
-
-    def group_broadcast(t, shape):
-        for i, s in enumerate(shape):
-            if t.shape[i] != s and t.shape[i] != 1:
-                assert s % t.shape[i] == 0
-                t = (
-                    t.unsqueeze(i + 1)
-                    .expand(*t.shape[: i + 1], s // t.shape[i], *t.shape[i + 1 :])
-                    .flatten(i, i + 1)
-                )
-        return t
-
-    scale_a = group_broadcast(scale_a, a.shape)
-    scale_b = group_broadcast(scale_b, b.shape)
-
-    return torch.mm(
-        (scale_a * a.to(dtype=torch.float32)), (scale_b * b.to(dtype=torch.float32))
-    ).to(out_dtype)
-
-
-def is_sm100_supported(device=None) -> bool:
-    return (torch.cuda.get_device_capability(device)[0] == 10) and (
-        torch.version.cuda >= "12.8"
-    )
-
-
-def is_sm90_supported(device=None) -> bool:
-    return (torch.cuda.get_device_capability(device)[0] == 9) and (
-        torch.version.cuda >= "12.3"
     )
 
 

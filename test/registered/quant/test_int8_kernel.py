@@ -9,31 +9,10 @@ from sglang.srt.layers.moe.topk import TopKConfig, select_experts
 from sglang.srt.layers.quantization.int8_kernel import per_token_quant_int8
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.srt.cpu.utils import native_w8a8_per_token_matmul
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=8, suite="stage-b-test-small-1-gpu")
-
-
-def native_w8a8_per_token_matmul(A, B, As, Bs, output_dtype=torch.float16):
-    """Matrix multiplication function that supports per-token input quantization and per-column weight quantization"""
-    A = A.to(torch.float32)
-    B = B.to(torch.float32)
-
-    assert A.shape[-1] == B.shape[-1], "Dimension mismatch"
-    assert B.ndim == 2 and B.is_contiguous(), "B must be a 2D contiguous tensor"
-
-    # Reshape input
-    M = A.numel() // A.shape[-1]
-    B = B.t()  # Transpose weight matrix
-    N, K = B.shape
-    origin_C_shape = A.shape[:-1] + (K,)
-    A = A.reshape(M, N)
-
-    # As is per-token [M, 1], Bs is per-column [1, K]
-    C = torch.matmul(A, B)  # [M, K]
-    C = As * C * Bs.view(1, -1)  # Broadcast per-column scale
-
-    return C.reshape(origin_C_shape).to(output_dtype)
 
 
 def torch_w8a8_per_column_moe(a, w1, w2, w1_s, w2_s, score, topk):
@@ -62,7 +41,7 @@ def torch_w8a8_per_column_moe(a, w1, w2, w1_s, w2_s, score, topk):
         if mask.sum():
             # First MLP layer: note that a_s is now per-token
             inter_out = native_w8a8_per_token_matmul(
-                a_q[mask], w1[i], a_s[mask], w1_s[i], output_dtype=a.dtype
+                a_q[mask], w1[i], a_s[mask], w1_s[i], bias=None, output_dtype=a.dtype
             )
             # Activation function
             act_out = SiluAndMul().forward_native(inter_out)
@@ -71,7 +50,7 @@ def torch_w8a8_per_column_moe(a, w1, w2, w1_s, w2_s, score, topk):
 
             # Second MLP layer
             out[mask] = native_w8a8_per_token_matmul(
-                act_out_q, w2[i], act_out_s, w2_s[i], output_dtype=a.dtype
+                act_out_q, w2[i], act_out_s, w2_s[i], bias=None, output_dtype=a.dtype
             )
     # Apply routing weights and sum
     return (

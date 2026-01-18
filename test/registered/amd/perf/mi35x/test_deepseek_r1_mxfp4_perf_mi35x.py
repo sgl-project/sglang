@@ -16,10 +16,9 @@ import os
 os.environ.setdefault("HF_HOME", "/data2/models/huggingface")
 os.environ.setdefault("HF_HUB_CACHE", "/data2/models/huggingface/hub")
 import unittest
-from typing import List
+from test.registered.amd.perf.perf_utils import generate_simple_markdown_report
 
 from sglang.test.ci.ci_register import register_amd_ci
-from sglang.test.nightly_bench_utils import BenchmarkResult
 from sglang.test.nightly_utils import NightlyBenchmarkRunner
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, _parse_int_list_env
 
@@ -27,27 +26,6 @@ from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, _parse_int_list_env
 register_amd_ci(
     est_time=18000, suite="nightly-perf-8-gpu-mi35x-deepseek-r1-mxfp4", nightly=True
 )
-
-
-def generate_simple_markdown_report(results: List[BenchmarkResult]) -> str:
-    """Generate a simplified markdown report without traces and cost columns."""
-    model_header = results[0].model_path
-    if results[0].run_name and results[0].run_name != "default":
-        model_header += f" ({results[0].run_name})"
-
-    gpu_config = os.getenv("GPU_CONFIG", "MI35x")
-    if gpu_config:
-        model_header += f" [{gpu_config}]"
-
-    summary = f"### {model_header}\n"
-    summary += "| batch size | input len | latency (s) | input throughput (tok/s) | output throughput (tok/s) | ITL (ms) |\n"
-    summary += "| ---------- | --------- | ----------- | ------------------------ | ------------------------- | -------- |\n"
-
-    for result in results:
-        itl = 1 / (result.output_throughput / result.batch_size) * 1000
-        summary += f"| {result.batch_size} | {result.input_len} | {result.latency:.2f} | {result.input_throughput:.2f} | {result.output_throughput:.2f} | {itl:.2f} |\n"
-
-    return summary
 
 
 # Model path configuration for MI35x DeepSeek-R1-MXFP4
@@ -152,7 +130,7 @@ class TestDeepseekR1MXFP4PerfMI35x(unittest.TestCase):
                     # Use simplified report format without traces
                     if results:
                         self.runner.full_report += (
-                            generate_simple_markdown_report(results) + "\n"
+                            generate_simple_markdown_report(results, "MI35x") + "\n"
                         )
         finally:
             self.runner.write_final_report()

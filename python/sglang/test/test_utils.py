@@ -2396,3 +2396,27 @@ def _repo_relative_path(filepath: str) -> str:
 
     except Exception:
         return Path(filepath).name
+
+
+def verify_params_close(params1, params2, error_msg):
+    """Verify if two parameter arrays are close enough."""
+    try:
+        assert np.allclose(np.array(params1), np.array(params2)), error_msg
+    except Exception as e:
+        print(f"Parameters not close for {error_msg}")
+        print("Params1:", np.array(params1))
+        print("Params2:", np.array(params2))
+        raise e
+
+
+def send_request_helper(base_url: str, text: str):
+    response = requests.post(
+        base_url + "/generate",
+        json={
+            "text": text,
+            "sampling_params": {
+                "max_new_tokens": 1,
+            },
+        },
+    )
+    return response.json()
