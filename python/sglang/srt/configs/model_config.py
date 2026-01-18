@@ -408,7 +408,9 @@ class ModelConfig:
                 if "factor" in self.hf_config.rope_scaling:
                     scaling_factor = self.hf_config.rope_scaling["factor"]
                 else:
-                    scaling_factor = self.hf_config.rope_scaling["partial_rotary_factor"]
+                    scaling_factor = self.hf_config.rope_scaling[
+                        "partial_rotary_factor"
+                    ]
                 mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
                 self.scaling = self.scaling * mscale * mscale
 

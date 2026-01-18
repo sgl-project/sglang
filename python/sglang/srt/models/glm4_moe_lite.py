@@ -22,6 +22,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.srt.batch_overlap.single_batch_overlap import SboFlags
 from sglang.srt.distributed import (
     get_moe_expert_parallel_world_size,
     get_pp_group,
@@ -72,7 +73,6 @@ from sglang.srt.models.deepseek_v2 import (
     DeepseekV2MoE,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.batch_overlap.single_batch_overlap import SboFlags
 from sglang.srt.utils import (
     BumpAllocator,
     LazyValue,
@@ -521,7 +521,10 @@ class Glm4MoeLiteDecoderLayer(DeepseekV2DecoderLayer):
         rope_scaling = getattr(config, "rope_scaling", None)
         # Fix for GLM-4-Moe-Lite where rope_scaling is populated with default values
         # but DeepseekV2AttentionMLA blindly treats any rope_scaling dict as deepseek_yarn
-        if rope_scaling is not None and rope_scaling.get("rope_type", "default") == "default":
+        if (
+            rope_scaling is not None
+            and rope_scaling.get("rope_type", "default") == "default"
+        ):
             rope_scaling = None
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         self.layer_id = layer_id
@@ -596,6 +599,7 @@ class Glm4MoeLiteDecoderLayer(DeepseekV2DecoderLayer):
             ),
             qkv_latent_func=self.self_attn.prepare_qkv_latent,
         )
+
 
 class Glm4MoeLiteModel(DeepseekV2Model):
     def __init__(
@@ -683,14 +687,15 @@ class Glm4MoeLiteForCausalLM(DeepseekV2ForCausalLM):
         )
         self.capture_aux_hidden_states = False
 
-
         from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
+
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
         if self.nsa_enable_prefill_cp:
             from sglang.srt.layers.dp_attention import (
                 get_attention_tp_rank,
                 get_attention_tp_size,
             )
+
             self.cp_rank = get_attention_tp_rank()
             self.cp_size = get_attention_tp_size()
         else:
