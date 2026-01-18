@@ -11,6 +11,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
+from python.sglang.srt.utils.common import is_sm100_supported
 from sglang.jit_kernel.norm import can_use_fused_inplace_qknorm as can_use_jit_qk_norm
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
@@ -18,7 +19,6 @@ from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.utils import (
     get_bool_env_var,
     get_device_capability,
-    is_blackwell,
     is_cuda,
     is_hip,
     is_npu,
@@ -715,7 +715,7 @@ class VisionAttention(nn.Module):
             major, minor = get_device_capability()
             if major == 9:
                 backend = "fa3"
-            elif is_blackwell():
+            elif is_sm100_supported():
                 backend = "fa4"
             else:
                 backend = "triton_attn"
@@ -726,7 +726,7 @@ class VisionAttention(nn.Module):
                 backend = "triton_attn"
         else:
             backend = "sdpa"
-        if backend == "fa3" and is_blackwell():
+        if backend == "fa3" and not is_sm100_supported():
             raise ValueError("The 'fa3' backend is not supported on Blackwell GPUs")
 
         return backend
