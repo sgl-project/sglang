@@ -1642,6 +1642,9 @@ class ServerArgs:
                         )
                         self.disable_radix_cache = True
                         self.disable_overlap_schedule = False
+            config = self.get_model_config()
+            if hasattr(config.hf_config, "mamba_chunk_size"):
+                self._mamba_chunk_size = config.hf_config.mamba_chunk_size
         elif model_arch in ["Lfm2ForCausalLM"]:
             assert (
                 not self.enable_mamba_extra_buffer()
