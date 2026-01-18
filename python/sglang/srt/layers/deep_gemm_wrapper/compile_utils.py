@@ -2,7 +2,7 @@ import logging
 import os
 from contextlib import contextmanager
 from enum import IntEnum, auto
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 from tqdm import tqdm
@@ -77,11 +77,13 @@ def _maybe_compile_deep_gemm_one_type_all(
     n: int,
     k: int,
     num_groups: int,
+    recipe: Optional[tuple[int, int, int]],
+    sf_dtype: Optional[torch.dtype],
 ) -> None:
     global _INITIALIZATION_DICT
     global _BUILTIN_M_LIST
 
-    query_key = (kernel_type, n, k, num_groups)
+    query_key = (kernel_type, n, k, num_groups, recipe, sf_dtype)
     if (
         _ENABLE_JIT_DEEPGEMM_PRECOMPILE
         and _DO_COMPILE_ALL
@@ -112,6 +114,8 @@ def _maybe_compile_deep_gemm_one_type_all(
             n=n,
             k=k,
             num_groups=num_groups,
+            recipe=recipe,
+            sf_dtype=sf_dtype,
             m_list=_BUILTIN_M_LIST,
         )
 
@@ -122,6 +126,8 @@ def _compile_deep_gemm_one_type_all(
     n: int,
     k: int,
     num_groups: int,
+    recipe: Optional[tuple[int, int, int]],
+    sf_dtype: Optional[torch.dtype],
     m_list: List[int],
 ) -> None:
     # Symmetric memory allocation performs a collective operation across all the GPUs.
@@ -160,7 +166,13 @@ def _compile_deep_gemm_one_type_all(
 
         # Need some methods to estimate needed memory for warmup
         executor = _BaseWarmupExecutor.create(
-            kernel_type, max_m=max_m, n=n, k=k, num_groups=num_groups
+            kernel_type,
+            max_m=max_m,
+            n=n,
+            k=k,
+            num_groups=num_groups,
+            recipe=recipe,
+            sf_dtype=sf_dtype,
         )
 
         old_compile_mode = deep_gemm.get_compile_mode()
@@ -212,51 +224,101 @@ class _BaseWarmupExecutor:
         raise NotImplementedError
 
 
-def _empty_token_fp8(size):
+def _empty_token_fp8(
+    size,
+    recipe: Optional[tuple[int, int, int]] = None,
+    sf_dtype: Optional[torch.dtype] = None,
+):
     *dims, k = size
+    if recipe is None:
+        block_k = 128
+    else:
+        _, _, block_k = recipe
+    if sf_dtype is None or sf_dtype == torch.float32:
+        sf_storage_elements_per_scale = 1
+    elif sf_dtype == torch.int:
+        sf_storage_elements_per_scale = 4
+    else:
+        raise ValueError(f"Unimplemented sf_dtype: {sf_dtype}")
     return (
         torch.empty(size, device="cuda", dtype=torch.float8_e4m3fn),
         torch.empty(
-            (*dims, ceil_div(k, _BLOCK_SIZE)), device="cuda", dtype=torch.float32
-        ),
-    )
-
-
-def _empty_block_fp8(size):
-    *dims, n, k = size
-    return (
-        torch.empty(size, device="cuda", dtype=torch.float8_e4m3fn),
-        torch.empty(
-            (*dims, ceil_div(n, _BLOCK_SIZE), ceil_div(k, _BLOCK_SIZE)),
+            (*dims, ceil_div(k, block_k * sf_storage_elements_per_scale)),
             device="cuda",
-            dtype=torch.float32,
+            dtype=sf_dtype,
         ),
     )
 
 
-_BLOCK_SIZE = 128
+def _empty_block_fp8(
+    size,
+    recipe: Optional[tuple[int, int, int]] = None,
+    sf_dtype: Optional[torch.dtype] = None,
+):
+    *dims, n, k = size
+    if recipe is None:
+        block_n = block_k = 128
+    else:
+        _, block_n, block_k = recipe
+    if sf_dtype is None or sf_dtype == torch.float32:
+        sf_storage_elements_per_scale = 1
+    elif sf_dtype == torch.int:
+        sf_storage_elements_per_scale = 4
+    else:
+        raise ValueError(f"Unimplemented sf_dtype: {sf_dtype}")
+    return (
+        torch.empty(size, device="cuda", dtype=torch.float8_e4m3fn),
+        torch.empty(
+            (
+                *dims,
+                ceil_div(n, block_n * sf_storage_elements_per_scale),
+                ceil_div(k, block_k * sf_storage_elements_per_scale),
+            ),
+            device="cuda",
+            dtype=sf_dtype,
+        ),
+    )
 
 
 class _NormalWarmupExecutor(_BaseWarmupExecutor):
-    def __init__(self, max_m: int, n: int, k: int, num_groups: int):
-        self.lhs_q, self.lhs_s = _empty_token_fp8((max_m, k))
-        self.rhs_q, self.rhs_s = _empty_block_fp8((n, k))
+    def __init__(
+        self,
+        max_m: int,
+        n: int,
+        k: int,
+        num_groups: int,
+        recipe: Optional[tuple[int, int, int]],
+        sf_dtype: Optional[torch.dtype],
+    ):
+        self.lhs_q, self.lhs_s = _empty_token_fp8((max_m, k), recipe, sf_dtype)
+        self.rhs_q, self.rhs_s = _empty_block_fp8((n, k), recipe, sf_dtype)
         self.out = torch.empty((max_m, n), device="cuda", dtype=torch.bfloat16)
+        self.recipe = recipe
 
     def execute(self, m):
         deep_gemm.fp8_gemm_nt(
             (self.lhs_q[:m], self.lhs_s[:m]),
             (self.rhs_q, self.rhs_s),
             self.out[:m],
+            recipe=self.recipe,
         )
 
 
 class _GroupedContWarmupExecutor(_BaseWarmupExecutor):
-    def __init__(self, max_m: int, n: int, k: int, num_groups: int):
-        self.lhs_q, self.lhs_s = _empty_token_fp8((max_m, k))
-        self.rhs_q, self.rhs_s = _empty_block_fp8((num_groups, n, k))
+    def __init__(
+        self,
+        max_m: int,
+        n: int,
+        k: int,
+        num_groups: int,
+        recipe: Optional[tuple[int, int, int]],
+        sf_dtype: Optional[torch.dtype],
+    ):
+        self.lhs_q, self.lhs_s = _empty_token_fp8((max_m, k), recipe, sf_dtype)
+        self.rhs_q, self.rhs_s = _empty_block_fp8((num_groups, n, k), recipe, sf_dtype)
         self.m_indices = torch.zeros((max_m,), device="cuda", dtype=torch.int32)
         self.out = torch.empty((max_m, n), device="cuda", dtype=torch.bfloat16)
+        self.recipe = recipe
 
     def execute(self, m):
         deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
@@ -264,17 +326,29 @@ class _GroupedContWarmupExecutor(_BaseWarmupExecutor):
             (self.rhs_q, self.rhs_s),
             self.out[:m],
             m_indices=self.m_indices[:m],
+            recipe=self.recipe,
         )
 
 
 class _GroupedMaskedWarmupExecutor(_BaseWarmupExecutor):
-    def __init__(self, max_m: int, n: int, k: int, num_groups: int):
-        self.lhs_q, self.lhs_s = _empty_token_fp8((num_groups, max_m, k))
-        self.rhs_q, self.rhs_s = _empty_block_fp8((num_groups, n, k))
+    def __init__(
+        self,
+        max_m: int,
+        n: int,
+        k: int,
+        num_groups: int,
+        recipe: Optional[tuple[int, int, int]],
+        sf_dtype: Optional[torch.dtype],
+    ):
+        self.lhs_q, self.lhs_s = _empty_token_fp8(
+            (num_groups, max_m, k), recipe, sf_dtype
+        )
+        self.rhs_q, self.rhs_s = _empty_block_fp8((num_groups, n, k), recipe, sf_dtype)
         self.masked_m = torch.zeros((num_groups,), device="cuda", dtype=torch.int32)
         self.out = torch.empty(
             (num_groups, max_m, n), device="cuda", dtype=torch.bfloat16
         )
+        self.recipe = recipe
 
     def execute(self, m):
         deep_gemm.fp8_m_grouped_gemm_nt_masked(
@@ -284,13 +358,22 @@ class _GroupedMaskedWarmupExecutor(_BaseWarmupExecutor):
             masked_m=self.masked_m,
             # DeepGEMM uses `expect_m` instead of input shape for `get_best_config`
             expected_m=m,
+            recipe=self.recipe,
         )
 
 
 @contextmanager
 def deep_gemm_execution_hook(
-    m: int, n: int, k: int, num_groups: int, kernel_type: DeepGemmKernelType
+    m: int,
+    n: int,
+    k: int,
+    num_groups: int,
+    recipe: Optional[tuple[int, int, int]],
+    sf_dtype: Optional[torch.dtype],
+    kernel_type: DeepGemmKernelType,
 ):
     if m > 0:
-        _maybe_compile_deep_gemm_one_type_all(kernel_type, n, k, num_groups)
+        _maybe_compile_deep_gemm_one_type_all(
+            kernel_type, n, k, num_groups, recipe, sf_dtype
+        )
     yield

@@ -29,6 +29,8 @@ def grouped_gemm_nt_f8f8bf16_masked(
     out: torch.Tensor,
     masked_m: torch.Tensor,
     expected_m: int,
+    recipe: Optional[tuple[int, int, int]] = None,
+    sf_dtype: Optional[torch.dtype] = None,
     overlap_args: Optional[Any] = None,
     max_block_n: int = 256,
 ):
@@ -40,7 +42,7 @@ def grouped_gemm_nt_f8f8bf16_masked(
     _sanity_check_input(rhs)
 
     with compile_utils.deep_gemm_execution_hook(
-        expected_m, n, k, num_groups, kernel_type
+        expected_m, n, k, num_groups, recipe, sf_dtype, kernel_type
     ):
         with configure_deep_gemm_num_sms(
             overlap_args.num_sms if overlap_args is not None else None
@@ -52,6 +54,7 @@ def grouped_gemm_nt_f8f8bf16_masked(
                 out,
                 masked_m,
                 expected_m,
+                recipe=recipe,
                 **(
                     dict(
                         enable_overlap=True,
@@ -69,6 +72,8 @@ def grouped_gemm_nt_f8f8bf16_contig(
     rhs: Tuple[torch.Tensor, torch.Tensor],
     out: torch.Tensor,
     m_indices: torch.Tensor,
+    recipe: Optional[tuple[int, int, int]] = None,
+    sf_dtype: Optional[torch.dtype] = None,
 ):
     m, k = lhs[0].shape
     num_groups, n, _ = rhs[0].shape
@@ -77,14 +82,20 @@ def grouped_gemm_nt_f8f8bf16_contig(
     _sanity_check_input(lhs)
     _sanity_check_input(rhs)
 
-    with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
-        deep_gemm.m_grouped_fp8_gemm_nt_contiguous(lhs, rhs, out, m_indices)
+    with compile_utils.deep_gemm_execution_hook(
+        m, n, k, num_groups, recipe, sf_dtype, kernel_type
+    ):
+        deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
+            lhs, rhs, out, m_indices, recipe=recipe
+        )
 
 
 def gemm_nt_f8f8bf16(
     lhs: Tuple[torch.Tensor, torch.Tensor],
     rhs: Tuple[torch.Tensor, torch.Tensor],
     out: torch.Tensor,
+    recipe: Optional[tuple[int, int, int]] = None,
+    sf_dtype: Optional[torch.dtype] = None,
 ):
     m, k = lhs[0].shape
     n, _ = rhs[0].shape
@@ -94,11 +105,14 @@ def gemm_nt_f8f8bf16(
     _sanity_check_input(lhs)
     _sanity_check_input(rhs)
 
-    with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
+    with compile_utils.deep_gemm_execution_hook(
+        m, n, k, num_groups, recipe, sf_dtype, kernel_type
+    ):
         deep_gemm.fp8_gemm_nt(
             lhs,
             rhs,
             out,
+            recipe=recipe,
         )
 
 
