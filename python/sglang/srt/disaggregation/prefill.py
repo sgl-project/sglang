@@ -677,6 +677,12 @@ class SchedulerDisaggregationPrefillMixin:
         )
         req.start_send_idx = end_idx
         state_indices = None
+        page_indices = kv_to_page_indices(kv_indices, page_size)
+
+        # For NSA, state_indices (Indexer Cache) maps 1:1 to page_indices, so we send the Indexer Cache for each chunk
+        if isinstance(self.token_to_kv_pool_allocator.get_kvcache(), NSATokenToKVPool):
+            state_indices = page_indices
+
         if last_chunk:
             self.disagg_metadata_buffers.set_buf(req)
 
@@ -711,17 +717,7 @@ class SchedulerDisaggregationPrefillMixin:
                 )
                 state_indices = window_kv_indices_swa.cpu().numpy()
                 state_indices = kv_to_page_indices(state_indices, page_size)
-            elif isinstance(
-                self.token_to_kv_pool_allocator.get_kvcache(), NSATokenToKVPool
-            ):
-                seq_len = len(req.fill_ids)
-                kv_indices_full = self.req_to_token_pool.req_to_token[
-                    req.req_pool_idx, :seq_len
-                ]
-                state_indices = kv_indices_full.cpu().numpy()
-                state_indices = kv_to_page_indices(state_indices, page_size)
 
-        page_indices = kv_to_page_indices(kv_indices, page_size)
         if len(page_indices) == 0:
             logger.info(
                 f"Skip sending kv chunk for request {req.rid=} {req.bootstrap_room=} because page_indices is empty"
