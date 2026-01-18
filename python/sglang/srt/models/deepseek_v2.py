@@ -620,11 +620,35 @@ class DeepseekV2MoE(nn.Module):
         self.moe_ep_size = get_moe_expert_parallel_world_size()
         self.routed_scaling_factor = config.routed_scaling_factor
         self.n_shared_experts = config.n_shared_experts
-        self.num_fused_shared_experts = (
-            0
-            if get_global_server_args().disable_shared_experts_fusion
-            else config.n_shared_experts
+        # NOTE:
+        # - `num_fused_shared_experts` controls the built-in "shared experts fusion optimization"
+        #   for DeepSeek V3/R1 on some backends.
+        # - DeepEP Waterfill is a separate mechanism that also fuses shared expert into the MoE
+        #   dispatch/compute/combine path (as an extra MoE slot routed through DeepEP).
+        #
+        # When DeepEP Waterfill is enabled, we disable the built-in fusion optimization here and
+        # let Waterfill handle shared expert fusion via DeepEP dispatch.
+        n_shared_experts = (
+            0 if config.n_shared_experts is None else int(config.n_shared_experts)
         )
+        will_enable_deepep_waterfill = (
+            get_global_server_args().enable_deepep_waterfill
+            and get_moe_a2a_backend().is_deepep()
+            and n_shared_experts > 0
+        )
+        if will_enable_deepep_waterfill and n_shared_experts != 1:
+            raise ValueError(
+                "DeepEP Waterfill currently supports exactly 1 shared expert "
+                f"(got n_shared_experts={n_shared_experts})."
+            )
+        if will_enable_deepep_waterfill:
+            self.num_fused_shared_experts = 0
+        else:
+            self.num_fused_shared_experts = (
+                0
+                if get_global_server_args().disable_shared_experts_fusion
+                else n_shared_experts
+            )
         self.config = config
         self.layer_id = layer_id
         self.alt_stream = alt_stream
@@ -657,15 +681,12 @@ class DeepseekV2MoE(nn.Module):
             # with fused_shared_experts
             fused_shared_experts_scaling_factor = 1.0 / float(self.moe_ep_size)
 
-        # Check if DeepEP Waterfill will be enabled (need to know before creating experts)
-        # Waterfill fuses shared expert as a real routed expert, expanding num_experts
-        self._will_enable_deepep_waterfill = (
-            get_global_server_args().enable_deepep_waterfill
-            and get_moe_a2a_backend().is_deepep()
-            and self.num_fused_shared_experts == 0
-            and config.n_shared_experts is not None
-            and config.n_shared_experts > 0
-        )
+        # Check if DeepEP Waterfill will be enabled (need to know before creating experts).
+        #
+        # IMPORTANT: Waterfill is itself a "shared expert fusion" mode (shared expert is routed
+        # through DeepEP as an extra MoE slot). Therefore, we should NOT gate Waterfill on
+        # `num_fused_shared_experts == 0` (which refers to the built-in fusion optimization).
+        self._will_enable_deepep_waterfill = will_enable_deepep_waterfill
 
         # Waterfill: expand num_experts to include shared expert per rank
         # New layout: each rank has (n_routed_experts // ep_size) + 1 experts
@@ -695,8 +716,8 @@ class DeepseekV2MoE(nn.Module):
             prefix=add_prefix("experts", prefix),
         )
 
-        # Note: For Waterfill mode, TopK still selects only routed experts (8)
-        # The 9th column (shared expert) is added by prepare_dispatch
+        # Note: For DeepEP Waterfill mode, TopK selects only routed experts.
+        # The shared expert slot is added by the Waterfill balancer during dispatch preparation.
         self.topk = TopK(
             top_k=config.num_experts_per_tok + self.num_fused_shared_experts,
             layer_id=self.layer_id,
@@ -723,7 +744,11 @@ class DeepseekV2MoE(nn.Module):
         self.shared_experts_is_int8 = False
         self.shared_experts_is_fp8 = False
         self.shared_experts_weight_block_size = None
-        if config.n_shared_experts is not None and self.num_fused_shared_experts == 0:
+        if (
+            config.n_shared_experts is not None
+            and config.n_shared_experts > 0
+            and self.num_fused_shared_experts == 0
+        ):
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
             # disable tp for shared experts when enable deepep moe, or with fp4 allgather
             self.shared_experts = DeepseekV2MLP(

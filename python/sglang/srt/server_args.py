@@ -3722,7 +3722,9 @@ class ServerArgs:
             default=ServerArgs.enable_deepep_waterfill,
             help="Enable waterfill load balancing for shared expert using DeepEP dispatch. "
             "This treats shared expert as the 9th expert and dispatches it through DeepEP "
-            "based on routed expert load for better load balancing.",
+            "based on routed expert load for better load balancing. "
+            "Note: enabling DeepEP Waterfill also fuses shared expert into the MoE "
+            "dispatch/compute/combine path.",
         )
 
         # Mamba Cache
@@ -4216,7 +4218,12 @@ class ServerArgs:
         parser.add_argument(
             "--disable-shared-experts-fusion",
             action="store_true",
-            help="Disable shared experts fusion optimization for deepseek v3/r1.",
+            help=(
+                "Disable the built-in shared experts fusion optimization for DeepSeek V3/R1. "
+                "Note: DeepEP Waterfill (--enable-deepep-waterfill) still routes shared expert "
+                "through DeepEP as an extra MoE slot, so shared expert is not separated from the "
+                "MoE path when Waterfill is enabled."
+            ),
         )
         parser.add_argument(
             "--disable-chunked-prefix-cache",
