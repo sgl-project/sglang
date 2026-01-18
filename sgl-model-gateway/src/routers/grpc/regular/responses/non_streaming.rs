@@ -13,21 +13,24 @@ use tracing::{debug, error, trace, warn};
 
 use super::{
     common::{
-        build_mcp_list_tools_item, build_next_request, convert_mcp_tools_to_chat_tools,
+        build_mcp_list_tools_items_for_request, build_next_request, build_server_label_map,
+        convert_mcp_tools_to_chat_tools, decode_mcp_function_name,
         extract_all_tool_calls_from_chat, load_conversation_history, prepare_chat_tools_and_choice,
-        ExtractedToolCall, ToolLoopState,
+        ExtractedToolCall, McpToolLookup, ToolLoopState,
     },
     conversions,
 };
 use crate::{
     observability::metrics::{metrics_labels, Metrics},
-    protocols::responses::{ResponseStatus, ResponsesRequest, ResponsesResponse},
+    protocols::responses::{
+        ResponseOutputItem, ResponseStatus, ResponsesRequest, ResponsesResponse,
+    },
     routers::{
         error,
         grpc::common::responses::{
             ensure_mcp_connection, persist_response_if_needed, ResponsesContext,
         },
-        mcp_utils::{extract_server_label, DEFAULT_MAX_ITERATIONS},
+        mcp_utils::DEFAULT_MAX_ITERATIONS,
     },
 };
 
@@ -159,27 +162,28 @@ pub(super) async fn execute_tool_loop(
     model_id: Option<String>,
     response_id: Option<String>,
 ) -> Result<ResponsesResponse, Response> {
-    // Get server label from original request tools
-    let server_label = extract_server_label(original_request.tools.as_deref(), "request-mcp");
+    let servers = ctx.requested_servers.read().unwrap().clone();
+    let server_labels = build_server_label_map(original_request.tools.as_deref());
 
-    let mut state = ToolLoopState::new(original_request.input.clone(), server_label.clone());
+    let mut state = ToolLoopState::new(original_request.input.clone(), McpToolLookup::default());
 
     // Configuration: max iterations as safety limit
     let max_tool_calls = original_request.max_tool_calls.map(|n| n as usize);
 
     trace!(
-        "Starting MCP tool loop: server_label={}, max_tool_calls={:?}, max_iterations={}",
-        server_label,
+        "Starting MCP tool loop: max_tool_calls={:?}, max_iterations={}",
         max_tool_calls,
         DEFAULT_MAX_ITERATIONS
     );
 
     // Get MCP tools and convert to chat format (do this once before loop)
-    let mcp_tools = {
-        let servers = ctx.requested_servers.read().unwrap();
-        ctx.mcp_manager.list_tools_for_servers(&servers)
-    };
-    let mcp_chat_tools = convert_mcp_tools_to_chat_tools(&mcp_tools);
+    let (mcp_chat_tools, tool_lookup) = convert_mcp_tools_to_chat_tools(
+        &ctx.mcp_manager,
+        &servers,
+        &server_labels,
+        original_request.tools.as_deref(),
+    );
+    state.tool_lookup = tool_lookup;
     trace!(
         "Converted {} MCP tools to chat format",
         mcp_chat_tools.len()
@@ -230,8 +234,10 @@ pub(super) async fn execute_tool_loop(
             );
 
             // Separate MCP and function tool calls
-            let mcp_tool_names: std::collections::HashSet<&str> =
-                mcp_tools.iter().map(|t| t.name.as_ref()).collect();
+            let mcp_tool_names: std::collections::HashSet<&str> = mcp_chat_tools
+                .iter()
+                .map(|t| t.function.name.as_str())
+                .collect();
             let (mcp_tool_calls, function_tool_calls): (Vec<ExtractedToolCall>, Vec<_>) =
                 tool_calls
                     .into_iter()
@@ -322,39 +328,68 @@ pub(super) async fn execute_tool_loop(
                 );
 
                 let tool_start = Instant::now();
-                let (output_str, success, error) = match ctx
-                    .mcp_manager
-                    .call_tool(tool_call.name.as_str(), tool_call.arguments.as_str())
-                    .await
-                {
-                    Ok(result) => match serde_json::to_string(&result) {
-                        Ok(output) => (output, true, None),
-                        Err(e) => {
-                            let err = format!("Failed to serialize tool result: {}", e);
-                            warn!("{}", err);
+                let (_resolved_label, raw_tool_name) = decode_mcp_function_name(&tool_call.name)
+                    .unwrap_or_else(|| ("mcp".to_string(), tool_call.name.clone()));
+
+                let (output_str, success, error) =
+                    match state.tool_lookup.tool_servers.get(&tool_call.name).cloned() {
+                        Some(server_key) => {
+                            let schema = state.tool_lookup.tool_schemas.get(&tool_call.name);
+                            let args_map = match crate::mcp::tool_args::ToolArgs::from(
+                                tool_call.arguments.as_str(),
+                            )
+                            .into_map(schema)
+                            {
+                                Ok(map) => Ok(map),
+                                Err(e) => Err(format!("Invalid tool args: {}", e)),
+                            };
+
+                            match args_map {
+                                Ok(args_map) => match ctx
+                                    .mcp_manager
+                                    .call_tool_on_server(&server_key, &raw_tool_name, args_map)
+                                    .await
+                                {
+                                    Ok(result) => match serde_json::to_string(&result) {
+                                        Ok(output) => (output, true, None),
+                                        Err(e) => {
+                                            let err =
+                                                format!("Failed to serialize tool result: {}", e);
+                                            warn!("{}", err);
+                                            let error_json = json!({ "error": &err }).to_string();
+                                            (error_json, false, Some(err))
+                                        }
+                                    },
+                                    Err(err) => {
+                                        let err_str = format!("tool call failed: {}", err);
+                                        warn!("Tool execution failed: {}", err_str);
+                                        let error_json = json!({ "error": &err_str }).to_string();
+                                        (error_json, false, Some(err_str))
+                                    }
+                                },
+                                Err(err) => {
+                                    let error_json = json!({ "error": &err }).to_string();
+                                    (error_json, false, Some(err))
+                                }
+                            }
+                        }
+                        None => {
+                            let err = format!("Unknown MCP tool '{}'", tool_call.name);
                             let error_json = json!({ "error": &err }).to_string();
                             (error_json, false, Some(err))
                         }
-                    },
-                    Err(err) => {
-                        let err_str = format!("tool call failed: {}", err);
-                        warn!("Tool execution failed: {}", err_str);
-                        // Return error as output, let model decide how to proceed
-                        let error_json = json!({ "error": &err_str }).to_string();
-                        (error_json, false, Some(err_str))
-                    }
-                };
+                    };
                 let tool_duration = tool_start.elapsed();
 
                 // Record MCP tool metrics
                 Metrics::record_mcp_tool_duration(
                     &current_request.model,
-                    &tool_call.name,
+                    &raw_tool_name,
                     tool_duration,
                 );
                 Metrics::record_mcp_tool_call(
                     &current_request.model,
-                    &tool_call.name,
+                    &raw_tool_name,
                     if success {
                         metrics_labels::RESULT_SUCCESS
                     } else {
@@ -410,17 +445,30 @@ pub(super) async fn execute_tool_loop(
 
             // Inject MCP metadata into output
             if state.total_calls > 0 {
-                // Prepend mcp_list_tools item
-                let servers = ctx.requested_servers.read().unwrap();
-                let mcp_list_tools =
-                    build_mcp_list_tools_item(&ctx.mcp_manager, &server_label, &servers);
-                responses_response.output.insert(0, mcp_list_tools);
+                responses_response.output.retain(|item| {
+                    !matches!(
+                        item,
+                        ResponseOutputItem::McpListTools { .. }
+                            | ResponseOutputItem::McpCall { .. }
+                    )
+                });
 
-                // Append all mcp_call items at the end
+                // Prepend mcp_list_tools items (one per server)
+                let mcp_list_tools_items = build_mcp_list_tools_items_for_request(
+                    &ctx.mcp_manager,
+                    &servers,
+                    original_request.tools.as_deref(),
+                );
+                let list_tools_count = mcp_list_tools_items.len();
+                let mut existing = Vec::new();
+                std::mem::swap(&mut existing, &mut responses_response.output);
+                responses_response.output.extend(mcp_list_tools_items);
                 responses_response.output.extend(state.mcp_call_items);
+                responses_response.output.extend(existing);
 
                 trace!(
-                    "Injected MCP metadata: 1 mcp_list_tools + {} mcp_call items",
+                    "Injected MCP metadata: {} mcp_list_tools + {} mcp_call items",
+                    list_tools_count,
                     state.total_calls
                 );
             }

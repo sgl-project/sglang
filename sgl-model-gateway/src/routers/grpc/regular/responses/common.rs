@@ -6,13 +6,17 @@
 //! - MCP metadata builders
 //! - Conversation history loading
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use axum::response::Response;
 use serde_json::{json, Value};
 use tracing::{debug, warn};
 use uuid::Uuid;
 
+pub(super) use crate::routers::mcp_utils::{
+    build_server_label_map, decode_mcp_function_name, encode_mcp_function_name,
+    filter_tools_for_server, list_tools_by_server, resolve_server_label, McpToolLookup,
+};
 use crate::{
     data_connector::{self, ConversationId, ResponseId},
     mcp::{self, McpManager},
@@ -21,10 +25,12 @@ use crate::{
         common::{Function, Tool, ToolChoice, ToolChoiceValue},
         responses::{
             self, McpToolInfo, ResponseContentPart, ResponseInput, ResponseInputOutputItem,
-            ResponseOutputItem, ResponsesRequest,
+            ResponseOutputItem, ResponseTool, ResponsesRequest,
         },
     },
-    routers::{error, grpc::common::responses::ResponsesContext},
+    routers::{
+        error, grpc::common::responses::ResponsesContext, mcp_utils::build_allowed_tools_map,
+    },
 };
 
 // ============================================================================
@@ -38,18 +44,18 @@ pub(super) struct ToolLoopState {
     pub conversation_history: Vec<ResponseInputOutputItem>,
     pub original_input: ResponseInput,
     pub mcp_call_items: Vec<ResponseOutputItem>,
-    pub server_label: String,
+    pub tool_lookup: McpToolLookup,
 }
 
 impl ToolLoopState {
-    pub fn new(original_input: ResponseInput, server_label: String) -> Self {
+    pub fn new(original_input: ResponseInput, tool_lookup: McpToolLookup) -> Self {
         Self {
             iteration: 0,
             total_calls: 0,
             conversation_history: Vec::new(),
             original_input,
             mcp_call_items: Vec::new(),
-            server_label,
+            tool_lookup,
         }
     }
 
@@ -73,12 +79,13 @@ impl ToolLoopState {
                 status: Some("completed".to_string()),
             });
 
-        // Add mcp_call output item for metadata
+        let (resolved_label, raw_tool_name) = decode_mcp_function_name(&tool_name)
+            .unwrap_or_else(|| ("mcp".to_string(), tool_name.clone()));
         let mcp_call = build_mcp_call_item(
-            &tool_name,
+            &raw_tool_name,
             &args_json_str,
             &output_str,
-            &self.server_label,
+            &resolved_label,
             success,
             error.as_deref(),
         );
@@ -151,20 +158,51 @@ pub(super) fn extract_all_tool_calls_from_chat(
     }
 }
 
-/// Convert MCP tools to Chat API tool format
-pub(super) fn convert_mcp_tools_to_chat_tools(mcp_tools: &[mcp::Tool]) -> Vec<Tool> {
-    mcp_tools
-        .iter()
-        .map(|tool_info| Tool {
-            tool_type: "function".to_string(),
-            function: Function {
-                name: tool_info.name.to_string(),
-                description: tool_info.description.as_ref().map(|d| d.to_string()),
-                parameters: Value::Object((*tool_info.input_schema).clone()),
-                strict: None,
-            },
-        })
-        .collect()
+/// Convert MCP tools to Chat API tool format and build lookup
+pub(super) fn convert_mcp_tools_to_chat_tools(
+    mcp: &Arc<McpManager>,
+    server_keys: &[String],
+    server_labels: &HashMap<String, String>,
+    request_tools: Option<&[ResponseTool]>,
+) -> (Vec<Tool>, McpToolLookup) {
+    let mut tools = Vec::new();
+    let mut lookup = McpToolLookup::default();
+    let allowed_tools = build_allowed_tools_map(request_tools);
+
+    for (server_key, tools_for_server) in list_tools_by_server(mcp, server_keys) {
+        let server_label = resolve_server_label(&server_key, server_labels);
+        let filtered_tools =
+            filter_tools_for_server(&tools_for_server, &server_label, &allowed_tools);
+
+        if filtered_tools.is_empty() {
+            continue;
+        }
+
+        for tool_info in filtered_tools {
+            let encoded_name = encode_mcp_function_name(&server_label, tool_info.name.as_ref());
+            let parameters = Value::Object((*tool_info.input_schema).clone());
+
+            tools.push(Tool {
+                tool_type: "function".to_string(),
+                function: Function {
+                    name: encoded_name.clone(),
+                    description: tool_info.description.as_ref().map(|d| d.to_string()),
+                    parameters: parameters.clone(),
+                    strict: None,
+                },
+            });
+
+            lookup
+                .tool_servers
+                .insert(encoded_name.clone(), server_key.clone());
+            lookup
+                .tool_names
+                .insert(encoded_name.clone(), tool_info.name.to_string());
+            lookup.tool_schemas.insert(encoded_name, parameters);
+        }
+    }
+
+    (tools, lookup)
 }
 
 // ============================================================================
@@ -176,13 +214,10 @@ pub(super) fn generate_mcp_id(prefix: &str) -> String {
     format!("{}_{}", prefix, Uuid::new_v4())
 }
 
-/// Build mcp_list_tools output item
-pub(super) fn build_mcp_list_tools_item(
-    mcp: &Arc<McpManager>,
+fn build_mcp_list_tools_item_from_tools(
     server_label: &str,
-    server_keys: &[String],
+    tools: &[mcp::Tool],
 ) -> ResponseOutputItem {
-    let tools = mcp.list_tools_for_servers(server_keys);
     let tools_info: Vec<McpToolInfo> = tools
         .iter()
         .map(|t| McpToolInfo {
@@ -200,6 +235,24 @@ pub(super) fn build_mcp_list_tools_item(
         server_label: server_label.to_string(),
         tools: tools_info,
     }
+}
+
+pub(super) fn build_mcp_list_tools_items_for_request(
+    mcp: &Arc<McpManager>,
+    server_keys: &[String],
+    tools: Option<&[ResponseTool]>,
+) -> Vec<ResponseOutputItem> {
+    let server_labels = build_server_label_map(tools);
+    let allowed_tools = build_allowed_tools_map(tools);
+
+    list_tools_by_server(mcp, server_keys)
+        .into_iter()
+        .map(|(server_key, tools)| {
+            let server_label = resolve_server_label(&server_key, &server_labels);
+            let filtered = filter_tools_for_server(&tools, &server_label, &allowed_tools);
+            build_mcp_list_tools_item_from_tools(&server_label, &filtered)
+        })
+        .collect()
 }
 
 /// Build mcp_call output item

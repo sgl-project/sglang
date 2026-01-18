@@ -230,6 +230,7 @@ mod tests {
             transport: McpTransport::Streamable {
                 url: url.to_string(),
                 token: None,
+                headers: None,
             },
             proxy: None,
             required: false,

@@ -3,10 +3,11 @@
 //! Manages both static MCP servers (from config) and dynamic MCP servers (from requests).
 //! Static clients are never evicted; dynamic clients use LRU eviction via connection pool.
 
-use std::{borrow::Cow, sync::Arc, time::Duration};
+use std::{borrow::Cow, collections::HashMap, sync::Arc, time::Duration};
 
 use backoff::ExponentialBackoffBuilder;
 use dashmap::DashMap;
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue, AUTHORIZATION};
 use rmcp::{
     model::{
         CallToolRequestParam, CallToolResult, GetPromptRequestParam, GetPromptResult,
@@ -21,6 +22,7 @@ use rmcp::{
     RoleClient, ServiceExt,
 };
 use serde_json::Map;
+use sha2::{Digest, Sha256};
 use tracing::{debug, error, info, warn};
 
 use crate::mcp::{
@@ -69,13 +71,17 @@ impl McpManager {
 
         // Connect to all static servers from config
         for server_config in &config.servers {
+            let server_key = Self::server_key(server_config);
             match Self::connect_server(server_config, global_proxy).await {
                 Ok(client) => {
                     let client_arc = Arc::new(client);
                     // Load inventory for this server
-                    Self::load_server_inventory(&inventory, &server_config.name, &client_arc).await;
-                    static_clients.insert(server_config.name.clone(), client_arc);
-                    info!("Connected to static server '{}'", server_config.name);
+                    Self::load_server_inventory(&inventory, &server_key, &client_arc).await;
+                    static_clients.insert(server_key.clone(), client_arc);
+                    info!(
+                        "Connected to static server '{}' (key: {})",
+                        server_config.name, server_key
+                    );
                 }
                 Err(e) => {
                     error!(
@@ -102,24 +108,23 @@ impl McpManager {
         Self::new(config, Self::MAX_DYNAMIC_CLIENTS).await
     }
 
-    pub async fn get_client(&self, server_name: &str) -> Option<Arc<McpClient>> {
-        if let Some(client) = self.static_clients.get(server_name) {
+    pub async fn get_client(&self, server_key: &str) -> Option<Arc<McpClient>> {
+        if let Some(client) = self.static_clients.get(server_key) {
             return Some(Arc::clone(client.value()));
         }
-        self.connection_pool.get(server_name)
+        self.connection_pool.get(server_key)
     }
 
     pub async fn get_or_create_client(
         &self,
         server_config: McpServerConfig,
     ) -> McpResult<Arc<McpClient>> {
-        let server_name = server_config.name.clone();
+        let server_key = Self::server_key(&server_config);
 
-        if let Some(client) = self.static_clients.get(&server_name) {
+        // Check if this matches an existing static server
+        if let Some(client) = self.static_clients.get(&server_key) {
             return Ok(Arc::clone(client.value()));
         }
-
-        let server_key = Self::server_key(&server_config);
         let client = self
             .connection_pool
             .get_or_create(
@@ -143,13 +148,13 @@ impl McpManager {
             .collect()
     }
 
-    pub fn is_static_server(&self, server_name: &str) -> bool {
-        self.static_clients.contains_key(server_name)
+    pub fn is_static_server(&self, server_key: &str) -> bool {
+        self.static_clients.contains_key(server_key)
     }
 
-    pub fn register_static_server(&self, name: String, client: Arc<McpClient>) {
-        self.static_clients.insert(name.clone(), client);
-        info!("Registered static MCP server: {}", name);
+    pub fn register_static_server(&self, server_key: String, client: Arc<McpClient>) {
+        self.static_clients.insert(server_key.clone(), client);
+        info!("Registered static MCP server: {}", server_key);
     }
 
     /// List all available tools from all servers
@@ -177,21 +182,33 @@ impl McpManager {
                 // Include if:
                 // 1. It's a static server (check by name in static_clients)
                 // 2. It's in the requested servers list
-                self.is_static_server_by_key(server_key) || server_keys.contains(server_key)
+                self.is_static_server(server_key) || server_keys.contains(server_key)
             })
             .map(|(_tool_name, _server_key, tool_info)| tool_info)
             .collect()
     }
 
-    /// Check if a server key belongs to a static server
-    ///
-    /// Static servers can be identified by checking if their name
-    /// exists in the static_clients map. We need to handle the fact
-    /// that static servers use name as key while dynamic use URL.
-    fn is_static_server_by_key(&self, server_key: &str) -> bool {
-        // For static servers, the server_key in inventory is the server name
-        // Check if this key exists in static_clients
-        self.static_clients.contains_key(server_key)
+    /// Call a tool on a specific server with already-parsed arguments.
+    pub async fn call_tool_on_server(
+        &self,
+        server_key: &str,
+        tool_name: &str,
+        arguments: Option<Map<String, serde_json::Value>>,
+    ) -> McpResult<CallToolResult> {
+        let client = self
+            .get_client(server_key)
+            .await
+            .ok_or_else(|| McpError::ServerNotFound(server_key.to_string()))?;
+
+        let request = CallToolRequestParam {
+            name: Cow::Owned(tool_name.to_string()),
+            arguments,
+        };
+
+        client
+            .call_tool(request)
+            .await
+            .map_err(|e| McpError::ToolExecution(format!("Failed to call tool: {}", e)))
     }
 
     /// Call a tool by name with automatic type coercion
@@ -315,15 +332,14 @@ impl McpManager {
     }
 
     /// Refresh inventory for a specific server
-    pub async fn refresh_server_inventory(&self, server_name: &str) -> McpResult<()> {
+    pub async fn refresh_server_inventory(&self, server_key: &str) -> McpResult<()> {
         let client = self
-            .get_client(server_name)
+            .get_client(server_key)
             .await
-            .ok_or_else(|| McpError::ServerNotFound(server_name.to_string()))?;
+            .ok_or_else(|| McpError::ServerNotFound(server_key.to_string()))?;
 
-        info!("Refreshing inventory for server: {}", server_name);
-        self.load_server_inventory_internal(server_name, &client)
-            .await;
+        info!("Refreshing inventory for server: {}", server_key);
+        Self::load_server_inventory(&self.inventory, server_key, &client).await;
         Ok(())
     }
 
@@ -543,45 +559,6 @@ impl McpManager {
         }
     }
 
-    /// Discover and cache tools/prompts/resources for a connected server (internal wrapper)
-    async fn load_server_inventory_internal(&self, server_name: &str, client: &McpClient) {
-        // Tools
-        match client.peer().list_all_tools().await {
-            Ok(ts) => {
-                info!("Discovered {} tools from '{}'", ts.len(), server_name);
-                for t in ts {
-                    self.inventory
-                        .insert_tool(t.name.to_string(), server_name.to_string(), t);
-                }
-            }
-            Err(e) => warn!("Failed to list tools from '{}': {}", server_name, e),
-        }
-
-        // Prompts
-        match client.peer().list_all_prompts().await {
-            Ok(ps) => {
-                info!("Discovered {} prompts from '{}'", ps.len(), server_name);
-                for p in ps {
-                    self.inventory
-                        .insert_prompt(p.name.clone(), server_name.to_string(), p);
-                }
-            }
-            Err(e) => debug!("No prompts or failed to list on '{}': {}", server_name, e),
-        }
-
-        // Resources
-        match client.peer().list_all_resources().await {
-            Ok(rs) => {
-                info!("Discovered {} resources from '{}'", rs.len(), server_name);
-                for r in rs {
-                    self.inventory
-                        .insert_resource(r.uri.clone(), server_name.to_string(), r.raw);
-                }
-            }
-            Err(e) => debug!("No resources or failed to list on '{}': {}", server_name, e),
-        }
-    }
-
     // ========================================================================
     // Connection Logic (from client_manager.rs)
     // ========================================================================
@@ -654,6 +631,67 @@ impl McpManager {
         }
     }
 
+    fn build_default_headers(
+        headers: Option<&HashMap<String, String>>,
+        token: Option<&String>,
+        include_token: bool,
+    ) -> McpResult<HeaderMap> {
+        let mut header_map = HeaderMap::new();
+
+        if let Some(headers) = headers {
+            for (key, value) in headers {
+                let name = HeaderName::from_bytes(key.as_bytes())
+                    .map_err(|_| McpError::Config(format!("Invalid header name: {}", key)))?;
+                let header_value = HeaderValue::from_str(value)
+                    .map_err(|_| McpError::Config(format!("Invalid header value for {}", key)))?;
+                header_map.insert(name, header_value);
+            }
+        }
+
+        if include_token {
+            if let Some(token) = token {
+                if !header_map.contains_key(AUTHORIZATION) {
+                    let value = HeaderValue::from_str(&format!("Bearer {}", token))
+                        .map_err(|_| McpError::Auth("Invalid bearer token".to_string()))?;
+                    header_map.insert(AUTHORIZATION, value);
+                }
+            }
+        }
+
+        Ok(header_map)
+    }
+
+    fn hash_server_identity(
+        url: &str,
+        token: Option<&String>,
+        headers: Option<&HashMap<String, String>>,
+    ) -> String {
+        let mut fingerprint = String::new();
+        fingerprint.push_str(url);
+        fingerprint.push('\n');
+        if let Some(token) = token {
+            fingerprint.push_str(token);
+        }
+        fingerprint.push('\n');
+
+        if let Some(headers) = headers {
+            let mut items: Vec<(String, String)> = headers
+                .iter()
+                .map(|(k, v)| (k.to_lowercase(), v.clone()))
+                .collect();
+            items.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+            for (key, value) in items {
+                fingerprint.push_str(&key);
+                fingerprint.push(':');
+                fingerprint.push_str(&value);
+                fingerprint.push('\n');
+            }
+        }
+
+        let digest = Sha256::digest(fingerprint.as_bytes());
+        format!("{:x}", digest)
+    }
+
     /// Internal implementation of server connection (stdio/sse/streamable)
     async fn connect_server_impl(
         config: &McpServerConfig,
@@ -687,12 +725,19 @@ impl McpManager {
                 Ok(client)
             }
 
-            McpTransport::Sse { url, token } => {
+            McpTransport::Sse {
+                url,
+                token,
+                headers,
+            } => {
                 // Resolve proxy configuration
                 let proxy_config = crate::mcp::proxy::resolve_proxy_config(config, global_proxy);
 
-                // Create HTTP client with proxy support
-                let client = if token.is_some() {
+                let default_headers =
+                    Self::build_default_headers(headers.as_ref(), token.as_ref(), true)?;
+                let client = if default_headers.is_empty() {
+                    crate::mcp::proxy::create_http_client(proxy_config)?
+                } else {
                     let mut builder =
                         reqwest::Client::builder().connect_timeout(Duration::from_secs(10));
 
@@ -701,23 +746,10 @@ impl McpManager {
                         builder = crate::mcp::proxy::apply_proxy_to_builder(builder, proxy_cfg)?;
                     }
 
-                    // Add Authorization header
-                    builder = builder.default_headers({
-                        let mut headers = reqwest::header::HeaderMap::new();
-                        headers.insert(
-                            reqwest::header::AUTHORIZATION,
-                            format!("Bearer {}", token.as_ref().unwrap())
-                                .parse()
-                                .map_err(|e| McpError::Transport(format!("auth token: {}", e)))?,
-                        );
-                        headers
-                    });
-
                     builder
+                        .default_headers(default_headers)
                         .build()
                         .map_err(|e| McpError::Transport(format!("build HTTP client: {}", e)))?
-                } else {
-                    crate::mcp::proxy::create_http_client(proxy_config)?
                 };
 
                 let cfg = SseClientConfig {
@@ -737,23 +769,42 @@ impl McpManager {
                 Ok(client)
             }
 
-            McpTransport::Streamable { url, token } => {
+            McpTransport::Streamable {
+                url,
+                token,
+                headers,
+            } => {
+                let proxy_config = crate::mcp::proxy::resolve_proxy_config(config, global_proxy);
                 // Note: Streamable transport doesn't support proxy yet
-                let _proxy_config = crate::mcp::proxy::resolve_proxy_config(config, global_proxy);
-                if _proxy_config.is_some() {
+                if proxy_config.is_some() {
                     warn!(
                         "Proxy configuration detected but not supported for Streamable transport on server '{}'",
                         config.name
                     );
                 }
-
-                let transport = if let Some(tok) = token {
-                    let mut cfg = StreamableHttpClientTransportConfig::with_uri(url.as_str());
-                    cfg.auth_header = Some(format!("Bearer {}", tok));
-                    StreamableHttpClientTransport::from_config(cfg)
+                let default_headers = Self::build_default_headers(headers.as_ref(), None, false)?;
+                let client = if default_headers.is_empty() {
+                    crate::mcp::proxy::create_http_client(proxy_config)?
                 } else {
-                    StreamableHttpClientTransport::from_uri(url.as_str())
+                    let mut builder =
+                        reqwest::Client::builder().connect_timeout(Duration::from_secs(10));
+
+                    if let Some(proxy_cfg) = proxy_config {
+                        builder = crate::mcp::proxy::apply_proxy_to_builder(builder, proxy_cfg)?;
+                    }
+
+                    builder
+                        .default_headers(default_headers)
+                        .build()
+                        .map_err(|e| McpError::Transport(format!("build HTTP client: {}", e)))?
                 };
+
+                let mut cfg = StreamableHttpClientTransportConfig::with_uri(url.as_str());
+                if let Some(tok) = token {
+                    cfg.auth_header = Some(format!("Bearer {}", tok));
+                }
+
+                let transport = StreamableHttpClientTransport::with_client(client, cfg);
 
                 let client = ().serve(transport).await.map_err(|e| {
                     McpError::ConnectionFailed(format!("initialize streamable client: {}", e))
@@ -771,8 +822,22 @@ impl McpManager {
     /// Generate a unique key for a server config based on its transport
     pub fn server_key(config: &McpServerConfig) -> String {
         match &config.transport {
-            McpTransport::Streamable { url, .. } => url.clone(),
-            McpTransport::Sse { url, .. } => url.clone(),
+            McpTransport::Streamable {
+                url,
+                token,
+                headers,
+            } => {
+                let digest = Self::hash_server_identity(url, token.as_ref(), headers.as_ref());
+                format!("{}#{}", url, digest)
+            }
+            McpTransport::Sse {
+                url,
+                token,
+                headers,
+            } => {
+                let digest = Self::hash_server_identity(url, token.as_ref(), headers.as_ref());
+                format!("{}#{}", url, digest)
+            }
             McpTransport::Stdio { command, .. } => command.clone(),
         }
     }
