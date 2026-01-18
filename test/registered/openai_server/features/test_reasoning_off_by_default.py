@@ -64,23 +64,6 @@ class TestReasoningOffByDefault(CustomTestCase):
                 "model": self.model,
                 "messages": [{"role": "user", "content": "What is 2+2?"}],
                 "temperature": 0,
-                "chat_template_kwargs": {"enable_thinking": True},
-            },
-        )
-        self.assertEqual(response.status_code, 200)
-        data = response.json()
-        message = data["choices"][0]["message"]
-        # If separate_reasoning is not set, it might be in content or reasoning_content depending on parser
-        # But qwen3 parser with enable_thinking=True should produce reasoning_content if separate_reasoning=True
-
-        # Let's try with separate_reasoning=True to be sure
-        response = requests.post(
-            f"{self.base_url}/v1/chat/completions",
-            headers={"Authorization": f"Bearer {self.api_key}"},
-            json={
-                "model": self.model,
-                "messages": [{"role": "user", "content": "What is 2+2?"}],
-                "temperature": 0,
                 "separate_reasoning": True,
                 "chat_template_kwargs": {"enable_thinking": True},
             },
