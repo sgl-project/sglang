@@ -229,6 +229,10 @@ class HiCacheHF3FS(HiCacheStorage):
         self.backup_pgs = []
         self.prefetch_bandwidth = []
         self.backup_bandwidth = []
+        self.prefetch_failed_count = 0
+        self.backup_failed_count = 0
+        self.prefetch_total_count = 0
+        self.backup_total_count = 0
 
     @staticmethod
     def from_env_config(
@@ -378,13 +382,19 @@ class HiCacheHF3FS(HiCacheStorage):
         )
 
         results = [False] * len(keys)
+        failed_count = 0
         for batch_index, read_result in zip(batch_indices, read_results):
             if read_result == self.bytes_per_page:
                 results[batch_index] = True
             else:
+                failed_count += 1
                 logger.error(
                     f"[Rank {self.rank}] HiCacheHF3FS get {keys[batch_index]} failed"
                 )
+
+        # Update failure metrics
+        self.prefetch_total_count += ionum
+        self.prefetch_failed_count += failed_count
 
         return results
 
@@ -438,15 +448,21 @@ class HiCacheHF3FS(HiCacheStorage):
 
         written_keys_to_confirm = []
         results = [index[0] for index in indices]
+        failed_count = 0
         for batch_index, write_result in zip(batch_indices, write_results):
             key = keys[batch_index]
             page_index = indices[batch_index][1]
             if write_result:
                 written_keys_to_confirm.append((key, page_index))
             else:
+                failed_count += 1
                 logger.error(f"[Rank {self.rank}] HiCacheHF3FS set {key} failed")
                 pages_to_release.append(page_index)
             results[batch_index] = write_result
+
+        # Update failure metrics
+        self.backup_total_count += ionum
+        self.backup_failed_count += failed_count
 
         if len(written_keys_to_confirm) > 0 or len(pages_to_release) > 0:
             self.metadata_client.confirm_write(
@@ -500,10 +516,31 @@ class HiCacheHF3FS(HiCacheStorage):
         storage_metrics.backup_pgs.extend(self.backup_pgs)
         storage_metrics.prefetch_bandwidth.extend(self.prefetch_bandwidth)
         storage_metrics.backup_bandwidth.extend(self.backup_bandwidth)
+
+        # Calculate failure rates
+        prefetch_failure_rate = (
+            self.prefetch_failed_count / self.prefetch_total_count
+            if self.prefetch_total_count > 0
+            else 0.0
+        )
+        backup_failure_rate = (
+            self.backup_failed_count / self.backup_total_count
+            if self.backup_total_count > 0
+            else 0.0
+        )
+
+        # Store failure rates in metrics
+        storage_metrics.prefetch_failure_rate = prefetch_failure_rate
+        storage_metrics.backup_failure_rate = backup_failure_rate
+
         self.prefetch_pgs.clear()
         self.backup_pgs.clear()
         self.prefetch_bandwidth.clear()
         self.backup_bandwidth.clear()
+        self.prefetch_failed_count = 0
+        self.backup_failed_count = 0
+        self.prefetch_total_count = 0
+        self.backup_total_count = 0
         return storage_metrics
 
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
