@@ -861,7 +861,11 @@ def _wait_for_scheduler_ready(
             raise RuntimeError(
                 "Initialization failed. Please see the error messages above."
             )
-        scheduler_infos.append(data)
+
+        if "_dp_scheduler_infos" in data:
+            scheduler_infos.extend(data["_dp_scheduler_infos"])
+        else:
+            scheduler_infos.append(data)
     return scheduler_infos
 
 

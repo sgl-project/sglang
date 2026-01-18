@@ -28,7 +28,7 @@ import os
 import pickle
 import weakref
 from collections import namedtuple
-from contextlib import ExitStack, contextmanager, nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import timedelta
 from multiprocessing import shared_memory
@@ -1982,73 +1982,119 @@ def monkey_patch_vllm_parallel_state(reverse: bool = False):
 
 
 class ParallelismContext:
-    """Context manager for creating model replicas with specific parallelism settings."""
+    """
+    Context manager for creating model replicas with specific parallelism settings.
+
+    This context manager temporarily sets global variables to allow creating model
+    shards outside of a real distributed environment.
+    Usage:
+        server_args = ...  # Get from engine.get_server_info()
+        parallelism_info = engine.get_parallelism_config(rank)
+        sglang.srt.server_args._global_server_args = server_args
+
+        with ParallelismContext(RankParallelismConfig.from_dict(parallelism_info)):
+            model = get_model(
+                model_config=model_config,
+                load_config=load_config,
+                device_config=device_config,
+            )
+    """
 
     def __init__(self, parallelism_config: RankParallelismConfig):
         self.config = parallelism_config
-        self.stack = ExitStack()
-        self._original_globals = {}
+        self._original_globals: Dict[str, Any] = {}
+
+    def _create_mock_group(self, world_size: int, rank_in_group: int):
+        """Create a mock group coordinator with all necessary properties."""
+        mock_group = MagicMock()
+        mock_group.world_size = world_size
+        mock_group.rank_in_group = rank_in_group
+        mock_group.rank = rank_in_group  # Use rank_in_group for .rank as well
+        mock_group.local_rank = rank_in_group
+        mock_group.ranks = list(range(world_size))
+        mock_group.first_rank = 0
+        mock_group.last_rank = world_size - 1
+        mock_group.is_first_rank = rank_in_group == 0
+        mock_group.is_last_rank = rank_in_group == world_size - 1
+        mock_group.next_rank = mock_group.ranks[(rank_in_group + 1) % world_size]
+        mock_group.prev_rank = mock_group.ranks[(rank_in_group - 1) % world_size]
+        return mock_group
 
     def __enter__(self):
         conf = self.config
-        p_state = "sglang.srt.distributed.parallel_state"
 
-        patch_map = {
-            f"{p_state}.get_tensor_model_parallel_world_size": conf.tp_size,
-            f"{p_state}.get_tensor_model_parallel_rank": conf.tp_rank,
-            f"{p_state}.get_pipeline_model_parallel_world_size": conf.pp_size,
-            f"{p_state}.get_pipeline_model_parallel_rank": conf.pp_rank,
-            f"{p_state}.get_expert_model_parallel_world_size": conf.ep_size,
-            f"{p_state}.get_expert_model_parallel_rank": conf.ep_rank,
-            f"{p_state}.get_tp_group": MagicMock(
-                world_size=conf.tp_size, rank_in_group=conf.tp_rank
-            ),
-            f"{p_state}.get_pp_group": MagicMock(
-                world_size=conf.pp_size, rank_in_group=conf.pp_rank
-            ),
-            f"{p_state}.get_ep_group": MagicMock(
-                world_size=conf.ep_size, rank_in_group=conf.ep_rank
-            ),
-        }
+        # Import the modules we need to modify
+        from sglang.srt.distributed import parallel_state
+        from sglang.srt.layers import dp_attention
 
-        if conf.has_dp_attention:
-            from sglang.srt.layers import dp_attention
+        # Save original global variables to restore later
+        self._original_globals["_TP"] = getattr(parallel_state, "_TP", None)
+        self._original_globals["_PP"] = getattr(parallel_state, "_PP", None)
+        self._original_globals["_MOE_EP"] = getattr(parallel_state, "_MOE_EP", None)
+        self._original_globals["_MOE_TP"] = getattr(parallel_state, "_MOE_TP", None)
+        self._original_globals["_ATTN_TP_RANK"] = getattr(
+            dp_attention, "_ATTN_TP_RANK", None
+        )
+        self._original_globals["_ATTN_TP_SIZE"] = getattr(
+            dp_attention, "_ATTN_TP_SIZE", None
+        )
+        self._original_globals["_ATTN_DP_RANK"] = getattr(
+            dp_attention, "_ATTN_DP_RANK", None
+        )
+        self._original_globals["_ATTN_DP_SIZE"] = getattr(
+            dp_attention, "_ATTN_DP_SIZE", None
+        )
+        self._original_globals["_ENABLE_DP_ATTENTION_FLAG"] = getattr(
+            dp_attention, "_ENABLE_DP_ATTENTION_FLAG", False
+        )
 
-            attn_map = {
-                "get_attention_tp_size": conf.attn_tp_size,
-                "get_attention_tp_rank": conf.attn_tp_rank,
-                "get_attention_dp_size": conf.attn_dp_size,
-                "get_attention_dp_rank": conf.attn_dp_rank,
-            }
-            for func, val in attn_map.items():
-                patch_map[f"sglang.srt.layers.dp_attention.{func}"] = val
+        # Create mock group objects with the correct attributes
+        mock_tp_group = self._create_mock_group(conf.tp_size, conf.tp_rank)
+        mock_pp_group = self._create_mock_group(conf.pp_size, conf.pp_rank)
+        mock_ep_group = self._create_mock_group(conf.ep_size, conf.ep_rank)
+        mock_moe_tp_group = self._create_mock_group(conf.moe_tp_size, conf.moe_tp_rank)
 
-            for attr in [
-                "_ATTN_TP_SIZE",
-                "_ATTN_TP_RANK",
-                "_ATTN_DP_SIZE",
-                "_ATTN_DP_RANK",
-            ]:
-                self._original_globals[attr] = getattr(dp_attention, attr, None)
-                setattr(dp_attention, attr, getattr(conf, attr.lower()[1:]))
+        # Set the global group objects directly on parallel_state module
+        parallel_state._TP = mock_tp_group
+        parallel_state._PP = mock_pp_group
+        parallel_state._MOE_EP = mock_ep_group
+        parallel_state._MOE_TP = mock_moe_tp_group
 
-        for target, value in patch_map.items():
-            try:
-                self.stack.enter_context(patch(target, return_value=value))
-            except (ImportError, AttributeError):
-                continue
+        # Set dp_attention globals directly
+        dp_attention._ATTN_TP_RANK = conf.attn_tp_rank
+        dp_attention._ATTN_TP_SIZE = conf.attn_tp_size
+        dp_attention._ATTN_DP_RANK = conf.attn_dp_rank
+        dp_attention._ATTN_DP_SIZE = conf.attn_dp_size
+        # Enable DP attention flag if attn_dp_size > 1
+        dp_attention._ENABLE_DP_ATTENTION_FLAG = conf.attn_dp_size > 1
 
         logger.info(
-            f"[ReplicaContext] Activated: TP={conf.tp_rank}/{conf.tp_size}, PP={conf.pp_rank}/{conf.pp_size}"
+            f"[ParallelismContext] Activated: TP={conf.tp_rank}/{conf.tp_size}, "
+            f"PP={conf.pp_rank}/{conf.pp_size}, EP={conf.ep_rank}/{conf.ep_size}, "
+            f"MoE-TP={conf.moe_tp_rank}/{conf.moe_tp_size}, "
+            f"AttnTP={conf.attn_tp_rank}/{conf.attn_tp_size}, "
+            f"AttnDP={conf.attn_dp_rank}/{conf.attn_dp_size}"
         )
         return self
 
     def __exit__(self, *args):
-        if self._original_globals:
-            from sglang.srt.layers import dp_attention
+        from sglang.srt.distributed import parallel_state
+        from sglang.srt.layers import dp_attention
 
-            for attr, val in self._original_globals.items():
-                setattr(dp_attention, attr, val)
+        # Restore original parallel_state globals
+        parallel_state._TP = self._original_globals.get("_TP")
+        parallel_state._PP = self._original_globals.get("_PP")
+        parallel_state._MOE_EP = self._original_globals.get("_MOE_EP")
+        parallel_state._MOE_TP = self._original_globals.get("_MOE_TP")
 
-        self.stack.close()
-        logger.info("[ReplicaContext] Deactivated")
+        # Restore original dp_attention globals
+        dp_attention._ATTN_TP_RANK = self._original_globals.get("_ATTN_TP_RANK")
+        dp_attention._ATTN_TP_SIZE = self._original_globals.get("_ATTN_TP_SIZE")
+        dp_attention._ATTN_DP_RANK = self._original_globals.get("_ATTN_DP_RANK")
+        dp_attention._ATTN_DP_SIZE = self._original_globals.get("_ATTN_DP_SIZE")
+        dp_attention._ENABLE_DP_ATTENTION_FLAG = self._original_globals.get(
+            "_ENABLE_DP_ATTENTION_FLAG", False
+        )
+
+        logger.info("[ParallelismContext] Deactivated")
+        return False

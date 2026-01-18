@@ -467,6 +467,7 @@ class DataParallelController:
 
         self.max_total_num_tokens = scheduler_info[0]["max_total_num_tokens"]
         self.max_req_input_len = scheduler_info[0]["max_req_input_len"]
+        self.scheduler_infos = scheduler_info
 
     def maybe_external_dp_rank_routing(self, req: Req):
         if req.data_parallel_rank is not None:
@@ -556,6 +557,8 @@ def run_data_parallel_controller_process(
                 "status": "ready",
                 "max_total_num_tokens": controller.max_total_num_tokens,
                 "max_req_input_len": controller.max_req_input_len,
+                # Include all scheduler infos for endpoints like /get_parallelism_config
+                "_dp_scheduler_infos": controller.scheduler_infos,
             }
         )
         if server_args.node_rank == 0:

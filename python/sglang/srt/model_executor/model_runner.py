@@ -30,7 +30,6 @@ import torch
 import torch.distributed as dist
 from torch import nn
 
-from python.sglang.srt.configs.parallelism_config import RankParallelismConfig
 from sglang.srt.configs import (
     FalconH1Config,
     JetNemotronConfig,
@@ -43,6 +42,7 @@ from sglang.srt.configs import (
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig, ModelImpl
+from sglang.srt.configs.parallelism_config import RankParallelismConfig
 from sglang.srt.configs.update_config import adjust_config_with_unaligned_cpu_tp
 from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
 from sglang.srt.debug_utils.tensor_dump_forward_hook import (
