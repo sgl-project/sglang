@@ -146,12 +146,14 @@ std::vector<std::pair<SAMNode*, int32_t>> Ngram::match(const std::vector<int32_t
   int matched_len = 0;
   for (size_t i = tokens.size() - max_k; i < tokens.size(); ++i) {
     int32_t t = tokens[i];
-    while (curr != root_ && !curr->next.count(t)) {
+    auto it = curr->next.find(t);
+    while (curr != root_ && it == curr->next.end()) {
       curr = curr->fail;
       matched_len = curr->len;
+      it = curr->next.find(t);
     }
-    if (curr->next.count(t)) {
-      curr = curr->next.at(t).target;
+    if (it != curr->next.end()) {
+      curr = it->second.target;
       matched_len++;
     }
   }
@@ -160,10 +162,10 @@ std::vector<std::pair<SAMNode*, int32_t>> Ngram::match(const std::vector<int32_t
   SAMNode* temp = curr;
   int current_len = matched_len;
 
-  while (temp && current_len >= min_k) {
+  while (temp && current_len >= (int)min_k) {
     int next_len = temp->fail ? temp->fail->len : 0;
     for (int l = current_len; l > next_len; --l) {
-      if (l >= min_k && l <= max_k) {
+      if (l >= (int)min_k && l <= (int)max_k) {
         results.push_back({temp, l});
       }
     }
@@ -181,8 +183,9 @@ void Ngram::extend(int32_t t, SAMNode*& last) {
   SAMNode* old_last = last;
   SAMNode* p = last;
 
-  if (p->next.count(t)) {
-    SAMNode* q = p->next[t].target;
+  auto it = p->next.find(t);
+  if (it != p->next.end()) {
+    SAMNode* q = it->second.target;
     if (p->len + 1 == q->len) {
       last = q;
     } else {
@@ -192,12 +195,16 @@ void Ngram::extend(int32_t t, SAMNode*& last) {
       clone->fail = q->fail;
       clone->token = q->token;
       clone->lru = q->lru;
-      for (auto it = clone->lru.begin(); it != clone->lru.end(); ++it) {
-        clone->next[*it].lru_it = it;
-        clone->sorted_children.insert(*it);
+      for (auto it_lru = clone->lru.begin(); it_lru != clone->lru.end(); ++it_lru) {
+        int32_t tid = *it_lru;
+        auto it_next = clone->next.find(tid);
+        it_next->second.lru_it = it_lru;
+        clone->sorted_children.insert({it_next->second.freq, tid});
       }
-      while (p && p->next.count(t) && p->next[t].target == q) {
-        p->next[t].target = clone;
+      while (p) {
+        auto it_p = p->next.find(t);
+        if (it_p == p->next.end() || it_p->second.target != q) break;
+        it_p->second.target = clone;
         p = p->fail;
       }
       q->fail = clone;
@@ -207,16 +214,19 @@ void Ngram::extend(int32_t t, SAMNode*& last) {
     SAMNode* cur = getNode();
     cur->len = last->len + 1;
     cur->token = t;
-    while (p && !p->next.count(t)) {
+    while (p) {
+      auto it_p = p->next.find(t);
+      if (it_p != p->next.end()) break;
       p->lru.push_front(t);
       p->next[t] = {cur, 0, p->lru.begin()};
-      p->sorted_children.insert(t);
+      p->sorted_children.insert({0, t});
       p = p->fail;
     }
     if (!p) {
       cur->fail = root_;
     } else {
-      SAMNode* q = p->next[t].target;
+      auto it_p = p->next.find(t);
+      SAMNode* q = it_p->second.target;
       if (p->len + 1 == q->len) {
         cur->fail = q;
       } else {
@@ -226,13 +236,16 @@ void Ngram::extend(int32_t t, SAMNode*& last) {
         clone->fail = q->fail;
         clone->token = q->token;
         clone->lru = q->lru;
-        for (auto it = clone->lru.begin(); it != clone->lru.end(); ++it) {
-          int32_t tid = *it;
-          clone->next[tid].lru_it = it;
-          clone->sorted_children.insert(tid);
+        for (auto it_lru = clone->lru.begin(); it_lru != clone->lru.end(); ++it_lru) {
+          int32_t tid = *it_lru;
+          auto it_next = clone->next.find(tid);
+          it_next->second.lru_it = it_lru;
+          clone->sorted_children.insert({it_next->second.freq, tid});
         }
-        while (p && p->next.count(t) && p->next[t].target == q) {
-          p->next[t].target = clone;
+        while (p) {
+          auto it_upd = p->next.find(t);
+          if (it_upd == p->next.end() || it_upd->second.target != q) break;
+          it_upd->second.target = clone;
           p = p->fail;
         }
         q->fail = cur->fail = clone;
@@ -300,8 +313,9 @@ Ngram::Result Ngram::matchBFS(const std::vector<int32_t>& tokens, size_t batch_s
       for (; count < breadth && iter != sam_node->lru.end() && cursor <= draft_token_num; ++count, ++iter) {
         int32_t t_id = *iter;
         int pos;
-        if (tree[parent].next.count(t_id)) {
-          pos = tree[parent].next[t_id];
+        auto it_tree = tree[parent].next.find(t_id);
+        if (it_tree != tree[parent].next.end()) {
+          pos = it_tree->second;
         } else {
           pos = tree[parent].next[t_id] = cursor++;
         }
@@ -330,16 +344,16 @@ Ngram::Result Ngram::matchProb(const std::vector<int32_t>& tokens, size_t batch_
   auto addToHeap = [&](std::priority_queue<HeapNode>& heap, int parent, const SAMNode* sam_node, double prob) {
     double sum_freq = 0;
     int count_sum = 0;
-    std::vector<int32_t> topk_tokens;
-    for (int32_t tid : sam_node->sorted_children) {
-      sum_freq += sam_node->next.at(tid).freq;
-      topk_tokens.push_back(tid);
+    std::vector<std::pair<int32_t, int32_t>> topk_tokens;
+    for (auto const& p : sam_node->sorted_children) {
+      sum_freq += p.first;
+      topk_tokens.push_back(p);
       if (++count_sum >= top_k) break;
     }
     if (sum_freq <= 0) return;
-    for (int32_t tid : topk_tokens) {
-      double norm_freq = (double)sam_node->next.at(tid).freq / sum_freq * prob;
-      heap.push({parent, sam_node->next.at(tid).target, norm_freq});
+    for (auto const& p : topk_tokens) {
+      double norm_freq = (double)p.first / sum_freq * prob;
+      heap.push({parent, sam_node->next.at(p.second).target, norm_freq});
     }
   };
 
@@ -353,8 +367,9 @@ Ngram::Result Ngram::matchProb(const std::vector<int32_t>& tokens, size_t batch_
     heap.pop();
     int32_t t_id = top.sam_node->token;
     int pos;
-    if (tree[top.parent].next.count(t_id)) {
-      pos = tree[top.parent].next[t_id];
+    auto it_tree = tree[top.parent].next.find(t_id);
+    if (it_tree != tree[top.parent].next.end()) {
+      pos = it_tree->second;
     } else {
       pos = tree[top.parent].next[t_id] = cursor++;
     }

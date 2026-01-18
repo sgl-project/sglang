@@ -11,6 +11,7 @@
 #include <thread>
 #include <tuple>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "param.h"
@@ -27,34 +28,30 @@ struct Transition {
 };
 
 struct SAMNode {
+  struct PairComparator {
+    bool operator()(const std::pair<int32_t, int32_t>& a, const std::pair<int32_t, int32_t>& b) const {
+      if (a.first != b.first) return a.first > b.first;
+      return a.second < b.second;
+    }
+  };
+
   std::unordered_map<int32_t, Transition> next;
-  std::list<SAMNode*>::const_iterator global_lru_pos;
   int32_t token;
-  SAMNode* parent = nullptr;
   std::list<int32_t> lru;
 
   SAMNode* fail = nullptr;
   int32_t len = 0;
 
-  struct CompareByFreq {
-    const std::unordered_map<int32_t, Transition>* next_map;
-    bool operator()(int32_t a, int32_t b) const {
-      const auto& ta = next_map->at(a);
-      const auto& tb = next_map->at(b);
-      if (ta.freq != tb.freq) return ta.freq > tb.freq;
-      return a < b;
-    }
-  };
-  std::set<int32_t, CompareByFreq> sorted_children;
+  std::set<std::pair<int32_t, int32_t>, PairComparator> sorted_children;
 
-  SAMNode() : sorted_children(CompareByFreq{&next}) {}
+  SAMNode() : sorted_children(PairComparator()) {}
 
   void update_freq(int32_t t, int32_t delta) {
     auto it = next.find(t);
     if (it != next.end()) {
-      sorted_children.erase(t);
+      sorted_children.erase({it->second.freq, t});
       it->second.freq += delta;
-      sorted_children.insert(t);
+      sorted_children.insert({it->second.freq, t});
       lru.splice(lru.begin(), lru, it->second.lru_it);
     }
   }
@@ -64,9 +61,7 @@ class Ngram {
   std::vector<SAMNode> nodes_;
   std::vector<SAMNode*> node_pool_;
   size_t free_node_count_;
-  std::list<SAMNode*> global_lru_;
   SAMNode* root_;
-  std::vector<SAMNode*> path_;
   Param param_;
 
   std::vector<std::pair<SAMNode*, int32_t>> match(const std::vector<int32_t>& tokens, size_t batch_size) const;
@@ -111,8 +106,6 @@ class Ngram {
   void reset() {
     std::unique_lock<std::mutex> lock(mutex_);
 
-    global_lru_.clear();
-    path_.clear();
     node_pool_.clear();
     for (auto& node : nodes_) {
       node_pool_.emplace_back(&node);
