@@ -38,6 +38,8 @@ from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.eagle_info_v2 import (
     assign_extend_cache_locs,
+    build_compact_kv_src_tgt_cache_loc,
+    compact_data_tensors_func,
     fill_accepted_out_cache_loc,
     fill_new_verified_id,
 )
@@ -61,6 +63,8 @@ from sglang.srt.utils.common import (
 )
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 
+_is_cuda = is_cuda()
+_is_hip = is_hip()
 _is_npu = is_npu()
 _is_cuda = is_cuda()
 
@@ -687,6 +691,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             return batch_output
 
     def verify(self, batch: ModelWorkerBatch):
+        """Run target model verification and handle tree mode compaction."""
         # Since batch.seq_lens is allocated in another stream, we need
         # record_stream() to prevent pytorch gc and reuse the gpu memory
         # while forward_stream is still running.
@@ -773,32 +778,88 @@ class EAGLEWorkerV2(BaseSpecWorker):
             accept_length,
             accept_index,
         ) = verify_input.sample(batch, logits_output, vocab_mask)
-        new_seq_lens = batch.seq_lens + accept_length
-        verify_done = torch.get_device_module(self.device).Event()
-        verify_done.record()
 
         if not batch.forward_mode.is_idle():
             all_verified_id = predict[accept_index]
+
             verified_id = torch.empty_like(accept_length, dtype=torch.int32)
             fill_new_verified_id[(bs,)](
                 all_verified_id,
                 accept_length,
                 verified_id,
-                self.speculative_num_draft_tokens,
+                self.speculative_num_steps + 1,
             )
+
+            is_tree_mode = self.topk > 1
+
+            if is_tree_mode:
+                # Tree mode requires CUDA/HIP for Triton kernels
+                if not (_is_cuda or _is_hip):
+                    raise RuntimeError(
+                        "Tree mode speculative decoding (topk > 1) requires CUDA or HIP."
+                    )
+
+                # Compact accepted KV cache to the front of the per-request
+                # speculative region so subsequent decode reads contiguous KV.
+                accept_index_len = self.speculative_num_steps + 1
+                src_cache_loc = torch.empty(
+                    (bs * accept_index_len,),
+                    dtype=batch.out_cache_loc.dtype,
+                    device=batch.out_cache_loc.device,
+                )
+                tgt_cache_loc = torch.empty_like(src_cache_loc)
+                build_compact_kv_src_tgt_cache_loc[(bs,)](
+                    accept_index,
+                    accept_length,
+                    batch.out_cache_loc,
+                    src_cache_loc,
+                    tgt_cache_loc,
+                    self.speculative_num_draft_tokens,
+                    accept_index_len,
+                    next_power_of_2(accept_index_len),
+                )
+                self.token_to_kv_pool_allocator.get_kvcache().move_kv_cache(
+                    tgt_loc=tgt_cache_loc,
+                    src_loc=src_cache_loc,
+                )
+
+                # Compact scattered acceptance to prefix
+                (
+                    padded_predict,
+                    packed_hidden,
+                    _packed_cache,  # Not used - KV compaction done via move_kv_cache
+                ) = compact_data_tensors_func(
+                    accept_index,
+                    accept_length,
+                    self.speculative_num_draft_tokens,
+                    predict,
+                    logits_output.hidden_states,
+                    batch.out_cache_loc,
+                )
+
+                logits_output.hidden_states = packed_hidden
+                output_predict = padded_predict
+            else:
+                # Chain mode: no compaction needed
+                output_predict = predict
         else:
             verified_id = torch.empty((0,), device=self.device, dtype=torch.int32)
+            output_predict = predict
 
-        # Construct the next draft input
+        new_seq_lens = batch.seq_lens + accept_length
+        verify_done = torch.get_device_module(self.device).Event()
+        verify_done.record()
+
         next_draft_input = EagleDraftInput(
             verified_id=verified_id,
             new_seq_lens=new_seq_lens,
             verify_done=verify_done,
+            hidden_states=None,
         )
 
         return GenerationBatchResult(
             logits_output=logits_output,
-            next_token_ids=predict,
+            next_token_ids=output_predict,
             can_run_cuda_graph=can_run_cuda_graph,
             next_draft_input=next_draft_input,
             accept_lens=accept_length,

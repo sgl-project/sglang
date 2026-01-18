@@ -94,13 +94,43 @@ class EagleDraftInputV2Mixin:
         cur_kv_lens_cpu = []
         nxt_kv_lens_cpu = []
         num_needed_tokens = 0
-        for r in batch.reqs:
-            # Over-allocation happens here
-            x = r.kv_committed_len + 2 * self.ALLOC_LEN_PER_DECODE - r.kv_allocated_len
-            cur_kv_lens_cpu.append(r.kv_allocated_len)
-            nxt_kv_lens_cpu.append(r.kv_allocated_len + x)
+
+        # paged(topk>1) alloc lower bound
+        # TODO Simply Getattr... Think of optimizing it later
+        seq_lens_cpu = getattr(batch, "seq_lens_cpu", batch.seq_lens.cpu())
+        page_size = batch.token_to_kv_pool_allocator.page_size
+        server_args = get_global_server_args()
+        topk = int(getattr(server_args, "speculative_eagle_topk", 1))
+        num_steps = int(getattr(server_args, "speculative_num_steps", 0))
+        self.page_size = page_size  # for later use...
+
+        for i, r in enumerate(batch.reqs):
+            x_dense = int(
+                r.kv_committed_len + 2 * self.ALLOC_LEN_PER_DECODE - r.kv_allocated_len
+            )
+            if x_dense < 0:
+                x_dense = 0
+
+            x_paged_min = 0
+            if page_size > 1 and topk > 1:
+                prefix_len = int(seq_lens_cpu[i])
+                last = prefix_len % page_size
+                base = prefix_len - last
+                num_new_pages = (last + num_steps + page_size - 1) // page_size
+
+                # abs lower_bound ：token_pool covers for base + topk*num_new_pages*page_size
+                required_min = base + topk * num_new_pages * page_size
+
+                x_paged_min = required_min - int(r.kv_allocated_len)
+                if x_paged_min < 0:
+                    x_paged_min = 0
+
+            x = x_dense if x_dense > x_paged_min else x_paged_min
+
+            cur_kv_lens_cpu.append(int(r.kv_allocated_len))
+            r.kv_allocated_len = int(r.kv_allocated_len) + x
+            nxt_kv_lens_cpu.append(int(r.kv_allocated_len))
             num_needed_tokens += x
-            r.kv_allocated_len += x
 
         cur_kv_lens_cpu = torch.tensor(cur_kv_lens_cpu, dtype=torch.int32, device="cpu")
         nxt_kv_lens_cpu = torch.tensor(nxt_kv_lens_cpu, dtype=torch.int32, device="cpu")
@@ -150,22 +180,62 @@ class EagleDraftInputV2Mixin:
         if not batch.forward_mode.is_idle():
             bs = len(batch.seq_lens)
 
-            # Assign cache locations
-            batch.out_cache_loc = torch.empty(
-                (bs * topk * num_steps,),
-                dtype=torch.int64,
-                device=batch.input_ids.device,
-            )
-            # FIXME(lsyin): align with the default code path
-            assign_draft_cache_locs_page_size_1[(bs,)](
-                batch.req_pool_indices,
-                req_to_token_pool.req_to_token,
-                batch.seq_lens,
-                batch.out_cache_loc,
-                req_to_token_pool.req_to_token.shape[1],
-                topk,
-                num_steps,
-            )
+            # Assign cache locations (page_size==1 or topk==1 => dense; else paged gather)
+            page_size = int(self.page_size)
+            topk = int(topk)
+            num_steps = int(num_steps)
+
+            if page_size == 1 or topk == 1:
+                batch.out_cache_loc = torch.empty(
+                    (bs * topk * num_steps,),
+                    device=batch.device,
+                    dtype=torch.int64,
+                )
+                assign_draft_cache_locs_page_size_1[(bs,)](
+                    batch.req_pool_indices,
+                    req_to_token_pool.req_to_token,
+                    batch.seq_lens,
+                    batch.out_cache_loc,
+                    req_to_token_pool.req_to_token.shape[1],
+                    topk,
+                    num_steps,
+                )
+
+            else:
+                # --- paged(topk>1) gather out_cache_loc from req_to_token ---
+                idx = batch.req_pool_indices.to(torch.int64)
+                rows = req_to_token_pool.req_to_token[idx]
+                pool_len = rows.size(1)
+
+                seq_lens = batch.seq_lens.to(rows.device, dtype=torch.int64)
+                last_page = seq_lens % page_size
+                prefix_base = seq_lens - last_page
+                num_new_pages = (
+                    last_page + num_steps + page_size - 1
+                ) // page_size  # (bs,)
+
+                topk_ids = torch.arange(
+                    topk, device=rows.device, dtype=torch.int64
+                ).view(
+                    1, topk
+                )  # (1,topk)
+                starts = (
+                    prefix_base.view(bs, 1)
+                    + topk_ids * (num_new_pages.view(bs, 1) * page_size)
+                    + last_page.view(bs, 1)
+                )
+                steps = torch.arange(
+                    num_steps, device=rows.device, dtype=torch.int64
+                ).view(1, 1, num_steps)
+
+                pos = (starts.view(bs, topk, 1) + steps).reshape(bs, topk * num_steps)
+
+                # TODO assertion should be removed into unit test
+                # assert int(pos.max()) < int(pool_len), f"paged out_cache_loc OOB: max_pos={int(pos.max())}, pool_len={int(pool_len)}"
+                # assert int(pos.min()) >= 0, f"paged out_cache_loc negative pos: min_pos={int(pos.min())}"
+
+                out = torch.gather(rows, 1, pos)  # (bs, topk*S)
+                batch.out_cache_loc = out.to(torch.int64).reshape(-1)
 
         # Get a forward batch
         self.num_tokens_per_batch = topk
@@ -371,6 +441,7 @@ class EagleVerifyInputV2Mixin:
 
         # Include the bonus token
         accept_length.add_(1)
+
         return predict, accept_length, accept_index
 
 
@@ -407,6 +478,102 @@ def fill_accepted_out_cache_loc(
     if src > -1:
         value = tl.load(out_cache_loc + src)
         tl.store(accepted_out_cache_loc + dst, value)
+
+
+@triton.jit
+def build_compact_kv_src_tgt_cache_loc(
+    accept_index,
+    accept_lens,
+    out_cache_loc,
+    src_cache_loc,
+    tgt_cache_loc,
+    draft_token_num: tl.constexpr,
+    accept_index_len: tl.constexpr,
+    accept_index_upper: tl.constexpr,
+):
+    """
+    Build (src_cache_loc, tgt_cache_loc) pairs to compact accepted KV cache to the
+    front of the per-request verify slots without any dynamic allocation.
+
+    Layout:
+    - accept_index: [bs, accept_index_len] (padded with -1)
+    - out_cache_loc: [bs, draft_token_num]
+    - src/tgt_cache_loc: [bs, accept_index_len]
+
+    For each request i and position j in [0, accept_index_len):
+    - tgt = out_cache_loc[i, j]
+    - src = out_cache_loc[accept_index[i, j]] if j < accept_lens[i] and accept_index[i, j] >= 0
+      else tgt (no-op copy)
+    """
+    bid = tl.program_id(axis=0)
+    offsets = tl.arange(0, accept_index_upper)
+    mask = offsets < accept_index_len
+
+    accept_len = tl.load(accept_lens + bid)
+
+    tgt_pos = bid * draft_token_num + offsets
+    tgt_vals = tl.load(out_cache_loc + tgt_pos, mask=mask, other=0)
+    src_vals = tgt_vals
+
+    acc_idx = tl.load(
+        accept_index + bid * accept_index_len + offsets, mask=mask, other=-1
+    )
+    copy_mask = mask & (offsets < accept_len) & (acc_idx >= 0)
+    src_candidate = tl.load(out_cache_loc + acc_idx, mask=copy_mask, other=0)
+    src_vals = tl.where(copy_mask, src_candidate, src_vals)
+
+    out_pos = bid * accept_index_len + offsets
+    tl.store(src_cache_loc + out_pos, src_vals, mask=mask)
+    tl.store(tgt_cache_loc + out_pos, tgt_vals, mask=mask)
+
+
+@triton.jit
+def compact_data_tensors_kernel(
+    accept_index,
+    accept_length,
+    predict,
+    hidden_states,
+    out_cache_loc,
+    out_predict,
+    out_hidden,
+    out_cache,
+    stride: tl.constexpr,
+    max_accept: tl.constexpr,
+    hidden_dim: tl.constexpr,
+):
+    """Compact predict, hidden_states, and out_cache_loc into fixed-stride buffers."""
+    BLOCK_H: tl.constexpr = 128
+    pid = tl.program_id(axis=0)
+    acc_len = tl.load(accept_length + pid)
+
+    accept_row = accept_index + pid * max_accept
+    out_base = pid * stride
+
+    for col in tl.static_range(max_accept):
+        if col < acc_len:
+            src_idx = tl.load(accept_row + col)
+            # Skip -1 padding to avoid OOB access
+            if src_idx >= 0:
+                dst_idx = out_base + col
+
+                tok = tl.load(predict + src_idx)
+                tl.store(out_predict + dst_idx, tok)
+
+                cache_loc = tl.load(out_cache_loc + src_idx)
+                tl.store(out_cache + dst_idx, cache_loc)
+
+                # Blocked copy over hidden dimension
+                for h_start in tl.static_range(0, hidden_dim, BLOCK_H):
+                    h_offsets = h_start + tl.arange(0, BLOCK_H)
+                    h_mask = h_offsets < hidden_dim
+                    h_vals = tl.load(
+                        hidden_states + src_idx * hidden_dim + h_offsets, mask=h_mask
+                    )
+                    tl.store(
+                        out_hidden + dst_idx * hidden_dim + h_offsets,
+                        h_vals,
+                        mask=h_mask,
+                    )
 
 
 @triton.jit
@@ -486,3 +653,48 @@ def assign_extend_cache_locs_func(
         )
 
         return out_cache_loc
+
+
+def compact_data_tensors_func(
+    accept_index: torch.Tensor,
+    accept_length: torch.Tensor,
+    tree_size: int,
+    predict: torch.Tensor,
+    hidden_states: torch.Tensor,
+    out_cache_loc: torch.Tensor,
+):
+    """Compact scattered acceptance into prefix form using fused Triton kernel."""
+    bs = accept_index.shape[0]
+    max_accept = accept_index.shape[1]
+    stride = tree_size
+    hidden_dim = hidden_states.shape[-1]
+
+    assert stride >= max_accept, "tree_size must be >= max accepted tokens"
+
+    packed_predict = torch.zeros(
+        (bs * stride,), device=predict.device, dtype=predict.dtype
+    )
+    packed_hidden = torch.zeros(
+        (bs * stride, hidden_dim),
+        device=hidden_states.device,
+        dtype=hidden_states.dtype,
+    )
+    packed_cache = torch.zeros(
+        (bs * stride,), device=out_cache_loc.device, dtype=out_cache_loc.dtype
+    )
+
+    compact_data_tensors_kernel[(bs,)](
+        accept_index,
+        accept_length,
+        predict,
+        hidden_states,
+        out_cache_loc,
+        packed_predict,
+        packed_hidden,
+        packed_cache,
+        stride=stride,
+        max_accept=max_accept,
+        hidden_dim=hidden_dim,
+    )
+
+    return packed_predict, packed_hidden, packed_cache
