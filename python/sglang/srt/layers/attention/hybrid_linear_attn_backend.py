@@ -280,15 +280,13 @@ class MambaAttnBackendBase(AttentionBackend):
                      flattened positions into the packed input tensor.
         """
         conv_state_len = self.conv_states_shape[-1]
-        chunk_size = getattr(
-            self, "mamba_chunk_size", get_global_server_args().mamba_cache_chunk_size
-        )
 
         # Calculate the end position of the last aligned chunk
         lens_to_track = (
             forward_batch.mamba_track_seqlens - forward_batch.extend_prefix_lens
         )
-        aligned_len = (lens_to_track // chunk_size) * chunk_size
+        mamba_cache_chunk_size = get_global_server_args().mamba_cache_chunk_size
+        aligned_len = (lens_to_track // mamba_cache_chunk_size) * mamba_cache_chunk_size
         start_indices = query_start_loc[:-1] + aligned_len - conv_state_len
         start_indices = start_indices[forward_batch.mamba_track_mask]
 
