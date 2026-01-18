@@ -4,7 +4,6 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 import torch
-import torch.nn.functional as F
 
 from sglang.multimodal_gen.configs.models import DiTConfig, EncoderConfig, VAEConfig
 from sglang.multimodal_gen.configs.models.dits.zimage import ZImageDitConfig
@@ -16,7 +15,6 @@ from sglang.multimodal_gen.configs.models.vaes.flux import FluxVAEConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ImagePipelineConfig,
     ModelTaskType,
-    PipelineConfig,
 )
 from sglang.multimodal_gen.runtime.distributed.communication_op import (
     sequence_model_parallel_all_gather,
@@ -63,6 +61,9 @@ class ZImagePipelineConfig(ImagePipelineConfig):
     postprocess_text_funcs: tuple[Callable, ...] = field(
         default_factory=lambda: (zimage_postprocess_text,)
     )
+    SEQ_LEN_MULTIPLE = 32
+    PATCH_SIZE = 2
+    F_PATCH_SIZE = 1
 
     def tokenize_prompt(self, prompts: list[str], tokenizer, tok_kwargs) -> dict:
         # flatten to 1-d list
@@ -95,26 +96,32 @@ class ZImagePipelineConfig(ImagePipelineConfig):
             H = int(raw_latent_shape[3])
             W = int(raw_latent_shape[4])
         else:
-            H = int(batch.height // self.vae_config.arch_config.spatial_compression_ratio)
-            W = int(batch.width // self.vae_config.arch_config.spatial_compression_ratio)
+            H = int(
+                batch.height // self.vae_config.arch_config.spatial_compression_ratio
+            )
+            W = int(
+                batch.width // self.vae_config.arch_config.spatial_compression_ratio
+            )
 
         # Rule: shard along the larger spatial dimension (W/H), implemented via optional H/W transpose.
-        # 目的：选择 H 和 W 较大的 进行 shard，所以 H_eff = max(H, W)
+        # To select the larger of H and W for sharding, therefore H_eff = max(H, W).
         swap_hw = W > H
         H_eff = W if swap_hw else H
         W_eff = H if swap_hw else W
 
-        # ZImage uses PATCH_SIZE=2 for spatial patchify; shard in token space and convert back to latent rows.
-        PATCH_SIZE = 2
-        H_tok = H_eff // PATCH_SIZE
-        W_tok = W_eff // PATCH_SIZE
+        H_tok = H_eff // self.PATCH_SIZE
+        W_tok = W_eff // self.PATCH_SIZE
         H_tok_pad = self._ceil_to_multiple(H_tok, sp_size)
         H_tok_local = H_tok_pad // sp_size
         h0_tok = rank * H_tok_local
 
         # Cap/text sharding: avoid duplicating cap tokens across ranks.
-        cap_len = int(batch.prompt_embeds[0].size(0)) if getattr(batch, "prompt_embeds", None) else 0
-        cap_total = self._ceil_to_multiple(cap_len, 32 * sp_size)
+        cap_len = (
+            int(batch.prompt_embeds[0].size(0))
+            if getattr(batch, "prompt_embeds", None)
+            else 0
+        )
+        cap_total = self._ceil_to_multiple(cap_len, self.SEQ_LEN_MULTIPLE * sp_size)
         cap_local = cap_total // sp_size
         cap_start = rank * cap_local
 
@@ -225,10 +232,6 @@ class ZImagePipelineConfig(ImagePipelineConfig):
             grids = torch.meshgrid(axes, indexing="ij")
             return torch.stack(grids, dim=-1)
 
-        PATCH_SIZE = 2
-        F_PATCH_SIZE = 1
-        SEQ_MULTI_OF = 32
-
         sp_size = get_sp_world_size()
         if sp_size > 1:
             # SP path: build local-only freqs_cis matching local cap/x.
@@ -251,17 +254,19 @@ class ZImagePipelineConfig(ImagePipelineConfig):
                 start=(plan["cap_total"] + 1, plan["h0_tok"], 0),
                 device=device,
             ).flatten(0, 2)
-            img_pad_len = (-img_pos_ids.shape[0]) % SEQ_MULTI_OF
+            img_pad_len = (-img_pos_ids.shape[0]) % self.SEQ_LEN_MULTIPLE
             if img_pad_len:
                 pad_ids = create_coordinate_grid(
                     size=(1, 1, 1), start=(0, 0, 0), device=device
                 ).flatten(0, 2)
-                img_pos_ids = torch.cat([img_pos_ids, pad_ids.repeat(img_pad_len, 1)], dim=0)
+                img_pos_ids = torch.cat(
+                    [img_pos_ids, pad_ids.repeat(img_pad_len, 1)], dim=0
+                )
             x_freqs_cis = rotary_emb(img_pos_ids)
             return (cap_freqs_cis, x_freqs_cis)
 
         cap_ori_len = prompt_embeds.size(0)
-        cap_padding_len = (-cap_ori_len) % SEQ_MULTI_OF
+        cap_padding_len = (-cap_ori_len) % self.SEQ_LEN_MULTIPLE
         cap_padded_pos_ids = create_coordinate_grid(
             size=(cap_ori_len + cap_padding_len, 1, 1),
             start=(1, 0, 0),
@@ -273,11 +278,11 @@ class ZImagePipelineConfig(ImagePipelineConfig):
         H = height // self.vae_config.arch_config.spatial_compression_ratio
         W = width // self.vae_config.arch_config.spatial_compression_ratio
 
-        pH, pW = PATCH_SIZE, PATCH_SIZE
-        pF = F_PATCH_SIZE
+        pH, pW = self.PATCH_SIZE, self.PATCH_SIZE
+        pF = self.F_PATCH_SIZE
         F_tokens, H_tokens, W_tokens = F // pF, H // pH, W // pW
         image_ori_len = F_tokens * H_tokens * W_tokens
-        image_padding_len = (-image_ori_len) % SEQ_MULTI_OF
+        image_padding_len = (-image_ori_len) % self.SEQ_LEN_MULTIPLE
 
         image_ori_pos_ids = create_coordinate_grid(
             size=(F_tokens, H_tokens, W_tokens),
