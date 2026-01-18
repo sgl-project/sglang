@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import bisect
 import logging
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Callable, Optional, Union
@@ -33,6 +34,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
     PPProxyTensors,
+    enable_num_token_non_padded,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
@@ -91,11 +93,15 @@ def set_torch_compile_config():
 
 
 def get_batch_sizes_to_capture(model_runner: ModelRunner):
+    # torch compile speeds up decoding by reducing python overhead on CPU
     server_args = model_runner.server_args
-    # cpu torch compile only speeds up decoding by
-    # reducing python overhead when bs is small
-    capture_bs = list(range(1, 17))
-    capture_bs = [bs for bs in capture_bs if bs <= server_args.torch_compile_max_bs]
+    # Note that we reuse server_args.cuda_graph_bs here.
+    # Users can customize the batch sizes supported by cpu_graph, such as:
+    # --cuda-graph-bs 1 2 4 8 16
+    capture_bs = server_args.cuda_graph_bs
+    assert (
+        max(capture_bs) <= server_args.torch_compile_max_bs
+    ), f"{capture_bs=}, {server_args.torch_compile_max_bs=}"
     capture_bs = [bs for bs in capture_bs if bs <= model_runner.req_to_token_pool.size]
     capture_bs = list(sorted(set(capture_bs)))
     assert len(capture_bs) > 0 and capture_bs[0] > 0, f"{capture_bs=}"
@@ -403,6 +409,7 @@ class CPUGraphRunner:
         # Batch sizes to capture
         self.capture_bs = get_batch_sizes_to_capture(model_runner)
         log_info_on_rank0(logger, f"Capture cpu graph bs {self.capture_bs}")
+        self.captured_forward_batches = {}
         # Attention backend
         self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.num_tokens_per_bs
@@ -444,7 +451,11 @@ class CPUGraphRunner:
             )
 
     def can_run(self, forward_batch: ForwardBatch):
-        is_bs_supported = forward_batch.batch_size in self.graphs
+        is_bs_supported = (
+            forward_batch.batch_size in self.graphs
+            if self.disable_padding
+            else forward_batch.batch_size <= self.max_bs
+        )
 
         requested_capture_hidden_mode = max(
             forward_batch.capture_hidden_mode,
@@ -497,7 +508,7 @@ class CPUGraphRunner:
         seq_lens = self.seq_lens[:bs]
         out_cache_loc = self.out_cache_loc[:num_tokens]
         positions = self.positions[:num_tokens]
-        mrope_positions = self.mrope_positions[:, :bs]
+        mrope_positions = self.mrope_positions[:, :num_tokens]
         self.num_token_non_padded[...] = num_tokens
 
         spec_info = self.get_spec_info(num_tokens)
@@ -526,16 +537,16 @@ class CPUGraphRunner:
             num_token_non_padded=self.num_token_non_padded,
             global_forward_mode=self.capture_forward_mode,
         )
-
-        # Attention backend
         self.model_runner.attn_backend.init_forward_metadata(forward_batch)
         # Do infernence to avoid setting attr at runtime, e.g.,
         # self.attn_mha.kv_b_proj = self.kv_b_proj for full graph compile on CPU
-        self.model_runner.model.forward(
-            forward_batch.input_ids,
-            forward_batch.positions,
-            forward_batch,
-        )
+        with torch.no_grad():
+            self.model_runner.tp_group.barrier()
+            self.model_runner.model.forward(
+                forward_batch.input_ids,
+                forward_batch.positions,
+                forward_batch,
+            )
 
         # Run and capture
         def run_once():
@@ -552,6 +563,8 @@ class CPUGraphRunner:
             for _ in range(2):
                 self.model_runner.tp_group.barrier()
                 out = run_once()
+            # Save the captured forward_batch
+            self.captured_forward_batches[bs] = forward_batch
             return forward, out
 
     def recapture_if_needed(self, forward_batch: ForwardBatch):
@@ -585,7 +598,53 @@ class CPUGraphRunner:
             self.capture_hidden_mode = required_capture_hidden_mode
             self.capture()
 
-    # TODO add padding support for CPUGraphRunner
+    def prepare_replay(
+        self,
+        forward_batch: ForwardBatch,
+    ):
+        self.recapture_if_needed(forward_batch)
+
+        raw_bs = forward_batch.batch_size
+        if raw_bs in self.graphs:
+            self.model_runner.attn_backend.init_forward_metadata(forward_batch)
+            return forward_batch
+
+        raw_num_token = raw_bs * self.num_tokens_per_bs
+        index = bisect.bisect_left(self.capture_bs, raw_bs)
+        bs = self.capture_bs[index]
+        assert bs > raw_bs
+        self.raw_bs = raw_bs
+        self.raw_num_token = raw_num_token
+        self.bs = bs
+
+        captured_forward_batch = self.captured_forward_batches[bs]
+        assert captured_forward_batch is not None
+        captured_forward_batch.seq_lens.fill_(self.seq_len_fill_value)
+        captured_forward_batch.out_cache_loc.zero_()
+        captured_forward_batch.input_ids[:raw_num_token].copy_(forward_batch.input_ids)
+        captured_forward_batch.req_pool_indices[:raw_bs].copy_(
+            forward_batch.req_pool_indices
+        )
+        captured_forward_batch.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
+        captured_forward_batch.out_cache_loc[:raw_num_token].copy_(
+            forward_batch.out_cache_loc
+        )
+        captured_forward_batch.positions[:raw_num_token].copy_(forward_batch.positions)
+        if forward_batch.mrope_positions is not None:
+            self.mrope_positions[:, :raw_num_token].copy_(forward_batch.mrope_positions)
+
+        if self.is_encoder_decoder:
+            captured_forward_batch.encoder_lens[:raw_bs].copy_(
+                forward_batch.encoder_lens
+            )
+        if enable_num_token_non_padded(self.model_runner.server_args):
+            captured_forward_batch.num_token_non_padded.copy_(
+                forward_batch.num_token_non_padded
+            )
+
+        self.model_runner.attn_backend.init_forward_metadata(captured_forward_batch)
+        return captured_forward_batch
+
     def replay(
         self,
         forward_batch: ForwardBatch,
@@ -595,14 +654,28 @@ class CPUGraphRunner:
         assert (
             pp_proxy_tensors is None
         ), "PPProxyTensors is not supported in CPUGraphRunner yet."
-        self.recapture_if_needed(forward_batch)
-        self.model_runner.attn_backend.init_forward_metadata(forward_batch)
-        output = self.graphs[forward_batch.batch_size](
-            forward_batch.input_ids,
-            forward_batch.positions,
-            forward_batch,
+
+        prepared_forward_batch = self.prepare_replay(forward_batch)
+        output = self.graphs[prepared_forward_batch.batch_size](
+            prepared_forward_batch.input_ids,
+            prepared_forward_batch.positions,
+            prepared_forward_batch,
         )
-        return output
+        if forward_batch.batch_size in self.graphs:
+            return output
+
+        if isinstance(output, LogitsProcessorOutput):
+            return LogitsProcessorOutput(
+                next_token_logits=output.next_token_logits[: self.raw_num_token],
+                hidden_states=(
+                    output.hidden_states[: self.raw_num_token]
+                    if output.hidden_states is not None
+                    else None
+                ),
+            )
+        else:
+            assert isinstance(output, PPProxyTensors)
+            return PPProxyTensors({k: v[: self.bs] for k, v in output.tensors.items()})
 
     def get_spec_info(self, num_tokens: int):
         spec_info = None
