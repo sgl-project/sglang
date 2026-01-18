@@ -11,26 +11,27 @@ tilelang.set_log_level("WARNING")
 pass_configs = {
     tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
     tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
-    tilelang.PassConfigKey.TL_DISABLE_FAST_MATH: True,
+    tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: False,
 }
 
-BF16 = "bfloat16"
-FP8 = "float8_e4m3"
-FP32 = "float32"
+# Use tilelang dtype objects for better type safety
+BF16 = T.bfloat16
+FP8 = T.float8_e4m3fn
+FP32 = T.float32
 
 _is_hip = is_hip()
 
 
 def fast_log2_ceil(x):
-    bits_x = T.reinterpret("uint32", x)
+    bits_x = T.reinterpret(T.uint32, x)
     exp_x = (bits_x >> 23) & 0xFF
     man_bits = bits_x & ((1 << 23) - 1)
-    return T.Cast("int32", exp_x - 127 + T.if_then_else(man_bits != 0, 1, 0))
+    return T.Cast(T.int32, exp_x - 127 + T.if_then_else(man_bits != 0, 1, 0))
 
 
 def fast_pow2(x):
     bits_x = (x + 127) << 23
-    return T.reinterpret("float32", bits_x)
+    return T.reinterpret(T.float32, bits_x)
 
 
 def fast_round_scale(amax, fp8_max_inv):
@@ -41,7 +42,7 @@ def fast_round_scale(amax, fp8_max_inv):
 def act_quant_kernel(
     N, in_dtype=BF16, out_dtype=FP8, scale_dtype=FP32, round_scale=False
 ):
-    M = T.symbolic("M")
+    M = T.dynamic("M")
     fp8_min = -448.0
     fp8_max = 448.0
     fp8_max_inv = 1 / fp8_max
@@ -117,9 +118,9 @@ def act_quant(
 
 @tilelang.jit(out_idx=[4], pass_configs=pass_configs)
 def fp8_index_kernel(h: int, d: int, clear_accum=True):
-    b = T.symbolic("b")
-    m = T.symbolic("m")
-    n = T.symbolic("n")
+    b = T.dynamic("b")
+    m = T.dynamic("m")
+    n = T.dynamic("n")
 
     blk_n1 = 512
     blk_n2 = 128
@@ -233,18 +234,18 @@ def sparse_attention_fwd_kernel_v1(
     else:
         sm_scale = sm_scale * 1.44269504  # log2(e)
 
-    batch = T.symbolic("batch")
-    seq_len = T.symbolic("seq_len")
-    seq_len_kv = T.symbolic("seq_len_kv")
+    batch = T.dynamic("batch")
+    seq_len = T.dynamic("seq_len")
+    seq_len_kv = T.dynamic("seq_len_kv")
 
     head_kv = num_heads // kv_group
     q_shape = [batch, seq_len, num_heads, dim + tail_dim]
     kv_shape = [batch, seq_len_kv, kv_group, dim + tail_dim]
     o_shape = [batch, seq_len, num_heads, dim]
     indices_shape = [batch, seq_len, kv_group, topk]
-    indices_dtype = "int32"
-    dtype = "bfloat16"
-    accum_dtype = "float"
+    indices_dtype = T.int32
+    dtype = T.bfloat16
+    accum_dtype = T.float32
 
     H = head_kv
     padded_H = max(tilelang.math.next_power_of_2(head_kv), 16)
@@ -279,7 +280,6 @@ def sparse_attention_fwd_kernel_v1(
             Q_tail_shared = T.alloc_shared([H_per_block, D_tail], dtype)
             KV_shared = T.alloc_shared([BI, D], dtype)
             K_tail_shared = T.alloc_shared([BI, D_tail], dtype)
-            O_shared = T.alloc_shared([H_per_block, D], dtype)
             mask = T.alloc_fragment([BI], "bool")
 
             acc_o = T.alloc_fragment([H_per_block, D], accum_dtype)
@@ -297,8 +297,6 @@ def sparse_attention_fwd_kernel_v1(
 
             b_i, g_i = by, bz
             s_i = bx if REPLICATE_H == 1 else (bx // REPLICATE_H)
-            q_i = s_i
-            max_kv_i = q_i
 
             H0 = g_i * padded_H + (0 if REPLICATE_H == 1 else (bx % REPLICATE_H) * 64)
             H1 = H0 + H_per_block
@@ -307,8 +305,8 @@ def sparse_attention_fwd_kernel_v1(
             T.copy(Q[b_i, s_i, H0:H1, D:], Q_tail_shared)
 
             for i_i in T.Pipelined(NI, num_stages=num_stages):
-
                 for bi_i in T.Parallel(BI):
+                    # Page-table indices use -1 for invalid entries.
                     mask[bi_i] = Indices[b_i, s_i, g_i, i_i * BI + bi_i] >= 0
 
                 for bi_i, d_i in T.Parallel(BI, D):
@@ -329,17 +327,19 @@ def sparse_attention_fwd_kernel_v1(
                     KV_shared,
                     acc_s,
                     transpose_B=True,
-                    policy=T.GemmWarpPolicy.FullCol,
+                    policy=T.GemmWarpPolicy.FullRow,
                 )
                 T.gemm(
                     Q_tail_shared,
                     K_tail_shared,
                     acc_s,
                     transpose_B=True,
-                    policy=T.GemmWarpPolicy.FullCol,
+                    policy=T.GemmWarpPolicy.FullRow,
                 )
                 T.copy(m_i, m_i_prev)
                 T.reduce_max(acc_s, m_i, dim=1, clear=False)
+                for h_i in T.Parallel(H_per_block):
+                    m_i[h_i] = T.max(m_i[h_i], m_i_prev[h_i])
                 for h_i in T.Parallel(H_per_block):
                     alpha[h_i] = T.exp2((m_i_prev[h_i] - m_i[h_i]) * sm_scale)
                 for h_i, bi_i in T.Parallel(H_per_block, BI):
@@ -353,7 +353,7 @@ def sparse_attention_fwd_kernel_v1(
                     acc_o[h_i, d_i] = acc_o[h_i, d_i] * alpha[h_i]
 
                 T.copy(acc_s, S_shared)
-                T.gemm(S_shared, KV_shared, acc_o, policy=T.GemmWarpPolicy.FullCol)
+                T.gemm(S_shared, KV_shared, acc_o, policy=T.GemmWarpPolicy.FullRow)
 
             # Rescale
             for h_i, d_i in T.Parallel(H_per_block, D):
@@ -361,7 +361,6 @@ def sparse_attention_fwd_kernel_v1(
             for h_i in T.Parallel(H_per_block):
                 sumexp[h_i] = T.log2(sumexp[h_i]) + m_i[h_i] * sm_scale
 
-            T.copy(acc_o, O_shared)
             T.copy(acc_o, Output[b_i, s_i, H0:H1, :])
 
     return main
@@ -407,18 +406,18 @@ def sparse_attention_fwd_kernel_v2(
         sm_scale = sm_scale * 1.44269504  # log2(e)
     threads = 384
 
-    batch = T.symbolic("batch")
-    qo_len = T.symbolic("seq_len")
-    num_pages = T.symbolic("num_pages")
+    batch = T.dynamic("batch")
+    qo_len = T.dynamic("seq_len")
+    num_pages = T.dynamic("num_pages")
 
     q_shape = [batch, qo_len, num_heads, dim + tail_dim]
     kv_shape = [batch, num_pages, kv_group, dim + tail_dim]
     o_shape = [batch, qo_len, num_heads, dim]
     indices_shape = [batch, qo_len, kv_group, topk]
 
-    indices_dtype = "int32"
-    dtype = "bfloat16"
-    accum_dtype = "float"
+    indices_dtype = T.int32
+    dtype = T.bfloat16
+    accum_dtype = T.float32
 
     H = num_heads
     padded_H = max(tilelang.math.next_power_of_2(num_heads), 16)
@@ -476,8 +475,6 @@ def sparse_attention_fwd_kernel_v2(
             alpha_local = T.alloc_fragment([H_per_block], accum_dtype)
             m_i = T.alloc_fragment([H_per_block], accum_dtype)
             m_i_prev = T.alloc_fragment([H_per_block], accum_dtype)
-            indices_local = T.alloc_local([1], indices_dtype)
-            indices_tmp = T.alloc_local([1], indices_dtype)
 
             bar_q = T.alloc_barrier(arrive_count=384)
             bar_k_0_ready = T.alloc_barrier(arrive_count=128)
@@ -486,7 +483,7 @@ def sparse_attention_fwd_kernel_v2(
             bar_k_1_free = T.alloc_barrier(arrive_count=256)
             bar_sScale_and_sS_ready = T.alloc_barrier(arrive_count=256)
             bar_sScale_and_sS_free = T.alloc_barrier(arrive_count=256)
-
+            # Warpgroup-local sync and final rescale sync.
             bar_0_128 = T.alloc_barrier(arrive_count=128)
             bar_1_128 = T.alloc_barrier(arrive_count=128)
             bar_2_128 = T.alloc_barrier(arrive_count=128)
@@ -514,7 +511,6 @@ def sparse_attention_fwd_kernel_v2(
 
                 for i_i in T.serial(T.ceildiv(NI, 2)):
                     # Buffer 0
-                    # with sync_at(bar_0_128, 0):
                     T.barrier_wait(bar_k_0_ready[0], (i_i & 1))
                     T.barrier_arrive(bar_0_128)
                     T.barrier_wait(bar_0_128, 0)
@@ -545,6 +541,8 @@ def sparse_attention_fwd_kernel_v2(
 
                     T.copy(m_i, m_i_prev)
                     T.reduce_max(acc_s, m_i, dim=1, clear=False)
+                    for h_i in T.Parallel(H_per_block):
+                        m_i[h_i] = T.max(m_i[h_i], m_i_prev[h_i])
                     for h_i in T.Parallel(H_per_block):
                         alpha_local[h_i] = T.exp2((m_i_prev[h_i] - m_i[h_i]) * sm_scale)
                     for h_i, bi_i in T.Parallel(H_per_block, BI):
@@ -597,6 +595,8 @@ def sparse_attention_fwd_kernel_v2(
                     T.copy(m_i, m_i_prev)
                     T.reduce_max(acc_s, m_i, dim=1, clear=False)
                     for h_i in T.Parallel(H_per_block):
+                        m_i[h_i] = T.max(m_i[h_i], m_i_prev[h_i])
+                    for h_i in T.Parallel(H_per_block):
                         alpha_local[h_i] = T.exp2((m_i_prev[h_i] - m_i[h_i]) * sm_scale)
                     for h_i, bi_i in T.Parallel(H_per_block, BI):
                         acc_s[h_i, bi_i] = T.exp2(
@@ -628,7 +628,7 @@ def sparse_attention_fwd_kernel_v2(
                 T.copy(acc_o_l, O_shared_l)
                 T.copy(O_shared_l, Output[b_i, s_i, H0:H1, 0 : D // 2])
             elif tx >= 128 and tx < 256:
-                # T.set_max_nreg(168, 1)
+                T.set_max_nreg(168, 1)
                 T.fill(acc_o_r, 0)
                 for i_i in T.serial(T.ceildiv(NI, 2)):
                     # Buffer 0
@@ -664,7 +664,6 @@ def sparse_attention_fwd_kernel_v2(
             elif tx >= 256:
                 # producer
                 T.set_max_nreg(80, 0)
-                indices_local[0] = 0
                 for i_i in T.serial(T.ceildiv(NI, 2)):
                     # Buffer 0
                     T.barrier_wait(bar_k_0_free[0], ((i_i & 1) ^ 1))
@@ -672,13 +671,12 @@ def sparse_attention_fwd_kernel_v2(
                     T.barrier_wait(bar_2_128, 0)
 
                     for r in T.serial(4):
-                        indices_tmp[0] = Indices[
+                        indices_local = Indices[
                             b_i, s_i, g_i, (i_i * 2) * BI + r * 16 + (tx - 256) // 8
                         ]
-                        is_kv_valid_0[r * 16 + (tx - 256) // 8] = indices_tmp[0] >= 0
-                        if is_kv_valid_0[r * 16 + (tx - 256) // 8]:
-                            indices_local[0] = indices_tmp[0]
-
+                        valid = indices_local >= 0
+                        is_kv_valid_0[r * 16 + (tx - 256) // 8] = valid
+                        indices_safe = T.if_then_else(valid, indices_local, 0)
                         with T.attr("default", "async_scope", 1):  # type: ignore
                             for u in T.serial(4):
                                 for v in T.vectorized(8):
@@ -687,7 +685,7 @@ def sparse_attention_fwd_kernel_v2(
                                         64 * u + (tx - 256) % 8 * 8 + v,
                                     ] = KV[
                                         b_i,
-                                        indices_local[0],
+                                        indices_safe,
                                         g_i,
                                         64 * u + (tx - 256) % 8 * 8 + v,
                                     ]
@@ -696,7 +694,7 @@ def sparse_attention_fwd_kernel_v2(
                                         64 * u + (tx - 256) % 8 * 8 + v,
                                     ] = KV[
                                         b_i,
-                                        indices_local[0],
+                                        indices_safe,
                                         g_i,
                                         D // 2 + 64 * u + (tx - 256) % 8 * 8 + v,
                                     ]
@@ -706,7 +704,7 @@ def sparse_attention_fwd_kernel_v2(
                                     r * 16 + (tx - 256) // 8, (tx - 256) % 8 * 8 + v
                                 ] = KV[
                                     b_i,
-                                    indices_local[0],
+                                    indices_safe,
                                     g_i,
                                     D + (tx - 256) % 8 * 8 + v,
                                 ]
@@ -719,13 +717,12 @@ def sparse_attention_fwd_kernel_v2(
                     T.barrier_wait(bar_2_128, 1)
 
                     for r in T.serial(4):
-                        indices_tmp[0] = Indices[
+                        indices_local = Indices[
                             b_i, s_i, g_i, (i_i * 2 + 1) * BI + r * 16 + (tx - 256) // 8
                         ]
-                        is_kv_valid_1[r * 16 + (tx - 256) // 8] = indices_tmp[0] >= 0
-                        if is_kv_valid_1[r * 16 + (tx - 256) // 8]:
-                            indices_local[0] = indices_tmp[0]
-
+                        valid = indices_local >= 0
+                        is_kv_valid_1[r * 16 + (tx - 256) // 8] = valid
+                        indices_safe = T.if_then_else(valid, indices_local, 0)
                         with T.attr("default", "async_scope", 1):  # type: ignore
                             for u in T.serial(4):
                                 for v in T.vectorized(8):
@@ -734,7 +731,7 @@ def sparse_attention_fwd_kernel_v2(
                                         64 * u + (tx - 256) % 8 * 8 + v,
                                     ] = KV[
                                         b_i,
-                                        indices_local[0],
+                                        indices_safe,
                                         g_i,
                                         64 * u + (tx - 256) % 8 * 8 + v,
                                     ]
@@ -743,7 +740,7 @@ def sparse_attention_fwd_kernel_v2(
                                         64 * u + (tx - 256) % 8 * 8 + v,
                                     ] = KV[
                                         b_i,
-                                        indices_local[0],
+                                        indices_safe,
                                         g_i,
                                         D // 2 + 64 * u + (tx - 256) % 8 * 8 + v,
                                     ]
@@ -753,7 +750,7 @@ def sparse_attention_fwd_kernel_v2(
                                     r * 16 + (tx - 256) // 8, (tx - 256) % 8 * 8 + v
                                 ] = KV[
                                     b_i,
-                                    indices_local[0],
+                                    indices_safe,
                                     g_i,
                                     D + (tx - 256) % 8 * 8 + v,
                                 ]
