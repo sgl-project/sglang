@@ -90,6 +90,10 @@ pub struct GenerateRequest {
     #[serde(default)]
     pub return_hidden_states: bool,
 
+    /// Return routed experts information
+    #[serde(default)]
+    pub return_routed_experts: bool,
+
     /// The modalities of the image data [image, multi-images, video]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub modalities: Option<Vec<String>>,
@@ -282,6 +286,8 @@ pub struct GenerateMetaInfo {
     pub e2e_latency: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub matched_stop: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub routed_experts: Option<Value>,
 }
 
 /// Finish reason for generate endpoint

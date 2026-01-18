@@ -454,6 +454,7 @@ pub(super) fn build_next_request(
         metadata: current_request.metadata.clone(),
         include: current_request.include.clone(),
         reasoning: current_request.reasoning.clone(),
+        return_routed_experts: false,
         service_tier: current_request.service_tier.clone(),
         top_logprobs: current_request.top_logprobs,
         truncation: current_request.truncation.clone(),

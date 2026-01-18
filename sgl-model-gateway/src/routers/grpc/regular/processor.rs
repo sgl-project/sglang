@@ -451,6 +451,7 @@ impl ResponseProcessor {
                 cached_tokens: complete.cached_tokens() as u32,
                 e2e_latency: start_time.elapsed().as_secs_f64(),
                 matched_stop,
+                routed_experts: None,
             };
 
             result_array.push(GenerateResponse {
