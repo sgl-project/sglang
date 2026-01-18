@@ -2231,6 +2231,13 @@ class ServerArgs:
                     "Currently ngram speculative decoding does not support dp attention."
                 )
 
+        if self.speculative_algorithm == "LLGUIDANCE":
+            # llguidance must be used as grammar backend
+            assert self.grammar_backend == "llguidance", (
+                "When using LLGuidance fast-forward tokens decoding, "
+                "please set grammar_backend to 'llguidance'."
+            )
+
     def _handle_load_format(self):
         if (
             self.load_format == "auto" or self.load_format == "gguf"
@@ -3549,7 +3556,7 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-algorithm",
             type=str,
-            choices=["EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "NGRAM"],
+            choices=["EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "NGRAM", "LLGUIDANCE"],
             help="Speculative algorithm.",
         )
         parser.add_argument(
