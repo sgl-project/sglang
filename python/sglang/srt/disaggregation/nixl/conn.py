@@ -134,7 +134,10 @@ class TransferStatus:
         if self.num_pp_ranks_expected is None or not self.received_aux:
             return False
         # If state data is expected, check all PP ranks have sent it
-        if self.expects_state and len(self.received_state_per_pp) < self.num_pp_ranks_expected:
+        if (
+            self.expects_state
+            and len(self.received_state_per_pp) < self.num_pp_ranks_expected
+        ):
             return False
         # All PP ranks must have reported their expected count
         if len(self.expected_kvs_per_pp) < self.num_pp_ranks_expected:
@@ -332,9 +335,13 @@ class NixlKVManager(CommonKVManager):
             for state_data_ptr, state_data_len in zip(
                 self.kv_args.state_data_ptrs, self.kv_args.state_data_lens
             ):
-                state_addrs.append((state_data_ptr, state_data_len, self.kv_args.gpu_id, ""))
+                state_addrs.append(
+                    (state_data_ptr, state_data_len, self.kv_args.gpu_id, "")
+                )
             self.state_descs = self.agent.register_memory(state_addrs, "VRAM")
-            logger.debug(f"Register state tensors, len(state_addrs)= {len(state_addrs)}")
+            logger.debug(
+                f"Register state tensors, len(state_addrs)= {len(state_addrs)}"
+            )
             if not self.state_descs:
                 raise Exception("NIXL memory registration failed for state tensors")
 
@@ -605,7 +612,9 @@ class NixlKVManager(CommonKVManager):
     ):
         """Transfer Mamba states via RDMA."""
         assert len(prefill_state_indices) == 1, "Mamba should have single state index"
-        assert len(dst_state_indices) == len(prefill_state_indices), "State indices count mismatch between Prefill and Decode"
+        assert len(dst_state_indices) == len(
+            prefill_state_indices
+        ), "State indices count mismatch between Prefill and Decode"
 
         src_addrs = []
         dst_addrs = []
@@ -615,7 +624,9 @@ class NixlKVManager(CommonKVManager):
 
         for i, dst_state_ptr in enumerate(dst_state_data_ptrs):
             length = prefill_state_item_lens[i]
-            src_addr = prefill_state_data_ptrs[i] + length * int(prefill_state_indices[0])
+            src_addr = prefill_state_data_ptrs[i] + length * int(
+                prefill_state_indices[0]
+            )
             dst_addr = dst_state_ptr + length * int(dst_state_indices[0])
             src_addrs.append((src_addr, length, self.kv_args.gpu_id))
             dst_addrs.append((dst_addr, length, dst_gpu_id))
@@ -696,7 +707,10 @@ class NixlKVManager(CommonKVManager):
             if is_last:
                 if state_indices is not None:
                     state_type = getattr(self.kv_args, "state_type", "none")
-                    if self.attn_tp_size != self.decode_kv_args_table[req.agent_name].decode_tp_size:
+                    if (
+                        self.attn_tp_size
+                        != self.decode_kv_args_table[req.agent_name].decode_tp_size
+                    ):
                         raise RuntimeError(
                             "PD Disaggregation does NOT support PD different TP sizes for hybrid mamba models yet."
                         )
@@ -705,7 +719,9 @@ class NixlKVManager(CommonKVManager):
                         state_xfer_handle = self._send_mamba_state(
                             req.agent_name,
                             state_indices,
-                            self.decode_kv_args_table[req.agent_name].dst_state_data_ptrs,
+                            self.decode_kv_args_table[
+                                req.agent_name
+                            ].dst_state_data_ptrs,
                             req.dst_state_indices,
                             self.decode_kv_args_table[req.agent_name].gpu_id,
                             f"{req.room}_state_{self.kv_args.pp_rank}",
