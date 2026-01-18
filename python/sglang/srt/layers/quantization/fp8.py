@@ -111,6 +111,7 @@ class Fp8Config(QuantizationConfig):
         activation_scheme: str = "dynamic",
         ignored_layers: Optional[List[str]] = None,
         weight_block_size: List[int] = None,
+        use_mxfp8: bool = False,
     ) -> None:
         self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
         if is_checkpoint_fp8_serialized:
@@ -119,6 +120,7 @@ class Fp8Config(QuantizationConfig):
             raise ValueError(f"Unsupported activation scheme {activation_scheme}")
         self.activation_scheme = activation_scheme
         self.ignored_layers = ignored_layers or []
+        self.use_mxfp8 = use_mxfp8
         if weight_block_size is not None:
             if not is_checkpoint_fp8_serialized:
                 raise ValueError(
@@ -132,19 +134,22 @@ class Fp8Config(QuantizationConfig):
                 raise ValueError(
                     f"The block-wise quantization only supports dynamic activation scheme for now, but got {activation_scheme} activation scheme."
                 )
+        if self.use_mxfp8:
+            if weight_block_size is None:
+                weight_block_size = [1, 32]
+            elif weight_block_size != [1, 32]:
+                raise ValueError("MXFP8 requires weight_block_size=[1, 32].")
         self.weight_block_size = weight_block_size
 
-    @classmethod
-    def get_name(cls) -> str:
-        return "fp8"
+    def get_name(self) -> str:
+        return "mxfp8" if self.use_mxfp8 else "fp8"
 
     @classmethod
     def get_supported_act_dtypes(cls) -> List[torch.dtype]:
         return [torch.bfloat16, torch.half]
 
-    @classmethod
-    def get_min_capability(cls) -> int:
-        return 80
+    def get_min_capability(self) -> int:
+        return 100 if self.use_mxfp8 else 80
 
     @classmethod
     def get_config_filenames(cls) -> List[str]:
@@ -153,7 +158,8 @@ class Fp8Config(QuantizationConfig):
     @classmethod
     def from_config(cls, config: Dict[str, Any]) -> Fp8Config:
         quant_method = cls.get_from_keys(config, ["quant_method"])
-        is_checkpoint_fp8_serialized = "fp8" in quant_method
+        use_mxfp8 = "mxfp8" in quant_method
+        is_checkpoint_fp8_serialized = ("fp8" in quant_method) or use_mxfp8
         activation_scheme = cls.get_from_keys(config, ["activation_scheme"])
         ignored_layers = cls.get_from_keys_or(
             config, ["ignored_layers", "modules_to_not_convert"], None
@@ -162,11 +168,16 @@ class Fp8Config(QuantizationConfig):
             # hack for ministral
             ignored_layers = [layer.replace("model.", "") for layer in ignored_layers]
         weight_block_size = cls.get_from_keys_or(config, ["weight_block_size"], None)
+        if use_mxfp8 and weight_block_size is not None:
+            raise ValueError(
+                "MXFP8 does not accept weight_block_size in config.json; it is fixed to [1, 32]."
+            )
         return cls(
             is_checkpoint_fp8_serialized=is_checkpoint_fp8_serialized,
             activation_scheme=activation_scheme,
             ignored_layers=ignored_layers,
             weight_block_size=weight_block_size,
+            use_mxfp8=use_mxfp8,
         )
 
     def get_quant_method(
@@ -222,7 +233,10 @@ class Fp8LinearMethod(LinearMethodBase):
             auto_enable = can_auto_enable_marlin_fp8()
             self.use_marlin = force_marlin or auto_enable
 
-        self.block_quant = self.quant_config.weight_block_size is not None
+        self.use_mxfp8 = getattr(self.quant_config, "use_mxfp8", False)
+        self.block_quant = (
+            self.use_mxfp8 or self.quant_config.weight_block_size is not None
+        )
         self.w8a8_block_fp8_linear = dispatch_w8a8_block_fp8_linear()
         self.is_checkpoint_fp8_serialized = (
             self.quant_config.is_checkpoint_fp8_serialized
@@ -321,18 +335,25 @@ class Fp8LinearMethod(LinearMethodBase):
                     assert self.quant_config.activation_scheme == "dynamic"
                 elif hasattr(self.quant_config, "linear_activation_scheme"):
                     assert self.quant_config.linear_activation_scheme == "dynamic"
+                if self.use_mxfp8 and not self.is_checkpoint_fp8_serialized:
+                    raise ValueError(
+                        "MXFP8 requires fp8-serialized checkpoint for linear layers."
+                    )
+                scale_dtype = torch.uint8 if self.use_mxfp8 else torch.float32
+                scale_init = torch.zeros if scale_dtype == torch.uint8 else torch.empty
                 scale = BlockQuantScaleParameter(
-                    data=torch.empty(
+                    data=scale_init(
                         (output_size_per_partition + block_n - 1) // block_n,
                         (input_size_per_partition + block_k - 1) // block_k,
-                        dtype=torch.float32,
+                        dtype=scale_dtype,
                     ),
                     input_dim=1,
                     output_dim=0,
                     weight_loader=weight_loader,
                 )
-                scale.format_ue8m0 = False
-                scale[:] = torch.finfo(torch.float32).min
+                scale.format_ue8m0 = self.use_mxfp8
+                if scale_dtype != torch.uint8:
+                    scale[:] = torch.finfo(torch.float32).min
                 layer.register_parameter("weight_scale_inv", scale)
             else:
                 scale = PerTensorScaleParameter(
@@ -361,6 +382,12 @@ class Fp8LinearMethod(LinearMethodBase):
                 layer.register_parameter("input_scale", None)
 
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
+        if self.use_mxfp8:
+            # MXFP8 scales are stored as UE8M0 uint8; no requantization here.
+            layer.weight_scale_inv = torch.nn.Parameter(
+                layer.weight_scale_inv.data, requires_grad=False
+            )
+            return
         # If ROCm, normalize the weights and scales to e4m3fnuz
         if _is_fp8_fnuz:
             # activation_scheme: dynamic
@@ -577,7 +604,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
     def __init__(self, quant_config: Fp8Config):
         self.quant_config = quant_config
-        self.block_quant = self.quant_config.weight_block_size is not None
+        self.use_mxfp8 = getattr(self.quant_config, "use_mxfp8", False)
+        self.block_quant = (
+            self.use_mxfp8 or self.quant_config.weight_block_size is not None
+        )
         if get_moe_runner_backend().is_cutlass():
             assert (
                 cutlass_fp8_supported()
@@ -685,27 +715,29 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         # WEIGHT_SCALES
         if self.block_quant:
+            scale_dtype = torch.uint8 if self.use_mxfp8 else torch.float32
+            scale_init = torch.zeros if scale_dtype == torch.uint8 else torch.ones
             w13_weight_scale = torch.nn.Parameter(
-                torch.ones(
+                scale_init(
                     num_experts,
                     2 * ((intermediate_size_per_partition + block_n - 1) // block_n),
                     (hidden_size + block_k - 1) // block_k,
-                    dtype=torch.float32,
+                    dtype=scale_dtype,
                 ),
                 requires_grad=False,
             )
             w2_weight_scale = torch.nn.Parameter(
-                torch.ones(
+                scale_init(
                     num_experts,
                     (hidden_size + block_n - 1) // block_n,
                     (intermediate_size_per_partition + block_k - 1) // block_k,
-                    dtype=torch.float32,
+                    dtype=scale_dtype,
                 ),
                 requires_grad=False,
             )
             # w13_weight and w2_weight are always requanted together
-            w13_weight_scale.format_ue8m0 = False
-            w2_weight_scale.format_ue8m0 = False
+            w13_weight_scale.format_ue8m0 = self.use_mxfp8
+            w2_weight_scale.format_ue8m0 = self.use_mxfp8
             layer.register_parameter("w13_weight_scale_inv", w13_weight_scale)
             layer.register_parameter("w2_weight_scale_inv", w2_weight_scale)
             assert self.quant_config.activation_scheme == "dynamic"
@@ -1172,6 +1204,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 self.problem_sizes1,
                 self.problem_sizes2,
                 use_fp8_blockscale=True,
+                use_mxfp8=getattr(self.quant_config, "use_mxfp8", False),
                 output=symm_output,
             )
             return StandardCombineInput(hidden_states=output)

@@ -1226,7 +1226,8 @@ class ServerArgs:
                 if (
                     self.moe_a2a_backend == "none"
                     and self.moe_runner_backend == "auto"
-                    and self.quantization in ["fp8", "modelopt_fp8", "modelopt_fp4"]
+                    and self.quantization
+                    in ["fp8", "mxfp8", "modelopt_fp8", "modelopt_fp4"]
                 ):
                     self.moe_runner_backend = "flashinfer_trtllm"
                     logger.info(
