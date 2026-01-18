@@ -380,6 +380,7 @@ class ServerArgs:
     served_model_name: Optional[str] = None
     weight_version: str = "default"
     chat_template: Optional[str] = None
+    hf_chat_template_name: Optional[str] = None
     completion_template: Optional[str] = None
     file_storage_path: str = "sglang_storage"
     enable_cache_report: bool = False
@@ -1261,6 +1262,16 @@ class ServerArgs:
                 f"- Decode: {decode_attn_backend}\n"
             )
 
+            if (
+                prefill_attn_backend == "trtllm_mha"
+                or decode_attn_backend == "trtllm_mha"
+            ):
+                # TODO: support swa kv indices translation for trtllm_mha attention backend
+                self.swa_full_tokens_ratio = 1.0
+                logger.warning(
+                    "Set swa_full_tokens_ratio to 1.0 for GPT-OSS model with trtllm_mha attention backend."
+                )
+
             quant_method = get_quantization_config(hf_config)
             is_mxfp4_quant_format = quant_method == "mxfp4"
             if is_mxfp4_quant_format:
@@ -1288,7 +1299,6 @@ class ServerArgs:
                 assert (
                     self.ep_size == 1
                 ), "Triton kernel MoE is only supported when ep_size == 1"
-            self.disable_hybrid_swa_memory = True
 
         elif "MiMoV2FlashForCausalLM" in model_arch:
             if self.speculative_algorithm == "EAGLE":
@@ -3281,6 +3291,13 @@ class ServerArgs:
             type=str,
             default=ServerArgs.chat_template,
             help="The buliltin chat template name or the path of the chat template file. This is only used for OpenAI-compatible API server.",
+        )
+        parser.add_argument(
+            "--hf-chat-template-name",
+            type=str,
+            default=ServerArgs.hf_chat_template_name,
+            help="When the HuggingFace tokenizer has multiple chat templates (e.g., 'default', 'tool_use', 'rag'), "
+            "specify which named template to use. If not set, the first available template is used.",
         )
         parser.add_argument(
             "--completion-template",
