@@ -42,6 +42,7 @@ from sglang.srt.utils.common import (
     get_device_memory_capacity,
     get_device_name,
     get_device_sm,
+    get_quantization_config,
     is_blackwell_supported,
     is_cuda,
     is_fa3_default_architecture,
@@ -69,6 +70,7 @@ from sglang.utils import is_in_ci
 logger = logging.getLogger(__name__)
 
 # Define constants
+DEFAULT_UVICORN_ACCESS_LOG_EXCLUDE_PREFIXES = ()
 SAMPLING_BACKEND_CHOICES = {"flashinfer", "pytorch", "ascend"}
 LOAD_FORMAT_CHOICES = [
     "auto",
@@ -346,6 +348,9 @@ class ServerArgs:
     log_requests_level: int = 2
     log_requests_format: str = "text"
     log_requests_target: Optional[List[str]] = None
+    uvicorn_access_log_exclude_prefixes: List[str] = dataclasses.field(
+        default_factory=lambda: list(DEFAULT_UVICORN_ACCESS_LOG_EXCLUDE_PREFIXES)
+    )
     crash_dump_folder: Optional[str] = None
     show_time_cost: bool = False
     enable_metrics: bool = False
@@ -487,6 +492,7 @@ class ServerArgs:
     hicache_write_policy: str = "write_through"
     hicache_io_backend: str = "kernel"
     hicache_mem_layout: str = "layer_first"
+    disable_hicache_numa_detect: bool = False
     hicache_storage_backend: Optional[str] = None
     hicache_storage_prefetch_policy: str = "best_effort"
     hicache_storage_backend_extra_config: Optional[str] = None
@@ -1191,12 +1197,7 @@ class ServerArgs:
 
             # Set moe backend for DeepSeek
             if is_sm100_supported():
-                quantization_config = getattr(hf_config, "quantization_config", None)
-                quant_method = (
-                    quantization_config.get("quant_method")
-                    if quantization_config is not None
-                    else None
-                )
+                quant_method = get_quantization_config(hf_config)
                 if self.quantization is None:
                     # Default DeepSeek V3/R1 native FP8 when not explicitly set,
                     # Because we need this condition for an assertion in
@@ -1260,11 +1261,18 @@ class ServerArgs:
                 f"- Decode: {decode_attn_backend}\n"
             )
 
-            quantization_config = getattr(hf_config, "quantization_config", None)
-            is_mxfp4_quant_format = (
-                quantization_config is not None
-                and quantization_config.get("quant_method") == "mxfp4"
-            )
+            if (
+                prefill_attn_backend == "trtllm_mha"
+                or decode_attn_backend == "trtllm_mha"
+            ):
+                # TODO: support swa kv indices translation for trtllm_mha attention backend
+                self.swa_full_tokens_ratio = 1.0
+                logger.warning(
+                    "Set swa_full_tokens_ratio to 1.0 for GPT-OSS model with trtllm_mha attention backend."
+                )
+
+            quant_method = get_quantization_config(hf_config)
+            is_mxfp4_quant_format = quant_method == "mxfp4"
             if is_mxfp4_quant_format:
                 # use bf16 for mxfp4 triton kernels
                 self.dtype = "bfloat16"
@@ -1290,7 +1298,6 @@ class ServerArgs:
                 assert (
                     self.ep_size == 1
                 ), "Triton kernel MoE is only supported when ep_size == 1"
-            self.disable_hybrid_swa_memory = True
 
         elif "MiMoV2FlashForCausalLM" in model_arch:
             if self.speculative_algorithm == "EAGLE":
@@ -1440,16 +1447,14 @@ class ServerArgs:
             "Qwen3VLMoeForConditionalGeneration",
         ]:
             if is_sm100_supported():
-                quantization_config = getattr(hf_config, "quantization_config", None)
-                quant_method = (
-                    quantization_config.get("quant_method")
-                    if quantization_config is not None
-                    else None
-                )
+                quant_method = get_quantization_config(hf_config)
                 if self.quantization is None and quant_method is not None:
                     self.quantization = quant_method
                 if (
-                    self.quantization in ("fp8", "modelopt_fp4")
+                    (
+                        self.quantization in ("fp8", "modelopt_fp4")
+                        or self.quantization is None
+                    )
                     and self.moe_a2a_backend == "none"
                     and self.moe_runner_backend == "auto"
                 ):
@@ -1460,16 +1465,14 @@ class ServerArgs:
                     )
         elif model_arch in ["Qwen3NextForCausalLM"]:
             if is_sm100_supported():
-                quantization_config = getattr(hf_config, "quantization_config", None)
-                quant_method = (
-                    quantization_config.get("quant_method")
-                    if quantization_config is not None
-                    else None
-                )
+                quant_method = get_quantization_config(hf_config)
                 if self.quantization is None and quant_method is not None:
                     self.quantization = quant_method
                 if (
-                    (self.quantization == "fp8" or self.quantization == "modelopt_fp4")
+                    (
+                        self.quantization in ("fp8", "modelopt_fp4")
+                        or self.quantization is None
+                    )
                     and self.moe_a2a_backend == "none"
                     and self.moe_runner_backend == "auto"
                 ):
@@ -3112,6 +3115,15 @@ class ServerArgs:
             "Can specify multiple targets, e.g., '--log-requests-target stdout /my/path'. ",
         )
         parser.add_argument(
+            "--uvicorn-access-log-exclude-prefixes",
+            type=str,
+            nargs="*",
+            default=list(DEFAULT_UVICORN_ACCESS_LOG_EXCLUDE_PREFIXES),
+            help="Exclude uvicorn access logs whose request path starts with any of these prefixes. "
+            "Defaults to empty (disabled). "
+            "Example: --uvicorn-access-log-exclude-prefixes /metrics /health",
+        )
+        parser.add_argument(
             "--crash-dump-folder",
             type=str,
             default=ServerArgs.crash_dump_folder,
@@ -3890,6 +3902,11 @@ class ServerArgs:
             ],
             default=ServerArgs.hicache_mem_layout,
             help="The layout of host memory pool for hierarchical cache.",
+        )
+        parser.add_argument(
+            "--disable-hicache-numa-detect",
+            action="store_true",
+            help="Disable binding the process to the NUMA node closest to the active CUDA device when hierarchical cache is enabled.",
         )
         parser.add_argument(
             "--hicache-storage-backend",
