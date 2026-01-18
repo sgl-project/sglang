@@ -159,6 +159,97 @@ CUTEDSL_MOE_SCALAR_INPUT_SCALE = get_bool_env_var(
     "SGLANG_CUTEDSL_MOE_SCALAR_INPUT_SCALE", "true"
 )
 
+# FP4 GEMM alignment constant - CUTLASS/FlashInfer kernels require dimensions divisible by 32
+FP4_GEMM_ALIGNMENT = 32
+
+
+def round_up_to_multiple(x: int, m: int) -> int:
+    """Round up x to the nearest multiple of m."""
+    return (x + m - 1) // m * m
+
+
+def pad_nvfp4_weight_for_cutlass(
+    weight: torch.Tensor,
+    alignment: int = FP4_GEMM_ALIGNMENT,
+) -> tuple[torch.Tensor, int]:
+    """
+    Pad packed NVFP4 weights so that both N (rows) and K (columns) satisfy
+    the alignment constraints required by CUTLASS / FlashInfer FP4 kernels.
+
+    CUTLASS FP4 kernel requires both K and N matrix dimensions to be divisible
+    by 32 for aligned memory access and efficient tensor core operations.
+
+    Args:
+        weight: Packed FP4 weight tensor of shape [N, K//2] (2 FP4 values per byte)
+        alignment: Required alignment (default 32)
+
+    Returns:
+        Tuple of (padded_weight, weights_padding_cols) where weights_padding_cols
+        is the number of columns added for K-dimension padding (in bytes).
+    """
+    weight_current_rows = weight.shape[0]  # N dimension
+    weight_current_col_bytes = weight.shape[1]  # K//2 (packed)
+
+    # Pad N dimension (rows) if not aligned
+    if weight_current_rows % alignment != 0:
+        total_rows = round_up_to_multiple(weight_current_rows, alignment)
+        pad_rows = total_rows - weight_current_rows
+        weight = torch.nn.functional.pad(weight, (0, 0, 0, pad_rows)).contiguous()
+
+    # Check K dimension alignment
+    # 2 FP4 items are packed per byte in the input dimension
+    weight_current_col_elements = weight_current_col_bytes * 2
+    weights_padding_cols = 0
+
+    if weight_current_col_elements % alignment != 0:
+        total_cols = round_up_to_multiple(weight_current_col_elements, alignment)
+        pad_cols = total_cols - weight_current_col_elements
+        # pad_cols is in elements, but padding is in bytes (2 elements per byte)
+        pad_cols_bytes = pad_cols // 2
+        weight = torch.nn.functional.pad(weight, (0, pad_cols_bytes, 0, 0)).contiguous()
+        weights_padding_cols = pad_cols_bytes
+
+    return weight, weights_padding_cols
+
+
+def pad_nvfp4_activation_for_cutlass(
+    x_fp4: torch.Tensor,
+    weights_padding_cols: int,
+) -> torch.Tensor:
+    """
+    Pad packed FP4 activations to match the K-dimension padding applied to weights.
+
+    Args:
+        x_fp4: Packed FP4 activation tensor
+        weights_padding_cols: Number of padding columns (in bytes) from weight padding
+
+    Returns:
+        Padded activation tensor
+    """
+    if weights_padding_cols > 0:
+        return torch.nn.functional.pad(x_fp4, (0, weights_padding_cols)).contiguous()
+    return x_fp4
+
+
+def slice_nvfp4_output(
+    out: torch.Tensor,
+    output_size: int,
+) -> torch.Tensor:
+    """
+    Slice the output tensor to remove padding in N dimension if weight was padded.
+
+    Args:
+        out: Output tensor from FP4 GEMM
+        output_size: Original output size before padding
+
+    Returns:
+        Sliced output tensor with padding removed
+    """
+    if out.shape[-1] != output_size:
+        return out[..., :output_size].contiguous()
+    return out
+
+
 # TODO make it true by default when the DeepEP PR is merged
 MOE_NVFP4_DISPATCH = envs.SGLANG_MOE_NVFP4_DISPATCH.get()
 # Supported activation schemes for the current configuration
@@ -1162,6 +1253,10 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         layer.input_scale_inv = Parameter(
             (1 / input_scale_2).to(torch.float32), requires_grad=False
         )
+
+        # Store original output size before any padding
+        layer.output_size_per_partition = layer.weight.shape[0]
+
         if get_fp4_gemm_runner_backend().is_flashinfer_trtllm():
             # FlashInfer TRTLLM FP4 GEMM requires a different weight layout.
             # FlashInfer provides nvfp4_quantize to quantize + shuffle the
@@ -1181,7 +1276,14 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
 
             layer.weight_scale_interleaved = Parameter(scale, requires_grad=False)
             layer.weight = Parameter(weight, requires_grad=False)
+            layer.weights_padding_cols = 0
             return
+
+        # Pad weights for CUTLASS/FlashInfer kernel alignment (K and N divisible by 32)
+        weight, weights_padding_cols = pad_nvfp4_weight_for_cutlass(layer.weight.data)
+        layer.weights_padding_cols = weights_padding_cols
+        layer.weight = Parameter(weight, requires_grad=False)
+
         # Pad and blockwise interleave weight_scale
         scales = layer.weight_scale
         scale_ndim = scales.ndim
@@ -1215,8 +1317,11 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
     ) -> torch.Tensor:
         output_dtype = x.dtype
         x_m, _ = x.shape
+
+        # Get original output size (before padding) and padded weight size
+        output_size = layer.output_size_per_partition
         w_n, _ = layer.weight.shape
-        output_shape = [x_m, w_n]
+        output_shape = [x_m, output_size]
 
         # Quantize BF16 or FP16 to (FP4 and interleaved block scale)
         x_fp4, x_scale_interleaved = fp4_quantize(x, layer.input_scale_inv)
@@ -1225,6 +1330,10 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         assert layer.weight.dtype == torch.uint8
         assert layer.weight_scale_interleaved.dtype == torch.float8_e4m3fn
         assert layer.alpha.dtype == torch.float32
+
+        # Pad activations to match weight K-dimension padding
+        weights_padding_cols = getattr(layer, "weights_padding_cols", 0)
+        x_fp4 = pad_nvfp4_activation_for_cutlass(x_fp4, weights_padding_cols)
 
         w = layer.weight
         w_scale_interleaved = layer.weight_scale_interleaved
@@ -1240,6 +1349,10 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
             output_dtype,
             w_n,
         )
+
+        # Slice output to remove N-dimension padding
+        out = slice_nvfp4_output(out, output_size)
+
         if bias is not None:
             out = out + bias
         return out.view(*output_shape)
