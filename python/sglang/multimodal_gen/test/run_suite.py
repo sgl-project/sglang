@@ -138,7 +138,14 @@ def run_pytest(files, filter_expr=None):
         print("No files to run.")
         return 0
 
-    base_cmd = [sys.executable, "-m", "pytest", "-s", "-v"]
+    base_cmd = [
+        sys.executable,
+        "-m",
+        "pytest",
+        "-s",  # Don't capture stdout/stderr (shows all print statements)
+        "-v",  # Verbose output
+        "--tb=long",  # Show full traceback for better error visibility
+    ]
 
     # Add pytest -k filter if provided
     if filter_expr:

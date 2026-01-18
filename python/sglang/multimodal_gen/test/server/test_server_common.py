@@ -95,14 +95,28 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
         env_vars["SGLANG_CACHE_DIT_ENABLED"] = "true"
 
     # start server
+    wait_deadline = float(os.environ.get("SGLANG_TEST_WAIT_SECS", "1200"))
+
     manager = ServerManager(
         model=server_args.model_path,
         port=port,
-        wait_deadline=float(os.environ.get("SGLANG_TEST_WAIT_SECS", "1200")),
+        wait_deadline=wait_deadline,
         extra_args=extra_args,
         env_vars=env_vars,
     )
-    ctx = manager.start()
+
+    try:
+        ctx = manager.start()
+    except (TimeoutError, RuntimeError) as e:
+        error_info = (
+            f"[server-test] Failed to start server for test case: {case.id}\n"
+            f"  Model: {server_args.model_path}\n"
+            f"  Port: {port}\n"
+            f"  Error type: {type(e).__name__}\n"
+            f"  Error message:\n{str(e)}"
+        )
+        logger.error(error_info)
+        raise
 
     try:
         # Reconstruct output size for OpenAI API
