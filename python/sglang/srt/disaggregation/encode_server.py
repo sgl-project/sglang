@@ -52,10 +52,28 @@ logger = logging.getLogger(__name__)
 rid_lock = asyncio.Lock()
 rid_to_receive_endpoint: Dict[str, List[str]] = dict()
 rid_to_receive_count: Dict[str, int] = dict()
+rid_to_err_msg: Dict[str, str] = dict()
 
 use_image_processor_gpu = (
     int(os.getenv("SGLANG_ENCODER_IMAGE_PROCESSOR_USE_GPU", "0")) == 1
 )
+
+
+class MMError(Exception):
+    def __init__(self, message, code=500):
+        self.message = message
+        self.code = code
+        super().__init__(self.message)
+
+
+class BadRequestError(MMError):
+    def __init__(self, message):
+        super().__init__(message, code=400)
+
+
+class InternalError(MMError):
+    def __init__(self, message):
+        super().__init__(message, code=500)
 
 
 class TensorWrapper:
@@ -196,6 +214,7 @@ class MMEncoder:
                 )
 
             self.embedding_to_send = dict()
+            self.background_tasks: Set[asyncio.Task] = set()
 
         logger.info(f"rank {rank} init finish ")
 
@@ -291,53 +310,61 @@ class MMEncoder:
             return await asyncio.gather(*async_futures)
 
     async def _encode(self, mm_items) -> torch.Tensor:
-        images = await self._flatten_and_load_images(mm_items)
+        try:
+            images = await self._flatten_and_load_images(mm_items)
+        except Exception as e:
+            raise BadRequestError(f"Failed to load images from input: {str(e)}")
 
-        kwargs = {"device": self.device} if self.use_image_processor_gpu else {}
-        images_input = self.image_processor(images=images, **kwargs)
-        feature = images_input["pixel_values"]
-        mm_item = MultimodalDataItem.from_dict(
-            {
-                "modality": Modality.IMAGE,
-                "feature": _convert(feature),
-            }
-        )
-        for k, v in images_input.items():
-            if k == "pixel_values":
-                continue
-            mm_item.set(k, _convert(v))
+        try:
+            kwargs = {"device": self.device} if self.use_image_processor_gpu else {}
+            images_input = self.image_processor(images=images, **kwargs)
+            feature = images_input["pixel_values"]
+            mm_item = MultimodalDataItem.from_dict(
+                {
+                    "modality": Modality.IMAGE,
+                    "feature": _convert(feature),
+                }
+            )
+            for k, v in images_input.items():
+                if k == "pixel_values":
+                    continue
+                mm_item.set(k, _convert(v))
 
-        # support mm_cache
-        mm_embedding = None
-        mm_hash = None
+            # support mm_cache
+            mm_embedding = None
+            mm_hash = None
 
-        start_time = time.perf_counter()
-        if self.server_args.enable_prefix_mm_cache:
-            mm_item.set_pad_value()
-            mm_hash = MultiModalStaticCache.combine_hashes([mm_item.hash])
-            async with self.mm_cache_lock:
-                mm_cache = self.mm_cache.get([mm_item.hash])
-                if mm_cache is not None:
-                    mm_embedding = mm_cache.embedding
+            start_time = time.perf_counter()
+            if self.server_args.enable_prefix_mm_cache:
+                mm_item.set_pad_value()
+                mm_hash = MultiModalStaticCache.combine_hashes([mm_item.hash])
+                async with self.mm_cache_lock:
+                    mm_cache = self.mm_cache.get([mm_item.hash])
+                    if mm_cache is not None:
+                        mm_embedding = mm_cache.embedding
 
-        if mm_embedding is None:
-            with torch.inference_mode():
-                mm_embedding: torch.Tensor = self.model.get_image_feature([mm_item])
-                mm_embedding = mm_embedding.cpu()
-            if len(mm_embedding.shape) != 2:
-                mm_embedding = mm_embedding.reshape(-1, mm_embedding.shape[-1])
+            if mm_embedding is None:
+                with torch.inference_mode():
+                    mm_embedding: torch.Tensor = self.model.get_image_feature([mm_item])
+                    mm_embedding = mm_embedding.cpu()
+                if len(mm_embedding.shape) != 2:
+                    mm_embedding = mm_embedding.reshape(-1, mm_embedding.shape[-1])
 
-        if self.server_args.enable_prefix_mm_cache:
-            async with self.mm_cache_lock:
-                self.mm_cache.set(mm_hash, EmbeddingResult(embedding=mm_embedding))
-        end_time = time.perf_counter()
-        logger.info(
-            f"Vit time : {(end_time - start_time)*1000:.2f} ms {mm_embedding.shape = }"
-        )
-        if self.profiler is not None:
-            self.profiler.step()
+            if self.server_args.enable_prefix_mm_cache:
+                async with self.mm_cache_lock:
+                    self.mm_cache.set(mm_hash, EmbeddingResult(embedding=mm_embedding))
+            end_time = time.perf_counter()
+            logger.info(
+                f"Vit time : {(end_time - start_time)*1000:.2f} ms {mm_embedding.shape = }"
+            )
+            if self.profiler is not None:
+                self.profiler.step()
 
-        return _get_image_grid_dim(images_input), mm_embedding
+            return _get_image_grid_dim(images_input), mm_embedding
+        except BadRequestError:
+            raise
+        except Exception as e:
+            raise InternalError(f"Internal encoding error: {str(e)}")
 
     async def _send(
         self,
@@ -377,26 +404,50 @@ class MMEncoder:
             socket.send_multipart([pickle.dumps(mm_data)])
         else:
             new_mm_data = mm_data.copy_without_embedding()
+            if new_mm_data.error_msg is not None:
+                socket.send_multipart([pickle.dumps(new_mm_data)])
+                return
+
             embedding_tensor = TensorWrapper(mm_data.embedding)
             socket.send_multipart(
                 [pickle.dumps(new_mm_data), embedding_tensor.__buffer__()]
             )
 
     async def encode(self, mm_items, req_id, num_parts, part_idx):
-        start_time = time.time()
-        image_grid_dim, mm_embedding = await self._encode(mm_items)
-        end_time = time.time()
-        logger.info(f"🕛 encode cost = {(end_time - start_time) * 1000:.2f}ms")
-        if self.rank == 0:
-            mm_data = EmbeddingData(
-                req_id,
-                num_parts,
-                part_idx,
-                image_grid_dim,
-                mm_embedding,
+        try:
+            start_time = time.time()
+            image_grid_dim, mm_embedding = await self._encode(mm_items)
+            end_time = time.time()
+            logger.info(f"🕛 encode cost = {(end_time - start_time) * 1000:.2f}ms")
+
+            if self.rank == 0:
+                mm_data = EmbeddingData(
+                    req_id, num_parts, part_idx, image_grid_dim, mm_embedding
+                )
+                self.embedding_to_send[req_id] = mm_data
+            return (
+                mm_embedding.nbytes,
+                mm_embedding.shape[0],
+                mm_embedding.shape[1],
+                None,
+                None,
             )
-            self.embedding_to_send[mm_data.req_id] = mm_data
-        return mm_embedding.nbytes, mm_embedding.shape[0], mm_embedding.shape[1]
+        except Exception as e:
+            error_code = getattr(e, "code", 500)
+            error_msg = str(e)
+            logger.error(f"Rank {self.rank} encode failed: {error_msg} {error_code = }")
+            if self.rank == 0:
+                mm_data = EmbeddingData(
+                    req_id,
+                    num_parts,
+                    part_idx,
+                    None,
+                    error_msg=error_msg,
+                    error_code=error_code,
+                )
+                self.embedding_to_send[req_id] = mm_data
+                logger.debug(f"Created error EmbeddingData: {mm_data}")
+            return 0, 0, 0, error_msg, error_code
 
     # For zmq_to_tokenizer zmq_to_scheduler and mooncake
     async def send(
@@ -624,55 +675,93 @@ def launch_server(server_args: ServerArgs):
 
 @app.post("/encode")
 async def handle_encode_request(request: dict):
-    # broadcast request
-    request.update({"enter_time": time.time()})
-    for socket in send_sockets:
-        socket.send_pyobj(request)
+    req_id = request["req_id"]
+    try:
 
-    nbytes, embedding_len, embedding_dim = await encoder.encode(
-        mm_items=request["mm_items"],
-        req_id=request["req_id"],
-        num_parts=request["num_parts"],
-        part_idx=request["part_idx"],
-    )
-    if encoder.server_args.encoder_transfer_backend == "mooncake":
-        del request["mm_items"]
-        request.update(
-            {
-                "embedding_size": nbytes,
-                "embedding_len": embedding_len,
-                "embedding_dim": embedding_dim,
-            }
-        )
-        return ORJSONResponse(content=request)
-    elif encoder.server_args.encoder_transfer_backend == "zmq_to_scheduler":
-        logger.info(f"{request['embedding_port'] = }")
-        if request["embedding_port"] is None:
-            await encoder.send_with_url(
+        def start_background_send(req_id):
+            task = asyncio.create_task(encoder.send_with_url(req_id=req_id))
+            encoder.background_tasks.add(task)
+            task.add_done_callback(encoder.background_tasks.discard)
+
+        # broadcast request
+        request.update({"enter_time": time.time()})
+        for socket in send_sockets:
+            socket.send_pyobj(request)
+
+        nbytes, embedding_len, embedding_dim, error_msg, error_code = (
+            await encoder.encode(
+                mm_items=request["mm_items"],
                 req_id=request["req_id"],
+                num_parts=request["num_parts"],
+                part_idx=request["part_idx"],
             )
-        else:
-            assert type(request["embedding_port"]) == list
-            tasks = []
-            for embedding_port in request["embedding_port"]:
-                tasks.append(
-                    encoder.send(
-                        req_id=request["req_id"],
-                        prefill_host=request["prefill_host"],
-                        embedding_port=embedding_port,
-                    )
-                )
-            await asyncio.gather(*tasks)
-            encoder.embedding_to_send.pop(request["req_id"], None)
-        return ORJSONResponse(content=None)
-    elif encoder.server_args.encoder_transfer_backend == "zmq_to_tokenizer":
-        await encoder.send(
-            req_id=request["req_id"],
-            prefill_host=request["prefill_host"],
-            embedding_port=request["embedding_port"],
         )
-        encoder.embedding_to_send.pop(request["req_id"], None)
-        return ORJSONResponse(content=None)
+
+        if error_msg:
+            if encoder.server_args.encoder_transfer_backend == "zmq_to_scheduler":
+                if request["embedding_port"] is None:
+                    start_background_send(req_id)
+                else:
+                    for port in request["embedding_port"]:
+                        await encoder.send(
+                            req_id=req_id,
+                            prefill_host=request["prefill_host"],
+                            embedding_port=port,
+                        )
+            return ORJSONResponse(
+                status_code=error_code,
+                content={"status": "error", "message": error_msg, "req_id": req_id},
+            )
+        if encoder.server_args.encoder_transfer_backend == "mooncake":
+            del request["mm_items"]
+            request.update(
+                {
+                    "embedding_size": nbytes,
+                    "embedding_len": embedding_len,
+                    "embedding_dim": embedding_dim,
+                }
+            )
+            return ORJSONResponse(content=request)
+        elif encoder.server_args.encoder_transfer_backend == "zmq_to_scheduler":
+            logger.info(f"{request['embedding_port'] = }")
+            if request["embedding_port"] is None:
+                await encoder.send_with_url(
+                    req_id=request["req_id"],
+                )
+            else:
+                assert type(request["embedding_port"]) == list
+                tasks = []
+                for embedding_port in request["embedding_port"]:
+                    tasks.append(
+                        encoder.send(
+                            req_id=request["req_id"],
+                            prefill_host=request["prefill_host"],
+                            embedding_port=embedding_port,
+                        )
+                    )
+                await asyncio.gather(*tasks)
+                encoder.embedding_to_send.pop(request["req_id"], None)
+            return ORJSONResponse(content=None)
+        elif encoder.server_args.encoder_transfer_backend == "zmq_to_tokenizer":
+            await encoder.send(
+                req_id=request["req_id"],
+                prefill_host=request["prefill_host"],
+                embedding_port=request["embedding_port"],
+            )
+            encoder.embedding_to_send.pop(request["req_id"], None)
+            return ORJSONResponse(content=None)
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f"Unexpected error in encoder logic for {req_id}: {error_msg}")
+        rid_to_err_msg[req_id] = error_msg
+        return ORJSONResponse(
+            status_code=500,
+            content={
+                "status": "error",
+                "message": error_msg,
+                "req_id": req_id,
+            },
+        )
 
 
 @app.post("/send")
