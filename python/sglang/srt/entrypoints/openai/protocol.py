@@ -690,7 +690,7 @@ class ChatCompletionRequest(BaseModel):
                 existing_bias = dict(existing_bias)  # Copy to avoid mutating original
                 existing_bias[token_key] = -100.0
                 sampling_params["logit_bias"] = existing_bias
-                logger.debug(
+                logger.info(
                     f"Applied logit bias of -100.0 to token {tool_token_id} for tool_choice=none"
                 )
 

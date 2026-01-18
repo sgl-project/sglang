@@ -294,7 +294,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     # Default to "before"
                     new_messages.insert(first_user_idx, prohibition_msg)
                 request.messages = new_messages
-                logger.debug(
+                logger.info(
                     f"Inserted tool prohibition system message for tool_choice=none at location: {insert_location}"
                 )
 
