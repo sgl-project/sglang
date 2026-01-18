@@ -31,6 +31,8 @@ class TestNvidiaNemotronNanoV2BF16ExtraBuffer(
     other_args = [
         "--max-mamba-cache-size",
         "256",
+        "--mem-fraction-static",
+        "0.8",
         "--mamba-scheduler-strategy",
         "extra_buffer",
     ]
