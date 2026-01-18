@@ -165,6 +165,7 @@ suite_ascend = {
     ],
     "per-commit-2-npu-a2": [
         TestFile("ascend/test_ascend_graph_tp2_bf16.py", 400),
+        TestFile("ascend/test_ascend_memory_consumption.py‎", 400),
         TestFile("ascend/test_ascend_mla_fia_w8a8int8.py", 400),
         TestFile("ascend/test_ascend_tp2_bf16.py", 400),
         TestFile("ascend/test_ascend_tp2_fia_bf16.py", 400),
