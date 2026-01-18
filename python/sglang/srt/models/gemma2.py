@@ -47,7 +47,6 @@ from sglang.srt.utils import add_prefix, make_layers
 def get_attention_sliding_window_size(config):
     return config.sliding_window - 1
 
-
 class Gemma2MLP(nn.Module):
     def __init__(
         self,
@@ -294,7 +293,9 @@ class Gemma2Model(nn.Module):
             hidden_states = self.embed_tokens(input_ids)
         else:
             hidden_states = input_embeds
-        normalizer = torch.tensor(self.config.hidden_size**0.5, dtype=torch.float16)
+        normalizer = torch.tensor(
+            self.config.hidden_size**0.5, dtype=hidden_states.dtype
+        )
         hidden_states *= normalizer
 
         residual = None
