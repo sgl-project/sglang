@@ -247,6 +247,8 @@ class Wan2_2_T2V_A14B_SamplingParam(Wan2_2_Base_SamplingParams):
         default_factory=lambda: [
             (1280, 720),  # 16:9
             (720, 1280),  # 9:16
+            (960, 512),  # 16:9
+            (512, 960),  # 9:16
             (832, 480),  # 16:9
             (480, 832),  # 9:16
         ]
@@ -267,6 +269,8 @@ class Wan2_2_I2V_A14B_SamplingParam(Wan2_2_Base_SamplingParams):
         default_factory=lambda: [
             (1280, 720),  # 16:9
             (720, 1280),  # 9:16
+            (960, 512),  # 16:9
+            (512, 960),  # 9:16
             (832, 480),  # 16:9
             (480, 832),  # 9:16
         ]

@@ -21,6 +21,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.resolution_utils import (
+    isotropic_crop_resize_pil,
+    parse_resolution_and_aspect_ratio,
+)
 from sglang.multimodal_gen.utils import best_output_size
 
 logger = init_logger(__name__)
@@ -162,18 +166,34 @@ class InputValidationStage(PipelineStage):
                     0
                 ]  # not support multi image input yet.
 
-            max_area = server_args.pipeline_config.max_area
-            aspect_ratio = condition_image_height / condition_image_width
             mod_value = (
                 server_args.pipeline_config.vae_config.arch_config.scale_factor_spatial
                 * server_args.pipeline_config.dit_config.arch_config.patch_size[1]
             )
-            height = round(np.sqrt(max_area * aspect_ratio)) // mod_value * mod_value
-            width = round(np.sqrt(max_area / aspect_ratio)) // mod_value * mod_value
 
-            batch.condition_image = batch.condition_image.resize((width, height))
-            batch.height = height
-            batch.width = width
+            target_size = parse_resolution_and_aspect_ratio(
+                condition_image_width / condition_image_height,
+                batch.resolution,
+                batch.aspect_ratio,
+            )
+
+            if target_size is not None:
+                target_width, target_height = target_size
+                height = target_height // mod_value * mod_value
+                width = target_width // mod_value * mod_value
+                batch.condition_image = isotropic_crop_resize_pil(
+                    batch.condition_image, (width, height)
+                )
+            else:
+                max_area = server_args.pipeline_config.max_area
+                aspect_ratio = condition_image_height / condition_image_width
+                height = (
+                    round(np.sqrt(max_area * aspect_ratio)) // mod_value * mod_value
+                )
+                width = round(np.sqrt(max_area / aspect_ratio)) // mod_value * mod_value
+                batch.condition_image = batch.condition_image.resize((width, height))
+
+            batch.height, batch.width = height, width
 
     def forward(
         self,
