@@ -21,6 +21,7 @@ from sglang.multimodal_gen.runtime.layers.triton_ops import (
     fuse_scale_shift_kernel,
     norm_infer,
     rms_norm_fn,
+    triton_one_pass_rms_norm,
 )
 from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
 
@@ -76,7 +77,7 @@ class RMSNorm(CustomOp):
             fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
             return x.view(shape), residual.view(residual_shape)
         else:
-            out = rmsnorm(x, self.weight.data, self.variance_epsilon)
+            out = triton_one_pass_rms_norm(x, self.weight.data, self.variance_epsilon)
         out = out.view(shape)
         return out
 
