@@ -59,6 +59,8 @@ class MarlinMoeQuantInfo(MoeQuantInfo):
     w13_g_idx_sort_indices: Optional[torch.Tensor]
     w2_g_idx_sort_indices: Optional[torch.Tensor]
     weight_bits: int
+    w13_q_type_id: Optional[int] = None
+    w2_q_type_id: Optional[int] = None
 
     # GPTQ specific (Optional)
     w13_g_idx: Optional[torch.Tensor] = None
@@ -118,6 +120,8 @@ def fused_experts_none_to_marlin(
         is_k_full=quant_info.is_k_full,
         inplace=runner_config.inplace,
         routed_scaling_factor=runner_config.routed_scaling_factor,
+        w1_q_type_id=quant_info.w13_q_type_id,
+        w2_q_type_id=quant_info.w2_q_type_id,
     ).to(hidden_states.dtype)
 
     return StandardCombineInput(
