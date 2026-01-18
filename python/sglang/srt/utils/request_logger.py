@@ -117,7 +117,11 @@ class RequestLogger:
             and obj.input_ids is not None
             and tokenizer is not None
         ):
-            decoded = tokenizer.decode(obj.input_ids, skip_special_tokens=False)
+            if obj.input_ids and isinstance(obj.input_ids[0], list):
+                # Prefill node warmup while PD disaggregated.
+                decoded = tokenizer.decode(obj.input_ids[0], skip_special_tokens=False)
+            else:
+                decoded = tokenizer.decode(obj.input_ids, skip_special_tokens=False)
             obj.text = decoded
 
     def log_finished_request(
