@@ -27,7 +27,7 @@ mod tests;
 use factory::{create_tokenizer_from_file, create_tokenizer_with_chat_template};
 // Re-export types used outside this module
 pub use huggingface::HuggingFaceTokenizer;
-pub use registry::TokenizerRegistry;
+pub use registry::{LoadError, LoadOutcome, TokenizerRegistry};
 pub use stop::StopSequenceDecoder;
 pub use stream::DecodeStream;
 pub use traits::{Decoder, Encoder, Encoding, SpecialTokens};

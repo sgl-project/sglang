@@ -17,7 +17,7 @@ import os
 import unittest
 from typing import List
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.lora_utils import (
     ALL_OTHER_LORA_MODELS,
     CI_LORA_MODELS,
@@ -29,6 +29,11 @@ from sglang.test.lora_utils import (
 from sglang.test.test_utils import CustomTestCase, is_in_ci
 
 register_cuda_ci(est_time=116, suite="stage-b-test-large-2-gpu")
+register_amd_ci(
+    est_time=116,
+    suite="stage-b-test-large-2-gpu-amd",
+    disabled="see https://github.com/sgl-project/sglang/issues/13107",
+)
 
 
 class TestLoRATP(CustomTestCase):
