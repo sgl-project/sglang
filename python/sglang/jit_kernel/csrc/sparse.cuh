@@ -4,7 +4,7 @@
 #include <stdint.h>
 
 constexpr int WARP_SIZE = 32;
-constexpr uint16_t NOT_PRESENT = 0xFFFF;
+constexpr int32_t TOKEN_HIT = 0xFFFFFFFF;
 
 __device__ __forceinline__ void
 transfer_item_warp(int32_t lane_id, const void* src_addr, void* dst_addr, int64_t item_size_bytes) {
@@ -40,32 +40,30 @@ __device__ __forceinline__ int warp_inclusive_scan(int* s_data, int lane_id, int
 // todo, each block for a request
 template <int BLOCK_SIZE, int NUM_TOP_K, int HOT_BUFFER_SIZE>
 __global__ void load_cache_to_device_buffer(
-    const uint32_t* __restrict__ top_k_tokens,
-    uint32_t* __restrict__ device_buffer_tokens,
-    uint16_t* __restrict__ token_residence_mapping,
+    const int32_t* __restrict__ top_k_tokens,
+    int32_t* __restrict__ device_buffer_tokens,
     const int64_t* __restrict__ host_cache_locs,
     const int64_t* __restrict__ device_buffer_locs,
     const void* __restrict__ host_cache,
     void* __restrict__ device_buffer,
     int64_t* __restrict__ top_k_device_locs,
-    uint32_t max_tokens,
     int64_t item_size_bytes) {
   constexpr int NUM_WARPS = BLOCK_SIZE / WARP_SIZE;
-  constexpr int NUM_CHUNKS = (NUM_TOP_K + WARP_SIZE - 1) / WARP_SIZE;
+  constexpr int NUM_TOKEN_CHUNKS = (NUM_TOP_K + WARP_SIZE - 1) / WARP_SIZE;
+  constexpr int NUM_BUFFER_CHUNKS = (HOT_BUFFER_SIZE + WARP_SIZE - 1) / WARP_SIZE;
 
   const int tid = threadIdx.x;
   const int warp_id = tid / WARP_SIZE;
   const int lane_id = tid % WARP_SIZE;
   const unsigned int lanes_before = (1u << lane_id) - 1;
 
-  // Protected slots bitmap
-  // todo: avoid bank conflicts
-  __shared__ bool s_protected_bitmap[HOT_BUFFER_SIZE];
+  // todo, use hashing for hit detection if top_k is large
+  __shared__ int32_t s_top_k_tokens[NUM_TOP_K];
   // Warp-level miss tracking
-  __shared__ int32_t s_chunk_miss_offset[NUM_CHUNKS + 1];
+  // HOT_BUFFER_SIZE is guaranteed to be larger than NUM_TOP_K
+  __shared__ int32_t s_chunk_offset[NUM_BUFFER_CHUNKS + 1];
+
   __shared__ int32_t s_missed_tokens[NUM_TOP_K];
-  __shared__ int16_t s_missed_tokens_idx[NUM_TOP_K];
-  // Evictable slots (only need num_misses worth)
   __shared__ int32_t s_evictable_slots[NUM_TOP_K];
   __shared__ int32_t s_total_misses;
 
@@ -73,42 +71,107 @@ __global__ void load_cache_to_device_buffer(
   if (tid == 0) {
     s_total_misses = 0;
   }
-  // Clear bitmaps (warp-efficient: each thread clears one word)
-  for (int i = tid; i < HOT_BUFFER_SIZE; i += BLOCK_SIZE) {
-    s_protected_bitmap[i] = false;
+  for (int i = tid; i < NUM_TOP_K; i += BLOCK_SIZE) {
+    s_top_k_tokens[i] = top_k_tokens[i];
   }
-  for (int i = tid; i < NUM_CHUNKS + 1; i += BLOCK_SIZE) {
-    s_chunk_miss_offset[i] = 0;
+  for (int i = tid; i < NUM_BUFFER_CHUNKS + 1; i += BLOCK_SIZE) {
+    s_chunk_offset[i] = 0;
   }
   __syncthreads();
 
-  // ===== Phase 1: Hit and Miss Detection ====
-  constexpr int ITERATIONS_PER_WARP = (NUM_CHUNKS + NUM_WARPS - 1) / NUM_WARPS;
-  for (int iter = 0; iter < ITERATIONS_PER_WARP; iter++) {
+  constexpr int ITERATIONS_PER_WARP_BUFFER = (NUM_BUFFER_CHUNKS + NUM_WARPS - 1) / NUM_WARPS;
+  int total_evictable = 0;
+  for (int iter = 0; iter < ITERATIONS_PER_WARP_BUFFER; iter++) {
     int chunk_idx = warp_id + iter * NUM_WARPS;
-    bool has_valid_chunk = chunk_idx < NUM_CHUNKS;
+    bool has_valid_chunk = chunk_idx < NUM_BUFFER_CHUNKS;
+
+    const int chunk_slot_start = chunk_idx * WARP_SIZE;
+    const int buf_slot = chunk_slot_start + lane_id;
+    const bool has_valid_slot = has_valid_chunk && (buf_slot < HOT_BUFFER_SIZE);
+
+    int32_t my_buffer_token = has_valid_slot ? device_buffer_tokens[buf_slot] : -1;
+    int my_found_top_k_idx = -1;
+    int local_evictable_offset = 0;
+
+    if (has_valid_chunk) {
+      for (int top_k_base = 0; top_k_base < NUM_TOP_K; top_k_base += WARP_SIZE) {
+        // Each lane loads one top_k token into register
+        int top_k_idx = top_k_base + lane_id;
+        int32_t my_top_k_token = (top_k_idx < NUM_TOP_K) ? s_top_k_tokens[top_k_idx] : -1;
+
+// 32 shuffle rotations for all-to-all comparison
+#pragma unroll
+        for (int rot = 0; rot < WARP_SIZE; rot++) {
+          // Get top_k token from lane (lane_id + rot) % 32
+          int src_lane = (lane_id + rot) & 31;  // Fast modulo for power of 2
+          int32_t rotated_top_k = __shfl_sync(0xFFFFFFFF, my_top_k_token, src_lane);
+          int rotated_top_k_idx = top_k_base + src_lane;
+
+          // Compare my buffer token against rotated top_k token
+          if (my_buffer_token >= 0 && my_buffer_token == rotated_top_k && rotated_top_k_idx < NUM_TOP_K) {
+            my_found_top_k_idx = rotated_top_k_idx;
+          }
+        }
+      }
+    }
+
+    // Record hits: if my buffer token matched a top_k token
+    if (my_found_top_k_idx >= 0) {
+      // reuse s_top_k_tokens to mark hits
+      s_top_k_tokens[my_found_top_k_idx] = TOKEN_HIT;
+      top_k_device_locs[my_found_top_k_idx] = device_buffer_locs[buf_slot];
+    }
+    __syncthreads();
+
+    bool is_evictable = has_valid_slot && (my_found_top_k_idx == -1);
+    if (has_valid_chunk) {
+      const unsigned int evictable_mask = __ballot_sync(0xFFFFFFFF, is_evictable);
+      local_evictable_offset = __popc(evictable_mask & lanes_before);
+      const int warp_evictable_count = __popc(evictable_mask);
+      if (lane_id == 0) {
+        s_chunk_offset[chunk_idx + 1] = warp_evictable_count;
+      }
+    }
+    __syncthreads();
+
+    if (warp_id == 0) {
+      total_evictable =
+          warp_inclusive_scan(s_chunk_offset, lane_id, chunk_idx + 1, NUM_BUFFER_CHUNKS + 1, total_evictable);
+    }
+    __syncthreads();
+
+    if (is_evictable) {
+      int evictable_offset = s_chunk_offset[chunk_idx] + local_evictable_offset;
+      if (evictable_offset < NUM_TOP_K) {
+        s_evictable_slots[evictable_offset] = buf_slot;
+      }
+    }
+    __syncthreads();
+  }
+
+  // Reset offsets for next phase
+  for (int i = tid; i < NUM_BUFFER_CHUNKS + 1; i += BLOCK_SIZE) {
+    s_chunk_offset[i] = 0;
+  }
+  __syncthreads();
+
+  constexpr int ITERATIONS_PER_WARP_TOKEN = (NUM_TOKEN_CHUNKS + NUM_WARPS - 1) / NUM_WARPS;
+  for (int iter = 0; iter < ITERATIONS_PER_WARP_TOKEN; iter++) {
+    int chunk_idx = warp_id + iter * NUM_WARPS;
+    bool has_valid_chunk = chunk_idx < NUM_TOKEN_CHUNKS;
 
     const int chunk_token_start = chunk_idx * WARP_SIZE;
     const int my_token_idx = chunk_token_start + lane_id;
     const bool has_valid_token = has_valid_chunk && (my_token_idx < NUM_TOP_K);
 
     int32_t my_token = 0;
-    bool is_hit = false;
     bool is_miss = false;
-    int32_t my_device_slot = -1;
     int local_miss_offset = 0;
 
     if (has_valid_token) {
-      my_token = top_k_tokens[my_token_idx];
-      uint16_t slot = token_residence_mapping[my_token];
-      is_hit = (slot != NOT_PRESENT);
-
-      if (is_hit) {
-        my_device_slot = static_cast<int32_t>(slot);
-        s_protected_bitmap[my_device_slot] = true;
-        top_k_device_locs[my_token_idx] = device_buffer_locs[my_device_slot];
-      } else {
-        is_miss = true;
+      is_miss = s_top_k_tokens[my_token_idx] != TOKEN_HIT;
+      if (is_miss) {
+        my_token = s_top_k_tokens[my_token_idx];
       }
     }
 
@@ -118,75 +181,26 @@ __global__ void load_cache_to_device_buffer(
       local_miss_offset = __popc(miss_mask & lanes_before);
       const int warp_miss_count = __popc(miss_mask);
       if (lane_id == 0) {
-        s_chunk_miss_offset[chunk_idx + 1] = warp_miss_count;
+        s_chunk_offset[chunk_idx + 1] = warp_miss_count;
       }
     }
     __syncthreads();
 
     if (warp_id == 0) {
-      s_total_misses = warp_inclusive_scan(s_chunk_miss_offset, lane_id, chunk_idx + 1, NUM_CHUNKS + 1, s_total_misses);
+      s_total_misses =
+          warp_inclusive_scan(s_chunk_offset, lane_id, chunk_idx + 1, NUM_TOKEN_CHUNKS + 1, s_total_misses);
     }
     __syncthreads();
 
     if (is_miss) {
-      int miss_offset = s_chunk_miss_offset[chunk_idx] + local_miss_offset;
+      int miss_offset = s_chunk_offset[chunk_idx] + local_miss_offset;
+      int evict_slot = s_evictable_slots[miss_offset];
       s_missed_tokens[miss_offset] = my_token;
-      s_missed_tokens_idx[miss_offset] = static_cast<int16_t>(my_token_idx);
+      top_k_device_locs[my_token_idx] = device_buffer_locs[evict_slot];
+      device_buffer_tokens[evict_slot] = my_token;
     }
     __syncthreads();
   }
-
-  // ===== Phase 2: Find Evictable Slots =====
-  // todo: further parallelize this if needed
-  if (warp_id == 0) {
-    int found = 0;
-    int base_slot = 0;
-
-    while (found < s_total_misses && base_slot < HOT_BUFFER_SIZE) {
-      const int my_slot = base_slot + lane_id;
-      bool is_evictable = false;
-
-      if (my_slot < HOT_BUFFER_SIZE) {
-        is_evictable = !s_protected_bitmap[my_slot];
-      }
-      // Warp ballot to find evictable slots
-      const unsigned int evict_mask = __ballot_sync(0xFFFFFFFF, is_evictable);
-      const int num_evictable = __popc(evict_mask);
-      const int need = s_total_misses - found;
-      const int use_count = min(num_evictable, need);
-
-      // Each evictable lane stores its slot
-      if (is_evictable) {
-        const int my_pos = __popc(evict_mask & lanes_before);
-        if (my_pos < use_count) {
-          s_evictable_slots[found + my_pos] = my_slot;
-        }
-      }
-
-      found += use_count;
-      base_slot += WARP_SIZE;
-    }
-  }
-  __syncthreads();
-
-  // ===== Phase 3a: Metadata Update (all threads in parallel) =====
-  // Each thread handles one or more misses
-  for (int miss_idx = tid; miss_idx < s_total_misses; miss_idx += BLOCK_SIZE) {
-    const int32_t miss_token = s_missed_tokens[miss_idx];
-    const int evict_slot = s_evictable_slots[miss_idx];
-    const int top_k_idx = s_missed_tokens_idx[miss_idx];
-    const int32_t old_token = device_buffer_tokens[evict_slot];
-
-    // Clear old token's residence mapping
-    if (old_token >= 0 && old_token < max_tokens) {
-      token_residence_mapping[old_token] = NOT_PRESENT;
-    }
-    // Set new token's mapping
-    token_residence_mapping[miss_token] = static_cast<uint16_t>(evict_slot);
-    device_buffer_tokens[evict_slot] = miss_token;
-    top_k_device_locs[top_k_idx] = device_buffer_locs[evict_slot];
-  }
-  __syncthreads();
 
   for (int miss_idx = warp_id; miss_idx < s_total_misses; miss_idx += NUM_WARPS) {
     const int32_t miss_token = s_missed_tokens[miss_idx];
