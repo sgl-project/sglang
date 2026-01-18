@@ -2,6 +2,7 @@ use super::{
     CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, HealthCheckConfig,
     HistoryBackend, MetricsConfig, OracleConfig, PolicyConfig, PostgresConfig, RedisConfig,
     RetryConfig, RouterConfig, RoutingMode, TokenizerCacheConfig, TraceConfig,
+    WorkerAdminKeyMapConfig,
 };
 use crate::{core::ConnectionMode, mcp::McpConfig};
 
@@ -17,6 +18,7 @@ pub struct RouterConfigBuilder {
     server_cert_path: Option<String>,
     server_key_path: Option<String>,
     mcp_config_path: Option<String>,
+    worker_admin_key_map_path: Option<String>,
 }
 
 impl RouterConfigBuilder {
@@ -34,6 +36,7 @@ impl RouterConfigBuilder {
             server_cert_path: None,
             server_key_path: None,
             mcp_config_path: None,
+            worker_admin_key_map_path: None,
         }
     }
 
@@ -638,6 +641,19 @@ impl RouterConfigBuilder {
         self
     }
 
+    // ==================== Worker Admin Key Map ====================
+
+    pub fn worker_admin_key_map_path<S: Into<String>>(mut self, path: S) -> Self {
+        self.worker_admin_key_map_path = Some(path.into());
+        self
+    }
+
+    /// Config file loaded during build()
+    pub fn maybe_worker_admin_key_map_path(mut self, path: Option<impl Into<String>>) -> Self {
+        self.worker_admin_key_map_path = path.map(|p| p.into());
+        self
+    }
+
     // ==================== Build ====================
 
     pub fn build(self) -> ConfigResult<RouterConfig> {
@@ -657,6 +673,9 @@ impl RouterConfigBuilder {
 
         // Read MCP config from path if provided
         self = self.read_mcp_config()?;
+
+        // Read worker admin key map from path if provided
+        self = self.read_worker_admin_key_map()?;
 
         let config: RouterConfig = self.into();
         if validate {
@@ -757,6 +776,29 @@ impl RouterConfigBuilder {
                     reason: format!("Failed to parse MCP config from {}: {}", mcp_config_path, e),
                 })?;
             self.config.mcp_config = Some(mcp_config);
+        }
+
+        Ok(self)
+    }
+
+    fn read_worker_admin_key_map(mut self) -> ConfigResult<Self> {
+        if let Some(map_path) = &self.worker_admin_key_map_path {
+            let contents = std::fs::read_to_string(map_path).map_err(|e| {
+                ConfigError::ValidationFailed {
+                    reason: format!(
+                        "Failed to read worker admin key map from {}: {}",
+                        map_path, e
+                    ),
+                }
+            })?;
+            let map: WorkerAdminKeyMapConfig =
+                serde_yaml::from_str(&contents).map_err(|e| ConfigError::ValidationFailed {
+                    reason: format!(
+                        "Failed to parse worker admin key map from {}: {}",
+                        map_path, e
+                    ),
+                })?;
+            self.config.worker_admin_key_map = Some(map);
         }
 
         Ok(self)

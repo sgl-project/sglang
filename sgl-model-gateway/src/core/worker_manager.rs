@@ -21,6 +21,7 @@ use tokio::{
 use tracing::{debug, info, warn};
 
 use crate::{
+    app_context::AppContext,
     core::{metrics_aggregator::MetricPack, ConnectionMode, Worker, WorkerRegistry, WorkerType},
     policies::PolicyRegistry,
     protocols::worker_spec::{FlushCacheResult, WorkerLoadInfo, WorkerLoadsResult},
@@ -41,6 +42,8 @@ async fn fan_out(
     client: &reqwest::Client,
     endpoint: &str,
     method: reqwest::Method,
+    app_context: &AppContext,
+    tenant_id: Option<&str>,
 ) -> Vec<WorkerResponse> {
     let futures: Vec<_> = workers
         .iter()
@@ -48,7 +51,9 @@ async fn fan_out(
             let client = client.clone();
             let url = worker.url().to_string();
             let full_url = format!("{}/{}", url, endpoint);
-            let api_key = worker.api_key().clone();
+            let api_key = app_context
+                .resolve_worker_admin_key(tenant_id, &url)
+                .or_else(|| worker.api_key().clone());
             let method = method.clone();
 
             async move {
@@ -136,10 +141,10 @@ impl WorkerManager {
     }
 
     pub async fn flush_cache_all(
-        worker_registry: &WorkerRegistry,
-        client: &reqwest::Client,
+        app_context: &AppContext,
+        tenant_id: Option<&str>,
     ) -> FlushCacheResult {
-        let workers = worker_registry.get_all();
+        let workers = app_context.worker_registry.get_all();
         let total_workers = workers.len();
 
         let http_workers: Vec<_> = workers
@@ -163,7 +168,15 @@ impl WorkerManager {
             total_workers
         );
 
-        let responses = fan_out(&http_workers, client, "flush_cache", reqwest::Method::POST).await;
+        let responses = fan_out(
+            &http_workers,
+            &app_context.client,
+            "flush_cache",
+            reqwest::Method::POST,
+            app_context,
+            tenant_id,
+        )
+        .await;
 
         let mut successful = Vec::new();
         let mut failed = Vec::new();
@@ -201,24 +214,26 @@ impl WorkerManager {
     }
 
     pub async fn get_all_worker_loads(
-        worker_registry: &WorkerRegistry,
-        client: &reqwest::Client,
+        app_context: &AppContext,
+        tenant_id: Option<&str>,
     ) -> WorkerLoadsResult {
-        let workers = worker_registry.get_all();
+        let workers = app_context.worker_registry.get_all();
         let total_workers = workers.len();
 
         let futures: Vec<_> = workers
             .iter()
             .map(|worker| {
                 let url = worker.url().to_string();
-                let api_key = worker.api_key().clone();
+                let api_key = app_context
+                    .resolve_worker_admin_key(tenant_id, &url)
+                    .or_else(|| worker.api_key().clone());
                 let worker_type = match worker.worker_type() {
                     WorkerType::Regular => None,
                     WorkerType::Prefill { .. } => Some("prefill".to_string()),
                     WorkerType::Decode => Some("decode".to_string()),
                 };
                 let is_http = matches!(worker.connection_mode(), ConnectionMode::Http);
-                let client = client.clone();
+                let client = app_context.client.clone();
 
                 async move {
                     let load = if is_http {
@@ -273,16 +288,24 @@ impl WorkerManager {
     }
 
     pub async fn get_engine_metrics(
-        worker_registry: &WorkerRegistry,
-        client: &reqwest::Client,
+        app_context: &AppContext,
+        tenant_id: Option<&str>,
     ) -> EngineMetricsResult {
-        let workers = worker_registry.get_all();
+        let workers = app_context.worker_registry.get_all();
 
         if workers.is_empty() {
             return EngineMetricsResult::Err("No available workers".to_string());
         }
 
-        let responses = fan_out(&workers, client, "metrics", reqwest::Method::GET).await;
+        let responses = fan_out(
+            &workers,
+            &app_context.client,
+            "metrics",
+            reqwest::Method::GET,
+            app_context,
+            tenant_id,
+        )
+        .await;
 
         let mut metric_packs = Vec::new();
         for resp in responses {

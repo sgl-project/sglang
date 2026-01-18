@@ -970,6 +970,73 @@ python3 -m sglang_router.launch_router \
    - Extracts role from `roles` claim (or `groups` as fallback)
    - Maps IDP role to gateway role via `--jwt-role-mapping`
 
+#### Worker Admin Key Mapping (Multi-Tenant)
+
+When workers enforce `--admin-api-key`, the gateway can map a tenant JWT to per-worker admin keys
+without storing secrets in the gateway config. Provide a YAML file with tenant-to-worker mappings
+and refer to environment variable names (env refs) that contain the actual keys.
+
+```bash
+python3 -m sglang_router.launch_router \
+  --worker-urls http://worker1:8000 http://worker2:8000 \
+  --jwt-issuer "https://login.microsoftonline.com/{tenant-id}/v2.0" \
+  --jwt-audience "api://my-gateway-client-id" \
+  --worker-admin-key-map-path /etc/sglang/worker_admin_key_map.yaml
+```
+
+`/etc/sglang/worker_admin_key_map.yaml`:
+```yaml
+tenant_claim: tenant_id
+tenants:
+  tenant-a:
+    workers:
+      http://worker1:8000: SMG_TENANT_A_WORKER1_ADMIN_KEY
+      http://worker2:8000: SMG_TENANT_A_WORKER2_ADMIN_KEY
+```
+
+**Behavior:**
+- Gateway extracts `tenant_id` claim from JWT.
+- For worker control-plane calls (cache flush, load/metrics), it resolves the env var name
+  and uses that value as `Authorization: Bearer <admin-api-key>`.
+- If no mapping is found, gateway falls back to the worker's configured `api_key`.
+
+**Architecture:**
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Gateway
+    participant JWTValidator
+    participant AdminKeyMap
+    participant WorkerA
+    participant WorkerB
+
+    Client->>Gateway: ControlPlaneRequest Authorization: Bearer JWT
+    Gateway->>JWTValidator: Validate JWT
+    JWTValidator-->>Gateway: subject, role=admin, tenant_id
+    Gateway->>AdminKeyMap: Lookup (tenant_id, worker_url)
+    AdminKeyMap-->>Gateway: env_var_name
+    Gateway->>Gateway: Resolve env_var to admin_api_key
+    Gateway->>WorkerA: Authorization: Bearer admin_api_key (tenant-scoped)
+    WorkerA-->>Gateway: Response
+    Gateway->>WorkerB: Authorization: Bearer admin_api_key (tenant-scoped)
+    WorkerB-->>Gateway: Response
+    Gateway-->>Client: ControlPlaneResponse
+```
+
+**Example flow:**
+- JWT contains `tenant_id: "tenant-a"`.
+- Env vars:
+  - `SMG_TENANT_A_WORKER1_ADMIN_KEY=worker1-admin-key`
+  - `SMG_TENANT_A_WORKER2_ADMIN_KEY=worker2-admin-key`
+- Client call:
+```bash
+curl -H "Authorization: Bearer <JWT with tenant_id=tenant-a>" \
+  http://gateway:30000/flush_cache
+```
+- Gateway calls:
+  - `http://worker1:8000/flush_cache` with `Authorization: Bearer worker1-admin-key`
+  - `http://worker2:8000/flush_cache` with `Authorization: Bearer worker2-admin-key`
+
 **Example Azure AD Configuration:**
 ```bash
 # Azure AD issues tokens with:
