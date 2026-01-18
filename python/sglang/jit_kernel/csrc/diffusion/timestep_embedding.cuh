@@ -51,19 +51,19 @@ __global__ void timestep_embedding_kernel(
     vals.z = scale * t_val * device::math::exp(neg_log_max_period * __int2float_rn(thread_offset * 4 + 2));
     vals.w = scale * t_val * device::math::exp(neg_log_max_period * __int2float_rn(thread_offset * 4 + 3));
 
-    float4 sin_vals;
-    sin_vals.x = device::math::cos(vals.x);
-    sin_vals.y = device::math::cos(vals.y);
-    sin_vals.z = device::math::cos(vals.z);
-    sin_vals.w = device::math::cos(vals.w);
-    *top_half = sin_vals;
-
     float4 cos_vals;
-    cos_vals.x = device::math::sin(vals.x);
-    cos_vals.y = device::math::sin(vals.y);
-    cos_vals.z = device::math::sin(vals.z);
-    cos_vals.w = device::math::sin(vals.w);
-    *bottom_half = cos_vals;
+    cos_vals.x = device::math::cos(vals.x);
+    cos_vals.y = device::math::cos(vals.y);
+    cos_vals.z = device::math::cos(vals.z);
+    cos_vals.w = device::math::cos(vals.w);
+    *top_half = cos_vals;
+
+    float4 sin_vals;
+    sin_vals.x = device::math::sin(vals.x);
+    sin_vals.y = device::math::sin(vals.y);
+    sin_vals.z = device::math::sin(vals.z);
+    sin_vals.w = device::math::sin(vals.w);
+    *bottom_half = sin_vals;
 
     thread_offset += static_cast<int>(blockDim.x);
   }
