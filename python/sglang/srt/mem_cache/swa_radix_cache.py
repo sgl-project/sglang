@@ -955,7 +955,8 @@ class SWARadixCache(BasePrefixCache):
             # contains tombstone. If this is the case and we don't update the kv value, then
             # the prefill prefix matching will stuck.
             if update_kv_after_len < total_prefix_length + prefix_len:
-                first_diff_idx = max(0, update_kv_after_len - total_prefix_length)
+                # For page_size > 1 and chunked prefill case, update_kv_after_len may be not page-aligned due to a trailing partial page
+                # (kept in the request but not inserted into the radix tree) appended to prefix_indices.
                 if node.swa_tombstone:
                     assert (
                         node.swa_lock_ref == 0
@@ -964,38 +965,34 @@ class SWARadixCache(BasePrefixCache):
                         swa_evicted_seqlen % self.page_size == 0
                     ), f"swa_evicted_seqlen must be page aligned, {swa_evicted_seqlen=}, {self.page_size=}"
                     if swa_evicted_seqlen <= total_prefix_length:
-                        self.token_to_kv_pool_allocator.free(
-                            node.value[first_diff_idx:]
-                        )
+                        # Branch 1: all swa tokens of value[:prefix_len] are not evicted, so we can insert it to the tree directly.
+                        # Free full tokens in the original tree node.
+                        self.token_to_kv_pool_allocator.free(node.value[:prefix_len])
+                        # Overwrite the new value in request to the tree node.
                         node.value = value[:prefix_len]
                         node.swa_tombstone = False
-                        # insert the node into the lru lists
                         self.swa_lru_list.insert_mru(node)
                         self.swa_evictable_size_ += len(node.value)
                     elif swa_evicted_seqlen < total_prefix_length + prefix_len:
-                        start_update_idx = max(
-                            first_diff_idx, swa_evicted_seqlen - total_prefix_length
-                        )
+                        # Branch 2: part of swa tokens of value[:prefix_len] are evicted, so we need to split the node and insert the value to new node.
+                        start_update_idx = swa_evicted_seqlen - total_prefix_length
                         self.token_to_kv_pool_allocator.free(
-                            node.value[start_update_idx:]
+                            node.value[start_update_idx:prefix_len]
                         )
                         self._split_node(node.key, node, start_update_idx)
+                        # Here node is the new node after split, so we can overwrite the value to the new node.
+                        # The old node is still swa tombstone and the full token is not freed.
                         node.value = value[start_update_idx:prefix_len]
-                        self.token_to_kv_pool_allocator.free(
-                            value[first_diff_idx:start_update_idx]
-                        )
+                        self.token_to_kv_pool_allocator.free(value[:start_update_idx])
                         node.swa_tombstone = False
-                        # insert the node into the lru lists
                         self.swa_lru_list.insert_mru(node)
                         self.swa_evictable_size_ += len(node.value)
                     else:
-                        self.token_to_kv_pool_allocator.free(
-                            value[first_diff_idx:prefix_len]
-                        )
+                        # Branch 3: all swa tokens of value[:prefix_len] are evicted, so we don't need to update the node.
+                        self.token_to_kv_pool_allocator.free(value[:prefix_len])
                 else:
-                    self.token_to_kv_pool_allocator.free(
-                        value[first_diff_idx:prefix_len]
-                    )
+                    # The node is not tombstone, so we don't need to update the node.
+                    self.token_to_kv_pool_allocator.free(value[:prefix_len])
 
             total_prefix_length += prefix_len
             key = key[prefix_len:]
