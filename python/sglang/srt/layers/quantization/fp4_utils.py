@@ -41,12 +41,8 @@ class Fp4GemmRunnerBackend(Enum):
             'flashinfer_cutlass' -> 'cutlass'
             'flashinfer_cudnn' -> 'cudnn'
         """
-        if self.is_flashinfer_trtllm():
-            return "trtllm"
-        elif self.is_flashinfer_cutlass():
-            return "cutlass"
-        elif self.is_flashinfer_cudnn():
-            return "cudnn"
+        if self.value.startswith("flashinfer_"):
+            return self.value.removeprefix("flashinfer_")
         else:
             return self.value
 
