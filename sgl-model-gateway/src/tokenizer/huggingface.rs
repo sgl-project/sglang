@@ -43,7 +43,7 @@ impl HuggingFaceTokenizer {
             .map_err(|e| Error::msg(format!("Failed to load tokenizer: {}", e)))?;
 
         // Extract special tokens
-        let special_tokens = Self::extract_special_tokens(&tokenizer);
+        let special_tokens = Self::extract_special_tokens(&tokenizer, Some(file_path));
 
         // Build vocab mappings (include special tokens to get added_tokens like <|im_start|>)
         let vocab = tokenizer.get_vocab(true); // true = include special tokens and added_tokens
@@ -152,7 +152,7 @@ impl HuggingFaceTokenizer {
 
     /// Create from an existing HuggingFace tokenizer
     pub fn from_tokenizer(tokenizer: HfTokenizer) -> Self {
-        let special_tokens = Self::extract_special_tokens(&tokenizer);
+        let special_tokens = Self::extract_special_tokens(&tokenizer, None);
         let vocab = tokenizer.get_vocab(true); // true = include special tokens and added_tokens
         let reverse_vocab: HashMap<TokenIdType, String> = vocab
             .iter()
@@ -169,15 +169,30 @@ impl HuggingFaceTokenizer {
         }
     }
 
+    fn load_config(tokenizer_path: &str) -> Option<serde_json::Value> {
+        let path = std::path::Path::new(tokenizer_path);
+        let config_path = path.parent()?.join("tokenizer_config.json");
+
+        if !config_path.exists() {
+            return None;
+        }
+
+        let config_str = config_path.to_str()?;
+        let content = std::fs::read_to_string(&config_path).ok()?;
+        let mut config: serde_json::Value = serde_json::from_str(&content).ok()?;
+        config["file_path"] = serde_json::Value::String(config_str.to_string());
+        Some(config)
+    }
+
     /// Extract special tokens from the tokenizer
-    fn extract_special_tokens(tokenizer: &HfTokenizer) -> SpecialTokens {
+    fn extract_special_tokens(tokenizer: &HfTokenizer, tokenizer_path: Option<&str>) -> SpecialTokens {
         // Get vocab with special tokens included (added_tokens like <|im_start|>)
         let vocab = tokenizer.get_vocab(true);
 
-        let find_token = |patterns: &[&str]| -> Option<String> {
+        let find_token = |patterns: &[String]| -> Option<String> {
             for pattern in patterns {
-                if vocab.contains_key(*pattern) {
-                    return Some(pattern.to_string());
+                if vocab.contains_key(pattern) {
+                    return Some(pattern.clone());
                 }
             }
             None
@@ -191,14 +206,43 @@ impl HuggingFaceTokenizer {
             .map(|(_id, token)| token.content.clone())
             .collect();
 
+        let mut potential_bos_tokens: Vec<String> = vec!["<s>", "<|startoftext|>", "<BOS>", "[CLS]"].into_iter().map(String::from).collect();
+        let mut potential_eos_tokens: Vec<String> = vec!["</s>", "<|endoftext|>", "<EOS>", "[SEP]"].into_iter().map(String::from).collect();
+        let mut potential_unk_tokens: Vec<String> = vec!["<unk>", "<UNK>", "[UNK]"].into_iter().map(String::from).collect();
+        let mut potential_sep_tokens: Vec<String> = vec!["[SEP]", "<sep>", "<SEP>"].into_iter().map(String::from).collect();
+        let mut potential_pad_tokens: Vec<String> = vec!["<pad>", "<PAD>", "[PAD]"].into_iter().map(String::from).collect();
+        let mut potential_cls_tokens: Vec<String> = vec!["[CLS]", "<cls>", "<CLS>"].into_iter().map(String::from).collect();
+        let mut potential_mask_tokens: Vec<String> = vec!["[MASK]", "<mask>", "<MASK>"].into_iter().map(String::from).collect();
+
+        let config = if let Some(tokenizer_path) = tokenizer_path {
+            Self::load_config(tokenizer_path).unwrap_or_else(|| serde_json::json!({}))
+        } else {
+            serde_json::json!({})
+        };
+
+        // Respect config file settings
+        let prepend_from_config = |key: &str, tokens: &mut Vec<String>| {
+            if let Some(token) = config.get(key).and_then(|v| v.as_str().map(String::from)) {
+                tokens.insert(0, token);
+            }
+        };
+
+        prepend_from_config("bos_token", &mut potential_bos_tokens);
+        prepend_from_config("eos_token", &mut potential_eos_tokens);
+        prepend_from_config("unk_token", &mut potential_unk_tokens);
+        prepend_from_config("sep_token", &mut potential_sep_tokens);
+        prepend_from_config("pad_token", &mut potential_pad_tokens);
+        prepend_from_config("cls_token", &mut potential_cls_tokens);
+        prepend_from_config("mask_token", &mut potential_mask_tokens);
+
         SpecialTokens {
-            bos_token: find_token(&["<s>", "<|startoftext|>", "<BOS>", "[CLS]"]),
-            eos_token: find_token(&["</s>", "<|endoftext|>", "<EOS>", "[SEP]"]),
-            unk_token: find_token(&["<unk>", "<UNK>", "[UNK]"]),
-            sep_token: find_token(&["[SEP]", "<sep>", "<SEP>"]),
-            pad_token: find_token(&["<pad>", "<PAD>", "[PAD]"]),
-            cls_token: find_token(&["[CLS]", "<cls>", "<CLS>"]),
-            mask_token: find_token(&["[MASK]", "<mask>", "<MASK>"]),
+            bos_token: find_token(&potential_bos_tokens),
+            eos_token: find_token(&potential_eos_tokens),
+            unk_token: find_token(&potential_unk_tokens),
+            sep_token: find_token(&potential_sep_tokens),
+            pad_token: find_token(&potential_pad_tokens),
+            cls_token: find_token(&potential_cls_tokens),
+            mask_token: find_token(&potential_mask_tokens),
             additional_special_tokens,
         }
     }
@@ -209,16 +253,8 @@ impl HuggingFaceTokenizer {
         tokenizer_path: &str,
     ) -> (Option<String>, Option<bool>, Option<bool>) {
         (|| {
-            let path = std::path::Path::new(tokenizer_path);
-            let config_path = path.parent()?.join("tokenizer_config.json");
-
-            if !config_path.exists() {
-                return None;
-            }
-
-            let config_str = config_path.to_str()?;
-            let content = std::fs::read_to_string(&config_path).ok()?;
-            let config: serde_json::Value = serde_json::from_str(&content).ok()?;
+            let config = Self::load_config(tokenizer_path)?;
+            let config_str = config.get("file_path").and_then(|v| v.as_str())?;
 
             let chat_template = super::chat_template::load_chat_template_from_config(config_str)
                 .ok()
