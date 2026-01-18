@@ -860,7 +860,9 @@ class ImageData:
     max_dynamic_patch: Optional[int] = None
 
 
-def _parse_media_allowlist(raw_value: str) -> tuple[set[str], list[ipaddress._BaseNetwork]]:
+def _parse_media_allowlist(
+    raw_value: str,
+) -> tuple[set[str], list[ipaddress._BaseNetwork]]:
     hosts: set[str] = set()
     networks: list[ipaddress._BaseNetwork] = []
     for entry in (raw_value or "").split(","):
@@ -1098,7 +1100,9 @@ def load_video(video_file: Union[str, bytes], use_gpu: bool = True):
                         for chunk in response.iter_content(chunk_size=8192):
                             total += len(chunk)
                             if total > policy["max_bytes"]:
-                                raise ValueError("Remote content exceeds max size limit")
+                                raise ValueError(
+                                    "Remote content exceeds max size limit"
+                                )
                             tmp_file.write(chunk)
                     finally:
                         tmp_file.close()
