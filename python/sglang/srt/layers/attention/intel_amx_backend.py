@@ -23,9 +23,18 @@ class IntelAMXAttnBackend(AttentionBackend):
         self.num_head = (
             model_runner.model_config.num_attention_heads // model_runner.tp_size
         )
-
-        self.v_head_dim = model_runner.token_to_kv_pool.get_value_buffer(0).shape[-1]
-
+        # [NB]: `layer_id` set to 0 for qwen3-next models, as not all attn layers require kv pool
+        # using "full_attention_layer_id_mapping" to map which layer needs kv pool
+        layer_id = 0
+        if hasattr(model_runner.token_to_kv_pool, "full_attention_layer_id_mapping"):
+            layer_id = [*model_runner.token_to_kv_pool.full_attention_layer_id_mapping][
+                0
+            ]
+        v_buffer = model_runner.token_to_kv_pool.get_value_buffer(layer_id)
+        if isinstance(v_buffer, tuple):
+            self.v_head_dim = v_buffer[0].shape[-1]
+        else:
+            self.v_head_dim = v_buffer.shape[-1]
         self.decode_attention_fwd = torch.ops.sgl_kernel.decode_attention_cpu
         self.extend_attention_fwd = torch.ops.sgl_kernel.extend_attention_cpu
 
@@ -73,13 +82,27 @@ class IntelAMXAttnBackend(AttentionBackend):
 
         _, max_extend_len = self.forward_metadata
 
+        key_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        value_buffer = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
+        key_buf1, value_buf1 = (
+            (key_buffer[1], value_buffer[1])
+            if isinstance(key_buffer, tuple)
+            else (None, None)
+        )
+        key_buf0, value_buf0 = (
+            (key_buffer[0], value_buffer[0])
+            if isinstance(key_buffer, tuple)
+            else (key_buffer, value_buffer)
+        )
         self.extend_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             k,
             v,
             o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-            forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
-            forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
+            key_buf0,
+            value_buf0,
+            key_buf1,
+            value_buf1,
             forward_batch.req_to_token_pool.req_to_token,
             forward_batch.req_pool_indices,
             forward_batch.seq_lens,
@@ -108,11 +131,24 @@ class IntelAMXAttnBackend(AttentionBackend):
             o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
         else:
             o = torch.empty_like(q)
-
+        key_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        value_buffer = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
+        key_buf1, value_buf1 = (
+            (key_buffer[1], value_buffer[1])
+            if isinstance(key_buffer, tuple)
+            else (None, None)
+        )
+        key_buf0, value_buf0 = (
+            (key_buffer[0], value_buffer[0])
+            if isinstance(key_buffer, tuple)
+            else (key_buffer, value_buffer)
+        )
         self.decode_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-            forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
-            forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
+            key_buf0,
+            value_buf0,
+            key_buf1,
+            value_buf1,
             o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
             k,
             v,
