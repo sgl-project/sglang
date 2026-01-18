@@ -54,19 +54,6 @@ class Qwen3CoderDetector(BaseFormatDetector):
         # Initialize attributes that were missing in the original PR
         self.current_func_name: Optional[str] = None
 
-    def _reset_streaming_state(self):
-        """Reset internal streaming cursors."""
-        self.parsed_pos = 0
-        self.current_tool_param_count = 0
-        self.json_started = False
-        self.is_inside_tool_call = False  # [FIX] Reset state
-
-        # Base class state reset is handled by base class logic mostly,
-        # but we ensure our cursor aligns with buffer resets.
-        # _buffer is always present from base class, no need for hasattr check
-        if not self._buffer:
-            self.parsed_pos = 0
-
     def has_tool_call(self, text: str) -> bool:
         return self.tool_call_start_token in text
 

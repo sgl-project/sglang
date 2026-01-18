@@ -1964,46 +1964,6 @@ class TestQwen3CoderDetector(unittest.TestCase):
         self.assertFalse(self.detector.has_tool_call("plain text only"))
         self.assertFalse(self.detector.has_tool_call(""))
 
-    # ==================== Streaming State Management ====================
-
-    def test_streaming_state_reset(self):
-        """
-        Test that streaming state is properly managed across calls.
-
-        Scenario: Multiple separate streaming sessions.
-        Purpose: Verify state doesn't leak between sessions.
-        """
-        detector = Qwen3CoderDetector()
-
-        # First session
-        result1 = detector.parse_streaming_increment("<tool_call>", self.tools)
-        result2 = detector.parse_streaming_increment(
-            "<function=get_current_weather>", self.tools
-        )
-        result3 = detector.parse_streaming_increment(
-            "<parameter=location>NYC</parameter>", self.tools
-        )
-        result4 = detector.parse_streaming_increment("</function>", self.tools)
-        result5 = detector.parse_streaming_increment("</tool_call>", self.tools)
-
-        # Reset for new session
-        detector._reset_streaming_state()
-
-        # Second session should work independently
-        result6 = detector.parse_streaming_increment("<tool_call>", self.tools)
-        result7 = detector.parse_streaming_increment(
-            "<function=sql_interpreter>", self.tools
-        )
-        result8 = detector.parse_streaming_increment(
-            "<parameter=query>SELECT 1</parameter>", self.tools
-        )
-        result9 = detector.parse_streaming_increment("</function>", self.tools)
-        result10 = detector.parse_streaming_increment("</tool_call>", self.tools)
-
-        # Both sessions should produce valid results
-        self.assertIsInstance(result1, StreamingParseResult)
-        self.assertIsInstance(result6, StreamingParseResult)
-
 
 class TestGlm4MoeDetector(unittest.TestCase):
     def setUp(self):
