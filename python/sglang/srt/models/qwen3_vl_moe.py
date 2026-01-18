@@ -50,19 +50,40 @@ class Qwen3MoeLLMModel(Qwen3MoeModel):
         # This approach follows the original implementation.
         # TODO: make config of type Qwen3VLMoeConfig, so that we can directly obtain deepstack_visual_indexes.
         self.deepstack_embed_to_decoder_layer = range(3)
+        self.deepstack_embeds_buffer = None
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.embed_tokens
 
     def get_deepstack_embeds(
-        self, layer_idx: int, input_deepstack_embeds: Optional[torch.Tensor]
+        self,
+        layer_idx: int,
+        input_deepstack_embeds: Optional[torch.Tensor],
+        seq_len: int,
     ) -> Optional[torch.Tensor]:
-        """Get deepstack embeddings for a given layer index, or None if not applicable."""
-        if (
-            input_deepstack_embeds is None
-            or layer_idx not in self.deepstack_embed_to_decoder_layer
-        ):
+        if layer_idx not in self.deepstack_embed_to_decoder_layer:
             return None
+        if input_deepstack_embeds is None:
+            device = next(self.parameters()).device
+            dtype = next(self.parameters()).dtype
+            total = self.hidden_size * len(self.deepstack_embed_to_decoder_layer)
+            if (
+                self.deepstack_embeds_buffer is None
+                or self.deepstack_embeds_buffer.size(0) < seq_len
+            ):
+                new_len = max(
+                    seq_len,
+                    (
+                        self.deepstack_embeds_buffer.size(0) * 2
+                        if self.deepstack_embeds_buffer is not None
+                        else seq_len
+                    ),
+                )
+                self.deepstack_embeds_buffer = torch.zeros(
+                    new_len, total, dtype=dtype, device=device
+                ).contiguous()
+            sep = self.hidden_size * layer_idx
+            return self.deepstack_embeds_buffer[:seq_len, sep : sep + self.hidden_size]
         sep = self.hidden_size * layer_idx
         return input_deepstack_embeds[:, sep : sep + self.hidden_size]
 
@@ -102,7 +123,7 @@ class Qwen3MoeLLMModel(Qwen3MoeModel):
             # The order matters because addition with different tensors is not associative in practice.
             # Deepstack for prev_layer is applied at the start of current layer via post_residual_addition.
             deepstack_embeds = self.get_deepstack_embeds(
-                layer_idx - 1, input_deepstack_embeds
+                layer_idx - 1, input_deepstack_embeds, hidden_states.shape[0]
             )
             hidden_states, residual = layer(
                 positions,
@@ -114,7 +135,7 @@ class Qwen3MoeLLMModel(Qwen3MoeModel):
 
         # Handle deepstack for the last processed layer if it exists.
         last_deepstack = self.get_deepstack_embeds(
-            self.end_layer - 1, input_deepstack_embeds
+            self.end_layer - 1, input_deepstack_embeds, hidden_states.shape[0]
         )
 
         if not self.pp_group.is_last_rank:
