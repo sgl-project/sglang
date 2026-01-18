@@ -447,6 +447,8 @@ class ModelConfig:
                     ):
                         setattr(self.hf_text_config, "head_dim", self.head_dim)
 
+            elif "BaichuanForCausalLM" in self.hf_config.architectures:
+                self.use_alibi = True if self.hf_config.hidden_size !=4096 else False
             self.attention_arch = AttentionArch.MHA
 
         self.num_attention_heads = self.hf_text_config.num_attention_heads
