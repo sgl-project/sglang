@@ -123,50 +123,66 @@ __global__ void load_cache_hash_kernel(
     }
     __syncthreads();
     
-    // ===== Phase 3: Scan buffer with warp-cooperative collection =====
-    // Each warp processes chunks of the buffer
-    // Uses ballot + prefix sum to collect evictable slots (one atomicAdd per warp, not per slot)
-    for (int base_slot = warp_id * WARP_SIZE; base_slot < HOT_BUFFER_SIZE; base_slot += NUM_WARPS * WARP_SIZE) {
-        int slot = base_slot + lane_id;
-        bool valid_slot = (slot < HOT_BUFFER_SIZE);
-        int32_t token = valid_slot ? device_buffer_tokens[slot] : -1;
-        bool is_hit = false;
+    // ===== Phase 3: Scan buffer with FULLY warp-cooperative lookup =====
+    // Each warp processes ONE buffer slot at a time
+    // All 32 lanes cooperate on hash lookup → consecutive accesses → NO bank conflicts
+    // Evictable slots written directly to s_evictable_slots with one atomicAdd per slot
+    // (We need at most NUM_TOP_K evictable slots, so we can stop early)
+    
+    // Each warp processes buffer slots sequentially (but lookup is parallel within warp)
+    for (int slot = warp_id; slot < HOT_BUFFER_SIZE; slot += NUM_WARPS) {
+        // Early exit if we have enough evictable slots
+        if (s_num_evictable >= NUM_TOP_K) break;
         
-        if (token >= 0 && valid_slot) {
-            // Lookup token in hash table - O(1) average
-            uint32_t hash = static_cast<uint32_t>(token) % HASH_SIZE;
+        int32_t token = device_buffer_tokens[slot];
+        bool is_hit = false;
+        int top_k_idx = -1;
+        
+        if (token >= 0) {
+            uint32_t base_hash = static_cast<uint32_t>(token) % HASH_SIZE;
             
-            while (s_hash_keys[hash] != -1) {
-                if (s_hash_keys[hash] == token) {
-                    int top_k_idx = s_hash_vals[hash];
-                    s_hit_slots[top_k_idx] = slot;
+            // Warp-cooperative hash lookup - ALL lanes search in parallel
+            // Consecutive lanes access consecutive slots → NO bank conflicts
+            for (int probe = 0; probe < HASH_SIZE; probe += WARP_SIZE) {
+                uint32_t h = (base_hash + probe + lane_id) % HASH_SIZE;
+                int32_t key = s_hash_keys[h];  // Conflict-free read!
+                
+                bool found = (key == token);
+                bool empty = (key == -1);
+                
+                unsigned int found_mask = __ballot_sync(0xFFFFFFFF, found);
+                unsigned int empty_mask = __ballot_sync(0xFFFFFFFF, empty);
+                
+                if (found_mask != 0) {
+                    // Token found in hash table - this is a HIT
+                    int found_lane = __ffs(found_mask) - 1;
+                    uint32_t found_h = (base_hash + probe + found_lane) % HASH_SIZE;
+                    top_k_idx = s_hash_vals[found_h];
                     is_hit = true;
                     break;
                 }
-                hash = (hash + 1) % HASH_SIZE;
+                
+                if (empty_mask != 0) {
+                    // Hit an empty slot before finding token - token not in hash table
+                    break;
+                }
             }
         }
         
-        // Warp-cooperative evictable slot collection
-        bool is_evictable = valid_slot && !is_hit;
-        unsigned int evict_mask = __ballot_sync(0xFFFFFFFF, is_evictable);
+        // Record hit (conflict-free: each top_k_idx is unique)
+        if (is_hit && lane_id == 0) {
+            s_hit_slots[top_k_idx] = slot;
+        }
         
-        if (evict_mask != 0) {
-            int evict_count = __popc(evict_mask);
-            int my_prefix = __popc(evict_mask & ((1u << lane_id) - 1));
-            
-            // One atomicAdd per warp (not per thread)
-            int warp_offset;
-            if (lane_id == 0) {
-                warp_offset = atomicAdd(&s_num_evictable, evict_count);
-            }
-            warp_offset = __shfl_sync(0xFFFFFFFF, warp_offset, 0);
-            
-            // Write evictable slots using prefix sum
-            if (is_evictable && warp_offset + my_prefix < NUM_TOP_K) {
-                s_evictable_slots[warp_offset + my_prefix] = slot;
+        // Collect evictable slot - one atomicAdd per evictable slot (not per warp chunk)
+        // This is acceptable because evictable slots are typically sparse
+        if (!is_hit && lane_id == 0) {
+            int idx = atomicAdd(&s_num_evictable, 1);
+            if (idx < NUM_TOP_K) {
+                s_evictable_slots[idx] = slot;
             }
         }
+        __syncwarp();
     }
     __syncthreads();
     
