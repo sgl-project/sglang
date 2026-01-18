@@ -2,7 +2,8 @@ import unittest
 
 from sglang.srt.utils import is_blackwell
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
-from sglang.test.mamba_scheduler_strategy_test_utils import MambaSchedulerStrategyMixin
+from sglang.test.kits.kl_divergence_kit import KLDivergenceMixin
+from sglang.test.kits.prefix_cache_branching_kit import PrefixCacheBranchingMixin
 from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 
 NVIDIA_NEMOTRON_NANO_V2_MODEL = "nvidia/NVIDIA-Nemotron-Nano-9B-v2"
@@ -21,9 +22,10 @@ class TestNvidiaNemotronNanoV2BF16PP(GSM8KMixin, DefaultServerBase):
 
 
 class TestNvidiaNemotronNanoV2BF16ExtraBuffer(
-    GSM8KMixin, MambaSchedulerStrategyMixin, DefaultServerBase
+    GSM8KMixin, KLDivergenceMixin, PrefixCacheBranchingMixin, DefaultServerBase
 ):
     model = NVIDIA_NEMOTRON_NANO_V2_MODEL
+    cache_chunk_size = 256
     gsm8k_accuracy_thres = 0.87
     kl_div_thres = 0.008
     other_args = [
@@ -32,21 +34,6 @@ class TestNvidiaNemotronNanoV2BF16ExtraBuffer(
         "--mamba-scheduler-strategy",
         "extra_buffer",
     ]
-
-    def test_input_output_logprobs_match_prefill_cache_hit(self):
-        self._test_input_output_logprobs_match_prefill_cache_hit_helper(
-            max_samples=32,
-            max_new_tokens=512,
-        )
-
-    def test_input_output_logprobs_match_decode_cache_hit(self):
-        self._test_input_output_logprobs_match_decode_cache_hit_helper(
-            max_samples=32,
-            max_new_tokens=512,
-        )
-
-    def test_prefix_cache_branching(self):
-        self._test_prefix_cache_branching_helper(256)
 
 
 class TestNvidiaNemotronNanoV2FP8(GSM8KMixin, DefaultServerBase):
