@@ -443,6 +443,12 @@ class Envs:
     # TokenizerManager
     SGLANG_REQUEST_STATE_WAIT_TIMEOUT = EnvInt(4)
 
+    # Attention
+    SGLANG_USE_PAGED_ATTENTION = EnvBool(False)
+
+    # MoE dual stream
+    SGLANG_MOE_USE_DUAL_STREAM = EnvBool(False)
+
     # fmt: on
 
 
