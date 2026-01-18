@@ -235,6 +235,7 @@ pub async fn add_tokenizer(context: &Arc<AppContext>, request: AddTokenizerReque
         source: request.source.clone(),
         chat_template_path: request.chat_template_path.clone(),
         cache_config: None,
+        fail_on_duplicate: true,
     };
 
     let job = Job::AddTokenizer {
