@@ -12,8 +12,6 @@ from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_extend_npu_graph_r
 from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_npu_graph_runner import (
     EAGLEDraftNpuGraphRunner,
 )
-from sglang.srt.layers.attention.triton_backend import TritonMultiStepDraftBackend
-from sglang.srt.layers.dp_attention import get_attention_tp_group
 from sglang.srt.layers.moe.utils import (
     speculative_moe_a2a_backend_context,
     speculative_moe_backend_context,
@@ -35,6 +33,8 @@ from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.eagle_info_v2 import (
     assign_extend_cache_locs,
+    build_compact_kv_src_tgt_cache_loc,
+    compact_data_tensors_func,
     fill_accepted_out_cache_loc,
     fill_new_verified_id,
 )
@@ -53,11 +53,14 @@ from sglang.srt.utils.common import (
     fast_topk,
     get_available_gpu_memory,
     is_cuda,
+    is_hip,
     is_npu,
     next_power_of_2,
 )
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 
+_is_cuda = is_cuda()
+_is_hip = is_hip()
 _is_npu = is_npu()
 _is_cuda = is_cuda()
 
@@ -119,15 +122,11 @@ class EagleDraftWorker(BaseDraftWorker):
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
             target_worker.get_memory_pool()
         )
-
-        # Init draft worker
-        if server_args.enable_dp_attention and self.speculative_algorithm.is_eagle3():
-            ctx = draft_tp_context(get_attention_tp_group())
-        else:
-            ctx = empty_context()
         with (
-            ctx
-        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+            empty_context(),
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+        ):
             # Init draft worker
             self.draft_worker = TpModelWorker(
                 server_args=server_args,
@@ -160,9 +159,21 @@ class EagleDraftWorker(BaseDraftWorker):
         self.draft_tp_context = (
             draft_tp_context if server_args.enable_dp_attention else empty_context
         )
-        with self.draft_tp_context(
-            self.draft_runner.tp_group
-        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+        # Set eagle_use_aux_hidden_state for EAGLE3 (needed by cuda graph runner)
+        self.eagle_use_aux_hidden_state = False
+        if self.speculative_algorithm.is_eagle3():
+            self.eagle_use_aux_hidden_state = True
+            eagle_config = getattr(
+                self.draft_runner.model_config.hf_config, "eagle_config", {}
+            )
+            self.eagle_use_aux_hidden_state = eagle_config.get(
+                "use_aux_hidden_state", True
+            )
+        with (
+            self.draft_tp_context(self.draft_runner.tp_group),
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+        ):
             self.init_attention_backend()
             self.init_cuda_graphs()
 
@@ -270,14 +281,10 @@ class EagleDraftWorker(BaseDraftWorker):
             "cuda": EAGLEDraftExtendCudaGraphRunner,
         }
         # Capture extend
-        # TODO: support draft extend cuda graph for more attention backends
-        if self.draft_extend_attn_backend and (
-            _is_npu
-            or (
-                _is_cuda
-                and isinstance(self.draft_attn_backend, TritonMultiStepDraftBackend)
-            )
-        ):
+        # Option A: CUDA graphs + Plan Stream overlap are now compatible.
+        # replay_prepare_metadata() runs on Plan Stream (overlapped with verify),
+        # replay_prepare_data() runs on Main Stream after wait_stream().
+        if self.draft_extend_attn_backend and (_is_cuda or _is_npu):
             tic = time.perf_counter()
             before_mem = get_available_gpu_memory(self.device, self.gpu_id)
             logger.info(
@@ -540,8 +547,14 @@ class EagleDraftWorker(BaseDraftWorker):
             and self.cuda_graph_runner_for_draft_extend.can_run(forward_batch)
         )
         if can_cuda_graph:
+            # Option A: Phase 2 - copy data that depends on Verify output
+            # (hidden_states, input_ids, accept_length)
+            # Phase 1 (replay_prepare_metadata) was already run on Plan Stream
+            self.cuda_graph_runner_for_draft_extend.replay_prepare_data(
+                forward_batch, accept_length=batch_result.accept_lens
+            )
             draft_logits_output = self.cuda_graph_runner_for_draft_extend.replay(
-                forward_batch
+                forward_batch, skip_prepare=True
             )
         else:
             draft_logits_output = self.draft_runner.forward(
@@ -634,6 +647,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
             model_worker_batch.forward_mode.is_extend()
             or model_worker_batch.is_extend_in_batch
         ):
+            # Wait for Plan Stream from previous request before starting new prefill.
+            # The previous request's Plan Stream may still be accessing shared data
+            # structures (req_to_token, kv_indices) when we start a new request.
+            if self.plan_stream is not None:
+                torch.cuda.current_stream().wait_stream(self.plan_stream)
+
             # Target prefill
             model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
             batch_output = self.target_worker.forward_batch_generation(
@@ -642,9 +661,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
             # Draft prefill
             model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
-            with self.draft_worker.draft_tp_context(
-                self.draft_worker.draft_runner.tp_group
-            ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+            with (
+                speculative_moe_backend_context(),
+                speculative_moe_a2a_backend_context(),
+            ):
                 batch_output.next_draft_input = (
                     self.draft_worker._draft_extend_for_prefill(
                         model_worker_batch,
@@ -662,24 +682,32 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     topk=self.topk,
                     capture_hidden_mode=CaptureHiddenMode.LAST,
                 )
-            with self.draft_worker.draft_tp_context(
-                self.draft_worker.draft_runner.tp_group
-            ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+
+            with (
+                speculative_moe_backend_context(),
+                speculative_moe_a2a_backend_context(),
+            ):
                 verify_input: EagleVerifyInput = self.draft_worker.draft(
                     model_worker_batch
                 )
+
             assert verify_input.is_verify_input()
             model_worker_batch.spec_info = verify_input
+
             batch_output = self.verify(model_worker_batch)
-            with self.draft_worker.draft_tp_context(
-                self.draft_worker.draft_runner.tp_group
-            ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+
+            with (
+                speculative_moe_backend_context(),
+                speculative_moe_a2a_backend_context(),
+            ):
                 self.draft_worker._draft_extend_for_decode(
                     model_worker_batch, batch_output
                 )
+
             return batch_output
 
     def verify(self, batch: ModelWorkerBatch):
+        """Run target model verification and handle tree mode compaction."""
         # Since batch.seq_lens is allocated in another stream, we need
         # record_stream() to prevent pytorch gc and reuse the gpu memory
         # while forward_stream is still running.
@@ -766,32 +794,88 @@ class EAGLEWorkerV2(BaseSpecWorker):
             accept_length,
             accept_index,
         ) = verify_input.sample(batch, logits_output, vocab_mask)
-        new_seq_lens = batch.seq_lens + accept_length
-        verify_done = torch.get_device_module(self.device).Event()
-        verify_done.record()
 
         if not batch.forward_mode.is_idle():
             all_verified_id = predict[accept_index]
+
             verified_id = torch.empty_like(accept_length, dtype=torch.int32)
             fill_new_verified_id[(bs,)](
                 all_verified_id,
                 accept_length,
                 verified_id,
-                self.speculative_num_draft_tokens,
+                self.speculative_num_steps + 1,
             )
+
+            is_tree_mode = self.topk > 1
+
+            if is_tree_mode:
+                # Tree mode requires CUDA/HIP for Triton kernels
+                if not (_is_cuda or _is_hip):
+                    raise RuntimeError(
+                        "Tree mode speculative decoding (topk > 1) requires CUDA or HIP."
+                    )
+
+                # Compact accepted KV cache to the front of the per-request
+                # speculative region so subsequent decode reads contiguous KV.
+                accept_index_len = self.speculative_num_steps + 1
+                src_cache_loc = torch.empty(
+                    (bs * accept_index_len,),
+                    dtype=batch.out_cache_loc.dtype,
+                    device=batch.out_cache_loc.device,
+                )
+                tgt_cache_loc = torch.empty_like(src_cache_loc)
+                build_compact_kv_src_tgt_cache_loc[(bs,)](
+                    accept_index,
+                    accept_length,
+                    batch.out_cache_loc,
+                    src_cache_loc,
+                    tgt_cache_loc,
+                    self.speculative_num_draft_tokens,
+                    accept_index_len,
+                    next_power_of_2(accept_index_len),
+                )
+                self.token_to_kv_pool_allocator.get_kvcache().move_kv_cache(
+                    tgt_loc=tgt_cache_loc,
+                    src_loc=src_cache_loc,
+                )
+
+                # Compact scattered acceptance to prefix
+                (
+                    padded_predict,
+                    packed_hidden,
+                    _packed_cache,  # Not used - KV compaction done via move_kv_cache
+                ) = compact_data_tensors_func(
+                    accept_index,
+                    accept_length,
+                    self.speculative_num_draft_tokens,
+                    predict,
+                    logits_output.hidden_states,
+                    batch.out_cache_loc,
+                )
+
+                logits_output.hidden_states = packed_hidden
+                output_predict = padded_predict
+            else:
+                # Chain mode: no compaction needed
+                output_predict = predict
         else:
             verified_id = torch.empty((0,), device=self.device, dtype=torch.int32)
+            output_predict = predict
 
-        # Construct the next draft input
+        new_seq_lens = batch.seq_lens + accept_length
+        verify_done = torch.get_device_module(self.device).Event()
+        verify_done.record()
+
         next_draft_input = EagleDraftInput(
             verified_id=verified_id,
             new_seq_lens=new_seq_lens,
             verify_done=verify_done,
+            hidden_states=None,
         )
 
         return GenerationBatchResult(
             logits_output=logits_output,
-            next_token_ids=predict,
+            next_token_ids=output_predict,
             can_run_cuda_graph=can_run_cuda_graph,
             next_draft_input=next_draft_input,
             accept_lens=accept_length,

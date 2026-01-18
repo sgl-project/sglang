@@ -2237,6 +2237,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_indices=self.mamba_track_indices,
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,
+            device=self.input_ids.device if self.input_ids is not None else None,
         )
 
     def copy(self):
@@ -2345,9 +2346,12 @@ class ModelWorkerBatch:
 
     spec_info: Optional[SpecInput] = None
 
+    hicache_consumer_index: int = -1
+
     # If set, the output of the batch contains the hidden states of the run.
     capture_hidden_mode: CaptureHiddenMode = None
-    hicache_consumer_index: int = -1
+    # Device
+    device: Optional[torch.device] = None
 
     # For matryoshka embeddings
     dimensions: Optional[list[int]] = None

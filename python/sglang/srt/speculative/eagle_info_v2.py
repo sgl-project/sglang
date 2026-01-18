@@ -203,8 +203,13 @@ class EagleDraftInputV2Mixin:
         )
         forward_batch = ForwardBatch.init_new(batch, draft_model_runner)
         can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run(forward_batch)
-        if not batch.forward_mode.is_idle() and not can_cuda_graph:
-            draft_model_runner.attn_backend.init_forward_metadata(forward_batch)
+        if not batch.forward_mode.is_idle():
+            if can_cuda_graph:
+                # Option A: Run Phase 1 on Plan Stream (FlashInfer plan + metadata)
+                # Phase 2 (data copy) runs on Main Stream after wait_stream()
+                cuda_graph_runner.replay_prepare_metadata(forward_batch)
+            else:
+                draft_model_runner.attn_backend.init_forward_metadata(forward_batch)
         return forward_batch
 
 
@@ -371,6 +376,7 @@ class EagleVerifyInputV2Mixin:
 
         # Include the bonus token
         accept_length.add_(1)
+
         return predict, accept_length, accept_index
 
 
@@ -407,6 +413,102 @@ def fill_accepted_out_cache_loc(
     if src > -1:
         value = tl.load(out_cache_loc + src)
         tl.store(accepted_out_cache_loc + dst, value)
+
+
+@triton.jit
+def build_compact_kv_src_tgt_cache_loc(
+    accept_index,
+    accept_lens,
+    out_cache_loc,
+    src_cache_loc,
+    tgt_cache_loc,
+    draft_token_num: tl.constexpr,
+    accept_index_len: tl.constexpr,
+    accept_index_upper: tl.constexpr,
+):
+    """
+    Build (src_cache_loc, tgt_cache_loc) pairs to compact accepted KV cache to the
+    front of the per-request verify slots without any dynamic allocation.
+
+    Layout:
+    - accept_index: [bs, accept_index_len] (padded with -1)
+    - out_cache_loc: [bs, draft_token_num]
+    - src/tgt_cache_loc: [bs, accept_index_len]
+
+    For each request i and position j in [0, accept_index_len):
+    - tgt = out_cache_loc[i, j]
+    - src = out_cache_loc[accept_index[i, j]] if j < accept_lens[i] and accept_index[i, j] >= 0
+      else tgt (no-op copy)
+    """
+    bid = tl.program_id(axis=0)
+    offsets = tl.arange(0, accept_index_upper)
+    mask = offsets < accept_index_len
+
+    accept_len = tl.load(accept_lens + bid)
+
+    tgt_pos = bid * draft_token_num + offsets
+    tgt_vals = tl.load(out_cache_loc + tgt_pos, mask=mask, other=0)
+    src_vals = tgt_vals
+
+    acc_idx = tl.load(
+        accept_index + bid * accept_index_len + offsets, mask=mask, other=-1
+    )
+    copy_mask = mask & (offsets < accept_len) & (acc_idx >= 0)
+    src_candidate = tl.load(out_cache_loc + acc_idx, mask=copy_mask, other=0)
+    src_vals = tl.where(copy_mask, src_candidate, src_vals)
+
+    out_pos = bid * accept_index_len + offsets
+    tl.store(src_cache_loc + out_pos, src_vals, mask=mask)
+    tl.store(tgt_cache_loc + out_pos, tgt_vals, mask=mask)
+
+
+@triton.jit
+def compact_data_tensors_kernel(
+    accept_index,
+    accept_length,
+    predict,
+    hidden_states,
+    out_cache_loc,
+    out_predict,
+    out_hidden,
+    out_cache,
+    stride: tl.constexpr,
+    max_accept: tl.constexpr,
+    hidden_dim: tl.constexpr,
+):
+    """Compact predict, hidden_states, and out_cache_loc into fixed-stride buffers."""
+    BLOCK_H: tl.constexpr = 128
+    pid = tl.program_id(axis=0)
+    acc_len = tl.load(accept_length + pid)
+
+    accept_row = accept_index + pid * max_accept
+    out_base = pid * stride
+
+    for col in tl.static_range(max_accept):
+        if col < acc_len:
+            src_idx = tl.load(accept_row + col)
+            # Skip -1 padding to avoid OOB access
+            if src_idx >= 0:
+                dst_idx = out_base + col
+
+                tok = tl.load(predict + src_idx)
+                tl.store(out_predict + dst_idx, tok)
+
+                cache_loc = tl.load(out_cache_loc + src_idx)
+                tl.store(out_cache + dst_idx, cache_loc)
+
+                # Blocked copy over hidden dimension
+                for h_start in tl.static_range(0, hidden_dim, BLOCK_H):
+                    h_offsets = h_start + tl.arange(0, BLOCK_H)
+                    h_mask = h_offsets < hidden_dim
+                    h_vals = tl.load(
+                        hidden_states + src_idx * hidden_dim + h_offsets, mask=h_mask
+                    )
+                    tl.store(
+                        out_hidden + dst_idx * hidden_dim + h_offsets,
+                        h_vals,
+                        mask=h_mask,
+                    )
 
 
 @triton.jit
@@ -486,3 +588,48 @@ def assign_extend_cache_locs_func(
         )
 
         return out_cache_loc
+
+
+def compact_data_tensors_func(
+    accept_index: torch.Tensor,
+    accept_length: torch.Tensor,
+    tree_size: int,
+    predict: torch.Tensor,
+    hidden_states: torch.Tensor,
+    out_cache_loc: torch.Tensor,
+):
+    """Compact scattered acceptance into prefix form using fused Triton kernel."""
+    bs = accept_index.shape[0]
+    max_accept = accept_index.shape[1]
+    stride = tree_size
+    hidden_dim = hidden_states.shape[-1]
+
+    assert stride >= max_accept, "tree_size must be >= max accepted tokens"
+
+    packed_predict = torch.zeros(
+        (bs * stride,), device=predict.device, dtype=predict.dtype
+    )
+    packed_hidden = torch.zeros(
+        (bs * stride, hidden_dim),
+        device=hidden_states.device,
+        dtype=hidden_states.dtype,
+    )
+    packed_cache = torch.zeros(
+        (bs * stride,), device=out_cache_loc.device, dtype=out_cache_loc.dtype
+    )
+
+    compact_data_tensors_kernel[(bs,)](
+        accept_index,
+        accept_length,
+        predict,
+        hidden_states,
+        out_cache_loc,
+        packed_predict,
+        packed_hidden,
+        packed_cache,
+        stride=stride,
+        max_accept=max_accept,
+        hidden_dim=hidden_dim,
+    )
+
+    return packed_predict, packed_hidden, packed_cache
