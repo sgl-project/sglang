@@ -304,6 +304,27 @@
             "expected_avg_denoise_ms": 520.09,
             "expected_median_denoise_ms": 528.0
         },
+        "flux_2_klein_image_t2i": {
+            "stages_ms": {
+                "InputValidationStage": 0.05,
+                "TextEncodingStage": 530.93,
+                "ImageVAEEncodingStage": 0.0,
+                "ConditioningStage": 0.02,
+                "LatentPreparationStage": 12.71,
+                "TimestepPreparationStage": 2.91,
+                "DenoisingStage": 2112.24,
+                "DecodingStage": 489.8
+            },
+            "denoise_step_ms": {
+                "0": 511.3,
+                "1": 541.19,
+                "2": 518.93,
+                "3": 541.2
+            },
+            "expected_e2e_ms": 3148.75,
+            "expected_avg_denoise_ms": 528.06,
+            "expected_median_denoise_ms": 526.56
+        },
         "flux_2_image_t2i_layerwise_offload": {
             "stages_ms": {
                 "InputValidationStage": 0.06,
