@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euxo pipefail
 
-SUDO=$(command -v sudo)
+SUDO=$(command -v sudo || true)
 $SUDO apt-get update
 $SUDO apt-get install -y libssl-dev pkg-config protobuf-compiler redis-server
 
