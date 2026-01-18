@@ -1134,7 +1134,7 @@ def _rms_norm_tiled_onepass(
     x = tl.load(x_blk, mask=mask, other=0.0).to(tl.float32)
     mean_square = tl.sum(x * x, axis=1, keep_dims=True) / DIM
     rstd = tl.math.rsqrt(mean_square + EPS)
-    w = tl.load(w_ptr + d_offset, mask=mask)
+    w = tl.load(w_ptr + d_offset, mask=d_mask)
     tl.store(y_blk, x * rstd * w, mask=mask)
 
 
