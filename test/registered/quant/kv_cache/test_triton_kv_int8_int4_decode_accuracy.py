@@ -16,7 +16,11 @@ from sglang.srt.mem_cache.kv_quant_kernels import (
     quantized_set_kv_int8_triton,
 )
 from sglang.srt.utils import get_device
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
+
+register_cuda_ci(est_time=60, suite="stage-b-test-small-1-gpu")
+register_amd_ci(est_time=60, suite="stage-b-test-small-1-gpu-amd")
 
 
 class TestTritonAttentionInt8Int4Kernels(CustomTestCase):

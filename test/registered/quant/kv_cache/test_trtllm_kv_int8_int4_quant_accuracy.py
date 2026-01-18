@@ -3,7 +3,6 @@ Unit tests for TRTLLM int8/int4 KV cache fusion kernel.
 1. flatten KV cache
 2. int4/int8 setkvcache
 
-Note: Decode backend tests are in test/srt/test_triton_attention_int8_int4_kernels.py
 """
 
 import unittest
@@ -15,7 +14,11 @@ from sglang.srt.mem_cache.kv_quant_kernels import (
     quantized_set_kv_int4_triton,
     quantized_set_kv_int8_triton,
 )
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
+
+register_cuda_ci(est_time=90, suite="stage-b-test-small-1-gpu")
+register_amd_ci(est_time=90, suite="stage-b-test-small-1-gpu-amd")
 
 
 class TestTRTLLMInt8Int4KVKernel(CustomTestCase):
