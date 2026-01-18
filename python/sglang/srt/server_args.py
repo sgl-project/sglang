@@ -2364,6 +2364,9 @@ class ServerArgs:
                 model_arch=model_arch,
                 sm100_default_attention_backend="triton",
             )
+            config = self.get_model_config()
+            if hasattr(config.hf_config, "mamba_chunk_size"):
+                self._mamba_chunk_size = config.hf_config.mamba_chunk_size
 
         elif model_arch == "GraniteMoeHybridForCausalLM":
             hf_config = self.get_model_config().hf_config
