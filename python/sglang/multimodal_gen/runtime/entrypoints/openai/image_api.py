@@ -241,9 +241,7 @@ async def edits(
         for idx, img in enumerate(image_list):
             filename = img.filename if hasattr(img, "filename") else f"image_{idx}"
             safe_name = sanitize_upload_filename(filename, f"image_{idx}")
-            target_path = os.path.join(
-                uploads_dir, f"{request_id}_{idx}_{safe_name}"
-            )
+            target_path = os.path.join(uploads_dir, f"{request_id}_{idx}_{safe_name}")
             input_path = await save_image_to_path(
                 img, target_path, uploads_root=uploads_dir
             )

@@ -259,9 +259,7 @@ async def create_video(
                 os.makedirs(uploads_dir, exist_ok=True)
                 filename = image.filename if hasattr(image, "filename") else "url_image"
                 safe_name = sanitize_upload_filename(filename, "url_image")
-                target_path = os.path.join(
-                    uploads_dir, f"{request_id}_{safe_name}"
-                )
+                target_path = os.path.join(uploads_dir, f"{request_id}_{safe_name}")
                 try:
                     input_path = await save_image_to_path(
                         image, target_path, uploads_root=uploads_dir
