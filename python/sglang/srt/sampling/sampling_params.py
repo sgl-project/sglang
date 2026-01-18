@@ -64,7 +64,6 @@ class SamplingParams:
         stream_interval: Optional[int] = None,
         logit_bias: Optional[Dict[str, float]] = None,
         sampling_seed: Optional[int] = None,
-        use_beam_search: bool = False,
     ) -> None:
         self.max_new_tokens = max_new_tokens
         self.stop_strs = stop
@@ -94,7 +93,6 @@ class SamplingParams:
         self.stream_interval = stream_interval
         self.logit_bias = logit_bias
         self.sampling_seed = sampling_seed
-        self.use_beam_search = use_beam_search
 
         # Process some special cases
         if 0 <= self.temperature < _SAMPLING_EPS:

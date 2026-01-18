@@ -48,6 +48,7 @@ from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.parser.jinja_template_utils import process_content_for_template_format
 from sglang.srt.parser.reasoning_parser import ReasoningParser
+from sglang.srt.server_args import get_global_server_args
 
 if TYPE_CHECKING:
     from sglang.srt.managers.template_manager import TemplateManager
@@ -532,7 +533,7 @@ class OpenAIServingChat(OpenAIBeamSearchMixin, OpenAIServingBase):
         raw_request: Request,
     ) -> AsyncGenerator[str, None]:
         """Generate streaming chat completion response"""
-        if request.use_beam_search and request.n > 1:
+        if get_global_server_args().enable_beam_search and request.n > 1:
             async for chunk in self._generate_chat_beam_search_stream(
                 adapted_request, request, raw_request
             ):
@@ -803,7 +804,7 @@ class OpenAIServingChat(OpenAIBeamSearchMixin, OpenAIServingBase):
         created: int,
     ) -> Union[ChatCompletionResponse, ORJSONResponse]:
         """Build chat completion response from generation results"""
-        if request.use_beam_search and request.n > 1:
+        if get_global_server_args().enable_beam_search and request.n > 1:
             return self._build_chat_beam_search_response(request, ret, created)
 
         choices = []

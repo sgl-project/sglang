@@ -1442,11 +1442,8 @@ class Scheduler(
                 # Use default bootstrap port
                 recv_req.bootstrap_port = self.server_args.disaggregation_bootstrap_port
 
-            # Check if beam search is enabled from request sampling params
-            is_beam_search = (
-                recv_req.sampling_params.use_beam_search
-                and recv_req.sampling_params.n > 1
-            )
+            # Check if beam search is enabled from server args
+            is_beam_search = self.server_args.enable_beam_search
 
             # beam search not support return logprob
             req = Req(
@@ -2001,14 +1998,6 @@ class Scheduler(
                     req, self.server_args
                 ):
                     break
-
-            # Ensure all requests in the batch have the same beam search type
-            if len(self.running_batch.reqs) > 0:
-                if req.is_beam_search != self.running_batch.reqs[0].is_beam_search:
-                    continue
-            if len(adder.can_run_list) > 0:
-                if req.is_beam_search != adder.can_run_list[0].is_beam_search:
-                    continue
 
             if self.enable_hicache_storage:
                 prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)

@@ -779,9 +779,14 @@ class Req(ReqBeamSearchMixin):
     def is_prefill_only(self) -> bool:
         """Check if this request is prefill-only (no token generation needed)."""
         # NOTE: when spec is enabled, prefill_only optimizations are disabled
+        # NOTE: prefill-only skips sampling, so beam search cannot be prefill-only as it requires sampling to obtain logprobs
 
-        spec_alg = get_global_server_args().speculative_algorithm
-        return self.sampling_params.max_new_tokens == 0 and spec_alg is None
+        server_args = get_global_server_args()
+        return (
+            self.sampling_params.max_new_tokens == 0
+            and server_args.speculative_algorithm is None
+            and not server_args.enable_beam_search
+        )
 
     @property
     def output_ids_through_stop(self) -> List[int]:

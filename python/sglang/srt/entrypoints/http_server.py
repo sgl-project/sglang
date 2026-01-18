@@ -1509,6 +1509,9 @@ def _execute_server_warmup(server_args: ServerArgs):
             "max_new_tokens": max_new_tokens,
         },
     }
+    if server_args.enable_beam_search:
+        # for beam search, beam width should be greater than 1
+        json_data["sampling_params"]["n"] = 2
     if server_args.skip_tokenizer_init:
         json_data["input_ids"] = [[10, 11, 12] for _ in range(server_args.dp_size)]
         # TODO Workaround the bug that embedding errors for list of size 1

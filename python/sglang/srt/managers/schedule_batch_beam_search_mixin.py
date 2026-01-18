@@ -23,6 +23,7 @@ import torch
 from sglang.srt.managers.beam_search_type import BeamSearchList
 from sglang.srt.mem_cache.common import alloc_for_decode
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.server_args import get_global_server_args
 
 logger = logging.getLogger(__name__)
 
@@ -269,7 +270,9 @@ class ReqBeamSearchMixin:
         self.is_beam_search = False
         self.beam_width = 0
         self.beam_candidates = 0
-        if sampling_params.use_beam_search and sampling_params.n > 1:
+
+        server_args = get_global_server_args()
+        if server_args.enable_beam_search and sampling_params.n > 1:
             self.is_beam_search = True
             self.beam_width = sampling_params.n
             self.beam_list = BeamSearchList()

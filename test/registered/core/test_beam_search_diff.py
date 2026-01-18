@@ -85,6 +85,7 @@ class TestBeamSearchDiff(unittest.TestCase):
         """Get beam search sequences from sglang."""
         engine = sgl.Engine(
             model_path=self.model_path,
+            enable_beam_search=True,
             disable_radix_cache=True,
             disable_overlap_schedule=True,
             disable_cuda_graph=True,
@@ -92,7 +93,6 @@ class TestBeamSearchDiff(unittest.TestCase):
 
         sampling_params = {
             "max_new_tokens": max_new_tokens,
-            "use_beam_search": True,
             "n": beam_width,
         }
 

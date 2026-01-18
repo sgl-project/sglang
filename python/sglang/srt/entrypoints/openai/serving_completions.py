@@ -153,7 +153,6 @@ class OpenAIServingCompletion(OpenAIBeamSearchMixin, OpenAIServingBase):
             "skip_special_tokens": request.skip_special_tokens,
             "logit_bias": request.logit_bias,
             "custom_params": request.custom_params,
-            "use_beam_search": request.use_beam_search,
             "sampling_seed": request.seed,
         }
 
@@ -193,7 +192,7 @@ class OpenAIServingCompletion(OpenAIBeamSearchMixin, OpenAIServingBase):
         raw_request: Request,
     ) -> AsyncGenerator[str, None]:
         """Generate streaming completion response"""
-        if request.use_beam_search and request.n > 1:
+        if self.server_args.enable_beam_search and request.n > 1:
             async for chunk in self._generate_completion_beam_search_stream(
                 adapted_request, request, raw_request
             ):
@@ -377,7 +376,7 @@ class OpenAIServingCompletion(OpenAIBeamSearchMixin, OpenAIServingBase):
         created: int,
     ) -> CompletionResponse:
         """Build completion response from generation results"""
-        if request.use_beam_search and request.n > 1:
+        if self.server_args.enable_beam_search and request.n > 1:
             return self._build_completion_beam_search_response(request, ret, created)
 
         choices = []

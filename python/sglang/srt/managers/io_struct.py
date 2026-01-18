@@ -32,6 +32,7 @@ from sglang.srt.managers.beam_search_type import BeamSearchSequence
 from sglang.srt.managers.schedule_batch import BaseFinishReason
 from sglang.srt.multimodal.mm_utils import has_valid_data
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import ImageData
 
 # Handle serialization of Image for pydantic
@@ -345,17 +346,17 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
                 self.batch_size = len(self.input_embeds)
 
     def _handle_beam_search_parallel_sampling(self) -> int:
-        """Override parallel sampling to 1 when beam search is enabled."""
-        use_beam_search = False
-        if isinstance(self.sampling_params, dict):
-            use_beam_search = self.sampling_params.get("use_beam_search", False)
-        else:  # isinstance(self.sampling_params, list):
-            use_beam_search = self.sampling_params[0].get("use_beam_search", False)
+        """Override parallel sampling to 1 when beam search is enabled and check that n (beam_width) must be greater than 1."""
+        server_args = get_global_server_args()
+        if not server_args.enable_beam_search:
+            return self.parallel_sample_num
 
-        if use_beam_search and self.parallel_sample_num > 1:
-            return 1
-
-        return self.parallel_sample_num
+        if self.parallel_sample_num <= 1:
+            raise ValueError(
+                f"Beam search mode requires n > 1 (beam_width), but got n={self.parallel_sample_num}. "
+                "Please set n to a value greater than 1 in sampling_params."
+            )
+        return 1
 
     def _handle_parallel_sampling(self):
         """Handle parallel sampling parameters and adjust batch size if needed."""
