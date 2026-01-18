@@ -31,7 +31,7 @@ class Event:
         self.flag = torch.zeros(1, dtype=torch.int32, device="cuda")
 
     def record(self, value: int = 1) -> None:
-        self.flag[0] = value
+        self.flag.fill_(value)
 
     def wait(self, value: int = 1) -> None:
         stream_wait_value(self.flag, value)
