@@ -1561,6 +1561,9 @@ class ServerArgs:
                         )
                         self.disable_radix_cache = True
                         self.disable_overlap_schedule = False
+            config = self.get_model_config()
+            if hasattr(config.hf_config, "mamba_chunk_size"):
+                self._mamba_chunk_size = config.hf_config.mamba_chunk_size
 
         if envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.is_set():
             self.disable_overlap_schedule = True
