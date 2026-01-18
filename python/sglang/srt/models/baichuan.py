@@ -29,9 +29,10 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
-    ColumnParallelLinear,
+    MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
 )
@@ -85,19 +86,12 @@ class BaiChuanMLP(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        self.gate_proj = ColumnParallelLinear(
+        self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
-            intermediate_size,
+            [intermediate_size] * 2,
             bias=False,
             quant_config=quant_config,
-            prefix=add_prefix("gate_proj", prefix),
-        )
-        self.up_proj = ColumnParallelLinear(
-            hidden_size,
-            intermediate_size,
-            bias=False,
-            quant_config=quant_config,
-            prefix=add_prefix("up_proj", prefix),
+            prefix=add_prefix("gate_up_proj", prefix),
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
@@ -111,15 +105,13 @@ class BaiChuanMLP(nn.Module):
                 f"Unsupported activation: {hidden_act}. "
                 "Only silu is supported for now."
             )
-        self.act_fn = torch.nn.functional.silu
+        self.act_fn = SiluAndMul()
 
     def forward(self, x):
-        dtype = x.dtype
-        x0, _ = self.gate_proj(x)
-        x1, _ = self.up_proj(x)
-        y = self.act_fn(x0.to(torch.float32)) * x1.permute(0, 1)
-        z, _ = self.down_proj(y)
-        return z.to(dtype)
+        gate_up, _ = self.gate_up_proj(x)
+        x = self.act_fn(gate_up)
+        x, _ = self.down_proj(x)
+        return x
 
 
 class BaiChuanAttention(nn.Module):
@@ -141,14 +133,21 @@ class BaiChuanAttention(nn.Module):
         self.hidden_size = hidden_size
         tp_size = get_tensor_model_parallel_world_size()
         self.total_num_heads = num_heads
-        assert self.total_num_heads % tp_size == 0
-        self.num_heads = self.total_num_heads // tp_size
+        self.total_num_kv_heads = self.total_num_heads
         self.head_dim = hidden_size // self.total_num_heads
         self.position_embedding = position_embedding
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
-        self.total_num_kv_heads = self.total_num_heads
-        self.num_kv_heads = self.num_heads
+        if self.total_num_kv_heads >= tp_size:
+            # Number of KV heads is greater than TP size, so we partition
+            # the KV heads across multiple tensor parallel GPUs.
+            assert self.total_num_kv_heads % tp_size == 0
+        else:
+            # Number of KV heads is less than TP size, so we replicate
+            # the KV heads across multiple tensor parallel GPUs.
+            assert tp_size % self.total_num_kv_heads == 0
+        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
+        self.num_heads = self.num_kv_heads
 
         # pylint: disable=invalid-name
         self.W_pack = QKVParallelLinear(
@@ -342,16 +341,16 @@ class BaiChuanModel(nn.Module):
 class BaiChuanBaseForCausalLM(nn.Module):
     packed_modules_mapping = {
         "W_pack": ["W_pack"],
-        "gate_proj": ["gate_proj"],
-        "up_proj": ["up_proj"],
-        "down_proj": ["down_proj"],
+        "gate_up_proj": [
+            "gate_proj",
+            "up_proj",
+        ],
     }
     # LoRA specific attributes
     supported_lora_modules = [
         "W_pack",
         "o_proj",
-        "gate_proj",
-        "up_proj",
+        "gate_up_proj",
         "down_proj",
     ]
     embedding_modules = {
@@ -397,6 +396,11 @@ class BaiChuanBaseForCausalLM(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        stacked_params_mapping = [
+            # (param_name, shard_name, shard_id)
+            ("gate_up_proj", "gate_proj", 0),
+            ("gate_up_proj", "up_proj", 1),
+        ]
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
@@ -412,11 +416,24 @@ class BaiChuanBaseForCausalLM(nn.Module):
                 if is_baichuan2:
                     loaded_weight = torch.nn.functional.normalize(loaded_weight)
 
-            if name.endswith(".bias") and name not in params_dict:
-                continue
-            param = params_dict[name]
-            weight_loader = getattr(param, "weight_loader", default_weight_loader)
-            weight_loader(param, loaded_weight)
+            for param_name, weight_name, shard_id in stacked_params_mapping:
+                if weight_name not in name:
+                    continue
+                name = name.replace(weight_name, param_name)
+                # Skip loading extra bias for GPTQ models.
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+                param = params_dict[name]
+                weight_loader = param.weight_loader
+                weight_loader(param, loaded_weight, shard_id)
+                break
+            else:
+                # Skip loading extra bias for GPTQ models.
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
 
 
 class BaichuanForCausalLM(BaiChuanBaseForCausalLM):

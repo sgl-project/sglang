@@ -213,10 +213,7 @@ class AscendAttnBackend(AttentionBackend):
                 self.qk_rope_head_dim + model_runner.model_config.qk_nope_head_dim
             )
         else:
-            self.use_alibi = (
-                hasattr(model_runner.model_config, "use_alibi")
-                and model_runner.model_config.use_alibi
-            )
+            self.use_alibi = getattr(model_runner.model_config, "use_alibi", False)
         self.native_attn = TorchNativeAttnBackend(model_runner)
         self.graph_metadata = {}
         self.max_context_len = model_runner.model_config.context_len
@@ -403,14 +400,14 @@ class AscendAttnBackend(AttentionBackend):
     ) -> torch.Tensor:
         position_point = torch.arange(seq_len) - seq_len + 1
         position_point = (
-            position_point.unsqueeze(0).unsqueeze(0).expand(num_heads, -1, -1)
+            position_point.unsqueeze(0, 0).expand(num_heads, -1, -1)
         )
         diag = torch.diag(position_point[0])
         position_point = position_point - diag.unsqueeze(0).unsqueeze(0).transpose(
             -1, -2
         )
         position_point = position_point.to(device)
-        alibi = slopes.unsqueeze(1).unsqueeze(1) * position_point
+        alibi = slopes.unsqueeze(1, 1) * position_point
         alibi_bias = alibi.view(num_heads, 1, seq_len)
         alibi_bias = alibi_bias.to(device).to(dtype)
         return alibi_bias
@@ -425,18 +422,15 @@ class AscendAttnBackend(AttentionBackend):
         is_extend: bool = True,
         dtype: torch.dtype = torch.bfloat16,
     ) -> torch.Tensor:
-        if not hasattr(self, "alibi_bias") or self.alibi_bias is None:
-            MAX_LEN_ALB = 5000
-            max_seq_len = max(kv_seq_len, q_seq_len)
-            max_seq_len = max(max_seq_len, MAX_LEN_ALB)
+        MAX_LEN_ALB = 5000
+        if getattr(self, "alibi_bias", None) is None:
+            max_seq_len = max(kv_seq_len, q_seq_len, MAX_LEN_ALB)
             self.alibi_bias = self._generate_alibi_bias(
                 max_seq_len, slopes, num_heads, device, dtype
             )
 
-        if not hasattr(self, "super_mask") or self.super_mask is None:
-            MAX_LEN_ALB = 5000
-            max_seq_len = max(kv_seq_len, q_seq_len)
-            max_seq_len = max(max_seq_len, MAX_LEN_ALB)
+        if getattr(self, "super_mask", None) is None:
+            max_seq_len = max(kv_seq_len, q_seq_len, MAX_LEN_ALB)
             super_mask = torch.ones(size=(1, max_seq_len, max_seq_len), dtype=dtype)
             super_mask = super_mask.float().fill_(float("-inf")).type_as(super_mask)
             super_mask = torch.triu(super_mask, 1).to(device)
