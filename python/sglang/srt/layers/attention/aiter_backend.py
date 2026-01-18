@@ -863,7 +863,7 @@ class AiterAttnBackend(AttentionBackend):
             kv_last_page_len = self.cuda_graph_kv_last_page_len[:bs]
             max_q_len = num_tokens_per_bs
 
-            if _use_mla_ps_kernel:
+            if self.use_mla and _use_mla_ps_kernel:
 
                 num_kv_splits = self.max_split_per_batch
 
