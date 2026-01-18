@@ -35,6 +35,7 @@ class RouterArgs:
     balance_rel_threshold: float = 1.5
     eviction_interval_secs: int = 60
     max_tree_size: int = 2**26
+    mesh_sync_interval_secs: int = 1
     max_idle_secs: int = 4 * 3600
     assignment_mode: str = "random"  # Mode for manual policy new routing key assignment
     max_payload_size: int = 512 * 1024 * 1024  # 512MB default for large batches
@@ -305,6 +306,12 @@ class RouterArgs:
             type=int,
             default=RouterArgs.max_tree_size,
             help="Maximum size of the approximation tree for cache-aware routing",
+        )
+        routing_group.add_argument(
+            f"--{prefix}mesh-sync-interval-secs",
+            type=int,
+            default=RouterArgs.mesh_sync_interval_secs,
+            help="Interval in seconds between mesh synchronization batches",
         )
         routing_group.add_argument(
             f"--{prefix}max-idle-secs",

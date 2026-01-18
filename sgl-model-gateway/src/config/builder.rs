@@ -113,6 +113,7 @@ impl RouterConfigBuilder {
         balance_rel_threshold: f32,
         eviction_interval_secs: u64,
         max_tree_size: usize,
+        mesh_sync_interval_secs: u64,
     ) -> Self {
         self.config.policy = PolicyConfig::CacheAware {
             cache_threshold,
@@ -120,6 +121,7 @@ impl RouterConfigBuilder {
             balance_rel_threshold,
             eviction_interval_secs,
             max_tree_size,
+            mesh_sync_interval_secs,
         };
         self
     }
@@ -828,7 +830,7 @@ mod tests {
     fn test_builder_cache_aware_policy() {
         let config = RouterConfigBuilder::new()
             .regular_mode(vec!["http://worker1:8000".to_string()])
-            .cache_aware_policy(0.8, 10, 1.5, 300, 1000)
+            .cache_aware_policy(0.8, 10, 1.5, 300, 1000, 1)
             .build()
             .unwrap();
 
