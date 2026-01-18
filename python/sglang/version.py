@@ -12,9 +12,7 @@ except ImportError:
 
             from setuptools_scm import get_version
 
-            # The root of the project is two levels up from this file's directory (python/sglang/version.py -> python/)
-            # But according to pyproject.toml, the scm root is ".." (the repo root).
-            # So we point to the directory containing pyproject.toml.
+            # point to the directory containing pyproject.toml.
             project_root = pathlib.Path(__file__).parent.parent.parent
             __version__ = get_version(
                 root=str(project_root), fallback_version="0.0.0.dev0"
