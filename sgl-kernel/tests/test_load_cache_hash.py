@@ -37,10 +37,10 @@ transfer_item_warp(int32_t lane_id, const void* src_addr, void* dst_addr, int64_
 }
 
 /**
- * Hash-based hit detection kernel.
+ * Hash-based hit detection kernel with warp-cooperative hash building.
  * 
  * Algorithm:
- * 1. Build hash table from top_k_tokens (token -> top_k_index)
+ * 1. Build hash table from top_k_tokens using warp-cooperative insertion (NO atomics)
  * 2. Scan device_buffer_tokens once:
  *    - For each slot, lookup token in hash table
  *    - If found: it's a hit, record slot for that top_k_index
@@ -68,7 +68,6 @@ __global__ void load_cache_hash_kernel(
     const int tid = threadIdx.x;
     const int warp_id = tid / WARP_SIZE;
     const int lane_id = tid % WARP_SIZE;
-    const unsigned int lanes_before = (1u << lane_id) - 1;
     
     // Hash table: token -> top_k_index
     __shared__ int32_t s_hash_keys[HASH_SIZE];    // token (-1 = empty)
@@ -76,7 +75,6 @@ __global__ void load_cache_hash_kernel(
     
     // Results
     __shared__ int32_t s_hit_slots[NUM_TOP_K];    // slot for each top_k (-1 = miss)
-    __shared__ bool s_is_protected[HOT_BUFFER_SIZE];
     __shared__ int32_t s_evictable_slots[NUM_TOP_K];
     __shared__ int32_t s_miss_indices[NUM_TOP_K]; // which top_k indices are misses
     __shared__ int32_t s_num_misses;
@@ -93,46 +91,55 @@ __global__ void load_cache_hash_kernel(
     for (int i = tid; i < NUM_TOP_K; i += BLOCK_SIZE) {
         s_hit_slots[i] = -1;
     }
-    for (int i = tid; i < HOT_BUFFER_SIZE; i += BLOCK_SIZE) {
-        s_is_protected[i] = false;
-    }
     __syncthreads();
     
-    // ===== Phase 2: Build hash table from top_k_tokens =====
-    // Each thread inserts one or more tokens
-    for (int i = tid; i < NUM_TOP_K; i += BLOCK_SIZE) {
-        int32_t token = top_k_tokens[i];
-        uint32_t hash = static_cast<uint32_t>(token) % HASH_SIZE;
-        
-        // Linear probing insertion
-        while (true) {
-            int32_t old = atomicCAS(&s_hash_keys[hash], -1, token);
-            if (old == -1 || old == token) {
-                // Successfully inserted or duplicate token
-                s_hash_vals[hash] = static_cast<int16_t>(i);
-                break;
+    // ===== Phase 2: Build hash table using warp-cooperative insertion =====
+    // Warp 0 builds the hash table - NO atomics needed
+    // O(K) iterations, each with warp-parallel empty slot search
+    if (warp_id == 0) {
+        for (int i = 0; i < NUM_TOP_K; i++) {
+            int32_t token = top_k_tokens[i];
+            uint32_t base_hash = static_cast<uint32_t>(token) % HASH_SIZE;
+            
+            // Warp-parallel search for empty slot
+            for (int probe = 0; probe < HASH_SIZE; probe += WARP_SIZE) {
+                uint32_t slot = (base_hash + probe + lane_id) % HASH_SIZE;
+                bool is_empty = (s_hash_keys[slot] == -1);
+                unsigned int mask = __ballot_sync(0xFFFFFFFF, is_empty);
+                
+                if (mask != 0) {
+                    // Found empty slot(s) - use first one
+                    int first_lane = __ffs(mask) - 1;
+                    uint32_t winner_slot = (base_hash + probe + first_lane) % HASH_SIZE;
+                    if (lane_id == 0) {
+                        s_hash_keys[winner_slot] = token;
+                        s_hash_vals[winner_slot] = static_cast<int16_t>(i);
+                    }
+                    __syncwarp();
+                    break;
+                }
             }
-            hash = (hash + 1) % HASH_SIZE;
         }
     }
     __syncthreads();
     
-    // ===== Phase 3: Scan buffer, lookup in hash table =====
-    // This finds hits AND identifies evictable slots in ONE pass
-    for (int slot = tid; slot < HOT_BUFFER_SIZE; slot += BLOCK_SIZE) {
-        int32_t token = device_buffer_tokens[slot];
+    // ===== Phase 3: Scan buffer with warp-cooperative collection =====
+    // Each warp processes chunks of the buffer
+    // Uses ballot + prefix sum to collect evictable slots (one atomicAdd per warp, not per slot)
+    for (int base_slot = warp_id * WARP_SIZE; base_slot < HOT_BUFFER_SIZE; base_slot += NUM_WARPS * WARP_SIZE) {
+        int slot = base_slot + lane_id;
+        bool valid_slot = (slot < HOT_BUFFER_SIZE);
+        int32_t token = valid_slot ? device_buffer_tokens[slot] : -1;
         bool is_hit = false;
         
-        if (token >= 0) {
-            // Lookup token in hash table
+        if (token >= 0 && valid_slot) {
+            // Lookup token in hash table - O(1) average
             uint32_t hash = static_cast<uint32_t>(token) % HASH_SIZE;
             
             while (s_hash_keys[hash] != -1) {
                 if (s_hash_keys[hash] == token) {
-                    // Found! This buffer slot contains a top_k token
                     int top_k_idx = s_hash_vals[hash];
                     s_hit_slots[top_k_idx] = slot;
-                    s_is_protected[slot] = true;
                     is_hit = true;
                     break;
                 }
@@ -140,26 +147,59 @@ __global__ void load_cache_hash_kernel(
             }
         }
         
-        // If not a hit, this slot is evictable
-        if (!is_hit) {
-            int idx = atomicAdd(&s_num_evictable, 1);
-            if (idx < NUM_TOP_K) {  // Only need NUM_TOP_K evictable slots max
-                s_evictable_slots[idx] = slot;
+        // Warp-cooperative evictable slot collection
+        bool is_evictable = valid_slot && !is_hit;
+        unsigned int evict_mask = __ballot_sync(0xFFFFFFFF, is_evictable);
+        
+        if (evict_mask != 0) {
+            int evict_count = __popc(evict_mask);
+            int my_prefix = __popc(evict_mask & ((1u << lane_id) - 1));
+            
+            // One atomicAdd per warp (not per thread)
+            int warp_offset;
+            if (lane_id == 0) {
+                warp_offset = atomicAdd(&s_num_evictable, evict_count);
+            }
+            warp_offset = __shfl_sync(0xFFFFFFFF, warp_offset, 0);
+            
+            // Write evictable slots using prefix sum
+            if (is_evictable && warp_offset + my_prefix < NUM_TOP_K) {
+                s_evictable_slots[warp_offset + my_prefix] = slot;
             }
         }
     }
     __syncthreads();
     
     // ===== Phase 4: Identify misses and set hit outputs =====
-    for (int i = tid; i < NUM_TOP_K; i += BLOCK_SIZE) {
-        int slot = s_hit_slots[i];
-        if (slot >= 0) {
-            // Hit - output device location
+    // Warp-cooperative miss collection (one atomicAdd per warp)
+    for (int base_i = warp_id * WARP_SIZE; base_i < NUM_TOP_K; base_i += NUM_WARPS * WARP_SIZE) {
+        int i = base_i + lane_id;
+        bool valid = (i < NUM_TOP_K);
+        int slot = valid ? s_hit_slots[i] : 0;
+        bool is_hit = valid && (slot >= 0);
+        bool is_miss = valid && !is_hit;
+        
+        // Set output for hits
+        if (is_hit) {
             top_k_device_locs[i] = device_buffer_locs[slot];
-        } else {
-            // Miss - record for eviction assignment
-            int miss_idx = atomicAdd(&s_num_misses, 1);
-            s_miss_indices[miss_idx] = i;
+        }
+        
+        // Warp-cooperative miss collection
+        unsigned int miss_mask = __ballot_sync(0xFFFFFFFF, is_miss);
+        
+        if (miss_mask != 0) {
+            int miss_count = __popc(miss_mask);
+            int my_prefix = __popc(miss_mask & ((1u << lane_id) - 1));
+            
+            int warp_offset;
+            if (lane_id == 0) {
+                warp_offset = atomicAdd(&s_num_misses, miss_count);
+            }
+            warp_offset = __shfl_sync(0xFFFFFFFF, warp_offset, 0);
+            
+            if (is_miss) {
+                s_miss_indices[warp_offset + my_prefix] = i;
+            }
         }
     }
     __syncthreads();
