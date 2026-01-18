@@ -190,6 +190,7 @@ FP8_GEMM_RUNNER_BACKEND_CHOICES = [
     "cutlass",
     "triton",
     "aiter",
+    "tilelang",
 ]
 
 FP4_GEMM_RUNNER_BACKEND_CHOICES = [
@@ -3547,6 +3548,7 @@ class ServerArgs:
             "'cutlass' (optimal for Hopper/Blackwell GPUs and high-throughput), "
             "'triton' (fallback, widely compatible), "
             "'aiter' (ROCm only). "
+            "'tilelang' (optimal for Ada and Hopper (decode)). "
             "NOTE: This replaces the deprecated environment variables "
             "SGLANG_ENABLE_FLASHINFER_FP8_GEMM and SGLANG_SUPPORT_CUTLASS_BLOCK_FP8.",
         )
