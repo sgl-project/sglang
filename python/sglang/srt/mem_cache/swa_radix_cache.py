@@ -362,6 +362,9 @@ class SWARadixCache(BasePrefixCache):
 
     ##### Public API #####
 
+    def supports_swa(self) -> bool:
+        return True
+
     def reset(self) -> None:
         self.root_node = TreeNode()
         self.root_node.key = []
@@ -818,13 +821,12 @@ class SWARadixCache(BasePrefixCache):
         while len(key) > 0 and child_key in node.children.keys():
             child = node.children[child_key]
 
-            # update best_value_len and best_last_node if needed
-            if (
-                child.swa_tombstone
-                and match_len_since_tombstone >= self.sliding_window_size
-            ):
-                best_value_len = len(value)
-                best_last_node = node
+            if child.swa_tombstone:
+                # update best_value_len and best_last_node if needed
+                if match_len_since_tombstone >= self.sliding_window_size:
+                    best_value_len = len(value)
+                    best_last_node = node
+                # reset match_len_since_tombstone if we hit a tombstone node
                 match_len_since_tombstone = 0
 
             prefix_len = self.key_match_fn(child.key, key)
@@ -876,7 +878,7 @@ class SWARadixCache(BasePrefixCache):
         new_node.full_lock_ref = child.full_lock_ref
         new_node.swa_lock_ref = child.swa_lock_ref
         new_node.key = child.key[:split_len]
-        new_node.value = child.value[:split_len]
+        new_node.value = child.value[:split_len].clone()
         # parent inherits the swa_uuid from child for swa lock ref
         new_node.swa_uuid = child.swa_uuid
         child.swa_uuid = None
@@ -889,7 +891,7 @@ class SWARadixCache(BasePrefixCache):
             self.swa_lru_list.remove_node(child)
         child.parent = new_node
         child.key = child.key[split_len:]
-        child.value = child.value[split_len:]
+        child.value = child.value[split_len:].clone()
         new_node.parent.children[self.get_child_key_fn(key)] = new_node
 
         # insert the new node and child into the lru lists, insert

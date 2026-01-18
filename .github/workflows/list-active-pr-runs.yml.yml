@@ -1,0 +1,253 @@
+name: List Active PR Runs
+
+on:
+  workflow_dispatch:
+    inputs:
+      workflows:
+        description: 'Space-separated list of workflow filenames to check'
+        required: false
+        type: string
+        default: 'pr-test.yml'
+
+permissions:
+  actions: read
+  contents: read
+  pull-requests: read
+
+jobs:
+  list-active-pr-runs:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install GitHub CLI
+        run: sudo apt-get install -y gh jq
+
+      - name: List active PR runs grouped by PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          WORKFLOWS: ${{ github.event.inputs.workflows || 'pr-test.yml' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "========================================="
+          echo "🔍 Active PR Workflow Runs Report"
+          echo "========================================="
+          echo ""
+
+          # Get all workflows or specific ones
+          read -r -a workflow_files <<< "${WORKFLOWS}"
+          echo "📋 Checking specified workflows: ${WORKFLOWS}"
+
+          echo ""
+
+          # Create a temporary file to store PR data
+          pr_data_file=$(mktemp)
+
+          # Process each workflow
+          for workflow_file in ${workflow_files[@]}; do
+            echo "Scanning workflow: $workflow_file"
+
+            # Get all active runs (queued, waiting, in_progress)
+            active_runs=$(gh run list \
+              --repo "$REPO" \
+              --workflow "$workflow_file" \
+              --json databaseId,status,event,headBranch,createdAt,updatedAt,headSha,number,attempt \
+              --limit 500 \
+              | jq -c '.[] | select(.status=="queued" or .status=="waiting" or .status=="in_progress") | select(.event=="pull_request")')
+
+            if [ -z "$active_runs" ]; then
+              continue
+            fi
+
+            # Process each run
+            echo "$active_runs" | while read -r run; do
+              run_id=$(echo "$run" | jq -r '.databaseId')
+              run_status=$(echo "$run" | jq -r '.status')
+              created_at=$(echo "$run" | jq -r '.createdAt')
+              head_sha=$(echo "$run" | jq -r '.headSha')
+              run_number=$(echo "$run" | jq -r '.number')
+              run_attempt=$(echo "$run" | jq -r '.attempt // 1')
+
+              # Get detailed run information including jobs
+              run_details=$(gh api "repos/$REPO/actions/runs/$run_id" 2>/dev/null || true)
+
+              if [ -z "$run_details" ]; then
+                continue
+              fi
+
+              head_owner=$(echo "$run_details" | jq -r '.head_repository.owner.login // empty')
+              head_branch=$(echo "$run_details" | jq -r '.head_branch // empty')
+
+              if [ -z "$head_owner" ] || [ -z "$head_branch" ]; then
+                continue
+              fi
+
+              # Find PR number
+              pr_number=$(gh api "repos/$REPO/pulls?state=open&head=${head_owner}:${head_branch}" \
+                --jq '.[0].number // empty' 2>/dev/null || true)
+
+              if [ -z "$pr_number" ]; then
+                continue
+              fi
+
+              # Get jobs for this run (with pagination to avoid missing jobs)
+              jobs=$(gh api "repos/$REPO/actions/runs/$run_id/jobs" --paginate --jq '.jobs[]' | jq -s '.')
+
+              running_jobs=$(echo "$jobs" | jq '[.[] | select(.status=="in_progress")] | length')
+              queued_jobs=$(echo "$jobs" | jq '[.[] | select(.status=="queued" or .status=="waiting")] | length')
+
+              # Get runner info for running jobs
+              runners=$(echo "$jobs" | jq -r '.[] | select(.status=="in_progress") | .runner_name // "N/A"' | paste -sd "," -)
+
+              # Calculate queue time
+              current_time=$(date -u +%s)
+              created_time=$(date -u -d "$created_at" +%s 2>/dev/null || echo "$current_time")
+              queue_time=$((current_time - created_time))
+              queue_minutes=$((queue_time / 60))
+
+              # Store data in temporary file
+              echo "$pr_number|$workflow_file|$run_id|$run_status|$running_jobs|$queued_jobs|$runners|$queue_minutes|$created_at|$head_sha|$run_attempt" >> "$pr_data_file"
+            done
+          done
+
+          echo ""
+          echo "========================================="
+          echo "📊 Active PRs Summary"
+          echo "========================================="
+          echo ""
+
+          if [ ! -s "$pr_data_file" ]; then
+            echo "✅ No active PR runs found"
+            rm -f "$pr_data_file"
+            exit 0
+          fi
+
+          # Get unique PR numbers
+          pr_numbers=$(cat "$pr_data_file" | cut -d'|' -f1 | sort -u)
+
+          # Separate high priority and normal PRs
+          high_priority_prs=()
+          normal_prs=()
+
+          for pr_num in $pr_numbers; do
+            labels=$(gh pr view "$pr_num" --repo "$REPO" --json labels \
+              | jq -r '.labels[].name' 2>/dev/null || true)
+
+            if echo "$labels" | grep -Fxq "high priority"; then
+              high_priority_prs+=($pr_num)
+            else
+              normal_prs+=($pr_num)
+            fi
+          done
+
+          # Combine: high priority first, then normal
+          sorted_pr_numbers=("${high_priority_prs[@]}" "${normal_prs[@]}")
+
+          pr_count=0
+          total_running=0
+          total_queued=0
+
+          for pr_num in "${sorted_pr_numbers[@]}"; do
+            pr_count=$((pr_count + 1))
+
+            # Get PR details
+            pr_info=$(gh pr view "$pr_num" --repo "$REPO" --json title,author,labels,url 2>/dev/null || true)
+
+            if [ -z "$pr_info" ]; then
+              continue
+            fi
+
+            pr_title=$(echo "$pr_info" | jq -r '.title')
+            pr_author=$(echo "$pr_info" | jq -r '.author.login')
+            pr_url=$(echo "$pr_info" | jq -r '.url')
+            pr_labels=$(echo "$pr_info" | jq -r '.labels[].name' | paste -sd ", " -)
+
+            if [ -z "$pr_labels" ]; then
+              pr_labels="(no labels)"
+            fi
+
+            # Add priority indicator
+            priority_indicator=""
+            if echo "$pr_labels" | grep -q "high priority"; then
+              priority_indicator="🔴 [HIGH PRIORITY] "
+            fi
+
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo "🔗 ${priority_indicator}PR #$pr_num: $pr_title"
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo "👤 Author: $pr_author"
+            echo "🏷️  Labels: $pr_labels"
+            echo "🔗 URL: $pr_url"
+            echo ""
+
+            # Get all runs for this PR
+            pr_runs=$(grep "^$pr_num|" "$pr_data_file")
+
+            pr_running_total=0
+            pr_queued_total=0
+
+            echo "$pr_runs" | while read -r line; do
+              workflow=$(echo "$line" | cut -d'|' -f2)
+              run_id=$(echo "$line" | cut -d'|' -f3)
+              status=$(echo "$line" | cut -d'|' -f4)
+              running=$(echo "$line" | cut -d'|' -f5)
+              queued=$(echo "$line" | cut -d'|' -f6)
+              runners=$(echo "$line" | cut -d'|' -f7)
+              queue_min=$(echo "$line" | cut -d'|' -f8)
+              created=$(echo "$line" | cut -d'|' -f9)
+              attempt=$(echo "$line" | cut -d'|' -f11)
+
+              pr_running_total=$((pr_running_total + running))
+              pr_queued_total=$((pr_queued_total + queued))
+
+              run_url="https://github.com/$REPO/actions/runs/$run_id"
+
+              # Calculate retry count for this specific run
+              retry_count=$((attempt - 1))
+
+              # Show retry indicator
+              retry_indicator=""
+              if [ "$retry_count" -gt 0 ]; then
+                retry_indicator=" 🔄 Retry #$retry_count"
+              fi
+
+              echo "  📦 Workflow: $workflow (Run #$run_id)$retry_indicator"
+              echo "     Status: $status"
+              echo "     🟢 Running jobs: $running"
+              echo "     🟡 Queued jobs: $queued"
+
+              if [ "$running" -gt 0 ] && [ "$runners" != "" ]; then
+                echo "     🖥️  Runners: $runners"
+              fi
+
+              if [ "$queue_min" -gt 0 ]; then
+                echo "     ⏱️  Queue time: ${queue_min} minutes"
+              fi
+
+              echo "     🔗 Run URL: $run_url"
+              echo ""
+            done
+
+            # Summary for this PR
+            pr_running_total=$(grep "^$pr_num|" "$pr_data_file" | cut -d'|' -f5 | awk '{sum+=$1} END {print sum+0}')
+            pr_queued_total=$(grep "^$pr_num|" "$pr_data_file" | cut -d'|' -f6 | awk '{sum+=$1} END {print sum+0}')
+
+            total_running=$((total_running + pr_running_total))
+            total_queued=$((total_queued + pr_queued_total))
+
+            echo "  📊 PR Total: $pr_running_total running, $pr_queued_total queued"
+            echo ""
+          done
+
+          # Overall summary
+          echo "========================================="
+          echo "📈 Overall Summary"
+          echo "========================================="
+          echo "Total PRs with active runs: $pr_count"
+          echo "Total running jobs: $total_running"
+          echo "Total queued jobs: $total_queued"
+          echo "========================================="
+
+          # Cleanup
+          rm -f "$pr_data_file"

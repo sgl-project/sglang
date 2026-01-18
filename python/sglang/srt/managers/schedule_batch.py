@@ -70,7 +70,6 @@ from sglang.srt.mem_cache.common import (
     evict_from_tree_cache,
     release_kv_cache,
 )
-from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
@@ -262,6 +261,12 @@ class MultimodalDataItem:
 
         from sglang.srt.managers.mm_utils import hash_feature
 
+        if envs.SGLANG_MM_SKIP_COMPUTE_HASH.get():
+            import uuid
+
+            self.hash = uuid.uuid4().int
+            self.pad_value = self.hash % (1 << 30)
+            return
         if self.hash is None:
             if self.feature is not None:
                 hashed_feature = self.feature
@@ -358,6 +363,9 @@ class MultimodalInputs:
         ret.mm_items = [item for item in ret.mm_items if item.is_valid()]
 
         if envs.SGLANG_MM_BUFFER_SIZE_MB.get() > 0:
+            # Multi-modal feature hashing optimization:
+            # When SGLANG_MM_BUFFER_SIZE_MB > 0, we temporarily move feature tensors to GPU
+            # for faster hash computation, while avoiding OOM issues.
             from sglang.srt.managers.mm_utils import (
                 init_feature_buffer,
                 is_feature_buffer_initialized,
@@ -516,6 +524,7 @@ class Req(ReqBeamSearchMixin):
         priority: Optional[int] = None,
         metrics_collector: Optional[SchedulerMetricsCollector] = None,
         extra_key: Optional[str] = None,
+        routing_key: Optional[str] = None,
         dimensions: Optional[int] = None,
         http_worker_ipc: Optional[str] = None,
     ):
@@ -575,6 +584,7 @@ class Req(ReqBeamSearchMixin):
 
         self.extra_key = extra_key
         self.lora_id = lora_id
+        self.routing_key = routing_key
 
         # Memory pool info
         self.req_pool_idx: Optional[int] = None
@@ -712,6 +722,7 @@ class Req(ReqBeamSearchMixin):
         self.embedding = None
 
         # Constrained decoding
+        self.grammar_key: Optional[str] = None
         self.grammar: Optional[BaseGrammarObject] = None
         self.grammar_wait_ct = 0
 
@@ -797,20 +808,11 @@ class Req(ReqBeamSearchMixin):
 
     def pop_committed_kv_cache(self) -> int:
         """Return the length of committed KV cache and mark them as freed."""
-
-        # NOTE: This function is called exactly once after the request is finished.
-        global_server_args = get_global_server_args()
-        topk = global_server_args.speculative_eagle_topk
-
-        enable_kv_committed_len = topk is None or topk == 1
-        if enable_kv_committed_len:
-            assert (
-                not self.kv_committed_freed
-            ), f"Committed KV cache already freed ({self.kv_committed_len=})"
-            self.kv_committed_freed = True
-            return self.kv_committed_len
-        else:
-            return len(self.origin_input_ids) + max(len(self.output_ids) - 1, 0)
+        assert (
+            not self.kv_committed_freed
+        ), f"Committed KV cache already freed ({self.kv_committed_len=})"
+        self.kv_committed_freed = True
+        return self.kv_committed_len
 
     def pop_overallocated_kv_cache(self) -> Tuple[int, int]:
         """Return the range of over-allocated KV cache and mark them as freed."""
@@ -877,7 +879,7 @@ class Req(ReqBeamSearchMixin):
                 key=RadixKey(token_ids=token_ids, extra_key=self.extra_key),
                 **(
                     {"req": self, "cow_mamba": True}
-                    if isinstance(tree_cache, MambaRadixCache)
+                    if tree_cache.supports_mamba()
                     else {}
                 ),
             )
@@ -1169,6 +1171,62 @@ class Req(ReqBeamSearchMixin):
         )
 
 
+class DllmStagingReqs:
+    def __init__(self, dllm_config: Optional[DllmConfig] = None):
+        self.dllm_config = dllm_config
+        self.max_running_reqs = (
+            dllm_config.max_running_requests if dllm_config is not None else 1
+        )
+        self.reqs: List[Req] = []
+
+    def add_reqs(self, req: Union[Req, List[Req], "DllmStagingReqs"]):
+        assert self.dllm_config is not None, "Diffusion LLM config is not set."
+
+        if isinstance(req, DllmStagingReqs):
+            reqs_to_add = req.reqs
+        elif isinstance(req, list):
+            reqs_to_add = req
+        else:
+            reqs_to_add = [req]
+
+        num_to_add = len(reqs_to_add)
+
+        # Sanity check:
+        if self.check_redundant_reqs(reqs_to_add):
+            raise RuntimeError("Redundant requests detected in dLLM requests.")
+
+        if len(self.reqs) + num_to_add > self.max_running_reqs:
+            raise RuntimeError(
+                f"Exceeding maximum number of concurrent diffusion LLM requests: {self.max_running_reqs}"
+            )
+
+        self.reqs.extend(reqs_to_add)
+
+    def check_redundant_reqs(self, reqs: List[Req]) -> bool:
+        existing_rids: Set[str] = {r.rid for r in self.reqs}
+        return any(req.rid in existing_rids for req in reqs)
+
+    def init_next_round(self):
+        for req in self.reqs:
+            req.init_next_round_input()
+
+    def non_empty(self) -> bool:
+        return self.dllm_config is not None and len(self.reqs) > 0
+
+    def empty(self) -> bool:
+        return self.dllm_config is None or len(self.reqs) == 0
+
+    def update_chunked_status(self):
+        for req in self.reqs:
+            req.is_chunked += 1
+
+    def filter_finished_reqs(self):
+        self.reqs = [req for req in self.reqs if not req.finished()]
+
+    def __iter__(self):
+        return iter(self.reqs)
+
+
 @dataclasses.dataclass
 class ScheduleBatch(
     ScheduleBatchDisaggregationDecodeMixin, ScheduleBatchBeamSearchMixin
@@ -1291,6 +1349,7 @@ class ScheduleBatch(
     hicache_consumer_index: int = -1
 
     # Diffusion LLM
+    dllm_staging_reqs: Optional[DllmStagingReqs] = None
     dllm_config: Optional[DllmConfig] = None
 
     # Metrics
@@ -1307,6 +1366,7 @@ class ScheduleBatch(
         enable_overlap: bool,
         spec_algorithm: SpeculativeAlgorithm,
         chunked_req: Optional[Req] = None,
+        dllm_staging_reqs: Optional[DllmStagingReqs] = None,
         dllm_config: Optional[DllmConfig] = None,
     ):
         return_logprob = any(req.return_logprob for req in reqs)
@@ -1332,6 +1392,7 @@ class ScheduleBatch(
             return_routed_experts=any(req.return_routed_experts for req in reqs),
             is_prefill_only=all(req.is_prefill_only for req in reqs),
             chunked_req=chunked_req,
+            dllm_staging_reqs=dllm_staging_reqs,
             dllm_config=dllm_config,
         )
 
@@ -1635,7 +1696,19 @@ class ScheduleBatch(
         mamba_track_indices_cpu: List[int],
         mamba_track_seqlens_cpu: List[int],
     ):
-        mask = (req.extend_input_len // FLA_CHUNK_SIZE) * FLA_CHUNK_SIZE > 0
+        def _force_track_h(i: int) -> int:
+            assert i % FLA_CHUNK_SIZE == 0
+            # There are 3 cases for mamba_track_seqlen passed to mamba_track_seqlens_cpu:
+            # 1) aligned with FLA_CHUNK_SIZE-> retrieve from last_recurrent_state
+            #    a) is the last position -> retrieve from last_recurrent_state
+            #    b) is NOT the last position -> retrieve from h
+            # 2) unaligned with FLA_CHUNK_SIZE -> retrieve from h
+            # Currently, the math calculation only supports case 1a and 2. So for 1b, we need to add 1
+            # to force the math calculation to retrieve the correct mamba state from h.
+            return i + 1
+
+        mamba_cache_chunk_size = get_global_server_args().mamba_cache_chunk_size
+        mask = req.extend_input_len >= mamba_cache_chunk_size
         mamba_track_mask_cpu.append(mask)
         mamba_track_indices_cpu.append(
             req.mamba_ping_pong_track_buffer[req.mamba_next_track_idx].item()
@@ -1650,12 +1723,28 @@ class ScheduleBatch(
             # We need to pass the non-aligned seqlen to the calculation. Even though
             # we pass in mamba_track_seqlen, the actual tracked seqlen is mamba_last_track_seqlen.
             mamba_track_seqlen = len(req.prefix_indices) + req.extend_input_len
-            # mamba_last_track_seqlen is actual tracked seqlen. Used to pass to
+
+            # mamba_track_seqlen_aligned/mamba_last_track_seqlen is actual tracked seqlen. Used to pass to
             # mamba radix cache to track which seqlen this mamba state should store at.
             mamba_track_seqlen_aligned = (
                 len(req.prefix_indices)
+                + (req.extend_input_len // mamba_cache_chunk_size)
+                * mamba_cache_chunk_size
+            )
+
+            # mamba_track_fla_chunk_aligned is the aligned seqlen based on FLA_CHUNK_SIZE
+            # If mamba_track_fla_chunk_aligned != mamba_track_seqlen_aligned, which can be true when
+            # page_size > FLA_CHUNK_SIZE, we need to force the math calculation to retrieve the correct mamba state from h
+            # by _force_track_h()
+            mamba_track_fla_chunk_aligned = (
+                len(req.prefix_indices)
                 + (req.extend_input_len // FLA_CHUNK_SIZE) * FLA_CHUNK_SIZE
             )
+            if mamba_track_fla_chunk_aligned != mamba_track_seqlen_aligned:
+                # We want to track mamba_track_seqlen_aligned, and it's not the last position,
+                # so we need to add 1 to the seqlen to retrieve the correct mamba state from h.
+                mamba_track_seqlen = _force_track_h(mamba_track_seqlen_aligned)
+
             req.mamba_next_track_idx = (
                 self.req_to_token_pool.get_mamba_ping_pong_other_idx(
                     req.mamba_next_track_idx
@@ -1666,18 +1755,16 @@ class ScheduleBatch(
                 # is within the current extend batch.
                 branching_seqlen_aligned_mask = (
                     req.mamba_branching_seqlen - len(req.prefix_indices)
-                ) % FLA_CHUNK_SIZE == 0
+                ) % mamba_cache_chunk_size == 0
                 if (
                     req.mamba_branching_seqlen > len(req.prefix_indices)
                     and req.mamba_branching_seqlen < mamba_track_seqlen
                     and branching_seqlen_aligned_mask
                 ):
-                    # NOTE: See the comment above for mamba_track_seqlen, the +1 is necessary
-                    # because the branching point is not the last aligned position, so we need
-                    # to retrieve its state from h. Adding 1 will give us the correct index in h,
-                    # otherwise the calculation will retrieve the state from the last_recurrent_state,
-                    # which is not correct.
-                    mamba_track_seqlen = req.mamba_branching_seqlen + 1
+                    # We want to track mamba_track_seqlen_aligned, and it's not the last position,
+                    # so we need to add 1 to the seqlen to retrieve the correct mamba state from h.
+                    # See _force_track_h() for more details.
+                    mamba_track_seqlen = _force_track_h(req.mamba_branching_seqlen)
                     mamba_track_seqlen_aligned = req.mamba_branching_seqlen
             req.mamba_last_track_seqlen = mamba_track_seqlen_aligned
         mamba_track_seqlens_cpu.append(mamba_track_seqlen)
