@@ -8,6 +8,7 @@ from statistics import mean, median
 
 import httpx
 import librosa
+import numpy as np
 import soundfile
 from datasets import load_dataset
 from evaluate import load
