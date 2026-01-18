@@ -141,7 +141,7 @@ class ModelConfig:
             and getattr(self.hf_config, "auto_map", None) is not None
         ):
             if self.hf_config.auto_map.get("AutoModelForCausalLM", None) is not None:
-                pattern = r'.'
+                pattern = r"."
                 auto_architecture = self.hf_config.auto_map[
                     "AutoModelForCausalLM"
                 ].split(pattern)[-1]
