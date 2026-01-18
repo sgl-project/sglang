@@ -50,6 +50,7 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterReqInput,
     MultimodalDataInputFormat,
+    PostLoadedWeightsReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
     RpcReqInput,
@@ -559,6 +560,22 @@ class Engine(EngineBase):
         return self.loop.run_until_complete(
             self.tokenizer_manager.update_weights_from_tensor(obj, None)
         )
+
+    def post_loaded_weights(
+        self,
+    ):
+        obj = PostLoadedWeightsReqInput()
+        loop = asyncio.get_event_loop()
+
+        if loop.is_running():
+            task = asyncio.create_task(
+                self.tokenizer_manager.post_loaded_weights(obj, None)
+            )
+            return task
+        else:
+            return loop.run_until_complete(
+                self.tokenizer_manager.post_loaded_weights(obj, None)
+            )
 
     def update_weights_from_disk(
         self,

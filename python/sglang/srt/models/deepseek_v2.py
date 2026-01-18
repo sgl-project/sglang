@@ -122,6 +122,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
 from sglang.srt.layers.quantization.int8_utils import (
     block_dequant as int8_block_dequant,
 )
+from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
@@ -165,6 +166,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_non_idle_and_non_empty,
     is_nvidia_cublas_cu12_version_ge_12_9,
+    is_sm100_supported,
     log_info_on_rank0,
     make_layers,
     use_intel_amx_backend,
@@ -2766,6 +2768,7 @@ class DeepseekV2ForCausalLM(nn.Module):
         self.fuse_qkv_a_proj = (
             hasattr(config, "q_lora_rank") and config.q_lora_rank is not None
         )
+        self.cached_a_proj = {} if self.fuse_qkv_a_proj else None
         if self.fuse_qkv_a_proj:
             self.packed_modules_mapping["fused_qkv_a_proj_with_mqa"] = [
                 "q_a_proj",
@@ -2815,6 +2818,7 @@ class DeepseekV2ForCausalLM(nn.Module):
 
         q_lora_rank = config.q_lora_rank if hasattr(config, "q_lora_rank") else None
         get_attn_tp_context().init_context(q_lora_rank, is_deepseek_nsa(config))
+        self.is_init = True
 
     @property
     def routed_experts_weights_of_layer(self):
@@ -2908,7 +2912,16 @@ class DeepseekV2ForCausalLM(nn.Module):
 
     def post_load_weights(self, is_nextn=False, weight_names=None):
 
-        # Perform post-processing after loading weights
+        # Perform post-processing after loading all weights
+        # TODO: Compatible with kv cache quantization
+        post_process_exclude_list = (BaseKVCacheMethod,)
+        for _, module in self.named_modules():
+            quant_method = getattr(module, "quant_method", None)
+            if quant_method is not None:
+                if isinstance(quant_method, post_process_exclude_list):
+                    continue
+                quant_method.process_weights_after_loading(module)
+
         if is_nextn:
             layer_ids = [self.config.num_hidden_layers]
         else:
@@ -3107,6 +3120,29 @@ class DeepseekV2ForCausalLM(nn.Module):
                 self_attn.w_vc = bind_or_assign(self_attn.w_vc, w_vc.contiguous())
                 self_attn.use_deep_gemm_bmm = True
 
+        self.cached_a_proj = {} if self.fuse_qkv_a_proj else None
+        self.is_init = False
+
+    def _maybe_use_scale_fp32(self, params_dict, name):
+        """TODO: We can retain the fp32 scale metadata and rebuild it during reload,
+        rather than the tensor itself, because it requires additional memory
+        """
+        if (
+            is_sm100_supported()
+            and "weight_scale_inv" in name
+            and f"{name}_buf" in params_dict
+            and not self.is_init
+            and params_dict[
+                name
+            ].format_ue8m0  # because may be called multi times by the same param
+        ):
+            # exchange param_fp32 (raw) and param_int32 (ue8m0 packed)
+            buf_name = f"{name}_buf"
+            params_dict[name], params_dict[buf_name] = (
+                params_dict[buf_name],
+                params_dict[name],
+            )
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
 
         if is_nextn:
@@ -3147,12 +3183,6 @@ class DeepseekV2ForCausalLM(nn.Module):
             expert_params_mapping += FusedMoE.make_expert_input_scale_params_mapping(
                 num_experts=self.config.n_routed_experts
             )
-
-        # Fuse q_a_proj and kv_a_proj_with_mqa along output dimension when q_lora_rank is not None
-        fuse_qkv_a_proj = hasattr(self.config, "q_lora_rank") and (
-            self.config.q_lora_rank is not None
-        )
-        cached_a_proj = {} if fuse_qkv_a_proj else None
 
         if is_nextn:
             nextn_layer_prefix = f"model.layers.{nextn_layer_id}"
@@ -3240,6 +3270,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                     # Skip loading extra bias for GPTQ models.
                     if name.endswith(".bias") and name not in params_dict:
                         continue
+                    self._maybe_use_scale_fp32(params_dict, name)
                     param = params_dict[name]
                     weight_loader = param.weight_loader
                     maybe_executor_submit(
@@ -3260,6 +3291,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                         name = name.replace(weight_name, param_name)
                         if name not in params_dict:
                             continue
+                        self._maybe_use_scale_fp32(params_dict, name)
                         param = params_dict[name]
                         weight_loader = param.weight_loader
                         maybe_executor_submit(
@@ -3288,10 +3320,10 @@ class DeepseekV2ForCausalLM(nn.Module):
                         # Skip loading norm if not last rank in pipeline parallelism
                         if ".norm." in name and not self.pp_group.is_last_rank:
                             continue
-                        if fuse_qkv_a_proj and (
+                        if self.fuse_qkv_a_proj and (
                             "q_a_proj" in name or "kv_a_proj_with_mqa" in name
                         ):
-                            cached_a_proj[name] = loaded_weight
+                            self.cached_a_proj[name] = loaded_weight
                             q_a_proj_name = (
                                 name
                                 if "q_a_proj" in name
@@ -3305,11 +3337,11 @@ class DeepseekV2ForCausalLM(nn.Module):
 
                             # When both q_a_proj and kv_a_proj_with_mqa has been cached, load the fused weight to parameter
                             if (
-                                q_a_proj_name in cached_a_proj
-                                and kv_a_proj_name in cached_a_proj
+                                q_a_proj_name in self.cached_a_proj
+                                and kv_a_proj_name in self.cached_a_proj
                             ):
-                                q_a_proj_weight = cached_a_proj[q_a_proj_name]
-                                kv_a_proj_weight = cached_a_proj[kv_a_proj_name]
+                                q_a_proj_weight = self.cached_a_proj[q_a_proj_name]
+                                kv_a_proj_weight = self.cached_a_proj[kv_a_proj_name]
 
                                 if q_a_proj_weight.shape == torch.Size(
                                     []
@@ -3338,8 +3370,8 @@ class DeepseekV2ForCausalLM(nn.Module):
                                         "fused_qkv_a_proj_with_mqa",
                                     )
                                 )
+                                self._maybe_use_scale_fp32(params_dict, param_name)
                                 param = params_dict[param_name]
-
                                 weight_loader = getattr(
                                     param, "weight_loader", default_weight_loader
                                 )
@@ -3350,8 +3382,8 @@ class DeepseekV2ForCausalLM(nn.Module):
                                     func=weight_loader,
                                     func_args=(param, fused_weight),
                                 )
-                                cached_a_proj.pop(q_a_proj_name)
-                                cached_a_proj.pop(kv_a_proj_name)
+                                self.cached_a_proj.pop(q_a_proj_name)
+                                self.cached_a_proj.pop(kv_a_proj_name)
                         else:
                             if (
                                 "k_scale" in name or "v_scale" in name
@@ -3369,6 +3401,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                                 # model.decoder.self_attn.attn_mqa.k_scale
                                 logger.warning(f"{name} not found in params_dict.")
                                 continue
+                            self._maybe_use_scale_fp32(params_dict, name)
                             param = params_dict[name]
                             weight_loader = getattr(
                                 param, "weight_loader", default_weight_loader
@@ -3384,8 +3417,6 @@ class DeepseekV2ForCausalLM(nn.Module):
             # Wait for all tasks to complete and raise any exceptions.
             for future in concurrent.futures.as_completed(futures):
                 future.result()
-
-        self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight

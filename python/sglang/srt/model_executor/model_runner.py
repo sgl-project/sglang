@@ -1359,6 +1359,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             raise NotImplementedError(f"Unknown load_format={load_format}")
         return True, "Success"
 
+    def post_loaded_weights(
+        self,
+    ):
+        monkey_patch_torch_reductions()
+        if hasattr(self.model, "post_load_weights"):
+            self.model.post_load_weights()
+        return True, "Success"
+
     def _update_weights_from_flattened_bucket(
         self,
         flattened_tensor_bucket_dict,

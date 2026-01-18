@@ -47,6 +47,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     dispatch_w8a8_block_fp8_linear,
     input_to_float8,
     normalize_e4m3fn_to_e4m3fnuz,
+    requant_weight_ue8m0,
     requant_weight_ue8m0_inplace,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
@@ -72,6 +73,7 @@ from sglang.srt.utils import (
     is_sm90_supported,
     is_sm100_supported,
     log_info_on_rank0,
+    offloader,
     print_warning_once,
     set_weight_attrs,
     use_intel_amx_backend,
@@ -334,6 +336,15 @@ class Fp8LinearMethod(LinearMethodBase):
                 scale.format_ue8m0 = False
                 scale[:] = torch.finfo(torch.float32).min
                 layer.register_parameter("weight_scale_inv", scale)
+                if is_sm100_supported():
+                    scale_buf = BlockQuantScaleParameter(
+                        data=torch.empty_like(scale.data),
+                        input_dim=1,
+                        output_dim=0,
+                        weight_loader=weight_loader,
+                    )
+                    scale_buf.format_ue8m0 = False
+                    layer.register_parameter("weight_scale_inv_buf", scale_buf)
             else:
                 scale = PerTensorScaleParameter(
                     data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
@@ -398,13 +409,33 @@ class Fp8LinearMethod(LinearMethodBase):
                     self.w8a8_block_fp8_linear
                     is deepgemm_w8a8_block_fp8_linear_with_fallback
                 )
-                and (not layer.weight_scale_inv.format_ue8m0)
+                and (
+                    (not layer.weight_scale_inv.format_ue8m0)
+                    or (
+                        layer.weight_scale_inv.format_ue8m0
+                        != layer.weight_scale_inv_buf.format_ue8m0
+                    )
+                )
             ):
-                requant_weight_ue8m0_inplace(
+                is_init = (
+                    layer.weight_scale_inv.format_ue8m0
+                    == layer.weight_scale_inv_buf.format_ue8m0
+                )
+                new_weight, new_weight_scale_inv = requant_weight_ue8m0(
                     layer.weight,
-                    layer.weight_scale_inv,
+                    (
+                        layer.weight_scale_inv_buf
+                        if not is_init
+                        else layer.weight_scale_inv
+                    ),
                     self.quant_config.weight_block_size,
                 )
+                if not is_init:
+                    layer.weight.data.copy_(new_weight.data)
+                    layer.weight_scale_inv.data.copy_(new_weight_scale_inv.data)
+                else:
+                    offloader.update_param(layer.weight, new_weight)
+                    layer.weight_scale_inv.data = new_weight_scale_inv
                 layer.weight_scale_inv.format_ue8m0 = True
             weight, weight_scale = layer.weight.data, layer.weight_scale_inv.data
 

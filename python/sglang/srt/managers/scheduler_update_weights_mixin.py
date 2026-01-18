@@ -21,6 +21,8 @@ from sglang.srt.managers.io_struct import (
     GetWeightsByNameReqOutput,
     InitWeightsUpdateGroupReqInput,
     InitWeightsUpdateGroupReqOutput,
+    PostLoadedWeightsReqInput,
+    PostLoadedWeightsReqOutput,
     ReleaseMemoryOccupationReqInput,
     ReleaseMemoryOccupationReqOutput,
     ResumeMemoryOccupationReqInput,
@@ -99,6 +101,17 @@ class SchedulerUpdateWeightsMixin:
             logger.error(message)
         torch.distributed.barrier(group=self.tp_cpu_group)
         return UpdateWeightsFromTensorReqOutput(success, message)
+
+    def post_loaded_weights(self, recv_req: PostLoadedWeightsReqInput):
+        """Post loaded model parameter."""
+        success, message = self.tp_worker.post_loaded_weights(recv_req)
+        if success:
+            flush_cache_success = self.flush_cache()
+            assert flush_cache_success, "Cache flush failed after updating weights"
+        else:
+            logger.error(message)
+        torch.distributed.barrier(group=self.tp_cpu_group)
+        return PostLoadedWeightsReqOutput(success, message)
 
     def update_weights_from_ipc(
         self: Scheduler, recv_req: UpdateWeightsFromIPCReqInput
