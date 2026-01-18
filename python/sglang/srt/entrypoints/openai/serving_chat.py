@@ -287,6 +287,9 @@ class OpenAIServingChat(OpenAIServingBase):
                 new_messages = list(request.messages)
                 new_messages.insert(first_user_idx, prohibition_msg)
                 request.messages = new_messages
+                logger.debug(
+                    f"Inserted tool prohibition system message for tool_choice=none"
+                )
 
         tool_call_constraint = None
 

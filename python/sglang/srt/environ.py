@@ -415,6 +415,7 @@ class Envs:
     # Tool-Call behavior
     SGLANG_TOOL_STRICT_LEVEL = EnvInt(ToolStrictLevel.OFF)
     # Token ID to bias when tool_choice is "none" (e.g., tool start token)
+    # TODO: Validate token ID is >= 0
     SGLANG_TOOL_START_TOKEN = EnvInt(None)
     # Whether to apply logit bias to SGLANG_TOOL_START_TOKEN when tool_choice is "none"
     SGLANG_BIAS_TOOL_WHEN_NONE = EnvBool(False)
