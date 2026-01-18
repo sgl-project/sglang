@@ -288,14 +288,20 @@ class OpenAIServingChat(OpenAIServingBase):
                 # Create a new messages list with the prohibition message inserted
                 new_messages = list(request.messages)
                 insert_location = envs.SGLANG_INSERT_TOOL_PROHIBIT_LOCATION.get()
-                if insert_location == "after":
+                insert_location_lower = insert_location.lower()
+                if insert_location_lower == "after":
                     new_messages.insert(first_user_idx + 1, prohibition_msg)
+                elif insert_location_lower == "before":
+                    new_messages.insert(first_user_idx, prohibition_msg)
                 else:
-                    # Default to "before"
+                    logger.warning(
+                        f"Invalid SGLANG_INSERT_TOOL_PROHIBIT_LOCATION value: {insert_location}. "
+                        f"Must be 'before' or 'after'. Defaulting to 'before'."
+                    )
                     new_messages.insert(first_user_idx, prohibition_msg)
                 request.messages = new_messages
                 logger.info(
-                    f"Inserted tool prohibition system message for tool_choice=none at location: {insert_location}"
+                    f"Inserted tool prohibition system message for tool_choice=none at location: {insert_location_lower}"
                 )
 
         tool_call_constraint = None
