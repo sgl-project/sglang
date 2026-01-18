@@ -49,7 +49,6 @@ from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.parser.jinja_template_utils import process_content_for_template_format
 from sglang.srt.parser.reasoning_parser import ReasoningParser
-from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
     from sglang.srt.managers.template_manager import TemplateManager
@@ -275,11 +274,7 @@ class OpenAIServingChat(OpenAIServingBase):
         tool_prohibit_msg = envs.SGLANG_INSERT_TOOL_PROHIBIT_WHEN_NONE.get()
         if request.tool_choice == "none" and tool_prohibit_msg:
             # Find the index of the first user message
-            first_user_idx = None
-            for i, msg in enumerate(request.messages):
-                if msg.role == "user":
-                    first_user_idx = i
-                    break
+            first_user_idx = next((i for i, msg in enumerate(request.messages) if msg.role == "user"), None)
 
             # Insert a system message right before the first user message
             if first_user_idx is not None:
@@ -1132,13 +1127,8 @@ class OpenAIServingChat(OpenAIServingBase):
         # If reasoning_off_by_default is set, reasoning is off unless explicitly requested
         reasoning_off_by_default = envs.SGLANG_REASONING_OFF_BY_DEFAULT.get()
 
-        if self.reasoning_parser in ["deepseek-v3"]:
-            return (
-                request.chat_template_kwargs is not None
-                and request.chat_template_kwargs.get("thinking") is True
-            )
-        if self.reasoning_parser in ["qwen3", "glm45", "nano_v3", "interns1"]:
-            # qwen3, glm45, nano_v3, and interns1 are reasoning by default
+        if self.reasoning_parser in ["deepseek-v3", "qwen3", "glm45", "nano_v3", "interns1"]:
+            # These models use enable_thinking parameter
             if reasoning_off_by_default:
                 return (
                     request.chat_template_kwargs is not None

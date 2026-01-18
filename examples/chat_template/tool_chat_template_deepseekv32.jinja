@@ -1,9 +1,8 @@
 {% if not add_generation_prompt is defined %}
   {% set add_generation_prompt = false %}
 {% endif %}
-{% if not thinking is defined %}
-  {% set thinking = false %}
-{% endif %}
+{# Support both thinking and enable_thinking parameters for compatibility #}
+{% set thinking = enable_thinking if enable_thinking is defined else thinking | default(false) %}
 {% set ns = namespace(is_first=false, is_tool=false, system_prompt='', is_first_sp=true, is_last_user=false, is_only_sys=false, is_prefix=false) %}
 {%- for message in messages %}
   {%- if message['role'] == 'system' %}
