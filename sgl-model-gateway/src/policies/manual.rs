@@ -24,9 +24,7 @@ use super::{
     get_healthy_worker_indices, utils::PeriodicTask, LoadBalancingPolicy, SelectWorkerInfo,
 };
 use crate::{
-    config::ManualAssignmentMode,
-    core::Worker,
-    observability::metrics::Metrics,
+    config::ManualAssignmentMode, core::Worker, observability::metrics::Metrics,
     routers::header_utils::extract_routing_key,
 };
 
@@ -108,9 +106,12 @@ impl ManualPolicy {
         }
 
         if let Some(routing_id) = extract_routing_key(info.headers) {
-            let (idx, branch) = self
-                .backend
-                .select_by_routing_id(routing_id, workers, &healthy_indices, self.assignment_mode);
+            let (idx, branch) = self.backend.select_by_routing_id(
+                routing_id,
+                workers,
+                &healthy_indices,
+                self.assignment_mode,
+            );
             return (Some(idx), branch);
         }
 
@@ -167,7 +168,7 @@ impl Backend {
         routing_id: &str,
         workers: &[Arc<dyn Worker>],
         healthy_indices: &[usize],
-    assignment_mode: ManualAssignmentMode,
+        assignment_mode: ManualAssignmentMode,
     ) -> (usize, ExecutionBranch) {
         match self {
             Backend::Local(b) => {
