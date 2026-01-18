@@ -915,8 +915,12 @@ class Qwen3MoeForCausalLM(nn.Module, StackedParamsMixin):
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
         ]
-        # Expert params mapping initialized as empty, populated during load_weights
-        self.expert_params_mapping = []
+        self.expert_params_mapping = FusedMoE.make_expert_params_mapping(
+            ckpt_gate_proj_name="gate_proj",
+            ckpt_down_proj_name="down_proj",
+            ckpt_up_proj_name="up_proj",
+            num_experts=self.config.num_experts,
+        )
 
         self.capture_aux_hidden_states = False
 
@@ -1023,21 +1027,8 @@ class Qwen3MoeForCausalLM(nn.Module, StackedParamsMixin):
             self.model.set_eagle3_layers_to_capture([val + 1 for val in layer_ids])
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
-        ]
-
-        expert_params_mapping = FusedMoE.make_expert_params_mapping(
-            ckpt_gate_proj_name="gate_proj",
-            ckpt_down_proj_name="down_proj",
-            ckpt_up_proj_name="up_proj",
-            num_experts=self.config.num_experts,
-        )
+        stacked_params_mapping = self.stacked_params_mapping
+        expert_params_mapping = self.expert_params_mapping
 
         # Cache params_dict to avoid repeated expensive traversal of model parameters
         if not hasattr(self, "_cached_params_dict"):

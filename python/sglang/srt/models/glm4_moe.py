@@ -1024,8 +1024,12 @@ class Glm4MoeForCausalLM(nn.Module, StackedParamsMixin):
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
         ]
-        # Expert params mapping initialized as empty, populated during load_weights
-        self.expert_params_mapping = []
+        self.expert_params_mapping = FusedMoE.make_expert_params_mapping(
+            ckpt_gate_proj_name="gate_proj",
+            ckpt_down_proj_name="down_proj",
+            ckpt_up_proj_name="up_proj",
+            num_experts=self.config.n_routed_experts + self.num_fused_shared_experts,
+        )
 
         # For EAGLE3 support
         self.capture_aux_hidden_states = False
@@ -1108,21 +1112,8 @@ class Glm4MoeForCausalLM(nn.Module, StackedParamsMixin):
             else:
                 raise ValueError("num_nextn_predict_layers is not in the config")
 
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
-        ]
-
-        expert_params_mapping = FusedMoE.make_expert_params_mapping(
-            ckpt_gate_proj_name="gate_proj",
-            ckpt_down_proj_name="down_proj",
-            ckpt_up_proj_name="up_proj",
-            num_experts=self.config.n_routed_experts + self.num_fused_shared_experts,
-        )
+        stacked_params_mapping = self.stacked_params_mapping
+        expert_params_mapping = self.expert_params_mapping
 
         if is_nextn:
             nextn_layer_prefix = f"model.layers.{nextn_layer_id}"

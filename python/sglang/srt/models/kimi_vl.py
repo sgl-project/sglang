@@ -137,28 +137,23 @@ class KimiVLForConditionalGeneration(nn.Module, StackedParamsMixin):
             prefix=add_prefix("language_model", prefix),
         )
 
-    # StackedParamsMixin delegation - forward to language model
-    def get_stacked_params_mapping(self, load_format: Optional[str] = None):
-        """Delegate stacked params mapping to the inner language model."""
+    def get_stacked_params_mapping(self):
+        """Delegate to inner language model."""
         if hasattr(self.language_model, "get_stacked_params_mapping"):
-            return self.language_model.get_stacked_params_mapping(
-                load_format=load_format
-            )
-        return super().get_stacked_params_mapping(load_format=load_format)
+            return self.language_model.get_stacked_params_mapping()
+        return super().get_stacked_params_mapping()
 
     def get_expert_params_mapping(self):
-        """Delegate expert params mapping to the inner language model."""
+        """Delegate to inner language model."""
         if hasattr(self.language_model, "get_expert_params_mapping"):
             return self.language_model.get_expert_params_mapping()
         return super().get_expert_params_mapping()
 
-    def map_weight_name(self, ckpt_weight_name: str, load_format: Optional[str] = None):
-        """Delegate weight name mapping to the inner language model."""
+    def map_weight_name(self, ckpt_weight_name: str):
+        """Delegate to inner language model."""
         if hasattr(self.language_model, "map_weight_name"):
-            return self.language_model.map_weight_name(
-                ckpt_weight_name, load_format=load_format
-            )
-        return super().map_weight_name(ckpt_weight_name, load_format=load_format)
+            return self.language_model.map_weight_name(ckpt_weight_name)
+        return super().map_weight_name(ckpt_weight_name)
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         pixel_values = (

@@ -3327,8 +3327,12 @@ class DeepseekV2ForCausalLM(nn.Module, StackedParamsMixin):
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
         ]
-        # Expert params mapping initialized as empty, populated during load_weights
-        self.expert_params_mapping = []
+        self.expert_params_mapping = FusedMoE.make_expert_params_mapping(
+            ckpt_gate_proj_name="gate_proj",
+            ckpt_down_proj_name="down_proj",
+            ckpt_up_proj_name="up_proj",
+            num_experts=self.config.n_routed_experts + self.num_fused_shared_experts,
+        )
 
         self._routed_experts_weights_of_layer = LazyValue(
             lambda: {
@@ -3659,20 +3663,11 @@ class DeepseekV2ForCausalLM(nn.Module, StackedParamsMixin):
             weights, NVFP4_CKPT_FP8_ATTN_QUANT_MODULES, is_nextn
         )
 
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
-        ]
+        stacked_params_mapping = self.stacked_params_mapping
 
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
-        expert_params_mapping = FusedMoE.make_expert_params_mapping(
-            ckpt_gate_proj_name="gate_proj",
-            ckpt_down_proj_name="down_proj",
-            ckpt_up_proj_name="up_proj",
-            num_experts=self.config.n_routed_experts + self.num_fused_shared_experts,
-        )
+        expert_params_mapping = list(self.expert_params_mapping)
         # Params for special naming rules in mixed-precision models, for example:
         # model.layers.xx.mlp.experts.xx.w1.input_scale. For details,
         # see https://huggingface.co/Barrrrry/DeepSeek-R1-W4AFP8/blob/main.
