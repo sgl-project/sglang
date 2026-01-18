@@ -22,6 +22,7 @@ from diffusers.models.normalization import AdaLayerNormContinuous
 
 from sglang.jit_kernel.norm import can_use_fused_inplace_qknorm
 from sglang.multimodal_gen.configs.models.dits.flux import FluxConfig
+from sglang.multimodal_gen.runtime.layers.activation import SiluAndMul
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
 from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm, apply_qk_norm
 from sglang.multimodal_gen.runtime.layers.linear import ColumnParallelLinear
@@ -61,12 +62,10 @@ class Flux2SwiGLU(nn.Module):
 
     def __init__(self):
         super().__init__()
-        self.gate_fn = nn.SiLU()
+        self.silu_and_mul = SiluAndMul()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x1, x2 = x.chunk(2, dim=-1)
-        x = self.gate_fn(x1) * x2
-        return x
+        return self.silu_and_mul(x)
 
 
 class Flux2FeedForward(nn.Module):
@@ -371,7 +370,7 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
         query = query.unflatten(-1, (self.heads, -1))
         key = key.unflatten(-1, (self.heads, -1))
         value = value.unflatten(-1, (self.heads, -1))
-        
+
         query = self.norm_q(query)
         key = self.norm_k(key)
 
