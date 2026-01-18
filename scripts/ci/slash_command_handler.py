@@ -215,7 +215,7 @@ def handle_rerun_stage(
         comment.create_reaction("confused")
         pr.create_issue_comment(
             f"❌ Please specify a stage name: `/rerun-stage <stage-name>`\n\n"
-            f"Examples: `/rerun-stage unit-test-backend-4-gpu`, `/rerun-stage accuracy-test-1-gpu`"
+            f"Examples: `/rerun-stage stage-c-test-4-gpu-h100`, `/rerun-stage accuracy-test-1-gpu`"
         )
         return False
 
@@ -234,20 +234,19 @@ def handle_rerun_stage(
         "multimodal-gen-test-2-gpu",
         "quantization-test",
         "stage-b-test-4-gpu-b200",
-        "unit-test-backend-4-gpu",
-        "unit-test-backend-8-gpu-h200",
-        "unit-test-backend-8-gpu-h20",
-        "unit-test-backend-8-gpu-b200",
+        "stage-c-test-4-gpu-h100",
+        "stage-c-test-8-gpu-h200",
+        "stage-c-test-8-gpu-h20",
         "performance-test-1-gpu-part-1",
         "performance-test-1-gpu-part-2",
         "performance-test-1-gpu-part-3",
         "performance-test-2-gpu",
         "accuracy-test-1-gpu",
         "accuracy-test-2-gpu",
-        "unit-test-deepep-4-gpu",
-        "unit-test-deepep-8-gpu",
-        "unit-test-backend-4-gpu-b200",
-        "unit-test-backend-4-gpu-gb200",
+        "stage-c-test-deepep-4-gpu",
+        "stage-c-test-deepep-8-gpu",
+        "stage-c-test-4-gpu-b200",
+        "stage-c-test-4-gpu-gb200",
     ]
 
     # Valid AMD stage names that support target_stage
