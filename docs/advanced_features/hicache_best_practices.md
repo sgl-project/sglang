@@ -151,6 +151,30 @@ python3 -m sglang.launch_server \
 ```
 
 
+## Storage Batch Optimization
+
+HiCache uses batching to optimize storage I/O operations. Two key parameters control this behavior:
+
+- `storage_batch_size_pages`: Controls the number of pages in each storage batch (default: 128)
+- `storage_batch_merge_tail_pages`: Merges small tail batches to reduce I/O calls (default: 32)
+
+### Performance Tuning
+
+For optimal performance, consider these guidelines:
+
+1. **Batch Size**: Larger batches reduce the number of I/O calls but may increase latency for individual operations. For high-throughput scenarios, consider increasing `storage_batch_size_pages` to 256 or 512.
+
+2. **Tail Merging**: The `storage_batch_merge_tail_pages` parameter helps reduce I/O overhead by merging small tail batches. The default value of 32 is suitable for most workloads, but you may adjust it based on your sequence length distribution.
+
+Example configuration:
+```bash
+python3 -m sglang.launch_server \
+  --model-path your-model \
+  --enable-hierarchical-cache \
+  --hicache-storage-backend hf3fs \
+  --hicache-storage-backend-extra-config '{"storage_batch_size_pages": 128, "storage_batch_merge_tail_pages": 32}'
+```
+
 ## Custom Storage Backend Integration
 
 To integrate a new storage backend:
@@ -183,6 +207,8 @@ python3 -m sglang.launch_server \
   - `module_path`: Python module path to your implementation
   - `class_name`: Your HiCache implementation class name
   - `interface_v1`: 0 (disable) or 1 (enable) to control usage of batch_get_v1 and batch_set_v1 methods
+  - `storage_batch_size_pages`: Number of pages per storage batch (default: 128)
+  - `storage_batch_merge_tail_pages`: Merge tail pages if smaller than this threshold (default: 32)
 
 
 ## Community and Support
