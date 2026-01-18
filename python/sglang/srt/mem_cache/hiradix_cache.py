@@ -839,11 +839,11 @@ class HiRadixCache(RadixCache):
         if child.evicted:
             new_node.value = None
         else:
-            new_node.value = child.value[:split_len]
-            child.value = child.value[split_len:]
+            new_node.value = child.value[:split_len].clone()
+            child.value = child.value[split_len:].clone()
         if child.backuped:
-            new_node.host_value = child.host_value[:split_len]
-            child.host_value = child.host_value[split_len:]
+            new_node.host_value = child.host_value[:split_len].clone()
+            child.host_value = child.host_value[split_len:].clone()
 
         new_node.hash_value, child.hash_value = split_node_hash_value(
             child.hash_value, split_len, self.page_size
