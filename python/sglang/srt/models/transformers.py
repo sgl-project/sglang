@@ -17,6 +17,7 @@
 """Wrapper around `transformers` models"""
 import logging
 import re
+from inspect import Parameter, signature
 from typing import Iterable, Literal, Optional, Tuple, Union
 
 import torch
@@ -202,6 +203,12 @@ class TransformersForCausalLM(nn.Module):
             self.lm_head.weight = self.model.get_input_embeddings().weight
 
         self.logits_processor = LogitsProcessor(config)
+        forward_signature = signature(self.model.forward)
+        self._forward_params = set(forward_signature.parameters.keys())
+        self._forward_accepts_kwargs = any(
+            param.kind == Parameter.VAR_KEYWORD
+            for param in forward_signature.parameters.values()
+        )
 
     def log_replacement(self, name: str, old_module: nn.Module, new_module: nn.Module):
         logger.debug("%s: %s -> %s", name, old_module, new_module)
@@ -259,16 +266,16 @@ class TransformersForCausalLM(nn.Module):
     ) -> LogitsProcessorOutput:
         assert get_embedding is False, "embedding is not supported yet"
         aux_hidden_states = None
-        hidden_states = self.model(
-            input_ids[None, ...],
-            use_cache=False,
-            position_ids=positions[None, ...],
-            forward_batch=forward_batch,
-            attention_instances=self.attention_instances,
-            return_dict=False,
-        )[0][
-            0, ...
-        ]  # we remove batch dimension for now
+        model_kwargs = {
+            "use_cache": False,
+            "position_ids": positions[None, ...],
+            "return_dict": False,
+        }
+        if self._forward_accepts_kwargs or "forward_batch" in self._forward_params:
+            model_kwargs["forward_batch"] = forward_batch
+        if self._forward_accepts_kwargs or "attention_instances" in self._forward_params:
+            model_kwargs["attention_instances"] = self.attention_instances
+        hidden_states = self.model(input_ids[None, ...], **model_kwargs)[0][0, ...]
 
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
