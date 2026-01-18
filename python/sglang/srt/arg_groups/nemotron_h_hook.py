@@ -38,6 +38,8 @@ def apply_nemotron_h_defaults(server_args: "ServerArgs", model_arch: str) -> Non
                 )
             else:
                 server_args.moe_runner_backend = "flashinfer_cutlass"
+    if hasattr(model_config.hf_config, "mamba_chunk_size"):
+        server_args._mamba_chunk_size = model_config.hf_config.mamba_chunk_size
 
     server_args._handle_mamba_radix_cache(
         model_arch=model_arch,
