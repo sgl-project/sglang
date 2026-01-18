@@ -274,9 +274,12 @@ class OpenAIServingChat(OpenAIServingBase):
         tool_prohibit_msg = envs.SGLANG_INSERT_TOOL_PROHIBIT_WHEN_NONE.get()
         if request.tool_choice == "none" and tool_prohibit_msg:
             # Find the index of the first user message
-            first_user_idx = next((i for i, msg in enumerate(request.messages) if msg.role == "user"), None)
+            first_user_idx = next(
+                (i for i, msg in enumerate(request.messages) if msg.role == "user"),
+                None,
+            )
 
-            # Insert a system message right before the first user message
+            # Insert the prohibition message before or after the first user message based on SGLANG_INSERT_TOOL_PROHIBIT_LOCATION
             if first_user_idx is not None:
                 prohibition_msg = ChatCompletionMessageGenericParam(
                     role="system",
@@ -284,10 +287,21 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
                 # Create a new messages list with the prohibition message inserted
                 new_messages = list(request.messages)
-                new_messages.insert(first_user_idx, prohibition_msg)
+                insert_location = envs.SGLANG_INSERT_TOOL_PROHIBIT_LOCATION.get()
+                insert_location_lower = insert_location.lower()
+                if insert_location_lower == "after":
+                    new_messages.insert(first_user_idx + 1, prohibition_msg)
+                elif insert_location_lower == "before":
+                    new_messages.insert(first_user_idx, prohibition_msg)
+                else:
+                    logger.warning(
+                        f"Invalid SGLANG_INSERT_TOOL_PROHIBIT_LOCATION value: {insert_location}. "
+                        f"Must be 'before' or 'after'. Defaulting to 'before'."
+                    )
+                    new_messages.insert(first_user_idx, prohibition_msg)
                 request.messages = new_messages
-                logger.debug(
-                    f"Inserted tool prohibition system message for tool_choice=none"
+                logger.info(
+                    f"Inserted tool prohibition system message for tool_choice=none at location: {insert_location_lower}"
                 )
 
         tool_call_constraint = None
@@ -1127,7 +1141,13 @@ class OpenAIServingChat(OpenAIServingBase):
         # If reasoning_off_by_default is set, reasoning is off unless explicitly requested
         reasoning_off_by_default = envs.SGLANG_REASONING_OFF_BY_DEFAULT.get()
 
-        if self.reasoning_parser in ["deepseek-v3", "qwen3", "glm45", "nano_v3", "interns1"]:
+        if self.reasoning_parser in [
+            "deepseek-v3",
+            "qwen3",
+            "glm45",
+            "nano_v3",
+            "interns1",
+        ]:
             # These models use enable_thinking parameter
             if reasoning_off_by_default:
                 return (
