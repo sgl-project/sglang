@@ -1,14 +1,18 @@
 import unittest
 
 from sglang.test.kits.gsm8k_accuracy_kit import GSM8KMixin
-from sglang.test.mamba_scheduler_strategy_test_utils import MambaSchedulerStrategyMixin
+from sglang.test.kits.kl_divergence_kit import KLDivergenceMixin
+from sglang.test.kits.prefix_cache_branching_kit import PrefixCacheBranchingMixin
 from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 
 QWEN3_NEXT_MODEL = "Qwen/Qwen3-Next-80B-A3B-Instruct"
 
 
-class TestQwen3Next(GSM8KMixin, MambaSchedulerStrategyMixin, DefaultServerBase):
+class TestQwen3Next(
+    GSM8KMixin, KLDivergenceMixin, PrefixCacheBranchingMixin, DefaultServerBase
+):
     model = QWEN3_NEXT_MODEL
+    cache_chunk_size = 64
     gsm8k_accuracy_thres = 0.93
     kl_div_thres = 0.0025
     other_args = [
@@ -21,21 +25,6 @@ class TestQwen3Next(GSM8KMixin, MambaSchedulerStrategyMixin, DefaultServerBase):
         "--mamba-track-interval",
         "128",
     ]
-
-    def test_input_output_logprobs_match_prefill_cache_hit(self):
-        self._test_input_output_logprobs_match_prefill_cache_hit_helper(
-            max_samples=32,
-            max_new_tokens=512,
-        )
-
-    def test_input_output_logprobs_match_decode_cache_hit(self):
-        self._test_input_output_logprobs_match_decode_cache_hit_helper(
-            max_samples=32,
-            max_new_tokens=512,
-        )
-
-    def test_prefix_cache_branching(self):
-        self._test_prefix_cache_branching_helper(64)
 
 
 if __name__ == "__main__":

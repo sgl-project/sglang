@@ -20,7 +20,12 @@ CACHE_DIR = os.path.join(os.path.dirname(__file__), ".longbench_cache")
 _cached_input_ids = {}
 
 
-class MambaSchedulerStrategyMixin:
+class KLDivergenceMixin:
+    kl_div_thres: float
+    kl_div_max_samples: int = 32
+    kl_div_prefill_max_new_tokens: int = 512
+    kl_div_decode_max_new_tokens: int = 512
+
     @classmethod
     def format_longbench_v2_example(cls, example):
         """Format a LongBench V2 example into a single text string (context + question only)."""
@@ -116,11 +121,6 @@ class MambaSchedulerStrategyMixin:
             f"for {cls.model} {test_name}"
         )
 
-    # Common request helpers
-    @classmethod
-    def _flush_cache(cls):
-        requests.post(cls.base_url + "/flush_cache")
-
     @classmethod
     def _generate(
         cls, input_ids, max_new_tokens, return_logprob=False, logprob_start_len=-1
@@ -148,7 +148,7 @@ class MambaSchedulerStrategyMixin:
     @classmethod
     def _get_input_logprobs(cls, new_input_ids, output_logprobs):
         """Run prefill to get input logprobs matching output logprobs."""
-        cls._flush_cache()
+        cls.flush_cache()
         results = cls._generate(
             new_input_ids,
             max_new_tokens=0,
@@ -182,7 +182,7 @@ class MambaSchedulerStrategyMixin:
         print(f"Running test_input_output_logprobs_match with {len(input_ids)} prompts")
 
         print("Flush Cache and Running generation to get output logprobs ...")
-        cls._flush_cache()
+        cls.flush_cache()
         results = cls._generate(input_ids, max_new_tokens, return_logprob=True)
         assert len(results) == len(input_ids)
 
@@ -202,32 +202,32 @@ class MambaSchedulerStrategyMixin:
         )
 
     @classmethod
-    def _test_input_output_logprobs_match_prefill_cache_hit_helper(
-        cls, max_samples=None, max_new_tokens=8192
-    ):
+    def test_input_output_logprobs_match_prefill_cache_hit(cls):
         server_info = requests.get(cls.base_url + "/get_server_info").json()
         if server_info["disable_radix_cache"]:
             print("Radix cache is disabled, skipping test")
             return
 
         num_samples = DEFAULT_NUM_SAMPLES
-        if max_samples is not None and max_samples > num_samples:
-            num_samples = max_samples
-        input_ids = cls.get_input_ids(tokenizer_path=cls.model, num_samples=num_samples)
-        if max_samples is not None:
-            input_ids = input_ids[:max_samples]
+        if cls.kl_div_max_samples > num_samples:
+            num_samples = cls.kl_div_max_samples
+        input_ids = cls.get_input_ids(
+            tokenizer_path=cls.model, num_samples=num_samples
+        )[: cls.kl_div_max_samples]
         print(
             f"Running test_input_output_logprobs_match_prefill_cache_hit with {len(input_ids)} prompts"
         )
 
         # Prefill to cache the input
         print("Flush Cache and Prefill to cache the input ...")
-        cls._flush_cache()
+        cls.flush_cache()
         cls._generate(input_ids, max_new_tokens=0)
 
         # Generate with cache hit
         print("Running generation to get output logprobs ...")
-        results = cls._generate(input_ids, max_new_tokens, return_logprob=True)
+        results = cls._generate(
+            input_ids, cls.kl_div_prefill_max_new_tokens, return_logprob=True
+        )
         assert len(results) == len(input_ids)
 
         new_input_ids = []
@@ -253,31 +253,27 @@ class MambaSchedulerStrategyMixin:
         )
 
     @classmethod
-    def _test_input_output_logprobs_match_decode_cache_hit_helper(
-        cls, max_samples=None, max_new_tokens=8192
-    ):
+    def test_input_output_logprobs_match_decode_cache_hit(cls):
         server_info = requests.get(cls.base_url + "/get_server_info").json()
         if server_info["disable_radix_cache"]:
             print("Radix cache is disabled, skipping test")
             return
 
         num_samples = DEFAULT_NUM_SAMPLES
-        if max_samples is not None and max_samples > num_samples:
-            num_samples = max_samples
+        if cls.kl_div_max_samples > num_samples:
+            num_samples = cls.kl_div_max_samples
         first_turn_input_ids = cls.get_input_ids(
             tokenizer_path=cls.model, num_samples=num_samples
-        )
-        if max_samples is not None:
-            first_turn_input_ids = first_turn_input_ids[:max_samples]
+        )[: cls.kl_div_max_samples]
         print(
             f"Running test_input_output_logprobs_match_decode_cache_hit with {len(first_turn_input_ids)} prompts"
         )
 
         # First turn: Prefill + Decode to cache
         print("Flush Cache and First turn: Prefill + Decode to cache decode ...")
-        cls._flush_cache()
+        cls.flush_cache()
         results = cls._generate(
-            first_turn_input_ids, max_new_tokens, return_logprob=True
+            first_turn_input_ids, cls.kl_div_decode_max_new_tokens, return_logprob=True
         )
         assert len(results) == len(first_turn_input_ids)
 
@@ -292,7 +288,7 @@ class MambaSchedulerStrategyMixin:
         # Second turn: should hit decode cache
         print("Running generation to get output logprobs ...")
         results = cls._generate(
-            second_turn_input_ids, max_new_tokens, return_logprob=True
+            second_turn_input_ids, cls.kl_div_decode_max_new_tokens, return_logprob=True
         )
         assert len(results) == len(second_turn_input_ids)
 
@@ -317,46 +313,3 @@ class MambaSchedulerStrategyMixin:
             output_logprobs,
             inspect.currentframe().f_code.co_name,
         )
-
-    @classmethod
-    def send_request_helper(cls, text: str):
-        response = requests.post(
-            cls.base_url + "/generate",
-            json={
-                "text": text,
-                "sampling_params": {
-                    "max_new_tokens": 1,
-                },
-            },
-        )
-        return response.json()
-
-    @classmethod
-    def _test_prefix_cache_branching_helper(cls, chunk_size: int):
-        cls._flush_cache()
-        branching_pos = 257
-        text_prefix = "hi" * branching_pos
-        suffix_list = [
-            "this" * chunk_size * 4,
-            "here" * chunk_size * 4,
-            "that" * chunk_size * 4,
-        ]
-        cache_hit_list = [False, False, True]
-
-        # First request only prefill the entire sequence
-        # Second request won't have cache hit, but will cache the branching point
-        # Third request will have cache hit on the branching point
-        for i, (suffix, cache_hit) in enumerate(
-            zip(suffix_list, cache_hit_list, strict=True)
-        ):
-            result = cls.send_request_helper(text_prefix + suffix)
-            cached_tokens = result["meta_info"]["cached_tokens"]
-            if cache_hit:
-                expected_cached_tokens = branching_pos // chunk_size * chunk_size
-                assert (
-                    cached_tokens == expected_cached_tokens
-                ), f"{i=}, {cache_hit=}, {cached_tokens=} is not equal to {expected_cached_tokens=}, {branching_pos=}"
-            else:
-                assert (
-                    cached_tokens == 0
-                ), f"{i=}, {cache_hit=}, {cached_tokens=} is not 0"
