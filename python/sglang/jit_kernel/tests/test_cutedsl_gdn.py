@@ -90,7 +90,9 @@ def test_cutedsl_gdn_precision(B: int):
     has_nan = torch.isnan(out_cutedsl).any() or torch.isinf(out_cutedsl).any()
 
     kernel_type = "SmallBatch" if B < 32 else "LargeBatch"
-    print(f"\n  B={B} ({kernel_type}): max_diff={max_diff:.2e}, mean_diff={mean_diff:.2e}, fail_rate={fail_rate:.2f}%")
+    print(
+        f"\n  B={B} ({kernel_type}): max_diff={max_diff:.2e}, mean_diff={mean_diff:.2e}, fail_rate={fail_rate:.2f}%"
+    )
 
     assert not has_nan, "Output contains NaN/Inf"
     assert fail_rate < 1.0, f"Fail rate {fail_rate:.2f}% >= 1%"
@@ -162,31 +164,54 @@ def test_cutedsl_gdn_performance(B: int):
     stream = cuda_driver.CUstream(torch_stream.cuda_stream)
 
     # Compile kernels
-    compiled = cutedsl_gdn._get_compiled_kernel(
-        N, H, HV, K, V, N, N < 32, is_varlen
-    )
+    compiled = cutedsl_gdn._get_compiled_kernel(N, H, HV, K, V, N, N < 32, is_varlen)
     torch.cuda.synchronize()
 
     for ri in range(run_iters):
         _ = run_triton_kernel(
-            A_log, dt_bias, q_triton[ri], k_triton[ri], v_triton[ri],
-            a_triton[ri], b_triton[ri], state_triton, indices, scale
+            A_log,
+            dt_bias,
+            q_triton[ri],
+            k_triton[ri],
+            v_triton[ri],
+            a_triton[ri],
+            b_triton[ri],
+            state_triton,
+            indices,
+            scale,
         )
     torch.cuda.synchronize()
 
     def run_cutedsl():
         for ri in range(run_iters):
             compiled(
-                cu_t, q_tensor_list[ri], k_tensor_list[ri], v_tensor_list[ri],
-                a_tensor_list[ri], b_tensor_list[ri], A_log_t, dt_bias_t,
-                h0_t, idx_t, o_t, stream
+                cu_t,
+                q_tensor_list[ri],
+                k_tensor_list[ri],
+                v_tensor_list[ri],
+                a_tensor_list[ri],
+                b_tensor_list[ri],
+                A_log_t,
+                dt_bias_t,
+                h0_t,
+                idx_t,
+                o_t,
+                stream,
             )
 
     def run_triton():
         for ri in range(run_iters):
             _ = run_triton_kernel(
-                A_log, dt_bias, q_triton[ri], k_triton[ri], v_triton[ri],
-                a_triton[ri], b_triton[ri], state_triton, indices, scale
+                A_log,
+                dt_bias,
+                q_triton[ri],
+                k_triton[ri],
+                v_triton[ri],
+                a_triton[ri],
+                b_triton[ri],
+                state_triton,
+                indices,
+                scale,
             )
 
     # Warmup
@@ -226,7 +251,9 @@ def test_cutedsl_gdn_performance(B: int):
     # Benchmark
     triton_times, cutedsl_times = [], []
     for _ in range(bench_iters):
-        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(
+            enable_timing=True
+        )
         start.record()
         if graph_triton:
             graph_triton.replay()
@@ -236,7 +263,9 @@ def test_cutedsl_gdn_performance(B: int):
         torch.cuda.synchronize()
         triton_times.append(start.elapsed_time(end))
 
-        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(
+            enable_timing=True
+        )
         with torch.cuda.stream(torch_stream):
             start.record()
             if graph_cutedsl:
@@ -254,7 +283,9 @@ def test_cutedsl_gdn_performance(B: int):
     speedup = triton_mean / cutedsl_mean
 
     kernel_type = "SmallBatch" if B < 32 else "LargeBatch"
-    print(f"\n  B={B} ({kernel_type}): Triton={triton_mean:.2f}±{triton_std:.2f}μs, CuTeDSL={cutedsl_mean:.2f}±{cutedsl_std:.2f}μs, speedup={speedup:.2f}x")
+    print(
+        f"\n  B={B} ({kernel_type}): Triton={triton_mean:.2f}±{triton_std:.2f}μs, CuTeDSL={cutedsl_mean:.2f}±{cutedsl_std:.2f}μs, speedup={speedup:.2f}x"
+    )
 
     min_speedup = 1.0 if B < 32 else 1.15
     assert speedup >= min_speedup, f"Speedup {speedup:.2f}x < {min_speedup}x for B={B}"
