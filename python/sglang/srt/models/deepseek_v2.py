@@ -870,6 +870,11 @@ class DeepseekV2MoE(nn.Module):
             return
 
         if not hasattr(self, "shared_experts"):
+            logger.warning(
+                "DeepEP Waterfill enabled but `shared_experts` module is missing "
+                "(layer_id=%s). Shared expert weights will NOT be copied into MoE.",
+                self.layer_id,
+            )
             return
 
         # Local shared expert index = old_experts_per_rank (e.g., 32)
@@ -883,8 +888,22 @@ class DeepseekV2MoE(nn.Module):
             dst_weight = self.experts.w13_weight.data[local_shared_idx]
 
             if src_weight.shape != dst_weight.shape:
+                logger.warning(
+                    "DeepEP Waterfill shared weight copy skipped due to shape mismatch "
+                    "(layer_id=%s, local_shared_idx=%s, w13 src=%s dst=%s).",
+                    self.layer_id,
+                    local_shared_idx,
+                    tuple(src_weight.shape),
+                    tuple(dst_weight.shape),
+                )
                 return
             self.experts.w13_weight.data[local_shared_idx].copy_(src_weight)
+        else:
+            logger.warning(
+                "DeepEP Waterfill cannot copy shared gate_up (w13) weights: missing "
+                "attrs on experts/shared_experts (layer_id=%s).",
+                self.layer_id,
+            )
 
             # Copy FP8 scale if present (for FP8 models)
             if hasattr(self.experts, "w13_weight_scale_inv") and hasattr(
@@ -911,8 +930,22 @@ class DeepseekV2MoE(nn.Module):
             dst_weight = self.experts.w2_weight.data[local_shared_idx]
 
             if src_weight.shape != dst_weight.shape:
+                logger.warning(
+                    "DeepEP Waterfill shared weight copy skipped due to shape mismatch "
+                    "(layer_id=%s, local_shared_idx=%s, w2 src=%s dst=%s).",
+                    self.layer_id,
+                    local_shared_idx,
+                    tuple(src_weight.shape),
+                    tuple(dst_weight.shape),
+                )
                 return
             self.experts.w2_weight.data[local_shared_idx].copy_(src_weight)
+        else:
+            logger.warning(
+                "DeepEP Waterfill cannot copy shared down (w2) weights: missing "
+                "attrs on experts/shared_experts (layer_id=%s).",
+                self.layer_id,
+            )
 
             # Copy FP8 scale if present
             if hasattr(self.experts, "w2_weight_scale_inv") and hasattr(
@@ -1405,6 +1438,7 @@ class DeepseekV2MoE(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         """Forward pass with DeepEP-based waterfill load balancing for shared expert."""
+        from sglang.srt.distributed import get_moe_ep_group
         from sglang.srt.layers.moe.topk import StandardTopKOutput
 
         num_tokens = hidden_states.shape[0]
@@ -1434,7 +1468,9 @@ class DeepseekV2MoE(nn.Module):
         )
         global_routed_counts = local_routed_counts.clone()
         torch.distributed.all_reduce(
-            global_routed_counts, op=torch.distributed.ReduceOp.SUM
+            global_routed_counts,
+            op=torch.distributed.ReduceOp.SUM,
+            group=get_moe_ep_group().device_group,
         )
 
         # Waterfill assignment and expand topk to 9 columns

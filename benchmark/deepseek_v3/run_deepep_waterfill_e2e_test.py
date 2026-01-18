@@ -384,7 +384,12 @@ def main() -> int:
     )
 
     # Accuracy
-    parser.add_argument("--run-accuracy", action="store_true", default=True)
+    # Default: run accuracy. Use --skip-accuracy to opt out.
+    parser.add_argument(
+        "--skip-accuracy",
+        action="store_true",
+        help="Skip accuracy evaluation (GSM8K + MMLU).",
+    )
     parser.add_argument("--gsm8k-parallel", type=int, default=64)
     parser.add_argument("--gsm8k-num-shots", type=int, default=5)
     parser.add_argument("--gsm8k-num-questions", type=int, default=200)
@@ -394,7 +399,12 @@ def main() -> int:
     parser.add_argument("--mmlu-data-dir", type=str, default="")
 
     # Serving benchmark
-    parser.add_argument("--run-serving", action="store_true", default=True)
+    # Default: run serving benchmark. Use --skip-serving to opt out.
+    parser.add_argument(
+        "--skip-serving",
+        action="store_true",
+        help="Skip serving benchmark.",
+    )
     parser.add_argument("--rounds", type=int, default=2)
     parser.add_argument("--output-len", type=int, default=1)
     parser.add_argument("--cases", type=str, default=DEFAULT_CASES)
@@ -442,7 +452,7 @@ def main() -> int:
     }
 
     # ---------------- Accuracy ----------------
-    if args.run_accuracy:
+    if not args.skip_accuracy:
         mmlu_data_dir = (
             args.mmlu_data_dir
             if args.mmlu_data_dir
@@ -509,7 +519,7 @@ def main() -> int:
         _run_accuracy_mode("waterfill", waterfill_dir, enable_waterfill=True)
 
     # ---------------- Serving benchmark ----------------
-    if args.run_serving:
+    if not args.skip_serving:
         cases = parse_cases(
             args.cases,
             requests_per_concurrency=args.requests_per_concurrency,
