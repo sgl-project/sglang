@@ -281,6 +281,7 @@ def sparse_attention_fwd_kernel_v1(
             KV_shared = T.alloc_shared([BI, D], dtype)
             K_tail_shared = T.alloc_shared([BI, D_tail], dtype)
             mask = T.alloc_fragment([BI], "bool")
+            indices_safe = T.alloc_fragment([BI], indices_dtype)
 
             acc_o = T.alloc_fragment([H_per_block, D], accum_dtype)
             acc_s = T.alloc_fragment([H_per_block, BI], accum_dtype)
@@ -307,16 +308,14 @@ def sparse_attention_fwd_kernel_v1(
             for i_i in T.Pipelined(NI, num_stages=num_stages):
                 for bi_i in T.Parallel(BI):
                     # Page-table indices use -1 for invalid entries.
-                    mask[bi_i] = Indices[b_i, s_i, g_i, i_i * BI + bi_i] >= 0
+                    idx = Indices[b_i, s_i, g_i, i_i * BI + bi_i]
+                    mask[bi_i] = idx >= 0
+                    indices_safe[bi_i] = T.if_then_else(mask[bi_i], idx, 0)
 
                 for bi_i, d_i in T.Parallel(BI, D):
-                    KV_shared[bi_i, d_i] = KV[
-                        b_i, Indices[b_i, s_i, g_i, i_i * BI + bi_i], g_i, d_i
-                    ]
+                    KV_shared[bi_i, d_i] = KV[b_i, indices_safe[bi_i], g_i, d_i]
                 for bi_i, d_i in T.Parallel(BI, D_tail):
-                    K_tail_shared[bi_i, d_i] = KV[
-                        b_i, Indices[b_i, s_i, g_i, i_i * BI + bi_i], g_i, D + d_i
-                    ]
+                    K_tail_shared[bi_i, d_i] = KV[b_i, indices_safe[bi_i], g_i, D + d_i]
 
                 for h_i, bi_i in T.Parallel(H_per_block, BI):
                     acc_s[h_i, bi_i] = T.if_then_else(
