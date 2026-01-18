@@ -246,9 +246,24 @@ echo "[CI-AITER-CHECK] === AITER VERSION CHECK END ==="
 
 # Clear pre-built AITER kernels from Docker image to avoid segfaults
 # The Docker image may contain pre-compiled kernels incompatible with the current environment
-echo "Clearing pre-built AITER kernels from Docker image..."
-docker exec ci_sglang find /sgl-workspace/aiter/aiter/jit -name "*.so" -delete 2>/dev/null || true
+echo "=== AITER JIT directories BEFORE clearing ==="
+echo "--- jit/ directory ---"
 docker exec ci_sglang ls -la /sgl-workspace/aiter/aiter/jit/ 2>/dev/null || echo "jit dir empty or not found"
+echo "--- jit/build/ directory ---"
+docker exec ci_sglang ls -la /sgl-workspace/aiter/aiter/jit/build/ 2>/dev/null || echo "jit/build dir empty or not found"
+
+echo "Clearing pre-built AITER kernels (.so files)..."
+docker exec ci_sglang find /sgl-workspace/aiter/aiter/jit -name "*.so" -delete 2>/dev/null || true
+
+# Clear AITER JIT lock files to prevent deadlocks in multi-process (TP>1) tests
+echo "Clearing AITER JIT lock files (lock_*)..."
+docker exec ci_sglang find /sgl-workspace/aiter/aiter/jit/build -name "lock_*" -delete 2>/dev/null || true
+
+echo "=== AITER JIT directories AFTER clearing ==="
+echo "--- jit/ directory ---"
+docker exec ci_sglang ls -la /sgl-workspace/aiter/aiter/jit/ 2>/dev/null || echo "jit dir empty or not found"
+echo "--- jit/build/ directory ---"
+docker exec ci_sglang ls -la /sgl-workspace/aiter/aiter/jit/build/ 2>/dev/null || echo "jit/build dir empty or not found"
 
 # Pre-build AITER kernels to avoid timeout during tests
 echo "Warming up AITER JIT kernels..."
