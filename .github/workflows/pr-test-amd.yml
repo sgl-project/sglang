@@ -90,7 +90,8 @@ jobs:
           filters: |
             main_package:
               - "python/sglang/!(multimodal_gen)/**"
-              - "python/*.toml"
+              - "python/pyproject_rocm.toml"
+              - "python/pyproject_other.toml"
               - "scripts/ci/**"
               - "test/**"
               - ".github/workflows/pr-test-amd.yml"
@@ -99,7 +100,8 @@ jobs:
             multimodal_gen:
               - "python/sglang/multimodal_gen/**"
               - "python/sglang/cli/**"
-              - "python/*.toml"
+              - "python/pyproject_rocm.toml"
+              - "python/pyproject_other.toml"
 
   # =============================================== sgl-kernel ====================================================
   sgl-kernel-unit-test-amd:
@@ -634,18 +636,29 @@ jobs:
         run: |
           bash scripts/ci/amd_ci_exec.sh python3 run_suite.py --suite per-commit-8-gpu-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --timeout-per-file 3600
 
-  unit-test-backend-8-gpu-amd-mi35x:
-    needs: [check-changes, stage-a-test-1-amd]
-    if: always() && !failure() && !cancelled() &&
-      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+  stage-c-test-large-8-gpu-amd-mi35x:
+    needs: [check-changes, call-gate, stage-b-test-small-1-gpu-amd, stage-b-test-large-2-gpu-amd]
+    if: |
+      always() &&
+      (
+        (inputs.target_stage == 'stage-c-test-large-8-gpu-amd-mi35x') ||
+        (
+          !inputs.target_stage &&
+          (!failure() && !cancelled()) &&
+          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+        )
+      )
     strategy:
       fail-fast: false
       matrix:
         runner: [linux-mi35x-gpu-8]
+        part: [0, 1, 2]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Ensure VRAM is clear
         run: bash scripts/ensure_vram_clear.sh rocm
@@ -661,7 +674,7 @@ jobs:
       - name: Run test
         timeout-minutes: 60
         run: |
-          bash scripts/ci/amd_ci_exec.sh python3 run_suite.py --suite per-commit-8-gpu-amd-mi35x --timeout-per-file 3600
+          bash scripts/ci/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-c-test-large-8-gpu-amd-mi35x --auto-partition-id ${{ matrix.part }} --auto-partition-size 3 --timeout-per-file 3600
 
   performance-test-1-gpu-part-1-amd:
     needs: [check-changes, stage-a-test-1-amd]
@@ -931,7 +944,7 @@ jobs:
         stage-b-test-large-2-gpu-amd,
         unit-test-backend-1-gpu-amd,
         unit-test-backend-8-gpu-amd,
-        unit-test-backend-8-gpu-amd-mi35x,
+        stage-c-test-large-8-gpu-amd-mi35x,
         performance-test-1-gpu-part-1-amd,
         performance-test-1-gpu-part-2-amd,
         performance-test-2-gpu-amd,

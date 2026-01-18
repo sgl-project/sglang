@@ -7,12 +7,12 @@ from sglang.test.run_combined_tests import run_combined_tests
 from sglang.test.test_utils import ModelLaunchSettings
 
 # Runs on both H200 and B200 via nightly-8-gpu-common suite
-register_cuda_ci(est_time=12000, suite="nightly-8-gpu-common", nightly=True)
+register_cuda_ci(est_time=1800, suite="nightly-8-gpu-common", nightly=True)
 
 KIMI_K2_THINKING_MODEL_PATH = "moonshotai/Kimi-K2-Thinking"
 
 
-class TestKimiK2Unified(unittest.TestCase):
+class TestKimiK2(unittest.TestCase):
     """Unified test class for Kimi-K2-Thinking performance and accuracy.
 
     Single variant with TP=8 + tool/reasoning parsers.

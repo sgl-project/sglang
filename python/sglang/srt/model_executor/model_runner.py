@@ -1485,6 +1485,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     @property
     def mamba2_config(self):
         config = self.model_config.hf_config
+        if isinstance(config, NemotronHConfig) and self.is_draft_worker:
+            # NemotronH MTP draft models have no Mamba layers (pattern like "*E")
+            # so they shouldn't use HybridLinearAttnBackend
+            pattern = getattr(config, "mtp_hybrid_override_pattern", None)
+            if pattern is not None and "M" not in pattern:
+                return None
         if isinstance(config, FalconH1Config | NemotronHConfig):
             return config
         if isinstance(config, NemotronH_Nano_VL_V2_Config):
@@ -1511,6 +1517,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         return self.mamba2_config or self.hybrid_gdn_config or self.kimi_linear_config
 
     def can_run_piecewise_cuda_graph(self):
+        if self.is_draft_worker:
+            return False
+
         if self.server_args.enable_torch_compile:
             log_info_on_rank0(
                 logger,

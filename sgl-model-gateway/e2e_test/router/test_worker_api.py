@@ -157,3 +157,64 @@ class TestIGWMode:
                 logger.info("Worker: id=%s, url=%s", w.id, w.url)
         finally:
             gateway.shutdown()
+
+
+@pytest.mark.e2e
+class TestDisableHealthCheck:
+    """Tests for --disable-health-check CLI option."""
+
+    def test_disable_health_check_workers_immediately_healthy(
+        self, model_pool: ModelPool
+    ):
+        """Test that workers are immediately healthy when health checks are disabled."""
+        http_instance = model_pool.get("llama-8b", ConnectionMode.HTTP)
+
+        gateway = Gateway()
+        gateway.start(
+            igw_mode=True,
+            extra_args=["--disable-health-check"],
+        )
+
+        try:
+            # Add worker - should be immediately healthy since health checks are disabled
+            success, worker_id = gateway.add_worker(
+                http_instance.worker_url,
+                wait_ready=True,
+                ready_timeout=10,  # Short timeout since it should be immediate
+            )
+            assert success, f"Failed to add worker: {worker_id}"
+            logger.info("Added worker with health checks disabled: %s", worker_id)
+
+            # Verify worker is healthy
+            workers = gateway.list_workers()
+            assert len(workers) >= 1, "Expected at least one worker"
+
+            for worker in workers:
+                logger.info(
+                    "Worker: id=%s, status=%s, disable_health_check=%s",
+                    worker.id,
+                    worker.status,
+                    worker.metadata.get("disable_health_check"),
+                )
+                # Worker should be healthy immediately
+                assert (
+                    worker.status == "healthy"
+                ), "Worker should be healthy when health checks disabled"
+        finally:
+            gateway.shutdown()
+
+    def test_disable_health_check_gateway_starts_without_health_checker(
+        self, model_pool: ModelPool
+    ):
+        """Test that gateway starts successfully with health checks disabled."""
+        gateway = Gateway()
+        gateway.start(
+            igw_mode=True,
+            extra_args=["--disable-health-check"],
+        )
+
+        try:
+            assert gateway.health(), "Gateway should be healthy"
+            logger.info("Gateway started with health checks disabled")
+        finally:
+            gateway.shutdown()
