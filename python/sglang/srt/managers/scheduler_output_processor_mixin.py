@@ -334,6 +334,17 @@ class SchedulerOutputProcessorMixin:
 
         self.token_to_kv_pool_allocator.free_group_begin()
 
+        if (
+            result.logits_output
+            and hasattr(result.logits_output, "step_maps")
+            and result.logits_output.step_maps is not None
+        ):
+            step_maps = result.logits_output.step_maps
+            for idx in range(min(batch.batch_size(), len(step_maps))):
+                req = batch.reqs[idx]
+                if req.return_step_maps:
+                    req.step_maps = step_maps[idx]
+
         for idx in range(batch.batch_size()):
             # If no new tokens generated, meaning the prefilling stage
             if not result.next_token_ids:
@@ -448,6 +459,14 @@ class SchedulerOutputProcessorMixin:
                 req.hidden_states.append(
                     logits_output.hidden_states[i].cpu().clone().tolist()
                 )
+
+            # Handle step maps for diffusion LLM
+            if (
+                req.return_step_maps
+                and logits_output.step_maps is not None
+                and i < len(logits_output.step_maps)
+            ):
+                req.step_maps = logits_output.step_maps[i]
 
             if req.grammar is not None:
                 # FIXME: this try-except block is for handling unexpected xgrammar issue.
@@ -856,6 +875,7 @@ class SchedulerOutputProcessorMixin:
         load = self.get_load()
         output_routed_experts = None
         customized_info = {}
+        output_step_maps = None
 
         queue_times = []
         forward_entry_times = []
@@ -1055,6 +1075,14 @@ class SchedulerOutputProcessorMixin:
                         output_routed_experts = []
                     output_routed_experts.append(req.routed_experts)
 
+                if req.return_step_maps and req.step_maps is not None:
+                    if output_step_maps is None:
+                        output_step_maps = []
+                    step_maps_data = req.step_maps
+                    if hasattr(step_maps_data, "cpu"):
+                        step_maps_data = step_maps_data.cpu().tolist()
+                    output_step_maps.append(step_maps_data)
+
                 if req.customized_info is not None:
                     for k, v in req.customized_info.items():
                         if k not in customized_info:
@@ -1110,6 +1138,7 @@ class SchedulerOutputProcessorMixin:
                     output_token_entropy_val=None,
                     output_hidden_states=output_hidden_states,
                     output_routed_experts=output_routed_experts,
+                    step_maps=output_step_maps,
                     customized_info=customized_info,
                     placeholder_tokens_idx=None,
                     placeholder_tokens_val=None,
