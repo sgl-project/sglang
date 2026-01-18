@@ -230,6 +230,8 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
 
     # For data parallel rank routing
     data_parallel_rank: Optional[int] = None
+    prefill_dp_rank: Optional[int] = None
+    decode_dp_rank: Optional[int] = None
 
     # For background responses (OpenAI responses API)
     background: bool = False
@@ -667,6 +669,12 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
             data_parallel_rank=(
                 self.data_parallel_rank if self.data_parallel_rank is not None else None
             ),
+            prefill_dp_rank=(
+                self.prefill_dp_rank if self.prefill_dp_rank is not None else None
+            ),
+            decode_dp_rank=(
+                self.decode_dp_rank if self.decode_dp_rank is not None else None
+            ),
             conversation_id=self.conversation_id,
             priority=self.priority,
             extra_key=self.extra_key,
@@ -736,6 +744,8 @@ class TokenizedGenerateReqInput(BaseReq):
 
     # For data parallel rank routing
     data_parallel_rank: Optional[int] = None
+    prefill_dp_rank: Optional[int] = None
+    decode_dp_rank: Optional[int] = None
 
     # Priority for the request
     priority: Optional[int] = None
@@ -808,6 +818,8 @@ class EmbeddingReqInput(BaseReq, APIServingTimingMixin):
     is_cross_encoder_request: bool = False
     # Priority for the request
     priority: Optional[int] = None
+    prefill_dp_rank: Optional[int] = None
+    decode_dp_rank: Optional[int] = None
     # Routing key for routing-key schedule policy
     routing_key: Optional[str] = None
 
@@ -896,6 +908,8 @@ class EmbeddingReqInput(BaseReq, APIServingTimingMixin):
             video_data=self.video_data[i] if self.video_data is not None else None,
             sampling_params=self.sampling_params[i],
             rid=self.rid[i],
+            prefill_dp_rank=self.prefill_dp_rank,
+            decode_dp_rank=self.decode_dp_rank,
             external_trace_header=self.external_trace_header,
             dimensions=self.dimensions,
             http_worker_ipc=self.http_worker_ipc,
@@ -920,6 +934,8 @@ class TokenizedEmbeddingReqInput(BaseReq):
     sampling_params: SamplingParams
     # For data parallel rank routing
     data_parallel_rank: Optional[int] = None
+    prefill_dp_rank: Optional[int] = None
+    decode_dp_rank: Optional[int] = None
     # Priority for the request
     priority: Optional[int] = None
     # The number of dimensions the resulting output embeddings should have. It is applicable for Matryoshka Embeddings.
