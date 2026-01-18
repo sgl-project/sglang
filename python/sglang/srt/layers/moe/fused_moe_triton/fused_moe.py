@@ -53,8 +53,8 @@ elif _is_hip:
             from aiter import moe_sum
         except ImportError:
             raise ImportError("aiter is required when SGLANG_USE_AITER is set to True")
-    else:
-        from vllm import _custom_ops as vllm_ops
+    # For HIP without AITER, use Triton implementations instead of vLLM
+    # No vLLM dependency needed
 
 padding_size = 128 if bool(int(os.getenv("SGLANG_MOE_PADDING", "0"))) else 0
 
@@ -492,8 +492,10 @@ def fused_experts_impl(
                         activation,
                     )
             else:
-                vllm_ops.silu_and_mul(
-                    intermediate_cache2, intermediate_cache1.view(-1, N)
+                # For CPU/other platforms, use native PyTorch implementation
+                gate, up = intermediate_cache1.view(-1, N).chunk(2, dim=-1)
+                intermediate_cache2.copy_(
+                    (gate * torch.nn.functional.silu(up)).to(intermediate_cache2.dtype)
                 )
         elif activation == "gelu" and is_gated:
             assert gemm1_alpha is None, "gemm1_alpha is not supported for gelu"
@@ -512,8 +514,10 @@ def fused_experts_impl(
                         activation,
                     )
             else:
-                vllm_ops.gelu_and_mul(
-                    intermediate_cache2, intermediate_cache1.view(-1, N)
+                # For CPU/other platforms, use native PyTorch implementation
+                gate, up = intermediate_cache1.view(-1, N).chunk(2, dim=-1)
+                intermediate_cache2.copy_(
+                    (gate * torch.nn.functional.gelu(up)).to(intermediate_cache2.dtype)
                 )
         # Activation function without multiplication
         elif activation == "silu" and not is_gated:
@@ -607,10 +611,20 @@ def fused_experts_impl(
                         routed_scaling_factor,
                     )
         else:
-            vllm_ops.moe_sum(
-                intermediate_cache3.view(*intermediate_cache3.shape),
-                out_hidden_states[begin_chunk_idx:end_chunk_idx],
-            )
+            # For CPU and other platforms, use torch.compile implementation
+            # (works on CPU, no vLLM dependency needed)
+            if tokens_in_chunk <= 32:
+                moe_sum_reduce_torch_compile(
+                    intermediate_cache3.view(*intermediate_cache3.shape),
+                    out_hidden_states[begin_chunk_idx:end_chunk_idx],
+                    routed_scaling_factor,
+                )
+            else:
+                moe_sum_reduce_triton(
+                    intermediate_cache3.view(*intermediate_cache3.shape),
+                    out_hidden_states[begin_chunk_idx:end_chunk_idx],
+                    routed_scaling_factor,
+                )
 
     return out_hidden_states
 

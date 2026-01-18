@@ -4,14 +4,21 @@ import pytest
 import torch
 
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz, scaled_fp8_quant
-from sglang.srt.utils import is_cuda, is_hip
+from sglang.srt.utils import get_device, is_cuda, is_hip
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_fp8_fnuz = is_fp8_fnuz()
 fp8_dtype = torch.float8_e4m3fnuz if _is_fp8_fnuz else torch.float8_e4m3fn
 
+# Use get_device() to support both CUDA and HIP platforms
+_device = get_device() if (_is_cuda or _is_hip) else "cpu"
 
+
+@pytest.mark.skipif(
+    not (_is_cuda or _is_hip),
+    reason="FP8 quantization requires GPU (CUDA or HIP)",
+)
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_scaled_fp8_quant_per_tensor(dtype) -> None:
 
@@ -31,7 +38,8 @@ def test_scaled_fp8_quant_per_tensor(dtype) -> None:
 
     # Note that we use a shape % 8 != 0 to cover edge cases,
     # because scaled_fp8_quant is vectorized by 8.
-    x = (torch.randn(size=(11, 11), device="cuda") * 13).to(dtype)
+    # Use get_device() to support both CUDA and HIP platforms
+    x = (torch.randn(size=(11, 11), device=_device) * 13).to(dtype)
 
     # Test Per Tensor Dynamic quantization
     # scale = max(abs(x)) / FP8_E4M3_MAX
@@ -75,7 +83,8 @@ if _is_cuda or _is_hip:
 
         # Note that we use a shape % 8 = 0,
         # because per_token_quant_fp8 is vectorized by 8 elements.
-        x = (torch.randn(size=(11, 16), device="cuda") * 13).to(dtype)
+        # Use get_device() to support both CUDA and HIP platforms
+        x = (torch.randn(size=(11, 16), device=_device) * 13).to(dtype)
 
         # Test Per Tensor Dynamic quantization
         # scale = max(abs(x)) / FP8_E4M3_MAX
@@ -90,7 +99,8 @@ if _is_cuda or _is_hip:
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
     def test_scaled_fp8_quant_with_padding(dtype) -> None:
         original_rows = 5
-        x = (torch.randn(size=(original_rows, 16), device="cuda") * 13).to(dtype)
+        # Use get_device() to support both CUDA and HIP platforms
+        x = (torch.randn(size=(original_rows, 16), device=_device) * 13).to(dtype)
 
         padding_size = 10
 

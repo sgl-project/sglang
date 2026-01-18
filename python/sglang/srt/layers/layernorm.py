@@ -67,8 +67,8 @@ if _is_cuda or _is_xpu:
 if _use_aiter:
     from aiter import rmsnorm2d_fwd as rms_norm
     from aiter import rmsnorm2d_fwd_with_add as fused_add_rms_norm
-elif _is_hip:
-    from vllm._custom_ops import fused_add_rms_norm, rms_norm
+# For HIP without AITER, use forward_native (pure PyTorch implementation)
+# instead of vLLM to avoid external dependency
 
 logger = logging.getLogger(__name__)
 
@@ -172,19 +172,9 @@ class RMSNorm(MultiPlatformOp):
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        if not x.is_contiguous():
-            # NOTE: Remove this if aiter kernel supports discontinuous input
-            x = x.contiguous()
-        if residual is not None:
-            out = torch.empty_like(x)
-            residual_out = torch.empty_like(x)
-            fused_add_rms_norm(
-                out, x, residual_out, residual, self.weight.data, self.variance_epsilon
-            )
-            return out, residual_out
-        out = torch.empty_like(x)
-        rms_norm(out, x, self.weight.data, self.variance_epsilon)
-        return out
+        # Use native PyTorch implementation instead of vLLM to avoid dependency
+        # This is slightly slower but removes external dependency
+        return self.forward_native(x, residual, **kwargs)
 
     def forward_native(
         self,

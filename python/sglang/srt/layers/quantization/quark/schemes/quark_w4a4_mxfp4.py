@@ -6,13 +6,28 @@ import torch
 
 from sglang.srt.layers.parameter import GroupQuantScaleParameter, PackedvLLMParameter
 from sglang.srt.layers.quantization.quark.schemes import QuarkScheme
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import get_bool_env_var, is_hip
 
 _is_hip = is_hip()
-if _is_hip:
-    from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4
-    from aiter.ops.triton.gemm_afp4wfp4_pre_quant_atomic import gemm_afp4wfp4_pre_quant
-    from aiter.ops.triton.quant import dynamic_mxfp4_quant
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+
+# Initialize functions to None - will be set if AITER is available
+gemm_afp4wfp4 = None
+gemm_afp4wfp4_pre_quant = None
+dynamic_mxfp4_quant = None
+
+if _use_aiter:
+    try:
+        from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4
+        from aiter.ops.triton.gemm_afp4wfp4_pre_quant_atomic import (
+            gemm_afp4wfp4_pre_quant,
+        )
+        from aiter.ops.triton.quant import dynamic_mxfp4_quant
+    except ImportError:
+        _use_aiter = False
+        gemm_afp4wfp4 = None
+        gemm_afp4wfp4_pre_quant = None
+        dynamic_mxfp4_quant = None
 
 
 __all__ = ["QuarkW4A4MXFP4"]
@@ -107,6 +122,19 @@ class QuarkW4A4MXFP4(QuarkScheme):
             three_d = True
             x = x.view(-1, x.shape[-1])
             output_shape = [*x.shape[:-1], layer.weight.shape[0]]
+
+        # Check if AITER functions are available
+        if (
+            dynamic_mxfp4_quant is None
+            or gemm_afp4wfp4 is None
+            or gemm_afp4wfp4_pre_quant is None
+        ):
+            raise ImportError(
+                "QuarkW4A4MXFP4 quantization requires AITER. "
+                "Please install AITER or set SGLANG_USE_AITER=1 if AITER is installed. "
+                "Note: AITER is only supported on MI300 series GPUs (gfx942/gfx950), "
+                "not on MI210 (gfx90a)."
+            )
 
         # use_fused_quant_gemm = true, x_q is a bf16/fp16 num
         # x_s is not None = true, x_q is uint8 num
