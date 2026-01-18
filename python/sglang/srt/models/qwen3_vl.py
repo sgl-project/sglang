@@ -1030,7 +1030,10 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         # NOTE: there's a +1 offset because sglang captures input to layer (output of previous)
         if layer_ids is None:
             # Qwen3VL uses config directly, text_config is only for Qwen3Omni
-            if hasattr(self.config, "text_config") and self.config.text_config is not None:
+            if (
+                hasattr(self.config, "text_config")
+                and self.config.text_config is not None
+            ):
                 num_layers = self.config.text_config.num_hidden_layers
             else:
                 num_layers = self.config.num_hidden_layers
