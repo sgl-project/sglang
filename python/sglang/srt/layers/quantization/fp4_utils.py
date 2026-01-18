@@ -16,18 +16,18 @@ class Fp4GemmRunnerBackend(Enum):
     """Enum for FP4 GEMM runner backend selection."""
 
     AUTO = "auto"
-    CUDNN = "cudnn"
-    CUTLASS = "cutlass"
+    FLASHINFER_CUDNN = "flashinfer_cudnn"
+    FLASHINFER_CUTLASS = "flashinfer_cutlass"
     FLASHINFER_TRTLLM = "flashinfer_trtllm"
 
     def is_auto(self) -> bool:
         return self == Fp4GemmRunnerBackend.AUTO
 
-    def is_cudnn(self) -> bool:
-        return self == Fp4GemmRunnerBackend.CUDNN
+    def is_flashinfer_cudnn(self) -> bool:
+        return self == Fp4GemmRunnerBackend.FLASHINFER_CUDNN
 
-    def is_cutlass(self) -> bool:
-        return self == Fp4GemmRunnerBackend.CUTLASS
+    def is_flashinfer_cutlass(self) -> bool:
+        return self == Fp4GemmRunnerBackend.FLASHINFER_CUTLASS
 
     def is_flashinfer_trtllm(self) -> bool:
         return self == Fp4GemmRunnerBackend.FLASHINFER_TRTLLM
@@ -36,10 +36,17 @@ class Fp4GemmRunnerBackend(Enum):
         """Get the backend string to pass to FlashInfer's mm_fp4 API.
 
         This remaps SGLang's user-facing backend names to FlashInfer's API names.
-        For example: 'flashinfer_trtllm' -> 'trtllm'
+        Examples:
+            'flashinfer_trtllm' -> 'trtllm'
+            'flashinfer_cutlass' -> 'cutlass'
+            'flashinfer_cudnn' -> 'cudnn'
         """
         if self.is_flashinfer_trtllm():
             return "trtllm"
+        elif self.is_flashinfer_cutlass():
+            return "cutlass"
+        elif self.is_flashinfer_cudnn():
+            return "cudnn"
         else:
             return self.value
 
