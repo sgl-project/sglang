@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import requests
 
 from sglang.srt.utils import kill_process_tree
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.few_shot_gsm8k import run_eval
 from sglang.test.kl_test_utils import (
     test_input_output_logprobs_match_decode_cache_hit_helper,
@@ -15,6 +16,8 @@ from sglang.test.test_utils import (
     CustomTestCase,
     popen_launch_server,
 )
+
+register_cuda_ci(est_time=500, suite="stage-c-test-4-gpu-h100")
 
 QWEN3_NEXT_MODEL = "Qwen/Qwen3-Next-80B-A3B-Instruct"
 
