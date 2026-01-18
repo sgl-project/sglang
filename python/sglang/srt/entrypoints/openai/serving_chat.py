@@ -47,6 +47,7 @@ from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.parser.jinja_template_utils import process_content_for_template_format
 from sglang.srt.parser.reasoning_parser import ReasoningParser
+from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
     from sglang.srt.managers.template_manager import TemplateManager
@@ -1100,6 +1101,10 @@ class OpenAIServingChat(OpenAIServingBase):
         """Judge whether the request needs reasoning"""
         if not self.reasoning_parser:
             return False
+
+        # If reasoning_off_by_default is set, reasoning is off unless explicitly requested
+        reasoning_off_by_default = envs.SGLANG_REASONING_OFF_BY_DEFAULT.get()
+
         if self.reasoning_parser in ["deepseek-v3"]:
             return (
                 request.chat_template_kwargs is not None
@@ -1107,9 +1112,21 @@ class OpenAIServingChat(OpenAIServingBase):
             )
         if self.reasoning_parser in ["qwen3", "glm45", "nano_v3", "interns1"]:
             # qwen3, glm45, nano_v3, and interns1 are reasoning by default
+            if reasoning_off_by_default:
+                return (
+                    request.chat_template_kwargs is not None
+                    and request.chat_template_kwargs.get("enable_thinking") is True
+                )
+            else:
+                return (
+                    not request.chat_template_kwargs
+                    or request.chat_template_kwargs.get("enable_thinking", True) is True
+                )
+
+        if reasoning_off_by_default:
             return (
-                not request.chat_template_kwargs
-                or request.chat_template_kwargs.get("enable_thinking", True) is True
+                request.chat_template_kwargs is not None
+                and request.chat_template_kwargs.get("enable_thinking") is True
             )
         return True  # default
 
