@@ -1,9 +1,10 @@
 import hashlib
+import json
 import logging
 import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Union
 
 import torch
 
@@ -52,7 +53,15 @@ class HiCacheStorageConfig:
     is_mla_model: bool
     is_page_first_layout: bool
     model_name: Optional[str]
-    extra_config: Optional[dict] = None
+    extra_config: Optional[Union[dict, str]] = None
+
+    def __post_init__(self):
+        if isinstance(self.extra_config, str):
+            try:
+                config = json.loads(self.extra_config)
+                self.extra_config = config if isinstance(config, dict) else None
+            except json.JSONDecodeError:
+                self.extra_config = None
 
 
 @dataclass
