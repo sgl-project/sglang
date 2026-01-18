@@ -215,6 +215,7 @@ class TestLayerNorm(CustomTestCase):
         weight: torch.Tensor,
         variance_epsilon: float,
         residual: Optional[torch.Tensor] = None,
+        bias: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         orig_dtype = x.dtype
         x = x.to(torch.float32)
@@ -224,45 +225,113 @@ class TestLayerNorm(CustomTestCase):
 
         (variance, mean) = torch.var_mean(x, dim=-1, keepdim=True, correction=0)
         x = (x - mean) * torch.rsqrt(variance + variance_epsilon)
-        x = x.to(orig_dtype) * weight
-        if residual is None:
-            return x
-        else:
-            return x, residual
+        x = x * weight.to(torch.float32)
+        if bias is not None:
+            x = x + bias.to(torch.float32)
+        x = x.to(orig_dtype)
+        return x if residual is None else (x, residual)
 
     @parametrize(
         m=[4096, 1024],
         n=[4096, 4109],
         dtype=[torch.float16, torch.bfloat16],
     )
-    def test_norm(self, m: int, n: int, dtype: torch.dtype) -> None:
-        x_ln = torch.randn([m, n], dtype=dtype)
-        x_ln = make_non_contiguous(x_ln)
-        ref_x_ln = x_ln.clone()
-        hidden_size = x_ln.size(-1)
+    def test_norm_input_2d(self, m: int, n: int, dtype: torch.dtype) -> None:
+        x = torch.randn([m, n], dtype=dtype)
+        x = make_non_contiguous(x)
+        hidden_size = x.size(-1)
         weight = torch.randn(hidden_size, dtype=dtype)
+        bias = torch.randn(hidden_size, dtype=dtype)
         variance_epsilon = 1e-6
 
-        torch.ops.sgl_kernel.layernorm_cpu(x_ln, weight, variance_epsilon)
-        ref_ln_out = self._forward_native(ref_x_ln, weight, variance_epsilon)
+        ln_out = torch.ops.sgl_kernel.layernorm_cpu(x, weight, None, variance_epsilon)
+        ref_ln_out = self._forward_native(x, weight, variance_epsilon)
 
         atol = rtol = precision[ref_ln_out.dtype]
-        torch.testing.assert_close(x_ln, ref_ln_out, atol=atol, rtol=rtol)
+        torch.testing.assert_close(ln_out, ref_ln_out, atol=atol, rtol=rtol)
 
-        x_add_ln = torch.randn([m, n], dtype=dtype)
-        x_add_ln = make_non_contiguous(x_add_ln)
-        ref_x_add_ln = x_add_ln.clone()
+        ln_out = torch.ops.sgl_kernel.layernorm_cpu(x, weight, bias, variance_epsilon)
+        ref_ln_out = self._forward_native(
+            x, weight, variance_epsilon, residual=None, bias=bias
+        )
+        torch.testing.assert_close(ln_out, ref_ln_out, atol=atol, rtol=rtol)
+
         residual = torch.randn([m, hidden_size], dtype=dtype)
         ref_residual = residual.clone()
 
-        torch.ops.sgl_kernel.fused_add_layernorm_cpu(
-            x_add_ln, residual, weight, variance_epsilon
+        add_ln_out = torch.ops.sgl_kernel.fused_add_layernorm_cpu(
+            x, residual, weight, None, variance_epsilon
         )
         ref_add_ln_out, ref_residual = self._forward_native(
-            ref_x_add_ln, weight, variance_epsilon, ref_residual
+            x, weight, variance_epsilon, residual=ref_residual
         )
 
-        torch.testing.assert_close(x_add_ln, ref_add_ln_out, atol=atol, rtol=rtol)
+        torch.testing.assert_close(add_ln_out, ref_add_ln_out, atol=atol, rtol=rtol)
+        torch.testing.assert_close(residual, ref_residual, atol=atol, rtol=rtol)
+
+        residual = torch.randn([m, hidden_size], dtype=dtype)
+        ref_residual = residual.clone()
+
+        add_ln_out = torch.ops.sgl_kernel.fused_add_layernorm_cpu(
+            x, residual, weight, bias, variance_epsilon
+        )
+        ref_add_ln_out, ref_residual = self._forward_native(
+            x, weight, variance_epsilon, residual=ref_residual, bias=bias
+        )
+
+        torch.testing.assert_close(add_ln_out, ref_add_ln_out, atol=atol, rtol=rtol)
+        torch.testing.assert_close(residual, ref_residual, atol=atol, rtol=rtol)
+
+    @parametrize(
+        l=[4096, 1024],
+        m=[1, 4],
+        n=[4096, 4109, 2304],
+        dtype=[torch.float16, torch.bfloat16],
+    )
+    def test_norm_input_3d(self, l: int, m: int, n: int, dtype: torch.dtype) -> None:
+        x = torch.randn([l, m, n], dtype=dtype)
+        x = make_non_contiguous(x)
+        hidden_size = x.size(-1)
+        weight = torch.randn(hidden_size, dtype=dtype)
+        bias = torch.randn(hidden_size, dtype=dtype)
+        variance_epsilon = 1e-6
+
+        ln_out = torch.ops.sgl_kernel.layernorm_cpu(x, weight, None, variance_epsilon)
+        ref_ln_out = self._forward_native(x, weight, variance_epsilon)
+
+        atol = rtol = precision[ref_ln_out.dtype]
+        torch.testing.assert_close(ln_out, ref_ln_out, atol=atol, rtol=rtol)
+
+        ln_out = torch.ops.sgl_kernel.layernorm_cpu(x, weight, bias, variance_epsilon)
+        ref_ln_out = self._forward_native(
+            x, weight, variance_epsilon, residual=None, bias=bias
+        )
+        torch.testing.assert_close(ln_out, ref_ln_out, atol=atol, rtol=rtol)
+
+        residual = torch.randn([l, m, hidden_size], dtype=dtype)
+        ref_residual = residual.clone()
+
+        add_ln_out = torch.ops.sgl_kernel.fused_add_layernorm_cpu(
+            x, residual, weight, None, variance_epsilon
+        )
+        ref_add_ln_out, ref_residual = self._forward_native(
+            x, weight, variance_epsilon, ref_residual
+        )
+
+        torch.testing.assert_close(add_ln_out, ref_add_ln_out, atol=atol, rtol=rtol)
+        torch.testing.assert_close(residual, ref_residual, atol=atol, rtol=rtol)
+
+        residual = torch.randn([l, m, hidden_size], dtype=dtype)
+        ref_residual = residual.clone()
+
+        add_ln_out = torch.ops.sgl_kernel.fused_add_layernorm_cpu(
+            x, residual, weight, bias, variance_epsilon
+        )
+        ref_add_ln_out, ref_residual = self._forward_native(
+            x, weight, variance_epsilon, residual=ref_residual, bias=bias
+        )
+
+        torch.testing.assert_close(add_ln_out, ref_add_ln_out, atol=atol, rtol=rtol)
         torch.testing.assert_close(residual, ref_residual, atol=atol, rtol=rtol)
 
 
