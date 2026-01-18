@@ -110,17 +110,9 @@ We also encourage evaluating on `Video-MME`, `DocVQA`, and other relevant benchm
 
 Performance benchmarks measure **Latency** (Time To First Token - TTFT) and **Throughput** (tokens/second).
 
-**For VLMs:**
-The following sections are examples for LLMs. For VLMs, add the following arguments to the commands:
-```bash
---backend sglang-oai-chat
---dataset-name image
---image-count 2
---image-resolution 720p
---random-input-len 128
-```
+### LLMs
 
-### Latency-Sensitive Benchmark
+**Latency-Sensitive Benchmark**
 
 This simulates a scenario with low concurrency (e.g., single user) to measure latency.
 
@@ -134,7 +126,7 @@ python -m sglang.bench_serving \
   --max-concurrency 1
 ```
 
-### Throughput-Sensitive Benchmark
+**Throughput-Sensitive Benchmark**
 
 This simulates a high-traffic scenario to measure maximum system throughput.
 
@@ -148,7 +140,8 @@ python -m sglang.bench_serving \
   --max-concurrency 100
 ```
 
-### Single Batch Performance
+**Single Batch Performance**
+
 You can also benchmark the performance of processing a single batch offline.
 
 ```bash
@@ -164,6 +157,44 @@ You can run more granular benchmarks:
 - **Low Concurrency**: `--num-prompts 10 --max-concurrency 1`
 - **Medium Concurrency**: `--num-prompts 80 --max-concurrency 16`
 - **High Concurrency**: `--num-prompts 500 --max-concurrency 100`
+
+### VLMs
+
+**Latency-Sensitive Benchmark**
+
+This simulates a scenario with low concurrency (e.g., single user) to measure latency.
+
+```bash
+python -m sglang.bench_serving \
+  --backend sglang-oai-chat \
+  --host 0.0.0.0 \
+  --port 30000 \
+  --dataset-name image \
+  --image-count 2 \
+  --image-resolution 720p \
+  --random-input-len 128 \
+  --random-output-len 1024 \
+  --num-prompts 10 \
+  --max-concurrency 1
+```
+
+**Throughput-Sensitive Benchmark**
+
+This simulates a high-traffic scenario to measure maximum system throughput.
+
+```bash
+python -m sglang.bench_serving \
+  --backend sglang-oai-chat \
+  --host 0.0.0.0 \
+  --port 30000 \
+  --dataset-name image \
+  --image-count 2 \
+  --image-resolution 720p \
+  --random-input-len 128 \
+  --random-output-len 1024 \
+  --num-prompts 1000 \
+  --max-concurrency 100
+```
 
 ## Reporting Results
 
