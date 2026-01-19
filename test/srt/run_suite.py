@@ -48,11 +48,9 @@ suites = {
         TestFile("ep/test_deepep_small.py", 531),
         TestFile("ep/test_mooncake_ep_small.py", 660),
     ],
-    # Disabled: IBGDA/cudaHostRegister environment issues on 8-GPU runner, see #17175
-    # 4-GPU DeepEP tests provide sufficient coverage
-    # "per-commit-8-gpu-h200-deepep": [
-    #     TestFile("ep/test_deepep_large.py", 563),
-    # ],
+    "per-commit-8-gpu-h200-deepep": [
+        TestFile("ep/test_deepep_large.py", 563),
+    ],
     "quantization_test": [
         TestFile("quant/test_awq.py", 163),
         TestFile("quant/test_marlin_moe.py", 200),
