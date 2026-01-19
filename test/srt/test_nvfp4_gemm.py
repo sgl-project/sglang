@@ -64,18 +64,18 @@ class TestFP4GemmAuto(FP4GemmBase, unittest.TestCase):
 
 
 @unittest.skipIf(get_device_sm() < 100, "Test requires CUDA SM 100 or higher")
-class TestFP4GemmCutlass(FP4GemmBase, unittest.TestCase):
-    backend = "cutlass"
+class TestFP4GemmFlashinferCutlass(FP4GemmBase, unittest.TestCase):
+    backend = "flashinfer_cutlass"
 
 
 @unittest.skipIf(get_device_sm() < 100, "Test requires CUDA SM 100 or higher")
-class TestFP4GemmCudnn(FP4GemmBase, unittest.TestCase):
-    backend = "cudnn"
+class TestFP4GemmFlashinferCudnn(FP4GemmBase, unittest.TestCase):
+    backend = "flashinfer_cudnn"
 
 
 @unittest.skipIf(get_device_sm() < 100, "Test requires CUDA SM 100 or higher")
-class TestFP4GemmTrtllm(FP4GemmBase, unittest.TestCase):
-    backend = "trtllm"
+class TestFP4GemmFlashinferTrtllm(FP4GemmBase, unittest.TestCase):
+    backend = "flashinfer_trtllm"
 
 
 if __name__ == "__main__":

@@ -98,7 +98,7 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
             layer.weight_global_scale.max().to(torch.float32), requires_grad=False
         )
 
-        if get_fp4_gemm_runner_backend().is_trtllm():
+        if get_fp4_gemm_runner_backend().is_flashinfer_trtllm():
             # FlashInfer TRTLLM FP4 GEMM requires a different weight layout.
             # FlashInfer provides nvfp4_quantize to quantize + shuffle the
             # layout but we use our own quantization so we have to call
