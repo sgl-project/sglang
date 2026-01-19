@@ -933,46 +933,60 @@ jobs:
     steps:
       - name: Find RDMA in CI Runner
         run: |
-          echo "=== Full RDMA Library Search ==="
-
-          echo "1. libibverbs provider configs:"
-          find /etc -name "*.driver" 2>/dev/null
-          find /etc -name "*libibverbs*" -o -name "*rdma*" 2>/dev/null | head -20
+          set +e  
+          
+          echo "=== Full RDMA Library Search on CI Runner Host ==="
 
           echo ""
-          echo "2. Provider libraries in various locations:"
-          find /usr/lib -name "*verbs*.so*" 2>/dev/null
-          find /usr/lib64 -name "*verbs*.so*" 2>/dev/null
-          find /lib -name "*verbs*.so*" 2>/dev/null
+          echo "=== 1. libibverbs provider configs ==="
+          find /etc -name "*.driver" 2>/dev/null || true
+          ls -la /etc/libibverbs.d/ 2>/dev/null || echo "/etc/libibverbs.d not found"
 
           echo ""
-          echo "3. ionic related:"
-          find / -name "*ionic*" 2>/dev/null | grep -v proc | head -20
+          echo "=== 2. Provider libraries ==="
+          find /usr/lib -name "*verbs*.so*" 2>/dev/null || true
+          find /usr/lib64 -name "*verbs*.so*" 2>/dev/null || true
+          ls -la /usr/lib/x86_64-linux-gnu/libibverbs/ 2>/dev/null || echo "Standard libibverbs path not found"
 
           echo ""
-          echo "4. libibverbs.d directory search:"
-          find / -name "libibverbs.d" -type d 2>/dev/null
+          echo "=== 3. ionic related ==="
+          find /usr -name "*ionic*" 2>/dev/null || echo "No ionic files found"
 
           echo ""
-          echo "5. ldconfig cache for libibverbs:"
-          ldconfig -p | grep -i verbs
+          echo "=== 4. libibverbs.d directory search ==="
+          find / -name "libibverbs.d" -type d 2>/dev/null || echo "Not found anywhere"
 
           echo ""
-          echo "6. Check rdma-core package files:"
-          dpkg -L rdma-core 2>/dev/null | grep -E "driver|libibverbs" | head -20
+          echo "=== 5. ldconfig cache ==="
+          ldconfig -p 2>/dev/null | grep -i verbs || echo "No verbs in ldconfig"
 
           echo ""
-          echo "7. Check libibverbs1 package files:"
-          dpkg -L libibverbs1 2>/dev/null | head -30
+          echo "=== 6. Installed packages ==="
+          dpkg -l 2>/dev/null | grep -E "rdma|verbs|infiniband" || rpm -qa 2>/dev/null | grep -E "rdma|verbs" || echo "Package manager check failed"
 
           echo ""
-          echo "8. Environment variables:"
-          echo "IBV_DRIVERS=$IBV_DRIVERS"
-          echo "RDMAV_HUGEPAGES_SAFE=$RDMAV_HUGEPAGES_SAFE"
+          echo "=== 7. /dev/infiniband ==="
+          ls -la /dev/infiniband/ 2>/dev/null || echo "/dev/infiniband not found"
 
           echo ""
-          echo "9. Try with explicit driver path:"
-          IBV_DRIVERS=/usr/lib/x86_64-linux-gnu/libibverbs ibv_devinfo 2>&1 || echo "Still failed"
+          echo "=== 8. /sys/class/infiniband ==="
+          ls -la /sys/class/infiniband/ 2>/dev/null || echo "Not found"
+
+          echo ""
+          echo "=== 9. /sys/class/infiniband_verbs ==="
+          ls -la /sys/class/infiniband_verbs/ 2>/dev/null || echo "Not found"
+
+          echo ""
+          echo "=== 10. ibv_devinfo ==="
+          which ibv_devinfo 2>/dev/null || echo "ibv_devinfo not in PATH"
+          ibv_devinfo 2>&1 || echo "ibv_devinfo failed or not found"
+
+          echo ""
+          echo "=== 11. Kernel modules ==="
+          lsmod 2>/dev/null | grep -E "ib_|rdma|ionic" || echo "lsmod failed or no modules"
+
+          echo ""
+          echo "=== Check Complete ==="
 
 
   # =============================================== Disaggregation ====================================================
