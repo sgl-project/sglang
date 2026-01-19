@@ -361,7 +361,12 @@ impl WasmThreadPool {
         } else {
             // Compile new component
             let comp = Component::new(engine, &wasm_bytes).map_err(|e| {
-                WasmError::Runtime(WasmRuntimeError::InstanceCreateFailed(e.to_string()))
+                WasmError::Runtime(WasmRuntimeError::CompileFailed(format!(
+                    "failed to parse WebAssembly component: {}. \
+                     Hint: The WASM file must be in component format. \
+                     If you're using wit-bindgen, use 'wasm-tools component new' to wrap the WASM module into a component.",
+                    e
+                )))
             })?;
 
             cache.push(wasm_hash, comp.clone());
