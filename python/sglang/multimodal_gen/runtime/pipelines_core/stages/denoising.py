@@ -161,16 +161,16 @@ class DenoisingStage(PipelineStage):
         if not envs.SGLANG_CACHE_DIT_ENABLED or batch.is_warmup:
             return
 
-        from sglang.multimodal_gen.runtime.distributed import (
-            get_sp_group,
-            get_tp_group,
-            get_world_size,
-        )
-        from sglang.multimodal_gen.runtime.utils.cache_dit_integration import (
+        from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
             CacheDitConfig,
             enable_cache_on_dual_transformer,
             enable_cache_on_transformer,
             get_scm_mask,
+        )
+        from sglang.multimodal_gen.runtime.distributed import (
+            get_sp_group,
+            get_tp_group,
+            get_world_size,
         )
 
         world_size = get_world_size()
