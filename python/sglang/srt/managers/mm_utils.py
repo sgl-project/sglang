@@ -1485,3 +1485,40 @@ def get_new_expanded_mm_items(original_mm_items):
         else:
             expanded_mm_items.append(item)
     return expanded_mm_items
+
+
+def clear_mm_features_for_decode(
+    tokenized_obj,
+    disaggregation_mode: str,
+    enable_clearing: bool = True,
+):
+    """
+    Clear multimodal features before sending to scheduler to reduce transfer overhead.
+    """
+    # Early return if not in decode mode or clearing is disabled
+    if disaggregation_mode != "decode" or not enable_clearing:
+        return
+
+    # Check if multimodal inputs exist
+    if not hasattr(tokenized_obj, "mm_inputs") or not tokenized_obj.mm_inputs:
+        return
+
+    # Get mm_items
+    mm_items = tokenized_obj.mm_inputs.get("mm_items", [])
+    if not mm_items:
+        return
+
+    # Get request ID for hash
+    rid = getattr(tokenized_obj, "rid", None)
+    if rid is None:
+        return
+
+    # Convert rid to hash value
+    hash_value = int(rid, 16)
+
+    # Clear features and set hash
+    for item in mm_items:
+        if hasattr(item, "feature"):
+            item.feature = None
+            item.pad_value = hash_value
+            item.hash = hash_value
