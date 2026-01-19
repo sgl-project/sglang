@@ -7,7 +7,6 @@ import time
 import uuid
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Union
 
-import jinja2
 import orjson
 from fastapi import Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
@@ -380,10 +379,14 @@ class OpenAIServingChat(OpenAIServingBase):
                     assistant_prefix = openai_compatible_messages[-1]["content"]
                     openai_compatible_messages = openai_compatible_messages[:-1]
 
+            # Optimization: For multimodal, skip tokenization (tokenize=False)
+            # The processor will do tokenization later with proper multimodal placeholders
+            # For non-multimodal, tokenize here (tokenize=True) to avoid redundant tokenization
+            should_tokenize = not is_multimodal
             try:
-                prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
+                result = self.tokenizer_manager.tokenizer.apply_chat_template(
                     openai_compatible_messages,
-                    tokenize=True,
+                    tokenize=should_tokenize,
                     add_generation_prompt=True,
                     tools=tools,
                     reasoning_effort=request.reasoning_effort,
@@ -393,44 +396,52 @@ class OpenAIServingChat(OpenAIServingBase):
                         else {}
                     ),
                 )
-            except Exception as e:
-                # If the first attempt fails, try transforming the tools format
-                # This handles models like Mistral that have a different tools input format
-                # that is not compatible with OpenAI's apply_chat_template tool_call format
+            except Exception:
+                # This except branch will be triggered when the chosen model
+                # has a different tools input format that is not compatible
+                # with openAI's apply_chat_template tool_call format, like Mistral.
                 tools = (
                     [t if "function" in t else {"function": t} for t in tools]
                     if tools
                     else None
                 )
-                try:
-                    prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
-                        openai_compatible_messages,
-                        tokenize=True,
-                        add_generation_prompt=True,
-                        tools=tools,
-                        reasoning_effort=request.reasoning_effort,
-                        **(
-                            request.chat_template_kwargs
-                            if request.chat_template_kwargs
-                            else {}
-                        ),
-                    )
-                except jinja2.TemplateError as template_error:
-                    # Template errors (e.g., from raise_exception in Jinja templates)
-                    # should be treated as client errors (400 BadRequest)
-                    raise ValueError(str(template_error)) from template_error
+                result = self.tokenizer_manager.tokenizer.apply_chat_template(
+                    openai_compatible_messages,
+                    tokenize=should_tokenize,
+                    add_generation_prompt=True,
+                    tools=tools,
+                    reasoning_effort=request.reasoning_effort,
+                    **(
+                        request.chat_template_kwargs
+                        if request.chat_template_kwargs
+                        else {}
+                    ),
+                )
 
+            # Handle assistant prefix
             if assistant_prefix:
-                encoded = self.tokenizer_manager.tokenizer.encode(assistant_prefix)
-                if (
-                    encoded
-                    and encoded[0] == self.tokenizer_manager.tokenizer.bos_token_id
-                ):
-                    encoded = encoded[1:]
-                prompt_ids += encoded
+                if is_multimodal:
+                    # For multimodal: result is text, just concatenate
+                    result = result + assistant_prefix
+                else:
+                    # For non-multimodal: result is token IDs, encode and concatenate
+                    encoded = self.tokenizer_manager.tokenizer.encode(assistant_prefix)
+                    if (
+                        encoded
+                        and encoded[0] == self.tokenizer_manager.tokenizer.bos_token_id
+                    ):
+                        encoded = encoded[1:]
+                    result = result + encoded
 
+            # Assign to prompt or prompt_ids based on type
             if is_multimodal:
-                prompt = self.tokenizer_manager.tokenizer.decode(prompt_ids)
+                # For multimodal: result is text string
+                prompt = result
+                prompt_ids = []
+            else:
+                # For non-multimodal: result is token IDs list
+                prompt = ""
+                prompt_ids = result
 
         stop = request.stop
         image_data = image_data if image_data else None
