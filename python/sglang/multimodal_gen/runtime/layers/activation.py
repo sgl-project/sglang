@@ -9,8 +9,13 @@ from typing import Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from sgl_kernel import silu_and_mul
 
+from sglang.multimodal_gen.runtime.platforms import current_platform
+
+_is_cuda = current_platform.is_cuda()
+_is_hip = current_platform.is_hip()
+if _is_cuda or _is_hip:
+    from sgl_kernel import silu_and_mul
 # TODO (will): remove this dependency
 from sglang.multimodal_gen.runtime.layers.custom_op import CustomOp
 
