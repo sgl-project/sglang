@@ -222,8 +222,8 @@ jobs:
                 console.log(`stage-a-test-1 status: ${stageAJob.status}, conclusion: ${stageAJob.conclusion}`);
 
                 if (stageAJob.status === 'completed') {
-                  if (stageAJob.conclusion === 'success') {
-                    core.setOutput('result', 'success');
+                  if (stageAJob.conclusion === 'success' || stageAJob.conclusion === 'skipped' || stageAJob.conclusion === 'cancelled') {
+                    core.setOutput('result', stageAJob.conclusion === 'success' ? 'success' : 'skipped');
                     return;
                   } else {
                     core.setOutput('result', 'failure');
@@ -306,7 +306,8 @@ jobs:
                     allCompleted = false;
                   } else {
                     completedCount++;
-                    if (job.conclusion !== 'success' && job.conclusion !== 'skipped') {
+                    // cancelled is not a failure - it means the workflow was stopped (e.g., by concurrency)
+                    if (job.conclusion !== 'success' && job.conclusion !== 'skipped' && job.conclusion !== 'cancelled') {
                       anyFailed = true;
                       failedJobs.push(job.name);
                     }
