@@ -604,28 +604,6 @@ class SchedulerPPMixin:
 
                 pp_proxy = PPProxyTensors(proxy_tensors)
 
-                # warmup
-                if i == 0:
-                    batch.prepare_for_extend()
-                    model_worker_batch = batch.get_model_worker_batch()
-                    from sglang.srt.model_executor.forward_batch_info import (
-                        ForwardBatch,
-                    )
-
-                    forward_batch = ForwardBatch.init_new(
-                        model_worker_batch, self.tp_worker.model_runner
-                    )
-                    _ = self.tp_worker.model_runner.forward(
-                        forward_batch=forward_batch, pp_proxy_tensors=pp_proxy
-                    )
-                    # Release KV cache
-                    if req.req_pool_idx is not None:
-                        kv_indices = self.req_to_token_pool.req_to_token[
-                            req.req_pool_idx, : len(req.fill_ids)
-                        ]
-                        self.token_to_kv_pool_allocator.free(kv_indices)
-                        self.req_to_token_pool.free(req.req_pool_idx)
-
                 # Measure latency with CUDA synchronization for accurate timing
                 # Synchronize before starting timing to ensure clean measurement
                 if torch.cuda.is_available():
@@ -1246,8 +1224,9 @@ class ChunkSizePredictor:
 
     def fit(self, seq_lens: List[int], latencies: List[float]):
         """Fit quadratic coefficients f(l) = al^2 + bl + c from data points."""
-        L = np.array(seq_lens, dtype=np.float64)
-        T = np.array(latencies, dtype=np.float64)
+        """Skip the first data point to avoid bias, as the first run is usually slower due to warmup."""
+        L = np.array(seq_lens[1:], dtype=np.float64)
+        T = np.array(latencies[1:], dtype=np.float64)
 
         if len(L) < 8:
             raise ValueError(
