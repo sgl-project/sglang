@@ -80,7 +80,7 @@ ARG ENABLE_MORI=0
 ARG NIC_BACKEND=none
 
 ARG MORI_REPO="https://github.com/ROCm/mori.git"
-ARG MORI_COMMIT="main"
+ARG MORI_COMMIT="b0dce4beebeb1f26c784eee17d5fd9785ee9447f"
 
 # AMD AINIC apt repo settings
 ARG AINIC_VERSION=1.117.5
@@ -341,11 +341,6 @@ RUN /bin/bash -lc 'set -euo pipefail; \
           ionic-common \
       ; \
       rm -rf /var/lib/apt/lists/*; \
-      ;; \
-    bnxt) \
-      export USE_IONIC="OFF"; \
-      export USE_BNXT="ON"; \
-      echo "[MORI] NIC_BACKEND=bnxt: USE_BNXT=ON. Add Broadcom bnxt packages/repos here when available."; \
       ;; \
     *) \
       echo "ERROR: unknown NIC_BACKEND=${NIC_BACKEND}. Use one of: none, ainic, bnxt"; \

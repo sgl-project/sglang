@@ -224,8 +224,24 @@ class MoriKVManager(CommonKVManager):
 
         engine = IOEngine(engine_key, config)
         poll_mode = PollCqMode.POLLING
+
+        # Number of RDMA Queue Pairs (QPs) used per transfer operation.
+        # Higher values can increase parallelism and bandwidth utilization.
+        # Default: 1
         qp_per_transfer = get_int_env_var("SGLANG_MORI_QP_PER_TRANSFER", 1)
+
+        # Number of RDMA work requests posted in a single batch to each QP.
+        # Larger batch sizes reduce per-operation overhead and improve throughput
+        # at the cost of higher latency. Use -1 for automatic sizing based on
+        # the number of merged work requests and available endpoints.
+        # Default: -1 (automatic)
         post_batch_size = get_int_env_var("SGLANG_MORI_POST_BATCH_SIZE", -1)
+
+        # Number of worker threads in the RDMA executor thread pool.
+        # Each worker handles RDMA operations on a separate CPU core (with affinity).
+        # More workers can improve parallelism for large batch transfers across
+        # multiple QPs, but excessive threads may cause contention.
+        # Default: 1
         num_worker_threads = get_int_env_var("SGLANG_MORI_NUM_WORKERS", 1)
 
         rdma_cfg = RdmaBackendConfig(

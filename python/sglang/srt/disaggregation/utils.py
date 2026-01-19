@@ -231,9 +231,9 @@ class MetadataBuffers:
 
 class TransferBackend(Enum):
     MOONCAKE = "mooncake"
+    MORI = "mori"
     NIXL = "nixl"
     ASCEND = "ascend"
-    MORI = "mori"
     FAKE = "fake"
 
 
