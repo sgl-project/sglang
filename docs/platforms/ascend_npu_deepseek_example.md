@@ -200,7 +200,7 @@ export ENABLE_MOE_NZ=1
 export TASK_QUEUE_ENABLE=2
 
 #Please list all host ips of Prefill instance
-P_HOST_IP=('xx,xx,xx,xx' 'xx,xx,xx,xx')
+P_HOST_IP=('xx.xx.xx.xx' 'xx.xx.xx.xx')
 
 for i in "${!P_HOST_IP[@]}";
 do
@@ -260,7 +260,7 @@ export SGLANG_USE_FIA_NZ=1
 export ENABLE_MOE_NZ=1
 
 #please list all host ips of Prefill instance
-D_HOST_IP=('xx,xx,xx,xx' 'xx,xx,xx,xx')
+D_HOST_IP=('xx.xx.xx.xx' 'xx.xx.xx.xx')
 
 for i in "${!D_HOST_IP[@]}";
 do

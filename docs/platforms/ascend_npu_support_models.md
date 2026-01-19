@@ -22,6 +22,7 @@ You are welcome to enable various models based on your business requirements.
 | vllm-ascend/QWQ-32B-W8A8                   | Qwen                           | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | meta-llama/Llama-4-Scout-17B-16E-Instruct  | Llama                          | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | AI-ModelScope/Llama-3.1-8B-Instruct        | Llama                          | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| LLM-Research/llama-2-7b                    | Llama                          | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | LLM-Research/Llama-3.2-1B-Instruct         | Llama                          | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | mistralai/Mistral-7B-Instruct-v0.2         | Mistral                        | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | google/gemma-3-4b-it                       | Gemma                          | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
