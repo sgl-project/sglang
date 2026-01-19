@@ -48,7 +48,12 @@ def _compute_sparse_seqlens_kernel(
     tl.store(out_ptr + b, out)
 
 
-def update_page_table_triton(page_table: torch.Tensor, physical_pages: torch.Tensor, valid_lengths: torch.Tensor, sparse_mask: torch.Tensor) -> None:
+def update_page_table_triton(
+    page_table: torch.Tensor,
+    physical_pages: torch.Tensor,
+    valid_lengths: torch.Tensor,
+    sparse_mask: torch.Tensor,
+) -> None:
     batch = page_table.shape[0]
     max_selected = physical_pages.shape[1]
     block_cols = 128
@@ -85,4 +90,3 @@ def compute_sparse_seqlens_triton(
         page_size,
     )
     return out
-

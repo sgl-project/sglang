@@ -4,11 +4,12 @@ from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 import triton
-from sglang.srt.utils.common import is_cuda, is_hip
+
 from sglang.srt.mem_cache.sparsity.kernel.flashattn_metadata_kernels import (
-    update_page_table_triton,
     compute_sparse_seqlens_triton,
+    update_page_table_triton,
 )
+from sglang.srt.utils.common import is_cuda, is_hip
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -149,11 +150,9 @@ class FlashAttentionAdaptor(BackendAdaptor):
                 sparse_mask.to(torch.int32),
             )
         else:
-            valid_mask = (
-                torch.arange(max_selected, device=physical_pages.device)
-                .unsqueeze(0)
-                < valid_lengths.unsqueeze(1)
-            )
+            valid_mask = torch.arange(
+                max_selected, device=physical_pages.device
+            ).unsqueeze(0) < valid_lengths.unsqueeze(1)
             update_mask = sparse_mask.unsqueeze(1) & valid_mask
             current_metadata.page_table[:, :max_selected] = torch.where(
                 update_mask,
