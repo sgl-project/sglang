@@ -934,7 +934,7 @@ jobs:
     if: |
       always() &&
       (
-        (inputs.target_stage == 'stage-b-test-large-2-gpu-disaggregation-amd') ||
+        (inputs.target_stage == 'stage-b-test-large-8-gpu-disaggregation-amd') ||
         (
           !inputs.target_stage &&
           (!failure() && !cancelled()) &&
