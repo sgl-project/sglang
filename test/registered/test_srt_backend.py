@@ -1,3 +1,4 @@
+import os
 import unittest
 
 import sglang as sgl
@@ -73,6 +74,10 @@ class TestSRTBackend(CustomTestCase):
     def test_dtype_gen(self):
         test_dtype_gen()
 
+    @unittest.skipIf(
+        os.environ.get("IS_BLACKWELL") == "1",
+        "Skip on Blackwell due to memory constraints",
+    )
     def test_hellaswag_select(self):
         # Run twice to capture more bugs
         for _ in range(2):
