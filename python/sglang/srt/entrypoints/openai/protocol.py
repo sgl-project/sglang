@@ -597,7 +597,7 @@ class ChatCompletionRequest(BaseModel):
                 ctk = values.get("chat_template_kwargs")
                 if not isinstance(ctk, dict):
                     ctk = {}
-                ctk.setdefault("thinking", True)
+                ctk.setdefault("enable_thinking", True)
                 values["chat_template_kwargs"] = ctk
 
         return values
