@@ -102,7 +102,9 @@ EP_DISPATCH_CONFIGS = {
 }
 
 
-@lru_cache(maxsize=2)
+# init_mori_op only needs do once in model initial stage
+# use lru_cache to reuse the same mori_op instance to avoid the init overhead for mori
+@lru_cache(maxsize=1)
 def init_mori_op(
     group,
     router_topk,
