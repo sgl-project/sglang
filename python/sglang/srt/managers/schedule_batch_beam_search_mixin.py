@@ -23,7 +23,6 @@ import torch
 from sglang.srt.managers.beam_search_type import BeamSearchList
 from sglang.srt.mem_cache.common import alloc_for_decode
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.server_args import get_global_server_args
 
 logger = logging.getLogger(__name__)
 
@@ -258,27 +257,19 @@ class ReqBeamSearchMixin:
     that can be mixed into the Req class.
     """
 
-    def _init_beam_search_attributes(self, sampling_params):
+    def _init_beam_search_attributes(self, is_beam_search, sampling_params):
         """Initialize beam search related attributes.
 
         This method should be called from Req.__init__() to set up beam search state.
-
-        Args:
-            sampling_params: The sampling parameters that may contain beam search settings
         """
-        self.is_beam_search = False
-        self.beam_width = 0
-        self.beam_candidates = 0
-
-        if get_global_server_args().enable_beam_search:
+        self.is_beam_search = is_beam_search
+        if self.is_beam_search:
             # sampling_params.n has already been validated in tokenizermanager
-            self.is_beam_search = True
             self.beam_width = sampling_params.n
             self.beam_list = BeamSearchList()
             # Path expansion candidate count
             self.beam_candidates = self.beam_width * 2
 
-        # stop_token_ids cache (only used in beam search)
         self._stop_token_ids_cache: Optional[set] = None
 
     @property

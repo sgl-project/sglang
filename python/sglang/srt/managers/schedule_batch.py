@@ -514,6 +514,7 @@ class Req(ReqBeamSearchMixin):
         require_reasoning: bool = False,
         return_hidden_states: bool = False,
         return_routed_experts: bool = False,
+        is_beam_search: bool = False,
         eos_token_ids: Optional[Set[int]] = None,
         bootstrap_host: Optional[str] = None,
         bootstrap_port: Optional[int] = None,
@@ -774,7 +775,7 @@ class Req(ReqBeamSearchMixin):
         self.dimensions = dimensions
 
         # beam search (initialized via mixin)
-        self._init_beam_search_attributes(self.sampling_params)
+        self._init_beam_search_attributes(is_beam_search, self.sampling_params)
 
         # For diffusion LLM
         self.dllm_ids = []
