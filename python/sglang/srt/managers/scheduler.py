@@ -951,11 +951,11 @@ class Scheduler(
         ):
             self.mm_receiver = MMReceiver(
                 self.server_args,
-                scheduler=self,
                 hf_config=self.model_config.hf_config,
-                tp_rank=self.tp_rank,
                 pp_rank=self.pp_rank,
+                tp_rank=self.tp_rank,
                 tp_group=self.tp_group,
+                scheduler=self,
             )
 
     def init_overlap(self):
