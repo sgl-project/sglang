@@ -49,7 +49,8 @@ __global__ void load_cache_to_device_buffer(
     void* __restrict__ device_buffer,
     int64_t* __restrict__ top_k_device_locs,
     int64_t item_size_bytes,
-    int64_t req_length) {
+    int64_t req_length,
+    int32_t* last_evicted_slot_ptr) {
   constexpr int NUM_WARPS = BLOCK_SIZE / WARP_SIZE;
   // HOT_BUFFER_SIZE is guaranteed to be >= NUM_TOP_K + 1
   constexpr int NUM_TOKEN_CHUNKS = (NUM_TOP_K + WARP_SIZE - 1) / WARP_SIZE;
@@ -80,11 +81,14 @@ __global__ void load_cache_to_device_buffer(
 
   constexpr int ITERATIONS_PER_WARP_BUFFER = (NUM_BUFFER_CHUNKS + NUM_WARPS - 1) / NUM_WARPS;
   int total_evictable = 0;
+  int physical_chunk_offset = (*last_evicted_slot_ptr + WARP_SIZE - 1) / WARP_SIZE;
   for (int iter = 0; iter < ITERATIONS_PER_WARP_BUFFER; iter++) {
     const int chunk_idx = warp_id + iter * NUM_WARPS;
     const bool has_valid_chunk = chunk_idx < NUM_BUFFER_CHUNKS;
 
-    const int buf_slot = chunk_idx * WARP_SIZE + lane_id;
+    // Map logical chunk idx to physical chunk idx to achieve round-robin eviction
+    const int physical_chunk_idx = (chunk_idx + physical_chunk_offset) % NUM_BUFFER_CHUNKS;
+    const int buf_slot = physical_chunk_idx * WARP_SIZE + lane_id;
     const bool has_valid_slot = has_valid_chunk && (buf_slot < HOT_BUFFER_SIZE);
 
     int32_t my_buffer_token = has_valid_slot ? device_buffer_tokens[buf_slot] : -1;
@@ -208,6 +212,7 @@ __global__ void load_cache_to_device_buffer(
   if (tid == 0) {
     // have one extra slot for the next token generation
     int extra_slot = s_evictable_slots[s_total_misses];
+    *last_evicted_slot_ptr = extra_slot;
     top_k_device_locs[NUM_TOP_K] = device_buffer_locs[extra_slot];
     device_buffer_tokens[extra_slot] = req_length;
   }
