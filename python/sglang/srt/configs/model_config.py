@@ -398,20 +398,21 @@ class ModelConfig:
                 else None
             )
 
-            # Handle rope scaling with yarn
-            self.scaling = 1 / math.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim)
-            if self.hf_config.rope_scaling:
-                mscale_all_dim = self.hf_config.rope_scaling.get(
-                    "mscale_all_dim", False
+            if "Glm4MoeLiteForCausalLM" in self.hf_config.architectures:
+                self.scaling = 1
+                self.hf_config.rope_scaling = None
+            else:
+                # Handle rope scaling with yarn
+                self.scaling = 1 / math.sqrt(
+                    self.qk_nope_head_dim + self.qk_rope_head_dim
                 )
-                if "factor" in self.hf_config.rope_scaling:
+                if self.hf_config.rope_scaling:
+                    mscale_all_dim = self.hf_config.rope_scaling.get(
+                        "mscale_all_dim", False
+                    )
                     scaling_factor = self.hf_config.rope_scaling["factor"]
-                else:
-                    scaling_factor = self.hf_config.rope_scaling[
-                        "partial_rotary_factor"
-                    ]
-                mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
-                self.scaling = self.scaling * mscale * mscale
+                    mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
+                    self.scaling = self.scaling * mscale * mscale
 
         elif "MiniCPM3ForCausalLM" in self.hf_config.architectures:
             self.head_dim = 128
