@@ -53,6 +53,7 @@ class MoeRunnerBackend(Enum):
     DEEP_GEMM = "deep_gemm"
     TRITON = "triton"
     TRITON_KERNELS = "triton_kernel"
+    TORCH_NPU_KERNELS = "torch_npu"
     FLASHINFER_TRTLLM = "flashinfer_trtllm"
     FLASHINFER_CUTLASS = "flashinfer_cutlass"
     FLASHINFER_MXFP4 = "flashinfer_mxfp4"
@@ -71,6 +72,9 @@ class MoeRunnerBackend(Enum):
 
     def is_triton_kernels(self):
         return self == MoeRunnerBackend.TRITON_KERNELS
+
+    def is_torch_npu_kernels(self):
+        return self == MoeRunnerBackend.TORCH_NPU_KERNELS
 
     def is_flashinfer_trtllm(self):
         return self == MoeRunnerBackend.FLASHINFER_TRTLLM
@@ -255,6 +259,7 @@ def filter_moe_weight_param_global_expert(name, x, num_local_experts):
     """
     return (
         not getattr(x, "_sglang_require_global_experts", False)
+        and not name.endswith("_blockscale_swizzled")
         and x.data.ndim > 0
         and x.data.shape[0] == num_local_experts
     )
