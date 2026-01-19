@@ -1168,9 +1168,9 @@ class ServerArgs:
                     # If user specified a backend but didn't explicitly set kv_cache_dtype,
                     # require them to be explicit about kv_cache_dtype to avoid surprises
                     if (user_set_prefill or user_set_decode) and self.kv_cache_dtype == "auto":
-                        raise ValueError(
+                        logger.warning(
                             f"When specifying --nsa-prefill-backend or --nsa-decode-backend, "
-                            f"you must also explicitly set --kv-cache-dtype (e.g., 'fp8_e4m3' or 'bfloat16'). "
+                            f"you should also explicitly set --kv-cache-dtype (e.g., 'fp8_e4m3' or 'bfloat16'). "
                             f"DeepSeek V3.2 defaults to FP8 KV cache which may not be compatible with all backends."
                         )
 
@@ -1197,12 +1197,12 @@ class ServerArgs:
                             f"Set NSA backends for FP8 KV Cache: prefill={self.nsa_prefill_backend}, decode={self.nsa_decode_backend}."
                         )
                     else:
-                        # set prefill/decode backends to flashmla_sparse based on architecture.
+                        # set prefill/decode backends based on hardware architecture.
                         if major >= 10:
                             if not user_set_prefill:
                                 self.nsa_prefill_backend = "flashmla_sparse"
                             if not user_set_decode:
-                                self.nsa_decode_backend = "flashmla_sparse"
+                                self.nsa_decode_backend = "trtllm_gen"
                         else:
                             # Hopper defaults for bfloat16
                             if not user_set_prefill:

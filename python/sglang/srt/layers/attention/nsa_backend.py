@@ -287,6 +287,9 @@ class NativeSparseAttnBackend(
             model_runner.model_config.num_attention_heads // get_attention_tp_size()
         )
         self.kv_cache_dim = model_runner.token_to_kv_pool.kv_cache_dim
+        self.qk_nope_head_dim = model_runner.model_config.qk_nope_head_dim
+        self.kv_lora_rank = model_runner.model_config.kv_lora_rank
+        self.qk_rope_head_dim = model_runner.model_config.qk_rope_head_dim
 
         assert model_runner.req_to_token_pool is not None
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
@@ -1725,15 +1728,15 @@ class NativeSparseAttnBackend(
         # kv_cache = kv_cache.view(-1, 1, layer.head_dim)
         return o
 
-    def _forward_trtllm_gen(                                                                                                         
-        self,                                                                                                                        
-        q_all: torch.Tensor,                                                                                                         
-        kv_cache: torch.Tensor,                                                                                                      
-        page_table_1: torch.Tensor,                                                                                                  
-        metadata: NSAMetadata,                                                                                                       
-        sm_scale: float,                                                                                                                                                                                                                        
+    def _forward_trtllm_gen(
+        self,
+        q_all: torch.Tensor,
+        kv_cache: torch.Tensor,
+        page_table_1: torch.Tensor,
+        metadata: NSAMetadata,
+        sm_scale: float,
     ) -> torch.Tensor:                                                                                                               
-        """Forward using TRT-LLM Gen sparse MLA kernel."""                                                                           
+        """Forward using TRT-LLM Gen sparse MLA kernel."""
         import flashinfer.decode
         batch_size = page_table_1.shape[0]
         _, num_heads, head_dim = q_all.shape
@@ -1746,9 +1749,9 @@ class NativeSparseAttnBackend(
             query=q,
             kv_cache=kv,
             workspace_buffer=self.workspace_buffer,
-            qk_nope_head_dim=128,
-            kv_lora_rank=512,
-            qk_rope_head_dim=64,
+            qk_nope_head_dim=self.qk_nope_head_dim,
+            kv_lora_rank=self.kv_lora_rank,
+            qk_rope_head_dim=self.qk_rope_head_dim,
             block_tables=block_tables,
             seq_lens=metadata.cache_seqlens_int32,
             max_seq_len=metadata.max_seq_len_k,
