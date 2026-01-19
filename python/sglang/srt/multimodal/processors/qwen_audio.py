@@ -1,11 +1,17 @@
 import re
 
 from sglang.srt.managers.schedule_batch import Modality
+from sglang.srt.models.moonshot_kimia import MoonshotKimiaForCausalLM
 from sglang.srt.models.qwen2_audio import Qwen2AudioForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,
 )
+
+__all__ = [
+    "Qwen2AudioMultimodalProcessor",
+    "MoonshotKimiaAudioMultimodalProcessor",
+]
 
 
 class Qwen2AudioMultimodalProcessor(BaseMultimodalProcessor):
@@ -65,3 +71,7 @@ class Qwen2AudioMultimodalProcessor(BaseMultimodalProcessor):
             "audio_token_id": self.audio_token_id,
             "audio_end_id": self.audio_end_id,
         }
+
+
+class MoonshotKimiaAudioMultimodalProcessor(Qwen2AudioMultimodalProcessor):
+    models = [MoonshotKimiaForCausalLM]
