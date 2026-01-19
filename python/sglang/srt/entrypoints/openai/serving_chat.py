@@ -84,6 +84,15 @@ def _extract_max_dynamic_patch(request: ChatCompletionRequest):
 class OpenAIServingChat(OpenAIServingBase):
     """Handler for /v1/chat/completions requests"""
 
+    # Keys that are passed explicitly to apply_chat_template() and should be
+    # filtered out from chat_template_kwargs to avoid duplicate argument errors
+    _RESERVED_TEMPLATE_KEYS = frozenset({
+        "tokenize",
+        "add_generation_prompt",
+        "tools",
+        "reasoning_effort",
+    })
+
     def __init__(
         self,
         tokenizer_manager: TokenizerManager,
@@ -380,6 +389,14 @@ class OpenAIServingChat(OpenAIServingBase):
                     assistant_prefix = openai_compatible_messages[-1]["content"]
                     openai_compatible_messages = openai_compatible_messages[:-1]
 
+            # Filter out keys from chat_template_kwargs that are already passed explicitly
+            # to avoid "got multiple values for keyword argument" errors
+            _filtered_chat_template_kwargs = {
+                k: v
+                for k, v in (request.chat_template_kwargs or {}).items()
+                if k not in self._RESERVED_TEMPLATE_KEYS
+            }
+
             try:
                 prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
                     openai_compatible_messages,
@@ -387,11 +404,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     add_generation_prompt=True,
                     tools=tools,
                     reasoning_effort=request.reasoning_effort,
-                    **(
-                        request.chat_template_kwargs
-                        if request.chat_template_kwargs
-                        else {}
-                    ),
+                    **_filtered_chat_template_kwargs,
                 )
             except Exception as e:
                 # If the first attempt fails, try transforming the tools format
@@ -409,11 +422,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         add_generation_prompt=True,
                         tools=tools,
                         reasoning_effort=request.reasoning_effort,
-                        **(
-                            request.chat_template_kwargs
-                            if request.chat_template_kwargs
-                            else {}
-                        ),
+                        **_filtered_chat_template_kwargs,
                     )
                 except jinja2.TemplateError as template_error:
                     # Template errors (e.g., from raise_exception in Jinja templates)
