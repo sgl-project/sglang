@@ -5,7 +5,9 @@ from typing import Callable, Optional, Tuple, Union
 import torch
 
 try:
-    from flash_attn.cute import flash_attn_varlen_func as _flash_attn_varlen_func
+    from sglang.jit_kernel.flash_attention.cute import (
+        flash_attn_varlen_func as _flash_attn_varlen_func,
+    )
 except Exception as _e:  # pragma: no cover
     _flash_attn_varlen_func = None
     _flash_attn_import_error = _e
@@ -49,8 +51,8 @@ def flash_attn_varlen_func(
 
     if _flash_attn_varlen_func is None:  # pragma: no cover
         raise ImportError(
-            "flash-attn-cute is not available (cannot import flash_attn.cute). "
-            "Please check your installation."
+            "Vendored FlashAttention CUTE is not available (cannot import "
+            "sglang.jit_kernel.flash_attention.cute). Please check your source tree."
         ) from _flash_attn_import_error
 
     q, k, v = [_maybe_contiguous(t) for t in (q, k, v)]
