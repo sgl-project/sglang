@@ -109,7 +109,6 @@ ${PROJ_ROOT}/csrc/kvcacheio/transfer.hip
 ${PROJ_ROOT}/csrc/moe/moe_align_kernel.hip
 ${PROJ_ROOT}/csrc/moe/moe_topk_softmax_kernels.hip
 ${PROJ_ROOT}/csrc/moe/moe_topk_sigmoid_kernels.hip
-${PROJ_ROOT}/csrc/sgl_diffusion/elementwise/timestep_embedding.hip
 ${PROJ_ROOT}/csrc/speculative/eagle_utils.hip
 )
 set_source_files_properties(
