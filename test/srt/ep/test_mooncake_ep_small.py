@@ -39,6 +39,14 @@ class TestTP(CustomTestCase):
                 "mooncake",
                 "--deepep-mode",
                 "low_latency",
+                "--moe-dense-tp-size",
+                "1",
+                "--enable-dp-lm-head",
+                "--enable-two-batch-overlap",
+                "--disable-custom-all-reduce",
+                "--enable-eplb",
+                "--ep-num-redundant-experts",
+                "72",
                 "--chunked-prefill-size",
                 "512",
                 "--cuda-graph-max-bs",
@@ -73,133 +81,38 @@ class TestTP(CustomTestCase):
 
 class TestPureDP(TestTP):
     extra_args = [
-        "--tp",
-        "4",
         "--enable-dp-attention",
         "--dp",
         "4",
-        "--moe-dense-tp-size",
-        "1",
-        "--enable-dp-lm-head",
-        "--disable-custom-all-reduce",
-        "--enable-eplb",
-        "--ep-num-redundant-experts",
-        "72",
     ]
+
+    pkill_process_1 = "sglang::scheduler_DP1_TP1_EP1"
+    pkill_process_2 = "sglang::scheduler_DP3_TP3_EP3"
 
     def test_gsm8k_fault_1(self):
         """
         Kill one rank and the system should remain operational.
         """
-        os.system("pkill -f sglang::scheduler_DP1_TP1_EP1")
+        os.system(f"pkill -f {self.pkill_process_1}")
         super().test_gsm8k()
 
     def test_gsm8k_fault_2(self):
         """
         Kill another rank and the system should remain operational.
         """
-        os.system("pkill -f sglang::scheduler_DP3_TP3_EP3")
+        os.system(f"pkill -f {self.pkill_process_2}")
         super().test_gsm8k()
 
 
 class TestHybridDPTP(TestTP):
     extra_args = [
-        "--tp",
-        "4",
-        "--enable-dp-attention",
-        "--dp",
-        "2",
-        "--moe-dense-tp-size",
-        "1",
-        "--enable-dp-lm-head",
-        "--disable-custom-all-reduce",
-        "--enable-eplb",
-        "--ep-num-redundant-experts",
-        "72",
-    ]
-
-    def test_gsm8k_fault_1(self):
-        """
-        Kill one rank and the system should remain operational.
-        """
-        os.system("pkill -f sglang::scheduler_DP1_TP2_EP2")
-        super().test_gsm8k()
-
-    def test_gsm8k_fault_2(self):
-        """
-        Kill another rank and the system should remain operational.
-        """
-        os.system("pkill -f sglang::scheduler_DP1_TP3_EP3")
-        super().test_gsm8k()
-
-
-@unittest.skip("covered in TestMooncakeWithEPLB")
-class TestNoGatherdBuffer(TestTP):
-    extra_args = [
-        "--tp",
-        "4",
         "--enable-dp-attention",
         "--dp",
         "4",
-        "--moe-dense-tp-size",
-        "1",
     ]
 
-
-class TestTBO(TestTP):
-    extra_args = [
-        "--tp",
-        "4",
-        "--enable-dp-attention",
-        "--dp",
-        "4",
-        "--moe-dense-tp-size",
-        "1",
-        "--enable-two-batch-overlap",
-        "--enable-dp-lm-head",
-        "--disable-custom-all-reduce",
-        "--enable-eplb",
-        "--ep-num-redundant-experts",
-        "72",
-    ]
-
-    def test_gsm8k_fault_1(self):
-        """
-        Kill one rank and the system should remain operational.
-        """
-        os.system("pkill -f sglang::scheduler_DP1_TP1_EP1")
-        super().test_gsm8k()
-
-    def test_gsm8k_fault_2(self):
-        """
-        Kill another rank and the system should remain operational.
-        """
-        os.system("pkill -f sglang::scheduler_DP3_TP3_EP3")
-        super().test_gsm8k()
-
-
-class TestMooncakeWithEPLB(TestTP):
-    extra_args = [
-        "--tp",
-        "4",
-        "--enable-dp-attention",
-        "--dp",
-        "4",
-        "--moe-dense-tp-size",
-        "1",
-        "--enable-two-batch-overlap",
-        "--enable-eplb",
-        "--ep-num-redundant-experts",
-        "4",
-        "--eplb-rebalance-num-iterations",
-        "50",
-        "--expert-distribution-recorder-buffer-size",
-        "50",
-        "--expert-distribution-recorder-mode",
-        "stat",
-        "--ep-dispatch-algorithm",
-        "static",
-    ]
+    pkill_process_1 = "sglang::scheduler_DP1_TP2_EP2"
+    pkill_process_2 = "sglang::scheduler_DP1_TP3_EP3"
 
 
 if __name__ == "__main__":
