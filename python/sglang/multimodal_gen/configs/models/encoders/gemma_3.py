@@ -47,7 +47,11 @@ class Gemma3ArchConfig(TextEncoderArchConfig):
     pretraining_tp: int = 1
     tie_word_embeddings: bool = True
     rope_theta: float = 10000.0
-    rope_scaling: float | None = None
+    rope_scaling: dict | None = None
+    rope_local_base_freq: float = 10000.0
+    sliding_window: int = 4096
+    layer_types: list[str] = field(default_factory=list)
+    query_pre_attn_scalar: int | None = None
     attention_bias: bool = False
     attention_dropout: float = 0.0
     mlp_bias: bool = False
