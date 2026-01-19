@@ -2481,6 +2481,17 @@ class ServerArgs:
                     "Attention backend is set to triton for diffusion LLM inference on AMD GPUs"
                 )
                 self.attention_backend = "triton"
+        if is_npu():
+            if not self.disable_cuda_graph:
+                logger.warning(
+                    "Cuda graph is disabled for diffusion LLM inference on NPUs"
+                )
+                self.disable_cuda_graph = True
+            if self.attention_backend != "ascend":
+                logger.warning(
+                    "Attention backend is set to ascend for diffusion LLM inference on NPUs"
+                )
+                self.attention_backend = "ascend"
         elif not self.disable_cuda_graph:
             if self.cuda_graph_bs != [1]:
                 logger.warning(
