@@ -113,10 +113,16 @@ class OpenAIServingChat(OpenAIServingBase):
         self.use_dpsk_v32_encoding = self._use_dpsk_v32_encoding()
 
     def _use_dpsk_v32_encoding(self) -> bool:
-        has_chat_template = (
-            self.tokenizer_manager.tokenizer is not None
-            and self.tokenizer_manager.tokenizer.chat_template is not None
+        tokenizer = self.tokenizer_manager.tokenizer
+        if tokenizer is None:
+            return False
+        get_chat_template = getattr(tokenizer, "get_chat_template", None)
+        chat_template = (
+            get_chat_template()
+            if callable(get_chat_template)
+            else getattr(tokenizer, "chat_template", None)
         )
+        has_chat_template = chat_template is not None
         architectures = self.tokenizer_manager.model_config.hf_config.architectures
         is_dpsk_v32 = "DeepseekV3" in architectures[0] if architectures else False
         return not has_chat_template and is_dpsk_v32
