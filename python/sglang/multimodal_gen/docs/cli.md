@@ -154,6 +154,32 @@ sglang serve "${SERVER_ARGS[@]}"
 
 For detailed API usage, including Image, Video Generation and LoRA management, please refer to the [OpenAI API Documentation](openai_api.md).
 
+### Cloud Storage Support
+
+SGLang diffusion supports automatically uploading generated images and videos to S3-compatible cloud storage (e.g., AWS S3, MinIO, Alibaba Cloud OSS, Tencent Cloud COS).
+
+When enabled, the server follows a **Generate -> Upload -> Delete** workflow:
+1. The artifact is generated to a temporary local file.
+2. The file is immediately uploaded to the configured S3 bucket in a background thread.
+3. Upon successful upload, the local file is deleted.
+4. The API response returns the public URL of the uploaded object.
+
+#### Configuration
+
+Cloud storage is enabled via environment variables. Note that `boto3` must be installed separately (`pip install boto3`) to use this feature.
+
+```bash
+# Enable S3 storage
+export SGLANG_CLOUD_STORAGE_TYPE=s3
+export SGLANG_S3_BUCKET_NAME=my-bucket
+export SGLANG_S3_ACCESS_KEY_ID=your-access-key
+export SGLANG_S3_SECRET_ACCESS_KEY=your-secret-key
+
+# Optional: Custom endpoint for MinIO/OSS/COS
+export SGLANG_S3_ENDPOINT_URL=https://minio.example.com
+```
+
+See [Environment Variables Documentation](environment_variables.md) for more details.
 
 ## Generate
 

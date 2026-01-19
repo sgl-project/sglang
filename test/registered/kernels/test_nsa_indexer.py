@@ -4,11 +4,8 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.test.ci.ci_register import register_cuda_ci
-
-register_cuda_ci(est_time=2, suite="nightly-1-gpu", nightly=True)
-
 from sglang.srt.layers import dp_attention as _dp_attn
+from sglang.test.ci.ci_register import register_cuda_ci
 
 # Patch DP-attention globals before importing backends
 _dp_attn.get_attention_tp_size = lambda: 1  # TP size = 1 for unit test
@@ -26,6 +23,8 @@ from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.test_utils import CustomTestCase
+
+register_cuda_ci(est_time=2, suite="nightly-1-gpu", nightly=True)
 
 # Global configuration for all indexer tests
 DEFAULT_CONFIG = {
