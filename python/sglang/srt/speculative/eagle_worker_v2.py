@@ -463,8 +463,8 @@ class EagleDraftWorker(BaseDraftWorker):
     ):
         if is_prepare_reflow:
             assert self.enable_spec_overlap_reflow, (
-                "The case where is_prepare_reflow is True "
-                "exists only when SGLANG_SPEC_ENABLE_OVERLAP_REFLOW is set to `1`."
+                "The case where param `is_prepare_reflow` is `True` "
+                "exists only when `SGLANG_SPEC_ENABLE_OVERLAP_REFLOW` is set to `1`."
             )
 
         # Parse args
