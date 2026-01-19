@@ -425,6 +425,17 @@ class OpenAIServingChat(OpenAIServingBase):
                     assistant_prefix = openai_compatible_messages[-1]["content"]
                     openai_compatible_messages = openai_compatible_messages[:-1]
 
+            # Prepare chat template kwargs, respecting SGLANG_REASONING_OFF_BY_DEFAULT
+            chat_template_kwargs = {}
+            if request.chat_template_kwargs:
+                chat_template_kwargs = request.chat_template_kwargs.copy()
+            # If reasoning is off by default, ensure enable_thinking is False
+            if envs.SGLANG_REASONING_OFF_BY_DEFAULT.get():
+                chat_template_kwargs["enable_thinking"] = False
+                logger.info(
+                    f"SGLANG_REASONING_OFF_BY_DEFAULT=True, setting enable_thinking=False in chat template kwargs"
+                )
+
             try:
                 prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
                     openai_compatible_messages,
@@ -432,11 +443,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     add_generation_prompt=True,
                     tools=tools,
                     reasoning_effort=request.reasoning_effort,
-                    **(
-                        request.chat_template_kwargs
-                        if request.chat_template_kwargs
-                        else {}
-                    ),
+                    **chat_template_kwargs,
                 )
             except Exception as e:
                 # If the first attempt fails, try transforming the tools format
@@ -454,11 +461,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         add_generation_prompt=True,
                         tools=tools,
                         reasoning_effort=request.reasoning_effort,
-                        **(
-                            request.chat_template_kwargs
-                            if request.chat_template_kwargs
-                            else {}
-                        ),
+                        **chat_template_kwargs,
                     )
                 except jinja2.TemplateError as template_error:
                     # Template errors (e.g., from raise_exception in Jinja templates)
@@ -859,9 +862,24 @@ class OpenAIServingChat(OpenAIServingBase):
             reasoning_text = None
             reasoning_parser = self.reasoning_parser
             if reasoning_parser and request.separate_reasoning:
+                reasoning_off_by_default = envs.SGLANG_REASONING_OFF_BY_DEFAULT.get()
+                template_force_reasoning = self.template_manager.force_reasoning
+                request_reasoning = self._get_reasoning_from_request(request)
                 is_force_reasoning = (
-                    self.template_manager.force_reasoning
-                    or self._get_reasoning_from_request(request)
+                    not reasoning_off_by_default and template_force_reasoning
+                ) or request_reasoning
+                logger.info(
+                    f"Reasoning force calculation: "
+                    f"SGLANG_REASONING_OFF_BY_DEFAULT={reasoning_off_by_default}, "
+                    f"template.force_reasoning={template_force_reasoning}, "
+                    f"request_reasoning={request_reasoning}, "
+                    f"is_force_reasoning={is_force_reasoning}"
+                )
+            elif request.separate_reasoning:
+                reasoning_off_by_default = envs.SGLANG_REASONING_OFF_BY_DEFAULT.get()
+                logger.info(
+                    f"No reasoning parser configured, SGLANG_REASONING_OFF_BY_DEFAULT={reasoning_off_by_default}, "
+                    f"skipping reasoning parsing"
                 )
                 try:
                     parser = ReasoningParser(
@@ -1106,9 +1124,27 @@ class OpenAIServingChat(OpenAIServingBase):
     ) -> tuple[Optional[str], str]:
         """Process reasoning content in streaming response"""
         if index not in reasoning_parser_dict:
+            if not self.reasoning_parser:
+                reasoning_off_by_default = envs.SGLANG_REASONING_OFF_BY_DEFAULT.get()
+                logger.info(
+                    f"Streaming (index={index}): No reasoning parser configured, "
+                    f"SGLANG_REASONING_OFF_BY_DEFAULT={reasoning_off_by_default}, "
+                    f"skipping reasoning parsing"
+                )
+                reasoning_parser_dict[index] = None
+                return None, delta
+            reasoning_off_by_default = envs.SGLANG_REASONING_OFF_BY_DEFAULT.get()
+            template_force_reasoning = self.template_manager.force_reasoning
+            request_reasoning = self._get_reasoning_from_request(request)
             is_force_reasoning = (
-                self.template_manager.force_reasoning
-                or self._get_reasoning_from_request(request)
+                not reasoning_off_by_default and template_force_reasoning
+            ) or request_reasoning
+            logger.info(
+                f"Streaming reasoning force calculation (index={index}): "
+                f"SGLANG_REASONING_OFF_BY_DEFAULT={reasoning_off_by_default}, "
+                f"template.force_reasoning={template_force_reasoning}, "
+                f"request_reasoning={request_reasoning}, "
+                f"is_force_reasoning={is_force_reasoning}"
             )
             reasoning_parser_dict[index] = ReasoningParser(
                 self.reasoning_parser,
