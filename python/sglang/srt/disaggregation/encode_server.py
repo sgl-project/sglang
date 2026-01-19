@@ -7,6 +7,7 @@ import os
 import pickle
 import time
 import traceback
+from http import HTTPStatus
 from typing import Dict, List, Optional, Set, Tuple
 
 import aiohttp
@@ -60,7 +61,7 @@ use_image_processor_gpu = (
 
 
 class MMError(Exception):
-    def __init__(self, message, code=500):
+    def __init__(self, message, code=HTTPStatus.INTERNAL_SERVER_ERROR):
         self.message = message
         self.code = code
         super().__init__(self.message)
@@ -68,12 +69,12 @@ class MMError(Exception):
 
 class BadRequestError(MMError):
     def __init__(self, message):
-        super().__init__(message, code=400)
+        super().__init__(message, code=HTTPStatus.BAD_REQUEST)
 
 
 class InternalError(MMError):
     def __init__(self, message):
-        super().__init__(message, code=500)
+        super().__init__(message, code=HTTPStatus.INTERNAL_SERVER_ERROR)
 
 
 class TensorWrapper:
@@ -334,7 +335,6 @@ class MMEncoder:
             mm_embedding = None
             mm_hash = None
 
-            start_time = time.perf_counter()
             if self.server_args.enable_prefix_mm_cache:
                 mm_item.set_pad_value()
                 mm_hash = MultiModalStaticCache.combine_hashes([mm_item.hash])
@@ -353,16 +353,12 @@ class MMEncoder:
             if self.server_args.enable_prefix_mm_cache:
                 async with self.mm_cache_lock:
                     self.mm_cache.set(mm_hash, EmbeddingResult(embedding=mm_embedding))
-            end_time = time.perf_counter()
-            logger.info(
-                f"Vit time : {(end_time - start_time)*1000:.2f} ms {mm_embedding.shape = }"
-            )
             if self.profiler is not None:
                 self.profiler.step()
 
             return _get_image_grid_dim(images_input), mm_embedding
-        except BadRequestError:
-            raise
+        except BadRequestError as e:
+            raise BadRequestError(f"Bad request error: {str(e)}")
         except Exception as e:
             raise InternalError(f"Internal encoding error: {str(e)}")
 
@@ -415,10 +411,7 @@ class MMEncoder:
 
     async def encode(self, mm_items, req_id, num_parts, part_idx):
         try:
-            start_time = time.time()
             image_grid_dim, mm_embedding = await self._encode(mm_items)
-            end_time = time.time()
-            logger.info(f"🕛 encode cost = {(end_time - start_time) * 1000:.2f}ms")
 
             if self.rank == 0:
                 mm_data = EmbeddingData(
@@ -433,7 +426,7 @@ class MMEncoder:
                 None,
             )
         except Exception as e:
-            error_code = getattr(e, "code", 500)
+            error_code = getattr(e, "code", HTTPStatus.INTERNAL_SERVER_ERROR)
             error_msg = str(e)
             logger.error(f"Rank {self.rank} encode failed: {error_msg} {error_code = }")
             if self.rank == 0:
@@ -755,7 +748,7 @@ async def handle_encode_request(request: dict):
         logger.error(f"Unexpected error in encoder logic for {req_id}: {error_msg}")
         rid_to_err_msg[req_id] = error_msg
         return ORJSONResponse(
-            status_code=500,
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
             content={
                 "status": "error",
                 "message": error_msg,
@@ -835,7 +828,9 @@ async def start_profile_async(obj: Optional[ProfileReqInput] = None):
             f"profile_id={encoder.profiler.profile_id}\n"
         )
         return Response(content=detail, status_code=200)
-    return Response(content=(msg or "Start profiling failed.\n"), status_code=400)
+    return Response(
+        content=(msg or "Start profiling failed.\n"), status_code=HTTPStatus.BAD_REQUEST
+    )
 
 
 @app.api_route("/stop_profile", methods=["GET", "POST"])
@@ -843,11 +838,15 @@ async def stop_profile_async():
     if encoder is None:
         return Response(content="encoder not ready\n", status_code=503)
     if encoder.profiler is None:
-        return Response(content="profiling not initialized\n", status_code=400)
+        return Response(
+            content="profiling not initialized\n", status_code=HTTPStatus.BAD_REQUEST
+        )
     req = ProfileReq(ProfileReqType.STOP_PROFILE)
     for socket in send_sockets:
         socket.send_pyobj(req)
     ok, msg = encoder.profiler.stop()
     if ok:
         return Response(content="Stop profiling.\n", status_code=200)
-    return Response(content=(msg or "Stop profiling failed.\n"), status_code=400)
+    return Response(
+        content=(msg or "Stop profiling failed.\n"), status_code=HTTPStatus.BAD_REQUEST
+    )

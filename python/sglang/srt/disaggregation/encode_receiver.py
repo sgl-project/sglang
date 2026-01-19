@@ -378,20 +378,22 @@ class MMReceiver:
         new_waiting = []
         abort_reqs = []
         for i, waiting_req in enumerate(self.waiting_list):
-            if local_status[i].item() > 0:
+            status_value = local_status[i].item()
+            if status_value == WaitingImageRequestStatus.SUCCESS:
                 new_recv_reqs.append(waiting_req.recv_req)
-            else:
-                if local_status[i].item() < 0:
-                    logger.info(f"Add one abort...")
-                    abort_reqs.append(
-                        (
-                            self.create_req(waiting_req.recv_req),
-                            waiting_req.error_msg,
-                            waiting_req.error_code,
-                        )
+            elif status_value == WaitingImageRequestStatus.FAIL:
+                logger.error(
+                    f"Waiting request {waiting_req.rid} failed: {waiting_req.error_msg} {waiting_req.error_code = }"
+                )
+                abort_reqs.append(
+                    (
+                        self.create_req(waiting_req.recv_req),
+                        waiting_req.error_msg,
+                        waiting_req.error_code,
                     )
-                else:
-                    new_waiting.append(waiting_req)
+                )
+            else:  # status_value == WaitingImageRequestStatus.PENDING
+                new_waiting.append(waiting_req)
 
         self.waiting_list = new_waiting
         return new_recv_reqs, abort_reqs
