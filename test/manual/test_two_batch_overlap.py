@@ -5,7 +5,7 @@ import requests
 
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.two_batch_overlap import (
+from sglang.srt.batch_overlap.two_batch_overlap import (
     compute_split_seq_index,
     compute_split_token_index,
 )
