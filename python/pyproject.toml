@@ -53,6 +53,7 @@ dependencies = [
   "py-spy",
   "pybase64",
   "pydantic",
+  "PyMuPDF>=1.22",
   "python-multipart",
   "pyzmq>=25.1.2",
   "quack-kernels==0.2.4",

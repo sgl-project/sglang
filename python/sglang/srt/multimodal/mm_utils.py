@@ -36,6 +36,7 @@ from typing import Literal
 
 import numpy as np
 import pybase64
+import requests
 import torch
 from PIL import Image
 
@@ -355,6 +356,48 @@ def process_images(images, image_processor, model_cfg):
     if all(x.shape == new_images[0].shape for x in new_images):
         new_images = np.stack(new_images, axis=0)
     return new_images
+
+
+def load_pdf_as_images(pdf_path, dpi=144, image_format="PNG"):
+    """
+    Convert PDF to a list of images
+    """
+    try:
+        import fitz
+    except ImportError as e:
+        raise ImportError("PyMuPDF is required for PDF input support. ") from e
+    images = []
+    response = requests.get(pdf_path)
+    response.raise_for_status()
+    pdf_bytes = BytesIO(response.content)
+    pdf_document = fitz.open(stream=pdf_bytes, filetype="pdf")
+
+    zoom = dpi / 72.0
+    matrix = fitz.Matrix(zoom, zoom)
+
+    for page_num in range(pdf_document.page_count):
+        page = pdf_document[page_num]
+
+        pixmap = page.get_pixmap(matrix=matrix, alpha=False)
+        Image.MAX_IMAGE_PIXELS = None
+
+        if image_format.upper() == "PNG":
+            img_data = pixmap.tobytes("png")
+            img = Image.open(BytesIO(img_data))
+        else:
+            img_data = pixmap.tobytes("png")
+            img = Image.open(BytesIO(img_data))
+            if img.mode in ("RGBA", "LA"):
+                background = Image.new("RGB", img.size, (255, 255, 255))
+                background.paste(
+                    img, mask=img.split()[-1] if img.mode == "RGBA" else None
+                )
+                img = background
+
+        images.append(img)
+
+    pdf_document.close()
+    return images
 
 
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/vision.py

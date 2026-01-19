@@ -150,9 +150,10 @@ class SessionParams:
 ImageDataInputItem = Union[Image, str, ImageData, Dict]
 AudioDataInputItem = Union[str, Dict]
 VideoDataInputItem = Union[str, Dict]
+PDFDataInputItem = Union[str, Dict]
 # Union type for any multimodal data item
 MultimodalDataInputItem = Union[
-    ImageDataInputItem, VideoDataInputItem, AudioDataInputItem
+    ImageDataInputItem, VideoDataInputItem, AudioDataInputItem, PDFDataInputItem
 ]
 # Format types supporting single items, lists, or nested lists for batch processing
 MultimodalDataInputFormat = Union[
@@ -181,6 +182,8 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
     video_data: Optional[MultimodalDataInputFormat] = None
     # The audio input. Like image data, it can be a file name, a url, or base64 encoded string.
     audio_data: Optional[MultimodalDataInputFormat] = None
+    # The PDF input. Can be a single URL string or a list of URL strings.
+    pdf_data: Optional[MultimodalDataInputFormat] = None
     # The sampling_params. See descriptions below.
     sampling_params: Optional[Union[List[Dict], Dict]] = None
     # Whether to return logprobs.
@@ -292,6 +295,7 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
                        text, input_ids, input_embeds are provided)
         """
         self._validate_inputs()
+        self._normalize_pdf_data()
         self._determine_batch_size()
         self._handle_parallel_sampling()
 
@@ -312,6 +316,44 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
             raise ValueError(
                 "Either text, input_ids or input_embeds should be provided."
             )
+
+    def _normalize_pdf_data(self):
+        """Normalize PDF data input and validate it before extraction."""
+
+        if self.pdf_data is None:
+            return
+
+        if isinstance(self.pdf_data, str):
+            self.pdf_data = [self.pdf_data]
+
+        assert not (
+            isinstance(self.pdf_data, list) and len(self.pdf_data) == 0
+        ), "pdf_data cannot be an empty list."
+        assert (
+            self.image_data is None or len(self.image_data) == 0
+        ), "Only support image_data or pdf_data at single request."
+        assert len(self.text) == len(
+            self.pdf_data
+        ), f"Number of items in pdf_data ({len(self.pdf_data)}) must match number of items in text ({len(self.text)})."
+
+        self._extract_pdf_data()
+
+    def _extract_pdf_data(self):
+        """Extract images from PDF data and populate image_data field and corresponding texts."""
+        from sglang.srt.multimodal.mm_utils import load_pdf_as_images
+
+        self.image_data = []
+        new_texts = []
+
+        for pdf_item, text_item in zip(self.pdf_data, self.text):
+            try:
+                images = load_pdf_as_images(pdf_item)
+            except Exception as e:
+                raise ValueError(f"Failed to extract images from PDF '{pdf_item}': {e}")
+            self.image_data.extend(images)
+            new_texts.extend([text_item] * len(images))
+
+        self.text = new_texts
 
     def _determine_batch_size(self):
         """Determine if this is a single example or a batch and the batch size."""
