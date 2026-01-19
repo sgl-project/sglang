@@ -348,7 +348,7 @@ impl WasmThreadPool {
 
     async fn execute_component_in_worker(
         engine: &Engine,
-        cache: &mut LruCache<Vec<u8>, Component>, //  cache argument
+        cache: &mut LruCache<[u8; 32], Component>, //  cache argument
         wasm_bytes: Vec<u8>,
         wasm_hash: [u8; 32],
         attach_point: WasmModuleAttachPoint,
@@ -362,15 +362,10 @@ impl WasmThreadPool {
         } else {
             // Compile new component
             let comp = Component::new(engine, &wasm_bytes).map_err(|e| {
-                WasmRuntimeError::CompileFailed(format!(
-                    "failed to parse WebAssembly component: {}. \
-                     Hint: The WASM file must be in component format. \
-                     If you're using wit-bindgen, use 'wasm-tools component new' to wrap the WASM module into a component.",
-                    e
-                ))
+                WasmError::Runtime(WasmRuntimeError::InstanceCreateFailed(e.to_string()))
             })?;
 
-            cache.push(wasm_bytes, comp.clone());
+            cache.push(wasm_hash, comp.clone());
             comp
         };
 
