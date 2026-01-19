@@ -46,25 +46,35 @@ class ModelSlimW8A8Int8(ModelSlimScheme):
         weight_loader = extra_weight_attrs.get("weight_loader")
         output_size_per_partition = sum(output_partition_sizes)
 
+        weight_data = torch.empty(
+            (output_size_per_partition, input_size_per_partition), dtype=torch.int8
+        )
+        layer.__dict__["weight_data"] = weight_data
         weight = ModelWeightParameter(
-            data=torch.empty(
-                (output_size_per_partition, input_size_per_partition), dtype=torch.int8
-            ),
+            data=weight_data,
             input_dim=1,
             output_dim=0,
             weight_loader=weight_loader,
         )
         layer.register_parameter("weight", weight)
 
+        weight_scale_data = torch.empty(
+            (output_size_per_partition, 1), dtype=params_dtype
+        )
+        layer.__dict__["weight_scale_data"] = weight_scale_data
         weight_scale = ChannelQuantScaleParameter(
-            data=torch.empty((output_size_per_partition, 1), dtype=params_dtype),
+            data=weight_scale_data,
             output_dim=0,
             weight_loader=weight_loader,
         )
         layer.register_parameter("weight_scale", weight_scale)
 
+        weight_offset_data = torch.empty(
+            (output_size_per_partition, 1), dtype=params_dtype
+        )
+        layer.__dict__["weight_offset_data"] = weight_offset_data
         weight_offset = ChannelQuantScaleParameter(
-            data=torch.empty((output_size_per_partition, 1), dtype=params_dtype),
+            data=weight_offset_data,
             output_dim=0,
             weight_loader=weight_loader,
         )
@@ -85,8 +95,10 @@ class ModelSlimW8A8Int8(ModelSlimScheme):
             input_offset.ignore_warning = True
             layer.register_parameter("input_offset", input_offset)
 
+            quant_bias_data = torch.empty(output_size_per_partition, dtype=torch.int32)
+            layer.__dict__["quant_bias_data"] = quant_bias_data
             quant_bias = ChannelQuantScaleParameter(
-                data=torch.empty(output_size_per_partition, dtype=torch.int32),
+                data=quant_bias_data,
                 output_dim=0,
                 weight_loader=weight_loader,
             )
@@ -98,8 +110,13 @@ class ModelSlimW8A8Int8(ModelSlimScheme):
                 deq_scale_dtype = torch.int64
             else:
                 raise ValueError(f"Unsupported params_dtype: {params_dtype}")
+
+            deq_scale_data = torch.empty(
+                output_size_per_partition, dtype=deq_scale_dtype
+            )
+            layer.__dict__["deq_scale_data"] = deq_scale_data
             deq_scale = ChannelQuantScaleParameter(
-                data=torch.empty(output_size_per_partition, dtype=deq_scale_dtype),
+                data=deq_scale_data,
                 output_dim=0,
                 weight_loader=weight_loader,
             )

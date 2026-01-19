@@ -39,9 +39,18 @@ _is_cuda = is_cuda()
 _is_npu = is_npu()
 
 if _is_npu:
-    from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
-
-    from sglang.srt.hardware_backend.npu.cmo import get_cmo_stream, wait_cmo_stream
+    if get_global_server_args().enable_torch_compile:
+        from sglang.srt.hardware_backend.npu.cmo import get_weight_cache
+        from sglang.srt.hardware_backend.npu.cmo_custom_ops import (
+            get_cmo_stream,
+            wait_cmo_stream,
+        )
+    else:
+        from sglang.srt.hardware_backend.npu.cmo import (
+            get_cmo_stream,
+            get_weight_cache,
+            wait_cmo_stream,
+        )
 
 
 class Qwen3Attention(nn.Module):
@@ -138,7 +147,15 @@ class Qwen3Attention(nn.Module):
         )
         self.alt_stream = alt_stream
 
-    def forward_prepare_native(self, positions, hidden_states):
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        if get_global_server_args().rl_on_policy_target is not None:
+            hidden_states = hidden_states.bfloat16()
+
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = apply_qk_norm(
@@ -150,48 +167,6 @@ class Qwen3Attention(nn.Module):
             alt_stream=self.alt_stream,
         )
         q, k = self.rotary_emb(positions, q, k)
-        return q, k, v
-
-    def forward_prepare_npu(self, positions, hidden_states, forward_batch):
-        qkv, _ = self.qkv_proj(hidden_states)
-
-        if self.attn.layer_id == forward_batch.token_to_kv_pool.start_layer:
-            self.rotary_emb.get_cos_sin_with_position(positions)
-        q, k, v = split_qkv_rmsnorm_rope(
-            qkv,
-            self.rotary_emb.position_sin,
-            self.rotary_emb.position_cos,
-            self.q_size,
-            self.kv_size,
-            self.head_dim,
-            eps=self.q_norm.variance_epsilon,
-            q_weight=self.q_norm.weight,
-            k_weight=self.k_norm.weight,
-            q_bias=getattr(self.q_norm, "bias", None),
-            k_bias=getattr(self.k_norm, "bias", None),
-        )
-        return q, k, v
-
-    def forward(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        forward_batch: ForwardBatch,
-    ) -> torch.Tensor:
-        if get_global_server_args().rl_on_policy_target is not None:
-            hidden_states = hidden_states.bfloat16()
-
-        if not _is_npu:
-            q, k, v = self.forward_prepare_native(
-                positions=positions,
-                hidden_states=hidden_states,
-            )
-        else:
-            q, k, v = self.forward_prepare_npu(
-                positions=positions,
-                hidden_states=hidden_states,
-                forward_batch=forward_batch,
-            )
 
         if get_global_server_args().rl_on_policy_target is not None:
             q = q.to(torch.bfloat16)
@@ -298,7 +273,10 @@ class Qwen3DecoderLayer(nn.Module):
             residual,
             forward_batch,
             cache=(
-                [self.mlp.gate_up_proj.weight, self.mlp.down_proj.weight]
+                [
+                    get_weight_cache(self.mlp.gate_up_proj),
+                    get_weight_cache(self.mlp.down_proj),
+                ]
                 if _is_npu
                 else None
             ),
