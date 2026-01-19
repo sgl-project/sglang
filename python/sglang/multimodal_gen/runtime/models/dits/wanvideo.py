@@ -243,8 +243,12 @@ class WanI2VCrossAttention(WanSelfAttention):
             quant_config=quant_config,
         )
 
-        self.add_k_proj = ColumnParallelLinear(dim, dim, gather_output=False)
-        self.add_v_proj = ColumnParallelLinear(dim, dim, gather_output=False)
+        self.add_k_proj = ColumnParallelLinear(
+            dim, dim, gather_output=False, quant_config=quant_config
+        )
+        self.add_v_proj = ColumnParallelLinear(
+            dim, dim, gather_output=False, quant_config=quant_config
+        )
         self.norm_added_k = RMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
     def forward(self, x, context, context_lens):
