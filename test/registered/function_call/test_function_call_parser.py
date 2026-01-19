@@ -12,6 +12,7 @@ from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.function_call.kimik2_detector import KimiK2Detector
 from sglang.srt.function_call.llama32_detector import Llama32Detector
 from sglang.srt.function_call.mistral_detector import MistralDetector
+from sglang.srt.function_call.phi4mini_detector import Phi4MiniDetector
 from sglang.srt.function_call.pythonic_detector import PythonicDetector
 from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -2996,6 +2997,285 @@ class TestJsonArrayParser(unittest.TestCase):
         # Verify all tool calls were parsed correctly
         total_calls = len(result1_2.calls) + len(result2_2.calls) + len(result3_2.calls)
         self.assertEqual(total_calls, 3, "Should have parsed exactly 3 tool calls")
+
+
+class TestPhi4MiniDetector(unittest.TestCase):
+    """
+    Test cases for Phi4MiniDetector which handles the functools[...] format
+    used by Phi-4 Mini models.
+
+    Format: functools[{"name": "function_name", "arguments": {...}}, ...]
+    """
+
+    def setUp(self):
+        """Set up test fixtures with sample tools."""
+        self.tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_weather",
+                    description="Get weather information",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "location": {
+                                "type": "string",
+                                "description": "Location to get weather for",
+                            },
+                            "unit": {
+                                "type": "string",
+                                "description": "Temperature unit",
+                                "enum": ["celsius", "fahrenheit"],
+                            },
+                        },
+                        "required": ["location"],
+                    },
+                ),
+            ),
+            Tool(
+                type="function",
+                function=Function(
+                    name="search",
+                    description="Search for information",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": "Search query",
+                            },
+                        },
+                        "required": ["query"],
+                    },
+                ),
+            ),
+        ]
+        self.detector = Phi4MiniDetector()
+
+    def test_has_tool_call_positive(self):
+        """Test that has_tool_call returns True for functools format."""
+        text = 'functools[{"name": "get_weather", "arguments": {"location": "Tokyo"}}]'
+        self.assertTrue(self.detector.has_tool_call(text))
+
+    def test_has_tool_call_negative(self):
+        """Test that has_tool_call returns False for non-functools text."""
+        text = "This is just normal text without any tool calls."
+        self.assertFalse(self.detector.has_tool_call(text))
+
+    def test_has_tool_call_partial(self):
+        """Test that has_tool_call returns True for partial functools."""
+        text = "functools["
+        self.assertTrue(self.detector.has_tool_call(text))
+
+    def test_detect_and_parse_single_tool_call(self):
+        """Test parsing a single tool call in functools format."""
+        text = 'functools[{"name": "get_weather", "arguments": {"location": "San Francisco"}}]'
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "get_weather")
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params["location"], "San Francisco")
+
+    def test_detect_and_parse_with_parameters_key(self):
+        """Test parsing tool call with 'parameters' key instead of 'arguments'."""
+        text = 'functools[{"name": "search", "parameters": {"query": "python programming"}}]'
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "search")
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params["query"], "python programming")
+
+    def test_detect_and_parse_multiple_tool_calls(self):
+        """Test parsing multiple tool calls in functools format."""
+        text = 'functools[{"name": "get_weather", "arguments": {"location": "Tokyo"}}, {"name": "search", "arguments": {"query": "restaurants"}}]'
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(len(result.calls), 2)
+        self.assertEqual(result.calls[0].name, "get_weather")
+        self.assertEqual(result.calls[1].name, "search")
+
+        params1 = json.loads(result.calls[0].parameters)
+        self.assertEqual(params1["location"], "Tokyo")
+
+        params2 = json.loads(result.calls[1].parameters)
+        self.assertEqual(params2["query"], "restaurants")
+
+    def test_detect_and_parse_with_text_before(self):
+        """Test parsing functools with text before it."""
+        text = 'Here is the tool call: functools[{"name": "get_weather", "arguments": {"location": "Paris"}}]'
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(result.normal_text, "Here is the tool call: ")
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "get_weather")
+
+    def test_detect_and_parse_with_text_after(self):
+        """Test parsing functools with text after it."""
+        text = 'functools[{"name": "get_weather", "arguments": {"location": "London"}}] That\'s the result!'
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(result.normal_text, " That's the result!")
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "get_weather")
+
+    def test_detect_and_parse_no_tool_call(self):
+        """Test parsing text without functools."""
+        text = "This is just normal text."
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(result.normal_text, text)
+        self.assertEqual(len(result.calls), 0)
+
+    def test_detect_and_parse_invalid_json(self):
+        """Test parsing functools with invalid JSON."""
+        text = 'functools[{"name": "get_weather", "arguments": {invalid}]'
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        # Should return the original text when JSON parsing fails
+        self.assertEqual(result.normal_text, text)
+        self.assertEqual(len(result.calls), 0)
+
+    def test_streaming_complete_tool_call(self):
+        """Test streaming a complete tool call in one chunk."""
+        text = (
+            'functools[{"name": "get_weather", "arguments": {"location": "New York"}}]'
+        )
+        result = self.detector.parse_streaming_increment(text, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "get_weather")
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params["location"], "New York")
+
+    def test_streaming_text_before_tool_call(self):
+        """Test streaming text that appears before a tool call."""
+        text = 'Let me check: functools[{"name": "get_weather", "arguments": {"location": "Berlin"}}]'
+        result = self.detector.parse_streaming_increment(text, self.tools)
+
+        self.assertEqual(result.normal_text, "Let me check: ")
+        self.assertEqual(len(result.calls), 1)
+
+    def test_streaming_partial_functools_token(self):
+        """Test streaming with partial 'functools[' token at the end."""
+        # First chunk ends with partial token
+        text1 = "Here is the result: func"
+        result1 = self.detector.parse_streaming_increment(text1, self.tools)
+
+        # Should hold back the partial token
+        self.assertEqual(result1.normal_text, "Here is the result: ")
+        self.assertEqual(self.detector._buffer, "func")
+
+        # Second chunk completes the token and adds content
+        text2 = 'tools[{"name": "get_weather", "arguments": {"location": "Munich"}}]'
+        result2 = self.detector.parse_streaming_increment(text2, self.tools)
+
+        self.assertEqual(len(result2.calls), 1)
+        self.assertEqual(result2.calls[0].name, "get_weather")
+
+    def test_streaming_incomplete_functools_block(self):
+        """Test streaming an incomplete functools block."""
+        # First chunk with incomplete functools
+        text1 = 'functools[{"name": "get_weather", "arguments": {"location":'
+        result1 = self.detector.parse_streaming_increment(text1, self.tools)
+
+        # Should buffer the incomplete block
+        self.assertEqual(len(result1.calls), 0)
+
+        # Second chunk completes the block
+        text2 = ' "Vienna"}}]'
+        result2 = self.detector.parse_streaming_increment(text2, self.tools)
+
+        self.assertEqual(len(result2.calls), 1)
+        self.assertEqual(result2.calls[0].name, "get_weather")
+
+    def test_streaming_no_tool_call(self):
+        """Test streaming text without any tool call."""
+        text = "This is just normal text without functools."
+        result = self.detector.parse_streaming_increment(text, self.tools)
+
+        self.assertEqual(result.normal_text, text)
+        self.assertEqual(len(result.calls), 0)
+        self.assertEqual(self.detector._buffer, "")
+
+    def test_streaming_multiple_chunks(self):
+        """Test streaming a tool call across multiple chunks."""
+        chunks = [
+            "Let me help: ",
+            "functools[",
+            '{"name": "get_weather",',
+            ' "arguments": {"location": "Amsterdam"',
+            "}}]",
+        ]
+
+        # Process first chunk - just normal text
+        result1 = self.detector.parse_streaming_increment(chunks[0], self.tools)
+        self.assertEqual(result1.normal_text, "Let me help: ")
+
+        # Process subsequent chunks
+        for chunk in chunks[1:-1]:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            self.assertEqual(len(result.calls), 0)  # Still buffering
+
+        # Final chunk should complete the tool call
+        final_result = self.detector.parse_streaming_increment(chunks[-1], self.tools)
+        self.assertEqual(len(final_result.calls), 1)
+        self.assertEqual(final_result.calls[0].name, "get_weather")
+
+    def test_streaming_with_nested_brackets(self):
+        """Test streaming functools with nested brackets in arguments."""
+        text = 'functools[{"name": "search", "arguments": {"query": "test", "filters": ["a", "b"]}}]'
+        result = self.detector.parse_streaming_increment(text, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "search")
+
+    def test_structure_info(self):
+        """Test that structure_info returns correct StructureInfo."""
+        get_info = self.detector.structure_info()
+        info = get_info("get_weather")
+
+        self.assertEqual(info.begin, 'functools[{"name": "get_weather", "arguments": ')
+        self.assertEqual(info.end, "}]")
+        self.assertEqual(info.trigger, "functools[")
+
+    def test_unknown_function_name(self):
+        """Test handling of unknown function names."""
+        text = (
+            'functools[{"name": "unknown_function", "arguments": {"param": "value"}}]'
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        # By default, unknown tools are skipped (not forwarded)
+        self.assertEqual(len(result.calls), 0)
+
+    def test_empty_arguments(self):
+        """Test parsing tool call with empty arguments."""
+        text = 'functools[{"name": "get_weather", "arguments": {}}]'
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "get_weather")
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params, {})
+
+    def test_multiline_functools(self):
+        """Test parsing functools that spans multiple lines."""
+        text = """functools[{
+            "name": "get_weather",
+            "arguments": {
+                "location": "Prague",
+                "unit": "celsius"
+            }
+        }]"""
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "get_weather")
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params["location"], "Prague")
+        self.assertEqual(params["unit"], "celsius")
 
 
 if __name__ == "__main__":
