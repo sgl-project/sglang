@@ -7,6 +7,7 @@ import threading
 import time
 import uuid
 from collections import defaultdict
+from itertools import repeat
 from typing import Dict, List, Optional, Set
 
 import numpy as np
@@ -136,14 +137,21 @@ class NixlKVManager(CommonKVManager):
     ):
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
         try:
-            from nixl._api import nixl_agent
+            from nixl._api import nixl_agent, nixl_agent_config
         except ImportError as e:
             raise ImportError(
                 "Please install NIXL by following the instructions at "
                 "https://github.com/ai-dynamo/nixl/blob/main/README.md "
                 "to run SGLang with NixlTransferEngine."
             ) from e
-        self.agent = nixl_agent(str(uuid.uuid4()))
+        self.agent = nixl_agent(
+            str(uuid.uuid4()),
+            nixl_agent_config(
+                num_threads=(
+                    8 if disaggregation_mode == DisaggregationMode.PREFILL else 0
+                )
+            ),
+        )
         self.register_buffer_to_engine()
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -362,13 +370,32 @@ class NixlKVManager(CommonKVManager):
 
         src_addrs = []
         dst_addrs = []
+
+        # Precompute block starts/lengths to reduce Python-level loops.
+        prefill_starts = np.fromiter(
+            (block[0] for block in prefill_kv_blocks), dtype=np.int64
+        )
+        dst_starts = np.fromiter((block[0] for block in dst_kv_blocks), dtype=np.int64)
+        block_lens = np.fromiter(
+            (len(block) for block in prefill_kv_blocks), dtype=np.int64
+        )
+
         for src_ptr, dst_ptr, item_len in layers_params:
-            for prefill_index, decode_index in zip(prefill_kv_blocks, dst_kv_blocks):
-                src_addr = src_ptr + int(prefill_index[0]) * item_len
-                dst_addr = dst_ptr + int(decode_index[0]) * item_len
-                length = item_len * len(prefill_index)
-                src_addrs.append((src_addr, length, self.kv_args.gpu_id))
-                dst_addrs.append((dst_addr, length, dst_gpu_id))
+            lengths = (item_len * block_lens).tolist()
+            src_addrs.extend(
+                zip(
+                    (src_ptr + prefill_starts * item_len).tolist(),
+                    lengths,
+                    repeat(self.kv_args.gpu_id),
+                )
+            )
+            dst_addrs.extend(
+                zip(
+                    (dst_ptr + dst_starts * item_len).tolist(),
+                    lengths,
+                    repeat(dst_gpu_id),
+                )
+            )
 
         logger.debug(
             f"len(src_addrs): before group: {len(prefill_kv_indices)}, after group: {len(src_addrs)}"
@@ -436,13 +463,6 @@ class NixlKVManager(CommonKVManager):
         src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage = (
             self.get_mha_kv_ptrs_with_pp(self.kv_args.kv_data_ptrs, dst_kv_ptrs)
         )
-        # Create transfer descriptors
-        src_addrs = []
-        dst_addrs = []
-
-        bytes_per_token_on_prefill = src_kv_item_len // page_size
-        bytes_per_token_on_decode = dst_kv_item_len // page_size
-
         # Calculate precise byte offset and length for the sub-slice within the token
         src_head_slice_offset = src_head_start_offset * bytes_per_head_slice_to_send
         dst_head_slice_offset = dst_head_start_offset * bytes_per_head_slice_to_send
@@ -462,48 +482,44 @@ class NixlKVManager(CommonKVManager):
             for layer_id in range(layers_current_pp_stage)
         ]
 
+        prefill_indices = np.asarray(prefill_kv_indices, dtype=np.int64)
+        dst_indices = np.asarray(dst_kv_indices, dtype=np.int64)
+        bytes_per_token_prefill = src_kv_item_len // page_size
+        bytes_per_token_decode = dst_kv_item_len // page_size
+        token_offsets = np.arange(page_size, dtype=np.int64)
+
         src_addrs = []
         dst_addrs = []
 
-        # Calculate strides for a single token slot
-        bytes_per_token_on_prefill = src_kv_item_len // page_size
-        bytes_per_token_on_decode = dst_kv_item_len // page_size
-
         for src_ptr, dst_ptr in src_dst_ptr_pairs:
-            for i in range(len(prefill_kv_indices)):
-                prefill_page_idx = int(prefill_kv_indices[i])
-                decode_page_idx = int(dst_kv_indices[i])
+            src_page_bases = src_ptr + prefill_indices * src_kv_item_len
+            dst_page_bases = dst_ptr + dst_indices * dst_kv_item_len
 
-                # Get the starting addresses for the current src and dst pages
-                src_page_start_addr = src_ptr + prefill_page_idx * src_kv_item_len
-                dst_page_start_addr = dst_ptr + decode_page_idx * dst_kv_item_len
+            src_all = (
+                src_page_bases[:, None]
+                + token_offsets[None, :] * bytes_per_token_prefill
+                + src_head_slice_offset
+            ).ravel()
+            dst_all = (
+                dst_page_bases[:, None]
+                + token_offsets[None, :] * bytes_per_token_decode
+                + dst_head_slice_offset
+            ).ravel()
 
-                # Iterate through each valid token slot within the current page
-                for token_slot_in_page in range(page_size):
-                    # Calculate the start address of the current token slot
-                    src_token_slot_start_addr = (
-                        src_page_start_addr
-                        + token_slot_in_page * bytes_per_token_on_prefill
-                    )
-                    dst_token_slot_start_addr = (
-                        dst_page_start_addr
-                        + token_slot_in_page * bytes_per_token_on_decode
-                    )
-
-                    # Calculate final src and dst addresses by applying head-slice offsets
-                    src_slice_addr = src_token_slot_start_addr + src_head_slice_offset
-                    dst_slice_addr = dst_token_slot_start_addr + dst_head_slice_offset
-
-                    src_addrs.append(
-                        (
-                            src_slice_addr,
-                            heads_bytes_per_token_to_send,
-                            self.kv_args.gpu_id,
-                        )
-                    )
-                    dst_addrs.append(
-                        (dst_slice_addr, heads_bytes_per_token_to_send, dst_gpu_id)
-                    )
+            src_addrs.extend(
+                zip(
+                    src_all.tolist(),
+                    repeat(heads_bytes_per_token_to_send),
+                    repeat(self.kv_args.gpu_id),
+                )
+            )
+            dst_addrs.extend(
+                zip(
+                    dst_all.tolist(),
+                    repeat(heads_bytes_per_token_to_send),
+                    repeat(dst_gpu_id),
+                )
+            )
 
         # Use NIXL agent for transfer
         src_descs = self.agent.get_xfer_descs(src_addrs, "VRAM")
