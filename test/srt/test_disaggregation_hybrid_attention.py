@@ -17,7 +17,7 @@ class TestDisaggregationHybridAttentionMamba(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
-        cls.model = "Qwen/Qwen3-Next-80B-A3B-Instruct"
+        cls.model = "/Qwen3-Next-80B-A3B-Instruct"
 
         # Non blocking start servers
         cls.start_prefill()
@@ -85,7 +85,7 @@ class TestDisaggregationHybridAttentionMambaExtraBuffer(PDDisaggregationServerBa
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
-        cls.model = "Qwen/Qwen3-Next-80B-A3B-Instruct"
+        cls.model = "/Qwen3-Next-80B-A3B-Instruct"
 
         # Non blocking start servers
         cls.start_prefill()
@@ -159,7 +159,7 @@ class TestDisaggregationHybridAttentionMambaDPDecode(PDDisaggregationServerBase)
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
-        cls.model = "Qwen/Qwen3-Next-80B-A3B-Instruct"
+        cls.model = "/Qwen3-Next-80B-A3B-Instruct"
 
         # Non blocking start servers
         cls.start_prefill()
@@ -179,8 +179,6 @@ class TestDisaggregationHybridAttentionMambaDPDecode(PDDisaggregationServerBase)
             "prefill",
             "--tp",
             "2",
-            "--load-balance-method",
-            "round_robin",
         ]
         prefill_args += cls.transfer_backend + cls.rdma_devices
         cls.process_prefill = popen_launch_pd_server(
@@ -204,7 +202,6 @@ class TestDisaggregationHybridAttentionMambaDPDecode(PDDisaggregationServerBase)
             "--enable-dp-lm-head",
             "--base-gpu-id",
             "2",
-            "--prefill-round-robin-balance",
         ]
         decode_args += cls.transfer_backend + cls.rdma_devices
         cls.process_decode = popen_launch_pd_server(
