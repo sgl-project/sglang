@@ -400,14 +400,14 @@ class AscendAttnBackend(AttentionBackend):
     ) -> torch.Tensor:
         position_point = torch.arange(seq_len) - seq_len + 1
         position_point = (
-            position_point.unsqueeze(0, 0).expand(num_heads, -1, -1)
+            position_point.unsqueeze(0).unsqueeze(0).expand(num_heads, -1, -1)
         )
         diag = torch.diag(position_point[0])
         position_point = position_point - diag.unsqueeze(0).unsqueeze(0).transpose(
             -1, -2
         )
         position_point = position_point.to(device)
-        alibi = slopes.unsqueeze(1, 1) * position_point
+        alibi = slopes.unsqueeze(1).unsqueeze(1) * position_point
         alibi_bias = alibi.view(num_heads, 1, seq_len)
         alibi_bias = alibi_bias.to(device).to(dtype)
         return alibi_bias
