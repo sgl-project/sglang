@@ -283,7 +283,7 @@ async def lifespan(fast_api_app: FastAPI):
         _global_state.tokenizer_manager
     )
     fast_api_app.state.openai_serving_rerank = OpenAIServingRerank(
-        _global_state.tokenizer_manager
+        _global_state.tokenizer_manager, _global_state.template_manager
     )
     fast_api_app.state.openai_serving_tokenize = OpenAIServingTokenize(
         _global_state.tokenizer_manager
@@ -358,6 +358,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Include routers
+from sglang.srt.entrypoints.v1_loads import router as v1_loads_router
+
+app.include_router(v1_loads_router)
 
 
 @app.exception_handler(HTTPException)
@@ -601,6 +606,11 @@ async def server_info():
 
 @app.get("/get_load")
 async def get_load():
+    """Get load metrics (deprecated - use /v1/loads instead)."""
+    logger.warning(
+        "Endpoint '/get_load' is deprecated and will be removed in a future version. "
+        "Please use '/v1/loads' instead."
+    )
     return await _global_state.tokenizer_manager.get_load()
 
 
@@ -1807,7 +1817,7 @@ def launch_server(
 
     try:
         # Update logging configs
-        set_uvicorn_logging_configs()
+        set_uvicorn_logging_configs(server_args)
 
         # Listen for HTTP requests
         if server_args.tokenizer_worker_num == 1:

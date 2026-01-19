@@ -148,3 +148,15 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
 
     def take_events(self):
         return []
+
+    def supports_swa(self) -> bool:
+        return False
+
+    def supports_mamba(self) -> bool:
+        return False
+
+    def is_chunk_cache(self) -> bool:
+        return False
+
+    def is_tree_cache(self) -> bool:
+        return not self.is_chunk_cache()
