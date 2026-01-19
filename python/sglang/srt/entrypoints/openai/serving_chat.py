@@ -366,7 +366,8 @@ class OpenAIServingChat(OpenAIServingBase):
         if self.use_dpsk_v32_encoding:
             thinking_mode = (
                 "thinking"
-                if (request.chat_template_kwargs or {}).get("thinking")
+                if (request.chat_template_kwargs or {}).get("enable_thinking")
+                or (request.chat_template_kwargs or {}).get("thinking")
                 else "chat"
             )
             messages = request.messages
