@@ -1214,32 +1214,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 a_mtp = a.view(batch_size, draft_token_num, num_value_heads)
                 b_mtp = b.view(batch_size, draft_token_num, num_value_heads)
 
-                # For exactness: reuse the same gating (g_log, beta) as Triton path.
-                # fused_gdn_gating expects [tokens, HV] where tokens = B*T.
-                a_flat = a_mtp.reshape(batch_size * draft_token_num, num_value_heads)
-                b_flat = b_mtp.reshape(batch_size * draft_token_num, num_value_heads)
-                g_log, beta = fused_gdn_gating(A_log, a_flat, b_flat, dt_bias)
-                g_log = (
-                    g_log.squeeze(0)
-                    .reshape(batch_size, draft_token_num, num_value_heads)
-                    .contiguous()
-                )
-                beta = (
-                    beta.squeeze(0)
-                    .reshape(batch_size, draft_token_num, num_value_heads)
-                    .contiguous()
-                )
-
                 core_attn_out = cutedsl_gdn_verify_k_last(
                     A_log=A_log,
                     a=a_mtp,
                     dt_bias=dt_bias,
-                    g_log_in=g_log,
                     q=query_mtp,
                     k=key_mtp,
                     v=value_mtp,
                     b=b_mtp,
-                    beta_in=beta,
                     initial_state_source=ssm_states,
                     initial_state_indices=cache_indices,
                     intermediate_states_buffer=intermediate_state_cache,
