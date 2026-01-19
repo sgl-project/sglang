@@ -74,6 +74,25 @@ class TestReasoningOffByDefault(CustomTestCase):
         self.assertIn("reasoning_content", message)
         self.assertIsNotNone(message["reasoning_content"])
 
+    def test_reasoning_off_by_default_without_parser(self):
+        # Test that reasoning is OFF when no reasoning parser is configured
+        # but SGLANG_REASONING_OFF_BY_DEFAULT is set
+        response = requests.post(
+            f"{self.base_url}/v1/chat/completions",
+            headers={"Authorization": f"Bearer {self.api_key}"},
+            json={
+                "model": self.model,
+                "messages": [{"role": "user", "content": "What is 2+2?"}],
+                "temperature": 0,
+                "separate_reasoning": True,
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        message = data["choices"][0]["message"]
+        # When reasoning is off by default, there should be no reasoning_content
+        self.assertNotIn("reasoning_content", message)
+
 
 if __name__ == "__main__":
     unittest.main()
