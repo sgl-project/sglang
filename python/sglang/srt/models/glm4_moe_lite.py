@@ -341,8 +341,8 @@ class Glm4MoeLiteDecoderLayer(DeepseekV2DecoderLayer):
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
         rope_theta = 1000000
         rope_scaling = None
-        max_position_embeddings = getattr(config, "max_position_embeddings", 202752)        self.layer_id = layer_id
-        self.mla = getattr(config, "mla", False)
+        max_position_embeddings = getattr(config, "max_position_embeddings", 202752)
+        self.layer_id = layer_id
 
         self.self_attn = DeepseekV2AttentionMLA(
             config=config,
