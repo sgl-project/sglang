@@ -11,12 +11,10 @@ use super::{
     common::responses::{
         handlers::{cancel_response_impl, get_response_impl},
         utils::validate_worker_availability,
+        ResponsesContext,
     },
     context::SharedComponents,
-    harmony::{
-        serve_harmony_responses, serve_harmony_responses_stream, HarmonyDetector,
-        HarmonyResponsesContext,
-    },
+    harmony::{serve_harmony_responses, serve_harmony_responses_stream, HarmonyDetector},
     pipeline::RequestPipeline,
     regular::responses,
 };
@@ -44,8 +42,8 @@ pub struct GrpcRouter {
     embedding_pipeline: RequestPipeline,
     classify_pipeline: RequestPipeline,
     shared_components: Arc<SharedComponents>,
-    responses_context: responses::ResponsesContext,
-    harmony_responses_context: responses::ResponsesContext,
+    responses_context: ResponsesContext,
+    harmony_responses_context: ResponsesContext,
     retry_config: RetryConfig,
 }
 
@@ -113,7 +111,7 @@ impl GrpcRouter {
 
         // Helper closure to create responses context with a given pipeline
         let create_responses_context = |pipeline: &RequestPipeline| {
-            responses::ResponsesContext::new(
+            ResponsesContext::new(
                 Arc::new(pipeline.clone()),
                 shared_components.clone(),
                 ctx.response_storage.clone(),
@@ -286,15 +284,15 @@ impl GrpcRouter {
                 model_id.unwrap_or(UNKNOWN_MODEL_ID),
                 body.stream.unwrap_or(false)
             );
-            let harmony_ctx = HarmonyResponsesContext::new(
+            let harmony_ctx = ResponsesContext::new(
                 Arc::new(self.harmony_pipeline.clone()),
                 self.shared_components.clone(),
-                self.harmony_responses_context.mcp_manager.clone(),
                 self.harmony_responses_context.response_storage.clone(),
                 self.harmony_responses_context.conversation_storage.clone(),
                 self.harmony_responses_context
                     .conversation_item_storage
                     .clone(),
+                self.harmony_responses_context.mcp_manager.clone(),
             );
 
             if body.stream.unwrap_or(false) {
