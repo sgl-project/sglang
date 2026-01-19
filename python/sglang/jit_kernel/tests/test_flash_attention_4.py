@@ -73,9 +73,7 @@ def apply_rotary_emb(
     return torch.cat((x_rot, x_pass), dim=-1)
 
 
-from sglang.jit_kernel.flash_attention_v4 import (
-    flash_attn_varlen_func,
-)
+from sglang.jit_kernel.flash_attention_v4 import flash_attn_varlen_func
 
 # from utils import is_hopper  # Not used in this test
 
