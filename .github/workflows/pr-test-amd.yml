@@ -928,6 +928,31 @@ jobs:
         run: |
           bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test/registered/eval -e SGLANG_USE_AITER_AR=0 -e SGLANG_USE_AITER=0 -e HF_HUB_ENABLE_HF_TRANSFER=0 python3 test_moe_eval_accuracy_large.py
 
+  check pdd env:
+    runs-on: linux-mi35x-gpu-8
+    if: inputs.target_stage == 'debug-rdma-pdd-env'
+    steps:
+      - name: Find RDMA in CI Runner
+        run: |
+          echo "=== CI Runner RDMA Info ==="
+          echo "1. /sys/class/infiniband:"
+          ls -la /sys/class/infiniband/ || echo "Not found"
+
+          echo "2. /dev/infiniband:"
+          ls -la /dev/infiniband/ || echo "Not found - THIS IS LIKELY THE PROBLEM"
+
+          echo "3. libibverbs providers:"
+          ls -la /etc/libibverbs.d/ || echo "Not found"
+          cat /etc/libibverbs.d/* 2>/dev/null || echo "No provider configs"
+
+          echo "4. RDMA libraries:"
+          ls -la /usr/lib/x86_64-linux-gnu/libibverbs/ 2>/dev/null || echo "Not found"
+          ls -la /usr/local/lib/libionic* 2>/dev/null || echo "libionic not found"
+
+          echo "5. ibv_devinfo:"
+          ibv_devinfo 2>&1 || echo "ibv_devinfo not available"
+
+
   # =============================================== Disaggregation ====================================================
   stage-b-test-large-8-gpu-35x-disaggregation-amd:
     needs: [check-changes, stage-a-test-1-amd]
@@ -969,26 +994,6 @@ jobs:
             echo "No RDMA devices found in /sys/class/infiniband"
             echo "SGLANG_TEST_RDMA_DEVICE=" >> $GITHUB_ENV
           fi
-
-      - name: Find RDMA in CI Runner
-        run: |
-          echo "=== CI Runner RDMA Info ==="
-          echo "1. /sys/class/infiniband:"
-          ls -la /sys/class/infiniband/ || echo "Not found"
-
-          echo "2. /dev/infiniband:"
-          ls -la /dev/infiniband/ || echo "Not found - THIS IS LIKELY THE PROBLEM"
-
-          echo "3. libibverbs providers:"
-          ls -la /etc/libibverbs.d/ || echo "Not found"
-          cat /etc/libibverbs.d/* 2>/dev/null || echo "No provider configs"
-
-          echo "4. RDMA libraries:"
-          ls -la /usr/lib/x86_64-linux-gnu/libibverbs/ 2>/dev/null || echo "Not found"
-          ls -la /usr/local/lib/libionic* 2>/dev/null || echo "libionic not found"
-
-          echo "5. ibv_devinfo:"
-          ibv_devinfo 2>&1 || echo "ibv_devinfo not available"
 
       - name: Start Special Container
         run: bash scripts/ci/amd_ci_start_container_disagg.sh
