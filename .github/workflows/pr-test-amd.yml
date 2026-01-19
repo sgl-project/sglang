@@ -802,7 +802,7 @@ jobs:
       - name: Benchmark Scores online latency and throughput (batch size scaling)
         timeout-minutes: 10
         run: |
-          bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test/registered/perf python3 -m unittest test_bench_serving_1gpu_part2.TestBenchServing1GPUPart2g.test_score_api_batch_scaling
+          bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test/registered/perf python3 -m unittest test_bench_serving_1gpu_part2.TestBenchServing1GPUPart2.test_score_api_batch_scaling
 
       - name: Benchmark Embeddings online latency and throughput
         timeout-minutes: 10
