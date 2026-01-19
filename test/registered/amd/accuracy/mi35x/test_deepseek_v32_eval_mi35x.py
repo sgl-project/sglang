@@ -85,7 +85,7 @@ MI35X_DEEPSEEK_V32_MODELS = [
             "--mem-fraction-static",
             "0.85",
             "--model-loader-extra-config",
-            '{"enable_multithread_load": true, "num_threads": 64}',
+            '{"enable_multithread_load": true}',
             "--watchdog-timeout",
             "1200",  # 20 minutes for weight loading
         ],
