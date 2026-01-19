@@ -122,6 +122,38 @@ class LoRAMemoryPool:
         else:
             return all(_can_support(x) for x in config)
 
+    def get_incompatibility_reason(self, config: LoRAConfig) -> Optional[str]:
+        """
+        Get a detailed reason why a LoRA adapter is incompatible with the memory pool.
+        Returns None if the adapter is compatible.
+        """
+        if config.r > self.max_lora_rank:
+            return (
+                f"LoRA rank {config.r} exceeds the configured maximum rank {self.max_lora_rank}. "
+                f"Please increase `--max-lora-rank` to at least {config.r}."
+            )
+
+        if config.lora_added_tokens_size > self.lora_added_tokens_size:
+            return (
+                f"LoRA adapter requires {config.lora_added_tokens_size} added tokens, but the memory pool "
+                f"was initialized with support for only {self.lora_added_tokens_size} added tokens. "
+                f"This typically happens when dynamic loading is used without initial `--lora-paths`. "
+                f"Please either: (1) specify an initial adapter with added tokens via `--lora-paths`, or "
+                f"(2) use an adapter without added tokens (no added_tokens.json file)."
+            )
+
+        target_module_names = get_normalized_target_modules(config.target_modules)
+        if not target_module_names.issubset(self.target_modules):
+            unsupported = target_module_names - self.target_modules
+            return (
+                f"LoRA adapter contains target modules {sorted(unsupported)} that are not supported "
+                f"by the current memory pool configuration. Configured target modules (normalized): "
+                f"{sorted(self.target_modules)}. Please update `--lora-target-modules` to include "
+                f"all required modules, or use 'all' to enable all supported modules."
+            )
+
+        return None
+
     def get_lora_A_shape(
         self,
         module_name: str,

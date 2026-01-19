@@ -170,13 +170,13 @@ class LoRAManager:
 
         # Check if the LoRA adapter shape is compatible with the current LoRA memory pool configuration.
         memory_pool = getattr(self, "memory_pool", None)
-        incompatible = memory_pool and not memory_pool.can_support(lora_config)
-        if incompatible:
-            raise ValueError(
-                f"LoRA adapter {lora_ref.lora_name} with rank {lora_config.r} is incompatible with the current "
-                "LoRA memory pool configuration. Please ensure that the LoRA adapter's rank is within the configured "
-                "`--max-lora-rank` and that the target modules are included in `--lora-target-modules`."
-            )
+        if memory_pool:
+            incompatibility_reason = memory_pool.get_incompatibility_reason(lora_config)
+            if incompatibility_reason:
+                raise ValueError(
+                    f"LoRA adapter {lora_ref.lora_name} is incompatible with the current "
+                    f"LoRA memory pool configuration: {incompatibility_reason}"
+                )
 
         # Ensure pinned LoRA adapters does not exceed maximal limit or cause starvation.
         if lora_ref.pinned and self.num_pinned_loras >= self.max_loras_per_batch - 1:
