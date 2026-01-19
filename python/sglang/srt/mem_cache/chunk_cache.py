@@ -7,7 +7,11 @@ from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
-from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
+from sglang.srt.mem_cache.base_prefix_cache import (
+    BasePrefixCache,
+    MatchPrefixParams,
+    MatchResult,
+)
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 
 if TYPE_CHECKING:
@@ -43,7 +47,7 @@ class ChunkCache(BasePrefixCache):
     def reset(self):
         pass
 
-    def match_prefix(self, **unused_kwargs) -> MatchResult:
+    def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         return MatchResult(
             device_indices=torch.empty((0,), dtype=torch.int64),
             last_device_node=None,

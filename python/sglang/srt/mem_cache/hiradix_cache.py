@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, List, Optional
 import torch
 
 from sglang.srt.managers.cache_controller import HiCacheController, PrefetchOperation
-from sglang.srt.mem_cache.base_prefix_cache import MatchResult
+from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams, MatchResult
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
 from sglang.srt.mem_cache.memory_pool_host import (
     MHATokenToKVPoolHost,
@@ -688,7 +688,8 @@ class HiRadixCache(RadixCache):
             return
         operation.mark_terminate()
 
-    def match_prefix(self, key: RadixKey, **kwargs):
+    def match_prefix(self, params: MatchPrefixParams):
+        key = params.key
         empty_value = torch.empty((0,), dtype=torch.int64, device=self.device)
         key, _ = self.maybe_bigram_convert(key)
         if self.disable or len(key) == 0:

@@ -2,6 +2,7 @@ import unittest
 
 import torch
 
+from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
@@ -188,7 +189,7 @@ class TestSWA(unittest.TestCase):
         tree.pretty_print()
 
         req5_token_ids = [1, 2, 3, 4, 5]
-        result = tree.match_prefix(RadixKey(req5_token_ids))
+        result = tree.match_prefix(MatchPrefixParams(key=RadixKey(req5_token_ids)))
         kv_indices, last_node = result.device_indices, result.last_device_node
         print(
             f"req5: token_ids: {req5_token_ids}, matched kv_indices: {kv_indices}, last_node.key: {last_node.key}"
@@ -196,7 +197,7 @@ class TestSWA(unittest.TestCase):
         self.assertEqual(len(kv_indices), 0)
 
         req6_token_ids = [1, 2, 3, 4, 5, 60, 70]
-        result = tree.match_prefix(RadixKey(req6_token_ids))
+        result = tree.match_prefix(MatchPrefixParams(key=RadixKey(req6_token_ids)))
         kv_indices, last_node = result.device_indices, result.last_device_node
         print(
             f"req6: token_ids: {req6_token_ids}, matched kv_indices: {kv_indices}, last_node.key: {last_node.key}"
@@ -329,7 +330,7 @@ class TestSWA(unittest.TestCase):
         tree.pretty_print()
 
         req5_token_ids = [1, 2, 3, 4, 5]
-        result = tree.match_prefix(RadixKey(req5_token_ids))
+        result = tree.match_prefix(MatchPrefixParams(key=RadixKey(req5_token_ids)))
         kv_indices, last_node = result.device_indices, result.last_device_node
         print(
             f"req5: token_ids: {req5_token_ids}, matched kv_indices: {kv_indices}, last_node.key: {last_node.key}"
@@ -337,7 +338,7 @@ class TestSWA(unittest.TestCase):
         self.assertEqual(len(kv_indices), 0)  # no swa prefix matched
 
         req6_token_ids = [1, 2, 3, 4, 5, 60, 70]
-        result = tree.match_prefix(RadixKey(req6_token_ids))
+        result = tree.match_prefix(MatchPrefixParams(key=RadixKey(req6_token_ids)))
         kv_indices, last_node = result.device_indices, result.last_device_node
         print(
             f"req6: token_ids: {req6_token_ids}, matched kv_indices: {kv_indices}, last_node.key: {last_node.key}"

@@ -28,7 +28,11 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 import torch
 from numpy import float64
 
-from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
+from sglang.srt.mem_cache.base_prefix_cache import (
+    BasePrefixCache,
+    MatchPrefixParams,
+    MatchResult,
+)
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.radix_cache import (
     RadixKey,
@@ -379,10 +383,10 @@ class SWARadixCache(BasePrefixCache):
         self.full_lru_list = LRUList(is_swa_list=False)
         self.swa_lru_list = LRUList(is_swa_list=True)
 
-    def match_prefix(self, key: RadixKey, **kwargs) -> MatchResult:
+    def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         """Find the matching prefix from the radix tree.
         Args:
-            key: A RadixKey contains token IDs to find a matching prefix.
+            params: MatchPrefixParams containing key.
         Returns:
             A tuple of a tensor of matching prefix token IDs and
             the last node that contains the prefix values. Note that
@@ -390,6 +394,7 @@ class SWARadixCache(BasePrefixCache):
             The last node create a new child if the prefix is shorter
             than the last node's value.
         """
+        key = params.key
         key.token_ids = self.key_convert_fn(key.token_ids)
 
         if self.disable or len(key) == 0:
@@ -546,7 +551,7 @@ class SWARadixCache(BasePrefixCache):
 
         # The prefix indices could be updated, reuse it
         match_result = self.match_prefix(
-            RadixKey(page_aligned_token_ids, req.extra_key)
+            MatchPrefixParams(key=RadixKey(page_aligned_token_ids, req.extra_key))
         )
         (new_indices, new_last_node) = (
             match_result.device_indices,
