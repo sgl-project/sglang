@@ -40,8 +40,6 @@ def flash_attn_varlen_func(
     pack_gqa: Optional[bool] = None,
     score_mod: Optional[Callable] = None,
     aux_tensors: Optional[list] = None,
-    mask_mod: Optional[Callable] = None,
-    block_sparse_tensors=None,
 ):
     if _flash_attn_varlen_func is None:  # pragma: no cover
         raise ImportError(
@@ -82,8 +80,6 @@ def flash_attn_varlen_func(
         pack_gqa=pack_gqa,
         score_mod=score_mod,
         aux_tensors=aux_tensors,
-        mask_mod=mask_mod,
-        block_sparse_tensors=block_sparse_tensors,
     )
 
 
