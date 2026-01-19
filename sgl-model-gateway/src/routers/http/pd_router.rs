@@ -274,114 +274,6 @@ impl PDRouter {
         Ok(original)
     }
 
-    // Helper for prefill-only workloads like embeddings and classify
-    async fn route_prefill_only_workload<T: GenerationRequest + Serialize>(
-        &self,
-        headers: Option<&HeaderMap>,
-        body: &T,
-        model_id: Option<&str>,
-        endpoint_path: &'static str,
-        workload_name: &'static str,
-    ) -> Response {
-        // This is a prefill-only workload in PD mode (no decode stage needed).
-        let request_text = if self.policies_need_request_text() {
-            Some(body.extract_text_for_routing())
-        } else {
-            None
-        };
-
-        // Select a prefill worker using the same model filtering semantics as PD pair selection.
-        let effective_model_id = if !self.enable_igw { None } else { model_id };
-        let prefill_workers: Vec<Arc<dyn Worker>> = if let Some(model) = effective_model_id {
-            self.worker_registry
-                .get_by_model(model)
-                .iter()
-                .filter(|w| matches!(w.worker_type(), WorkerType::Prefill { .. }))
-                .cloned()
-                .collect()
-        } else {
-            self.worker_registry.get_prefill_workers()
-        };
-
-        let prefill_policy = self.policy_registry.get_prefill_policy();
-
-        // Get cached hash ring for consistent hashing
-        let hash_ring = self
-            .worker_registry
-            .get_hash_ring(effective_model_id.unwrap_or(UNKNOWN_MODEL_ID));
-
-        let prefill = match Self::pick_worker_by_policy_arc(
-            &prefill_workers,
-            &*prefill_policy,
-            request_text.as_deref(),
-            headers,
-            hash_ring.clone(),
-            "prefill",
-        ) {
-            Ok(w) => w,
-            Err(e) => return Self::handle_server_selection_error(e),
-        };
-
-        // Record worker selection metric (Layer 3)
-        let model = model_id.unwrap_or("default");
-        Metrics::record_worker_selection(
-            metrics_labels::WORKER_PREFILL,
-            metrics_labels::CONNECTION_HTTP,
-            model,
-            prefill_policy.name(),
-        );
-
-        // Build request with trace context injected
-        let mut headers_with_trace = headers.cloned().unwrap_or_default();
-        inject_trace_context_http(&mut headers_with_trace);
-        let headers = Some(&headers_with_trace);
-
-        let json_request = match serde_json::to_value(body) {
-            Ok(v) => v,
-            Err(e) => return Self::handle_serialization_error(e),
-        };
-
-        let _prefill_guard = WorkerLoadGuard::new(prefill.clone(), headers);
-        let request = self.build_post_with_headers(
-            &self.client,
-            prefill.url(),
-            endpoint_path,
-            &json_request,
-            headers,
-            false,
-        );
-
-        match request.send().await {
-            Ok(res) => {
-                let status = StatusCode::from_u16(res.status().as_u16())
-                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                let response_headers = header_utils::preserve_response_headers(res.headers());
-                match res.bytes().await {
-                    Ok(body_bytes) => {
-                        let mut response = Response::new(Body::from(body_bytes));
-                        *response.status_mut() = status;
-                        *response.headers_mut() = response_headers;
-                        response
-                    }
-                    Err(e) => {
-                        error!("Failed to read {} response body: {}", workload_name, e);
-                        error::internal_error(
-                            "read_response_body_failed",
-                            format!("Failed to read {} response body: {}", workload_name, e),
-                        )
-                    }
-                }
-            }
-            Err(e) => {
-                error!("Failed to proxy {} request: {}", workload_name, e);
-                error::bad_gateway(
-                    "prefill_request_failed",
-                    format!("Failed to proxy {} request: {}", workload_name, e),
-                )
-            }
-        }
-    }
-
     async fn execute_dual_dispatch<T: Serialize + Clone>(
         &self,
         headers: Option<&HeaderMap>,
@@ -1488,8 +1380,12 @@ impl RouterTrait for PDRouter {
         body: &EmbeddingRequest,
         model_id: Option<&str>,
     ) -> Response {
-        self.route_prefill_only_workload(headers, body, model_id, "/v1/embeddings", "embeddings")
-            .await
+        let _ = (headers, body, model_id);
+        warn!("PD mode does not support /v1/embeddings; returning bad request");
+        error::bad_request(
+            "pd_unsupported_embeddings",
+            "PD mode does not support /v1/embeddings",
+        )
     }
 
     async fn route_classify(
@@ -1498,8 +1394,12 @@ impl RouterTrait for PDRouter {
         body: &ClassifyRequest,
         model_id: Option<&str>,
     ) -> Response {
-        self.route_prefill_only_workload(headers, body, model_id, "/v1/classify", "classify")
-            .await
+        let _ = (headers, body, model_id);
+        warn!("PD mode does not support /v1/classify; returning bad request");
+        error::bad_request(
+            "pd_unsupported_classify",
+            "PD mode does not support /v1/classify",
+        )
     }
 
     fn router_type(&self) -> &'static str {
