@@ -30,6 +30,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from sglang.srt.layers.quantization.fp4_utils import get_fp4_gemm_runner_backend
 from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
@@ -42,6 +43,7 @@ from sglang.srt.layers.quantization.utils import (
     convert_to_channelwise,
     is_layer_skipped,
     per_tensor_dequantize,
+    prepare_static_weights_for_trtllm_fp4_moe,
     requantize_with_max_scale,
     swizzle_blockscale,
 )
@@ -52,6 +54,7 @@ from sglang.srt.utils.common import (
     is_sm120_supported,
     next_power_of_2,
 )
+from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.patch_torch import register_fake_if_exists
 
 if TYPE_CHECKING:
@@ -72,15 +75,13 @@ except ImportError:
     fp4_quantize = None
 
 try:
-    from flashinfer import mm_fp4 as fp4_gemm
+    from flashinfer import mm_fp4 as flashinfer_fp4_gemm
     from flashinfer import reorder_rows_for_gated_act_gemm, shuffle_matrix_sf_a
 
     enable_flashinfer_fp4_gemm = True
 except ImportError:
     if is_cuda():
-        from sgl_kernel import cutlass_scaled_fp4_mm as fp4_gemm
-    else:
-        fp4_gemm = None
+        from sgl_kernel import cutlass_scaled_fp4_mm as cutlass_fp4_gemm
     enable_flashinfer_fp4_gemm = False
     reorder_rows_for_gated_act_gemm = None
     shuffle_matrix_a = None
@@ -102,8 +103,7 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
-@torch.library.custom_op("sglang::fp4_gemm", mutates_args=())
-def _sglang_fp4_gemm(
+def _sglang_fp4_gemm_fake(
     input: torch.Tensor,
     weight: torch.Tensor,
     input_sf: torch.Tensor,
@@ -112,28 +112,31 @@ def _sglang_fp4_gemm(
     out_dtype: torch.dtype,
     out_features: int,
 ) -> torch.Tensor:
-    backend = FLASHINFER_FP4_GEMM_BACKEND if FLASHINFER_FP4_GEMM_BACKEND else "cutlass"
-    if enable_flashinfer_fp4_gemm:
-        return fp4_gemm(
-            input, weight, input_sf, weight_sf, alpha, out_dtype, backend=backend
-        )
-    else:
-        return fp4_gemm(input, weight, input_sf, weight_sf, alpha, out_dtype)
-
-
-@torch.library.register_fake("sglang::fp4_gemm")
-def _sglang_fp4_gemm_fake(
-    input,
-    weight,
-    input_sf,
-    weight_sf,
-    alpha,
-    out_dtype,
-    out_features: int,
-):
     M = input.shape[-2]
     N = int(out_features)
     return input.new_empty((M, N), dtype=out_dtype)
+
+
+@register_custom_op(fake_impl=_sglang_fp4_gemm_fake)
+def fp4_gemm(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    input_sf: torch.Tensor,
+    weight_sf: torch.Tensor,
+    alpha: torch.Tensor,
+    out_dtype: torch.dtype,
+    out_features: int,
+) -> torch.Tensor:
+    fp4_backend = get_fp4_gemm_runner_backend()
+    # TODO(shuw@nvidia.com): Remove the "cutlass" default override after flashinfer 0.6.0
+    # and let flashinfer's auto backend selection handle it.
+    backend = fp4_backend.value if not fp4_backend.is_auto() else "cutlass"
+    if enable_flashinfer_fp4_gemm:
+        return flashinfer_fp4_gemm(
+            input, weight, input_sf, weight_sf, alpha, out_dtype, backend=backend
+        )
+    else:
+        return cutlass_fp4_gemm(input, weight, input_sf, weight_sf, alpha, out_dtype)
 
 
 if is_cuda() and (not is_sm120_supported()) and (fp4_quantize is not None):
@@ -151,7 +154,6 @@ CUTEDSL_MOE_SCALAR_INPUT_SCALE = get_bool_env_var(
 
 # TODO make it true by default when the DeepEP PR is merged
 MOE_NVFP4_DISPATCH = envs.SGLANG_MOE_NVFP4_DISPATCH.get()
-FLASHINFER_FP4_GEMM_BACKEND = envs.SGLANG_FLASHINFER_FP4_GEMM_BACKEND.get()
 # Supported activation schemes for the current configuration
 ACTIVATION_SCHEMES = ["static"]
 
@@ -784,7 +786,6 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
                         else 1.0
                     ),
                     use_routing_scales_on_input=use_routing_scales_on_input,
-                    tile_tokens_dim=None,
                     routing_method_type=routing_method_type,
                     tune_max_num_tokens=next_power_of_2(x.shape[0]),
                 )
@@ -949,12 +950,22 @@ class ModelOptFp4Config(ModelOptQuantConfig):
             if not kv_cache_quant_algo:
                 # For config.json format, derive from kv_cache_scheme if available
                 kv_cache_scheme = config.get("kv_cache_scheme")
-                if (
-                    kv_cache_scheme
-                    and kv_cache_scheme.get("type") == "float"
-                    and kv_cache_scheme.get("num_bits") == 8
-                ):
-                    kv_cache_quant_algo = "FP8"
+                if isinstance(kv_cache_scheme, dict):
+                    if (
+                        kv_cache_scheme.get("type") == "float"
+                        and kv_cache_scheme.get("num_bits") == 8
+                    ):
+                        kv_cache_quant_algo = "FP8"
+                    else:
+                        kv_cache_quant_algo = "auto"
+                elif isinstance(kv_cache_scheme, str):
+                    scheme_name = kv_cache_scheme.strip().upper()
+                    if scheme_name in ("FP8", "FLOAT8"):
+                        kv_cache_quant_algo = "FP8"
+                    elif scheme_name in ("FP4", "FLOAT4", "NVFP4"):
+                        kv_cache_quant_algo = "NVFP4"
+                    else:
+                        kv_cache_quant_algo = "auto"
                 else:
                     kv_cache_quant_algo = "auto"
 
@@ -1144,7 +1155,7 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         layer.input_scale_inv = Parameter(
             (1 / input_scale_2).to(torch.float32), requires_grad=False
         )
-        if FLASHINFER_FP4_GEMM_BACKEND == "trtllm":
+        if get_fp4_gemm_runner_backend().is_trtllm():
             # FlashInfer TRTLLM FP4 GEMM requires a different weight layout.
             # FlashInfer provides nvfp4_quantize to quantize + shuffle the
             # layout but we use our own quantization so we have to call
@@ -1213,12 +1224,7 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         if enable_flashinfer_fp4_gemm:
             w = layer.weight.T
             w_scale_interleaved = layer.weight_scale_interleaved.T
-        # TODO(shuw@nvidia.com)
-        # Remove the default after flashinfer bumped to 0.5.1
-        backend = (
-            FLASHINFER_FP4_GEMM_BACKEND if FLASHINFER_FP4_GEMM_BACKEND else "cutlass"
-        )
-        out = _sglang_fp4_gemm(
+        out = fp4_gemm(
             x_fp4,
             w,
             x_scale_interleaved,
@@ -1398,130 +1404,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         w2_input_scale._sglang_require_global_experts = True
         layer.register_parameter("w2_input_scale", w2_input_scale)
 
-    def prepare_static_weights_for_kernel(
-        self,
-        # args_dequant,
-        # args,
-        gemm1_weights,
-        gemm2_weights,
-        gemm1_scales_linear_fp4_bytes,
-        gemm2_scales_linear_fp4_bytes,
-        hidden_size,
-        intermediate_size,
-        num_experts,
-    ):
-        from flashinfer import nvfp4_block_scale_interleave
-        from flashinfer.fused_moe.core import (
-            _maybe_get_cached_w3_w1_permute_indices,
-            get_w2_permute_indices_with_cache,
-        )
-
-        """Prepare quantized weights for kernel (done offline with weights)."""
-        epilogue_tile_m = 128  # FIXME: this depends on the kernel internals
-
-        # Convert quantized weights to proper formats
-        gemm1_weights_fp4 = gemm1_weights.view(torch.float8_e4m3fn).reshape(
-            num_experts, 2 * intermediate_size, hidden_size // 2
-        )  # packed fp4
-        gemm1_scales_linear_fp4 = gemm1_scales_linear_fp4_bytes.view(
-            torch.float8_e4m3fn
-        ).reshape(
-            num_experts, 2 * intermediate_size, hidden_size // 16
-        )  # fp8 scaling factors
-
-        gemm2_weights_fp4 = gemm2_weights.view(torch.float8_e4m3fn).reshape(
-            num_experts, hidden_size, intermediate_size // 2
-        )  # packed fp4
-        gemm2_scales_linear_fp4 = gemm2_scales_linear_fp4_bytes.view(
-            torch.float8_e4m3fn
-        ).reshape(
-            num_experts, hidden_size, intermediate_size // 16
-        )  # fp8 scaling factors
-
-        gemm1_weights_fp4_shuffled = []
-        gemm1_scales_fp4_shuffled = []
-        gemm2_weights_fp4_shuffled = []
-        gemm2_scales_fp4_shuffled = []
-        for i in range(num_experts):
-            # Calculate the permute indices for the following:
-            # 1. Reorder rows of W1 and scales for fused gated activation
-            # 2. Shuffle weights and scaling factors for transposed mma output
-            # for both w3_w1 and w2 weights and scale factors
-            permute_indices = _maybe_get_cached_w3_w1_permute_indices(
-                self._cache_permute_indices,
-                gemm1_weights_fp4[i].view(torch.uint8),
-                epilogue_tile_m,
-            )
-            gemm1_weights_fp4_shuffled.append(
-                gemm1_weights_fp4[i]
-                .view(torch.uint8)[permute_indices.to(gemm1_weights_fp4.device)]
-                .contiguous()
-            )
-
-            permute_sf_indices = _maybe_get_cached_w3_w1_permute_indices(
-                self._cache_permute_indices,
-                gemm1_scales_linear_fp4[i].view(torch.uint8),
-                epilogue_tile_m,
-                num_elts_per_sf=16,
-            )
-            gemm1_scales_fp4_shuffled.append(
-                nvfp4_block_scale_interleave(
-                    gemm1_scales_linear_fp4[i]
-                    .view(torch.uint8)[
-                        permute_sf_indices.to(gemm1_scales_linear_fp4.device)
-                    ]
-                    .contiguous()
-                )
-            )
-
-            permute_indices = get_w2_permute_indices_with_cache(
-                self._cache_permute_indices,
-                gemm2_weights_fp4[i].view(torch.uint8),
-                epilogue_tile_m,
-            )
-            gemm2_weights_fp4_shuffled.append(
-                gemm2_weights_fp4[i]
-                .view(torch.uint8)[permute_indices.to(gemm2_weights_fp4.device)]
-                .contiguous()
-            )
-
-            permute_sf_indices = get_w2_permute_indices_with_cache(
-                self._cache_permute_indices,
-                gemm2_scales_linear_fp4[i].view(torch.uint8),
-                epilogue_tile_m,
-                num_elts_per_sf=16,
-            )
-            gemm2_scales_fp4_shuffled.append(
-                nvfp4_block_scale_interleave(
-                    gemm2_scales_linear_fp4[i]
-                    .view(torch.uint8)[
-                        permute_sf_indices.to(gemm2_scales_linear_fp4.device)
-                    ]
-                    .contiguous()
-                )
-            )
-
-        # Stack weights for all experts
-        gemm1_weights_fp4_shuffled = torch.stack(gemm1_weights_fp4_shuffled)
-        gemm1_scales_fp4_shuffled = (
-            torch.stack(gemm1_scales_fp4_shuffled)
-            .view(torch.float8_e4m3fn)
-            .reshape(num_experts, 2 * intermediate_size, hidden_size // 16)
-        )
-
-        gemm2_weights_fp4_shuffled = torch.stack(gemm2_weights_fp4_shuffled)
-        gemm2_scales_fp4_shuffled = (
-            torch.stack(gemm2_scales_fp4_shuffled)
-            .view(torch.float8_e4m3fn)
-            .reshape(num_experts, hidden_size, intermediate_size // 16)
-        )
-        return (
-            gemm1_weights_fp4_shuffled,
-            gemm1_scales_fp4_shuffled,
-            gemm2_weights_fp4_shuffled,
-            gemm2_scales_fp4_shuffled,
-        )
-
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Process FP4 MoE weights after loading from serialized checkpoint.
 
@@ -1608,15 +1490,30 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 )
             }
         )
+        block_size = 16
         # Validate weight scales
         assert_dim = 2 if layer.moe_runner_config.is_gated else 1
         for name, weight_scale in [
             ("w13", layer.w13_weight_scale),
             ("w2", layer.w2_weight_scale),
         ]:
-            assert (
-                weight_scale.shape[assert_dim] % 16 == 0
-            ), f"Expected {name}_weight_scale.dim({assert_dim}) to be divisible by 16"
+            # For NVFP4 TRTLLM we require one scale per 16 inputs (last dim == expected_blocks[name]).
+            if get_moe_runner_backend().is_flashinfer_trtllm():
+                expected_blocks = {
+                    "w13": layer.w13_weight.shape[2] * 2 // block_size,
+                    "w2": layer.w2_weight.shape[2] * 2 // block_size,
+                }
+                assert (
+                    weight_scale.shape[-1] == expected_blocks[name]
+                ), f"Expected {name}_weight_scale.dim(2) == {expected_blocks[name]}, got {weight_scale.shape[-1]}"
+            else:
+                if weight_scale.shape[assert_dim] % 4 != 0:
+                    logger.warning(
+                        "NVFP4 %s_weight_scale K' not multiple of 4: shape=%s, group_size=%s",
+                        name,
+                        tuple(weight_scale.shape),
+                        getattr(self.quant_config, "group_size", None),
+                    )
             assert (
                 weight_scale.dtype == torch.float8_e4m3fn
             ), f"{name} Weight Blockscale must be represented as FP8-E4M3"
@@ -1633,7 +1530,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 gemm1_scales_fp4_shuffled,
                 gemm2_weights_fp4_shuffled,
                 gemm2_scales_fp4_shuffled,
-            ) = self.prepare_static_weights_for_kernel(
+            ) = prepare_static_weights_for_trtllm_fp4_moe(
                 layer.w13_weight,
                 layer.w2_weight,
                 layer.w13_weight_scale,

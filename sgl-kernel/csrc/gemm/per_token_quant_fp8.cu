@@ -48,13 +48,14 @@ __global__ void per_token_quant_fp8_kernel(
 
   float warp_max = warpReduceMax(max_value);
 
-  __shared__ float scale;
-  scale = warp_max / FP8_E4M3_MAX;
+  // NOTE: one CTA has multiple warps (each warp handles one token), so `scale`
+  // must be per-warp/per-thread (register) instead of a single shared variable.
+  const float scale = warp_max / FP8_E4M3_MAX;
   // Broadcast scale
   if (lane_id == 0) {
     token_scale[0] = scale;
   }
-  float scale_inv = (scale == 0.f) ? 0.f : 1.0f / scale;
+  const float scale_inv = (scale == 0.f) ? 0.f : 1.0f / scale;
 
   //
   // Pass-2: quantize and write back
