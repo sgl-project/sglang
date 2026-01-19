@@ -313,8 +313,7 @@ class ModelConfig:
             self.swa_attention_layer_ids, self.full_attention_layer_ids = (
                 get_hybrid_layer_ids(
                     self.hf_config.architectures,
-                    self.hf_text_config.num_hidden_layers,
-                    getattr(self.hf_text_config, "hybrid_layer_pattern", None),
+                    self.hf_text_config,
                 )
             )
 
@@ -1197,6 +1196,7 @@ def is_hybrid_swa_model(model_architectures: List[str]):
 
     hybrid_swa_archs = {
         "Llama4ForConditionalGeneration",
+        "GptOssForCausalLM",
         "MiMoV2FlashForCausalLM",
         "MiMoV2MTP",
     }
@@ -1205,9 +1205,9 @@ def is_hybrid_swa_model(model_architectures: List[str]):
 
 def get_hybrid_layer_ids(
     model_architectures: List[str],
-    num_hidden_layers: int,
-    hybrid_layer_pattern: Optional[List[int]] = None,
+    hf_text_config: PretrainedConfig,
 ):
+    num_hidden_layers = hf_text_config.num_hidden_layers
     if "Llama4ForConditionalGeneration" in model_architectures:
         swa_attention_layer_ids = [
             i for i in range(num_hidden_layers) if (i + 1) % 4 != 0
@@ -1215,7 +1215,16 @@ def get_hybrid_layer_ids(
         full_attention_layer_ids = [
             i for i in range(num_hidden_layers) if (i + 1) % 4 == 0
         ]
+    elif "GptOssForCausalLM" in model_architectures:
+        layer_types = getattr(hf_text_config, "layer_types", None)
+        swa_attention_layer_ids = [
+            i for i, x in enumerate(layer_types) if x == "sliding_attention"
+        ]
+        full_attention_layer_ids = [
+            i for i, x in enumerate(layer_types) if x == "full_attention"
+        ]
     elif "MiMoV2FlashForCausalLM" in model_architectures:
+        hybrid_layer_pattern = getattr(hf_text_config, "hybrid_layer_pattern", None)
         swa_attention_layer_ids = [
             i for i in range(num_hidden_layers) if hybrid_layer_pattern[i] == 1
         ]

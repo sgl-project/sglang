@@ -42,6 +42,7 @@ from sglang.srt.utils.common import (
     get_device_memory_capacity,
     get_device_name,
     get_device_sm,
+    get_quantization_config,
     is_blackwell_supported,
     is_cuda,
     is_fa3_default_architecture,
@@ -191,6 +192,13 @@ FP8_GEMM_RUNNER_BACKEND_CHOICES = [
     "aiter",
 ]
 
+FP4_GEMM_RUNNER_BACKEND_CHOICES = [
+    "auto",
+    "cudnn",
+    "cutlass",
+    "trtllm",
+]
+
 MAMBA_SSM_DTYPE_CHOICES = ["float32", "bfloat16"]
 
 MAMBA_SCHEDULER_STRATEGY_CHOICES = ["auto", "no_buffer", "extra_buffer"]
@@ -223,6 +231,10 @@ def add_moe_runner_backend_choices(choices):
 
 def add_fp8_gemm_runner_backend_choices(choices):
     FP8_GEMM_RUNNER_BACKEND_CHOICES.extend(choices)
+
+
+def add_fp4_gemm_runner_backend_choices(choices):
+    FP4_GEMM_RUNNER_BACKEND_CHOICES.extend(choices)
 
 
 def add_deterministic_attention_backend_choices(choices):
@@ -379,6 +391,7 @@ class ServerArgs:
     served_model_name: Optional[str] = None
     weight_version: str = "default"
     chat_template: Optional[str] = None
+    hf_chat_template_name: Optional[str] = None
     completion_template: Optional[str] = None
     file_storage_path: str = "sglang_storage"
     enable_cache_report: bool = False
@@ -402,6 +415,7 @@ class ServerArgs:
 
     # LoRA
     enable_lora: Optional[bool] = None
+    enable_lora_overlap_loading: Optional[bool] = None
     max_lora_rank: Optional[int] = None
     lora_target_modules: Optional[Union[set[str], List[str]]] = None
     lora_paths: Optional[
@@ -421,6 +435,7 @@ class ServerArgs:
     grammar_backend: Optional[str] = None
     mm_attention_backend: Optional[str] = None
     fp8_gemm_runner_backend: str = "auto"
+    fp4_gemm_runner_backend: str = "auto"
     nsa_prefill_backend: str = "flashmla_sparse"
     nsa_decode_backend: str = "fa3"
     disable_flashinfer_autotune: bool = False
@@ -1196,12 +1211,7 @@ class ServerArgs:
 
             # Set moe backend for DeepSeek
             if is_sm100_supported():
-                quantization_config = getattr(hf_config, "quantization_config", None)
-                quant_method = (
-                    quantization_config.get("quant_method")
-                    if quantization_config is not None
-                    else None
-                )
+                quant_method = get_quantization_config(hf_config)
                 if self.quantization is None:
                     # Default DeepSeek V3/R1 native FP8 when not explicitly set,
                     # Because we need this condition for an assertion in
@@ -1254,7 +1264,7 @@ class ServerArgs:
                 else:
                     self.attention_backend = "triton"
 
-            supported_backends = ["triton", "trtllm_mha", "fa3", "fa4"]
+            supported_backends = ["triton", "trtllm_mha", "fa3", "fa4", "ascend"]
             prefill_attn_backend, decode_attn_backend = self.get_attention_backends()
             assert (
                 prefill_attn_backend in supported_backends
@@ -1265,11 +1275,18 @@ class ServerArgs:
                 f"- Decode: {decode_attn_backend}\n"
             )
 
-            quantization_config = getattr(hf_config, "quantization_config", None)
-            is_mxfp4_quant_format = (
-                quantization_config is not None
-                and quantization_config.get("quant_method") == "mxfp4"
-            )
+            if (
+                prefill_attn_backend == "trtllm_mha"
+                or decode_attn_backend == "trtllm_mha"
+            ):
+                # TODO: support swa kv indices translation for trtllm_mha attention backend
+                self.swa_full_tokens_ratio = 1.0
+                logger.warning(
+                    "Set swa_full_tokens_ratio to 1.0 for GPT-OSS model with trtllm_mha attention backend."
+                )
+
+            quant_method = get_quantization_config(hf_config)
+            is_mxfp4_quant_format = quant_method == "mxfp4"
             if is_mxfp4_quant_format:
                 # use bf16 for mxfp4 triton kernels
                 self.dtype = "bfloat16"
@@ -1295,7 +1312,6 @@ class ServerArgs:
                 assert (
                     self.ep_size == 1
                 ), "Triton kernel MoE is only supported when ep_size == 1"
-            self.disable_hybrid_swa_memory = True
 
         elif "MiMoV2FlashForCausalLM" in model_arch:
             if self.speculative_algorithm == "EAGLE":
@@ -1445,16 +1461,14 @@ class ServerArgs:
             "Qwen3VLMoeForConditionalGeneration",
         ]:
             if is_sm100_supported():
-                quantization_config = getattr(hf_config, "quantization_config", None)
-                quant_method = (
-                    quantization_config.get("quant_method")
-                    if quantization_config is not None
-                    else None
-                )
+                quant_method = get_quantization_config(hf_config)
                 if self.quantization is None and quant_method is not None:
                     self.quantization = quant_method
                 if (
-                    self.quantization in ("fp8", "modelopt_fp4")
+                    (
+                        self.quantization in ("fp8", "modelopt_fp4")
+                        or self.quantization is None
+                    )
                     and self.moe_a2a_backend == "none"
                     and self.moe_runner_backend == "auto"
                 ):
@@ -1465,16 +1479,14 @@ class ServerArgs:
                     )
         elif model_arch in ["Qwen3NextForCausalLM"]:
             if is_sm100_supported():
-                quantization_config = getattr(hf_config, "quantization_config", None)
-                quant_method = (
-                    quantization_config.get("quant_method")
-                    if quantization_config is not None
-                    else None
-                )
+                quant_method = get_quantization_config(hf_config)
                 if self.quantization is None and quant_method is not None:
                     self.quantization = quant_method
                 if (
-                    (self.quantization == "fp8" or self.quantization == "modelopt_fp4")
+                    (
+                        self.quantization in ("fp8", "modelopt_fp4")
+                        or self.quantization is None
+                    )
                     and self.moe_a2a_backend == "none"
                     and self.moe_runner_backend == "auto"
                 ):
@@ -3290,6 +3302,13 @@ class ServerArgs:
             help="The buliltin chat template name or the path of the chat template file. This is only used for OpenAI-compatible API server.",
         )
         parser.add_argument(
+            "--hf-chat-template-name",
+            type=str,
+            default=ServerArgs.hf_chat_template_name,
+            help="When the HuggingFace tokenizer has multiple chat templates (e.g., 'default', 'tool_use', 'rag'), "
+            "specify which named template to use. If not set, the first available template is used.",
+        )
+        parser.add_argument(
             "--completion-template",
             type=str,
             default=ServerArgs.completion_template,
@@ -3398,6 +3417,12 @@ class ServerArgs:
             default=ServerArgs.enable_lora,
             action="store_true",
             help="Enable LoRA support for the model. This argument is automatically set to True if `--lora-paths` is provided for backward compatibility.",
+        )
+        parser.add_argument(
+            "--enable-lora-overlap-loading",
+            default=ServerArgs.enable_lora_overlap_loading,
+            action="store_true",
+            help="Enable asynchronous LoRA weight loading in order to overlap H2D transfers with GPU compute. This should be enabled if you find that your LoRA workloads are bottlenecked by adapter weight loading, for example when frequently loading large LoRA adapters.",
         )
         parser.add_argument(
             "--max-lora-rank",
@@ -3527,6 +3552,20 @@ class ServerArgs:
             "'aiter' (ROCm only). "
             "NOTE: This replaces the deprecated environment variables "
             "SGLANG_ENABLE_FLASHINFER_FP8_GEMM and SGLANG_SUPPORT_CUTLASS_BLOCK_FP8.",
+        )
+        parser.add_argument(
+            "--fp4-gemm-backend",
+            type=str,
+            choices=FP4_GEMM_RUNNER_BACKEND_CHOICES,
+            default=ServerArgs.fp4_gemm_runner_backend,
+            dest="fp4_gemm_runner_backend",
+            help="Choose the runner backend for NVFP4 GEMM operations. "
+            "Options: 'auto' (default, selects between cudnn/cutlass based on CUDA/cuDNN version), "
+            "'cudnn' (cuDNN backend, optimal on CUDA 13+ with cuDNN 9.15+), "
+            "'cutlass' (CUTLASS backend, optimal on CUDA 12), "
+            "'trtllm' (TensorRT-LLM backend, requires different weight preparation with shuffling). "
+            "NOTE: This replaces the deprecated environment variable "
+            "SGLANG_FLASHINFER_FP4_GEMM_BACKEND.",
         )
         parser.add_argument(
             "--disable-flashinfer-autotune",
@@ -4933,6 +4972,20 @@ class ServerArgs:
                 )
 
         if self.enable_lora:
+            if self.enable_lora_overlap_loading is None:
+                self.enable_lora_overlap_loading = False
+
+            if self.enable_lora_overlap_loading:
+                # TODO (glenliu21): use some sort of buffer with eviction instead of enforcing a limit
+                max_loaded_loras_limit = self.max_loras_per_batch * 2
+                assert (
+                    self.max_loaded_loras is not None
+                    and self.max_loaded_loras <= max_loaded_loras_limit
+                ), (
+                    "Enabling LoRA overlap loading requires pinning LoRA adapter weights in CPU memory, "
+                    f"so --max-loaded-loras must be less than or equal to double --max-loras-per-batch: {max_loaded_loras_limit}"
+                )
+
             # Validate compatibility with speculative decoding
             if self.speculative_algorithm not in ["NGRAM", None]:
                 raise ValueError(
