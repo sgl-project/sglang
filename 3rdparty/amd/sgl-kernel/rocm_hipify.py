@@ -24,7 +24,6 @@ sources = [
     "csrc/moe/moe_align_kernel.cu",
     "csrc/moe/moe_topk_softmax_kernels.cu",
     "csrc/moe/moe_topk_sigmoid_kernels.cu",
-    "csrc/sgl_diffusion/elementwise/timestep_embedding.cu",
     "csrc/speculative/eagle_utils.cu",
 ]
 
