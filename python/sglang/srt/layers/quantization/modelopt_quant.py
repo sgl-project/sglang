@@ -30,6 +30,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from sglang.srt.layers.quantization.fp4_utils import get_fp4_gemm_runner_backend
 from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
@@ -126,7 +127,10 @@ def fp4_gemm(
     out_dtype: torch.dtype,
     out_features: int,
 ) -> torch.Tensor:
-    backend = FLASHINFER_FP4_GEMM_BACKEND if FLASHINFER_FP4_GEMM_BACKEND else "cutlass"
+    fp4_backend = get_fp4_gemm_runner_backend()
+    # TODO(shuw@nvidia.com): Remove the "cutlass" default override after flashinfer 0.6.0
+    # and let flashinfer's auto backend selection handle it.
+    backend = fp4_backend.value if not fp4_backend.is_auto() else "cutlass"
     if enable_flashinfer_fp4_gemm:
         return flashinfer_fp4_gemm(
             input, weight, input_sf, weight_sf, alpha, out_dtype, backend=backend
@@ -150,7 +154,6 @@ CUTEDSL_MOE_SCALAR_INPUT_SCALE = get_bool_env_var(
 
 # TODO make it true by default when the DeepEP PR is merged
 MOE_NVFP4_DISPATCH = envs.SGLANG_MOE_NVFP4_DISPATCH.get()
-FLASHINFER_FP4_GEMM_BACKEND = envs.SGLANG_FLASHINFER_FP4_GEMM_BACKEND.get()
 # Supported activation schemes for the current configuration
 ACTIVATION_SCHEMES = ["static"]
 
@@ -783,7 +786,6 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
                         else 1.0
                     ),
                     use_routing_scales_on_input=use_routing_scales_on_input,
-                    tile_tokens_dim=None,
                     routing_method_type=routing_method_type,
                     tune_max_num_tokens=next_power_of_2(x.shape[0]),
                 )
@@ -1153,7 +1155,7 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         layer.input_scale_inv = Parameter(
             (1 / input_scale_2).to(torch.float32), requires_grad=False
         )
-        if FLASHINFER_FP4_GEMM_BACKEND == "trtllm":
+        if get_fp4_gemm_runner_backend().is_trtllm():
             # FlashInfer TRTLLM FP4 GEMM requires a different weight layout.
             # FlashInfer provides nvfp4_quantize to quantize + shuffle the
             # layout but we use our own quantization so we have to call
@@ -1222,11 +1224,6 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         if enable_flashinfer_fp4_gemm:
             w = layer.weight.T
             w_scale_interleaved = layer.weight_scale_interleaved.T
-        # TODO(shuw@nvidia.com)
-        # Remove the default after flashinfer bumped to 0.5.1
-        backend = (
-            FLASHINFER_FP4_GEMM_BACKEND if FLASHINFER_FP4_GEMM_BACKEND else "cutlass"
-        )
         out = fp4_gemm(
             x_fp4,
             w,
@@ -1510,10 +1507,13 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                     weight_scale.shape[-1] == expected_blocks[name]
                 ), f"Expected {name}_weight_scale.dim(2) == {expected_blocks[name]}, got {weight_scale.shape[-1]}"
             else:
-                # For other backends, ensure the per-input block dimension is aligned to 16.
-                assert (
-                    weight_scale.shape[assert_dim] % block_size == 0
-                ), f"Expected {name}_weight_scale.dim({assert_dim}) to be divisible by {block_size}"
+                if weight_scale.shape[assert_dim] % 4 != 0:
+                    logger.warning(
+                        "NVFP4 %s_weight_scale K' not multiple of 4: shape=%s, group_size=%s",
+                        name,
+                        tuple(weight_scale.shape),
+                        getattr(self.quant_config, "group_size", None),
+                    )
             assert (
                 weight_scale.dtype == torch.float8_e4m3fn
             ), f"{name} Weight Blockscale must be represented as FP8-E4M3"

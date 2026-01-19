@@ -21,11 +21,62 @@ env:
   SCCACHE_GHA_ENABLED: "true"
 
 jobs:
-  maturin-build-test:
+  build-wheel:
     if: |
       github.event_name != 'pull_request' ||
       (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'run-ci')) ||
       (github.event.action == 'labeled' && github.event.label.name == 'run-ci')
+    runs-on: 4-gpu-a10
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install rust dependencies
+        run: |
+          bash scripts/ci/ci_install_gateway_dependencies.sh
+
+      - name: Configure sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+        with:
+          version: "v0.12.0"
+          disable_annotations: true
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: sgl-model-gateway
+          shared-key: "rust-cache"
+          cache-all-crates: true
+          cache-on-failure: true
+          save-if: true
+
+      - name: Build python binding
+        run: |
+          source "$HOME/.cargo/env"
+          export RUSTC_WRAPPER=sccache
+          cd sgl-model-gateway/bindings/python
+          python3 -m pip install --upgrade pip maturin
+          maturin build --profile ci --features vendored-openssl --out dist
+
+      - name: List built wheel
+        run: ls -lh sgl-model-gateway/bindings/python/dist/
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: smg-wheel
+          path: sgl-model-gateway/bindings/python/dist/*.whl
+          retention-days: 1
+
+      - name: Test wheel install
+        run: |
+          pip install sgl-model-gateway/bindings/python/dist/*.whl
+          python3 -c "import sglang_router; print('Python package: OK')"
+          python3 -c "from sglang_router.sglang_router_rs import Router; print('Rust extension: OK')"
+          python3 -m sglang_router.launch_router --help > /dev/null && echo "Entry point: OK"
+
+  python-unit-tests:
+    needs: build-wheel
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -42,48 +93,14 @@ jobs:
         with:
           python-version: "3.13"
 
-      - name: Install protoc and dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y wget unzip gcc g++ perl make
-          cd /tmp
-          wget https://github.com/protocolbuffers/protobuf/releases/download/v32.0/protoc-32.0-linux-x86_64.zip
-          sudo unzip protoc-32.0-linux-x86_64.zip -d /usr/local
-          rm protoc-32.0-linux-x86_64.zip
-          protoc --version
-
-      - name: Configure sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Download wheel artifact
+        uses: actions/download-artifact@v4
         with:
-          version: "v0.12.0"
-          disable_annotations: true
+          name: smg-wheel
+          path: dist/
 
-      - name: Rust cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: "."
-          shared-key: "rust-cache"
-          cache-all-crates: true
-          cache-on-failure: true
-          save-if: true
-
-      - name: Test maturin build
-        uses: PyO3/maturin-action@v1
-        with:
-          working-directory: bindings/python
-          args: --release --out dist --features vendored-openssl
-          rust-toolchain: stable
-          sccache: true
-
-      - name: List built wheel
-        run: ls -lh bindings/python/dist/
-
-      - name: Test wheel install
-        run: |
-          pip install bindings/python/dist/*.whl
-          python -c "import sglang_router; print('Python package: OK')"
-          python -c "from sglang_router.sglang_router_rs import Router; print('Rust extension: OK')"
-          python -m sglang_router.launch_router --help > /dev/null && echo "Entry point: OK"
+      - name: Install wheel
+        run: pip install dist/*.whl
 
       - name: Run Python unit tests
         run: |
@@ -103,7 +120,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          bash scripts/ci/ci_install_rust.sh
+          bash scripts/ci/ci_install_gateway_dependencies.sh
 
       - name: Configure sccache
         uses: mozilla-actions/sccache-action@v0.0.9
@@ -157,6 +174,7 @@ jobs:
 
   gateway-e2e:
     name: ${{ matrix.name }}
+    needs: build-wheel
     if: |
       github.event_name != 'pull_request' ||
       (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'run-ci')) ||
@@ -172,50 +190,35 @@ jobs:
             env_vars: ""
             reruns: ""
             upload_benchmarks: true
-          - name: response-api
-            timeout: 32
-            test_dirs: "e2e_test/e2e_response_api"
-            extra_deps: ""
-            env_vars: "SHOW_ROUTER_LOGS=1"
-            reruns: "--reruns 3 --reruns-delay 2"
-            setup_oracle: true
-            setup_brave: true
-          - name: grpc
-            timeout: 32
-            test_dirs: "e2e_test/e2e_grpc"
-            extra_deps: ""
-            env_vars: "SHOW_ROUTER_LOGS=1"
-            reruns: "--reruns 3 --reruns-delay 2"
-          - name: router-embeddings
+            parallel_opts: ""  # No parallel for benchmarks (performance measurement)
+          - name: responses
             timeout: 45
-            test_dirs: "e2e_test/router e2e_test/embeddings"
+            test_dirs: "e2e_test/responses"
             extra_deps: ""
             env_vars: "SHOW_WORKER_LOGS=0 SHOW_ROUTER_LOGS=1"
             reruns: "--reruns 2 --reruns-delay 5"
+            setup_oracle: true
+            setup_brave: true
+            parallel_opts: ""  # Cloud backend tests not compatible with parallel execution
+          - name: e2e
+            timeout: 45
+            test_dirs: "e2e_test/router e2e_test/embeddings"
+            extra_deps: "pytest-parallel py"  # py is required for pytest-parallel with newer pytest
+            env_vars: "SHOW_WORKER_LOGS=0 SHOW_ROUTER_LOGS=1"
+            reruns: "--reruns 2 --reruns-delay 5"
+            parallel_opts: "--workers 1 --tests-per-worker 4"  # Thread-based parallelism
+          - name: chat-completions
+            timeout: 45
+            test_dirs: "e2e_test/chat_completions"
+            extra_deps: ""
+            env_vars: "SHOW_WORKER_LOGS=0 SHOW_ROUTER_LOGS=1"
+            reruns: "--reruns 2 --reruns-delay 5"
+            parallel_opts: ""
     runs-on: 4-gpu-a10
     timeout-minutes: ${{ matrix.timeout }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
-      - name: Install rust dependencies
-        run: |
-          bash scripts/ci/ci_install_rust.sh
-
-      - name: Configure sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
-        with:
-          version: "v0.12.0"
-          disable_annotations: true
-
-      - name: Rust cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: sgl-model-gateway
-          shared-key: "rust-cache"
-          cache-all-crates: true
-          cache-on-failure: true
-          save-if: true
 
       - name: Install SGLang dependencies
         run: |
@@ -264,15 +267,16 @@ jobs:
           sleep 2
           curl -f --max-time 1 http://localhost:8001/sse > /dev/null 2>&1 && echo "Brave MCP Server is healthy!" || echo "Brave MCP Server responded"
 
-      - name: Build python binding
+      - name: Download wheel artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: smg-wheel
+          path: wheel/
+
+      - name: Install wheel
         run: |
-          source "$HOME/.cargo/env"
-          export RUSTC_WRAPPER=sccache
-          cd sgl-model-gateway/bindings/python
-          python3 -m pip install --upgrade pip maturin
           pip uninstall -y sglang-router || true
-          maturin build --profile ci --features vendored-openssl --out dist
-          pip install dist/*.whl
+          pip install wheel/*.whl
 
       - name: Install e2e test dependencies
         run: |
@@ -285,8 +289,7 @@ jobs:
         run: |
           bash scripts/killall_sglang.sh "nuk_gpus"
           cd sgl-model-gateway
-          source "$HOME/.cargo/env"
-          ${{ matrix.env_vars }} ROUTER_LOCAL_MODEL_PATH="/home/ubuntu/models" pytest ${{ matrix.reruns }} ${{ matrix.test_dirs }} -s -vv -o log_cli=true --log-cli-level=INFO
+          ${{ matrix.env_vars }} ROUTER_LOCAL_MODEL_PATH="/home/ubuntu/models" pytest ${{ matrix.reruns }} ${{ matrix.parallel_opts }} ${{ matrix.test_dirs }} -s -vv -o log_cli=true --log-cli-level=INFO
 
       - name: Upload benchmark results
         if: matrix.upload_benchmarks && success()
@@ -331,7 +334,7 @@ jobs:
           cache-to: type=gha,mode=max
 
   finish:
-    needs: [maturin-build-test, unit-tests, gateway-e2e, docker-build-test]
+    needs: [build-wheel, python-unit-tests, unit-tests, gateway-e2e, docker-build-test]
     runs-on: ubuntu-latest
     steps:
       - name: Finish
