@@ -426,7 +426,7 @@ class SamplingParams:
     def from_user_sampling_params_args(model_path: str, server_args, *args, **kwargs):
         try:
             sampling_params = SamplingParams.from_pretrained(
-                model_path, backend=getattr(server_args, "backend", None)
+                model_path, backend=server_args.backend
             )
         except (AttributeError, ValueError) as e:
             # Handle safetensors files or other cases where model_index.json is not available
