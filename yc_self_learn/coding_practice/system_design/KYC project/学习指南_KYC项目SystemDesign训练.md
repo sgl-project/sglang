@@ -553,12 +553,411 @@ graph TD
 
 ---
 
+---
+
+## 🎯 Day 8｜端到端实战：KYC Orchestration 模块（完整走一遍就懂了）
+
+**学习目标**：
+- 把 KYC 项目升级为标准的 KYC Orchestration（编排/审核运行时）模块
+- 完整走一遍从需求→API→数据→队列→Worker→幂等→测试→上线→监控→runbook 的全流程
+- 用"先做能跑的 MVP，再逐步加严谨"的方式实现
+
+**核心价值**：
+- 上游业务把一个 `kyc_case` 丢进来
+- 系统负责：收集资料 → 调用验证服务 → 风险打分/规则 →（可选）LLM 结构化审核 → 产出可审计的决定
+- 全程可回放、可追责、可灰度
+
+---
+
+### 0) 成功定义（SLO + 幂等）
+
+**目标**：把一次 KYC 审核变成一个可追踪的 case，输出：
+
+- **决策结果**：`APPROVED` / `REJECTED` / `NEEDS_REVIEW`（或更细分）
+- **证据链**：每个检查的输入/输出/版本/时间
+- **可审计日志**：以后任何争议能复盘
+
+**SLO（面试/设计 doc 必说）**：
+- **Intake API p95 < 100ms**（只入库+入队）
+- **大多数 case 在 30–120s 内出结果**（取决于第三方 provider）
+- **可用性 99.9%**
+- **幂等**：同一 request 不重复创建 case / 不重复扣费调用 provider
+
+---
+
+### 1) 入口 API（把"case"标准化）
+
+#### 1.1 创建/提交 KYC Case（业务系统调用）
+
+```http
+POST /v1/kyc/cases
+
+{
+  "request_id": "uuid-...", 
+  "user_id": "u123",
+  "jurisdiction": "US",
+  "flow": "STANDARD",
+  "documents": [
+    {"type":"ID_FRONT","object_key":"s3://.../front.jpg"},
+    {"type":"ID_BACK","object_key":"s3://.../back.jpg"},
+    {"type":"SELFIE","object_key":"s3://.../selfie.jpg"}
+  ],
+  "pii_ref": "vault_token_abc", 
+  "metadata": {"app_version":"1.2.3"}
+}
+```
+
+**返回**：
+```json
+{"case_id":"c_001","status":"QUEUED"}
+```
+
+#### 1.2 查询 Case（给前端/客服/运营）
+
+```http
+GET /v1/kyc/cases/{case_id}
+GET /v1/kyc/cases?user_id=u123&cursor=...
+```
+
+**安全注意**：返回里不要直接吐 PII/原图，只给脱敏字段 + 资源引用（object_key/hashed id）。
+
+---
+
+### 2) 数据模型（可审计是核心）
+
+你至少需要 4 张表/集合（或等价存储）：
+
+#### 2.1 `kyc_cases`
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `case_id` | PK | 主键 |
+| `request_id` | UNIQUE | 幂等键 |
+| `user_id` | INDEX | 用户ID |
+| `status` | ENUM | QUEUED / RUNNING / NEEDS_REVIEW / APPROVED / REJECTED / FAILED / CANCELED |
+| `jurisdiction` | STRING | 司法管辖区 |
+| `flow` | STRING | 流程类型 |
+| `created_at` | TIMESTAMP | 创建时间 |
+| `updated_at` | TIMESTAMP | 更新时间 |
+| `decision` | JSON | 最终决定 + reason_code |
+| `risk_score` | INT | 0–100 |
+| `version` | STRING | 该 case 使用的 pipeline 版本（超级重要） |
+
+#### 2.2 `kyc_artifacts`
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `artifact_id` | PK | 主键 |
+| `case_id` | INDEX | 关联 case |
+| `type` | ENUM | ID_FRONT/SELFIE/… |
+| `object_key` | STRING | 对象存储位置 |
+| `sha256` | STRING | 防篡改/可追溯 |
+| `created_at` | TIMESTAMP | 创建时间 |
+
+#### 2.3 `kyc_checks`
+
+一条"检查"一行（provider / internal rule / LLM judge 都算）
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `check_id` | PK | 主键 |
+| `case_id` | INDEX | 关联 case |
+| `check_type` | ENUM | OCR / FACE_MATCH / DOC_AUTH / WATCHLIST / ADDRESS / LLM_REVIEW / RULE_ENGINE |
+| `provider` | STRING | VendorA/VendorB/INTERNAL |
+| `status` | ENUM | PENDING / OK / FAIL / ERROR |
+| `result_json` | JSON | 结构化结果（脱敏） |
+| `latency_ms` | INT | 耗时 |
+| `attempt_no` | INT | 重试次数 |
+| `created_at` | TIMESTAMP | 创建时间 |
+
+#### 2.4 `kyc_events`（事件溯源，可选但强烈推荐）
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `event_id` | PK | 主键 |
+| `case_id` | INDEX | 关联 case |
+| `event_type` | ENUM | CASE_CREATED/CHECK_STARTED/CHECK_DONE/DECISION_MADE/… |
+| `payload_json` | JSON | 最小必要信息 |
+| `created_at` | TIMESTAMP | 创建时间 |
+
+---
+
+### 3) 架构（先 MVP，后增强）
+
+#### 3.1 MVP（你能在本地完整跑通）
+
+```
+API (KYC Intake)
+  -> DB (create case + artifacts)
+  -> Queue: kyc.case.created
+
+Worker: Orchestrator
+  -> step1 OCR
+  -> step2 doc auth
+  -> step3 face match
+  -> step4 watchlist
+  -> step5 rule engine + risk score
+  -> step6 decision (or needs_review)
+  -> DB update + emit event
+```
+
+#### 3.2 生产增强（你后面加）
+
+- 每个 step 拆成独立 worker（并发更强）
+- 每个 provider call 都有 retry queue + DLQ
+- 多 provider fallback（VendorA 挂了切 VendorB）
+- 人工审核 UI（NEEDS_REVIEW case）
+
+---
+
+### 4) 关键工程点（你走一遍就"真会了"）
+
+#### 4.1 幂等（不重复创建、不重复扣费）
+
+- **`request_id UNIQUE`**：创建 case 时插入，冲突就返回已有 case_id
+- **每个 check 再加一层幂等**：`(case_id, check_type, provider, version) UNIQUE`
+- **避免 worker 重跑导致重复调用第三方**
+
+#### 4.2 状态机（case 怎么从 QUEUED 走到 DECISION）
+
+建议用"事件驱动 + 状态转移"：
+
+```
+case_created -> RUNNING
+checks_done -> DECISION_MADE
+provider_error 多次 -> FAILED 或 NEEDS_REVIEW
+```
+
+**规则**：任何时候更新状态都写 `kyc_events`，保证可回放。
+
+#### 4.3 重试、退避、DLQ
+
+对 provider call：
+- **timeout/5xx**：指数退避重试（1m/5m/30m）
+- **4xx**（invalid image/unsupported doc）：直接 FAIL（可转 NEEDS_REVIEW）
+- **超过 N 次进 DLQ**，人工/自动处理（重放/降级/换 provider）
+
+#### 4.4 限流与保护（别把 vendor 打挂、别把自己拖死）
+
+- **对每个 provider 设置 QPS/并发上限**
+- **熔断**：某 provider error rate 高，暂时停用并切备用
+- **backpressure**：队列堆积时，API 仍能入队，但要有"延迟升高告警"
+
+#### 4.5 可审计（KYC 的灵魂）
+
+- **所有结果都要记录**：输入引用、输出 JSON、版本号、时间、耗时
+- **不记录明文 PII**，记录 vault_token 或脱敏摘要
+- **每次决策写 decision_reason_codes**（可枚举）
+
+---
+
+### 5) 你亲自"走一遍"的操作清单（建议照抄执行）
+
+你可以按这个顺序做一个本地闭环：
+
+#### Step A：本地最小系统
+
+1. **起 DB（Postgres）+ Queue（Kafka/Rabbit/Redis Streams 都行）**
+2. **写 Intake API**：收到请求 → 写 `kyc_cases` + `kyc_artifacts` → 发消息 `case_created`
+3. **写 Orchestrator Worker**：消费 `case_created`，依次执行 3–5 个 check
+
+**输出**：
+- ✅ `src/api/kyc_intake.py`（Intake API）
+- ✅ `src/workers/orchestrator.py`（Orchestrator Worker）
+- ✅ `src/models/kyc_models.py`（数据模型）
+- ✅ `migrations/001_create_kyc_tables.sql`（数据库迁移）
+
+#### Step B：先用 Mock Provider 跑通（不花钱、不依赖外部）
+
+- **OCR mock**：返回固定结构（name/dob/id_number_confidence）
+- **face_match mock**：返回 similarity 分数
+- **watchlist mock**：随机返回 hit/no_hit
+- **doc_auth mock**：返回 valid/invalid
+
+**输出**：
+- ✅ `src/providers/mock_provider.py`（Mock Provider）
+- ✅ `tests/integration/test_orchestrator_mock.py`（集成测试）
+
+#### Step C：实现 Rule Engine + 决策
+
+- **给每个 check 一个分值/权重**
+- **risk_score = Σ(weight * signal)**
+- **阈值**：<30 APPROVED，30–70 NEEDS_REVIEW，>70 REJECTED（示例）
+
+**输出**：
+- ✅ `src/engines/rule_engine.py`（规则引擎）
+- ✅ `src/engines/decision_engine.py`（决策引擎）
+- ✅ `tests/unit/test_rule_engine.py`（单元测试）
+
+#### Step D：加可靠性（这一步最"系统设计"）
+
+- **重试队列 + DLQ**
+- **幂等约束**（unique keys）
+- **case 状态机 + events**
+
+**输出**：
+- ✅ `src/workers/retry_worker.py`（重试 Worker）
+- ✅ `src/workers/dlq_worker.py`（DLQ Worker）
+- ✅ `src/state_machine/case_state_machine.py`（状态机）
+- ✅ `tests/integration/test_reliability.py`（可靠性测试）
+
+#### Step E：做一套最小可观测
+
+- **metrics**：`case_created_qps`、`queue_lag`、`provider_error_rate`、`p95_check_latency`、`decision_rate`
+- **log**：带 `case_id` / `request_id` / `check_type` 的结构化日志
+- **dashboard**：一眼看到 backlog、失败率、p95
+
+**输出**：
+- ✅ `src/observability/metrics.py`（Metrics）
+- ✅ `src/observability/logger.py`（结构化日志）
+- ✅ `dashboards/kyc_dashboard.json`（Dashboard 配置）
+
+---
+
+### 6) 测试策略（你练完就能面试讲）
+
+#### 单测
+- 状态机转移
+- 幂等冲突
+- risk_score 计算
+
+#### 集成
+- API -> queue -> worker -> DB 全链路
+
+#### 故障注入
+- provider timeout
+- provider 500
+- queue 延迟
+- DB 写失败（观察重试/回滚）
+
+**输出**：
+- ✅ `tests/unit/test_state_machine.py`
+- ✅ `tests/unit/test_idempotency.py`
+- ✅ `tests/integration/test_full_pipeline.py`
+- ✅ `tests/chaos/test_fault_injection.py`
+
+---
+
+### 7) 上线/灰度（大厂味）
+
+#### Shadow
+- 先跑全流程但不做最终决策（只写 checks）
+
+#### 1% 流量
+- 真实决策但不触发下游（例如不真正开通账户）
+
+#### 逐步扩大
+- 10% → 50% → 100%
+
+#### 每一步盯
+- 错误率、队列堆积、p95 延迟、DLQ 增长
+
+#### 回滚开关
+- 关闭某个 check
+- 切换 provider
+- 把 decision 改为全 NEEDS_REVIEW（保守模式）
+
+**输出**：
+- ✅ `src/feature_flags/feature_flags.py`（Feature Flags）
+- ✅ `scripts/canary_rollout.py`（灰度发布脚本）
+- ✅ `docs/ROLLOUT_PLAN.md`（发布计划）
+
+---
+
+### 8) Runbook（当你 oncall 时怎么处理）
+
+#### 队列堆积
+- **扩 worker 并发**？provider 限流太低？某个 check 变慢？
+
+#### provider 失败率上升
+- **熔断切备用**？降级（跳过非关键 check）？
+
+#### 重复扣费/重复调用
+- **检查幂等键和 unique constraint 是否漏了**
+
+#### 误杀/误放
+- **调整阈值、增加 NEEDS_REVIEW、补充 reason_code**
+
+**输出**：
+- ✅ `docs/RUNBOOK.md`（运维手册）
+
+---
+
+### 9) 完整流程一句话
+
+**Intake（入库+入队）→ Orchestrate（按步骤调用 checks）→ Score（规则/模型汇总）→ Decide（出结论或转人工）→ Audit（事件+证据链）→ Observe（指标/报警/回放）→ Rollout（灰度/回滚）**
+
+---
+
+### 10) 与现有 KYC 项目文档体系的整合
+
+如果你想把上面这套拆成一组可落地的文档名（A1/A2/B1…），可以这样组织：
+
+| 文档 | 内容 |
+|------|------|
+| `KYC_Day08_A1_ORCHESTRATION_OVERVIEW.md` | 整体架构、成功定义、SLO |
+| `KYC_Day08_A2_API_AND_DATA_MODEL.md` | API 设计、数据模型（4张表） |
+| `KYC_Day08_A3_ARCHITECTURE.md` | MVP 架构、生产增强 |
+| `KYC_Day08_A4_ENGINEERING_POINTS.md` | 幂等、状态机、重试、限流、可审计 |
+| `KYC_Day08_B1_IMPLEMENTATION_CHECKLIST.md` | Step A-E 操作清单 |
+| `KYC_Day08_B2_TESTING_STRATEGY.md` | 测试策略（单测/集成/故障注入） |
+| `KYC_Day08_B3_ROLLOUT_PLAN.md` | 上线/灰度计划 |
+| `KYC_Day08_B4_RUNBOOK.md` | 运维手册 |
+
+---
+
+### 11) 实战时间安排
+
+**如果你有 3-5 天**：
+- **Day 1**：Step A + Step B（本地最小系统 + Mock Provider）
+- **Day 2**：Step C + Step D（Rule Engine + 可靠性）
+- **Day 3**：Step E + 测试策略（可观测性 + 测试）
+- **Day 4**：上线/灰度 + Runbook（发布计划 + 运维手册）
+- **Day 5**：整合到现有 KYC 项目，写文档
+
+**如果你只有 1-2 天**：
+- **Day 1**：Step A + Step B + Step C（最小闭环）
+- **Day 2**：Step D + Step E（可靠性 + 可观测性）
+
+---
+
+### 12) 学习检查清单
+
+- [ ] **Step A**：本地最小系统（API + Worker + DB）
+- [ ] **Step B**：Mock Provider 跑通
+- [ ] **Step C**：Rule Engine + 决策
+- [ ] **Step D**：可靠性（重试、幂等、状态机）
+- [ ] **Step E**：可观测性（Metrics、Logs、Dashboard）
+- [ ] **测试策略**：单测、集成、故障注入
+- [ ] **上线/灰度**：Shadow、1% → 100%、回滚开关
+- [ ] **Runbook**：队列堆积、provider 失败、重复扣费、误杀/误放
+
+---
+
+### 13) 关键学习要点
+
+1. **你不是在"学大厂流程"，而是在"完整走一遍端到端系统设计"**
+   - 从需求到上线，每一步都要亲手做
+   - 先做能跑的 MVP，再逐步加严谨
+
+2. **核心逻辑：可审计是 KYC 的灵魂**
+   - 所有结果都要记录：输入引用、输出 JSON、版本号、时间、耗时
+   - 不记录明文 PII，记录 vault_token 或脱敏摘要
+   - 每次决策写 decision_reason_codes（可枚举）
+
+3. **面试时要展示的：完整流程 + 工程能力**
+   - **完整流程**：Intake → Orchestrate → Score → Decide → Audit → Observe → Rollout
+   - **工程能力**：幂等、状态机、重试、限流、可审计
+
+---
+
 ## 🚀 开始学习
 
 **第 1 步**：理解你的 KYC 项目（1-2 小时）  
 **第 2 步**：从 Day 1 开始，每天完成一个模块  
-**第 3 步**：持续练习表达，准备面试
+**第 3 步**：Day 8 完整走一遍 KYC Orchestration 实战  
+**第 4 步**：持续练习表达，准备面试
 
-**记住**：这 7 天不是在"学大厂流程"，而是在把你的深技术变成"可托付的工业能力"。
+**记住**：这 7 天不是在"学大厂流程"，而是在把你的深技术变成"可托付的工业能力"。Day 8 的实战会让你真正"懂了"。
 
 **加油！** 🎉
