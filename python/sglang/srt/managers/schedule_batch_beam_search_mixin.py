@@ -266,13 +266,12 @@ class ReqBeamSearchMixin:
         Args:
             sampling_params: The sampling parameters that may contain beam search settings
         """
-        # beam search
         self.is_beam_search = False
         self.beam_width = 0
         self.beam_candidates = 0
 
-        server_args = get_global_server_args()
-        if server_args.enable_beam_search and sampling_params.n > 1:
+        if get_global_server_args().enable_beam_search:
+            # sampling_params.n has already been validated in tokenizermanager
             self.is_beam_search = True
             self.beam_width = sampling_params.n
             self.beam_list = BeamSearchList()

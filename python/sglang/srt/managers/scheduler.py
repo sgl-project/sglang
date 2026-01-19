@@ -1421,10 +1421,8 @@ class Scheduler(
                 # Use default bootstrap port
                 recv_req.bootstrap_port = self.server_args.disaggregation_bootstrap_port
 
-            # Check if beam search is enabled from server args
-            is_beam_search = self.server_args.enable_beam_search
-
             # beam search not support return logprob
+            is_beam_search = self.server_args.enable_beam_search
             req = Req(
                 recv_req.rid,
                 recv_req.input_text,

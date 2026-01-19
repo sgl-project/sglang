@@ -350,8 +350,7 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
 
     def _handle_beam_search_parallel_sampling(self) -> int:
         """Override parallel sampling to 1 when beam search is enabled and check that n (beam_width) must be greater than 1."""
-        server_args = get_global_server_args()
-        if not server_args.enable_beam_search:
+        if not get_global_server_args().enable_beam_search:
             return self.parallel_sample_num
 
         if self.parallel_sample_num <= 1:

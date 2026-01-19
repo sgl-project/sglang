@@ -885,18 +885,15 @@ class SchedulerBeamSearchProcessorMixin:
             ... )
             # Returns unique KV indices from ranges [5:10], [8:15], [6:12]
         """
-        # TODO(cswuyg) broadcast maybe better than expand?
         num_reqs = len(pool_indices)
         if prefix_lens is None:
             prefix_lens = torch.zeros(num_reqs, dtype=torch.int64, device=device)
         max_range_len = (seq_lens - prefix_lens).max().item()
         # Create position index matrix [num_reqs, max_range_len]
         # Add corresponding prefix_len offset to each position
-        position_indices = (
-            torch.arange(max_range_len, dtype=torch.int64, device=device)
-            .unsqueeze(0)
-            .expand(num_reqs, -1)
-        ) + prefix_lens.unsqueeze(1)
+        position_indices = torch.arange(
+            max_range_len, dtype=torch.int64, device=device
+        ).unsqueeze(0) + prefix_lens.unsqueeze(1)
 
         mask = position_indices < seq_lens.unsqueeze(1)
         batch_kv_indices = self.req_to_token_pool.req_to_token[

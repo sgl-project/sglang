@@ -482,28 +482,6 @@ class TestInitBeamSearchAttributes(unittest.TestCase):
     @patch(
         "sglang.srt.managers.schedule_batch_beam_search_mixin.get_global_server_args"
     )
-    def test_init_beam_search_attributes_disabled_n_equals_1(
-        self, mock_get_global_server_args
-    ):
-        """Test initialization when n=1 (beam search disabled)."""
-        mock_server_args = Mock()
-        mock_server_args.enable_beam_search = True
-        mock_get_global_server_args.return_value = mock_server_args
-
-        req = Mock()
-
-        sampling_params = Mock()
-        sampling_params.n = 1
-
-        ReqBeamSearchMixin._init_beam_search_attributes(req, sampling_params)
-
-        self.assertFalse(req.is_beam_search)
-        self.assertEqual(req.beam_width, 0)
-        self.assertEqual(req.beam_candidates, 0)
-
-    @patch(
-        "sglang.srt.managers.schedule_batch_beam_search_mixin.get_global_server_args"
-    )
     def test_init_beam_search_attributes_disabled_flag_false(
         self, mock_get_global_server_args
     ):
@@ -516,28 +494,6 @@ class TestInitBeamSearchAttributes(unittest.TestCase):
 
         sampling_params = Mock()
         sampling_params.n = 3
-
-        ReqBeamSearchMixin._init_beam_search_attributes(req, sampling_params)
-
-        self.assertFalse(req.is_beam_search)
-        self.assertEqual(req.beam_width, 0)
-        self.assertEqual(req.beam_candidates, 0)
-
-    @patch(
-        "sglang.srt.managers.schedule_batch_beam_search_mixin.get_global_server_args"
-    )
-    def test_init_beam_search_attributes_disabled_flag_false_n_equals_1(
-        self, mock_get_global_server_args
-    ):
-        """Test initialization when enable_beam_search flag is False and n=1."""
-        mock_server_args = Mock()
-        mock_server_args.enable_beam_search = False
-        mock_get_global_server_args.return_value = mock_server_args
-
-        req = Mock()
-
-        sampling_params = Mock()
-        sampling_params.n = 1
 
         ReqBeamSearchMixin._init_beam_search_attributes(req, sampling_params)
 
