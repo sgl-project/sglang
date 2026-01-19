@@ -6,7 +6,7 @@ import cutlass.cute as cute
 from cutlass.cute.nvgpu import cpasync
 from cutlass import Int32, const_expr
 
-from . import utils
+import sglang.jit_kernel.flash_attention.cute.utils as utils
 from .cute_dsl_utils import ParamsBase
 from cutlass.cute import FastDivmodDivisor
 

@@ -13,7 +13,7 @@ from cutlass._mlir import ir
 import cutlass.cute as cute
 from cutlass import Int32, const_expr
 
-from . import utils
+import sglang.jit_kernel.flash_attention.cute.utils as utils
 from .fast_math import clz
 from cutlass.cute import FastDivmodDivisor
 

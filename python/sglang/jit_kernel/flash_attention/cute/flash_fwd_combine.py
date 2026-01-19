@@ -13,7 +13,7 @@ import cutlass.cute as cute
 from cutlass.cute.nvgpu import cpasync
 from cutlass import Float32, Int32, const_expr
 
-from . import utils
+import sglang.jit_kernel.flash_attention.cute.utils as utils
 from .seqlen_info import SeqlenInfo
 from cutlass.cute import FastDivmodDivisor
 

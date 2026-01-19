@@ -31,7 +31,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 
-from . import utils
+import sglang.jit_kernel.flash_attention.cute.utils as utils
 from .cute_dsl_utils import to_cute_tensor
 from .flash_fwd import FlashAttentionForwardSm90
 from .flash_fwd_sm100 import FlashAttentionForwardSm100

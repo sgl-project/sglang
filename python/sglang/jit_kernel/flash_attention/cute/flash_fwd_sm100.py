@@ -28,9 +28,9 @@ import cutlass.cute.nvgpu.tcgen05 as tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils_basic
 
 from .paged_kv import PagedKVManager
-from . import utils
-from . import copy_utils
-from . import pipeline
+import sglang.jit_kernel.flash_attention.cute.utils as utils
+import sglang.jit_kernel.flash_attention.cute.copy_utils as copy_utils
+import sglang.jit_kernel.flash_attention.cute.pipeline as pipeline
 from .mask import AttentionMask
 from .softmax import SoftmaxSm100, apply_score_mod_inner
 from .seqlen_info import SeqlenInfoQK
@@ -43,8 +43,8 @@ from .block_sparse_utils import (
     handle_block_sparse_empty_tile_correction_sm100,
 )
 from .pack_gqa import PackGQA
-from . import mma_sm100_desc as sm100_desc
-from . import blackwell_helpers as sm100_utils
+import sglang.jit_kernel.flash_attention.cute.mma_sm100_desc as sm100_desc
+import sglang.jit_kernel.flash_attention.cute.blackwell_helpers as sm100_utils
 from cutlass.cute import FastDivmodDivisor
 from .tile_scheduler import (
     TileSchedulerArguments,

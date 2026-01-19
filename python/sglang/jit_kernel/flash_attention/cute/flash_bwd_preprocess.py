@@ -11,8 +11,8 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float32
 
-from . import utils
-from . import copy_utils
+import sglang.jit_kernel.flash_attention.cute.utils as utils
+import sglang.jit_kernel.flash_attention.cute.copy_utils as copy_utils
 from .seqlen_info import SeqlenInfoQK
 from .tile_scheduler import (
     ParamsBase,

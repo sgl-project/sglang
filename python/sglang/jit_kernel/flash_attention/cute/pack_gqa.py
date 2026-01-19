@@ -4,7 +4,7 @@
 import cutlass
 import cutlass.cute as cute
 
-from . import utils
+import sglang.jit_kernel.flash_attention.cute.utils as utils
 
 
 class PackGQA:

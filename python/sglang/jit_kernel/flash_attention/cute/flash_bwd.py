@@ -14,8 +14,8 @@ from cutlass.cute.nvgpu import cpasync, warp
 from cutlass import Float32, Int32
 import cutlass.utils as utils_basic
 
-from . import ampere_helpers as sm80_utils
-from . import utils
+import sglang.jit_kernel.flash_attention.cute.ampere_helpers as sm80_utils
+import sglang.jit_kernel.flash_attention.cute.utils as utils
 from .mask import AttentionMask
 from .seqlen_info import SeqlenInfoQK
 from .tile_scheduler import ParamsBase, SingleTileScheduler, SingleTileVarlenScheduler, TileSchedulerArguments

@@ -9,7 +9,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float32
 
-from . import utils
+import sglang.jit_kernel.flash_attention.cute.utils as utils
 from .cute_dsl_utils import ParamsBase
 from .seqlen_info import SeqlenInfoQK
 

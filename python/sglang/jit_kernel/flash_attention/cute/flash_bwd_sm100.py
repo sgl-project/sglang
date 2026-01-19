@@ -14,9 +14,9 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils_basic
 from cutlass.pipeline import PipelineAsync, PipelineConsumer
 
-from . import utils
-from . import copy_utils
-from . import pipeline
+import sglang.jit_kernel.flash_attention.cute.utils as utils
+import sglang.jit_kernel.flash_attention.cute.copy_utils as copy_utils
+import sglang.jit_kernel.flash_attention.cute.pipeline as pipeline
 from .blackwell_helpers import gemm_w_idx, gemm_ptx_w_idx  # noqa
 from .mask import AttentionMask
 from .seqlen_info import SeqlenInfoQK
@@ -29,7 +29,7 @@ from .tile_scheduler import (
     ParamsBase,
 )
 
-from . import barrier
+import sglang.jit_kernel.flash_attention.cute.barrier as barrier
 from .named_barrier import NamedBarrierBwdSm100
 from .softmax import apply_score_mod_inner, apply_score_mod_bwd_inner
 from .block_sparsity import BlockSparseTensors

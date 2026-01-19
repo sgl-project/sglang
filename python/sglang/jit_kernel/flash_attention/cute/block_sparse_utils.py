@@ -14,8 +14,8 @@ from cutlass import Float32, Int32, const_expr
 
 # Import data structures from block_sparsity
 from .block_sparsity import BlockSparseTensors
-from . import utils
-from . import copy_utils
+import sglang.jit_kernel.flash_attention.cute.utils as utils
+import sglang.jit_kernel.flash_attention.cute.copy_utils as copy_utils
 from .named_barrier import NamedBarrierBwd
 
 

@@ -13,14 +13,14 @@ from cutlass.cute import FastDivmodDivisor
 from cutlass import Float32, Int32, Boolean, const_expr
 from cutlass.utils import LayoutEnum
 
-from . import hopper_helpers as sm90_utils
-from . import utils
-from . import copy_utils
+import sglang.jit_kernel.flash_attention.cute.hopper_helpers as sm90_utils
+import sglang.jit_kernel.flash_attention.cute.utils as utils
+import sglang.jit_kernel.flash_attention.cute.copy_utils as copy_utils
 from .hopper_helpers import gemm_zero_init, gemm_w_idx
 from .mask import AttentionMask
 from .seqlen_info import SeqlenInfoQK
 from .block_info import BlockInfo
-from . import pipeline
+import sglang.jit_kernel.flash_attention.cute.pipeline as pipeline
 from .tile_scheduler import TileSchedulerArguments, SingleTileScheduler, ParamsBase
 from .named_barrier import NamedBarrierFwd, NamedBarrierBwd
 from .softmax import apply_score_mod_inner, apply_score_mod_bwd_inner

@@ -23,10 +23,10 @@ import cutlass.utils.hopper_helpers as sm90_utils_basic
 
 from quack import copy_utils as quack_copy_utils
 
-from . import ampere_helpers as sm80_utils
-from . import hopper_helpers as sm90_utils
-from . import utils
-from . import copy_utils
+import sglang.jit_kernel.flash_attention.cute.ampere_helpers as sm80_utils
+import sglang.jit_kernel.flash_attention.cute.hopper_helpers as sm90_utils
+import sglang.jit_kernel.flash_attention.cute.utils as utils
+import sglang.jit_kernel.flash_attention.cute.copy_utils as copy_utils
 from .mask import AttentionMask
 from .softmax import Softmax, apply_score_mod_inner
 from .seqlen_info import SeqlenInfoQK
@@ -36,7 +36,7 @@ from .block_sparse_utils import (
     produce_block_sparse_loads,
     consume_block_sparse_loads,
 )
-from . import pipeline
+import sglang.jit_kernel.flash_attention.cute.pipeline as pipeline
 from .pack_gqa import PackGQA
 from .named_barrier import NamedBarrierFwd
 from .tile_scheduler import (
