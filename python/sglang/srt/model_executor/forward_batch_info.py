@@ -428,9 +428,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             )
 
         if enable_num_token_non_padded(model_runner.server_args):
-            ret.num_token_non_padded = torch.tensor(
-                len(batch.input_ids), dtype=torch.int32
-            ).pin_memory().to(device, non_blocking=True)
+            ret.num_token_non_padded = (
+                torch.tensor(len(batch.input_ids), dtype=torch.int32)
+                .pin_memory()
+                .to(device, non_blocking=True)
+            )
         ret.num_token_non_padded_cpu = len(batch.input_ids)
 
         # For MLP sync
@@ -471,16 +473,18 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             block_size = batch.dllm_config.block_size
             # Use int64 for AMD rotary embedding kernel compatibility
             positions_dtype = torch.int64 if is_hip() else torch.int32
-            ret.positions = (torch.tensor(
-                [
-                    i
-                    for block_offset in batch.dllm_block_offsets
-                    for i in range(block_offset, block_offset + block_size)
-                ],
-                dtype=positions_dtype,
+            ret.positions = (
+                torch.tensor(
+                    [
+                        i
+                        for block_offset in batch.dllm_block_offsets
+                        for i in range(block_offset, block_offset + block_size)
+                    ],
+                    dtype=positions_dtype,
+                )
+                .pin_memory()
+                .to(device, non_blocking=True)
             )
-            .pin_memory()
-            .to(device, non_blocking=True))
         elif (
             ret.spec_info is not None
             and getattr(ret.spec_info, "positions", None) is not None

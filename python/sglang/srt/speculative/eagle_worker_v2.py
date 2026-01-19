@@ -371,6 +371,7 @@ class EagleDraftWorker(BaseDraftWorker):
                 seq_lens_sum=None,
                 seq_lens_cpu=None,
             )
+
         return wrapper
 
     @draft_wrapper
@@ -398,7 +399,9 @@ class EagleDraftWorker(BaseDraftWorker):
 
         return parent_list, top_scores_index, draft_tokens
 
-    def draft_v2(self, model_worker_batch: ModelWorkerBatch, batch_result: GenerationBatchResult):
+    def draft_v2(
+        self, model_worker_batch: ModelWorkerBatch, batch_result: GenerationBatchResult
+    ):
         if self.speculative_num_steps <= 1:
             return
 
@@ -438,9 +441,7 @@ class EagleDraftWorker(BaseDraftWorker):
                 and self.speculative_num_steps > 1
             ):
                 self.draft_attn_backend.init_forward_metadata(forward_batch)
-            ret_topk_p_list, ret_topk_index_list = self.draft_forward(
-                forward_batch
-            )
+            ret_topk_p_list, ret_topk_index_list = self.draft_forward(forward_batch)
 
         next_draft_input = batch_result.next_draft_input
         ret_topk_p_list = [next_draft_input.topk_p] + [ret_topk_p_list]
@@ -457,7 +458,9 @@ class EagleDraftWorker(BaseDraftWorker):
 
         model_worker_batch.seq_lens = seq_lens_bk
 
-    def draft_forward(self, forward_batch: ForwardBatch, *, is_prepare_reflow: bool = False):
+    def draft_forward(
+        self, forward_batch: ForwardBatch, *, is_prepare_reflow: bool = False
+    ):
         # Parse args
         spec_info: EagleDraftInput = forward_batch.spec_info
         out_cache_loc = forward_batch.out_cache_loc
@@ -494,11 +497,20 @@ class EagleDraftWorker(BaseDraftWorker):
             )
 
             if is_prepare_reflow:
-                score_list = [tree_info[0][:, :, i].unsqueeze(-1) for i in range(self.speculative_num_steps)]
-                token_list = [tree_info[1][:, i].unsqueeze(-1) for i in range(self.speculative_num_steps)]
+                score_list = [
+                    tree_info[0][:, :, i].unsqueeze(-1)
+                    for i in range(self.speculative_num_steps)
+                ]
+                token_list = [
+                    tree_info[1][:, i].unsqueeze(-1)
+                    for i in range(self.speculative_num_steps)
+                ]
                 parents_list = [tree_info[2]] + [
-                    torch.full((tree_info[2].size(0), 1), i, dtype=torch.long, device="cuda")
-                    for i in range(1, self.speculative_num_steps)]
+                    torch.full(
+                        (tree_info[2].size(0), 1), i, dtype=torch.long, device="cuda"
+                    )
+                    for i in range(1, self.speculative_num_steps)
+                ]
                 break
 
             score_list.append(tree_info[0])
@@ -539,7 +551,9 @@ class EagleDraftWorker(BaseDraftWorker):
             else:
                 batch_size = topk_p_list[0].shape[0]
                 topk_p_list = torch.empty(batch_size, 0, device=topk_p_list[0].device)
-                topk_index_list = torch.empty(batch_size, 0, device=topk_index_list[0].device)
+                topk_index_list = torch.empty(
+                    batch_size, 0, device=topk_index_list[0].device
+                )
 
             return topk_p_list, topk_index_list
 
@@ -788,8 +802,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 self.draft_worker.draft_runner.tp_group
             ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
                 if self.draft_worker.enable_spec_overlap_reflow:
-                    verify_input: EagleVerifyInput = self.draft_worker.prepare_verify_reflow(
-                        model_worker_batch
+                    verify_input: EagleVerifyInput = (
+                        self.draft_worker.prepare_verify_reflow(model_worker_batch)
                     )
                 else:
                     verify_input: EagleVerifyInput = self.draft_worker.draft(
