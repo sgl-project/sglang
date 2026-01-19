@@ -18,7 +18,7 @@ If the idle condition is not met, the API will fail fast (HTTP 400) and **will n
 The control path is:
 
 1. **HTTP Server** (`python/sglang/srt/entrypoints/http_server.py`)
-   - Exposes `/attach_hicache_storage_backend`, `/detach_hicache_storage_backend`, `/info_from_hicache_storage_backend`
+   - Exposes `PUT /hicache/storage-backend`, `DELETE /hicache/storage-backend`, `GET /hicache/storage-backend`
 2. **TokenizerManager** (`python/sglang/srt/managers/tokenizer_communicator_mixin.py`)
    - Sends the request to the Scheduler via `_Communicator`
 3. **Scheduler** (`python/sglang/srt/managers/scheduler.py`)
@@ -72,7 +72,7 @@ The examples below assume your SGLang HTTP server is at `http://127.0.0.1:30000`
 ### 3.1 Query current storage backend status
 
 ```bash
-curl -s http://127.0.0.1:30000/info_from_hicache_storage_backend
+curl -s http://127.0.0.1:30000/hicache/storage-backend
 ```
 
 Example response:
@@ -86,7 +86,7 @@ Example response:
 
 ### 3.2 Attach (enable) a storage backend
 ```bash
-curl -s -X POST http://127.0.0.1:30000/attach_hicache_storage_backend \
+curl -s -X PUT http://127.0.0.1:30000/hicache/storage-backend \
   -H 'Content-Type: application/json' \
   -d '{
     "hicache_storage_backend": "mooncake"
@@ -94,7 +94,7 @@ curl -s -X POST http://127.0.0.1:30000/attach_hicache_storage_backend \
 ```
 
 ```bash
-curl -s -X POST http://127.0.0.1:30000/attach_hicache_storage_backend \
+curl -s -X PUT http://127.0.0.1:30000/hicache/storage-backend \
   -H 'Content-Type: application/json' \
   -d '{
     "hicache_storage_backend": "mooncake",
@@ -112,15 +112,13 @@ Notes:
 ### 3.3 Detach (disable) the storage backend
 
 ```bash
-curl -s -X POST http://127.0.0.1:30000/detach_hicache_storage_backend
+curl -s -X DELETE http://127.0.0.1:30000/hicache/storage-backend
 ```
 
 Notes:
 
 - Detach only makes SGLang **stop using** the L3 storage backend and stops prefetch/backup threads
 - It **does not automatically delete** data stored in Mooncake/HF3FS (or other remote backends)
-- To clear remote storage content, use the existing endpoint:
-  - `/clear_hicache_storage_backend`
 
 ---
 

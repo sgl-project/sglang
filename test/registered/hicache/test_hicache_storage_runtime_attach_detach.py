@@ -6,7 +6,7 @@ any storage backend at startup, then attaches/detaches a storage backend via the
 HTTP endpoints.
 
 Usage:
-    python3 -m pytest test/srt/hicache/test_hicache_storage_runtime_attach_detach.py -v
+    python3 -m pytest test/registered/hicache/test_hicache_storage_runtime_attach_detach.py -v
 """
 
 import json
@@ -125,9 +125,42 @@ class TestHiCacheStorageRuntimeAttachDetach(CustomTestCase):
             body = e.read().decode("utf-8", errors="replace")
             return e.code, body
 
+    @staticmethod
+    def _http_put_json_with_headers(
+        url: str,
+        payload: dict | None = None,
+        timeout: int = 30,
+        headers: dict | None = None,
+    ):
+        data = None
+        all_headers = dict(headers or {})
+        if payload is not None:
+            data = json.dumps(payload).encode("utf-8")
+            all_headers["Content-Type"] = "application/json"
+        req = request.Request(url, data=data, headers=all_headers, method="PUT")
+        try:
+            with request.urlopen(req, timeout=timeout) as resp:
+                return resp.getcode(), resp.read().decode("utf-8", errors="replace")
+        except error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="replace")
+            return e.code, body
+
+    @staticmethod
+    def _http_delete_with_headers(
+        url: str, timeout: int = 30, headers: dict | None = None
+    ):
+        all_headers = dict(headers or {})
+        req = request.Request(url, headers=all_headers, method="DELETE")
+        try:
+            with request.urlopen(req, timeout=timeout) as resp:
+                return resp.getcode(), resp.read().decode("utf-8", errors="replace")
+        except error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="replace")
+            return e.code, body
+
     def _get_backend_status(self, base_url: str, headers: dict | None = None):
         code, body = self._http_get(
-            f"{base_url}/info_from_hicache_storage_backend", timeout=10, headers=headers
+            f"{base_url}/hicache/storage-backend", timeout=10, headers=headers
         )
         self.assertEqual(code, 200, body)
         return json.loads(body)
@@ -147,17 +180,16 @@ class TestHiCacheStorageRuntimeAttachDetach(CustomTestCase):
             "hicache_storage_prefetch_policy": prefetch_policy,
             "hicache_write_policy": write_policy,
         }
-        return self._http_post_json_with_headers(
-            f"{base_url}/attach_hicache_storage_backend",
+        return self._http_put_json_with_headers(
+            f"{base_url}/hicache/storage-backend",
             payload,
             timeout=30,
             headers=headers,
         )
 
     def _detach_backend(self, base_url: str, headers: dict | None = None):
-        return self._http_post_json_with_headers(
-            f"{base_url}/detach_hicache_storage_backend",
-            None,
+        return self._http_delete_with_headers(
+            f"{base_url}/hicache/storage-backend",
             timeout=30,
             headers=headers,
         )
@@ -175,7 +207,7 @@ class TestHiCacheStorageRuntimeAttachDetach(CustomTestCase):
             self._wait_for_server_ready(self.base_url)
 
             code_info, _body_info = self._http_get(
-                f"{self.base_url}/info_from_hicache_storage_backend", timeout=10
+                f"{self.base_url}/hicache/storage-backend", timeout=10
             )
             self.assertEqual(code_info, 400)
             code_attach_no_admin, _body_attach_no_admin = self._attach_backend(
@@ -206,7 +238,7 @@ class TestHiCacheStorageRuntimeAttachDetach(CustomTestCase):
 
             # 1) Initially disabled (but unauthorized without admin key)
             code_info2_unauth, _ = self._http_get(
-                f"{base_url2}/info_from_hicache_storage_backend", timeout=10
+                f"{base_url2}/hicache/storage-backend", timeout=10
             )
             self.assertEqual(code_info2_unauth, 401)
 
