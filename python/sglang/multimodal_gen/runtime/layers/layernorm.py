@@ -443,15 +443,6 @@ def apply_qk_norm(
     """
 
     batch_size = q.size(0)
-    q_shape = q.shape
-    k_shape = k.shape
-
-    # Ensure contiguous for view operation
-    if not q.is_contiguous():
-        q = q.contiguous()
-    if not k.is_contiguous():
-        k = k.contiguous()
-
     q_eps = q_norm.variance_epsilon
     k_eps = k_norm.variance_epsilon
     # Only try fused path on CUDA and when it won't introduce implicit copies.
@@ -469,8 +460,7 @@ def apply_qk_norm(
             head_dim=head_dim,
             eps=q_eps,
         )
-        # Inplace kernel modifies q, k - return with original shape
-        return q.view(q_shape), k.view(k_shape)
+        return q, k
 
     # Fallback for AMD/ROCm: apply RMSNorm separately to q and k
     import warnings
@@ -479,6 +469,8 @@ def apply_qk_norm(
         "Fused QK-norm not available, using RMSNorm fallback",
         stacklevel=2,
     )
+    q_shape = q.shape
+    k_shape = k.shape
     q_out = q_norm(q.view(-1, head_dim)).view(q_shape)
     k_out = k_norm(k.view(-1, head_dim)).view(k_shape)
     return q_out, k_out
