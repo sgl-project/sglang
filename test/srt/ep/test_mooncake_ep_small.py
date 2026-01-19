@@ -104,11 +104,11 @@ class TestPureDP(TestTP):
         super().test_gsm8k()
 
 
-class TestHybridDPTP(TestTP):
+class TestHybridDPTP(TestPureDP):
     extra_args = [
         "--enable-dp-attention",
         "--dp",
-        "4",
+        "2",
     ]
 
     pkill_process_1 = "sglang::scheduler_DP1_TP2_EP2"
