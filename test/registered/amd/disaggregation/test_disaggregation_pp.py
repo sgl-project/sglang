@@ -21,6 +21,7 @@ register_amd_ci(est_time=1200, suite="stage-b-test-large-8-gpu-35x-disaggregatio
 class TestDisaggregationPrefillPPAccuracy(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
+        super().setUpClass()
         # set up ROCm env
         os.environ["SGLANG_USE_AITER"] = "1"
         rdma_env = os.environ.get("SGLANG_TEST_RDMA_DEVICE")
@@ -32,7 +33,6 @@ class TestDisaggregationPrefillPPAccuracy(PDDisaggregationServerBase):
             print("SGLANG_TEST_RDMA_DEVICE is not set! Running without RDMA.")
             cls.rdma_devices = []
 
-        super().setUpClass()
         cls.model = try_cached_model(DEFAULT_MODEL_NAME_FOR_TEST)
 
         # Non blocking start servers
@@ -110,6 +110,7 @@ class TestDisaggregationPrefillPPAccuracy(PDDisaggregationServerBase):
 class TestDisaggregationPrefillPPDynamicChunkAccuracy(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
+        super().setUpClass()
         # set up ROCm env
         os.environ["SGLANG_USE_AITER"] = "1"
         rdma_env = os.environ.get("SGLANG_TEST_RDMA_DEVICE")
@@ -121,7 +122,6 @@ class TestDisaggregationPrefillPPDynamicChunkAccuracy(PDDisaggregationServerBase
             print("SGLANG_TEST_RDMA_DEVICE is not set! Running without RDMA.")
             cls.rdma_devices = []
 
-        super().setUpClass()
         cls.model = try_cached_model(DEFAULT_MODEL_NAME_FOR_TEST)
 
         # Non blocking start servers
@@ -200,6 +200,7 @@ class TestDisaggregationPrefillPPDynamicChunkAccuracy(PDDisaggregationServerBase
 class TestDisaggregationDecodePPAccuracy(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
+        super().setUpClass()
         # set up ROCm env
         os.environ["SGLANG_USE_AITER"] = "1"
         rdma_env = os.environ.get("SGLANG_TEST_RDMA_DEVICE")
@@ -211,7 +212,6 @@ class TestDisaggregationDecodePPAccuracy(PDDisaggregationServerBase):
             print("SGLANG_TEST_RDMA_DEVICE is not set! Running without RDMA.")
             cls.rdma_devices = []
 
-        super().setUpClass()
         cls.model = try_cached_model(DEFAULT_MODEL_NAME_FOR_TEST)
 
         # Non blocking start servers

@@ -24,6 +24,7 @@ register_amd_ci(est_time=1200, suite="stage-b-test-large-8-gpu-35x-disaggregatio
 class TestDisaggregationAccuracy(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
+        super().setUpClass()
         # Configure ROCm RDMA environment
         os.environ["SGLANG_USE_AITER"] = "1"
         rdma_env = os.environ.get("SGLANG_TEST_RDMA_DEVICE")
@@ -35,7 +36,6 @@ class TestDisaggregationAccuracy(PDDisaggregationServerBase):
             print("SGLANG_TEST_RDMA_DEVICE is not set! Running without RDMA.")
             cls.rdma_devices = []
 
-        super().setUpClass()
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
         # DEFAULT_MODEL_NAME_FOR_TEST
 
@@ -216,6 +216,7 @@ class TestDisaggregationAccuracy(PDDisaggregationServerBase):
 class TestDisaggregationMooncakeFailure(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
+        super().setUpClass()
         # Configure ROCm RDMA environment
         os.environ["SGLANG_USE_AITER"] = "1"
         rdma_env = os.environ.get("SGLANG_TEST_RDMA_DEVICE")
@@ -227,7 +228,6 @@ class TestDisaggregationMooncakeFailure(PDDisaggregationServerBase):
             print("SGLANG_TEST_RDMA_DEVICE is not set! Running without RDMA.")
             cls.rdma_devices = []
 
-        super().setUpClass()
         # set DISAGGREGATION_TEST_FAILURE_PROB to simulate failure
         os.environ["DISAGGREGATION_TEST_FAILURE_PROB"] = "0.05"
 
@@ -326,6 +326,7 @@ class TestDisaggregationMooncakeFailure(PDDisaggregationServerBase):
 class TestDisaggregationSimulatedRetract(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
+        super().setUpClass()
         # Configure ROCm RDMA environment
         os.environ["SGLANG_USE_AITER"] = "1"
         rdma_env = os.environ.get("SGLANG_TEST_RDMA_DEVICE")
@@ -337,7 +338,6 @@ class TestDisaggregationSimulatedRetract(PDDisaggregationServerBase):
             print("SGLANG_TEST_RDMA_DEVICE is not set! Running without RDMA.")
             cls.rdma_devices = []
 
-        super().setUpClass()
         os.environ["SGLANG_TEST_RETRACT"] = "true"
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
 
