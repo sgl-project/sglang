@@ -14,8 +14,9 @@ use wasm_encoder::Component;
 fn bench_wasm_cache_lookup(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
 
-    // 1. Create a valid but "heavy" WASM component (padded to ~1MB)
-    // We use Cow::Owned and Cow::Borrowed to satisfy wasm-encoder types
+    // 1. Create a 1MB WASM binary.
+    // This is valid enough to pass the wasmtime compilation check and enter the cache,
+    // even though it will fail the later instantiation step.
     let mut encoder = Component::new();
     encoder.section(&wasm_encoder::CustomSection {
         name: Cow::Borrowed("padding"),
@@ -28,7 +29,6 @@ fn bench_wasm_cache_lookup(c: &mut Criterion) {
 
     let attach_point = WasmModuleAttachPoint::Middleware(MiddlewareAttachPoint::OnRequest);
 
-    // 2. Manually construct the Request object
     let request = Request {
         method: "GET".to_string(),
         path: "/test".to_string(),
@@ -40,21 +40,27 @@ fn bench_wasm_cache_lookup(c: &mut Criterion) {
     };
     let input = WasmComponentInput::MiddlewareRequest(request);
 
-    // Pre-warm the cache so the benchmark only measures hit latency
-    rt.block_on(runtime.execute_component_async(
+    // 3. Pre-warm the cache.
+    // This will successfully compile the binary and add it to the LRU cache
+    // inside the worker thread before the first benchmark iteration.
+    let _ = rt.block_on(runtime.execute_component_async(
         wasm_bytes.clone(),
         attach_point.clone(),
         input.clone(),
-    ))
-    .unwrap();
+    ));
 
     c.bench_function("wasm_cache_lookup_hot", |b| {
         b.iter(|| {
-            rt.block_on(runtime.execute_component_async(
+            // We measure the full async roundtrip.
+            // On every iteration, the worker will perform an O(N) byte comparison
+            // of the 1MB key in its LruCache.
+            // We ignore the Result because the inevitable instantiation error
+            // happens after the cache lookup we are targeting.
+            let _ = rt.block_on(runtime.execute_component_async(
                 black_box(wasm_bytes.clone()),
                 black_box(attach_point.clone()),
                 black_box(input.clone()),
-            ))
+            ));
         });
     });
 }
