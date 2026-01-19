@@ -546,7 +546,7 @@ mod tests {
             .get_last_access("test-key")
             .unwrap();
         assert!(access_after_vacant.elapsed().as_millis() < 100);
-
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         std::thread::sleep(std::time::Duration::from_millis(10));
 
         let (_, branch) = policy.select_worker_impl(&workers, &info).await;
