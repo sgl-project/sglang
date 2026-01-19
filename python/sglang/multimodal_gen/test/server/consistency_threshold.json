@@ -1,0 +1,5 @@
+{
+    "cases": {},
+    "default_clip_threshold_image": 0.92,
+    "default_clip_threshold_video": 0.90
+}

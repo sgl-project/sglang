@@ -1,12 +1,18 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 import base64
+import io
 import json
 import os
 import socket
+import tempfile
 import time
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import cv2
+import numpy as np
+import requests
 from PIL import Image
 
 from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
@@ -15,8 +21,19 @@ from sglang.multimodal_gen.runtime.utils.perf_logger import (
     RequestPerfRecord,
     get_diffusion_perf_log_dir,
 )
+from sglang.multimodal_gen.test.server.testcase_configs import DiffusionTestCase
 
 logger = init_logger(__name__)
+
+# --- Consistency testing: GT from sgl-test-files ---
+SGL_TEST_FILES_CONSISTENCY_GT_BASE = "https://raw.githubusercontent.com/sgl-project/sgl-test-files/main/diffusion-ci/consistency_gt"
+CONSISTENCY_THRESHOLD_JSON_PATH = (
+    Path(__file__).resolve().parent / "server" / "consistency_threshold.json"
+)
+CLIP_MODEL_NAME = "openai/clip-vit-large-patch14"
+DEFAULT_CLIP_THRESHOLD_IMAGE = 0.92
+DEFAULT_CLIP_THRESHOLD_VIDEO = 0.90
+_clip_model_cache: dict[str, Any] = {}
 
 
 def is_image_url(image_path: str | Path | None) -> bool:
@@ -358,3 +375,315 @@ def validate_video_file(
         assert (
             actual_height == expected_height
         ), f"Video height mismatch: expected {expected_height}, got {actual_height}"
+
+
+# --- Consistency testing (GT from sgl-test-files, embeddings computed on the fly) ---
+
+
+def _load_threshold_json() -> dict[str, Any]:
+    """Load consistency_threshold.json; returns {} if missing."""
+    if not CONSISTENCY_THRESHOLD_JSON_PATH.exists():
+        return {}
+    with CONSISTENCY_THRESHOLD_JSON_PATH.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def get_clip_threshold(
+    case: DiffusionTestCase,
+    metadata: dict[str, Any] | None = None,
+) -> float:
+    """
+    Get CLIP similarity threshold for a consistency test case.
+    Uses consistency_threshold.json: default_clip_threshold_image/video and
+    optional per-case override in cases.<case_id>.clip_threshold.
+    """
+    if metadata is None:
+        metadata = _load_threshold_json()
+    case_meta = metadata.get("cases", {}).get(case.id, {})
+    is_video = case.server_args.modality == "video"
+    default = (
+        metadata.get("default_clip_threshold_video", DEFAULT_CLIP_THRESHOLD_VIDEO)
+        if is_video
+        else metadata.get("default_clip_threshold_image", DEFAULT_CLIP_THRESHOLD_IMAGE)
+    )
+    return float(case_meta.get("clip_threshold", default))
+
+
+@dataclass
+class ConsistencyResult:
+    """Result of a consistency comparison."""
+
+    case_id: str
+    passed: bool
+    similarity_scores: list[float]
+    min_similarity: float
+    threshold: float
+    frame_details: list[dict[str, Any]]
+
+
+def get_clip_model() -> tuple[Any, Any]:
+    """
+    Get CLIP model and processor (lazy loading with singleton pattern).
+
+    Returns:
+        Tuple of (model, processor)
+
+    Raises:
+        ImportError: If transformers is not installed
+    """
+    global _clip_model_cache
+
+    if "model" not in _clip_model_cache:
+        try:
+            import torch
+            from transformers import CLIPModel, CLIPProcessor
+        except ImportError:
+            raise ImportError(
+                "transformers and torch are required for CLIP consistency check. "
+                "Install with: pip install transformers torch"
+            )
+
+        logger.info(f"Loading CLIP model: {CLIP_MODEL_NAME}")
+        processor = CLIPProcessor.from_pretrained(CLIP_MODEL_NAME)
+        model = CLIPModel.from_pretrained(CLIP_MODEL_NAME)
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        model = model.to(device)
+        model.eval()
+
+        _clip_model_cache["model"] = model
+        _clip_model_cache["processor"] = processor
+        _clip_model_cache["device"] = device
+        logger.info(f"CLIP model loaded on {device}")
+
+    return _clip_model_cache["model"], _clip_model_cache["processor"]
+
+
+def compute_clip_embedding(image: np.ndarray) -> np.ndarray:
+    """
+    Compute CLIP embedding for a single image.
+
+    Args:
+        image: numpy array (H, W, C) in RGB format
+
+    Returns:
+        768-dimensional numpy array (L2 normalized)
+    """
+    try:
+        import torch
+    except ImportError:
+        raise ImportError(
+            "torch is required for CLIP consistency check. "
+            "Install with: pip install torch"
+        )
+
+    model, processor = get_clip_model()
+    device = _clip_model_cache["device"]
+
+    pil_image = Image.fromarray(image)
+    inputs = processor(images=pil_image, return_tensors="pt")
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+
+    with torch.no_grad():
+        image_features = model.get_image_features(**inputs)
+        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+
+    return image_features.cpu().numpy().flatten()
+
+
+def compute_clip_similarity(emb1: np.ndarray, emb2: np.ndarray) -> float:
+    """
+    Compute cosine similarity between two CLIP embeddings.
+    """
+    similarity = np.dot(emb1, emb2)
+    return float(similarity)
+
+
+def _consistency_gt_filenames(case_id: str, is_video: bool) -> list[str]:
+    """Return the list of GT image filenames for a case."""
+    if is_video:
+        return [
+            f"{case_id}_frame_0.png",
+            f"{case_id}_frame_mid.png",
+            f"{case_id}_frame_last.png",
+        ]
+    return [f"{case_id}.png"]
+
+
+def load_gt_embeddings(
+    case_id: str, num_gpus: int, is_video: bool = False
+) -> list[np.ndarray]:
+    """
+    Load ground truth by downloading PNG(s) from sgl-test-files and computing CLIP embeddings.
+
+    Args:
+        case_id: Test case identifier.
+        num_gpus: Unused, kept for API compatibility.
+        is_video: Whether this is a video case (default: False).
+
+    Returns:
+        List of numpy arrays (embeddings) for each key frame.
+        Image: 1 embedding, Video: 3 embeddings (first, mid, last)
+
+    Raises:
+        FileNotFoundError: If GT images are not available at the expected URLs.
+    """
+    filenames = _consistency_gt_filenames(case_id, is_video)
+    embeddings = []
+
+    for fn in filenames:
+        url = f"{SGL_TEST_FILES_CONSISTENCY_GT_BASE}/{fn}"
+        resp = requests.get(url, timeout=30)
+        if resp.status_code != 200:
+            raise FileNotFoundError(f"GT image not found: {url}")
+
+        arr = np.array(Image.open(io.BytesIO(resp.content)).convert("RGB"))
+        emb = compute_clip_embedding(arr)
+        embeddings.append(emb)
+
+    logger.info(
+        f"Loaded {len(embeddings)} GT embeddings for {case_id} from sgl-test-files"
+    )
+    return embeddings
+
+
+def gt_exists(case_id: str, num_gpus: int, is_video: bool = False) -> bool:
+    """Check if GT image(s) exist at sgl-test-files (by requesting the first required file)."""
+    filenames = _consistency_gt_filenames(case_id, is_video)
+    fn = filenames[0]
+    url = f"{SGL_TEST_FILES_CONSISTENCY_GT_BASE}/{fn}"
+    try:
+        r = requests.head(url, timeout=10)
+        return r.status_code == 200
+    except Exception:
+        return False
+
+
+def extract_key_frames_from_video(
+    video_bytes: bytes,
+    num_frames: int | None = None,
+) -> list[np.ndarray]:
+    """
+    Extract key frames (first, middle, last) from video bytes.
+
+    Args:
+        video_bytes: Raw video bytes (MP4 format)
+        num_frames: Total number of frames (if known), used for validation
+
+    Returns:
+        List of numpy arrays [first_frame, middle_frame, last_frame].
+    """
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+        tmp.write(video_bytes)
+        tmp_path = tmp.name
+
+    try:
+        cap = cv2.VideoCapture(tmp_path)
+        if not cap.isOpened():
+            raise ValueError("Failed to open video file")
+
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if total_frames < 1:
+            raise ValueError("Video has no frames")
+
+        first_idx = 0
+        mid_idx = total_frames // 2
+        last_idx = total_frames - 1
+        key_indices = [first_idx, mid_idx, last_idx]
+
+        frames = []
+        for idx in key_indices:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+            ret, frame = cap.read()
+            if not ret:
+                raise ValueError(f"Failed to read frame at index {idx}")
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frames.append(frame_rgb)
+
+        cap.release()
+        logger.info(
+            f"Extracted {len(frames)} key frames from video "
+            f"(total: {total_frames}, indices: {key_indices})"
+        )
+        return frames
+
+    finally:
+        os.unlink(tmp_path)
+
+
+def image_bytes_to_numpy(image_bytes: bytes) -> np.ndarray:
+    """Convert image bytes to numpy array."""
+    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    return np.array(img)
+
+
+def compare_with_gt(
+    output_frames: list[np.ndarray],
+    gt_embeddings: list[np.ndarray],
+    threshold: float,
+    case_id: str,
+) -> ConsistencyResult:
+    """
+    Compare output frames with ground truth embeddings using CLIP similarity.
+    """
+    if len(output_frames) != len(gt_embeddings):
+        raise ValueError(
+            f"Frame count mismatch: output={len(output_frames)}, gt={len(gt_embeddings)}"
+        )
+
+    similarity_scores = []
+    frame_details = []
+
+    for i, (out_frame, gt_emb) in enumerate(zip(output_frames, gt_embeddings)):
+        out_emb = compute_clip_embedding(out_frame)
+        similarity = compute_clip_similarity(out_emb, gt_emb)
+        similarity_scores.append(similarity)
+        frame_details.append(
+            {
+                "frame_index": i,
+                "similarity": similarity,
+                "passed": similarity >= threshold,
+                "output_shape": out_frame.shape,
+            }
+        )
+
+    min_similarity = min(similarity_scores)
+    passed = all(s >= threshold for s in similarity_scores)
+
+    result = ConsistencyResult(
+        case_id=case_id,
+        passed=passed,
+        similarity_scores=similarity_scores,
+        min_similarity=min_similarity,
+        threshold=threshold,
+        frame_details=frame_details,
+    )
+
+    status = "PASSED" if passed else "FAILED"
+    print(f"\n{'='*60}")
+    print(f"[CLIP Consistency] {case_id}: {status}")
+    print(f"  Threshold: {threshold}")
+    print(f"  Min similarity: {min_similarity:.4f}")
+    print(f"  Frame details:")
+    for detail in frame_details:
+        frame_status = "✓" if detail["passed"] else "✗"
+        print(
+            f"    Frame {detail['frame_index']}: similarity={detail['similarity']:.4f} {frame_status}"
+        )
+    print(f"{'='*60}\n")
+
+    if passed:
+        logger.info(
+            f"[Consistency] {case_id}: PASSED (min_similarity={min_similarity:.4f}, threshold={threshold})"
+        )
+    else:
+        logger.error(
+            f"[Consistency] {case_id}: FAILED (min_similarity={min_similarity:.4f}, threshold={threshold})"
+        )
+        for detail in frame_details:
+            if not detail["passed"]:
+                logger.error(
+                    f"  Frame {detail['frame_index']}: similarity={detail['similarity']:.4f} < {threshold}"
+                )
+
+    return result

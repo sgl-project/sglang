@@ -19,9 +19,6 @@ from PIL import Image
 
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.test.server.consistency_utils import (
-    extract_key_frames_from_video,
-)
 from sglang.multimodal_gen.test.server.test_server_utils import (
     ServerManager,
     WarmupRunner,
@@ -34,7 +31,11 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     TWO_GPU_CASES_B,
     DiffusionTestCase,
 )
-from sglang.multimodal_gen.test.test_utils import get_dynamic_server_port, is_image_url
+from sglang.multimodal_gen.test.test_utils import (
+    extract_key_frames_from_video,
+    get_dynamic_server_port,
+    is_image_url,
+)
 
 logger = init_logger(__name__)
 

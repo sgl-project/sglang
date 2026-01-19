@@ -1,9 +1,6 @@
 """
 Config-driven diffusion generation test with pytest parametrization.
 
-This module provides:
-- Performance validation against baselines
-- Consistency validation against ground truth (GT)
 
 If the actual run is significantly better than the baseline, the improved cases with their updated baseline will be printed
 """
@@ -23,15 +20,6 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
 from sglang.multimodal_gen.test.server.conftest import _GLOBAL_PERF_RESULTS
-from sglang.multimodal_gen.test.server.consistency_utils import (
-    compare_with_gt,
-    extract_key_frames_from_video,
-    get_consistency_config,
-    gt_exists,
-    image_bytes_to_numpy,
-    load_gt_embeddings,
-    save_gt_to_staging,
-)
 from sglang.multimodal_gen.test.server.test_server_utils import (
     VALIDATOR_REGISTRY,
     PerformanceValidator,
@@ -48,8 +36,14 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     ScenarioConfig,
 )
 from sglang.multimodal_gen.test.test_utils import (
+    compare_with_gt,
+    extract_key_frames_from_video,
+    get_clip_threshold,
     get_dynamic_server_port,
+    gt_exists,
+    image_bytes_to_numpy,
     is_image_url,
+    load_gt_embeddings,
     wait_for_req_perf_record,
 )
 
@@ -465,67 +459,29 @@ Consider updating perf_baselines.json with the snippets below:
         num_gpus = case.server_args.num_gpus
         is_video = case.server_args.modality == "video"
 
-        # Check GT exists - if not, save to staging and fail
-        if not gt_exists(case.id, num_gpus):
-            # Convert output to frames for staging
-            # Wrap in try-except to preserve helpful error message even if content is invalid
-            staging_path = None
-            try:
-                if is_video:
-                    output_frames = extract_key_frames_from_video(content)
-                else:
-                    output_frames = [image_bytes_to_numpy(content)]
-
-                # Save to staging directory if enabled
-                staging_path = save_gt_to_staging(output_frames, case, is_video)
-            except Exception as frame_err:
-                logger.warning(
-                    f"[Consistency] Failed to extract frames for staging: {frame_err}. "
-                    "GT guidance will still be shown."
-                )
-
-            # Build helpful error message
-            gpu_dir = f"{num_gpus}-gpu"
-
+        # Check GT exists - if not, fail with instructions to add PNG(s) to sgl-test-files
+        if not gt_exists(case.id, num_gpus, is_video=is_video):
+            if is_video:
+                names = f"{case.id}_frame_0.png, {case.id}_frame_mid.png, {case.id}_frame_last.png"
+            else:
+                names = f"{case.id}.png"
             error_msg = f"""
 --- MISSING GROUND TRUTH DETECTED ---
-GT embedding not found for '{case.id}' ({num_gpus}-gpu).
+GT image(s) not found for '{case.id}'.
 
-"""
-            if staging_path:
-                error_msg += f"""GT embeddings have been generated and saved to staging directory.
-These are available in the 'missing-gt' CI artifact.
+Add the expected PNG(s) to sgl-test-files in diffusion-ci/consistency_gt/ with naming:
+  Image: {case.id}.png
+  Video: {case.id}_frame_0.png, {case.id}_frame_mid.png, {case.id}_frame_last.png
 
-To add GT embeddings to pass consistency tests:
-1. Download the 'missing-gt' artifact from this CI run
+For this case, expected file(s): {names}
 
-2. Copy the embedding file to the sglang repository:
-   cp <downloaded-artifact>/{gpu_dir}/{case.id}.npy \\
-      python/sglang/multimodal_gen/test/consistency_gt/embeddings/{gpu_dir}/
+Repository: https://github.com/sgl-project/sgl-test-files (path: diffusion-ci/consistency_gt/)
 
-3. Commit and push:
-   git add python/sglang/multimodal_gen/test/consistency_gt/embeddings/
-   git commit -m "Add consistency GT embedding for {case.id}"
-   git push
-
-4. Re-run this CI after the commit is merged.
-"""
-            else:
-                error_msg += f"""GT staging is not enabled. To generate GT embeddings:
-1. Set environment variable: SGLANG_GT_STAGING_DIR=/path/to/staging
-2. Re-run this test to generate GT embeddings
-3. Copy the generated .npy file to:
-   python/sglang/multimodal_gen/test/consistency_gt/embeddings/{gpu_dir}/{case.id}.npy
-"""
-            error_msg += f"""
-(Optional) Add custom CLIP threshold to gt_metadata.json if needed:
-   "{case.id}": {{
-       "clip_threshold": 0.92
-   }}
+(Optional) Per-case override in consistency_threshold.json: "cases": {{ "{case.id}": {{ "clip_threshold": 0.92 }} }}
 """
             logger.error(error_msg)
             pytest.fail(
-                f"GT embedding not found for {case.id}. See logs for instructions to add GT."
+                f"GT not found for {case.id}. See logs for instructions to add GT."
             )
 
         # Load GT embeddings
@@ -537,14 +493,13 @@ To add GT embeddings to pass consistency tests:
         else:
             output_frames = [image_bytes_to_numpy(content)]
 
-        # Get consistency config for threshold
-        config = get_consistency_config(case)
+        threshold = get_clip_threshold(case)
 
         # Compare frames with GT embeddings using CLIP similarity
         result = compare_with_gt(
             output_frames=output_frames,
             gt_embeddings=gt_embeddings,
-            threshold=config.clip_threshold,
+            threshold=threshold,
             case_id=case.id,
         )
 

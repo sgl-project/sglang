@@ -3,7 +3,7 @@
 Test script to verify CLIP consistency checking works correctly.
 
 This script tests:
-1. Loading GT embeddings from .npy files
+1. Loading GT from sgl-test-files (PNG via URL) and computing CLIP embeddings
 2. Computing CLIP embeddings for images
 3. Computing cosine similarity between embeddings
 
@@ -27,66 +27,55 @@ import numpy as np
 
 
 def test_load_embeddings():
-    """Test that all GT embeddings can be loaded."""
+    """Test that GT embeddings can be loaded from sgl-test-files (PNG via URL)."""
     print("=" * 60)
-    print("Test 1: Loading GT embeddings")
+    print("Test 1: Loading GT embeddings from sgl-test-files")
     print("=" * 60)
 
-    # Add sglang to path
     script_dir = Path(__file__).parent
     sglang_root = script_dir.parent.parent.parent.parent.parent
     sys.path.insert(0, str(sglang_root))
 
-    from sglang.multimodal_gen.test.server.consistency_utils import (
-        EMBEDDINGS_DIR,
-        gt_exists,
-        load_gt_embeddings,
+    from sglang.multimodal_gen.test.server.testcase_configs import (
+        ONE_GPU_CASES_A,
+        ONE_GPU_CASES_B,
+        TWO_GPU_CASES_A,
+        TWO_GPU_CASES_B,
     )
+    from sglang.multimodal_gen.test.test_utils import gt_exists, load_gt_embeddings
 
-    print(f"Embeddings directory: {EMBEDDINGS_DIR}")
-
-    # Find all .npy files
-    npy_files = list(EMBEDDINGS_DIR.rglob("*.npy"))
-    print(f"Found {len(npy_files)} embedding files\n")
+    all_cases = ONE_GPU_CASES_A + ONE_GPU_CASES_B + TWO_GPU_CASES_A + TWO_GPU_CASES_B
+    print(f"Checking GT for {len(all_cases)} cases from testcase_configs\n")
 
     success_count = 0
     fail_count = 0
 
-    for npy_file in sorted(npy_files):
-        # Parse path to get num_gpus and case_id
-        gpu_dir = npy_file.parent.name  # e.g., "1-gpu"
-        num_gpus = int(gpu_dir.split("-")[0])
-        case_id = npy_file.stem  # e.g., "qwen_image_t2i"
+    for case in all_cases:
+        case_id = case.id
+        num_gpus = getattr(case.server_args, "num_gpus", None) or 1
+        is_video = case.server_args.modality == "video"
+
+        if not gt_exists(case_id, num_gpus, is_video=is_video):
+            continue
 
         try:
-            # Test gt_exists
-            exists = gt_exists(case_id, num_gpus)
-            assert exists, f"gt_exists returned False for {case_id}"
-
-            # Check raw embedding shape to determine if video or image
-            raw_emb = np.load(npy_file)
-            is_video = raw_emb.ndim == 2 and raw_emb.shape[0] > 1
-
-            # Test loading
             embeddings = load_gt_embeddings(case_id, num_gpus, is_video=is_video)
 
-            # Verify shape based on actual data
-            expected_count = raw_emb.shape[0] if raw_emb.ndim == 2 else 1
+            expected_count = 3 if is_video else 1
             assert (
                 len(embeddings) == expected_count
             ), f"Expected {expected_count} embeddings, got {len(embeddings)}"
 
             for emb in embeddings:
                 assert emb.shape == (768,), f"Expected shape (768,), got {emb.shape}"
-                # Verify L2 normalized (norm should be ~1.0)
                 norm = np.linalg.norm(emb)
                 assert 0.99 < norm < 1.01, f"Embedding not normalized, norm={norm}"
 
-            print(f"  ✓ {gpu_dir}/{case_id}: {len(embeddings)} embedding(s), shape OK")
+            print(f"  ✓ {case_id}: {len(embeddings)} embedding(s), shape OK")
             success_count += 1
 
         except Exception as e:
-            print(f"  ✗ {gpu_dir}/{case_id}: {e}")
+            print(f"  ✗ {case_id}: {e}")
             fail_count += 1
 
     print(f"\nResults: {success_count} passed, {fail_count} failed")
@@ -103,7 +92,7 @@ def test_clip_model():
     sglang_root = script_dir.parent.parent.parent.parent.parent
     sys.path.insert(0, str(sglang_root))
 
-    from sglang.multimodal_gen.test.server.consistency_utils import (
+    from sglang.multimodal_gen.test.test_utils import (
         compute_clip_embedding,
         get_clip_model,
     )
@@ -138,9 +127,7 @@ def test_similarity_computation():
     sglang_root = script_dir.parent.parent.parent.parent.parent
     sys.path.insert(0, str(sglang_root))
 
-    from sglang.multimodal_gen.test.server.consistency_utils import (
-        compute_clip_similarity,
-    )
+    from sglang.multimodal_gen.test.test_utils import compute_clip_similarity
 
     try:
         # Test with identical embeddings (should be 1.0)
@@ -182,47 +169,47 @@ def test_compare_with_gt():
     sglang_root = script_dir.parent.parent.parent.parent.parent
     sys.path.insert(0, str(sglang_root))
 
-    from sglang.multimodal_gen.test.server.consistency_utils import (
-        EMBEDDINGS_DIR,
+    from sglang.multimodal_gen.test.server.testcase_configs import (
+        ONE_GPU_CASES_A,
+        ONE_GPU_CASES_B,
+    )
+    from sglang.multimodal_gen.test.test_utils import (
         compare_with_gt,
+        gt_exists,
         load_gt_embeddings,
     )
 
     try:
-        # Find a case to test with
-        npy_files = list((EMBEDDINGS_DIR / "1-gpu").glob("*.npy"))
-        if not npy_files:
-            print("  ⚠ No 1-gpu embeddings found, skipping")
-            return True
-
-        # Use the first non-video case
-        test_file = None
-        for f in npy_files:
-            case_id = f.stem
-            if "t2v" not in case_id and "i2v" not in case_id and "ti2v" not in case_id:
-                test_file = f
+        all_cases = ONE_GPU_CASES_A + ONE_GPU_CASES_B
+        test_case = None
+        for case in all_cases:
+            num_gpus = getattr(case.server_args, "num_gpus", None) or 1
+            is_video = case.server_args.modality == "video"
+            if gt_exists(case.id, num_gpus, is_video=is_video):
+                test_case = case
                 break
 
-        if test_file is None:
-            test_file = npy_files[0]
+        if test_case is None:
+            print("  ⚠ No case with GT found in sgl-test-files, skipping")
+            return True
 
-        case_id = test_file.stem
-        is_video = "t2v" in case_id or "i2v" in case_id or "ti2v" in case_id
+        case_id = test_case.id
+        num_gpus = getattr(test_case.server_args, "num_gpus", None) or 1
+        is_video = test_case.server_args.modality == "video"
 
         print(f"  Testing with case: {case_id} (is_video={is_video})")
 
-        # Load GT embeddings
-        gt_embeddings = load_gt_embeddings(case_id, num_gpus=1, is_video=is_video)
+        gt_embeddings = load_gt_embeddings(
+            case_id, num_gpus=num_gpus, is_video=is_video
+        )
         print(f"  Loaded {len(gt_embeddings)} GT embedding(s)")
 
-        # Create dummy frames (random images won't match GT)
         num_frames = len(gt_embeddings)
         dummy_frames = [
             np.random.randint(0, 255, (256, 256, 3), dtype=np.uint8)
             for _ in range(num_frames)
         ]
 
-        # Compare (should fail since dummy images won't match GT)
         result = compare_with_gt(
             output_frames=dummy_frames,
             gt_embeddings=gt_embeddings,
@@ -234,10 +221,6 @@ def test_compare_with_gt():
             f"  Result: passed={result.passed}, min_similarity={result.min_similarity:.4f}"
         )
         print(f"  (Expected to fail since using random dummy images)")
-
-        # Now test with GT embeddings directly (simulate perfect match)
-        # Create frames that would produce the same embeddings
-        # This is a sanity check - we just verify the workflow runs
 
         print("  ✓ Comparison workflow executed successfully")
         return True
@@ -265,7 +248,7 @@ def test_with_real_image(image_path: Path, case_id: str, num_gpus: int):
 
     from PIL import Image
 
-    from sglang.multimodal_gen.test.server.consistency_utils import (
+    from sglang.multimodal_gen.test.test_utils import (
         compare_with_gt,
         gt_exists,
         load_gt_embeddings,
@@ -275,7 +258,8 @@ def test_with_real_image(image_path: Path, case_id: str, num_gpus: int):
         print(f"  ✗ Image not found: {image_path}")
         return False
 
-    if not gt_exists(case_id, num_gpus):
+    is_video = "t2v" in case_id or "i2v" in case_id or "ti2v" in case_id
+    if not gt_exists(case_id, num_gpus, is_video=is_video):
         print(f"  ✗ GT not found for case: {case_id} ({num_gpus}-gpu)")
         return False
 
@@ -286,7 +270,6 @@ def test_with_real_image(image_path: Path, case_id: str, num_gpus: int):
         print(f"  Image shape: {img_array.shape}")
 
         # Load GT
-        is_video = "t2v" in case_id or "i2v" in case_id or "ti2v" in case_id
         gt_embeddings = load_gt_embeddings(case_id, num_gpus, is_video=is_video)
 
         # Compare
