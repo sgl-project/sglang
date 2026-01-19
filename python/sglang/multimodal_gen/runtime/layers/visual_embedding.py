@@ -28,6 +28,7 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 
 _is_cuda = current_platform.is_cuda()
 
+
 class PatchEmbed(nn.Module):
     """2D Image to Patch Embedding
 
