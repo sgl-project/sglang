@@ -5,7 +5,7 @@ import random
 import threading
 import uuid
 from enum import IntEnum
-from typing import List, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 import aiohttp
 import torch
@@ -23,6 +23,9 @@ from sglang.srt.utils import get_local_ip_auto, get_zmq_socket_on_host
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.scheduler import Scheduler
 
 
 class EmbeddingData:
@@ -248,7 +251,7 @@ class MMReceiver:
         pp_rank: Optional[int] = None,
         tp_rank: Optional[int] = None,
         tp_group: Optional[GroupCoordinator] = None,
-        scheduler=None,
+        scheduler: Optional["Scheduler"] = None,
     ):
         self.context = zmq.asyncio.Context(20)
         self.encoder_transfer_backend = server_args.encoder_transfer_backend
