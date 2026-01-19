@@ -269,7 +269,7 @@ class OpenAIServingChat(OpenAIServingBase):
         if self.is_gpt_oss:
             request.skip_special_tokens = False
 
-        # Insert tool prohibition user message when tool_choice is "none"
+        # Insert tool prohibition text into the last user message when tool_choice is "none"
         # and SGLANG_INSERT_TOOL_PROHIBIT_WHEN_NONE is set to a non-empty string
         tool_prohibit_msg = envs.SGLANG_INSERT_TOOL_PROHIBIT_WHEN_NONE.get()
         if request.tool_choice == "none" and tool_prohibit_msg:
@@ -279,29 +279,34 @@ class OpenAIServingChat(OpenAIServingBase):
                 if msg.role == "user":
                     last_user_idx = i
 
-            # Insert the prohibition message before or after the last user message based on SGLANG_INSERT_TOOL_PROHIBIT_LOCATION
+            # Append or prepend the prohibition text to the last user message based on SGLANG_INSERT_TOOL_PROHIBIT_LOCATION
             if last_user_idx is not None:
-                prohibition_msg = ChatCompletionMessageGenericParam(
-                    role="user",
-                    content=tool_prohibit_msg,
-                )
-                # Create a new messages list with the prohibition message inserted
-                new_messages = list(request.messages)
+                last_user_msg = request.messages[last_user_idx]
                 insert_location = envs.SGLANG_INSERT_TOOL_PROHIBIT_LOCATION.get()
                 insert_location_lower = insert_location.lower()
+
+                # Get current content and handle None/empty cases
+                current_content = last_user_msg.content
+                if current_content is None:
+                    current_content = ""
+                elif not isinstance(current_content, str):
+                    # If content is a list (e.g., multimodal), convert to string representation
+                    current_content = str(current_content)
+
                 if insert_location_lower == "after":
-                    new_messages.insert(last_user_idx + 1, prohibition_msg)
+                    new_content = current_content + tool_prohibit_msg
                 elif insert_location_lower == "before":
-                    new_messages.insert(last_user_idx, prohibition_msg)
+                    new_content = tool_prohibit_msg + current_content
                 else:
                     logger.warning(
                         f"Invalid SGLANG_INSERT_TOOL_PROHIBIT_LOCATION value: {insert_location}. "
                         f"Must be 'before' or 'after'. Defaulting to 'before'."
                     )
-                    new_messages.insert(last_user_idx, prohibition_msg)
-                request.messages = new_messages
+                    new_content = tool_prohibit_msg + current_content
+
+                last_user_msg.content = new_content
                 logger.info(
-                    f"Inserted tool prohibition user message for tool_choice=none at location: {insert_location_lower}"
+                    f"Appended tool prohibition text to last user message for tool_choice=none at location: {insert_location_lower}"
                 )
 
         tool_call_constraint = None
