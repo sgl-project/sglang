@@ -141,7 +141,8 @@ class StorageBackendFactory:
                 f"({module_path}.{class_name})"
             )
 
-            # Create the backend instance with storage_config
+            # Create the backend instance with storage_config and mem_pool_host
+            kwargs['mem_pool_host'] = mem_pool_host
             return backend_class(storage_config, kwargs)
         except Exception as e:
             logger.error(
