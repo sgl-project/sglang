@@ -488,7 +488,7 @@ class DataParallelController:
 
         while True:
             if self.status[self.round_robin_counter]:
-                logger.info(f"Choose worker {self.round_robin_counter}")
+                logger.debug(f"Choose worker {self.round_robin_counter}")
                 self.workers[self.round_robin_counter].send_pyobj(req)
                 self.round_robin_counter = (self.round_robin_counter + 1) % len(
                     self.workers
