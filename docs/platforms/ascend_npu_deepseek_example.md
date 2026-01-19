@@ -88,6 +88,8 @@ python -m sglang.launch_server \
     --mem-fraction-static 0.6 \
     --attention-backend ascend \
     --device npu \
+    --quantization modelslim \
+    --load-balance-method round_robin \
     --max-running-requests 8 \
     --context-length 8192 \
     --disable-radix-cache \
@@ -143,6 +145,8 @@ python -m sglang.launch_server \
     --max-running-requests 352 \
     --attention-backend ascend \
     --device npu \
+    --quantization modelslim \
+    --prefill-round-robin-balance \
     --moe-a2a-backend deepep \
     --enable-dp-attention \
     --deepep-mode low_latency \
