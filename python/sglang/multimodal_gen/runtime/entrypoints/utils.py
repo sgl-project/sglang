@@ -36,6 +36,16 @@ def prepare_request(
     if diffusers_kwargs:
         req.extra["diffusers_kwargs"] = diffusers_kwargs
 
+    enable_teacache = getattr(sampling_params, "enable_teacache", False)
+    if enable_teacache:
+        teacache_params = getattr(sampling_params, "teacache_params", None)
+        if teacache_params is not None:
+            req.teacache_params = teacache_params
+            logger.debug(
+                f"TeaCache enabled: cache_type={teacache_params.cache_type}, "
+                f"teacache_thresh={teacache_params.teacache_thresh}"
+            )
+
     req.adjust_size(server_args)
 
     if (req.width is not None and req.width <= 0) or (
