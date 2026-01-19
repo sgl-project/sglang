@@ -17,10 +17,7 @@ from sglang.test.test_programs import (
     test_stream,
     test_tool_use,
 )
-from sglang.test.test_utils import CustomTestCase
-
-# Use FP8 quantized 8B model - fits on 32GB GPUs (~8GB weights) with 8B quality
-MODEL_FOR_TEST = "neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8"
+from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST, CustomTestCase
 
 register_cuda_ci(est_time=80, suite="stage-a-test-1")
 register_amd_ci(est_time=120, suite="stage-a-test-1")
@@ -32,7 +29,7 @@ class TestSRTBackend(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.backend = sgl.Runtime(
-            model_path=MODEL_FOR_TEST, cuda_graph_max_bs=4
+            model_path=DEFAULT_MODEL_NAME_FOR_TEST, cuda_graph_max_bs=4
         )
         sgl.set_default_backend(cls.backend)
 
