@@ -386,12 +386,12 @@ class OpenAIServingChat(OpenAIServingBase):
                     assistant_prefix = openai_compatible_messages[-1]["content"]
                     openai_compatible_messages = openai_compatible_messages[:-1]
 
-            try:
-                prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
+            def _apply_chat_template(tool_defs):
+                return self.tokenizer_manager.tokenizer.apply_chat_template(
                     openai_compatible_messages,
-                    tokenize=True,
+                    tokenize=not is_multimodal,
                     add_generation_prompt=True,
-                    tools=tools,
+                    tools=tool_defs,
                     reasoning_effort=request.reasoning_effort,
                     **(
                         request.chat_template_kwargs
@@ -399,7 +399,10 @@ class OpenAIServingChat(OpenAIServingBase):
                         else {}
                     ),
                 )
-            except Exception as e:
+
+            try:
+                rendered = _apply_chat_template(tools)
+            except Exception:
                 # If the first attempt fails, try transforming the tools format
                 # This handles models like Mistral that have a different tools input format
                 # that is not compatible with OpenAI's apply_chat_template tool_call format
@@ -409,34 +412,28 @@ class OpenAIServingChat(OpenAIServingBase):
                     else None
                 )
                 try:
-                    prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
-                        openai_compatible_messages,
-                        tokenize=True,
-                        add_generation_prompt=True,
-                        tools=tools,
-                        reasoning_effort=request.reasoning_effort,
-                        **(
-                            request.chat_template_kwargs
-                            if request.chat_template_kwargs
-                            else {}
-                        ),
-                    )
+                    rendered = _apply_chat_template(tools)
                 except jinja2.TemplateError as template_error:
                     # Template errors (e.g., from raise_exception in Jinja templates)
                     # should be treated as client errors (400 BadRequest)
                     raise ValueError(str(template_error)) from template_error
 
-            if assistant_prefix:
-                encoded = self.tokenizer_manager.tokenizer.encode(assistant_prefix)
-                if (
-                    encoded
-                    and encoded[0] == self.tokenizer_manager.tokenizer.bos_token_id
-                ):
-                    encoded = encoded[1:]
-                prompt_ids += encoded
-
             if is_multimodal:
-                prompt = self.tokenizer_manager.tokenizer.decode(prompt_ids)
+                prompt = rendered
+            else:
+                prompt_ids = rendered
+
+            if assistant_prefix:
+                if is_multimodal:
+                    prompt += assistant_prefix
+                else:
+                    encoded = self.tokenizer_manager.tokenizer.encode(assistant_prefix)
+                    if (
+                        encoded
+                        and encoded[0] == self.tokenizer_manager.tokenizer.bos_token_id
+                    ):
+                        encoded = encoded[1:]
+                    prompt_ids += encoded
 
         stop = request.stop
         image_data = image_data if image_data else None
