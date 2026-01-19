@@ -49,7 +49,7 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     kv_cache_scales_loader,
 )
-from sglang.srt.models.stacked_params_mixin import StackedParamsMixin
+from sglang.srt.models.remap_params_mixin import RemapParamsMixin
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, make_layers
 
@@ -409,7 +409,7 @@ class Qwen2Model(nn.Module):
                 )
 
 
-class Qwen2ForCausalLM(nn.Module, StackedParamsMixin):
+class Qwen2ForCausalLM(nn.Module, RemapParamsMixin):
     # BitandBytes specific attributes
     default_bitsandbytes_target_modules = [
         ".gate_proj.",

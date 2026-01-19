@@ -51,6 +51,7 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     kv_cache_scales_loader,
 )
+from sglang.srt.models.remap_params_mixin import RemapParamsMixin
 from sglang.srt.utils import add_prefix, make_layers
 
 Glm4Config = None
@@ -414,14 +415,14 @@ class Glm4Model(nn.Module):
                 )
 
 
-class Glm4ForCausalLM(nn.Module):
+class Glm4ForCausalLM(nn.Module, RemapParamsMixin):
     def __init__(
         self,
         config: Glm4Config,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
-        super().__init__()
+        nn.Module.__init__(self)
         self.pp_group = get_pp_group()
         self.config = config
         self.quant_config = quant_config
@@ -460,6 +461,17 @@ class Glm4ForCausalLM(nn.Module):
 
         self.logits_processor = LogitsProcessor(config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
+
+        # Stacked params mapping for unified weight loading API
+        self.stacked_params_mapping = [
+            # (param_name, shard_name, shard_id)
+            ("qkv_proj", "q_proj", "q"),
+            ("qkv_proj", "k_proj", "k"),
+            ("qkv_proj", "v_proj", "v"),
+            ("gate_up_proj", "gate_proj", 0),
+            ("gate_up_proj", "up_proj", 1),
+        ]
+
         # For EAGLE3 support
         self.capture_aux_hidden_states = False
 
@@ -554,14 +566,7 @@ class Glm4ForCausalLM(nn.Module):
         return self.model.end_layer
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            (".qkv_proj", ".q_proj", "q"),
-            (".qkv_proj", ".k_proj", "k"),
-            (".qkv_proj", ".v_proj", "v"),
-            (".gate_up_proj", ".up_proj", 1),
-            (".gate_up_proj", ".gate_proj", 0),
-        ]
+        stacked_params_mapping = self.stacked_params_mapping
 
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:

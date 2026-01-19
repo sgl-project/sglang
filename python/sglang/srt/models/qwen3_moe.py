@@ -61,7 +61,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2_moe import Qwen2MoeMLP as Qwen3MoeMLP
 from sglang.srt.models.qwen2_moe import Qwen2MoeModel
-from sglang.srt.models.stacked_params_mixin import StackedParamsMixin
+from sglang.srt.models.remap_params_mixin import RemapParamsMixin
 from sglang.srt.models.utils import (
     apply_qk_norm,
     create_fused_set_kv_buffer_arg,
@@ -881,7 +881,7 @@ class Qwen3MoeModel(Qwen2MoeModel):
         )
 
 
-class Qwen3MoeForCausalLM(nn.Module, StackedParamsMixin):
+class Qwen3MoeForCausalLM(nn.Module, RemapParamsMixin):
     fall_back_to_pt_during_load = False
 
     def __init__(

@@ -1,11 +1,11 @@
-"""Unit tests for StackedParamsMixin.map_weight_name()."""
+"""Unit tests for RemapParamsMixin.map_weight_name()."""
 
 import pytest
 
-from sglang.srt.models.stacked_params_mixin import StackedParamsMixin
+from sglang.srt.models.remap_params_mixin import RemapParamsMixin
 
 
-class DummyModel(StackedParamsMixin):
+class DummyModel(RemapParamsMixin):
     def __init__(self):
         self.stacked_params_mapping = [
             ("qkv_proj", "q_proj", "q"),
@@ -73,6 +73,21 @@ def model():
             None,
         ),
         ("embed_tokens.weight", "embed_tokens.weight", None, 1, None),
+        # Scale remapping - Standard patterns
+        (
+            "model.layers.0.self_attn.k_scale",
+            "model.layers.0.self_attn.attn.k_scale",
+            None,
+            1,
+            None,
+        ),
+        (
+            "model.layers.0.self_attn.v_scale",
+            "model.layers.0.self_attn.attn.v_scale",
+            None,
+            1,
+            None,
+        ),
     ],
 )
 def test_map_weight_name(

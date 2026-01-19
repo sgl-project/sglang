@@ -75,7 +75,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.models.stacked_params_mixin import StackedParamsMixin
+from sglang.srt.models.remap_params_mixin import RemapParamsMixin
 from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
@@ -989,7 +989,7 @@ class Glm4MoeModel(nn.Module):
         return hidden_states, aux_hidden_states
 
 
-class Glm4MoeForCausalLM(nn.Module, StackedParamsMixin):
+class Glm4MoeForCausalLM(nn.Module, RemapParamsMixin):
     def __init__(
         self,
         config: PretrainedConfig,
@@ -1033,6 +1033,15 @@ class Glm4MoeForCausalLM(nn.Module, StackedParamsMixin):
 
         # For EAGLE3 support
         self.capture_aux_hidden_states = False
+
+    def mutate_weight_preload(self, name: str) -> str:
+        """GLM4-MoE: shared expert fusion."""
+        if self.num_fused_shared_experts > 0 and "mlp.shared_experts" in name:
+            return name.replace(
+                "mlp.shared_experts",
+                f"mlp.experts.{self.config.n_routed_experts}",
+            )
+        return name
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens

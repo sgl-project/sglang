@@ -138,7 +138,7 @@ from sglang.srt.model_loader.utils import (
     should_deepgemm_weight_requant_ue8m0,
 )
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.models.stacked_params_mixin import StackedParamsMixin
+from sglang.srt.models.remap_params_mixin import RemapParamsMixin
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
@@ -3274,7 +3274,7 @@ class DeepseekV2Model(nn.Module):
         return hidden_states, aux_hidden_states
 
 
-class DeepseekV2ForCausalLM(nn.Module, StackedParamsMixin):
+class DeepseekV2ForCausalLM(nn.Module, RemapParamsMixin):
     # for quark model load
     packed_modules_mapping = {}
 
@@ -3327,6 +3327,15 @@ class DeepseekV2ForCausalLM(nn.Module, StackedParamsMixin):
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
         ]
+        # Add A-proj fusion mapping when q_lora_rank is enabled
+        # q_a_proj + kv_a_proj_with_mqa -> fused_qkv_a_proj_with_mqa
+        if self.fuse_qkv_a_proj:
+            self.stacked_params_mapping.extend(
+                [
+                    ("fused_qkv_a_proj_with_mqa", "q_a_proj", 0),
+                    ("fused_qkv_a_proj_with_mqa", "kv_a_proj_with_mqa", 1),
+                ]
+            )
         self.expert_params_mapping = FusedMoE.make_expert_params_mapping(
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
@@ -3352,6 +3361,22 @@ class DeepseekV2ForCausalLM(nn.Module, StackedParamsMixin):
 
         q_lora_rank = config.q_lora_rank if hasattr(config, "q_lora_rank") else None
         get_attn_tp_context().init_context(q_lora_rank, is_deepseek_nsa(config))
+
+    def mutate_weight_preload(self, name: str) -> str:
+        """DeepSeek V2: shared expert fusion."""
+        if self.num_fused_shared_experts > 0 and "mlp.shared_experts" in name:
+            return name.replace(
+                "mlp.shared_experts",
+                f"mlp.experts.{self.config.n_routed_experts}",
+            )
+        return name
+
+    def custom_scale_remap(self, name: str) -> str:
+        """DeepSeek V2: k_proj.k_scale -> attn_mqa.k_scale."""
+        for scale in ["k_scale", "v_scale"]:
+            if name.endswith(scale) and f"{scale[0]}_proj.{scale}" in name:
+                return name.replace(f"{scale[0]}_proj", "attn_mqa")
+        return name
 
     @property
     def routed_experts_weights_of_layer(self):
@@ -3663,7 +3688,11 @@ class DeepseekV2ForCausalLM(nn.Module, StackedParamsMixin):
             weights, NVFP4_CKPT_FP8_ATTN_QUANT_MODULES, is_nextn
         )
 
-        stacked_params_mapping = self.stacked_params_mapping
+        stacked_params_mapping = [
+            # (param_name, shard_name, shard_id)
+            ("gate_up_proj", "gate_proj", 0),
+            ("gate_up_proj", "up_proj", 1),
+        ]
 
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)

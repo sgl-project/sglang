@@ -73,7 +73,6 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
 from sglang.srt.models.kimi_vl_moonvit import MoonVitPretrainedModel
-from sglang.srt.models.stacked_params_mixin import StackedParamsMixin
 from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
@@ -113,7 +112,7 @@ class KimiVLMultiModalProjector(nn.Module):
         return hidden_states
 
 
-class KimiVLForConditionalGeneration(nn.Module, StackedParamsMixin):
+class KimiVLForConditionalGeneration(nn.Module):
     def __init__(
         self,
         config: KimiVLConfig,
@@ -136,24 +135,6 @@ class KimiVLForConditionalGeneration(nn.Module, StackedParamsMixin):
             quant_config=quant_config,
             prefix=add_prefix("language_model", prefix),
         )
-
-    def get_stacked_params_mapping(self):
-        """Delegate to inner language model."""
-        if hasattr(self.language_model, "get_stacked_params_mapping"):
-            return self.language_model.get_stacked_params_mapping()
-        return super().get_stacked_params_mapping()
-
-    def get_expert_params_mapping(self):
-        """Delegate to inner language model."""
-        if hasattr(self.language_model, "get_expert_params_mapping"):
-            return self.language_model.get_expert_params_mapping()
-        return super().get_expert_params_mapping()
-
-    def map_weight_name(self, ckpt_weight_name: str):
-        """Delegate to inner language model."""
-        if hasattr(self.language_model, "map_weight_name"):
-            return self.language_model.map_weight_name(ckpt_weight_name)
-        return super().map_weight_name(ckpt_weight_name)
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         pixel_values = (
