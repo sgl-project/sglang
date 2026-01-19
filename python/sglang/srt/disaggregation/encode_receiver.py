@@ -54,7 +54,9 @@ class EmbeddingData:
 
     def get_embedding(self, is_concat=False):
         if is_concat:
-            return torch.concat([embedding.cuda() for embedding in self.embedding_list])
+            return torch.concat(
+                [embedding.cuda() for embedding in self.embedding_list]
+            ).to("cpu", non_blocking=True)
         else:
             return self.embedding_list
 
