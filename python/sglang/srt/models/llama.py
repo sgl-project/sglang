@@ -575,7 +575,7 @@ class LlamaForCausalLM(nn.Module, RemapParamsMixin):
         params_dict = dict(self.named_parameters())
 
         for name, loaded_weight in weights:
-
+            name = self.custom_scale_remap(name)
             layer_id = get_layer_id(name)
             if (
                 layer_id is not None

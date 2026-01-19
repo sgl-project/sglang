@@ -3372,9 +3372,9 @@ class DeepseekV2ForCausalLM(nn.Module, RemapParamsMixin):
         return name
 
     def custom_scale_remap(self, name: str) -> str:
-        """DeepSeek V2: k_proj.k_scale -> attn_mqa.k_scale."""
+        """DeepSeek V2: k_proj -> attn_mqa when k_scale in name, v_proj -> attn_mqa when v_scale in name."""
         for scale in ["k_scale", "v_scale"]:
-            if name.endswith(scale) and f"{scale[0]}_proj.{scale}" in name:
+            if scale in name:
                 return name.replace(f"{scale[0]}_proj", "attn_mqa")
         return name
 
@@ -3740,11 +3740,8 @@ class DeepseekV2ForCausalLM(nn.Module, RemapParamsMixin):
                     )
                 ):
                     continue
-                if self.num_fused_shared_experts > 0 and "mlp.shared_experts" in name:
-                    name = name.replace(
-                        "mlp.shared_experts",
-                        f"mlp.experts.{self.config.n_routed_experts}",
-                    )
+
+                name = self.mutate_weight_preload(name)
 
                 weight_names.append(name)
 
@@ -3914,12 +3911,7 @@ class DeepseekV2ForCausalLM(nn.Module, RemapParamsMixin):
                                 "k_scale" in name or "v_scale" in name
                             ) and name not in params_dict:
                                 # modelopt attn kv scale is named differently
-                                for scale in ["k_scale", "v_scale"]:
-                                    if scale in name:
-                                        name = name.replace(
-                                            f"{scale[0]}_proj", "attn_mqa"
-                                        )
-                                        break
+                                name = self.custom_scale_remap(name)
                             if name not in params_dict:
                                 # modelopt ckpt contains not needed weights for MTP module:
                                 # model.decoder.self_attn.attn_mqa.v_scale and

@@ -1138,13 +1138,7 @@ class Glm4MoeForCausalLM(nn.Module, RemapParamsMixin):
         for name, loaded_weight in weights:
             weight_names.append(name)
 
-            if self.num_fused_shared_experts > 0 and "mlp.shared_experts" in name:
-                # Map shared expert weights to the last expert slot
-                # Shared expert becomes expert ID = n_routed_experts
-                name = name.replace(
-                    "mlp.shared_experts",
-                    f"mlp.experts.{self.config.n_routed_experts}",
-                )
+            name = self.mutate_weight_preload(name)
 
             if not is_nextn:
                 if hasattr(self.config, "num_nextn_predict_layers"):
