@@ -701,7 +701,6 @@ class AscendAttnBackend(AttentionBackend):
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
         topk_indices: Optional[torch.Tensor] = None,
-        slopes: Optional[torch.Tensor] = None,
     ):
         if topk_indices is not None:
             return self.forward_sparse(
@@ -805,7 +804,7 @@ class AscendAttnBackend(AttentionBackend):
                             query_lens=self.forward_metadata.extend_seq_lens_cpu_int,
                             scale_value=layer.scaling,
                             num_heads=layer.tp_q_head_num,
-                            slopes=slopes,
+                            slopes=layer.slopes,
                             is_extend=True,
                         )
                 else:
@@ -1357,7 +1356,6 @@ class AscendAttnBackend(AttentionBackend):
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
         topk_indices: Optional[torch.Tensor] = None,
-        slopes: Optional[torch.Tensor] = None,
     ):
         if is_mla_preprocess_enabled():
             # MLAPO does saving kv_cache
@@ -1455,7 +1453,7 @@ class AscendAttnBackend(AttentionBackend):
                         query_lens=torch.ones(num_tokens, dtype=torch.int32),
                         scale_value=layer.scaling,
                         num_heads=layer.tp_q_head_num,
-                        slopes=slopes,
+                        slopes=layer.slopes,
                         is_extend=False,
                     )
             return attn_output.view(num_tokens, layer.tp_q_head_num * layer.v_head_dim)

@@ -185,6 +185,7 @@ class BaiChuanAttention(nn.Module):
                 num_kv_heads=self.num_kv_heads,
                 layer_id=layer_id,
                 quant_config=quant_config,
+                slopes=self.alibi_slopes,
                 prefix=add_prefix("attn", prefix),
             )
         else:
@@ -215,9 +216,7 @@ class BaiChuanAttention(nn.Module):
         q, k, v = qkv.chunk(chunks=3, dim=-1)
         if self.position_embedding != "ALIBI":
             q, k = self.rotary_emb(positions, q, k)
-            attn_output = self.attn(q, k, v, forward_batch)
-        else:
-            attn_output = self.attn(q, k, v, forward_batch, slopes=self.alibi_slopes)
+        attn_output = self.attn(q, k, v, forward_batch)
 
         output, _ = self.o_proj(attn_output)
         return output
