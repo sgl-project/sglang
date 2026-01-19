@@ -466,7 +466,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             logger.info(f"Initialize Gemm-AllReduce Overlap Operator...")
             self.init_overlap_gemm_allreduce_operator()
 
-        # Check if the model is using hybrid SWA
         if (
             self.server_args.remote_instance_weight_loader_use_transfer_engine()
             and self.remote_instance_transfer_engine is not None
