@@ -1434,6 +1434,7 @@ class Scheduler(
                 require_reasoning=recv_req.require_reasoning,
                 return_hidden_states=recv_req.return_hidden_states,
                 return_routed_experts=recv_req.return_routed_experts,
+                return_step_maps=recv_req.return_step_maps,
                 eos_token_ids=self.model_config.hf_eos_token_id,
                 bootstrap_host=recv_req.bootstrap_host,
                 bootstrap_port=recv_req.bootstrap_port,
@@ -2093,6 +2094,9 @@ class Scheduler(
             chunked_req=self.chunked_req,
             dllm_staging_reqs=self.dllm_staging_reqs,
             dllm_config=self.dllm_config,
+            return_step_maps=(
+                self.dllm_config.return_step_maps if self.dllm_config else False
+            ),
         )
         if self.enable_hierarchical_cache:
             # todo (zhiqiang): disable cuda graph execution if hicache loading triggered

@@ -375,6 +375,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For hidden states before normal
     return_hidden_states_before_norm: bool = False
 
+    # For diffusion LLM step maps
+    return_step_maps: bool = False
+    diffusion_steps: Optional[torch.Tensor] = None
+
     @classmethod
     def init_new(
         cls,
@@ -419,6 +423,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             tbo_split_seq_index=batch.tbo_split_seq_index,
             dimensions=batch.dimensions,
             return_hidden_states_before_norm=batch.return_hidden_states_before_norm,
+            return_step_maps=getattr(batch, "return_step_maps", False),
         )
         device = model_runner.device
 
@@ -475,6 +480,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 ],
                 dtype=positions_dtype,
             ).to(device, non_blocking=True)
+            # Initialize diffusion_steps for diffusion LLM
+            ret.diffusion_steps = torch.zeros(
+                ret.batch_size, dtype=torch.int32, device=device
+            )
         elif (
             ret.spec_info is not None
             and getattr(ret.spec_info, "positions", None) is not None

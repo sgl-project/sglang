@@ -490,6 +490,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
         # Normalize the request
         obj.normalize_batch_and_arguments()
+
         if self.enable_trace:
             self._trace_request_start(obj, created_time, request)
         if self.server_args.language_only:
@@ -940,6 +941,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 routing_key=obj.routing_key,
                 need_wait_for_image=obj.need_wait_for_image,
                 num_items_assigned=obj.num_items_assigned,
+                return_step_maps=obj.return_step_maps,
             )
         elif isinstance(obj, EmbeddingReqInput):
             tokenized_obj = TokenizedEmbeddingReqInput(
@@ -1531,6 +1533,8 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 meta_info["hidden_states"] = recv_obj.output_hidden_states[i]
             if getattr(recv_obj, "output_routed_experts", None):
                 meta_info["routed_experts"] = recv_obj.output_routed_experts[i]
+            if getattr(recv_obj, "step_maps", None):
+                meta_info["step_maps"] = recv_obj.step_maps[i]
             if getattr(recv_obj, "customized_info", None):
                 for k, v in recv_obj.customized_info.items():
                     meta_info[k] = v[i]

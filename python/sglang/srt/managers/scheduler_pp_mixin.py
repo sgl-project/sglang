@@ -579,6 +579,7 @@ class SchedulerPPMixin:
                     self.model_config,
                     False,
                     self.spec_algorithm,
+                    return_step_maps=False,
                 )
 
                 current_seq_len = len(req.fill_ids)
