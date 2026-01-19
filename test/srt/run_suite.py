@@ -19,7 +19,7 @@ suites = {
     "per-commit-8-gpu-h200": [
         TestFile("test_deepseek_v3_basic.py", 275),
         TestFile("test_deepseek_v3_mtp.py", 275),
-        TestFile("test_disaggregation_hybrid_attention.py", 600),
+        TestFile("test_disaggregation_hybrid_attention.py", 400),
         TestFile("models/test_kimi_k2_models.py", 200),
         TestFile("test_deepseek_v32_basic.py", 360),
         TestFile("test_deepseek_v32_mtp.py", 360),
@@ -35,7 +35,7 @@ suites = {
         TestFile("test_deepseek_v3_fp4_4gpu.py", 1500),
         TestFile("test_fp8_blockwise_gemm.py", 280),
         TestFile("test_gpt_oss_4gpu.py", 700),
-        TestFile("test_llama31_fp4.py", 90),
+        TestFile("test_nvfp4_gemm.py", 360),
     ],
     # "per-commit-8-gpu-b200": [
     #     TestFile("test_mistral_large3_basic.py", 275),  # Moved to nightly - large model
@@ -48,9 +48,11 @@ suites = {
         TestFile("ep/test_deepep_small.py", 531),
         TestFile("ep/test_mooncake_ep_small.py", 660),
     ],
-    "per-commit-8-gpu-h200-deepep": [
-        TestFile("ep/test_deepep_large.py", 563),
-    ],
+    # Disabled: IBGDA/cudaHostRegister environment issues on 8-GPU runner, see #17175
+    # 4-GPU DeepEP tests provide sufficient coverage
+    # "per-commit-8-gpu-h200-deepep": [
+    #     TestFile("ep/test_deepep_large.py", 563),
+    # ],
     "quantization_test": [
         TestFile("quant/test_awq.py", 163),
         TestFile("quant/test_marlin_moe.py", 200),
@@ -74,6 +76,7 @@ suites = {
         TestFile(
             "models/test_qwen3_next_models_pcg.py"
         ),  # Disabled: intermittent failures, see #17039
+        TestFile("ep/test_deepep_large.py", 563),  # Disabled: see #17175
     ],
 }
 
@@ -108,9 +111,6 @@ suite_amd = {
     "per-commit-8-gpu-amd": [
         TestFile("test_deepseek_v3_basic.py", 275),
         TestFile("test_deepseek_v3_mtp.py", 275),
-    ],
-    "per-commit-8-gpu-amd-mi35x": [
-        TestFile("test_deepseek_r1_mxfp4_8gpu.py", 3600),
     ],
     # NOTE: AMD nightly suites (nightly-amd, nightly-amd-vlm, nightly-amd-8-gpu)
     # have been migrated to test/registered/amd/nightly/ and are now managed
