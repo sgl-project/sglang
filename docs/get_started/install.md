@@ -21,14 +21,14 @@ For example, on GB200, you will need to do the following. Otherwise, it will ins
 uv pip install "sglang" --extra-index-url https://download.pytorch.org/whl/cu129
 ```
 
-For CUDA 13, Docker is recommended (see Method 3 note on B300/CUDA 13). If you do not have Docker access, installing the matching `sgl_kernel` wheel from https://github.com/sgl-project/whl/releases after installing SGLang also works. Replace `X.Y.Z` with the `sgl_kernel` version required by your SGLang install. Examples:
+For CUDA 13, Docker is recommended (see Method 3 note on B300/GB300/CUDA 13). If you do not have Docker access, installing the matching `sgl_kernel` wheel from [the sgl-project whl releases](https://github.com/sgl-project/whl/releases) after installing SGLang also works. Replace `X.Y.Z` with the `sgl_kernel` version required by your SGLang install (you can find this by running `uv pip show sgl_kernel`). Examples:
 
 ```bash
-uv pip install "https://github.com/sgl-project/whl/releases/download/vX.Y.Z/sgl_kernel-X.Y.Z+cu130-cp310-abi3-manylinux2014_x86_64.whl" # x86_64
-```
+# x86_64
+uv pip install "https://github.com/sgl-project/whl/releases/download/vX.Y.Z/sgl_kernel-X.Y.Z+cu130-cp310-abi3-manylinux2014_x86_64.whl"
 
-```bash
-uv pip install "https://github.com/sgl-project/whl/releases/download/vX.Y.Z/sgl_kernel-X.Y.Z+cu130-cp310-abi3-manylinux2014_aarch64.whl" # aarch64
+# aarch64
+uv pip install "https://github.com/sgl-project/whl/releases/download/vX.Y.Z/sgl_kernel-X.Y.Z+cu130-cp310-abi3-manylinux2014_aarch64.whl"
 ```
 
 **Quick fixes to common problems**
@@ -84,7 +84,7 @@ docker run --gpus all \
 
 You can also find the nightly docker images [here](https://hub.docker.com/r/lmsysorg/sglang/tags?name=nightly).
 
-On B300 (SM103) or CUDA 13 environment, we recommend using the nightly image at `lmsysorg/sglang:dev-cu13` or stable image at `lmsysorg/sglang:latest-cu130-runtime`.
+On B300/GB300 (SM103) or CUDA 13 environment, we recommend using the nightly image at `lmsysorg/sglang:dev-cu13` or stable image at `lmsysorg/sglang:latest-cu130-runtime`.
 Please, do not re-install the project as editable inside the docker image, since it will override the version of
 libraries specified by the cu13 docker image.
 
