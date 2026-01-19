@@ -1568,6 +1568,20 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self.kv_cache_dtype = torch.float8_e4m3fn
         elif self.server_args.kv_cache_dtype in ("bf16", "bfloat16"):
             self.kv_cache_dtype = torch.bfloat16
+        elif self.server_args.kv_cache_dtype in ("int4", "int8"):
+            assert (
+                self.spec_algorithm.is_none()
+            ), "int4 and int8 kv cache is not supported for speculative decoding"
+            assert (
+                self.use_mla_backend is False
+            ), "int4 and int8 kv cache is not supported for MLA backend"
+            assert (
+                self.server_args.decode_attention_backend == "triton"
+            ), "int4 and int8 kv cache is only supported for triton decode attention backend"
+            assert (
+                self.server_args.prefill_attention_backend == "fa3"
+            ), "int4 and int8 kv cache is only supported for fa3 prefill attention backend"
+            self.kv_cache_dtype = self.server_args.kv_cache_dtype
         elif self.server_args.kv_cache_dtype == "fp4_e2m1":
             if hasattr(torch, "float4_e2m1fn_x2"):
                 self.kv_cache_dtype = torch.float4_e2m1fn_x2
