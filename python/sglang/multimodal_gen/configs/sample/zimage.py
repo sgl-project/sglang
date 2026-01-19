@@ -31,3 +31,10 @@ class ZImageSamplingParams(SamplingParams):
             ],
         )
     )
+
+
+@dataclass
+class ZImageOmniSamplingParams(ZImageSamplingParams):
+    # zimage-omni default
+    num_inference_steps: int = 50
+    guidance_scale: float = 5.0
