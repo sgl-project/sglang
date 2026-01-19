@@ -882,20 +882,6 @@ class OpenAIServingChat(OpenAIServingBase):
                     f"No reasoning parser configured, SGLANG_REASONING_OFF_BY_DEFAULT={reasoning_off_by_default}, "
                     f"skipping reasoning parsing"
                 )
-                try:
-                    parser = ReasoningParser(
-                        model_type=reasoning_parser,
-                        stream_reasoning=False,
-                        force_reasoning=is_force_reasoning,
-                    )
-                    reasoning_text, text = parser.parse_non_stream(text)
-                except Exception as e:
-                    logger.error(f"Reasoning parsing error: {e}")
-                    return self.create_error_response(
-                        "Failed to parse reasoning content",
-                        err_type="InternalServerError",
-                        status_code=500,
-                    )
 
             # Handle tool calls
             tool_calls = None
