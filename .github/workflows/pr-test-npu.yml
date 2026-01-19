@@ -56,7 +56,7 @@ jobs:
           filters: |
             main_package:
               - "python/sglang/!(multimodal_gen)/**"
-              - "python/*.toml"
+              - "python/pyproject_other.toml"
               - "scripts/ci/npu_ci_install_dependency.sh"
               - "test/srt/ascend/**"
               - ".github/workflows/pr-test-npu.yml"
