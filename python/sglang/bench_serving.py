@@ -1333,10 +1333,10 @@ def sample_custom_requests(
     processed_dataset = []
     for data in dataset:
         convs = data.get("conversations", data.get("conversation", []))
-        if len(convs) >= 2:
-            user_turn = convs[0].get("content", convs[0].get("value", ""))
-            assist_turn = convs[1].get("content", convs[1].get("value", ""))
-            processed_dataset.append((user_turn, assist_turn))
+        while convs and convs[-1]["role"] != "assistant":
+            convs.pop()
+        if convs:
+            processed_dataset.append(convs)
     dataset = processed_dataset
     random.shuffle(dataset)
 
@@ -1348,7 +1348,7 @@ def sample_custom_requests(
             break
 
         # Tokenize the prompts and completions.
-        prompt = dataset[i][0]
+        prompt = dataset[i][:-1]
 
         if prompt_suffix:
             prompt = (
@@ -1357,18 +1357,17 @@ def sample_custom_requests(
                 + ASSISTANT_SUFFIX
             )
 
-        if apply_chat_template:
-            prompt = tokenizer.apply_chat_template(
-                [{"role": "user", "content": prompt}],
-                add_generation_prompt=True,
-                tokenize=False,
-                return_dict=False,
-            )
-            if tokenizer.bos_token:
-                prompt = prompt.replace(tokenizer.bos_token, "")
+        prompt = tokenizer.apply_chat_template(
+            prompt,
+            add_generation_prompt=True,
+            tokenize=False,
+            return_dict=False,
+        )
+        if tokenizer.bos_token:
+            prompt = prompt.replace(tokenizer.bos_token, "")
 
         prompt_token_ids = tokenizer.encode(prompt)
-        completion = dataset[i][1]
+        completion = dataset[i][-1]["content"]
         completion_token_ids = tokenizer.encode(completion)
         prompt_len = len(prompt_token_ids)
         output_len = (
