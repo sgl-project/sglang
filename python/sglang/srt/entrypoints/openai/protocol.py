@@ -654,7 +654,11 @@ class ChatCompletionRequest(BaseModel):
 
         sampling_params = {
             "temperature": get_param("temperature"),
-            "max_new_tokens": self.max_tokens or self.max_completion_tokens,
+            "max_new_tokens": (
+                self.max_tokens
+                if self.max_tokens is not None
+                else self.max_completion_tokens
+            ),
             "min_new_tokens": self.min_tokens,
             "stop": stop,
             "stop_token_ids": self.stop_token_ids,
