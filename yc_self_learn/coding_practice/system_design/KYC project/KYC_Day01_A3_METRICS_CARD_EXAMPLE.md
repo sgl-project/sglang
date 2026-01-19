@@ -1,3 +1,17 @@
+# A3_METRICS_CARD：指标体系卡片示例（L0/L1/L2 汇总）
+
+---
+doc_type: reference
+layer: L1
+scope_in:  L0/L1/L2 三层指标的卡片式汇总、快速参考
+scope_out: 详细讲解（见 A1）；计算方法（见 A2）；业务收益详解（见 A3）
+inputs:   (读者) 需求：快速查看 KYC 项目的所有指标
+outputs:  指标卡片汇总表
+entrypoints: [ L0 稳定性, L1 业务收益, L2 长期健康 ]
+children: [ KYC_Day01_A3_B1_good_batch.md（完全成功的 batch） ]
+related: [ L0/L1/L2 指标, KYC_Day01_A1_详细讲解_指标与测试.md, KYC_Day01_A2_指标计算脚本示例.md, KYC_Day01_A3_业务收益与ROI详解.md ]
+---
+
 # Day 1｜指标体系：KYC 项目示例
 
 **基于项目**：KYC Identity Verification System (PoV)  

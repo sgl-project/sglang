@@ -8,7 +8,10 @@ scope_out: 具体 pipeline 配置（见 howto）；分支/发布策略（见 ADR
 inputs:   (读者) 需求：自动化构建、测试、发布；或「发布前卡质量」
 outputs:  概念定义 + 门禁在 KYC 指标计算里的角色
 entrypoints: [ Definition ]
-children: []
+children: [ 
+  KYC_Day01_A2_B2_C1_production_environment_and_docker.md（生产环境、Docker 和 Linux 的关系）,
+  KYC_Day01_A2_B2_C2_CI_CD的设计原理与架构.md（CI/CD 的设计原理与架构）
+]
 related: [ 门禁, test_release_gate, pipeline, KYC_Day01_A2_指标计算脚本示例 ]
 ---
 

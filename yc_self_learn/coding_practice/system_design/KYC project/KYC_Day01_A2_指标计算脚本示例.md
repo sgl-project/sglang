@@ -817,6 +817,7 @@ def test_p95_latency_gate():
 |------|------|----------|
 | Cron | [KYC_Day01_A2_B1_cron](./KYC_Day01_A2_B1_cron.md) | 时机 2 定时任务 |
 | CI/CD、CI/CD 门禁 | [KYC_Day01_A2_B2_ci_cd](./KYC_Day01_A2_B2_ci_cd.md) | 时机 3 CI/CD 门禁 |
+| 从开发到用户使用的完整流程 | [KYC_Day01_A2_B3_从开发到用户使用的完整流程](./KYC_Day01_A2_B3_从开发到用户使用的完整流程.md) | 整体流程概览 |
 
 ---
 
