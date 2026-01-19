@@ -195,12 +195,16 @@ class DeepSeekV32Detector(BaseFormatDetector):
                 self.invoke_regex, function_calls_content, re.DOTALL
             )
 
-            for func_name, invoke_content, _ in invoke_matches:
+            for i, (func_name, invoke_content, _) in enumerate(invoke_matches):
                 # Parse parameters from XML format
                 func_args = self._parse_parameters_from_xml(invoke_content)
-                # construct match_result for parse_base_json
-                match_result = {"name": func_name, "parameters": func_args}
-                calls.extend(self.parse_base_json(match_result, tools))
+                calls.append(
+                    ToolCallItem(
+                        tool_index=i,
+                        name=func_name,
+                        parameters=json.dumps(func_args, ensure_ascii=False),
+                    )
+                )
 
             return StreamingParseResult(normal_text=normal_text, calls=calls)
         except Exception as e:
