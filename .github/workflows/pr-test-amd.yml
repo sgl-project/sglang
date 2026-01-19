@@ -928,9 +928,9 @@ jobs:
         run: |
           bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test/registered/eval -e SGLANG_USE_AITER_AR=0 -e SGLANG_USE_AITER=0 -e HF_HUB_ENABLE_HF_TRANSFER=0 python3 test_moe_eval_accuracy_large.py
 
-  check pdd env:
+  check-pdd-env:
     runs-on: linux-mi35x-gpu-8
-    if: inputs.target_stage == 'debug-rdma-pdd-env'
+    if: inputs.target_stage == 'check-pdd-env'
     steps:
       - name: Find RDMA in CI Runner
         run: |
