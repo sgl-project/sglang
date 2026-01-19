@@ -38,17 +38,12 @@ def flash_attn_varlen_func(
     sinks: Optional[torch.Tensor] = None,
     num_splits: int = 1,
     pack_gqa: Optional[bool] = None,
-    return_softmax_lse: bool = False,
     score_mod: Optional[Callable] = None,
     aux_tensors: Optional[list] = None,
     score_mod_bwd: Optional[Callable] = None,
     mask_mod: Optional[Callable] = None,
     block_sparse_tensors=None,
-    ver: int = 4,
 ):
-    if ver != 4:
-        raise ValueError(f"flash_attention_v4 only supports ver=4, got ver={ver}")
-
     if _flash_attn_varlen_func is None:  # pragma: no cover
         raise ImportError(
             "Vendored FlashAttention CUTE is not available (cannot import "
@@ -86,7 +81,6 @@ def flash_attn_varlen_func(
         learnable_sink=learnable_sink,
         num_splits=num_splits,
         pack_gqa=pack_gqa,
-        return_softmax_lse=return_softmax_lse,
         score_mod=score_mod,
         aux_tensors=aux_tensors,
         score_mod_bwd=score_mod_bwd,
@@ -125,11 +119,9 @@ def flash_attn_with_kvcache(
     num_splits: int = 0,
     pack_gqa: Optional[bool] = None,
     sm_margin: int = 0,
-    return_softmax_lse: bool = False,
     sinks: Optional[torch.Tensor] = None,
     score_mod: Optional[Callable] = None,
     aux_tensors: Optional[list] = None,
-    ver: int = 4,
 ):
     if ver != 4:
         raise ValueError(f"flash_attention_v4 only supports ver=4, got ver={ver}")
@@ -164,9 +156,7 @@ def flash_attn_with_kvcache(
         window_size=window_size,
         num_splits=num_splits if num_splits != 0 else 1,
         pack_gqa=pack_gqa,
-        return_softmax_lse=return_softmax_lse,
         learnable_sink=sinks,
         score_mod=score_mod,
         aux_tensors=aux_tensors,
-        ver=4,
     )

@@ -825,8 +825,6 @@ def test_flash_attn_varlen_output(
                 softcap=softcap,
                 sinks=learnable_sink,  # FA4 uses learnable_sink, not sinks
                 pack_gqa=pack_gqa,
-                return_softmax_lse=True,
-                ver=4,  # Use FA4
             )
             out = output_pad_fn(out_unpad)
             if query_unused_mask is not None:
@@ -1384,8 +1382,6 @@ def test_flash_attn_kvcache(
                     sinks=learnable_sink,  # FA4 uses learnable_sink, not sinks
                     softcap=0.0,
                     pack_gqa=None,
-                    return_softmax_lse=True,
-                    ver=4,  # Use FA4
                 )
                 if varlen_q:
                     out = output_pad_fn(out)
