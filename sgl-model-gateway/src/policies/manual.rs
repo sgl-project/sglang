@@ -547,7 +547,6 @@ mod tests {
             .unwrap();
         assert!(access_after_vacant.elapsed().as_millis() < 100);
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        std::thread::sleep(std::time::Duration::from_millis(10));
 
         let (_, branch) = policy.select_worker_impl(&workers, &info).await;
         assert_eq!(branch, ExecutionBranch::OccupiedHit);
@@ -558,7 +557,6 @@ mod tests {
             .unwrap();
         assert!(access_after_hit > access_after_vacant);
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        std::thread::sleep(std::time::Duration::from_millis(10));
 
         workers[first_idx].set_healthy(false);
         let (_, branch) = policy.select_worker_impl(&workers, &info).await;
@@ -592,7 +590,6 @@ mod tests {
 
         assert_eq!(policy.local_backend().unwrap().len(), 1);
         tokio::time::sleep(Duration::from_secs(3)).await;
-        std::thread::sleep(Duration::from_secs(3));
 
         assert_eq!(policy.local_backend().unwrap().len(), 0);
     }
