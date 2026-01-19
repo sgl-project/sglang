@@ -266,6 +266,23 @@ class NPUW8A8Int8DynamicMoEMethod(_NPUFusedMoEMethodBase):
 
 class NPUW4A8Int8DynamicMoEMethod(_NPUFusedMoEMethodBase):
 
+    def __init__(
+        self,
+        quant_config: Optional["QuantizationConfig"] = None,
+    ):
+        super().__init__(quant_config)
+        # Detect device capability once at initialization
+        self._use_v2_api = None
+
+    def _detect_device_capability(self, device_index: int = 0) -> bool:
+        """Detect if device supports v2 MoE API (not supported on 910B)."""
+        if self._use_v2_api is None:
+            if torch_npu is None:
+                raise ImportError("torch_npu is required for NPU MoE operations")
+            device_name = torch_npu.npu.get_device_name(device_index)
+            self._use_v2_api = "910b" not in device_name.lower()
+        return self._use_v2_api
+
     def _process_scale(
         self, weight: torch.Tensor, scale, per_group_scale, is_per_channel_weight
     ):
@@ -408,10 +425,7 @@ class NPUW4A8Int8DynamicMoEMethod(_NPUFusedMoEMethodBase):
         global_num_experts = layer.num_experts
 
         # Check if device supports npu_moe_init_routing_v2 (not supported on 910B)
-        if torch_npu is None:
-            raise ImportError("torch_npu is required for NPU MoE operations")
-        device_name = torch_npu.npu.get_device_name(hidden_states.device.index or 0)
-        use_v2_api = "910b" not in device_name.lower()
+        use_v2_api = self._detect_device_capability(hidden_states.device.index or 0)
 
         if use_v2_api:
             # Use v2 API for devices that support it (A3, etc.)
