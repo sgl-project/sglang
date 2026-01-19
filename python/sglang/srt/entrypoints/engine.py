@@ -65,6 +65,7 @@ from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.managers.template_manager import TemplateManager
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
+    parse_parallelism_config_from_scheduler_infos,
     parse_remote_instance_transfer_engine_info_from_scheduler_infos,
 )
 from sglang.srt.server_args import PortArgs, ServerArgs
@@ -173,6 +174,9 @@ class Engine(EngineBase):
             parse_remote_instance_transfer_engine_info_from_scheduler_infos(
                 scheduler_infos
             )
+        )
+        self.parallelism_config = parse_parallelism_config_from_scheduler_infos(
+            scheduler_infos
         )
 
         # Initialize ZMQ sockets
@@ -857,7 +861,11 @@ def _wait_for_scheduler_ready(
             raise RuntimeError(
                 "Initialization failed. Please see the error messages above."
             )
-        scheduler_infos.append(data)
+
+        if "_dp_scheduler_infos" in data:
+            scheduler_infos.extend(data["_dp_scheduler_infos"])
+        else:
+            scheduler_infos.append(data)
     return scheduler_infos
 
 

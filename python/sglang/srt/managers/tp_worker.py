@@ -426,6 +426,9 @@ class TpModelWorker(BaseTpWorker):
             self.model_runner.remote_instance_transfer_engine_weight_info,
         )
 
+    def get_parallelism_config(self):
+        return self.model_runner.parallelism_config
+
     def forward_batch_generation(
         self,
         model_worker_batch: ModelWorkerBatch,

@@ -42,6 +42,7 @@ from sglang.srt.configs import (
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig, ModelImpl
+from sglang.srt.configs.parallelism_config import RankParallelismConfig
 from sglang.srt.configs.update_config import adjust_config_with_unaligned_cpu_tp
 from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
 from sglang.srt.debug_utils.tensor_dump_forward_hook import (
@@ -316,6 +317,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.remote_instance_transfer_engine = None
         self.remote_instance_transfer_engine_session_id = ""
         self.remote_instance_transfer_engine_weight_info = None
+        self.parallelism_config = None
         # auxiliary hidden capture mode. TODO: expose this to server args?
         self.eagle_use_aux_hidden_state = False
         if self.spec_algorithm.is_eagle3() and not self.is_draft_worker:
@@ -420,6 +422,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if self.server_args.remote_instance_weight_loader_use_transfer_engine():
             self.remote_instance_init_transfer_engine()
+            self.parallelism_config = RankParallelismConfig.from_parallel_state(
+                self.tp_rank
+            )
 
         if not self.is_draft_worker:
             set_global_expert_location_metadata(
