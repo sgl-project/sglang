@@ -461,6 +461,12 @@ class EagleDraftWorker(BaseDraftWorker):
     def draft_forward(
         self, forward_batch: ForwardBatch, *, is_prepare_reflow: bool = False
     ):
+        if is_prepare_reflow:
+            assert self.enable_spec_overlap_reflow, (
+                "The case where is_prepare_reflow is True "
+                "exists only when SGLANG_SPEC_ENABLE_OVERLAP_REFLOW is set to `1`."
+            )
+
         # Parse args
         spec_info: EagleDraftInput = forward_batch.spec_info
         out_cache_loc = forward_batch.out_cache_loc
