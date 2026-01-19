@@ -14,6 +14,7 @@ mod memory;
 mod noop;
 mod oracle;
 mod postgres;
+mod redis;
 
 pub use core::{
     Conversation, ConversationId, ConversationItem, ConversationItemId, ConversationItemStorage,

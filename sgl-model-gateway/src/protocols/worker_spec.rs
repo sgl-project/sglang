@@ -6,6 +6,8 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use super::UNKNOWN_MODEL_ID;
+
 /// Worker configuration for API requests
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct WorkerConfigRequest {
@@ -77,6 +79,10 @@ pub struct WorkerConfigRequest {
     /// Number of failed health checks before marking worker as unhealthy (default: 3)
     #[serde(default = "default_health_failure_threshold")]
     pub health_failure_threshold: u32,
+
+    /// Disable periodic health checks for this worker (default: false)
+    #[serde(default)]
+    pub disable_health_check: bool,
 
     /// Maximum connection attempts during worker registration (default: 20)
     #[serde(default = "default_max_connection_attempts")]
@@ -163,9 +169,39 @@ pub struct WorkerInfo {
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     pub metadata: HashMap<String, String>,
 
+    /// Whether health checks are disabled for this worker
+    pub disable_health_check: bool,
+
     /// Job status for async operations (if available)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub job_status: Option<JobStatus>,
+}
+
+impl WorkerInfo {
+    /// Create a partial WorkerInfo for pending workers (not yet registered).
+    /// Used when a worker ID maps to a URL but the worker is still being registered.
+    pub fn pending(worker_id: &str, url: String, job_status: Option<JobStatus>) -> Self {
+        Self {
+            id: worker_id.to_string(),
+            url,
+            model_id: UNKNOWN_MODEL_ID.to_string(),
+            priority: 0,
+            cost: 1.0,
+            worker_type: UNKNOWN_MODEL_ID.to_string(),
+            is_healthy: false,
+            load: 0,
+            connection_mode: UNKNOWN_MODEL_ID.to_string(),
+            runtime_type: None,
+            tokenizer_path: None,
+            reasoning_parser: None,
+            tool_parser: None,
+            chat_template: None,
+            bootstrap_port: None,
+            metadata: HashMap::new(),
+            disable_health_check: false,
+            job_status,
+        }
+    }
 }
 
 /// Job status for async control plane operations
@@ -210,7 +246,7 @@ pub struct WorkerTypeStats {
 }
 
 /// Worker update request
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerUpdateRequest {
     /// Update priority
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -223,6 +259,30 @@ pub struct WorkerUpdateRequest {
     /// Update labels
     #[serde(skip_serializing_if = "Option::is_none")]
     pub labels: Option<HashMap<String, String>>,
+
+    /// Update API key (for key rotation)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+
+    /// Update health check timeout in seconds
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub health_check_timeout_secs: Option<u64>,
+
+    /// Update health check interval in seconds
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub health_check_interval_secs: Option<u64>,
+
+    /// Update health success threshold
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub health_success_threshold: Option<u32>,
+
+    /// Update health failure threshold
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub health_failure_threshold: Option<u32>,
+
+    /// Disable periodic health checks for this worker
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disable_health_check: Option<bool>,
 }
 
 /// Generic API response

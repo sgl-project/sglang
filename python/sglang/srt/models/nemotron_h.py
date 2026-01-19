@@ -48,6 +48,7 @@ from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
     DEFAULT_VOCAB_PADDING_SIZE,
     ParallelLMHead,
@@ -65,7 +66,7 @@ from sglang.srt.utils import (
     add_prefix,
     get_current_device_stream_fast,
     is_cuda,
-    make_layers_non_pp,
+    make_layers,
 )
 from sglang.utils import logger
 
@@ -137,6 +138,10 @@ class NemotronHMoE(nn.Module):
         self.ep_size = self.ep_group.size()
         self.n_routed_experts = config.n_routed_experts
         self.n_shared_experts = config.n_shared_experts
+        self.use_latent_moe = getattr(config, "moe_latent_size", None) is not None
+        self.moe_hidden_size = (
+            config.moe_latent_size if self.use_latent_moe else config.hidden_size
+        )
 
         self.gate = ReplicatedLinear(
             config.hidden_size,
@@ -164,7 +169,7 @@ class NemotronHMoE(nn.Module):
             num_experts=config.n_routed_experts
             + get_global_server_args().ep_num_redundant_experts,
             top_k=config.num_experts_per_tok,
-            hidden_size=config.hidden_size,
+            hidden_size=self.moe_hidden_size,
             intermediate_size=config.moe_intermediate_size,
             reduce_results=False,
             quant_config=quant_config,
@@ -184,6 +189,25 @@ class NemotronHMoE(nn.Module):
             )
         else:
             self.shared_experts = None
+
+        if self.use_latent_moe:
+            self.fc1_latent_proj = ReplicatedLinear(
+                input_size=config.hidden_size,
+                output_size=self.moe_hidden_size,
+                bias=config.mlp_bias,
+                quant_config=quant_config,
+                prefix=f"{prefix}.fc1_latent_proj",
+            )
+            self.fc2_latent_proj = ReplicatedLinear(
+                input_size=self.moe_hidden_size,
+                output_size=config.hidden_size,
+                bias=config.mlp_bias,
+                quant_config=quant_config,
+                prefix=f"{prefix}.fc2_latent_proj",
+            )
+        else:
+            self.fc1_latent_proj = None
+            self.fc2_latent_proj = None
 
     def _forward_core(
         self,
@@ -205,6 +229,8 @@ class NemotronHMoE(nn.Module):
         else:
             shared_output = None
         topk_output = self.topk(hidden_states, router_logits)
+        if self.use_latent_moe:
+            hidden_states, _ = self.fc1_latent_proj(hidden_states)
         final_hidden_states = self.experts(hidden_states, topk_output)
         return final_hidden_states, shared_output
 
@@ -225,6 +251,8 @@ class NemotronHMoE(nn.Module):
             # router_scores: [num_tokens, num_experts]
             router_logits, _ = self.gate(hidden_states.to(dtype=torch.float32))
             topk_output = self.topk(hidden_states, router_logits)
+            if self.use_latent_moe:
+                hidden_states, _ = self.fc1_latent_proj(hidden_states)
             final_hidden_states = self.experts(hidden_states, topk_output)
         get_current_device_stream_fast().wait_stream(alt_stream)
 
@@ -240,6 +268,9 @@ class NemotronHMoE(nn.Module):
         elif self.shared_experts is not None:
             assert shared_output is not None
             shared_output *= 1.0 / self.routed_scaling_factor
+
+        if self.use_latent_moe:
+            final_hidden_states, _ = self.fc2_latent_proj(final_hidden_states)
 
         if shared_output is not None:
             final_hidden_states += shared_output
@@ -526,21 +557,32 @@ class NemotronHModel(nn.Module):
         )
         self.vocab_size = config.vocab_size + lora_vocab
         self.org_vocab_size = config.vocab_size
+        self.pp_group = get_pp_group()
 
-        self.embed_tokens = VocabParallelEmbedding(
-            self.vocab_size,
-            config.hidden_size,
-            org_num_embeddings=config.vocab_size,
-        )
+        if self.pp_group.is_first_rank:
+            self.embed_tokens = VocabParallelEmbedding(
+                self.vocab_size,
+                config.hidden_size,
+                org_num_embeddings=config.vocab_size,
+            )
+        else:
+            self.embed_tokens = PPMissingLayer()
 
         def get_layer(idx: int, prefix: str):
             layer_class = ALL_DECODER_LAYER_TYPES[config.hybrid_override_pattern[idx]]
             return layer_class(config, idx, quant_config=quant_config, prefix=prefix)
 
-        self.layers = make_layers_non_pp(
-            len(config.hybrid_override_pattern), get_layer, prefix=f"{prefix}.layers"
+        self.layers, self.start_layer, self.end_layer = make_layers(
+            len(config.hybrid_override_pattern),
+            get_layer,
+            pp_rank=self.pp_group.rank_in_group,
+            pp_size=self.pp_group.world_size,
+            prefix=f"{prefix}.layers",
         )
-        self.norm_f = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
+        if self.pp_group.is_last_rank:
+            self.norm_f = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
+        else:
+            self.norm_f = PPMissingLayer(return_tuple=True)
 
     def forward(
         self,
@@ -550,7 +592,7 @@ class NemotronHModel(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
-        if get_pp_group().is_first_rank:
+        if self.pp_group.is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
             else:
@@ -561,8 +603,8 @@ class NemotronHModel(nn.Module):
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
 
-        residual = None
-        for layer in self.layers:
+        for i in range(self.start_layer, self.end_layer):
+            layer = self.layers[i]
             if not isinstance(layer, Layers):
                 raise ValueError(f"Unknown layer type: {type(layer)}")
             hidden_states, residual = layer.forward(
@@ -571,7 +613,7 @@ class NemotronHModel(nn.Module):
                 forward_batch=forward_batch,
             )
 
-        if not get_pp_group().is_last_rank:
+        if not self.pp_group.is_last_rank:
             return PPProxyTensors(
                 {"hidden_states": hidden_states, "residual": residual}
             )
@@ -606,26 +648,45 @@ class NemotronHForCausalLM(nn.Module):
         self.model = self._init_model(
             config=config, quant_config=quant_config, prefix=prefix
         )
-        if self.config.tie_word_embeddings:
-            self.lm_head = self.model.embed_tokens
+        self.pp_group = get_pp_group()
+
+        if self.pp_group.is_last_rank:
+            if self.pp_group.world_size == 1 and self.config.tie_word_embeddings:
+                self.lm_head = self.model.embed_tokens
+            else:
+                self.unpadded_vocab_size = config.vocab_size
+                if lora_config:
+                    self.unpadded_vocab_size += lora_config.lora_extra_vocab_size
+                self.lm_head = ParallelLMHead(
+                    self.unpadded_vocab_size,
+                    config.hidden_size,
+                    org_num_embeddings=config.vocab_size,
+                    padding_size=(
+                        DEFAULT_VOCAB_PADDING_SIZE
+                        # We need bigger padding if using lora for kernel
+                        # compatibility
+                        if not lora_config
+                        else lora_config.lora_vocab_padding_size
+                    ),
+                    quant_config=quant_config,
+                    prefix=add_prefix("lm_head", prefix),
+                )
         else:
-            self.unpadded_vocab_size = config.vocab_size
-            if lora_config:
-                self.unpadded_vocab_size += lora_config.lora_extra_vocab_size
-            self.lm_head = ParallelLMHead(
-                self.unpadded_vocab_size,
-                config.hidden_size,
-                org_num_embeddings=config.vocab_size,
-                padding_size=(
-                    DEFAULT_VOCAB_PADDING_SIZE
-                    # We need bigger padding if using lora for kernel
-                    # compatibility
-                    if not lora_config
-                    else lora_config.lora_vocab_padding_size
-                ),
-                quant_config=quant_config,
-                prefix=add_prefix("lm_head", prefix),
-            )
+            self.lm_head = PPMissingLayer()
+
+        if self.pp_group.world_size > 1 and self.config.tie_word_embeddings:
+            if self.pp_group.is_first_rank:
+                self.pp_group.send(
+                    self.model.embed_tokens.weight, dst=self.pp_group.last_rank
+                )
+            elif self.pp_group.is_last_rank:
+                emb_token_weight = self.pp_group.recv(
+                    size=self.lm_head.weight.shape,
+                    dtype=next(self.model.parameters()).dtype,
+                    src=self.pp_group.first_rank,
+                )
+                self.lm_head.weight.copy_(emb_token_weight)
+
         self.logits_processor = LogitsProcessor(config)
 
     def _init_model(
@@ -653,9 +714,12 @@ class NemotronHForCausalLM(nn.Module):
         hidden_states = self.model.forward(
             input_ids, positions, forward_batch, pp_proxy_tensors, input_embeds
         )
-        return self.logits_processor(
-            input_ids, hidden_states, self.lm_head, forward_batch
-        )
+        if self.pp_group.is_last_rank:
+            return self.logits_processor(
+                input_ids, hidden_states, self.lm_head, forward_batch
+            )
+        else:
+            return hidden_states
 
     def copy_inputs_before_cuda_graphs(self, input_buffers, **kwargs):
         return self.mamba_cache.copy_inputs_before_cuda_graphs(input_buffers, **kwargs)
@@ -663,7 +727,20 @@ class NemotronHForCausalLM(nn.Module):
     def get_seqlen_agnostic_capture_inputs(self, batch_size: int):
         return self.mamba_cache.get_seqlen_agnostic_capture_inputs(batch_size)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> None:
+    def get_embed_and_head(self):
+        return self.model.embed_tokens.weight, self.lm_head.weight
+
+    def set_embed_and_head(self, embed, head):
+        del self.model.embed_tokens.weight
+        del self.lm_head.weight
+        self.model.embed_tokens.weight = embed
+        self.lm_head.weight = head
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+    def load_weights(
+        self, weights: Iterable[tuple[str, torch.Tensor]], is_mtp: bool = False
+    ) -> None:
         updated_weights = []
         for name, loaded_weight in weights:
             name = replace_prefix(name, self.remap_prefix)
@@ -684,10 +761,43 @@ class NemotronHForCausalLM(nn.Module):
         params_dict = dict(self.named_parameters())
 
         for name, loaded_weight in updated_weights:
+            if is_mtp:
+                if "mtp" not in name:
+                    continue
+
+                name = name.replace("mtp.layers.", "model.layers.")
+
+                if "embeddings" in name:
+                    name = name.replace("embeddings", "model.embed_tokens")
+                    if name.startswith("backbone."):
+                        name = name.replace("backbone.", "")
+
+            if not is_mtp and "mtp" in name:
+                continue
+
             if "scale" in name:
                 name = maybe_remap_kv_scale_name(name, params_dict)
                 if name is None:
                     continue
+
+            layer_id = get_layer_id(name)
+            if (
+                layer_id is not None
+                and hasattr(self.model, "start_layer")
+                and (
+                    layer_id < self.model.start_layer
+                    or layer_id >= self.model.end_layer
+                )
+            ):
+                continue
+
+            if "embed_tokens" in name and not self.pp_group.is_first_rank:
+                continue
+
+            if (
+                "norm_f" in name or "lm_head" in name
+            ) and not self.pp_group.is_last_rank:
+                continue
 
             for param_name, weight_name, shard_id in self.stacked_params_mapping:
                 if weight_name not in name:

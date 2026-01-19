@@ -12,17 +12,25 @@
 # limitations under the License.
 # ==============================================================================
 """Utilities for Prometheus Metrics Collection."""
+import dataclasses
+import logging
 import os
 import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Union
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.environ import envs
 from sglang.srt.metrics.utils import exponential_buckets, generate_buckets
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_bool_env_var
+from sglang.srt.utils.gauge_histogram import GaugeHistogram
 
 SGLANG_TEST_REQUEST_TIME_STATS = get_bool_env_var("SGLANG_TEST_REQUEST_TIME_STATS")
+
+
+logger = logging.getLogger(__name__)
 
 
 def get_histogram_conf_from_env(env_var_name: str) -> Optional[List[float]]:
@@ -63,6 +71,17 @@ class TimeStats:
     alloc_waiting_duration: float = 0.0
     prefill_start_time_host: float = 0.0
     prefill_end_time_host: float = 0.0
+    transfer_speed_gb_s: float = 0.0
+    transfer_total_mb: float = 0.0
+    # Number of prefill retries for this request
+    prefill_retry_count: int = 0
+
+    # Timestamp when prefill phase finishes, obtained from `time.time()`.
+    # Note that this differs from the other `_time` fields tracked by the
+    # `TimeStats` class, which are obtained from `time.perf_counter()`.
+    # We use `time.time()` instead of `time.perf_counter()` here in order to
+    # maintain unit consistency with other timestamp fields tracked by the `ReqState` class.
+    prefill_finished_ts: float = 0.0
 
     def get_queueing_time(self) -> float:
         return self.forward_entry_time - self.wait_queue_entry_time
@@ -75,6 +94,11 @@ class TimeStats:
     def get_prefill_launch_latency(self) -> Optional[float]:
         if self.prefill_start_time_host > 0.0 and self.prefill_end_time_host > 0.0:
             return self.prefill_end_time_host - self.prefill_start_time_host
+        return None
+
+    def get_prefill_finished_ts(self) -> Optional[float]:
+        if self.prefill_finished_ts > 0.0:
+            return self.prefill_finished_ts
         return None
 
     def convert_to_duration(self) -> str:
@@ -115,7 +139,10 @@ class TimeStats:
                 f"+ other({self.format_duration(other)}); "
                 f"queue_duration={self.format_duration(queue_duration)}, "
                 f"forward_duration={self.format_duration(forward_duration)}, "
-                f"start={self.prefill_bootstrap_queue_entry_time:.3f}"
+                f"start={self.prefill_bootstrap_queue_entry_time:.3f}, "
+                f"transfer_speed={self.transfer_speed_gb_s:.2f}GB/s, "
+                f"transfer_total={self.transfer_total_mb:.2f}MB, "
+                f"#retries={self.prefill_retry_count}"
             )
         elif self.disagg_mode == DisaggregationMode.DECODE:
             prealloc_duration = (
@@ -178,6 +205,7 @@ class SchedulerStats:
     pending_prealloc_token_usage: float = 0.0
     swa_token_usage: float = 0.0
     mamba_usage: float = 0.0
+    decode_sum_seq_lens: int = 0
     gen_throughput: float = 0.0
     num_queue_reqs: int = 0
     num_grammar_queue_reqs: int = 0
@@ -203,6 +231,7 @@ class SchedulerStats:
     kv_transfer_latency_ms: float = 0.0
     kv_transfer_bootstrap_ms: float = 0.0
     kv_transfer_alloc_ms: float = 0.0
+    kv_transfer_total_mb: float = 0.0
 
     # Utilization
     utilization: float = 0.0
@@ -216,17 +245,59 @@ class SchedulerStats:
     # CUDA graph
     is_cuda_graph: float = 0.0
 
+    # LoRA pool metrics
+    lora_pool_slots_used: int = 0
+    lora_pool_slots_total: int = 0
+    lora_pool_utilization: float = 0.0
+
+    # Routing key metrics
+    num_unique_running_routing_keys: int = 0
+    routing_key_running_req_counts: List[int] = field(default_factory=list)
+    routing_key_all_req_counts: List[int] = field(default_factory=list)
+
+
+ROUTING_KEY_REQ_COUNT_BUCKET_BOUNDS = [1, 2, 3, 5, 7, 10, 20, 50, 100, 200]
+
+
+def compute_routing_key_stats(routing_keys: List[Optional[str]]) -> tuple:
+    """Returns (num_unique_keys, per_key_counts)."""
+    from collections import Counter
+
+    key_counts = Counter(k for k in routing_keys if k is not None)
+    return len(key_counts), list(key_counts.values())
+
+
+@dataclass
+class DPCooperationInfo:
+    # Users can derive that, except for cases with idle, num_decode_ranks=world_size-num_prefill_ranks
+    # We do not provide `num_decode_ranks` to avoid cardinality explosion.
+    num_prefill_ranks: int
+
+    @staticmethod
+    def create(forward_modes: List[int]):
+        return DPCooperationInfo(
+            num_prefill_ranks=sum(
+                1 for mode in forward_modes if mode == ForwardMode.EXTEND.value
+            ),
+        )
+
+    def to_labels(self):
+        return dataclasses.asdict(self)
+
 
 class SchedulerMetricsCollector:
 
     def __init__(
         self,
         labels: Dict[str, str],
+        enable_lora: bool = False,
+        server_args: Optional["ServerArgs"] = None,
     ) -> None:
         # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
-        from prometheus_client import Counter, Gauge, Histogram
+        from prometheus_client import Counter, Gauge, Histogram, Summary
 
         self.labels = labels
+        self.enable_lora = enable_lora
         self.last_log_time = time.perf_counter()
 
         self.num_running_reqs = Gauge(
@@ -262,6 +333,12 @@ class SchedulerMetricsCollector:
         self.mamba_usage = Gauge(
             name="sglang:mamba_usage",
             documentation="The token usage for Mamba layers.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.decode_sum_seq_lens = Gauge(
+            name="sglang:decode_sum_seq_lens",
+            documentation="The sum of all sequence lengths in decode.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
@@ -318,9 +395,26 @@ class SchedulerMetricsCollector:
         )
 
         # Retract
+        # TODO maybe remove this old gauge in favor of the new counter
         self.num_retracted_reqs = Gauge(
             name="sglang:num_retracted_reqs",
             documentation="The number of retracted requests.",
+            labelnames=labels.keys(),
+        )
+        self.num_retracted_reqs_total = Counter(
+            # The name is `requests` instead of `reqs` to avoid dup name error
+            name="sglang:num_retracted_requests_total",
+            documentation="Total number of retracted requests.",
+            labelnames=labels.keys(),
+        )
+        self.num_retracted_input_tokens_total = Counter(
+            name="sglang:num_retracted_input_tokens_total",
+            documentation="Total number of retracted input tokens.",
+            labelnames=labels.keys(),
+        )
+        self.num_retracted_output_tokens_total = Counter(
+            name="sglang:num_retracted_output_tokens_total",
+            documentation="Total number of retracted output tokens.",
             labelnames=labels.keys(),
         )
         self.num_paused_reqs = Gauge(
@@ -364,6 +458,11 @@ class SchedulerMetricsCollector:
             documentation="The number of transfer failed requests.",
             labelnames=labels.keys(),
         )
+        self.num_prefill_retries_total = Counter(
+            name="sglang:num_prefill_retries_total",
+            documentation="Total number of prefill retries.",
+            labelnames=labels.keys(),
+        )
         self.kv_transfer_speed_gb_s = Gauge(
             name="sglang:kv_transfer_speed_gb_s",
             documentation="The transfer speed of the KV cache in GB/s.",
@@ -385,6 +484,12 @@ class SchedulerMetricsCollector:
         self.kv_transfer_alloc_ms = Gauge(
             name="sglang:kv_transfer_alloc_ms",
             documentation="The allocation waiting time of the KV transfer in ms.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.kv_transfer_total_mb = Gauge(
+            name="sglang:kv_transfer_total_mb",
+            documentation="The total number of tokens transferred in the KV cache.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
@@ -598,11 +703,66 @@ class SchedulerMetricsCollector:
             labelnames=list(labels.keys()) + ["stage"],
         )
 
+        # TODO maybe remove this old gauge in favor of the new counter
         self.is_cuda_graph = Gauge(
             name="sglang:is_cuda_graph",
             documentation="Whether the batch is using CUDA graph.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
+        )
+        self.cuda_graph_passes_total = Counter(
+            name="sglang:cuda_graph_passes_total",
+            documentation="Total number of forward passes categorized by CUDA graph.",
+            labelnames=list(labels.keys()) + ["mode"],
+        )
+
+        if (
+            labels["moe_ep_rank"] == 0
+        ) and envs.SGLANG_ENABLE_EPLB_BALANCEDNESS_METRIC.get():
+            self.eplb_balancedness = Summary(
+                name="sglang:eplb_balancedness",
+                documentation="Balancedness of MoE in expert parallelism.",
+                labelnames=list(labels.keys()) + ["forward_mode"],
+            )
+
+        # LoRA pool metrics (only created when LoRA is enabled)
+        if self.enable_lora:
+            self.lora_pool_slots_used = Gauge(
+                name="sglang:lora_pool_slots_used",
+                documentation="Number of LoRA adapter slots currently occupied in GPU memory.",
+                labelnames=labels.keys(),
+                multiprocess_mode="mostrecent",
+            )
+            self.lora_pool_slots_total = Gauge(
+                name="sglang:lora_pool_slots_total",
+                documentation="Total number of LoRA adapter slots available (max_loras_per_batch).",
+                labelnames=labels.keys(),
+                multiprocess_mode="mostrecent",
+            )
+            self.lora_pool_utilization = Gauge(
+                name="sglang:lora_pool_utilization",
+                documentation="LoRA pool utilization ratio (used/total). 1.0 means pool is full.",
+                labelnames=labels.keys(),
+                multiprocess_mode="mostrecent",
+            )
+
+        self.num_unique_running_routing_keys = Gauge(
+            name="sglang:num_unique_running_routing_keys",
+            documentation="Number of unique routing keys in running batch.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.routing_key_running_req_count = GaugeHistogram(
+            name="sglang:routing_key_running_req_count",
+            documentation="Distribution of routing keys by running request count (gt < count <= le).",
+            labelnames=list(labels.keys()),
+            bucket_bounds=ROUTING_KEY_REQ_COUNT_BUCKET_BOUNDS,
+        )
+        self.routing_key_all_req_count = GaugeHistogram(
+            name="sglang:routing_key_all_req_count",
+            documentation="Distribution of routing keys by running+waiting request count (gt < count <= le).",
+            labelnames=list(labels.keys()),
+            bucket_bounds=ROUTING_KEY_REQ_COUNT_BUCKET_BOUNDS,
         )
 
         self.new_token_ratio = Gauge(
@@ -610,6 +770,83 @@ class SchedulerMetricsCollector:
             documentation="The new token ratio.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
+        )
+
+        self.realtime_tokens_total = Counter(
+            name="sglang:realtime_tokens_total",
+            documentation=(
+                "Total number of tokens processed (updated on each log interval). "
+                "mode: prefill_compute, prefill_cache, decode."
+            ),
+            labelnames=list(labels.keys()) + ["mode"],
+        )
+        self.gpu_execution_seconds_total = Counter(
+            name="sglang:gpu_execution_seconds_total",
+            documentation=(
+                "Total time that GPU is busy executing a workload. "
+                "Refer to ForwardMode for category labels."
+            ),
+            labelnames=list(labels.keys()) + ["category"],
+        )
+
+        self.dp_cooperation_realtime_tokens_total = Counter(
+            name="sglang:dp_cooperation_realtime_tokens_total",
+            documentation=(
+                "Total number of tokens processed with labels about DP cooperation. "
+                "mode: prefill_compute, prefill_cache, decode."
+            ),
+            labelnames=list(labels.keys()) + ["mode", "num_prefill_ranks"],
+        )
+        self.dp_cooperation_gpu_execution_seconds_total = Counter(
+            name="sglang:dp_cooperation_gpu_execution_seconds_total",
+            documentation=(
+                "Total time that GPU is busy executing a workload with labels about DP cooperation. "
+                "Refer to ForwardMode for category labels."
+            ),
+            labelnames=list(labels.keys()) + ["category", "num_prefill_ranks"],
+        )
+
+        max_delay = server_args.prefill_delayer_max_delay_passes
+        self.prefill_delayer_wait_forward_passes = Histogram(
+            name="sglang:prefill_delayer_wait_forward_passes",
+            documentation="Histogram of forward passes waited by prefill delayer.",
+            labelnames=labels.keys(),
+            buckets=sorted(
+                set(
+                    x
+                    for x in (
+                        server_args.prefill_delayer_forward_passes_buckets
+                        or [5, 20, 50, 100, 200]
+                    )
+                    if x < max_delay
+                )
+                # Need bucket "<=0" for zero-delay cases, and "max_delay-1" to distinguish "max_delay" timeout passes
+                | {0, max_delay - 1}
+            ),
+        )
+        self.prefill_delayer_wait_seconds = Histogram(
+            name="sglang:prefill_delayer_wait_seconds",
+            documentation="Histogram of wait time in seconds by prefill delayer.",
+            labelnames=labels.keys(),
+            buckets=sorted(
+                set(
+                    server_args.prefill_delayer_wait_seconds_buckets
+                    or [1, 2, 5, 10, 20, 50, 100, 200, 500]
+                )
+                # Need bucket "<=0" for zero-delay cases
+                | {0}
+            ),
+        )
+        self.prefill_delayer_outcomes_total = Counter(
+            name="sglang:prefill_delayer_outcomes_total",
+            documentation="Prefill delayer outcome counts.",
+            labelnames=[
+                *labels.keys(),
+                "input_estimation",
+                "output_allow",
+                "output_reason",
+                "actual_execution",
+            ],
         )
 
     def _log_gauge(self, gauge, data: Union[int, float]) -> None:
@@ -625,12 +862,100 @@ class SchedulerMetricsCollector:
     def increment_transfer_failed_reqs(self) -> None:
         self.num_transfer_failed_reqs.labels(**self.labels).inc(1)
 
+    def increment_prefill_retries(self, count: int) -> None:
+        if count > 0:
+            self.num_prefill_retries_total.labels(**self.labels).inc(count)
+
     def observe_per_stage_req_latency(self, stage: str, latency: float) -> None:
         labels_with_stage = {**self.labels, "stage": stage}
         self.per_stage_req_latency_seconds.labels(**labels_with_stage).observe(latency)
 
     def observe_queue_time(self, latency: float) -> None:
         self._log_histogram(self.queue_time, latency)
+
+    def observe_prefill_delayer_outcome(
+        self,
+        forward_passes: int,
+        wait_seconds: float,
+        input_estimation: str,
+        output_allow: bool,
+        output_reason: str,
+        actual_execution: bool,
+    ) -> None:
+        if output_allow and actual_execution:
+            self._log_histogram(
+                self.prefill_delayer_wait_forward_passes, forward_passes
+            )
+            self._log_histogram(self.prefill_delayer_wait_seconds, wait_seconds)
+
+        self.prefill_delayer_outcomes_total.labels(
+            **self.labels,
+            input_estimation=input_estimation,
+            output_allow=str(output_allow).lower(),
+            output_reason=output_reason,
+            actual_execution=str(actual_execution).lower(),
+        ).inc(1)
+
+    def increment_retracted_reqs(
+        self,
+        num_retracted_reqs: int,
+        num_retracted_input_tokens: int,
+        num_retracted_output_tokens: int,
+    ) -> None:
+        self.num_retracted_reqs_total.labels(**self.labels).inc(num_retracted_reqs)
+        self.num_retracted_input_tokens_total.labels(**self.labels).inc(
+            num_retracted_input_tokens
+        )
+        self.num_retracted_output_tokens_total.labels(**self.labels).inc(
+            num_retracted_output_tokens
+        )
+
+    def increment_cuda_graph_pass(self, value: bool) -> None:
+        # leave room for piecewise cuda graph, etc
+        mode = "decode_cuda_graph" if value else "decode_none"
+        self.cuda_graph_passes_total.labels(**self.labels, mode=mode).inc(1)
+
+    def increment_eplb_balancedness(
+        self, forward_mode: str, balancedness: float
+    ) -> None:
+        self.eplb_balancedness.labels(**self.labels, forward_mode=forward_mode).observe(
+            balancedness
+        )
+
+    def increment_realtime_tokens(
+        self,
+        dp_cooperation_info: Optional[DPCooperationInfo],
+        prefill_compute_tokens=0,
+        prefill_cache_tokens=0,
+        decode_tokens=0,
+    ):
+        for mode, delta in [
+            ("prefill_compute", prefill_compute_tokens),
+            ("prefill_cache", prefill_cache_tokens),
+            ("decode", decode_tokens),
+        ]:
+            self.realtime_tokens_total.labels(**self.labels, mode=mode).inc(delta)
+            if dp_cooperation_info is not None:
+                self.dp_cooperation_realtime_tokens_total.labels(
+                    **self.labels,
+                    mode=mode,
+                    **dp_cooperation_info.to_labels(),
+                ).inc(delta)
+
+    def increment_gpu_execution_seconds(
+        self,
+        category: str,
+        t: float,
+        dp_cooperation_info: Optional[DPCooperationInfo],
+    ):
+        logger.debug(f"GPU execution seconds: {category=} {t=:.3f}")
+        self.gpu_execution_seconds_total.labels(**self.labels, category=category).inc(t)
+        if dp_cooperation_info is not None:
+            self.dp_cooperation_gpu_execution_seconds_total.labels(
+                **self.labels,
+                category=category,
+                **dp_cooperation_info.to_labels(),
+            ).inc(t)
 
     def log_stats(self, stats: SchedulerStats) -> None:
         self._log_gauge(self.num_running_reqs, stats.num_running_reqs)
@@ -641,6 +966,7 @@ class SchedulerMetricsCollector:
         )
         self._log_gauge(self.swa_token_usage, stats.swa_token_usage)
         self._log_gauge(self.mamba_usage, stats.mamba_usage)
+        self._log_gauge(self.decode_sum_seq_lens, stats.decode_sum_seq_lens)
         self._log_gauge(self.gen_throughput, stats.gen_throughput)
         self._log_gauge(self.num_queue_reqs, stats.num_queue_reqs)
         self._log_gauge(self.num_grammar_queue_reqs, stats.num_grammar_queue_reqs)
@@ -672,6 +998,7 @@ class SchedulerMetricsCollector:
         self._log_gauge(self.kv_transfer_latency_ms, stats.kv_transfer_latency_ms)
         self._log_gauge(self.kv_transfer_bootstrap_ms, stats.kv_transfer_bootstrap_ms)
         self._log_gauge(self.kv_transfer_alloc_ms, stats.kv_transfer_alloc_ms)
+        self._log_gauge(self.kv_transfer_total_mb, stats.kv_transfer_total_mb)
 
         # Retract
         self._log_gauge(self.num_retracted_reqs, stats.num_retracted_reqs)
@@ -695,6 +1022,22 @@ class SchedulerMetricsCollector:
 
         # CUDA graph
         self._log_gauge(self.is_cuda_graph, stats.is_cuda_graph)
+
+        # LoRA pool metrics (only logged if LoRA is enabled)
+        if self.enable_lora:
+            self._log_gauge(self.lora_pool_slots_used, stats.lora_pool_slots_used)
+            self._log_gauge(self.lora_pool_slots_total, stats.lora_pool_slots_total)
+            self._log_gauge(self.lora_pool_utilization, stats.lora_pool_utilization)
+
+        self._log_gauge(
+            self.num_unique_running_routing_keys, stats.num_unique_running_routing_keys
+        )
+        self.routing_key_running_req_count.set_by_current_observations(
+            self.labels, stats.routing_key_running_req_counts
+        )
+        self.routing_key_all_req_count.set_by_current_observations(
+            self.labels, stats.routing_key_all_req_counts
+        )
 
         self.last_log_time = time.perf_counter()
 

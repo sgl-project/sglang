@@ -67,8 +67,6 @@ _DP: Optional[GroupCoordinator] = None
 _DIT: Optional[GroupCoordinator] = None
 _VAE: Optional[GroupCoordinator] = None
 
-logger = init_logger(__name__)
-
 TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 
 
@@ -244,8 +242,12 @@ def init_distributed_environment(
             "distributed environment"
         )
 
-        # For MPS, don't pass device_id as it doesn't support device indices
-        extra_args = {} if current_platform.is_mps() else dict(device_id=device_id)
+        # For MPS and MUSA, don't pass device_id as it doesn't support device indices
+        extra_args = (
+            {}
+            if (current_platform.is_mps() or current_platform.is_musa())
+            else dict(device_id=device_id)
+        )
         torch.distributed.init_process_group(
             backend=backend,
             init_method=distributed_init_method,
@@ -342,7 +344,9 @@ def initialize_model_parallel(
     """
 
     if backend is None:
-        backend = envs.get_torch_distributed_backend()
+        from sglang.multimodal_gen.runtime.platforms import current_platform
+
+        backend = current_platform.get_torch_distributed_backend_str()
     # Get world size and rank. Ensure some consistencies.
     assert torch.distributed.is_initialized()
     world_size: int = torch.distributed.get_world_size()
@@ -404,15 +408,31 @@ def initialize_model_parallel(
     global _SP
     assert _SP is None, "sequence parallel group is already initialized"
 
-    from yunchang import set_seq_parallel_pg
-    from yunchang.globals import PROCESS_GROUP
+    try:
+        from .parallel_groups import PROCESS_GROUP as _YC_PROCESS_GROUP
+        from .parallel_groups import (
+            set_seq_parallel_pg_by_sp_groups as _set_seq_parallel_pg_by_sp_groups,
+        )
+    except ImportError:
+        _set_seq_parallel_pg_by_sp_groups = None
 
-    set_seq_parallel_pg(
-        sp_ulysses_degree=ulysses_degree,
-        sp_ring_degree=ring_degree,
-        rank=get_world_group().rank_in_group,
-        world_size=dit_parallel_size,
-    )
+        class _DummyProcessGroup:
+            ULYSSES_PG = torch.distributed.group.WORLD
+            RING_PG = torch.distributed.group.WORLD
+
+        PROCESS_GROUP = _DummyProcessGroup()
+    else:
+        # Build SGLang Diffusion SP sub-groups based on the true SP groups. This is
+        # critical when TP>1, because SP groups may be strided in global ranks
+        # (e.g., tp-sp order).
+        sp_groups = rank_generator.get_ranks("sp")
+        _set_seq_parallel_pg_by_sp_groups(
+            sp_ulysses_degree=ulysses_degree,
+            sp_ring_degree=ring_degree,
+            rank=get_world_group().rank,
+            sp_groups=sp_groups,
+        )
+        PROCESS_GROUP = _YC_PROCESS_GROUP
 
     _SP = init_parallel_group_coordinator(
         group_ranks=rank_generator.get_ranks("sp"),
@@ -617,8 +637,6 @@ def patch_tensor_parallel_group(tp_group: GroupCoordinator):
     This method is for draft workers of speculative decoding to run draft model
     with different tp degree from that of target model workers.
 
-    Args:
-        tp_group (GroupCoordinator): the tp group coordinator
     """
     global _TP_STATE_PATCHED
     assert not _TP_STATE_PATCHED, "Should not call when it's already patched"

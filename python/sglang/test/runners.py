@@ -31,6 +31,7 @@ from transformers import (
 )
 
 from sglang.srt.entrypoints.engine import Engine
+from sglang.srt.model_loader.ci_weight_validation import ci_validate_and_clean_hf_cache
 from sglang.srt.utils import is_npu, load_image
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.test_utils import DEFAULT_PORT_FOR_SRT_TEST_RUNNER, calculate_rouge_l
@@ -250,6 +251,10 @@ class HFRunner:
     ):
         # Apply model-specific patches
         monkey_patch_gemma2_sdpa()
+
+        # Validate and clean corrupted files in HF cache (CI only)
+        # This is needed because HFRunner bypasses SGLang's weight validation
+        ci_validate_and_clean_hf_cache(model_path)
 
         # Load the model and tokenizer
         if self.model_type == "generation":
@@ -547,6 +552,7 @@ class SRTRunner:
         max_lora_rank: Optional[int] = None,
         lora_target_modules: Optional[List[str]] = None,
         enable_lora: Optional[bool] = None,
+        enable_lora_overlap_loading: Optional[bool] = None,
         max_loaded_loras: Optional[int] = None,
         json_model_override_args: Optional[dict[str, Any]] = None,
         lora_eviction_policy: str = "lru",
@@ -607,6 +613,7 @@ class SRTRunner:
             max_lora_rank=max_lora_rank,
             lora_target_modules=lora_target_modules,
             enable_lora=enable_lora,
+            enable_lora_overlap_loading=enable_lora_overlap_loading,
             max_loaded_loras=max_loaded_loras,
             json_model_override_args=(
                 json.dumps(json_model_override_args)
