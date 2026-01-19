@@ -2,7 +2,7 @@
 """
 Generate diffusion CI outputs for consistency testing.
 
-This script reuses the CI test code by running pytest with SGLANG_GEN_GT=1,
+This script reuses the CI test code by calling run_suite.py with SGLANG_GEN_GT=1,
 ensuring that GT generation uses exactly the same code path as CI tests.
 
 Usage:
@@ -12,61 +12,13 @@ Usage:
 
 import argparse
 import os
-import subprocess
 import sys
 from pathlib import Path
 
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.test.server.testcase_configs import (
-    ONE_GPU_CASES_A,
-    ONE_GPU_CASES_B,
-    TWO_GPU_CASES_A,
-    TWO_GPU_CASES_B,
-    DiffusionTestCase,
-)
+from sglang.multimodal_gen.test.run_suite import SUITES, collect_test_items, run_pytest
 
 logger = init_logger(__name__)
-
-
-def _get_cases_for_suite(
-    suite: str, case_ids: list[str] | None = None
-) -> list[DiffusionTestCase]:
-    """Get test cases for the specified suite, optionally filtered by case IDs."""
-    if suite == "1-gpu":
-        all_cases = ONE_GPU_CASES_A + ONE_GPU_CASES_B
-    elif suite == "2-gpu":
-        all_cases = TWO_GPU_CASES_A + TWO_GPU_CASES_B
-    else:
-        raise ValueError(f"Invalid suite: {suite}. Must be '1-gpu' or '2-gpu'")
-
-    # Deduplicate by case.id
-    seen: set[str] = set()
-    deduplicated: list[DiffusionTestCase] = []
-    for c in all_cases:
-        if c.id not in seen:
-            seen.add(c.id)
-            deduplicated.append(c)
-
-    # Filter by case_ids if provided
-    if case_ids is not None and len(case_ids) > 0:
-        case_id_set = set(case_ids)
-        filtered_cases = [c for c in deduplicated if c.id in case_id_set]
-        if len(filtered_cases) == 0:
-            logger.warning(f"No matching cases found for provided case IDs: {case_ids}")
-        missing_ids = case_id_set - {c.id for c in filtered_cases}
-        if missing_ids:
-            logger.warning(f"Some case IDs not found: {missing_ids}")
-        return filtered_cases
-
-    return deduplicated
-
-
-def _build_pytest_filter(case_ids: list[str]) -> str:
-    """Build pytest -k filter expression for specific case IDs."""
-    # pytest parametrized test format: test_diffusion_generation[case_id]
-    # We need to match any of the case IDs
-    filters = [f"test_diffusion_generation[{case_id}]" for case_id in case_ids]
-    return " or ".join(filters)
 
 
 def main():
@@ -125,86 +77,77 @@ def main():
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Get cases
-    all_cases = _get_cases_for_suite(
-        args.suite, args.case_ids if args.case_ids else None
+    # Set environment variables for GT generation mode
+    os.environ["SGLANG_GEN_GT"] = "1"
+    os.environ["SGLANG_GT_OUTPUT_DIR"] = str(out_dir.absolute())
+    os.environ["SGLANG_SKIP_CONSISTENCY"] = (
+        "1"  # Skip consistency checks in GT gen mode
     )
 
-    # Apply partition filtering if specified
-    if args.partition_id is not None and args.total_partitions is not None:
-        my_cases = [
-            c
-            for i, c in enumerate(all_cases)
-            if i % args.total_partitions == args.partition_id
-        ]
-        logger.info(
-            f"Partition {args.partition_id}/{args.total_partitions}: "
-            f"running {len(my_cases)} of {len(all_cases)} cases"
-        )
-    else:
-        my_cases = all_cases
-        logger.info(f"Running {len(my_cases)} cases")
-
-    if len(my_cases) == 0:
-        logger.warning("No cases to run")
-        return
-
-    # Build pytest filter expression
-    case_ids = [case.id for case in my_cases]
-    pytest_filter = _build_pytest_filter(case_ids)
-
-    # Determine test files based on suite
-    # For 1-gpu: test_server_a.py (ONE_GPU_CASES_A) and test_server_b.py (ONE_GPU_CASES_B)
-    # For 2-gpu: test_server_2_gpu_a.py (TWO_GPU_CASES_A) and test_server_2_gpu_b.py (TWO_GPU_CASES_B)
-    if args.suite == "1-gpu":
-        test_files = [
-            "python/sglang/multimodal_gen/test/server/test_server_a.py",
-            "python/sglang/multimodal_gen/test/server/test_server_b.py",
-        ]
-    else:  # 2-gpu
-        test_files = [
-            "python/sglang/multimodal_gen/test/server/test_server_2_gpu_a.py",
-            "python/sglang/multimodal_gen/test/server/test_server_2_gpu_b.py",
-        ]
-
-    # Build pytest command
-    pytest_cmd = [
-        sys.executable,
-        "-m",
-        "pytest",
-        "-s",  # Don't capture output
-        "-v",  # Verbose
-        "-k",
-        pytest_filter,
-    ] + test_files
-
-    # Set environment variables for GT generation mode
-    env = os.environ.copy()
-    env["SGLANG_GEN_GT"] = "1"
-    env["SGLANG_GT_OUTPUT_DIR"] = str(out_dir.absolute())
-    env["SGLANG_SKIP_CONSISTENCY"] = "1"  # Skip consistency checks in GT gen mode
-
-    logger.info(f"Running pytest with filter: {pytest_filter}")
+    logger.info(f"GT generation mode enabled")
     logger.info(f"Output directory: {out_dir}")
-    logger.info(f"Command: {' '.join(pytest_cmd)}")
 
-    # Run pytest
-    try:
-        result = subprocess.run(
-            pytest_cmd,
-            env=env,
-            check=not args.continue_on_error,
-        )
-        if result.returncode != 0:
-            if args.continue_on_error:
-                logger.warning(f"pytest exited with code {result.returncode}")
-            else:
-                sys.exit(result.returncode)
-    except subprocess.CalledProcessError as e:
+    # Resolve test files path (same as run_suite.py)
+    current_file_path = Path(__file__).resolve()
+    test_root_dir = current_file_path.parent.parent  # scripts -> test
+    target_dir = test_root_dir / "server"
+
+    # Get files from suite (same as run_suite.py)
+    suite_files_rel = SUITES[args.suite]
+    suite_files_abs = []
+    for f_rel in suite_files_rel:
+        f_abs = target_dir / f_rel
+        if not f_abs.exists():
+            logger.warning(f"Test file {f_rel} not found in {target_dir}. Skipping.")
+            continue
+        suite_files_abs.append(str(f_abs))
+
+    if not suite_files_abs:
+        logger.error(f"No valid test files found for suite '{args.suite}'.")
+        sys.exit(1)
+
+    # Build pytest filter for case_ids if provided
+    filter_expr = None
+    if args.case_ids:
+        # pytest parametrized test format: test_diffusion_generation[case_id]
+        filters = [f"test_diffusion_generation[{case_id}]" for case_id in args.case_ids]
+        filter_expr = " or ".join(filters)
+        logger.info(f"Filtering by case IDs: {args.case_ids}")
+
+    # Collect all test items (same as run_suite.py)
+    all_test_items = collect_test_items(suite_files_abs, filter_expr=filter_expr)
+
+    if not all_test_items:
+        logger.warning(f"No test items found for suite '{args.suite}'.")
+        sys.exit(0)
+
+    # Partition by test items (same as run_suite.py)
+    partition_id = args.partition_id if args.partition_id is not None else 0
+    total_partitions = args.total_partitions if args.total_partitions is not None else 1
+
+    my_items = [
+        item
+        for i, item in enumerate(all_test_items)
+        if i % total_partitions == partition_id
+    ]
+
+    logger.info(
+        f"Partition {partition_id}/{total_partitions}: "
+        f"running {len(my_items)} of {len(all_test_items)} test items"
+    )
+
+    if not my_items:
+        logger.warning("No items assigned to this partition. Exiting success.")
+        sys.exit(0)
+
+    # Run pytest with the specific test items (same as run_suite.py)
+    exit_code = run_pytest(my_items)
+
+    if exit_code != 0:
         if args.continue_on_error:
-            logger.error(f"pytest failed: {e}", exc_info=True)
+            logger.warning(f"pytest exited with code {exit_code}")
         else:
-            raise
+            sys.exit(exit_code)
 
 
 if __name__ == "__main__":
