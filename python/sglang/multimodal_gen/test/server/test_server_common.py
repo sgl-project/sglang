@@ -37,9 +37,11 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
 )
 from sglang.multimodal_gen.test.test_utils import (
     _consistency_gt_filenames,
+    _get_consistency_gt_dir,
     compare_with_gt,
     extract_key_frames_from_video,
     get_clip_threshold,
+    get_consistency_gt_candidates,
     get_dynamic_server_port,
     gt_exists,
     image_bytes_to_numpy,
@@ -471,9 +473,18 @@ Consider updating perf_baselines.json with the snippets below:
         if not gt_exists(
             case.id, num_gpus, is_video=is_video, output_format=output_format
         ):
-            names = ", ".join(
-                _consistency_gt_filenames(case.id, num_gpus, is_video, output_format)
-            )
+            if _get_consistency_gt_dir() is not None:
+                names = ", ".join(
+                    get_consistency_gt_candidates(
+                        case.id, num_gpus, is_video, output_format
+                    )
+                )
+            else:
+                names = ", ".join(
+                    _consistency_gt_filenames(
+                        case.id, num_gpus, is_video, output_format
+                    )
+                )
             error_msg = f"""
 --- MISSING GROUND TRUTH DETECTED ---
 GT image(s) not found for '{case.id}'.

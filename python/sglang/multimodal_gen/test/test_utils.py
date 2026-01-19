@@ -539,6 +539,28 @@ def _consistency_gt_filenames(
     return [f"{case_id}_{n}gpu.{ext}"]
 
 
+def get_consistency_gt_candidates(
+    case_id: str, num_gpus: int, is_video: bool, output_format: str | None = None
+) -> list[str]:
+    """Return list of GT filenames to try when using SGLANG_CONSISTENCY_GT_DIR.
+
+    For image: [base.png, base.jpg, base.webp] in preferred-first order so that
+    GT can be stored as .png, .jpg, or .webp. For video: the 3 frame filenames
+    (no extension fallback).
+    """
+    n = num_gpus
+    if is_video:
+        return [
+            f"{case_id}_{n}gpu_frame_0.png",
+            f"{case_id}_{n}gpu_frame_mid.png",
+            f"{case_id}_{n}gpu_frame_last.png",
+        ]
+    base = f"{case_id}_{n}gpu"
+    preferred = output_format_to_ext(output_format)
+    exts = [preferred] + [e for e in ("png", "jpg", "webp") if e != preferred]
+    return [f"{base}.{e}" for e in exts]
+
+
 def _get_consistency_gt_dir() -> Path | None:
     """If SGLANG_CONSISTENCY_GT_DIR is set, return that Path; else None (use remote)."""
     d = os.environ.get("SGLANG_CONSISTENCY_GT_DIR")
@@ -563,10 +585,28 @@ def load_gt_embeddings(
 
     gt_dir = _get_consistency_gt_dir()
     if gt_dir is not None:
-        for fn in filenames:
-            path = gt_dir / fn
-            if not path.exists():
-                raise FileNotFoundError(f"GT image not found: {path}")
+        candidates = get_consistency_gt_candidates(
+            case_id, num_gpus, is_video, output_format
+        )
+        if is_video:
+            for fn in candidates:
+                path = gt_dir / fn
+                if not path.exists():
+                    raise FileNotFoundError(f"GT image not found: {path}")
+                arr = np.array(Image.open(path).convert("RGB"))
+                emb = compute_clip_embedding(arr)
+                embeddings.append(emb)
+        else:
+            path = None
+            for fn in candidates:
+                p = gt_dir / fn
+                if p.exists():
+                    path = p
+                    break
+            if path is None:
+                raise FileNotFoundError(
+                    f"GT image not found in {gt_dir}. Tried: {', '.join(candidates)}"
+                )
             arr = np.array(Image.open(path).convert("RGB"))
             emb = compute_clip_embedding(arr)
             embeddings.append(emb)
@@ -597,13 +637,17 @@ def gt_exists(
     output_format: str | None = None,
 ) -> bool:
     """Check if GT image(s) exist (sgl-test-files or SGLANG_CONSISTENCY_GT_DIR)."""
-    filenames = _consistency_gt_filenames(case_id, num_gpus, is_video, output_format)
-    fn = filenames[0]
-
     gt_dir = _get_consistency_gt_dir()
     if gt_dir is not None:
-        return (gt_dir / fn).exists()
+        candidates = get_consistency_gt_candidates(
+            case_id, num_gpus, is_video, output_format
+        )
+        if is_video:
+            return all((gt_dir / c).exists() for c in candidates)
+        return any((gt_dir / c).exists() for c in candidates)
 
+    filenames = _consistency_gt_filenames(case_id, num_gpus, is_video, output_format)
+    fn = filenames[0]
     url = f"{SGL_TEST_FILES_CONSISTENCY_GT_BASE}/{fn}"
     try:
         r = requests.head(url, timeout=10)
