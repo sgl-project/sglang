@@ -92,6 +92,7 @@ LOAD_FORMAT_CHOICES = [
 QUANTIZATION_CHOICES = [
     "awq",
     "fp8",
+    "mxfp8",
     "gptq",
     "marlin",
     "gptq_marlin",

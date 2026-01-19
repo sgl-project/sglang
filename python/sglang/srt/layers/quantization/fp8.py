@@ -46,8 +46,10 @@ from sglang.srt.layers.quantization.fp8_utils import (
     cutlass_fp8_supported,
     dispatch_w8a8_block_fp8_linear,
     input_to_float8,
+    mxfp8_group_quantize,
     normalize_e4m3fn_to_e4m3fnuz,
     requant_weight_ue8m0_inplace,
+    triton_mxfp8_blockscaled_linear,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.layers.quantization.marlin_utils_fp8 import (
@@ -383,6 +385,10 @@ class Fp8LinearMethod(LinearMethodBase):
 
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
         if self.use_mxfp8:
+            if not self.is_checkpoint_fp8_serialized:
+                print("@@@ Quantizing MXFP8 weights")
+                self._quantize_mxfp8_weights(layer)
+                return
             # MXFP8 scales are stored as UE8M0 uint8; no requantization here.
             layer.weight_scale_inv = torch.nn.Parameter(
                 layer.weight_scale_inv.data, requires_grad=False
@@ -437,6 +443,14 @@ class Fp8LinearMethod(LinearMethodBase):
 
         layer.weight.data = weight.data
         layer.weight_scale_inv.data = weight_scale.data
+
+    def _quantize_mxfp8_weights(self, layer: Module) -> None:
+        weight = layer.weight.data
+        qweight, weight_scale = mxfp8_group_quantize(weight, group_size=32)
+        layer.weight = Parameter(qweight, requires_grad=False)
+        layer.weight_scale_inv = Parameter(weight_scale, requires_grad=False)
+        layer.weight_scale_inv.format_ue8m0 = True
+        layer.input_scale = None
 
     def process_weights_after_loading(self, layer: Module) -> None:
         if self.block_quant:
@@ -544,6 +558,23 @@ class Fp8LinearMethod(LinearMethodBase):
                 workspace=layer.workspace,
                 size_n=layer.output_size_per_partition,
                 size_k=layer.input_size_per_partition,
+                bias=bias,
+            )
+
+        if self.use_mxfp8:
+            if isinstance(x, tuple):
+                return triton_mxfp8_blockscaled_linear(
+                    input=x[0],
+                    weight=layer.weight,
+                    weight_scale=layer.weight_scale_inv,
+                    input_scale=x[1],
+                    bias=bias,
+                )
+            return triton_mxfp8_blockscaled_linear(
+                input=x,
+                weight=layer.weight,
+                weight_scale=layer.weight_scale_inv,
+                input_scale=None,
                 bias=bias,
             )
 
@@ -819,6 +850,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.w2_input_scale = None
 
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
+        if self.use_mxfp8 and not self.quant_config.is_checkpoint_fp8_serialized:
+            self._quantize_mxfp8_moe_weights(layer)
+            return
         # If ROCm, normalize the weights and scales to e4m3fnuz
         if _is_fp8_fnuz:
             # activation_scheme: dynamic
@@ -896,6 +930,31 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 )
                 layer.w13_weight_scale_inv.format_ue8m0 = True
                 layer.w2_weight_scale_inv.format_ue8m0 = True
+
+    def _quantize_mxfp8_moe_weights(self, layer: Module) -> None:
+        w13 = layer.w13_weight.data.contiguous()
+        w2 = layer.w2_weight.data.contiguous()
+
+        w13_flat = w13.view(-1, w13.shape[-1])
+        w2_flat = w2.view(-1, w2.shape[-1])
+
+        w13_q_flat, w13_s_flat = mxfp8_group_quantize(w13_flat, group_size=32)
+        w2_q_flat, w2_s_flat = mxfp8_group_quantize(w2_flat, group_size=32)
+
+        layer.w13_weight = torch.nn.Parameter(
+            w13_q_flat.view_as(w13), requires_grad=False
+        )
+        layer.w2_weight = torch.nn.Parameter(w2_q_flat.view_as(w2), requires_grad=False)
+        layer.w13_weight_scale_inv = torch.nn.Parameter(
+            w13_s_flat.view(w13.shape[0], w13.shape[1], -1), requires_grad=False
+        )
+        layer.w2_weight_scale_inv = torch.nn.Parameter(
+            w2_s_flat.view(w2.shape[0], w2.shape[1], -1), requires_grad=False
+        )
+        layer.w13_weight_scale_inv.format_ue8m0 = True
+        layer.w2_weight_scale_inv.format_ue8m0 = True
+        layer.w13_input_scale = None
+        layer.w2_input_scale = None
 
     def process_weights_after_loading(self, layer: Module) -> None:
         if _is_hip and _use_hip_int4:
@@ -1182,6 +1241,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 symm_output = torch.empty_like(x)
 
             topk_weights, topk_ids, _ = dispatch_output.topk_output
+            use_mxfp8 = getattr(self.quant_config, "use_mxfp8", False)
             output = cutlass_fused_experts_fp8(
                 x,
                 layer.w13_weight.transpose(1, 2),
@@ -1204,8 +1264,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 self.problem_sizes1,
                 self.problem_sizes2,
                 use_fp8_blockscale=True,
-                use_mxfp8=getattr(self.quant_config, "use_mxfp8", False),
+                use_mxfp8=use_mxfp8,
                 output=symm_output,
+                enable_es=(use_mxfp8, use_mxfp8),
             )
             return StandardCombineInput(hidden_states=output)
 
