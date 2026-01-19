@@ -42,6 +42,8 @@ from sglang.srt.layers.dp_attention import (
     get_attention_dp_size,
     get_attention_tp_rank,
     get_attention_tp_size,
+    get_attention_cp_size,
+    get_attention_cp_rank,
     get_global_dp_buffer,
     get_local_dp_buffer,
     is_allocation_symmetric,
@@ -608,6 +610,8 @@ class CommunicateContext:
     attn_tp_rank: int
     attn_tp_size: int
     attn_dp_size: int
+    attn_cp_rank: int
+    attn_cp_size: int
     tp_size: int
     cache = None
     tp_rank: int
@@ -620,6 +624,8 @@ class CommunicateContext:
         attn_tp_rank = get_attention_tp_rank()
         attn_tp_size = get_attention_tp_size()
         attn_dp_size = get_attention_dp_size()
+        attn_cp_size = get_attention_cp_size()
+        attn_cp_rank = get_attention_cp_rank()
         tp_size = get_tensor_model_parallel_world_size()
         tp_rank = get_tensor_model_parallel_rank()
         process_group_sizes = {
@@ -633,6 +639,8 @@ class CommunicateContext:
             attn_tp_rank=attn_tp_rank,
             attn_tp_size=attn_tp_size,
             attn_dp_size=attn_dp_size,
+            attn_cp_rank=attn_cp_rank,
+            attn_cp_size=attn_cp_size,
             tp_size=tp_size,
             tp_rank=tp_rank,
         )

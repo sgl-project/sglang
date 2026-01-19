@@ -44,6 +44,7 @@ CP_IN_SEQ_SPLIT_ARGS = [
 CP_ROUND_ROBIN_ARGS = [
     "--enable-nsa-prefill-context-parallel",
     "--nsa-prefill-cp-mode=round-robin-split",
+    "--attn-cp-size=8",
 ]
 
 
