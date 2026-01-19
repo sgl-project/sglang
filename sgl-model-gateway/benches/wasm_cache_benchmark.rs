@@ -24,6 +24,10 @@ fn bench_wasm_cache_lookup(c: &mut Criterion) {
     });
     let wasm_bytes = encoder.finish();
 
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(&wasm_bytes);
+    let wasm_hash: [u8; 32] = hasher.finalize().into();
+
     let config = WasmRuntimeConfig::default();
     let runtime = WasmRuntime::new(config).unwrap();
 
@@ -45,6 +49,7 @@ fn bench_wasm_cache_lookup(c: &mut Criterion) {
     // inside the worker thread before the first benchmark iteration.
     let _ = rt.block_on(runtime.execute_component_async(
         wasm_bytes.clone(),
+        wasm_hash,
         attach_point.clone(),
         input.clone(),
     ));
@@ -58,6 +63,7 @@ fn bench_wasm_cache_lookup(c: &mut Criterion) {
             // happens after the cache lookup we are targeting.
             let _ = rt.block_on(runtime.execute_component_async(
                 black_box(wasm_bytes.clone()),
+                black_box(wasm_hash),
                 black_box(attach_point.clone()),
                 black_box(input.clone()),
             ));
