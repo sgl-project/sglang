@@ -93,6 +93,32 @@ class TestReasoningOffByDefault(CustomTestCase):
         # When reasoning is off by default, there should be no reasoning_content
         self.assertNotIn("reasoning_content", message)
 
+    def test_reasoning_off_by_default_overrides_template_force_reasoning(self):
+        # Test that SGLANG_REASONING_OFF_BY_DEFAULT takes precedence over
+        # template force_reasoning pattern
+        response = requests.post(
+            f"{self.base_url}/v1/chat/completions",
+            headers={"Authorization": f"Bearer {self.api_key}"},
+            json={
+                "model": self.model,
+                "messages": [{"role": "user", "content": "What is 2+2?"}],
+                "temperature": 0,
+                "separate_reasoning": True,
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        message = data["choices"][0]["message"]
+        # Even if template has force_reasoning, SGLANG_REASONING_OFF_BY_DEFAULT
+        # should prevent reasoning_content from being generated
+        self.assertNotIn("reasoning_content", message)
+        # Also verify the response doesn't start with thinking token
+        content = message.get("content", "")
+        self.assertFalse(
+            content.startswith(""),
+            "Response should not start with thinking token when reasoning is off by default",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
