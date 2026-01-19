@@ -55,6 +55,9 @@ python -m sglang.launch_server --model-path <MODEL> --sampling-defaults openai
 | top_k           | `int (model default; fallback -1)`           | [Top-k](https://developer.nvidia.com/blog/how-to-get-better-outputs-from-your-large-language-model/#predictability_vs_creativity) randomly selects from the `k` highest-probability tokens. |
 | min_p           | `float (model default; fallback 0.0)`        | [Min-p](https://github.com/huggingface/transformers/issues/27670) samples from tokens with probability larger than `min_p * highest_token_probability`. |
 
+> **Security note**
+> Remote URL inputs for image/audio/video are validated and may be blocked if they resolve to private or loopback IPs. Controls: `SGLANG_VLM_MEDIA_URL_FETCH_ENABLED`, `SGLANG_VLM_MEDIA_URL_ALLOWED_SCHEMES`, `SGLANG_VLM_MEDIA_URL_ALLOWLIST`, `SGLANG_VLM_MEDIA_URL_MAX_BYTES`, `SGLANG_VLM_MEDIA_URL_MAX_REDIRECTS`, `SGLANG_VLM_MEDIA_URL_TIMEOUT`.
+
 ### Penalizers
 
 | Argument           | Type/Default           | Description                                                                                                                                    |
