@@ -130,6 +130,11 @@ curl -sS -X POST "http://localhost:30010/v1/images/edits" \
   -F "response_format=url"
 ```
 
+> **Security note**
+> - Remote `url` inputs are validated; private/loopback/link-local IPs are blocked by default.
+> - Uploaded filenames are sanitized and constrained to the uploads directory.
+> - Tuning knobs: `SGLANG_OPENAI_MEDIA_URL_FETCH_ENABLED`, `SGLANG_OPENAI_MEDIA_URL_ALLOWED_SCHEMES`, `SGLANG_OPENAI_MEDIA_URL_ALLOWLIST`, `SGLANG_OPENAI_MEDIA_URL_MAX_BYTES`, `SGLANG_OPENAI_MEDIA_URL_MAX_REDIRECTS`, `SGLANG_OPENAI_MEDIA_URL_TIMEOUT`.
+
 #### Download image content
 
 When `response_format=url` is used with `POST /v1/images/edits`, the API returns a relative URL like `/v1/images/<IMAGE_ID>/content`.

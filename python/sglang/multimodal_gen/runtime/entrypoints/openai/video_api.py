@@ -34,6 +34,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     add_common_data_to_response,
     merge_image_input_list,
     process_generation_batch,
+    sanitize_upload_filename,
     save_image_to_path,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
@@ -191,10 +192,13 @@ async def create_video(
         image = image_list[0]
         uploads_dir = os.path.join("outputs", "uploads")
         os.makedirs(uploads_dir, exist_ok=True)
-        filename = image.filename if hasattr(image, "filename") else f"url_image"
-        input_path = os.path.join(uploads_dir, f"{request_id}_{filename}")
+        filename = image.filename if hasattr(image, "filename") else "url_image"
+        safe_name = sanitize_upload_filename(filename, "url_image")
+        target_path = os.path.join(uploads_dir, f"{request_id}_{safe_name}")
         try:
-            input_path = await save_image_to_path(image, input_path)
+            input_path = await save_image_to_path(
+                image, target_path, uploads_root=uploads_dir
+            )
         except Exception as e:
             raise HTTPException(
                 status_code=400, detail=f"Failed to process image source: {str(e)}"
@@ -253,12 +257,13 @@ async def create_video(
                 image = image_list[0]
                 uploads_dir = os.path.join("outputs", "uploads")
                 os.makedirs(uploads_dir, exist_ok=True)
-                filename = (
-                    image.filename if hasattr(image, "filename") else f"url_image"
-                )
-                input_path = os.path.join(uploads_dir, f"{request_id}_{filename}")
+                filename = image.filename if hasattr(image, "filename") else "url_image"
+                safe_name = sanitize_upload_filename(filename, "url_image")
+                target_path = os.path.join(uploads_dir, f"{request_id}_{safe_name}")
                 try:
-                    input_path = await save_image_to_path(image, input_path)
+                    input_path = await save_image_to_path(
+                        image, target_path, uploads_root=uploads_dir
+                    )
                 except Exception as e:
                     raise HTTPException(
                         status_code=400,
