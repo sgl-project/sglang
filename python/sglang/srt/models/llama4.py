@@ -116,6 +116,7 @@ class Llama4MoE(nn.Module):
             hidden_size=config.hidden_size,
             intermediate_size=intermediate_size_moe,
             layer_id=layer_id,
+            top_k=self.top_k,
             reduce_results=False,
             quant_config=quant_config,
             apply_router_weight_on_input=True,
