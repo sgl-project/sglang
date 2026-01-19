@@ -57,5 +57,5 @@ export LMCACHE_CONFIG_FILE=example_config.yaml # Don't forget to enable `enable_
 python -m sglang.launch_server \
   --model-path MODEL \
   --enable-lmcache \
-  --kv-events-config '{"enable_kv_cache_events": "True", "publisher": "zmq", "topic": "kv-events"}'
+  --kv-events-config '{"publisher": "zmq", "topic": "kv-events"}'
 ```
