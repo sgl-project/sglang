@@ -591,7 +591,7 @@ mod tests {
         policy.select_worker_impl(&workers, &info).await;
 
         assert_eq!(policy.local_backend().unwrap().len(), 1);
-
+        tokio::time::sleep(Duration::from_secs(3)).await;
         std::thread::sleep(Duration::from_secs(3));
 
         assert_eq!(policy.local_backend().unwrap().len(), 0);
