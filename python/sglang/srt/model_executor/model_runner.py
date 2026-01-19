@@ -62,7 +62,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
-from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
+from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager, try_recover_ranks
 from sglang.srt.environ import envs
 from sglang.srt.eplb.eplb_manager import EPLBManager
 from sglang.srt.eplb.expert_distribution import (
@@ -144,6 +144,7 @@ from sglang.srt.server_args import (
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     MultiprocessingSerializer,
+    broadcast_pyobj,
     cpu_has_amx_support,
     dynamic_import,
     enable_show_time_cost,
@@ -389,6 +390,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Initialize the model runner
         self.initialize(min_per_gpu_memory)
         self.check_quantized_moe_compatibility()
+
+        if self.eplb_manager:
+            logging.info("EPLB due to recovering ranks")
+            gen = self.eplb_manager.rebalance()
+            while True:
+                try:
+                    next(gen)
+                except StopIteration:
+                    break
 
         # Temporary cached values
         self.support_pp = (
@@ -771,16 +781,19 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 local_rank=self.gpu_id,
                 distributed_init_method=dist_init_method,
                 timeout=self.server_args.dist_timeout,
+                extend_group=self.server_args.mooncake_extend_group,
             )
             initialize_model_parallel(
                 tensor_model_parallel_size=self.tp_size,
                 pipeline_model_parallel_size=self.pp_size,
                 expert_model_parallel_size=self.moe_ep_size,
                 duplicate_tp_group=self.server_args.enable_pdmux,
+                extend_group=self.server_args.mooncake_extend_group,
             )
             initialize_dp_attention(
                 server_args=self.server_args,
                 model_config=self.model_config,
+                extend_group=self.server_args.mooncake_extend_group,
             )
             if is_npu():
                 register_sgl_tp_rank(self.gpu_id)
@@ -788,7 +801,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         min_per_gpu_memory = get_available_gpu_memory(
             self.device,
             self.gpu_id,
-            distributed=get_world_group().world_size > 1,
+            distributed=get_world_group().world_size > 1 and not self.server_args.mooncake_extend_group,
             cpu_group=get_world_group().cpu_group,
         )
         self.tp_group = get_tp_group()
@@ -2287,6 +2300,51 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if self.eplb_manager is not None:
             self.eplb_manager.on_forward_pass_end()
+
+        tp_active_ranks = self.tp_group.active_ranks.detach().cpu().numpy()
+        tp_active_ranks_cpu = self.tp_group.active_ranks_cpu.detach().numpy()
+        tp_active_ranks &= tp_active_ranks_cpu
+        ranks_to_recover = [i for i in range(len(tp_active_ranks)) if not tp_active_ranks[i]]
+        if len(ranks_to_recover) > 0:
+            logger.info(f"Begin to recover ranks {ranks_to_recover}")
+
+            ret = try_recover_ranks(ranks_to_recover)
+            if ret:
+                # To sync with the new ranks' load_weight barrier
+                dist.barrier(group=get_tp_group().cpu_group)
+
+                ElasticEPStateManager.reset(self.server_args)
+
+                self.init_device_graphs()
+
+                self.forward_pass_id = 0
+
+                if self.eplb_manager is not None:
+                    self.eplb_manager.reset_generator()
+
+                    logging.info("EPLB due to recovering ranks")
+                    gen = self.eplb_manager.rebalance()
+                    while True:
+                        try:
+                            next(gen)
+                        except StopIteration:
+                            break
+
+                # To sync with the new ranks' random seed setup
+                self.random_seed = broadcast_pyobj(
+                    [self.server_args.random_seed],
+                    self.tp_size * self.pp_rank + self.tp_rank,
+                    get_world_group().cpu_group,
+                    src=get_world_group().ranks[0],
+                )[0]
+
+                logger.info(f"recover ranks {ranks_to_recover} done")
+
+                tp_active_ranks = self.tp_group.active_ranks.detach().cpu().numpy()
+                tp_active_ranks_cpu = self.tp_group.active_ranks_cpu.detach().numpy()
+                tp_active_ranks &= tp_active_ranks_cpu
+                ranks_to_recover = [i for i in range(len(tp_active_ranks)) if not tp_active_ranks[i]]
+                logger.info(f"new ranks_to_recover: {ranks_to_recover}")
 
         return output
 

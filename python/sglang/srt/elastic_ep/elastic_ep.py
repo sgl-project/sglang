@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+import logging
+from typing import List, Optional
+import weakref
 
 import torch
 
+from sglang.srt.distributed import parallel_state
+from sglang.srt.layers.dp_attention import get_attention_tp_group
 from sglang.srt.managers.schedule_batch import ServerArgs
 from sglang.srt.utils import is_cpu, is_cuda
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -43,6 +49,17 @@ class ElasticEPStateManager:
             cls._instance = cls._build_state(ep_size=None, device=None)
         return cls._instance
 
+    @classmethod
+    def reset(cls, server_args: ServerArgs):
+        from sglang.srt.layers.moe import MoeA2ABackend
+        from sglang.srt.layers.moe.token_dispatcher.mooncake import EPBuffer
+
+        moe_a2a_backend = MoeA2ABackend(server_args.moe_a2a_backend)
+        if moe_a2a_backend.is_mooncake():
+            EPBuffer._buffer = None
+        cls._instance = None
+        cls.init(server_args)
+
     @staticmethod
     def _select_device() -> torch.device:
         if is_cuda():
@@ -72,3 +89,95 @@ class ElasticEPStateManager:
         dev = device if device is not None else cls._select_device()
 
         return torch.ones(size, dtype=torch.int32, device=dev)
+
+
+def try_recover_ranks(global_ranks: List[int]):
+    from mooncake import ep as mooncake_ep
+
+    logger.info(f"Trying to recover ranks: {global_ranks}")
+
+    backend = torch.distributed.group.WORLD._get_backend(torch.device('cuda'))
+    peer_state = mooncake_ep.get_peer_state(backend, global_ranks)
+    logger.info(f"World group peer_state={peer_state}")
+
+    if not all(peer_state):
+        logger.info("Early return from try_recover_ranks")
+        return False
+
+    groups = parallel_state._groups
+    groups = {group_name: groups[group_name] for group_name in groups}
+    groups["attention_tp"] = weakref.ref(get_attention_tp_group())
+
+    for group_name in groups:
+        group = groups[group_name]()
+        if group is not None:
+            group_ranks = group.ranks
+            ranks_in_group = [r for r in global_ranks if r in group_ranks]
+
+            if ranks_in_group:
+                group_rank_mapping = {global_rank: idx for idx, global_rank in enumerate(group_ranks)}
+                group_local_ranks = [group_rank_mapping[r] for r in ranks_in_group if r in group_rank_mapping]
+                if group_local_ranks:
+                    device_backend = group.device_group._get_backend(torch.device('cuda'))
+                    logger.info(f"device group {group_name} before get peer state for ranks {ranks_in_group}")
+                    group_peer_state = mooncake_ep.get_peer_state(device_backend, group_local_ranks)
+                    logger.info(
+                        f"device group {group_name} peer_state for ranks {ranks_in_group} (group-local: {group_local_ranks}): {group_peer_state}")
+
+                    cpu_backend = group.cpu_group._get_backend(torch.device('cpu'))
+                    logger.info(f"cpu group {group_name} before get peer state for ranks {ranks_in_group}")
+                    group_peer_state = mooncake_ep.get_peer_state(cpu_backend, group_local_ranks)
+                    logger.info(
+                        f"cpu group {group_name} peer_state for ranks {ranks_in_group} (group-local: {group_local_ranks}): {group_peer_state}")
+
+    mooncake_ep.recover_ranks(backend, global_ranks)
+
+    device_group_status = {group_name: False for group_name in groups}
+    cpu_group_status = {group_name: False for group_name in groups}
+    while True:
+        for group_name in groups:
+            group = groups[group_name]()
+            if group is not None:
+                group_ranks = group.ranks
+                ranks_in_group = [r for r in global_ranks if r in group_ranks]
+
+                if ranks_in_group:
+                    # Convert to group-local ranks
+                    group_rank_mapping = {global_rank: idx for idx, global_rank in enumerate(group_ranks)}
+                    group_local_ranks = [group_rank_mapping[r] for r in ranks_in_group if r in group_rank_mapping]
+
+                    if group_local_ranks:
+                        if not device_group_status[group_name]:
+                            device_backend = group.device_group._get_backend(torch.device('cuda'))
+                            logger.info(f"device group {group_name} before get peer state for ranks {ranks_in_group}")
+                            group_peer_state = mooncake_ep.get_peer_state(device_backend, group_local_ranks)
+                            logger.info(f"device group {group_name} peer_state for ranks {ranks_in_group} (group-local: {group_local_ranks}): {group_peer_state}")
+                            if all(group_peer_state):
+                                mooncake_ep.recover_ranks(device_backend, group_local_ranks)
+                                device_group_status[group_name] = True
+
+                        if not cpu_group_status[group_name]:
+                            cpu_backend = group.cpu_group._get_backend(torch.device('cpu'))
+                            logger.info(f"cpu group {group_name} before get peer state for ranks {ranks_in_group}")
+                            group_peer_state = mooncake_ep.get_peer_state(cpu_backend, group_local_ranks)
+                            logger.info(f"cpu group {group_name} peer_state for ranks {ranks_in_group} (group-local: {group_local_ranks}): {group_peer_state}")
+                            if all(group_peer_state):
+                                mooncake_ep.recover_ranks(cpu_backend, group_local_ranks)
+                                if group.use_message_queue_broadcaster and group.world_size > 1:
+                                    # Create message queue
+                                    from sglang.srt.distributed.device_communicators.shm_broadcast import (
+                                        MessageQueue,
+                                    )
+                                    group.mq_broadcaster = MessageQueue.create_from_process_group(
+                                        group.cpu_group, 1 << 22, 6
+                                    )
+                                cpu_group_status[group_name] = True
+                    else:
+                        device_group_status[group_name] = True
+                        cpu_group_status[group_name] = True
+                else:
+                    device_group_status[group_name] = True
+                    cpu_group_status[group_name] = True
+        if all(device_group_status.values()) and all(cpu_group_status.values()):
+            logger.info(f"Recovered ranks {global_ranks}")
+            return True

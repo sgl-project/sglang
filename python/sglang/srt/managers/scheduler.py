@@ -2961,7 +2961,8 @@ def run_scheduler_process(
                 }
             )
 
-        pipe_writer.send(result_dict)
+        if not server_args.mooncake_extend_group:
+            pipe_writer.send(result_dict)
 
         # Dispatch to the appropriate event loop based on the disaggregation mode
         disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode
