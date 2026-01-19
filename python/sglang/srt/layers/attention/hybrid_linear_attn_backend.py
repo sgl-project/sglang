@@ -1,4 +1,5 @@
 import logging
+import os
 from typing import Optional, Union
 
 import torch
@@ -9,6 +10,7 @@ import triton.language as tl
 from einops import rearrange
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.in_place_transpose import in_place_transpose_indexed
 from sglang.srt.layers.attention.fla.chunk import chunk_gated_delta_rule
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.layers.attention.fla.fused_gdn_gating import fused_gdn_gating
@@ -983,14 +985,15 @@ class GDNAttnBackend(MambaAttnBackendBase):
         value = value.view(1, seq_len, value.shape[1] // head_v_dim, head_v_dim)
 
         if self.ssm_k_last:
-            # K-last -> V-last: transpose for kernel
-            # ssm_states shape: (pool_size+1, HV, V, K) for K-last
-            valid_mask = cache_indices >= 0
-            if valid_mask.any():
-                valid_cache_indices = cache_indices[valid_mask]
-                ssm_input = ssm_states[valid_cache_indices]  # [valid, HV, V, K]
-                ssm_states_v_last = ssm_input.transpose(-1, -2).contiguous()  # [valid, HV, K, V]
-
+            # K-last decode currently uses V-last Triton kernel.
+            # Optimize K==V case with in-place transpose to avoid allocating V-last buffers.
+            kv_same = head_k_dim == head_v_dim
+            disable_k_last_inplace_transpose = (
+                os.getenv("SGLANG_DISABLE_KLAST_INPLACE_TRANSPOSE", "0") == "1"
+            )
+            if kv_same and (not disable_k_last_inplace_transpose) and ssm_states.is_contiguous():
+                # K-last -> V-last in-place for the kernel
+                in_place_transpose_indexed(ssm_states, cache_indices)
                 core_attn_out = fused_sigmoid_gating_delta_rule_update(
                     A_log=A_log,
                     dt_bias=dt_bias,
@@ -999,23 +1002,48 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     v=value,
                     a=a,
                     b=b,
-                    initial_state_source=ssm_states_v_last,
-                    initial_state_indices=torch.arange(
-                        ssm_states_v_last.shape[0],
-                        dtype=torch.int32,
-                        device=cache_indices.device,
-                    ),
+                    initial_state_source=ssm_states,
+                    initial_state_indices=cache_indices,
                     cu_seqlens=query_start_loc,
                     use_qk_l2norm_in_kernel=True,
                     softplus_beta=1.0,
                     softplus_threshold=20.0,
                 )
-                # V-last -> K-last: transpose back and write to pool
-                ssm_states[valid_cache_indices] = ssm_states_v_last.transpose(-1, -2)
+                # V-last -> K-last: transpose back to pool layout
+                in_place_transpose_indexed(ssm_states, cache_indices)
             else:
-                core_attn_out = value.new_zeros(
-                    (1, seq_len, value.shape[1] // head_v_dim, head_v_dim)
-                )
+                # Fallback: materialize a V-last buffer (needed for K!=V or when transpose is disabled)
+                valid_mask = cache_indices >= 0
+                if valid_mask.any():
+                    valid_cache_indices = cache_indices[valid_mask]
+                    ssm_input = ssm_states[valid_cache_indices]  # [valid, HV, V, K]
+                    ssm_states_v_last = ssm_input.transpose(-1, -2).contiguous()  # [valid, HV, K, V]
+
+                    core_attn_out = fused_sigmoid_gating_delta_rule_update(
+                        A_log=A_log,
+                        dt_bias=dt_bias,
+                        q=query,
+                        k=key,
+                        v=value,
+                        a=a,
+                        b=b,
+                        initial_state_source=ssm_states_v_last,
+                        initial_state_indices=torch.arange(
+                            ssm_states_v_last.shape[0],
+                            dtype=torch.int32,
+                            device=cache_indices.device,
+                        ),
+                        cu_seqlens=query_start_loc,
+                        use_qk_l2norm_in_kernel=True,
+                        softplus_beta=1.0,
+                        softplus_threshold=20.0,
+                    )
+                    # V-last -> K-last: transpose back and write to pool
+                    ssm_states[valid_cache_indices] = ssm_states_v_last.transpose(-1, -2)
+                else:
+                    core_attn_out = value.new_zeros(
+                        (1, seq_len, value.shape[1] // head_v_dim, head_v_dim)
+                    )
         else:
             # V-last mode: ssm_states shape is (pool_size+1, HV, K, V)
             core_attn_out = fused_sigmoid_gating_delta_rule_update(
@@ -1166,7 +1194,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
         if is_target_verify:
             # Check if K-last GDN verify kernel should be used
-            use_k_last_gdn = self.ssm_k_last and retrieve_parent_token is None
+            disable_k_last_gdn_verify = os.getenv("SGLANG_DISABLE_KLAST_GDN_VERIFY", "0") == "1"
+            use_k_last_gdn = (
+                self.ssm_k_last
+                and retrieve_parent_token is None
+                and not disable_k_last_gdn_verify
+            )
             if use_k_last_gdn:
                 available, cutedsl_gdn_verify_k_last = _get_cutedsl_gdn_verify()
                 use_k_last_gdn = available
@@ -1181,14 +1214,32 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 a_mtp = a.view(batch_size, draft_token_num, num_value_heads)
                 b_mtp = b.view(batch_size, draft_token_num, num_value_heads)
 
+                # For exactness: reuse the same gating (g_log, beta) as Triton path.
+                # fused_gdn_gating expects [tokens, HV] where tokens = B*T.
+                a_flat = a_mtp.reshape(batch_size * draft_token_num, num_value_heads)
+                b_flat = b_mtp.reshape(batch_size * draft_token_num, num_value_heads)
+                g_log, beta = fused_gdn_gating(A_log, a_flat, b_flat, dt_bias)
+                g_log = (
+                    g_log.squeeze(0)
+                    .reshape(batch_size, draft_token_num, num_value_heads)
+                    .contiguous()
+                )
+                beta = (
+                    beta.squeeze(0)
+                    .reshape(batch_size, draft_token_num, num_value_heads)
+                    .contiguous()
+                )
+
                 core_attn_out = cutedsl_gdn_verify_k_last(
                     A_log=A_log,
                     a=a_mtp,
                     dt_bias=dt_bias,
+                    g_log_in=g_log,
                     q=query_mtp,
                     k=key_mtp,
                     v=value_mtp,
                     b=b_mtp,
+                    beta_in=beta,
                     initial_state_source=ssm_states,
                     initial_state_indices=cache_indices,
                     intermediate_states_buffer=intermediate_state_cache,
@@ -1203,23 +1254,123 @@ class GDNAttnBackend(MambaAttnBackendBase):
             else:
                 # Use original V-last kernel with pre-computed gates
                 g, beta = fused_gdn_gating(A_log, a, b, dt_bias)
-                
-                core_attn_out = fused_recurrent_gated_delta_rule_update(
-                    q=query,
-                    k=key,
-                    v=value,
-                    g=g,
-                    beta=beta,
-                    initial_state_source=ssm_states,
-                    initial_state_indices=cache_indices,
-                    cu_seqlens=query_start_loc,
-                    use_qk_l2norm_in_kernel=True,
-                    disable_state_update=True,
-                    intermediate_states_buffer=intermediate_state_cache,
-                    intermediate_state_indices=intermediate_state_indices,
-                    cache_steps=forward_batch.spec_info.draft_token_num,
-                    retrieve_parent_token=retrieve_parent_token,
-                )
+
+                if self.ssm_k_last:
+                    # K-last pool requires V-last semantics for the original kernel.
+                    # Since disable_state_update=True, we can safely transpose in-place for reads.
+                    kv_same = head_k_dim == head_v_dim
+                    if kv_same:
+                        in_place_transpose_indexed(ssm_states, cache_indices)  # K-last -> V-last
+
+                        # IMPORTANT: intermediate_state_cache is later copied directly into ssm_states in
+                        # update_mamba_state_after_mtp_verify(). Therefore, its layout must match ssm_states.
+                        # When we fall back to the V-last Triton verify kernel, we must also keep the
+                        # intermediate cache in V-last semantics during the kernel, then transpose back.
+                        cache_steps = forward_batch.spec_info.draft_token_num
+                        if intermediate_state_cache is not None:
+                            # intermediate_state_cache shape (per-layer):
+                            #   K-last: [buffer, cache_steps, HV, V, K]
+                            # Flatten (buffer, step) into one dim so we can reuse the transpose kernel.
+                            intermediate_state_cache_2d = intermediate_state_cache.reshape(
+                                -1,
+                                intermediate_state_cache.shape[2],
+                                intermediate_state_cache.shape[-2],
+                                intermediate_state_cache.shape[-1],
+                            )
+                            step_offsets = torch.arange(
+                                cache_steps,
+                                device=intermediate_state_indices.device,
+                                dtype=intermediate_state_indices.dtype,
+                            )
+                            inter_indices = (
+                                intermediate_state_indices[:, None] * cache_steps
+                                + step_offsets[None, :]
+                            ).reshape(-1)
+                            in_place_transpose_indexed(intermediate_state_cache_2d, inter_indices)  # K-last -> V-last
+
+                        core_attn_out = fused_recurrent_gated_delta_rule_update(
+                            q=query,
+                            k=key,
+                            v=value,
+                            g=g,
+                            beta=beta,
+                            initial_state_source=ssm_states,
+                            initial_state_indices=cache_indices,
+                            cu_seqlens=query_start_loc,
+                            use_qk_l2norm_in_kernel=True,
+                            disable_state_update=True,
+                            intermediate_states_buffer=intermediate_state_cache,
+                            intermediate_state_indices=intermediate_state_indices,
+                            cache_steps=cache_steps,
+                            retrieve_parent_token=retrieve_parent_token,
+                        )
+
+                        if intermediate_state_cache is not None:
+                            in_place_transpose_indexed(intermediate_state_cache_2d, inter_indices)  # V-last -> K-last
+
+                        in_place_transpose_indexed(ssm_states, cache_indices)  # V-last -> K-last
+                    else:
+                        # Conservative fallback: materialize a V-last buffer (K!=V can't be in-place).
+                        valid_mask = cache_indices >= 0
+                        valid_cache_indices = cache_indices[valid_mask]
+                        if valid_cache_indices.numel() == 0:
+                            core_attn_out = fused_recurrent_gated_delta_rule_update(
+                                q=query,
+                                k=key,
+                                v=value,
+                                g=g,
+                                beta=beta,
+                                initial_state_source=ssm_states,
+                                initial_state_indices=cache_indices,
+                                cu_seqlens=query_start_loc,
+                                use_qk_l2norm_in_kernel=True,
+                                disable_state_update=True,
+                                intermediate_states_buffer=intermediate_state_cache,
+                                intermediate_state_indices=intermediate_state_indices,
+                                cache_steps=forward_batch.spec_info.draft_token_num,
+                                retrieve_parent_token=retrieve_parent_token,
+                            )
+                        else:
+                            ssm_input = ssm_states[valid_cache_indices]  # [valid, HV, V, K]
+                            ssm_states_v_last = ssm_input.transpose(-1, -2).contiguous()  # [valid, HV, K, V]
+                            sequential_indices = torch.arange(
+                                ssm_states_v_last.shape[0],
+                                device=cache_indices.device,
+                                dtype=cache_indices.dtype,
+                            )
+                            core_attn_out = fused_recurrent_gated_delta_rule_update(
+                                q=query,
+                                k=key,
+                                v=value,
+                                g=g,
+                                beta=beta,
+                                initial_state_source=ssm_states_v_last,
+                                initial_state_indices=sequential_indices,
+                                cu_seqlens=query_start_loc,
+                                use_qk_l2norm_in_kernel=True,
+                                disable_state_update=True,
+                                intermediate_states_buffer=intermediate_state_cache,
+                                intermediate_state_indices=intermediate_state_indices,
+                                cache_steps=forward_batch.spec_info.draft_token_num,
+                                retrieve_parent_token=retrieve_parent_token,
+                            )
+                else:
+                    core_attn_out = fused_recurrent_gated_delta_rule_update(
+                        q=query,
+                        k=key,
+                        v=value,
+                        g=g,
+                        beta=beta,
+                        initial_state_source=ssm_states,
+                        initial_state_indices=cache_indices,
+                        cu_seqlens=query_start_loc,
+                        use_qk_l2norm_in_kernel=True,
+                        disable_state_update=True,
+                        intermediate_states_buffer=intermediate_state_cache,
+                        intermediate_state_indices=intermediate_state_indices,
+                        cache_steps=forward_batch.spec_info.draft_token_num,
+                        retrieve_parent_token=retrieve_parent_token,
+                    )
                 
         else:
             # Prefill/Extend path
@@ -1228,25 +1379,34 @@ class GDNAttnBackend(MambaAttnBackendBase):
             # Only cuda env uses fuse ssm_states update
             # For K-last layout, we need to handle V-last kernel with K-last pool
             if self.ssm_k_last:
-                batch_size = cache_indices.shape[0]
+                disable_k_last_inplace_transpose = (
+                    os.getenv("SGLANG_DISABLE_KLAST_INPLACE_TRANSPOSE", "0") == "1"
+                )
                 # has_prefix_cache is pre-computed in init_forward_metadata (no GPU-CPU sync here)
                 has_prefix_cache = self._cached_has_prefix_cache
 
                 # Only safe to use direct K-last buffer when K == V
                 kv_same = head_k_dim == head_v_dim
                 
-                if has_prefix_cache or not kv_same:
-                    # Has prefix cache: need to read and transpose existing state
+                if (not disable_k_last_inplace_transpose) and has_prefix_cache and kv_same:
+                    # Has prefix cache with K==V: use optimized in-place transpose
+                    # Convert K-last -> V-last in-place before kernel
+                    in_place_transpose_indexed(ssm_states, cache_indices)
+                    recurrent_state = ssm_states
+                    recurrent_state_indices_args = {"initial_state_indices": cache_indices}
+                elif has_prefix_cache or not kv_same or disable_k_last_inplace_transpose:
+                    # Has prefix cache with K!=V, or need separate buffer
+                    # Fall back to copy-based approach
+                    batch_size = cache_indices.shape[0]
                     ssm_input = ssm_states[cache_indices]  # [batch, HV, V, K]
                     recurrent_state = ssm_input.transpose(-1, -2).contiguous()  # [batch, HV, K, V]
                     sequential_indices = torch.arange(batch_size, device=cache_indices.device, dtype=cache_indices.dtype)
                     recurrent_state_indices_args = {"initial_state_indices": sequential_indices}
                 else:
-                    # No prefix cache: initial state is all zeros
-                    # Optimization: pass ssm_states directly, kernel writes in-place
-                    # Since initial is 0, reading with wrong stride is fine (0 == 0)
-                    # After kernel, transpose the modified slots to fix semantics
-                    # Note: This works because K == V (stride values are identical)
+                    # No prefix cache: still ensure correct layout for the kernel.
+                    # Pool slots may be reused (e.g., CUDA graph capture), so don't assume zeros.
+                    # Convert K-last -> V-last in-place before kernel, then transpose back after.
+                    in_place_transpose_indexed(ssm_states, cache_indices)
                     recurrent_state = ssm_states  # Direct reference, no copy
                     recurrent_state_indices_args = {"initial_state_indices": cache_indices}
             else:
@@ -1274,9 +1434,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 # Note: INPLACE_UPDATE=True in kernel, so recurrent_state is updated in-place
                 if recurrent_state is ssm_states:
                     # Optimization path: kernel wrote directly to ssm_states with V-last semantics
-                    # Need to fix by reading, transposing, and writing back
-                    # Since K == V, stride values are identical, only semantics differ
-                    ssm_states[cache_indices] = ssm_states[cache_indices].transpose(-1, -2).contiguous()
+                    # Use optimized in-place transpose (4-5x faster than PyTorch ops)
+                    in_place_transpose_indexed(ssm_states, cache_indices)
                 else:
                     # Standard path: recurrent_state is a separate V-last buffer
                     ssm_states[cache_indices] = recurrent_state.to(ssm_states.dtype, copy=False).transpose(-1, -2)
