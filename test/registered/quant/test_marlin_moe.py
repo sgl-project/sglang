@@ -8,8 +8,11 @@ from sgl_kernel.scalar_type import scalar_types
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import fused_marlin_moe
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_marlin_utils import awq_marlin_quantize, marlin_quantize
 from sglang.test.test_utils import CustomTestCase
+
+register_cuda_ci(est_time=200, suite="stage-b-test-small-1-gpu")
 
 set_global_server_args_for_scheduler(object.__new__(ServerArgs))
 
