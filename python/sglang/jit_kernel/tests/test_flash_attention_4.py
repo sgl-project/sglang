@@ -4,27 +4,80 @@
 
 import itertools
 import math
-from functools import partial
 
 import pytest
 import torch
 import torch.nn.functional as F
 from einops import rearrange, repeat
 
-try:
-    from flash_attn.layers.rotary import apply_rotary_emb
-except ImportError:
-    apply_rotary_emb = None
 
-from sglang.jit_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
-from sglang.jit_kernel.testing.rotary_embedding import _apply_rotary_emb as apply_rotary_emb
+def apply_rotary_emb(
+    x: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    seqlen_offsets: torch.Tensor | int | None = 0,
+    interleaved: bool = False,
+) -> torch.Tensor:
+    rotary_dim = cos.shape[-1] * 2
+    x_rot = x[..., :rotary_dim]
+    x_pass = x[..., rotary_dim:]
+
+    cos = cos.to(dtype=x.dtype)
+    sin = sin.to(dtype=x.dtype)
+
+    if x_rot.dim() < 2:
+        raise ValueError(f"apply_rotary_emb expects x.dim() >= 2, got {x_rot.dim()}")
+
+    b = x_rot.shape[0]
+    s = x_rot.shape[1]
+
+    if seqlen_offsets is None:
+        seqlen_offsets = 0
+
+    if isinstance(seqlen_offsets, int):
+        positions = (
+            torch.arange(s, device=x_rot.device, dtype=torch.long) + seqlen_offsets
+        )
+        cos_s = cos.index_select(0, positions)
+        sin_s = sin.index_select(0, positions)
+        cos_s = cos_s.unsqueeze(0).expand(b, -1, -1)
+        sin_s = sin_s.unsqueeze(0).expand(b, -1, -1)
+    else:
+        if seqlen_offsets.dim() != 1 or seqlen_offsets.shape[0] != b:
+            raise ValueError(
+                "apply_rotary_emb expects seqlen_offsets to be int or shape [batch]"
+            )
+        positions = torch.arange(s, device=x_rot.device, dtype=torch.long).unsqueeze(
+            0
+        ) + seqlen_offsets.to(dtype=torch.long).unsqueeze(1)
+        cos_s = cos.index_select(0, positions.reshape(-1)).view(b, s, -1)
+        sin_s = sin.index_select(0, positions.reshape(-1)).view(b, s, -1)
+
+    x_rot = x_rot.reshape(b, s, -1, rotary_dim)
+    cos_s = cos_s.unsqueeze(2)
+    sin_s = sin_s.unsqueeze(2)
+
+    if interleaved:
+        x1 = x_rot[..., ::2]
+        x2 = x_rot[..., 1::2]
+        o1 = x1 * cos_s - x2 * sin_s
+        o2 = x2 * cos_s + x1 * sin_s
+        x_rot = torch.stack((o1, o2), dim=-1).flatten(-2)
+    else:
+        x1, x2 = torch.chunk(x_rot, 2, dim=-1)
+        o1 = x1 * cos_s - x2 * sin_s
+        o2 = x2 * cos_s + x1 * sin_s
+        x_rot = torch.cat((o1, o2), dim=-1)
+
+    x_rot = x_rot.reshape_as(x[..., :rotary_dim])
+    return torch.cat((x_rot, x_pass), dim=-1)
+
+
+from sglang.jit_kernel.flash_attention_v4 import (
+    flash_attn_varlen_func,
+)
 
 # from utils import is_hopper  # Not used in this test
-
-# Force sgl_kernel.flash_attn wrappers to use FA4 (Cute-DSL) implementations.
-# The wrappers accept a superset of args; for FA4, extra args are ignored.
-flash_attn_varlen_func = partial(flash_attn_varlen_func, ver=4)
-flash_attn_with_kvcache = partial(flash_attn_with_kvcache, ver=4)
 
 # Skip this test on Hopper machine
 skip_condition = torch.cuda.get_device_capability() < (10, 0)
