@@ -29,7 +29,7 @@ import pickle
 import weakref
 from collections import namedtuple
 from contextlib import contextmanager, nullcontext
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import timedelta
 from multiprocessing import shared_memory
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
@@ -40,7 +40,6 @@ import torch.distributed
 from torch.distributed import Backend, ProcessGroup
 
 from sglang.srt.compilation.compilation_config import register_split_op
-from sglang.srt.configs.parallelism_config import RankParallelismConfig
 from sglang.srt.environ import envs
 from sglang.srt.utils import (
     get_bool_env_var,
@@ -1979,6 +1978,112 @@ def monkey_patch_vllm_parallel_state(reverse: bool = False):
         setattr(vllm_parrlel_state, "get_pp_group", get_pp_group)
         setattr(vllm_parrlel_state, "get_tp_group", get_tp_group)
         setattr(vllm_parrlel_state, "get_world_group", get_world_group)
+
+
+@dataclass
+class RankParallelismConfig:
+    """
+    Complete parallelism configuration for a single inference rank.
+
+    This configuration captures all the parallelism settings needed to recreate
+    a model shard outside of sglang. It supports:
+    - TP/PP/EP for model parallelism
+    - MoE-TP/Attn-TP/Attn-DP for MoE and DP attention.
+    """
+
+    tp_size: int = 1
+    tp_rank: int = 0
+    pp_size: int = 1
+    pp_rank: int = 0
+    ep_size: int = 1
+    ep_rank: int = 0
+    moe_tp_size: int = 1
+    moe_tp_rank: int = 0
+    attn_tp_size: int = 1
+    attn_tp_rank: int = 0
+    attn_dp_size: int = 1
+    attn_dp_rank: int = 0
+
+    world_size: int = 1
+    global_rank: int = 0
+    local_rank: int = 0
+
+    @property
+    def has_dp_attention(self) -> bool:
+        """Check if DP attention is enabled."""
+        return self.attn_dp_size > 1
+
+    @property
+    def has_expert_parallelism(self) -> bool:
+        """Check if expert parallelism is enabled."""
+        return self.ep_size > 1
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for serialization."""
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "RankParallelismConfig":
+        """Create from dictionary, filtering unknown fields."""
+        import dataclasses
+
+        valid_fields = {f.name for f in dataclasses.fields(cls)}
+        filtered_data = {k: v for k, v in data.items() if k in valid_fields}
+        return cls(**filtered_data)
+
+    @classmethod
+    def from_parallel_state(cls, local_rank: int = 0) -> "RankParallelismConfig":
+        """Extract current parallelism settings from the global parallel state."""
+        tp_size = get_tensor_model_parallel_world_size()
+        tp_rank = get_tensor_model_parallel_rank()
+
+        # Import dp_attention lazily to avoid circular imports
+        from sglang.srt.layers.dp_attention import (
+            get_attention_dp_rank,
+            get_attention_dp_size,
+            get_attention_tp_rank,
+            get_attention_tp_size,
+        )
+
+        return cls(
+            tp_size=tp_size,
+            tp_rank=tp_rank,
+            pp_size=get_pipeline_model_parallel_world_size(),
+            pp_rank=get_pipeline_model_parallel_rank(),
+            ep_size=get_moe_expert_parallel_world_size(),
+            ep_rank=get_moe_expert_parallel_rank(),
+            moe_tp_size=get_moe_tensor_parallel_world_size(),
+            moe_tp_rank=get_moe_tensor_parallel_rank(),
+            attn_tp_size=get_attention_tp_size(),
+            attn_tp_rank=get_attention_tp_rank(),
+            attn_dp_size=get_attention_dp_size(),
+            attn_dp_rank=get_attention_dp_rank(),
+            world_size=(
+                torch.distributed.get_world_size()
+                if torch.distributed.is_initialized()
+                else 1
+            ),
+            global_rank=(
+                torch.distributed.get_rank()
+                if torch.distributed.is_initialized()
+                else 0
+            ),
+            local_rank=local_rank,
+        )
+
+    def __repr__(self) -> str:
+        parts = [
+            f"TP={self.tp_rank}/{self.tp_size}",
+            f"PP={self.pp_rank}/{self.pp_size}",
+        ]
+        if self.has_expert_parallelism:
+            parts.append(f"EP={self.ep_rank}/{self.ep_size}")
+            parts.append(f"MoE-TP={self.moe_tp_rank}/{self.moe_tp_size}")
+        if self.has_dp_attention:
+            parts.append(f"AttnTP={self.attn_tp_rank}/{self.attn_tp_size}")
+            parts.append(f"AttnDP={self.attn_dp_rank}/{self.attn_dp_size}")
+        parts.append(f"Global={self.global_rank}/{self.world_size}")
+        return f"RankParallelismConfig({', '.join(parts)})"
 
 
 class ParallelismContext:

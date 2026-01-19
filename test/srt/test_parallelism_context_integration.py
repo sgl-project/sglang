@@ -24,7 +24,7 @@ import pytest
 import requests
 import torch
 
-from sglang.srt.configs.parallelism_config import RankParallelismConfig
+from sglang.srt.distributed.parallel_state import RankParallelismConfig
 from sglang.test.test_utils import (
     DEFAULT_MLA_MODEL_NAME_FOR_TEST,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
