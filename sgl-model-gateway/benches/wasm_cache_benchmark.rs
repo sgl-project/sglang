@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use smg::wasm::{
     config::WasmRuntimeConfig,
@@ -13,10 +15,11 @@ fn bench_wasm_cache_lookup(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
 
     // 1. Create a valid but "heavy" WASM component (padded to ~1MB)
+    // We use Cow::Owned and Cow::Borrowed to satisfy wasm-encoder types
     let mut encoder = Component::new();
     encoder.section(&wasm_encoder::CustomSection {
-        name: "padding".into(),
-        data: &vec![0u8; 1_000_000],
+        name: Cow::Borrowed("padding"),
+        data: Cow::Owned(vec![0u8; 1_000_000]),
     });
     let wasm_bytes = encoder.finish();
 
@@ -37,7 +40,7 @@ fn bench_wasm_cache_lookup(c: &mut Criterion) {
     };
     let input = WasmComponentInput::MiddlewareRequest(request);
 
-    // Pre-warm the cache
+    // Pre-warm the cache so the benchmark only measures hit latency
     rt.block_on(runtime.execute_component_async(
         wasm_bytes.clone(),
         attach_point.clone(),
