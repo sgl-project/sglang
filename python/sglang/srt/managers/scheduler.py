@@ -526,6 +526,16 @@ class Scheduler(
             logger.info(
                 f"Using draft model load_format: '{self.server_args.speculative_draft_load_format}'"
             )
+        if self.server_args.speculative_draft_quantization is not None:
+            if self.server_args.speculative_draft_quantization == "none":
+                self.server_args.quantization = None
+            else:
+                self.server_args.quantization = (
+                    self.server_args.speculative_draft_quantization
+                )
+            logger.info(
+                f"Using draft model quantization: '{self.server_args.speculative_draft_quantization}'"
+            )
 
         DraftWorkerClass = self.spec_algorithm.create_worker(self.server_args)
         self.draft_worker = DraftWorkerClass(**draft_worker_kwargs)
