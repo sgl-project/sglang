@@ -23,6 +23,7 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 register_cuda_ci(est_time=5, suite="stage-b-test-small-1-gpu")
 register_amd_ci(est_time=5, suite="stage-b-test-small-1-gpu-amd")
 
+import random
 import time
 import unittest
 import unittest.mock
@@ -30,6 +31,7 @@ import unittest.mock
 import torch
 
 from sglang.srt.disaggregation.kv_events import BlockRemoved, BlockStored
+from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 
 # Test constants
@@ -293,12 +295,12 @@ class TestRadixCache(unittest.TestCase):
                 self.assertEqual(cache.evictable_size(), 3)
 
                 # Test match_prefix
-                result = cache.match_prefix(RadixKey([1, 2, 3]))
+                result = cache.match_prefix(MatchPrefixParams(key=RadixKey([1, 2, 3])))
                 self.assertEqual(len(result.device_indices), 3)
                 torch.testing.assert_close(result.device_indices, value)
 
                 # Test partial match
-                result = cache.match_prefix(RadixKey([1, 2]))
+                result = cache.match_prefix(MatchPrefixParams(key=RadixKey([1, 2])))
                 self.assertEqual(len(result.device_indices), 2)
                 torch.testing.assert_close(
                     result.device_indices, torch.tensor([10, 20], dtype=torch.int64)
@@ -401,10 +403,12 @@ class TestRadixCache(unittest.TestCase):
         )
 
         # Keys with different extra_key should not match each other
-        result1 = cache.match_prefix(RadixKey([1, 2, 3], "key1"))
-        result2 = cache.match_prefix(RadixKey([1, 2, 3], "key2"))
-        result3 = cache.match_prefix(RadixKey([1, 2, 3], None))
-        result4 = cache.match_prefix(RadixKey([1, 2, 3], "nonexistent"))
+        result1 = cache.match_prefix(MatchPrefixParams(key=RadixKey([1, 2, 3], "key1")))
+        result2 = cache.match_prefix(MatchPrefixParams(key=RadixKey([1, 2, 3], "key2")))
+        result3 = cache.match_prefix(MatchPrefixParams(key=RadixKey([1, 2, 3], None)))
+        result4 = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey([1, 2, 3], "nonexistent"))
+        )
 
         # Each should match only its own data
         self.assertEqual(len(result1.device_indices), 3)
@@ -433,7 +437,7 @@ class TestRadixCache(unittest.TestCase):
         cache.insert(RadixKey([1, 2, 3]), torch.tensor([10, 20, 30], dtype=torch.int64))
 
         # Get node
-        result = cache.match_prefix(RadixKey([1, 2, 3]))
+        result = cache.match_prefix(MatchPrefixParams(key=RadixKey([1, 2, 3])))
         node = result.last_device_node
 
         initial_evictable = cache.evictable_size()
@@ -484,7 +488,7 @@ class TestRadixCache(unittest.TestCase):
                 tokens = list(range(sequence_length))
                 cache.insert(RadixKey(tokens), torch.tensor(tokens, dtype=torch.int64))
 
-                result = cache.match_prefix(RadixKey(tokens))
+                result = cache.match_prefix(MatchPrefixParams(key=RadixKey(tokens)))
                 self.assertGreater(len(result.device_indices), 0)
 
                 # Match length should be page-aligned
@@ -540,23 +544,25 @@ class TestRadixCache(unittest.TestCase):
                 # Match that causes a split inside an existing node:
                 # take first 4 tokens of seq1, then diverge.
                 query1 = [1, 2, 3, 4, 999, 1000]
-                result1 = cache.match_prefix(RadixKey(query1))
+                result1 = cache.match_prefix(MatchPrefixParams(key=RadixKey(query1)))
                 torch.testing.assert_close(result1.device_indices, val1[:4])
                 # No data change after structural split during matching.
                 self.assertEqual(cache.total_size(), baseline_total)
 
                 # Full match of the long sequence still returns the full indices.
-                result_full = cache.match_prefix(RadixKey(seq1))
+                result_full = cache.match_prefix(MatchPrefixParams(key=RadixKey(seq1)))
                 torch.testing.assert_close(result_full.device_indices, val1)
 
                 # Another split deeper on the path (after matching 6 tokens, then diverge).
                 query2 = [1, 2, 3, 4, 5, 6, 777, 888]
-                result2 = cache.match_prefix(RadixKey(query2))
+                result2 = cache.match_prefix(MatchPrefixParams(key=RadixKey(query2)))
                 torch.testing.assert_close(result2.device_indices, val1[:6])
                 self.assertEqual(cache.total_size(), baseline_total)
 
                 # Matching the short diverging branch should return exactly its indices.
-                result_branch = cache.match_prefix(RadixKey(seq2))
+                result_branch = cache.match_prefix(
+                    MatchPrefixParams(key=RadixKey(seq2))
+                )
                 torch.testing.assert_close(result_branch.device_indices, val2)
 
     def test_hash_value_storage(self):
@@ -646,6 +652,39 @@ class TestRadixCache(unittest.TestCase):
             self.assertIsNotNone(node.hash_value)
             # Should have 1 page (split at page_size=2)
             self.assertEqual(len(node.hash_value), 1)
+
+    def test_memory_allocated(self):
+        keys, values = [], []
+
+        num_seqs = 10000
+        vocab_size = 1000
+        base_prefix_len = 10000
+        suffix_len = 100
+
+        torch_allocated_before = torch.cuda.memory_allocated()
+
+        # build dataset with common prefix
+        common_prefix = [random.randint(1, vocab_size) for _ in range(base_prefix_len)]
+        for _ in range(num_seqs):
+            suffix = [random.randint(1, vocab_size) for _ in range(suffix_len)]
+            seq = common_prefix + suffix
+            keys.append(seq)
+            values.append(torch.zeros(len(seq), device="cuda", dtype=torch.int32))
+
+        cache: RadixCache = RadixCache.create_simulated()
+
+        for key, value in zip(keys, values):
+            cache.insert(RadixKey(key), value)
+
+        del values
+
+        torch_allocated = torch.cuda.memory_allocated() - torch_allocated_before
+        cache_size_bytes = cache.total_size() * 4
+        print(f"\nCache size (MB): {cache_size_bytes / (1024 * 1024)}")
+        print(f"Torch allocated (MB): {torch_allocated / (1024 * 1024)}")
+
+        # The cache size should be within reasonable bounds of the actual allocated memory.
+        self.assertLess(torch_allocated, cache_size_bytes * 2)
 
 
 if __name__ == "__main__":
