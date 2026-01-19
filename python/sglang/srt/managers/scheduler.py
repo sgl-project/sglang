@@ -297,9 +297,6 @@ class Scheduler(
         self.enable_metrics_for_all_schedulers = (
             server_args.enable_metrics_for_all_schedulers
         )
-        self.enable_kv_cache_events = bool(
-            server_args.kv_events_config and tp_rank == 0
-        )
         self.enable_trace = server_args.enable_trace
         self.stream_interval = server_args.stream_interval
         self.spec_algorithm = SpeculativeAlgorithm.from_string(
@@ -319,6 +316,10 @@ class Scheduler(
                 self.tp_size,
                 self.dp_size,
             )
+        )
+
+        self.enable_kv_cache_events = bool(
+            server_args.kv_events_config and self.attn_tp_rank == 0
         )
 
         # Init model configs
@@ -646,10 +647,9 @@ class Scheduler(
             else:
                 from sglang.srt.mem_cache.chunk_cache import SWAChunkCache
 
-                params.sliding_window_size = self.model_config.sliding_window_size
-                params.attention_chunk_size = self.model_config.attention_chunk_size
-
-                self.tree_cache = SWAChunkCache(params)
+                self.tree_cache = SWAChunkCache(
+                    params, sliding_window_size=self.sliding_window_size
+                )
         else:
 
             if envs.SGLANG_EXPERIMENTAL_CPP_RADIX_TREE.get():
