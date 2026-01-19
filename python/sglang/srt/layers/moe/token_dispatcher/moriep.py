@@ -73,6 +73,35 @@ class MoriEPNormalCombineInput(NamedTuple):
 assert isinstance(MoriEPNormalCombineInput, CombineInput)
 
 
+class EpMode(Enum):
+    INTRA_NODE = "intra_node"
+    INTER_NODE = "inter_node"
+
+
+@dataclass(frozen=True)
+class EpDispatchConfig:
+    kernel_type: mori.ops.EpDispatchCombineKernelType
+    warp_num_per_block: int
+    block_num: int
+    rdma_block_num: int
+
+
+EP_DISPATCH_CONFIGS = {
+    EpMode.INTRA_NODE: EpDispatchConfig(
+        kernel_type=mori.ops.EpDispatchCombineKernelType.IntraNode,
+        warp_num_per_block=16,
+        block_num=80,
+        rdma_block_num=0,
+    ),
+    EpMode.INTER_NODE: EpDispatchConfig(
+        kernel_type=mori.ops.EpDispatchCombineKernelType.InterNodeV1,
+        warp_num_per_block=8,
+        block_num=64,
+        rdma_block_num=32,
+    ),
+}
+
+
 @lru_cache(maxsize=2)
 def init_mori_op(
     group,
@@ -94,18 +123,13 @@ def init_mori_op(
         f"[MORI init] {world_size=} {rank=} {hidden_size=} {params_dtype=} {num_max_dispatch_tokens_per_rank=} {num_local_experts=} {router_topk=}"
     )
 
-    if world_size <= 8:
-        # single node
-        kernel_type = mori.ops.EpDispatchCombineKernelType.IntraNode
-        warp_num_per_block = 16
-        block_num = 80
-        rdma_block_num = 0
-    else:
-        # multi node
-        kernel_type = mori.ops.EpDispatchCombineKernelType.InterNodeV1
-        warp_num_per_block = 8
-        block_num = 64
-        rdma_block_num = 32
+    mode = EpMode.INTRA_NODE if world_size <= 8 else EpMode.INTER_NODE
+    cfg = EP_DISPATCH_CONFIGS[mode]
+
+    kernel_type = cfg.kernel_type
+    warp_num_per_block = cfg.warp_num_per_block
+    block_num = cfg.block_num
+    rdma_block_num = cfg.rdma_block_num
 
     mori_config = mori.ops.EpDispatchCombineConfig(
         rank=rank,
@@ -307,13 +331,7 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
         return hidden_states, topk_ids, topk_weights, previous_event
 
     def combine_b(self, hidden_states, topk_ids, topk_weights, previous_event):
-        # logger.info(f"bill-dbg: before comb combine_b: {hidden_states.shape=}")
-        # logger.info(f"bill-dbg: before comb combine_b: {topk_ids.shape=}")
-        # logger.info(f"bill-dbg: before comb combine_b: {topk_weights.shape=}")
-
         hidden_states = self._combine_core(hidden_states, topk_ids, topk_weights)
-
-        # logger.info(f"bill-dbg: after comb combine_b: {hidden_states.shape=}")
         return hidden_states
 
     def _combine_core(

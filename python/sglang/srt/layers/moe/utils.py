@@ -23,8 +23,8 @@ class MoeA2ABackend(Enum):
     NONE = "none"
     DEEPEP = "deepep"
     MOONCAKE = "mooncake"
-    ASCEND_FUSEEP = "ascend_fuseep"
     MORI = "mori"
+    ASCEND_FUSEEP = "ascend_fuseep"
 
     @classmethod
     def _missing_(cls, value):

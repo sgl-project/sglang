@@ -519,8 +519,8 @@ class DeepseekV2MoE(nn.Module):
                     dict(tp_rank=0, tp_size=1)
                     if get_moe_a2a_backend().is_deepep()
                     or get_moe_a2a_backend().is_mooncake()
-                    or get_moe_a2a_backend().is_ascend_fuseep()
                     or get_moe_a2a_backend().is_mori()
+                    or get_moe_a2a_backend().is_ascend_fuseep()
                     or should_use_flashinfer_cutlass_moe_fp4_allgather()
                     else {}
                 ),
@@ -562,8 +562,8 @@ class DeepseekV2MoE(nn.Module):
         if (
             get_moe_a2a_backend().is_deepep()
             or get_moe_a2a_backend().is_mooncake()
-            or get_moe_a2a_backend().is_ascend_fuseep()
             or get_moe_a2a_backend().is_mori()
+            or get_moe_a2a_backend().is_ascend_fuseep()
         ):
             # TODO: we will support tp < ep in the future
             self.ep_size = get_moe_expert_parallel_world_size()
@@ -583,8 +583,8 @@ class DeepseekV2MoE(nn.Module):
         self._enable_a2a_moe = (
             get_moe_a2a_backend().is_deepep()
             or get_moe_a2a_backend().is_mooncake()
-            or get_moe_a2a_backend().is_ascend_fuseep()
             or get_moe_a2a_backend().is_mori()
+            or get_moe_a2a_backend().is_ascend_fuseep()
         )
         self._fuse_shared_experts_inside_sbo = SboFlags.fuse_shared_experts_inside_sbo()
 
@@ -952,6 +952,8 @@ class DeepseekV2MoE(nn.Module):
             torch.cuda.current_stream().wait_event(shared_event)
         if shared_output is not None:
             x = shared_output
+            # aiter moe call will handle routed_scaling_factor in the function
+            # so add _use_aiter condition to eliminate to use self.routed_scaling_factor in add_ call
             if self.experts.should_fuse_routed_scaling_factor_in_topk or _use_aiter:
                 x.add_(final_hidden_states)
             else:
@@ -2952,8 +2954,8 @@ class DeepseekV2Model(nn.Module):
                     a2a_backend = get_moe_a2a_backend()
                     is_a2a_moe = (
                         a2a_backend.is_deepep()
-                        or a2a_backend.is_mooncake()
                         or a2a_backend.is_mori()
+                        or a2a_backend.is_mooncake()
                     )
                     tp_size = (
                         1 if is_a2a_moe else get_tensor_model_parallel_world_size()

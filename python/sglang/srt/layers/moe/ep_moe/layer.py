@@ -648,7 +648,7 @@ class MoriEPMoE(FusedMoE):
         elif is_fp8_quant:
             if hasattr(self, "w13_weight_scale_inv"):
                 w13_scale = self.w13_weight_scale_inv
-            if hasattr(self, "w13_weight_scale_inv"):
+            if hasattr(self, "w2_weight_scale_inv"):
                 w2_scale = self.w2_weight_scale_inv
 
             quant_type = QuantType.per_128x128
@@ -691,9 +691,7 @@ def get_moe_impl_class(quant_config: Optional[QuantizationConfig]):
     # [TODO] kk, temporary solution
     if get_moe_a2a_backend().is_mori():
         return MoriEPMoE
-    if (
-        get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake()
-    ):  # or get_moe_a2a_backend().is_mori():
+    if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():
         return DeepEPMoE
     if get_moe_a2a_backend().is_ascend_fuseep():
         return NpuFuseEPMoE
