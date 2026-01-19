@@ -117,9 +117,6 @@ def flash_attn_with_kvcache(
     score_mod: Optional[Callable] = None,
     aux_tensors: Optional[list] = None,
 ):
-    if ver != 4:
-        raise ValueError(f"flash_attention_v4 only supports ver=4, got ver={ver}")
-
     if k is not None or v is not None or qv is not None:
         raise NotImplementedError("FA4 does not support updating KV cache in-place.")
     if rotary_cos is not None or rotary_sin is not None or rotary_seqlens is not None:

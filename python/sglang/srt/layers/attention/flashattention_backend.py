@@ -22,6 +22,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 from sgl_kernel import merge_state_v2
+from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 
 from sglang.jit_kernel.flash_attention_v4 import (
     flash_attn_varlen_func as flash_attn_varlen_func_fa4,
@@ -802,9 +803,19 @@ class FlashAttentionBackend(AttentionBackend):
             and not is_swa_layer
         )
 
-        if self.fa_impl_ver == 4:
-            flash_attn_varlen_func = flash_attn_varlen_func_fa4
-            flash_attn_with_kvcache = flash_attn_with_kvcache_fa4
+        flash_attn_varlen_func_base = flash_attn_varlen_func
+        flash_attn_with_kvcache_base = flash_attn_with_kvcache
+
+        flash_attn_varlen_func = (
+            flash_attn_varlen_func_fa4
+            if self.fa_impl_ver == 4
+            else flash_attn_varlen_func_base
+        )
+        flash_attn_with_kvcache = (
+            flash_attn_with_kvcache_fa4
+            if self.fa_impl_ver == 4
+            else flash_attn_with_kvcache_base
+        )
 
         kwargs = {}
         if sinks is not None:
@@ -1110,8 +1121,6 @@ class FlashAttentionBackend(AttentionBackend):
         causal = True
         if layer.is_cross_attention or layer.attn_type == AttentionType.ENCODER_ONLY:
             causal = False
-
-        flash_attn_with_kvcache = flash_attn_with_kvcache_fa3
 
         kwargs = {}
         if sinks is not None:
