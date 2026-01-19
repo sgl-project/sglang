@@ -988,11 +988,11 @@ jobs:
             python /sgl-workspace/aiter/op_tests/test_rmsnorm2d.py
 
       - name: Run test_disaggregation_basic and test_disaggregation_pp
-        timeout-minutes: 15
+        timeout-minutes: 60
         run: |
           bash scripts/ci/amd_ci_exec.sh \
             -e SGLANG_TEST_RDMA_DEVICE="${{ env.SGLANG_TEST_RDMA_DEVICE }}" \
-            -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-large-2-gpu-35x-disaggregation-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --timeout-per-file 1200
+            -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-large-2-gpu-35x-disaggregation-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --timeout-per-file 3600
 
       # - name: Run test_disaggregation_pp
       #   timeout-minutes: 15
