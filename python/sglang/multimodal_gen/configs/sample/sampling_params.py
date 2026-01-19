@@ -95,7 +95,7 @@ class SamplingParams:
         "Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards"
     )
     prompt_path: str | None = None
-    output_path: str = "outputs/"
+    output_path: str | None = None
     output_file_name: str | None = None
 
     # Batch info
@@ -318,7 +318,7 @@ class SamplingParams:
 
         self.data_type = server_args.pipeline_config.task_type.data_type()
 
-        if server_args.output_path is not None:
+        if self.output_path is None and server_args.output_path is not None:
             self.output_path = server_args.output_path
             logger.debug(
                 f"Overriding output_path with server configuration: {self.output_path}"
