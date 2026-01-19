@@ -25,7 +25,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import DiffusionTestCase
 
 logger = init_logger(__name__)
 
-# --- Consistency testing: GT from sgl-test-files ---
+# --- Consistency testing: GT from sgl-test-files or local SGLANG_CONSISTENCY_GT_DIR ---
 SGL_TEST_FILES_CONSISTENCY_GT_BASE = "https://raw.githubusercontent.com/sgl-project/sgl-test-files/main/diffusion-ci/consistency_gt"
 CONSISTENCY_THRESHOLD_JSON_PATH = (
     Path(__file__).resolve().parent / "server" / "consistency_threshold.json"
@@ -539,6 +539,14 @@ def _consistency_gt_filenames(
     return [f"{case_id}_{n}gpu.{ext}"]
 
 
+def _get_consistency_gt_dir() -> Path | None:
+    """If SGLANG_CONSISTENCY_GT_DIR is set, return that Path; else None (use remote)."""
+    d = os.environ.get("SGLANG_CONSISTENCY_GT_DIR")
+    if not d:
+        return None
+    return Path(d).resolve()
+
+
 def load_gt_embeddings(
     case_id: str,
     num_gpus: int,
@@ -546,25 +554,39 @@ def load_gt_embeddings(
     output_format: str | None = None,
 ) -> list[np.ndarray]:
     """
-    Load ground truth by downloading image(s) from sgl-test-files and computing CLIP embeddings.
+    Load ground truth by downloading image(s) from sgl-test-files or reading from
+    SGLANG_CONSISTENCY_GT_DIR, then compute CLIP embeddings.
     Format (png/jpg/webp) follows case output_format; PIL converts to RGB for CLIP.
     """
     filenames = _consistency_gt_filenames(case_id, num_gpus, is_video, output_format)
     embeddings = []
 
-    for fn in filenames:
-        url = f"{SGL_TEST_FILES_CONSISTENCY_GT_BASE}/{fn}"
-        resp = requests.get(url, timeout=30)
-        if resp.status_code != 200:
-            raise FileNotFoundError(f"GT image not found: {url}")
+    gt_dir = _get_consistency_gt_dir()
+    if gt_dir is not None:
+        for fn in filenames:
+            path = gt_dir / fn
+            if not path.exists():
+                raise FileNotFoundError(f"GT image not found: {path}")
+            arr = np.array(Image.open(path).convert("RGB"))
+            emb = compute_clip_embedding(arr)
+            embeddings.append(emb)
+        logger.info(
+            f"Loaded {len(embeddings)} GT embeddings for {case_id} from {gt_dir}"
+        )
+    else:
+        for fn in filenames:
+            url = f"{SGL_TEST_FILES_CONSISTENCY_GT_BASE}/{fn}"
+            resp = requests.get(url, timeout=30)
+            if resp.status_code != 200:
+                raise FileNotFoundError(f"GT image not found: {url}")
 
-        arr = np.array(Image.open(io.BytesIO(resp.content)).convert("RGB"))
-        emb = compute_clip_embedding(arr)
-        embeddings.append(emb)
+            arr = np.array(Image.open(io.BytesIO(resp.content)).convert("RGB"))
+            emb = compute_clip_embedding(arr)
+            embeddings.append(emb)
 
-    logger.info(
-        f"Loaded {len(embeddings)} GT embeddings for {case_id} from sgl-test-files"
-    )
+        logger.info(
+            f"Loaded {len(embeddings)} GT embeddings for {case_id} from sgl-test-files"
+        )
     return embeddings
 
 
@@ -574,9 +596,14 @@ def gt_exists(
     is_video: bool = False,
     output_format: str | None = None,
 ) -> bool:
-    """Check if GT image(s) exist at sgl-test-files (by requesting the first required file)."""
+    """Check if GT image(s) exist (sgl-test-files or SGLANG_CONSISTENCY_GT_DIR)."""
     filenames = _consistency_gt_filenames(case_id, num_gpus, is_video, output_format)
     fn = filenames[0]
+
+    gt_dir = _get_consistency_gt_dir()
+    if gt_dir is not None:
+        return (gt_dir / fn).exists()
+
     url = f"{SGL_TEST_FILES_CONSISTENCY_GT_BASE}/{fn}"
     try:
         r = requests.head(url, timeout=10)
