@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use sha2::{Digest, Sha256};
 use smg::wasm::{
     config::WasmRuntimeConfig,
     module::{MiddlewareAttachPoint, WasmModuleAttachPoint},

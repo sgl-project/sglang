@@ -13,7 +13,6 @@ use std::{
 };
 
 use lru::LruCache;
-use sha2::{Digest, Sha256};
 use tokio::sync::oneshot;
 use tracing::{debug, error};
 use wasmtime::{
