@@ -233,6 +233,7 @@ class TransferBackend(Enum):
     MOONCAKE = "mooncake"
     NIXL = "nixl"
     ASCEND = "ascend"
+    MORI = "mori"
     FAKE = "fake"
 
 
@@ -264,6 +265,23 @@ def get_kv_class(
             KVClassType.SENDER: MooncakeKVSender,
             KVClassType.RECEIVER: (MooncakeKVReceiver),
             KVClassType.BOOTSTRAP_SERVER: MooncakeKVBootstrapServer,
+        }
+        return class_mapping.get(class_type)
+    elif transfer_backend == TransferBackend.MORI:
+        from sglang.srt.disaggregation.base import KVArgs
+        from sglang.srt.disaggregation.mori import (
+            MoriKVBootstrapServer,
+            MoriKVManager,
+            MoriKVReceiver,
+            MoriKVSender,
+        )
+
+        class_mapping = {
+            KVClassType.KVARGS: KVArgs,
+            KVClassType.MANAGER: MoriKVManager,
+            KVClassType.SENDER: MoriKVSender,
+            KVClassType.RECEIVER: (MoriKVReceiver),
+            KVClassType.BOOTSTRAP_SERVER: MoriKVBootstrapServer,
         }
         return class_mapping.get(class_type)
     elif transfer_backend == TransferBackend.ASCEND:
