@@ -5,13 +5,16 @@ from typing import Literal, get_args
 from sglang.multimodal_gen.runtime.layers.quantization.base_config import (
     QuantizationConfig,
 )
+from sglang.multimodal_gen.runtime.layers.quantization.int8 import Int8Config
 
-QuantizationMethods = Literal[None]
+QuantizationMethods = Literal["int8"]
 
 QUANTIZATION_METHODS: list[str] = list(get_args(QuantizationMethods))
 
 # The customized quantization methods which will be added to this dict.
-_CUSTOMIZED_METHOD_TO_QUANT_CONFIG = {}
+_CUSTOMIZED_METHOD_TO_QUANT_CONFIG = {
+    "int8": Int8Config,
+}
 
 
 def register_quantization_config(quantization: str):
