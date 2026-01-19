@@ -545,13 +545,12 @@ def _ceil_to_ue8m0_scale(x: torch.Tensor) -> torch.Tensor:
 
 def _float_to_ue8m0(scale: torch.Tensor) -> torch.Tensor:
     scale = scale.to(torch.float32)
-    out = torch.empty_like(scale, dtype=torch.uint8)
     invalid = torch.isnan(scale) | torch.isinf(scale) | (scale <= 0)
-    out[invalid] = 255
-    if (~invalid).any():
-        exp = torch.floor(torch.log2(scale[~invalid]))
-        exp_biased = (exp + 127).clamp(0, 254).to(torch.int32)
-        out[~invalid] = exp_biased.to(torch.uint8)
+    safe_scale = torch.where(invalid, torch.ones_like(scale), scale)
+    exp = torch.floor(torch.log2(safe_scale))
+    exp_biased = (exp + 127).clamp(0, 254).to(torch.int32)
+    out = exp_biased.to(torch.uint8)
+    out = out.masked_fill(invalid, 255)
     return out
 
 
