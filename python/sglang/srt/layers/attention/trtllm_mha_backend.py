@@ -619,8 +619,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         )
         bmm1_scale = q_scale * k_scale * layer.scaling
         bmm2_scale = 1.0
-        # sink: additional value per head in the denominator of the softmax.
-        attention_sink = kwargs.get("sinks", None)
 
         # Call TRT-LLM kernel
         # raw_out: like q, [bs, acc_q_len, num_q_heads, head_dim] but with output dtype
@@ -634,8 +632,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             bmm1_scale=bmm1_scale,
             bmm2_scale=bmm2_scale,
             window_left=layer.sliding_window_size,
-            # TODO: add attention_sink operation or nvfp4 scale factor if needed
-            sinks=attention_sink,
             out_dtype=self.q_data_type,  # model_runner.dtype
         )
 
@@ -709,13 +705,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 bmm1_scale=bmm1_scale,
                 bmm2_scale=bmm2_scale,
                 window_left=layer.sliding_window_size,
-                # TODO: add attention_sink operation or nvfp4 scale factor if needed
-                sinks=attention_sink,
                 out_dtype=self.q_data_type,  # model_runner.dtype
                 q_len_per_req=self.forward_metadata.max_seq_len_q,
             )
         else:
-
             o = flashinfer.prefill.trtllm_batch_context_with_kv_cache(
                 query=q,
                 kv_cache=kv_cache,
@@ -730,8 +723,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 cum_seq_lens_q=self.forward_metadata.cu_seqlens_q,
                 cum_seq_lens_kv=self.forward_metadata.cu_seqlens_k,
                 window_left=layer.sliding_window_size,
-                # TODO: add attention_sink operation or nvfp4 scale factor if needed
-                sinks=attention_sink,
                 out_dtype=self.q_data_type,  # model_runner.dtype
             )
 
@@ -787,7 +778,6 @@ class TRTLLMHAAttnMultiStepDraftBackend(FlashInferMultiStepDraftBackend):
         assert forward_batch.spec_info.is_draft_input()
 
         for i in range(self.speculative_num_steps - 1):
-
             self.attn_backends[i].init_forward_metadata_replay_cuda_graph(
                 bs,
                 forward_batch.req_pool_indices,
