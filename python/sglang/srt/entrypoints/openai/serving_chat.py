@@ -1140,11 +1140,20 @@ class OpenAIServingChat(OpenAIServingBase):
 
     def _get_reasoning_from_request(self, request: ChatCompletionRequest) -> bool:
         """Judge whether the request needs reasoning"""
-        if not self.reasoning_parser:
-            return False
-
         # If reasoning_off_by_default is set, reasoning is off unless explicitly requested
         reasoning_off_by_default = envs.SGLANG_REASONING_OFF_BY_DEFAULT.get()
+
+        if reasoning_off_by_default:
+            # Reasoning is off by default, only enable if explicitly requested
+            return (
+                request.chat_template_kwargs is not None
+                and request.chat_template_kwargs.get("enable_thinking") is True
+            )
+
+        if not self.reasoning_parser:
+            # No reasoning parser configured, but reasoning is not off by default
+            # Allow reasoning to proceed
+            return True
 
         if self.reasoning_parser in [
             "deepseek-v3",
@@ -1154,22 +1163,11 @@ class OpenAIServingChat(OpenAIServingBase):
             "interns1",
         ]:
             # These models use enable_thinking parameter
-            if reasoning_off_by_default:
-                return (
-                    request.chat_template_kwargs is not None
-                    and request.chat_template_kwargs.get("enable_thinking") is True
-                )
-            else:
-                return (
-                    not request.chat_template_kwargs
-                    or request.chat_template_kwargs.get("enable_thinking", True) is True
-                )
-
-        if reasoning_off_by_default:
             return (
-                request.chat_template_kwargs is not None
-                and request.chat_template_kwargs.get("enable_thinking") is True
+                not request.chat_template_kwargs
+                or request.chat_template_kwargs.get("enable_thinking", True) is True
             )
+
         return True  # default
 
     async def _process_tool_call_stream(
