@@ -19,4 +19,18 @@ SGL_DEVICE void reduce_max(T value, float* smem, float min_value = 0.0f) {
   // no extra sync; it is caller's responsibility to sync if needed
 }
 
+template <typename T>
+SGL_DEVICE void reduce_sum(T value, float* smem) {
+  const uint32_t warp_id = threadIdx.x / kWarpThreads;
+  smem[warp_id] = warp::reduce_sum(value);
+  __syncthreads();
+  if (warp_id == 0) {
+    const auto tx = threadIdx.x;
+    const auto local_value = tx * kWarpThreads < blockDim.x ? smem[tx] : 0.0f;
+    const auto sum_value = warp::reduce_sum(local_value);
+    smem[0] = sum_value;
+  }
+  // no extra sync; it is caller's responsibility to sync if needed
+}
+
 }  // namespace device::cta
