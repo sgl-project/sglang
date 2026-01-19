@@ -19,9 +19,6 @@ register_amd_ci(est_time=3600, suite="stage-c-test-large-8-gpu-amd-mi35x")
 DEEPSEEK_V32_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2-Exp"
 
 
-@unittest.skipIf(
-    is_in_amd_ci(), "DP=8 causes barrier deadlock during model loading on AMD."
-)
 class TestDeepseekV32DP(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -93,6 +90,7 @@ class TestDeepseekV32DP(CustomTestCase):
                 self.assertGreater(speed, 50)
 
 
+@unittest.skipIf(is_in_amd_ci(), "To reduce the CI execution time for AMD.")
 class TestDeepseekV32TP(CustomTestCase):
     @classmethod
     def setUpClass(cls):
