@@ -98,7 +98,7 @@ pip install ./custom_ops-2.0.$DEVICE_TYPE-cp311-cp311-linux_aarch64.whl
 
 ```shell
 # Use the last release branch
-git clone -b ifmn/eagle-dp-attn https://github.com/sgl-project/sglang.git
+git clone https://github.com/sgl-project/sglang.git
 cd sglang
 mv python/pyproject_other.toml python/pyproject.toml
 pip install -e python[srt_npu]
