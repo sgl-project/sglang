@@ -67,12 +67,21 @@ logger = logging.getLogger(__name__)
 NVFP4_CKPT_FP8_ATTN_QUANT_MODULES = ["q_b_proj"]
 
 
-@dataclass
-class NextNConfigurations:
+@dataclass(frozen=True)
+class NextNEnabledConfig:
     num_nextn_layers: int
     nextn_layer_id: int
     nextn_layer_prefix: str
     nextn_spec_weight_names: List[str]
+
+
+@dataclass(frozen=True)
+class NextNDisabledConfig:
+    pass
+
+
+"""Union type for NextN configuration, including enabled and disabled configurations."""
+NextNConfig = NextNEnabledConfig | NextNDisabledConfig
 
 
 class DeepseekV2WeightLoaderMixin:
@@ -95,7 +104,7 @@ class DeepseekV2WeightLoaderMixin:
             weights: Iterable of (weight_name, weight_tensor) pairs
             is_nextn: Whether loading NextN speculative decoding weights
         """
-        nextn_conf = self._initialize_nextn_conf() if is_nextn else None
+        nextn_conf = self._initialize_nextn_conf(is_nextn)
 
         weights = self._maybe_quant_weights_to_fp8_ue8m0(
             weights, NVFP4_CKPT_FP8_ATTN_QUANT_MODULES, nextn_conf
@@ -157,36 +166,34 @@ class DeepseekV2WeightLoaderMixin:
 
                 weight_names.append(name)
 
-                if not is_nextn:
-                    if hasattr(self.config, "num_nextn_predict_layers"):
-                        num_nextn_layers = self.config.num_nextn_predict_layers
-                        if num_nextn_layers > 0 and name.startswith("model.layers"):
-                            name_list = name.split(".")
-                            if (
-                                len(name_list) >= 3
-                                and int(name_list[2]) >= self.config.num_hidden_layers
-                            ):
-                                continue
-                else:
-                    if not name.startswith(nextn_conf.nextn_layer_prefix):
-                        continue
+                match nextn_conf:
+                    case NextNEnabledConfig(
+                        nextn_layer_prefix=layer_prefix,
+                        nextn_spec_weight_names=spec_weight_names,
+                    ):
+                        if not name.startswith(layer_prefix):
+                            continue
 
-                    # Use shared head and embed weights from target model
-                    if "shared_head.head" in name or "embed_tokens" in name:
-                        continue
+                        # Use shared head and embed weights from target model
+                        if "shared_head.head" in name or "embed_tokens" in name:
+                            continue
 
-                    is_decoder = True
-                    # For nextn specific weights
-                    for weight_name in nextn_conf.nextn_spec_weight_names:
-                        if weight_name in name:
-                            name = name.replace(nextn_conf.nextn_layer_prefix, "model")
-                            is_decoder = False
-                            break
-                    # For decoder layer weights
-                    if is_decoder:
-                        name = name.replace(
-                            nextn_conf.nextn_layer_prefix, "model.decoder"
-                        )
+                        # Transform name: NextN-specific → "model.*", decoder → "model.decoder.*"
+                        if any(s in name for s in spec_weight_names):
+                            name = name.replace(layer_prefix, "model")
+                        else:
+                            name = name.replace(layer_prefix, "model.decoder")
+                    case NextNDisabledConfig():
+                        if hasattr(self.config, "num_nextn_predict_layers"):
+                            num_nextn_layers = self.config.num_nextn_predict_layers
+                            if num_nextn_layers > 0 and name.startswith("model.layers"):
+                                name_list = name.split(".")
+                                if (
+                                    len(name_list) >= 3
+                                    and int(name_list[2])
+                                    >= self.config.num_hidden_layers
+                                ):
+                                    continue
 
                 if "rotary_emb.inv_freq" in name:
                     continue
@@ -356,7 +363,7 @@ class DeepseekV2WeightLoaderMixin:
 
         self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
 
-    def _initialize_nextn_conf(self) -> NextNConfigurations:
+    def _initialize_nextn_conf(self, is_nextn: bool) -> NextNConfig:
         """
         Initialize the nextn configuration.
 
@@ -364,6 +371,8 @@ class DeepseekV2WeightLoaderMixin:
             ValueError: If num_nextn_predict_layers is not in the config.
             AssertionError: If num_nextn_predict_layers is not equal to 1.
         """
+        if not is_nextn:
+            return NextNDisabledConfig()
 
         if not hasattr(self.config, "num_nextn_predict_layers"):
             raise ValueError("num_nextn_predict_layers is not in the config")
@@ -376,7 +385,7 @@ class DeepseekV2WeightLoaderMixin:
             0 if self.config.num_hidden_layers == 1 else self.config.num_hidden_layers
         )
 
-        return NextNConfigurations(
+        return NextNEnabledConfig(
             num_nextn_layers=num_nextn_layers,
             nextn_layer_id=nextn_layer_id,
             nextn_layer_prefix=f"model.layers.{nextn_layer_id}",
@@ -604,43 +613,47 @@ class DeepseekV2WeightLoaderMixin:
         self,
         weights,
         attn_quant_modules,
-        nextn_conf: Optional[NextNConfigurations] = None,
+        nextn_conf: NextNConfig,
     ):
         """Optionally quantize weights to FP8 UE8M0 format for DeepSeek nvfp4 checkpoints.
 
         Args:
             weights: Iterable of (name, tensor) weight pairs
             attn_quant_modules: List of attention module names to quantize
-            nextn_conf: NextN configuration if loading NextN weights, None otherwise
+            nextn_conf: NextN configuration
 
         Returns:
             List of (name, tensor) pairs with quantized weights
         """
-        is_nextn = nextn_conf is not None
         weights_dict = dict(weights)
         weight_block_size = [128, 128]
         partial_names = []
 
-        if envs.SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN.get():
-            layer_ids = (
-                list(range(self.config.num_hidden_layers))
-                if not is_nextn
-                else [nextn_conf.nextn_layer_id]
-            )
-            for layer_id in layer_ids:
-                for stem in attn_quant_modules:
-                    partial_names.append(f"model.layers.{layer_id}.self_attn.{stem}")
+        match nextn_conf:
+            case NextNEnabledConfig(nextn_layer_id=layer_id):
+                if envs.SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN.get():
+                    for stem in attn_quant_modules:
+                        partial_names.append(
+                            f"model.layers.{layer_id}.self_attn.{stem}"
+                        )
 
-        if is_nextn and enable_nextn_moe_bf16_cast_to_fp8(self.quant_config):
-            expert_sub_names = ["shared_experts"] + [
-                f"experts.{i}" for i in range(self.config.n_routed_experts)
-            ]
-            stems = ["gate_proj", "up_proj", "down_proj"]
-            for expert_sub_name in expert_sub_names:
-                for stem in stems:
-                    partial_names.append(
-                        f"model.layers.{nextn_conf.nextn_layer_id}.mlp.{expert_sub_name}.{stem}"
-                    )
+                if enable_nextn_moe_bf16_cast_to_fp8(self.quant_config):
+                    expert_sub_names = ["shared_experts"] + [
+                        f"experts.{i}" for i in range(self.config.n_routed_experts)
+                    ]
+                    for expert_sub_name in expert_sub_names:
+                        for stem in ["gate_proj", "up_proj", "down_proj"]:
+                            partial_names.append(
+                                f"model.layers.{layer_id}.mlp.{expert_sub_name}.{stem}"
+                            )
+
+            case NextNDisabledConfig():
+                if envs.SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN.get():
+                    for layer_id in range(self.config.num_hidden_layers):
+                        for stem in attn_quant_modules:
+                            partial_names.append(
+                                f"model.layers.{layer_id}.self_attn.{stem}"
+                            )
 
         if partial_names:
             for partial_name in tqdm.tqdm(
@@ -653,7 +666,9 @@ class DeepseekV2WeightLoaderMixin:
                 weights_dict[f"{partial_name}.weight"] = out_w
                 weights_dict[f"{partial_name}.weight_scale_inv"] = out_s
 
-        if is_nextn and enable_nextn_moe_bf16_cast_to_fp8(self.quant_config):
+        if isinstance(
+            nextn_conf, NextNEnabledConfig
+        ) and enable_nextn_moe_bf16_cast_to_fp8(self.quant_config):
             self._mark_nextn_moe_weights_as_ue8m0()
 
         return list(weights_dict.items())
