@@ -339,17 +339,9 @@ class Glm4MoeLiteDecoderLayer(DeepseekV2DecoderLayer):
         from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
 
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
-        rope_theta = getattr(config, "rope_theta", 10000)
-        rope_scaling = getattr(config, "rope_scaling", None)
-        # Fix for GLM-4-Moe-Lite where rope_scaling is populated with default values
-        # but DeepseekV2AttentionMLA blindly treats any rope_scaling dict as deepseek_yarn
-        if (
-            rope_scaling is not None
-            and rope_scaling.get("rope_type", "default") == "default"
-        ):
-            rope_scaling = None
-        max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
-        self.layer_id = layer_id
+        rope_theta = 1000000
+        rope_scaling = None
+        max_position_embeddings = getattr(config, "max_position_embeddings", 202752)        self.layer_id = layer_id
         self.mla = getattr(config, "mla", False)
 
         self.self_attn = DeepseekV2AttentionMLA(
