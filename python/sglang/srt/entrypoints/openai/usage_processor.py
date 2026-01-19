@@ -20,10 +20,12 @@ class UsageProcessor:
         n_choices: int = 1,
         enable_cache_report: bool = False,
     ) -> UsageInfo:
-        completion_tokens = sum(r["meta_info"]["completion_tokens"] for r in responses)
+        completion_tokens = sum(
+            r["meta_info"].get("completion_tokens", 0) for r in responses
+        )
 
         prompt_tokens = sum(
-            responses[i]["meta_info"]["prompt_tokens"]
+            responses[i]["meta_info"].get("prompt_tokens", 0)
             for i in range(0, len(responses), n_choices)
         )
 
