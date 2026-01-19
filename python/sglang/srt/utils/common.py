@@ -89,6 +89,8 @@ from torch import nn
 from torch.library import Library
 from torch.profiler import ProfilerActivity, profile, record_function
 from torch.utils._contextlib import _DecoratorContextManager
+from torchvision.io import ImageReadMode, decode_image, read_image
+from torchvision.transforms.v2 import functional as F
 from typing_extensions import Literal
 
 from sglang.srt.environ import envs
@@ -888,6 +890,107 @@ def load_image(
         raise ValueError(f"Invalid image: {image_file}")
 
     return image, image_size
+
+
+def load_image_tensor(
+    image_file: Union[Image.Image, str, ImageData, bytes],
+    discard_alpha_channel: bool = True,
+) -> tuple[Image.Image, tuple[int, int]]:
+    """
+    Load image, prioritize using torchvision for hardware-accelerated decoding
+    Return PIL Image for backward compatibility
+    """
+    if isinstance(image_file, ImageData):
+        image_file = image_file.url
+
+    image = image_size = None
+
+    if isinstance(image_file, Image.Image):
+        # Already a PIL Image object
+        image = image_file
+        image_size = (image.width, image.height)
+        img_tensor = F.pil_to_tensor(image)
+
+    elif isinstance(image_file, bytes):
+        # bytes format - prioritize torchvision decoding
+        try:
+            img_tensor_bytes = torch.frombuffer(
+                bytearray(image_file), dtype=torch.uint8
+            )
+            img_tensor = decode_image(img_tensor_bytes, mode=ImageReadMode.RGB)
+        except Exception:
+            # Fallback to PIL
+            image = Image.open(BytesIO(image_file))
+            if discard_alpha_channel and image.mode != "RGB":
+                image = image.convert("RGB")
+            img_tensor = F.pil_to_tensor(image)
+
+    elif image_file.startswith("http://") or image_file.startswith("https://"):
+        # HTTP/HTTPS URL
+        timeout = int(os.getenv("REQUEST_TIMEOUT", "3"))
+        response = requests.get(image_file, stream=True, timeout=timeout)
+        try:
+            response.raise_for_status()
+            # Read to memory and decode with torchvision
+            img_bytes = response.content
+            try:
+                img_tensor_bytes = torch.frombuffer(
+                    bytearray(img_bytes), dtype=torch.uint8
+                )
+                img_tensor = decode_image(img_tensor_bytes, mode=ImageReadMode.RGB)
+            except Exception:
+                # Fallback to PIL
+                image = Image.open(BytesIO(img_bytes))
+                if discard_alpha_channel and image.mode != "RGB":
+                    image = image.convert("RGB")
+                img_tensor = F.pil_to_tensor(image)
+        finally:
+            response.close()
+
+    elif image_file.lower().endswith(("png", "jpg", "jpeg", "webp", "gif")):
+        # Local file path - use torchvision for direct reading (fastest)
+        try:
+            img_tensor = read_image(image_file, mode=ImageReadMode.RGB)
+        except Exception:
+            # Fallback to PIL
+            image = Image.open(image_file)
+            if discard_alpha_channel and image.mode != "RGB":
+                image = image.convert("RGB")
+            img_tensor = F.pil_to_tensor(image)
+
+    elif image_file.startswith("data:"):
+        # data URL format: data:image/jpeg;base64,/9j/4AAQ...
+        base64_str = image_file.split(",")[1]
+        img_bytes = pybase64.b64decode(base64_str, validate=True)
+
+        # Decode with torchvision
+        try:
+            img_tensor_bytes = torch.frombuffer(bytearray(img_bytes), dtype=torch.uint8)
+            img_tensor = decode_image(img_tensor_bytes, mode=ImageReadMode.RGB)
+        except Exception:
+            # Fallback to PIL
+            image = Image.open(BytesIO(img_bytes))
+            if discard_alpha_channel and image.mode != "RGB":
+                image = image.convert("RGB")
+            img_tensor = F.pil_to_tensor(image)
+    elif isinstance(image_file, str):
+        # Pure base64 string
+        img_bytes = pybase64.b64decode(image_file, validate=True)
+
+        # Decode with torchvision
+        try:
+            img_tensor_bytes = torch.frombuffer(bytearray(img_bytes), dtype=torch.uint8)
+            img_tensor = decode_image(img_tensor_bytes, mode=ImageReadMode.RGB)
+        except Exception:
+            # Fallback to PIL
+            image = Image.open(BytesIO(img_bytes))
+            if discard_alpha_channel and image.mode != "RGB":
+                image = image.convert("RGB")
+            img_tensor = F.pil_to_tensor(image)
+    else:
+        raise ValueError(f"Invalid image: {image_file}")
+
+    return img_tensor, image_size
 
 
 def get_image_bytes(image_file: Union[str, bytes]):

@@ -18,7 +18,14 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputFormat,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import envs, is_npu, load_audio, load_image, load_video, logger
+from sglang.srt.utils import (
+    envs,
+    is_npu,
+    load_audio,
+    load_image_tensor,
+    load_video,
+    logger,
+)
 from sglang.srt.utils.cuda_ipc_transport_utils import (
     MM_FEATURE_CACHE_SIZE,
     MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
@@ -406,10 +413,8 @@ class BaseMultimodalProcessor(ABC):
                 return data
         try:
             if modality == Modality.IMAGE:
-                img, _ = load_image(data)
-                if discard_alpha_channel and img.mode != "RGB":
-                    img = img.convert("RGB")
-                return img
+                img_tensor, _ = load_image_tensor(data, discard_alpha_channel)
+                return img_tensor
             elif modality == Modality.VIDEO:
                 return load_video(data, frame_count_limit)
             elif modality == Modality.AUDIO:
