@@ -2708,6 +2708,14 @@ def has_hf_quant_config(model_path: str) -> bool:
         return False
 
 
+def get_quantization_config(hf_config) -> str | None:
+    """Extract quantization method from HuggingFace config."""
+    quantization_config = getattr(hf_config, "quantization_config", None)
+    if quantization_config is not None:
+        return quantization_config.get("quant_method")
+    return None
+
+
 def flatten_nested_list(nested_list):
     if isinstance(nested_list, list):
         return [
@@ -2862,6 +2870,7 @@ def is_fa3_default_architecture(hf_config):
         "Olmo2ForCausalLM",
         "Gemma2ForCausalLM",
         "Gemma3ForConditionalGeneration",
+        "MixtralForCausalLM",
         "Qwen2ForCausalLM",
         "Qwen3ForCausalLM",
         "Qwen3MoeForCausalLM",
@@ -3956,7 +3965,7 @@ def is_numa_available() -> bool:
         return False
 
 
-def get_system_gpu_count() -> int:
+def get_system_nvgpu_count() -> int:
     """
     Get the total number of GPUs in the system (not affected by CUDA_VISIBLE_DEVICES).
 
@@ -3978,7 +3987,7 @@ def get_system_gpu_count() -> int:
 
 
 @lru_cache(maxsize=1)
-def get_current_device_numa_node() -> int:
+def get_current_device_numa_node_cuda() -> int:
     """
     Retrieve the NUMA node ID of the CPU socket closest to the currently active CUDA device.
 
@@ -4017,7 +4026,7 @@ def get_current_device_numa_node() -> int:
 
     # Fall back: distribute GPUs evenly across NUMA nodes
     numa_count = get_numa_node_count()
-    gpu_count = get_system_gpu_count()
+    gpu_count = get_system_nvgpu_count()
 
     if gpu_count >= numa_count:
         gpus_per_numa = gpu_count // numa_count  # >= 1
@@ -4031,11 +4040,20 @@ def get_current_device_numa_node() -> int:
     return numa_node
 
 
-def bind_to_closest_numa_node():
+def nvgpu_available() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    if torch.version.cuda is None:
+        return False
+    return True
+
+
+def bind_to_closest_numa_node_cuda():
     """
     Bind the current process to the NUMA node closest to the active CUDA device.
 
     Uses `numa` library calls via ctypes to set the CPU affinity of the process.
     """
-    node_id = get_current_device_numa_node()
-    numa_bind_to_node(node_id)
+    if is_numa_available() and nvgpu_available():
+        node_id = get_current_device_numa_node_cuda()
+        numa_bind_to_node(node_id)
