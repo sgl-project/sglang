@@ -716,9 +716,12 @@ class Scheduler(
                 self.tp_worker.register_hicache_layer_transfer_counter(
                     self.tree_cache.cache_controller.layer_done_counter
                 )
-
-                # Register draft model KV pool for EAGLE speculative decoding
                 if self.spec_algorithm.is_eagle():
+                    # NOTE: I believe there are bugs when enabling HiCache L3 with EAGLE.
+                    # But for compatibility commented out the assertion for now.
+                    # assert not self.server_args.enable_hicache_storage, (
+                    #     "L3 cache with HiCache storage backend is not supported for EAGLE speculative decoding"
+                    #     )
                     self._register_draft_kv_pool_for_hicache(server_args)
             elif self.is_hybrid_swa:
                 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache

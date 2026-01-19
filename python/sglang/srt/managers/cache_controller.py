@@ -272,7 +272,6 @@ class HiCacheController:
         self.pp_rank = pp_rank
         self.pp_size = pp_size
 
-        # Support for EAGLE speculative decoding: draft model KV cache
         self.has_draft_kv_pool = False
         self.mem_pool_device_draft = None
         self.mem_pool_host_draft = None
@@ -472,11 +471,9 @@ class HiCacheController:
         start_event.record()
         with device_module.stream(self.write_stream):
             start_event.wait(self.write_stream)
-            # Backup target model KV cache
             self.mem_pool_host.backup_from_device_all_layer(
                 self.mem_pool_device, host_indices, device_indices, self.io_backend
             )
-            # Backup draft model KV cache if EAGLE mode
             if self.has_draft_kv_pool:
                 self.mem_pool_host_draft.backup_from_device_all_layer(
                     self.mem_pool_device_draft,
@@ -545,7 +542,6 @@ class HiCacheController:
         with device_module.stream(self.load_stream):
             producer_event.start_event.wait(self.load_stream)
             for i in range(self.layer_num):
-                # Load target model KV cache
                 self.mem_pool_host.load_to_device_per_layer(
                     self.mem_pool_device,
                     host_indices,
@@ -553,9 +549,7 @@ class HiCacheController:
                     i,
                     self.io_backend,
                 )
-                # Load draft model KV cache if EAGLE mode
-                # Only restore if layer index is within draft model's layer range
-                # TODO: further optimize by only loading layers that are used in current decoding
+                # TODO: only loading when they are used in current drafting
                 if self.has_draft_kv_pool and i < self.mem_pool_host_draft.layer_num:
                     self.mem_pool_host_draft.load_to_device_per_layer(
                         self.mem_pool_device_draft,
