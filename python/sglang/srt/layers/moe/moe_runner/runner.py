@@ -12,6 +12,7 @@ from sglang.srt.layers.moe.moe_runner.base import (
 from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmRunnerCore
 from sglang.srt.layers.moe.moe_runner.triton import TritonRunnerCore
 from sglang.srt.layers.moe.moe_runner.triton_kernels import TritonKernelsRunnerCore
+from sglang.srt.hardware_backend.npu.quantization.torch_npu_kernels import TorchNpuKernelsRunnerCore
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 
 if TYPE_CHECKING:
@@ -31,7 +32,9 @@ class MoeRunner:
 
         self.fused_func = None
 
-        if runner_backend.is_triton():
+        if runner_backend.is_torch_npu_kernels():
+            self.runner_core = TorchNpuKernelsRunnerCore(config)
+        elif runner_backend.is_triton():
             self.runner_core = TritonRunnerCore(config)
         elif runner_backend.is_triton_kernels():
             self.runner_core = TritonKernelsRunnerCore(config)
