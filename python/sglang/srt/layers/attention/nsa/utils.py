@@ -10,14 +10,11 @@ import triton.language as tl
 
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
-    attn_tp_all_gather_into_tensor,
     get_attention_dp_rank,
-    get_attention_tp_group,
-    get_attention_tp_rank,
-    get_attention_tp_size,
     get_attention_cp_size,
     get_attention_cp_rank,
     get_attention_cp_group,
+    attn_cp_all_gather_into_tensor
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils.common import ceil_align, ceil_div
@@ -110,10 +107,11 @@ def cal_padded_tokens(forward_batch: "ForwardBatch"):
 
 
 def pad_nsa_cache_seqlens(forward_batch: "ForwardBatch", nsa_cache_seqlens):
-    if forward_batch.global_num_tokens_cpu is None:
+    attn_cp_size = get_attention_cp_size()
+    if attn_cp_size == 1 or not can_nsa_prefill_cp_round_robin_split(forward_batch):
         return nsa_cache_seqlens
-    tokens = cal_padded_tokens(forward_batch)
-    pad_len = tokens - nsa_cache_seqlens.shape[0]
+    tokens = sum(forward_batch.extend_seq_lens_cpu)
+    pad_len = (tokens - 1) // attn_cp_size + 1 - nsa_cache_seqlens.shape[0]
     if pad_len > 0:
         nsa_cache_seqlens = torch.cat(
             [
@@ -354,7 +352,7 @@ def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
         output_tensor = input_tensor.new_empty(
             (input_tensor.shape[0] * cp_size, *input_tensor.shape[1:]),
         )
-        attn_tp_all_gather_into_tensor(
+        attn_cp_all_gather_into_tensor(
             output_tensor,
             input_tensor,
         )
