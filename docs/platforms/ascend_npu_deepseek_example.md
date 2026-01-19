@@ -30,6 +30,7 @@ python3 -m sglang.launch_server \
     --trust-remote-code \
     --attention-backend ascend \
     --device npu \
+    --quantization modelslim \
     --watchdog-timeout 9000 \
     --cuda-graph-bs 8 16 24 28 32 \
     --mem-fraction-static 0.68 \
