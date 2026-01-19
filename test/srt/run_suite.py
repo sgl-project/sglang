@@ -35,7 +35,7 @@ suites = {
         TestFile("test_deepseek_v3_fp4_4gpu.py", 1500),
         TestFile("test_fp8_blockwise_gemm.py", 280),
         TestFile("test_gpt_oss_4gpu.py", 700),
-        TestFile("test_llama31_fp4.py", 90),
+        TestFile("test_nvfp4_gemm.py", 360),
     ],
     # "per-commit-8-gpu-b200": [
     #     TestFile("test_mistral_large3_basic.py", 275),  # Moved to nightly - large model
