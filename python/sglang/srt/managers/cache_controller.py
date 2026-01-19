@@ -687,6 +687,14 @@ class HiCacheController:
         tokens_to_fetch = operation.token_ids
         prefix_keys = operation.prefix_keys.copy() if operation.prefix_keys else None
 
+        # Debug log: record query start state
+        logger.debug(
+            f"[PREFETCH_QUERY] request_id={operation.request_id}, "
+            f"last_hash={last_hash[:16] if last_hash else 'None'}..., "
+            f"tokens_to_fetch_len={len(tokens_to_fetch)}, "
+            f"first_5_tokens={tokens_to_fetch[:5]}"
+        )
+
         storage_query_count = 0
         hash_value = []
 
@@ -698,13 +706,37 @@ class HiCacheController:
             )
             batch_tokens = tokens_to_fetch[start:end]
             batch_hashes = []
+            batch_token_hash_pairs = []  # Debug: record token-hash correspondence
             for i in range(0, len(batch_tokens), self.page_size):
-                last_hash = self.get_hash_str(
-                    batch_tokens[i : i + self.page_size], last_hash
-                )
+                page_tokens = batch_tokens[i : i + self.page_size]
+                last_hash = self.get_hash_str(page_tokens, last_hash)
                 batch_hashes.append(last_hash)
+                batch_token_hash_pairs.append((page_tokens, last_hash[:16]))
+
+            # Debug log: record hash for each batch query
+            logger.debug(
+                f"[PREFETCH_QUERY] batch start={start}, "
+                f"batch_size={len(batch_hashes)}, "
+                f"first_3_pairs={batch_token_hash_pairs[:3]}, "
+                f"last_3_pairs={batch_token_hash_pairs[-3:] if len(batch_token_hash_pairs) > 3 else []}"
+            )
+
             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
             hit_page_num = self.storage_backend.batch_exists(batch_hashes, extra_info)
+
+            # Debug log: record hit result
+            logger.debug(
+                f"[PREFETCH_QUERY] batch_exists result: hit_page_num={hit_page_num}/{len(batch_hashes)}"
+            )
+            if hit_page_num < len(batch_hashes) and hit_page_num < 5:
+                # Log the first missed hash
+                miss_idx = hit_page_num
+                logger.debug(
+                    f"[PREFETCH_QUERY] first miss at idx={miss_idx}, "
+                    f"hash={batch_hashes[miss_idx][:16]}..., "
+                    f"tokens={batch_token_hash_pairs[miss_idx][0]}"
+                )
+
             hash_value.extend(batch_hashes[:hit_page_num])
             storage_query_count += hit_page_num * self.page_size
             if hit_page_num < len(batch_hashes):
@@ -712,6 +744,10 @@ class HiCacheController:
             if prefix_keys and len(prefix_keys) > 0:
                 prefix_keys += batch_hashes
 
+        logger.debug(
+            f"[PREFETCH_QUERY] final result: storage_query_count={storage_query_count}, "
+            f"hash_value_len={len(hash_value)}"
+        )
         return hash_value, storage_query_count
 
     def prefetch_thread_func(self):
@@ -743,7 +779,8 @@ class HiCacheController:
                     self.prefetch_revoke_queue.put(operation.request_id)
                     self.append_host_mem_release(operation.host_indices)
                     logger.debug(
-                        f"Revoking prefetch for request {operation.request_id} due to insufficient hits ({storage_hit_count})."
+                        f"[PREFETCH] Revoking prefetch for request {operation.request_id} "
+                        f"due to insufficient hits ({storage_hit_count}), threshold={self.prefetch_threshold}."
                     )
                 else:
                     operation.hash_value = hash_value[
@@ -793,6 +830,35 @@ class HiCacheController:
 
     # Backup batch by batch
     def _page_backup(self, operation):
+        # Debug log: record token-hash correspondence for writes
+        logger.debug(
+            f"[BACKUP_WRITE] operation_id={operation.id}, "
+            f"hash_value_len={len(operation.hash_value)}, "
+            f"host_indices_len={len(operation.host_indices)}, "
+            f"token_ids_len={len(operation.token_ids)}"
+        )
+
+        # Log first and last token-hash pairs
+        if len(operation.hash_value) > 0 and len(operation.token_ids) > 0:
+            first_hashes = [
+                (
+                    operation.token_ids[i * self.page_size : (i + 1) * self.page_size],
+                    operation.hash_value[i][:16],
+                )
+                for i in range(min(3, len(operation.hash_value)))
+            ]
+            last_hashes = [
+                (
+                    operation.token_ids[i * self.page_size : (i + 1) * self.page_size],
+                    operation.hash_value[i][:16],
+                )
+                for i in range(
+                    max(0, len(operation.hash_value) - 3), len(operation.hash_value)
+                )
+            ]
+            logger.debug(f"[BACKUP_WRITE] first_3_token_hash_pairs={first_hashes}")
+            logger.debug(f"[BACKUP_WRITE] last_3_token_hash_pairs={last_hashes}")
+
         # Backup batch by batch
         prefix_keys = operation.prefix_keys
         for i in range(0, len(operation.hash_value), self.storage_batch_size):
@@ -804,6 +870,12 @@ class HiCacheController:
             # todo: allow partial success
             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
             success = self.page_set_func(batch_hashes, batch_host_indices, extra_info)
+
+            logger.debug(
+                f"[BACKUP_WRITE] batch {i // self.storage_batch_size}: "
+                f"wrote {len(batch_hashes)} hashes, success={success}"
+            )
+
             if not success:
                 logger.warning(
                     f"Write page to storage: {len(batch_hashes)} pages failed."
