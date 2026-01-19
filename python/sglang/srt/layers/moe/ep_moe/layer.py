@@ -21,6 +21,7 @@ from sglang.srt.layers.moe.fused_moe_triton.layer import (
     FusedMoE,
     moe_forward_piecewise_cuda_graph_impl,
 )
+from sglang.srt.layers.moe.rocm_moe_utils import upscale
 from sglang.srt.layers.moe.token_dispatcher.deepep import (
     DeepEPLLCombineInput,
     DeepEPNormalCombineInput,
@@ -632,6 +633,12 @@ class MoriEPMoE(FusedMoE):
         w2_scale = None
 
         quant_type = QuantType.No
+
+        if not is_fp8_quant and dispatch_scale is not None:
+            dispatch_a1 = upscale(
+                dispatch_a1, dispatch_scale, dispatch_recv_token_num, output_dtype
+            )
+            dispatch_scale = None
 
         if is_quark_w4a4:
             if hasattr(torch, "float4_e2m1fn_x2"):

@@ -14,7 +14,6 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
 )
 from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.moe.utils import DeepEPMode
-from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
 from sglang.srt.utils import get_bool_env_var, get_int_env_var, is_hip
 
 if TYPE_CHECKING:
@@ -254,14 +253,7 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
         num_token = hidden_states.shape[0]
         scale = None
 
-        is_fp8_quant = (
-            isinstance(self.quant_config["quant_method"], Fp8MoEMethod)
-            if hasattr(self.quant_config, "quant_method")
-            else False
-        )
-        fp8_dispatch = (
-            get_bool_env_var("SGLANG_MORI_FP8_DISP", "False") and is_fp8_quant
-        )
+        fp8_dispatch = get_bool_env_var("SGLANG_MORI_FP8_DISP", "False")
 
         if fp8_dispatch:
             # FP8 quant
