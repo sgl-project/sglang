@@ -1,0 +1,1705 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SGLang 3D Attention Tree</title>
+    <style>
+        :root {
+            --bg-primary: #0a0a0f;
+            --bg-secondary: #12121a;
+            --bg-tertiary: #1a1a25;
+            --border: #2a2a3a;
+            --text-primary: #e0e0e8;
+            --text-secondary: #8888a0;
+            --accent: #00d4ff;
+            --accent-dim: rgba(0, 212, 255, 0.15);
+            --success: #00ff88;
+            --warning: #ffaa00;
+            --error: #ff4466;
+        }
+
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            overflow: hidden;
+            display: flex;
+        }
+
+        #canvas-container {
+            flex: 1;
+            position: relative;
+        }
+
+        /* Right sidebar for text */
+        #sidebar {
+            width: 350px;
+            background: var(--bg-secondary);
+            border-left: 1px solid var(--border);
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+        }
+
+        .sidebar-section {
+            border-bottom: 1px solid var(--border);
+        }
+
+        .section-header {
+            padding: 12px 16px;
+            font-size: 11px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 1.5px;
+            color: var(--accent);
+            background: var(--bg-tertiary);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .section-content {
+            padding: 12px 16px;
+        }
+
+        /* Stats row */
+        .stats-row {
+            display: flex;
+            gap: 8px;
+        }
+
+        .stat-box {
+            flex: 1;
+            text-align: center;
+            padding: 8px;
+            background: var(--bg-tertiary);
+            border-radius: 6px;
+        }
+
+        .stat-value {
+            font-size: 20px;
+            font-weight: 700;
+            color: var(--accent);
+        }
+
+        .stat-label {
+            font-size: 9px;
+            text-transform: uppercase;
+            color: var(--text-secondary);
+        }
+
+        /* Input area */
+        textarea {
+            width: 100%;
+            height: 60px;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            padding: 10px;
+            color: var(--text-primary);
+            font-family: inherit;
+            font-size: 12px;
+            resize: none;
+        }
+
+        textarea:focus {
+            outline: none;
+            border-color: var(--accent);
+        }
+
+        .btn-row {
+            display: flex;
+            gap: 8px;
+            margin-top: 10px;
+        }
+
+        .btn {
+            flex: 1;
+            padding: 8px 12px;
+            border: none;
+            border-radius: 6px;
+            font-size: 12px;
+            font-weight: 500;
+            cursor: pointer;
+        }
+
+        .btn-primary {
+            background: var(--accent);
+            color: #000;
+        }
+
+        .btn-primary:disabled {
+            opacity: 0.4;
+        }
+
+        .btn-secondary {
+            background: var(--bg-tertiary);
+            color: var(--text-primary);
+            border: 1px solid var(--border);
+        }
+
+        /* Generated text display */
+        #text-display {
+            flex: 1;
+            overflow-y: auto;
+            overflow-x: hidden;
+            padding: 16px;
+            font-family: 'SF Mono', Monaco, monospace;
+            font-size: 13px;
+            line-height: 2.0;
+            background: var(--bg-primary);
+            word-wrap: break-word;
+            white-space: pre-wrap;
+        }
+
+        .text-word {
+            display: inline;
+            padding: 3px 6px;
+            margin: 2px;
+            border-radius: 4px;
+            cursor: pointer;
+            transition: all 0.15s;
+            background: var(--bg-tertiary);
+        }
+
+        .text-word:hover {
+            background: var(--accent-dim);
+            transform: scale(1.05);
+        }
+
+        .text-word.selected {
+            background: var(--accent);
+            color: #000;
+        }
+
+        .text-word.high-attention {
+            background: linear-gradient(135deg, #ff6600, #ffaa00);
+            color: #000;
+            font-weight: 600;
+            box-shadow: 0 0 8px rgba(255, 170, 0, 0.5);
+        }
+
+        .text-word.medium-attention {
+            background: rgba(255, 170, 0, 0.3);
+            border: 1px solid var(--warning);
+        }
+
+        /* Top attention words section */
+        #top-attention-list {
+            max-height: 120px;
+            overflow-y: auto;
+        }
+
+        .top-word-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 6px 8px;
+            background: var(--bg-tertiary);
+            border-radius: 4px;
+            margin-bottom: 4px;
+            font-size: 12px;
+            cursor: pointer;
+        }
+
+        .top-word-item:hover {
+            background: var(--accent-dim);
+        }
+
+        .top-word-rank {
+            width: 20px;
+            height: 20px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: linear-gradient(135deg, #ff6600, #ffaa00);
+            color: #000;
+            border-radius: 50%;
+            font-size: 10px;
+            font-weight: 700;
+        }
+
+        .top-word-text {
+            flex: 1;
+            font-family: monospace;
+            font-weight: 500;
+        }
+
+        .top-word-score {
+            color: var(--warning);
+            font-weight: 600;
+        }
+
+        /* Token detail popup */
+        #token-popup {
+            display: none;
+            position: fixed;
+            background: var(--bg-secondary);
+            border: 1px solid var(--accent);
+            border-radius: 8px;
+            padding: 12px;
+            min-width: 200px;
+            z-index: 1000;
+            box-shadow: 0 8px 32px rgba(0,0,0,0.5);
+        }
+
+        #token-popup.active {
+            display: block;
+        }
+
+        .popup-title {
+            font-size: 16px;
+            color: var(--accent);
+            margin-bottom: 8px;
+            font-family: monospace;
+        }
+
+        .popup-row {
+            display: flex;
+            justify-content: space-between;
+            font-size: 11px;
+            padding: 4px 0;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .popup-row:last-child {
+            border-bottom: none;
+        }
+
+        /* Controls overlay */
+        #controls {
+            position: absolute;
+            bottom: 16px;
+            left: 16px;
+            display: flex;
+            gap: 8px;
+            z-index: 100;
+        }
+
+        .control-btn {
+            padding: 8px 14px;
+            background: rgba(18, 18, 26, 0.9);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            color: var(--text-primary);
+            font-size: 11px;
+            cursor: pointer;
+            backdrop-filter: blur(8px);
+        }
+
+        .control-btn:hover, .control-btn.active {
+            border-color: var(--accent);
+            color: var(--accent);
+        }
+
+        .control-btn kbd {
+            background: var(--bg-primary);
+            padding: 2px 5px;
+            border-radius: 3px;
+            margin-left: 6px;
+            font-size: 9px;
+        }
+
+        /* Status indicator */
+        #status {
+            position: absolute;
+            top: 16px;
+            left: 16px;
+            padding: 8px 16px;
+            background: rgba(18, 18, 26, 0.9);
+            border: 1px solid var(--border);
+            border-radius: 20px;
+            font-size: 12px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            z-index: 100;
+            backdrop-filter: blur(8px);
+        }
+
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: var(--error);
+        }
+
+        .status-dot.connected {
+            background: var(--success);
+            box-shadow: 0 0 8px var(--success);
+        }
+
+        /* Legend */
+        #legend {
+            position: absolute;
+            top: 16px;
+            right: 366px;
+            padding: 12px;
+            background: rgba(18, 18, 26, 0.9);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            font-size: 10px;
+            z-index: 100;
+            backdrop-filter: blur(8px);
+        }
+
+        .legend-title {
+            color: var(--accent);
+            font-weight: 600;
+            margin-bottom: 8px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+
+        .legend-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin: 4px 0;
+        }
+
+        .legend-color {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+        }
+
+        /* Minimap */
+        #minimap {
+            position: absolute;
+            bottom: 16px;
+            right: 366px;
+            width: 150px;
+            height: 100px;
+            background: rgba(18, 18, 26, 0.9);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            overflow: hidden;
+            z-index: 100;
+        }
+
+        #minimap canvas {
+            width: 100%;
+            height: 100%;
+        }
+
+        /* Attention list in sidebar */
+        .attention-list {
+            max-height: 150px;
+            overflow-y: auto;
+        }
+
+        .attention-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 6px 8px;
+            background: var(--bg-tertiary);
+            border-radius: 4px;
+            margin-bottom: 4px;
+            font-size: 11px;
+        }
+
+        .attention-rank {
+            width: 18px;
+            height: 18px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: var(--accent);
+            color: #000;
+            border-radius: 50%;
+            font-size: 9px;
+            font-weight: 700;
+        }
+
+        .attention-text {
+            flex: 1;
+            font-family: monospace;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .attention-score {
+            color: var(--accent);
+            font-weight: 600;
+        }
+
+        /* Config inputs */
+        .config-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 8px;
+            margin-top: 10px;
+        }
+
+        .config-item label {
+            display: block;
+            font-size: 9px;
+            color: var(--text-secondary);
+            margin-bottom: 3px;
+            text-transform: uppercase;
+        }
+
+        .config-item input {
+            width: 100%;
+            padding: 6px 8px;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            color: var(--text-primary);
+            font-size: 12px;
+        }
+
+        /* Scrollbar */
+        ::-webkit-scrollbar { width: 6px; }
+        ::-webkit-scrollbar-track { background: var(--bg-tertiary); }
+        ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+        /* Timeline Navigation */
+        #timeline-nav {
+            position: absolute;
+            bottom: 70px;
+            left: 16px;
+            right: 366px;
+            background: rgba(18, 18, 26, 0.95);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 12px 16px;
+            z-index: 100;
+            backdrop-filter: blur(8px);
+        }
+
+        .timeline-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 10px;
+        }
+
+        .timeline-title {
+            font-size: 11px;
+            color: var(--accent);
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+
+        .timeline-position {
+            font-family: monospace;
+            font-size: 12px;
+            color: var(--text-primary);
+        }
+
+        .timeline-controls {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .nav-btn {
+            width: 36px;
+            height: 36px;
+            border: 1px solid var(--border);
+            background: var(--bg-tertiary);
+            color: var(--text-primary);
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 16px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.15s;
+        }
+
+        .nav-btn:hover {
+            border-color: var(--accent);
+            color: var(--accent);
+        }
+
+        .nav-btn:disabled {
+            opacity: 0.3;
+            cursor: not-allowed;
+        }
+
+        .nav-btn.primary {
+            background: var(--accent);
+            color: #000;
+            border-color: var(--accent);
+        }
+
+        #timeline-slider {
+            flex: 1;
+            height: 8px;
+            -webkit-appearance: none;
+            background: var(--bg-tertiary);
+            border-radius: 4px;
+            outline: none;
+            cursor: pointer;
+        }
+
+        #timeline-slider::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            width: 20px;
+            height: 20px;
+            background: var(--accent);
+            border-radius: 50%;
+            cursor: pointer;
+            box-shadow: 0 0 10px var(--accent);
+        }
+
+        #timeline-slider::-moz-range-thumb {
+            width: 20px;
+            height: 20px;
+            background: var(--accent);
+            border-radius: 50%;
+            cursor: pointer;
+            border: none;
+        }
+
+        .current-token-display {
+            margin-top: 10px;
+            padding: 8px 12px;
+            background: var(--bg-primary);
+            border-radius: 6px;
+            font-family: monospace;
+            font-size: 13px;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .current-token-text {
+            flex: 1;
+            color: var(--accent);
+            font-weight: 600;
+        }
+
+        .current-token-stats {
+            font-size: 11px;
+            color: var(--text-secondary);
+        }
+
+        /* Selected node highlight */
+        .text-word.viewing {
+            background: var(--accent) !important;
+            color: #000 !important;
+            box-shadow: 0 0 12px var(--accent);
+        }
+    </style>
+</head>
+<body>
+    <div id="canvas-container">
+        <div id="status">
+            <div class="status-dot" id="statusDot"></div>
+            <span id="statusText">Disconnected</span>
+        </div>
+
+        <div id="legend">
+            <div class="legend-title">Attention Zones</div>
+            <div class="legend-item">
+                <div class="legend-color" style="background: #00d4ff;"></div>
+                <span>Semantic Bridge</span>
+            </div>
+            <div class="legend-item">
+                <div class="legend-color" style="background: #ffcc00;"></div>
+                <span>Syntax Floor</span>
+            </div>
+            <div class="legend-item">
+                <div class="legend-color" style="background: #ff6699;"></div>
+                <span>Exploration</span>
+            </div>
+            <div class="legend-item">
+                <div class="legend-color" style="background: #00ff88;"></div>
+                <span>Steering</span>
+            </div>
+            <div class="legend-item" style="margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--border);">
+                <div class="legend-color" style="background: #444455;"></div>
+                <span>Attention Sink (filtered)</span>
+            </div>
+            <div style="margin-top: 10px; padding-top: 8px; border-top: 1px solid var(--border);">
+                <div class="legend-title">Height = Attention Received</div>
+                <div style="color: var(--text-secondary);">Higher = More Important</div>
+                <div style="color: var(--text-secondary); margin-top: 4px; font-size: 9px;">First 5 tokens filtered as sinks</div>
+            </div>
+            <div style="margin-top: 10px; padding-top: 8px; border-top: 1px solid var(--border);">
+                <div class="legend-title">Edge Colors</div>
+                <div class="legend-item">
+                    <div class="legend-color" style="background: #33ffee;"></div>
+                    <span>Strong (&gt;30%)</span>
+                </div>
+                <div class="legend-item">
+                    <div class="legend-color" style="background: #ffe64d;"></div>
+                    <span>Medium (10-30%)</span>
+                </div>
+                <div class="legend-item">
+                    <div class="legend-color" style="background: #ff8033;"></div>
+                    <span>Weak (&lt;10%)</span>
+                </div>
+            </div>
+        </div>
+
+        <div id="controls">
+            <button class="control-btn active" onclick="setView('tree')" data-view="tree">Tree<kbd>1</kbd></button>
+            <button class="control-btn" onclick="setView('top')" data-view="top">Top<kbd>2</kbd></button>
+            <button class="control-btn" onclick="setView('side')" data-view="side">Side<kbd>3</kbd></button>
+            <button class="control-btn" onclick="setView('front')" data-view="front">Front<kbd>4</kbd></button>
+            <button class="control-btn" onclick="toggleEdges()">Edges<kbd>E</kbd></button>
+            <button class="control-btn" onclick="resetCamera()">Reset<kbd>R</kbd></button>
+        </div>
+
+        <div id="minimap">
+            <canvas id="minimapCanvas"></canvas>
+        </div>
+
+        <div id="timeline-nav">
+            <div class="timeline-header">
+                <span class="timeline-title">Token Navigation</span>
+                <span class="timeline-position" id="timelinePosition">0 / 0</span>
+            </div>
+            <div class="timeline-controls">
+                <button class="nav-btn" onclick="navToStart()" title="Jump to Start">⏮</button>
+                <button class="nav-btn" onclick="navPrev()" title="Previous Token (←)">◀</button>
+                <input type="range" id="timeline-slider" min="0" max="0" value="0" oninput="navToIndex(this.value)">
+                <button class="nav-btn" onclick="navNext()" title="Next Token (→)">▶</button>
+                <button class="nav-btn" onclick="navToEnd()" title="Jump to End">⏭</button>
+            </div>
+            <div class="current-token-display">
+                <span class="current-token-text" id="currentTokenText">No token selected</span>
+                <span class="current-token-stats" id="currentTokenStats"></span>
+            </div>
+        </div>
+    </div>
+
+    <div id="sidebar">
+        <div class="sidebar-section">
+            <div class="section-header">Statistics</div>
+            <div class="section-content">
+                <div class="stats-row">
+                    <div class="stat-box">
+                        <div class="stat-value" id="tokenCount">0</div>
+                        <div class="stat-label">Tokens</div>
+                    </div>
+                    <div class="stat-box">
+                        <div class="stat-value" id="edgeCount">0</div>
+                        <div class="stat-label">Edges</div>
+                    </div>
+                    <div class="stat-box">
+                        <div class="stat-value" id="tps">0</div>
+                        <div class="stat-label">Tok/s</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="sidebar-section">
+            <div class="section-header">Input</div>
+            <div class="section-content">
+                <textarea id="inputText" placeholder="Enter your prompt...">Explain how neural networks learn.</textarea>
+                <div class="btn-row">
+                    <button class="btn btn-primary" id="streamBtn" onclick="startStream()">Generate</button>
+                    <button class="btn btn-secondary" onclick="clearAll()">Clear</button>
+                </div>
+                <div class="config-grid">
+                    <div class="config-item">
+                        <label>Max Tokens</label>
+                        <input type="number" id="maxTokens" value="100" min="1" max="10000">
+                    </div>
+                    <div class="config-item">
+                        <label>Top-K</label>
+                        <input type="number" id="topK" value="10" min="1" max="50">
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="sidebar-section">
+            <div class="section-header">
+                <span>🔥 Top Attention Words</span>
+            </div>
+            <div class="section-content">
+                <div id="top-attention-list">
+                    <div style="color: var(--text-secondary); font-size: 11px;">Generate to see top words...</div>
+                </div>
+            </div>
+        </div>
+
+        <div class="sidebar-section">
+            <div class="section-header">
+                <span>Selected Token</span>
+                <span id="selectedTokenId">-</span>
+            </div>
+            <div class="section-content" id="tokenDetailSection" style="display: none;">
+                <div style="font-family: monospace; font-size: 16px; color: var(--accent); margin-bottom: 8px;" id="selectedTokenText"></div>
+                <div class="attention-list" id="attentionList"></div>
+            </div>
+        </div>
+
+        <div class="sidebar-section" style="flex: 1; display: flex; flex-direction: column; min-height: 0;">
+            <div class="section-header">Generated Text</div>
+            <div id="text-display"></div>
+        </div>
+    </div>
+
+    <div id="token-popup">
+        <div class="popup-title" id="popupTitle"></div>
+        <div class="popup-row"><span>Position</span><span id="popupPos"></span></div>
+        <div class="popup-row"><span>Zone</span><span id="popupZone"></span></div>
+        <div class="popup-row"><span>Importance</span><span id="popupImportance"></span></div>
+    </div>
+
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+            "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+        }
+    }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+        // ============================================
+        // Configuration
+        // ============================================
+        const CONFIG = {
+            // Tree layout - use LOG scale for height due to extreme attention differences
+            xSpacing: 1.0,           // Horizontal spacing
+            yScale: 8,               // Height multiplier after log transform
+            baseY: 1,                // Minimum height
+            useLogScale: true,       // Use logarithmic scaling for height
+
+            // Attention sink filtering - first N tokens act as sinks, exclude from tree
+            attentionSinkTokens: 5,  // Filter out edges to first N tokens (they're attention sinks)
+            showSinkEdges: false,    // Whether to show edges to sink tokens
+
+            // Visual
+            baseRadius: 0.4,
+            maxRadius: 2.0,
+            edgeOpacity: 0.7,
+            edgeMinScore: 0.02,      // Minimum attention score to show edge
+            edgesPerToken: 5,        // Top N edges per token
+
+            // Performance
+            maxVisibleTokens: 500,   // LOD: only render nearby tokens in detail
+            edgeSampleRate: 1.0,     // Show 100% of edges (was 50%)
+
+            // Colors
+            zoneColors: {
+                semantic_bridge: 0x00d4ff,
+                syntax_floor: 0xffcc00,
+                exploration: 0xff6699,
+                steering: 0x00ff88,
+                unknown: 0x888899
+            }
+        };
+
+        // ============================================
+        // State
+        // ============================================
+        let scene, camera, renderer, controls;
+        let tokenGroup, edgeGroup;
+        let instancedMesh = null;
+
+        let tokens = [];
+        let attentionReceived = {};  // Track how much attention each position receives
+        let edgeCount = 0;
+
+        let ws = null;
+        let isStreaming = false;
+        let streamStartTime = null;
+        let showEdges = true;
+        let selectedTokenIndex = null;
+
+        // ============================================
+        // Scene Setup
+        // ============================================
+        function initScene() {
+            const container = document.getElementById('canvas-container');
+
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0x080810);
+            scene.fog = new THREE.FogExp2(0x080810, 0.008);
+
+            camera = new THREE.PerspectiveCamera(
+                60,
+                container.clientWidth / container.clientHeight,
+                0.1,
+                2000
+            );
+            camera.position.set(50, 40, 80);
+
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setSize(container.clientWidth, container.clientHeight);
+            renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+            container.appendChild(renderer.domElement);
+
+            controls = new OrbitControls(camera, renderer.domElement);
+            controls.enableDamping = true;
+            controls.dampingFactor = 0.05;
+            controls.minDistance = 15;      // Don't zoom too close
+            controls.maxDistance = 200;     // Don't zoom too far
+            controls.minPolarAngle = 0.2;   // Limit vertical rotation
+            controls.maxPolarAngle = Math.PI * 0.8;
+            controls.target.set(0, 15, 0);
+
+            // Lighting
+            scene.add(new THREE.AmbientLight(0xffffff, 0.5));
+
+            const mainLight = new THREE.DirectionalLight(0xffffff, 1);
+            mainLight.position.set(50, 100, 50);
+            scene.add(mainLight);
+
+            const blueLight = new THREE.PointLight(0x00d4ff, 0.5, 200);
+            blueLight.position.set(-50, 50, 0);
+            scene.add(blueLight);
+
+            // Ground reference
+            const gridHelper = new THREE.GridHelper(200, 100, 0x222233, 0x111122);
+            scene.add(gridHelper);
+
+            // Y-axis reference (importance axis)
+            const yAxisGeo = new THREE.BufferGeometry().setFromPoints([
+                new THREE.Vector3(0, 0, 0),
+                new THREE.Vector3(0, 50, 0)
+            ]);
+            const yAxis = new THREE.Line(yAxisGeo, new THREE.LineBasicMaterial({
+                color: 0x00d4ff,
+                transparent: true,
+                opacity: 0.5
+            }));
+            scene.add(yAxis);
+
+            // Groups
+            tokenGroup = new THREE.Group();
+            scene.add(tokenGroup);
+
+            edgeGroup = new THREE.Group();
+            scene.add(edgeGroup);
+
+            // Events
+            window.addEventListener('resize', onResize);
+            window.addEventListener('keydown', (e) => { onKeyDown(e); handleNavKeys(e); });
+            renderer.domElement.addEventListener('click', onClick);
+            renderer.domElement.addEventListener('mousemove', onMouseMove);
+
+            animate();
+        }
+
+        function onResize() {
+            const container = document.getElementById('canvas-container');
+            camera.aspect = container.clientWidth / container.clientHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(container.clientWidth, container.clientHeight);
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+            controls.update();
+            renderer.render(scene, camera);
+            updateMinimap();
+        }
+
+        // ============================================
+        // Token Management
+        // ============================================
+        function addToken(index, text, zone, attentionData, fullContent) {
+            // Track attention received by each target position
+            // FILTER OUT sink tokens (first N tokens that act as attention sinks)
+            if (attentionData) {
+                attentionData.forEach(edge => {
+                    const pos = edge.position;
+                    // Only count attention to non-sink tokens for height calculation
+                    if (pos >= CONFIG.attentionSinkTokens) {
+                        attentionReceived[pos] = (attentionReceived[pos] || 0) + edge.score;
+                    }
+                });
+            }
+
+            // Calculate importance (attention received so far)
+            // Sink tokens get minimal height since we filtered their incoming attention
+            const importance = attentionReceived[index] || 0;
+
+            // Store fullContent for text display
+            const tokenFullContent = fullContent;
+
+            // Position: X = sequence position, Y = importance with LOG scale
+            const x = index * CONFIG.xSpacing;
+            // Log scale: log(1 + importance) to handle the huge range
+            const logImportance = Math.log(1 + importance * 10);
+            const y = CONFIG.baseY + logImportance * CONFIG.yScale;
+            const z = 0;
+
+            // Size based on importance (also log scaled)
+            const sizeScale = Math.log(1 + importance * 5) / 2;
+            let radius = CONFIG.baseRadius + Math.min(sizeScale, CONFIG.maxRadius - CONFIG.baseRadius);
+
+            // Check if this is a sink token (first N tokens)
+            const isSinkToken = index < CONFIG.attentionSinkTokens;
+
+            // Sink tokens are smaller and grayed out
+            if (isSinkToken) {
+                radius = CONFIG.baseRadius * 0.5;
+            }
+
+            // Create token sphere
+            const color = isSinkToken ? 0x444455 : getZoneColor(zone);
+            const geometry = new THREE.SphereGeometry(radius, 16, 16);
+            const material = new THREE.MeshStandardMaterial({
+                color: color,
+                emissive: color,
+                emissiveIntensity: isSinkToken ? 0.1 : 0.3,
+                roughness: 0.4,
+                metalness: 0.6,
+            });
+
+            const mesh = new THREE.Mesh(geometry, material);
+            mesh.position.set(x, y, z);
+            mesh.userData = { index, text, zone, importance, attentionData, baseScale: 1 };
+            tokenGroup.add(mesh);
+
+            // Store token data
+            tokens.push({
+                index,
+                text,
+                zone,
+                importance,
+                attentionData,
+                mesh,
+                x, y, z
+            });
+
+            // Add edges (sampled for performance)
+            if (attentionData && showEdges && Math.random() < CONFIG.edgeSampleRate) {
+                addEdges(index, x, y, attentionData);
+            }
+
+            // Add to text display with full content for proper spacing
+            addTextToken(index, text, zone, tokenFullContent);
+
+            // Update positions of previous tokens (their importance may have changed)
+            updateTokenPositions();
+
+            return mesh;
+        }
+
+        function updateTokenPositions() {
+            // Recalculate Y positions based on current attention received (log scale)
+            tokens.forEach(token => {
+                const importance = attentionReceived[token.index] || 0;
+                const logImportance = Math.log(1 + importance * 10);
+                const newY = CONFIG.baseY + logImportance * CONFIG.yScale;
+
+                if (token.mesh && Math.abs(token.mesh.position.y - newY) > 0.1) {
+                    // Animate position change
+                    token.mesh.position.y += (newY - token.mesh.position.y) * 0.3;
+                    token.y = token.mesh.position.y;
+                    token.importance = importance;
+
+                    // Update size (log scaled)
+                    const sizeScale = Math.log(1 + importance * 5) / 2;
+                    const newRadius = CONFIG.baseRadius + Math.min(sizeScale, CONFIG.maxRadius - CONFIG.baseRadius);
+                    const scale = newRadius / CONFIG.baseRadius;
+                    token.mesh.scale.setScalar(scale);
+                }
+            });
+        }
+
+        function addEdges(srcIndex, srcX, srcY, attentionData) {
+            // Don't draw edges during streaming - we'll redraw them all at the end
+            // Just store the attention data on the token
+        }
+
+        function rebuildAllEdges() {
+            // Clear existing edges
+            while(edgeGroup.children.length) edgeGroup.remove(edgeGroup.children[0]);
+            edgeCount = 0;
+
+            // Rebuild edges using final token positions
+            tokens.forEach(token => {
+                if (!token.attentionData || token.attentionData.length === 0) return;
+                if (Math.random() > CONFIG.edgeSampleRate) return;
+
+                const srcX = token.x;
+                const srcY = token.mesh ? token.mesh.position.y : token.y;
+
+                // Filter out edges to sink tokens
+                let filteredEdges = token.attentionData;
+                if (!CONFIG.showSinkEdges) {
+                    filteredEdges = filteredEdges.filter(e => e.position >= CONFIG.attentionSinkTokens);
+                }
+
+                // Get top N edges
+                const topEdges = filteredEdges.slice(0, CONFIG.edgesPerToken);
+
+                topEdges.forEach(edge => {
+                    if (edge.score < CONFIG.edgeMinScore) return;
+
+                    const dstToken = tokens[edge.position];
+                    if (!dstToken) return;
+
+                    const dstX = dstToken.x;
+                    const dstY = dstToken.mesh ? dstToken.mesh.position.y : dstToken.y;
+
+                    // Create curved edge - curve up based on attention strength
+                    const midX = (srcX + dstX) / 2;
+                    const curveHeight = Math.max(srcY, dstY) + edge.score * 10 + 3;
+
+                    const curve = new THREE.QuadraticBezierCurve3(
+                        new THREE.Vector3(srcX, srcY, 0),
+                        new THREE.Vector3(midX, curveHeight, 0),
+                        new THREE.Vector3(dstX, dstY, 0)
+                    );
+
+                    // Use TubeGeometry for thick, visible edges
+                    const tubeRadius = 0.08 + edge.score * 0.3;  // Thicker for stronger attention
+                    const tubeGeometry = new THREE.TubeGeometry(curve, 20, tubeRadius, 6, false);
+
+                    const material = new THREE.MeshBasicMaterial({
+                        color: getAttentionColor(edge.score),
+                        transparent: true,
+                        opacity: Math.max(0.5, 0.3 + edge.score * 2),
+                    });
+
+                    const tube = new THREE.Mesh(tubeGeometry, material);
+                    tube.userData = { srcIndex: token.index, dstIndex: edge.position, score: edge.score };
+                    edgeGroup.add(tube);
+                    edgeCount++;
+                });
+            });
+
+            document.getElementById('edgeCount').textContent = edgeCount;
+        }
+
+        function getZoneColor(zone) {
+            if (!zone) return CONFIG.zoneColors.unknown;
+            const z = zone.toLowerCase();
+            if (z.includes('bridge') || z.includes('semantic')) return CONFIG.zoneColors.semantic_bridge;
+            if (z.includes('syntax') || z.includes('floor')) return CONFIG.zoneColors.syntax_floor;
+            if (z.includes('explor') || z.includes('diffuse')) return CONFIG.zoneColors.exploration;
+            if (z.includes('steer') || z.includes('ripple')) return CONFIG.zoneColors.steering;
+            return CONFIG.zoneColors.unknown;
+        }
+
+        function getAttentionColor(score) {
+            // Bright gradient: orange (low) -> yellow (mid) -> cyan (high)
+            if (score < 0.1) {
+                // Orange for weak attention
+                return new THREE.Color(1.0, 0.5, 0.2);
+            } else if (score < 0.3) {
+                // Yellow for medium attention
+                return new THREE.Color(1.0, 0.9, 0.3);
+            } else {
+                // Cyan for strong attention
+                return new THREE.Color(0.2, 1.0, 0.9);
+            }
+        }
+
+        // ============================================
+        // Text Display
+        // ============================================
+        // Track accumulated text for word grouping
+        let accumulatedText = '';
+        let wordAttention = {};  // word -> {indices: [], totalAttention: 0}
+
+        function addTextToken(index, text, zone, fullContent) {
+            // Use full_content from server (has proper spacing)
+            if (fullContent) {
+                accumulatedText = fullContent;
+            } else {
+                accumulatedText += text;
+            }
+
+            // Show progress during streaming
+            const display = document.getElementById('text-display');
+            display.textContent = accumulatedText;
+        }
+
+        function rebuildTextDisplay() {
+            const display = document.getElementById('text-display');
+            display.innerHTML = '';
+
+            // Split accumulated text into words
+            const words = accumulatedText.split(/(\s+)/);  // Keep whitespace
+
+            // Map tokens to words
+            let charPos = 0;
+            let tokenIdx = 0;
+            wordAttention = {};
+
+            words.forEach((word, wordIdx) => {
+                if (!word) return;
+
+                const wordStart = charPos;
+                const wordEnd = charPos + word.length;
+                charPos = wordEnd;
+
+                // Find which tokens belong to this word
+                const wordTokens = [];
+                let tokenCharPos = 0;
+                tokens.forEach((t, idx) => {
+                    const tokenStart = tokenCharPos;
+                    const tokenEnd = tokenCharPos + (t.text || '').length;
+                    tokenCharPos = tokenEnd;
+
+                    // Check if token overlaps with this word
+                    if (tokenStart < wordEnd && tokenEnd > wordStart) {
+                        wordTokens.push(idx);
+                    }
+                });
+
+                // Skip whitespace-only
+                if (word.trim() === '') {
+                    display.appendChild(document.createTextNode(word));
+                    return;
+                }
+
+                // Calculate total attention for this word
+                let totalAttention = 0;
+                wordTokens.forEach(idx => {
+                    totalAttention += attentionReceived[idx] || 0;
+                });
+
+                wordAttention[word] = { indices: wordTokens, attention: totalAttention, wordIdx };
+
+                // Create word element
+                const span = document.createElement('span');
+                span.className = 'text-word';
+                span.dataset.word = word;
+                span.dataset.indices = JSON.stringify(wordTokens);
+                span.textContent = word;
+
+                // Highlight based on attention
+                if (totalAttention > 0.15) {
+                    span.classList.add('high-attention');
+                } else if (totalAttention > 0.08) {
+                    span.classList.add('medium-attention');
+                }
+
+                span.onclick = () => {
+                    // Select first token of this word
+                    if (wordTokens.length > 0) selectToken(wordTokens[0]);
+                };
+
+                display.appendChild(span);
+            });
+
+            // Update top attention words list
+            updateTopAttentionWords();
+        }
+
+        function updateTopAttentionWords() {
+            const list = document.getElementById('top-attention-list');
+            list.innerHTML = '';
+
+            // Sort words by attention
+            const sortedWords = Object.entries(wordAttention)
+                .filter(([word, data]) => word.trim().length > 1)  // Skip single chars
+                .sort((a, b) => b[1].attention - a[1].attention)
+                .slice(0, 8);
+
+            if (sortedWords.length === 0) {
+                list.innerHTML = '<div style="color: var(--text-secondary); font-size: 11px;">No high-attention words</div>';
+                return;
+            }
+
+            sortedWords.forEach(([word, data], rank) => {
+                const item = document.createElement('div');
+                item.className = 'top-word-item';
+                item.innerHTML = `
+                    <span class="top-word-rank">${rank + 1}</span>
+                    <span class="top-word-text">${word}</span>
+                    <span class="top-word-score">${(data.attention * 100).toFixed(1)}%</span>
+                `;
+                item.onclick = () => {
+                    if (data.indices.length > 0) selectToken(data.indices[0]);
+                };
+                list.appendChild(item);
+            });
+        }
+
+        function getZoneColorCSS(zone) {
+            const colors = {
+                semantic_bridge: '#00d4ff',
+                syntax_floor: '#ffcc00',
+                exploration: '#ff6699',
+                steering: '#00ff88',
+                unknown: '#888899'
+            };
+            if (!zone) return colors.unknown;
+            const z = zone.toLowerCase();
+            if (z.includes('bridge') || z.includes('semantic')) return colors.semantic_bridge;
+            if (z.includes('syntax') || z.includes('floor')) return colors.syntax_floor;
+            if (z.includes('explor') || z.includes('diffuse')) return colors.exploration;
+            if (z.includes('steer') || z.includes('ripple')) return colors.steering;
+            return colors.unknown;
+        }
+
+        function showPopup(e, index) {
+            const token = tokens[index];
+            if (!token) return;
+
+            const popup = document.getElementById('token-popup');
+            popup.classList.add('active');
+            popup.style.left = (e.clientX + 10) + 'px';
+            popup.style.top = (e.clientY + 10) + 'px';
+
+            document.getElementById('popupTitle').textContent = token.text;
+            document.getElementById('popupPos').textContent = index;
+            document.getElementById('popupZone').textContent = token.zone || 'unknown';
+            document.getElementById('popupImportance').textContent = (token.importance * 100).toFixed(1) + '%';
+        }
+
+        function hidePopup() {
+            document.getElementById('token-popup').classList.remove('active');
+        }
+
+        // ============================================
+        // Selection
+        // ============================================
+        const raycaster = new THREE.Raycaster();
+        const mouse = new THREE.Vector2();
+
+        function onClick(event) {
+            const container = document.getElementById('canvas-container');
+            const rect = container.getBoundingClientRect();
+            mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+            mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+
+            raycaster.setFromCamera(mouse, camera);
+            const meshes = tokens.map(t => t.mesh).filter(m => m);
+            const intersects = raycaster.intersectObjects(meshes);
+
+            if (intersects.length > 0) {
+                selectToken(intersects[0].object.userData.index);
+            }
+        }
+
+        function onMouseMove(event) {
+            // Could add hover effects here
+        }
+
+        function selectToken(index, flyToToken = true) {
+            selectedTokenIndex = index;
+            const token = tokens[index];
+            if (!token) return;
+
+            // Update 3D view - highlight selected, scale up
+            tokens.forEach(t => {
+                if (t.mesh) {
+                    const isSelected = t.index === index;
+                    t.mesh.material.emissiveIntensity = isSelected ? 1.0 : 0.3;
+                    // Scale selected token larger
+                    const baseScale = t.mesh.userData.baseScale || 1;
+                    t.mesh.scale.setScalar(isSelected ? baseScale * 1.5 : baseScale);
+                }
+            });
+
+            // Highlight edges connected to this token
+            edgeGroup.children.forEach(edge => {
+                if (edge.userData.srcIndex === index || edge.userData.dstIndex === index) {
+                    edge.material.opacity = 0.95;
+                    edge.material.color.setHex(0x00ffff);  // Bright cyan for selected
+                } else {
+                    edge.material.opacity = 0.15;
+                }
+            });
+
+            // Update text display - highlight words containing this token
+            document.querySelectorAll('.text-word').forEach(el => {
+                el.classList.remove('selected', 'highlighted', 'viewing');
+                const indices = JSON.parse(el.dataset.indices || '[]');
+                if (indices.includes(index)) {
+                    el.classList.add('viewing');
+                    el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                }
+            });
+
+            // Highlight attended tokens in text
+            if (token.attentionData) {
+                token.attentionData.forEach(edge => {
+                    document.querySelectorAll('.text-word').forEach(el => {
+                        const indices = JSON.parse(el.dataset.indices || '[]');
+                        if (indices.includes(edge.position)) {
+                            el.classList.add('highlighted');
+                        }
+                    });
+                });
+            }
+
+            // Update sidebar
+            document.getElementById('selectedTokenId').textContent = `#${index}`;
+            document.getElementById('selectedTokenText').textContent = token.text;
+            document.getElementById('tokenDetailSection').style.display = 'block';
+
+            // Render attention list
+            const list = document.getElementById('attentionList');
+            list.innerHTML = '';
+            if (token.attentionData) {
+                token.attentionData.slice(0, 8).forEach((edge, rank) => {
+                    const targetToken = tokens[edge.position];
+                    const item = document.createElement('div');
+                    item.className = 'attention-item';
+                    item.innerHTML = `
+                        <span class="attention-rank">${rank + 1}</span>
+                        <span class="attention-text">${targetToken ? targetToken.text : `[${edge.position}]`}</span>
+                        <span class="attention-score">${(edge.score * 100).toFixed(1)}%</span>
+                    `;
+                    item.onclick = () => selectToken(edge.position);
+                    list.appendChild(item);
+                });
+            }
+
+            // Update timeline controls
+            updateTimelineDisplay(index);
+
+            // Fly camera to token (closer zoom)
+            if (flyToToken) {
+                const targetPos = new THREE.Vector3(token.x + 12, token.y + 8, 25);
+                const targetLook = new THREE.Vector3(token.x, token.y, 0);
+                animateCamera(targetPos, targetLook);
+            }
+        }
+
+        // ============================================
+        // Timeline Navigation
+        // ============================================
+        function updateTimelineDisplay(index) {
+            const slider = document.getElementById('timeline-slider');
+            slider.max = Math.max(0, tokens.length - 1);
+            slider.value = index;
+
+            document.getElementById('timelinePosition').textContent = `${index + 1} / ${tokens.length}`;
+
+            const token = tokens[index];
+            if (token) {
+                const importance = (attentionReceived[index] || 0) * 100;
+                document.getElementById('currentTokenText').textContent = `"${token.text}"`;
+                document.getElementById('currentTokenStats').textContent =
+                    `Position: ${index} | Attention: ${importance.toFixed(1)}% | Zone: ${token.zone || 'unknown'}`;
+            }
+        }
+
+        window.navToStart = function() {
+            if (tokens.length > 0) selectToken(0);
+        };
+
+        window.navToEnd = function() {
+            if (tokens.length > 0) selectToken(tokens.length - 1);
+        };
+
+        window.navPrev = function() {
+            if (selectedTokenIndex > 0) {
+                selectToken(selectedTokenIndex - 1);
+            }
+        };
+
+        window.navNext = function() {
+            if (selectedTokenIndex < tokens.length - 1) {
+                selectToken(selectedTokenIndex + 1);
+            }
+        };
+
+        window.navToIndex = function(index) {
+            const idx = parseInt(index);
+            if (idx >= 0 && idx < tokens.length) {
+                selectToken(idx);
+            }
+        };
+
+        // Keyboard shortcuts for navigation
+        function handleNavKeys(event) {
+            if (event.target.tagName === 'INPUT' || event.target.tagName === 'TEXTAREA') return;
+
+            switch(event.key) {
+                case 'ArrowLeft':
+                    navPrev();
+                    event.preventDefault();
+                    break;
+                case 'ArrowRight':
+                    navNext();
+                    event.preventDefault();
+                    break;
+                case 'Home':
+                    navToStart();
+                    event.preventDefault();
+                    break;
+                case 'End':
+                    navToEnd();
+                    event.preventDefault();
+                    break;
+            }
+        }
+
+        // ============================================
+        // Camera
+        // ============================================
+        const VIEWS = {
+            tree: () => ({
+                pos: [tokens.length * CONFIG.xSpacing / 2 + 30, 25, 60],
+                target: [tokens.length * CONFIG.xSpacing / 2, 15, 0]
+            }),
+            top: () => ({
+                pos: [tokens.length * CONFIG.xSpacing / 2, 80, 1],
+                target: [tokens.length * CONFIG.xSpacing / 2, 0, 0]
+            }),
+            side: () => ({
+                pos: [tokens.length * CONFIG.xSpacing / 2, 20, 80],
+                target: [tokens.length * CONFIG.xSpacing / 2, 15, 0]
+            }),
+            front: () => ({
+                pos: [-30, 20, 0],
+                target: [tokens.length * CONFIG.xSpacing / 4, 15, 0]
+            })
+        };
+
+        window.setView = function(viewName) {
+            const view = VIEWS[viewName]();
+            animateCamera(
+                new THREE.Vector3(...view.pos),
+                new THREE.Vector3(...view.target)
+            );
+
+            document.querySelectorAll('.control-btn').forEach(btn => {
+                btn.classList.toggle('active', btn.dataset.view === viewName);
+            });
+        };
+
+        function animateCamera(targetPos, targetLook) {
+            const duration = 600;
+            const start = performance.now();
+            const startPos = camera.position.clone();
+            const startTarget = controls.target.clone();
+
+            function animate(time) {
+                const t = Math.min((time - start) / duration, 1);
+                const ease = 1 - Math.pow(1 - t, 3);
+
+                camera.position.lerpVectors(startPos, targetPos, ease);
+                controls.target.lerpVectors(startTarget, targetLook, ease);
+
+                if (t < 1) requestAnimationFrame(animate);
+            }
+            requestAnimationFrame(animate);
+        }
+
+        window.resetCamera = function() {
+            setView('tree');
+        };
+
+        window.toggleEdges = function() {
+            showEdges = !showEdges;
+            edgeGroup.visible = showEdges;
+        };
+
+        // ============================================
+        // Minimap
+        // ============================================
+        function updateMinimap() {
+            const canvas = document.getElementById('minimapCanvas');
+            const ctx = canvas.getContext('2d');
+
+            canvas.width = 150;
+            canvas.height = 100;
+
+            ctx.fillStyle = '#0a0a12';
+            ctx.fillRect(0, 0, 150, 100);
+
+            if (tokens.length === 0) return;
+
+            // Scale to fit
+            const maxX = tokens.length * CONFIG.xSpacing;
+            const maxY = 50;
+            const scaleX = 140 / maxX;
+            const scaleY = 90 / maxY;
+
+            // Draw tokens
+            tokens.forEach(token => {
+                const x = 5 + token.x * scaleX;
+                const y = 95 - token.y * scaleY;
+                const radius = 1 + token.importance * 3;
+
+                ctx.beginPath();
+                ctx.arc(x, y, radius, 0, Math.PI * 2);
+                ctx.fillStyle = getZoneColorCSS(token.zone);
+                ctx.fill();
+            });
+
+            // Draw camera position indicator
+            const camX = 5 + (camera.position.x / CONFIG.xSpacing) * CONFIG.xSpacing * scaleX;
+            const camY = 95 - camera.position.y * scaleY;
+            ctx.strokeStyle = '#fff';
+            ctx.lineWidth = 1;
+            ctx.strokeRect(camX - 10, camY - 5, 20, 10);
+        }
+
+        // ============================================
+        // Keyboard
+        // ============================================
+        function onKeyDown(event) {
+            if (event.target.tagName === 'INPUT' || event.target.tagName === 'TEXTAREA') return;
+
+            switch(event.key) {
+                case '1': setView('tree'); break;
+                case '2': setView('top'); break;
+                case '3': setView('side'); break;
+                case '4': setView('front'); break;
+                case 'r': case 'R': resetCamera(); break;
+                case 'e': case 'E': toggleEdges(); break;
+            }
+        }
+
+        // ============================================
+        // WebSocket
+        // ============================================
+        function connect() {
+            const port = 8765;
+            ws = new WebSocket(`ws://localhost:${port}/ws`);
+
+            ws.onopen = () => {
+                document.getElementById('statusDot').classList.add('connected');
+                document.getElementById('statusText').textContent = 'Connected';
+            };
+
+            ws.onclose = () => {
+                document.getElementById('statusDot').classList.remove('connected');
+                document.getElementById('statusText').textContent = 'Disconnected';
+                setTimeout(connect, 3000);
+            };
+
+            ws.onerror = () => {
+                document.getElementById('statusText').textContent = 'Error';
+            };
+
+            ws.onmessage = (e) => {
+                const data = JSON.parse(e.data);
+                handleMessage(data);
+            };
+        }
+
+        function handleMessage(data) {
+            switch(data.type) {
+                case 'stream_start':
+                    isStreaming = true;
+                    streamStartTime = Date.now();
+                    document.getElementById('streamBtn').disabled = true;
+                    break;
+
+                case 'token':
+                    addToken(data.index, data.content, data.zone, data.attends_to || [], data.full_content);
+                    updateStats();
+
+                    // Auto-adjust camera for growing sequence
+                    if (tokens.length % 20 === 0) {
+                        const centerX = tokens.length * CONFIG.xSpacing / 2;
+                        controls.target.lerp(new THREE.Vector3(centerX, 15, 0), 0.05);
+                    }
+                    break;
+
+                case 'stream_end':
+                    isStreaming = false;
+                    document.getElementById('streamBtn').disabled = false;
+
+                    // Finalize token positions
+                    for (let i = 0; i < 10; i++) {
+                        updateTokenPositions();
+                    }
+
+                    // Rebuild edges with final positions
+                    rebuildAllEdges();
+
+                    // Rebuild text display with full words
+                    rebuildTextDisplay();
+
+                    // Initialize timeline navigation
+                    const slider = document.getElementById('timeline-slider');
+                    slider.max = Math.max(0, tokens.length - 1);
+                    slider.value = 0;
+                    document.getElementById('timelinePosition').textContent = `1 / ${tokens.length}`;
+
+                    // Select first non-sink token
+                    if (tokens.length > CONFIG.attentionSinkTokens) {
+                        setTimeout(() => selectToken(CONFIG.attentionSinkTokens), 600);
+                    }
+
+                    updateStats();
+                    setTimeout(() => setView('tree'), 500);
+                    break;
+
+                case 'error':
+                    alert('Error: ' + data.message);
+                    document.getElementById('streamBtn').disabled = false;
+                    break;
+            }
+        }
+
+        // ============================================
+        // UI
+        // ============================================
+        window.startStream = function() {
+            if (!ws || ws.readyState !== WebSocket.OPEN) {
+                alert('Not connected');
+                return;
+            }
+
+            const text = document.getElementById('inputText').value.trim();
+            if (!text) return;
+
+            clearAll();
+
+            ws.send(JSON.stringify({
+                action: 'analyze',
+                messages: [{ role: 'user', content: text }],
+                max_tokens: parseInt(document.getElementById('maxTokens').value),
+                temperature: 0.7,
+                attention_top_k: parseInt(document.getElementById('topK').value),
+            }));
+        };
+
+        window.clearAll = function() {
+            // Clear 3D
+            while(tokenGroup.children.length) tokenGroup.remove(tokenGroup.children[0]);
+            while(edgeGroup.children.length) edgeGroup.remove(edgeGroup.children[0]);
+
+            tokens = [];
+            attentionReceived = {};
+            edgeCount = 0;
+            selectedTokenIndex = null;
+
+            // Clear text tracking
+            accumulatedText = '';
+            wordAttention = {};
+
+            // Clear text display
+            document.getElementById('text-display').innerHTML = '';
+            document.getElementById('tokenDetailSection').style.display = 'none';
+            document.getElementById('top-attention-list').innerHTML = '<div style="color: var(--text-secondary); font-size: 11px;">Generate to see top words...</div>';
+
+            updateStats();
+        };
+
+        function updateStats() {
+            document.getElementById('tokenCount').textContent = tokens.length;
+            document.getElementById('edgeCount').textContent = edgeCount;
+
+            if (streamStartTime && tokens.length > 0) {
+                const elapsed = (Date.now() - streamStartTime) / 1000;
+                document.getElementById('tps').textContent = (tokens.length / elapsed).toFixed(1);
+            }
+        }
+
+        // ============================================
+        // Init
+        // ============================================
+        document.addEventListener('DOMContentLoaded', () => {
+            initScene();
+            connect();
+        });
+    </script>
+</body>
+</html>

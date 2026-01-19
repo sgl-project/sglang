@@ -53,7 +53,7 @@ async def stream_completion(request: web.Request, ws: web.WebSocketResponse, dat
     try:
         async with aiohttp.ClientSession() as session:
             # First, tokenize the prompt to get token count
-            tokenize_payload = {"text": prompt_text}
+            tokenize_payload = {"prompt": prompt_text}
             prompt_token_count = 0
 
             try:
@@ -173,10 +173,16 @@ async def stream_completion(request: web.Request, ws: web.WebSocketResponse, dat
                     while len(token_texts) < num_tokens:
                         token_texts.append("…")
 
-            accumulated_text = ""
+            # Use original content for proper spacing
+            # Calculate cumulative text based on token progress
             for i, attn in enumerate(attention_tokens):
                 token_text = token_texts[i] if i < len(token_texts) else ""
-                accumulated_text += token_text
+
+                # Calculate approximate position in original content
+                # Use ratio of tokens processed to estimate position
+                progress = (i + 1) / num_tokens
+                approx_end = int(len(content) * progress)
+                accumulated_text = content[:approx_end]
 
                 # Build token message with attention
                 token_msg = {
@@ -185,16 +191,37 @@ async def stream_completion(request: web.Request, ws: web.WebSocketResponse, dat
                     "content": token_text if token_text.strip() else "·",
                     "full_content": accumulated_text,
                     "attention": attn,
-                    "zone": attn.get("manifold_zone", "unknown"),
+                    "zone": attn.get("manifold_zone") or attn.get("manifold", "unknown"),
                     "fingerprint": attn.get("fingerprint"),
                 }
 
-                # Extract attention edges
-                if attn.get("token_positions") and attn.get("attention_scores"):
+                # Extract attention edges - handle both flat and nested layers format
+                token_positions = None
+                attention_scores = None
+                layer_id = 0
+
+                # Check for nested layers format (mode: "raw")
+                if attn.get("layers"):
+                    layers = attn["layers"]
+                    # Get the last layer (usually most informative)
+                    layer_ids = sorted(layers.keys(), key=lambda x: int(x))
+                    if layer_ids:
+                        layer_id = int(layer_ids[-1])
+                        layer_data = layers[layer_ids[-1]]
+                        token_positions = layer_data.get("token_positions")
+                        attention_scores = layer_data.get("attention_scores")
+                # Check for flat format
+                elif attn.get("token_positions") and attn.get("attention_scores"):
+                    token_positions = attn["token_positions"]
+                    attention_scores = attn["attention_scores"]
+                    layer_id = attn.get("layer_id", 0)
+
+                if token_positions and attention_scores:
                     token_msg["attends_to"] = [
-                        {"position": pos, "score": score}
-                        for pos, score in zip(attn["token_positions"], attn["attention_scores"])
+                        {"position": pos, "score": score, "layer": layer_id}
+                        for pos, score in zip(token_positions, attention_scores)
                     ]
+                    token_msg["layer_id"] = layer_id
 
                 await ws.send_json(token_msg)
 
