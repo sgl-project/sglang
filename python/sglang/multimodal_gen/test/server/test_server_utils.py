@@ -1029,7 +1029,7 @@ def get_generate_fn(
         )
         os.remove(tmp_path)
 
-        return rid
+        return (rid, img_data)
 
     def generate_video(case_id, client) -> str:
         """T2V: Text ? Video."""
