@@ -77,13 +77,14 @@ class NgramVerifyInput(SpecInput):
 
         batch.input_ids = self.draft_token
 
-        if page_size == 1:
+        if page_size == 1:  # decode一个一个slot去分配 一个slot就是一个block
+            # TODO spec-v2: 第一次decode是否应该分配draft_token+1个slot 因为prefill的token还没有slot？
             batch.out_cache_loc = alloc_token_slots(
                 batch.tree_cache,
                 len(batch.input_ids),
             )
             end_offset = batch.seq_lens + self.draft_token_num
-        else:
+        else:  # 每次分配都分一个block，根据last_loc去分配，先填满当前block中的空余的部分
             # TODO(lsyin): add prefix lens cpu here to support page size > 1
             prefix_lens = batch.seq_lens
             prefix_lens_cpu = batch.seq_lens_cpu
@@ -106,11 +107,13 @@ class NgramVerifyInput(SpecInput):
             self.last_loc = last_loc
 
         bs = batch.batch_size()
-        assign_req_to_token_pool[(bs,)](
-            batch.req_pool_indices,
-            batch.req_to_token_pool.req_to_token,
-            batch.seq_lens,
-            end_offset,
+        assign_req_to_token_pool[
+            (bs,)
+        ](  # 把刚分配出来的out_cache_loc写回总的block table (req_to_token池)
+            batch.req_pool_indices,  # where is the block table
+            batch.req_to_token_pool.req_to_token,  # block table
+            batch.seq_lens,  # start offset
+            end_offset,  # seqlens + draft_token_num
             batch.out_cache_loc,
             batch.req_to_token_pool.req_to_token.shape[1],
             triton.next_power_of_2(bs),
@@ -371,12 +374,32 @@ class NgramVerifyInput(SpecInput):
             deterministic=True,
         )
 
+    def fill_requests_and_free_cache(
+        self,
+        batch: ScheduleBatch,
+        logits_output: LogitsProcessorOutput,
+        page_size: int,
+    ) -> Tuple[LogitsProcessorOutput, int]:
+        self._fill_requests(batch, logits_output)
+
+        accept_length_cpu = self.accept_length.cpu()
+        num_accepted_tokens = accept_length_cpu.sum().item()
+
+        self._free_cache(batch, page_size, accept_length_cpu)
+
+        batch.seq_lens.add_(self.accept_length + 1)
+        batch.seq_lens_cpu.add_(accept_length_cpu + 1)
+        self.verify_done = torch.get_device_module(self.device).Event()
+        self.verify_done.record()
+        return logits_output, self.verified_id, num_accepted_tokens
+
     def verify(
         self,
         batch: ScheduleBatch,
         logits_output: LogitsProcessorOutput,
         page_size: int,
         vocab_mask: Optional[torch.Tensor] = None,  # For grammar
+        is_spec_v2: bool = False,
     ) -> torch.Tensor:
         bs = self.retrive_index.shape[0]
         sampling_info = batch.sampling_info
@@ -430,15 +453,13 @@ class NgramVerifyInput(SpecInput):
             # NOTE: Compared with greedy_verify, the performance of _sampling_verify is relatively poor.
             self._sampling_verify(batch, logits_output, sampling_info)
 
-        self._fill_requests(batch, logits_output)
+        if is_spec_v2:
+            # In spec-v2, we fill requests later in scheduler
+            return logits_output, self.predict, self.accept_length
 
-        accept_length_cpu = self.accept_length.cpu()
-        num_accepted_tokens = accept_length_cpu.sum().item()
-
-        self._free_cache(batch, page_size, accept_length_cpu)
-
-        batch.seq_lens.add_(self.accept_length + 1)
-        batch.seq_lens_cpu.add_(accept_length_cpu + 1)
+        logits_output, verified_id, num_accepted_tokens = (
+            self.fill_requests_and_free_cache(batch, logits_output, page_size)
+        )
 
         return logits_output, self.verified_id, num_accepted_tokens
 

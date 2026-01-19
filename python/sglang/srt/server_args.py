@@ -2113,7 +2113,7 @@ class ServerArgs:
                 )
 
             if (
-                self.speculative_algorithm in ["EAGLE", "EAGLE3", "STANDALONE"]
+                self.speculative_algorithm in ["NGRAM", "EAGLE", "EAGLE3", "STANDALONE"]
                 and envs.SGLANG_ENABLE_SPEC_V2.get()
             ):
                 self.disable_overlap_schedule = False
@@ -2214,7 +2214,7 @@ class ServerArgs:
                     "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
                 )
 
-            self.disable_overlap_schedule = True
+            self.disable_overlap_schedule = False
             self.enable_mixed_chunk = False
             self.speculative_eagle_topk = self.speculative_ngram_max_bfs_breadth
             if self.speculative_num_draft_tokens is None:

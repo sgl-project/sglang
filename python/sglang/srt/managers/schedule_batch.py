@@ -58,6 +58,7 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.common import (
@@ -1321,6 +1322,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     spec_algorithm: SpeculativeAlgorithm = None
     # spec_info: Optional[SpecInput] = None
     spec_info: Optional[SpecInput] = None
+    logits_output: Optional[LogitsProcessorOutput] = None
 
     # Whether to return hidden states
     return_hidden_states: bool = False
@@ -1949,7 +1951,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.forward_mode = ForwardMode.DECODE
         bs = len(self.reqs)
 
-        if self.is_spec_v2:
+        if self.is_spec_v2 and not self.spec_algorithm.is_ngram():
             # TODO(spec-v2): all spec v2 should go through this path
             draft_input: EagleDraftInput = self.spec_info
             draft_input.prepare_for_decode(self)
@@ -2032,7 +2034,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def maybe_wait_verify_done(self):
         if self.is_spec_v2:
             draft_input: EagleDraftInput = self.spec_info
-            if draft_input.verify_done is not None:
+            if draft_input and draft_input.verify_done is not None:
                 draft_input.verify_done.synchronize()
 
     def filter_batch(
@@ -2251,6 +2253,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             return_logprob=self.return_logprob,
             decoding_reqs=self.decoding_reqs,
             spec_algorithm=self.spec_algorithm,
+            spec_info=self.spec_info,
             global_num_tokens=self.global_num_tokens,
             global_num_tokens_for_logprob=self.global_num_tokens_for_logprob,
             can_run_dp_cuda_graph=self.can_run_dp_cuda_graph,
