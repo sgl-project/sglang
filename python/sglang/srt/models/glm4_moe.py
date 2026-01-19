@@ -684,7 +684,7 @@ class Glm4MoeDecoderLayer(nn.Module):
         rms_norm_eps = config.rms_norm_eps
         attention_bias = config.attention_bias
         self.layer_id = layer_id
-        
+
         use_qk_norm = config.use_qk_norm if hasattr(config, "use_qk_norm") else False
 
         self.self_attn = Glm4MoeAttention(
