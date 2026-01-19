@@ -384,7 +384,7 @@ class SchedulerMetricsMixin:
             msg += f"#retracted-req: {len(self.disagg_decode_prealloc_queue.retracted_queue)}, "
 
         msg += (
-            f"{'cuda graph' if self.device == 'cuda' else 'cpu graph'}: {can_run_cuda_graph}, "
+            f"{'cuda graph' if self.device == 'cuda' else 'musa graph' if self.device == 'musa' else 'cpu graph'}: {can_run_cuda_graph}, "
             f"gen throughput (token/s): {self.last_gen_throughput:.2f}, "
             f"#queue-req: {len(self.waiting_queue)}, "
         )
