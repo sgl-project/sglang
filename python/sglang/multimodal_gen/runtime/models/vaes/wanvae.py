@@ -35,6 +35,7 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_sp_parallel_rank,
     get_sp_world_size,
+    get_sp_group,
 )
 
 CACHE_T = 2
@@ -762,7 +763,17 @@ class WanDistResidualBlock(nn.Module):
 
 
 def attention_block_forward(self, x):
+    rank = 0
+    world_size = 1
+    if dist.is_initialized():
+        world_size = get_sp_world_size()
+        rank = get_sp_parallel_rank()
+
     identity = x
+
+    if world_size > 1:
+        x = get_sp_group().all_gather(x, dim=-2)
+
     batch_size, channels, time, height, width = x.size()
 
     x = x.permute(0, 2, 1, 3, 4).reshape(batch_size * time, channels, height, width)
@@ -789,6 +800,9 @@ def attention_block_forward(self, x):
     # Reshape back: [(b*t), c, h, w] -> [b, c, t, h, w]
     x = x.view(batch_size, time, channels, height, width)
     x = x.permute(0, 2, 1, 3, 4)
+
+    if world_size > 1:
+        x = torch.chunk(x, world_size, dim=-2)[rank]
 
     return x + identity
 
