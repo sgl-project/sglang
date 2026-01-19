@@ -296,7 +296,7 @@ impl PDRouter {
         // Clone request once outside the retry loop, then use Arc to share across attempts
         // This avoids O(retries) clones by sharing the same data
         let shared_request = Arc::new(original_request.clone());
-        let response = RetryExecutor::execute_response_with_retry(
+        let response = RetryExecutor::execute_with_retry_or_last(
             &self.retry_config,
             {
                 move |attempt: u32| {
@@ -375,7 +375,7 @@ impl PDRouter {
                 }
             },
             |res, _attempt| is_retryable_status(res.status()),
-            |delay, attempt| {
+            |_output, delay, attempt| {
                 // Layer 3 worker metrics (PD mode uses both prefill and decode workers)
                 Metrics::record_worker_retry(metrics_labels::WORKER_PREFILL, endpoint);
                 Metrics::record_worker_retry(metrics_labels::WORKER_DECODE, endpoint);
