@@ -882,7 +882,7 @@ def get_generate_fn(
         )
         os.remove(tmp_path)
 
-        return rid
+        return (rid, img_data)
 
     def generate_image_edit(case_id, client) -> tuple[str, bytes]:
         """TI2I: Text + Image -> Image edit."""
