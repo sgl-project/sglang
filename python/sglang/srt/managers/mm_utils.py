@@ -48,6 +48,8 @@ _BUFFER_OFFSET = 0
 _EXTRA_PRE_TOKENS = 0  # pre chunk extra token (0 for the moment)
 _EXTRA_POST_TOKENS = 0  # post chunk extra token (0 for the moment)
 
+_is_default_tensor_transport = None
+
 
 def init_feature_buffer(device):
     global _GPU_FEATURE_BUFFER, _BUFFER_OFFSET
@@ -1533,11 +1535,20 @@ class ShmPointerMMData:
             shm_handle.unlink()
 
 
+def _get_is_default_transport():
+    global _is_default_tensor_transport
+    if _is_default_tensor_transport is None:
+        _is_default_tensor_transport = (
+            _determine_tensor_transport_mode(get_global_server_args()) == "default"
+        )
+    return _is_default_tensor_transport
+
+
 def wrap_shm_features(obj):
     """
     Scan the object for multimodal tensors and wrap them in SHM pointers.
     """
-    if _determine_tensor_transport_mode(get_global_server_args()) == "default":
+    if _get_is_default_transport():
         return obj
 
     if hasattr(obj, "mm_inputs") and obj.mm_inputs:
@@ -1556,7 +1567,7 @@ def unwrap_shm_features(obj):
     """
     Restore ShmPointerMMData wrappers back into standard torch.Tensors.
     """
-    if _determine_tensor_transport_mode(get_global_server_args()) == "default":
+    if _get_is_default_transport():
         return obj
     if hasattr(obj, "mm_inputs") and obj.mm_inputs:
         mm_items = obj.mm_inputs.get("mm_items", [])
