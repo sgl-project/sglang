@@ -5,6 +5,8 @@ import triton
 import triton.language as tl
 from einops import rearrange
 
+from sglang.jit_kernel.cutedsl_gdn import cutedsl_fused_sigmoid_gating_delta_rule_update
+from sglang.srt.environ import Envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.fla.chunk import chunk_gated_delta_rule
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
@@ -38,6 +40,7 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import is_cuda, is_npu
+from sglang.srt.utils.common import rank0_log
 
 if is_cuda():
     from sglang.srt.layers.attention.mamba.causal_conv1d import (
@@ -843,6 +846,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
             self.conv_states_shape[-1] < FLA_CHUNK_SIZE
         ), f"{self.conv_states_shape[-1]=} should be less than {FLA_CHUNK_SIZE}"
 
+        use_cutedsl = Envs.SGLANG_USE_CUTEDSL_GDN_DECODE.get()
+        rank0_log(f"CuTe DSL GDN decode enabled: {use_cutedsl}")
+        self._kernel_func = (
+            cutedsl_fused_sigmoid_gating_delta_rule_update
+            if use_cutedsl
+            else fused_sigmoid_gating_delta_rule_update
+        )
+
     def forward_decode(
         self,
         q: torch.Tensor,
@@ -899,7 +910,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         key = key.view(1, seq_len, num_heads, head_k_dim)
         value = value.view(1, seq_len, value.shape[1] // head_v_dim, head_v_dim)
 
-        core_attn_out = fused_sigmoid_gating_delta_rule_update(
+        core_attn_out = self._kernel_func(
             A_log=A_log,
             dt_bias=dt_bias,
             q=query,

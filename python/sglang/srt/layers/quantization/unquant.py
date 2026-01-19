@@ -492,6 +492,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         )
 
         expert_tokens = expert_tokens.to(torch.int64)
+        w13_bias = [layer.w13_weight_bias] if self.with_bias else None
+        w2_bias = [layer.w2_weight_bias] if self.with_bias else None
         if layer.w13_weight.shape[-1] == layer.hidden_size:
             w13 = layer.w13_weight.transpose(1, 2)
             w2 = layer.w2_weight.transpose(1, 2)
@@ -500,6 +502,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         hidden_states = torch_npu.npu_grouped_matmul(
             x=[hidden_states],
             weight=[w13],
+            bias=w13_bias,
             split_item=2,
             group_list_type=0,
             group_type=0,
@@ -508,7 +511,11 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         )[0]
 
         # act_fn:
-        if self.moe_runner_config.activation == "silu":
+        if self.moe_runner_config.activation == "npu_swiglu_oai":
+            from sgl_kernel_npu.activation.swiglu_oai import swiglu_oai
+
+            hidden_states = swiglu_oai(layer, hidden_states)
+        elif self.moe_runner_config.activation == "silu":
             hidden_states = torch_npu.npu_swiglu(hidden_states)
         else:
             from sglang.srt.layers.activation import GeluAndMul
@@ -519,6 +526,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         hidden_states = torch_npu.npu_grouped_matmul(
             x=[hidden_states],
             weight=[w2],
+            bias=w2_bias,
             split_item=2,
             group_list_type=0,
             group_type=0,

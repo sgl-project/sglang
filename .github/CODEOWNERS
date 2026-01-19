@@ -4,6 +4,8 @@
 /python/pyproject.toml @merrymercy @Fridge003 @ispobock
 /python/sglang/jit_kernel @DarkSharpness @BBuf
 /python/sglang/multimodal_gen @mickqian @yhyang201
+/python/sglang/multimodal_gen/runtime/layers @mickqian @yhyang201 @BBuf
+/python/sglang/multimodal_gen/runtime/models/dits @mickqian @yhyang201 @BBuf
 /python/sglang/srt/batch_invariant_ops @Fridge003 @hebiao064
 /python/sglang/srt/constrained @hnyls2002 @DarkSharpness
 /python/sglang/srt/compilation @hebiao064

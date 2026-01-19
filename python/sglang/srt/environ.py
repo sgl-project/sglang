@@ -175,6 +175,9 @@ class Envs:
     SGLANG_GRAMMAR_POLL_INTERVAL = EnvFloat(0.005)
     SGLANG_GRAMMAR_MAX_POLL_ITERATIONS = EnvInt(10000)
 
+    # CuTe DSL GDN Decode
+    SGLANG_USE_CUTEDSL_GDN_DECODE = EnvBool(False)
+
     # Test & Debug
     SGLANG_DETECT_SLOW_RANK = EnvBool(False)
     SGLANG_TEST_STUCK_DETOKENIZER = EnvFloat(0)
@@ -502,6 +505,10 @@ _warn_deprecated_env_to_cli_flag(
 _warn_deprecated_env_to_cli_flag(
     "SGLANG_SUPPORT_CUTLASS_BLOCK_FP8",
     "It will be completely removed in 0.5.7. Please use '--fp8-gemm-backend=cutlass' instead.",
+)
+_warn_deprecated_env_to_cli_flag(
+    "SGLANG_FLASHINFER_FP4_GEMM_BACKEND",
+    "It will be completely removed in 0.5.9. Please use '--fp4-gemm-backend' instead.",
 )
 _warn_deprecated_env_to_cli_flag(
     "SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE",

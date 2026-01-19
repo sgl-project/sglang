@@ -208,3 +208,14 @@ class LoRAAdapter(nn.Module):
                 if "lora_A" in weight_name:
                     weights[gate_up_name] = weights[gate_up_name].repeat(2, 1)
                 # else: no-op as LoRA B weight is already stacked.
+
+    def pin_weights_in_cpu(self):
+        for layer in self.layers:
+            for name, weight in layer.weights.items():
+                layer.weights[name] = weight.pin_memory()
+
+        for name, weight in self.embedding_layers.items():
+            self.embedding_layers[name] = weight.pin_memory()
+
+        for name, weight in self.added_tokens_embeddings.items():
+            self.added_tokens_embeddings[name] = weight.pin_memory()

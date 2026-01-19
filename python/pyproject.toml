@@ -172,7 +172,7 @@ exclude = [
 [tool.setuptools_scm]
 root = ".."
 version_file = "sglang/_version.py"
-git_describe_command = ["git", "describe", "--tags", "--long", "--match", "v*"]
+git_describe_command = ["bash", "-c", "git tag --list --sort=-version:refname 'v*.*.*' | head -1 | xargs git describe --tags --long"]
 # Allow editable installs even when .git metadata is not available.
 fallback_version = "0.0.0.dev0"
 

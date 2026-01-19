@@ -1263,7 +1263,16 @@ class NativeSparseAttnBackend(
                     page_size=1,
                 )
 
-        if self.nsa_prefill_impl == "tilelang":
+        nsa_impl = (
+            self.nsa_decode_impl
+            if (
+                forward_batch.forward_mode.is_target_verify()
+                or forward_batch.forward_mode.is_draft_extend(include_v2=True)
+            )
+            else self.nsa_prefill_impl
+        )
+
+        if nsa_impl == "tilelang":
             if q_rope is not None:
                 q_all = _concat_mla_absorb_q_general(q_nope, q_rope)
             return self._forward_tilelang(
@@ -1273,7 +1282,7 @@ class NativeSparseAttnBackend(
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
             )
-        elif self.nsa_prefill_impl == "flashmla_sparse":
+        elif nsa_impl == "flashmla_sparse":
             if q_rope is not None:
                 q_all = _concat_mla_absorb_q_general(q_nope, q_rope)
 
@@ -1297,7 +1306,7 @@ class NativeSparseAttnBackend(
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
             )
-        elif self.nsa_prefill_impl == "flashmla_kv":
+        elif nsa_impl == "flashmla_kv":
             if q_rope is not None:
                 q_all = _concat_mla_absorb_q_general(q_nope, q_rope)
             return self._forward_flashmla_kv(
@@ -1310,7 +1319,7 @@ class NativeSparseAttnBackend(
                 metadata=metadata,
                 page_table_1=page_table_1,
             )
-        elif self.nsa_prefill_impl == "fa3":
+        elif nsa_impl == "fa3":
             return self._forward_fa3(
                 q_rope=q_rope,
                 kv_cache=kv_cache,
@@ -1326,7 +1335,7 @@ class NativeSparseAttnBackend(
                 page_size=1,
             )
         else:
-            raise ValueError(f"Unsupported {self.nsa_prefill_impl = }")
+            raise ValueError(f"Unsupported {nsa_impl = }")
 
     def forward_decode(
         self,

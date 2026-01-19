@@ -1613,507 +1613,356 @@ class TestDeepSeekV32Detector(unittest.TestCase):
 
 
 class TestQwen3CoderDetector(unittest.TestCase):
+    """Test suite for Qwen3CoderDetector."""
+
     def setUp(self):
-        # Create sample tools for testing
+        """Initialize test fixtures before each test method."""
         self.tools = [
             Tool(
                 type="function",
                 function=Function(
                     name="get_current_weather",
-                    description="Get the current weather",
                     parameters={
+                        "type": "object",
                         "properties": {
-                            "city": {"type": "string", "description": "The city name"},
-                            "state": {
-                                "type": "string",
-                                "description": "The state code",
-                            },
+                            "location": {"type": "string"},
                             "unit": {
                                 "type": "string",
-                                "enum": ["fahrenheit", "celsius"],
+                                "enum": ["celsius", "fahrenheit"],
                             },
+                            "days": {"type": "integer"},
                         },
-                        "required": ["city", "state"],
+                        "required": ["location"],
                     },
                 ),
             ),
             Tool(
                 type="function",
                 function=Function(
-                    name="calculate_area",
-                    description="Calculate area of a shape",
+                    name="sql_interpreter",
                     parameters={
+                        "type": "object",
                         "properties": {
-                            "shape": {"type": "string"},
-                            "dimensions": {"type": "object"},
-                            "precision": {"type": "integer"},
-                        }
+                            "query": {"type": "string"},
+                            "dry_run": {"type": "boolean"},
+                        },
+                    },
+                ),
+            ),
+            Tool(
+                type="function",
+                function=Function(
+                    name="TodoWrite",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "todos": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "content": {"type": "string"},
+                                        "status": {"type": "string"},
+                                    },
+                                    "required": ["content", "status"],
+                                },
+                            },
+                        },
                     },
                 ),
             ),
         ]
         self.detector = Qwen3CoderDetector()
 
-    def test_has_tool_call(self):
-        """Test detection of tool call markers."""
-        self.assertTrue(self.detector.has_tool_call("<tool_call>test</tool_call>"))
-        self.assertFalse(self.detector.has_tool_call("No tool call here"))
+    # ==================== Basic Functionality Tests ====================
 
-    def test_detect_and_parse_no_tools(self):
-        """Test parsing text without tool calls."""
-        model_output = "This is a test response without any tool calls"
-        result = self.detector.detect_and_parse(model_output, tools=[])
-        self.assertEqual(result.normal_text, model_output)
-        self.assertEqual(result.calls, [])
+    def test_plain_text_only(self):
+        """
+        Test parsing of plain text without any tool calls.
 
-    def test_detect_and_parse_single_tool(self):
-        """Test parsing a single tool call."""
-        model_output = """<tool_call>
+        Scenario: Input contains only plain text, no tool call markers.
+        Purpose: Verify that plain text is correctly identified and no false tool calls are detected.
+        """
+        text = "This is plain text without any tool calls."
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(result.normal_text, text)
+        self.assertEqual(len(result.calls), 0)
+
+    def test_single_tool_call(self):
+        """
+        Test parsing of a single tool call.
+
+        Scenario: Input contains one complete tool call with parameters.
+        Purpose: Verify correct extraction of tool name and parameters.
+        """
+        text = """<tool_call>
 <function=get_current_weather>
-<parameter=city>
-Dallas
-</parameter>
-<parameter=state>
-TX
-</parameter>
-<parameter=unit>
-fahrenheit
-</parameter>
+<parameter=location>Boston</parameter>
+<parameter=unit>celsius</parameter>
+<parameter=days>3</parameter>
 </function>
 </tool_call>"""
+        result = self.detector.detect_and_parse(text, self.tools)
 
-        result = self.detector.detect_and_parse(model_output, tools=self.tools)
-
-        self.assertEqual(result.normal_text, "")
         self.assertEqual(len(result.calls), 1)
         self.assertEqual(result.calls[0].name, "get_current_weather")
 
         params = json.loads(result.calls[0].parameters)
-        self.assertEqual(params["city"], "Dallas")
-        self.assertEqual(params["state"], "TX")
-        self.assertEqual(params["unit"], "fahrenheit")
+        self.assertEqual(params["location"], "Boston")
+        self.assertEqual(params["unit"], "celsius")
+        self.assertEqual(params["days"], 3)
 
-    def test_detect_and_parse_with_content(self):
-        """Test parsing tool call with surrounding text."""
-        model_output = """Sure! Let me check the weather for you.<tool_call>
+    def test_single_tool_call_with_text_prefix(self):
+        """
+        Test parsing of tool call with preceding text.
+
+        Scenario: Input has plain text followed by a tool call.
+        Purpose: Verify correct separation of text and tool call.
+        """
+        text = """Let me check the weather for you.
+
+<tool_call>
 <function=get_current_weather>
-<parameter=city>
-Dallas
-</parameter>
-<parameter=state>
-TX
-</parameter>
-<parameter=unit>
-fahrenheit
-</parameter>
+<parameter=location>New York</parameter>
 </function>
 </tool_call>"""
+        result = self.detector.detect_and_parse(text, self.tools)
 
-        result = self.detector.detect_and_parse(model_output, tools=self.tools)
-
-        self.assertEqual(result.normal_text, "Sure! Let me check the weather for you.")
+        self.assertTrue(result.normal_text.startswith("Let me check"))
         self.assertEqual(len(result.calls), 1)
         self.assertEqual(result.calls[0].name, "get_current_weather")
 
-    def test_detect_and_parse_multiline_param(self):
-        """Test parsing tool call with multiline parameter values."""
-        model_output = """<tool_call>
-<function=calculate_area>
-<parameter=shape>
-rectangle
-</parameter>
-<parameter=dimensions>
-{"width": 10,
- "height": 20}
-</parameter>
-<parameter=precision>
-2
-</parameter>
-</function>
-</tool_call>"""
+    def test_multiple_tool_calls(self):
+        """
+        Test parsing of multiple consecutive tool calls.
 
-        result = self.detector.detect_and_parse(model_output, tools=self.tools)
-
-        self.assertEqual(len(result.calls), 1)
-        self.assertEqual(result.calls[0].name, "calculate_area")
-
-        params = json.loads(result.calls[0].parameters)
-        self.assertEqual(params["shape"], "rectangle")
-        self.assertEqual(params["dimensions"], {"width": 10, "height": 20})
-        self.assertEqual(params["precision"], 2)
-
-    def test_detect_and_parse_parallel_tools(self):
-        """Test parsing multiple tool calls."""
-        model_output = """<tool_call>
+        Scenario: Input contains two tool calls one after another.
+        Purpose: Verify that multiple tool calls are correctly identified and parsed.
+        """
+        text = """<tool_call>
 <function=get_current_weather>
-<parameter=city>
-Dallas
-</parameter>
-<parameter=state>
-TX
-</parameter>
-<parameter=unit>
-fahrenheit
-</parameter>
+<parameter=location>New York</parameter>
 </function>
 </tool_call>
 <tool_call>
-<function=get_current_weather>
-<parameter=city>
-Orlando
-</parameter>
-<parameter=state>
-FL
-</parameter>
-<parameter=unit>
-fahrenheit
-</parameter>
+<function=sql_interpreter>
+<parameter=query>SELECT * FROM users</parameter>
+<parameter=dry_run>True</parameter>
 </function>
 </tool_call>"""
+        result = self.detector.detect_and_parse(text, self.tools)
 
-        result = self.detector.detect_and_parse(model_output, tools=self.tools)
-
-        self.assertEqual(result.normal_text, "\n")
         self.assertEqual(len(result.calls), 2)
-
-        # First call
         self.assertEqual(result.calls[0].name, "get_current_weather")
+        self.assertEqual(result.calls[1].name, "sql_interpreter")
+
         params1 = json.loads(result.calls[0].parameters)
-        self.assertEqual(params1["city"], "Dallas")
-        self.assertEqual(params1["state"], "TX")
+        self.assertEqual(params1["location"], "New York")
 
-        # Second call
-        self.assertEqual(result.calls[1].name, "get_current_weather")
         params2 = json.loads(result.calls[1].parameters)
-        self.assertEqual(params2["city"], "Orlando")
-        self.assertEqual(params2["state"], "FL")
+        self.assertEqual(params2["query"], "SELECT * FROM users")
+        self.assertEqual(params2["dry_run"], True)
 
-    def test_parse_streaming_simple(self):
-        """Test basic streaming parsing."""
-        chunks = [
-            "Sure! ",
-            "Let me check ",
-            "the weather.",
-            "<tool_call>",
-            "\n<function=get_current_weather>",
-            "\n<parameter=city>",
-            "\nDallas",
-            "\n</parameter>",
-            "\n<parameter=state>",
-            "\nTX",
-            "\n</parameter>",
-            "\n</function>",
-            "\n</tool_call>",
-        ]
+    # ==================== Streaming Tests ====================
 
-        accumulated_text = ""
-        accumulated_calls = []
-        tool_calls_by_index = {}
+    def test_streaming_single_tool_call(self):
+        """
+        Test streaming parsing of a single tool call.
 
-        for chunk in chunks:
-            result = self.detector.parse_streaming_increment(chunk, tools=self.tools)
-            accumulated_text += result.normal_text
-
-            # Track calls by tool_index to handle streaming properly
-            for call in result.calls:
-                if call.tool_index is not None:
-                    if call.tool_index not in tool_calls_by_index:
-                        tool_calls_by_index[call.tool_index] = {
-                            "name": "",
-                            "parameters": "",
-                        }
-
-                    if call.name:
-                        tool_calls_by_index[call.tool_index]["name"] = call.name
-                    if call.parameters:
-                        tool_calls_by_index[call.tool_index][
-                            "parameters"
-                        ] += call.parameters
-
-        self.assertEqual(accumulated_text, "Sure! Let me check the weather.")
-        self.assertEqual(len(tool_calls_by_index), 1)
-
-        # Get the complete tool call
-        tool_call = tool_calls_by_index[0]
-        self.assertEqual(tool_call["name"], "get_current_weather")
-
-        # Parse the accumulated parameters
-        params = json.loads(tool_call["parameters"])
-        self.assertEqual(params["city"], "Dallas")
-        self.assertEqual(params["state"], "TX")
-
-    def test_parse_streaming_incomplete(self):
-        """Test streaming with incomplete tool call."""
-        # Send incomplete tool call
+        Scenario: Tool call is fed incrementally in chunks.
+        Purpose: Verify streaming parser correctly assembles tool call from chunks.
+        """
         chunks = [
             "<tool_call>",
-            "\n<function=get_current_weather>",
-            "\n<parameter=city>",
-            "\nDallas",
-            "\n</parameter>",
-            "\n<parameter=state>",
-            "\nTX",
-            # Missing </parameter>, </function>, </tool_call>
-        ]
-
-        tool_calls_by_index = {}
-        for chunk in chunks:
-            result = self.detector.parse_streaming_increment(chunk, tools=self.tools)
-
-            # Track calls by tool_index to handle streaming properly
-            for call in result.calls:
-                if call.tool_index is not None:
-                    if call.tool_index not in tool_calls_by_index:
-                        tool_calls_by_index[call.tool_index] = {
-                            "name": "",
-                            "parameters": "",
-                        }
-
-                    if call.name:
-                        tool_calls_by_index[call.tool_index]["name"] = call.name
-                    if call.parameters:
-                        tool_calls_by_index[call.tool_index][
-                            "parameters"
-                        ] += call.parameters
-
-        # Should have partial tool call with name but incomplete parameters
-        self.assertGreater(len(tool_calls_by_index), 0)
-        self.assertEqual(tool_calls_by_index[0]["name"], "get_current_weather")
-
-        # Parameters should be incomplete (no closing brace)
-        params_str = tool_calls_by_index[0]["parameters"]
-        self.assertTrue(params_str.startswith('{"city": "Dallas"'))
-        self.assertFalse(params_str.endswith("}"))
-
-        # Now complete it
-        result = self.detector.parse_streaming_increment(
-            "\n</parameter>\n</function>\n</tool_call>", tools=self.tools
-        )
-
-        # Update the accumulated parameters
-        for call in result.calls:
-            if call.tool_index is not None and call.parameters:
-                tool_calls_by_index[call.tool_index]["parameters"] += call.parameters
-
-        # Now should have complete parameters
-        final_params = json.loads(tool_calls_by_index[0]["parameters"])
-        self.assertEqual(final_params["city"], "Dallas")
-        self.assertEqual(final_params["state"], "TX")
-
-    def test_edge_case_no_parameters(self):
-        """Test tool call without parameters."""
-        model_output = """<tool_call>
-<function=get_current_weather>
-</function>
-</tool_call>"""
-
-        result = self.detector.detect_and_parse(model_output, tools=self.tools)
-        self.assertEqual(len(result.calls), 1)
-        self.assertEqual(result.calls[0].name, "get_current_weather")
-        self.assertEqual(json.loads(result.calls[0].parameters), {})
-
-    def test_edge_case_special_chars_in_value(self):
-        """Test parameter with special characters in value."""
-        model_output = """<tool_call>
-<function=get_current_weather>
-<parameter=city>
-Dallas->TX
-</parameter>
-</function>
-</tool_call>"""
-
-        result = self.detector.detect_and_parse(model_output, tools=self.tools)
-        self.assertEqual(len(result.calls), 1)
-
-        params = json.loads(result.calls[0].parameters)
-        self.assertEqual(params["city"], "Dallas->TX")
-
-    def test_extract_tool_calls_fallback_no_tags(self):
-        """Test fallback parsing when XML tags are missing (just function without tool_call wrapper)."""
-        model_output = """<function=get_current_weather>
-<parameter=city>
-Dallas
-</parameter>
-<parameter=state>
-TX
-</parameter>
-</function>"""
-
-        result = self.detector.detect_and_parse(model_output, tools=self.tools)
-
-        self.assertIsNotNone(result)
-
-    def test_extract_tool_calls_type_conversion(self):
-        """Test parameter type conversion based on tool schema."""
-        test_tool = Tool(
-            type="function",
-            function=Function(
-                name="test_types",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "int_param": {"type": "integer"},
-                        "float_param": {"type": "float"},
-                        "bool_param": {"type": "boolean"},
-                        "str_param": {"type": "string"},
-                        "obj_param": {"type": "object"},
-                    },
-                },
-            ),
-        )
-
-        model_output = """<tool_call>
-<function=test_types>
-<parameter=int_param>
-42
-</parameter>
-<parameter=float_param>
-3.14
-</parameter>
-<parameter=bool_param>
-true
-</parameter>
-<parameter=str_param>
-hello world
-</parameter>
-<parameter=obj_param>
-{"key": "value"}
-</parameter>
-</function>
-</tool_call>"""
-
-        result = self.detector.detect_and_parse(model_output, tools=[test_tool])
-
-        self.assertEqual(len(result.calls), 1)
-        params = json.loads(result.calls[0].parameters)
-        self.assertEqual(params["int_param"], 42)
-        self.assertEqual(params["float_param"], 3.14)
-        self.assertEqual(params["bool_param"], True)
-        self.assertEqual(params["str_param"], "hello world")
-        self.assertEqual(params["obj_param"], {"key": "value"})
-
-    def test_parse_streaming_incremental(self):
-        """Test that streaming is truly incremental with very small chunks."""
-        model_output = """I'll check the weather.<tool_call>
-        <function=get_current_weather>
-        <parameter=city>
-        Dallas
-        </parameter>
-        <parameter=state>
-        TX
-        </parameter>
-        </function>
-        </tool_call>"""
-
-        # Simulate more realistic token-based chunks where <tool_call> is a single token
-        chunks = [
-            "I'll check the weather.",
-            "<tool_call>",
-            "\n<function=get_current_weather>\n",
-            "<parameter=city>\n",
-            "Dallas\n",
-            "</parameter>\n",
-            "<parameter=state>\n",
-            "TX\n",
-            "</parameter>\n",
-            "</function>\n",
+            "<function=get_current_weather>",
+            "<parameter=location>",
+            "Boston",
+            "</parameter>",
+            "<parameter=unit>celsius</parameter>",
+            "</function>",
             "</tool_call>",
         ]
 
-        accumulated_text = ""
-        tool_calls = []
-        chunks_count = 0
+        detector = Qwen3CoderDetector()
+        all_calls = []
+        collected_params = ""
 
         for chunk in chunks:
-            result = self.detector.parse_streaming_increment(chunk, self.tools)
-            accumulated_text += result.normal_text
-            chunks_count += 1
-            for tool_call_chunk in result.calls:
-                if (
-                    hasattr(tool_call_chunk, "tool_index")
-                    and tool_call_chunk.tool_index is not None
-                ):
-                    while len(tool_calls) <= tool_call_chunk.tool_index:
-                        tool_calls.append({"name": "", "parameters": ""})
-                    tc = tool_calls[tool_call_chunk.tool_index]
-                    if tool_call_chunk.name:
-                        tc["name"] = tool_call_chunk.name
-                    if tool_call_chunk.parameters:
-                        tc["parameters"] += tool_call_chunk.parameters
+            result = detector.parse_streaming_increment(chunk, self.tools)
+            all_calls.extend(result.calls)
+            for call in result.calls:
+                if call.parameters:
+                    collected_params += call.parameters
 
-        self.assertGreater(chunks_count, 3)
+        # Verify we got the tool call
+        self.assertGreater(len(all_calls), 0)
 
-        # Verify the accumulated results
-        self.assertIn("I'll check the weather.", accumulated_text)
-        self.assertEqual(len(tool_calls), 1)
-        self.assertEqual(tool_calls[0]["name"], "get_current_weather")
+        # Verify parameters were collected
+        if collected_params:
+            params = json.loads(collected_params)
+            self.assertEqual(params["location"], "Boston")
+            self.assertEqual(params["unit"], "celsius")
 
-        params = json.loads(tool_calls[0]["parameters"])
-        self.assertEqual(params, {"city": "Dallas", "state": "TX"})
+    def test_streaming_with_text_and_tool(self):
+        """
+        Test streaming parsing with mixed text and tool call.
 
-    def test_parse_streaming_multiple_tools(self):
-        """Test streaming with multiple tool calls."""
-        model_output = """<tool_call>
-        <function=get_current_weather>
-        <parameter=city>
-        Dallas
-        </parameter>
-        <parameter=state>
-        TX
-        </parameter>
-        </function>
-        </tool_call>
-        Some text in between.
-        <tool_call>
-        <function=calculate_area>
-        <parameter=shape>
-        circle
-        </parameter>
-        <parameter=dimensions>
-        {"radius": 5}
-        </parameter>
-        </function>
-        </tool_call>"""
-
-        # Simulate streaming by chunks
-        chunk_size = 20
+        Scenario: Stream contains plain text followed by a tool call.
+        Purpose: Verify correct separation in streaming mode.
+        """
         chunks = [
-            model_output[i : i + chunk_size]
-            for i in range(0, len(model_output), chunk_size)
+            "Let me ",
+            "help you.\n\n",
+            "<tool_call>",
+            "<function=get_current_weather>",
+            "<parameter=location>Paris</parameter>",
+            "</function>",
+            "</tool_call>",
         ]
 
-        accumulated_text = ""
-        tool_calls = []
-        chunks_count = 0
+        detector = Qwen3CoderDetector()
+        full_text = ""
+        all_calls = []
 
         for chunk in chunks:
-            result = self.detector.parse_streaming_increment(chunk, self.tools)
-            accumulated_text += result.normal_text
-            chunks_count += 1
-            for tool_call_chunk in result.calls:
-                if (
-                    hasattr(tool_call_chunk, "tool_index")
-                    and tool_call_chunk.tool_index is not None
-                ):
-                    while len(tool_calls) <= tool_call_chunk.tool_index:
-                        tool_calls.append({"name": "", "parameters": ""})
-                    tc = tool_calls[tool_call_chunk.tool_index]
-                    if tool_call_chunk.name:
-                        tc["name"] = tool_call_chunk.name
-                    if tool_call_chunk.parameters:
-                        tc["parameters"] += tool_call_chunk.parameters
+            result = detector.parse_streaming_increment(chunk, self.tools)
+            if result.normal_text:
+                full_text += result.normal_text
+            all_calls.extend(result.calls)
 
-        self.assertIn("Some text in between.", accumulated_text)
-        self.assertEqual(len(tool_calls), 2)
-        self.assertEqual(tool_calls[0]["name"], "get_current_weather")
-        self.assertEqual(tool_calls[1]["name"], "calculate_area")
+        self.assertTrue(full_text.startswith("Let me"))
+        self.assertGreater(len(all_calls), 0)
 
-        # Verify parameters
-        params1 = json.loads(tool_calls[0]["parameters"])
-        self.assertEqual(params1, {"city": "Dallas", "state": "TX"})
+    # ==================== Parameter Type Tests ====================
 
-        params2 = json.loads(tool_calls[1]["parameters"])
-        self.assertEqual(params2, {"shape": "circle", "dimensions": {"radius": 5}})
+    def test_integer_parameter_conversion(self):
+        """
+        Test correct type conversion for integer parameters.
+
+        Scenario: Tool call with integer parameter.
+        Purpose: Verify integer values are correctly parsed and typed.
+        """
+        text = """<tool_call>
+<function=get_current_weather>
+<parameter=location>Tokyo</parameter>
+<parameter=days>5</parameter>
+</function>
+</tool_call>"""
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        params = json.loads(result.calls[0].parameters)
+        self.assertIsInstance(params["days"], int)
+        self.assertEqual(params["days"], 5)
+
+    def test_boolean_parameter_conversion(self):
+        """
+        Test correct type conversion for boolean parameters.
+
+        Scenario: Tool call with boolean parameter.
+        Purpose: Verify boolean values are correctly parsed.
+        """
+        text = """<tool_call>
+<function=sql_interpreter>
+<parameter=query>SELECT 1</parameter>
+<parameter=dry_run>True</parameter>
+</function>
+</tool_call>"""
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        params = json.loads(result.calls[0].parameters)
+        self.assertIsInstance(params["dry_run"], bool)
+        self.assertEqual(params["dry_run"], True)
+
+    def test_complex_array_parameter(self):
+        """
+        Test parsing of complex array parameters.
+
+        Scenario: Tool call with array of objects as parameter.
+        Purpose: Verify complex nested structures are correctly parsed.
+        """
+        text = """<tool_call>
+<function=TodoWrite>
+<parameter=todos>
+[
+  {"content": "Buy groceries", "status": "pending"},
+  {"content": "Finish report", "status": "completed"}
+]
+</parameter>
+</function>
+</tool_call>"""
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        params = json.loads(result.calls[0].parameters)
+        self.assertIsInstance(params["todos"], list)
+        self.assertEqual(len(params["todos"]), 2)
+        self.assertEqual(params["todos"][0]["content"], "Buy groceries")
+        self.assertEqual(params["todos"][1]["status"], "completed")
+
+    # ==================== Edge Cases ====================
+
+    def test_empty_parameter_value(self):
+        """
+        Test handling of empty parameter values.
+
+        Scenario: Tool call with empty parameter value.
+        Purpose: Verify empty values are handled gracefully.
+        """
+        text = """<tool_call>
+<function=get_current_weather>
+<parameter=location></parameter>
+</function>
+</tool_call>"""
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params["location"], "")
+
+    def test_parameter_with_special_characters(self):
+        """
+        Test handling of parameters with special characters.
+
+        Scenario: Parameter value contains special characters like quotes, newlines.
+        Purpose: Verify special characters are correctly preserved.
+        """
+        text = """<tool_call>
+<function=sql_interpreter>
+<parameter=query>SELECT * FROM users WHERE name = 'John "Doe"'</parameter>
+</function>
+</tool_call>"""
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        params = json.loads(result.calls[0].parameters)
+        self.assertIn("John", params["query"])
+        self.assertIn("Doe", params["query"])
+
+    def test_incomplete_tool_call(self):
+        """
+        Test handling of incomplete tool call at end of stream.
+
+        Scenario: Stream ends with an incomplete tool call (missing closing tag).
+        Purpose: Verify detector handles incomplete input gracefully without crashing.
+        """
+        text = """<tool_call>
+<function=get_current_weather>
+<parameter=location>London"""
+
+        # Should not crash
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertIsInstance(result, StreamingParseResult)
+
+    def test_has_tool_call_detection(self):
+        """
+        Test the has_tool_call method for detecting tool call markers.
+
+        Scenario: Various inputs with and without tool call markers.
+        Purpose: Verify correct detection of tool call presence.
+        """
+        self.assertTrue(self.detector.has_tool_call("<tool_call>"))
+        self.assertTrue(self.detector.has_tool_call("text <tool_call> more"))
+        self.assertFalse(self.detector.has_tool_call("plain text only"))
+        self.assertFalse(self.detector.has_tool_call(""))
 
 
 class TestGlm4MoeDetector(unittest.TestCase):

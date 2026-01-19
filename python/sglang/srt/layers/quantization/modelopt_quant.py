@@ -30,6 +30,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from sglang.srt.layers.quantization.fp4_utils import get_fp4_gemm_runner_backend
 from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
@@ -126,7 +127,10 @@ def fp4_gemm(
     out_dtype: torch.dtype,
     out_features: int,
 ) -> torch.Tensor:
-    backend = FLASHINFER_FP4_GEMM_BACKEND if FLASHINFER_FP4_GEMM_BACKEND else "cutlass"
+    fp4_backend = get_fp4_gemm_runner_backend()
+    # TODO(shuw@nvidia.com): Remove the "cutlass" default override after flashinfer 0.6.0
+    # and let flashinfer's auto backend selection handle it.
+    backend = fp4_backend.value if not fp4_backend.is_auto() else "cutlass"
     if enable_flashinfer_fp4_gemm:
         return flashinfer_fp4_gemm(
             input, weight, input_sf, weight_sf, alpha, out_dtype, backend=backend
@@ -241,7 +245,6 @@ def slice_nvfp4_output(
 
 # TODO make it true by default when the DeepEP PR is merged
 MOE_NVFP4_DISPATCH = envs.SGLANG_MOE_NVFP4_DISPATCH.get()
-FLASHINFER_FP4_GEMM_BACKEND = envs.SGLANG_FLASHINFER_FP4_GEMM_BACKEND.get()
 # Supported activation schemes for the current configuration
 ACTIVATION_SCHEMES = ["static"]
 
@@ -1246,8 +1249,8 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
 
         # Store original output size before any padding
         layer.output_size_per_partition = layer.weight.shape[0]
+        if get_fp4_gemm_runner_backend().is_trtllm():
 
-        if FLASHINFER_FP4_GEMM_BACKEND == "trtllm":
             # FlashInfer TRTLLM FP4 GEMM requires a different weight layout.
             # FlashInfer provides nvfp4_quantize to quantize + shuffle the
             # layout but we use our own quantization so we have to call
@@ -1330,11 +1333,6 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         if enable_flashinfer_fp4_gemm:
             w = layer.weight.T
             w_scale_interleaved = layer.weight_scale_interleaved.T
-        # TODO(shuw@nvidia.com)
-        # Remove the default after flashinfer bumped to 0.5.1
-        backend = (
-            FLASHINFER_FP4_GEMM_BACKEND if FLASHINFER_FP4_GEMM_BACKEND else "cutlass"
-        )
         out = fp4_gemm(
             x_fp4,
             w,
