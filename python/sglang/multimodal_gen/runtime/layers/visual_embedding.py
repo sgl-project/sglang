@@ -24,7 +24,9 @@ from sglang.jit_kernel.timestep_embedding import (
 from sglang.multimodal_gen.runtime.layers.activation import get_act_fn
 from sglang.multimodal_gen.runtime.layers.linear import ColumnParallelLinear
 from sglang.multimodal_gen.runtime.layers.mlp import MLP
+from sglang.multimodal_gen.runtime.platforms import current_platform
 
+_is_cuda = current_platform.is_cuda()
 
 class PatchEmbed(nn.Module):
     """2D Image to Patch Embedding
@@ -82,7 +84,7 @@ class PatchEmbed(nn.Module):
 
 class Timesteps(_Timesteps):
     def forward(self, timesteps: torch.Tensor) -> torch.Tensor:
-        if timesteps.is_cuda:
+        if _is_cuda:
             return timestep_embedding_cuda(
                 timesteps,
                 self.num_channels,
