@@ -518,6 +518,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         # Init lora information
         if model_runner.server_args.enable_lora:
+            # In the non-LoRA overlap loading case, we fetch LoRA adapters into the memory pool
+            # as a batch, right before running the batch
+            if not model_runner.server_args.enable_lora_overlap_loading:
+                model_runner.lora_manager.fetch_new_loras(set(ret.lora_ids))
+
             model_runner.lora_manager.prepare_lora_batch(ret)
 
         return ret
