@@ -557,7 +557,7 @@ mod tests {
             .get_last_access("test-key")
             .unwrap();
         assert!(access_after_hit > access_after_vacant);
-
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         std::thread::sleep(std::time::Duration::from_millis(10));
 
         workers[first_idx].set_healthy(false);
