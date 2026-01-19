@@ -13,8 +13,8 @@ from sglang.srt.layers.dp_attention import (
     get_attention_dp_rank,
     get_attention_cp_size,
     get_attention_cp_rank,
+    attn_cp_all_gather_into_tensor,
     get_attention_cp_group,
-    attn_cp_all_gather_into_tensor
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils.common import ceil_align, ceil_div

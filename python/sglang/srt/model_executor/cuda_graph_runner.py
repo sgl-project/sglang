@@ -43,9 +43,9 @@ from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
+    get_attention_cp_size,
     get_attention_tp_rank,
     get_attention_tp_size,
-    get_attention_cp_size,
     set_dp_buffer_len,
     set_is_extend_in_batch,
 )

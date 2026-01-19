@@ -1406,21 +1406,30 @@ def get_tp_group() -> GroupCoordinator:
     assert _TP is not None, "tensor model parallel group is not initialized"
     return _TP
 
+
 def get_attn_tp_group() -> GroupCoordinator:
-    assert _ATTN_TP is not None, "attention tensor model parallel group is not initialized"
+    assert (
+        _ATTN_TP is not None
+    ), "attention tensor model parallel group is not initialized"
     return _ATTN_TP
 
+
 def get_attn_cp_group() -> GroupCoordinator:
-    assert _ATTN_CP is not None, "attention context model parallel group is not initialized"
+    assert (
+        _ATTN_CP is not None
+    ), "attention context model parallel group is not initialized"
     return _ATTN_CP
+
 
 _MOE_CP: Optional[GroupCoordinator] = None
 _MOE_EP: Optional[GroupCoordinator] = None
 _MOE_TP: Optional[GroupCoordinator] = None
 
+
 def get_moe_cp_group() -> GroupCoordinator:
     assert _MOE_CP is not None, "moe context model parallel group is not initialized"
     return _MOE_CP
+
 
 def get_moe_ep_group() -> GroupCoordinator:
     assert _MOE_EP is not None, "expert model parallel group is not initialized"
@@ -1653,13 +1662,15 @@ def initialize_model_parallel(
         if _TP.pynccl_comm:
             _TP.pynccl_comm.disabled = False
             _PDMUX_PREFILL_TP_GROUP.pynccl_comm.disabled = False
-    
+
     attn_dp_size = attention_data_parallel_size
     attn_cp_size = attention_context_model_parallel_size
     attn_tp_size = tensor_model_parallel_size // attn_cp_size // attn_dp_size
 
     global _ATTN_CP
-    assert _ATTN_CP is None, "attention context model parallel group is already initialized"
+    assert (
+        _ATTN_CP is None
+    ), "attention context model parallel group is already initialized"
     if attn_cp_size == tensor_model_parallel_size:
         _ATTN_CP = _TP
     else:
@@ -1667,8 +1678,16 @@ def initialize_model_parallel(
         for i in range(num_tensor_model_parallel_groups):
             for j in range(attn_dp_size):
                 for k in range(attn_tp_size):
-                    st = i * tensor_model_parallel_size + j * attn_tp_size * attn_cp_size + k
-                    en = i * tensor_model_parallel_size + (j + 1) * attn_tp_size * attn_cp_size + k
+                    st = (
+                        i * tensor_model_parallel_size
+                        + j * attn_tp_size * attn_cp_size
+                        + k
+                    )
+                    en = (
+                        i * tensor_model_parallel_size
+                        + (j + 1) * attn_tp_size * attn_cp_size
+                        + k
+                    )
                     ranks = list(range(st, en, attn_tp_size))
                     group_ranks.append(ranks)
         _ATTN_CP = init_model_parallel_group(
@@ -1679,11 +1698,13 @@ def initialize_model_parallel(
         )
 
     from sglang.srt.layers.sampler import SYNC_TOKEN_IDS_ACROSS_TP
-    
+
     global _ATTN_TP
-    assert _ATTN_TP is None, "attention tensor model parallel group is already initialized"
+    assert (
+        _ATTN_TP is None
+    ), "attention tensor model parallel group is already initialized"
     if attn_tp_size == tensor_model_parallel_size:
-        _ATTN_TP = _TP 
+        _ATTN_TP = _TP
     else:
         group_ranks = []
         for i in range(num_tensor_model_parallel_groups):
@@ -1696,7 +1717,7 @@ def initialize_model_parallel(
             group_ranks,
             get_world_group().local_rank,
             backend,
-            use_pynccl= SYNC_TOKEN_IDS_ACROSS_TP,
+            use_pynccl=SYNC_TOKEN_IDS_ACROSS_TP,
             group_name="attention_tp",
         )
 
@@ -1709,7 +1730,7 @@ def initialize_model_parallel(
     # gpus_per_pp_stage = tensor_model_parallel_size * attention_context_model_parallel_size
     if moe_ep_size == tensor_model_parallel_size:
         _MOE_CP = _TP
-    else: 
+    else:
         group_ranks = []
         for i in range(num_tensor_model_parallel_groups):
             for j in range(moe_tp_size * moe_ep_size):
@@ -1734,7 +1755,11 @@ def initialize_model_parallel(
         for i in range(num_tensor_model_parallel_groups):
             for j in range(moe_cp_size):
                 for k in range(moe_tp_size):
-                    st = i * tensor_model_parallel_size + j * moe_ep_size * moe_tp_size + k 
+                    st = (
+                        i * tensor_model_parallel_size
+                        + j * moe_ep_size * moe_tp_size
+                        + k
+                    )
                     en = st + moe_ep_size * moe_tp_size
                     ranks = list(range(st, en, moe_tp_size))
                     group_ranks.append(ranks)
@@ -1917,23 +1942,28 @@ def get_tensor_model_parallel_rank():
     """Return my rank for the tensor model parallel group."""
     return get_tp_group().rank_in_group
 
+
 # ATTN_TP
 def get_attn_tensor_model_parallel_world_size():
     """Return world size for the attention tensor model parallel group."""
     return get_attn_tp_group().world_size
 
+
 def get_attn_tensor_model_parallel_rank():
     """Return my rank for the attention tensor model parallel group."""
     return get_attn_tp_group().rank_in_group
+
 
 # ATTN_CP
 def get_attn_context_model_parallel_world_size():
     """Return world size for the attention context model parallel group."""
     return get_attn_cp_group().world_size
 
+
 def get_attn_context_model_parallel_rank():
     """Return my rank for the attention context model parallel group."""
     return get_attn_cp_group().rank_in_group
+
 
 def get_pipeline_model_parallel_world_size():
     """Return world size for the pipeline model parallel group."""
@@ -1944,14 +1974,17 @@ def get_pipeline_model_parallel_rank():
     """Return my rank for the pipeline model parallel group."""
     return get_pp_group().rank_in_group
 
+
 # MOE_CP
 def get_moe_context_model_parallel_world_size():
     """Return world size for the moe context model parallel group."""
     return get_moe_cp_group().world_size
 
+
 def get_moe_context_model_parallel_rank():
     """Return my rank for the moe context model parallel group."""
     return get_moe_cp_group().rank_in_group
+
 
 # MOE_EP
 def get_moe_expert_parallel_world_size():
@@ -1962,6 +1995,7 @@ def get_moe_expert_parallel_world_size():
 def get_moe_expert_parallel_rank():
     """Return my rank for the moe expert parallel group."""
     return get_moe_ep_group().rank_in_group
+
 
 # MOE_TP
 def get_moe_tensor_parallel_world_size():

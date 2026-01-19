@@ -12,14 +12,14 @@ import triton.language as tl
 
 from sglang.srt.distributed import (
     GroupCoordinator,
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
+    get_attn_context_model_parallel_rank,
+    get_attn_context_model_parallel_world_size,
+    get_attn_cp_group,
     get_attn_tensor_model_parallel_rank,
     get_attn_tensor_model_parallel_world_size,
     get_attn_tp_group,
-    get_attn_cp_group,
-    get_attn_context_model_parallel_rank,
-    get_attn_context_model_parallel_world_size,
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
     get_tp_group,
     tensor_model_parallel_all_reduce,
 )
@@ -312,20 +312,26 @@ def is_allocation_symmetric() -> bool:
 def get_attention_tp_group() -> GroupCoordinator:
     return get_attn_tp_group()
 
+
 def get_attention_tp_rank() -> int:
     return get_attn_tensor_model_parallel_rank()
 
+
 def get_attention_tp_size() -> int:
-    return get_attn_tensor_model_parallel_world_size()  
+    return get_attn_tensor_model_parallel_world_size()
+
 
 def get_attention_cp_group() -> GroupCoordinator:
     return get_attn_cp_group()
 
+
 def get_attention_cp_rank() -> int:
     return get_attn_context_model_parallel_rank()
 
+
 def get_attention_cp_size() -> int:
     return get_attn_context_model_parallel_world_size()
+
 
 def get_attention_dp_rank() -> int:
     assert _ATTN_DP_RANK is not None, "dp attention not initialized!"
@@ -550,18 +556,20 @@ def dp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
 def attn_tp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
     return get_attention_tp_group().reduce_scatter_tensor(output, input)
 
+
 def attn_cp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
     return get_attention_cp_group().reduce_scatter_tensor(output, input)
 
 def attn_tp_all_reduce(input: torch.Tensor):
     return get_attention_tp_group().all_reduce(input)
 
-
 def attn_tp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
     return get_attention_tp_group().all_gather_into_tensor(output, input)
 
+
 def attn_cp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
     return get_attention_cp_group().all_gather_into_tensor(output, input)
+
 
 def attn_tp_all_gather(output_list: List[torch.Tensor], input: torch.Tensor):
     return get_attention_tp_group().all_gather(input, output_tensor_list=output_list)
