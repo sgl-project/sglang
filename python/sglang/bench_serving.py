@@ -1320,16 +1320,18 @@ def sample_openai_requests(
     Each line should be a JSON object with:
     - "messages": list of {"role": str, "content": str}
     - "max_tokens": int (used as output_len if fixed_output_len not set)
-    - Optional: "tools", "temperature", "top_p" (passed through)
     """
     dataset = []
     with open(dataset_path, "r") as f:
         for line in f:
+            if num_requests > 0 and len(dataset) >= num_requests:
+                break
             if line.strip():
-                dataset.append(json.loads(line))
-
-    if num_requests > 0:
-        dataset = dataset[:num_requests]
+                try:
+                    dataset.append(json.loads(line))
+                except json.JSONDecodeError:
+                    # Skip invalid JSON lines
+                    continue
 
     filtered_dataset: List[DatasetRow] = []
     for data in dataset:
@@ -1341,10 +1343,11 @@ def sample_openai_requests(
         output_len = fixed_output_len or data.get("max_tokens", 256)
 
         # Calculate prompt length by applying chat template
-        prompt_text = tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
+        prompt_len = len(
+            tokenizer.apply_chat_template(
+                messages, tokenize=True, add_generation_prompt=True
+            )
         )
-        prompt_len = len(tokenizer.encode(prompt_text))
 
         # Pass messages list directly - bench_serving handles List[Dict] prompts
         filtered_dataset.append(
