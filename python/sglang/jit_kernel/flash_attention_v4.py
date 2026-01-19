@@ -40,7 +40,6 @@ def flash_attn_varlen_func(
     pack_gqa: Optional[bool] = None,
     score_mod: Optional[Callable] = None,
     aux_tensors: Optional[list] = None,
-    score_mod_bwd: Optional[Callable] = None,
     mask_mod: Optional[Callable] = None,
     block_sparse_tensors=None,
 ):
@@ -83,7 +82,6 @@ def flash_attn_varlen_func(
         pack_gqa=pack_gqa,
         score_mod=score_mod,
         aux_tensors=aux_tensors,
-        score_mod_bwd=score_mod_bwd,
         mask_mod=mask_mod,
         block_sparse_tensors=block_sparse_tensors,
     )
