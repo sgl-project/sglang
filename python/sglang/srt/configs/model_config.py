@@ -1071,6 +1071,7 @@ multimodal_model_archs = [
     "Qwen3VLForConditionalGeneration",
     "Qwen3VLMoeForConditionalGeneration",
     "Qwen3OmniMoeForConditionalGeneration",
+    "MoonshotKimiaForCausalLM",
     "KimiVLForConditionalGeneration",
     "InternVLChatModel",
     "InternS1ForConditionalGeneration",
@@ -1092,6 +1093,14 @@ if external_mm_model_arch := envs.SGLANG_EXTERNAL_MM_MODEL_ARCH.get():
     multimodal_model_archs.append(external_mm_model_arch)
 
 
+audio_model_archs = [
+    "GlmAsrForConditionalGeneration",
+    "MiDashengLMModel",
+    "MoonshotKimiaForCausalLM",
+    "Qwen2AudioForConditionalGeneration",
+]
+
+
 def is_multimodal_model(model_architectures: List[str]):
     if any(
         multi_model_arch in model_architectures
@@ -1111,7 +1120,7 @@ def is_image_gen_model(model_architectures: List[str]):
 
 
 def is_audio_model(model_architectures: List[str]):
-    return False
+    return any(arch in model_architectures for arch in audio_model_archs)
 
 
 def is_encoder_decoder_model(model_architectures: List[str]):
