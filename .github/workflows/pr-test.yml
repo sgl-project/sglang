@@ -900,11 +900,8 @@ jobs:
         timeout-minutes: 10
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh diffusion
-
       - name: Run diffusion server tests
         timeout-minutes: 60
-        env:
-          SGLANG_GT_STAGING_DIR: ${{ runner.temp }}/gt_staging
         run: |
           cd python
           CONTINUE_ON_ERROR_FLAG=""
@@ -917,13 +914,6 @@ jobs:
             --total-partitions 2 \
             $CONTINUE_ON_ERROR_FLAG
 
-      - name: Upload missing GT as artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: missing-gt-1gpu-part${{ matrix.part }}
-          path: ${{ runner.temp }}/gt_staging/
-          if-no-files-found: ignore
 
   multimodal-gen-test-2-gpu:
     needs: [check-changes, call-gate, sgl-kernel-build-wheels]
@@ -963,8 +953,6 @@ jobs:
 
       - name: Run diffusion server tests
         timeout-minutes: 60
-        env:
-          SGLANG_GT_STAGING_DIR: ${{ runner.temp }}/gt_staging
         run: |
           cd python
           CONTINUE_ON_ERROR_FLAG=""
@@ -976,14 +964,6 @@ jobs:
             --partition-id ${{ matrix.part }} \
             --total-partitions 2 \
             $CONTINUE_ON_ERROR_FLAG
-
-      - name: Upload missing GT as artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: missing-gt-2gpu-part${{ matrix.part }}
-          path: ${{ runner.temp }}/gt_staging/
-          if-no-files-found: ignore
 
   quantization-test:
       needs: [check-changes, call-gate, stage-a-test-1]
