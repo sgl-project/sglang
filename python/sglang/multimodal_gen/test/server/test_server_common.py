@@ -36,6 +36,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     ScenarioConfig,
 )
 from sglang.multimodal_gen.test.test_utils import (
+    _consistency_gt_filenames,
     compare_with_gt,
     extract_key_frames_from_video,
     get_clip_threshold,
@@ -71,6 +72,12 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
     port = int(os.environ.get("SGLANG_TEST_SERVER_PORT", default_port))
     sampling_params = case.sampling_params
     extra_args = os.environ.get("SGLANG_TEST_SERVE_ARGS", "")
+
+    # In GT generation mode, force --backend diffusers
+    if os.environ.get("SGLANG_GEN_GT", "0") == "1":
+        if "--backend" not in extra_args:
+            extra_args = "--backend diffusers " + extra_args.strip()
+
     extra_args += f" --num-gpus {server_args.num_gpus}"
 
     if server_args.tp_size is not None:
@@ -459,19 +466,21 @@ Consider updating perf_baselines.json with the snippets below:
         num_gpus = case.server_args.num_gpus
         is_video = case.server_args.modality == "video"
 
-        # Check GT exists - if not, fail with instructions to add PNG(s) to sgl-test-files
-        if not gt_exists(case.id, num_gpus, is_video=is_video):
-            if is_video:
-                names = f"{case.id}_frame_0.png, {case.id}_frame_mid.png, {case.id}_frame_last.png"
-            else:
-                names = f"{case.id}.png"
+        # Check GT exists - if not, fail with instructions to add image(s) to sgl-test-files
+        output_format = case.sampling_params.output_format
+        if not gt_exists(
+            case.id, num_gpus, is_video=is_video, output_format=output_format
+        ):
+            names = ", ".join(
+                _consistency_gt_filenames(case.id, num_gpus, is_video, output_format)
+            )
             error_msg = f"""
 --- MISSING GROUND TRUTH DETECTED ---
 GT image(s) not found for '{case.id}'.
 
-Add the expected PNG(s) to sgl-test-files in diffusion-ci/consistency_gt/ with naming:
-  Image: {case.id}.png
-  Video: {case.id}_frame_0.png, {case.id}_frame_mid.png, {case.id}_frame_last.png
+Add the expected file(s) to sgl-test-files in diffusion-ci/consistency_gt/ with naming (n=num_gpus).
+  Image: {case.id}_{{n}}gpu.<ext> (ext from output_format: png, jpg, webp)
+  Video: {case.id}_{{n}}gpu_frame_0.png, {case.id}_{{n}}gpu_frame_mid.png, {case.id}_{{n}}gpu_frame_last.png
 
 For this case, expected file(s): {names}
 
@@ -484,8 +493,10 @@ Repository: https://github.com/sgl-project/sgl-test-files (path: diffusion-ci/co
                 f"GT not found for {case.id}. See logs for instructions to add GT."
             )
 
-        # Load GT embeddings
-        gt_embeddings = load_gt_embeddings(case.id, num_gpus, is_video=is_video)
+        # Load GT embeddings (format matches case; PIL converts to RGB for CLIP)
+        gt_embeddings = load_gt_embeddings(
+            case.id, num_gpus, is_video=is_video, output_format=output_format
+        )
 
         # Convert output to frames
         if is_video:
@@ -520,6 +531,60 @@ Repository: https://github.com/sgl-project/sgl-test-files (path: diffusion-ci/co
         logger.info(
             f"[Consistency] {case.id}: PASSED (min_similarity={result.min_similarity:.4f})"
         )
+
+    def _save_gt_output(
+        self,
+        case: DiffusionTestCase,
+        content: bytes,
+    ) -> None:
+        """Save generated content as ground truth files.
+
+        Args:
+            case: Test case configuration
+            content: Generated content bytes (image or video)
+        """
+        gt_output_dir = os.environ.get("SGLANG_GT_OUTPUT_DIR")
+        if not gt_output_dir:
+            logger.error("SGLANG_GT_OUTPUT_DIR not set, cannot save GT output")
+            return
+
+        out_dir = Path(gt_output_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        num_gpus = case.server_args.num_gpus
+        is_video = case.server_args.modality == "video"
+
+        if is_video:
+            # Extract key frames from video
+            frames = extract_key_frames_from_video(
+                content, num_frames=case.sampling_params.num_frames
+            )
+
+            if len(frames) != 3:
+                logger.warning(
+                    f"{case.id}: expected 3 frames, got {len(frames)}, skipping frame save"
+                )
+                return
+
+            # Save frames (reuse naming from _consistency_gt_filenames)
+            filenames = _consistency_gt_filenames(case.id, num_gpus, is_video=True)
+            from PIL import Image
+
+            for frame, fn in zip(frames, filenames):
+                frame_path = out_dir / fn
+                Image.fromarray(frame).save(frame_path)
+                logger.info(f"Saved GT frame: {frame_path}")
+        else:
+            # Save image
+            from sglang.multimodal_gen.test.test_utils import detect_image_format
+
+            detected_format = detect_image_format(content)
+            filenames = _consistency_gt_filenames(
+                case.id, num_gpus, is_video=False, output_format=detected_format
+            )
+            output_path = out_dir / filenames[0]
+            output_path.write_bytes(content)
+            logger.info(f"Saved GT image: {output_path} (format: {detected_format})")
 
     def _test_lora_api_functionality(
         self,
@@ -834,7 +899,7 @@ Repository: https://github.com/sgl-project/sgl-test-files (path: diffusion-ci/co
         """Single parametrized test that runs for all cases.
 
         This test performs:
-        1. Generation with fixed seed for reproducibility
+        1. Generation
         2. Performance validation against baselines
         3. Consistency validation against ground truth
 
@@ -844,19 +909,18 @@ Repository: https://github.com/sgl-project/sgl-test-files (path: diffusion-ci/co
         - test_diffusion_generation[qwen_image_edit]
         - etc.
         """
+        # Check if we're in GT generation mode
+        is_gt_gen_mode = os.environ.get("SGLANG_GEN_GT", "0") == "1"
+
         # Dynamic LoRA loading test - tests LayerwiseOffload + set_lora interaction
         # Server starts WITHOUT lora_path, then set_lora is called after startup
-        if case.server_args.dynamic_lora_path:
+        if case.server_args.dynamic_lora_path and not is_gt_gen_mode:
             self._test_dynamic_lora_loading(diffusion_server, case)
-
-        # Fixed seed for consistency testing
-        consistency_seed = 1024
 
         generate_fn = get_generate_fn(
             model_path=case.server_args.model_path,
             modality=case.server_args.modality,
             sampling_params=case.sampling_params,
-            seed=consistency_seed,
         )
 
         # Single generation - output is reused for both validations
@@ -865,6 +929,11 @@ Repository: https://github.com/sgl-project/sgl-test-files (path: diffusion-ci/co
             case.id,
             generate_fn,
         )
+
+        if is_gt_gen_mode:
+            # GT generation mode: save output and skip all validations/tests
+            self._save_gt_output(case, content)
+            return
 
         # Validation 1: Performance
         self._validate_and_record(case, perf_record)

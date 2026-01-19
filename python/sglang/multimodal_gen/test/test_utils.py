@@ -98,6 +98,19 @@ def is_webp(data: bytes) -> bool:
     return data[:4] == b"RIFF" and data[8:12] == b"WEBP"
 
 
+def detect_image_format(data: bytes) -> str:
+    """Detect image format from bytes (magic). Returns 'png'|'jpeg'|'webp'; default 'png'."""
+    if len(data) < 12:
+        return "png"
+    if is_png(data):
+        return "png"
+    if is_jpeg(data):
+        return "jpeg"
+    if is_webp(data):
+        return "webp"
+    return "png"
+
+
 def get_expected_image_format(
     output_format: str | None = None,
     background: str | None = None,
@@ -499,36 +512,44 @@ def compute_clip_similarity(emb1: np.ndarray, emb2: np.ndarray) -> float:
     return float(similarity)
 
 
-def _consistency_gt_filenames(case_id: str, is_video: bool) -> list[str]:
-    """Return the list of GT image filenames for a case."""
+def output_format_to_ext(output_format: str | None) -> str:
+    """Map output_format to file extension. Used by GT naming and consistency check."""
+    if not output_format:
+        return "png"
+    of = output_format.lower()
+    if of == "jpeg":
+        return "jpg"
+    if of in ("png", "webp", "jpg"):
+        return of
+    return "png"
+
+
+def _consistency_gt_filenames(
+    case_id: str, num_gpus: int, is_video: bool, output_format: str | None = None
+) -> list[str]:
+    """Return the list of GT image filenames for a case. Reused by GT generation and consistency check."""
+    n = num_gpus
     if is_video:
         return [
-            f"{case_id}_frame_0.png",
-            f"{case_id}_frame_mid.png",
-            f"{case_id}_frame_last.png",
+            f"{case_id}_{n}gpu_frame_0.png",
+            f"{case_id}_{n}gpu_frame_mid.png",
+            f"{case_id}_{n}gpu_frame_last.png",
         ]
-    return [f"{case_id}.png"]
+    ext = output_format_to_ext(output_format)
+    return [f"{case_id}_{n}gpu.{ext}"]
 
 
 def load_gt_embeddings(
-    case_id: str, num_gpus: int, is_video: bool = False
+    case_id: str,
+    num_gpus: int,
+    is_video: bool = False,
+    output_format: str | None = None,
 ) -> list[np.ndarray]:
     """
-    Load ground truth by downloading PNG(s) from sgl-test-files and computing CLIP embeddings.
-
-    Args:
-        case_id: Test case identifier.
-        num_gpus: Unused, kept for API compatibility.
-        is_video: Whether this is a video case (default: False).
-
-    Returns:
-        List of numpy arrays (embeddings) for each key frame.
-        Image: 1 embedding, Video: 3 embeddings (first, mid, last)
-
-    Raises:
-        FileNotFoundError: If GT images are not available at the expected URLs.
+    Load ground truth by downloading image(s) from sgl-test-files and computing CLIP embeddings.
+    Format (png/jpg/webp) follows case output_format; PIL converts to RGB for CLIP.
     """
-    filenames = _consistency_gt_filenames(case_id, is_video)
+    filenames = _consistency_gt_filenames(case_id, num_gpus, is_video, output_format)
     embeddings = []
 
     for fn in filenames:
@@ -547,9 +568,14 @@ def load_gt_embeddings(
     return embeddings
 
 
-def gt_exists(case_id: str, num_gpus: int, is_video: bool = False) -> bool:
+def gt_exists(
+    case_id: str,
+    num_gpus: int,
+    is_video: bool = False,
+    output_format: str | None = None,
+) -> bool:
     """Check if GT image(s) exist at sgl-test-files (by requesting the first required file)."""
-    filenames = _consistency_gt_filenames(case_id, is_video)
+    filenames = _consistency_gt_filenames(case_id, num_gpus, is_video, output_format)
     fn = filenames[0]
     url = f"{SGL_TEST_FILES_CONSISTENCY_GT_BASE}/{fn}"
     try:

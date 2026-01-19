@@ -111,11 +111,10 @@ jobs:
           path: combined
           merge-multiple: true
 
-      - name: Copy PNG files
+      - name: Copy image and video frame files
         run: |
           mkdir -p sgl-test-files/diffusion-ci/consistency_gt
-          # Try to copy from merged artifact (may be in subdirectories)
-          find combined -name "*.png" -type f -exec cp -f {} sgl-test-files/diffusion-ci/consistency_gt/ \;
+          find combined \( -name "*.png" -o -name "*.jpg" -o -name "*.jpeg" -o -name "*.webp" \) -type f -exec cp -f {} sgl-test-files/diffusion-ci/consistency_gt/ \;
 
       - name: Git commit and push
         env:
