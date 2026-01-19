@@ -560,7 +560,7 @@ class LoRAPipeline(ComposedPipelineBase):
             name, _, _ = lora_param_names_mapping_fn(name)
             # HF-format (LoRA) -> SGLang-dit-format
             target_name, merge_index, num_params_to_merge = param_names_mapping_fn(name)
-            # for multiple B(out_dim, r) @ A(r, in_dim) -> (N, out_dim, r) @ (N, out_dim, r)
+            # for fuse B(out_dim, r) @ A(r, in_dim) -> (N, out_dim, r) @ (N, r, in_dim)
             # see param mapping in HunyuanVideoArchConfig
             if merge_index is not None:
                 to_merge_params[target_name][merge_index] = weight
