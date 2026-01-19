@@ -374,9 +374,9 @@ class EAGLEWorker(TpModelWorker):
         )
 
     def _draft_preprocess_decode(self, batch: ScheduleBatch):
-        if batch.tree_cache.supports_swa() and batch.tree_cache.is_chunk_cache():
-            for req in batch.reqs:
-                batch.tree_cache.evict_swa(req, req.seqlen - 1)
+        batch.maybe_evict_swa()
+        for req in batch.reqs:
+            req.decode_batch_idx += 1
 
         # Parse args
         num_seqs = batch.batch_size()
