@@ -171,9 +171,10 @@ class Fp8Config(QuantizationConfig):
             ignored_layers = [layer.replace("model.", "") for layer in ignored_layers]
         weight_block_size = cls.get_from_keys_or(config, ["weight_block_size"], None)
         if use_mxfp8 and weight_block_size is not None:
-            raise ValueError(
-                "MXFP8 does not accept weight_block_size in config.json; it is fixed to [1, 32]."
+            logger.warning(
+                "MXFP8 ignoring incoming weight_block_size in config.json; it is fixed to [1, 32]."
             )
+            weight_block_size = [1, 32]
         return cls(
             is_checkpoint_fp8_serialized=is_checkpoint_fp8_serialized,
             activation_scheme=activation_scheme,

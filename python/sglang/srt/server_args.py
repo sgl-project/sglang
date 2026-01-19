@@ -1227,8 +1227,7 @@ class ServerArgs:
                 if (
                     self.moe_a2a_backend == "none"
                     and self.moe_runner_backend == "auto"
-                    and self.quantization
-                    in ["fp8", "mxfp8", "modelopt_fp8", "modelopt_fp4"]
+                    and self.quantization in ["fp8", "modelopt_fp8", "modelopt_fp4"]
                 ):
                     self.moe_runner_backend = "flashinfer_trtllm"
                     logger.info(
@@ -1924,6 +1923,14 @@ class ServerArgs:
             ), "Please enable dp attention when setting enable_dp_lm_head. "
 
     def _handle_moe_kernel_config(self):
+        if self.quantization == "mxfp8":
+            if self.moe_runner_backend not in ["auto", "cutlass"]:
+                logger.warning(
+                    "mxfp8 quantization forces --moe-runner-backend=cutlass. "
+                    f"Overriding {self.moe_runner_backend!r}."
+                )
+            self.moe_runner_backend = "cutlass"
+
         if self.moe_runner_backend == "flashinfer_cutlass":
             assert self.quantization in [
                 "modelopt_fp4",
@@ -1952,14 +1959,18 @@ class ServerArgs:
             logger.warning(
                 "SGLANG_CUTLASS_MOE is deprecated, use --moe-runner-backend=cutlass and/or --speculative-moe-runner-backend=cutlass instead"
             )
-            assert (
-                self.quantization == "fp8"
-            ), "cutlass MoE is only supported with fp8 quantization"
+            assert self.quantization in [
+                "fp8",
+                "mxfp8",
+            ], "cutlass MoE is only supported with fp8/mxfp8 quantization"
             self.moe_runner_backend = "cutlass"
-        if self.moe_runner_backend == "cutlass" and self.quantization == "fp8":
+        if self.moe_runner_backend == "cutlass" and self.quantization in [
+            "fp8",
+            "mxfp8",
+        ]:
             assert (
                 self.ep_size == 1
-            ), "FP8 Cutlass MoE is only supported with ep_size == 1"
+            ), "FP8/MXFP8 Cutlass MoE is only supported with ep_size == 1"
 
     def _handle_a2a_moe(self):
         if self.moe_a2a_backend == "deepep":
