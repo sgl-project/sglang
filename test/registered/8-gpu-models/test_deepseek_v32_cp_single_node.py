@@ -18,6 +18,7 @@ BASE_ARGS = [
 DP_ARGS = [
     "--tp=8",
     "--dp=2",
+    "--attn-cp-size=4",
     "--enable-dp-attention",
 ]
 
