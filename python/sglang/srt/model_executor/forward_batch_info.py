@@ -45,12 +45,12 @@ from sglang.srt.distributed.parallel_state import (
 from sglang.srt.layers.attention.nsa.utils import NSAContextParallelMetadata
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
+    get_attention_cp_size,
     get_attention_dp_rank,
     get_attention_tp_rank,
     get_attention_tp_size,
     set_dp_buffer_len,
     set_is_extend_in_batch,
-    get_attention_cp_size,
 )
 from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
     ForwardBatchDeepSeekMHAMixin,
@@ -748,7 +748,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             # make sure that the padded length is divisible by attn_tp_size because we may need reduce-scatter across attn_tp dim.
             # there is no reduce-scatter in LM logprob, so we do not need to adjust the padded length for logprob
             global_num_tokens[i] = ceil_align(global_num_tokens[i], attn_tp_size)
-        
+
         attn_cp_size = get_attention_cp_size()
         for i in range(sync_group_size):
             global_num_tokens[i] = ceil_align(global_num_tokens[i], attn_cp_size)

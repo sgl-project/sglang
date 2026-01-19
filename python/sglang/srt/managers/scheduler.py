@@ -62,8 +62,8 @@ from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.dp_attention import (
     compute_dp_attention_world_info,
-    get_attention_tp_group,
     get_attention_cp_group,
+    get_attention_tp_group,
 )
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
@@ -1254,7 +1254,7 @@ class Scheduler(
                     self.attn_tp_cpu_group,
                     src=self.attn_tp_group.ranks[0],
                 )
-            
+
             if self.attn_cp_size != 1:
                 work_reqs = broadcast_pyobj(
                     work_reqs,

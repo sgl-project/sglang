@@ -9,11 +9,10 @@ import triton
 import triton.language as tl
 
 from sglang.srt.layers.dp_attention import (
-    get_attention_tp_size,
-    get_attention_cp_size,
-    get_attention_cp_rank,
+    attn_cp_all_gather_into_tensor,
     get_attention_cp_group,
-    attn_cp_all_gather_into_tensor
+    get_attention_cp_rank,
+    get_attention_cp_size,
 )
 from sglang.srt.server_args import get_global_server_args
 

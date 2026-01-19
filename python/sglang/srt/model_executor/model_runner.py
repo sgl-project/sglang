@@ -565,8 +565,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             (
                 self.max_total_num_tokens // 2
                 if server_args.max_running_requests is None
-                else server_args.max_running_requests
-                // (self.dp_size)
+                else server_args.max_running_requests // (self.dp_size)
             ),
             self.req_to_token_pool.size,
         )

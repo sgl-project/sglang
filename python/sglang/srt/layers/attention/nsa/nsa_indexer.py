@@ -26,16 +26,16 @@ if _is_npu:
     import torch_npu
     from sglang.srt.hardware_backend.npu.utils import get_indexer_weight_stream
 
+from sglang.srt.distributed import (
+    get_attn_context_model_parallel_rank,
+    get_attn_context_model_parallel_world_size,
+)
 from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.nsa.utils import (
     cp_all_gather_rerange_output,
     is_nsa_enable_prefill_cp,
     is_nsa_prefill_cp_in_seq_split,
-)
-from sglang.srt.distributed import (
-    get_attn_context_model_parallel_world_size,
-    get_attn_context_model_parallel_rank,
 )
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
