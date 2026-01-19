@@ -5,7 +5,6 @@ import triton
 import triton.language as tl
 from einops import rearrange
 
-from sglang.jit_kernel.cutedsl_gdn import cutedsl_fused_sigmoid_gating_delta_rule_update
 from sglang.srt.environ import Envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.fla.fused_gdn_gating import fused_gdn_gating
@@ -37,6 +36,9 @@ from sglang.srt.utils.common import rank0_log
 
 if not is_cpu():
     # fix import error on CPU device, no impacts when non-CPU path
+    from sglang.jit_kernel.cutedsl_gdn import (
+        cutedsl_fused_sigmoid_gating_delta_rule_update,
+    )
     from sglang.srt.layers.attention.fla.chunk import chunk_gated_delta_rule
     from sglang.srt.layers.attention.fla.chunk_delta_h import (
         CHUNK_SIZE as FLA_CHUNK_SIZE,
