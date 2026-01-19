@@ -45,6 +45,7 @@ from sglang.srt.model_loader.ci_weight_validation import (
     ci_validate_and_cleanup_local_snapshot,
 )
 from sglang.srt.utils import (
+    BAR_FORMAT,
     find_local_repo_dir,
     is_cpu,
     log_info_on_rank0,
@@ -613,13 +614,6 @@ def filter_files_not_needed_for_inference(hf_weights_files: List[str]) -> List[s
     return hf_weights_files
 
 
-# explicitly use pure text format, with a newline at the end
-# this makes it impossible to see the animation in the progress bar
-# but will avoid messing up with ray or multiprocessing, which wraps
-# each line of output with some prefix.
-_BAR_FORMAT = "{desc}: {percentage:3.0f}% Completed | {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]\n"  # noqa: E501
-
-
 def np_cache_weights_iterator(
     model_name_or_path: str,
     cache_dir: Optional[str],
@@ -647,7 +641,8 @@ def np_cache_weights_iterator(
                 hf_weights_files,
                 desc="Loading np_cache checkpoint shards",
                 disable=not enable_tqdm,
-                bar_format=_BAR_FORMAT,
+                bar_format=BAR_FORMAT,
+                position=tqdm._get_free_pos(),
             ):
                 state = torch.load(bin_file, map_location="cpu", weights_only=True)
                 for name, param in state.items():
@@ -704,7 +699,8 @@ def safetensors_weights_iterator(
         hf_weights_files,
         desc="Loading safetensors checkpoint shards",
         disable=not enable_tqdm,
-        bar_format=_BAR_FORMAT,
+        bar_format=BAR_FORMAT,
+        position=tqdm._get_free_pos(),
     ):
         if disable_mmap:
             with open(st_file, "rb") as f:
@@ -816,7 +812,7 @@ def multi_thread_safetensors_weights_iterator(
                 total=len(hf_weights_files),
                 desc="Multi-thread loading shards",
                 disable=not enable_tqdm,
-                bar_format=_BAR_FORMAT,
+                bar_format=BAR_FORMAT,
             )
         else:
             futures_iter = concurrent.futures.as_completed(futures)
@@ -858,7 +854,8 @@ def pt_weights_iterator(
         hf_weights_files,
         desc="Loading pt checkpoint shards",
         disable=not enable_tqdm,
-        bar_format=_BAR_FORMAT,
+        bar_format=BAR_FORMAT,
+        position=tqdm._get_free_pos(),
     ):
         state = _load_pt_file(bin_file)
         yield from state.items()
@@ -885,7 +882,7 @@ def multi_thread_pt_weights_iterator(
                 total=len(hf_weights_files),
                 desc="Multi-thread loading pt checkpoint shards",
                 disable=not enable_tqdm,
-                bar_format=_BAR_FORMAT,
+                bar_format=BAR_FORMAT,
             )
         else:
             futures_iter = concurrent.futures.as_completed(futures)
@@ -1055,7 +1052,8 @@ def runai_safetensors_weights_iterator(
             hf_weights_files,
             desc="Loading safetensors using Runai Model Streamer",
             disable=not enable_tqdm,
-            bar_format=_BAR_FORMAT,
+            bar_format=BAR_FORMAT,
+            position=tqdm._get_free_pos(),
         ):
             streamer.stream_file(st_file)
             yield from streamer.get_tensors()
