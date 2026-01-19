@@ -93,6 +93,17 @@ class StandaloneWorker(EAGLEWorker):
         self.draft_tp_context = (
             draft_tp_context if server_args.enable_dp_attention else empty_context
         )
+
+        # Initialize vocab mapper before cuda graphs (used in draft_forward)
+        if server_args.enable_heterogeneous_vocab:
+            self.vocab_mapper = create_vocab_mapper(
+                draft_tokenizer=self.draft_model_runner.tokenizer,
+                target_tokenizer=target_worker.model_runner.tokenizer,
+                device=self.device,
+            )
+        else:
+            self.vocab_mapper = None
+
         with self.draft_tp_context(
             self.draft_model_runner.tp_group
         ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
@@ -104,10 +115,3 @@ class StandaloneWorker(EAGLEWorker):
             (), dtype=torch.int64, device=self.device
         )
         self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
-
-        if server_args.enable_heterogeneous_vocab:
-            self.vocab_mapper = create_vocab_mapper(
-                draft_tokenizer=self.draft_model_runner.tokenizer,
-                target_tokenizer=target_worker.model_runner.tokenizer,
-                device=self.device,
-            )
