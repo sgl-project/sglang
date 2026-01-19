@@ -23,8 +23,8 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.managers.scheduler_multimodal import (
     MMDPSchedulePolicy,
-    MMDPScheduler,
     MMPackPolicy,
+    MMScheduler,
 )
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -549,10 +549,9 @@ def get_embedding_items_per_chunk_with_extra_padding(
     return selected_items
 
 
-# TODO: To be obsoleted.
-def _get_chunked_prefill_embedding(
+# TODO: To be obsoleted after MM batch scheduling enabled.
+def _get_chunked_prefill_embedding_ori(
     data_embedding_func: DataEmbeddingFunc,
-    get_mm_dp_metadata_func: Callable,
     embedding_items: List[MultimodalDataItem],
     items_size: List[int],
     prefix_length: List[int],
@@ -560,21 +559,6 @@ def _get_chunked_prefill_embedding(
     items_offset_list: List[List[Tuple[int, int]]],
     input_ids: torch.Tensor,
 ) -> tuple[torch.Tensor | None, torch.Tensor]:
-    enable_batch_compute = get_global_server_args().enable_batch_compute_mm_embeddings
-    modality = embedding_items[0].modality
-    batch_compute_embedding = None
-    if enable_batch_compute and modality == Modality.IMAGE:
-        batch_compute_embedding = _get_chunked_prefill_embedding_batch(
-            data_embedding_func,
-            get_mm_dp_metadata_func,
-            embedding_items,
-            items_size,
-            prefix_length,
-            extend_length,
-            items_offset_list,
-        )
-        return batch_compute_embedding
-
     # Calculate embedding for each request, try to get it from cache to avoid repeated calculation
     embedding_list = []
     # FIXME(Xinyuan): temporary workaround for eagle3, which may have len(items_size) > len(prefix_length)
@@ -629,13 +613,53 @@ def _get_chunked_prefill_embedding(
         )
 
         embedding_list.append(embedding_per_req_chunk)
+
+    if len(embedding_list) == 0:
+        return None, input_ids
+    return torch.concat(embedding_list, dim=0), input_ids
+
+
+# TODO: To be obsoleted.
+def _get_chunked_prefill_embedding(
+    data_embedding_func: DataEmbeddingFunc,
+    get_mm_dp_metadata_func: Callable,
+    embedding_items: List[MultimodalDataItem],
+    items_size: List[int],
+    prefix_length: List[int],
+    extend_length: List[int],
+    items_offset_list: List[List[Tuple[int, int]]],
+    input_ids: torch.Tensor,
+) -> tuple[torch.Tensor | None, torch.Tensor]:
+    enable_batch_compute = get_global_server_args().enable_batch_compute_mm_embeddings
+    modality = embedding_items[0].modality
+    if enable_batch_compute and modality == Modality.IMAGE:
+        batch_compute_embedding, input_ids = _get_chunked_prefill_embedding_batch(
+            data_embedding_func,
+            get_mm_dp_metadata_func,
+            embedding_items,
+            items_size,
+            prefix_length,
+            extend_length,
+            items_offset_list,
+            input_ids,
+            modality,
+        )
+        # return batch_compute_embedding
+
+    ori_embedding, input_ids = _get_chunked_prefill_embedding_ori(
+        data_embedding_func,
+        embedding_items,
+        items_size,
+        prefix_length,
+        extend_length,
+        items_offset_list,
+        input_ids,
+    )
     # if batch_compute_embedding is not None:
     #     single_compute_embedding = torch.concat(embedding_list, dim=0)
     #     assert torch.equal(batch_compute_embedding, single_compute_embedding)
     #     print("equal!!!")
-    if len(embedding_list) == 0:
-        return None, input_ids
-    return torch.concat(embedding_list, dim=0), input_ids
+    return ori_embedding, input_ids
 
 
 def _get_chunked_prefill_embedding_batch(
@@ -646,13 +670,11 @@ def _get_chunked_prefill_embedding_batch(
     prefix_length: List[int],
     extend_length: List[int],
     items_offset_list: List[List[Tuple[int, int]]],
+    input_ids: torch.Tensor,
+    modality: Modality,
 ) -> Optional[torch.Tensor]:
-    # Calculate embedding for each request, try to get it from cache to avoid repeated calculation
-    # FIXME(Xinyuan): temporary workaround for eagle3, which may have len(items_size) > len(prefix_length)
-    max_iterations = min(len(items_size) - 1, len(prefix_length))
-
     # step1: check cache and collect cache-miss items and their metadata
-    all_req_embedding_map = []  # List[Tuple[req_idx,embeddings]]
+    all_req_embedding_list = []  # List[Tuple[req_idx,embeddings]]
     cache_miss_items = (
         {}
     )  # Dict[key: req_idx or 'batch', value: List[MultimodalDataItem]]
@@ -660,9 +682,9 @@ def _get_chunked_prefill_embedding_batch(
     new_compute_req_token_num_list = []
     pixel_values_list = []
     grid_thw_list = []
-    modality = None
     enable_batch_compute = get_global_server_args().enable_batch_compute_mm_embeddings
 
+    max_iterations = min(len(items_size) - 1, len(prefix_length))
     for i in range(max_iterations):
         if items_size[i] == items_size[i + 1]:
             continue
@@ -672,14 +694,12 @@ def _get_chunked_prefill_embedding_batch(
         # if all items has been prefixed, we do not need to calculate embedding
         if all([offset_end < prefix_length[i] for _, offset_end in items_offset]):
             continue
-        if modality is None:
-            modality = embedding_items_per_req[0].modality
 
         item_hashes = [item.hash for item in embedding_items_per_req]
         embedding_items_hash = MultiModalStaticCache.combine_hashes(item_hashes)
         embedding_per_req = embedding_cache.get(item_hashes)
         if embedding_per_req is None:
-            all_req_embedding_map.append((i, None))
+            all_req_embedding_list.append((i, None))
             req_items_hash_map[i] = embedding_items_hash
             if enable_batch_compute:
                 pixel_values_list.extend(
@@ -695,9 +715,8 @@ def _get_chunked_prefill_embedding_batch(
             else:
                 cache_miss_items[i] = embedding_items_per_req
         else:
-            all_req_embedding_map.append((i, embedding_per_req))
+            all_req_embedding_list.append((i, embedding_per_req))
 
-    assert modality is not None
     if enable_batch_compute:
         cum_token_num_list = [0] + list(np.cumsum(new_compute_req_token_num_list))
         pixel_values = torch.cat(pixel_values_list, dim=0)
@@ -716,7 +735,7 @@ def _get_chunked_prefill_embedding_batch(
         # step2.1: get mm items to be computed on current rank according to MMDPSchedulePolicy and MMPackPolicy
 
         # if enable encoder DP, first apply MMDPSchedulePolicy
-        if len(embedding_items) == 0:
+        if len(embedding_items) == 1:
             # only one MultimodalDataItem in embedding_items, no need to construct pixel_values and grid_thw again
             pixel_values = embedding_items[0].feature
             grid_thw_list = embedding_items[0].image_grid_thw.tolist()
@@ -733,12 +752,12 @@ def _get_chunked_prefill_embedding_batch(
                 image_to_tp_rank,
                 gpu_sample_counts,
                 grouped_pixel_values_len,
-            ) = MMDPScheduler.get_dp_encoder_assignment(
+            ) = MMScheduler.get_dp_encoder_assignment(
                 grid_thw_list, MMDPSchedulePolicy.LOAD_BALANCE
             )
             # print(f"{patches_per_image=}, {image_to_tp_rank=}, {gpu_sample_counts=}, {grouped_pixel_values_len=}")
             pixel_values_local, grid_thw_list_local = (
-                MMDPScheduler.split_mm_to_dp_encoder(
+                MMScheduler.split_mm_to_dp_encoder(
                     pixel_values,
                     grid_thw_list,
                     patches_per_image,
@@ -752,7 +771,7 @@ def _get_chunked_prefill_embedding_batch(
         # print(f"{grid_thw_list_local=}")
 
         # apply MMPackPolicy
-        embedding_items_list_local_rank = MMDPScheduler.get_mm_pack_result(
+        embedding_items_list_local_rank = MMScheduler.get_mm_pack_result(
             pixel_values_local, grid_thw_list_local, modality, MMPackPolicy.ALL_PACK
         )
         # print(f"{embedding_items_list_local_rank=}")
@@ -768,7 +787,7 @@ def _get_chunked_prefill_embedding_batch(
         # step2.3: gather embeddings from different dp rank if needed
         if use_encoder_dp and get_mm_dp_metadata_func is not None:
             # gather embeddings from different dp rank
-            embeddings_all_rank = MMDPScheduler.gather_dp_result(
+            embeddings_all_rank = MMScheduler.gather_dp_result(
                 patches_per_image,
                 image_to_tp_rank,
                 gpu_sample_counts,
@@ -789,7 +808,7 @@ def _get_chunked_prefill_embedding_batch(
     # step3: split embeddings to different requests, cache and chunk
     embedding_list = []
     new_computed_req_index = 0
-    for i, embeddings in all_req_embedding_map:
+    for i, embeddings in all_req_embedding_list:
         embeddings_per_req = None
         if embeddings is not None:
             embeddings_per_req = embeddings
@@ -805,27 +824,42 @@ def _get_chunked_prefill_embedding_batch(
                 # print(f"{i}, embeddings_per_req {embeddings_per_req.shape}, {embeddings_per_req[0]}")
             else:
                 embeddings_per_req = cache_miss_items[i]
+
+            if not embedding_cache.set(req_items_hash_map[i], embeddings_per_req):
+                print_warning_once(
+                    "Multimodal embedding cache is full. This typically occurs when a single "
+                    "embedding exceeds the cache size limit. Consider increasing the "
+                    "`SGLANG_VLM_CACHE_SIZE_MB` environment variable or reducing the input "
+                    "embedding size."
+                )
         assert embeddings_per_req is not None
 
-        if not embedding_cache.set(req_items_hash_map[i], embeddings_per_req):
-            print_warning_once(
-                "Multimodal embedding cache is full. This typically occurs when a single "
-                "embedding exceeds the cache size limit. Consider increasing the "
-                "`SGLANG_VLM_CACHE_SIZE_MB` environment variable or reducing the input "
-                "embedding size."
+        extend_prefix_len = prefix_length[i]
+        extend_seq_len = extend_length[i] if i < len(extend_length) else 0
+
+        if isinstance(embedding_per_req, EVSEmbeddingResult):
+            item = embedding_items_per_req[0]
+            input_ids, items_offset = (
+                embedding_per_req.redistribute_pruned_frames_placeholders(
+                    input_ids,
+                    items_offset,
+                    item=item,
+                    extend_prefix_len=extend_prefix_len,
+                    extend_seq_len=extend_seq_len,
+                )
             )
 
         embedding_per_req_chunk, _, _ = get_embedding_chunk(
-            embedding=embeddings_per_req,
-            extend_prefix_len=prefix_length[i],
-            extend_seq_len=extend_length[i] if i < len(extend_length) else 0,
-            items_offset=items_offset_list[i],
+            embedding=embedding_per_req.embedding,
+            extend_prefix_len=extend_prefix_len,
+            extend_seq_len=extend_seq_len,
+            items_offset=items_offset,
         )
-        # print(f"{i}, embedding_per_req_chunk {embedding_per_req_chunk.shape}, {embedding_per_req_chunk[0]}")
+
         embedding_list.append(embedding_per_req_chunk)
     if len(embedding_list) == 0:
-        return None
-    return torch.concat(embedding_list, dim=0)
+        return None, input_ids
+    return torch.concat(embedding_list, dim=0), input_ids
 
 
 def get_embedding_chunk_remove_extra_padding(

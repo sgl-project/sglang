@@ -32,12 +32,10 @@ class MMDPSchedulePolicy(Enum):
     LOAD_BALANCE = "load_balance"
 
 
-class MMDPScheduler:
+class MMScheduler:
     """
-    Multi-modal Data Parallel Scheduler.
-
-    This policy decides how to distribute multiple requests with multiple images/videos
-    across different encoder instances (data parallelism).
+    Multi-modal Scheduler, use MMDPSchedulePolicy to distribute multiple images/videos to different encoder instances and
+    MMPackPolicy to pack multiple images/videos in a single encoder instance.
     """
 
     def get_dp_encoder_lb_assignment(
