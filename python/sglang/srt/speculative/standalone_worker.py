@@ -97,8 +97,8 @@ class StandaloneWorker(EAGLEWorker):
         # Initialize vocab mapper before cuda graphs (used in draft_forward)
         if server_args.enable_heterogeneous_vocab:
             self.vocab_mapper = create_vocab_mapper(
-                draft_tokenizer=self.draft_model_runner.tokenizer,
-                target_tokenizer=target_worker.model_runner.tokenizer,
+                draft_tokenizer=self.tokenizer,
+                target_tokenizer=target_worker.tokenizer,
                 device=self.device,
             )
         else:
