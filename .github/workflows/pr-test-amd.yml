@@ -930,7 +930,6 @@ jobs:
 
   check-pdd-env:
     runs-on: linux-mi35x-gpu-8
-    if: inputs.target_stage == 'check-pdd-env'
     steps:
       - name: Find RDMA in CI Runner
         run: |
