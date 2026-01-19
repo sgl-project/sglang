@@ -240,8 +240,11 @@ class PiecewiseCudaGraphRunner:
         set_graph_pool_id(get_global_graph_memory_pool())
 
         with enable_piecewise_cuda_graph():
+            language_model = getattr(
+                self.model_runner.model, "language_model", self.model_runner.model
+            )
             with patch_model(
-                self.model_runner.model.model, self.compile_config.compiler
+                language_model.model, self.compile_config.compiler
             ) as patched_model:
                 install_torch_compiled(
                     patched_model,
