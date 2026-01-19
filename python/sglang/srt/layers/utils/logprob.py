@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, List, Optional, Union
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.flashinfer_topk import flashinfer_topk
 
 if TYPE_CHECKING:
     from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessorOutput
@@ -70,7 +71,7 @@ def get_top_logprobs_raw(
     extend_logprob_pruned_lens_cpu: Optional[List[int]] = None,
 ):
     max_k = max(top_logprobs_nums)
-    values, indices = logprobs.topk(max_k, dim=-1)
+    values, indices = flashinfer_topk(logprobs, max_k, dim=-1, sorted=True)
     values = values.tolist()
     indices = indices.tolist()
 

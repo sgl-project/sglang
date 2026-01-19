@@ -18,12 +18,13 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import crash_on_warnings, get_bool_env_var, is_cuda, is_npu
 
 if is_cuda():
+    # sgl_kernel sampling functions (CUDA kernels from sgl-kernel package)
+    from sgl_kernel import min_p_sampling_from_probs  # sgl_kernel: min-p sampling
+    from sgl_kernel import top_k_renorm_prob  # sgl_kernel: top-k renormalization
     from sgl_kernel import (
-        min_p_sampling_from_probs,
-        top_k_renorm_prob,
-        top_k_top_p_sampling_from_probs,
-        top_p_renorm_prob,
+        top_k_top_p_sampling_from_probs,  # sgl_kernel: fused top-k + top-p sampling
     )
+    from sgl_kernel import top_p_renorm_prob  # sgl_kernel: top-p renormalization
 
 if is_npu():
     import torch_npu
@@ -33,7 +34,7 @@ logger = logging.getLogger(__name__)
 SYNC_TOKEN_IDS_ACROSS_TP = get_bool_env_var("SYNC_TOKEN_IDS_ACROSS_TP")
 SGLANG_RETURN_ORIGINAL_LOGPROB = get_bool_env_var("SGLANG_RETURN_ORIGINAL_LOGPROB")
 _CUSTOM_SAMPLER_FACTORIES: Dict[str, Callable[[], "Sampler"]] = {}
-_BUILT_IN_SAMPLING_BACKENDS = {"flashinfer", "pytorch", "ascend"}
+_BUILT_IN_SAMPLING_BACKENDS = {"flashinfer", "flashinfer_python", "pytorch", "ascend"}
 
 
 class Sampler(nn.Module):
@@ -134,7 +135,68 @@ class Sampler(nn.Module):
                     positions=positions,
                 )
             else:
-                if get_global_server_args().sampling_backend == "flashinfer":
+                if get_global_server_args().sampling_backend == "flashinfer_python":
+                    # ============================================================
+                    # flashinfer_python backend: uses flashinfer.sampling Python API
+                    # Benefits: bf16/fp16 support, multi-CTA kernels, radix top-k
+                    #
+                    # Functions used:
+                    # - flashinfer.sampling.top_k_renorm_probs: top-k renormalization
+                    # - flashinfer.sampling.top_p_renorm_probs: top-p renormalization
+                    # - flashinfer.sampling.top_p_sampling_from_probs: top-p sampling
+                    # - sgl_kernel.min_p_sampling_from_probs: min-p sampling (not in flashinfer)
+                    # ============================================================
+                    try:
+                        import flashinfer.sampling as flashinfer_sampling
+                    except ImportError as exc:
+                        raise ImportError(
+                            "flashinfer is required for sampling_backend='flashinfer_python'. "
+                            "Install flashinfer or choose a different sampling_backend."
+                        ) from exc
+                    top_ks = sampling_info.top_ks
+                    if sampling_info.need_top_k_sampling and torch.any(
+                        top_ks == TOP_K_ALL
+                    ):
+                        top_ks = top_ks.clone()
+                        top_ks.masked_fill_(top_ks == TOP_K_ALL, probs.shape[1])
+
+                    if sampling_info.need_min_p_sampling:
+                        # Path A/B: min_p sampling (uses sgl_kernel for final sampling)
+                        # Trigger: min_p > 0
+                        if sampling_info.need_top_k_sampling:
+                            # Path A: top_k + min_p
+                            # flashinfer.sampling.top_k_renorm_probs(probs, top_ks)
+                            probs = flashinfer_sampling.top_k_renorm_probs(
+                                probs, top_ks
+                            )
+                        # flashinfer.sampling.top_p_renorm_probs(probs, top_ps)
+                        probs = flashinfer_sampling.top_p_renorm_probs(
+                            probs, sampling_info.top_ps
+                        )
+                        # sgl_kernel.min_p_sampling_from_probs(probs, min_ps)
+                        batch_next_token_ids = min_p_sampling_from_probs(
+                            probs, sampling_info.min_ps
+                        )
+                    else:
+                        # Path C/D: top_p sampling (no min_p)
+                        # Use separate ops to get bf16 + radix speedup on renorm step
+                        # Note: top_k_renorm_probs keeps bf16, top_p_sampling casts to fp32 internally
+                        # Still beneficial: radix speedup on renorm + less data to cast
+                        if sampling_info.need_top_k_sampling:
+                            # Path C: top_k + top_p
+                            # flashinfer.sampling.top_k_renorm_probs(probs, top_ks)
+                            probs = flashinfer_sampling.top_k_renorm_probs(
+                                probs, top_ks
+                            )
+                        # Path C or D: flashinfer.sampling.top_p_sampling_from_probs
+                        batch_next_token_ids = (
+                            flashinfer_sampling.top_p_sampling_from_probs(
+                                probs.contiguous(),
+                                sampling_info.top_ps,
+                                check_nan=self.use_nan_detection,
+                            )
+                        )
+                elif get_global_server_args().sampling_backend == "flashinfer":
                     if sampling_info.need_min_p_sampling:
                         probs = top_k_renorm_prob(probs, sampling_info.top_ks)
                         probs = top_p_renorm_prob(probs, sampling_info.top_ps)
