@@ -5,15 +5,18 @@ This test evaluates Vision-Language Models (VLMs) on the MMMU benchmark on AMD G
 Models are selected based on compatibility with AMD/ROCm platform.
 
 VLMs tested here:
-- Qwen2-VL series (Qwen2-VL-7B, Qwen2.5-VL-7B)
-- InternVL2 series
-- MiniCPM-v series
-- deepseek-vl2-small
+- Qwen VL series (Qwen2-VL-7B, Qwen2.5-VL-7B, Qwen3-VL-30B)
+- InternVL2 series (InternVL2_5-2B)
+- MiniCPM series (MiniCPM-v-2_6, MiniCPM-o-2_6)
+- DeepSeek VL series (deepseek-vl2-small, Janus-Pro-7B)
+- Kimi VL (Kimi-VL-A3B-Instruct)
+- MiMo VL (MiMo-VL-7B-RL)
+- GLM VL (GLM-4.1V-9B-Thinking)
 
-Note: Some VLMs from the Nvidia test are excluded due to AMD compatibility issues.
+Note: NVILA models are excluded (NVIDIA-specific).
 Note: This test runs only on MI30x runners (linux-mi325-gpu-2), not on MI35x.
 
-Registry: nightly-amd-vlm suite (2-GPU VLM tests)
+Registry: nightly-amd-accuracy-2-gpu-vlm suite (2-GPU VLM tests)
 """
 
 import os
@@ -40,7 +43,7 @@ register_amd_ci(est_time=7200, suite="nightly-amd-accuracy-2-gpu-vlm", nightly=T
 # AMD-verified VLM models with conservative thresholds on 100 MMMU samples
 # Format: (model_path, tp_size, accuracy_threshold, extra_args)
 AMD_VLM_MODELS = [
-    # Qwen2-VL series - well supported on AMD
+    # Qwen VL series - well supported on AMD
     {
         "model_path": "Qwen/Qwen2-VL-7B-Instruct",
         "tp_size": 1,
@@ -53,6 +56,12 @@ AMD_VLM_MODELS = [
         "accuracy_threshold": 0.33,
         "extra_args": ["--trust-remote-code"],
     },
+    {
+        "model_path": "Qwen/Qwen3-VL-30B-A3B-Instruct",
+        "tp_size": 2,
+        "accuracy_threshold": 0.29,
+        "extra_args": ["--trust-remote-code"],
+    },
     # InternVL2 - smaller model, good for testing
     {
         "model_path": "OpenGVLab/InternVL2_5-2B",
@@ -60,25 +69,60 @@ AMD_VLM_MODELS = [
         "accuracy_threshold": 0.29,
         "extra_args": ["--trust-remote-code"],
     },
-    # MiniCPM-v - lightweight VLM
+    # MiniCPM series
     {
         "model_path": "openbmb/MiniCPM-v-2_6",
         "tp_size": 1,
         "accuracy_threshold": 0.25,
         "extra_args": ["--trust-remote-code"],
     },
-    # DeepSeek VL2 small - MoE VLM
+    {
+        "model_path": "openbmb/MiniCPM-o-2_6",
+        "tp_size": 1,
+        "accuracy_threshold": 0.32,
+        "extra_args": ["--trust-remote-code"],
+    },
+    # DeepSeek VL series
     {
         "model_path": "deepseek-ai/deepseek-vl2-small",
         "tp_size": 1,
         "accuracy_threshold": 0.31,
         "extra_args": ["--trust-remote-code"],
     },
+    {
+        "model_path": "deepseek-ai/Janus-Pro-7B",
+        "tp_size": 1,
+        "accuracy_threshold": 0.28,
+        "extra_args": ["--trust-remote-code"],
+    },
+    # Kimi VL - MoE
+    {
+        "model_path": "moonshotai/Kimi-VL-A3B-Instruct",
+        "tp_size": 1,
+        "accuracy_threshold": 0.26,
+        "extra_args": ["--trust-remote-code"],
+    },
+    # MiMo VL
+    {
+        "model_path": "XiaomiMiMo/MiMo-VL-7B-RL",
+        "tp_size": 1,
+        "accuracy_threshold": 0.27,
+        "extra_args": ["--trust-remote-code"],
+    },
+    # GLM VL
+    {
+        "model_path": "zai-org/GLM-4.1V-9B-Thinking",
+        "tp_size": 1,
+        "accuracy_threshold": 0.27,
+        "extra_args": ["--trust-remote-code"],
+    },
 ]
 
-# Models that need special handling on AMD
+# Models that need special handling on AMD (MoE models)
 TRITON_ATTENTION_MODELS = {
-    "deepseek-ai/deepseek-vl2-small",  # MoE model
+    "deepseek-ai/deepseek-vl2-small",
+    "Qwen/Qwen3-VL-30B-A3B-Instruct",
+    "moonshotai/Kimi-VL-A3B-Instruct",
 }
 
 # Models known to fail on AMD - exclude from testing
