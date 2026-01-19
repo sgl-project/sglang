@@ -199,16 +199,14 @@ class InternMLP(nn.Module):
             config.intermediate_size,
             bias=True,
             quant_config=None,
-            tp_size=self.tp_size,
-            tp_rank=self.tp_rank,
+            disable_tp=use_data_parallel,
         )
         self.fc2 = RowParallelLinear(
             config.intermediate_size,
             config.hidden_size,
             bias=True,
             quant_config=None,
-            tp_size=self.tp_size,
-            tp_rank=self.tp_rank,
+            disable_tp=use_data_parallel,
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
