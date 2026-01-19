@@ -969,7 +969,7 @@ class SWARadixCache(BasePrefixCache):
                         # Free full tokens in the original tree node.
                         self.token_to_kv_pool_allocator.free(node.value[:prefix_len])
                         # Overwrite the new value in request to the tree node.
-                        node.value = value[:prefix_len]
+                        node.value = value[:prefix_len].clone()
                         node.swa_tombstone = False
                         self.swa_lru_list.insert_mru(node)
                         self.swa_evictable_size_ += len(node.value)
@@ -982,7 +982,7 @@ class SWARadixCache(BasePrefixCache):
                         self._split_node(node.key, node, start_update_idx)
                         # Here node is the new node after split, so we can overwrite the value to the new node.
                         # The old node is still swa tombstone and the full token is not freed.
-                        node.value = value[start_update_idx:prefix_len]
+                        node.value = value[start_update_idx:prefix_len].clone()
                         self.token_to_kv_pool_allocator.free(value[:start_update_idx])
                         node.swa_tombstone = False
                         self.swa_lru_list.insert_mru(node)
@@ -1030,7 +1030,7 @@ class SWARadixCache(BasePrefixCache):
         new_node = TreeNode()
         new_node.parent = parent
         new_node.key = key
-        new_node.value = value
+        new_node.value = value.clone()
         new_node.swa_tombstone = swa_tombstone
         parent.children[self.get_child_key_fn(key)] = new_node
         self.full_lru_list.insert_mru(new_node)
