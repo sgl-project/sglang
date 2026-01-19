@@ -228,16 +228,34 @@ class Req:
     @property
     def batch_size(self):
         # Determine batch size
-        if isinstance(self.prompt, list):
-            batch_size = len(self.prompt)
-        elif self.prompt is not None:
+        if isinstance(self.sampling_params.prompt, list):
+            batch_size = len(self.sampling_params.prompt)
+        elif self.sampling_params.prompt is not None:
             batch_size = 1
         else:
             batch_size = self.prompt_embeds[0].shape[0]
 
         # Adjust batch size for number of videos per prompt
-        batch_size *= self.num_outputs_per_prompt
+        batch_size *= self.sampling_params.num_outputs_per_prompt
         return batch_size
+
+    @property
+    def prompts_as_list(self) -> list[str]:
+        """Always return prompts as a list."""
+        if self.sampling_params.prompt is None:
+            return []
+        if isinstance(self.sampling_params.prompt, str):
+            return [self.sampling_params.prompt]
+        return self.sampling_params.prompt
+
+    @property
+    def negative_prompts_as_list(self) -> list[str]:
+        """Always return negative prompts as a list matching batch size."""
+        if self.sampling_params.negative_prompt is None:
+            return [""] * self.batch_size
+        if isinstance(self.sampling_params.negative_prompt, str):
+            return [self.sampling_params.negative_prompt] * self.batch_size
+        return self.sampling_params.negative_prompt
 
     def output_file_path(self, num_outputs=1, output_idx=None):
         output_file_name = self.output_file_name
