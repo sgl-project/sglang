@@ -84,7 +84,10 @@ class OpenAIServingBase(ABC):
             )
 
     async def handle_request(
-        self, request: OpenAIServingRequest, raw_request: Request
+        self,
+        request: OpenAIServingRequest,
+        raw_request: Request,
+        tokenizer_rev_request_time: Optional[float] = None,
     ) -> Union[Any, StreamingResponse, ErrorResponse]:
         """Handle the specific request type with common pattern
         If you want to override this method, you should be careful to record the validation time.
@@ -114,11 +117,17 @@ class OpenAIServingBase(ABC):
             # Note(Xinyuan): raw_request below is only used for detecting the connection of the client
             if hasattr(request, "stream") and request.stream:
                 return await self._handle_streaming_request(
-                    adapted_request, processed_request, raw_request
+                    adapted_request,
+                    processed_request,
+                    raw_request,
+                    tokenizer_rev_request_time,
                 )
             else:
                 return await self._handle_non_streaming_request(
-                    adapted_request, processed_request, raw_request
+                    adapted_request,
+                    processed_request,
+                    raw_request,
+                    tokenizer_rev_request_time,
                 )
         except HTTPException as e:
             return self.create_error_response(

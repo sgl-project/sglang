@@ -59,6 +59,8 @@ class TimeStats:
 
     disagg_mode: DisaggregationMode = DisaggregationMode.NULL
     lb_entry_time: float = 0.0
+    dispatch_to_scheduler_time: float = 0.0
+    arrive_scheduler_time: float = 0.0
     wait_queue_entry_time: float = 0.0
     forward_entry_time: float = 0.0
     completion_time: float = 0.0
@@ -83,6 +85,13 @@ class TimeStats:
     # maintain unit consistency with other timestamp fields tracked by the `ReqState` class.
     prefill_finished_ts: float = 0.0
 
+    def get_request_zmq_time(self) -> float:
+        """get_request_zmq_time"""
+        # Avoid pushing uninitialized values into metrics
+        if self.dispatch_to_scheduler_time <= 0.0 or self.arrive_scheduler_time <= 0.0:
+            return 0.0
+        return max(0.0, self.arrive_scheduler_time - self.dispatch_to_scheduler_time)
+
     def get_queueing_time(self) -> float:
         return self.forward_entry_time - self.wait_queue_entry_time
 
@@ -100,6 +109,22 @@ class TimeStats:
         if self.prefill_finished_ts > 0.0:
             return self.prefill_finished_ts
         return None
+
+    def get_request_waiting_time(self) -> float:
+        """get_request_waiting_time"""
+        if self.disagg_mode == DisaggregationMode.NULL:
+            return self.forward_entry_time - self.wait_queue_entry_time
+        elif self.disagg_mode == DisaggregationMode.PREFILL:
+            return self.forward_entry_time - self.prefill_bootstrap_queue_entry_time
+        elif self.disagg_mode == DisaggregationMode.DECODE:
+            return self.forward_entry_time - self.decode_transfer_queue_entry_time
+
+    def get_request_first_token_forward_time(self) -> float:
+        """get_request_first_token_forward_time"""
+        if self.disagg_mode == DisaggregationMode.NULL:
+            return self.completion_time - self.wait_queue_entry_time
+        elif self.disagg_mode == DisaggregationMode.PREFILL:
+            return self.completion_time - self.prefill_bootstrap_queue_entry_time
 
     def convert_to_duration(self) -> str:
         if self.disagg_mode == DisaggregationMode.NULL:
@@ -210,9 +235,24 @@ class SchedulerStats:
     num_queue_reqs: int = 0
     num_grammar_queue_reqs: int = 0
     num_running_reqs_offline_batch: int = 0
+    num_max_batchs: int = 0
     cache_hit_rate: float = 0.0
 
     max_total_num_tokens: int = 0
+
+    # Run batch
+    generation_time: float = 0.0
+    run_batch_time: float = 0.0
+    iter_token_process_time: float = 0.0
+
+    # DP balance
+    dp_balance: float = 0.0
+    idle_batch_ratio: float = 0.0
+    decode_bs_util: float = 0.0
+    prefill_chunk_util: float = 0.0
+
+    # DP all_gather latency
+    all_gather_latency_us: float = 0.0
 
     # Speculative decoding
     spec_accept_length: float = 0.0
@@ -366,6 +406,12 @@ class SchedulerMetricsCollector:
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
+        self.num_max_batchs = Gauge(
+            name="sglang:num_max_batchs",
+            documentation="The number of max running requests",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
         self.cache_hit_rate = Gauge(
             name="sglang:cache_hit_rate",
             documentation="The prefix cache hit rate.",
@@ -376,6 +422,56 @@ class SchedulerMetricsCollector:
         self.max_total_num_tokens = Gauge(
             name="sglang:max_total_num_tokens",
             documentation="Maximum total number of tokens in the KV cache pool.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+
+        # Run batch
+        self.generation_time = Gauge(
+            name="sglang:generation_time",
+            documentation="The generation time",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.run_batch_time = Gauge(
+            name="sglang:run_batch_time",
+            documentation="The run batch time",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.iter_token_process_time = Gauge(
+            name="sglang:iter_token_process_time",
+            documentation="The time between token",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+
+        # DP balance
+        self.dp_balance = Gauge(
+            name="sglang:dp_balance",
+            documentation="Variance of token counts across all DPs, indicating load balance",
+            labelnames=labels.keys(),
+        )
+        self.idle_batch_ratio = Gauge(
+            name="sglang:idle_batch_ratio",
+            documentation="Idle batch ratio across all DPs",
+            labelnames=labels.keys(),
+        )
+        self.decode_bs_util = Gauge(
+            name="sglang:decode_bs_util",
+            documentation="Active decode requests ratio per DP worker.",
+            labelnames=labels.keys(),
+        )
+        self.prefill_chunk_util = Gauge(
+            name="sglang:prefill_chunk_util",
+            documentation="Used prefill tokens ratio per DP worker.",
+            labelnames=labels.keys(),
+        )
+
+        # DP all_gather latency
+        self.all_gather_latency_us = Gauge(
+            name="sglang:all_gather_latency_us",
+            documentation="The dp prepare allgather time",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
@@ -522,6 +618,30 @@ class SchedulerMetricsCollector:
             multiprocess_mode="mostrecent",
         )
 
+        # Additional zmq time histogram
+        self.request_zmq_time = Histogram(
+            name="sglang:request_zmq_time_seconds",
+            documentation="Histogram of zmq time in seconds.",
+            labelnames=labels.keys(),
+            buckets=[
+                0.01,
+                0.05,
+                0.1,
+                0.25,
+                0.5,
+                0.75,
+                1,
+                2,
+                3,
+                5,
+                10,
+                20,
+                40,
+                60,
+                80,
+                120,
+            ],
+        )
         # Additional queueing time histogram
         self.queue_time = Histogram(
             name="sglang:queue_time_seconds",
@@ -564,6 +684,52 @@ class SchedulerMetricsCollector:
                 2000,
                 2500,
                 3000,
+            ],
+        )
+        self.request_waiting_time = Histogram(
+            name="sglang:request_waiting_time",
+            documentation="Histogram of request waiting time in seconds",
+            labelnames=labels.keys(),
+            buckets=[
+                0.01,
+                0.05,
+                0.1,
+                0.25,
+                0.5,
+                0.75,
+                1,
+                2,
+                5,
+                10,
+                20,
+                40,
+                60,
+                80,
+                120,
+                160,
+            ],
+        )
+        self.histogram_request_first_token_forward_time = Histogram(
+            name="sglang:request_first_token_forward_time",
+            documentation="Histogram of request first token forward time in seconds",
+            labelnames=labels.keys(),
+            buckets=[
+                0.01,
+                0.05,
+                0.1,
+                0.25,
+                0.5,
+                0.75,
+                1,
+                2,
+                3,
+                5,
+                10,
+                20,
+                40,
+                60,
+                80,
+                120,
             ],
         )
 
@@ -870,6 +1036,14 @@ class SchedulerMetricsCollector:
         labels_with_stage = {**self.labels, "stage": stage}
         self.per_stage_req_latency_seconds.labels(**labels_with_stage).observe(latency)
 
+    def observe_request_first_token_forward_time(self, value: Union[float, int]):
+        """observe_request_first_token_forward_time"""
+        self._log_histogram(self.histogram_request_first_token_forward_time, value)
+
+    def observe_request_zmq_time(self, latency: float) -> None:
+        """observe_request_zmq_time"""
+        self._log_histogram(self.request_zmq_time, latency)
+
     def observe_queue_time(self, latency: float) -> None:
         self._log_histogram(self.queue_time, latency)
 
@@ -957,6 +1131,10 @@ class SchedulerMetricsCollector:
                 **dp_cooperation_info.to_labels(),
             ).inc(t)
 
+    def observe_request_waiting_time(self, latency: Union[float, int]) -> None:
+        """observe_request_waiting_time"""
+        self._log_histogram(self.request_waiting_time, latency)
+
     def log_stats(self, stats: SchedulerStats) -> None:
         self._log_gauge(self.num_running_reqs, stats.num_running_reqs)
         self._log_gauge(self.num_used_tokens, stats.num_used_tokens)
@@ -973,9 +1151,24 @@ class SchedulerMetricsCollector:
         self._log_gauge(
             self.num_running_reqs_offline_batch, stats.num_running_reqs_offline_batch
         )
+        self._log_gauge(self.num_max_batchs, stats.num_max_batchs)
         self._log_gauge(self.cache_hit_rate, stats.cache_hit_rate)
 
         self._log_gauge(self.max_total_num_tokens, stats.max_total_num_tokens)
+
+        # Run batch
+        self._log_gauge(self.generation_time, stats.generation_time)
+        self._log_gauge(self.run_batch_time, stats.run_batch_time)
+        self._log_gauge(self.iter_token_process_time, stats.iter_token_process_time)
+
+        # DP balance
+        self._log_gauge(self.dp_balance, stats.dp_balance)
+        self._log_gauge(self.idle_batch_ratio, stats.idle_batch_ratio)
+        self._log_gauge(self.prefill_chunk_util, stats.prefill_chunk_util)
+        self._log_gauge(self.decode_bs_util, stats.decode_bs_util)
+
+        # DP all_gather latency
+        self._log_gauge(self.all_gather_latency_us, stats.all_gather_latency_us)
 
         # Speculative decoding
         self._log_gauge(self.spec_accept_length, stats.spec_accept_length)
@@ -1294,6 +1487,28 @@ class TokenizerMetricsCollector:
             ],
         )
 
+        self.histogram_request_time_to_tokenizer_ready = Histogram(
+            name="sglang:request_time_to_tokenizer_ready_seconds",
+            documentation="Histogram of time to tokenizer request in seconds",
+            labelnames=labels.keys(),
+            buckets=[
+                0.01,
+                0.02,
+                0.05,
+                0.1,
+                0.2,
+                0.5,
+                1,
+                2,
+                5,
+                10,
+                20,
+                40,
+                80,
+                120,
+            ],
+        )
+
     def observe_one_finished_request(
         self,
         labels: Dict[str, str],
@@ -1352,6 +1567,12 @@ class TokenizerMetricsCollector:
 
     def observe_one_aborted_request(self, labels: Dict[str, str]):
         self.num_aborted_requests_total.labels(**labels).inc(1)
+
+    def observe_request_time_to_tokenizer_ready(self, latency: float) -> None:
+        """Observe the time it took to generate a request from HTTP receipt to tokenizer-ready input."""
+        self.histogram_request_time_to_tokenizer_ready.labels(**self.labels).observe(
+            latency
+        )
 
 
 @dataclass

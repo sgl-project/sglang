@@ -836,6 +836,7 @@ class SchedulerDisaggregationDecodeMixin:
 
         while True:
             # Receive requests
+            self.iter_start_time = time.perf_counter()
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
             # polling and allocating kv cache
@@ -863,6 +864,7 @@ class SchedulerDisaggregationDecodeMixin:
 
         while True:
             # Receive requests
+            self.iter_start_time = time.perf_counter()
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
             # polling and allocating kv cache
@@ -980,6 +982,10 @@ class SchedulerDisaggregationDecodeMixin:
 
         for req in can_run_list:
             req.time_stats.forward_entry_time = time.perf_counter()
+            if self.enable_metrics:
+                self.metrics_collector.observe_request_waiting_time(
+                    req.time_stats.get_request_waiting_time(),
+                )
 
         # construct a schedule batch with those requests and mark as decode
         new_batch = ScheduleBatch.init_new(
