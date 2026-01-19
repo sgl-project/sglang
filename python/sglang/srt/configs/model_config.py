@@ -17,6 +17,7 @@ import logging
 import math
 import os
 from enum import Enum, IntEnum, auto
+from pathlib import Path
 from typing import Any, List, Optional, Set, Union
 
 import torch
@@ -300,6 +301,10 @@ class ModelConfig:
             self.hf_config.architectures[0] = "Qwen3NextForCausalLMMTP"
             self.hf_config.num_nextn_predict_layers = 1
 
+        if is_draft_model and self.hf_config.architectures[0] == "NemotronHForCausalLM":
+            self.hf_config.architectures[0] = "NemotronHForCausalLMMTP"
+            self.hf_config.num_nextn_predict_layers = 1
+
     def _derive_hybrid_model(self):
         # Use self.context_len after it has been initialized to prevent using context_len which may be None.
         self.is_hybrid_swa = is_hybrid_swa_model(self.hf_config.architectures)
@@ -308,8 +313,7 @@ class ModelConfig:
             self.swa_attention_layer_ids, self.full_attention_layer_ids = (
                 get_hybrid_layer_ids(
                     self.hf_config.architectures,
-                    self.hf_text_config.num_hidden_layers,
-                    getattr(self.hf_text_config, "hybrid_layer_pattern", None),
+                    self.hf_text_config,
                 )
             )
 
@@ -585,39 +589,56 @@ class ModelConfig:
 
                     hf_api = HfApi()
                 try:
-                    # Retry HF API call up to 3 times
-                    file_exists = retry(
-                        lambda: hf_api.file_exists(
-                            self.model_path, "hf_quant_config.json"
-                        ),
-                        max_retry=2,
-                        initial_delay=1.0,
-                        max_delay=5.0,
+                    # In offline mode, skip file_exists check to avoid OfflineModeIsEnabled error
+                    # Instead, directly try to download/read from cache with local_files_only
+                    file_exists = False  # Initialize to avoid UnboundLocalError
+                    if not huggingface_hub.constants.HF_HUB_OFFLINE:
+                        # Online mode: check if file exists before attempting download (optimization)
+                        file_exists = retry(
+                            lambda: hf_api.file_exists(
+                                self.model_path, "hf_quant_config.json"
+                            ),
+                            max_retry=2,
+                            initial_delay=1.0,
+                            max_delay=5.0,
+                        )
+                        if not file_exists:
+                            # File doesn't exist on hub, no need to try downloading
+                            return quant_cfg  # None
+
+                    # Download (online mode) or read from cache (offline mode)
+                    if envs.SGLANG_USE_MODELSCOPE.get():
+                        quant_config_file = model_file_download(
+                            model_id=self.model_path,
+                            file_path="hf_quant_config.json",
+                            revision=self.revision,
+                        )
+                    else:
+                        quant_config_file = hf_hub_download(
+                            repo_id=self.model_path,
+                            filename="hf_quant_config.json",
+                            revision=self.revision,
+                            local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
+                        )
+                    with open(quant_config_file) as f:
+                        quant_config_dict = json.load(f)
+                    quant_cfg = self._parse_modelopt_quant_config(quant_config_dict)
+                except huggingface_hub.errors.LocalEntryNotFoundError:
+                    # Offline mode and file not in cache - this is normal for non-quantized models
+                    logger.debug(
+                        f"hf_quant_config.json not found in cache for {self.model_path} "
+                        "(offline mode, normal for non-quantized models)"
                     )
-                    if file_exists:
-                        # Download and parse the quantization config for remote models
-                        if envs.SGLANG_USE_MODELSCOPE.get():
-                            quant_config_file = model_file_download(
-                                model_id=self.model_path,
-                                file_path="hf_quant_config.json",
-                                revision=self.revision,
-                            )
-                        else:
-                            quant_config_file = hf_hub_download(
-                                repo_id=self.model_path,
-                                filename="hf_quant_config.json",
-                                revision=self.revision,
-                            )
-                        with open(quant_config_file) as f:
-                            quant_config_dict = json.load(f)
-                        quant_cfg = self._parse_modelopt_quant_config(quant_config_dict)
                 except huggingface_hub.errors.OfflineModeIsEnabled:
+                    # Should not reach here after our changes, but keep for safety
                     logger.warning(
                         "Offline mode is enabled, skipping hf_quant_config.json check"
                     )
                 except Exception as e:
                     logger.warning(
-                        f"Failed to check hf_quant_config.json: {self.model_path} {e}"
+                        "Failed to load hf_quant_config.json for model %s: %s",
+                        self.model_path,
+                        e,
                     )
             elif os.path.exists(os.path.join(self.model_path, "hf_quant_config.json")):
                 quant_config_file = os.path.join(
@@ -626,6 +647,18 @@ class ModelConfig:
                 with open(quant_config_file) as f:
                     quant_config_dict = json.load(f)
                 quant_cfg = self._parse_modelopt_quant_config(quant_config_dict)
+        return quant_cfg
+
+    def _find_quant_modelslim_config(self):
+        quant_config_file = Path(self.model_path, "quant_model_description.json")
+        quant_cfg = None
+        if quant_config_file.is_file():
+            with open(quant_config_file) as f:
+                quant_cfg = json.load(f)
+            # This field is required for flagless model loading but is not present in
+            # modelslim model description, so we're adding it here manually.
+            quant_cfg["quant_method"] = "modelslim"
+
         return quant_cfg
 
     def _parse_modelopt_quant_config(self, quant_config_dict: dict) -> Optional[dict]:
@@ -719,6 +752,7 @@ class ModelConfig:
             "quark",
             "mxfp4",
             "auto-round",
+            "quark_int4fp8_moe",
         ]
         optimized_quantization_methods = [
             "fp8",
@@ -739,6 +773,7 @@ class ModelConfig:
             "w4afp8",
             "petit_nvfp4",
             "quark",
+            "modelslim",
         ]
         compatible_quantization_methods = {
             "modelopt_fp8": ["modelopt"],
@@ -750,8 +785,19 @@ class ModelConfig:
         if self.quantization is not None:
             self.quantization = self.quantization.lower()
 
-        # Parse quantization method from the HF model config, if available.
-        quant_cfg = self._parse_quant_hf_config()
+        # Parse quantization method from the HF and ModelSlim model config, if available.
+        # Only one function should return config, other should return None.
+        cfg_list = []
+        cfg_list.append(self._parse_quant_hf_config())
+        cfg_list.append(self._find_quant_modelslim_config())
+
+        # Filter out None values
+        cfg_list = [item for item in cfg_list if item is not None]
+        if len(cfg_list) > 1:
+            raise ValueError(
+                "Config list contains configs from 2 methods, must be only 1"
+            )
+        quant_cfg = cfg_list[0] if cfg_list else None
 
         if quant_cfg is not None:
             quant_method = quant_cfg.get(
@@ -1150,6 +1196,7 @@ def is_hybrid_swa_model(model_architectures: List[str]):
 
     hybrid_swa_archs = {
         "Llama4ForConditionalGeneration",
+        "GptOssForCausalLM",
         "MiMoV2FlashForCausalLM",
         "MiMoV2MTP",
     }
@@ -1158,9 +1205,9 @@ def is_hybrid_swa_model(model_architectures: List[str]):
 
 def get_hybrid_layer_ids(
     model_architectures: List[str],
-    num_hidden_layers: int,
-    hybrid_layer_pattern: Optional[List[int]] = None,
+    hf_text_config: PretrainedConfig,
 ):
+    num_hidden_layers = hf_text_config.num_hidden_layers
     if "Llama4ForConditionalGeneration" in model_architectures:
         swa_attention_layer_ids = [
             i for i in range(num_hidden_layers) if (i + 1) % 4 != 0
@@ -1168,7 +1215,16 @@ def get_hybrid_layer_ids(
         full_attention_layer_ids = [
             i for i in range(num_hidden_layers) if (i + 1) % 4 == 0
         ]
+    elif "GptOssForCausalLM" in model_architectures:
+        layer_types = getattr(hf_text_config, "layer_types", None)
+        swa_attention_layer_ids = [
+            i for i, x in enumerate(layer_types) if x == "sliding_attention"
+        ]
+        full_attention_layer_ids = [
+            i for i, x in enumerate(layer_types) if x == "full_attention"
+        ]
     elif "MiMoV2FlashForCausalLM" in model_architectures:
+        hybrid_layer_pattern = getattr(hf_text_config, "hybrid_layer_pattern", None)
         swa_attention_layer_ids = [
             i for i in range(num_hidden_layers) if hybrid_layer_pattern[i] == 1
         ]
