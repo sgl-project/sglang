@@ -429,12 +429,13 @@ class OpenAIServingChat(OpenAIServingBase):
             chat_template_kwargs = {}
             if request.chat_template_kwargs:
                 chat_template_kwargs = request.chat_template_kwargs.copy()
-            # If reasoning is off by default, ensure enable_thinking is False
+            # If reasoning is off by default, ensure enable_thinking is False (unless explicitly set)
             if envs.SGLANG_REASONING_OFF_BY_DEFAULT.get():
-                chat_template_kwargs["enable_thinking"] = False
-                logger.info(
-                    f"SGLANG_REASONING_OFF_BY_DEFAULT=True, setting enable_thinking=False in chat template kwargs"
-                )
+                if "enable_thinking" not in chat_template_kwargs:
+                    chat_template_kwargs["enable_thinking"] = False
+                    logger.info(
+                        f"SGLANG_REASONING_OFF_BY_DEFAULT=True, setting enable_thinking=False in chat template kwargs"
+                    )
 
             try:
                 prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
