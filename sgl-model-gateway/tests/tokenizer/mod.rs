@@ -1,5 +1,6 @@
 //! Tokenizer and chat template integration tests
 
+mod cache_collision_test;
 mod chat_template_format_detection;
 mod chat_template_integration;
 mod chat_template_loading;

@@ -164,11 +164,9 @@ impl CachedTokenizer {
 impl Encoder for CachedTokenizer {
     fn encode(&self, input: &str, add_special_tokens: bool) -> Result<Encoding> {
         // L0 cache lookup (exact match) - returns Arc<Encoding> for zero-copy
-        // Note: L0 cache doesn't distinguish by add_special_tokens flag
-        // This is acceptable for the current use case where embeddings always use true
-        // and chat always uses false with different input content
+        // L0 cache key includes add_special_tokens flag to prevent key collisions
         if let Some(l0) = &self.l0 {
-            if let Some(cached) = l0.get(input) {
+            if let Some(cached) = l0.get(input, add_special_tokens) {
                 // Unwrap the Arc - since Encoding is Clone, we can return the inner value
                 // For callers who need the tokens, they can access via token_ids() which is &[u32]
                 return Ok((*cached).clone());
@@ -199,7 +197,11 @@ impl Encoder for CachedTokenizer {
 
                     // Cache the full result in L0
                     if let Some(l0) = &self.l0 {
-                        l0.insert(input.to_string(), merged_encoding.clone());
+                        l0.insert(
+                            input.to_string(),
+                            add_special_tokens,
+                            merged_encoding.clone(),
+                        );
                     }
 
                     return Ok(merged_encoding);
@@ -212,7 +214,7 @@ impl Encoder for CachedTokenizer {
 
         // Cache in L0
         if let Some(l0) = &self.l0 {
-            l0.insert(input.to_string(), encoding.clone());
+            l0.insert(input.to_string(), add_special_tokens, encoding.clone());
         }
 
         // Cache in L1 at special token boundaries
