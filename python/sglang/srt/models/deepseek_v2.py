@@ -1107,14 +1107,13 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
         self.use_nsa = is_deepseek_nsa(config)
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
         self.enable_o_proj_tp = is_enable_o_proj_tp()
+        self.o_proj_tp_size = attn_tp_size
+        self.o_proj_tp_rank = attn_tp_rank
         if self.nsa_enable_prefill_cp:
             assert self.use_nsa, "CP currently only supports deepseek v3.2 model"
         # cp reuse the attn_tp comm group but need to duplicate the weights
         if self.nsa_enable_prefill_cp and self.use_nsa:
-            if self.enable_o_proj_tp:
-                self.o_proj_tp_size = attn_tp_size
-                self.o_proj_tp_rank = attn_tp_rank
-            else:
+            if not self.enable_o_proj_tp:
                 self.o_proj_tp_size = 1
                 self.o_proj_tp_rank = 0
             attn_tp_rank = 0
@@ -1933,7 +1932,7 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
                         -1, self.num_local_heads, self.v_head_dim
                     ).transpose(0, 1),
                 )
-        output, _ = self._o_proj_warpper_forward(attn_output)
+        output, _ = self._o_proj_warpper_forward(attn_bmm_output)
 
         return output
 
@@ -2238,15 +2237,15 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
                 self.o_proj_tp_size,
                 self.num_heads // self.o_proj_tp_size * self.v_head_dim,
             )
-            # after transpose: (oproj_tp_size, bs*q_len, num_heads // oproj_tp_size * v_head_dim)
-            # after view: (oproj_tp_size * bs*q_len * num_heads // oproj_tp_size * v_head_dim)
+            # after transpose: (o_proj_tp_size, bs*q_len, num_heads // o_proj_tp_size * v_head_dim)
+            # after view: (o_proj_tp_size * bs*q_len * num_heads // o_proj_tp_size * v_head_dim)
             attn_output = attn_output.transpose(1, 0).contiguous().view(-1)
             all2all_output = torch.empty_like(attn_output)
-            # after all2all: (oproj_tp_size * bs*q_len * num_heads // oproj_tp_size * v_head_dim)
+            # after all2all: (o_proj_tp_size * bs*q_len * num_heads // o_proj_tp_size * v_head_dim)
             dist.all_to_all_single(
                 all2all_output, attn_output, group=get_tp_group().device_group
             )
-            # after view: (oproj_tp_size * bs*q_len, num_heads // oproj_tp_size * v_head_dim)
+            # after view: (o_proj_tp_size * bs*q_len, num_heads // o_proj_tp_size * v_head_dim)
             attn_output = all2all_output.view(
                 -1, self.num_heads // self.o_proj_tp_size * self.v_head_dim
             )

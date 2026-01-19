@@ -4423,6 +4423,13 @@ class ServerArgs:
             action="store_true",
             help="Enable context parallelism used in the long sequence prefill phase of DeepSeek v3.2.",
         )
+
+        parser.add_argument(
+            "--enable-o-proj-tensor-parallel",
+            action="store_true",
+            help="Enable tensor parallel o proj linear used in context parallelism phase of DeepSeek v3.2.",
+        )
+
         parser.add_argument(
             "--nsa-prefill-cp-mode",
             type=str,
