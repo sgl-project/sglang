@@ -933,23 +933,48 @@ jobs:
     steps:
       - name: Find RDMA in CI Runner
         run: |
-          echo "=== CI Runner RDMA Info ==="
+          echo "=== RDMA Environment Check ==="
+          
+          echo ""
           echo "1. /sys/class/infiniband:"
-          ls -la /sys/class/infiniband/ || echo "Not found"
+          ls -la /sys/class/infiniband/ 2>/dev/null || echo "Not found"
 
+          echo ""
           echo "2. /dev/infiniband:"
-          ls -la /dev/infiniband/ || echo "Not found - THIS IS LIKELY THE PROBLEM"
+          ls -la /dev/infiniband/ 2>/dev/null || echo "Not found"
 
-          echo "3. libibverbs providers:"
-          ls -la /etc/libibverbs.d/ || echo "Not found"
-          cat /etc/libibverbs.d/* 2>/dev/null || echo "No provider configs"
+          echo ""
+          echo "3. libibverbs providers (/etc/libibverbs.d):"
+          ls -la /etc/libibverbs.d/ 2>/dev/null || echo "Not found"
+          echo "--- Provider configs ---"
+          cat /etc/libibverbs.d/* 2>/dev/null || echo "No configs found"
 
+          echo ""
           echo "4. RDMA libraries:"
+          echo "--- /usr/lib/x86_64-linux-gnu/libibverbs/ ---"
           ls -la /usr/lib/x86_64-linux-gnu/libibverbs/ 2>/dev/null || echo "Not found"
-          ls -la /usr/local/lib/libionic* 2>/dev/null || echo "libionic not found"
+          echo "--- libionic ---"
+          ls -la /usr/local/lib/libionic* 2>/dev/null || echo "Not found"
+          ls -la /usr/lib/libionic* 2>/dev/null || echo "Not found"
 
+          echo ""
           echo "5. ibv_devinfo:"
           ibv_devinfo 2>&1 || echo "ibv_devinfo not available"
+
+          echo ""
+          echo "6. rdma link (if available):"
+          rdma link 2>&1 || echo "rdma command not available"
+
+          echo ""
+          echo "7. Kernel modules:"
+          lsmod | grep -E "ib_|rdma|mlx|ionic" 2>/dev/null || echo "No RDMA modules found"
+
+          echo ""
+          echo "8. rdma-core package:"
+          dpkg -l | grep rdma-core 2>/dev/null || rpm -qa | grep rdma-core 2>/dev/null || echo "rdma-core not installed via package manager"
+
+          echo ""
+          echo "=== Check Complete ==="
 
 
   # =============================================== Disaggregation ====================================================
