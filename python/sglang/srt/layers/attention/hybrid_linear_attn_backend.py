@@ -17,11 +17,7 @@ from sglang.srt.layers.attention.fla.fused_recurrent import (
 from sglang.srt.layers.attention.fla.fused_sigmoid_gating_recurrent import (
     fused_sigmoid_gating_delta_rule_update,
 )
-from sglang.srt.layers.attention.fla.kda import (
-    chunk_kda,
-    fused_kda_gate,
-    fused_recurrent_kda,
-)
+from sglang.srt.layers.attention.fla.kda import chunk_kda, fused_recurrent_kda
 from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
     PAD_SLOT_ID,
     causal_conv1d_fn,
@@ -646,14 +642,10 @@ class KimiLinearAttnBackend(MambaAttnBackendBase):
         k_conv_bias = kwargs["k_conv_bias"]
         v_conv_bias = kwargs["v_conv_bias"]
 
-        A_log = kwargs["A_log"]
-        dt_bias = kwargs["dt_bias"]
-        b_proj = kwargs["b_proj"]
-        f_a_proj = kwargs["f_a_proj"]
-        f_b_proj = kwargs["f_b_proj"]
-        hidden_states = kwargs["hidden_states"]
         head_dim = kwargs["head_dim"]
         layer_id = kwargs["layer_id"]
+        beta = kwargs["beta"]
+        g = kwargs["gate"]
 
         layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer_id)
         q_conv_state, k_conv_state, v_conv_state = layer_cache.conv
@@ -693,14 +685,6 @@ class KimiLinearAttnBackend(MambaAttnBackendBase):
         q, k, v = map(
             lambda x: rearrange(x, "n (h d) -> 1 n h d", d=head_dim), (q, k, v)
         )
-
-        beta = b_proj(hidden_states)[0].float().sigmoid()
-
-        g = f_b_proj(f_a_proj(hidden_states)[0])[0]
-        g = fused_kda_gate(g, A_log, head_dim, g_bias=dt_bias)
-
-        beta = beta.unsqueeze(0)
-        g = g.unsqueeze(0)
 
         initial_state = ssm_states[cache_indices].contiguous()
         (
@@ -744,14 +728,10 @@ class KimiLinearAttnBackend(MambaAttnBackendBase):
         k_conv_bias = kwargs["k_conv_bias"]
         v_conv_bias = kwargs["v_conv_bias"]
 
-        A_log = kwargs["A_log"]
-        dt_bias = kwargs["dt_bias"]
-        b_proj = kwargs["b_proj"]
-        f_a_proj = kwargs["f_a_proj"]
-        f_b_proj = kwargs["f_b_proj"]
-        hidden_states = kwargs["hidden_states"]
         head_dim = kwargs["head_dim"]
         layer_id = kwargs["layer_id"]
+        beta = kwargs["beta"]
+        g = kwargs["gate"]
 
         query_start_loc = self.forward_metadata.query_start_loc
         cache_indices = self.forward_metadata.mamba_cache_indices
@@ -810,14 +790,6 @@ class KimiLinearAttnBackend(MambaAttnBackendBase):
         q, k, v = map(
             lambda x: rearrange(x, "n (h d) -> 1 n h d", d=head_dim), (q, k, v)
         )
-
-        beta = b_proj(hidden_states)[0].float().sigmoid()
-
-        g = f_b_proj(f_a_proj(hidden_states)[0])[0]
-        g = fused_kda_gate(g, A_log, head_dim, g_bias=dt_bias)
-
-        beta = beta.unsqueeze(0)
-        g = g.unsqueeze(0)
 
         core_attn_out = chunk_kda(
             q=q,
