@@ -14,9 +14,7 @@ from sglang.multimodal_gen.runtime.platforms import (
 )
 
 try:
-    from sgl_kernel.flash_attn import (
-        flash_attn_varlen_func as flash_attn_varlen_func_fa3,
-    )
+    from sgl_kernel.flash_attn import flash_attn_varlen_func
 
     from sglang.jit_kernel.flash_attention_v4 import (
         flash_attn_varlen_func as flash_attn_varlen_func_fa4,
@@ -25,7 +23,7 @@ try:
     def flash_attn_func(*args, ver: int = 3, **kwargs):
         if ver == 4:
             return flash_attn_varlen_func_fa4(*args, ver=4, **kwargs)
-        return flash_attn_varlen_func_fa3(*args, ver=ver, **kwargs)
+        return flash_attn_varlen_func(*args, ver=ver, **kwargs)
 
 except ImportError as e:
     raise e

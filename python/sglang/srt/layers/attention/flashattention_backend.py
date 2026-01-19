@@ -22,8 +22,8 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 from sgl_kernel import merge_state_v2
-from sgl_kernel.flash_attn import flash_attn_varlen_func as flash_attn_varlen_func_fa3
-from sgl_kernel.flash_attn import flash_attn_with_kvcache as flash_attn_with_kvcache_fa3
+from sgl_kernel.flash_attn import flash_attn_varlen_func
+from sgl_kernel.flash_attn import flash_attn_with_kvcache
 
 from sglang.jit_kernel.flash_attention_v4 import (
     flash_attn_varlen_func as flash_attn_varlen_func_fa4,
@@ -804,14 +804,9 @@ class FlashAttentionBackend(AttentionBackend):
             and not is_swa_layer
         )
 
-        if self.fa_impl_ver == 3:
-            flash_attn_varlen_func = flash_attn_varlen_func_fa3
-            flash_attn_with_kvcache = flash_attn_with_kvcache_fa3
-        elif self.fa_impl_ver == 4:
+        if self.fa_impl_ver == 4:
             flash_attn_varlen_func = flash_attn_varlen_func_fa4
             flash_attn_with_kvcache = flash_attn_with_kvcache_fa4
-        else:
-            raise ValueError(f"Unsupported fa_impl_ver={self.fa_impl_ver}")
 
         kwargs = {}
         if sinks is not None:
@@ -1118,7 +1113,6 @@ class FlashAttentionBackend(AttentionBackend):
         if layer.is_cross_attention or layer.attn_type == AttentionType.ENCODER_ONLY:
             causal = False
 
-        flash_attn_varlen_func = flash_attn_varlen_func_fa3
         flash_attn_with_kvcache = flash_attn_with_kvcache_fa3
 
         kwargs = {}
