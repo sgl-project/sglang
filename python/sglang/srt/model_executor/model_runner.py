@@ -1517,6 +1517,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         return self.mamba2_config or self.hybrid_gdn_config or self.kimi_linear_config
 
     def can_run_piecewise_cuda_graph(self):
+        if self.is_draft_worker:
+            return False
+
         if self.server_args.enable_torch_compile:
             log_info_on_rank0(
                 logger,

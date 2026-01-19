@@ -28,8 +28,8 @@ dependencies = [
   "datasets",
   "einops",
   "fastapi",
-  "flashinfer_python==0.5.3", # keep it aligned with jit-cache version in Dockerfile
-  "flashinfer_cubin==0.5.3",
+  "flashinfer_python==0.6.1", # keep it aligned with jit-cache version in Dockerfile
+  "flashinfer_cubin==0.6.1",
   "gguf",
   "hf_transfer",
   "huggingface_hub",
@@ -93,7 +93,7 @@ diffusion = [
   "moviepy>=2.0.0",
   "opencv-python-headless==4.10.0.84",
   "remote-pdb",
-  "st_attn ==0.0.7",
+  "st_attn==0.0.7",
   "vsa==0.0.4",
   "runai_model_streamer",
   "cache-dit==1.1.8"
@@ -172,7 +172,7 @@ exclude = [
 [tool.setuptools_scm]
 root = ".."
 version_file = "sglang/_version.py"
-git_describe_command = ["git", "describe", "--tags", "--long", "--match", "v*"]
+git_describe_command = ["bash", "-c", "git tag --list --sort=-version:refname 'v*.*.*' | head -1 | xargs git describe --tags --long"]
 # Allow editable installs even when .git metadata is not available.
 fallback_version = "0.0.0.dev0"
 
