@@ -925,7 +925,7 @@ def dp_draft_context(group: GroupCoordinator):
 
 
 class DPDraftWorker(EagleDraftWorker):
-    """DP-Draft worker that runs draft model in single-GPU mode."""
+    """DP-Draft worker that runs draft model in DP-Draft mode."""
 
     def __init__(
         self,
