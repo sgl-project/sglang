@@ -3,14 +3,14 @@ import unittest
 import requests
 
 from sglang.srt.utils import is_npu, kill_process_tree
+from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import (
-    DEFAULT_MODEL_NAME_FOR_TEST,
+    DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
 )
-
 
 register_npu_ci(est_time=400, suite="nightly-1-npu-a3", nightly=True)
 
