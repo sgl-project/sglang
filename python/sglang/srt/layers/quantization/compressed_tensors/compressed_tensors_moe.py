@@ -15,6 +15,11 @@ from sglang.srt.distributed import get_tensor_model_parallel_world_size, get_tp_
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
+    NPUW4A8Int8DynamicMoEMethod,
+    NPUW4A16Int4DynamicMoEMethod,
+    NPUW8A8Int8DynamicMoEMethod,
+)
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams, CutlassMoEType
@@ -43,6 +48,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_cuda,
     is_hip,
+    is_npu,
     next_power_of_2,
     set_weight_attrs,
 )
@@ -58,6 +64,7 @@ if TYPE_CHECKING:
     )
 
 _is_hip = is_hip()
+_is_npu = is_npu()
 _is_cuda = is_cuda()
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
@@ -79,8 +86,11 @@ class GPTQMarlinState(Enum):
 __all__ = [
     "CompressedTensorsMoEMethod",
     "CompressedTensorsW4A4Nvfp4MoEMethod",
+    "NPUCompressedTensorsW4A8Int8DynamicMoEMethod",
     "CompressedTensorsW8A8Fp8MoEMethod",
+    "NPUCompressedTensorsW8A8Int8MoEMethod",
     "CompressedTensorsWNA16MoEMethod",
+    "NPUCompressedTensorsW4A16Int4DynamicMoEMethod",
 ]
 
 
@@ -103,14 +113,40 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
         input_quant = quant_config.target_scheme_map["Linear"].get("input_activations")
 
         if quant_config._is_wNa16_group_channel(weight_quant, input_quant):
-            logger.info_once("Using CompressedTensorsWNA16MarlinMoEMethod")
-            return CompressedTensorsWNA16MoEMethod(quant_config)
+            if not _is_npu:
+                logger.info_once("Using CompressedTensorsWNA16MarlinMoEMethod")
+                return CompressedTensorsWNA16MoEMethod(quant_config)
+            else:
+                if (
+                    quant_config._is_dynamic_token_w4(weight_quant, input_quant)
+                    and input_quant is None
+                ):
+                    logger.info_once(
+                        "Using NPUCompressedTensorsW4A16Int4DynamicMoEMethod"
+                    )
+                    return NPUCompressedTensorsW4A16Int4DynamicMoEMethod(quant_config)
         elif quant_config._is_fp4a4_nvfp4(weight_quant, input_quant):
             logger.info_once("Using CompressedTensorsW4A4Nvfp4MoEMethod")
             return CompressedTensorsW4A4Nvfp4MoEMethod(quant_config)
         elif quant_config._is_fp8_w8a8(weight_quant, input_quant):
             logger.info_once("Using CompressedTensorsW8A8Fp8MoEMethod")
             return CompressedTensorsW8A8Fp8MoEMethod(quant_config)
+        elif quant_config._is_dynamic_token_w8a8(weight_quant, input_quant):
+            if _is_npu:
+                logger.info_once("Using NPUCompressedTensorsW8A8Int8DynamicMoEMethod")
+                return NPUCompressedTensorsW8A8Int8DynamicMoEMethod(quant_config)
+            else:
+                raise NotImplementedError(
+                    f"The W8A8Int8 Fused MoE scheme is implemented only for NPU for now."
+                )
+        elif quant_config._is_dynamic_token_w4a8(weight_quant, input_quant):
+            if _is_npu:
+                logger.info_once("Using NPUCompressedTensorsW4A8Int8DynamicMoEMethod")
+                return NPUCompressedTensorsW4A8Int8DynamicMoEMethod(quant_config)
+            else:
+                raise NotImplementedError(
+                    f"The W4A8Int8 Fused MoE scheme is implemented only for NPU for now."
+                )
         else:
             raise RuntimeError(
                 f"Unsupported FusedMoe scheme: {weight_quant}, {input_quant}"
@@ -501,7 +537,6 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
             local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
             local_num_experts=layer.num_local_experts,
             routed_scaling_factor=routed_scaling_factor,
-            tile_tokens_dim=None,
             routing_method_type=layer.routing_method_type,
             do_finalize=True,
             tune_max_num_tokens=next_power_of_2(hs_fp4.shape[0]),
@@ -853,6 +888,117 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
             return self.runner.run(dispatch_output, quant_info)
 
 
+class NPUCompressedTensorsW8A8Int8DynamicMoEMethod(CompressedTensorsMoEMethod):
+
+    def __init__(self, quant_config: CompressedTensorsConfig):
+        self.quant_config = quant_config
+        self.weight_quant = self.quant_config.target_scheme_map["Linear"].get("weights")
+        self.input_quant = self.quant_config.target_scheme_map["Linear"].get(
+            "input_activations"
+        )
+        self.kernel = NPUW8A8Int8DynamicMoEMethod()
+
+        self.static_input_scales = not self.input_quant.dynamic
+        per_channel = (
+            self.weight_quant.strategy == QuantizationStrategy.CHANNEL
+            and self.input_quant.strategy == QuantizationStrategy.TOKEN
+        )
+        if not per_channel:
+            raise ValueError(
+                "For INT8 Fused MoE layers, we require channelwise, "
+                "dynamic per token quantization. Found "
+                f"{self.weight_quant}, {self.input_quant}"
+            )
+
+        self.static_input_scales = not self.input_quant.dynamic
+        if self.static_input_scales:
+            raise ValueError(
+                "For INT8 Fused MoE layers, we require channelwise, "
+                "dynamic per token quantization. Found static input scales."
+            )
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
+
+        params_dtype = torch.int8
+
+        # WEIGHTS
+        w13_weight = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                2 * intermediate_size_per_partition,
+                hidden_size,
+                dtype=params_dtype,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_weight", w13_weight)
+        set_weight_attrs(w13_weight, extra_weight_attrs)
+
+        w2_weight = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                hidden_size,
+                intermediate_size_per_partition,
+                dtype=params_dtype,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w2_weight", w2_weight)
+        set_weight_attrs(w2_weight, extra_weight_attrs)
+
+        # WEIGHT_SCALES
+        assert self.weight_quant.strategy == QuantizationStrategy.CHANNEL
+        w13_weight_scale = torch.nn.Parameter(
+            torch.ones(
+                num_experts, 2 * intermediate_size_per_partition, 1, dtype=torch.float32
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_weight_scale", w13_weight_scale)
+        w2_weight_scale = torch.nn.Parameter(
+            torch.ones(num_experts, hidden_size, 1, dtype=torch.float32),
+            requires_grad=False,
+        )
+        layer.register_parameter("w2_weight_scale", w2_weight_scale)
+        # Add PER-CHANNEL quantization for FusedMoE.weight_loader.
+        extra_weight_attrs.update(
+            {"quant_method": FusedMoeWeightScaleSupported.CHANNEL.value}
+        )
+        set_weight_attrs(w13_weight_scale, extra_weight_attrs)
+        set_weight_attrs(w2_weight_scale, extra_weight_attrs)
+
+        # INPUT_SCALES
+        assert not self.static_input_scales
+        layer.w13_input_scale = None
+        layer.w2_input_scale = None
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        self.kernel.process_weights_after_loading(layer)
+
+    def create_moe_runner(
+        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
+    ):
+        self.moe_runner_config = moe_runner_config
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output: StandardDispatchOutput,
+    ) -> CombineInput:
+
+        return self.kernel.apply(layer, dispatch_output)
+
+
 class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
 
     def __init__(self, quant_config: CompressedTensorsConfig, num_gpu_experts=-1):
@@ -1200,3 +1346,421 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             routed_scaling_factor=self.moe_runner_config.routed_scaling_factor,
         )
         return StandardCombineInput(hidden_states=output)
+
+
+class NPUCompressedTensorsW4A8Int8DynamicMoEMethod(CompressedTensorsMoEMethod):
+
+    ### TODO: Get rid of code duplication with python/sglang/srt/modelslim/modelslim_moe.py @OrangeRedeng @TamirBaydasov
+    def __init__(self, quantization_config) -> None:
+        self.group_size = 0
+        self.is_per_channel_weight = self.group_size == 0
+        self.tp_size = 1
+        self.activation_use_clip = (
+            self.quantization_config.get("config_groups", {})
+            .get("group_1", {})
+            .get("activation_use_clip", False)
+        )
+        self.kernel = NPUW4A8Int8DynamicMoEMethod()
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ) -> None:
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
+
+        self.num_experts = num_experts
+        extra_weight_attrs.update(
+            {"quant_method": FusedMoeWeightScaleSupported.CHANNEL.value}
+        )
+
+        # >> weight
+        w13_output_size = intermediate_size_per_partition
+        w2_output_size = hidden_size // 2
+        w13_weight = torch.nn.Parameter(
+            torch.empty(num_experts, w13_output_size, hidden_size, dtype=torch.int8),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_weight", w13_weight)
+        set_weight_attrs(w13_weight, extra_weight_attrs)
+        w2_weight = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                w2_output_size,
+                intermediate_size_per_partition,
+                dtype=torch.int8,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w2_weight", w2_weight)
+        set_weight_attrs(w2_weight, extra_weight_attrs)
+
+        # >> scale
+        weight_scale_dtype = torch.int64 if self.activation_use_clip else torch.float32
+        w13_weight_scale = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                2 * intermediate_size_per_partition,
+                1,
+                dtype=weight_scale_dtype,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_weight_scale", w13_weight_scale)
+        set_weight_attrs(w13_weight_scale, extra_weight_attrs)
+
+        w2_weight_scale = torch.nn.Parameter(
+            torch.empty(num_experts, hidden_size, 1, dtype=weight_scale_dtype),
+            requires_grad=False,
+        )
+        layer.register_parameter("w2_weight_scale", w2_weight_scale)
+        set_weight_attrs(w2_weight_scale, extra_weight_attrs)
+
+        # >> offset
+        w13_weight_offset = torch.nn.Parameter(
+            torch.empty(
+                num_experts, 2 * intermediate_size_per_partition, 1, dtype=torch.float32
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_weight_offset", w13_weight_offset)
+        set_weight_attrs(w13_weight_offset, extra_weight_attrs)
+
+        w2_weight_offset = torch.nn.Parameter(
+            torch.empty(num_experts, hidden_size, 1, dtype=torch.float32),
+            requires_grad=False,
+        )
+        layer.register_parameter("w2_weight_offset", w2_weight_offset)
+        set_weight_attrs(w2_weight_offset, extra_weight_attrs)
+
+        # >>> special param for w4a8
+        if self.activation_use_clip:
+            self._init_activation_clip_params(
+                layer,
+                num_experts,
+                hidden_size,
+                intermediate_size_per_partition,
+                extra_weight_attrs,
+            )
+        else:
+            self._init_extra_scale_params(
+                layer,
+                num_experts,
+                hidden_size,
+                intermediate_size_per_partition,
+                extra_weight_attrs,
+            )
+
+    def _init_activation_clip_params(
+        self,
+        layer: torch.nn.Module,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        extra_weight_attrs: dict,
+    ) -> None:
+        """
+        Initializes bias and alpha parameters for quantization schemes that use activation clipping.
+
+        This helper registers `w13_bias`, `w2_bias`, and `w2_alpha`, which are required to
+        shift and scale the activations or outputs to compensate for the precision loss
+        introduced by clamping activations.
+        """
+        w13_bias = torch.nn.Parameter(
+            torch.ones(
+                num_experts, 2 * intermediate_size_per_partition, dtype=torch.float
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_bias", w13_bias)
+        set_weight_attrs(w13_bias, extra_weight_attrs)
+
+        w2_bias = torch.nn.Parameter(
+            torch.ones(num_experts, hidden_size, dtype=torch.float),
+            requires_grad=False,
+        )
+        layer.register_parameter("w2_bias", w2_bias)
+        set_weight_attrs(w2_bias, extra_weight_attrs)
+
+        w2_alpha = torch.nn.Parameter(
+            torch.ones(num_experts, dtype=torch.float), requires_grad=False
+        )
+        layer.register_parameter("w2_alpha", w2_alpha)
+        set_weight_attrs(w2_alpha, extra_weight_attrs)
+
+    def _init_extra_scale_params(
+        self,
+        layer: torch.nn.Module,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        extra_weight_attrs: dict,
+    ) -> None:
+        """
+        Initializes additional scaling, offset, and bias parameters for quantization schemes without activation clipping.
+
+        This method registers the following parameters:
+        1. Scale Biases: `w13_scale_bias` and `w2_scale_bias`.
+        2. Secondary Quantization Params (initialized only for grouped quantization):
+            `w13_weight_scale_second`, `w13_weight_offset_second`,
+            `w2_weight_scale_second`, and `w2_weight_offset_second`.
+        """
+        if not self.is_per_channel_weight:
+            w13_weight_scale_second = torch.nn.Parameter(
+                torch.empty(
+                    num_experts,
+                    2 * intermediate_size_per_partition,
+                    hidden_size // self.group_size,
+                    dtype=torch.float32,
+                ),
+                requires_grad=False,
+            )
+            layer.register_parameter("w13_weight_scale_second", w13_weight_scale_second)
+            set_weight_attrs(w13_weight_scale_second, extra_weight_attrs)
+
+            w13_weight_offset_second = torch.nn.Parameter(
+                torch.empty(
+                    num_experts,
+                    2 * intermediate_size_per_partition,
+                    hidden_size // self.group_size,
+                    dtype=torch.float32,
+                ),
+                requires_grad=False,
+            )
+            layer.register_parameter(
+                "w13_weight_offset_second", w13_weight_offset_second
+            )
+            set_weight_attrs(w13_weight_offset_second, extra_weight_attrs)
+
+            w2_weight_scale_second = torch.nn.Parameter(
+                torch.empty(
+                    num_experts,
+                    hidden_size,
+                    intermediate_size_per_partition // self.group_size,
+                    dtype=torch.float32,
+                ),
+                requires_grad=False,
+            )
+            layer.register_parameter("w2_weight_scale_second", w2_weight_scale_second)
+            set_weight_attrs(w2_weight_scale_second, extra_weight_attrs)
+
+            w2_weight_offset_second = torch.nn.Parameter(
+                torch.empty(
+                    num_experts,
+                    hidden_size,
+                    intermediate_size_per_partition // self.group_size,
+                    dtype=torch.float32,
+                ),
+                requires_grad=False,
+            )
+            layer.register_parameter("w2_weight_offset_second", w2_weight_offset_second)
+            set_weight_attrs(w2_weight_offset_second, extra_weight_attrs)
+
+        w13_scale_bias = torch.nn.Parameter(
+            torch.empty(
+                num_experts, 2 * intermediate_size_per_partition, 1, dtype=torch.float32
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_scale_bias", w13_scale_bias)
+        set_weight_attrs(w13_scale_bias, extra_weight_attrs)
+
+        w2_scale_bias = torch.nn.Parameter(
+            torch.empty(
+                num_experts, hidden_size, 16 // self.tp_size, dtype=torch.float32
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w2_scale_bias", w2_scale_bias)
+        set_weight_attrs(w2_scale_bias, extra_weight_attrs)
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        self.kernel.process_weights_after_loading(
+            layer, self.is_per_channel_weight, self.activation_use_clip
+        )
+
+    def create_moe_runner(
+        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
+    ):
+        self.moe_runner_config = moe_runner_config
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output: StandardDispatchOutput,
+    ) -> CombineInput:
+
+        return self.kernel.apply(layer, dispatch_output)
+
+    def apply_without_routing_weights(
+        self,
+        layer,
+        hidden_states,
+        hidden_states_scale,
+        group_list_type,
+        group_list,
+        output_dtype,
+    ):
+        return self.kernel.apply_without_routing_weights(
+            layer,
+            hidden_states,
+            hidden_states_scale,
+            group_list_type,
+            group_list,
+            output_dtype,
+        )
+
+
+class NPUCompressedTensorsW4A16Int4DynamicMoEMethod(CompressedTensorsMoEMethod):
+
+    def __init__(self, quantization_config) -> None:
+        self.pack_factor = 8  # weight dtype is int4,  but use int32 to create
+        target = (
+            "MoEGMM" if "MoEGMM" in quantization_config.target_scheme_map else "Linear"
+        )
+        if target in quantization_config.target_scheme_map:
+            self.group_size = quantization_config.target_scheme_map[target][
+                "weights"
+            ].group_size
+        else:
+            self.group_size = 128
+
+        self.kernel = NPUW4A16Int4DynamicMoEMethod()
+
+    # TODO: See if we can merge this method's logic
+    # with CompressedTensorsWNA16MoEMethod. Need more models and tests.
+    # @OrangeRedeng @TamirBaydasov
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ) -> None:
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
+
+        self.num_experts = num_experts
+        if (
+            extra_weight_attrs.get(
+                "intermediate_size_full", intermediate_size_per_partition
+            )
+            // intermediate_size_per_partition
+            > 1
+        ):
+            quant_method = FusedMoeWeightScaleSupported.GROUP.value
+        else:
+            quant_method = FusedMoeWeightScaleSupported.CHANNEL.value
+        extra_weight_attrs.update({"quant_method": quant_method})
+        # weight
+        w13_weight = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                2 * intermediate_size_per_partition,
+                hidden_size // self.pack_factor,
+                dtype=torch.int32,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_weight", w13_weight)
+        set_weight_attrs(w13_weight, extra_weight_attrs)
+        w2_weight = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                hidden_size,
+                intermediate_size_per_partition // self.pack_factor,
+                dtype=torch.int32,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w2_weight", w2_weight)
+        set_weight_attrs(w2_weight, extra_weight_attrs)
+
+        # scale
+        weight_scale_dtype = torch.bfloat16
+        w13_weight_scale = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                2 * intermediate_size_per_partition,
+                hidden_size // self.group_size,
+                dtype=weight_scale_dtype,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_weight_scale", w13_weight_scale)
+        set_weight_attrs(w13_weight_scale, extra_weight_attrs)
+        w2_weight_scale = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                hidden_size,
+                intermediate_size_per_partition // self.group_size,
+                dtype=weight_scale_dtype,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w2_weight_scale", w2_weight_scale)
+        set_weight_attrs(w2_weight_scale, extra_weight_attrs)
+
+        # offset
+        w13_weight_offset = torch.nn.Parameter(
+            torch.zeros(
+                num_experts,
+                2 * intermediate_size_per_partition,
+                hidden_size // self.group_size,
+                dtype=weight_scale_dtype,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_weight_offset", w13_weight_offset)
+        set_weight_attrs(w13_weight_offset, extra_weight_attrs)
+
+        w2_weight_offset = torch.nn.Parameter(
+            torch.zeros(
+                num_experts,
+                hidden_size,
+                intermediate_size_per_partition // self.group_size,
+                dtype=weight_scale_dtype,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w2_weight_offset", w2_weight_offset)
+        set_weight_attrs(w2_weight_offset, extra_weight_attrs)
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        self.kernel.process_weights_after_loading(layer)
+
+    def create_moe_runner(
+        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
+    ):
+        self.moe_runner_config = moe_runner_config
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output: StandardDispatchOutput,
+    ) -> CombineInput:
+
+        return self.kernel.apply(layer, dispatch_output)
+
+    def apply_without_routing_weights(
+        self,
+        layer,
+        hidden_states,
+        hidden_states_scale,
+        group_list_type,
+        group_list,
+        output_dtype,
+    ):
+        return self.kernel.apply_without_routing_weights(
+            layer,
+            hidden_states,
+            hidden_states_scale,
+            group_list_type,
+            group_list,
+            output_dtype,
+        )

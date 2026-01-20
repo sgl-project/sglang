@@ -1,7 +1,3 @@
-from sglang.test.ci.ci_register import register_amd_ci
-
-register_amd_ci(est_time=520, suite="stage-b-test-small-1-gpu-amd")
-
 """
 Test LLaDA2 (Diffusion Language Model) on AMD GPUs.
 
@@ -12,6 +8,7 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
+from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.send_one import BenchArgs, send_one_prompt
 from sglang.test.test_utils import (
@@ -22,6 +19,8 @@ from sglang.test.test_utils import (
     popen_launch_server,
     write_github_step_summary,
 )
+
+register_amd_ci(est_time=520, suite="stage-b-test-small-1-gpu-amd")
 
 
 class TestLLaDA2MiniAMD(CustomTestCase):
