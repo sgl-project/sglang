@@ -2,7 +2,6 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.server_args import get_global_server_args
 
 def sgemm_lora_a_fwd(
     inputs: torch.Tensor,
@@ -18,7 +17,7 @@ def sgemm_lora_a_fwd(
         return torch.zeros(total_seq_len, 0, dtype=inputs.dtype, device=inputs.device)
 
     num_loras, weight_out_dim, _ = weights.shape
-    
+
     if len(weight_indices) == 1:
         idx = weight_indices[0]
         rank = lora_ranks[idx]
@@ -26,7 +25,9 @@ def sgemm_lora_a_fwd(
         if rank > 0:
             output = torch.einsum("si, oi -> so", inputs, weights[idx, :, :]) * scaling
         else:
-            output = torch.zeros(total_seq_len, weight_out_dim, dtype=inputs.dtype, device=inputs.device)
+            output = torch.zeros(
+                total_seq_len, weight_out_dim, dtype=inputs.dtype, device=inputs.device
+            )
         return output
 
     max_rank = weight_out_dim // num_slices
@@ -47,7 +48,7 @@ def sgemm_lora_a_fwd(
             x_seq = inputs[token_offset : token_offset + seq_len, :]
             w_seq = weights[lora_idx, : num_slices * rank, :]
 
-            result = torch.einsum("si, oi -> so", x_seq, w_seq)
+            result = torch.mm(x_seq, w_seq.T)
             output[token_offset : token_offset + seq_len, : num_slices * rank] = (
                 scaling_tensor[lora_idx] * result
             )
@@ -69,7 +70,7 @@ def sgemm_lora_b_fwd(
     total_seq_len, _ = inputs.shape
     num_loras, weight_out_dim, _ = weights.shape
     total_output_dim = slice_offsets[-1].item() if len(slice_offsets) > 0 else 0
-    
+
     if weights.numel() == 0:
         return torch.zeros(
             total_seq_len, total_output_dim, dtype=inputs.dtype, device=inputs.device
@@ -84,7 +85,7 @@ def sgemm_lora_b_fwd(
             total_seq_len, total_output_dim, dtype=inputs.dtype, device=inputs.device
         )
     if len(weight_indices) == 1:
-        idx= weight_indices[0]
+        idx = weight_indices[0]
         rank = lora_ranks[idx]
         if rank > 0:
             for slice_idx in range(num_slices):
@@ -136,11 +137,10 @@ def sgemm_lora_b_fwd(
                 lora_idx, slice_start_output:slice_end_output, :rank
             ]  # (slice_dim, rank)
 
-            result = torch.einsum("si, oi -> so", x_slice, w_slice)
             output[
                 token_offset : token_offset + seq_len,
                 slice_start_output:slice_end_output,
-            ] += result
+            ].add_(torch.mm(x_slice, w_slice.T))
 
         token_offset += seq_len
 
