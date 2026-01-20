@@ -20,6 +20,8 @@ import requests
 from openai import OpenAI
 from tqdm import tqdm
 
+from .constants import MAX_RETRY_ATTEMPTS
+
 logger = logging.getLogger(__name__)
 
 OPENAI_SYSTEM_MESSAGE_API = "You are a helpful assistant."
@@ -119,7 +121,6 @@ class ChatCompletionSampler(SamplerBase):
         image: str,
         encoding: str = "base64",
         format: str = "png",
-        fovea: int = 768,
     ):
         new_image = {
             "type": "image_url",
@@ -141,7 +142,7 @@ class ChatCompletionSampler(SamplerBase):
                 self._pack_message("system", self.system_message)
             ] + message_list
         trial = 0
-        while trial < 6:  # 126 seconds in total
+        while trial < MAX_RETRY_ATTEMPTS:
             try:
                 response = self.client.chat.completions.create(
                     model=self.model,
@@ -157,15 +158,21 @@ class ChatCompletionSampler(SamplerBase):
                 return ""
             except Exception as e:
                 exception_backoff = 2**trial  # exponential back off
-                logger.debug(
-                    "Rate limit, retry %d after %ds: %s",
-                    trial,
+                # Log first few retries at debug, later ones at warning
+                log_fn = logger.warning if trial >= 3 else logger.debug
+                log_fn(
+                    "Request failed (retry %d/%d, backoff %ds): %s",
+                    trial + 1,
+                    MAX_RETRY_ATTEMPTS,
                     exception_backoff,
                     e,
                 )
                 time.sleep(exception_backoff)
                 trial += 1
-        logger.warning("All retry attempts exhausted, returning empty response")
+        logger.warning(
+            "All retry attempts exhausted after %d retries, returning empty response",
+            MAX_RETRY_ATTEMPTS,
+        )
         return ""
 
 
@@ -437,7 +444,7 @@ def make_report(eval_result: EvalResult) -> str:
     )
 
 
-def make_report_from_example_htmls(htmls: List[str]):
+def make_report_from_example_htmls(htmls: list[str]):
     """
     Create a standalone HTML report from a list of example htmls
     """

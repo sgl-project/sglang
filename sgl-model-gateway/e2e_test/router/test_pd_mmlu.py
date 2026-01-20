@@ -10,7 +10,8 @@ Requirements:
 
 Configuration via markers:
     @pytest.mark.model("model-id")  # Override default model
-    @pytest.mark.pd(num_prefill=2, num_decode=2)  # Custom worker counts
+    @pytest.mark.workers(prefill=2, decode=2)  # Custom worker counts
+    @pytest.mark.gateway(policy="round_robin")  # Gateway configuration
 
 Usage:
     # Basic (1 prefill + 1 decode)
@@ -42,11 +43,10 @@ class TestPDMMLU:
         Runs MMLU with 1 prefill + 1 decode worker and validates
         accuracy meets threshold (>= 0.65).
         """
-        backend, model, client = setup_backend
-        base_url = str(client.base_url).rstrip("/v1")
+        backend, model, client, *_ = setup_backend
 
         args = SimpleNamespace(
-            base_url=base_url,
+            base_url=str(client.base_url),
             model=model,
             eval_name="mmlu",
             num_examples=64,

@@ -51,6 +51,7 @@ class SGLangFailuresAnalyzer:
             "pr-gate",
             "check-all-jobs",
         ]
+        self.test_summaries = {}
 
     def get_recent_runs(
         self,
@@ -122,7 +123,13 @@ class SGLangFailuresAnalyzer:
                     links = link_header.split(", ")
                     for link in links:
                         if 'rel="next"' in link:
-                            next_url = link.split(";")[0].strip("<>")
+                            try:
+                                parts = link.split(";")
+                                if parts:
+                                    next_url = parts[0].strip("<>")
+                            except Exception as e:
+                                print(f"Error parsing Link header: {link}, error: {e}")
+                                next_url = None
                             break
                 url = next_url
                 params = {}  # Clear params for subsequent requests (URL has them)
@@ -185,7 +192,13 @@ class SGLangFailuresAnalyzer:
                     links = link_header.split(", ")
                     for link in links:
                         if 'rel="next"' in link:
-                            next_url = link.split(";")[0].strip("<>")
+                            try:
+                                parts = link.split(";")
+                                if parts:
+                                    next_url = parts[0].strip("<>")
+                            except Exception as e:
+                                print(f"Error parsing Link header: {link}, error: {e}")
+                                next_url = None
                             break
                 url = next_url
                 params = {}  # Clear params for subsequent requests
@@ -223,12 +236,70 @@ class SGLangFailuresAnalyzer:
             print(f"Error fetching runners: {e}")
             return {}
 
+    def find_last_running_test(self, logs: str) -> Optional[Dict]:
+        """
+        Find the last test that was running before logs cut off (for timeout/exit scenarios).
+        Finds the last instance of 'server_args:' and looks for the test file a few lines above it.
+
+        Returns:
+            Dict with test info if found, or None if no test found.
+        """
+        import re
+
+        # Strip ANSI escape codes
+        ansi_escape = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+        logs = ansi_escape.sub("", logs)
+
+        lines = logs.split("\n")
+
+        # Patterns to match test files
+        # Examples:
+        # - "sglang/test/test_example.py::TestClass::test_method[param]"
+        # - "python3 /path/to/test_example.py"
+        # - "Begin (0/0):" then "python3 /path/to/test.py" on next line
+        test_patterns = [
+            r"(\S+\.py)::",  # pytest format: something.py::
+            r"python3?\s+(\S+\.py)",  # python3 /path/to/test.py
+        ]
+
+        # Find the last occurrence of server_args: (searching from bottom)
+        server_args_idx = None
+        for i in range(len(lines) - 1, -1, -1):
+            if "server_args:" in lines[i].lower() or "server_args =" in lines[i]:
+                server_args_idx = i
+                break
+
+        if server_args_idx is not None:
+            # Look at lines above server_args (up to 10 lines)
+            for j in range(1, 11):
+                line_idx = server_args_idx - j
+                if line_idx >= 0:
+                    line = lines[line_idx]
+                    for pattern in test_patterns:
+                        match = re.search(pattern, line)
+                        if match:
+                            full_path = match.group(1)
+                            test_file = (
+                                full_path.split("/")[-1]
+                                if "/" in full_path
+                                else full_path
+                            )
+                            if test_file.endswith(".py"):
+                                return {
+                                    "test_file": test_file,
+                                    "full_path": full_path,
+                                    "context": "last_running",
+                                }
+
+        return None
+
     def parse_test_summary(self, logs: str) -> Optional[Dict]:
         """
         Parse the test summary block from job logs.
 
         Returns:
             Dict with passed/total counts and list of failed tests, or None if no summary found.
+            If no summary found, attempts to find the last running test (for timeout scenarios).
         """
         import re
 
@@ -240,10 +311,23 @@ class SGLangFailuresAnalyzer:
         # Pattern matches: "Test Summary: 7/8 passed"
         summary_match = re.search(r"Test Summary:\s*(\d+)/(\d+)\s*passed", logs)
         if not summary_match:
+            # No summary found - try to find last running test
+            last_test = self.find_last_running_test(logs)
+            if last_test:
+                return {
+                    "passed": 0,
+                    "total": 0,
+                    "failed_tests": [last_test],
+                    "incomplete": True,  # Mark that this is incomplete/inferred
+                }
             return None
 
-        passed = int(summary_match.group(1))
-        total = int(summary_match.group(2))
+        try:
+            passed = int(summary_match.group(1))
+            total = int(summary_match.group(2))
+        except (ValueError, TypeError) as e:
+            print(f"Error parsing test summary numbers: {e}")
+            return None
 
         # Find failed tests section
         # Look for "FAILED:" (the ✗ character may be mangled due to encoding)
@@ -304,24 +388,68 @@ class SGLangFailuresAnalyzer:
             if conclusion == "failure" and job_id:
                 logs = self.get_job_logs(job_id)
                 test_summary = self.parse_test_summary(logs) if logs else None
+                self.test_summaries[job_id] = test_summary
+
+                # Debug logging for failed jobs without test summary
+                if not test_summary:
+                    job_name = run_info.get("job_name", "unknown")
+                    run_number = run_info.get("run_number", "unknown")
+                    job_url = run_info.get("job_url", "N/A")
+                    log_size = len(logs) if logs else 0
+                    print(
+                        f"  ⚠️  Job failed without test summary: {job_name} (Run #{run_number})"
+                    )
+                    print(f"      URL: {job_url}")
+                    print(
+                        f"      Log size: {log_size} chars, Logs available: {bool(logs)}"
+                    )
+                    if logs:
+                        # Show a snippet of the logs to help debug
+                        log_snippet = logs[-500:] if len(logs) > 500 else logs
+                        print(f"      Last 500 chars of logs: {log_snippet[:200]}...")
+                elif test_summary.get("incomplete"):
+                    # Log when we inferred a test from timeout
+                    job_name = run_info.get("job_name", "unknown")
+                    run_number = run_info.get("run_number", "unknown")
+                    inferred_tests = [
+                        t["test_file"] for t in test_summary.get("failed_tests", [])
+                    ]
+                    print(
+                        f"  ⏱️  Inferred timeout test for {job_name} (Run #{run_number}): {inferred_tests}"
+                    )
 
                 if test_summary and test_summary["failed_tests"]:
                     parsed_any_test_summary = True
                     # Track each failed test
                     failed_test_files = set()
+                    is_incomplete = test_summary.get("incomplete", False)
+
                     for failed_test in test_summary["failed_tests"]:
                         test_file = failed_test["test_file"]
                         failed_test_files.add(test_file)
                         test_failures[test_file]["total_failures"] += 1
                         test_failures[test_file]["current_streak"] += 1
+
+                        # Mark if this is a "last running" test (inferred from timeout)
+                        is_last_running = failed_test.get("context") == "last_running"
+                        status = "⏱️" if is_last_running else "❌"
+
                         test_failures[test_file]["recent_runs"].append(
                             {
                                 "run_number": run_info.get("run_number"),
                                 "job_url": run_info.get("job_url"),
-                                "status": "❌",
+                                "status": status,
                                 "failed": True,
+                                "last_running": is_last_running,
                             }
                         )
+
+                        # Track if any run was a timeout/last_running
+                        if (
+                            is_last_running
+                            and "has_timeout" not in test_failures[test_file]
+                        ):
+                            test_failures[test_file]["has_timeout"] = True
 
                     # For tests we've seen before that didn't fail this time,
                     # they get a "pass" (the job failed but this specific test passed)
@@ -381,10 +509,30 @@ class SGLangFailuresAnalyzer:
         # Convert to regular dict and sort by streak then total failures
         result = {}
         for test_file, data in test_failures.items():
+            # Filter out test failures where the current streak is composed ONLY of
+            # skipped/cancelled/unknown runs (no actual failures in the streak)
+            # We do this by checking if there's at least one actual failure (failed=True)
+            # in the recent runs that contribute to the current streak
+            current_streak = data["current_streak"]
+            recent_runs = data["recent_runs"]
+
+            # If there's a current streak, check if it contains actual failures
+            if current_streak > 0:
+                # Look at the last N runs where N = current_streak
+                # Check if any of them are actual failures (not just cancelled/skipped)
+                streak_runs = recent_runs[-current_streak:]
+                has_actual_failure = any(
+                    run.get("failed") == True for run in streak_runs
+                )
+
+                # Skip this test if the streak contains no actual failures
+                if not has_actual_failure:
+                    continue
+
             result[test_file] = {
                 "total_failures": data["total_failures"],
-                "current_streak": data["current_streak"],
-                "recent_runs": data["recent_runs"][-10:],  # Keep last 10
+                "current_streak": current_streak,
+                "recent_runs": recent_runs[-10:],  # Keep last 10
             }
 
         return result
@@ -535,7 +683,10 @@ class SGLangFailuresAnalyzer:
                                 runner_instance_queue_times[runner_instance_key].append(
                                     queue_time_seconds
                                 )
-                        except (ValueError, AttributeError):
+                        except (ValueError, AttributeError, TypeError) as e:
+                            print(
+                                f"Error parsing timestamps for job {job.get('id')}: {e}"
+                            )
                             pass  # Skip if timestamp parsing fails
 
                 conclusion = job.get("conclusion")
@@ -1018,6 +1169,119 @@ class SGLangFailuresAnalyzer:
         print(f"Found test-level failures for {len(job_test_failures)} jobs")
         return job_test_failures
 
+    def analyze_runner_specific_test_failures(
+        self, runs: List[Dict]
+    ) -> Dict[str, Dict[str, Dict]]:
+        """
+        Analyze test failures grouped by runner to identify runner-specific issues.
+
+        Args:
+            runs: List of workflow runs to analyze
+
+        Returns:
+            Dict mapping runner_instance -> {test_file -> {"count": int, "jobs": [job_names]}}
+        """
+        print("\nAnalyzing runner-specific test failures...")
+
+        runner_test_failures: Dict[str, Dict[str, Dict]] = defaultdict(
+            lambda: defaultdict(lambda: {"count": 0, "jobs": [], "job_urls": []})
+        )
+
+        for run in runs:
+            # Get jobs for this run
+            jobs = self.get_jobs_for_run(run.get("id"))
+
+            for job in jobs:
+                job_name = job.get("name", "")
+                conclusion = job.get("conclusion")
+
+                # Skip excluded jobs
+                if any(
+                    job_name.startswith(excluded) for excluded in self.excluded_jobs
+                ):
+                    continue
+
+                # Only analyze failed jobs
+                if conclusion != "failure":
+                    continue
+
+                # Get runner information
+                runner_name = (
+                    job.get("runner_name")
+                    or job.get("runner", {}).get("name")
+                    or "unknown"
+                )
+                runner_id = job.get("runner_id") or job.get("runner", {}).get("id")
+                runner_labels = job.get("labels", [])
+                runner_labels_str = (
+                    ", ".join(runner_labels) if runner_labels else "unknown"
+                )
+
+                # Skip if no runner info
+                if not runner_id or runner_labels_str == "unknown":
+                    continue
+
+                # Create runner instance key
+                runner_instance_key = f"{runner_name}_{runner_id}"
+
+                # Get job logs and parse test failures
+                job_id = job.get("id")
+                if job_id:
+                    if job_id not in self.test_summaries:
+                        logs = self.get_job_logs(job_id)
+                        test_summary = self.parse_test_summary(logs) if logs else None
+                    else:
+                        test_summary = self.test_summaries[job_id]
+
+                    if test_summary and test_summary.get("failed_tests"):
+                        # Track each failed test for this runner
+                        for failed_test in test_summary["failed_tests"]:
+                            test_file = failed_test["test_file"]
+
+                            runner_test_failures[runner_instance_key][test_file][
+                                "count"
+                            ] += 1
+                            runner_test_failures[runner_instance_key][test_file][
+                                "jobs"
+                            ].append(job_name)
+                            runner_test_failures[runner_instance_key][test_file][
+                                "job_urls"
+                            ].append(
+                                job.get(
+                                    "html_url",
+                                    f"https://github.com/{self.repo}/actions/runs/{run.get('id')}",
+                                )
+                            )
+
+                            # Store runner metadata
+                            if (
+                                "runner_name"
+                                not in runner_test_failures[runner_instance_key][
+                                    test_file
+                                ]
+                            ):
+                                runner_test_failures[runner_instance_key][test_file][
+                                    "runner_name"
+                                ] = runner_name
+                                runner_test_failures[runner_instance_key][test_file][
+                                    "runner_labels"
+                                ] = runner_labels_str
+
+            time.sleep(0.05)
+
+        # Filter to only include runners with tests that failed multiple times
+        filtered_results = {}
+        for runner_key, tests in runner_test_failures.items():
+            # Only include tests that failed 2+ times on this runner
+            multi_failure_tests = {
+                test: data for test, data in tests.items() if data["count"] >= 2
+            }
+            if multi_failure_tests:
+                filtered_results[runner_key] = multi_failure_tests
+
+        print(f"Found {len(filtered_results)} runners with repeated test failures")
+        return filtered_results
+
     # print statements here mainly for local testing
     def generate_failure_report(
         self,
@@ -1049,6 +1313,10 @@ class SGLangFailuresAnalyzer:
         online_runners: Optional[Dict[str, Dict]] = None,
         # Test failures (per job -> per test)
         job_test_failures: Optional[Dict[str, Dict[str, Dict]]] = None,
+        # Test failures for general runs (per job -> per test)
+        job_test_failures_general: Optional[Dict[str, Dict[str, Dict]]] = None,
+        # Runner-specific test failures
+        runner_test_failures: Optional[Dict[str, Dict[str, Dict]]] = None,
         # Config
         output_file: Optional[str] = None,
         pr_test_scheduled_limit: int = 12,
@@ -1170,6 +1438,12 @@ class SGLangFailuresAnalyzer:
                 runner_instance_streak_data if runner_instance_streak_data else {}
             ),
             "job_test_failures": job_test_failures if job_test_failures else {},
+            "job_test_failures_general": (
+                job_test_failures_general if job_test_failures_general else {}
+            ),
+            "runner_test_failures": (
+                runner_test_failures if runner_test_failures else {}
+            ),
             "online_runners": online_runners if online_runners else {},
         }
 
@@ -1328,94 +1602,14 @@ class SGLangFailuresAnalyzer:
 
             # Get test failures data
             job_test_failures = report_data.get("job_test_failures", {})
-
-            # Helper function to generate test failure dropdown for a job
-            def generate_test_failure_dropdown(job_name: str) -> List[str]:
-                """Generate collapsible test failure details for a job."""
-                lines = []
-                test_failures = job_test_failures.get(job_name, {})
-                if not test_failures:
-                    return lines
-
-                # Check if we couldn't parse any test summaries for this job
-                if test_failures.get("_no_test_summary"):
-                    lines.append("<details>")
-                    lines.append(
-                        f"<summary>🔬 Test failures for <code>{job_name}</code> (no test summary available)</summary>"
-                    )
-                    lines.append("")
-                    lines.append(
-                        "_Could not parse test summary from job logs. The job may not produce a test summary, or the log format may have changed._"
-                    )
-                    lines.append("")
-                    lines.append("</details>")
-                    lines.append("")
-                    return lines
-
-                # Filter out the marker key if present
-                test_failures = {
-                    k: v for k, v in test_failures.items() if not k.startswith("_")
-                }
-                if not test_failures:
-                    return lines
-
-                # Sort by current streak (descending), then total failures
-                sorted_tests = sorted(
-                    test_failures.items(),
-                    key=lambda x: (x[1]["current_streak"], x[1]["total_failures"]),
-                    reverse=True,
-                )
-
-                lines.append("<details>")
-                lines.append(
-                    f"<summary>🔬 Test failures for <code>{job_name}</code> ({len(sorted_tests)} tests)</summary>"
-                )
-                lines.append("")
-                lines.append(
-                    "| Test File | Failures | Streak | Recent Runs (oldest → latest) |"
-                )
-                lines.append(
-                    "|-----------|----------|--------|-------------------------------|"
-                )
-
-                for test_file, test_data in sorted_tests[:10]:  # Limit to top 10 tests
-                    total_failures = test_data["total_failures"]
-                    current_streak = test_data["current_streak"]
-                    recent_runs = test_data.get("recent_runs", [])
-
-                    # Format streak with fire emoji if consecutive
-                    streak_str = (
-                        f"🔥 {current_streak}"
-                        if current_streak >= 2
-                        else str(current_streak)
-                    )
-
-                    # Build history links
-                    if recent_runs:
-                        history_links = "… " + " ".join(
-                            [f"[{r['status']}]({r['job_url']})" for r in recent_runs]
-                        )
-                    else:
-                        history_links = "N/A"
-
-                    # Highlight tests with high streak
-                    if current_streak >= 3:
-                        lines.append(
-                            f"| <span style='color:red'>`{test_file}`</span> | <span style='color:red'>{total_failures}</span> | <span style='color:red'>{streak_str}</span> | <span style='color:red'>{history_links}</span> |"
-                        )
-                    else:
-                        lines.append(
-                            f"| `{test_file}` | {total_failures} | {streak_str} | {history_links} |"
-                        )
-
-                lines.append("")
-                lines.append("</details>")
-                lines.append("")
-                return lines
+            job_test_failures_general = report_data.get("job_test_failures_general", {})
 
             # Helper function to generate job section for GitHub markdown
             def generate_job_section_md(
-                title: str, data: Dict[str, Dict], show_test_failures: bool = True
+                title: str,
+                data: Dict[str, Dict],
+                show_test_failures: bool = True,
+                test_failures_dict: Optional[Dict[str, Dict[str, Dict]]] = None,
             ):
                 sorted_data = sorted(
                     data.items(),
@@ -1444,10 +1638,280 @@ class SGLangFailuresAnalyzer:
                 summary_lines.append(f"## {title}")
                 summary_lines.append("")
 
+                # ==== TEST-LEVEL FAILURES FIRST (if show_test_failures is enabled) ====
+                if show_test_failures:
+                    # Use the provided test_failures_dict, or default to job_test_failures
+                    active_test_failures = (
+                        test_failures_dict
+                        if test_failures_dict is not None
+                        else job_test_failures
+                    )
+
+                    # Collect all test failures from broken and high_failure_rate jobs
+                    all_test_failures = []
+
+                    # Collect from broken jobs (current_streak >= 2)
+                    for job_name, job_data in broken:
+                        test_failures = active_test_failures.get(job_name, {})
+                        if test_failures and not test_failures.get("_no_test_summary"):
+                            for test_file, test_data in test_failures.items():
+                                if not test_file.startswith("_"):  # Skip marker keys
+                                    all_test_failures.append(
+                                        {
+                                            "job_name": job_name,
+                                            "test_file": test_file,
+                                            "test_data": test_data,
+                                            "job_data": job_data,
+                                        }
+                                    )
+
+                    # Collect from high_failure_rate jobs
+                    for job_name, job_data in high_failure_rate:
+                        test_failures = active_test_failures.get(job_name, {})
+                        if test_failures and not test_failures.get("_no_test_summary"):
+                            for test_file, test_data in test_failures.items():
+                                if not test_file.startswith("_"):
+                                    all_test_failures.append(
+                                        {
+                                            "job_name": job_name,
+                                            "test_file": test_file,
+                                            "test_data": test_data,
+                                            "job_data": job_data,
+                                        }
+                                    )
+
+                    # Sort by current_streak descending, then total_failures descending
+                    all_test_failures.sort(
+                        key=lambda x: (
+                            x["test_data"]["current_streak"],
+                            x["test_data"]["total_failures"],
+                        ),
+                        reverse=True,
+                    )
+
+                    # Split into streak tests and non-streak tests
+                    streak_tests = [
+                        t
+                        for t in all_test_failures
+                        if t["test_data"]["current_streak"] >= 2
+                    ]
+
+                    # For non-streak tests, calculate failure rate and include all that have failed
+                    non_streak_tests = []
+                    for t in all_test_failures:
+                        if t["test_data"]["current_streak"] < 2:
+                            # Calculate test failure rate from recent_runs
+                            recent_runs = t["test_data"].get("recent_runs", [])
+                            if recent_runs:
+                                # Count actual failures (failed=True) vs total runs
+                                total_runs = len(recent_runs)
+                                failed_runs = sum(
+                                    1 for r in recent_runs if r.get("failed") == True
+                                )
+                                failure_rate = (
+                                    (failed_runs / total_runs * 100)
+                                    if total_runs > 0
+                                    else 0
+                                )
+
+                                # Include all tests that have at least 1 failure
+                                if failed_runs >= 1:
+                                    # Store failure rate for sorting
+                                    t["failure_rate"] = failure_rate
+                                    t["failed_runs"] = failed_runs
+                                    t["total_test_runs"] = total_runs
+                                    non_streak_tests.append(t)
+
+                    # Sort by failure rate descending
+                    non_streak_tests.sort(key=lambda x: x["failure_rate"], reverse=True)
+
+                    # Show tests with consecutive failures
+                    if streak_tests:
+                        summary_lines.append(
+                            "🔥 **Tests with consecutive failures (≥2) & currently failing**"
+                        )
+                        summary_lines.append("")
+
+                        # Check if any test has timeout indicator
+                        has_timeout = any(
+                            any(
+                                r.get("status") == "⏱️"
+                                for r in t["test_data"].get("recent_runs", [])
+                            )
+                            for t in streak_tests
+                        )
+                        if has_timeout:
+                            summary_lines.append(
+                                "_Note: ⏱️ indicates test was last running when logs cut off (possible timeout)_"
+                            )
+                            summary_lines.append("")
+                        summary_lines.append(
+                            "| Test File | Job | Failures | Streak | First | Last | Recent Runs (oldest → latest) |"
+                        )
+                        summary_lines.append(
+                            "|-----------|-----|----------|--------|-------|------|-------------------------------|"
+                        )
+
+                        for test_info in streak_tests[:20]:  # Show top 20 tests
+                            test_file = test_info["test_file"]
+                            job_name = test_info["job_name"]
+                            test_data = test_info["test_data"]
+                            job_data = test_info["job_data"]
+
+                            # Truncate names
+                            test_display = (
+                                test_file
+                                if len(test_file) <= 30
+                                else test_file[:27] + "..."
+                            )
+                            job_display = (
+                                job_name
+                                if len(job_name) <= 25
+                                else job_name[:22] + "..."
+                            )
+
+                            # Get first and last failure from job level
+                            first_failure = job_data.get("first_failure_in_streak")
+                            first_str = (
+                                f"[Run #{first_failure['run_number']}]({first_failure.get('job_url', first_failure['url'])})"
+                                if first_failure
+                                else "N/A"
+                            )
+
+                            last_failure = job_data.get("last_failure_in_streak")
+                            last_str = (
+                                f"[Run #{last_failure['run_number']}]({last_failure.get('job_url', last_failure['url'])})"
+                                if last_failure
+                                else "N/A"
+                            )
+
+                            # Format streak with fire emoji
+                            streak_str = f"🔥 {test_data['current_streak']}"
+
+                            # Build history links
+                            recent_runs = test_data.get("recent_runs", [])
+                            if recent_runs:
+                                history_links = "… " + " ".join(
+                                    [
+                                        f"[{r['status']}]({r['job_url']})"
+                                        for r in recent_runs[-10:]
+                                    ]  # Last 10 runs
+                                )
+                            else:
+                                history_links = "N/A"
+
+                            # Highlight if streak >= 3
+                            if test_data["current_streak"] >= 3:
+                                summary_lines.append(
+                                    f"| <span style='color:red'>`{test_display}`</span> | <span style='color:red'>`{job_display}`</span> | "
+                                    f"<span style='color:red'>{test_data['total_failures']}</span> | <span style='color:red'>{streak_str}</span> | "
+                                    f"<span style='color:red'>{first_str}</span> | <span style='color:red'>{last_str}</span> | "
+                                    f"<span style='color:red'>{history_links}</span> |"
+                                )
+                            else:
+                                summary_lines.append(
+                                    f"| `{test_display}` | `{job_display}` | {test_data['total_failures']} | {streak_str} | "
+                                    f"{first_str} | {last_str} | {history_links} |"
+                                )
+
+                        summary_lines.append("")
+
+                    # Show all tests that have failed (no current streak), ranked by failure rate
+                    if non_streak_tests:
+                        summary_lines.append(
+                            "📋 **Other tests with failures (ranked by failure rate)**"
+                        )
+                        summary_lines.append("")
+
+                        # Check if any test has timeout indicator
+                        has_timeout = any(
+                            any(
+                                r.get("status") == "⏱️"
+                                for r in t["test_data"].get("recent_runs", [])
+                            )
+                            for t in non_streak_tests
+                        )
+                        if has_timeout:
+                            summary_lines.append(
+                                "_Note: ⏱️ indicates test was last running when logs cut off (possible timeout)_"
+                            )
+                            summary_lines.append("")
+                        summary_lines.append(
+                            "| Test File | Job | Failed | Total | Fail Rate | Recent Runs (oldest → latest) |"
+                        )
+                        summary_lines.append(
+                            "|-----------|-----|--------|-------|-----------|-------------------------------|"
+                        )
+
+                        for test_info in non_streak_tests[:20]:  # Show top 20
+                            test_file = test_info["test_file"]
+                            job_name = test_info["job_name"]
+                            test_data = test_info["test_data"]
+                            failure_rate = test_info["failure_rate"]
+                            failed_runs = test_info["failed_runs"]
+                            total_test_runs = test_info["total_test_runs"]
+
+                            test_display = (
+                                test_file
+                                if len(test_file) <= 30
+                                else test_file[:27] + "..."
+                            )
+                            job_display = (
+                                job_name
+                                if len(job_name) <= 25
+                                else job_name[:22] + "..."
+                            )
+
+                            # Build history links
+                            recent_runs = test_data.get("recent_runs", [])
+                            if recent_runs:
+                                history_links = "… " + " ".join(
+                                    [
+                                        f"[{r['status']}]({r['job_url']})"
+                                        for r in recent_runs[-10:]
+                                    ]
+                                )
+                            else:
+                                history_links = "N/A"
+
+                            # Highlight if failure rate >= 50%
+                            if failure_rate >= 50.0:
+                                summary_lines.append(
+                                    f"| <span style='color:orange'>`{test_display}`</span> | <span style='color:orange'>`{job_display}`</span> | "
+                                    f"<span style='color:orange'>{failed_runs}</span> | <span style='color:orange'>{total_test_runs}</span> | "
+                                    f"<span style='color:orange'>{failure_rate:.1f}%</span> | <span style='color:orange'>{history_links}</span> |"
+                                )
+                            else:
+                                summary_lines.append(
+                                    f"| `{test_display}` | `{job_display}` | {failed_runs} | {total_test_runs} | "
+                                    f"{failure_rate:.1f}% | {history_links} |"
+                                )
+
+                        summary_lines.append("")
+
+                    # If no test failures found but we have broken/high_failure_rate jobs
+                    if (
+                        not streak_tests
+                        and not non_streak_tests
+                        and (broken or high_failure_rate)
+                    ):
+                        summary_lines.append(
+                            "_No test-level failure data available for this workflow_"
+                        )
+                        summary_lines.append("")
+
+                # ==== JOB-LEVEL SUMMARY (COLLAPSIBLE) ====
+                summary_lines.append("<details>")
+                summary_lines.append(
+                    "<summary><b>📊 Job-level summary (click to expand)</b></summary>"
+                )
+                summary_lines.append("")
+
+                # Broken jobs (with active streak)
                 if broken:
-                    # Add sub-header to clarify this shows ongoing failure streaks
+                    summary_lines.append("<details>")
                     summary_lines.append(
-                        "🔥 **Consecutive failures (≥2) & currently failing**"
+                        "<summary>🔥 <b>Consecutive failures (≥2) & currently failing</b></summary>"
                     )
                     summary_lines.append("")
                     summary_lines.append(
@@ -1475,7 +1939,6 @@ class SGLangFailuresAnalyzer:
                             else "N/A"
                         )
 
-                        # Recent history (last 5 runs as clickable emoji)
                         recent_runs = d.get("recent_runs", [])
                         if recent_runs:
                             history_links = "… " + " ".join(
@@ -1487,7 +1950,6 @@ class SGLangFailuresAnalyzer:
                         else:
                             history_links = "N/A"
 
-                        # Make entire row red if current streak >= 3
                         if d["current_streak"] >= 3:
                             summary_lines.append(
                                 f"| <span style='color:red'>`{display_name}`</span> | <span style='color:red'>{d['current_streak']}</span> | <span style='color:red'>{d['max_streak']}</span> | <span style='color:red'>{d['total_runs']}</span> | "
@@ -1499,23 +1961,15 @@ class SGLangFailuresAnalyzer:
                                 f"{first_str} | {last_str} | {history_links} |"
                             )
 
-                    # Add test failure dropdowns after the table (only for scheduled runs)
                     summary_lines.append("")
-                    if show_test_failures:
-                        for job_name, d in broken[:15]:
-                            test_dropdown = generate_test_failure_dropdown(job_name)
-                            if test_dropdown:
-                                summary_lines.extend(test_dropdown)
-                else:
-                    summary_lines.append(
-                        "✅ **No jobs with active failure streaks (streak >= 2)**"
-                    )
+                    summary_lines.append("</details>")
                     summary_lines.append("")
 
-                # Show high failure rate jobs (NOT collapsible)
+                # High failure rate jobs (no active streak)
                 if high_failure_rate:
+                    summary_lines.append("<details>")
                     summary_lines.append(
-                        "⚠️ **No current failure streak but high intermittent failure rate (≥50%)**"
+                        "<summary>⚠️ <b>No current failure streak but high intermittent failure rate (≥50%)</b></summary>"
                     )
                     summary_lines.append("")
                     summary_lines.append(
@@ -1539,32 +1993,20 @@ class SGLangFailuresAnalyzer:
                         else:
                             history_links = "N/A"
 
-                        # Highlight rows with failure rate >= 50%
                         summary_lines.append(
                             f"| <span style='color:orange'>`{display_name}`</span> | <span style='color:orange'>{d['total_failures']}</span> | <span style='color:orange'>{d['failure_rate']:.1f}%</span> | <span style='color:orange'>{d['total_runs']}</span> | <span style='color:orange'>{history_links}</span> |"
                         )
 
-                    # Add test failure dropdowns after the table (only for scheduled runs)
                     summary_lines.append("")
-                    if show_test_failures:
-                        for job_name, d in high_failure_rate[:15]:
-                            test_dropdown = generate_test_failure_dropdown(job_name)
-                            if test_dropdown:
-                                summary_lines.extend(test_dropdown)
+                    summary_lines.append("</details>")
+                    summary_lines.append("")
 
-                # Show recently failed jobs in a collapsible section
+                # Recently failed jobs (collapsible)
                 if recently_failed:
-                    # Extract just the workflow name without the run count for cleaner display
-                    # e.g., "1. PR Test NVIDIA - Scheduled (latest 12 runs)" -> "PR Test NVIDIA - Scheduled"
-                    short_title = title.split("(")[0].strip()
-                    # Remove the leading number and period if present
-                    if short_title and short_title[0].isdigit():
-                        short_title = short_title.split(".", 1)[-1].strip()
-                    # Get the max total_runs from recently_failed jobs to show the analysis window
                     max_total_runs = max(d["total_runs"] for _, d in recently_failed)
                     summary_lines.append("<details>")
                     summary_lines.append(
-                        f"<summary>📋 [{short_title}] No current failure streak, but had failures in the past {max_total_runs} runs - {len(recently_failed)} jobs</summary>"
+                        f"<summary>📋 <b>No current failure streak, but had failures in the past {max_total_runs} runs - {len(recently_failed)} jobs</b></summary>"
                     )
                     summary_lines.append("")
                     summary_lines.append(
@@ -1594,6 +2036,20 @@ class SGLangFailuresAnalyzer:
                     summary_lines.append("")
                     summary_lines.append("</details>")
                     summary_lines.append("")
+
+                # Combined message when no broken/high_failure_rate jobs but has recently_failed
+                if not broken and not high_failure_rate and recently_failed:
+                    max_total_runs = max(d["total_runs"] for _, d in recently_failed)
+                    summary_lines.append(
+                        f"✅ No jobs with active failure streaks, but **{len(recently_failed)} jobs** had failures in the past **{max_total_runs} runs**"
+                    )
+                    summary_lines.append("")
+                elif not broken and not high_failure_rate and not recently_failed:
+                    summary_lines.append("✅ **No jobs with active failure streaks**")
+                    summary_lines.append("")
+
+                summary_lines.append("</details>")
+                summary_lines.append("")
 
             # ========== RUNNERS (at the top) ==========
             summary_lines.append("---")
@@ -1634,15 +2090,28 @@ class SGLangFailuresAnalyzer:
                     reverse=True,
                 )
 
-                runners_with_issues = [
+                # Split runners into consecutive failures and high failure rate
+                runners_with_streak = [
                     r for r in sorted_runners if r["current_streak"] >= 2
+                ]
+                runners_high_fail_rate = [
+                    r
+                    for r in sorted_runners
+                    if r["current_streak"] < 2
+                    and r["failure_rate"] >= 50.0
+                    and r["total_jobs"] >= 2
                 ]
 
                 # Always show section header
                 summary_lines.append("## Workers")
                 summary_lines.append("")
 
-                if runners_with_issues:
+                # Runners with consecutive failures
+                if runners_with_streak:
+                    summary_lines.append(
+                        "🔥 **Consecutive failures (≥2) & currently failing**"
+                    )
+                    summary_lines.append("")
                     summary_lines.append(
                         "| Machine Name | Current Streak | Max | Fail Rate | Avg Queue | Total Jobs | Unique Jobs | First Failure | Last Failure |"
                     )
@@ -1650,7 +2119,7 @@ class SGLangFailuresAnalyzer:
                         "|--------------|----------------|-----|-----------|-----------|------------|-------------|---------------|--------------|"
                     )
 
-                    for runner_data in runners_with_issues[:15]:
+                    for runner_data in runners_with_streak[:15]:
                         display_name = (
                             runner_data["runner_name"]
                             if len(runner_data["runner_name"]) <= 28
@@ -1690,10 +2159,125 @@ class SGLangFailuresAnalyzer:
                             )
 
                     summary_lines.append("")
-                else:
+
+                # Runners with high failure rate (but no current streak)
+                if runners_high_fail_rate:
                     summary_lines.append(
-                        "✅ **No runners with active failure streaks (streak >= 2)**"
+                        "⚠️ **No current failure streak but high failure rate (≥50%)**"
                     )
+                    summary_lines.append("")
+                    summary_lines.append(
+                        "| Machine Name | Fail Rate | Avg Queue | Total Jobs | Unique Jobs |"
+                    )
+                    summary_lines.append(
+                        "|--------------|-----------|-----------|------------|-------------|"
+                    )
+
+                    for runner_data in runners_high_fail_rate[:15]:
+                        display_name = (
+                            runner_data["runner_name"]
+                            if len(runner_data["runner_name"]) <= 28
+                            else runner_data["runner_name"][:25] + "..."
+                        )
+
+                        avg_queue_str = (
+                            f"{runner_data['avg_queue'] / 60:.1f}m"
+                            if runner_data["avg_queue"] > 0
+                            else "N/A"
+                        )
+
+                        summary_lines.append(
+                            f"| <span style='color:orange'>`{display_name}`</span> | <span style='color:orange'>{runner_data['failure_rate']:.1f}%</span> | "
+                            f"<span style='color:orange'>{avg_queue_str}</span> | <span style='color:orange'>{runner_data['total_jobs']}</span> | "
+                            f"<span style='color:orange'>{runner_data.get('unique_jobs', 0)}</span> |"
+                        )
+
+                    summary_lines.append("")
+
+                # If no issues
+                if not runners_with_streak and not runners_high_fail_rate:
+                    summary_lines.append(
+                        "✅ **No runners with active failure streaks or high failure rates**"
+                    )
+                    summary_lines.append("")
+
+            # ========== RUNNER-SPECIFIC TEST FAILURES ==========
+            runner_test_failures = report_data.get("runner_test_failures", {})
+            if runner_test_failures:
+                summary_lines.append("## Runner-Specific Test Failures")
+                summary_lines.append("")
+                summary_lines.append(
+                    "_Tests that fail multiple times on the same runner (possible runner-specific issues)_"
+                )
+                summary_lines.append("")
+
+                # Sort runners by number of multi-failure tests
+                sorted_runners = sorted(
+                    runner_test_failures.items(),
+                    key=lambda x: sum(test["count"] for test in x[1].values()),
+                    reverse=True,
+                )
+
+                for runner_key, tests in sorted_runners[:10]:  # Show top 10 runners
+                    # Sort tests by failure count
+                    sorted_tests = sorted(
+                        tests.items(),
+                        key=lambda x: x[1]["count"],
+                        reverse=True,
+                    )
+
+                    # Get runner name from first test
+                    runner_name = sorted_tests[0][1].get("runner_name", runner_key)
+                    total_failures = sum(test["count"] for test in tests.values())
+
+                    summary_lines.append("<details>")
+                    summary_lines.append(
+                        f"<summary>🤖 <b>Runner: {runner_name}</b> ({len(tests)} tests, {total_failures} total failures)</summary>"
+                    )
+                    summary_lines.append("")
+                    summary_lines.append("| Test File | Failures | Jobs |")
+                    summary_lines.append("|-----------|----------|------|")
+
+                    for test_file, test_data in sorted_tests[
+                        :15
+                    ]:  # Show top 15 tests per runner
+                        count = test_data["count"]
+                        jobs = test_data["jobs"]
+                        job_urls = test_data["job_urls"]
+
+                        # Truncate test file name
+                        test_display = (
+                            test_file
+                            if len(test_file) <= 35
+                            else test_file[:32] + "..."
+                        )
+
+                        # Create job links (show first 3, then count)
+                        job_links = []
+                        for job_name, job_url in zip(jobs[:3], job_urls[:3]):
+                            job_short = (
+                                job_name
+                                if len(job_name) <= 20
+                                else job_name[:17] + "..."
+                            )
+                            job_links.append(f"[{job_short}]({job_url})")
+
+                        jobs_str = ", ".join(job_links)
+                        if len(jobs) > 3:
+                            jobs_str += f" +{len(jobs) - 3} more"
+
+                        # Highlight if many failures
+                        if count >= 3:
+                            summary_lines.append(
+                                f"| <span style='color:red'>`{test_display}`</span> | <span style='color:red'>{count}</span> | <span style='color:red'>{jobs_str}</span> |"
+                            )
+                        else:
+                            summary_lines.append(
+                                f"| `{test_display}` | {count} | {jobs_str} |"
+                            )
+
+                    summary_lines.append("")
+                    summary_lines.append("</details>")
                     summary_lines.append("")
 
             # ========== SCHEDULED RUNS (9 sections) ==========
@@ -1752,53 +2336,62 @@ class SGLangFailuresAnalyzer:
 
             gen_limit = report_data.get("general_limit", 100)
 
-            # PR Tests - General (5 workflows) - no test failure analysis
+            # PR Tests - General (5 workflows) - with test failure analysis
             generate_job_section_md(
                 f"10. PR Test NVIDIA - General (latest {gen_limit} runs)",
                 report_data.get("pr_test_nvidia_general_data", {}),
-                show_test_failures=False,
+                show_test_failures=True,
+                test_failures_dict=job_test_failures_general,
             )
             generate_job_section_md(
                 f"11. PR Test AMD - General (latest {gen_limit} runs)",
                 report_data.get("pr_test_amd_general_data", {}),
-                show_test_failures=False,
+                show_test_failures=True,
+                test_failures_dict=job_test_failures_general,
             )
             generate_job_section_md(
                 f"12. PR Test Xeon - General (latest {gen_limit} runs)",
                 report_data.get("pr_test_xeon_general_data", {}),
-                show_test_failures=False,
+                show_test_failures=True,
+                test_failures_dict=job_test_failures_general,
             )
             generate_job_section_md(
                 f"13. PR Test XPU - General (latest {gen_limit} runs)",
                 report_data.get("pr_test_xpu_general_data", {}),
-                show_test_failures=False,
+                show_test_failures=True,
+                test_failures_dict=job_test_failures_general,
             )
             generate_job_section_md(
                 f"14. PR Test NPU - General (latest {gen_limit} runs)",
                 report_data.get("pr_test_npu_general_data", {}),
-                show_test_failures=False,
+                show_test_failures=True,
+                test_failures_dict=job_test_failures_general,
             )
 
-            # Nightly Tests - General (4 workflows) - no test failure analysis
+            # Nightly Tests - General (4 workflows) - with test failure analysis
             generate_job_section_md(
                 f"15. Nightly NVIDIA - General (latest {gen_limit} runs)",
                 report_data.get("nightly_nvidia_general_data", {}),
-                show_test_failures=False,
+                show_test_failures=True,
+                test_failures_dict=job_test_failures_general,
             )
             generate_job_section_md(
                 f"16. Nightly AMD - General (latest {gen_limit} runs)",
                 report_data.get("nightly_amd_general_data", {}),
-                show_test_failures=False,
+                show_test_failures=True,
+                test_failures_dict=job_test_failures_general,
             )
             generate_job_section_md(
                 f"17. Nightly Intel - General (latest {gen_limit} runs)",
                 report_data.get("nightly_intel_general_data", {}),
-                show_test_failures=False,
+                show_test_failures=True,
+                test_failures_dict=job_test_failures_general,
             )
             generate_job_section_md(
                 f"18. Nightly NPU - General (latest {gen_limit} runs)",
                 report_data.get("nightly_npu_general_data", {}),
-                show_test_failures=False,
+                show_test_failures=True,
+                test_failures_dict=job_test_failures_general,
             )
 
             # Write summary
@@ -2070,6 +2663,27 @@ def main():
             all_scheduled_data
         )
 
+        # Analyze test-level failures for general runs (all branches)
+        all_general_data = {
+            **pr_test_nvidia_general_data,
+            **pr_test_amd_general_data,
+            **pr_test_xeon_general_data,
+            **pr_test_xpu_general_data,
+            **pr_test_npu_general_data,
+            **nightly_nvidia_general_data,
+            **nightly_amd_general_data,
+            **nightly_intel_general_data,
+            **nightly_npu_general_data,
+        }
+        job_test_failures_general = analyzer.analyze_test_failures_for_broken_jobs(
+            all_general_data
+        )
+
+        # Analyze runner-specific test failures
+        runner_test_failures = analyzer.analyze_runner_specific_test_failures(
+            runner_runs
+        )
+
         # Generate report with all datasets
         report_data = analyzer.generate_failure_report(
             # Scheduled runs (9 workflows)
@@ -2100,6 +2714,8 @@ def main():
             online_runners,
             # Test failures
             job_test_failures,
+            job_test_failures_general,
+            runner_test_failures,
             # Config
             args.output,
             pr_test_scheduled_limit,
