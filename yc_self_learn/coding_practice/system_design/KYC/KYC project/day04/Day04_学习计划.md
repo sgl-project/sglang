@@ -38,11 +38,11 @@ related: [ Day 3 回归测试, Day 5 保护策略 ]
 
 根据学习进度和需求，可以补充以下子文档：
 
-- [ ] **KYC_Day04_A1_B1_Feature_Flag实现详解.md** - Feature Flag 的具体实现方式
-- [ ] **KYC_Day04_A1_B2_Canary_Release监控详解.md** - Canary Release 的监控和指标
-- [ ] **KYC_Day04_A1_B3_Rollback自动化详解.md** - Rollback 的自动化实现
-- [ ] **KYC_Day04_A1_B4_版本管理详解.md** - 版本管理和版本对比
-- [ ] **KYC_Day04_A1_B5_发布流程详解.md** - 完整的发布流程设计
+- [x] **KYC_Day04_A1_B1_Feature_Flag实现详解.md** - Feature Flag 的具体实现方式（如何只开想要开的功能）
+- [x] **KYC_Day04_A1_B2_Canary_Release监控详解.md** - Canary Release 的监控和指标（自动化推进和回滚）
+- [x] **KYC_Day04_A1_B3_Rollback自动化详解.md** - Rollback 的自动化实现（自动检测、执行、验证）
+- [x] **KYC_Day04_A1_B4_版本管理详解.md** - 版本管理和版本对比（版本对比、版本回滚）
+- [x] **KYC_Day04_A1_B5_发布流程详解.md** - 完整的发布流程设计（开发到生产的完整流程、审批、通知）
 
 ---
 
