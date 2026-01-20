@@ -92,15 +92,6 @@ def awq_dequantize_func():
 def enable_nextn_moe_bf16_cast_to_fp8(
     quant_config: Optional[QuantizationConfig],
 ) -> bool:
-    """
-    Determine if BF16 to FP8 casting should be enabled for DeepSeek NextN MoE layers.
-
-    Args:
-        quant_config: Quantization configuration, or None if no quantization is used.
-
-    Returns:
-        True if BF16 to FP8 casting should be enabled, False otherwise.
-    """
     return (
         envs.SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE.get()
         and quant_config is not None
@@ -110,20 +101,6 @@ def enable_nextn_moe_bf16_cast_to_fp8(
 
 
 def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
-    """
-    Calculate YaRN (Yet another RoPE extensioN method) attention scaling factor.
-
-    YaRN applies a specific scaling formula to handle extended context lengths
-    in rotary position embeddings.
-
-    Args:
-        scale: Position scaling factor. If <= 1, no scaling is applied.
-        mscale: Multiplier for the logarithmic scaling component.
-
-    Returns:
-        Computed mscale value. Returns 1.0 if scale <= 1, otherwise computes
-        0.1 * mscale * log(scale) + 1.0.
-    """
     if scale <= 1:
         return 1.0
     return 0.1 * mscale * math.log(scale) + 1.0
@@ -132,22 +109,6 @@ def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
 def _get_llama_4_scaling(
     original_max_position_embeddings: int, scaling_beta: float, positions: torch.Tensor
 ) -> torch.Tensor:
-    """
-    Compute position-dependent scaling for Llama 4 style RoPE (used in Mistral-Large-3).
-
-    This applies a logarithmic scaling that increases with position beyond the
-    original maximum context length.
-
-    Args:
-        original_max_position_embeddings: Original maximum sequence length the model
-            was trained on.
-        scaling_beta: Beta parameter controlling the strength of scaling.
-        positions: Tensor of position indices with shape (seq_len,) or (batch, seq_len).
-
-    Returns:
-        Scaling tensor with shape (..., 1, 1) for broadcasting with attention scores.
-        Values are >= 1.0 and increase logarithmically with position.
-    """
     scaling = 1 + scaling_beta * torch.log(
         1 + torch.floor(positions / original_max_position_embeddings)
     )
