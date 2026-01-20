@@ -1471,7 +1471,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             with self.soft_watchdog.disable():
                 recv_obj = await self.recv_from_detokenizer.recv_pyobj()
             self._result_dispatcher(recv_obj)
-            self.last_receive_tstamp = time.time()
+            self.last_receive_tstamp = time.perf_counter()
             self.soft_watchdog.feed()
 
     def _handle_batch_output(
@@ -1483,74 +1483,128 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             BatchTokenIDOutput,
         ],
     ):
-        for i, rid in enumerate(recv_obj.rids):
-            state = self.rid_to_state.get(rid, None)
+        # Fast type check using type() instead of isinstance() - avoids MRO traversal
+        obj_type = type(recv_obj)
+        is_str_output = obj_type is BatchStrOutput
+        is_token_id_output = obj_type is BatchTokenIDOutput
+        is_embedding_output = obj_type is BatchEmbeddingOutput
+        is_multimodal_output = obj_type is BatchMultimodalOutput
+
+        if is_multimodal_output:
+            raise NotImplementedError("BatchMultimodalOut not implemented")
+
+        # Pre-fetch frequently accessed attributes outside the loop
+        rids = recv_obj.rids
+        finished_reasons = recv_obj.finished_reasons
+        prompt_tokens = recv_obj.prompt_tokens
+        retraction_counts = recv_obj.retraction_counts
+        weight_version = self.server_args.weight_version
+        rid_to_state = self.rid_to_state
+        server_args = self.server_args
+        enable_metrics = self.enable_metrics
+
+        # Pre-fetch output-type specific attributes once (avoid repeated getattr in loop)
+        if is_str_output or is_token_id_output:
+            completion_tokens = recv_obj.completion_tokens
+            cached_tokens = recv_obj.cached_tokens
+            output_ids_list = recv_obj.output_ids
+            stream_output = server_args.stream_output
+
+        if is_str_output:
+            output_strs = recv_obj.output_strs
+
+        if is_embedding_output:
+            embeddings = recv_obj.embeddings
+
+        # Pre-fetch optional attributes once outside the loop
+        output_hidden_states = getattr(recv_obj, "output_hidden_states", None)
+        output_routed_experts = getattr(recv_obj, "output_routed_experts", None)
+        customized_info = getattr(recv_obj, "customized_info", None)
+
+        # Pre-fetch metric attributes if metrics are enabled
+        if enable_metrics:
+            queue_time = getattr(recv_obj, "queue_time", None)
+            prefill_launch_delay = getattr(recv_obj, "prefill_launch_delay", None)
+            prefill_launch_latency = getattr(recv_obj, "prefill_launch_latency", None)
+            prefill_finished_ts = getattr(recv_obj, "prefill_finished_ts", None)
+
+        for i, rid in enumerate(rids):
+            state = rid_to_state.get(rid)
             if state is None:
                 logger.error(
                     f"Received output for {rid=} but the state was deleted in TokenizerManager."
                 )
                 continue
 
-            # Build meta_info and return value
+            finished_reason = finished_reasons[i]
+
+            # Build meta_info directly without dict.update()
             meta_info = {
                 "id": rid,
-                "finish_reason": recv_obj.finished_reasons[i],
-                "prompt_tokens": recv_obj.prompt_tokens[i],
-                "weight_version": self.server_args.weight_version,
-                "total_retractions": recv_obj.retraction_counts[i],
+                "finish_reason": finished_reason,
+                "prompt_tokens": prompt_tokens[i],
+                "weight_version": weight_version,
+                "total_retractions": retraction_counts[i],
             }
 
-            if self.enable_metrics:
-                self._add_metric_if_present(recv_obj, "queue_time", meta_info, i)
-                self._add_metric_if_present(
-                    recv_obj, "prefill_launch_delay", meta_info, i
-                )
-                self._add_metric_if_present(
-                    recv_obj, "prefill_launch_latency", meta_info, i
-                )
-                self._add_metric_if_present(
-                    recv_obj, "prefill_finished_ts", meta_info, i
-                )
+            # Inline metric addition when enabled (avoid function call overhead)
+            if enable_metrics:
+                if queue_time and queue_time[i] is not None:
+                    meta_info["queue_time"] = queue_time[i]
+                if prefill_launch_delay and prefill_launch_delay[i] is not None:
+                    meta_info["prefill_launch_delay"] = prefill_launch_delay[i]
+                if prefill_launch_latency and prefill_launch_latency[i] is not None:
+                    meta_info["prefill_launch_latency"] = prefill_launch_latency[i]
+                if prefill_finished_ts and prefill_finished_ts[i] is not None:
+                    meta_info["prefill_finished_ts"] = prefill_finished_ts[i]
 
-            if getattr(state.obj, "return_logprob", False):
+            state_obj = state.obj
+            if getattr(state_obj, "return_logprob", False):
                 self.convert_logprob_style(
                     meta_info,
                     state,
-                    state.obj.top_logprobs_num,
-                    state.obj.token_ids_logprob,
-                    state.obj.return_text_in_logprobs
-                    and not self.server_args.skip_tokenizer_init,
+                    state_obj.top_logprobs_num,
+                    state_obj.token_ids_logprob,
+                    state_obj.return_text_in_logprobs
+                    and not server_args.skip_tokenizer_init,
                     recv_obj,
                     i,
                 )
 
-            if not isinstance(recv_obj, BatchEmbeddingOutput):
-                meta_info.update(
-                    {
-                        "completion_tokens": recv_obj.completion_tokens[i],
-                        "cached_tokens": recv_obj.cached_tokens[i],
-                    }
-                )
+            # Add completion/cached tokens for non-embedding outputs (direct assignment)
+            if not is_embedding_output:
+                meta_info["completion_tokens"] = completion_tokens[i]
+                meta_info["cached_tokens"] = cached_tokens[i]
 
-            if getattr(recv_obj, "output_hidden_states", None):
-                meta_info["hidden_states"] = recv_obj.output_hidden_states[i]
-            if getattr(recv_obj, "output_routed_experts", None):
-                meta_info["routed_experts"] = recv_obj.output_routed_experts[i]
-            if getattr(recv_obj, "customized_info", None):
-                for k, v in recv_obj.customized_info.items():
+            # Handle optional fields inline
+            if output_hidden_states is not None:
+                meta_info["hidden_states"] = output_hidden_states[i]
+            if output_routed_experts is not None:
+                meta_info["routed_experts"] = output_routed_experts[i]
+            if customized_info is not None:
+                for k, v in customized_info.items():
                     meta_info[k] = v[i]
 
-            if isinstance(recv_obj, BatchStrOutput):
-                state.text += recv_obj.output_strs[i]
-                # Not all request types have `stream` (e.g., EmbeddingReqInput). Default to non-streaming.
-                is_stream = getattr(state.obj, "stream", False)
-                if self.server_args.stream_output and is_stream:
-                    state.output_ids.extend(recv_obj.output_ids[i])
-                    output_token_ids = state.output_ids[state.last_output_offset :]
+            is_finished = finished_reason is not None
+
+            # Build output dict based on type (using pre-computed type flags)
+            if is_str_output:
+                state.text += output_strs[i]
+                is_stream = getattr(state_obj, "stream", False)
+                # Use += instead of extend() - equivalent but more idiomatic
+                new_ids = output_ids_list[i]
+                state.output_ids += new_ids
+                if stream_output and is_stream:
+                    # Streaming: only send new tokens since last offset
+                    output_token_ids = state.output_ids[state.last_output_offset:]
                     state.last_output_offset = len(state.output_ids)
+                elif is_finished:
+                    # Non-streaming, finished: copy needed for final result
+                    output_token_ids = state.output_ids[:]
                 else:
-                    state.output_ids.extend(recv_obj.output_ids[i])
-                    output_token_ids = state.output_ids.copy()
+                    # Non-streaming, not finished: use reference (intermediate results are discarded)
+                    # This avoids expensive copy for long sequences
+                    output_token_ids = state.output_ids
 
                 out_dict = {
                     "text": state.text,
@@ -1558,64 +1612,69 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     "meta_info": meta_info,
                 }
 
-            elif isinstance(recv_obj, BatchTokenIDOutput):
-                is_stream = getattr(state.obj, "stream", False)
-                if self.server_args.stream_output and is_stream:
-                    state.output_ids.extend(recv_obj.output_ids[i])
-                    output_token_ids = state.output_ids[state.last_output_offset :]
+            elif is_token_id_output:
+                is_stream = getattr(state_obj, "stream", False)
+                new_ids = output_ids_list[i]
+                state.output_ids += new_ids
+                if stream_output and is_stream:
+                    # Streaming: only send new tokens since last offset
+                    output_token_ids = state.output_ids[state.last_output_offset:]
                     state.last_output_offset = len(state.output_ids)
+                elif is_finished:
+                    # Non-streaming, finished: copy needed for final result
+                    output_token_ids = state.output_ids[:]
                 else:
-                    state.output_ids.extend(recv_obj.output_ids[i])
-                    output_token_ids = state.output_ids.copy()
+                    # Non-streaming, not finished: use reference (intermediate results are discarded)
+                    output_token_ids = state.output_ids
 
                 out_dict = {
                     "output_ids": output_token_ids,
                     "meta_info": meta_info,
                 }
-            elif isinstance(recv_obj, BatchMultimodalOutput):
-                raise NotImplementedError("BatchMultimodalOut not implemented")
             else:
-                assert isinstance(recv_obj, BatchEmbeddingOutput)
+                # BatchEmbeddingOutput
                 out_dict = {
-                    "embedding": recv_obj.embeddings[i],
+                    "embedding": embeddings[i],
                     "meta_info": meta_info,
                 }
+            state.finished = is_finished
+            if is_finished:
+                # Get both timestamps together to minimize syscalls
+                now_time = time.time()
+                now_perf = time.perf_counter()
+                state.finished_time = now_time
+                state.finished_time_perf = now_perf
+                meta_info["e2e_latency"] = now_time - state.created_time
 
-            state.finished = recv_obj.finished_reasons[i] is not None
-            if state.finished:
-                state.finished_time = time.time()
-                state.finished_time_perf = time.perf_counter()
-                meta_info["e2e_latency"] = state.finished_time - state.created_time
-
-                if self.server_args.speculative_algorithm:
+                if server_args.speculative_algorithm:
                     self._calculate_spec_decoding_metrics(meta_info, recv_obj, i)
-                if self.enable_metrics:
+                if enable_metrics:
                     self._calculate_timing_metrics(meta_info, state, recv_obj, i)
 
-                trace_req_finish(rid, ts=int(state.finished_time * 1e9))
+                trace_req_finish(rid, ts=int(now_time * 1e9))
 
-                del self.rid_to_state[rid]
+                del rid_to_state[rid]
 
                 # Mark ongoing LoRA request as finished.
-                if self.server_args.enable_lora and state.obj.lora_path:
-                    asyncio.create_task(self.lora_registry.release(state.obj.lora_id))
+                if server_args.enable_lora and state_obj.lora_path:
+                    asyncio.create_task(self.lora_registry.release(state_obj.lora_id))
 
             state.out_list.append(out_dict)
             state.event.set()
 
             # Log metrics and dump
-            if self.enable_metrics and state.obj.log_metrics:
+            if enable_metrics and state_obj.log_metrics:
                 self.collect_metrics(state, recv_obj, i)
-            if self.dump_requests_folder and state.finished and state.obj.log_metrics:
+            if self.dump_requests_folder and is_finished and state_obj.log_metrics:
                 self.dump_requests(state, out_dict)
-            if self.crash_dump_folder and state.finished and state.obj.log_metrics:
+            if self.crash_dump_folder and is_finished and state_obj.log_metrics:
                 self.record_request_for_crash_dump(state, out_dict)
 
-        # When skip_tokenizer_init is enabled, tokensizer_manager receives
-        # BatchTokenIDOutput.
+        # When skip_tokenizer_init is enabled, tokenizer_manager receives
+        # BatchTokenIDOutput. Use pre-computed type flags instead of isinstance.
         if (
-            self.server_args.dp_size > 1
-            and isinstance(recv_obj, (BatchStrOutput, BatchTokenIDOutput))
+            server_args.dp_size > 1
+            and (is_str_output or is_token_id_output)
             and recv_obj.load is not None
         ):
             load_update_req = WatchLoadUpdateReq(loads=[recv_obj.load])
@@ -1881,10 +1940,11 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             meta_info["inference_time"] = inference_time
 
         # Decode throughput, time per token calculation. Only calculated if TTFT is available.
+        # Use hasattr instead of isinstance for faster type checking
         if (
             state.first_token_time_perf > 0.0
             and state.finished_time_perf > 0.0
-            and not isinstance(recv_obj, BatchEmbeddingOutput)
+            and hasattr(recv_obj, "completion_tokens")
             and recv_obj.completion_tokens[i] > 0
         ):
             decode_time = state.finished_time_perf - state.first_token_time_perf
