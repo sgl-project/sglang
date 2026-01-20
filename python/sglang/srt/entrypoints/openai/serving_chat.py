@@ -283,7 +283,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 # If content is a list (e.g., multimodal), convert to string representation
                 current_content = str(current_content)
 
-            new_content = tool_prohibit_msg + current_content
+            new_content = current_content + tool_prohibit_msg
             last_msg.content = new_content
             logger.info(
                 f"Inserted tool prohibition text to last message for tool_choice=none"
