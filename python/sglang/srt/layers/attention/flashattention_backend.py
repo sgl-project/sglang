@@ -22,7 +22,11 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 from sgl_kernel import merge_state_v2
-from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+from sgl_kernel.flash_attn import flash_attn_varlen_func as flash_attn_varlen_func_fa3
+from sgl_kernel.flash_attn import flash_attn_with_kvcache as flash_attn_with_kvcache_fa3
+
+flash_attn_varlen_func = flash_attn_varlen_func_fa3
+flash_attn_with_kvcache = flash_attn_with_kvcache_fa3
 
 from sglang.jit_kernel.flash_attention_v4 import (
     flash_attn_varlen_func as flash_attn_varlen_func_fa4,
@@ -803,8 +807,8 @@ class FlashAttentionBackend(AttentionBackend):
             and not is_swa_layer
         )
 
-        flash_attn_varlen_func_base = flash_attn_varlen_func
-        flash_attn_with_kvcache_base = flash_attn_with_kvcache
+        flash_attn_varlen_func_base = flash_attn_varlen_func_fa3
+        flash_attn_with_kvcache_base = flash_attn_with_kvcache_fa3
 
         flash_attn_varlen_func = (
             flash_attn_varlen_func_fa4
