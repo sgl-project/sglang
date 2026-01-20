@@ -124,13 +124,8 @@ class CudaPlatformBase(Platform):
         if empty_cache:
             torch.cuda.empty_cache()
 
-        # Orin, Thor, Spark
-        # SM 8.7 is Orin, 11.0 is Thor, 12.1 is Spark
-        SHARED_SYSMEM_DEVICE_MEM_SMS = (87, 110, 121)
-        capability = cls.get_device_capability(device_id)
-        sm = capability.to_int() if capability else 0
-
-        if sm in SHARED_SYSMEM_DEVICE_MEM_SMS:
+        device_props = torch.cuda.get_device_properties(device_id)
+        if device_props.is_integrated:
             free_gpu_memory = psutil.virtual_memory().available
         else:
             free_gpu_memory, _ = torch.cuda.mem_get_info(device_id)
@@ -245,6 +240,9 @@ class CudaPlatformBase(Platform):
         elif selected_backend == AttentionBackendEnum.TORCH_SDPA:
             logger.info("Using Torch SDPA backend")
             return "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
+        elif selected_backend == AttentionBackendEnum.SLA_ATTN:
+            logger.info("Using Sparse Linear Attention backend")
+            return "sglang.multimodal_gen.runtime.layers.attention.backends.sparse_linear_attn.SparseLinearAttentionBackend"
         elif selected_backend in [
             AttentionBackendEnum.FA,
         ]:
