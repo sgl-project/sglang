@@ -565,10 +565,16 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             from triton_kernels.numerics_details.mxfp import upcast_from_mxfp
 
             w13_weight = upcast_from_mxfp(
-                layer.w13_weight, layer.w13_weight_scale, dtype=torch.bfloat16, axis=-1
+                layer.w13_weight,
+                layer.w13_weight_scale,
+                target_dtype=torch.bfloat16,
+                axis=-1,
             )
             w2_weight = upcast_from_mxfp(
-                layer.w2_weight, layer.w2_weight_scale, dtype=torch.bfloat16, axis=-1
+                layer.w2_weight,
+                layer.w2_weight_scale,
+                target_dtype=torch.bfloat16,
+                axis=-1,
             )
             del layer.w13_weight
             del layer.w2_weight
@@ -668,7 +674,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 layer.moe_ep_rank * layer.num_local_experts,  # local_expert_offset
                 layer.num_local_experts,  # local num experts
                 None,
-                None,  # tile_tokens_dim
                 1,  # routing_method_type, renormalize
                 True,  # do finalize
                 tune_max_num_tokens=next_power_of_2(x_quant.shape[0]),
