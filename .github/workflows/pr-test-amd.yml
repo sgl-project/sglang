@@ -641,7 +641,7 @@ jobs:
           bash scripts/ci/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-c-test-large-8-gpu-amd-mi35x --auto-partition-id ${{ matrix.part }} --auto-partition-size 3 --timeout-per-file 3600
 
   stage-b-test-small-1-gpu-performance-amd:
-    needs: [check-changes, call-gate, stage-b-test-small-1-gpu-amd]
+    needs: [check-changes, call-gate, stage-a-test-1-amd]
     if: |
       always() &&
       (
@@ -680,7 +680,7 @@ jobs:
           bash scripts/ci/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-small-1-gpu-performance-amd --timeout-per-file 1200
 
   stage-b-test-large-1-gpu-performance-amd:
-    needs: [check-changes, call-gate, stage-b-test-small-1-gpu-amd]
+    needs: [check-changes, call-gate, stage-a-test-1-amd]
     if: |
       always() &&
       (
@@ -720,7 +720,7 @@ jobs:
           bash scripts/ci/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-large-1-gpu-performance-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --timeout-per-file 1200
 
   stage-b-test-large-2-gpu-performance-amd:
-    needs: [check-changes, call-gate, stage-b-test-small-1-gpu-amd]
+    needs: [check-changes, call-gate, stage-a-test-1-amd]
     if: |
       always() &&
       (
