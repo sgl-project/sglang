@@ -19,7 +19,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     mxfp8_group_quantize,
     triton_mxfp8_blockscaled_linear,
 )
-from sglang.srt.utils import is_sm100_supported, is_triton_kernels_available
+from sglang.srt.utils import is_sm100_supported
 from sglang.test.test_utils import CustomTestCase
 
 _is_cuda = torch.cuda.is_available() and torch.version.cuda
@@ -28,12 +28,12 @@ _is_cuda = torch.cuda.is_available() and torch.version.cuda
 # For test
 @lru_cache(maxsize=1)
 def _get_triton_mxfp8_upcast():
-    if not is_triton_kernels_available():
-        return None
     try:
         from triton_kernels.numerics_details.mxfp import upcast_from_mxfp_torch
-    except Exception:
-        return None
+    except Exception as err:
+        raise RuntimeError(
+            "MXFP8 dequantization requires triton_kernels with MXFP8 support."
+        ) from err
     return upcast_from_mxfp_torch
 
 
@@ -431,20 +431,9 @@ class TestW8A8BlockFP8Matmul(CustomTestCase):
                 self._w8a8_block_fp8_matmul(*params)
 
 
-def _ue8m0_to_f32(scale_u8: torch.Tensor) -> torch.Tensor:
-    scale_i32 = scale_u8.to(torch.int32)
-    value = (scale_i32 << 23).view(torch.float32)
-    return value.masked_fill(scale_i32 == 255, float("nan"))
-
-
 def _mxfp8_group_dequant(q: torch.Tensor, scale_u8: torch.Tensor) -> torch.Tensor:
     upcast_from_mxfp_torch = _get_triton_mxfp8_upcast()
-    if upcast_from_mxfp_torch is not None:
-        return upcast_from_mxfp_torch(q, scale_u8, torch.float32, axis=1)
-    m, k = q.shape
-    q_view = q.view(m, k // 32, 32).to(torch.float32)
-    scale_f32 = _ue8m0_to_f32(scale_u8)
-    return (q_view * scale_f32.unsqueeze(2)).view(m, k)
+    return upcast_from_mxfp_torch(q, scale_u8, torch.float32, axis=1)
 
 
 class TestMXFP8DenseLinear(CustomTestCase):
