@@ -137,8 +137,8 @@ from sglang.srt.server_args import (
     get_global_server_args,
     set_global_server_args_for_scheduler,
 )
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.dflash_utils import resolve_dflash_target_layer_ids
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     MultiprocessingSerializer,
     cpu_has_amx_support,
@@ -352,16 +352,25 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 model_revision=server_args.speculative_draft_model_revision,
                 is_draft_model=True,
             )
-            draft_num_layers = getattr(draft_model_config.hf_config, "num_hidden_layers", None)
-            target_num_layers = getattr(self.model_config.hf_config, "num_hidden_layers", None)
+            draft_num_layers = getattr(
+                draft_model_config.hf_config, "num_hidden_layers", None
+            )
+            target_num_layers = getattr(
+                self.model_config.hf_config, "num_hidden_layers", None
+            )
             if draft_num_layers is None or target_num_layers is None:
                 raise ValueError(
                     "DFLASH requires both draft and target to expose num_hidden_layers in config. "
                     f"Got draft={draft_num_layers}, target={target_num_layers}."
                 )
 
-            trained_target_layers = getattr(draft_model_config.hf_config, "num_target_layers", None)
-            if trained_target_layers is not None and trained_target_layers != target_num_layers:
+            trained_target_layers = getattr(
+                draft_model_config.hf_config, "num_target_layers", None
+            )
+            if (
+                trained_target_layers is not None
+                and trained_target_layers != target_num_layers
+            ):
                 logger.warning(
                     "DFLASH draft config num_target_layers=%s differs from runtime target num_hidden_layers=%s; "
                     "selecting capture layers based on the runtime target model.",

@@ -589,7 +589,8 @@ class FlashInferAttnBackend(AttentionBackend):
             # custom mask, so we must avoid initializing `custom_mask_buf`, otherwise
             # FlashInfer will treat the (zero) buffer as a real mask and block attention.
             use_custom_mask = (
-                spec_info is not None and getattr(spec_info, "custom_mask", None) is not None
+                spec_info is not None
+                and getattr(spec_info, "custom_mask", None) is not None
             )
             prefill_wrappers = []
             for i in range(self.num_wrappers):

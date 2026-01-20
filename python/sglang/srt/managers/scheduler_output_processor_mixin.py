@@ -44,7 +44,9 @@ class SchedulerOutputProcessorMixin:
     We put them into a separate file to make the `scheduler.py` shorter.
     """
 
-    def _release_kv_cache_and_draft(self: Scheduler, req: Req, *, is_insert: bool = True):
+    def _release_kv_cache_and_draft(
+        self: Scheduler, req: Req, *, is_insert: bool = True
+    ):
         release_kv_cache(req, self.tree_cache, is_insert=is_insert)
         draft_worker = getattr(self, "draft_worker", None)
         hook = getattr(draft_worker, "on_req_finished", None) if draft_worker else None

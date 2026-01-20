@@ -1,9 +1,8 @@
 import logging
 from copy import deepcopy
-from typing import List, Optional, Union
+from typing import Optional, Union
 
 import torch
-import torch.nn.functional as F
 
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
@@ -84,7 +83,9 @@ class DFlashWorker:
         draft_server_args.decode_attention_backend = None
         draft_server_args.attention_backend = draft_backend
         # Keep draft context length aligned with the target.
-        draft_server_args.context_length = target_worker.model_runner.model_config.context_len
+        draft_server_args.context_length = (
+            target_worker.model_runner.model_config.context_len
+        )
         self.draft_worker = TpModelWorker(
             server_args=draft_server_args,
             gpu_id=gpu_id,
@@ -105,7 +106,9 @@ class DFlashWorker:
         else:
             self.block_size = int(server_args.speculative_num_draft_tokens)
             model_block_size = getattr(self.draft_model, "block_size", None)
-            if model_block_size is not None and int(model_block_size) != int(self.block_size):
+            if model_block_size is not None and int(model_block_size) != int(
+                self.block_size
+            ):
                 logger.warning(
                     "DFLASH block size mismatch: using speculative_num_draft_tokens=%s but draft config block_size=%s.",
                     self.block_size,
@@ -133,8 +136,12 @@ class DFlashWorker:
             self.block_size, device=self.device, dtype=torch.int64
         )
         self._draft_block_ids_buf: Optional[torch.Tensor] = None  # [cap_bs, block_size]
-        self._draft_block_positions_buf: Optional[torch.Tensor] = None  # [cap_bs, block_size]
-        self._draft_block_tokens_buf: Optional[torch.Tensor] = None  # [cap_bs, block_size]
+        self._draft_block_positions_buf: Optional[torch.Tensor] = (
+            None  # [cap_bs, block_size]
+        )
+        self._draft_block_tokens_buf: Optional[torch.Tensor] = (
+            None  # [cap_bs, block_size]
+        )
         self._draft_block_end_buf: Optional[torch.Tensor] = None  # [cap_bs]
         self._draft_seq_lens_cpu_buf: Optional[torch.Tensor] = None  # [cap_bs] on CPU
         self._draft_block_spec_info = DFlashVerifyInput(
@@ -153,7 +160,11 @@ class DFlashWorker:
         self._draft_greedy_index_cap: int = 0
 
     def _ensure_draft_block_buffers(self, bs: int) -> None:
-        cap = 0 if self._draft_block_ids_buf is None else int(self._draft_block_ids_buf.shape[0])
+        cap = (
+            0
+            if self._draft_block_ids_buf is None
+            else int(self._draft_block_ids_buf.shape[0])
+        )
         if cap >= int(bs):
             return
 
@@ -172,7 +183,9 @@ class DFlashWorker:
         self._draft_block_end_buf = torch.empty(
             (new_cap,), dtype=torch.int32, device=device
         )
-        self._draft_seq_lens_cpu_buf = torch.empty((new_cap,), dtype=torch.int32, device="cpu")
+        self._draft_seq_lens_cpu_buf = torch.empty(
+            (new_cap,), dtype=torch.int32, device="cpu"
+        )
 
     def __getattr__(self, name):
         # Delegate anything not implemented yet to the target worker.
@@ -190,11 +203,15 @@ class DFlashWorker:
 
     def _resolve_mask_token_id(self, *, mask_token: str) -> int:
         if not isinstance(mask_token, str) or not mask_token:
-            raise ValueError(f"DFLASH mask_token must be a non-empty string, got {mask_token!r}.")
+            raise ValueError(
+                f"DFLASH mask_token must be a non-empty string, got {mask_token!r}."
+            )
 
         tokenizer = getattr(self.target_worker, "tokenizer", None)
         if tokenizer is None:
-            raise RuntimeError("DFLASH requires tokenizer initialization (skip_tokenizer_init is not supported).")
+            raise RuntimeError(
+                "DFLASH requires tokenizer initialization (skip_tokenizer_init is not supported)."
+            )
 
         vocab_size = int(self.target_worker.model_runner.model_config.vocab_size)
         mask_token_id = None
@@ -239,12 +256,16 @@ class DFlashWorker:
 
         return int(mask_token_id)
 
-    def _prepare_for_speculative_decoding(self, batch: ScheduleBatch, draft_input: DFlashDraftInput):
+    def _prepare_for_speculative_decoding(
+        self, batch: ScheduleBatch, draft_input: DFlashDraftInput
+    ):
         if batch.forward_mode.is_extend() or batch.forward_mode.is_idle():
             return
 
         if batch.has_grammar:
-            raise ValueError("DFLASH does not support grammar-constrained decoding yet.")
+            raise ValueError(
+                "DFLASH does not support grammar-constrained decoding yet."
+            )
         if batch.sampling_info is not None and not batch.sampling_info.is_all_greedy:
             if not self._warned_forced_greedy and self.tp_rank == 0:
                 logger.warning(
@@ -262,7 +283,11 @@ class DFlashWorker:
         target_model = self.target_worker.model_runner.model
         embed_module = target_model.get_input_embeddings()
         lm_head = getattr(target_model, "lm_head", None)
-        if lm_head is None or not hasattr(lm_head, "weight") or not hasattr(lm_head, "shard_indices"):
+        if (
+            lm_head is None
+            or not hasattr(lm_head, "weight")
+            or not hasattr(lm_head, "shard_indices")
+        ):
             raise RuntimeError(
                 "DFLASH requires the target model to expose a vocab-parallel `lm_head` with `weight` and "
                 "`shard_indices` attributes."
@@ -381,7 +406,11 @@ class DFlashWorker:
             build_custom_mask=build_custom_mask,
         )
 
-        batch.forward_mode = ForwardMode.TARGET_VERIFY if not batch.forward_mode.is_idle() else ForwardMode.IDLE
+        batch.forward_mode = (
+            ForwardMode.TARGET_VERIFY
+            if not batch.forward_mode.is_idle()
+            else ForwardMode.IDLE
+        )
         batch.spec_info = verify_input
         batch.return_hidden_states = False
 
@@ -440,7 +469,8 @@ class DFlashWorker:
                 if num_org > 0:
                     base_logits = torch.matmul(hs, weight[:num_org].T)
                     out_token_ids[start:end] = (
-                        torch.argmax(base_logits, dim=-1).to(torch.long) + org_vocab_start
+                        torch.argmax(base_logits, dim=-1).to(torch.long)
+                        + org_vocab_start
                     )
                 else:
                     out_token_ids[start:end] = 0
@@ -470,23 +500,31 @@ class DFlashWorker:
             if num_added > 0:
                 added_slice_start = num_org_padded
                 added_slice_end = num_org_padded + num_added
-                added_logits = torch.matmul(hs, weight[added_slice_start:added_slice_end].T)
+                added_logits = torch.matmul(
+                    hs, weight[added_slice_start:added_slice_end].T
+                )
                 added_max, added_arg = torch.max(added_logits, dim=-1)
                 use_added = added_max > local_max
                 local_max = torch.where(use_added, added_max, local_max)
                 # For base/added conversion below, keep local_arg expressed in the full local
                 # weight index space (base + padding + added), matching `lm_head.weight`.
-                local_arg = torch.where(use_added, added_arg.to(local_arg.dtype) + num_org_padded, local_arg)
+                local_arg = torch.where(
+                    use_added, added_arg.to(local_arg.dtype) + num_org_padded, local_arg
+                )
 
             # Convert local argmax indices to global token ids.
             if num_added == 0:
                 local_arg.add_(org_vocab_start)
                 global_ids = local_arg
             else:
-                global_ids = torch.empty((chunk_len,), dtype=torch.int64, device=hs.device)
+                global_ids = torch.empty(
+                    (chunk_len,), dtype=torch.int64, device=hs.device
+                )
                 is_base = local_arg < num_org
                 global_ids[is_base] = org_vocab_start + local_arg[is_base]
-                global_ids[~is_base] = added_vocab_start + (local_arg[~is_base] - num_org_padded)
+                global_ids[~is_base] = added_vocab_start + (
+                    local_arg[~is_base] - num_org_padded
+                )
 
             if tp_size == 1:
                 out_token_ids[start:end] = global_ids.to(torch.long)
@@ -565,7 +603,9 @@ class DFlashWorker:
         device = self.model_runner.device
 
         if draft_input.target_hidden is None:
-            raise RuntimeError("DFLASH draft state missing target_hidden context features.")
+            raise RuntimeError(
+                "DFLASH draft state missing target_hidden context features."
+            )
         if draft_input.ctx_lens.numel() != bs:
             raise RuntimeError(
                 f"DFLASH ctx_lens length mismatch: got {draft_input.ctx_lens.numel()} for bs={bs}."
@@ -664,7 +704,9 @@ class DFlashWorker:
         **kwargs,
     ) -> GenerationBatchResult:
         if getattr(batch, "return_logprob", False):
-            raise ValueError("DFLASH speculative decoding does not support return_logprob yet.")
+            raise ValueError(
+                "DFLASH speculative decoding does not support return_logprob yet."
+            )
 
         if isinstance(batch, ModelWorkerBatch):
             # Should not happen for spec-v1 (non-overlap) scheduling, but keep a sane fallback.
@@ -687,7 +729,10 @@ class DFlashWorker:
                     "Make sure the target model has DFlash layers-to-capture configured."
                 )
 
-            if model_worker_batch.extend_seq_lens is None or model_worker_batch.extend_prefix_lens is None:
+            if (
+                model_worker_batch.extend_seq_lens is None
+                or model_worker_batch.extend_prefix_lens is None
+            ):
                 raise RuntimeError(
                     "DFLASH expected extend_seq_lens / extend_prefix_lens to be populated in extend mode, but got None."
                 )
@@ -707,7 +752,9 @@ class DFlashWorker:
                 verified_id=next_token_ids.to(torch.int64),
                 target_hidden=logits_output.hidden_states,
                 ctx_lens=_to_int32_device_tensor(model_worker_batch.extend_seq_lens),
-                draft_seq_lens=_to_int32_device_tensor(model_worker_batch.extend_prefix_lens),
+                draft_seq_lens=_to_int32_device_tensor(
+                    model_worker_batch.extend_prefix_lens
+                ),
             )
             self._append_target_hidden_to_draft_kv(batch, draft_input)
             batch.spec_info = draft_input

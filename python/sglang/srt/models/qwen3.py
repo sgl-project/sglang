@@ -593,7 +593,9 @@ class Qwen3ForCausalLM(nn.Module):
             return
 
         if layer_ids is None:
-            raise ValueError("DFLASH requires explicit layer_ids for aux hidden capture.")
+            raise ValueError(
+                "DFLASH requires explicit layer_ids for aux hidden capture."
+            )
 
         self.capture_aux_hidden_states = True
         # SGLang captures "before layer i". To capture the hidden state after target

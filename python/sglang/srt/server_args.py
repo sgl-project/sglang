@@ -2116,18 +2116,18 @@ class ServerArgs:
                         "DFLASH requires --speculative-dflash-block-size to be positive, "
                         f"got {self.speculative_dflash_block_size}."
                     )
-                if (
-                    self.speculative_num_draft_tokens is not None
-                    and int(self.speculative_num_draft_tokens)
-                    != int(self.speculative_dflash_block_size)
-                ):
+                if self.speculative_num_draft_tokens is not None and int(
+                    self.speculative_num_draft_tokens
+                ) != int(self.speculative_dflash_block_size):
                     raise ValueError(
                         "Both --speculative-num-draft-tokens and --speculative-dflash-block-size are set "
                         "but they differ. For DFLASH they must match. "
                         f"speculative_num_draft_tokens={self.speculative_num_draft_tokens}, "
                         f"speculative_dflash_block_size={self.speculative_dflash_block_size}."
                     )
-                self.speculative_num_draft_tokens = int(self.speculative_dflash_block_size)
+                self.speculative_num_draft_tokens = int(
+                    self.speculative_dflash_block_size
+                )
 
             if self.speculative_num_draft_tokens is None:
                 inferred_block_size = None
@@ -2139,7 +2139,9 @@ class ServerArgs:
                         if os.path.isfile(draft_config_path):
                             with open(draft_config_path, "r") as f:
                                 draft_config_json = json.load(f)
-                            top_level_block_size = draft_config_json.get("block_size", None)
+                            top_level_block_size = draft_config_json.get(
+                                "block_size", None
+                            )
                             dflash_cfg = draft_config_json.get("dflash_config", None)
                             dflash_block_size = (
                                 dflash_cfg.get("block_size", None)
@@ -2149,10 +2151,9 @@ class ServerArgs:
 
                             if dflash_block_size is not None:
                                 inferred_block_size = dflash_block_size
-                                if (
-                                    top_level_block_size is not None
-                                    and int(dflash_block_size) != int(top_level_block_size)
-                                ):
+                                if top_level_block_size is not None and int(
+                                    dflash_block_size
+                                ) != int(top_level_block_size):
                                     logger.warning(
                                         "DFLASH draft config has both block_size=%s and dflash_config.block_size=%s; "
                                         "using dflash_config.block_size for speculative_num_draft_tokens inference.",

@@ -4,7 +4,6 @@ from typing import Any, List, Tuple
 
 import torch
 
-
 DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
 
 
@@ -27,7 +26,9 @@ def build_target_layer_ids(num_target_layers: int, num_draft_layers: int) -> Lis
           when mapping to capture points.
     """
     if num_target_layers <= 0:
-        raise ValueError(f"num_target_layers must be positive, got {num_target_layers}.")
+        raise ValueError(
+            f"num_target_layers must be positive, got {num_target_layers}."
+        )
     if num_draft_layers <= 0:
         raise ValueError(f"num_draft_layers must be positive, got {num_draft_layers}.")
 

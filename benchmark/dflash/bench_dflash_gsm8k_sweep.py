@@ -15,8 +15,8 @@ import argparse
 import ast
 import os
 import re
-import time
 import statistics
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Optional
@@ -182,7 +182,9 @@ def _run_gsm8k_requests(
         bs = max(int(concurrency), 1)
         for start_idx in range(0, len(prompts), bs):
             chunk_prompts = prompts[start_idx : start_idx + bs]
-            chunk_labels = labels[start_idx : start_idx + bs] if labels is not None else None
+            chunk_labels = (
+                labels[start_idx : start_idx + bs] if labels is not None else None
+            )
             outs = _send_generate_batch(
                 base_url,
                 chunk_prompts,
@@ -381,12 +383,17 @@ def main() -> None:
         raise RuntimeError("No concurrencies specified.")
 
     num_questions_by_conc = {
-        c: min(int(args.questions_per_concurrency_base) * int(c), int(args.max_questions_per_config))
+        c: min(
+            int(args.questions_per_concurrency_base) * int(c),
+            int(args.max_questions_per_config),
+        )
         for c in concurrencies
     }
     max_questions = max(num_questions_by_conc.values())
 
-    attention_backends = [s.strip() for s in args.attention_backends.split(",") if s.strip()]
+    attention_backends = [
+        s.strip() for s in args.attention_backends.split(",") if s.strip()
+    ]
     is_blackwell = _is_blackwell()
     device_sm = get_device_sm()
     if is_blackwell:
@@ -436,7 +443,9 @@ def main() -> None:
         raise RuntimeError("Invalid labels in GSM8K data.")
 
     default_stop = (
-        ["Question", "Assistant:", "<|separator|>"] if args.prompt_style == "fewshot_qa" else []
+        ["Question", "Assistant:", "<|separator|>"]
+        if args.prompt_style == "fewshot_qa"
+        else []
     )
 
     # Results indexed by (backend, tp, concurrency) for baseline + dflash.
@@ -464,7 +473,12 @@ def main() -> None:
                 str(args.max_running_requests),
             ]
             common_server_args.extend(
-                ["--cuda-graph-bs", *[str(i) for i in range(1, 33)], "--cuda-graph-max-bs", "32"]
+                [
+                    "--cuda-graph-bs",
+                    *[str(i) for i in range(1, 33)],
+                    "--cuda-graph-max-bs",
+                    "32",
+                ]
             )
             if args.disable_radix_cache:
                 common_server_args.append("--disable-radix-cache")
@@ -587,7 +601,9 @@ def main() -> None:
     md_lines.append(f"- attention_backends: `{', '.join(attention_backends)}`")
     md_lines.append(f"- tp_sizes: `{', '.join(str(x) for x in tp_sizes)}`")
     md_lines.append(f"- concurrencies: `{', '.join(str(x) for x in concurrencies)}`")
-    md_lines.append(f"- questions_per_concurrency: `base={args.questions_per_concurrency_base}`")
+    md_lines.append(
+        f"- questions_per_concurrency: `base={args.questions_per_concurrency_base}`"
+    )
     md_lines.append(f"- device_sm: `{device_sm}`")
     md_lines.append(f"- is_blackwell: `{is_blackwell}`")
     md_lines.append(f"- skip_baseline: `{bool(args.skip_baseline)}`")
@@ -617,7 +633,9 @@ def main() -> None:
             for conc in concurrencies:
                 b = baseline_values.get((tp, conc), None)
                 d = dflash_values.get((tp, conc), None)
-                speedup_values[(tp, conc)] = None if (b is None or d is None or b <= 0) else (d / b)
+                speedup_values[(tp, conc)] = (
+                    None if (b is None or d is None or b <= 0) else (d / b)
+                )
 
         md_lines.append("### Baseline output tok/s")
         md_lines.append(
@@ -678,7 +696,9 @@ def main() -> None:
         )
         md_lines.append("")
 
-        md_lines.append("### DFLASH acceptance length (mean per-request spec_accept_length)")
+        md_lines.append(
+            "### DFLASH acceptance length (mean per-request spec_accept_length)"
+        )
         md_lines.append(
             _format_table(
                 tp_sizes=tp_sizes,

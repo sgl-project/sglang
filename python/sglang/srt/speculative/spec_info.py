@@ -64,7 +64,9 @@ class SpeculativeAlgorithm(Enum):
 
         if self.is_dflash():
             if enable_overlap:
-                raise ValueError("DFLASH does not support overlap scheduling (spec v2).")
+                raise ValueError(
+                    "DFLASH does not support overlap scheduling (spec v2)."
+                )
             from sglang.srt.speculative.dflash_worker import DFlashWorker
 
             return DFlashWorker
@@ -134,7 +136,10 @@ class SpecInput(ABC):
     def is_draft_input(self) -> bool:
         # FIXME: remove this function which is only used for assertion
         # or use another variable name like `draft_input` to substitute `spec_info`
-        return self.spec_input_type in {SpecInputType.EAGLE_DRAFT, SpecInputType.DFLASH_DRAFT}
+        return self.spec_input_type in {
+            SpecInputType.EAGLE_DRAFT,
+            SpecInputType.DFLASH_DRAFT,
+        }
 
     def is_verify_input(self) -> bool:
         return self.spec_input_type in {

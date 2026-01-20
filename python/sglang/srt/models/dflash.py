@@ -14,12 +14,12 @@ from torch import nn
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
 )
-from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -37,7 +37,9 @@ class DFlashAttention(nn.Module):
         hidden_size = int(config.hidden_size)
         tp_size = int(get_tensor_model_parallel_world_size())
         total_num_heads = int(config.num_attention_heads)
-        total_num_kv_heads = int(getattr(config, "num_key_value_heads", total_num_heads))
+        total_num_kv_heads = int(
+            getattr(config, "num_key_value_heads", total_num_heads)
+        )
         head_dim = int(getattr(config, "head_dim", hidden_size // total_num_heads))
 
         self.hidden_size = hidden_size
@@ -129,17 +131,23 @@ class DFlashAttention(nn.Module):
         output, _ = self.o_proj(attn_output)
         return output
 
-    def kv_proj_only(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def kv_proj_only(
+        self, hidden_states: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Project hidden_states to K/V only (skip Q).
 
         This is used by DFlash to materialize ctx tokens into the draft KV cache:
         we only need K/V for the cached tokens; Q is never consumed.
         """
         # Fast path for unquantized weights: slice the fused QKV weight and run one GEMM.
-        if isinstance(getattr(self.qkv_proj, "quant_method", None), UnquantizedLinearMethod):
+        if isinstance(
+            getattr(self.qkv_proj, "quant_method", None), UnquantizedLinearMethod
+        ):
             kv_slice = slice(self.q_size, self.q_size + 2 * self.kv_size)
             weight = self.qkv_proj.weight[kv_slice]
-            bias = self.qkv_proj.bias[kv_slice] if self.qkv_proj.bias is not None else None
+            bias = (
+                self.qkv_proj.bias[kv_slice] if self.qkv_proj.bias is not None else None
+            )
             kv = F.linear(hidden_states, weight, bias)
             k, v = kv.split([self.kv_size, self.kv_size], dim=-1)
             return k, v
@@ -167,7 +175,9 @@ class DFlashMLP(nn.Module):
         hidden_size = int(config.hidden_size)
         intermediate_size = int(getattr(config, "intermediate_size", 0))
         if intermediate_size <= 0:
-            raise ValueError(f"Invalid intermediate_size={intermediate_size} for DFlash MLP.")
+            raise ValueError(
+                f"Invalid intermediate_size={intermediate_size} for DFlash MLP."
+            )
 
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
@@ -295,7 +305,10 @@ class DFlashDraftModel(nn.Module):
         )
         if block_size is None:
             block_size = 16
-        elif getattr(config, "block_size", None) is not None and dflash_block_size is not None:
+        elif (
+            getattr(config, "block_size", None) is not None
+            and dflash_block_size is not None
+        ):
             if int(dflash_block_size) != int(getattr(config, "block_size")):
                 logger.warning(
                     "DFLASH draft config has both block_size=%s and dflash_config.block_size=%s; using dflash_config.block_size.",
@@ -339,7 +352,9 @@ class DFlashDraftModel(nn.Module):
         residual: Optional[torch.Tensor] = None
 
         for layer in self.layers:
-            hidden_states, residual = layer(positions, hidden_states, forward_batch, residual)
+            hidden_states, residual = layer(
+                positions, hidden_states, forward_batch, residual
+            )
 
         if hidden_states.numel() == 0:
             return hidden_states
@@ -391,9 +406,9 @@ class DFlashDraftModel(nn.Module):
                     # Ignore unexpected weights (e.g., HF rotary caches).
                     continue
                 param = params_dict[resolved_name]
-                if resolved_name.endswith("fc.weight") and tuple(loaded_weight.shape) != tuple(
-                    param.shape
-                ):
+                if resolved_name.endswith("fc.weight") and tuple(
+                    loaded_weight.shape
+                ) != tuple(param.shape):
                     raise ValueError(
                         "DFLASH fc.weight shape mismatch. This usually means the draft checkpoint's "
                         "number of context features (K) does not match this config. "
