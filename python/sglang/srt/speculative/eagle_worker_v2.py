@@ -1,4 +1,6 @@
 import contextlib
+import copy
+import json
 import logging
 import time
 from typing import List, Optional, Tuple
@@ -49,6 +51,12 @@ from sglang.srt.speculative.spec_utils import (
     generate_token_bitmask,
     load_token_map,
     select_top_k_tokens,
+)
+from sglang.srt.distributed import parallel_state
+from sglang.srt.distributed.parallel_state import (
+    GroupCoordinator,
+    patch_moe_parallel_groups,
+    patch_tensor_parallel_group,
 )
 from sglang.srt.utils.common import (
     MultiprocessingSerializer,
@@ -604,6 +612,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
+        self.is_dp_draft = bool(getattr(server_args, "speculative_dp_draft", False))
 
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
             target_worker.get_memory_pool()
@@ -612,8 +621,15 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # Override the context length of the draft model to be the same as the target model.
         server_args.context_length = target_worker.model_runner.model_config.context_len
 
-        self._draft_worker = EagleDraftWorker(
-            server_args, gpu_id, tp_rank, dp_rank, moe_ep_rank, nccl_port, target_worker
+        draft_worker_cls = DPDraftWorker if self.is_dp_draft else EagleDraftWorker
+        self._draft_worker = draft_worker_cls(
+            server_args,
+            gpu_id,
+            tp_rank,
+            dp_rank,
+            moe_ep_rank,
+            nccl_port,
+            target_worker,
         )
 
         # Some dummy tensors
@@ -865,3 +881,146 @@ class EAGLEWorkerV2(BaseSpecWorker):
             load_format=recv_req.load_format,
         )
         return success, message
+
+
+class _DPDraftGroup(GroupCoordinator):
+    """DP-Draft group: single-rank group to disable cross-rank communication."""
+
+    def __init__(self, device: str):
+        orig_tp_group = parallel_state.get_tp_group()
+        # NOTE: This intentionally skips GroupCoordinator.__init__ to avoid
+        # creating multi-rank communication groups. We only need a minimal,
+        # single-rank-compatible interface for draft-only execution.
+        self.world_size = 1
+        self.rank = orig_tp_group.rank
+        self.rank_in_group = 0
+        self.local_rank = orig_tp_group.local_rank
+        self.ranks = [self.rank]
+        self.device = getattr(orig_tp_group, "device", device)
+        self.device_module = torch.get_device_module(self.device)
+        self.ca_comm = None
+        self.pynccl_comm = None
+        self.pymscclpp_comm = None
+        backend = torch.distributed.get_backend(
+            parallel_state.get_world_group().device_group
+        )
+        self.device_group = torch.distributed.new_group(self.ranks, backend=backend)
+        self.cpu_group = torch.distributed.new_group(self.ranks, backend="gloo")
+
+    def barrier(self):
+        return None
+
+    def all_reduce(self, x):
+        return x
+
+    def all_gather(self, x, dim=-1):
+        return x
+
+
+@contextlib.contextmanager
+def dp_draft_context(group: GroupCoordinator):
+    """Run draft model with TP/MoE-TP/MoE-EP forced to a single-rank group."""
+    with patch_tensor_parallel_group(group), patch_moe_parallel_groups(group, group):
+        yield
+
+
+class DPDraftWorker(EagleDraftWorker):
+    """DP-Draft worker that runs draft model in single-GPU mode."""
+
+    def __init__(
+        self,
+        server_args: ServerArgs,
+        gpu_id: int,
+        tp_rank: int,
+        dp_rank: int,
+        moe_ep_rank: int,
+        nccl_port: int,
+        target_worker: TpModelWorker,
+    ):
+        single_gpu_args = copy.copy(server_args)
+        self._apply_single_gpu_defaults(single_gpu_args)
+        self._dpdraft_group = _DPDraftGroup(single_gpu_args.device)
+        with (
+            self._dpdraft_context(),
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+        ):
+            # Force draft MoE A2A backend to NONE for single-GPU draft.
+            from sglang.srt.layers.moe import utils as moe_utils
+
+            prev_a2a = moe_utils.SPECULATIVE_MOE_A2A_BACKEND
+            moe_utils.SPECULATIVE_MOE_A2A_BACKEND = moe_utils.MoeA2ABackend.NONE
+            final_a2a = moe_utils.SPECULATIVE_MOE_A2A_BACKEND
+            super().__init__(
+                server_args=single_gpu_args,
+                gpu_id=gpu_id,
+                tp_rank=0,
+                dp_rank=0,
+                moe_ep_rank=0,
+                nccl_port=nccl_port,
+                target_worker=target_worker,
+            )
+
+        self.draft_runner.tp_group = self._dpdraft_group
+
+        self.draft_tp_context = empty_context
+
+        logger.info(
+            "[DP-Draft] Ready: draft model initialized in dp draft mode "
+            "(draft_model=%s, target(tp=%s dp=%s ep=%s), "
+            "draft(tp=%s dp=%s ep=%s), attn_tp=%s, dp_attn=%s, "
+            "spec_moe_a2a=%s (prev=%s)",
+            type(self.draft_runner.model).__name__,
+            server_args.tp_size,
+            server_args.dp_size,
+            server_args.ep_size,
+            single_gpu_args.tp_size,
+            single_gpu_args.dp_size,
+            single_gpu_args.ep_size,
+            self.draft_runner.attention_tp_group.world_size
+            if hasattr(self.draft_runner, "attention_tp_group")
+            else "N/A",
+            self.server_args.enable_dp_attention,
+            final_a2a,
+            prev_a2a,
+        )
+
+    @staticmethod
+    def _apply_single_gpu_defaults(draft_args: ServerArgs) -> None:
+        draft_args.tp_size = 1
+        draft_args.dp_size = 1
+        draft_args.ep_size = 1
+        draft_args.enable_dp_attention = False
+
+        override_args = {}
+        if draft_args.json_model_override_args:
+            try:
+                override_args = json.loads(draft_args.json_model_override_args)
+            except Exception:
+                override_args = {}
+        override_args["moe_a2a_backend"] = None
+        draft_args.json_model_override_args = json.dumps(override_args)
+
+    def _dpdraft_context(self):
+        return dp_draft_context(self._dpdraft_group)
+
+    def draft(self, model_worker_batch: ModelWorkerBatch):
+        with self._dpdraft_context():
+            return super().draft(model_worker_batch)
+
+    def _draft_extend_for_prefill(
+        self,
+        batch: ModelWorkerBatch,
+        target_hidden_states: torch.Tensor,
+        next_token_ids: torch.Tensor,
+    ):
+        with self._dpdraft_context():
+            return super()._draft_extend_for_prefill(
+                batch, target_hidden_states, next_token_ids
+            )
+
+    def _draft_extend_for_decode(
+        self, batch: ModelWorkerBatch, batch_result: GenerationBatchResult
+    ):
+        with self._dpdraft_context():
+            return super()._draft_extend_for_decode(batch, batch_result)

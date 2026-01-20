@@ -448,6 +448,7 @@ class ServerArgs:
     speculative_num_steps: Optional[int] = None
     speculative_eagle_topk: Optional[int] = None
     speculative_num_draft_tokens: Optional[int] = None
+    speculative_dp_draft: bool = False
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
     speculative_token_map: Optional[str] = None
@@ -2142,6 +2143,17 @@ class ServerArgs:
                     "eagle speculative decoding."
                 )
 
+            if self.speculative_dp_draft:
+                if self.speculative_algorithm not in ("EAGLE", "EAGLE3"):
+                    raise ValueError(
+                        "DP-Draft currently only supports EAGLE/EAGLE3."
+                    )
+                if not envs.SGLANG_ENABLE_SPEC_V2.get():
+                    raise ValueError(
+                        "DP-Draft requires spec v2 overlap worker. "
+                        "Please set SGLANG_ENABLE_SPEC_V2=true."
+                    )
+
             model_arch = self.get_model_config().hf_config.architectures[0]
             if model_arch in [
                 "DeepseekV32ForCausalLM",
@@ -3625,6 +3637,11 @@ class ServerArgs:
             type=int,
             help="The number of tokens sampled from the draft model in Speculative Decoding.",
             default=ServerArgs.speculative_num_draft_tokens,
+        )
+        parser.add_argument(
+            "--speculative-dp-draft",
+            action="store_true",
+            help="Enable DP-Draft mode: run draft model with TP=1 on each GPU locally while target model uses full distributed parallelism.",
         )
         parser.add_argument(
             "--speculative-accept-threshold-single",

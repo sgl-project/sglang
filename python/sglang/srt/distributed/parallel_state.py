@@ -1776,6 +1776,32 @@ def patch_tensor_parallel_group(tp_group: GroupCoordinator):
         _TP = old_tp_group
 
 
+@contextmanager
+def patch_moe_parallel_groups(
+    moe_tp_group: GroupCoordinator, moe_ep_group: GroupCoordinator
+):
+    """Patch the MoE TP/EP groups temporarily until this function ends.
+
+    This method is for draft workers of speculative decoding to run draft model
+    with different MoE TP/EP degrees from that of target model workers.
+
+    Args:
+        moe_tp_group (GroupCoordinator): the MoE TP group coordinator
+        moe_ep_group (GroupCoordinator): the MoE EP group coordinator
+    """
+    global _MOE_TP
+    global _MOE_EP
+    old_moe_tp = _MOE_TP
+    old_moe_ep = _MOE_EP
+    _MOE_TP = moe_tp_group
+    _MOE_EP = moe_ep_group
+    try:
+        yield
+    finally:
+        _MOE_TP = old_moe_tp
+        _MOE_EP = old_moe_ep
+
+
 def get_world_size():
     """Return world size for the world group."""
     return get_world_group().world_size
