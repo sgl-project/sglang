@@ -20,13 +20,16 @@ def fused_gdn_gating_kernel(
     beta: tl.constexpr,
     threshold: tl.constexpr,
     BLK_HEADS: tl.constexpr,
+    a_stride_m: tl.constexpr,
+    a_stride_k: tl.constexpr,
 ):
     i_b, i_s, i_d = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     head_off = i_d * BLK_HEADS + tl.arange(0, BLK_HEADS)
     off = i_b * seq_len * NUM_HEADS + i_s * NUM_HEADS + head_off
     mask = head_off < NUM_HEADS
     blk_A_log = tl.load(A_log + head_off, mask=mask)
-    blk_a = tl.load(a + off, mask=mask)
+    off_a = (i_b * seq_len + i_s) * a_stride_m + head_off * a_stride_k
+    blk_a = tl.load(a + off_a, mask=mask)
     blk_b = tl.load(b + off, mask=mask)
     blk_bias = tl.load(dt_bias + head_off, mask=mask)
     x = blk_a.to(tl.float32) + blk_bias.to(tl.float32)
@@ -64,6 +67,8 @@ def fused_gdn_gating(
         beta,
         threshold,
         8,
+        a.stride(0),
+        a.stride(1),
         num_warps=1,
     )
     return g, beta_output
