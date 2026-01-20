@@ -92,7 +92,6 @@ impl StopSequenceDecoder {
         } else {
             Some(AhoCorasick::new(patterns).expect("Failed to build Aho-Corasick"))
         };
-        let visible_boundary_idx = config.stop_sequences.len();
         StopSequenceDecoder {
             sequence: Sequence::new_with_options(tokenizer, skip_special_tokens),
             config,
