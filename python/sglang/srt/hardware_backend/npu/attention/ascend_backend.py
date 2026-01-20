@@ -871,7 +871,7 @@ class AscendAttnBackend(AttentionBackend):
                 )
                 kv_cache = torch.cat([k_cache, v_cache], dim=-1)
                 attn_output = self.native_attn._run_sdpa_forward_extend(
-                    q_,
+                    q,
                     attn_output,
                     kv_cache.view(-1, layer.tp_k_head_num, layer.qk_head_dim),
                     k_cache.view(-1, layer.tp_v_head_num, layer.v_head_dim),
