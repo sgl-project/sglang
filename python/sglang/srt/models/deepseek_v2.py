@@ -2051,7 +2051,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             if not _use_aiter_gfx95:
                 attn_output = self.attn_mqa(
                     q,
-                    forward_batch.token_to_kv_pool.get_key_buffer(self.attn_mqa.layer_id),#k,
+                    forward_batch.token_to_kv_pool.get_key_buffer(self.attn_mqa.layer_id),
                     k_nope,
                     forward_batch,
                     save_kv_cache=True,
