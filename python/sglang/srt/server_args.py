@@ -45,7 +45,6 @@ from sglang.srt.utils.common import (
     get_quantization_config,
     is_blackwell_supported,
     is_cuda,
-    is_fa3_default_architecture,
     is_flashinfer_available,
     is_hip,
     is_hopper_with_cuda_12_3,
@@ -1628,11 +1627,9 @@ class ServerArgs:
 
             if not use_mla_backend:
                 # MHA architecture
-                if (
-                    is_hopper_with_cuda_12_3()
-                    and is_no_spec_infer_or_topk_one(self)
-                    and is_fa3_default_architecture(self.model_config.hf_config)
-                ):
+                if is_hopper_with_cuda_12_3() and is_no_spec_infer_or_topk_one(self):
+                    # Note: flashinfer 0.6.1 caused performance regression on Hopper attention kernel
+                    # Before the kernel is fixed, we choose fa3 as the default backend on Hopper MHA
                     self.attention_backend = "fa3"
                 elif (
                     is_sm100_supported()
