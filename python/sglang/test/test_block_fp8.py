@@ -1,5 +1,6 @@
 import itertools
 import unittest
+from functools import lru_cache
 
 import torch
 
@@ -14,14 +15,26 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     w8a8_block_fp8_matmul,
 )
 from sglang.srt.layers.quantization.fp8_utils import (
-    mxfp8_group_quantize,
     input_to_float8,
+    mxfp8_group_quantize,
     triton_mxfp8_blockscaled_linear,
 )
-from sglang.srt.utils import is_sm100_supported
+from sglang.srt.utils import is_sm100_supported, is_triton_kernels_available
 from sglang.test.test_utils import CustomTestCase
 
 _is_cuda = torch.cuda.is_available() and torch.version.cuda
+
+
+# For test
+@lru_cache(maxsize=1)
+def _get_triton_mxfp8_upcast():
+    if not is_triton_kernels_available():
+        return None
+    try:
+        from triton_kernels.numerics_details.mxfp import upcast_from_mxfp_torch
+    except Exception:
+        return None
+    return upcast_from_mxfp_torch
 
 
 # For test
@@ -331,7 +344,6 @@ def native_w8a8_block_fp8_matmul(A, B, As, Bs, block_size, output_dtype=torch.fl
 
 
 class TestW8A8BlockFP8Matmul(CustomTestCase):
-
     if not _is_cuda:
         OUT_DTYPES = [torch.float32, torch.half, torch.bfloat16]
         M = [1, 7, 83, 512, 2048]
@@ -420,20 +432,17 @@ class TestW8A8BlockFP8Matmul(CustomTestCase):
 
 
 def _ue8m0_to_f32(scale_u8: torch.Tensor) -> torch.Tensor:
-    scale_u8 = scale_u8.to(torch.float32)
-    is_nan = scale_u8 == 255
-    e = scale_u8.clone()
-    e[is_nan] = 0
-    value = torch.pow(2.0, e - 127.0)
-    value[is_nan] = float("nan")
-    return value
+    scale_i32 = scale_u8.to(torch.int32)
+    value = (scale_i32 << 23).view(torch.float32)
+    return value.masked_fill(scale_i32 == 255, float("nan"))
 
 
-def _mxfp8_group_dequant(
-    q: torch.Tensor, scale_u8: torch.Tensor, group_size: int = 32
-) -> torch.Tensor:
+def _mxfp8_group_dequant(q: torch.Tensor, scale_u8: torch.Tensor) -> torch.Tensor:
+    upcast_from_mxfp_torch = _get_triton_mxfp8_upcast()
+    if upcast_from_mxfp_torch is not None:
+        return upcast_from_mxfp_torch(q, scale_u8, torch.float32, axis=1)
     m, k = q.shape
-    q_view = q.view(m, k // group_size, group_size).to(torch.float32)
+    q_view = q.view(m, k // 32, 32).to(torch.float32)
     scale_f32 = _ue8m0_to_f32(scale_u8)
     return (q_view * scale_f32.unsqueeze(2)).view(m, k)
 
@@ -468,9 +477,7 @@ class TestMXFP8DenseLinear(CustomTestCase):
         weight_q, weight_scale_u8 = mxfp8_group_quantize(weight_fp32)
 
         with torch.inference_mode():
-            q_input, input_scale_u8 = mxfp8_group_quantize(
-                input_fp16.to(torch.float32)
-            )
+            q_input, input_scale_u8 = mxfp8_group_quantize(input_fp16.to(torch.float32))
             a_dq = _mxfp8_group_dequant(q_input, input_scale_u8)
             b_dq = _mxfp8_group_dequant(weight_q, weight_scale_u8)
             ref_out = torch.matmul(a_dq, b_dq.t()).to(dtype)
@@ -737,7 +744,6 @@ class TestW8A8BlockFP8BatchedDeepGemm(CustomTestCase):
         )
 
     def test_w8a8_block_fp8_batched_deep_gemm(self):
-
         for params in itertools.product(
             self.M,
             self.N,

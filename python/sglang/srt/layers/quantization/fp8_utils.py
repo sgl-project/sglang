@@ -40,6 +40,7 @@ from sglang.srt.utils import (
     is_hip,
     is_sm90_supported,
     is_sm100_supported,
+    is_triton_kernels_available,
     offloader,
 )
 
@@ -554,13 +555,30 @@ def _float_to_ue8m0(scale: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@lru_cache(maxsize=1)
+def _get_triton_mxfp8_downcast():
+    if not is_triton_kernels_available():
+        return None
+    try:
+        from triton_kernels.numerics_details.mxfp import downcast_to_mxfp
+    except Exception:
+        return None
+    return downcast_to_mxfp
+
+
 def _mxfp8_per_token_group_quant(
-    x: torch.Tensor, group_size: int = 32
+    x: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     assert x.dim() == 2, f"Expected 2D input, got {x.dim()}D"
     m, k = x.shape
-    assert k % group_size == 0, f"{k=} must be divisible by {group_size}"
-    x_view = x.view(m, k // group_size, group_size)
+    assert k % 32 == 0, f"{k=} must be divisible by 32"
+    downcast_to_mxfp = _get_triton_mxfp8_downcast()
+    if downcast_to_mxfp is not None and x.is_cuda:
+        q_input, scale_u8 = downcast_to_mxfp(
+            x.contiguous(), torch.float8_e4m3fn, axis=1
+        )
+        return q_input.contiguous(), scale_u8.contiguous()
+    x_view = x.view(m, k // 32, 32)
     amax = x_view.abs().float().amax(dim=2).clamp(min=1e-4)
     scale_f32 = _ceil_to_ue8m0_scale(amax / fp8_max)
     q_input = (x_view * (1.0 / scale_f32.unsqueeze(2))).to(torch.float8_e4m3fn)
@@ -568,11 +586,9 @@ def _mxfp8_per_token_group_quant(
     return q_input.view(m, k).contiguous(), scale_u8.contiguous()
 
 
-def mxfp8_group_quantize(
-    x: torch.Tensor, group_size: int = 32
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Quantize a 2D tensor to MXFP8 with UE8M0 scales per group."""
-    return _mxfp8_per_token_group_quant(x.contiguous(), group_size)
+def mxfp8_group_quantize(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Quantize a 2D tensor to MXFP8 with UE8M0 scales per group (32)."""
+    return _mxfp8_per_token_group_quant(x.contiguous())
 
 
 def _pack_mxfp8_scales(scale_u8: torch.Tensor) -> torch.Tensor:
@@ -629,7 +645,7 @@ def triton_mxfp8_blockscaled_linear(
     assert weight_scale.dtype == torch.uint8, "MXFP8 weight_scale must be UE8M0 uint8."
 
     if input_scale is None:
-        q_input, x_scale_u8 = _mxfp8_per_token_group_quant(input_2d, group_size=32)
+        q_input, x_scale_u8 = _mxfp8_per_token_group_quant(input_2d)
     else:
         q_input = input_2d
         x_scale_u8 = input_scale
