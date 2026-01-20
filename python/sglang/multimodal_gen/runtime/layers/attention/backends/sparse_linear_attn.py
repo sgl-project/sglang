@@ -522,12 +522,12 @@ class SageSparseLinearAttentionImpl(AttentionImpl, nn.Module):
     ) -> torch.Tensor:
         """Forward pass for Sage Sparse Linear attention with quantized kernels.
         Args:
-            query: query tensor of shape (B, H, L, D)
-            key: key tensor of shape (B, H, L, D)
-            value: value tensor of shape (B, H, L, D)
+            query: query tensor of shape (B, L, H, D)
+            key: key tensor of shape (B, L, H, D)
+            value: value tensor of shape (B, L, H, D)
             attn_metadata: attention metadata containing configuration
         Returns:
-            output tensor of shape (B, H, L, D)
+            output tensor of shape (B, L, H, D)
         """
         dtype = query.dtype
 
