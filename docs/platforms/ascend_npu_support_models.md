@@ -52,8 +52,8 @@ You are welcome to enable various models based on your business requirements.
 
 ## Multimodal Language Models
 
-| Models                                        | Model Family (Variants)   | A2 Supported                             |               A3 Supported               |
-|-----------------------------------------------|---------------------------|------------------------------------------|:----------------------------------------:|
+| Models                                        | Model Family (Variants)   |               A2 Supported               |               A3 Supported               |
+|-----------------------------------------------|---------------------------|:----------------------------------------:|:----------------------------------------:|
 | Qwen/Qwen2.5-VL-3B-Instruct                   | Qwen-VL                   | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | Qwen/Qwen2.5-VL-72B-Instruct                  | Qwen-VL                   | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | Qwen/Qwen3-VL-30B-A3B-Instruct                | Qwen-VL                   | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
@@ -78,8 +78,8 @@ You are welcome to enable various models based on your business requirements.
 
 ## Embedding Models
 
-| Models                                    | Model Family             | A2 Supported                             |               A3 Supported               |
-|-------------------------------------------|--------------------------|------------------------------------------|:----------------------------------------:|
+| Models                                    | Model Family             |               A2 Supported               |               A3 Supported               |
+|-------------------------------------------|--------------------------|:----------------------------------------:|:----------------------------------------:|
 | 	intfloat/e5-mistral-7b-instruct          | E5 (Llama/Mistral based) | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | 	iic/gte_Qwen2-1.5B-instruct              | GTE-Qwen2                | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | 	Qwen/Qwen3-Embedding-8B                  | Qwen3-Embedding          | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
