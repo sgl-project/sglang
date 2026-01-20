@@ -30,9 +30,8 @@ from sglang.multimodal_gen.runtime.layers.triton_ops import (
 )
 from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
 
+
 # Copied and adapted from sglang
-
-
 @CustomOp.register("rms_norm")
 class RMSNorm(CustomOp):
     """Root mean square normalization.
@@ -291,6 +290,7 @@ class _ScaleResidualNormScaleShift(CustomOp):
     1. residual_out = residual + gate * x
     2. normed = layernorm(residual_out) or rmsnorm(residual_out)
     3. out = normed * (1 + scale) + shift
+    compute_dtype is always fp32 for higher precision.
     """
 
     norm_type: str
@@ -309,7 +309,6 @@ class _ScaleResidualNormScaleShift(CustomOp):
         if self.norm_type == "rms":
             self.norm = RMSNorm(hidden_size, eps=eps, dtype=dtype)
         elif self.norm_type == "layer":
-            # compute_dtype is hardcoded to fp32 in fused kernel
             self.norm = FP32LayerNorm(
                 hidden_size, elementwise_affine=elementwise_affine, eps=eps, dtype=dtype
             )
@@ -353,9 +352,7 @@ class _ScaleResidualNormScaleShift(CustomOp):
         shift: torch.Tensor,
         scale: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # Fallback path for triton kernel (not fused)
         # x.shape: [batch_size, seq_len, inner_dim]
-        # Compute residual_output to return (kernel also computes this internally)
         if isinstance(gate, int):
             # used by cross-attention, should be 1
             assert gate == 1
@@ -391,6 +388,7 @@ class _NormScaleShift(CustomOp):
     Fused kernel that combines:
     1. normed = layernorm(x) or rmsnorm(x)
     2. out = normed * (1 + scale) + shift
+    compute_dtype is always fp32 for higher precision.
     """
 
     norm_type: str
@@ -408,7 +406,6 @@ class _NormScaleShift(CustomOp):
         if self.norm_type == "rms":
             self.norm = RMSNorm(hidden_size, eps=eps, dtype=dtype)
         elif self.norm_type == "layer":
-            # compute_dtype is hardcoded to fp32 in fused kernel
             self.norm = FP32LayerNorm(
                 hidden_size, elementwise_affine=elementwise_affine, eps=eps, dtype=dtype
             )
@@ -420,6 +417,7 @@ class _NormScaleShift(CustomOp):
     ) -> torch.Tensor:
         if x.shape[-1] % 256 != 0:
             import warnings
+
             warnings.warn(
                 "FusedNormScaleShift cuda not available, using native fallback",
                 stacklevel=2,
@@ -439,7 +437,6 @@ class _NormScaleShift(CustomOp):
     def forward_native(
         self, x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor
     ) -> torch.Tensor:
-        # Fallback path for triton kernel (not fused)
         normalized = self.norm(x)
         modulated = fuse_scale_shift_kernel(normalized, scale, shift)
         return modulated.to(x.dtype)
