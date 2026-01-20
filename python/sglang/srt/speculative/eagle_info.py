@@ -114,8 +114,6 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 len(batch.input_ids),
             )
             end_offset = batch.seq_lens + self.draft_token_num
-            for req in batch.reqs:
-                req.kv_allocated_len += 1
         else:
             prefix_lens = batch.seq_lens
             prefix_lens_cpu = batch.seq_lens_cpu
@@ -146,6 +144,16 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             batch.out_cache_loc,
             bs,
         )
+
+        if get_global_server_args().enable_mamba_extra_buffer():
+            batch.mamba_track_indices = torch.tensor(
+                [
+                    req.mamba_ping_pong_track_buffer[req.mamba_next_track_idx]
+                    for req in batch.reqs
+                ],
+                dtype=torch.int64,
+                device=batch.device,
+            )
 
     def generate_attn_arg_prefill(
         self,
@@ -386,9 +394,11 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         # Iterate every accepted token and check if req has finished after append the token
         # should be checked BEFORE free kv cache slots
         for i, (req, accept_index_row) in enumerate(zip(batch.reqs, accept_index_cpu)):
+            num_accepted = 0
             for j, idx in enumerate(accept_index_row):
                 if idx == -1:
                     break
+                num_accepted += 1
                 id = predict_cpu[idx]
                 req.output_ids.append(id)
                 req.check_finished()
@@ -406,6 +416,9 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                                 f"{i=}, {req=}\n" f"{accept_index=}\n" f"{predict=}\n"
                             )
                             raise e
+            # Update KV cache tracking for the accepted tokens
+            req.kv_committed_len += num_accepted
+            req.kv_allocated_len = req.kv_committed_len
             if not req.finished():
                 unfinished_index.append(i)
                 if idx == -1:
@@ -434,9 +447,6 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         if page_size == 1:
             # TODO: boolean array index leads to a device sync. Remove it.
             token_to_kv_pool_allocator.free(batch.out_cache_loc[evict_mask])
-            for i, req in enumerate(batch.reqs):
-                req.kv_committed_len += accept_length_list[i] + 1
-                req.kv_allocated_len = req.kv_committed_len
         else:
             if self.topk == 1:
                 # Only evict full empty page. Do not evict partial empty page
@@ -448,9 +458,6 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                     next_power_of_2(self.draft_token_num),
                 )
                 token_to_kv_pool_allocator.free(batch.out_cache_loc[evict_mask])
-                for i, req in enumerate(batch.reqs):
-                    req.kv_committed_len += accept_length_list[i] + 1
-                    req.kv_allocated_len = req.kv_committed_len
             else:
                 # Shift the accepted tokens to the beginning.
                 # Only evict the last part

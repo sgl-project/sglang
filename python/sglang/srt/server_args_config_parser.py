@@ -3,6 +3,7 @@ Configuration argument parser for command-line applications.
 Handles merging of YAML configuration files with command-line arguments.
 """
 
+import argparse
 import logging
 from pathlib import Path
 from typing import Any, Dict, List
@@ -15,9 +16,37 @@ logger = logging.getLogger(__name__)
 class ConfigArgumentMerger:
     """Handles merging of configuration file arguments with command-line arguments."""
 
-    def __init__(self, boolean_actions: List[str] = None):
-        """Initialize with list of boolean action destinations."""
-        self.boolean_actions = boolean_actions or []
+    def __init__(
+        self,
+        parser: argparse.ArgumentParser = None,
+        boolean_actions: List[str] = None,
+    ):
+        """Initialize with list of store_true action names."""
+        # NOTE: The current code does not support actions other than "store_true" and "store".
+        if parser is not None:
+            self.parser = parser
+            self.store_true_actions = [
+                action.dest
+                for action in parser._actions
+                if isinstance(action, argparse._StoreTrueAction)
+            ]
+            self.unsupported_actions = {
+                a.dest: a
+                for a in parser._actions
+                if a.option_strings
+                and not isinstance(a, argparse._StoreTrueAction)
+                and not isinstance(a, argparse._StoreAction)
+                and "--config" not in a.option_strings
+                and "--help" not in a.option_strings
+                and "-h" not in a.option_strings
+            }
+        elif boolean_actions is not None:
+            # Legacy interface for compatibility
+            self.store_true_actions = boolean_actions
+            self.unsupported_actions = {}
+        else:
+            self.store_true_actions = []
+            self.unsupported_actions = {}
 
     def merge_config_with_args(self, cli_args: List[str]) -> List[str]:
         """
@@ -39,8 +68,18 @@ class ConfigArgumentMerger:
         if not config_file_path:
             return cli_args
 
-        config_args = self._parse_yaml_config(config_file_path)
-        return self._insert_config_args(cli_args, config_args, config_file_path)
+        config_data = self._parse_yaml_config(config_file_path)
+        config_args = self._convert_config_to_args(config_data)
+
+        # Merge config args into CLI args
+        config_index = cli_args.index("--config")
+
+        # Split arguments around config file
+        before_config = cli_args[:config_index]
+        after_config = cli_args[config_index + 2 :]  # Skip --config and file path
+
+        # Simple merge: config args + CLI args
+        return config_args + before_config + after_config
 
     def _extract_config_file_path(self, args: List[str]) -> str:
         """Extract the config file path from arguments."""
@@ -58,20 +97,7 @@ class ConfigArgumentMerger:
 
         return args[config_index + 1]
 
-    def _insert_config_args(
-        self, cli_args: List[str], config_args: List[str], config_file_path: str
-    ) -> List[str]:
-        """Insert configuration arguments into the CLI argument list."""
-        config_index = cli_args.index("--config")
-
-        # Split arguments around config file
-        before_config = cli_args[:config_index]
-        after_config = cli_args[config_index + 2 :]  # Skip --config and file path
-
-        # Simple merge: config args + CLI args
-        return config_args + before_config + after_config
-
-    def _parse_yaml_config(self, file_path: str) -> List[str]:
+    def _parse_yaml_config(self, file_path: str) -> Dict[str, Any]:
         """
         Parse YAML configuration file and convert to argument list.
 
@@ -100,7 +126,7 @@ class ConfigArgumentMerger:
         if not isinstance(config_data, dict):
             raise ValueError("Config file must contain a dictionary at root level")
 
-        return self._convert_config_to_args(config_data)
+        return config_data
 
     def _validate_yaml_file(self, file_path: str) -> None:
         """Validate that the file is a YAML file."""
@@ -116,6 +142,11 @@ class ConfigArgumentMerger:
         args = []
 
         for key, value in config.items():
+            key_norm = key.replace("-", "_")
+            if key_norm in self.unsupported_actions:
+                action = self.unsupported_actions[key_norm]
+                msg = f"Unsupported config option '{key_norm}' with action '{action.__class__.__name__}'"
+                raise ValueError(msg)
             if isinstance(value, bool):
                 self._add_boolean_arg(args, key, value)
             elif isinstance(value, list):
@@ -126,14 +157,21 @@ class ConfigArgumentMerger:
         return args
 
     def _add_boolean_arg(self, args: List[str], key: str, value: bool) -> None:
-        """Add boolean argument to the list."""
-        if key in self.boolean_actions:
-            # For boolean actions, always add the flag and value
-            args.extend([f"--{key}", str(value).lower()])
-        else:
-            # For regular booleans, only add flag if True
+        """
+        Add boolean argument to the list.
+
+        Only store_true flags:
+            - value True -> add flag
+            - value False -> skip
+        Regular booleans:
+            - always add --key true/false
+        """
+        key_norm = key.replace("-", "_")
+        if key_norm in self.store_true_actions:
             if value:
                 args.append(f"--{key}")
+        else:
+            args.extend([f"--{key}", str(value).lower()])
 
     def _add_list_arg(self, args: List[str], key: str, value: List[Any]) -> None:
         """Add list argument to the list."""
