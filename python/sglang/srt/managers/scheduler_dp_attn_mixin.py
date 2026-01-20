@@ -6,9 +6,11 @@ from typing import TYPE_CHECKING, Callable, Optional
 import torch
 
 from sglang.srt.batch_overlap.two_batch_overlap import TboDPAttentionPreparer
+from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.metrics.collector import DPCooperationInfo
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.utils.common import require_mlp_tp_gather
 
 if TYPE_CHECKING:
@@ -53,6 +55,20 @@ class MLPSyncBatchInfo:
             dtype=dtype,
         )
 
+    def _get_fallback_tensor(self, device, dtype=torch.int64) -> torch.Tensor:
+        return torch.tensor(
+            [
+                0,  # num_tokens
+                0,  # num_tokens_for_logprob
+                1,  # can_cuda_graph
+                0,  # is_extend_in_batch
+                1,  # local_can_run_tbo
+                ForwardMode.IDLE.value,  # local_forward_mode
+            ],
+            device=device,
+            dtype=dtype,
+        )
+
     def all_gather(self, device, group: torch.distributed.ProcessGroup):
         local_info_tensor = self._get_local_tensor(device=device)
         global_info_tensor = torch.empty(
@@ -66,6 +82,14 @@ class MLPSyncBatchInfo:
             local_info_tensor,
             group=group,
         )
+        if device == "cpu":
+            tp_active_ranks = get_tp_group().active_ranks_cpu
+        else:
+            tp_active_ranks = get_tp_group().active_ranks
+
+        # Set fallback values for inactive ranks
+        tp_info = global_info_tensor.view(self.dp_size * self.tp_size, 6)
+        tp_info[tp_active_ranks == 0] = self._get_fallback_tensor(device=device)
 
         tp0_info = global_info_tensor[:, 0, :]
         self.tp0_info = tp0_info
