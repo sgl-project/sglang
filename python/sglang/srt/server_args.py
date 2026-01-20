@@ -1630,6 +1630,7 @@ class ServerArgs:
                 if is_hopper_with_cuda_12_3() and is_no_spec_infer_or_topk_one(self):
                     # Note: flashinfer 0.6.1 caused performance regression on Hopper attention kernel
                     # Before the kernel is fixed, we choose fa3 as the default backend on Hopper MHA
+                    # ref: https://github.com/sgl-project/sglang/issues/17411
                     self.attention_backend = "fa3"
                 elif (
                     is_sm100_supported()
