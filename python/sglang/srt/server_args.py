@@ -35,6 +35,7 @@ from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.utils.common import (
     LORA_TARGET_ALL_MODULES,
     SUPPORTED_LORA_TARGET_MODULES,
+    check_pkg_version_at_least,
     configure_ipv6,
     cpu_has_amx_support,
     get_bool_env_var,
@@ -1524,10 +1525,17 @@ class ServerArgs:
                     and self.moe_a2a_backend == "none"
                     and self.moe_runner_backend == "auto"
                 ):
-                    self.moe_runner_backend = "flashinfer_trtllm"
-                    logger.info(
-                        "Use flashinfer_trtllm as MoE runner backend on sm100 for Glm4MoeForCausalLM"
-                    )
+                    # Only enable flashinfer_trtllm if flashinfer-python version is >= 0.6.2
+                    if check_pkg_version_at_least("flashinfer-python", "0.6.2"):
+                        self.moe_runner_backend = "flashinfer_trtllm"
+                        logger.info(
+                            "Use flashinfer_trtllm as MoE runner backend on sm100 for Glm4MoeForCausalLM"
+                        )
+                    else:
+                        logger.warning(
+                            "flashinfer-python version >= 0.6.2 is required for flashinfer_trtllm MoE runner backend. "
+                            "flashinfer_trtllm MoE runner backend is not enabled."
+                        )
 
             # Mamba radix cache v2
             if self.enable_mamba_extra_buffer():
