@@ -4,23 +4,28 @@
 
 import dataclasses
 import glob
+import importlib.util
 import json
 import os
-import time
-from abc import ABC, abstractmethod
+import traceback
+from abc import ABC
 from collections.abc import Generator, Iterable
 from copy import deepcopy
-from typing import cast
+from typing import Any, cast
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+from diffusers import AutoModel
 from safetensors.torch import load_file as safetensors_load_file
 from torch.distributed import init_device_mesh
 from transformers import AutoImageProcessor, AutoProcessor, AutoTokenizer
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 
-from sglang.multimodal_gen.configs.models import EncoderConfig
+from sglang.multimodal_gen.configs.models import EncoderConfig, ModelConfig
+from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
+    QwenImageEditPipelineConfig,
+)
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.loader.fsdp_load import (
     maybe_load_fsdp_model,
@@ -38,12 +43,71 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     get_config,
-    get_diffusers_config,
+    get_diffusers_component_config,
+    get_hf_config,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
 logger = init_logger(__name__)
+
+
+class skip_init_modules:
+    def __enter__(self):
+        # Save originals
+        self._orig_reset = {}
+        for cls in (nn.Linear, nn.Conv1d, nn.Conv2d, nn.Conv3d):
+            self._orig_reset[cls] = cls.reset_parameters
+            cls.reset_parameters = lambda self: None  # skip init
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        # restore originals
+        for cls, orig in self._orig_reset.items():
+            cls.reset_parameters = orig
+
+
+def _normalize_module_type(module_type: str) -> str:
+    """Normalize module types like 'text_encoder_2' -> 'text_encoder'."""
+    if module_type.endswith("_2"):
+        return module_type[:-2]
+    return module_type
+
+
+def _clean_hf_config_inplace(model_config: dict) -> None:
+    """Remove common extraneous HF fields if present."""
+    for key in (
+        "_name_or_path",
+        "transformers_version",
+        "model_type",
+        "tokenizer_class",
+        "torch_dtype",
+    ):
+        model_config.pop(key, None)
+
+
+def _list_safetensors_files(model_path: str) -> list[str]:
+    """List all .safetensors files under a directory."""
+    return sorted(glob.glob(os.path.join(str(model_path), "*.safetensors")))
+
+
+def get_memory_usage_of_component(module) -> float | None:
+    """
+    returned value is in GB, rounded to 2 decimal digits
+    """
+    if not isinstance(module, nn.Module):
+        return None
+    BYTES_PER_GB = 1024**3
+    if hasattr(module, "get_memory_footprint"):
+        usage = module.get_memory_footprint() / BYTES_PER_GB
+    else:
+        # manually
+        param_size = sum(p.numel() * p.element_size() for p in module.parameters())
+        buffer_size = sum(b.numel() * b.element_size() for b in module.buffers())
+
+        total_size_bytes = param_size + buffer_size
+        usage = total_size_bytes / (1024**3)
+
+    return round(usage, 2)
 
 
 class ComponentLoader(ABC):
@@ -52,19 +116,133 @@ class ComponentLoader(ABC):
     def __init__(self, device=None) -> None:
         self.device = device
 
-    @abstractmethod
-    def load(self, model_path: str, server_args: ServerArgs, module_name: str):
-        """
-        Load the component based on the model path, architecture, and inference args.
+    def should_offload(
+        self, server_args: ServerArgs, model_config: ModelConfig | None = None
+    ):
+        # not offload by default
+        return False
 
-        Args:
-            model_path: Path to the component model
-            server_args: ServerArgs
+    def target_device(self, should_offload):
+        if should_offload:
+            return (
+                torch.device("mps")
+                if current_platform.is_mps()
+                else torch.device("cpu")
+            )
+        else:
+            return get_local_torch_device()
 
-        Returns:
-            The loaded component
+    def load(
+        self,
+        component_model_path: str,
+        server_args: ServerArgs,
+        module_name: str,
+        transformers_or_diffusers: str,
+    ) -> tuple[AutoModel, float]:
         """
-        raise NotImplementedError
+        Template method that standardizes logging around the core load implementation.
+        The priority of loading method is:
+            1. load customized module
+            2. load native diffusers/transformers module
+        If all of the above methods failed, an error will be thrown
+
+        """
+        gpu_mem_before_loading = current_platform.get_available_gpu_memory()
+        logger.info(
+            "Loading %s from %s. avail mem: %.2f GB",
+            module_name,
+            component_model_path,
+            gpu_mem_before_loading,
+        )
+        try:
+            component = self.load_customized(
+                component_model_path, server_args, module_name
+            )
+            source = "sgl-diffusion"
+        except Exception as e:
+            if "Unsupported model architecture" in str(e):
+                logger.info(
+                    f"Module: {module_name} doesn't have a customized version yet, using native version"
+                )
+            else:
+                traceback.print_exc()
+                logger.error(
+                    f"Error while loading customized {module_name}, falling back to native version"
+                )
+            # fallback to native version
+            component = self.load_native(
+                component_model_path, server_args, transformers_or_diffusers
+            )
+            should_offload = self.should_offload(server_args)
+            target_device = self.target_device(should_offload)
+            component = component.to(device=target_device)
+            source = "native"
+            logger.warning(
+                "Native module %s: %s is loaded, performance may be sub-optimal",
+                module_name,
+                component.__class__.__name__,
+            )
+
+        if component is None:
+            logger.warning("Loaded %s returned None", module_name)
+            consumed = 0.0
+        else:
+            current_gpu_mem = current_platform.get_available_gpu_memory()
+            consumed = get_memory_usage_of_component(component)
+            if consumed is None or consumed == 0.0:
+                consumed = gpu_mem_before_loading - current_gpu_mem
+            logger.info(
+                f"Loaded %s: %s ({source} version). model size: %.2f GB, avail mem: %.2f GB",
+                module_name,
+                component.__class__.__name__,
+                consumed,
+                current_gpu_mem,
+            )
+        return component, consumed
+
+    def load_native(
+        self,
+        component_model_path: str,
+        server_args: ServerArgs,
+        transformers_or_diffusers: str,
+    ) -> AutoModel:
+        """
+        Load the component using the native library (transformers/diffusers).
+        """
+        if transformers_or_diffusers == "transformers":
+            from transformers import AutoModel
+
+            config = get_hf_config(
+                component_model_path,
+                trust_remote_code=server_args.trust_remote_code,
+                revision=server_args.revision,
+            )
+            return AutoModel.from_pretrained(
+                component_model_path,
+                config=config,
+                trust_remote_code=server_args.trust_remote_code,
+                revision=server_args.revision,
+            )
+        elif transformers_or_diffusers == "diffusers":
+            from diffusers import AutoModel
+
+            return AutoModel.from_pretrained(
+                component_model_path,
+                revision=server_args.revision,
+                trust_remote_code=server_args.trust_remote_code,
+            )
+        else:
+            raise ValueError(f"Unsupported library: {transformers_or_diffusers}")
+
+    def load_customized(
+        self, component_model_path: str, server_args: ServerArgs, module_name: str
+    ):
+        """
+        Load the customized version component, implemented and optimized in SGL-diffusion
+        """
+        raise NotImplementedError(
+            f"load_customized not implemented for {self.__class__.__name__}"
+        )
 
     @classmethod
     def for_module_type(
@@ -76,23 +254,19 @@ class ComponentLoader(ABC):
         Args:
             module_type: Type of module (e.g., "vae", "text_encoder", "transformer", "scheduler")
             transformers_or_diffusers: Whether the module is from transformers or diffusers
-
-        Returns:
-            A component loader for the specified module type
         """
         # Map of module types to their loader classes and expected library
+        module_type = _normalize_module_type(module_type)
         module_loaders = {
             "scheduler": (SchedulerLoader, "diffusers"),
             "transformer": (TransformerLoader, "diffusers"),
-            "transformer_2": (TransformerLoader, "diffusers"),
             "vae": (VAELoader, "diffusers"),
             "text_encoder": (TextEncoderLoader, "transformers"),
-            "text_encoder_2": (TextEncoderLoader, "transformers"),
             "tokenizer": (TokenizerLoader, "transformers"),
-            "tokenizer_2": (TokenizerLoader, "transformers"),
             "image_processor": (ImageProcessorLoader, "transformers"),
             "image_encoder": (ImageEncoderLoader, "transformers"),
             "processor": (AutoProcessorLoader, "transformers"),
+            "vision_language_encoder": (VisionLanguageEncoderLoader, "transformers"),
         }
 
         if module_type in module_loaders:
@@ -130,8 +304,19 @@ class TextEncoderLoader(ComponentLoader):
         allow_patterns_overrides: list[str] | None = None
         """If defined, weights will load exclusively using these patterns."""
 
-    counter_before_loading_weights: float = 0.0
-    counter_after_loading_weights: float = 0.0
+    def should_offload(self, server_args, model_config: ModelConfig | None = None):
+        should_offload = server_args.text_encoder_cpu_offload
+        if not should_offload:
+            return False
+        # _fsdp_shard_conditions is in arch_config, not directly on model_config
+        arch_config = (
+            getattr(model_config, "arch_config", model_config) if model_config else None
+        )
+        fsdp_shard_conditions = (
+            getattr(arch_config, "_fsdp_shard_conditions", []) if arch_config else []
+        )
+        use_cpu_offload = should_offload and len(fsdp_shard_conditions) > 0
+        return use_cpu_offload
 
     def _prepare_weights(
         self,
@@ -185,7 +370,7 @@ class TextEncoderLoader(ComponentLoader):
     def _get_weights_iterator(
         self, source: "Source", to_cpu: bool
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
-        """Get an iterator for the model weights based on the load format."""
+        """get an iterator for the model weights based on the load format."""
         hf_folder, hf_weights_files, use_safetensors = self._prepare_weights(
             source.model_or_path,
             source.fall_back_to_pt,
@@ -198,9 +383,7 @@ class TextEncoderLoader(ComponentLoader):
         else:
             weights_iterator = pt_weights_iterator(hf_weights_files, to_cpu=to_cpu)
 
-        if self.counter_before_loading_weights == 0.0:
-            self.counter_before_loading_weights = time.perf_counter()
-        # Apply the prefix.
+        # apply the prefix.
         return ((source.prefix + name, tensor) for (name, tensor) in weights_iterator)
 
     def _get_all_weights(
@@ -224,7 +407,9 @@ class TextEncoderLoader(ComponentLoader):
         for source in secondary_weights:
             yield from self._get_weights_iterator(source, to_cpu)
 
-    def load(self, model_path: str, server_args: ServerArgs, module_name: str):
+    def load_customized(
+        self, component_model_path: str, server_args: ServerArgs, module_name: str
+    ):
         """Load the text encoders based on the model path, and inference args."""
         # model_config: PretrainedConfig = get_hf_config(
         #     model=model_path,
@@ -232,14 +417,12 @@ class TextEncoderLoader(ComponentLoader):
         #     revision=server_args.revision,
         #     model_override_args=None,
         # )
-        diffusers_pretrained_config = get_config(model_path, trust_remote_code=True)
-        model_config = get_diffusers_config(model=model_path)
-        model_config.pop("_name_or_path", None)
-        model_config.pop("transformers_version", None)
-        model_config.pop("model_type", None)
-        model_config.pop("tokenizer_class", None)
-        model_config.pop("torch_dtype", None)
-        logger.info("HF model config: %s", model_config)
+        diffusers_pretrained_config = get_config(
+            component_model_path, trust_remote_code=True
+        )
+        model_config = get_diffusers_component_config(model_path=component_model_path)
+        _clean_hf_config_inplace(model_config)
+        logger.debug("HF model config: %s", model_config)
 
         def is_not_first_encoder(module_name):
             return "2" in module_name
@@ -256,12 +439,10 @@ class TextEncoderLoader(ComponentLoader):
             encoder_config = server_args.pipeline_config.text_encoder_configs[1]
             encoder_config.update_model_arch(model_config)
             encoder_dtype = server_args.pipeline_config.text_encoder_precisions[1]
-        target_device = get_local_torch_device()
         # TODO(will): add support for other dtypes
         return self.load_model(
-            model_path,
+            component_model_path,
             encoder_config,
-            target_device,
             server_args,
             encoder_dtype,
         )
@@ -270,51 +451,49 @@ class TextEncoderLoader(ComponentLoader):
         self,
         model_path: str,
         model_config: EncoderConfig,
-        target_device: torch.device,
         server_args: ServerArgs,
         dtype: str = "fp16",
+        cpu_offload_flag: bool | None = None,
     ):
-        use_cpu_offload = (
-            server_args.text_encoder_cpu_offload
-            and len(getattr(model_config, "_fsdp_shard_conditions", [])) > 0
-        )
+        # Determine CPU offload behavior and target device
 
-        if server_args.text_encoder_cpu_offload:
-            target_device = (
-                torch.device("mps")
-                if current_platform.is_mps()
-                else torch.device("cpu")
-            )
+        local_torch_device = get_local_torch_device()
+        should_offload = self.should_offload(server_args, model_config)
+
+        if should_offload and not current_platform.is_mps():
+            model_device = torch.device("cpu")
+        else:
+            model_device = local_torch_device
 
         with set_default_torch_dtype(PRECISION_TO_TYPE[dtype]):
-            with target_device:
+            with model_device, skip_init_modules():
                 architectures = getattr(model_config, "architectures", [])
                 model_cls, _ = ModelRegistry.resolve_model_cls(architectures)
+                enable_image_understanding = (
+                    True
+                    if isinstance(
+                        server_args.pipeline_config, QwenImageEditPipelineConfig
+                    )
+                    else False
+                )
+                model_config.enable_image_understanding = enable_image_understanding
                 model = model_cls(model_config)
 
             weights_to_load = {name for name, _ in model.named_parameters()}
             loaded_weights = model.load_weights(
-                self._get_all_weights(model, model_path, to_cpu=use_cpu_offload)
-            )
-            self.counter_after_loading_weights = time.perf_counter()
-            logger.info(
-                "Loading weights took %.2f seconds",
-                self.counter_after_loading_weights
-                - self.counter_before_loading_weights,
+                self._get_all_weights(model, model_path, to_cpu=should_offload)
             )
 
-            # Explicitly move model to target device after loading weights
-            model = model.to(target_device)
-
-            if use_cpu_offload:
+            if should_offload:
                 # Disable FSDP for MPS as it's not compatible
                 if current_platform.is_mps():
                     logger.info(
                         "Disabling FSDP sharding for MPS platform as it's not compatible"
                     )
+                    model = model.to(local_torch_device)
                 else:
                     mesh = init_device_mesh(
-                        "cuda",
+                        current_platform.device_type,
                         mesh_shape=(1, dist.get_world_size()),
                         mesh_dim_names=("offload", "replicate"),
                     )
@@ -323,16 +502,19 @@ class TextEncoderLoader(ComponentLoader):
                         cpu_offload=True,
                         reshard_after_forward=True,
                         mesh=mesh["offload"],
-                        fsdp_shard_conditions=model._fsdp_shard_conditions,
+                        fsdp_shard_conditions=model_config.arch_config._fsdp_shard_conditions
+                        or getattr(model, "_fsdp_shard_conditions", None),
                         pin_cpu_memory=server_args.pin_cpu_memory,
                     )
+            else:
+                model = model.to(local_torch_device)
             # We only enable strict check for non-quantized models
             # that have loaded weights tracking currently.
             # if loaded_weights is not None:
             weights_not_loaded = weights_to_load - loaded_weights
             if weights_not_loaded:
                 raise ValueError(
-                    "Following weights were not initialized from "
+                    "Following model weights were not initialized from "
                     f"checkpoint: {weights_not_loaded}"
                 )
 
@@ -340,8 +522,23 @@ class TextEncoderLoader(ComponentLoader):
 
 
 class ImageEncoderLoader(TextEncoderLoader):
+    def should_offload(self, server_args, model_config: ModelConfig | None = None):
+        should_offload = server_args.image_encoder_cpu_offload
+        if not should_offload:
+            return False
+        # _fsdp_shard_conditions is in arch_config, not directly on model_config
+        arch_config = (
+            getattr(model_config, "arch_config", model_config) if model_config else None
+        )
+        fsdp_shard_conditions = (
+            getattr(arch_config, "_fsdp_shard_conditions", []) if arch_config else []
+        )
+        use_cpu_offload = should_offload and len(fsdp_shard_conditions) > 0
+        return use_cpu_offload
 
-    def load(self, model_path: str, server_args: ServerArgs, *args):
+    def load_customized(
+        self, component_model_path: str, server_args: ServerArgs, *args
+    ):
         """Load the text encoders based on the model path, and inference args."""
         # model_config: PretrainedConfig = get_hf_config(
         #     model=model_path,
@@ -349,135 +546,132 @@ class ImageEncoderLoader(TextEncoderLoader):
         #     revision=server_args.revision,
         #     model_override_args=None,
         # )
-        with open(os.path.join(model_path, "config.json")) as f:
+        with open(os.path.join(component_model_path, "config.json")) as f:
             model_config = json.load(f)
-        model_config.pop("_name_or_path", None)
-        model_config.pop("transformers_version", None)
-        model_config.pop("torch_dtype", None)
-        model_config.pop("model_type", None)
-        logger.info("HF model config: %s", model_config)
+        _clean_hf_config_inplace(model_config)
+        logger.debug("HF model config: %s", model_config)
 
         encoder_config = server_args.pipeline_config.image_encoder_config
         encoder_config.update_model_arch(model_config)
 
-        if server_args.image_encoder_cpu_offload:
-            target_device = (
-                torch.device("mps")
-                if current_platform.is_mps()
-                else torch.device("cpu")
-            )
-        else:
-            target_device = get_local_torch_device()
+        # Always start with local device; load_model will adjust for offload if needed
         # TODO(will): add support for other dtypes
         return self.load_model(
-            model_path,
+            component_model_path,
             encoder_config,
-            target_device,
             server_args,
             server_args.pipeline_config.image_encoder_precision,
+            cpu_offload_flag=server_args.image_encoder_cpu_offload,
         )
 
 
 class ImageProcessorLoader(ComponentLoader):
     """Loader for image processor."""
 
-    def load(self, model_path: str, server_args: ServerArgs, *args):
-        """Load the image processor based on the model path, and inference args."""
-        logger.info("Loading image processor from %s", model_path)
-
-        image_processor = AutoImageProcessor.from_pretrained(model_path, use_fast=True)
-        logger.info("Loaded image processor: %s", image_processor.__class__.__name__)
-        return image_processor
+    def load_customized(
+        self, component_model_path: str, server_args: ServerArgs, module_name: str
+    ) -> Any:
+        return AutoImageProcessor.from_pretrained(component_model_path, use_fast=True)
 
 
 class AutoProcessorLoader(ComponentLoader):
     """Loader for auto processor."""
 
-    def load(self, model_path: str, server_args: ServerArgs, *args):
-        """Load the image processor based on the model path, and inference args."""
-        logger.info("Loading auto processor from %s", model_path)
-
-        processor = AutoProcessor.from_pretrained(
-            model_path,
-        )
-        logger.info("Loaded auto processor: %s", processor.__class__.__name__)
-        return processor
+    def load_customized(
+        self, component_model_path: str, server_args: ServerArgs, module_name: str
+    ) -> Any:
+        return AutoProcessor.from_pretrained(component_model_path)
 
 
 class TokenizerLoader(ComponentLoader):
     """Loader for tokenizers."""
 
-    def load(self, model_path: str, server_args: ServerArgs, *args):
-        """Load the tokenizer based on the model path, and inference args."""
-        logger.info("Loading tokenizer from %s", model_path)
-
-        tokenizer = AutoTokenizer.from_pretrained(
-            model_path,  # "<path to model>/tokenizer"
-            # in v0, this was same string as encoder_name "ClipTextModel"
-            # TODO(will): pass these tokenizer kwargs from inference args? Maybe
-            # other method of config?
+    def load_customized(
+        self, component_model_path: str, server_args: ServerArgs, module_name: str
+    ) -> Any:
+        return AutoTokenizer.from_pretrained(
+            component_model_path,
             padding_size="right",
         )
-        logger.info("Loaded tokenizer: %s", tokenizer.__class__.__name__)
-        return tokenizer
 
 
 class VAELoader(ComponentLoader):
     """Loader for VAE."""
 
-    def load(self, model_path: str, server_args: ServerArgs, *args):
+    def should_offload(
+        self, server_args: ServerArgs, model_config: ModelConfig | None = None
+    ):
+        return server_args.vae_cpu_offload
+
+    def load_customized(
+        self, component_model_path: str, server_args: ServerArgs, *args
+    ):
         """Load the VAE based on the model path, and inference args."""
-        config = get_diffusers_config(model=model_path)
-        class_name = config.pop("_class_name")
+        config = get_diffusers_component_config(model_path=component_model_path)
+        class_name = config.pop("_class_name", None)
         assert (
             class_name is not None
         ), "Model config does not contain a _class_name attribute. Only diffusers format is supported."
 
-        server_args.model_paths["vae"] = model_path
+        server_args.model_paths["vae"] = component_model_path
 
-        # TODO: abstract these logics
-        logger.info("HF model config: %s", config)
+        logger.debug("HF model config: %s", config)
         vae_config = server_args.pipeline_config.vae_config
         vae_config.update_model_arch(config)
 
         # NOTE: some post init logics are only available after updated with config
         vae_config.post_init()
 
-        if server_args.vae_cpu_offload:
-            target_device = (
-                torch.device("mps")
-                if current_platform.is_mps()
-                else torch.device("cpu")
-            )
-        else:
-            target_device = get_local_torch_device()
+        should_offload = self.should_offload(server_args)
+        target_device = self.target_device(should_offload)
 
-        with set_default_torch_dtype(
-            PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
+        # Check for auto_map first (custom VAE classes)
+        auto_map = config.get("auto_map", {})
+        auto_model_map = auto_map.get("AutoModel")
+        if auto_model_map:
+            module_path, cls_name = auto_model_map.rsplit(".", 1)
+            custom_module_file = os.path.join(component_model_path, f"{module_path}.py")
+            spec = importlib.util.spec_from_file_location("_custom", custom_module_file)
+            custom_module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(custom_module)
+            vae_cls = getattr(custom_module, cls_name)
+            vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
+            with set_default_torch_dtype(vae_dtype):
+                vae = vae_cls.from_pretrained(
+                    component_model_path,
+                    revision=server_args.revision,
+                    trust_remote_code=server_args.trust_remote_code,
+                )
+            vae = vae.to(device=target_device, dtype=vae_dtype)
+            return vae.eval()
+
+        # Load from ModelRegistry (standard VAE classes)
+        with (
+            set_default_torch_dtype(
+                PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
+            ),
+            skip_init_modules(),
         ):
             vae_cls, _ = ModelRegistry.resolve_model_cls(class_name)
             vae = vae_cls(vae_config).to(target_device)
 
-        # Find all safetensors files
-        safetensors_list = glob.glob(os.path.join(str(model_path), "*.safetensors"))
-        # TODO(PY)
+        safetensors_list = _list_safetensors_files(component_model_path)
         assert (
             len(safetensors_list) == 1
-        ), f"Found {len(safetensors_list)} safetensors files in {model_path}"
+        ), f"Found {len(safetensors_list)} safetensors files in {component_model_path}"
         loaded = safetensors_load_file(safetensors_list[0])
-        vae.load_state_dict(
-            loaded, strict=False
-        )  # We might only load encoder or decoder
-
+        vae.load_state_dict(loaded, strict=False)
         return vae.eval()
 
 
 class TransformerLoader(ComponentLoader):
     """Loader for transformer."""
 
-    def load(self, model_path: str, server_args: ServerArgs, *args):
+    def load_customized(
+        self, component_model_path: str, server_args: ServerArgs, *args
+    ):
         """Load the transformer based on the model path, and inference args."""
-        config = get_diffusers_config(model=model_path)
+        config = get_diffusers_component_config(model_path=component_model_path)
         hf_config = deepcopy(config)
         cls_name = config.pop("_class_name")
         if cls_name is None:
@@ -486,12 +680,7 @@ class TransformerLoader(ComponentLoader):
                 "Only diffusers format is supported."
             )
 
-        logger.info("transformer cls_name: %s", cls_name)
-        if server_args.override_transformer_cls_name is not None:
-            cls_name = server_args.override_transformer_cls_name
-            logger.info("Overriding transformer cls_name to %s", cls_name)
-
-        server_args.model_paths["transformer"] = model_path
+        server_args.model_paths["transformer"] = component_model_path
 
         # Config from Diffusers supersedes sgl_diffusion's model config
         dit_config = server_args.pipeline_config.dit_config
@@ -500,9 +689,9 @@ class TransformerLoader(ComponentLoader):
         model_cls, _ = ModelRegistry.resolve_model_cls(cls_name)
 
         # Find all safetensors files
-        safetensors_list = glob.glob(os.path.join(str(model_path), "*.safetensors"))
+        safetensors_list = _list_safetensors_files(component_model_path)
         if not safetensors_list:
-            raise ValueError(f"No safetensors files found in {model_path}")
+            raise ValueError(f"No safetensors files found in {component_model_path}")
 
         # Check if we should use custom initialization weights
         custom_weights_path = getattr(
@@ -518,25 +707,23 @@ class TransformerLoader(ComponentLoader):
                 custom_weights_path is not None
             ), "Custom initialization weights must be provided"
             if os.path.isdir(custom_weights_path):
-                safetensors_list = glob.glob(
-                    os.path.join(str(custom_weights_path), "*.safetensors")
-                )
+                safetensors_list = _list_safetensors_files(custom_weights_path)
             else:
                 assert custom_weights_path.endswith(
                     ".safetensors"
                 ), "Custom initialization weights must be a safetensors file"
                 safetensors_list = [custom_weights_path]
 
-        logger.info(
-            "Loading model from %s safetensors files: %s",
-            len(safetensors_list),
-            safetensors_list,
-        )
-
         default_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.dit_precision]
 
+        logger.info(
+            "Loading %s from %s safetensors files, default_dtype: %s",
+            cls_name,
+            len(safetensors_list),
+            default_dtype,
+        )
+
         # Load the model using FSDP loader
-        logger.info("Loading %s, default_dtype: %s", cls_name, default_dtype)
         assert server_args.hsdp_shard_dim is not None
         model = maybe_load_fsdp_model(
             model_cls=model_cls,
@@ -553,6 +740,7 @@ class TransformerLoader(ComponentLoader):
             param_dtype=torch.bfloat16,
             reduce_dtype=torch.float32,
             output_dtype=None,
+            strict=False,
         )
 
         total_params = sum(p.numel() for p in model.parameters())
@@ -563,15 +751,18 @@ class TransformerLoader(ComponentLoader):
         ), "Model dtype does not match default dtype"
 
         model = model.eval()
+
         return model
 
 
 class SchedulerLoader(ComponentLoader):
     """Loader for scheduler."""
 
-    def load(self, model_path: str, server_args: ServerArgs, *args):
+    def load_customized(
+        self, component_model_path: str, server_args: ServerArgs, *args
+    ):
         """Load the scheduler based on the model path, and inference args."""
-        config = get_diffusers_config(model=model_path)
+        config = get_diffusers_component_config(model_path=component_model_path)
 
         class_name = config.pop("_class_name")
         assert (
@@ -583,8 +774,7 @@ class SchedulerLoader(ComponentLoader):
         scheduler = scheduler_cls(**config)
         if server_args.pipeline_config.flow_shift is not None:
             scheduler.set_shift(server_args.pipeline_config.flow_shift)
-        if server_args.pipeline_config.timesteps_scale is not None:
-            scheduler.set_timesteps_scale(server_args.pipeline_config.timesteps_scale)
+
         return scheduler
 
 
@@ -595,35 +785,35 @@ class GenericComponentLoader(ComponentLoader):
         super().__init__()
         self.library = library
 
-    def load(self, model_path: str, server_args: ServerArgs, *args):
-        """Load a generic component based on the model path, and inference args."""
-        logger.warning(
-            "Using generic loader for %s with library %s", model_path, self.library
-        )
 
-        if self.library == "transformers":
-            from transformers import AutoModel
+class VisionLanguageEncoderLoader(ComponentLoader):
+    """Loader for vision language encoder (typically Causal LM or Vision2Seq)."""
 
-            model = AutoModel.from_pretrained(
-                model_path,
+    def load_customized(
+        self,
+        component_model_path: str,
+        server_args: ServerArgs,
+        transformers_or_diffusers: str = "vision_language_encoder",
+    ) -> Any:
+        if transformers_or_diffusers == "vision_language_encoder":
+            from transformers import GlmImageForConditionalGeneration
+
+            config = get_hf_config(
+                component_model_path,
                 trust_remote_code=server_args.trust_remote_code,
                 revision=server_args.revision,
             )
-            logger.info(
-                "Loaded generic transformers model: %s", model.__class__.__name__
-            )
+            model = GlmImageForConditionalGeneration.from_pretrained(
+                component_model_path,
+                config=config,
+                trust_remote_code=server_args.trust_remote_code,
+                revision=server_args.revision,
+            ).to(get_local_torch_device())
             return model
-        elif self.library == "diffusers":
-            logger.warning(
-                "Generic loading for diffusers components is not fully implemented"
-            )
-
-            model_config = get_diffusers_config(model=model_path)
-            logger.info("Diffusers Model config: %s", model_config)
-            # This is a placeholder - in a real implementation, you'd need to handle this properly
-            return None
         else:
-            raise ValueError(f"Unsupported library: {self.library}")
+            raise ValueError(
+                f"Unsupported library for VisionLanguageEncoder: {transformers_or_diffusers}"
+            )
 
 
 class PipelineComponentLoader:
@@ -647,22 +837,19 @@ class PipelineComponentLoader:
             component_model_path: Path to the component model
             transformers_or_diffusers: Whether the module is from transformers or diffusers
 
-        Returns:
-            The loaded module
         """
-        logger.info(
-            "Loading %s using %s from %s",
-            module_name,
-            transformers_or_diffusers,
-            component_model_path,
-        )
 
         # Get the appropriate loader for this module type
         loader = ComponentLoader.for_module_type(module_name, transformers_or_diffusers)
 
         try:
             # Load the module
-            return loader.load(component_model_path, server_args, module_name)
+            return loader.load(
+                component_model_path,
+                server_args,
+                module_name,
+                transformers_or_diffusers,
+            )
         except Exception as e:
             logger.error(
                 f"Error while loading component: {module_name}, {component_model_path=}"

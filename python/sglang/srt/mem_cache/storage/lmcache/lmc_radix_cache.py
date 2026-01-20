@@ -6,9 +6,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-from sglang.srt.mem_cache.base_prefix_cache import MatchResult
-from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams, MatchResult
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 
 try:
@@ -22,9 +20,11 @@ except ImportError as e:
         "LMCache is not installed. Please install it by running `pip install lmcache`"
     ) from e
 
+
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 
 logger = logging.getLogger(__name__)
 
@@ -69,27 +69,13 @@ class LMCRadixCache(RadixCache):
 
     def __init__(
         self,
-        req_to_token_pool: ReqToTokenPool,
-        token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
-        page_size: int,
-        disable: bool = False,
-        enable_metrics: bool = False,
-        enable_kv_cache_events: bool = False,
+        params: CacheInitParams,
         model_config: Optional["ModelConfig"] = None,
         tp_size: int = 1,
         rank: int = 0,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
-        eviction_policy: str = "lru",
     ):
-        super().__init__(
-            req_to_token_pool=req_to_token_pool,
-            token_to_kv_pool_allocator=token_to_kv_pool_allocator,
-            page_size=page_size,
-            disable=disable,
-            enable_metrics=enable_metrics,
-            enable_kv_cache_events=enable_kv_cache_events,
-            eviction_policy=eviction_policy,
-        )
+        super().__init__(params)
 
         kvcache = self.token_to_kv_pool_allocator.get_kvcache()
         self.lmcache_connector = LMCacheLayerwiseConnector(
@@ -133,7 +119,7 @@ class LMCRadixCache(RadixCache):
             with self._node_lock:
                 self._in_flight_nodes.clear()
 
-    def match_prefix(self, key: RadixKey, **kwargs) -> MatchResult:  # type: ignore[override]
+    def match_prefix(self, params: MatchPrefixParams) -> MatchResult:  # type: ignore[override]
         """Match cached prefix; if there's a tail miss, prefetch from LMCache.
 
         Reuses the base matching logic to obtain (value, last_node). If there
@@ -142,14 +128,15 @@ class LMCRadixCache(RadixCache):
         into those slots, then materialize a new child node for the retrieved
         chunk.
         """
+        key = params.key
         if self.disable or not key:
-            return super().match_prefix(key, **kwargs)
+            return super().match_prefix(params)
 
         if self.page_size != 1:
             aligned_len = len(key) // self.page_size * self.page_size
             key = key[:aligned_len]
 
-        base_res = super().match_prefix(key, **kwargs)
+        base_res = super().match_prefix(params)
         value: torch.Tensor = base_res.device_indices
         last_node: TreeNode = base_res.last_device_node
 
@@ -196,7 +183,7 @@ class LMCRadixCache(RadixCache):
 
         if num_retrieved > 0:
             fetched = num_retrieved - prefix_pad
-            new_node = TreeNode()
+            new_node = TreeNode(priority=last_node.priority)
             start = value.numel()
             end = start + fetched
             new_node.key = key[start:end]
@@ -226,13 +213,27 @@ class LMCRadixCache(RadixCache):
         if not is_insert:
             return
 
-        kv_committed_len = req.pop_committed_kv_cache()
+        from sglang.srt.server_args import get_global_server_args
+
+        global_server_args = get_global_server_args()
+        topk = global_server_args.speculative_eagle_topk
+        enable_kv_committed_len = topk is None or topk == 1
+        if enable_kv_committed_len:
+            kv_committed_len = req.kv_committed_len
+        else:
+            kv_committed_len = len(req.origin_input_ids) + max(
+                len(req.output_ids) - 1, 0
+            )
+
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, :kv_committed_len
         ]
 
-        _, new_last_node, _, _ = self.match_prefix(RadixKey(token_ids, req.extra_key))
+        match_result = self.match_prefix(
+            MatchPrefixParams(key=RadixKey(token_ids, req.extra_key))
+        )
+        new_last_node = match_result.last_device_node
         assert new_last_node is not None
 
         self.inc_lock_ref(new_last_node)
@@ -268,22 +269,3 @@ class LMCRadixCache(RadixCache):
             )
         except Exception:  # pragma: no cover
             pass
-
-
-if __name__ == "__main__":
-    cache = LMCRadixCache(
-        req_to_token_pool=None,
-        token_to_kv_pool_allocator=None,
-        page_size=1,
-        disable=False,
-        enable_kv_cache_events=False,
-        model_config=None,
-        tp_size=1,
-        rank=0,
-        tp_group=None,
-    )
-    cache.insert(RadixKey([1, 2, 3]), torch.tensor([10, 11, 12], dtype=torch.int64))
-    cache.insert(
-        RadixKey([1, 2, 3, 4]), torch.tensor([10, 11, 12, 13], dtype=torch.int64)
-    )
-    cache.pretty_print()

@@ -1,6 +1,154 @@
-# Ascend NPUs
+
+# SGLang installation with NPUs support
 
 You can install SGLang using any of the methods below. Please go through `System Settings` section to ensure the clusters are roaring at max performance. Feel free to leave an issue [here at sglang](https://github.com/sgl-project/sglang/issues) if you encounter any issues or have any problems.
+
+## Component Version Mapping For SGLang
+| Component         | Version                 | Obtain Way                                                                                                                                                                                                                   |
+|-------------------|-------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| HDK               | 25.3.RC1                  | [link](https://hiascend.com/hardware/firmware-drivers/commercial?product=7&model=33) |
+| CANN              | 8.3.rc2                 | [Obtain Images](#obtain-cann-image)                                                                                                                                                                                          |
+| Pytorch Adapter   | 7.3.0                   | [link](https://gitcode.com/Ascend/pytorch/releases)                                                                                                                                                                          |
+| MemFabric         | 1.0.3                   | `pip install memfabric-hybrid==1.0.3`                                                                                                                                                                 |
+| Triton            | 3.2.0.dev2025112116     | [link](https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/sglang/triton_ascend/triton_ascend-3.2.0.dev2025112116-cp311-cp311-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl)                                           |
+| Bisheng           | 20251121                | [link](https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/sglang/triton_ascend/Ascend-BiSheng-toolkit_aarch64_20251121.run)                                                                                               |
+| SGLang NPU Kernel | NA                      | [link](https://github.com/sgl-project/sgl-kernel-npu/releases)                                                                                                                                                               |
+
+<a id="obtain-cann-image"></a>
+### Obtain CANN Image
+You can obtain the dependency of a specified version of CANN through an image.
+```shell
+# for Atlas 800I A3 and Ubuntu OS
+docker pull quay.io/ascend/cann:8.3.rc2-a3-ubuntu22.04-py3.11
+# for Atlas 800I A2 and Ubuntu OS
+docker pull quay.io/ascend/cann:8.3.rc2-910b-ubuntu22.04-py3.11
+```
+
+## Preparing the Running Environment
+
+### Method 1: Installing from source with prerequisites
+
+#### Python Version
+
+Only `python==3.11` is supported currently. If you don't want to break system pre-installed python, try installing with [conda](https://github.com/conda/conda).
+
+```shell
+conda create --name sglang_npu python=3.11
+conda activate sglang_npu
+```
+
+#### CANN
+
+Prior to start work with SGLang on Ascend you need to install CANN Toolkit, Kernels operator package and NNAL version 8.3.RC2 or higher, check the [installation guide](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/83RC1/softwareinst/instg/instg_0008.html?Mode=PmIns&InstallType=local&OS=openEuler&Software=cannToolKit)
+
+#### MemFabric-Hybrid
+
+If you want to use PD disaggregation mode, you need to install MemFabric-Hybrid. MemFabric-Hybrid is a drop-in replacement of Mooncake Transfer Engine that enables KV cache transfer on Ascend NPU clusters.
+
+```shell
+pip install memfabric-hybrid==1.0.3
+```
+
+#### Pytorch and Pytorch Framework Adaptor on Ascend
+
+```shell
+PYTORCH_VERSION=2.8.0
+TORCHVISION_VERSION=0.23.0
+TORCH_NPU_VERSION=2.8.0
+pip install torch==$PYTORCH_VERSION torchvision==$TORCHVISION_VERSION --index-url https://download.pytorch.org/whl/cpu
+pip install torch_npu==$TORCH_NPU_VERSION
+```
+
+If you are using other versions of `torch` and install `torch_npu`, check [installation guide](https://github.com/Ascend/pytorch/blob/master/README.md)
+
+#### Triton on Ascend
+
+We provide our own implementation of Triton for Ascend.
+
+```shell
+BISHENG_NAME="Ascend-BiSheng-toolkit_aarch64_20251121.run"
+BISHENG_URL="https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/sglang/triton_ascend/${BISHENG_NAME}"
+wget -O "${BISHENG_NAME}" "${BISHENG_URL}" && chmod a+x "${BISHENG_NAME}" && "./${BISHENG_NAME}" --install && rm "${BISHENG_NAME}"
+```
+```shell
+pip install -i https://test.pypi.org/simple/ "triton-ascend<3.2.0rc" --pre --no-cache-dir
+```
+For installation of Triton on Ascend nightly builds or from sources, follow [installation guide](https://gitcode.com/Ascend/triton-ascend/blob/master/docs/sources/getting-started/installation.md)
+
+#### SGLang Kernels NPU
+We provide SGL kernels for Ascend NPU, check [installation guide](https://github.com/sgl-project/sgl-kernel-npu/blob/main/python/sgl_kernel_npu/README.md).
+
+#### DeepEP-compatible Library
+We provide a DeepEP-compatible Library as a drop-in replacement of deepseek-ai's DeepEP library, check the [installation guide](https://github.com/sgl-project/sgl-kernel-npu/blob/main/python/deep_ep/README.md).
+
+#### CustomOps
+_TODO: to be removed once merged into sgl-kernel-npu._
+Additional package with custom operations. DEVICE_TYPE can be "a3" for Atlas A3 server or "910b" for Atlas A2 server.
+
+```shell
+DEVICE_TYPE="a3"
+wget https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/ops/CANN-custom_ops-8.3.0.1-$DEVICE_TYPE-linux.aarch64.run
+chmod a+x ./CANN-custom_ops-8.3.0.1-$DEVICE_TYPE-linux.aarch64.run
+./CANN-custom_ops-8.3.0.1-$DEVICE_TYPE-linux.aarch64.run --quiet --install-path=/usr/local/Ascend/ascend-toolkit/latest/opp
+wget https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/ops/custom_ops-2.0.$DEVICE_TYPE-cp311-cp311-linux_aarch64.whl
+pip install ./custom_ops-2.0.$DEVICE_TYPE-cp311-cp311-linux_aarch64.whl
+```
+
+#### Installing SGLang from source
+
+```shell
+# Use the last release branch
+git clone https://github.com/sgl-project/sglang.git
+cd sglang
+mv python/pyproject_other.toml python/pyproject.toml
+pip install -e python[srt_npu]
+```
+
+### Method 2: Using Docker Image
+#### Obtain Image
+You can download the SGLang image or build an image based on Dockerfile to obtain the Ascend NPU image.
+1. Download SGLang image
+```angular2html
+dockerhub: docker.io/lmsysorg/sglang:$tag
+# Main-based tag, change main to specific version like v0.5.6,
+# you can get image for specific version
+Atlas 800I A3 : {main}-cann8.3.rc2-a3
+Atlas 800I A2: {main}-cann8.3.rc2-910b
+```
+2. Build an image based on Dockerfile
+```shell
+# Clone the SGLang repository
+git clone https://github.com/sgl-project/sglang.git
+cd sglang/docker
+
+# Build the docker image
+# If there are network errors, please modify the Dockerfile to use offline dependencies or use a proxy
+docker build -t <image_name> -f npu.Dockerfile .
+```
+
+#### Create Docker
+__Notice:__ `--privileged` and `--network=host` are required by RDMA, which is typically needed by Ascend NPU clusters.
+
+__Notice:__ The following docker command is based on Atlas 800I A3 machines. If you are using Atlas 800I A2, make sure only `davinci[0-7]` are mapped into container.
+
+```shell
+
+alias drun='docker run -it --rm --privileged --network=host --ipc=host --shm-size=16g \
+    --device=/dev/davinci0 --device=/dev/davinci1 --device=/dev/davinci2 --device=/dev/davinci3 \
+    --device=/dev/davinci4 --device=/dev/davinci5 --device=/dev/davinci6 --device=/dev/davinci7 \
+    --device=/dev/davinci8 --device=/dev/davinci9 --device=/dev/davinci10 --device=/dev/davinci11 \
+    --device=/dev/davinci12 --device=/dev/davinci13 --device=/dev/davinci14 --device=/dev/davinci15 \
+    --device=/dev/davinci_manager --device=/dev/hisi_hdc \
+    --volume /usr/local/sbin:/usr/local/sbin --volume /usr/local/Ascend/driver:/usr/local/Ascend/driver \
+    --volume /usr/local/Ascend/firmware:/usr/local/Ascend/firmware \
+    --volume /etc/ascend_install.info:/etc/ascend_install.info \
+    --volume /var/queue_schedule:/var/queue_schedule --volume ~/.cache/:/root/.cache/'
+
+# Add HF_TOKEN env for download model by SGLang.
+drun --env "HF_TOKEN=<secret>" \
+    <image_name> \
+    python3 -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --attention-backend ascend
+```
 
 ## System Settings
 
@@ -19,7 +167,6 @@ cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor # shows performance
 
 ```shell
 sudo sysctl -w kernel.numa_balancing=0
-
 # Check
 cat /proc/sys/kernel/numa_balancing # shows 0
 ```
@@ -33,175 +180,84 @@ sudo sysctl -w vm.swappiness=10
 cat /proc/sys/vm/swappiness # shows 10
 ```
 
-## Installing SGLang
-
-### Method 1: Installing from source with prerequisites
-
-#### Python Version
-
-Only `python==3.11` is supported currently. If you don't want to break system pre-installed python, try installing with [conda](https://github.com/conda/conda).
-
+## Running SGLang Service
+### Running Service For Large Language Models
+#### PD Mixed Scene
 ```shell
-conda create --name sglang_npu python=3.11
-conda activate sglang_npu
+# Enabling CPU Affinity
+export SGLANG_SET_CPU_AFFINITY=1
+python3 -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --attention-backend ascend
 ```
 
-#### MemFabric Adaptor
-
-_TODO: MemFabric is still a working project yet open sourced til August/September, 2025. We will release it as prebuilt wheel package for now._
-
-_Notice: Prebuilt wheel package is based on `aarch64`, please leave an issue [here at sglang](https://github.com/sgl-project/sglang/issues) to let us know the requests for `amd64` build._
-
-MemFabric Adaptor is a drop-in replacement of Mooncake Transfer Engine that enables KV cache transfer on Ascend NPU clusters.
-
+#### PD Separation Scene
+1. Launch Prefill Server
 ```shell
-MF_WHL_NAME="mf_adapter-1.0.0-cp311-cp311-linux_aarch64.whl"
-MEMFABRIC_URL="https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/sglang/${MF_WHL_NAME}"
-wget -O "${MF_WHL_NAME}" "${MEMFABRIC_URL}" && pip install "./${MF_WHL_NAME}"
-```
+# Enabling CPU Affinity
+export SGLANG_SET_CPU_AFFINITY=1
 
-#### Pytorch and Pytorch Framework Adaptor on Ascend
-
-Only `torch==2.6.0` is supported currently due to NPUgraph and Triton-on-Ascend's limitation, however a more generalized version will be release by the end of September, 2025.
-
-```shell
-PYTORCH_VERSION=2.6.0
-TORCHVISION_VERSION=0.21.0
-pip install torch==$PYTORCH_VERSION torchvision==$TORCHVISION_VERSION --index-url https://download.pytorch.org/whl/cpu
-
-PTA_VERSION="v7.1.0.1-pytorch2.6.0"
-PTA_NAME="torch_npu-2.6.0.post1-cp311-cp311-manylinux_2_28_aarch64.whl"
-PTA_URL="https://gitee.com/ascend/pytorch/releases/download/${PTA_VERSION}/${PTA_WHL_NAME}"
-wget -O "${PTA_NAME}" "${PTA_URL}" && pip install "./${PTA_NAME}"
-```
-
-#### vLLM
-
-vLLM is still a major prerequisite on Ascend NPU. Because of `torch==2.6.0` limitation, only vLLM v0.8.5 is supported.
-
-```shell
-VLLM_TAG=v0.8.5
-git clone --depth 1 https://github.com/vllm-project/vllm.git --branch $VLLM_TAG
-(cd vllm && VLLM_TARGET_DEVICE="empty" pip install -v -e .)
-```
-
-#### Triton on Ascend
-
-_Notice:_ We recommend installing triton-ascend from source due to its rapid development, the version on PYPI can't keep up for know. This problem will be solved on Sep. 2025, afterwards `pip install` would be the one and only installing method.
-
-Please follow Triton-on-Ascend's [installation guide from source](https://gitee.com/ascend/triton-ascend#2%E6%BA%90%E4%BB%A3%E7%A0%81%E5%AE%89%E8%A3%85-triton-ascend) to install the latest `triton-ascend` package.
-
-#### DeepEP-compatible Library
-
-We are also providing a DeepEP-compatible Library as a drop-in replacement of deepseek-ai's DeepEP library, check the [installation guide](https://github.com/sgl-project/sgl-kernel-npu/blob/main/python/deep_ep/README.md).
-
-#### Installing SGLang from source
-
-```shell
-# Use the last release branch
-git clone -b v0.5.5.post3 https://github.com/sgl-project/sglang.git
-cd sglang
-
-pip install --upgrade pip
-pip install -e python[srt_npu]
-```
-
-### Method 2: Using docker
-
-__Notice:__ `--privileged` and `--network=host` are required by RDMA, which is typically needed by Ascend NPU clusters.
-
-__Notice:__ The following docker command is based on Atlas 800I A3 machines. If you are using Atlas 800I A2, make sure only `davinci[0-7]` are mapped into container.
-
-```shell
-# Clone the SGLang repository
-git clone https://github.com/sgl-project/sglang.git
-cd sglang/docker
-
-# Build the docker image
-docker build -t <image_name> -f npu.Dockerfile .
-
-alias drun='docker run -it --rm --privileged --network=host --ipc=host --shm-size=16g \
-    --device=/dev/davinci0 --device=/dev/davinci1 --device=/dev/davinci2 --device=/dev/davinci3 \
-    --device=/dev/davinci4 --device=/dev/davinci5 --device=/dev/davinci6 --device=/dev/davinci7 \
-    --device=/dev/davinci8 --device=/dev/davinci9 --device=/dev/davinci10 --device=/dev/davinci11 \
-    --device=/dev/davinci12 --device=/dev/davinci13 --device=/dev/davinci14 --device=/dev/davinci15 \
-    --device=/dev/davinci_manager --device=/dev/hisi_hdc \
-    --volume /usr/local/sbin:/usr/local/sbin --volume /usr/local/Ascend/driver:/usr/local/Ascend/driver \
-    --volume /usr/local/Ascend/firmware:/usr/local/Ascend/firmware \
-    --volume /etc/ascend_install.info:/etc/ascend_install.info \
-    --volume /var/queue_schedule:/var/queue_schedule --volume ~/.cache/:/root/.cache/'
-
-drun --env "HF_TOKEN=<secret>" \
-    <image_name> \
-    python3 -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --attention-backend ascend --host 0.0.0.0 --port 30000
-```
-
-## Examples
-
-### Running DeepSeek-V3
-
-Running DeepSeek with PD disaggregation on 2 x Atlas 800I A3.
-Model weights could be found [here](https://modelers.cn/models/State_Cloud/Deepseek-R1-bf16-hfd-w8a8).
-
-Prefill:
-
-```shell
-export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
-export ASCEND_MF_STORE_URL="tcp://<PREFILL_HOST_IP>:<PORT>"
-
-drun <image_name> \
-    python3 -m sglang.launch_server --model-path State_Cloud/DeepSeek-R1-bf16-hfd-w8a8 \
-    --trust-remote-code \
-    --attention-backend ascend \
-    --mem-fraction-static 0.8 \
-    --quantization w8a8_int8 \
-    --tp-size 16 \
-    --dp-size 1 \
-    --nnodes 1 \
-    --node-rank 0 \
+# PIP: recommended to config first Prefill Server IP
+# PORT: one free port
+# all sglang servers need to be config the same PIP and PORT,
+export ASCEND_MF_STORE_URL="tcp://PIP:PORT"
+# if you are Atlas 800I A2 hardware and use rdma for kv cache transfer, add this parameter
+export ASCEND_MF_TRANSFER_PROTOCOL="device_rdma"
+python3 -m sglang.launch_server \
+    --model-path meta-llama/Llama-3.1-8B-Instruct \
     --disaggregation-mode prefill \
-    --disaggregation-bootstrap-port 6657 \
     --disaggregation-transfer-backend ascend \
-    --dist-init-addr <PREFILL_HOST_IP>:6688 \
-    --host <PREFILL_HOST_IP> \
+    --disaggregation-bootstrap-port 8995 \
+    --attention-backend ascend \
+    --device npu \
+    --base-gpu-id 0 \
+    --tp-size 1 \
+    --host 127.0.0.1 \
     --port 8000
 ```
 
-Decode:
-
+2. Launch Decode Server
 ```shell
-export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
-export ASCEND_MF_STORE_URL="tcp://<PREFILL_HOST_IP>:<PORT>"
-export HCCL_BUFFSIZE=200
-export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=24
-export SGLANG_NPU_USE_MLAPO=1
-
-drun <image_name> \
-    python3 -m sglang.launch_server --model-path State_Cloud/DeepSeek-R1-bf16-hfd-w8a8 \
-    --trust-remote-code \
-    --attention-backend ascend \
-    --mem-fraction-static 0.8 \
-    --quantization w8a8_int8 \
-    --enable-deepep-moe \
-    --deepep-mode low_latency \
-    --tp-size 16 \
-    --dp-size 1 \
-    --ep-size 16 \
-    --nnodes 1 \
-    --node-rank 0 \
+# PIP: recommended to config first Prefill Server IP
+# PORT: one free port
+# all sglang servers need to be config the same PIP and PORT,
+export ASCEND_MF_STORE_URL="tcp://PIP:PORT"
+# if you are Atlas 800I A2 hardware and use rdma for kv cache transfer, add this parameter
+export ASCEND_MF_TRANSFER_PROTOCOL="device_rdma"
+python3 -m sglang.launch_server \
+    --model-path meta-llama/Llama-3.1-8B-Instruct \
     --disaggregation-mode decode \
     --disaggregation-transfer-backend ascend \
-    --dist-init-addr <DECODE_HOST_IP>:6688 \
-    --host <DECODE_HOST_IP> \
+    --attention-backend ascend \
+    --device npu \
+    --base-gpu-id 1 \
+    --tp-size 1 \
+    --host 127.0.0.1 \
     --port 8001
 ```
 
-Mini_LB:
-
+3. Launch Router
 ```shell
-drun <image_name> \
-    python -m sglang.srt.disaggregation.launch_lb \
-    --prefill http://<PREFILL_HOST_IP>:8000 \
-    --decode http://<DECODE_HOST_IP>:8001 \
-    --host 127.0.0.1 --port 5000
+python3 -m sglang_router.launch_router \
+    --pd-disaggregation \
+    --policy cache_aware \
+    --prefill http://127.0.0.1:8000 8995 \
+    --decode http://127.0.0.1:8001 \
+    --host 127.0.0.1 \
+    --port 6688
+```
+
+### Running Service For Multimodal Language Models
+#### PD Mixed Scene
+```shell
+python3 -m sglang.launch_server \
+    --model-path Qwen3-VL-30B-A3B-Instruct \
+    --host 127.0.0.1 \
+    --port 8000 \
+    --tp 4 \
+    --device npu \
+    --attention-backend ascend \
+    --mm-attention-backend ascend_attn \
+    --disable-radix-cache \
+    --trust-remote-code \
+    --enable-multimodal \
+    --sampling-backend ascend
 ```

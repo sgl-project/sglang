@@ -22,13 +22,14 @@ from transformers import PretrainedConfig
 
 from sglang.srt.configs.model_config import is_deepseek_nsa
 from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
+from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.attention.nsa.utils import (
     can_cp_split,
     cp_all_gather_rerange_output,
     cp_split_and_rebuild_data,
-    enable_prefill_cp,
     is_nsa_enable_prefill_cp,
+    nsa_use_prefill_cp,
     prepare_input_dp_with_cp_dsa,
 )
 from sglang.srt.layers.dp_attention import (
@@ -45,11 +46,8 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.models.deepseek_v2 import (
-    DeepseekV2DecoderLayer,
-    DeepseekV3ForCausalLM,
-    enable_nextn_moe_bf16_cast_to_fp8,
-)
+from sglang.srt.models.deepseek_common.utils import enable_nextn_moe_bf16_cast_to_fp8
+from sglang.srt.models.deepseek_v2 import DeepseekV2DecoderLayer, DeepseekV3ForCausalLM
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import BumpAllocator, add_prefix, is_cuda, is_npu
 
@@ -70,12 +68,12 @@ class DeepseekModelNextN(nn.Module):
         super().__init__()
         if enable_nextn_moe_bf16_cast_to_fp8(quant_config):
             # refer to real DeepSeek V3 quant config
-            moe_quant_config = Fp8Config(
+            moe_quant_config_override = Fp8Config(
                 is_checkpoint_fp8_serialized=True,
                 weight_block_size=[128, 128],
             )
         else:
-            moe_quant_config = None
+            moe_quant_config_override = None
 
         if quant_config is not None and quant_config.get_name() == "modelopt_fp4":
             logger.warning(
@@ -97,7 +95,11 @@ class DeepseekModelNextN(nn.Module):
 
         self.eh_proj = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
 
-        self.alt_stream = torch.cuda.Stream() if _is_cuda else None
+        self.alt_stream = (
+            torch.cuda.Stream()
+            if _is_cuda or envs.SGLANG_NPU_USE_MULTI_STREAM.get()
+            else None
+        )
 
         layer_name = "decoder"
         if _is_npu and (
@@ -110,7 +112,7 @@ class DeepseekModelNextN(nn.Module):
             config,
             0,
             quant_config=quant_config,
-            moe_quant_config=moe_quant_config,
+            moe_quant_config_override=moe_quant_config_override,
             is_nextn=True,
             prefix=add_prefix(layer_name, prefix),
             alt_stream=self.alt_stream,
@@ -155,7 +157,7 @@ class DeepseekModelNextN(nn.Module):
                 )
             )
 
-        if enable_prefill_cp(forward_batch, self.nsa_enable_prefill_cp):
+        if nsa_use_prefill_cp(forward_batch, self.nsa_enable_prefill_cp):
             hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
         residual = None
         with get_global_expert_distribution_recorder().disable_this_region():
@@ -173,7 +175,7 @@ class DeepseekModelNextN(nn.Module):
             else:
                 hidden_states = self.shared_head.norm(hidden_states)
 
-            if enable_prefill_cp(forward_batch, self.nsa_enable_prefill_cp):
+            if nsa_use_prefill_cp(forward_batch, self.nsa_enable_prefill_cp):
                 # allgather + rerrange
                 hidden_states = cp_all_gather_rerange_output(
                     hidden_states,
@@ -220,7 +222,6 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
             use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
-        self._executed_weight_requant_ue8m0 = False
 
     @torch.no_grad()
     def forward(
@@ -231,10 +232,9 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
     ) -> torch.Tensor:
         # TODO current just support prefill batch=1 and len(input_ids) > self.cp_size * 2
         if self.nsa_enable_prefill_cp:
-            cur_cp_seq_len = len(input_ids) // (self.cp_size * 2)
-            if can_cp_split(cur_cp_seq_len, self.cp_size, self.use_nsa, forward_batch):
+            if can_cp_split(len(input_ids), self.cp_size, self.use_nsa, forward_batch):
                 forward_batch.nsa_cp_metadata = prepare_input_dp_with_cp_dsa(
-                    torch.tensor(len(input_ids)),
+                    len(input_ids),
                     self.cp_rank,
                     self.cp_size,
                     forward_batch.seq_lens_cpu.tolist(),

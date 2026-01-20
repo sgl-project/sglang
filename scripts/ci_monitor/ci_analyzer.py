@@ -105,6 +105,7 @@ class SGLangCIAnalyzer:
                 "stage-a-test-1",
                 "unit-test-backend-1-gpu",
                 "unit-test-backend-2-gpu",
+                "stage-b-test-4-gpu-b200",
                 "unit-test-backend-4-gpu",
                 "unit-test-backend-8-gpu",
             ],
@@ -134,6 +135,7 @@ class SGLangCIAnalyzer:
                 "nightly-test-general-4-gpu-h100",
                 "nightly-test-general-8-gpu-h200",
                 "nightly-test-general-8-gpu-h20",
+                "nightly-test-general-8-gpu-b200",
                 "nightly-test-text-accuracy-2-gpu-runner",
                 "nightly-test-text-perf-2-gpu-runner",
                 "nightly-test-vlm-accuracy-2-gpu-runner",
@@ -212,6 +214,7 @@ class SGLangCIAnalyzer:
                     "stage-a-test-1",
                     "unit-test-backend-1-gpu",
                     "unit-test-backend-2-gpu",
+                    "stage-b-test-4-gpu-b200",
                     "unit-test-backend-4-gpu",
                     "unit-test-backend-8-gpu-h200",
                     "unit-test-backend-8-gpu-h20",
@@ -232,6 +235,7 @@ class SGLangCIAnalyzer:
                     "nightly-test-general-4-gpu-h100",
                     "nightly-test-general-8-gpu-h200",
                     "nightly-test-general-8-gpu-h20",
+                    "nightly-test-general-8-gpu-b200",
                     "nightly-test-text-accuracy-2-gpu-runner",
                     "nightly-test-text-perf-2-gpu-runner",
                     "nightly-test-vlm-accuracy-2-gpu-runner",
@@ -728,6 +732,7 @@ class SGLangCIAnalyzer:
             "nightly-test-general-4-gpu-h100",
             "nightly-test-general-8-gpu-h200",
             "nightly-test-general-8-gpu-h20",
+            "nightly-test-general-8-gpu-b200",
             "nightly-test-text-accuracy-2-gpu-runner",
             "nightly-test-text-perf-2-gpu-runner",
             "nightly-test-vlm-accuracy-2-gpu-runner",
@@ -1174,12 +1179,12 @@ def main():
             analyzer.generate_nightly_github_summary(stats)
             regressions = analyzer.detect_nightly_regressions(stats)
 
-            # Exit with error code if regressions detected
+            # Report regressions but don't stop the monitor
             if regressions:
-                sys.exit(1)
+                print("\n⚠️  Regressions detected - see report above")
             else:
                 print("\n✓ No significant regressions detected")
-                sys.exit(0)
+            sys.exit(0)
 
         else:
             # Regular CI analysis mode

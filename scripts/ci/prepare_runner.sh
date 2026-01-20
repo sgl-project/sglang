@@ -11,19 +11,9 @@ echo ""
 python3 "${SCRIPT_DIR}/cleanup_hf_cache.py"
 echo ""
 
-# Validate model integrity for configured runners
-echo "Validating model integrity..."
-
-# Enable accelerated HuggingFace downloads (10x faster on high-bandwidth networks)
-export HF_HUB_ENABLE_HF_TRANSFER=1
-
-python3 "${SCRIPT_DIR}/validate_and_download_models.py"
-VALIDATION_EXIT_CODE=$?
-
-if [ $VALIDATION_EXIT_CODE -ne 0 ]; then
-    echo "Model validation failed with exit code: $VALIDATION_EXIT_CODE"
-    exit $VALIDATION_EXIT_CODE
-fi
-
+# Pre-validate cached models and write markers for offline mode
+# This allows tests to run with HF_HUB_OFFLINE=1 for models that are fully cached
+python3 "${SCRIPT_DIR}/prevalidate_cached_models.py"
 echo ""
+
 echo "CI runner preparation complete!"
