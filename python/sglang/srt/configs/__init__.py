@@ -1,3 +1,4 @@
+from sglang.srt.configs.afmoe import AfmoeConfig
 from sglang.srt.configs.chatglm import ChatGLMConfig
 from sglang.srt.configs.dbrx import DbrxConfig
 from sglang.srt.configs.deepseekvl2 import DeepseekVL2Config
@@ -23,6 +24,7 @@ from sglang.srt.configs.step3_vl import (
 )
 
 __all__ = [
+    "AfmoeConfig",
     "ExaoneConfig",
     "ChatGLMConfig",
     "DbrxConfig",

@@ -1,11 +1,11 @@
 import os
-import subprocess
 import threading
 import unittest
 
 import openai
 
 from sglang.srt.utils import kill_process_tree
+from sglang.test.kits.mmmu_vlm_kit import _run_lmms_eval_with_retry
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
@@ -182,7 +182,7 @@ class TestEPDDisaggregationOneEncoder(PDDisaggregationServerBase):
             limit,
         ]
 
-        subprocess.run(cmd, check=True, timeout=3600)
+        _run_lmms_eval_with_retry(cmd, timeout=3600)
 
     def test_mmmu(self):
         """Test MMMU evaluation with EPD disaggregation"""
@@ -398,7 +398,7 @@ class TestEPDDisaggregationMultiEncoders(PDDisaggregationServerBase):
             limit,
         ]
 
-        subprocess.run(cmd, check=True, timeout=3600)
+        _run_lmms_eval_with_retry(cmd, timeout=3600)
 
     def test_mmmu(self):
         """Test MMMU evaluation with EPD disaggregation (multiple encoders)"""

@@ -318,6 +318,12 @@ class SamplingParams:
 
         self.data_type = server_args.pipeline_config.task_type.data_type()
 
+        if server_args.output_path is not None:
+            self.output_path = server_args.output_path
+            logger.debug(
+                f"Overriding output_path with server configuration: {self.output_path}"
+            )
+
         # Process negative prompt
         if self.negative_prompt is not None and not self.negative_prompt.isspace():
             # avoid stripping default negative prompt: ' ' for qwen-image
@@ -346,11 +352,10 @@ class SamplingParams:
                         [f"{w}x{h}" for w, h in self.supported_resolutions]
                     )
                     error_msg = (
-                        f"Unsupported resolution: {self.width}x{self.height}. "
+                        f"Unsupported resolution: {self.width}x{self.height}, output quality may suffer. "
                         f"Supported resolutions: {supported_str}"
                     )
-                    logger.error(error_msg)
-                    raise ValueError(error_msg)
+                    logger.warning(error_msg)
 
         if pipeline_config.task_type.is_image_gen():
             # settle num_frames
@@ -405,7 +410,8 @@ class SamplingParams:
                 )
                 self.num_frames = new_num_frames
 
-        self._set_output_file_name()
+        if not server_args.comfyui_mode:
+            self._set_output_file_name()
 
     @classmethod
     def from_pretrained(cls, model_path: str, **kwargs) -> "SamplingParams":
@@ -417,7 +423,45 @@ class SamplingParams:
 
     @staticmethod
     def from_user_sampling_params_args(model_path: str, server_args, *args, **kwargs):
-        sampling_params = SamplingParams.from_pretrained(model_path)
+        try:
+            sampling_params = SamplingParams.from_pretrained(model_path)
+        except (AttributeError, ValueError) as e:
+            # Handle safetensors files or other cases where model_index.json is not available
+            # Use appropriate SamplingParams based on pipeline_class_name from registry
+            if os.path.isfile(model_path) and model_path.endswith(".safetensors"):
+                # Determine which sampling params to use based on pipeline_class_name
+                pipeline_class_name = getattr(server_args, "pipeline_class_name", None)
+
+                # Try to get SamplingParams from registry
+                from sglang.multimodal_gen.registry import get_pipeline_config_classes
+
+                config_classes = (
+                    get_pipeline_config_classes(pipeline_class_name)
+                    if pipeline_class_name
+                    else None
+                )
+
+                if config_classes is not None:
+                    _, sampling_params_cls = config_classes
+                    try:
+                        sampling_params = sampling_params_cls()
+                        logger.info(
+                            f"Using {sampling_params_cls.__name__} for {pipeline_class_name} safetensors file (no model_index.json): %s",
+                            model_path,
+                        )
+                    except Exception as import_error:
+                        logger.warning(
+                            f"Failed to instantiate {sampling_params_cls.__name__}: {import_error}. "
+                            "Using default SamplingParams"
+                        )
+                        sampling_params = SamplingParams()
+                else:
+                    raise ValueError(
+                        f"Could not get pipeline config classes for {pipeline_class_name}"
+                    )
+            else:
+                # Re-raise if it's not a safetensors file issue
+                raise
 
         user_sampling_params = SamplingParams(*args, **kwargs)
         # TODO: refactor
@@ -494,12 +538,6 @@ class SamplingParams:
             type=str,
             default=SamplingParams.prompt_path,
             help="Path to a text file containing the prompt",
-        )
-        parser.add_argument(
-            "--output-path",
-            type=str,
-            default=SamplingParams.output_path,
-            help="Path to save the generated image/video",
         )
         parser.add_argument(
             "--output-file-name",
