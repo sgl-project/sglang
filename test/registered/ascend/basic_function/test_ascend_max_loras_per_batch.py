@@ -67,6 +67,7 @@ class TestLoraPaths(CustomTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["max_loras_per_batch"], 1)
 
+
 if __name__ == "__main__":
 
     unittest.main()
