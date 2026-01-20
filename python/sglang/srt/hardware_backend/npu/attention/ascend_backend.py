@@ -212,8 +212,8 @@ class AscendAttnBackend(AttentionBackend):
             self.q_head_dim = (
                 self.qk_rope_head_dim + model_runner.model_config.qk_nope_head_dim
             )
-            if hasattr(
-                model_runner.model_config, "not_use_fused_infer_attention_score"
+            if getattr(
+                model_runner.model_config, "not_use_fused_infer_attention_score", False
             ):
                 self.not_use_fused_infer_attention_score = True
         self.native_attn = TorchNativeAttnBackend(model_runner)
@@ -810,7 +810,7 @@ class AscendAttnBackend(AttentionBackend):
             assert (
                 layer.qk_head_dim != layer.v_head_dim
             ), "FIA only supports qk_head_dim != v_head_dim"
-            if not hasattr(self, "not_use_fused_infer_attention_score"):
+            if not getattr(self, "not_use_fused_infer_attention_score", False):
                 num_token_padding = q.shape[0]
                 q, k, v = [
                     data[: forward_batch.num_token_non_padded_cpu] for data in [q, k, v]
@@ -865,48 +865,25 @@ class AscendAttnBackend(AttentionBackend):
                 )
                 use_gqa = layer.tp_q_head_num != layer.tp_k_head_num
 
-                q = q.movedim(0, q.dim() - 2)
-                k = k.movedim(0, q.dim() - 2)
-                v = v.movedim(0, q.dim() - 2)
                 k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
                 v_cache = forward_batch.token_to_kv_pool.get_value_buffer(
                     layer.layer_id
                 )
-
-                curr = 0
-                head_size = k_cache.shape[3]
-                head_size_v = v_cache.shape[3]
-                block_size = k_cache.shape[1]
-                for i in range(forward_batch.seq_lens_cpu.shape[0]):
-                    q_len = forward_batch.extend_seq_lens[i]
-                    q_ = q[:, curr : curr + q_len, :]
-
-                    block_table = self.forward_metadata.block_tables[i]
-                    j = torch.arange(q_len, device=block_table.device)
-                    block_number = block_table[j // block_size]
-                    block_offset = j % block_size
-
-                    k_ = k_cache[block_number, block_offset]
-                    v_ = v_cache[block_number, block_offset]
-                    k_ = k_.view(q_len, layer.tp_k_head_num, head_size)
-                    v_ = v_.view(q_len, layer.tp_k_head_num, head_size_v)
-
-                    k_kpe = torch.cat([k_, v_], dim=-1).transpose(0, 1)
-                    o_ = (
-                        torch.nn.functional.scaled_dot_product_attention(
-                            q_.unsqueeze(0),
-                            k_kpe.unsqueeze(0),
-                            v.unsqueeze(0),
-                            enable_gqa=use_gqa,
-                            scale=layer.scaling,
-                            is_causal=True,
-                        )
-                        .squeeze(0)
-                        .movedim(0, q.dim() - 2)
-                    )
-
-                    attn_output[curr : curr + q_len, :, :] = o_
-                    curr += q_len
+                kv_cache = torch.cat([k_cache, v_cache], dim=-1)
+                attn_output = self.native_attn._run_sdpa_forward_extend(
+                    q_,
+                    attn_output,
+                    kv_cache.view(-1, layer.tp_k_head_num, layer.qk_head_dim),
+                    k_cache.view(-1, layer.tp_v_head_num, layer.v_head_dim),
+                    forward_batch.req_to_token_pool.req_to_token,
+                    forward_batch.req_pool_indices,
+                    forward_batch.seq_lens,
+                    forward_batch.extend_prefix_lens,
+                    forward_batch.extend_seq_lens,
+                    scaling=layer.scaling,
+                    enable_gqa=use_gqa,
+                    causal=True,
+                )
 
         return attn_output
 
