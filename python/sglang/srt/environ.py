@@ -423,10 +423,8 @@ class Envs:
     SGLANG_TOOL_START_TOKEN = EnvInt(None)
     # Whether to apply logit bias to SGLANG_TOOL_START_TOKEN when tool_choice is "none"
     SGLANG_BIAS_TOOL_WHEN_NONE = EnvBool(False)
-    # System message to insert before user query when tool_choice is "none" (empty string disables)
-    SGLANG_INSERT_TOOL_PROHIBIT_WHEN_NONE = EnvStr("")
-    # Location to insert the tool prohibit message: "before" or "after" the user message
-    SGLANG_INSERT_TOOL_PROHIBIT_LOCATION = EnvStr("before")
+    # Message to insert to prohibit tool calls (inserted into the last message, empty string disables)
+    SGLANG_INSERT_TOOL_PROHIBIT = EnvStr("")
 
     # Ngram
     SGLANG_NGRAM_FORCE_GREEDY_VERIFY = EnvBool(False)
