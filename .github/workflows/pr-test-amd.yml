@@ -758,12 +758,12 @@ jobs:
         run: |
           bash scripts/ci/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-large-2-gpu-performance-amd --timeout-per-file 1200
 
-  accuracy-test-1-gpu-amd:
+  stage-b-test-small-1-gpu-accuracy-amd:
     needs: [check-changes, stage-a-test-1-amd]
     if: |
       always() &&
       (
-        (inputs.target_stage == 'accuracy-test-1-gpu-amd') ||
+        (inputs.target_stage == 'stage-b-test-small-1-gpu-accuracy-amd') ||
         (
           !inputs.target_stage &&
           (!failure() && !cancelled()) &&
@@ -792,18 +792,17 @@ jobs:
       - name: Install dependencies
         run: bash scripts/ci/amd_ci_install_dependency.sh
 
-      - name: Evaluate Accuracy
+      - name: Run test
         timeout-minutes: 30
         run: |
-          bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test/registered/eval -e SGLANG_USE_AITER=0 python3 test_eval_accuracy_large.py
+          bash scripts/ci/amd_ci_exec.sh -w "/sglang-checkout/test" -e SGLANG_USE_AITER=0 python3 run_suite.py --hw amd --suite stage-b-test-small-1-gpu-accuracy-amd --timeout-per-file 1800
 
-  accuracy-test-2-gpu-amd:
-    needs: [check-changes, accuracy-test-1-gpu-amd]
-    # Temporarily disabled - uncomment when ready to re-enable (tracked here: https://github.com/sgl-project/sglang/issues/13107)
+  stage-b-test-large-2-gpu-accuracy-amd:
+    needs: [check-changes, stage-a-test-1-amd]
     if: |
       always() &&
       (
-        (inputs.target_stage == 'accuracy-test-2-gpu-amd') ||
+        (inputs.target_stage == 'stage-b-test-large-2-gpu-accuracy-amd') ||
         (
           !inputs.target_stage &&
           (!failure() && !cancelled()) &&
@@ -832,10 +831,10 @@ jobs:
       - name: Install dependencies
         run: bash scripts/ci/amd_ci_install_dependency.sh
 
-      - name: Evaluate accuracy (TP=2)
+      - name: Run test
         timeout-minutes: 30
         run: |
-          bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test/registered/eval -e SGLANG_USE_AITER_AR=0 -e SGLANG_USE_AITER=0 -e HF_HUB_ENABLE_HF_TRANSFER=0 python3 test_moe_eval_accuracy_large.py
+          bash scripts/ci/amd_ci_exec.sh -w "/sglang-checkout/test" -e SGLANG_USE_AITER_AR=0 -e SGLANG_USE_AITER=0 -e HF_HUB_ENABLE_HF_TRANSFER=0 python3 run_suite.py --hw amd --suite stage-b-test-large-2-gpu-accuracy-amd --timeout-per-file 1800
 
   pr-test-amd-finish:
     needs:
@@ -851,13 +850,13 @@ jobs:
         stage-b-test-small-1-gpu-amd,
         stage-b-test-small-1-gpu-amd-mi35x,
         stage-b-test-large-2-gpu-amd,
-        stage-c-test-large-8-gpu-amd,
-        stage-c-test-large-8-gpu-amd-mi35x,
         stage-b-test-small-1-gpu-performance-amd,
         stage-b-test-large-1-gpu-performance-amd,
         stage-b-test-large-2-gpu-performance-amd,
-        accuracy-test-1-gpu-amd,
-        accuracy-test-2-gpu-amd,
+        stage-b-test-small-1-gpu-accuracy-amd,
+        stage-b-test-large-2-gpu-accuracy-amd,
+        stage-c-test-large-8-gpu-amd,
+        stage-c-test-large-8-gpu-amd-mi35x,
       ]
     if: always()
     runs-on: ubuntu-latest
