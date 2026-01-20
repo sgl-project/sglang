@@ -1,37 +1,12 @@
 # Evaluating New Models with SGLang
 
-This document provides a comprehensive guide for evaluating new models using SGLang before open-sourcing or deployment. It covers installation, server launching, and evaluating both accuracy and performance (latency and throughput) for Large Language Models and Multimodal Language Models.
+This document provides commands for evaluating models' accuracy and performance. Before open-sourcing new models, we strongly suggest running these commands to verify whether the score matches your internal benchmark results.
 
-## Installation
+**For cross verification, please submit commands for installation, server launching, and benchmark running with all the scores and hardware requirements when open-sourcing your models.**
 
-To get started, clone the SGLang repository and install the dependencies.
+[Reference: MiniMax M2](https://github.com/sgl-project/sglang/pull/12129)
 
-```bash
-git clone -b <your-branch> https://github.com/<your-fork>/sglang.git
-cd sglang
-
-pip install --upgrade pip
-pip install -e "python"
-```
-
-## Launching the Server
-
-Before running evaluations, you need to launch the SGLang server. The command below shows a general usage pattern. You should adjust flags based on your specific model and hardware requirements.
-
-> [!NOTE]
-> Below is a minimal example. Please change the install and launch commands to your own.
-
-```bash
-python -m sglang.launch_server \
-  --model-path <model-path> \
-  --host 0.0.0.0 \
-  --port 30000 \
-```
-
-> [!NOTE]
-> Record the exact GPU type, count, and any specific flags used for reproducibility, submit them when you are making the PR.
-
-## Accuracy Evaluation
+## Accuracy
 
 ### LLMs
 
@@ -83,7 +58,6 @@ python -m sglang.test.run_eval \
 **HumanEval**
 
 ```bash
-# Install human-eval if it is not installed yet
 pip install human_eval
 
 python -m sglang.test.run_eval \
@@ -106,7 +80,7 @@ python benchmark/mmmu/bench_sglang.py \
 
 For models capable of processing video, we recommend extending the evaluation to include `VideoMME`, `MVBench`, and other relevant benchmarks.
 
-## Performance Evaluation
+## Performance
 
 Performance benchmarks measure **Latency** (Time To First Token - TTFT) and **Throughput** (tokens/second).
 
@@ -161,6 +135,7 @@ You can run more granular benchmarks:
 ## Reporting Results
 
 For each evaluation, please report:
+
 1.  **Metric Score**: Accuracy % (LLMs and VLMs); Latency (ms) and Throughput (tok/s) (LLMs only).
 2.  **Environment settings**: GPU type/count, SGLang commit hash.
 3.  **Launch configuration**: Model path, TP size, and any special flags.
