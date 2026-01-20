@@ -124,26 +124,8 @@ If the `--attention-backend` argument is not specified, SGLang automatically sel
 
 **2. MLA Models (e.g., DeepSeek V3)**
 - **Hopper**: Defaults to `fa3` (requires CUDA 12.3+).
-- **Blackwell**: Defaults to `flashinfer` (though `trtllm_mla` is also an optimized option available for manual selection).
+- **Blackwell**: Defaults to `trtllm_mla`.
 - **Other Architectures**: Defaults to `triton`.
-
-### Constraints & Requirements
-
-When manually selecting a backend, be aware of the following constraints:
-
-- **FlashMLA (`flashmla`)**: Requires `page_size=64`.
-- **Cutlass MLA (`cutlass_mla`)**: Requires `page_size=128`.
-- **TensorRT-LLM MLA (`trtllm_mla`)**:
-    - Only supported on Blackwell (SM100).
-    - Requires `page_size` of 32 or 64.
-    - Supports KV cache dtypes: `fp8_e4m3`, `fp4_e2m1`, `bf16`, or `auto`.
-- **TensorRT-LLM MHA (`trtllm_mha`)**:
-    - Only supported on Blackwell (SM100).
-    - Requires `page_size` of 16, 32, or 64.
-- **FlashAttention 3 (`fa3`)**:
-    - If using FP8 KV cache, only supports `fp8_e4m3`.
-- **FlashAttention 4 (`fa4`)**:
-    - Currently supported for **prefill only**. Use via `--prefill-attention-backend fa4`.
 
 
 ## User Guide
