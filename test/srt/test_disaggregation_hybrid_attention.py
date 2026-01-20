@@ -17,7 +17,7 @@ class TestDisaggregationHybridAttentionMamba(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
-        cls.model = "/Qwen3-Next-80B-A3B-Instruct"
+        cls.model = "Qwen/Qwen3-Next-80B-A3B-Instruct"
 
         # Non blocking start servers
         cls.start_prefill()
