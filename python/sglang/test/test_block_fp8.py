@@ -14,6 +14,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     w8a8_block_fp8_matmul,
 )
 from sglang.srt.layers.quantization.fp8_utils import (
+    mxfp8_group_quantize,
     input_to_float8,
     triton_mxfp8_blockscaled_linear,
 )
@@ -418,23 +419,6 @@ class TestW8A8BlockFP8Matmul(CustomTestCase):
                 self._w8a8_block_fp8_matmul(*params)
 
 
-def _ceil_to_ue8m0_scale(x: torch.Tensor) -> torch.Tensor:
-    x = x.clamp(min=1e-4)
-    return torch.pow(2.0, torch.ceil(torch.log2(x)))
-
-
-def _float_to_ue8m0(scale: torch.Tensor) -> torch.Tensor:
-    scale = scale.to(torch.float32)
-    out = torch.empty_like(scale, dtype=torch.uint8)
-    invalid = torch.isnan(scale) | torch.isinf(scale) | (scale <= 0)
-    out[invalid] = 255
-    if (~invalid).any():
-        exp = torch.floor(torch.log2(scale[~invalid]))
-        exp_biased = (exp + 127).clamp(0, 254).to(torch.int32)
-        out[~invalid] = exp_biased.to(torch.uint8)
-    return out
-
-
 def _ue8m0_to_f32(scale_u8: torch.Tensor) -> torch.Tensor:
     scale_u8 = scale_u8.to(torch.float32)
     is_nan = scale_u8 == 255
@@ -443,23 +427,6 @@ def _ue8m0_to_f32(scale_u8: torch.Tensor) -> torch.Tensor:
     value = torch.pow(2.0, e - 127.0)
     value[is_nan] = float("nan")
     return value
-
-
-def _mxfp8_group_quant(
-    x: torch.Tensor, group_size: int = 32
-) -> tuple[torch.Tensor, torch.Tensor]:
-    assert x.dim() == 2
-    m, k = x.shape
-    assert k % group_size == 0
-    fp8_max = torch.finfo(torch.float8_e4m3fn).max
-
-    x_view = x.view(m, k // group_size, group_size)
-    amax = x_view.abs().float().amax(dim=2).clamp(min=1e-4)
-    scale_f32 = _ceil_to_ue8m0_scale(amax / fp8_max)
-    scale_u8 = _float_to_ue8m0(scale_f32)
-    scale_f32 = _ue8m0_to_f32(scale_u8)
-    q_input = (x_view * (1.0 / scale_f32.unsqueeze(2))).to(torch.float8_e4m3fn)
-    return (q_input.view(m, k).contiguous(), scale_u8.contiguous())
 
 
 def _mxfp8_group_dequant(
@@ -498,10 +465,12 @@ class TestMXFP8DenseLinear(CustomTestCase):
         input_fp16 = input_fp32.to(dtype)
 
         weight_fp32 = torch.randn((N, K), dtype=torch.float32) / 4
-        weight_q, weight_scale_u8 = _mxfp8_group_quant(weight_fp32)
+        weight_q, weight_scale_u8 = mxfp8_group_quantize(weight_fp32)
 
         with torch.inference_mode():
-            q_input, input_scale_u8 = _mxfp8_group_quant(input_fp16.to(torch.float32))
+            q_input, input_scale_u8 = mxfp8_group_quantize(
+                input_fp16.to(torch.float32)
+            )
             a_dq = _mxfp8_group_dequant(q_input, input_scale_u8)
             b_dq = _mxfp8_group_dequant(weight_q, weight_scale_u8)
             ref_out = torch.matmul(a_dq, b_dq.t()).to(dtype)
