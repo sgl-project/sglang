@@ -2105,19 +2105,21 @@ class Scheduler(
             tmp_batch, tmp_result = self.result_queue.popleft()
             if tmp_batch.forward_mode != ForwardMode.EXTEND:  # TODO csy idle???
                 # if the last batch is decode, then no new req will be merged into batch, i.e. batch is the same as tmp_batch
-                # TODO support chunk prefill and mixed-chunk
-                verify_input: NgramVerifyInputV2 = batch.spec_info
-                logits_output, next_token_ids, num_accepted_tokens = (
-                    verify_input.fill_requests_and_free_cache(
-                        batch, batch.logits_output, self.page_size
+                # TODO support chunk prefill and pd disaggregation
+                with self.forward_stream_ctx:
+                    self.forward_stream.wait_stream(self.default_stream)
+                    verify_input: NgramVerifyInputV2 = batch.spec_info
+                    logits_output, next_token_ids, num_accepted_tokens = (
+                        verify_input.fill_requests_and_free_cache(
+                            batch, batch.logits_output, self.page_size
+                        )
                     )
-                )
-                self.model_worker._update_ngram_cache(batch)
-                # update result_queue using the new result, token ids do not need to store in future map since all output ids are updated in speculative module
-                tmp_result.logits_output = logits_output
-                tmp_result.next_token_ids = next_token_ids
-                tmp_result.num_accepted_tokens = num_accepted_tokens
-                tmp_result.copy_to_cpu(return_logprob=tmp_batch.return_logprob)
+                    batch.output_ids = next_token_ids
+                    # update result_queue using the new result, token ids do not need to store in future map since all output ids are updated in speculative module
+                    tmp_result.logits_output = logits_output
+                    tmp_result.next_token_ids = next_token_ids
+                    tmp_result.num_accepted_tokens = num_accepted_tokens
+                    tmp_result.copy_to_cpu(return_logprob=tmp_batch.return_logprob)
                 self.result_queue.appendleft((batch.copy(), tmp_result))
             else:
                 self.result_queue.appendleft((tmp_batch, tmp_result))
@@ -2253,7 +2255,7 @@ class Scheduler(
                 model_worker_batch = worker_batch_or_batch
                 self.record_batch_in_overlap(model_worker_batch)
 
-                # TODO csy unify model_worker_batch and schedule_batc, why here schedule_batch's sampling_info has no penalizer???
+                # TODO csy unify model_worker_batch and schedule_batch, but why here schedule_batch's sampling_info has no penalizer???
                 # # Sampling info will be modified during forward, so we store a copy.
                 # model_worker_batch.sampling_info = (
                 #     model_worker_batch.sampling_info.copy_for_forward()

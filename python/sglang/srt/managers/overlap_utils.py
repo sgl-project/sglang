@@ -9,8 +9,9 @@ from sglang.srt.speculative.spec_utils import spec_need_hidden_states
 from sglang.srt.utils import get_compiler_backend
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.schedule_batch import ModelWorkerBatch
+    from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
     from sglang.srt.managers.scheduler import GenerationBatchResult
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
     from sglang.srt.speculative.eagle_info import EagleDraftInput
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
@@ -57,7 +58,7 @@ class FutureMap:
         self.device = device
         self.spec_algo = spec_algo
 
-        if self.spec_algo.is_none():
+        if self.spec_algo.is_none() or self.spec_algo.is_ngram():
             # For non-speculative decoding, we only need to store the token ids.
             self.buf_initialized = True
             self.token_ids_buf = torch.empty(
@@ -115,8 +116,13 @@ class FutureMap:
         indices = torch.arange(start, end, dtype=torch.int64, device=self.device)
         return FutureIndices(indices=indices, interval=slice(start, end))
 
-    def resolve_future(self, model_worker_batch: ModelWorkerBatch):
-        if self.spec_algo.is_none():
+    def resolve_future(
+        self, model_worker_batch: ModelWorkerBatch, batch: ScheduleBatch
+    ):
+        ngram_v2 = batch.is_spec_v2 and self.spec_algo.is_ngram()
+        if ngram_v2 and model_worker_batch.forward_mode != ForwardMode.EXTEND:
+            return
+        if self.spec_algo.is_none() or ngram_v2:
             _resolve_future_token_ids(model_worker_batch.input_ids, self.token_ids_buf)
         else:
             # TODO(lsyin): write future indices into spec_info.future_indices
@@ -140,11 +146,16 @@ class FutureMap:
             return start <= stop
 
     def store_to_map(
-        self, future_indices: FutureIndices, batch_result: GenerationBatchResult
+        self,
+        future_indices: FutureIndices,
+        batch_result: GenerationBatchResult,
+        batch: ScheduleBatch,
     ):
-        if self.spec_algo.is_ngram():
+        # ngram decode return, prefill behaves like normal overlap
+        ngram_v2 = batch.is_spec_v2 and self.spec_algo.is_ngram()
+        if ngram_v2 and batch.forward_mode != ForwardMode.EXTEND:
             return
-        if self.spec_algo.is_none():
+        if self.spec_algo.is_none() or ngram_v2:
             intv = future_indices.interval
             self.token_ids_buf[intv] = batch_result.next_token_ids
         else:

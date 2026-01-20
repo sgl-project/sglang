@@ -77,9 +77,6 @@ class NGRAMWorkerV2(NGRAMWorker):
         self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
 
     def forward_batch_generation(self, batch: ScheduleBatch) -> GenerationBatchResult:
-        # self._update_ngram_cache(
-        #     batch
-        # )  # here the output_id in req is not updated yet, this round's output id will be updated in the end of next round
         self._prepare_for_speculative_decoding(batch)
         model_worker_batch = batch.get_model_worker_batch()
         num_accepted_tokens = 0
@@ -102,7 +99,7 @@ class NGRAMWorkerV2(NGRAMWorker):
             # TODO csy ngram v2 logprob not supported yet
             # if batch.return_logprob:
             #     add_output_logprobs_for_spec_v1(batch, verify_input, logits_output)
-
+            self._update_ngram_cache(batch)
             batch.forward_mode = ForwardMode.DECODE
             batch.logits_output = logits_output  # to be used as parameter in scheduler update_running_batch
 
@@ -122,5 +119,5 @@ class NGRAMWorkerV2(NGRAMWorker):
             num_accepted_tokens=num_accepted_tokens,
             can_run_cuda_graph=can_run_cuda_graph,
             accept_lens=accept_lens,
-            next_draft_input=batch.spec_info,
+            next_draft_input=model_worker_batch.spec_info,
         )
