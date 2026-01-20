@@ -633,7 +633,7 @@ def _get_chunked_prefill_embedding(
     enable_batch_compute = get_global_server_args().enable_batch_compute_mm_embeddings
     modality = embedding_items[0].modality
     if enable_batch_compute and modality == Modality.IMAGE:
-        batch_compute_embedding, input_ids = _get_chunked_prefill_embedding_batch(
+        batch_compute_embedding, batch_input_ids = _get_chunked_prefill_embedding_batch(
             data_embedding_func,
             get_mm_dp_metadata_func,
             embedding_items,
@@ -655,10 +655,10 @@ def _get_chunked_prefill_embedding(
         items_offset_list,
         input_ids,
     )
-    # if batch_compute_embedding is not None:
-    #     single_compute_embedding = torch.concat(embedding_list, dim=0)
-    #     assert torch.equal(batch_compute_embedding, single_compute_embedding)
-    #     print("equal!!!")
+    if batch_compute_embedding is not None:
+        assert torch.equal(batch_compute_embedding, ori_embedding)
+        assert torch.equal(batch_input_ids, input_ids)
+        print("equal!!!")
     return ori_embedding, input_ids
 
 
@@ -674,7 +674,7 @@ def _get_chunked_prefill_embedding_batch(
     modality: Modality,
 ) -> Optional[torch.Tensor]:
     # step1: check cache and collect cache-miss items and their metadata
-    all_req_embedding_list = []  # List[Tuple[req_idx,embeddings]]
+    all_req_embedding_list = []  # List[Tuple[req_idx,EmbeddingResult]]
     cache_miss_items = (
         {}
     )  # Dict[key: req_idx or 'batch', value: List[MultimodalDataItem]]
@@ -825,6 +825,13 @@ def _get_chunked_prefill_embedding_batch(
             else:
                 embeddings_per_req = cache_miss_items[i]
 
+            assert embeddings_per_req is not None
+            embeddings_per_req = (
+                EmbeddingResult(embedding=embeddings_per_req)
+                if isinstance(embeddings_per_req, torch.Tensor)
+                else embeddings_per_req
+            )
+
             if not embedding_cache.set(req_items_hash_map[i], embeddings_per_req):
                 print_warning_once(
                     "Multimodal embedding cache is full. This typically occurs when a single "
@@ -832,15 +839,14 @@ def _get_chunked_prefill_embedding_batch(
                     "`SGLANG_VLM_CACHE_SIZE_MB` environment variable or reducing the input "
                     "embedding size."
                 )
-        assert embeddings_per_req is not None
 
         extend_prefix_len = prefix_length[i]
         extend_seq_len = extend_length[i] if i < len(extend_length) else 0
 
-        if isinstance(embedding_per_req, EVSEmbeddingResult):
+        if isinstance(embeddings_per_req, EVSEmbeddingResult):
             item = embedding_items_per_req[0]
             input_ids, items_offset = (
-                embedding_per_req.redistribute_pruned_frames_placeholders(
+                embeddings_per_req.redistribute_pruned_frames_placeholders(
                     input_ids,
                     items_offset,
                     item=item,
@@ -850,7 +856,7 @@ def _get_chunked_prefill_embedding_batch(
             )
 
         embedding_per_req_chunk, _, _ = get_embedding_chunk(
-            embedding=embedding_per_req.embedding,
+            embedding=embeddings_per_req.embedding,
             extend_prefix_len=extend_prefix_len,
             extend_seq_len=extend_seq_len,
             items_offset=items_offset,
