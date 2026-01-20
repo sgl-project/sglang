@@ -129,7 +129,6 @@ from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
 )
 from sglang.srt.models.deepseek_common.utils import (
     FORWARD_ABSORB_CORE_ATTENTION_BACKENDS,
-    NVFP4_CKPT_FP8_ATTN_QUANT_MODULES,
     _device_sm,
     _get_llama_4_scaling,
     _is_cpu,
@@ -141,7 +140,6 @@ from sglang.srt.models.deepseek_common.utils import (
     _is_npu,
     _use_aiter,
     _use_aiter_gfx95,
-    enable_nextn_moe_bf16_cast_to_fp8,
     yarn_get_mscale,
 )
 from sglang.srt.server_args import get_global_server_args
@@ -201,7 +199,6 @@ else:
 logger = logging.getLogger(__name__)
 
 
-
 FORWARD_ABSORB_CORE_ATTENTION_BACKENDS = [
     "fa3",
     "nsa",
@@ -210,7 +207,6 @@ FORWARD_ABSORB_CORE_ATTENTION_BACKENDS = [
     "trtllm_mla",
     "ascend",
 ]
-
 
 
 class DeepseekV2MLP(nn.Module):

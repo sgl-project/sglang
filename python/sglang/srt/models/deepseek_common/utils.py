@@ -13,14 +13,13 @@
 # ==============================================================================
 import logging
 import math
-
 from typing import Optional
+
 import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.fused_moe_triton.layer import get_moe_runner_backend
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -114,7 +113,6 @@ def enable_nextn_moe_bf16_cast_to_fp8(quant_config):
     )
 
 
-
 def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
     """
     Calculate YaRN (Yet another RoPE extensioN method) attention scaling factor.
@@ -158,4 +156,3 @@ def _get_llama_4_scaling(
         1 + torch.floor(positions / original_max_position_embeddings)
     )
     return scaling[..., None, None]
-
