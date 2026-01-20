@@ -75,12 +75,6 @@ CAT_SHORT2LONG = {
 }
 
 
-# DATA SAVING
-def save_json(filename, ds):
-    with open(filename, "w") as f:
-        json.dump(ds, f, indent=4)
-
-
 def get_multi_choice_info(options):
     """
     Given the list of options for multiple choice question

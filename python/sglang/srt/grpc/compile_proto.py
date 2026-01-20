@@ -16,7 +16,10 @@ Options:
     --proto-file    Specify proto file (default: sglang_scheduler.proto)
 
 ### Install Dependencies
-pip install "grpcio==1.74.0" "grpcio-tools==1.74.0"
+pip install "grpcio==1.75.1" "grpcio-tools==1.75.1"
+
+Please make sure to use the same version of grpcio and grpcio-tools specified in pyproject.toml
+otherwise update the versions specified in pyproject.toml
 
 ### Run Script
 cd python/sglang/srt/grpc
@@ -30,7 +33,7 @@ import sys
 from importlib.metadata import version
 from pathlib import Path
 
-GRPC_VERSION = "1.74.0"
+GRPC_VERSION = "1.75.1"
 
 
 def get_file_mtime(path: Path) -> float:
@@ -70,7 +73,7 @@ def compile_proto(proto_file: Path, output_dir: Path, verbose: bool = True) -> b
 
     # Check if grpc_tools is available
     try:
-        import grpc_tools.protoc
+        import grpc_tools.protoc  # noqa: F401
     except ImportError:
         print("Error: grpcio-tools not installed")
         print(

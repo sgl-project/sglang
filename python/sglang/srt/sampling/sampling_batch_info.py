@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import dataclasses
 import logging
-import threading
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 import torch
@@ -10,6 +9,7 @@ import torch
 import sglang.srt.sampling.penaltylib as penaltylib
 from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
+from sglang.srt.server_args import get_global_server_args
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -67,15 +67,9 @@ class SamplingBatchInfo:
     logit_bias: Optional[torch.Tensor] = None
 
     @classmethod
-    def _get_global_server_args_dict(cls):
-        from sglang.srt.managers.schedule_batch import global_server_args_dict
-
-        return global_server_args_dict
-
-    @classmethod
     def from_schedule_batch(cls, batch: ScheduleBatch, vocab_size: int):
-        global_server_args_dict = cls._get_global_server_args_dict()
-        enable_deterministic = global_server_args_dict["enable_deterministic_inference"]
+        global_server_args = get_global_server_args()
+        enable_deterministic = global_server_args.enable_deterministic_inference
 
         reqs = batch.reqs
         device = batch.device
@@ -95,8 +89,15 @@ class SamplingBatchInfo:
         )
         sampling_seed = (
             torch.tensor(
-                [r.sampling_params.sampling_seed for r in reqs],
-                dtype=torch.int32,
+                [
+                    (
+                        r.sampling_params.sampling_seed
+                        if r.sampling_params.sampling_seed is not None
+                        else 42
+                    )
+                    for r in reqs
+                ],
+                dtype=torch.int64,
                 device=device,
             )
             if enable_deterministic
@@ -112,10 +113,9 @@ class SamplingBatchInfo:
                         logit_bias[i, int(key)] = value
 
         # Check if any request has custom logit processor
-        has_custom_logit_processor = global_server_args_dict[
-            "enable_custom_logit_processor"
-        ] and any(  # check the flag first.
-            r.custom_logit_processor for r in reqs
+        has_custom_logit_processor = (
+            global_server_args.enable_custom_logit_processor
+            and any(r.custom_logit_processor for r in reqs)  # check the flag first.
         )  # then check the requests.
 
         if has_custom_logit_processor:
@@ -180,7 +180,16 @@ class SamplingBatchInfo:
             device=device,
             logit_bias=logit_bias,
         )
+        ret.adjusted_from_schedule_batch(batch, vocab_size)
         return ret
+
+    # placeholder for override
+    def adjusted_from_schedule_batch(self, batch: ScheduleBatch, vocab_size: int):
+        pass
+
+    # placeholder for override
+    def adjusted_merge_batch(self, other: "SamplingBatchInfo"):
+        pass
 
     def __len__(self):
         return len(self.temperatures)
@@ -366,6 +375,8 @@ class SamplingBatchInfo:
         self.need_top_p_sampling |= other.need_top_p_sampling
         self.need_top_k_sampling |= other.need_top_k_sampling
         self.need_min_p_sampling |= other.need_min_p_sampling
+
+        self.adjusted_merge_batch(other)
 
     def copy_for_forward(self):
         # Accumulate the penalty into a pre-allocated buffer to get rid of the dependency of `penalizer_orchestrator` later

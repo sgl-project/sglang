@@ -103,7 +103,7 @@ def transform_index_page_table_decode_ref(
         result = torch.empty_like(topk_indices, dtype=torch.int32)
     assert result.shape == topk_indices.shape
     torch.gather(
-        page_table,
+        page_table.to(result.dtype),
         dim=1,
         index=topk_indices.clamp(min=0),
         out=result,

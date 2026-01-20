@@ -43,9 +43,18 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import add_prefix, make_layers
+from sglang.srt.utils import add_prefix, is_cuda, make_layers
+
+_is_cuda = is_cuda()
+
+
+# Aligned with HF's implementation, using sliding window inclusive with the last token
+# SGLang assumes exclusive
+def get_attention_sliding_window_size(config):
+    return config.sliding_window - 1 if hasattr(config, "sliding_window") else None
 
 
 class Olmo2Attention(nn.Module):
@@ -61,6 +70,7 @@ class Olmo2Attention(nn.Module):
         layer_id: int = 0,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        alt_stream: Optional[torch.cuda.Stream] = None,
     ):
         super().__init__()
         self.config = config
@@ -85,6 +95,8 @@ class Olmo2Attention(nn.Module):
         self.num_kv_heads = max(1, self.total_num_kv_heads // self.tp_size)
 
         self.head_dim = self.hidden_size // self.total_num_heads
+        self.q_size = self.num_heads * self.head_dim
+        self.kv_size = self.num_kv_heads * self.head_dim
         self.max_position_embeddings = config.max_position_embeddings
         self.rope_theta = config.rope_theta
 
@@ -93,23 +105,39 @@ class Olmo2Attention(nn.Module):
             self.hidden_size,
             self.head_dim,
             self.total_num_heads,
+            total_num_kv_heads=self.total_num_kv_heads,
             bias=config.attention_bias,
             quant_config=quant_config,
             prefix=add_prefix("qkv_proj", prefix),
         )
         self.tp_rank = get_tensor_model_parallel_rank()
+        self.alt_stream = alt_stream
 
         self.k_norm = RMSNorm(
             self.total_num_kv_heads * self.head_dim,
             eps=self.config.rms_norm_eps,
         )
         self.q_norm = RMSNorm(self.config.hidden_size, eps=self.config.rms_norm_eps)
-        # Rotary embeddings.
+
+        sliding_window = None
+        if (
+            layer_types := getattr(self.config, "layer_types", None)
+        ) is not None and layer_types[layer_id] == "sliding_attention":
+            sliding_window = get_attention_sliding_window_size(self.config)
+
+        # Rotary embeddings. Rope scaling is only applied on full attention
+        # layers.
+        self.rope_scaling = (
+            self.config.rope_scaling
+            if sliding_window is None
+            else {"rope_type": "default"}
+        )
         self.rotary_emb = get_rope(
             self.head_dim,
             rotary_dim=self.head_dim,
             max_position=self.max_position_embeddings,
             base=self.rope_theta,
+            rope_scaling=self.rope_scaling,
         )
         self.scaling = self.head_dim**-0.5
         self.attn = RadixAttention(
@@ -118,6 +146,7 @@ class Olmo2Attention(nn.Module):
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
+            sliding_window_size=sliding_window,
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
         )
@@ -137,8 +166,29 @@ class Olmo2Attention(nn.Module):
         if self.tp_size > 1:
             q = tensor_model_parallel_all_gather(q.contiguous())
             k = tensor_model_parallel_all_gather(k.contiguous())
-        q = self.q_norm.forward_native(q)
-        k = self.k_norm.forward_native(k)
+
+        if self.alt_stream is not None and get_is_capture_mode():
+            current_stream = torch.cuda.current_stream()
+            self.alt_stream.wait_stream(current_stream)
+
+            q_shape = q.shape
+            k_shape = k.shape
+
+            q_by_last = q.reshape(-1, q_shape[-1])
+            q_by_last = self.q_norm(q_by_last)
+
+            with torch.cuda.stream(self.alt_stream):
+                k_by_last = k.reshape(-1, k_shape[-1])
+                k_by_last = self.k_norm(k_by_last)
+
+            current_stream.wait_stream(self.alt_stream)
+
+            q = q_by_last.view(q_shape)
+            k = k_by_last.view(k_shape)
+        else:
+            q = self.q_norm.forward_native(q)
+            k = self.k_norm.forward_native(k)
+
         if self.tp_size > 1:
             splitter = partial(split_tensor_along_last_dim, num_partitions=self.tp_size)
             q = splitter(q)[self.tp_rank]
@@ -152,7 +202,7 @@ class Olmo2Attention(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.chunk(chunks=3, dim=-1)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self._apply_qk_norm(q, k)
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v, forward_batch)
@@ -222,11 +272,18 @@ class Olmo2DecoderLayer(nn.Module):
         layer_id: int = 0,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        alt_stream: Optional[torch.cuda.Stream] = None,
     ):
         super().__init__()
+        self.layer_id = layer_id
+        self.alt_stream = alt_stream
         # Attention block.
         self.self_attn = Olmo2Attention(
-            config, layer_id, quant_config, prefix=add_prefix("self_attn", prefix)
+            config,
+            layer_id,
+            quant_config,
+            prefix=add_prefix("self_attn", prefix),
+            alt_stream=alt_stream,
         )
 
         # MLP block.
@@ -268,9 +325,13 @@ class Olmo2Model(nn.Module):
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        alt_stream: Optional[torch.cuda.Stream] = None,
     ):
         super().__init__()
         self.config = config
+        if alt_stream is None and _is_cuda:
+            alt_stream = torch.cuda.Stream()
+        self.alt_stream = alt_stream
 
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
@@ -280,10 +341,11 @@ class Olmo2Model(nn.Module):
         self.layers = make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: Olmo2DecoderLayer(
-                layer_id=idx,
                 config=config,
+                layer_id=idx,
                 quant_config=quant_config,
                 prefix=prefix,
+                alt_stream=self.alt_stream,
             ),
             prefix=add_prefix("layers", prefix),
         )
@@ -294,7 +356,7 @@ class Olmo2Model(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
-        input_embeds: torch.Tensor = None,
+        input_embeds: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         :param input_ids: A tensor of shape `(batch_size, seq_len)`.
@@ -332,11 +394,15 @@ class Olmo2ForCausalLM(nn.Module):
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        alt_stream: Optional[torch.cuda.Stream] = None,
     ):
         super().__init__()
         self.config = config
         self.model = Olmo2Model(
-            config, quant_config, prefix=add_prefix("model", prefix)
+            config,
+            quant_config,
+            prefix=add_prefix("model", prefix),
+            alt_stream=alt_stream,
         )
         if config.tie_word_embeddings:
             self.lm_head = self.model.embed_tokens
@@ -351,6 +417,10 @@ class Olmo2ForCausalLM(nn.Module):
             )
         self.logits_processor = LogitsProcessor(config)
 
+    def get_attention_sliding_window_size(self):
+        return get_attention_sliding_window_size(self.config)
+
+    @torch.no_grad()
     def forward(
         self,
         input_ids: torch.Tensor,
