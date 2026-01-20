@@ -214,7 +214,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     ; \
     fi \
     && python3 -m pip install -e "python[${BUILD_TYPE}]" --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} \
-    && uv pip install git+https://github.com/huggingface/transformers.git@76732b4e7120808ff989edbd16401f61fa6a0afa \
+    && uv pip install --system git+https://github.com/huggingface/transformers.git@76732b4e7120808ff989edbd16401f61fa6a0afa \
     && if [ "$INSTALL_FLASHINFER_JIT_CACHE" = "1" ]; then \
         python3 -m pip install flashinfer-jit-cache==${FLASHINFER_VERSION} --index-url https://flashinfer.ai/whl/cu${CUINDEX} ; \
     fi \
