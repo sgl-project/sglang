@@ -59,7 +59,7 @@ from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
+from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchPrefixParams
 from sglang.srt.mem_cache.common import (
     alloc_for_decode,
     alloc_for_extend,
@@ -549,8 +549,12 @@ class Req:
         # for corss-endoder model
         self.token_type_ids = token_type_ids
 
-        # The length of KV that have been removed in swa chunk cache
-        self.evicted_seqlen_local = 0
+        # The length of KV that have been removed in swa cache.
+        # SWA KV cache eviction behavior differs by cache type:
+        # - Radix cache: KV in range [cache_protected_len, swa_evicted_seqlen) is freed manually in
+        #   `ScheduleBatch.maybe_evict_swa`; KV in range [0, cache_protected_len) is freed during radix cache eviction.
+        # - Chunk cache: KV in range [0, swa_evicted_seqlen) is freed manually in `ScheduleBatch.maybe_evict_swa`.
+        self.swa_evicted_seqlen = 0
 
         # The index of the extend / decode batch
         self.extend_batch_idx = 0
@@ -864,12 +868,11 @@ class Req:
 
         if tree_cache is not None:
             match_result = tree_cache.match_prefix(
-                key=RadixKey(token_ids=token_ids, extra_key=self.extra_key),
-                **(
-                    {"req": self, "cow_mamba": True}
-                    if tree_cache.supports_mamba()
-                    else {}
-                ),
+                MatchPrefixParams(
+                    key=RadixKey(token_ids=token_ids, extra_key=self.extra_key),
+                    req=self if tree_cache.supports_mamba() else None,
+                    cow_mamba=tree_cache.supports_mamba(),
+                )
             )
             (
                 self.prefix_indices,
@@ -2263,6 +2266,59 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_seqlens=self.mamba_track_seqlens,
             dp_cooperation_info=self.dp_cooperation_info,
         )
+
+    def maybe_evict_swa(self):
+        if self.tree_cache.supports_swa():
+            sliding_window_size = self.tree_cache.sliding_window_size
+            for idx, req in enumerate(self.reqs):
+                if self.forward_mode.is_decode():
+                    # We set evict_swa condition here with two reasons:
+                    # 1. In overlap scheduler, we cannot evict swa when req.decode_batch_idx == 0 since the prev extend batch is still running.
+                    # 2. Evict swa every window_size tokens to reduce the overhead.
+                    if req.decode_batch_idx % sliding_window_size == 1:
+                        self._evict_swa(req, req.seqlen - 1)
+                elif self.forward_mode.is_extend() and self.tree_cache.is_chunk_cache():
+                    pre_len = self.prefix_lens[idx]
+                    if self.enable_overlap:
+                        # In chunked prefill case, when the second extend batch is scheduling, the first extend batch is still running, so we cannot evict swa tokens
+                        if req.extend_batch_idx < 2:
+                            continue
+                        else:
+                            server_args = get_global_server_args()
+                            pre_len = (
+                                pre_len - server_args.chunked_prefill_size
+                                if server_args.chunked_prefill_size > 0
+                                else pre_len
+                            )
+                            self._evict_swa(req, pre_len)
+                    else:
+                        self._evict_swa(req, pre_len)
+
+    def _evict_swa(self, req: Req, pre_len: int):
+        assert self.tree_cache.supports_swa(), "prefix cache must support swa"
+        sliding_window_size = self.tree_cache.sliding_window_size
+
+        # For swa radix cache, we need to evict the tokens that are not in the tree cache and also not in the sliding window
+        assert (
+            req.cache_protected_len % self.tree_cache.page_size == 0
+        ), "cache_protected_len must be page aligned"
+        req.swa_evicted_seqlen = max(req.swa_evicted_seqlen, req.cache_protected_len)
+
+        new_swa_evicted_seqlen = max(
+            req.swa_evicted_seqlen, pre_len - sliding_window_size
+        )
+
+        if self.tree_cache.page_size > 1:
+            new_swa_evicted_seqlen = (
+                new_swa_evicted_seqlen // self.tree_cache.page_size
+            ) * self.tree_cache.page_size
+
+        if new_swa_evicted_seqlen > req.swa_evicted_seqlen:
+            free_slots = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, req.swa_evicted_seqlen : new_swa_evicted_seqlen
+            ]
+            self.token_to_kv_pool_allocator.free_swa(free_slots)
+            req.swa_evicted_seqlen = new_swa_evicted_seqlen
 
     def _is_available_size_sufficient(self, num_tokens: int) -> bool:
         if self.is_hybrid_swa:

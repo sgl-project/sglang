@@ -39,5 +39,5 @@ jobs:
         run: |
           python scripts/ci/runner_utilization_report.py \
             --repo ${{ github.repository }} \
-            --hours ${{ inputs.hours || '6' }} \
+            --hours ${{ inputs.hours || '24' }} \
             ${{ inputs.filter && format('--filter {0}', inputs.filter) || '' }}
