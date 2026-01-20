@@ -22,10 +22,6 @@ if TYPE_CHECKING:
     )
     from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
 
-from sglang.srt.layers.moe.utils import get_moe_runner_backend
-from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
-from sglang.srt.hardware_backend.npu.quantization.torch_npu_kernels import TorchNpuKernelsQuantInfo
-
 logger = logging.getLogger(__name__)
 
 
@@ -353,28 +349,14 @@ class ModelSlimW8A8Int8MoE(ModelSlimMoEMethod):
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: "MoeRunnerConfig"
     ):
-        self.moe_runner_config = moe_runner_config
-        backend = get_moe_runner_backend()
-        if backend.is_auto():
-            backend = (
-                MoeRunnerBackend.TORCH_NPU_KERNELS
-            )
-        self.runner = MoeRunner(backend, moe_runner_config)
+        moe_runner_config = "ModelSlimW8A8Int8MoE"
+        self.kernel.create_moe_runner(layer, moe_runner_config)
 
     def apply(
         self,
         layer,
         dispatch_output: "StandardDispatchOutput",
     ) -> "CombineInput":
-        '''backend = self.runner.runner_backend
-        print(backend)
-        quant_info = TorchNpuKernelsQuantInfo(
-                w13_weight=layer.w13_weight,
-                w2_weight=layer.w2_weight,
-                w13_scale=layer.w13_weight_scale,
-                w2_scale=layer.w2_weight_scale,
-            )
-        return self.runner.run(dispatch_output, quant_info)'''
         return self.kernel.apply(layer, dispatch_output)
 
     def apply_without_routing_weights(
