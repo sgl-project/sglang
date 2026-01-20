@@ -24,6 +24,7 @@ if TYPE_CHECKING:
         StandardDispatchOutput,
     )
 
+from sglang.srt.hardware_backend.npu.moe.npu_fused_experts import npu_fused_experts
 
 # ---------------------------------------------------------------------------
 # Runner IO dataclasses
@@ -67,24 +68,8 @@ class TorchNpuKernelsQuantInfo(MoeQuantInfo):
 # ---------------------------------------------------------------------------
 # Runner core
 # ---------------------------------------------------------------------------
-
-
-class TorchNpuKernelsRunnerCore(MoeRunnerCore):
-    """Execute MoE experts via the external torch_npu_kernels package."""
-
-    def run(
-        self,
-        runner_input: TorchNpuKernelsRunnerInput,
-        quant_info: TorchNpuKernelsQuantInfo,
-        running_state: dict,
-    ) -> TorchNpuKernelsRunnerOutput:
-        from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import npu_fused_experts
-
-        hidden_states = runner_input.hidden_states
-        topk_ids = runner_input.topk_ids
-        topk_weights = runner_input.topk_weights
-
-        output = npu_fused_experts(
+def output_w8a8(hidden_states, quant_info, topk_weights, topk_ids):
+    output = npu_fused_experts(
             hidden_states=hidden_states,
             w13=quant_info.w13_weight,
             w13_scale=quant_info.w13_scale,
@@ -94,6 +79,30 @@ class TorchNpuKernelsRunnerCore(MoeRunnerCore):
             topk_ids=topk_ids,
             top_k=topk_ids.shape[1],
         )
+    return output
+
+
+class TorchNpuKernelsRunnerCore(MoeRunnerCore):
+    """Execute MoE experts via the external torch_npu_kernels package."""
+
+    def __init__(self, config: MoeRunnerConfig):
+        super().__init__(config)
+        if config.quantization == "ModelSlimW8A8Int8MoE":
+            self.selected_run = output_w8a8
+
+
+    def run(
+        self,
+        runner_input: TorchNpuKernelsRunnerInput,
+        quant_info: TorchNpuKernelsQuantInfo,
+        running_state: dict,
+    ) -> TorchNpuKernelsRunnerOutput:
+
+        hidden_states = runner_input.hidden_states
+        topk_ids = runner_input.topk_ids
+        topk_weights = runner_input.topk_weights
+
+        output = self.selected_run(hidden_states, quant_info, topk_weights, topk_ids)
 
         return TorchNpuKernelsRunnerOutput(hidden_states=output)
 
