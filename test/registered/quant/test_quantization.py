@@ -4,6 +4,7 @@ import warnings
 from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_QUANT_TP1,
@@ -14,6 +15,8 @@ from sglang.test.test_utils import (
     write_github_step_summary,
     write_results_to_json,
 )
+
+register_cuda_ci(est_time=185, suite="stage-b-test-large-1-gpu")
 
 MODEL_SCORE_THRESHOLDS = {
     "hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4": 0.825,

@@ -473,13 +473,23 @@ class Flux2PipelineConfig(FluxPipelineConfig):
     def calculate_condition_image_size(
         self, image, width, height
     ) -> Optional[tuple[int, int]]:
+        vae_scale_factor = self.vae_config.arch_config.vae_scale_factor
+        multiple_of = vae_scale_factor * 2
+
         target_area: int = 1024 * 1024
         if width is not None and height is not None:
+            new_width, new_height = width, height
             if width * height > target_area:
                 scale = math.sqrt(target_area / (width * height))
-                width = int(width * scale)
-                height = int(height * scale)
-                return width, height
+                new_width = int(width * scale)
+                new_height = int(height * scale)
+
+            # Flux requires multiples of (VAE scale 8 * Patch size 2)
+            new_width = (new_width // multiple_of) * multiple_of
+            new_height = (new_height // multiple_of) * multiple_of
+
+            if new_width != width or new_height != height:
+                return new_width, new_height
 
         return None
 
@@ -628,7 +638,6 @@ class Flux2PipelineConfig(FluxPipelineConfig):
 class Flux2KleinPipelineConfig(Flux2PipelineConfig):
     # Klein is distilled, so no guidance embeddings
     should_use_guidance: bool = False
-    task_type: ModelTaskType = ModelTaskType.T2I
 
     text_encoder_precisions: tuple[str, ...] = field(default_factory=lambda: ("bf16",))
 
