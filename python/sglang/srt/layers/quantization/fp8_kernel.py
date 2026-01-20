@@ -1176,6 +1176,7 @@ def w8a8_block_fp8_matmul(
     )
 
 
+# Copied and adapted from https://github.com/triton-lang/triton/blob/main/python/tutorials/10-block-scaled-matmul.py
 @triton.jit
 def _mxfp8_block_scaled_matmul_kernel(  #
     a_desc,  #
@@ -1201,8 +1202,6 @@ def _mxfp8_block_scaled_matmul_kernel(  #
         output_dtype = tl.float16
     elif output_type == 2:
         output_dtype = tl.bfloat16
-    else:
-        output_dtype = tl.float16
 
     pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(M, BLOCK_M)
@@ -1247,6 +1246,7 @@ def _mxfp8_block_scaled_matmul_kernel(  #
     c_desc.store([offs_am, offs_bn], accumulator.to(output_dtype))
 
 
+# Copied and adapted from https://github.com/triton-lang/triton/blob/main/python/tutorials/10-block-scaled-matmul.py
 def mxfp8_block_scaled_matmul_triton(
     a: torch.Tensor,
     a_scale: torch.Tensor,
@@ -1259,7 +1259,6 @@ def mxfp8_block_scaled_matmul_triton(
     block_k: int = 128,
     num_stages: int = 4,
 ) -> torch.Tensor:
-    # print("@@@ mxfp8_block_scaled_matmul_triton")
     """Block-scaled matmul for MXFP8 using Triton dot_scaled."""
     M, K = a.shape
     N, K_b = b.shape
