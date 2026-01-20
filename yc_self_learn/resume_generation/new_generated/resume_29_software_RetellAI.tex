@@ -1,0 +1,256 @@
+\documentclass[letterpaper,10pt]{article}
+
+% ---------- Packages ----------
+\usepackage[empty]{fullpage}
+\usepackage{titlesec}
+\usepackage{marvosym}
+\usepackage[usenames,dvipsnames]{color}
+\usepackage{enumitem}
+\setlist[itemize]{noitemsep, topsep=4pt, left=1.5em}
+\usepackage[hidelinks]{hyperref}
+\usepackage{fancyhdr}
+\usepackage[english]{babel}
+\usepackage{tabularx}
+\usepackage[sfdefault]{roboto}
+
+% ---------- Page Style ----------
+\pagestyle{fancy}
+\fancyhf{}
+\renewcommand{\headrulewidth}{0pt}
+\renewcommand{\footrulewidth}{0pt}
+
+% ---------- Margins ----------
+\addtolength{\oddsidemargin}{-0.5 in}
+\addtolength{\textwidth}{1in}
+\addtolength{\topmargin}{-0.9in}
+\addtolength{\textheight}{1.15in}
+
+% ---------- Section Formatting ----------
+\titleformat{\section}{\large\bfseries\scshape}{}{0em}{}[\titlerule]
+\titlespacing{\section}{0pt}{5pt plus 1pt minus 1pt}{3pt}
+
+% ---------- Commands ----------
+\newcommand{\resumeItem}[1]{\item\small{#1}}
+
+\newcommand{\resumeSubheading}[4]{
+  \vspace{-1 pt}\item
+  \begin{tabular*}{0.97\textwidth}[t]{l@{\extracolsep{\fill}}r}
+    \textbf{#1} & #2 \\
+    \textit{#3} & \textit{#4} \\
+  \end{tabular*}\vspace{0.5pt}
+}
+
+\newcommand{\resumeSubHeadingList}{\begin{itemize}[leftmargin=0.0in, label={}]}
+\newcommand{\resumeSubHeadingListEnd}{\end{itemize}}
+
+\newcommand{\resumeItemListStart}{\begin{itemize}[leftmargin=0.2in]}
+\newcommand{\resumeItemListEnd}{\end{itemize}}
+
+% ---------- Document ----------
+\begin{document}
+
+% ---------- Header ----------
+\begin{center}
+\vspace{-5pt}
+  {\Large \textbf{Yanda Cheng}} \\
+  \vspace{-2pt}
+  \small +1(859)3383379 \textbar\ \href{mailto:nickcp39@gmail.com}{nickcp39@gmail.com} \textbar\
+\href{https://linkedin.com/in/yanda-cheng-4888a216b}{linkedin.com/in/yanda-cheng-4888a216b} \textbar\
+\href{https://github.com/YandaCheng}{github.com/YandaCheng}
+\vspace*{-5pt}
+\end{center}
+\vspace*{-10pt}
+\vspace*{-5pt}
+% ---------- Summary (merged with Skills/Keywords) ----------
+% ---------- Summary ----------
+
+
+
+
+
+
+% ---------- Education ----------
+\section{Education}
+\begin{itemize}[leftmargin=0.0in, label={}, itemsep=2pt, topsep=2pt]
+  \item \textbf{PhD} in Biomedical Engineering \hfill\textit{| University at Buffalo, Buffalo, NY}\hfill GPA: 4.0/4.0 \hfill 2021--2026 (Expected)
+  \vspace*{-3pt}
+  \item \textbf{Master}  in Biomedical Engineering\hfill\textit{| Cornell University, Ithaca, NY} \hfill 2020--2021
+  \vspace*{-3pt}
+  \item \textbf{Bachelor}  in Electrical and Computer Engineering\hfill  \textit{| University of Kentucky, Lexington, KY} \hfill 2015--2020
+\end{itemize}
+
+
+\vspace*{-10pt}
+% ---------- Experience ----------
+\section{Work Experience}
+\begin{itemize}[leftmargin=0in, label={}]
+
+
+
+
+
+
+
+
+
+
+\end{itemize}
+\vspace*{-10pt}
+\vspace*{-2pt}
+% ---------- Projects ----------
+% ---------- Projects ----------
+\section{Projects}
+
+\begin{itemize}[leftmargin=0.0in, label={}]
+
+% ---------- Project 1: SGLang ----------
+\vspace{-3pt}\item
+\begin{tabular*}{0.97\textwidth}[t]{l@{\extracolsep{\fill}}r}
+  \textbf{SGLang (LLM Serving Framework)} \quad\textit{| Open-Source Contributor} & Mountain View, CA \quad\quad\textit{Aug 2025 -- Oct 2025}
+\end{tabular*}\vspace{-1mm}
+\begin{itemize}[leftmargin=0.2in]
+  \item \small Actively contributing to the open-source \textbf{SGLang large language model serving framework}, focusing on \textbf{router performance} and \textbf{scalability improvements}.  
+        \small Investigated and reproduced \textbf{concurrency and scheduling bottlenecks} in multi-worker inference; proposed and benchmarked fixes reducing cross-GPU latency.  
+  \item \small Optimized \textbf{data-parallel scheduling} and message streaming logic to improve throughput and achieve more balanced GPU utilization under mixed workloads.  
+        \small Collaborated with maintainers through pull requests and code reviews to refine \textbf{load reporting, task batching}, and dynamic scheduling in distributed inference.  
+\end{itemize}
+
+% ---------- Project 2: Edge AI ----------
+\vspace{-3pt}\item
+\begin{tabular*}{0.97\textwidth}[t]{l@{\extracolsep{\fill}}r}
+  \textbf{Baby Monitoring System (AWS)}\quad\textit{| Individual Contributor} & New York City, NY \quad\quad\textit{May 2022 -- Aug 2022}
+\end{tabular*}\vspace{-1mm}
+\begin{itemize}[leftmargin=0.2in]
+  \item \small Developed a \textbf{production-ready edge AI system} for continuous infant vital monitoring, integrating embedded sensors, on-device PyTorch inference, and AWS IoT Greengrass for local anomaly detection.
+  \item \small Enabled \textbf{offline operation and data caching} with AWS Greengrass v2, ensuring uninterrupted monitoring and automatic synchronization to \textbf{AWS S3} once connectivity resumed. \small Containerized the entire pipeline with \textbf{Docker}, automated model updates via \textbf{AWS Lambda triggers}, and configured \textbf{CloudWatch metrics} for system health tracking and anomaly alerts.
+\end{itemize}
+
+\end{itemize}
+
+
+
+
+
+\vspace*{-10pt}
+\vspace*{-3pt}
+% ---------- Publications ----------
+% ---------- Publications ----------
+\section{Selected Publications and Skills}
+\begin{itemize}[leftmargin=0.2in]
+  \item \small \textbf{Cheng, Y.}, et al., ``Unsupervised Denoising of Medical Images Based on the Noise2Noise Network'', \textit{Biomedical Optics Express} 15 (8), 4390-4405 2024.
+    \item  \noindent \small
+\textbf {Languages:} Python, C/C++, SQL, Bash, MATLAB, JavaScript  \textbf{Libraries:} NumPy, Pandas, Scikit-learn, OpenCV, Matplotlib, Seaborn \textbf{Frameworks:} PyTorch, TensorFlow, Keras, CUDA, FastAPI, Flask, gRPC, Docker, Kubernetes, Git, Linux \textbf{Machine Learning:} Retrieval, Reranking, RAG, LoRA, QLoRA, Quantization, CNN, UNet, LSTM, Transformer, SVM, LASSO \textbf{Data/Cloud:} PostgreSQL, BigQuery, AWS, GCP, CI/CD, REST API, Container Orchestration, Monitoring, MLflow
+\end{itemize}
+
+
+
+\vspace*{-10pt}
+\vspace*{-3pt}
+
+\end{document}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

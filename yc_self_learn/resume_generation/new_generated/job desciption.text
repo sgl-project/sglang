@@ -1,56 +1,90 @@
-Company logo for, Prestige Staffing.
-Prestige Staffing
+AI Engineer 
+
+Harrisonburg, VA · 8 hours ago · 9 people clicked apply
+
+Promoted by hirer · Responses managed off LinkedIn
 
 
-Senior AI Engineer 
+On-site
 
-Charlotte, NC · Reposted 15 hours ago · 71 applicants
-
-Promoted by hirer · No response insights available yet
-
-
-Hybrid
-
-Contract
-Easy Apply
+Part-time
+Apply
 
 Save
-Job match is low, review match details
+Job match is high, we can help you stand out
 
-Your profile is missing some qualifications, add your experience or try exploring other jobs.
+Your profile matches the required qualifications well.
 
 Show match details
 
-Help me update my profile
+Help me stand out
+
+Create cover letter
 
 BETA • Is this information helpful?
 
 
 
 About the job
-About The Role
+Capital One has partnered with iHire to reach top talent for their opening below. Check it out and apply via iHireTechnology today!
 
-We are seeking a Senior AI Agent Engineer to join a fast-moving digital transformation team at a leading organization. This is a hands-on role designing and deploying agentic AI systems that deliver real-world impact for customers. You will be working on sophisticated AI workflows, from prompt architecture and multi-step reasoning agents to serverless orchestration using AWS-native technologies.
+Lead AI Engineer (AI Foundations, LLM Core)
 
-This is an opportunity to join a small, collaborative product team at a state-of-the-art innovation center, building safe, scalable, and efficient AI solutions that will shape the future of customer-facing systems.
+Overview
 
-Key Responsibilities
+At Capital One, we are creating responsible and reliable AI systems, changing banking for good. For years, Capital One has been an industry leader in using machine learning to create real-time, personalized customer experiences. Our investments in technology infrastructure and world-class talent along with our deep experience in machine learning position us to be at the forefront of enterprises leveraging AI. From informing customers about unusual charges to answering their questions in real time, our applications of AI & ML are bringing humanity and simplicity to banking. We are committed to continuing to build world-class applied science and engineering teams to deliver our industry leading capabilities with breakthrough product experiences and scalable, high-performance AI infrastructure. At Capital One, you will help bring the transformative power of emerging AI capabilities to reimagine how we serve our customers and businesses who have come to love the products and services we build.
 
- Design and implement agentic AI solutions using AWS Bedrock, including Agents, Knowledge Bases, and Guardrails
- Build and orchestrate serverless workflows with Lambda, Step Functions, and EventBridge
- Develop advanced prompt strategies for multi-step reasoning and autonomous agents (ReAct, chain-of-thought, plan-and-execute, reflection)
- Integrate AI agents with APIs, tools, and external resources
- Build frameworks to evaluate agent performance, reliability, and safety
- Collaborate with software engineers, designers, and product owners to deliver fully integrated solutions
- Mentor junior team members and share best practices in AI and software engineering
+Team Description
 
-Technical Requirements / Skills
+The Intelligent Foundations and Experiences (IFX) team is at the center of bringing our vision for AI at Capital One to life. We work hand-in-hand with our partners across the company to advance the state of the art in science and AI engineering, and we build and deploy proprietary solutions that are central to our business and deliver value to millions of customers. Our AI models and platforms empower teams across Capital One to enhance their products with the transformative power of AI, in responsible and scalable ways for the highest leverage impact.
 
- Strong experience in prompt engineering and building autonomous AI agents
- Hands-on with AWS Bedrock, Python, LangChain, and serverless services (Lambda, Step Functions, API Gateway, DynamoDB, S3)
- Experience with Terraform and modern CI/CD practices
- Strong understanding of API integration, tool-use patterns, and database optimization
- Solid software development experience in Python or Java (5–9 years total experience preferred)
- Familiarity with functional programming concepts, software design patterns, and cybersecurity principles
+In This Role, You Will
 
-This is a great opportunity for engineers looking to work at the forefront of AI agent development in a production environment, contributing to transformative digital initiatives while working with a collaborative, high-performing team.
+ Partner with a cross-functional team of engineers, research scientists, technical program managers, and product managers to deliver AI-powered products that change how our associates work and how our customers interact with Capital One. 
+ Design, develop, test, deploy, and support AI software components including foundation model training, large language model inference, similarity search, guardrails, model evaluation, experimentation, governance, and observability, etc. 
+ Leverage a broad stack of Open Source and SaaS AI technologies such as AWS Ultraclusters, Huggingface, VectorDBs, Nemo Guardrails, PyTorch, and more. 
+ Invent and introduce state-of-the-art LLM optimization techniques to improve the performance scalability, cost, latency, throughput of large scale production AI systems. 
+ Contribute to the technical vision and the long term roadmap of foundational AI systems at Capital One. 
+
+The Ideal Candidate
+
+ You love to build systems, take pride in the quality of your work, and also share our passion to do the right thing. You want to work on problems that will help change banking for good. 
+ Passion for staying abreast of the latest research, and an ability to intuitively understand scientific publications and judiciously apply novel techniques in production. 
+ You adapt quickly and thrive on bringing clarity to big, undefined problems. You love asking questions and digging deep to uncover the root of problems and can articulate your findings concisely with clarity. You have the courage to share new ideas even when they are unproven. 
+ You are deeply Technical. You possess a strong foundation in engineering and mathematics, and your expertise in hardware, software, and AI enable you to see and exploit optimization opportunities that others miss. 
+ You are a resilient trail blazer who can forge new paths to achieve business goals when the route is unknown. 
+
+Basic Qualifications
+
+ Bachelor's degree in Computer Science, AI, Electrical Engineering, Computer Engineering, or related fields plus at least 4 years of experience developing AI and ML algorithms or technologies, or a Master's degree in Computer Science, AI, Electrical Engineering, Computer Engineering, or related fields plus at least 2 years of experience developing AI and ML algorithms or technologies 
+ At least 4 years of experience programming with Python, Go, Scala, or Java 
+
+Preferred Qualifications
+
+ 6 years of experience deploying scalable and responsible AI solutions on cloud platforms (e.g. AWS, Google Cloud, Azure, or equivalent private cloud) 
+ Experience designing, developing, delivering, and supporting AI services 
+ Experience developing AI and ML algorithms or technologies (e.g. LLM Inference, Similarity Search and VectorDBs, Guardrails, Memory) using Python, C++, C#, Java, or Golang 
+ Experience developing and applying state-of-the-art techniques for optimizing training and inference software to improve hardware utilization, latency, throughput, and cost 
+ Passion for staying abreast of the latest AI research and AI systems, and judiciously apply novel techniques in production 
+
+Capital One will consider sponsoring a new qualified applicant for employment authorization for this position.
+
+The minimum and maximum full-time annual salaries for this role are listed below, by location. Please note that this salary information is solely for candidates hired to perform work within one of these locations, and refers to the amount Capital One is willing to pay at the time of this posting. Salaries for part-time roles will be prorated based upon the agreed upon number of hours to be regularly worked.
+
+Cambridge, MA: $193,400 - $220,700 for Lead AI EngineerMcLean, VA: $193,400 - $220,700 for Lead AI EngineerNew York, NY: $211,000 - $240,800 for Lead AI EngineerSan Francisco, CA: $211,000 - $240,800 for Lead AI EngineerSan Jose, CA: $211,000 - $240,800 for Lead AI Engineer
+
+Candidates hired to work in other locations will be subject to the pay range associated with that location, and the actual annualized salary amount offered to any candidate at the time of hire will be reflected solely in the candidates offer letter.
+
+This role is also eligible to earn performance based incentive compensation, which may include cash bonus(es) and/or long term incentives (LTI). Incentives could be discretionary or non discretionary depending on the plan.
+
+Capital One offers a comprehensive, competitive, and inclusive set of health, financial and other benefits that support your total well-being. Learn more at the Capital One Careers website . Eligibility varies based on full or part-time status, exempt or non-exempt status, and management level.
+
+This role is expected to accept applications for a minimum of 5 business days.No agencies please. Capital One is an equal opportunity employer (EOE, including disability/vet) committed to non-discrimination in compliance with applicable federal, state, and local laws. Capital One promotes a drug-free workplace. Capital One will consider for employment qualified applicants with a criminal history in a manner consistent with the requirements of applicable laws regarding criminal background inquiries, including, to the extent applicable, Article 23-A of the New York Correction Law; San Francisco, California Police Code Article 49, Sections 4901-4920; New York Citys Fair Chance Act; Philadelphias Fair Criminal Records Screening Act; and other applicable federal, state, and local laws and regulations regarding criminal background inquiries.
+
+If you have visited our website in search of information on employment opportunities or to apply for a position, and you require an accommodation, please contact Capital One Recruiting at [phone removed] or via email at [email removed] . All information you provide will be kept confidential and will be used only to the extent required to provide needed reasonable accommodations.
+
+For technical support or questions about Capital One's recruiting process, please send an email to [email removed]
+
+Capital One does not provide, endorse nor guarantee and is not liable for third-party products, services, educational tools or other information available through this site.
+
+Capital One Financial is made up of several different entities. Please note that any position posted in Canada is for Capital One Canada, any position posted in the United Kingdom is for Capital One Europe and any position posted in the Philippines is for Capital One Philippines Service Corp. (COPSSC).

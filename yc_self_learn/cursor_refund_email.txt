@@ -1,0 +1,54 @@
+Subject: Refund Request for Unexpected Charges - Pro Subscription
+
+Dear Cursor Support Team,
+
+I am a Cursor Pro subscriber paying $20/month, and I was recently charged additional fees that I did not expect or understand.
+
+Account Information:
+- Name: Yanda Cheng
+- Email: nickcp39@gmail.com
+- Billing Address: 352 Carmen Road, Buffalo, NY 14226 US
+
+When I subscribed to Cursor Pro, I believed that:
+- The $20/month subscription included unlimited usage of Auto mode
+- I would not be charged additional fees beyond the monthly subscription
+
+However, I was charged unexpected additional fees on the following dates:
+
+1. January 15, 2026 - $21.79
+   - Invoice ID: 392eabec
+   - 490 token-based usage calls totaling $20.04 (exceeded my $20 monthly allowance)
+
+2. January 18, 2026 - $18.47
+   - Invoice ID: 392eabec
+   - 825 token-based usage calls totaling $37.02 (exceeded my $20 monthly allowance)
+
+I was not aware of Cursor's pricing policy changes in 2025, particularly:
+1. The shift from "per-request" to "token-based" billing
+2. That Auto mode still consumes the $20 allowance
+3. That additional charges would be automatically deducted if the allowance is exceeded
+
+I have been using Auto mode assuming it was included in my Pro subscription. I did not realize that my usage would generate additional charges beyond the monthly fee I was already paying.
+
+According to your July 2025 announcement regarding pricing clarification, refunds are available for charges incurred due to unclear communication about pricing changes. I believe these charges resulted from a lack of clear communication about how the new pricing model works.
+
+I respectfully request a full refund for the unexpected charges I incurred on:
+- January 15, 2026: $21.79
+- January 18, 2026: $18.47
+- Total: $40.26
+
+I have now set my Spending Limit to $0 to prevent further unexpected charges.
+
+Please let me know if you need any additional information to process this refund request.
+
+Thank you for your understanding and assistance.
+
+Best regards,
+Yanda Cheng
+
+---
+
+Contact Information:
+- Email: nickcp39@gmail.com
+- Invoice IDs: 392eabec (for both charges)
+- Account Type: Pro Subscription ($20/month)

@@ -162,10 +162,18 @@ JD 明确写：
 Leveraged cutting-edge machine learning paradigms to architect a sophisticated data processing infrastructure that synergistically integrates advanced neural network architectures, resulting in substantial performance enhancements across multiple dimensions.
 ```
 
-**✅ 符合风格（STAR格式、简洁直接）**：
+**✅ 符合风格（严格STAR格式、清晰pipeline、明确impact）**：
 ```
-Built an end-to-end deployment stack: C++ firmware on STM32-based controllers plus Python services on an edge gateway, with secure OTA updates over RS-485 and Bluetooth/Wi-Fi, enabling fleet-wide remote monitoring and configuration for 5000+ devices.
+Built an end-to-end device management pipeline to address remote monitoring challenges across distributed fleet, 
+by developing C++ firmware on STM32 controllers plus Python services on edge gateway, with secure OTA updates 
+via RS-485 and Bluetooth/Wi-Fi, resulting in fleet-wide remote monitoring and configuration for 5000+ devices 
+with 95% update success rate and 60% reduction in on-site maintenance visits.
 ```
+
+**STAR格式分解**：
+- **Situation/Task**（隐含在开头）："to address remote monitoring challenges across distributed fleet" - 明确了问题和任务
+- **Action**（pipeline搭建）："Built... by developing C++ firmware... plus Python services... with secure OTA updates" - 清晰说明了搭建的pipeline组件（firmware layer + gateway layer + update mechanism）
+- **Result**（量化impact）："resulting in... 5000+ devices, 95% update success rate, 60% reduction in maintenance" - 明确的量化成果和业务价值
 
 ### 6.5.4 执行标准
 
