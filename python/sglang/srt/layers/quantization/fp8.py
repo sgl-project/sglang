@@ -387,7 +387,6 @@ class Fp8LinearMethod(LinearMethodBase):
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
         if self.use_mxfp8:
             if not self.is_checkpoint_fp8_serialized:
-                print("@@@ Quantizing MXFP8 weights")
                 self._quantize_mxfp8_weights(layer)
                 return
             # MXFP8 scales are stored as UE8M0 uint8; no requantization here.
@@ -447,7 +446,7 @@ class Fp8LinearMethod(LinearMethodBase):
 
     def _quantize_mxfp8_weights(self, layer: Module) -> None:
         weight = layer.weight.data
-        qweight, weight_scale = mxfp8_group_quantize(weight, group_size=32)
+        qweight, weight_scale = mxfp8_group_quantize(weight)
         layer.weight = Parameter(qweight, requires_grad=False)
         layer.weight_scale_inv = Parameter(weight_scale, requires_grad=False)
         layer.weight_scale_inv.format_ue8m0 = True
@@ -939,8 +938,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         w13_flat = w13.view(-1, w13.shape[-1])
         w2_flat = w2.view(-1, w2.shape[-1])
 
-        w13_q_flat, w13_s_flat = mxfp8_group_quantize(w13_flat, group_size=32)
-        w2_q_flat, w2_s_flat = mxfp8_group_quantize(w2_flat, group_size=32)
+        w13_q_flat, w13_s_flat = mxfp8_group_quantize(w13_flat)
+        w2_q_flat, w2_s_flat = mxfp8_group_quantize(w2_flat)
 
         layer.w13_weight = torch.nn.Parameter(
             w13_q_flat.view_as(w13), requires_grad=False
