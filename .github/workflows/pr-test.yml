@@ -33,6 +33,11 @@ on:
         required: false
         type: string
         default: ""
+      test_parallel_dispatch:
+        description: "Test parallel dispatch behavior (simulates scheduled run)"
+        required: false
+        type: boolean
+        default: false
   workflow_call:
     inputs:
       ref:
@@ -47,12 +52,20 @@ on:
         default: false
 
 concurrency:
-  # Include pr_head_sha in group for /rerun-stage dispatches to avoid collisions with main branch runs
-  group: pr-test-${{ inputs.pr_head_sha || inputs.ref || github.ref }}
+  # Concurrency group structure: pr-test-{branch}-{pr_sha}-{stage}
+  # - github.head_ref (pull_request) or github.ref_name (workflow_dispatch) normalizes to branch name
+  # - pr_head_sha isolates /rerun-stage from main branch runs
+  # - target_stage allows parallel stage dispatches to run independently
+  # This ensures pull_request and workflow_dispatch on same branch cancel each other
+  group: pr-test-${{ github.head_ref || github.ref_name || 'default' }}-${{ inputs.pr_head_sha || 'current' }}-${{ inputs.target_stage || inputs.ref || 'all' }}
   cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
 
 env:
   SGLANG_IS_IN_CI: true
+
+permissions:
+  actions: write
+  contents: read
 
 jobs:
   # =============================================== check changes ====================================================
@@ -169,14 +182,179 @@ jobs:
             echo "| continue_on_error | ${{ steps.set-continue-on-error.outputs.continue_on_error }} |"
           } >> $GITHUB_STEP_SUMMARY
 
+  # =============================================== Wait Jobs for Sequential PR Execution ====================================================
+  # These jobs poll GitHub API to wait for previous stages to complete.
+  # For PR runs: wait jobs run and enforce sequential execution via polling.
+  # For scheduled runs: wait jobs are skipped, enabling parallel execution for easier retry.
+
+  wait-for-stage-a:
+    needs: [check-changes]
+    # Only run for PRs (not scheduled) and when not targeting a specific stage
+    if: |
+      github.event_name == 'pull_request' &&
+      !inputs.target_stage &&
+      inputs.test_parallel_dispatch != true &&
+      (needs.check-changes.outputs.main_package == 'true' || needs.check-changes.outputs.sgl_kernel == 'true')
+    runs-on: ubuntu-latest
+    outputs:
+      stage_a_result: ${{ steps.wait.outputs.result }}
+    steps:
+      - name: Wait for stage-a-test-1 to complete
+        id: wait
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const maxWaitMinutes = 60;
+            const pollIntervalSeconds = 30;
+            const maxAttempts = (maxWaitMinutes * 60) / pollIntervalSeconds;
+
+            for (let attempt = 0; attempt < maxAttempts; attempt++) {
+              const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                run_id: context.runId,
+                per_page: 100,
+              });
+
+              const stageAJob = jobs.find(job => job.name === 'stage-a-test-1');
+
+              if (stageAJob) {
+                console.log(`stage-a-test-1 status: ${stageAJob.status}, conclusion: ${stageAJob.conclusion}`);
+
+                if (stageAJob.status === 'completed') {
+                  if (stageAJob.conclusion === 'success' || stageAJob.conclusion === 'skipped' || stageAJob.conclusion === 'cancelled') {
+                    core.setOutput('result', stageAJob.conclusion === 'success' ? 'success' : 'skipped');
+                    return;
+                  } else {
+                    core.setOutput('result', 'failure');
+                    core.setFailed(`stage-a-test-1 ${stageAJob.conclusion}`);
+                    return;
+                  }
+                }
+              } else {
+                console.log('stage-a-test-1 job not found yet');
+              }
+
+              console.log(`Waiting ${pollIntervalSeconds}s... (attempt ${attempt + 1}/${maxAttempts})`);
+              await new Promise(resolve => setTimeout(resolve, pollIntervalSeconds * 1000));
+            }
+
+            core.setFailed('Timeout waiting for stage-a-test-1');
+            core.setOutput('result', 'timeout');
+
+  wait-for-stage-b:
+    needs: [check-changes, wait-for-stage-a]
+    # Only run for PRs (not scheduled) and when not targeting a specific stage
+    if: |
+      always() &&
+      github.event_name == 'pull_request' &&
+      !inputs.target_stage &&
+      inputs.test_parallel_dispatch != true &&
+      (needs.check-changes.outputs.main_package == 'true' || needs.check-changes.outputs.sgl_kernel == 'true') &&
+      (needs.wait-for-stage-a.result == 'success' || needs.wait-for-stage-a.result == 'skipped')
+    runs-on: ubuntu-latest
+    outputs:
+      stage_b_result: ${{ steps.wait.outputs.result }}
+    steps:
+      - name: Wait for stage-b jobs to complete
+        id: wait
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const maxWaitMinutes = 90;
+            const pollIntervalSeconds = 30;
+            const maxAttempts = (maxWaitMinutes * 60) / pollIntervalSeconds;
+
+            // Stage-b jobs to wait for
+            // Use exact prefix + ( or end-of-string to avoid matching -performance/-accuracy variants
+            const stageBJobs = [
+              { prefix: 'stage-b-test-small-1-gpu', expectedCount: 8 },      // partitions 0-7
+              { prefix: 'stage-b-test-large-1-gpu', expectedCount: 12 },     // partitions 0-11
+              { prefix: 'stage-b-test-large-2-gpu', expectedCount: 2 },      // partitions 0-1
+              { prefix: 'stage-b-test-4-gpu-b200', expectedCount: 1 }
+            ];
+            const totalExpectedJobs = stageBJobs.reduce((sum, j) => sum + j.expectedCount, 0);
+
+            // Helper to match job names exactly (prefix + optional " (N)" suffix)
+            const matchesPrefix = (jobName, prefix) => {
+              return jobName === prefix || jobName.startsWith(prefix + ' (');
+            };
+
+            for (let attempt = 0; attempt < maxAttempts; attempt++) {
+              const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                run_id: context.runId,
+                per_page: 100,
+              });
+
+              let allCompleted = true;
+              let anyFailed = false;
+              let failedJobs = [];
+              let completedCount = 0;
+              let totalCount = 0;
+
+              for (const { prefix, expectedCount } of stageBJobs) {
+                const matchingJobs = jobs.filter(job => matchesPrefix(job.name, prefix));
+
+                // Check existing jobs for failures first (fail fast)
+                for (const job of matchingJobs) {
+                  totalCount++;
+                  console.log(`${job.name}: status=${job.status}, conclusion=${job.conclusion}`);
+
+                  if (job.status !== 'completed') {
+                    allCompleted = false;
+                  } else {
+                    completedCount++;
+                    // cancelled is not a failure - it means the workflow was stopped (e.g., by concurrency)
+                    if (job.conclusion !== 'success' && job.conclusion !== 'skipped' && job.conclusion !== 'cancelled') {
+                      anyFailed = true;
+                      failedJobs.push(job.name);
+                    }
+                  }
+                }
+
+                if (matchingJobs.length < expectedCount) {
+                  console.log(`${prefix}: found ${matchingJobs.length}/${expectedCount} jobs (waiting for more)`);
+                  allCompleted = false;
+                }
+              }
+
+              console.log(`Progress: ${completedCount}/${totalCount} jobs completed (expected ${totalExpectedJobs})`);
+
+              // Fail fast if any jobs failed (don't wait for all jobs to be created)
+              if (anyFailed) {
+                core.setOutput('result', 'failure');
+                core.setFailed(`Stage-b jobs failed: ${failedJobs.join(', ')}`);
+                return;
+              }
+
+              if (allCompleted && totalCount >= totalExpectedJobs) {
+                core.setOutput('result', 'success');
+                return;
+              }
+
+              console.log(`Waiting ${pollIntervalSeconds}s... (attempt ${attempt + 1}/${maxAttempts})`);
+              await new Promise(resolve => setTimeout(resolve, pollIntervalSeconds * 1000));
+            }
+
+            core.setFailed('Timeout waiting for stage-b jobs');
+            core.setOutput('result', 'timeout');
+
   # =============================================== PR Gate ====================================================
   call-gate:
     needs: check-changes
+    # Skip for scheduled runs (they run all tests) and when target_stage is specified
     if: |
-      needs.check-changes.outputs.main_package == 'true' ||
-      needs.check-changes.outputs.sgl_kernel == 'true' ||
-      needs.check-changes.outputs.jit_kernel == 'true' ||
-      needs.check-changes.outputs.multimodal_gen == 'true'
+      github.event_name != 'schedule' &&
+      inputs.test_parallel_dispatch != true &&
+      !inputs.target_stage &&
+      (
+        needs.check-changes.outputs.main_package == 'true' ||
+        needs.check-changes.outputs.sgl_kernel == 'true' ||
+        needs.check-changes.outputs.jit_kernel == 'true' ||
+        needs.check-changes.outputs.multimodal_gen == 'true'
+      )
     uses: ./.github/workflows/pr-gate.yml
     secrets: inherit
 
@@ -184,8 +362,10 @@ jobs:
 
   sgl-kernel-build-wheels:
     needs: [check-changes, call-gate]
-    if: needs.check-changes.outputs.sgl_kernel == 'true'
+    # Skip for scheduled runs (they run stages independently) and when target_stage is set
+    if: github.event_name != 'schedule' && inputs.test_parallel_dispatch != true && !inputs.target_stage && needs.check-changes.outputs.sgl_kernel == 'true'
     runs-on: x64-kernel-build-node
+    timeout-minutes: 60
     strategy:
       matrix:
         include:
@@ -231,8 +411,10 @@ jobs:
 
   sgl-kernel-build-wheels-arm:
     needs: [check-changes, call-gate]
-    if: needs.check-changes.outputs.sgl_kernel == 'true'
+    # Skip for scheduled runs (they run stages independently) and when target_stage is set
+    if: github.event_name != 'schedule' && inputs.test_parallel_dispatch != true && !inputs.target_stage && needs.check-changes.outputs.sgl_kernel == 'true'
     runs-on: arm-kernel-build-node
+    timeout-minutes: 60
     strategy:
       matrix:
         include:
@@ -279,10 +461,14 @@ jobs:
 
   sgl-kernel-unit-test:
     needs: [check-changes, call-gate, sgl-kernel-build-wheels]
+    # Skip for scheduled runs and when target_stage is set
     if: |
+      github.event_name != 'schedule' &&
+      inputs.test_parallel_dispatch != true &&
       !inputs.target_stage &&
       needs.check-changes.outputs.sgl_kernel == 'true'
     runs-on: 1-gpu-runner
+    timeout-minutes: 60
     env:
       RUNNER_LABELS: 1-gpu-runner
     steps:
@@ -315,10 +501,14 @@ jobs:
 
   sgl-kernel-mla-test:
     needs: [check-changes, call-gate, sgl-kernel-build-wheels]
+    # Skip for scheduled runs and when target_stage is set
     if: |
+      github.event_name != 'schedule' &&
+      inputs.test_parallel_dispatch != true &&
       !inputs.target_stage &&
       needs.check-changes.outputs.sgl_kernel == 'true'
     runs-on: 1-gpu-runner
+    timeout-minutes: 60
     env:
       RUNNER_LABELS: 1-gpu-runner
     steps:
@@ -351,10 +541,14 @@ jobs:
 
   sgl-kernel-benchmark-test:
     needs: [check-changes, call-gate, sgl-kernel-build-wheels]
+    # Skip for scheduled runs and when target_stage is set
     if: |
+      github.event_name != 'schedule' &&
+      inputs.test_parallel_dispatch != true &&
       !inputs.target_stage &&
       needs.check-changes.outputs.sgl_kernel == 'true'
     runs-on: 1-gpu-runner
+    timeout-minutes: 60
     env:
       CI: true
       RUNNER_LABELS: 1-gpu-runner
@@ -400,10 +594,14 @@ jobs:
 
   sgl-kernel-b200-test:
     needs: [check-changes, sgl-kernel-build-wheels]
+    # Skip for scheduled runs and when target_stage is set
     if: |
+      github.event_name != 'schedule' &&
+      inputs.test_parallel_dispatch != true &&
       !inputs.target_stage &&
       needs.check-changes.outputs.sgl_kernel == 'true'
     runs-on: ${{ needs.check-changes.outputs.b200_runner }}
+    timeout-minutes: 60
     env:
       RUNNER_LABELS: ${{ needs.check-changes.outputs.b200_runner }}
     steps:
@@ -469,10 +667,14 @@ jobs:
 
   jit-kernel-unit-test:
     needs: [check-changes, call-gate]
+    # Skip for scheduled runs and when target_stage is set
     if: |
+      github.event_name != 'schedule' &&
+      inputs.test_parallel_dispatch != true &&
       !inputs.target_stage &&
       needs.check-changes.outputs.jit_kernel == 'true'
     runs-on: 1-gpu-runner
+    timeout-minutes: 60
     env:
       RUNNER_LABELS: 1-gpu-runner
     steps:
@@ -501,11 +703,12 @@ jobs:
         (inputs.target_stage == 'stage-a-test-1') ||
         (
           !inputs.target_stage &&
-          (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
+          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
     runs-on: 1-gpu-runner
+    timeout-minutes: 60
     env:
       RUNNER_LABELS: 1-gpu-runner
     steps:
@@ -547,11 +750,12 @@ jobs:
         (inputs.target_stage == 'stage-a-cpu-only') ||
         (
           !inputs.target_stage &&
-          (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
+          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
           (needs.check-changes.outputs.main_package == 'true')
         )
       )
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - name: Free disk space
         run: |
@@ -585,18 +789,19 @@ jobs:
 
   # Runs on 5090 (32GB, SM120)
   stage-b-test-small-1-gpu:
-    needs: [check-changes, call-gate, stage-a-test-1, sgl-kernel-build-wheels]
+    needs: [check-changes, call-gate, wait-for-stage-a, sgl-kernel-build-wheels]
     if: |
       always() &&
       (
         (inputs.target_stage == 'stage-b-test-small-1-gpu') ||
         (
           !inputs.target_stage &&
-          (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
+          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
     runs-on: 1-gpu-5090
+    timeout-minutes: 60
     env:
       RUNNER_LABELS: 1-gpu-5090
       IS_BLACKWELL: "1"
@@ -638,25 +843,26 @@ jobs:
 
   # Runs on H100 (80GB, SM90) - tests that don't pass on 5090 (FA3, FP8, high VRAM, etc.)
   stage-b-test-large-1-gpu:
-    needs: [check-changes, call-gate, stage-a-test-1, sgl-kernel-build-wheels]
+    needs: [check-changes, call-gate, wait-for-stage-a, sgl-kernel-build-wheels]
     if: |
       always() &&
       (
         (inputs.target_stage == 'stage-b-test-large-1-gpu') ||
         (
           !inputs.target_stage &&
-          (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
+          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
     runs-on: 1-gpu-runner
+    timeout-minutes: 60
     env:
       RUNNER_LABELS: 1-gpu-runner
     strategy:
       fail-fast: false
       max-parallel: ${{ fromJson(needs.check-changes.outputs.max_parallel) }}
       matrix:
-        partition: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+        partition: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -684,21 +890,22 @@ jobs:
           if [[ "${{ needs.check-changes.outputs.continue_on_error }}" == "true" ]]; then
             CONTINUE_ON_ERROR_FLAG="--continue-on-error"
           fi
-          python3 run_suite.py --hw cuda --suite stage-b-test-large-1-gpu --auto-partition-id ${{ matrix.partition }} --auto-partition-size 10 $CONTINUE_ON_ERROR_FLAG
+          python3 run_suite.py --hw cuda --suite stage-b-test-large-1-gpu --auto-partition-id ${{ matrix.partition }} --auto-partition-size 12 $CONTINUE_ON_ERROR_FLAG
 
   stage-b-test-large-2-gpu:
-    needs: [check-changes, call-gate, stage-a-test-1, sgl-kernel-build-wheels]
+    needs: [check-changes, call-gate, wait-for-stage-a, sgl-kernel-build-wheels]
     if: |
       always() &&
       (
         (inputs.target_stage == 'stage-b-test-large-2-gpu') ||
         (
           !inputs.target_stage &&
-          (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
+          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
     runs-on: 2-gpu-runner
+    timeout-minutes: 60
     env:
       RUNNER_LABELS: 2-gpu-runner
     strategy:
@@ -734,19 +941,261 @@ jobs:
           fi
           python3 run_suite.py --hw cuda --suite stage-b-test-large-2-gpu --auto-partition-id ${{ matrix.partition }} --auto-partition-size 2 $CONTINUE_ON_ERROR_FLAG
 
+  stage-b-test-small-1-gpu-performance:
+    needs: [check-changes, call-gate, wait-for-stage-a, sgl-kernel-build-wheels]
+    if: |
+      always() &&
+      (
+        (inputs.target_stage == 'stage-b-test-small-1-gpu-performance') ||
+        (
+          !inputs.target_stage &&
+          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
+          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+        )
+      )
+    runs-on: 1-gpu-5090
+    timeout-minutes: 60
+    env:
+      RUNNER_LABELS: 1-gpu-5090
+      IS_BLACKWELL: "1"
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
+
+      - name: Download artifacts
+        if: needs.check-changes.outputs.sgl_kernel == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          path: sgl-kernel/dist/
+          merge-multiple: true
+          pattern: wheel-python3.10-cuda12.9
+
+      - name: Install dependencies
+        timeout-minutes: 10
+        run: |
+          source /etc/profile.d/sglang-ci.sh
+          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh
+
+      - name: Run test
+        timeout-minutes: 30
+        run: |
+          source /etc/profile.d/sglang-ci.sh
+          cd test/
+          CONTINUE_ON_ERROR_FLAG=""
+          if [[ "${{ needs.check-changes.outputs.continue_on_error }}" == "true" ]]; then
+            CONTINUE_ON_ERROR_FLAG="--continue-on-error"
+          fi
+          python3 run_suite.py --hw cuda --suite stage-b-test-small-1-gpu-performance $CONTINUE_ON_ERROR_FLAG
+
+  stage-b-test-large-1-gpu-performance:
+    needs: [check-changes, call-gate, wait-for-stage-a, sgl-kernel-build-wheels]
+    if: |
+      always() &&
+      (
+        (inputs.target_stage == 'stage-b-test-large-1-gpu-performance') ||
+        (
+          !inputs.target_stage &&
+          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
+          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+        )
+      )
+    runs-on: 1-gpu-runner
+    timeout-minutes: 60
+    env:
+      RUNNER_LABELS: 1-gpu-runner
+    strategy:
+      fail-fast: false
+      matrix:
+        partition: [0, 1]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
+
+      - name: Download artifacts
+        if: needs.check-changes.outputs.sgl_kernel == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          path: sgl-kernel/dist/
+          merge-multiple: true
+          pattern: wheel-python3.10-cuda12.9
+
+      - name: Install dependencies
+        timeout-minutes: 10
+        run: |
+          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh
+
+      - name: Run test
+        timeout-minutes: 40
+        run: |
+          cd test/
+          CONTINUE_ON_ERROR_FLAG=""
+          if [[ "${{ needs.check-changes.outputs.continue_on_error }}" == "true" ]]; then
+            CONTINUE_ON_ERROR_FLAG="--continue-on-error"
+          fi
+          python3 run_suite.py --hw cuda --suite stage-b-test-large-1-gpu-performance --auto-partition-id ${{ matrix.partition }} --auto-partition-size 2 --timeout-per-file 1800 $CONTINUE_ON_ERROR_FLAG
+
+  stage-b-test-large-2-gpu-performance:
+    needs: [check-changes, call-gate, wait-for-stage-a, sgl-kernel-build-wheels]
+    if: |
+      always() &&
+      (
+        (inputs.target_stage == 'stage-b-test-large-2-gpu-performance') ||
+        (
+          !inputs.target_stage &&
+          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
+          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+        )
+      )
+    runs-on: 2-gpu-runner
+    timeout-minutes: 60
+    env:
+      RUNNER_LABELS: 2-gpu-runner
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
+
+      - name: Download artifacts
+        if: needs.check-changes.outputs.sgl_kernel == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          path: sgl-kernel/dist/
+          merge-multiple: true
+          pattern: wheel-python3.10-cuda12.9
+
+      - name: Install dependencies
+        timeout-minutes: 10
+        run: |
+          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh
+
+      - name: Run test
+        timeout-minutes: 30
+        run: |
+          cd test/
+          CONTINUE_ON_ERROR_FLAG=""
+          if [[ "${{ needs.check-changes.outputs.continue_on_error }}" == "true" ]]; then
+            CONTINUE_ON_ERROR_FLAG="--continue-on-error"
+          fi
+          python3 run_suite.py --hw cuda --suite stage-b-test-large-2-gpu-performance $CONTINUE_ON_ERROR_FLAG
+
+  stage-b-test-small-1-gpu-accuracy:
+    needs: [check-changes, call-gate, wait-for-stage-a, sgl-kernel-build-wheels]
+    if: |
+      always() &&
+      (
+        (inputs.target_stage == 'stage-b-test-small-1-gpu-accuracy') ||
+        (
+          !inputs.target_stage &&
+          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
+          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+        )
+      )
+    runs-on: 1-gpu-5090
+    timeout-minutes: 60
+    env:
+      RUNNER_LABELS: 1-gpu-5090
+      IS_BLACKWELL: "1"
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
+
+      - name: Download artifacts
+        if: needs.check-changes.outputs.sgl_kernel == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          path: sgl-kernel/dist/
+          merge-multiple: true
+          pattern: wheel-python3.10-cuda12.9
+
+      - name: Install dependencies
+        timeout-minutes: 10
+        run: |
+          source /etc/profile.d/sglang-ci.sh
+          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh
+          git clone https://github.com/merrymercy/human-eval.git
+          cd human-eval
+          pip install -e .
+
+      - name: Run test
+        timeout-minutes: 25
+        run: |
+          source /etc/profile.d/sglang-ci.sh
+          cd test/
+          CONTINUE_ON_ERROR_FLAG=""
+          if [[ "${{ needs.check-changes.outputs.continue_on_error }}" == "true" ]]; then
+            CONTINUE_ON_ERROR_FLAG="--continue-on-error"
+          fi
+          python3 run_suite.py --hw cuda --suite stage-b-test-small-1-gpu-accuracy $CONTINUE_ON_ERROR_FLAG
+
+  stage-b-test-large-2-gpu-accuracy:
+    needs: [check-changes, call-gate, wait-for-stage-a, sgl-kernel-build-wheels]
+    if: |
+      always() &&
+      (
+        (inputs.target_stage == 'stage-b-test-large-2-gpu-accuracy') ||
+        (
+          !inputs.target_stage &&
+          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
+          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+        )
+      )
+    runs-on: 2-gpu-runner
+    timeout-minutes: 60
+    env:
+      RUNNER_LABELS: 2-gpu-runner
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
+
+      - name: Download artifacts
+        if: needs.check-changes.outputs.sgl_kernel == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          path: sgl-kernel/dist/
+          merge-multiple: true
+          pattern: wheel-python3.10-cuda12.9
+
+      - name: Install dependencies
+        timeout-minutes: 10
+        run: |
+          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh
+          git clone https://github.com/merrymercy/human-eval.git
+          cd human-eval
+          pip install -e .
+
+      - name: Run test
+        timeout-minutes: 25
+        run: |
+          cd test/
+          CONTINUE_ON_ERROR_FLAG=""
+          if [[ "${{ needs.check-changes.outputs.continue_on_error }}" == "true" ]]; then
+            CONTINUE_ON_ERROR_FLAG="--continue-on-error"
+          fi
+          python3 run_suite.py --hw cuda --suite stage-b-test-large-2-gpu-accuracy $CONTINUE_ON_ERROR_FLAG
+
   stage-b-test-4-gpu-b200:
-    needs: [check-changes, call-gate, stage-a-test-1, sgl-kernel-build-wheels]
+    needs: [check-changes, call-gate, wait-for-stage-a, sgl-kernel-build-wheels]
     if: |
       always() &&
       (
         (inputs.target_stage == 'stage-b-test-4-gpu-b200') ||
         (
           !inputs.target_stage &&
-          (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
+          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
     runs-on: ${{ needs.check-changes.outputs.b200_runner }}
+    timeout-minutes: 60
     env:
       RUNNER_LABELS: ${{ needs.check-changes.outputs.b200_runner }}
     strategy:
@@ -782,18 +1231,19 @@ jobs:
           IS_BLACKWELL=1 python3 run_suite.py --hw cuda --suite stage-b-test-4-gpu-b200 $CONTINUE_ON_ERROR_FLAG
 
   stage-c-test-large-4-gpu:
-    needs: [check-changes, call-gate, stage-b-test-small-1-gpu, stage-b-test-large-1-gpu, stage-b-test-large-2-gpu, sgl-kernel-build-wheels]
+    needs: [check-changes, call-gate, wait-for-stage-b, sgl-kernel-build-wheels]
     if: |
       always() &&
       (
         (inputs.target_stage == 'stage-c-test-large-4-gpu') ||
         (
           !inputs.target_stage &&
-          (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
+          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
     runs-on: 4-gpu-h100
+    timeout-minutes: 60
     env:
       RUNNER_LABELS: 4-gpu-h100
     steps:
@@ -826,18 +1276,19 @@ jobs:
           python3 run_suite.py --hw cuda --suite stage-c-test-large-4-gpu $CONTINUE_ON_ERROR_FLAG
 
   stage-c-test-large-4-gpu-b200:
-    needs: [check-changes, call-gate, stage-b-test-small-1-gpu, stage-b-test-large-1-gpu, stage-b-test-large-2-gpu, stage-b-test-4-gpu-b200, sgl-kernel-build-wheels]
+    needs: [check-changes, call-gate, wait-for-stage-b, sgl-kernel-build-wheels]
     if: |
       always() &&
       (
         (inputs.target_stage == 'stage-c-test-large-4-gpu-b200') ||
         (
           !inputs.target_stage &&
-          (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
+          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
     runs-on: ${{ needs.check-changes.outputs.b200_runner }}
+    timeout-minutes: 60
     env:
       RUNNER_LABELS: ${{ needs.check-changes.outputs.b200_runner }}
     steps:
@@ -873,11 +1324,12 @@ jobs:
         (inputs.target_stage == 'multimodal-gen-test-1-gpu') ||
         (
           !inputs.target_stage &&
-          (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
+          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
           needs.check-changes.outputs.multimodal_gen == 'true'
         )
       )
     runs-on: 1-gpu-runner
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -923,11 +1375,12 @@ jobs:
         (inputs.target_stage == 'multimodal-gen-test-2-gpu') ||
         (
           !inputs.target_stage &&
-          (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
+          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
           needs.check-changes.outputs.multimodal_gen == 'true'
         )
       )
     runs-on: 2-gpu-runner
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -965,65 +1418,20 @@ jobs:
             --total-partitions 2 \
             $CONTINUE_ON_ERROR_FLAG
 
-  quantization-test:
-      needs: [check-changes, call-gate, stage-a-test-1]
-      if: |
-        always() &&
-        (
-          (inputs.target_stage == 'quantization-test') ||
-          (
-            !inputs.target_stage &&
-            (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
-            ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-          )
-        )
-      runs-on: 1-gpu-runner
-      steps:
-        - name: Checkout code
-          uses: actions/checkout@v4
-          with:
-            ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
-
-        - name: Download artifacts
-          if: needs.check-changes.outputs.sgl_kernel == 'true'
-          uses: actions/download-artifact@v4
-          with:
-            path: sgl-kernel/dist/
-            merge-multiple: true
-            pattern: wheel-python3.10-cuda12.9
-
-        - name: Install dependencies
-          timeout-minutes: 10
-          run: |
-            CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh
-
-        - name: Run test
-          timeout-minutes: 30
-          run: |
-            cd test/srt
-            RETRY_FLAG=""
-            if [[ "${{ needs.check-changes.outputs.enable_retry }}" == "true" ]]; then
-              RETRY_FLAG="--enable-retry"
-            fi
-            CONTINUE_ON_ERROR_FLAG=""
-            if [[ "${{ needs.check-changes.outputs.continue_on_error }}" == "true" ]]; then
-              CONTINUE_ON_ERROR_FLAG="--continue-on-error"
-            fi
-            python3 run_suite.py --suite quantization_test $RETRY_FLAG $CONTINUE_ON_ERROR_FLAG
-
   unit-test-backend-4-gpu:
-    needs: [check-changes, call-gate, stage-b-test-small-1-gpu, stage-b-test-large-1-gpu, stage-b-test-large-2-gpu, stage-b-test-4-gpu-b200]
+    needs: [check-changes, call-gate, wait-for-stage-b]
     if: |
       always() &&
       (
         (inputs.target_stage == 'unit-test-backend-4-gpu') ||
         (
           !inputs.target_stage &&
-          (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
+          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
     runs-on: 4-gpu-h100
+    timeout-minutes: 60
     env:
       RUNNER_LABELS: 4-gpu-h100
     strategy:
@@ -1064,18 +1472,19 @@ jobs:
           python3 run_suite.py --suite per-commit-4-gpu --auto-partition-id ${{ matrix.part }} --auto-partition-size 3 $RETRY_FLAG $CONTINUE_ON_ERROR_FLAG
 
   unit-test-backend-8-gpu-h200:
-    needs: [check-changes, call-gate, stage-b-test-small-1-gpu, stage-b-test-large-1-gpu, stage-b-test-large-2-gpu, stage-b-test-4-gpu-b200]
+    needs: [check-changes, call-gate, wait-for-stage-b]
     if: |
       always() &&
       (
         (inputs.target_stage == 'unit-test-backend-8-gpu-h200') ||
         (
           !inputs.target_stage &&
-          (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
+          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
     runs-on: 8-gpu-h200
+    timeout-minutes: 60
     env:
       RUNNER_LABELS: 8-gpu-h200
     strategy:
@@ -1122,18 +1531,19 @@ jobs:
           python3 run_suite.py --suite per-commit-8-gpu-h200 --auto-partition-id ${{ matrix.part }} --auto-partition-size 4 $RETRY_FLAG $CONTINUE_ON_ERROR_FLAG
 
   unit-test-backend-8-gpu-h20:
-    needs: [check-changes, call-gate, stage-b-test-small-1-gpu, stage-b-test-large-1-gpu, stage-b-test-large-2-gpu, stage-b-test-4-gpu-b200]
+    needs: [check-changes, call-gate, wait-for-stage-b]
     if: |
       always() &&
       (
         (inputs.target_stage == 'unit-test-backend-8-gpu-h20') ||
         (
           !inputs.target_stage &&
-          (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
+          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
     runs-on: 8-gpu-h20
+    timeout-minutes: 60
     env:
       SGLANG_CI_RDMA_ALL_DEVICES: "mlx5_1,mlx5_2,mlx5_3,mlx5_4"
       RUNNER_LABELS: 8-gpu-h20
@@ -1174,369 +1584,20 @@ jobs:
           fi
           python3 run_suite.py --suite per-commit-8-gpu-h20 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 $RETRY_FLAG $CONTINUE_ON_ERROR_FLAG
 
-  performance-test-1-gpu-part-1:
-    needs: [check-changes, call-gate, stage-a-test-1]
-    if: |
-      always() &&
-      (
-        (inputs.target_stage == 'performance-test-1-gpu-part-1') ||
-        (
-          !inputs.target_stage &&
-          (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
-          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-        )
-      )
-    runs-on: 1-gpu-runner
-    env:
-      RUNNER_LABELS: 1-gpu-runner
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
-
-      - name: Download artifacts
-        if: needs.check-changes.outputs.sgl_kernel == 'true'
-        uses: actions/download-artifact@v4
-        with:
-          path: sgl-kernel/dist/
-          merge-multiple: true
-          pattern: wheel-python3.10-cuda12.9
-
-      - name: Install dependencies
-        timeout-minutes: 10
-        run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh
-
-      - name: Benchmark single latency
-        timeout-minutes: 10
-        run: |
-          cd test/srt
-          python3 -m unittest test_bench_one_batch.TestBenchOneBatch.test_bs1_small
-          python3 -m unittest test_bench_one_batch.TestBenchOneBatch.test_bs1_default
-
-      - name: Benchmark online latency
-        timeout-minutes: 10
-        run: |
-          cd test/srt
-          python3 -m unittest test_bench_serving.TestBenchServing.test_online_latency_default
-
-      - name: Benchmark offline throughput
-        timeout-minutes: 10
-        run: |
-          cd test/srt
-          python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_default
-
-      - name: Benchmark offline throughput (Non-streaming, small batch size)
-        timeout-minutes: 10
-        run: |
-          cd test/srt
-          python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_non_stream_small_batch_size
-
-      - name: Benchmark online latency (EAGLE)
-        timeout-minutes: 10
-        run: |
-          cd test/srt
-          python3 -m unittest test_bench_serving.TestBenchServing.test_online_latency_eagle
-
-      - name: Benchmark online latency (LoRA)
-        timeout-minutes: 10
-        run: |
-          cd test/srt
-          python3 -m unittest test_bench_serving.TestBenchServing.test_lora_online_latency
-          python3 -m unittest test_bench_serving.TestBenchServing.test_lora_online_latency_with_concurrent_adapter_updates
-
-  performance-test-1-gpu-part-2:
-    needs: [check-changes, call-gate, stage-a-test-1]
-    if: |
-      always() &&
-      (
-        (inputs.target_stage == 'performance-test-1-gpu-part-2') ||
-        (
-          !inputs.target_stage &&
-          (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
-          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-        )
-      )
-    runs-on: 1-gpu-runner
-    env:
-      RUNNER_LABELS: 1-gpu-runner
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
-
-      - name: Download artifacts
-        if: needs.check-changes.outputs.sgl_kernel == 'true'
-        uses: actions/download-artifact@v4
-        with:
-          path: sgl-kernel/dist/
-          merge-multiple: true
-          pattern: wheel-python3.10-cuda12.9
-
-      - name: Install dependencies
-        timeout-minutes: 10
-        run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh
-
-      - name: Benchmark offline throughput (w/o RadixAttention)
-        timeout-minutes: 10
-        run: |
-          cd test/srt
-          python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_without_radix_cache
-
-      - name: Benchmark offline throughput (w/ Triton)
-        timeout-minutes: 10
-        run: |
-          cd test/srt
-          python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_with_triton_attention_backend
-
-      - name: Benchmark offline throughput (w/ FP8)
-        timeout-minutes: 10
-        run: |
-          cd test/srt
-          python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_default_fp8
-
-      - name: Benchmark VLM offline throughput
-        timeout-minutes: 10
-        run: |
-          cd test/srt
-          python3 -m unittest test_bench_serving.TestBenchServing.test_vlm_offline_throughput
-
-      - name: Benchmark VLM online latency
-        timeout-minutes: 10
-        run: |
-          cd test/srt
-          python3 -m unittest test_bench_serving.TestBenchServing.test_vlm_online_latency
-
-  performance-test-1-gpu-part-3:
-    needs: [check-changes, call-gate, stage-a-test-1]
-    if: |
-      always() &&
-      (
-        (inputs.target_stage == 'performance-test-1-gpu-part-3') ||
-        (
-          !inputs.target_stage &&
-          (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
-          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-        )
-      )
-    runs-on: 1-gpu-runner
-    env:
-      RUNNER_LABELS: 1-gpu-runner
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
-
-      - name: Download artifacts
-        if: needs.check-changes.outputs.sgl_kernel == 'true'
-        uses: actions/download-artifact@v4
-        with:
-          path: sgl-kernel/dist/
-          merge-multiple: true
-          pattern: wheel-python3.10-cuda12.9
-
-      - name: Install dependencies
-        timeout-minutes: 10
-        run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh
-
-      - name: Benchmark Scores online latency and throughput
-        timeout-minutes: 10
-        run: |
-          cd test/srt
-          python3 -m unittest test_bench_serving.TestBenchServing.test_score_api_latency_throughput
-
-      - name: Benchmark Scores online latency and throughput (batch size scaling)
-        timeout-minutes: 10
-        run: |
-          cd test/srt
-          python3 -m unittest test_bench_serving.TestBenchServing.test_score_api_batch_scaling
-
-      - name: Benchmark Embeddings online latency and throughput
-        timeout-minutes: 10
-        run: |
-          cd test/srt
-          python3 -m unittest test_bench_serving.TestBenchServing.test_embeddings_api_latency_throughput
-
-      - name: Benchmark Embeddings online latency and throughput (batch size scaling)
-        timeout-minutes: 10
-        run: |
-          cd test/srt
-          python3 -m unittest test_bench_serving.TestBenchServing.test_embeddings_api_batch_scaling
-
-  performance-test-2-gpu:
-    needs: [check-changes, call-gate, stage-b-test-4-gpu-b200]
-    if: |
-      always() &&
-      (
-        (inputs.target_stage == 'performance-test-2-gpu') ||
-        (
-          !inputs.target_stage &&
-          (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
-          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-        )
-      )
-    runs-on: 2-gpu-runner
-    env:
-      RUNNER_LABELS: 2-gpu-runner
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
-
-      - name: Download artifacts
-        if: needs.check-changes.outputs.sgl_kernel == 'true'
-        uses: actions/download-artifact@v4
-        with:
-          path: sgl-kernel/dist/
-          merge-multiple: true
-          pattern: wheel-python3.10-cuda12.9
-
-      - name: Install dependencies
-        timeout-minutes: 10
-        run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh
-
-      - name: Benchmark single latency (TP=2)
-        timeout-minutes: 10
-        run: |
-          cd test/srt
-          python3 -m unittest test_bench_one_batch.TestBenchOneBatch.test_moe_tp2_bs1
-
-      - name: Benchmark single latency + torch.compile (TP=2)
-        timeout-minutes: 10
-        run: |
-          cd test/srt
-          python3 -m unittest test_bench_one_batch.TestBenchOneBatch.test_torch_compile_tp2_bs1
-
-      - name: Benchmark offline throughput (TP=2)
-        timeout-minutes: 10
-        run: |
-          cd test/srt
-          python3 -m unittest test_bench_serving.TestBenchServing.test_moe_offline_throughput_default
-
-      - name: Benchmark offline throughput (w/o RadixAttention) (TP=2)
-        timeout-minutes: 10
-        run: |
-          cd test/srt
-          python3 -m unittest test_bench_serving.TestBenchServing.test_moe_offline_throughput_without_radix_cache
-
-      - name: Benchmark offline PP decode throughput (PP=2)
-        timeout-minutes: 10
-        run: |
-          cd test/srt
-          python3 -m unittest test_bench_serving.TestBenchServing.test_pp_offline_throughput_default_decode
-
-      - name: Benchmark offline PP prefill throughput (PP=2)
-        timeout-minutes: 10
-        run: |
-          cd test/srt
-          python3 -m unittest test_bench_serving.TestBenchServing.test_pp_long_context_prefill
-
-  accuracy-test-1-gpu:
-    needs: [check-changes, call-gate, stage-a-test-1]
-    if: |
-      always() &&
-      (
-        (inputs.target_stage == 'accuracy-test-1-gpu') ||
-        (
-          !inputs.target_stage &&
-          (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
-          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-        )
-      )
-    runs-on: 1-gpu-runner
-    env:
-      RUNNER_LABELS: 1-gpu-runner
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
-
-      - name: Download artifacts
-        if: needs.check-changes.outputs.sgl_kernel == 'true'
-        uses: actions/download-artifact@v4
-        with:
-          path: sgl-kernel/dist/
-          merge-multiple: true
-          pattern: wheel-python3.10-cuda12.9
-
-      - name: Install dependencies
-        timeout-minutes: 10
-        run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh
-          git clone https://github.com/merrymercy/human-eval.git
-          cd human-eval
-          pip install -e .
-
-      - name: Evaluate accuracy
-        timeout-minutes: 25
-        run: |
-          cd test/srt
-          python3 -m sglang.test.ci.run_with_retry test_eval_accuracy_large.py
-
-  accuracy-test-2-gpu:
-    needs: [check-changes, call-gate, accuracy-test-1-gpu]
-    if: |
-      always() &&
-      (
-        (inputs.target_stage == 'accuracy-test-2-gpu') ||
-        (
-          !inputs.target_stage &&
-          (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
-          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-        )
-      )
-    runs-on: 2-gpu-runner
-    env:
-      RUNNER_LABELS: 2-gpu-runner
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
-
-      - name: Download artifacts
-        if: needs.check-changes.outputs.sgl_kernel == 'true'
-        uses: actions/download-artifact@v4
-        with:
-          path: sgl-kernel/dist/
-          merge-multiple: true
-          pattern: wheel-python3.10-cuda12.9
-
-      - name: Install dependencies
-        timeout-minutes: 10
-        run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh
-          git clone https://github.com/merrymercy/human-eval.git
-          cd human-eval
-          pip install -e .
-
-      - name: Evaluate accuracy (TP=2)
-        timeout-minutes: 25
-        run: |
-          cd test/srt
-          python3 -m sglang.test.ci.run_with_retry test_moe_eval_accuracy_large.py
-
   unit-test-deepep-4-gpu:
-    needs: [check-changes, call-gate, stage-b-test-small-1-gpu, stage-b-test-large-1-gpu, stage-b-test-large-2-gpu, stage-b-test-4-gpu-b200]
+    needs: [check-changes, call-gate, wait-for-stage-b]
     if: |
       always() &&
       (
         (inputs.target_stage == 'unit-test-deepep-4-gpu') ||
         (
           !inputs.target_stage &&
-          (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
+          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
     runs-on: 4-gpu-h100
+    timeout-minutes: 60
     env:
       RUNNER_LABELS: 4-gpu-h100
     steps:
@@ -1622,18 +1683,19 @@ jobs:
   #         python3 run_suite.py --suite per-commit-8-gpu-h200-deepep $RETRY_FLAG $CONTINUE_ON_ERROR_FLAG
 
   unit-test-backend-4-gpu-b200:
-    needs: [check-changes, call-gate, stage-b-test-small-1-gpu, stage-b-test-large-1-gpu, stage-b-test-large-2-gpu, stage-b-test-4-gpu-b200]
+    needs: [check-changes, call-gate, wait-for-stage-b]
     if: |
       always() &&
       (
         (inputs.target_stage == 'unit-test-backend-4-gpu-b200') ||
         (
           !inputs.target_stage &&
-          (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
+          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
     runs-on: ${{ needs.check-changes.outputs.b200_runner }}
+    timeout-minutes: 60
     env:
       RUNNER_LABELS: ${{ needs.check-changes.outputs.b200_runner }}
     strategy:
@@ -1674,55 +1736,57 @@ jobs:
           fi
           IS_BLACKWELL=1 python3 run_suite.py --suite per-commit-4-gpu-b200 --auto-partition-id ${{ matrix.part }} --auto-partition-size 3 --timeout-per-file 1800 $RETRY_FLAG $CONTINUE_ON_ERROR_FLAG
 
-  unit-test-backend-4-gpu-gb200:
-    needs: [check-changes, call-gate, stage-b-test-small-1-gpu, stage-b-test-large-1-gpu, stage-b-test-large-2-gpu, stage-b-test-4-gpu-b200, sgl-kernel-build-wheels-arm]
-    if: |
-      always() &&
-      (
-        (inputs.target_stage == 'unit-test-backend-4-gpu-gb200') ||
-        (
-          !inputs.target_stage &&
-          (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
-          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-        )
-      )
-    runs-on: 4-gpu-gb200
-    env:
-      RUNNER_LABELS: 4-gpu-gb200
-    strategy:
-      fail-fast: false
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
-
-      - name: Download artifacts
-        if: needs.check-changes.outputs.sgl_kernel == 'true'
-        uses: actions/download-artifact@v4
-        with:
-          path: sgl-kernel/dist/
-          merge-multiple: true
-          pattern: wheel-python3.10-cuda12.9-aarch64
-
-      - name: Install dependencies
-        timeout-minutes: 10
-        run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} IS_BLACKWELL=1 GRACE_BLACKWELL=1 bash scripts/ci/ci_install_deepep.sh
-
-      - name: Run test
-        timeout-minutes: 45
-        run: |
-          cd test/srt
-          RETRY_FLAG=""
-          if [[ "${{ needs.check-changes.outputs.enable_retry }}" == "true" ]]; then
-            RETRY_FLAG="--enable-retry"
-          fi
-          CONTINUE_ON_ERROR_FLAG=""
-          if [[ "${{ needs.check-changes.outputs.continue_on_error }}" == "true" ]]; then
-            CONTINUE_ON_ERROR_FLAG="--continue-on-error"
-          fi
-          python3 run_suite.py --suite per-commit-4-gpu-gb200 --auto-partition-id 0 --auto-partition-size 1 --timeout-per-file 3600 $RETRY_FLAG $CONTINUE_ON_ERROR_FLAG
+  # Disabled: GB200 runner needs repair
+  # unit-test-backend-4-gpu-gb200:
+  #   needs: [check-changes, call-gate, wait-for-stage-b, sgl-kernel-build-wheels-arm]
+  #   if: |
+  #     always() &&
+  #     (
+  #       (inputs.target_stage == 'unit-test-backend-4-gpu-gb200') ||
+  #       (
+  #         !inputs.target_stage &&
+  #         ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
+  #         ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+  #       )
+  #     )
+  #   runs-on: 4-gpu-gb200
+  #   timeout-minutes: 60
+  #   env:
+  #     RUNNER_LABELS: 4-gpu-gb200
+  #   strategy:
+  #     fail-fast: false
+  #   steps:
+  #     - name: Checkout code
+  #       uses: actions/checkout@v4
+  #       with:
+  #         ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
+  #
+  #     - name: Download artifacts
+  #       if: needs.check-changes.outputs.sgl_kernel == 'true'
+  #       uses: actions/download-artifact@v4
+  #       with:
+  #         path: sgl-kernel/dist/
+  #         merge-multiple: true
+  #         pattern: wheel-python3.10-cuda12.9-aarch64
+  #
+  #     - name: Install dependencies
+  #       timeout-minutes: 10
+  #       run: |
+  #         CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} IS_BLACKWELL=1 GRACE_BLACKWELL=1 bash scripts/ci/ci_install_deepep.sh
+  #
+  #     - name: Run test
+  #       timeout-minutes: 45
+  #       run: |
+  #         cd test/srt
+  #         RETRY_FLAG=""
+  #         if [[ "${{ needs.check-changes.outputs.enable_retry }}" == "true" ]]; then
+  #           RETRY_FLAG="--enable-retry"
+  #         fi
+  #         CONTINUE_ON_ERROR_FLAG=""
+  #         if [[ "${{ needs.check-changes.outputs.continue_on_error }}" == "true" ]]; then
+  #           CONTINUE_ON_ERROR_FLAG="--continue-on-error"
+  #         fi
+  #         python3 run_suite.py --suite per-commit-4-gpu-gb200 --auto-partition-id 0 --auto-partition-size 1 --timeout-per-file 3600 $RETRY_FLAG $CONTINUE_ON_ERROR_FLAG
 
   pr-test-finish:
     needs:
@@ -1746,22 +1810,20 @@ jobs:
         stage-b-test-small-1-gpu,
         stage-b-test-large-1-gpu,
         stage-b-test-large-2-gpu,
+        stage-b-test-small-1-gpu-performance,
+        stage-b-test-large-1-gpu-performance,
+        stage-b-test-large-2-gpu-performance,
+        stage-b-test-small-1-gpu-accuracy,
+        stage-b-test-large-2-gpu-accuracy,
         stage-c-test-large-4-gpu,
-        quantization-test,
         stage-b-test-4-gpu-b200,
         unit-test-backend-4-gpu,
         unit-test-backend-8-gpu-h20,
         unit-test-backend-8-gpu-h200,
-        performance-test-1-gpu-part-1,
-        performance-test-1-gpu-part-2,
-        performance-test-1-gpu-part-3,
-        performance-test-2-gpu,
-        accuracy-test-1-gpu,
-        accuracy-test-2-gpu,
         unit-test-deepep-4-gpu,
         # unit-test-deepep-8-gpu,  # Disabled, see #17175
         unit-test-backend-4-gpu-b200,
-        unit-test-backend-4-gpu-gb200,
+        # unit-test-backend-4-gpu-gb200,  # Disabled: GB200 runner needs repair
       ]
     if: always()
     runs-on: ubuntu-latest
