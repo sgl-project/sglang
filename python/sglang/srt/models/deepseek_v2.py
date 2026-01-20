@@ -1517,6 +1517,169 @@ class DeepseekV2MoE(nn.Module):
             )
         )
 
+        # ---------------- Debug-only: validate EPLB+Waterfill shared destination ----------------
+        # Enable via env var:
+        #   SGLANG_DEBUG_WATERFILL_EPLB=1
+        #
+        # Optional:
+        #   SGLANG_DEBUG_WATERFILL_EPLB_LAYER=<layer_id|all|-1>   (default: only layer 0)
+        #   SGLANG_DEBUG_WATERFILL_EPLB_MAX_PRINTS=<N>            (default: 1)
+        #   SGLANG_DEBUG_WATERFILL_EPLB_VALIDATE_MAX_TOKENS=<N>   (default: 4096)
+        #
+        # Each EP rank prints a single line (up to MAX_PRINTS) including:
+        # - routed tokens per rank (global_routed_counts)
+        # - shared tokens per rank BEFORE waterfill (local num_tokens per rank)
+        # - shared tokens per rank AFTER waterfill (derived from expanded_topk_ids[:, -1])
+        # - total token load per rank BEFORE vs AFTER: routed + shared
+        # - validation failures count (shared dest rank must be local or among routed ranks)
+        debug_waterfill_eplb = os.environ.get(
+            "SGLANG_DEBUG_WATERFILL_EPLB", ""
+        ) not in (
+            "",
+            "0",
+            "false",
+            "False",
+        )
+        if debug_waterfill_eplb and not torch.cuda.is_current_stream_capturing():
+            layer_filter = os.environ.get("SGLANG_DEBUG_WATERFILL_EPLB_LAYER", "")
+            if layer_filter and layer_filter not in ("all", "-1"):
+                try:
+                    debug_waterfill_eplb = int(layer_filter) == int(self.layer_id)
+                except Exception:
+                    debug_waterfill_eplb = False
+            else:
+                # Default: only layer 0 to avoid log spam.
+                if not layer_filter:
+                    debug_waterfill_eplb = int(self.layer_id) == 0
+        else:
+            debug_waterfill_eplb = False
+
+        if debug_waterfill_eplb:
+            max_prints = int(
+                os.environ.get("SGLANG_DEBUG_WATERFILL_EPLB_MAX_PRINTS", "1")
+            )
+            printed = getattr(self, "_debug_waterfill_eplb_print_count", 0)
+            debug_waterfill_eplb = printed < max_prints
+
+        if debug_waterfill_eplb:
+            # Avoid printing on tiny warmups / decode-only steps by default.
+            # (Waterfill is typically only meaningful when num_tokens is large enough.)
+            min_tokens_to_print = int(
+                os.environ.get(
+                    "SGLANG_DEBUG_WATERFILL_EPLB_MIN_TOKENS",
+                    str(self.deepep_waterfill_balancer.MIN_BATCH_FOR_BALANCE),
+                )
+            )
+            debug_waterfill_eplb = num_tokens >= min_tokens_to_print
+
+        if debug_waterfill_eplb:
+            group = get_moe_ep_group().device_group
+            ep_rank = torch.distributed.get_rank(group=group)
+            ep_world = torch.distributed.get_world_size(group=group)
+
+            # (1) Per-rank local token counts (shared expert local BEFORE waterfill)
+            local_num_tokens = torch.tensor(
+                [num_tokens], device=device, dtype=torch.int64
+            )
+            gather_list = [torch.empty_like(local_num_tokens) for _ in range(ep_world)]
+            torch.distributed.all_gather(gather_list, local_num_tokens, group=group)
+            local_tokens_per_rank = torch.cat(gather_list).to(
+                torch.int64
+            )  # (ep_world,)
+
+            # (2) Shared expert tokens assigned per rank AFTER waterfill
+            shared_ids = expanded_topk_ids[:, -1].to(torch.int64)
+            valid_shared = shared_ids >= 0
+            new_epr = int(self.deepep_waterfill_balancer.new_experts_per_rank)
+            old_epr = int(self.deepep_waterfill_balancer.old_experts_per_rank)
+
+            # dest_rank extracted from the real shared expert id
+            dest_rank = torch.div(shared_ids, new_epr, rounding_mode="floor")
+            dest_rank_valid = dest_rank[valid_shared].to(torch.int64)
+            local_shared_counts_after = torch.bincount(
+                dest_rank_valid,
+                minlength=ep_world,
+            ).to(torch.int64)
+            shared_counts_after = local_shared_counts_after.clone()
+            torch.distributed.all_reduce(
+                shared_counts_after,
+                op=torch.distributed.ReduceOp.SUM,
+                group=group,
+            )
+
+            routed_counts = global_routed_counts.to(torch.int64)
+            total_before = routed_counts + local_tokens_per_rank
+            total_after = routed_counts + shared_counts_after
+
+            # (3) Validation: shared id encoding + dest membership (local tokens only)
+            validate_max_tokens = int(
+                os.environ.get(
+                    "SGLANG_DEBUG_WATERFILL_EPLB_VALIDATE_MAX_TOKENS", "4096"
+                )
+            )
+            n_check = min(num_tokens, validate_max_tokens)
+            if n_check > 0:
+                shared_ids_c = shared_ids[:n_check]
+                valid_shared_c = valid_shared[:n_check]
+                dest_rank_c = dest_rank[:n_check].to(torch.int64)
+                topk_ids_c = topk_ids[:n_check].to(torch.int64)
+                valid_topk = topk_ids_c >= 0
+
+                # shared_id should always point to the shared slot: id % new_epr == old_epr
+                mod_ok = (~valid_shared_c) | (
+                    torch.remainder(shared_ids_c, new_epr) == old_epr
+                )
+                # dest rank should be within [0, ep_world-1]
+                range_ok = (~valid_shared_c) | (
+                    (dest_rank_c >= 0) & (dest_rank_c < ep_world)
+                )
+                # dest rank is either local EP rank, or among routed ranks of this token
+                routed_rank = torch.div(topk_ids_c, old_epr, rounding_mode="floor")
+                in_routed = (
+                    (routed_rank == dest_rank_c.unsqueeze(1)) & valid_topk
+                ).any(dim=1)
+                membership_ok = (~valid_shared_c) | (dest_rank_c == ep_rank) | in_routed
+
+                bad = valid_shared_c & (~(mod_ok & range_ok & membership_ok))
+                bad_count = int(bad.sum().item())
+            else:
+                bad_count = 0
+
+            # Per-rank values for this EP rank
+            routed_this = int(routed_counts[ep_rank].item())
+            shared_before_this = int(local_tokens_per_rank[ep_rank].item())
+            shared_after_this = int(shared_counts_after[ep_rank].item())
+            total_before_this = int(total_before[ep_rank].item())
+            total_after_this = int(total_after[ep_rank].item())
+
+            # Global stats (same on every rank)
+            tb_min = int(total_before.min().item())
+            tb_max = int(total_before.max().item())
+            tb_avg = float(total_before.float().mean().item())
+            ta_min = int(total_after.min().item())
+            ta_max = int(total_after.max().item())
+            ta_avg = float(total_after.float().mean().item())
+            tb_imbal = (float(tb_max) / tb_avg) if tb_avg > 0 else 0.0
+            ta_imbal = (float(ta_max) / ta_avg) if ta_avg > 0 else 0.0
+
+            print(
+                (
+                    f"[waterfill_eplb_debug] layer={self.layer_id} "
+                    f"ep_rank={ep_rank}/{ep_world} num_tokens_local={num_tokens} "
+                    f"routed={routed_this} shared_before={shared_before_this} "
+                    f"shared_after={shared_after_this} total_before={total_before_this} "
+                    f"total_after={total_after_this} "
+                    f"before(min={tb_min} avg={tb_avg:.2f} max={tb_max} "
+                    f"imbal={tb_imbal:.3f}x) "
+                    f"after(min={ta_min} avg={ta_avg:.2f} max={ta_max} "
+                    f"imbal={ta_imbal:.3f}x) "
+                    f"bad_tokens={bad_count}/{n_check}"
+                ),
+                flush=True,
+            )
+
+            self._debug_waterfill_eplb_print_count = printed + 1
+
         expanded_topk_output = StandardTopKOutput(
             topk_weights=expanded_topk_weights,
             topk_ids=expanded_topk_ids,
