@@ -1586,6 +1586,7 @@ class ServerArgs:
                 "DeepseekV3ForCausalLM",
                 "GptOssForCausalLM",
                 "Glm4MoeForCausalLM",
+                "Glm4MoeLiteForCausalLM",
                 "Qwen3MoeForCausalLM",
             ]
             and (is_sm90_supported() or is_sm100_supported())
@@ -2147,6 +2148,7 @@ class ServerArgs:
                 "DeepseekV32ForCausalLM",
                 "DeepseekV3ForCausalLM",
                 "Glm4MoeForCausalLM",
+                "Glm4MoeLiteForCausalLM",
                 "BailingMoeForCausalLM",
                 "BailingMoeV2ForCausalLM",
                 "MistralLarge3ForCausalLM",
@@ -5422,6 +5424,7 @@ def auto_choose_speculative_params(self: ServerArgs):
         "DeepseekV2ForCausalLM",
         "GptOssForCausalLM",
         "Glm4MoeForCausalLM",
+        "Glm4MoeLiteForCausalLM",
         "BailingMoeForCausalLM",
         "BailingMoeV2ForCausalLM",
         "MistralLarge3ForCausalLM",
