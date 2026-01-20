@@ -52,8 +52,10 @@ python -m sglang.test.run_eval \
   --max-tokens 120000 \
   --repeat 8
 ```
-> [!TIP]
-> For reasoning models, add `--thinking-mode <mode>` (e.g., `qwen3`, `deepseek-r1`, `deepseek-v3`). You may skip it if the model has forced thinking enabled.
+
+```{tip}
+For reasoning models, add `--thinking-mode <mode>` (e.g., `qwen3`, `deepseek-r1`, `deepseek-v3`). You may skip it if the model has forced thinking enabled.
+```
 
 **HumanEval**
 
@@ -75,8 +77,10 @@ python benchmark/mmmu/bench_sglang.py \
   --port 30000 \
   --concurrency 64
 ```
-> [!TIP]
-> You can set max tokens by passing `--extra-request-body '{"max_tokens": 4096}'`.
+
+```{tip}
+You can set max tokens by passing `--extra-request-body '{"max_tokens": 4096}'`.
+```
 
 For models capable of processing video, we recommend extending the evaluation to include `VideoMME`, `MVBench`, and other relevant benchmarks.
 
