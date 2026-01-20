@@ -6,10 +6,10 @@ You can install SGLang using any of the methods below. Please go through `System
 ## Component Version Mapping For SGLang
 | Component         | Version                 | Obtain Way                                                                                                                                                                                                                   |
 |-------------------|-------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| HDK               | 25.2.1                  | [link](https://support.huawei.com/carrier/productNewOffering?col=product&path=PBI1-262732867/PBI1-262735886/PBI1-262735910/PBI1-261410188/PBI1-252764743&pVR=PBI1-263550357&pC=PBI1-264360782&pSPC=PBI1-266220744&resTab=SW) |
+| HDK               | 25.3.RC1                  | [link](https://hiascend.com/hardware/firmware-drivers/commercial?product=7&model=33) |
 | CANN              | 8.3.rc2                 | [Obtain Images](#obtain-cann-image)                                                                                                                                                                                          |
 | Pytorch Adapter   | 7.3.0                   | [link](https://gitcode.com/Ascend/pytorch/releases)                                                                                                                                                                          |
-| MemFabric         | 0.1.0                   | [link](https://gitcode.com/Ascend/memfabric_hybrid/releases)                                                                                                                                                                 |
+| MemFabric         | 1.0.3                   | `pip install memfabric-hybrid==1.0.3`                                                                                                                                                                 |
 | Triton            | 3.2.0.dev2025112116     | [link](https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/sglang/triton_ascend/triton_ascend-3.2.0.dev2025112116-cp311-cp311-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl)                                           |
 | Bisheng           | 20251121                | [link](https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/sglang/triton_ascend/Ascend-BiSheng-toolkit_aarch64_20251121.run)                                                                                               |
 | SGLang NPU Kernel | NA                      | [link](https://github.com/sgl-project/sgl-kernel-npu/releases)                                                                                                                                                               |
@@ -46,32 +46,17 @@ Prior to start work with SGLang on Ascend you need to install CANN Toolkit, Kern
 If you want to use PD disaggregation mode, you need to install MemFabric-Hybrid. MemFabric-Hybrid is a drop-in replacement of Mooncake Transfer Engine that enables KV cache transfer on Ascend NPU clusters.
 
 ```shell
-pip install memfabric-hybrid==1.0.0
+pip install memfabric-hybrid==1.0.3
 ```
 
 #### Pytorch and Pytorch Framework Adaptor on Ascend
 
-At the moment NPUGraph optimizations are supported only in `torch_npu==2.6.0.post3` that requires 'torch==2.6.0'.
-
-_TODO: NPUGraph optimizations will be supported in future releases of 'torch_npu' 2.7.1, 2.8.0 and 2.9.0_
-
 ```shell
-PYTORCH_VERSION=2.6.0
-TORCHVISION_VERSION=0.21.0
-TORCH_NPU_VERSION=2.6.0.post3
-pip install torch==$PYTORCH_VERSION torchvision==$TORCHVISION_VERSION --index-url https://download.pytorch.org/whl/cpu
-pip install torch_npu==$TORCH_NPU_VERSION
-```
-
-While there is no released versions of 'torch_npu' for 'torch==2.7.1' and 'torch==2.8.0' we provide custom builds of 'torch_npu'. PLATFORM can be 'aarch64' or 'x86_64'
-
-```shell
-PLATFORM="aarch64"
 PYTORCH_VERSION=2.8.0
 TORCHVISION_VERSION=0.23.0
+TORCH_NPU_VERSION=2.8.0
 pip install torch==$PYTORCH_VERSION torchvision==$TORCHVISION_VERSION --index-url https://download.pytorch.org/whl/cpu
-wget https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/sglang/torch_npu/torch_npu-${PYTORCH_VERSION}.post2.dev20251120-cp311-cp311-manylinux_2_28_${PLATFORM}.whl
-pip install torch_npu-${PYTORCH_VERSION}.post2.dev20251120-cp311-cp311-manylinux_2_28_${PLATFORM}.whl
+pip install torch_npu==$TORCH_NPU_VERSION
 ```
 
 If you are using other versions of `torch` and install `torch_npu`, check [installation guide](https://github.com/Ascend/pytorch/blob/master/README.md)
@@ -86,7 +71,7 @@ BISHENG_URL="https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/sglang/triton
 wget -O "${BISHENG_NAME}" "${BISHENG_URL}" && chmod a+x "${BISHENG_NAME}" && "./${BISHENG_NAME}" --install && rm "${BISHENG_NAME}"
 ```
 ```shell
-pip install triton-ascend==3.2.0rc4
+pip install -i https://test.pypi.org/simple/ "triton-ascend<3.2.0rc" --pre --no-cache-dir
 ```
 For installation of Triton on Ascend nightly builds or from sources, follow [installation guide](https://gitcode.com/Ascend/triton-ascend/blob/master/docs/sources/getting-started/installation.md)
 
@@ -102,18 +87,18 @@ Additional package with custom operations. DEVICE_TYPE can be "a3" for Atlas A3 
 
 ```shell
 DEVICE_TYPE="a3"
-wget https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/ops/CANN-custom_ops-8.2.0.0-$DEVICE_TYPE-linux.aarch64.run
-chmod a+x ./CANN-custom_ops-8.2.0.0-$DEVICE_TYPE-linux.aarch64.run
-./CANN-custom_ops-8.2.0.0-$DEVICE_TYPE-linux.aarch64.run --quiet --install-path=/usr/local/Ascend/ascend-toolkit/latest/opp
-wget https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/ops/custom_ops-1.0.$DEVICE_TYPE-cp311-cp311-linux_aarch64.whl
-pip install ./custom_ops-1.0.$DEVICE_TYPE-cp311-cp311-linux_aarch64.whl
+wget https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/ops/CANN-custom_ops-8.3.0.1-$DEVICE_TYPE-linux.aarch64.run
+chmod a+x ./CANN-custom_ops-8.3.0.1-$DEVICE_TYPE-linux.aarch64.run
+./CANN-custom_ops-8.3.0.1-$DEVICE_TYPE-linux.aarch64.run --quiet --install-path=/usr/local/Ascend/ascend-toolkit/latest/opp
+wget https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/ops/custom_ops-2.0.$DEVICE_TYPE-cp311-cp311-linux_aarch64.whl
+pip install ./custom_ops-2.0.$DEVICE_TYPE-cp311-cp311-linux_aarch64.whl
 ```
 
 #### Installing SGLang from source
 
 ```shell
 # Use the last release branch
-git clone -b v0.5.6.post2 https://github.com/sgl-project/sglang.git
+git clone https://github.com/sgl-project/sglang.git
 cd sglang
 mv python/pyproject_other.toml python/pyproject.toml
 pip install -e python[srt_npu]
@@ -137,6 +122,7 @@ git clone https://github.com/sgl-project/sglang.git
 cd sglang/docker
 
 # Build the docker image
+# If there are network errors, please modify the Dockerfile to use offline dependencies or use a proxy
 docker build -t <image_name> -f npu.Dockerfile .
 ```
 
@@ -224,6 +210,8 @@ python3 -m sglang.launch_server \
     --device npu \
     --base-gpu-id 0 \
     --tp-size 1 \
+    --host 127.0.0.1 \
+    --port 8000
 ```
 
 2. Launch Decode Server
