@@ -8,11 +8,13 @@ on:
 jobs:
   retry-failed:
     name: Retry Failed Jobs
-    # Only retry for scheduled runs on main that have failures
+    # Only retry for scheduled runs on main that have failures and haven't been retried twice yet
+    # run_attempt starts at 1, so attempt <= 2 means we allow up to 2 retries (attempts 1, 2, 3)
     if: |
       github.event.workflow_run.event == 'schedule' &&
       github.event.workflow_run.head_branch == 'main' &&
-      github.event.workflow_run.conclusion == 'failure'
+      github.event.workflow_run.conclusion == 'failure' &&
+      github.event.workflow_run.run_attempt <= 2
     runs-on: ubuntu-latest
     steps:
       - name: Retry failed jobs
@@ -21,9 +23,11 @@ jobs:
           script: |
             const runId = context.payload.workflow_run.id;
             const runUrl = context.payload.workflow_run.html_url;
+            const runAttempt = context.payload.workflow_run.run_attempt;
 
             console.log(`Workflow run ${runId} failed on scheduled main branch run`);
             console.log(`URL: ${runUrl}`);
+            console.log(`Current attempt: ${runAttempt} (max 2 retries allowed)`);
 
             // Get failed jobs
             const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun, {
@@ -37,7 +41,7 @@ jobs:
             const failedJobs = jobs.filter(job => job.conclusion === 'failure');
 
             if (failedJobs.length === 0) {
-              console.log('No failed jobs found');
+              console.log('No failed jobs found, skipping retry');
               return;
             }
 
@@ -46,16 +50,15 @@ jobs:
               console.log(`  - ${job.name}`);
             }
 
-            // Rerun failed jobs
+            // Rerun failed jobs only
             try {
               await github.rest.actions.reRunWorkflowFailedJobs({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 run_id: runId,
               });
-              console.log('Successfully triggered rerun of failed jobs');
+              console.log(`Successfully triggered retry ${runAttempt + 1} of failed jobs`);
             } catch (error) {
               console.log(`Failed to rerun: ${error.message}`);
-              // If rerun fails, it might be because the run is too old or already rerunning
               core.warning(`Could not rerun failed jobs: ${error.message}`);
             }
