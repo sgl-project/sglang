@@ -22,7 +22,7 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe import get_moe_runner_backend
 from sglang.srt.layers.moe.utils import is_sbo_enabled
-from sglang.srt.utils import get_bool_env_var, is_blackwell
+from sglang.srt.utils import is_blackwell
 
 
 class SboFlags:
@@ -44,9 +44,7 @@ class SboFlags:
         return (
             is_sbo_enabled()
             and not cls.enable_dispatch_shared_one_stream_overlap()
-            and not get_bool_env_var(
-                "SGLANG_BLACKWELL_OVERLAP_SHARED_EXPERTS_OUTSIDE_SBO"
-            )
+            and not envs.SGLANG_BLACKWELL_OVERLAP_SHARED_EXPERTS_OUTSIDE_SBO.get()
         )
 
     @classmethod
