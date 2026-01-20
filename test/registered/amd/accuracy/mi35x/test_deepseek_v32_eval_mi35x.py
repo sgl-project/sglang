@@ -1,9 +1,9 @@
-"""MI35x DeepSeek-R1-MXFP4 GSM8K Completion Evaluation Test (8-GPU)
+"""MI35x DeepSeek-V3.2 GSM8K Completion Evaluation Test (8-GPU)
 
-Tests DeepSeek-R1-MXFP4 quantized model with basic configuration
-using few-shot completion benchmark on MI35x.
+Tests DeepSeek-V3.2 with basic configuration using few-shot completion
+benchmark on MI35x.
 
-Registry: nightly-amd-8-gpu-mi35x-deepseek-r1-mxfp4 suite
+Registry: nightly-amd-accuracy-8-gpu-mi35x-deepseek-v32 suite
 """
 
 import ast
@@ -32,27 +32,14 @@ from sglang.test.test_utils import (
 )
 from sglang.utils import download_and_cache_file, read_jsonl
 
-# Register for AMD CI - MI35x DeepSeek-R1-MXFP4 accuracy test (~60 min, basic only)
+# Register for AMD CI - MI35x DeepSeek-V3.2 accuracy test (~60 min for basic only)
 register_amd_ci(
-    est_time=3600, suite="nightly-amd-8-gpu-mi35x-deepseek-r1-mxfp4", nightly=True
+    est_time=3600,
+    suite="nightly-amd-8-gpu-mi35x-deepseek-v32",
+    nightly=True,
 )
 
 INVALID = -9999999
-
-# Model path configuration for MI35x DeepSeek-R1-MXFP4
-# Priority: 1) env var, 2) local path, 3) HuggingFace model ID
-DEEPSEEK_R1_MXFP4_LOCAL_PATH = "/data2/models/amd-DeepSeek-R1-MXFP4-Preview"
-DEEPSEEK_R1_MXFP4_HF_MODEL_ID = "amd/DeepSeek-R1-MXFP4-Preview"
-
-
-def get_model_path() -> str:
-    """Get effective model path: env var > local path > HF model ID."""
-    env_path = os.environ.get("DEEPSEEK_R1_MXFP4_MODEL_PATH")
-    if env_path:
-        return env_path
-    if os.path.exists(DEEPSEEK_R1_MXFP4_LOCAL_PATH):
-        return DEEPSEEK_R1_MXFP4_LOCAL_PATH
-    return DEEPSEEK_R1_MXFP4_HF_MODEL_ID
 
 
 @dataclass
@@ -79,30 +66,32 @@ class ModelConfig:
         return self.model_path
 
 
-def get_mxfp4_models() -> List[ModelConfig]:
-    """Get DeepSeek-R1-MXFP4 model configurations for MI35x."""
-    model_path = get_model_path()
-    return [
-        # DeepSeek-R1-MXFP4 basic only (MTP tested in perf job)
-        ModelConfig(
-            model_path=model_path,
-            tp_size=8,
-            accuracy_threshold=0.93,
-            timeout=3600,
-            variant="basic",
-            other_args=[
-                "--attention-backend",
-                "aiter",
-                "--chunked-prefill-size",
-                "131072",
-                "--disable-radix-cache",
-                "--mem-fraction-static",
-                "0.85",
-                "--trust-remote-code",
-            ],
-            env_vars={"SGLANG_USE_AITER": "1"},
-        ),
-    ]
+# DeepSeek-V3.2 models for MI35x - only basic variant for nightly
+# DP variant removed due to barrier deadlock during model loading
+MI35X_DEEPSEEK_V32_MODELS = [
+    # DeepSeek-V3.2 basic (TP=8 only)
+    ModelConfig(
+        model_path="deepseek-ai/DeepSeek-V3.2",
+        tp_size=8,
+        accuracy_threshold=0.93,
+        timeout=3600,
+        variant="basic",
+        other_args=[
+            "--trust-remote-code",
+            "--nsa-prefill-backend",
+            "tilelang",
+            "--nsa-decode-backend",
+            "tilelang",
+            "--mem-fraction-static",
+            "0.85",
+            "--model-loader-extra-config",
+            '{"enable_multithread_load": true}',
+            "--watchdog-timeout",
+            "1200",  # 20 minutes for weight loading
+        ],
+        env_vars={},
+    ),
+]
 
 
 def get_one_example(lines, i, include_answer):
@@ -180,32 +169,19 @@ def run_gsm8k_benchmark(
     return float(acc), float(invalid), float(latency)
 
 
-class TestDeepSeekR1MXFP4EvalMI35x(unittest.TestCase):
-    """DeepSeek-R1-MXFP4 GSM8K Completion Evaluation Test for AMD MI35x."""
+class TestDeepSeekV32EvalMI35x(unittest.TestCase):
+    """DeepSeek-V3.2 GSM8K Completion Evaluation Test for AMD MI35x."""
 
     @classmethod
     def setUpClass(cls):
-        cls.models = get_mxfp4_models()
+        cls.models = MI35X_DEEPSEEK_V32_MODELS
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.num_questions = int(os.environ.get("GSM8K_NUM_QUESTIONS", "200"))
 
-    def test_deepseek_r1_mxfp4_accuracy(self):
-        """Test DeepSeek-R1-MXFP4 models with GSM8K completion benchmark."""
-        # Check if model exists
-        model_path = get_model_path()
-        is_local_path = model_path.startswith("/")
-        if is_local_path and not os.path.exists(model_path):
-            print(f"\n⏭️ SKIPPING: Local model not found at {model_path}")
-            self.skipTest(f"Local model not found at {model_path}")
-            return
-
-        if is_local_path:
-            print(f"📁 Using local model: {model_path}")
-        else:
-            print(f"📥 Using HuggingFace model: {model_path}")
-
+    def test_deepseek_v32_accuracy(self):
+        """Test DeepSeek-V3.2 models with GSM8K completion benchmark."""
         all_results = []
-        summary = "### DeepSeek-R1-MXFP4 Models (MI35x)\n\n"
+        summary = "### DeepSeek-V3.2 Models (MI35x)\n\n"
         summary += "| Model | Variant | TP | Accuracy | Threshold | Status |\n"
         summary += "| ----- | ------- | -- | -------- | --------- | ------ |\n"
 
