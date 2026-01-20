@@ -118,6 +118,18 @@ fn default_l1_max_memory() -> usize {
     50 * 1024 * 1024 // 50MB
 }
 
+impl TokenizerCacheConfig {
+    /// Returns Some(self) if any caching is enabled, None otherwise.
+    /// Use this when passing cache config to tokenizer registration workflow.
+    pub fn to_option(&self) -> Option<Self> {
+        if self.enable_l0 || self.enable_l1 {
+            Some(self.clone())
+        } else {
+            None
+        }
+    }
+}
+
 impl Default for TokenizerCacheConfig {
     fn default() -> Self {
         Self {
@@ -489,6 +501,16 @@ pub struct DiscoveryConfig {
     /// PD mode decode
     pub decode_selector: HashMap<String, String>,
     pub bootstrap_port_annotation: String,
+    /// Router node discovery for HA (Kubernetes label selector)
+    #[serde(default)]
+    pub router_selector: HashMap<String, String>,
+    /// Annotation key to read mesh port from Router Pods
+    #[serde(default = "default_router_mesh_port_annotation")]
+    pub router_mesh_port_annotation: String,
+}
+
+fn default_router_mesh_port_annotation() -> String {
+    "sglang.ai/mesh-port".to_string()
 }
 
 impl Default for DiscoveryConfig {
@@ -502,6 +524,8 @@ impl Default for DiscoveryConfig {
             prefill_selector: HashMap::new(),
             decode_selector: HashMap::new(),
             bootstrap_port_annotation: "sglang.ai/bootstrap-port".to_string(),
+            router_selector: HashMap::new(),
+            router_mesh_port_annotation: default_router_mesh_port_annotation(),
         }
     }
 }
@@ -542,6 +566,7 @@ pub struct HealthCheckConfig {
     pub timeout_secs: u64,
     pub check_interval_secs: u64,
     pub endpoint: String,
+    pub disable_health_check: bool,
 }
 
 impl Default for HealthCheckConfig {
@@ -552,6 +577,7 @@ impl Default for HealthCheckConfig {
             timeout_secs: 5,
             check_interval_secs: 60,
             endpoint: "/health".to_string(),
+            disable_health_check: false,
         }
     }
 }
@@ -1008,6 +1034,8 @@ mod tests {
             prefill_selector: selector.clone(),
             decode_selector: selector.clone(),
             bootstrap_port_annotation: "custom.io/port".to_string(),
+            router_selector: HashMap::new(),
+            router_mesh_port_annotation: "sglang.ai/mesh-port".to_string(),
         };
 
         assert!(config.enabled);
@@ -1284,6 +1312,8 @@ mod tests {
                 prefill_selector: selectors.clone(),
                 decode_selector: selectors,
                 bootstrap_port_annotation: "mycompany.io/bootstrap".to_string(),
+                router_selector: HashMap::new(),
+                router_mesh_port_annotation: "sglang.ai/mesh-port".to_string(),
             })
             .enable_metrics("::", 9999) // IPv6 any
             .enable_trace("localhost:4317")

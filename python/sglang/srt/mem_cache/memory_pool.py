@@ -52,7 +52,7 @@ from sglang.srt.mem_cache.utils import (
     set_mla_kv_buffer_triton,
     set_mla_kv_scale_buffer_triton,
 )
-from sglang.srt.utils import is_cuda, is_npu, next_power_of_2
+from sglang.srt.utils import is_cuda, is_hip, is_npu, next_power_of_2
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
@@ -68,6 +68,7 @@ logger = logging.getLogger(__name__)
 GB = 1024 * 1024 * 1024
 _is_cuda = is_cuda()
 _is_npu = is_npu()
+_is_hip = is_hip()
 
 
 def get_tensor_size_bytes(t: Union[torch.Tensor, List[torch.Tensor]]):
@@ -1724,7 +1725,10 @@ class NSATokenToKVPool(MLATokenToKVPool):
         # num head == 1 and head dim == 128 for index_k in NSA
         assert index_head_dim == 128
 
-        assert self.page_size == 64
+        if _is_hip:
+            assert self.page_size == 1
+        else:
+            assert self.page_size == 64
         with (
             torch.cuda.use_mem_pool(self.custom_mem_pool)
             if self.custom_mem_pool
