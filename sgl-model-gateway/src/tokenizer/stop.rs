@@ -80,17 +80,25 @@ impl StopSequenceDecoder {
         config: StopSequenceConfig,
         skip_special_tokens: bool,
     ) -> Self {
-        let patterns: Vec<String> = config
+        let mut patterns: Vec<String> = config
             .stop_sequences
             .iter()
-            .chain(config.visible_stop_sequences.iter())
+            .filter(|s| !s.is_empty())
             .cloned()
             .collect();
-        let visible_boundary_idx = config.stop_sequences.len();
+        let visible_boundary_idx = patterns.len();
+        patterns.extend(
+            config
+                .visible_stop_sequences
+                .iter()
+                .filter(|s| !s.is_empty())
+                .cloned(),
+        );
+
         let aho_corasick = if patterns.is_empty() {
             None
         } else {
-            Some(AhoCorasick::new(patterns).expect("Failed to build Aho-Corasick"))
+            Some(AhoCorasick::new(patterns).expect("Failed to build Aho-Corasick automaton"))
         };
         StopSequenceDecoder {
             sequence: Sequence::new_with_options(tokenizer, skip_special_tokens),
