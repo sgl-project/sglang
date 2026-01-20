@@ -10,8 +10,10 @@ import triton.testing
 
 from sglang.jit_kernel.benchmark.utils import is_in_ci
 from sglang.multimodal_gen.runtime.layers.layernorm import (
-    _NormScaleShift,
-    _ScaleResidualNormScaleShift,
+    LayerNormScaleShift,
+    RMSNormScaleShift,
+    ScaleResidualLayerNormScaleShift,
+    ScaleResidualRMSNormScaleShift,
 )
 
 if is_in_ci():
@@ -27,24 +29,20 @@ EPS = 1e-5
 LINE_VALS = ["native", "cuda"]
 LINE_NAMES = ["SGLang Native", "SGLang Fused"]
 STYLES = [("red", "-"), ("blue", "--")]
-configs = list(
+config = list(
     itertools.product(B_RANGE, S_RANGE, D_RANGE, NORM_TYPE_RANGE, AFFINE_RANGE)
 )
 
 
-def create_layer(D: int, norm_type: str, elementwise_affine: bool, Layer):
-    """Create layer with or without affine parameters."""
-    layer = Layer(
-        D, norm_type, eps=EPS, elementwise_affine=elementwise_affine, dtype=DTYPE
-    )
-    if elementwise_affine:
+def preprocess_layer(layer, affine: bool, D: int, DTYPE: torch.dtype):
+    if affine:
         weight = torch.randn(D, dtype=DTYPE, device=DEVICE)
         bias = torch.randn(D, dtype=DTYPE, device=DEVICE)
         with torch.no_grad():
             layer.norm.weight.copy_(weight)
-            if norm_type == "layer":
+            if hasattr(layer.norm, "bias"):
                 layer.norm.bias.copy_(bias)
-    return layer
+    return layer.to(DEVICE)
 
 
 # ============================================================================
@@ -53,7 +51,7 @@ def create_layer(D: int, norm_type: str, elementwise_affine: bool, Layer):
 @triton.testing.perf_report(
     triton.testing.Benchmark(
         x_names=["B", "S", "D", "norm_type", "affine"],
-        x_vals=configs,
+        x_vals=config,
         line_arg="provider",
         line_vals=LINE_VALS,
         line_names=LINE_NAMES,
@@ -64,13 +62,16 @@ def create_layer(D: int, norm_type: str, elementwise_affine: bool, Layer):
     )
 )
 def bench_fused_norm_scale_shift(
-    B: int, S: int, D: int, norm_type: str, affine: bool, provider: str
+    B: int, S: int, D: int, norm_type, affine: bool, provider: str
 ) -> Tuple[float, float, float]:
     x = torch.randn(B, S, D, dtype=DTYPE, device=DEVICE)
     scale = torch.randn(B, S, D, dtype=DTYPE, device=DEVICE)
     shift = torch.randn(B, S, D, dtype=DTYPE, device=DEVICE)
-    layer = create_layer(D, norm_type, affine, _NormScaleShift)
-
+    if norm_type == "layer":
+        layer = LayerNormScaleShift(D, EPS, affine, dtype=DTYPE)
+    else:
+        layer = RMSNormScaleShift(D, EPS, affine, dtype=DTYPE)
+    layer = preprocess_layer(layer, affine, D, DTYPE)
     if provider == "native":
         fn = lambda: layer.forward_native(x, shift, scale)
     else:
@@ -87,7 +88,7 @@ def bench_fused_norm_scale_shift(
 @triton.testing.perf_report(
     triton.testing.Benchmark(
         x_names=["B", "S", "D", "norm_type", "affine"],
-        x_vals=configs,
+        x_vals=config,
         line_arg="provider",
         line_vals=LINE_VALS,
         line_names=LINE_NAMES,
@@ -98,15 +99,18 @@ def bench_fused_norm_scale_shift(
     )
 )
 def bench_fused_scale_residual_norm_scale_shift(
-    B: int, S: int, D: int, norm_type: str, affine: bool, provider: str
+    B: int, S: int, D: int, norm_type, affine: bool, provider: str
 ) -> Tuple[float, float, float]:
     residual = torch.randn(B, S, D, dtype=DTYPE, device=DEVICE)
     x = torch.randn(B, S, D, dtype=DTYPE, device=DEVICE)
     scale = torch.randn(B, S, D, dtype=DTYPE, device=DEVICE)
     shift = torch.randn(B, S, D, dtype=DTYPE, device=DEVICE)
     gate = torch.randn(B, 1, D, dtype=DTYPE, device=DEVICE)
-    layer = create_layer(D, norm_type, affine, _ScaleResidualNormScaleShift)
-
+    if norm_type == "layer":
+        layer = ScaleResidualLayerNormScaleShift(D, EPS, affine, dtype=DTYPE).to(DEVICE)
+    else:
+        layer = ScaleResidualRMSNormScaleShift(D, EPS, affine, dtype=DTYPE).to(DEVICE)
+    layer = preprocess_layer(layer, affine, D, DTYPE)
     if provider == "native":
         fn = lambda: layer.forward_native(residual, x, gate, shift, scale)
     else:

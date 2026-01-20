@@ -33,7 +33,6 @@ SHAPES = [
     (1, 32760, 1, 1536),  # Wan
     (1, 6, 1, 3072),  # Qwen
 ]
-# DTYPES = [torch.float16, torch.bfloat16, torch.float32]
 DTYPES = [torch.float16, torch.bfloat16]
 NORM_TYPES = ["layer", "rms"]
 AFFINE_MODES = ["D", "NAT"]

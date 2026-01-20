@@ -323,7 +323,7 @@ class _ScaleResidualNormScaleShift(CustomOp):
         shift: torch.Tensor,
         scale: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if x.shape[-1] % 256 != 0:
+        if x.shape[-1] % 256 != 0 or x.dtype == torch.float32:
             import warnings
 
             warnings.warn(
@@ -415,7 +415,7 @@ class _NormScaleShift(CustomOp):
     def forward_cuda(
         self, x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor
     ) -> torch.Tensor:
-        if x.shape[-1] % 256 != 0:
+        if x.shape[-1] % 256 != 0 or x.dtype == torch.float32:
             import warnings
 
             warnings.warn(
