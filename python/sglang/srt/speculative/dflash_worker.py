@@ -18,8 +18,22 @@ from sglang.srt.speculative.dflash_info import DFlashDraftInput, DFlashVerifyInp
 from sglang.srt.speculative.dflash_utils import resolve_dflash_mask_token
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
+from sglang.srt.utils import is_cuda
 
 logger = logging.getLogger(__name__)
+
+_FusedKVMaterializeHelper = None
+
+
+def _get_fused_kv_materialize_helper():
+    global _FusedKVMaterializeHelper
+    if _FusedKVMaterializeHelper is None:
+        from sglang.srt.speculative.triton_ops.fused_kv_materialize import (
+            FusedKVMaterializeHelper,
+        )
+
+        _FusedKVMaterializeHelper = FusedKVMaterializeHelper
+    return _FusedKVMaterializeHelper
 
 
 class DFlashWorker:
@@ -158,6 +172,49 @@ class DFlashWorker:
         self._draft_greedy_rank_index_buf: Optional[torch.Tensor] = None
         self._draft_greedy_selected_ids_buf: Optional[torch.Tensor] = None
         self._draft_greedy_index_cap: int = 0
+
+        self._use_fused_kv_materialize = is_cuda()
+        self._fused_kv_helper: Optional[object] = None
+        if self._use_fused_kv_materialize:
+            self._init_fused_kv_helper()
+
+    def _init_fused_kv_helper(self) -> None:
+        """Initialize the fused KV materialization helper with pre-stacked weights."""
+        try:
+            FusedKVMaterializeHelper = _get_fused_kv_materialize_helper()
+            layers = self.draft_model.layers
+            if len(layers) == 0:
+                logger.warning(
+                    "DFLASH fused KV: no layers found, disabling fused path."
+                )
+                self._use_fused_kv_materialize = False
+                return
+
+            first_attn = layers[0].self_attn
+            rotary_emb = first_attn.rotary_emb
+
+            self._fused_kv_helper = FusedKVMaterializeHelper(
+                layers=layers,
+                rotary_emb=rotary_emb,
+                num_kv_heads=first_attn.num_kv_heads,
+                head_dim=first_attn.head_dim,
+                device=self.device,
+            )
+            if self.tp_rank == 0:
+                logger.info(
+                    "DFLASH fused KV materialization enabled. "
+                    "n_layers=%d, num_kv_heads=%d, head_dim=%d",
+                    len(layers),
+                    first_attn.num_kv_heads,
+                    first_attn.head_dim,
+                )
+        except Exception as e:
+            logger.warning(
+                "DFLASH fused KV initialization failed, falling back to sequential path: %s",
+                e,
+            )
+            self._use_fused_kv_materialize = False
+            self._fused_kv_helper = None
 
     def _ensure_draft_block_buffers(self, bs: int) -> None:
         cap = (
@@ -678,25 +735,64 @@ class DFlashWorker:
                     f"DFLASH ctx_hidden/cache_loc mismatch: {ctx_hidden.shape[0]} vs {ctx_cache_loc.numel()}."
                 )
 
-            for layer in self.draft_model.layers:
-                attn = layer.self_attn
-                k, v = attn.kv_proj_only(ctx_hidden)
-                k = attn.apply_k_norm(k)
-                k = attn.apply_k_rope(ctx_positions, k)
-                k = k.view(-1, attn.num_kv_heads, attn.head_dim)
-                v = v.view(-1, attn.num_kv_heads, attn.head_dim)
-                self.draft_model_runner.token_to_kv_pool.set_kv_buffer(
-                    attn.attn,
-                    ctx_cache_loc,
-                    k,
-                    v,
-                    attn.attn.k_scale,
-                    attn.attn.v_scale,
+            if self._use_fused_kv_materialize and self._fused_kv_helper is not None:
+                self._append_target_hidden_fused(
+                    ctx_hidden, ctx_positions, ctx_cache_loc
+                )
+            else:
+                self._append_target_hidden_sequential(
+                    ctx_hidden, ctx_positions, ctx_cache_loc
                 )
 
         draft_input.draft_seq_lens = draft_seq_lens + ctx_lens
         draft_input.ctx_lens = torch.zeros_like(ctx_lens)
         draft_input.target_hidden = draft_input.target_hidden[:0]
+
+    def _append_target_hidden_sequential(
+        self,
+        ctx_hidden: torch.Tensor,
+        ctx_positions: torch.Tensor,
+        ctx_cache_loc: torch.Tensor,
+    ) -> None:
+        for layer in self.draft_model.layers:
+            attn = layer.self_attn
+            k, v = attn.kv_proj_only(ctx_hidden)
+            k = attn.apply_k_norm(k)
+            k = attn.apply_k_rope(ctx_positions, k)
+            k = k.view(-1, attn.num_kv_heads, attn.head_dim)
+            v = v.view(-1, attn.num_kv_heads, attn.head_dim)
+            self.draft_model_runner.token_to_kv_pool.set_kv_buffer(
+                attn.attn,
+                ctx_cache_loc,
+                k,
+                v,
+                attn.attn.k_scale,
+                attn.attn.v_scale,
+            )
+
+    def _append_target_hidden_fused(
+        self,
+        ctx_hidden: torch.Tensor,
+        ctx_positions: torch.Tensor,
+        ctx_cache_loc: torch.Tensor,
+    ) -> None:
+        """Fused KV materialization using batched projection + Triton kernel."""
+        token_to_kv_pool = self.draft_model_runner.token_to_kv_pool
+        k_cache_buffers = []
+        v_cache_buffers = []
+        for layer in self.draft_model.layers:
+            layer_id = layer.self_attn.attn.layer_id
+            k_buf, v_buf = token_to_kv_pool.get_kv_buffer(layer_id)
+            k_cache_buffers.append(k_buf)
+            v_cache_buffers.append(v_buf)
+
+        self._fused_kv_helper.materialize(
+            ctx_hidden=ctx_hidden,
+            positions=ctx_positions,
+            cache_locs=ctx_cache_loc,
+            k_cache_buffers=k_cache_buffers,
+            v_cache_buffers=v_cache_buffers,
+        )
 
     def forward_batch_generation(
         self,
