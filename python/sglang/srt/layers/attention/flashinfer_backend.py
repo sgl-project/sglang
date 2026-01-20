@@ -873,6 +873,7 @@ class FlashInferAttnBackend(AttentionBackend):
                         get_dcp_group(),
                         return_lse=True,
                     )
+                    o2 = o2.contiguous()
                     s2 = s2.contiguous()
 
                 o, _ = merge_state(o1, s1, o2, s2)
@@ -911,12 +912,13 @@ class FlashInferAttnBackend(AttentionBackend):
             else forward_batch.encoder_out_cache_loc
         )
 
-        q = q.contiguous()
         if self.dcp_size > 1:
             with use_symmetric_memory(get_dcp_group()) as sm_context:
                 if isinstance(sm_context, SymmetricMemoryContext):
-                    q = q.clone()
+                    q = q.clone(memory_format=torch.contiguous_format)
             q = get_dcp_group().all_gather(q, dim=1)
+        else:
+            q = q.contiguous()
 
         if k is not None:
             assert v is not None

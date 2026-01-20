@@ -697,7 +697,8 @@ class GroupCoordinator:
             # Convert negative dim to positive.
             dim += input_.dim()
 
-        input_tensor = input_.movedim(0, dim).contiguous()
+        with self.use_symmetric_memory(self):
+            input_tensor = input_.movedim(0, dim).contiguous()
         assert input_tensor.shape[0] % world_size == 0
 
         chunk_size = input_tensor.shape[0] // world_size
