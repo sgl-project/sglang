@@ -472,34 +472,6 @@ def mark_end(name):
         time_infos[name].pretty_print()
 
 
-def get_numa_node(gpu_id):
-    try:
-        device = get_device()
-        if device == "cuda":
-            # obtain GPU PCI ID
-            cmd = [
-                "nvidia-smi",
-                "--query-gpu=pci.bus_id",
-                "--format=csv,noheader",
-                "-i",
-                str(gpu_id),
-            ]
-            bus_id = subprocess.check_output(cmd).decode().strip().lower()
-            # 0000:ab:cd.f or 00000000:ab:cd.f
-            pci_path = f"/sys/bus/pci/devices/{bus_id}/numa_node"
-            if not os.path.exists(pci_path) and len(bus_id.split(":")[0]) == 8:
-                pci_path = f"/sys/bus/pci/devices/{bus_id[4:]}/numa_node"
-            with open(pci_path) as f:
-                node = int(f.read().strip())
-                return node if node >= 0 else None
-        else:
-            logger.info(f"Now only supports NVIDIA devices")
-            return None
-    except Exception as e:
-        logger.error(f"Error: {e}")
-        return None
-
-
 def calculate_time(show=False, min_cost_ms=0.0):
     def wrapper(func):
         def inner_func(*args, **kwargs):
@@ -4015,9 +3987,9 @@ def get_system_nvgpu_count() -> int:
 
 
 @lru_cache(maxsize=1)
-def get_current_device_numa_node_cuda() -> int:
+def get_device_numa_node_cuda(gpu_id: int = 0) -> int:
     """
-    Retrieve the NUMA node ID of the CPU socket closest to the currently active CUDA device.
+    Retrieve the NUMA node ID of the CPU socket closest to the gpu_id.
 
     First tries to query nvidia-smi topology. If it returns a single NUMA ID, uses that directly.
     If it returns multiple NUMA IDs (comma/dash separated), falls back to distributing GPUs
@@ -4031,10 +4003,8 @@ def get_current_device_numa_node_cuda() -> int:
     Raises:
         RuntimeError: If device information cannot be retrieved.
     """
-    import torch
 
-    logical_device_id = torch.cuda.current_device()
-    physical_device_id = get_physical_device_id(logical_device_id)
+    physical_device_id = get_physical_device_id(gpu_id)
 
     # Query NUMA topology from nvidia-smi
     result = subprocess.run(
@@ -4064,6 +4034,31 @@ def get_current_device_numa_node_cuda() -> int:
             f"GPU count {gpu_count} is less than NUMA count {numa_count}. Using first NUMA node."
         )
         numa_node = 0
+
+    return numa_node
+
+
+def get_numa_node(gpu_id):
+    try:
+        device = get_device()
+        if device == "cuda":
+            numa_node = get_device_numa_node_cuda(gpu_id)
+        else:
+            logger.info(f"Now only supports NVIDIA devices")
+            return None
+    except Exception as e:
+        logger.error(f"Error: {e}")
+        return None
+
+
+@lru_cache(maxsize=1)
+def get_current_device_numa_node_cuda() -> int:
+    """
+    Retrieve the NUMA node ID of the CPU socket closest to the currently active CUDA device.
+    """
+
+    logical_device_id = torch.cuda.current_device()
+    numa_node = get_device_numa_node_cuda(logical_device_id)
 
     return numa_node
 
