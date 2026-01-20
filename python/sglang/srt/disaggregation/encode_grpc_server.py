@@ -13,7 +13,7 @@ import logging
 import multiprocessing as mp
 import traceback
 from concurrent import futures
-from typing import Dict, List, Optional, Set
+from typing import List
 
 import grpc
 import zmq
@@ -21,17 +21,19 @@ import zmq.asyncio
 from grpc_health.v1 import health_pb2, health_pb2_grpc
 from grpc_reflection.v1alpha import reflection
 
-from sglang.srt.disaggregation.encode_server import MMEncoder
+from sglang.srt.disaggregation.encode_server import (
+    MMEncoder,
+    rid_lock,
+    rid_to_receive_count,
+    rid_to_receive_endpoint,
+)
 from sglang.srt.grpc import sglang_encoder_pb2, sglang_encoder_pb2_grpc
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import get_zmq_socket, random_uuid
 
 logger = logging.getLogger(__name__)
 
-# Global state for scheduler receive URL handling (same as HTTP version)
-rid_lock = asyncio.Lock()
-rid_to_receive_endpoint: Dict[str, Set[str]] = dict()
-rid_to_receive_count: Dict[str, int] = dict()
+# Shared scheduler receive URL state (use encode_server globals).
 
 
 class EncoderHealthServicer(health_pb2_grpc.HealthServicer):
