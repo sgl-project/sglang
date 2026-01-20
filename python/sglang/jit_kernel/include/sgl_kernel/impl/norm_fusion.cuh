@@ -1,3 +1,4 @@
+#pragma once
 #include <sgl_kernel/tensor.h>  // For TensorMatcher, SymbolicSize, SymbolicDevice
 #include <sgl_kernel/utils.h>   // For div_ceil, RuntimeCheck
 

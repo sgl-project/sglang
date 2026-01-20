@@ -1,5 +1,5 @@
 from enum import Enum
-from typing import Union
+from typing import Optional
 
 import torch
 
@@ -27,14 +27,19 @@ class IndexEnum(Enum):
     BF1D = 5
 
 
-def get_index_enum(t: Union[torch.Tensor, int]) -> IndexEnum:
+def get_index_enum(t: Optional[torch.Tensor]) -> IndexEnum:
     if not isinstance(t, torch.Tensor):
         return IndexEnum.NotATensor
     ndim = t.ndim
     shape = t.shape
-    # Scalar: [1]
+    # 1D cases
+    # [1]        -> Scalar
+    # [D]        -> BroadcastBS
     if ndim == 1:
-        return IndexEnum.Scalar
+        if shape[0] == 1:
+            return IndexEnum.Scalar
+        else:
+            return IndexEnum.BroadcastBS
     # 2D cases
     # [B, D]        -> BroadcastS
     # [1, D]        -> BroadcastBS

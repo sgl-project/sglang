@@ -50,6 +50,10 @@ struct AlignedVector {
   using storage_t = AlignedStorage<element_t, N>;
 
  public:
+  SGL_DEVICE AlignedVector() {}
+  SGL_DEVICE AlignedVector(T value) {
+    fill(value);
+  }
   template <typename U>
   SGL_DEVICE void load(const U* ptr, std::size_t offset = 0) {
     static_assert(std::is_same_v<U, T> || std::is_same_v<U, void>);

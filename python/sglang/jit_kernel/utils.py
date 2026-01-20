@@ -43,7 +43,7 @@ DEFAULT_INCLUDE = [str(KERNEL_PATH / "include")]
 DEFAULT_CFLAGS = ["-std=c++20", "-O3"]
 DEFAULT_CUDA_CFLAGS = ["-std=c++20", "-O3", "--expt-relaxed-constexpr"]
 DEFAULT_LDFLAGS = []
-CPP_TEMPLATE_TYPE: TypeAlias = Union[int, float, bool, torch.dtype]
+CPP_TEMPLATE_TYPE: TypeAlias = Union[int, float, bool, torch.dtype, Enum]
 
 
 class CPPArgList(list[str]):
@@ -140,8 +140,11 @@ def load_jit(
     cuda_sources = [f'#include "{path}"' for path in cuda_paths]
     cuda_sources += [_make_wrapper(tup) for tup in cuda_wrappers]
 
+    # Sanitize name for cpp identifier (replace invalid chars with '_').
+    sanitize = lambda s: s.replace(":", "_")
+
     return load_inline(
-        "sgl_kernel_jit_" + "_".join(str(arg) for arg in args),
+        "sgl_kernel_jit_" + "_".join(sanitize(str(arg)) for arg in args),
         cpp_sources=cpp_sources,
         cuda_sources=cuda_sources,
         extra_cflags=DEFAULT_CFLAGS + extra_cflags,

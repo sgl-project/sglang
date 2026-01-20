@@ -55,7 +55,7 @@ inline constexpr uint32_t get_cta_threads() {
 /**
  * \brief Norm type selector for fused norm kernels.
  */
-enum NormEnum : int {
+enum class NormEnum : int {
   LayerNorm = 0,
   RMSNorm = 1,
 };
@@ -125,9 +125,9 @@ SGL_DEVICE AlignedVector<PackedFloat, N> apply_layernorm_impl(
 
   // Reduce
   if constexpr (kUseCTA) {
-    cta::reduce_sum(local_sum, smem_buffer);
+    cta::reduce_sum(local_sum, smem_buffer, 32);
     __syncthreads();
-    local_sum = smem_buffer[0];
+    local_sum = smem_buffer[32];
   } else {
     local_sum = warp::reduce_sum(local_sum);
   }
@@ -145,9 +145,9 @@ SGL_DEVICE AlignedVector<PackedFloat, N> apply_layernorm_impl(
 
   // Reduce variance
   if constexpr (kUseCTA) {
-    cta::reduce_sum(variance_sum, smem_buffer);
+    cta::reduce_sum(variance_sum, smem_buffer, 32);
     __syncthreads();
-    variance_sum = smem_buffer[0];
+    variance_sum = smem_buffer[32];
   } else {
     variance_sum = warp::reduce_sum(variance_sum);
   }
@@ -161,13 +161,10 @@ SGL_DEVICE AlignedVector<PackedFloat, N> apply_layernorm_impl(
     const auto fp32_input = cast<fp32x2_t>(input[i]);
     const auto fp32_weight = cast<fp32x2_t>(weight[i]);
     const auto fp32_bias = cast<fp32x2_t>(bias[i]);
-
     float norm_x = (fp32_input.x - mean) * norm_factor;
     float norm_y = (fp32_input.y - mean) * norm_factor;
-
     float out_x = norm_x * fp32_weight.x + fp32_bias.x;
     float out_y = norm_y * fp32_weight.y + fp32_bias.y;
-
     output[i] = cast<PackedFloat, fp32x2_t>({out_x, out_y});
   }
 
@@ -203,7 +200,7 @@ SGL_DEVICE T apply_rmsnorm_warp(const T& input, const T& weight, float eps) {
  */
 template <int64_t kDim, typename T>
 SGL_DEVICE T apply_rmsnorm_cta(const T& input, const T& weight, float eps, float* smem) {
-  static_assert(kDim > 256, "CTA norm only supports dim > 256");
+  static_assert(kDim >= 256, "CTA norm only supports dim >= 256");
   return details::apply_rmsnorm_impl<kDim, true>(input, weight, eps, smem);
 }
 
@@ -236,7 +233,7 @@ SGL_DEVICE T apply_layernorm_warp(const T& input, const T& weight, const T& bias
  */
 template <int64_t kDim, typename T>
 SGL_DEVICE T apply_layernorm_cta(const T& input, const T& weight, const T& bias, float eps, float* smem) {
-  static_assert(kDim > 256, "CTA norm only supports dim > 256");
+  static_assert(kDim >= 256, "CTA norm only supports dim >= 256");
   return details::apply_layernorm_impl<kDim, true>(input, weight, bias, eps, smem);
 }
 
