@@ -556,9 +556,7 @@ class NpuFuseEPMoE(DeepEPMoE):
             )
 
 
-class MoriEPMoE(FusedMoE):
-    _has_printed = False
-
+class MoriEPMoE(DeepEPMoE):
     def __init__(
         self,
         num_experts: int,
