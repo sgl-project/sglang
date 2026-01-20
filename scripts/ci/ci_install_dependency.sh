@@ -5,7 +5,7 @@ set -euxo pipefail
 # Set up environment variables
 IS_BLACKWELL=${IS_BLACKWELL:-0}
 CU_VERSION="cu129"
-FLASHINFER_VERSION=0.5.3
+FLASHINFER_VERSION=0.6.1
 OPTIONAL_DEPS="${1:-}"
 
 # Detect system architecture
@@ -136,14 +136,25 @@ if [ "${CUSTOM_BUILD_SGL_KERNEL:-}" = "true" ]; then
     fi
     $PIP_CMD install sgl-kernel/dist/sgl_kernel-${SGL_KERNEL_VERSION_FROM_KERNEL}-cp310-abi3-manylinux2014_${WHEEL_ARCH}.whl --force-reinstall $PIP_INSTALL_SUFFIX
 else
-    $PIP_CMD install sgl-kernel==${SGL_KERNEL_VERSION_FROM_SRT} --force-reinstall $PIP_INSTALL_SUFFIX
+    # On Blackwell machines, skip reinstall if correct version already installed to avoid race conditions
+    if [ "$IS_BLACKWELL" = "1" ]; then
+        INSTALLED_SGL_KERNEL=$(pip show sgl-kernel 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
+        if [ "$INSTALLED_SGL_KERNEL" = "$SGL_KERNEL_VERSION_FROM_SRT" ]; then
+            echo "sgl-kernel==${SGL_KERNEL_VERSION_FROM_SRT} already installed, skipping reinstall"
+        else
+            echo "Installing sgl-kernel==${SGL_KERNEL_VERSION_FROM_SRT} (current: ${INSTALLED_SGL_KERNEL:-none})"
+            $PIP_CMD install sgl-kernel==${SGL_KERNEL_VERSION_FROM_SRT} $PIP_INSTALL_SUFFIX
+        fi
+    else
+        $PIP_CMD install sgl-kernel==${SGL_KERNEL_VERSION_FROM_SRT} --force-reinstall $PIP_INSTALL_SUFFIX
+    fi
 fi
 
 # Show current packages
 $PIP_CMD list
 
 # Install other python dependencies
-$PIP_CMD install mooncake-transfer-engine==0.3.8 "${NVRTC_SPEC}" py-spy scipy huggingface_hub[hf_xet] pytest $PIP_INSTALL_SUFFIX
+$PIP_CMD install mooncake-transfer-engine==0.3.8.post1 "${NVRTC_SPEC}" py-spy scipy huggingface_hub[hf_xet] pytest $PIP_INSTALL_SUFFIX
 
 if [ "$IS_BLACKWELL" != "1" ]; then
     # For lmms_evals evaluating MMMU
@@ -152,10 +163,30 @@ if [ "$IS_BLACKWELL" != "1" ]; then
 fi
 
 # DeepEP depends on nvshmem 3.4.5
-$PIP_CMD install nvidia-nvshmem-cu12==3.4.5 --force-reinstall $PIP_INSTALL_SUFFIX
+# On Blackwell machines, skip reinstall if correct version already installed to avoid race conditions
+if [ "$IS_BLACKWELL" = "1" ]; then
+    INSTALLED_NVSHMEM=$(pip show nvidia-nvshmem-cu12 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
+    if [ "$INSTALLED_NVSHMEM" = "3.4.5" ]; then
+        echo "nvidia-nvshmem-cu12==3.4.5 already installed, skipping reinstall"
+    else
+        $PIP_CMD install nvidia-nvshmem-cu12==3.4.5 $PIP_INSTALL_SUFFIX
+    fi
+else
+    $PIP_CMD install nvidia-nvshmem-cu12==3.4.5 --force-reinstall $PIP_INSTALL_SUFFIX
+fi
 
 # Cudnn with version less than 9.16.0.29 will cause performance regression on Conv3D kernel
-$PIP_CMD install nvidia-cudnn-cu12==9.16.0.29 --force-reinstall $PIP_INSTALL_SUFFIX
+# On Blackwell machines, skip reinstall if correct version already installed to avoid race conditions
+if [ "$IS_BLACKWELL" = "1" ]; then
+    INSTALLED_CUDNN=$(pip show nvidia-cudnn-cu12 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
+    if [ "$INSTALLED_CUDNN" = "9.16.0.29" ]; then
+        echo "nvidia-cudnn-cu12==9.16.0.29 already installed, skipping reinstall"
+    else
+        $PIP_CMD install nvidia-cudnn-cu12==9.16.0.29 $PIP_INSTALL_SUFFIX
+    fi
+else
+    $PIP_CMD install nvidia-cudnn-cu12==9.16.0.29 --force-reinstall $PIP_INSTALL_SUFFIX
+fi
 $PIP_CMD uninstall xformers || true
 
 # Install flashinfer-jit-cache with caching and retry logic (flashinfer.ai can have transient DNS issues)

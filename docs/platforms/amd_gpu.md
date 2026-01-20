@@ -52,10 +52,10 @@ pip install --upgrade pip
 cd sgl-kernel
 python setup_rocm.py install
 
-# Install sglang python package
+# Install sglang python package along with diffusion support
 cd ..
 rm -rf python/pyproject.toml && mv python/pyproject_other.toml python/pyproject.toml
-pip install -e "python[all_hip]"
+pip install -e "python[all_hip,diffusion_hip]"
 ```
 
 ### Install Using Docker (Recommended)

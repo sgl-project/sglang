@@ -26,8 +26,10 @@ class DmdDenoisingStage(DenoisingStage):
     Denoising stage for DMD.
     """
 
-    def __init__(self, transformer, scheduler) -> None:
-        super().__init__(transformer, scheduler)
+    def __init__(self, transformer, scheduler, transformer_2=None) -> None:
+        super().__init__(
+            transformer=transformer, scheduler=scheduler, transformer_2=transformer_2
+        )
         self.scheduler = FlowMatchEulerDiscreteScheduler(shift=8.0)
 
     def _preprocess_sp_latents(self, batch: Req, server_args: ServerArgs):
@@ -103,6 +105,20 @@ class DmdDenoisingStage(DenoisingStage):
                     timings=batch.timings,
                     perf_dump_path_provided=batch.perf_dump_path is not None,
                 ):
+                    t_int = int(t.item())
+                    if self.transformer_2 is not None:
+                        current_model, current_guidance_scale = (
+                            self._select_and_manage_model(
+                                t_int=t_int,
+                                boundary_timestep=self._handle_boundary_ratio(
+                                    server_args, batch
+                                ),
+                                server_args=server_args,
+                                batch=batch,
+                            )
+                        )
+                    else:
+                        current_model = self.transformer
                     # Expand latents for I2V
                     noise_latents = latents.clone()
                     latent_model_input = latents.to(target_dtype)
@@ -143,7 +159,7 @@ class DmdDenoisingStage(DenoisingStage):
                             forward_batch=batch,
                         ):
                             # Run transformer
-                            pred_noise = self.transformer(
+                            pred_noise = current_model(
                                 hidden_states=latent_model_input.permute(0, 2, 1, 3, 4),
                                 timestep=t_expand,
                                 guidance=guidance_expand,
@@ -202,3 +218,76 @@ class DmdDenoisingStage(DenoisingStage):
         )
 
         return batch
+
+    def _select_and_manage_model(
+        self,
+        t_int: int,
+        boundary_timestep: float | None,
+        server_args: ServerArgs,
+        batch: Req,
+    ):
+        if boundary_timestep is None or t_int >= boundary_timestep:
+            # High-noise stage
+            current_model = self.transformer
+            model_to_offload = self.transformer_2
+            current_guidance_scale = batch.guidance_scale
+        else:
+            # Low-noise stage
+            current_model = self.transformer_2
+            model_to_offload = self.transformer
+            current_guidance_scale = batch.guidance_scale_2
+
+        self._manage_device_placement(current_model, model_to_offload, server_args)
+
+        assert current_model is not None, "The model for the current step is not set."
+        return current_model, current_guidance_scale
+
+    def _manage_device_placement(
+        self,
+        model_to_use: torch.nn.Module,
+        model_to_offload: torch.nn.Module | None,
+        server_args: ServerArgs,
+    ):
+        """
+        Manages the offload / load behavior of dit
+        """
+        if not server_args.dit_cpu_offload:
+            return
+
+        # Offload the unused model if it's on CUDA
+        if (
+            model_to_offload is not None
+            and next(model_to_offload.parameters()).device.type == "cuda"
+        ):
+            model_to_offload.to("cpu")
+
+        # Load the model to use if it's on CPU
+        if (
+            model_to_use is not None
+            and next(model_to_use.parameters()).device.type == "cpu"
+        ):
+            model_to_use.to(get_local_torch_device())
+
+    def _handle_boundary_ratio(
+        self,
+        server_args,
+        batch,
+    ):
+        """
+        (Wan2.2) Calculate timestep to switch from high noise expert to low noise expert
+        """
+        boundary_ratio = server_args.pipeline_config.dit_config.boundary_ratio
+        if batch.boundary_ratio is not None:
+            logger.info(
+                "Overriding boundary ratio from %s to %s",
+                boundary_ratio,
+                batch.boundary_ratio,
+            )
+            boundary_ratio = batch.boundary_ratio
+
+        if boundary_ratio is not None:
+            boundary_timestep = boundary_ratio * self.scheduler.num_train_timesteps
+        else:
+            boundary_timestep = None
+
+        return boundary_timestep

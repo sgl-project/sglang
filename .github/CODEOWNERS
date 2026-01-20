@@ -4,6 +4,8 @@
 /python/pyproject.toml @merrymercy @Fridge003 @ispobock
 /python/sglang/jit_kernel @DarkSharpness @BBuf
 /python/sglang/multimodal_gen @mickqian @yhyang201
+/python/sglang/multimodal_gen/runtime/layers @mickqian @yhyang201 @BBuf
+/python/sglang/multimodal_gen/runtime/models/dits @mickqian @yhyang201 @BBuf
 /python/sglang/srt/batch_invariant_ops @Fridge003 @hebiao064
 /python/sglang/srt/constrained @hnyls2002 @DarkSharpness
 /python/sglang/srt/compilation @hebiao064
@@ -16,6 +18,7 @@
 /python/sglang/srt/function_call @CatherineSue @JustinTong0323
 /python/sglang/srt/grpc @CatherineSue @slin1237
 /python/sglang/srt/hardware_backend/npu @ping1jing2 @iforgetmyname
+/python/sglang/srt/hardware_backend/npu/quantization @OrangeRedeng @TamirBaydasov @iforgetmyname
 /python/sglang/srt/layers @merrymercy @Ying1123 @Fridge003 @ispobock @HaiShaw @ch-wan @BBuf @Edwardf0t1
 /python/sglang/srt/layers/attention @merrymercy @Fridge003 @ispobock @Qiaolin-Yu @hebiao064
 /python/sglang/srt/layers/attention/fla @yizhang2077 @hebiao064

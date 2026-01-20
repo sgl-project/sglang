@@ -42,9 +42,7 @@ class LatentPreparationStage(PipelineStage):
         """
         Prepare initial latent variables for the diffusion process.
 
-        Args:
-            batch: The current batch information.
-            server_args: The inference arguments.
+
 
         Returns:
             The batch with prepared latent variables.
@@ -111,9 +109,7 @@ class LatentPreparationStage(PipelineStage):
         """
         Adjust video length based on VAE version.
 
-        Args:
-            batch: The current batch information.
-            server_args: The inference arguments.
+
 
         Returns:
             The batch with adjusted video length.

@@ -277,7 +277,7 @@ def _get_video_dimensions_from_metadata(
     if width == 0 or height == 0:
         return None
 
-    return (int(width), int(height))
+    return int(width), int(height)
 
 
 def _get_video_dimensions_from_frame(cap: cv2.VideoCapture) -> tuple[int, int]:
@@ -289,8 +289,6 @@ def _get_video_dimensions_from_frame(cap: cv2.VideoCapture) -> tuple[int, int]:
     Returns:
         Tuple of (width, height)
 
-    Raises:
-        ValueError: If unable to read a frame from the video
     """
     ret, frame = cap.read()
     if not ret or frame is None:
@@ -298,7 +296,7 @@ def _get_video_dimensions_from_frame(cap: cv2.VideoCapture) -> tuple[int, int]:
 
     # frame.shape is (height, width, channels)
     height, width = frame.shape[:2]
-    return (int(width), int(height))
+    return int(width), int(height)
 
 
 def get_video_dimensions(file_path: str) -> tuple[int, int]:
@@ -306,14 +304,9 @@ def get_video_dimensions(file_path: str) -> tuple[int, int]:
 
     Tries to get dimensions from metadata first, falls back to reading first frame.
 
-    Args:
-        file_path: Path to the video file
-
     Returns:
         Tuple of (width, height)
 
-    Raises:
-        ValueError: If unable to get video dimensions
     """
     cap = cv2.VideoCapture(file_path)
     try:

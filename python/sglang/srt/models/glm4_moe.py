@@ -63,6 +63,7 @@ from sglang.srt.layers.moe import (
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
+from sglang.srt.layers.moe.utils import filter_moe_weight_param_global_expert
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -438,6 +439,9 @@ class Glm4MoeSparseMoeBlock(nn.Module):
             x.data
             for name, x in self.experts.named_parameters()
             if name not in ["correction_bias"]
+            and filter_moe_weight_param_global_expert(
+                name, x, self.experts.num_local_experts
+            )
         ]
 
     def forward(
@@ -681,6 +685,8 @@ class Glm4MoeDecoderLayer(nn.Module):
         attention_bias = config.attention_bias
         self.layer_id = layer_id
 
+        use_qk_norm = config.use_qk_norm if hasattr(config, "use_qk_norm") else False
+
         self.self_attn = Glm4MoeAttention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
@@ -695,7 +701,7 @@ class Glm4MoeDecoderLayer(nn.Module):
             attention_bias=attention_bias,
             quant_config=quant_config,
             prefix=add_prefix("self_attn", prefix),
-            use_qk_norm=config.use_qk_norm,
+            use_qk_norm=use_qk_norm,
             alt_stream=alt_stream,
         )
 

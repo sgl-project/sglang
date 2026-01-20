@@ -5,6 +5,8 @@ import pathlib
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Callable, List, Tuple, TypeAlias, TypeVar, Union
 
+import torch
+
 if TYPE_CHECKING:
     from tvm_ffi import Module
 
@@ -40,12 +42,19 @@ DEFAULT_INCLUDE = [str(KERNEL_PATH / "include")]
 DEFAULT_CFLAGS = ["-std=c++20", "-O3"]
 DEFAULT_CUDA_CFLAGS = ["-std=c++20", "-O3", "--expt-relaxed-constexpr"]
 DEFAULT_LDFLAGS = []
-CPP_TEMPLATE_TYPE: TypeAlias = Union[int, float, bool]
+CPP_TEMPLATE_TYPE: TypeAlias = Union[int, float, bool, torch.dtype]
 
 
 class CPPArgList(list[str]):
     def __str__(self) -> str:
         return ", ".join(self)
+
+
+CPP_DTYPE_MAP = {
+    torch.float: "fp32_t",
+    torch.float16: "fp16_t",
+    torch.bfloat16: "bf16_t",
+}
 
 
 def make_cpp_args(*args: CPP_TEMPLATE_TYPE) -> CPPArgList:
@@ -54,6 +63,8 @@ def make_cpp_args(*args: CPP_TEMPLATE_TYPE) -> CPPArgList:
             return "true" if arg else "false"
         if isinstance(arg, (int, float)):
             return str(arg)
+        if isinstance(arg, torch.dtype):
+            return CPP_DTYPE_MAP[arg]
         raise TypeError(f"Unsupported argument type for cpp template: {type(arg)}")
 
     return CPPArgList(_convert(arg) for arg in args)

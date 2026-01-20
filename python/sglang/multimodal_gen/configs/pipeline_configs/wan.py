@@ -149,6 +149,18 @@ class WanI2V720PConfig(WanI2V480PConfig):
 
 
 @dataclass
+class TurboWanI2V720Config(WanI2V720PConfig):
+    flow_shift: float | None = 8.0
+    dmd_denoising_steps: list[int] | None = field(
+        default_factory=lambda: [996, 932, 852, 608]
+    )
+    boundary_ratio: float | None = 0.9
+
+    def __post_init__(self) -> None:
+        self.dit_config.boundary_ratio = self.boundary_ratio
+
+
+@dataclass
 class FastWan2_1_T2V_480P_Config(WanT2V480PConfig):
     """Base configuration for FastWan T2V 1.3B 480P pipeline architecture with DMD"""
 

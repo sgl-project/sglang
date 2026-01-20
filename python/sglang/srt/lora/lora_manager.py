@@ -72,6 +72,9 @@ class LoRAManager:
         self.tp_size: int = tp_size
         self.tp_rank: int = tp_rank
         self.lora_added_tokens_size: Optional[int] = None
+        self.enable_lora_overlap_loading: Optional[bool] = (
+            server_args.enable_lora_overlap_loading
+        )
 
         # Store eviction policy from server args
         self.eviction_policy = server_args.lora_eviction_policy
@@ -208,7 +211,7 @@ class LoRAManager:
 
         return self.create_lora_update_result(success=True)
 
-    def validate_lora_batch(self, lora_ids: set[str]) -> bool:
+    def validate_lora_batch(self, lora_ids: set[Optional[str]]) -> bool:
         """
         Validate if the LoRA IDs in the batch can be loaded into the current LoRA memory pool.
         """
@@ -239,9 +242,11 @@ class LoRAManager:
 
         return required_slots <= mem_pool_vacancy
 
-    def prepare_lora_batch(self, forward_batch: ForwardBatch):
+    def fetch_new_loras(
+        self, new_loras: set[Optional[str]], running_loras: set[Optional[str]] = set()
+    ):
         # Load active loras into lora memory pool
-        cur_uids = set(forward_batch.lora_ids)
+        cur_uids = new_loras | running_loras
 
         assert len(cur_uids) <= self.max_loras_per_batch
         self.memory_pool.prepare_lora_batch(
@@ -253,6 +258,7 @@ class LoRAManager:
             lora_lm_head_module=self.lm_head_module,  # merge into embedding or lora module
         )
 
+    def prepare_lora_batch(self, forward_batch: ForwardBatch):
         # set up batch info shared by all lora modules
         bs = forward_batch.batch_size
 
@@ -442,7 +448,62 @@ class LoRAManager:
             self.lora_backend,
         )
         lora_adapter.initialize_weights()
+
+        # If we want to overlap loading LoRA adapters with compute, they must be pinned in CPU memory
+        if self.enable_lora_overlap_loading:
+            lora_adapter.pin_weights_in_cpu()
+
         self.loras[lora_ref.lora_id] = lora_adapter
+
+    def load_lora_weights_from_tensors(
+        self, lora_ref: LoRARef, tensors: Dict[str, torch.Tensor]
+    ):
+        """
+        Load the weights of a LoRA adapter from tensors to CPU memory.
+        """
+        lora_adapter = LoRAAdapter(
+            lora_ref.lora_id,
+            self.configs[lora_ref.lora_id],
+            self.base_hf_config,
+            self.load_config,
+            self.lora_backend,
+        )
+        lora_adapter.initialize_weights_from_tensors(tensors)
+        self.loras[lora_ref.lora_id] = lora_adapter
+
+    def load_lora_adapter_from_tensors(
+        self,
+        lora_ref: LoRARef,
+        tensors: Dict[str, torch.Tensor],
+        config_dict: Dict,
+        added_tokens_config: Optional[Dict] = None,
+    ) -> LoRAUpdateOutput:
+        """
+        Load a single LoRA adapter from tensors and config dict.
+        """
+        assert (
+            lora_ref.lora_name is not None and lora_ref.lora_path is not None
+        ), "LoRARef must have both lora_name and lora_path set for loading."
+        assert (
+            lora_ref.lora_id not in self.loras
+        ), f"LoRA adapter with ID {lora_ref.lora_id} is already loaded. This should have been verified before request is sent to the backend."
+
+        try:
+            new_adapter = LoRAConfig.from_dict(config_dict, added_tokens_config)
+            self.validate_new_adapter(new_adapter, lora_ref)
+            self.configs[lora_ref.lora_id] = new_adapter
+
+            self.load_lora_weights_from_tensors(lora_ref, tensors)
+
+            self.lora_refs[lora_ref.lora_id] = lora_ref
+            self.num_pinned_loras += int(lora_ref.pinned)
+        except Exception as e:
+            return self.create_lora_update_result(
+                success=False,
+                error_message=str(e),
+            )
+
+        return self.create_lora_update_result(success=True)
 
     def init_memory_pool(self):
         """(Re)initialize the LoRA memory pool based on the current configurations."""
@@ -458,6 +519,9 @@ class LoRAManager:
             eviction_policy=self.eviction_policy,
             lora_added_tokens_size=self.lora_added_tokens_size,
         )
+
+        # Initializing memory pool with base model
+        self.fetch_new_loras({None})
 
     def set_lora_module(self, module_name, module):
         lora_module = get_lora_layer(module, self.lora_backend)

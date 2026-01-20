@@ -7,12 +7,13 @@ from sglang.test.run_combined_tests import run_combined_tests
 from sglang.test.test_utils import ModelLaunchSettings
 
 # Runs on both H200 and B200 via nightly-8-gpu-common suite
-register_cuda_ci(est_time=12000, suite="nightly-8-gpu-common", nightly=True)
+register_cuda_ci(est_time=1800, suite="nightly-8-gpu-common", nightly=True)
 
 LLAMA4_MODEL_PATH = "meta-llama/Llama-4-Scout-17B-16E-Instruct"
 
 
-class TestLlama4Unified(unittest.TestCase):
+@unittest.skip("Blocked: Missing HF token permission for Llama 4 model")
+class TestLlama4(unittest.TestCase):
     """Unified test class for Llama-4-Scout performance and accuracy.
 
     Llama4 has local attention mechanism with hybrid sliding window attention.

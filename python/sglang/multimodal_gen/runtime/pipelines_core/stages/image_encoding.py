@@ -96,13 +96,6 @@ class ImageEncodingStage(PipelineStage):
     ) -> Req:
         """
         Encode the prompt into image encoder hidden states.
-
-        Args:
-            batch: The current batch information.
-            server_args: The inference arguments.
-
-        Returns:
-            The batch with encoded prompt embeddings.
         """
 
         if batch.condition_image is None:
@@ -212,13 +205,6 @@ class ImageVAEEncodingStage(PipelineStage):
     ) -> Req:
         """
         Encode pixel representations into latent space.
-
-        Args:
-            batch: The current batch information.
-            server_args: The inference arguments.
-
-        Returns:
-            The batch with encoded outputs.
         """
 
         if batch.condition_image is None:

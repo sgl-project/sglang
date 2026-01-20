@@ -76,6 +76,11 @@ if _is_cuda:
     from sgl_kernel import moe_fused_gate
 
     try:
+        from flashinfer.fused_moe import fused_topk_deepseek
+    except ImportError:
+        fused_topk_deepseek = None
+
+    try:
         from sgl_kernel import kimi_k2_moe_fused_gate
     except ImportError as e:
         pass
@@ -732,12 +737,67 @@ def biased_grouped_topk_gpu(
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
     apply_routed_scaling_factor_on_output: Optional[bool] = False,
 ):
-    # TODO: moe_fused_gate kernel is not supported for num_fused_shared_experts > 0 now.
+
+    num_tokens = gating_output.shape[0]
+    num_experts = gating_output.shape[1]
+    experts_per_group = (
+        num_experts // num_expert_group if num_expert_group else num_experts
+    )
+
     if (
         _is_cuda
-        and gating_output.shape[1] // num_expert_group
-        <= 32  # moe_fused_gate kernel ensure that num_experts/num_expert_group does not exceed MAX_VPT=32 now. And when kernel can handle MAX_VPT > 32, we can remove this assertion.
-        and is_power_of_two(correction_bias.shape[0])
+        and fused_topk_deepseek is not None
+        and num_fused_shared_experts == 0
+        and is_power_of_two(num_experts)
+        # flashinfer constraints
+        and topk <= 8
+        and topk_group <= num_expert_group
+        and topk_group * num_expert_group >= topk
+        and (
+            (experts_per_group <= 32 and experts_per_group * topk_group <= 128)
+            if num_expert_group > 1
+            else num_experts <= 384
+        )
+    ):
+        # Pre-allocate output tensors (flashinfer mutates them in-place)
+        topk_weights = torch.empty(
+            (num_tokens, topk), dtype=torch.float32, device=gating_output.device
+        )
+        topk_ids = torch.empty(
+            (num_tokens, topk), dtype=torch.int32, device=gating_output.device
+        )
+
+        # flashinfer always applies the scaling_factor internally
+        scaling_factor = 1.0
+        if routed_scaling_factor is not None and apply_routed_scaling_factor_on_output:
+            scaling_factor = routed_scaling_factor
+
+        # flashinfer's fused_topk_deepseek
+        fused_topk_deepseek(
+            gating_output.to(dtype=torch.float32),
+            correction_bias,
+            num_expert_group,
+            topk_group,
+            topk,
+            scaling_factor,
+            topk_weights,
+            topk_ids,
+            True,
+        )
+
+        if (expert_location_dispatch_info is not None) or (
+            num_token_non_padded is not None
+        ):
+            topk_ids = _biased_grouped_topk_postprocess(
+                topk_ids, expert_location_dispatch_info, num_token_non_padded
+            )
+        return topk_weights, topk_ids
+
+    elif (
+        _is_cuda
+        # moe_fused_gate kernel ensures that num_experts/num_expert_group does not exceed MAX_VPT=32 now. And when kernel can handle MAX_VPT > 32, we can remove this assertion.
+        and experts_per_group <= 32
+        and is_power_of_two(num_experts)
     ):
         topk_weights, topk_ids = moe_fused_gate(
             gating_output.to(dtype=torch.float32),
@@ -757,6 +817,7 @@ def biased_grouped_topk_gpu(
                 topk_ids, expert_location_dispatch_info, num_token_non_padded
             )
         return topk_weights, topk_ids
+
     elif _use_aiter:
         assert not apply_routed_scaling_factor_on_output, "Not implemented"
         token = gating_output.shape[0]

@@ -34,7 +34,7 @@ def start_disagg_service(
         )
         if is_create_store:
             try:
-                from mf_adapter import create_config_store
+                from memfabric_hybrid import create_config_store
 
                 ascend_url = os.getenv("ASCEND_MF_STORE_URL")
                 create_config_store(ascend_url)

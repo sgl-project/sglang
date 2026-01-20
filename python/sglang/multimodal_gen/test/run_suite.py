@@ -27,6 +27,8 @@ SUITES = {
         "test_lora_format_adapter.py",
         # cli test
         "../cli/test_generate_t2i_perf.py",
+        # unit tests (no server needed)
+        "../test_sampling_params_validate.py",
         # add new 1-gpu test files here
     ],
     "2-gpu": [
@@ -81,12 +83,7 @@ def parse_args():
 
 
 def collect_test_items(files, filter_expr=None):
-    """Collect test item node IDs from the given files using pytest --collect-only.
-
-    Raises:
-        RuntimeError: If pytest collection fails due to errors (e.g., syntax errors,
-            import errors, or other collection failures).
-    """
+    """Collect test item node IDs from the given files using pytest --collect-only."""
     cmd = [sys.executable, "-m", "pytest", "--collect-only", "-q"]
     if filter_expr:
         cmd.extend(["-k", filter_expr])

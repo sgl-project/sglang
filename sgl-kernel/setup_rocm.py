@@ -54,6 +54,7 @@ sources = [
     "csrc/speculative/eagle_utils.cu",
     "csrc/kvcacheio/transfer.cu",
     "csrc/elementwise/pos_enc.cu",
+    "csrc/sgl_diffusion/elementwise/timestep_embedding.cu",
 ]
 
 cxx_flags = ["-O3"]

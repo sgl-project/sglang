@@ -139,12 +139,6 @@ class AttentionImpl(ABC, Generic[T]):
 
         Called AFTER all_to_all for distributed attention
 
-        Args:
-            qkv: The query-key-value tensor
-            attn_metadata: Metadata for the attention operation
-
-        Returns:
-            Processed QKV tensor
         """
         return qkv
 
@@ -161,12 +155,6 @@ class AttentionImpl(ABC, Generic[T]):
 
         Called BEFORE all_to_all for distributed attention
 
-        Args:
-            output: The output tensor from the attention operation
-            attn_metadata: Metadata for the attention operation
-
-        Returns:
-            Postprocessed output tensor
         """
 
         return output

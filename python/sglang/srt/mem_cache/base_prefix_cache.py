@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import time
 from abc import ABC, abstractmethod
 from typing import (
@@ -20,6 +21,7 @@ from sglang.srt.metrics.collector import RadixCacheMetricsCollector
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.mem_cache.radix_cache import RadixKey
 
 
 @runtime_checkable
@@ -28,6 +30,17 @@ class PrefixCacheTrait(Protocol):
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
     page_size: int
     disable: bool
+
+
+@dataclasses.dataclass
+class MatchPrefixParams:
+    """Unified parameters for match_prefix across different cache types"""
+
+    key: RadixKey
+
+    # Mamba specific
+    cow_mamba: bool = False
+    req: Optional[Req] = None
 
 
 class MatchResult(NamedTuple):
@@ -77,7 +90,7 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         pass
 
     @abstractmethod
-    def match_prefix(self, key: Any, **kwargs) -> MatchResult:
+    def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         pass
 
     @abstractmethod
@@ -148,3 +161,15 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
 
     def take_events(self):
         return []
+
+    def supports_swa(self) -> bool:
+        return False
+
+    def supports_mamba(self) -> bool:
+        return False
+
+    def is_chunk_cache(self) -> bool:
+        return False
+
+    def is_tree_cache(self) -> bool:
+        return not self.is_chunk_cache()

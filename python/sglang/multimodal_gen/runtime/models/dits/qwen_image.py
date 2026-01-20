@@ -116,7 +116,7 @@ class QwenEmbedRope(nn.Module):
         #     rope_theta=theta,
         #     use_real=False,
         #     repeat_interleave_real=False,
-        #     dtype=torch.float32 if current_platform.is_mps() else torch.float64,
+        #     dtype=torch.float32 if current_platform.is_mps() or current_platform.is_musa() else torch.float64,
         # )
 
         # DO NOT USING REGISTER BUFFER HERE, IT WILL CAUSE COMPLEX NUMBERS LOSE ITS IMAGINARY PART

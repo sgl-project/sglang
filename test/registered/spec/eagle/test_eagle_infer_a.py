@@ -22,7 +22,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=500, suite="stage-b-test-small-1-gpu")
+register_cuda_ci(est_time=561, suite="stage-b-test-large-1-gpu")
 
 torch_dtype = torch.float16
 prefill_tolerance = 5e-2

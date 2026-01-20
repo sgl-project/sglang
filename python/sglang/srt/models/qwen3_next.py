@@ -5,6 +5,7 @@ from typing import Any, Iterable, Optional, Set, Tuple
 import torch
 from torch import nn
 
+from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.compilation.piecewise_context_manager import get_forward_context
 from sglang.srt.configs.qwen3_next import Qwen3NextConfig
 from sglang.srt.distributed import get_pp_group
@@ -357,7 +358,11 @@ class Qwen3GatedDeltaNet(nn.Module):
             DUAL_STREAM_TOKEN_THRESHOLD = 1024
 
         seq_len, _ = hidden_states.shape
-        if seq_len < DUAL_STREAM_TOKEN_THRESHOLD:
+        if (
+            seq_len < DUAL_STREAM_TOKEN_THRESHOLD
+            and self.alt_stream is not None
+            and get_is_capture_mode()
+        ):
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
             projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
@@ -1060,6 +1065,7 @@ EntryClass = Qwen3NextForCausalLM
 
 
 @register_custom_op(mutates_args=["output"])
+@register_split_op()
 def gdn_with_output(
     hidden_states: torch.Tensor,
     output: torch.Tensor,

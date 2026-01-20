@@ -55,7 +55,7 @@ jobs:
           filters: |
             main_package:
               - "python/sglang/!(multimodal_gen)/**"
-              - "python/*.toml"
+              - "python/pyproject_xpu.toml"
               - "scripts/ci/**"
               - "test/**"
               - "sgl-kernel/**"
