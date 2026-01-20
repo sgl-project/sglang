@@ -40,6 +40,7 @@ SGLang supports various environment variables that can be used to configure its 
 | `SGLANG_SCHEDULER_RECV_SKIPPER_WEIGHT_NONE` | Weight increment when forward mode is None in scheduler recv skipper. Works with `--scheduler-recv-interval` to control polling frequency when no specific forward mode is active. | `1` |
 | `SGLANG_MM_BUFFER_SIZE_MB` | Size of preallocated GPU buffer (in MB) for multi-modal feature hashing optimization. When set to a positive value, temporarily moves features to GPU for faster hash computation, then moves them back to CPU to save GPU memory. Larger features benefit more from GPU hashing. Set to `0` to disable. | `0` |
 | `SGLANG_MM_PRECOMPUTE_HASH` | Enable precomputing of hash values for MultimodalDataItem | `false` |
+| `SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH` | Enable NCCL for gathering when preparing mlp sync batch under overlap scheduler (without this flag gloo is used for gathering) | `false` |
 
 
 ## DeepGEMM Configuration (Advanced Optimization)

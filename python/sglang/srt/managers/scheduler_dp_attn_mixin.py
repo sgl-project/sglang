@@ -9,7 +9,7 @@ from sglang.srt.batch_overlap.two_batch_overlap import TboDPAttentionPreparer
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.metrics.collector import DPCooperationInfo
-from sglang.srt.utils.common import get_bool_env_var, require_mlp_tp_gather
+from sglang.srt.utils.common import require_mlp_tp_gather
 
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state import GroupCoordinator
@@ -148,7 +148,7 @@ def prepare_mlp_sync_batch_raw(
     tbo_preparer = TboDPAttentionPreparer()
     if len(offload_tags) == 0 and (
         disable_overlap_schedule
-        or get_bool_env_var("SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH")
+        or envs.SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH.get()
     ):
         group = tp_group.device_group
         device = tp_group.device
