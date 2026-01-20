@@ -191,8 +191,10 @@ jobs:
     needs: [check-changes, call-gate]
     # Only run for PRs (not scheduled) and when not targeting a specific stage
     # Skip if call-gate failed (stage-a jobs will be skipped, nothing to wait for)
+    # !cancelled() ensures this job respects workflow cancellation from concurrency group
     if: |
       always() &&
+      !cancelled() &&
       github.event_name == 'pull_request' &&
       !inputs.target_stage &&
       inputs.test_parallel_dispatch != true &&
@@ -249,8 +251,10 @@ jobs:
     needs: [check-changes, call-gate, wait-for-stage-a]
     # Only run for PRs (not scheduled) and when not targeting a specific stage
     # Skip if call-gate failed (stage-b jobs will be skipped, nothing to wait for)
+    # !cancelled() ensures this job respects workflow cancellation from concurrency group
     if: |
       always() &&
+      !cancelled() &&
       github.event_name == 'pull_request' &&
       !inputs.target_stage &&
       inputs.test_parallel_dispatch != true &&
