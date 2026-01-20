@@ -49,6 +49,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda_alike,
     is_hip,
+    is_musa,
     is_npu,
     is_shm_available,
     is_xpu,
@@ -58,6 +59,7 @@ from sglang.srt.utils.custom_op import register_custom_op
 _is_npu = is_npu()
 _is_cpu = is_cpu()
 _is_xpu = is_xpu()
+_is_musa = is_musa()
 
 TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 
@@ -247,6 +249,8 @@ class GroupCoordinator:
             self.device = torch.device(f"npu:{local_rank}")
         elif _is_xpu:
             self.device = torch.device(f"xpu:{local_rank}")
+        elif _is_musa:
+            self.device = torch.device(f"musa:{local_rank}")
         else:
             self.device = torch.device("cpu")
         self.device_module = torch.get_device_module(self.device)
@@ -1903,6 +1907,8 @@ def cleanup_dist_env_and_memory(shutdown_ray: bool = False):
             torch.xpu.empty_cache()
         elif hasattr(torch, "npu") and torch.npu.is_available():
             torch.npu.empty_cache()
+        elif hasattr(torch, "musa") and torch.musa.is_available():
+            torch.musa.empty_cache()
 
 
 def in_the_same_node_as(pg: ProcessGroup, source_rank: int = 0) -> List[bool]:
