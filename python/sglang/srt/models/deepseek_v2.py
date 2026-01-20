@@ -1045,11 +1045,29 @@ class DeepseekV2MoE(nn.Module):
                 )
 
     def get_moe_weights(self):
-        return [
-            x.data
-            for name, x in self.experts.named_parameters()
-            if name not in ["correction_bias"]
-        ]
+        # EPLB only manages routed experts. In DeepEP Waterfill mode, we add one extra
+        # local expert slot per rank for the shared expert. Exclude that shared slot
+        # from the returned tensors so expert-location updates operate on the routed
+        # expert weights only.
+        maybe_exclude_shared_slot = getattr(
+            self, "_enable_deepep_waterfill", False
+        ) and hasattr(self, "_old_experts_per_rank")
+        routed_local_experts = getattr(self, "_old_experts_per_rank", None)
+
+        weights = []
+        for name, x in self.experts.named_parameters():
+            if name in ["correction_bias"]:
+                continue
+            w = x.data
+            if (
+                maybe_exclude_shared_slot
+                and routed_local_experts is not None
+                and w.dim() >= 1
+                and w.shape[0] == routed_local_experts + 1
+            ):
+                w = w[:routed_local_experts]
+            weights.append(w)
+        return weights
 
     def forward(
         self,
