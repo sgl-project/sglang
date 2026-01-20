@@ -352,3 +352,34 @@ class ReasoningParser:
         """Streaming call: incremental parsing"""
         ret = self.detector.parse_streaming_increment(chunk_text)
         return ret.reasoning_text, ret.normal_text
+
+    def calculate_reasoning_tokens(self, full_content: str, tokenizer) -> int:
+        """
+        Calculate reasoning tokens from full_content by splitting with think_end_token.
+        Returns the token count including the think_end_token.
+
+        Args:
+            full_content: The full content string to analyze
+            tokenizer: Tokenizer instance with encode method
+
+        Returns:
+            Number of reasoning tokens (including think_end_token)
+        """
+        think_end_token = self.detector.think_end_token
+
+        # Split by think_end_token to get reasoning part
+        if think_end_token in full_content:
+            # Take the part before think_end_token and include think_end_token
+            reasoning_part = full_content.split(think_end_token, 1)[0]
+            reasoning_with_end = reasoning_part + think_end_token
+        else:
+            # No think_end_token found
+            # If we're in reasoning mode or force_reasoning, use all content
+            if self.detector._in_reasoning or getattr(
+                self.detector, "force_reasoning", False
+            ):
+                reasoning_with_end = full_content
+            else:
+                return 0
+
+        return len(tokenizer.encode(reasoning_with_end, add_special_tokens=False))

@@ -19,6 +19,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, List, NamedTuple, Optional, Tuple, TypeAlias, Union
 
+from openai.types.completion_usage import CompletionTokensDetails, PromptTokensDetails
 from openai.types.responses import (
     ResponseFunctionToolCall,
     ResponseInputItemParam,
@@ -106,8 +107,9 @@ class UsageInfo(BaseModel):
     prompt_tokens: int = 0
     total_tokens: int = 0
     completion_tokens: Optional[int] = 0
-    # only used to return cached tokens when --enable-cache-report is set
-    prompt_tokens_details: Optional[Dict[str, int]] = None
+    prompt_tokens_details: Optional[PromptTokensDetails] = None
+    completion_tokens_details: Optional[CompletionTokensDetails] = None
+    # Deprecated: kept for backward compatibility
     reasoning_tokens: Optional[int] = 0
 
 

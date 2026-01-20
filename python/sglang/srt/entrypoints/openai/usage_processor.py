@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Mapping, Optional, final
 
-from sglang.srt.entrypoints.openai.protocol import UsageInfo
+from sglang.srt.entrypoints.openai.protocol import (
+    CompletionTokensDetails,
+    PromptTokensDetails,
+    UsageInfo,
+)
 
 
 @final
@@ -10,9 +14,9 @@ class UsageProcessor:
     """Stateless helpers that turn raw token counts into a UsageInfo."""
 
     @staticmethod
-    def _details_if_cached(count: int) -> Optional[Dict[str, int]]:
-        """Return {"cached_tokens": N} only when N > 0 (keeps JSON slim)."""
-        return {"cached_tokens": count} if count > 0 else None
+    def _details_if_cached(count: int) -> Optional[PromptTokensDetails]:
+        """Return PromptTokensDetails only when cached_tokens > 0 (keeps JSON slim)."""
+        return PromptTokensDetails(cached_tokens=count) if count > 0 else None
 
     @staticmethod
     def calculate_response_usage(
@@ -35,10 +39,18 @@ class UsageProcessor:
             )
             cached_details = UsageProcessor._details_if_cached(cached_total)
 
+        # Calculate total reasoning tokens from all responses
+        total_reasoning_tokens = sum(
+            r["meta_info"].get("reasoning_tokens", 0) for r in responses
+        )
+
         return UsageProcessor.calculate_token_usage(
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             cached_tokens=cached_details,
+            reasoning_tokens=(
+                total_reasoning_tokens if total_reasoning_tokens > 0 else None
+            ),
         )
 
     @staticmethod
@@ -48,6 +60,7 @@ class UsageProcessor:
         cached_tokens: Mapping[int, int],
         n_choices: int,
         enable_cache_report: bool = False,
+        reasoning_tokens: Optional[Mapping[int, int]] = None,
     ) -> UsageInfo:
         # index % n_choices == 0 marks the first choice of a prompt
         total_prompt_tokens = sum(
@@ -63,22 +76,40 @@ class UsageProcessor:
             else None
         )
 
+        total_reasoning_tokens = (
+            sum(reasoning_tokens.values()) if reasoning_tokens else None
+        )
+
         return UsageProcessor.calculate_token_usage(
             prompt_tokens=total_prompt_tokens,
             completion_tokens=total_completion_tokens,
             cached_tokens=cached_details,
+            reasoning_tokens=(
+                total_reasoning_tokens
+                if total_reasoning_tokens and total_reasoning_tokens > 0
+                else None
+            ),
         )
 
     @staticmethod
     def calculate_token_usage(
         prompt_tokens: int,
         completion_tokens: int,
-        cached_tokens: Optional[Dict[str, int]] = None,
+        cached_tokens: Optional[PromptTokensDetails] = None,
+        reasoning_tokens: Optional[int] = None,
     ) -> UsageInfo:
         """Calculate token usage information"""
+        completion_tokens_details = None
+        if reasoning_tokens is not None and reasoning_tokens > 0:
+            completion_tokens_details = CompletionTokensDetails(
+                reasoning_tokens=reasoning_tokens,
+            )
+
         return UsageInfo(
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             total_tokens=prompt_tokens + completion_tokens,
             prompt_tokens_details=cached_tokens,
+            completion_tokens_details=completion_tokens_details,
+            reasoning_tokens=reasoning_tokens,  # Keep for backward compatibility
         )
