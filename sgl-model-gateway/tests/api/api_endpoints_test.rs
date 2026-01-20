@@ -4,7 +4,7 @@ use axum::{
     http::{header::CONTENT_TYPE, StatusCode},
 };
 use serde_json::json;
-use smg::{config::RouterConfig, routers::RouterFactory};
+use smg::{config::RouterConfig};
 use tower::ServiceExt;
 
 use crate::common::{
@@ -320,6 +320,11 @@ mod model_info_tests {
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+        // Ensure Content-Type: applications/json header is set
+        assert_eq!(
+            resp.headers().get(CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+            Some("application/json")
+        );
 
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
@@ -358,6 +363,11 @@ mod model_info_tests {
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+        // Ensure Content-Type: applications/json header is set
+        assert_eq!(
+            resp.headers().get(CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+            Some("application/json")
+        );
 
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
@@ -403,6 +413,11 @@ mod model_info_tests {
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+        // Ensure Content-Type: applications/json header is set
+        assert_eq!(
+            resp.headers().get(CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+            Some("application/json")
+        );
 
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
@@ -525,6 +540,11 @@ mod model_info_tests {
 
             let resp = app.clone().oneshot(req).await.unwrap();
             assert_eq!(resp.status(), StatusCode::OK);
+            // Ensure Content-Type: applications/json header is set
+            assert_eq!(
+                resp.headers().get(CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+                Some("application/json")
+            );
 
             let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
                 .await
@@ -1344,6 +1364,7 @@ mod load_balancing_tests {
 #[cfg(test)]
 mod pd_mode_tests {
     use super::*;
+    use smg::routers::RouterFactory;
 
     #[tokio::test]
     async fn test_pd_mode_routing() {
@@ -1401,6 +1422,133 @@ mod pd_mode_tests {
 
         // For now, just verify the configuration was attempted
         assert!(router_result.is_err() || router_result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_pd_mode_content_type() {
+        // Create PD mode configuration with prefill and decode workers
+        let mut prefill_worker = MockWorker::new(MockWorkerConfig {
+            port: 19701,
+            worker_type: WorkerType::Prefill,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        });
+
+        let mut decode_worker = MockWorker::new(MockWorkerConfig {
+            port: 19702,
+            worker_type: WorkerType::Decode,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        });
+
+        let prefill_url = prefill_worker.start().await.unwrap();
+        let decode_url = decode_worker.start().await.unwrap();
+
+        // Extract port from prefill URL
+        let prefill_port = prefill_url
+            .split(':')
+            .next_back()
+            .and_then(|p| p.trim_end_matches('/').parse::<u16>().ok())
+            .unwrap_or(19701);
+
+        let config = RouterConfig::builder()
+            .prefill_decode_mode(vec![(prefill_url, Some(prefill_port))], vec![decode_url])
+            .random_policy()
+            .host("127.0.0.1")
+            .port(3012)
+            .max_payload_size(256 * 1024 * 1024)
+            .request_timeout_secs(600)
+            .worker_startup_timeout_secs(1)
+            .worker_startup_check_interval_secs(1)
+            .max_concurrent_requests(64)
+            .queue_timeout_secs(60)
+            .build_unchecked();
+
+        // Create app context
+        let ctx = AppTestContext::new_with_config(config.clone(), vec![]).await;
+
+        // Manually trigger worker initialization since AppTestContext doesn't handle PD mode automatically
+        // when mock workers are created externally
+        let job = smg::core::Job::InitializeWorkersFromConfig {
+            router_config: Box::new(config.clone()),
+        };
+        ctx.app_context
+            .worker_job_queue
+            .get()
+            .unwrap()
+            .submit(job)
+            .await
+            .unwrap();
+
+        // Wait for workers to be healthy
+        let start = tokio::time::Instant::now();
+        loop {
+            let healthy = ctx
+                .app_context
+                .worker_registry
+                .get_all()
+                .iter()
+                .filter(|w| w.is_healthy())
+                .count();
+            if healthy >= 2 {
+                break;
+            }
+            if start.elapsed().as_secs() > 10 {
+                panic!("Timeout waiting for workers");
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        }
+
+        let app = ctx.create_app().await;
+
+        // Test /v1/models
+        let req = Request::builder()
+            .method("GET")
+            .uri("/v1/models")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+            Some("application/json")
+        );
+
+        // Test /get_model_info
+        let req = Request::builder()
+            .method("GET")
+            .uri("/get_model_info")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+            Some("application/json")
+        );
+
+        // Test /get_server_info
+        let req = Request::builder()
+            .method("GET")
+            .uri("/get_server_info")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+            Some("application/json")
+        );
+
+        // Clean up
+        prefill_worker.stop().await;
+        decode_worker.stop().await;
+        ctx.shutdown().await;
     }
 }
 

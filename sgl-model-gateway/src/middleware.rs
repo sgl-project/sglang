@@ -1047,3 +1047,17 @@ mod tests {
         assert!(!is_dynamic_id("chat"));
     }
 }
+
+/// Middleware to ensure Content-Type is application/json on successful responses.
+pub async fn ensure_json_content_type(request: Request<Body>, next: Next) -> Response {
+    let mut response = next.run(request).await;
+
+    if response.status().is_success() {
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+    }
+
+    response
+}

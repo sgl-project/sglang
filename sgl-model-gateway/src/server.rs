@@ -604,9 +604,24 @@ pub fn build_app(
         .route("/health", get(health))
         .route("/health_generate", get(health_generate))
         .route("/engine_metrics", get(engine_metrics))
-        .route("/v1/models", get(v1_models))
-        .route("/get_model_info", get(get_model_info))
-        .route("/get_server_info", get(get_server_info));
+        .route(
+            "/v1/models",
+            get(v1_models).layer(axum::middleware::from_fn(
+                middleware::ensure_json_content_type,
+            )),
+        )
+        .route(
+            "/get_model_info",
+            get(get_model_info).layer(axum::middleware::from_fn(
+                middleware::ensure_json_content_type,
+            )),
+        )
+        .route(
+            "/get_server_info",
+            get(get_server_info).layer(axum::middleware::from_fn(
+                middleware::ensure_json_content_type,
+            )),
+        );
 
     // Build admin routes with control plane auth if configured, otherwise use simple API key auth
     let admin_routes = Router::new()
