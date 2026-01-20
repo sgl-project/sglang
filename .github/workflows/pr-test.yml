@@ -243,15 +243,17 @@ jobs:
             core.setOutput('result', 'timeout');
 
   wait-for-stage-b:
-    needs: [check-changes, wait-for-stage-a]
+    needs: [check-changes, call-gate, wait-for-stage-a]
     # Only run for PRs (not scheduled) and when not targeting a specific stage
+    # Skip if call-gate failed (stage-b jobs will be skipped, nothing to wait for)
     if: |
       always() &&
       github.event_name == 'pull_request' &&
       !inputs.target_stage &&
       inputs.test_parallel_dispatch != true &&
       (needs.check-changes.outputs.main_package == 'true' || needs.check-changes.outputs.sgl_kernel == 'true') &&
-      (needs.wait-for-stage-a.result == 'success' || needs.wait-for-stage-a.result == 'skipped')
+      (needs.wait-for-stage-a.result == 'success' || needs.wait-for-stage-a.result == 'skipped') &&
+      (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped')
     runs-on: ubuntu-latest
     outputs:
       stage_b_result: ${{ steps.wait.outputs.result }}
