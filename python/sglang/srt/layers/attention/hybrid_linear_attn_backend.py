@@ -5,6 +5,8 @@ import triton
 import triton.language as tl
 from einops import rearrange
 
+from sglang.jit_kernel.cutedsl_gdn import cutedsl_fused_sigmoid_gating_delta_rule_update
+from sglang.srt.environ import Envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.fla.chunk import chunk_gated_delta_rule
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
@@ -15,11 +17,7 @@ from sglang.srt.layers.attention.fla.fused_recurrent import (
 from sglang.srt.layers.attention.fla.fused_sigmoid_gating_recurrent import (
     fused_sigmoid_gating_delta_rule_update,
 )
-from sglang.srt.layers.attention.fla.kda import (
-    chunk_kda,
-    fused_kda_gate,
-    fused_recurrent_kda,
-)
+from sglang.srt.layers.attention.fla.kda import chunk_kda, fused_recurrent_kda
 from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
     PAD_SLOT_ID,
     causal_conv1d_fn,
@@ -34,9 +32,11 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, MambaPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import is_cuda, is_npu
+from sglang.srt.utils.common import rank0_log
 
 if is_cuda():
     from sglang.srt.layers.attention.mamba.causal_conv1d import (
@@ -284,7 +284,8 @@ class MambaAttnBackendBase(AttentionBackend):
         lens_to_track = (
             forward_batch.mamba_track_seqlens - forward_batch.extend_prefix_lens
         )
-        aligned_len = (lens_to_track // FLA_CHUNK_SIZE) * FLA_CHUNK_SIZE
+        mamba_cache_chunk_size = get_global_server_args().mamba_cache_chunk_size
+        aligned_len = (lens_to_track // mamba_cache_chunk_size) * mamba_cache_chunk_size
         start_indices = query_start_loc[:-1] + aligned_len - conv_state_len
         start_indices = start_indices[forward_batch.mamba_track_mask]
 
@@ -641,14 +642,10 @@ class KimiLinearAttnBackend(MambaAttnBackendBase):
         k_conv_bias = kwargs["k_conv_bias"]
         v_conv_bias = kwargs["v_conv_bias"]
 
-        A_log = kwargs["A_log"]
-        dt_bias = kwargs["dt_bias"]
-        b_proj = kwargs["b_proj"]
-        f_a_proj = kwargs["f_a_proj"]
-        f_b_proj = kwargs["f_b_proj"]
-        hidden_states = kwargs["hidden_states"]
         head_dim = kwargs["head_dim"]
         layer_id = kwargs["layer_id"]
+        beta = kwargs["beta"]
+        g = kwargs["gate"]
 
         layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer_id)
         q_conv_state, k_conv_state, v_conv_state = layer_cache.conv
@@ -688,14 +685,6 @@ class KimiLinearAttnBackend(MambaAttnBackendBase):
         q, k, v = map(
             lambda x: rearrange(x, "n (h d) -> 1 n h d", d=head_dim), (q, k, v)
         )
-
-        beta = b_proj(hidden_states)[0].float().sigmoid()
-
-        g = f_b_proj(f_a_proj(hidden_states)[0])[0]
-        g = fused_kda_gate(g, A_log, head_dim, g_bias=dt_bias)
-
-        beta = beta.unsqueeze(0)
-        g = g.unsqueeze(0)
 
         initial_state = ssm_states[cache_indices].contiguous()
         (
@@ -739,14 +728,10 @@ class KimiLinearAttnBackend(MambaAttnBackendBase):
         k_conv_bias = kwargs["k_conv_bias"]
         v_conv_bias = kwargs["v_conv_bias"]
 
-        A_log = kwargs["A_log"]
-        dt_bias = kwargs["dt_bias"]
-        b_proj = kwargs["b_proj"]
-        f_a_proj = kwargs["f_a_proj"]
-        f_b_proj = kwargs["f_b_proj"]
-        hidden_states = kwargs["hidden_states"]
         head_dim = kwargs["head_dim"]
         layer_id = kwargs["layer_id"]
+        beta = kwargs["beta"]
+        g = kwargs["gate"]
 
         query_start_loc = self.forward_metadata.query_start_loc
         cache_indices = self.forward_metadata.mamba_cache_indices
@@ -806,14 +791,6 @@ class KimiLinearAttnBackend(MambaAttnBackendBase):
             lambda x: rearrange(x, "n (h d) -> 1 n h d", d=head_dim), (q, k, v)
         )
 
-        beta = b_proj(hidden_states)[0].float().sigmoid()
-
-        g = f_b_proj(f_a_proj(hidden_states)[0])[0]
-        g = fused_kda_gate(g, A_log, head_dim, g_bias=dt_bias)
-
-        beta = beta.unsqueeze(0)
-        g = g.unsqueeze(0)
-
         core_attn_out = chunk_kda(
             q=q,
             k=k,
@@ -840,6 +817,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
         assert (
             self.conv_states_shape[-1] < FLA_CHUNK_SIZE
         ), f"{self.conv_states_shape[-1]=} should be less than {FLA_CHUNK_SIZE}"
+
+        use_cutedsl = Envs.SGLANG_USE_CUTEDSL_GDN_DECODE.get()
+        rank0_log(f"CuTe DSL GDN decode enabled: {use_cutedsl}")
+        self._kernel_func = (
+            cutedsl_fused_sigmoid_gating_delta_rule_update
+            if use_cutedsl
+            else fused_sigmoid_gating_delta_rule_update
+        )
 
     def forward_decode(
         self,
@@ -897,7 +882,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         key = key.view(1, seq_len, num_heads, head_k_dim)
         value = value.view(1, seq_len, value.shape[1] // head_v_dim, head_v_dim)
 
-        core_attn_out = fused_sigmoid_gating_delta_rule_update(
+        core_attn_out = self._kernel_func(
             A_log=A_log,
             dt_bias=dt_bias,
             q=query,

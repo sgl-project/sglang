@@ -19,7 +19,11 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.layers.amx_utils import PackWeightMethod
 from sglang.srt.layers.communicator import get_attn_tp_context
-from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
+from sglang.srt.layers.dp_attention import (
+    attn_tp_all_reduce,
+    get_attention_tp_rank,
+    get_attention_tp_size,
+)
 from sglang.srt.layers.parameter import BasevLLMParameter
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
@@ -31,6 +35,7 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     get_compiler_backend,
     is_cpu,
+    is_npu,
     set_weight_attrs,
 )
 
@@ -38,6 +43,7 @@ DEFAULT_VOCAB_PADDING_SIZE = 64
 
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
+_is_npu = is_npu()
 
 logger = logging.getLogger(__name__)
 
@@ -123,7 +129,7 @@ class VocabParallelEmbeddingShardIndices:
         assert self.num_added_elements <= self.num_added_elements_padded
 
 
-@torch.compile(dynamic=True, backend=get_compiler_backend())
+@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
 def get_masked_input_and_mask(
     input_: torch.Tensor,
     org_vocab_start_index: int,
@@ -208,6 +214,7 @@ class VocabParallelEmbedding(torch.nn.Module):
         self.quant_config = quant_config
 
         self.enable_tp = enable_tp
+        self.use_attn_tp_group = use_attn_tp_group
         if self.enable_tp:
             if use_attn_tp_group:
                 tp_rank = get_attention_tp_rank()
@@ -482,8 +489,11 @@ class VocabParallelEmbedding(torch.nn.Module):
             # Mask the output embedding.
             output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
             if not get_attn_tp_context().input_scattered:
-                # Reduce across all the model parallel GPUs.
-                output_parallel = tensor_model_parallel_all_reduce(output_parallel)
+                if self.use_attn_tp_group:
+                    output_parallel = attn_tp_all_reduce(output_parallel)
+                else:
+                    # Reduce across all the model parallel GPUs.
+                    output_parallel = tensor_model_parallel_all_reduce(output_parallel)
         return output_parallel
 
     def extra_repr(self) -> str:
