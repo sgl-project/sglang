@@ -1518,6 +1518,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         return self.mamba2_config or self.hybrid_gdn_config or self.kimi_linear_config
 
     def can_run_piecewise_cuda_graph(self):
+        if self.is_draft_worker:
+            return False
+
         if self.server_args.enable_torch_compile:
             log_info_on_rank0(
                 logger,
@@ -2244,6 +2247,27 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 reinit_attn_backend,
                 split_forward_count,
             )
+            elastic_ep_state = ElasticEPStateManager.instance()
+            if (
+                elastic_ep_state is not None
+                and not elastic_ep_state.is_active_equal_last()
+            ):
+                elastic_ep_state.snapshot_active_to_last()
+                elastic_ep_state.sync_active_to_cpu()
+                logging.info("EPLB due to rank faults")
+                gen = self.eplb_manager.rebalance()
+                while True:
+                    try:
+                        next(gen)
+                    except StopIteration:
+                        break
+                output = self._forward_raw(
+                    forward_batch,
+                    skip_attn_backend_init,
+                    pp_proxy_tensors,
+                    reinit_attn_backend,
+                    split_forward_count,
+                )
         output.expert_distribution_metrics = recorder_outputs.get("metrics")
 
         # Copy cached routing experts' buffers back to CPU cache

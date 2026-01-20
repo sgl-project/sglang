@@ -59,7 +59,7 @@ from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
+from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchPrefixParams
 from sglang.srt.mem_cache.common import (
     alloc_for_decode,
     alloc_for_extend,
@@ -549,8 +549,12 @@ class Req:
         # for corss-endoder model
         self.token_type_ids = token_type_ids
 
-        # The length of KV that have been removed in swa chunk cache
-        self.evicted_seqlen_local = 0
+        # The length of KV that have been removed in swa cache.
+        # SWA KV cache eviction behavior differs by cache type:
+        # - Radix cache: KV in range [cache_protected_len, swa_evicted_seqlen) is freed manually in
+        #   `ScheduleBatch.maybe_evict_swa`; KV in range [0, cache_protected_len) is freed during radix cache eviction.
+        # - Chunk cache: KV in range [0, swa_evicted_seqlen) is freed manually in `ScheduleBatch.maybe_evict_swa`.
+        self.swa_evicted_seqlen = 0
 
         # The index of the extend / decode batch
         self.extend_batch_idx = 0
@@ -864,12 +868,11 @@ class Req:
 
         if tree_cache is not None:
             match_result = tree_cache.match_prefix(
-                key=RadixKey(token_ids=token_ids, extra_key=self.extra_key),
-                **(
-                    {"req": self, "cow_mamba": True}
-                    if tree_cache.supports_mamba()
-                    else {}
-                ),
+                MatchPrefixParams(
+                    key=RadixKey(token_ids=token_ids, extra_key=self.extra_key),
+                    req=self if tree_cache.supports_mamba() else None,
+                    cow_mamba=tree_cache.supports_mamba(),
+                )
             )
             (
                 self.prefix_indices,
@@ -1159,6 +1162,62 @@ class Req:
         )
 
 
+class DllmStagingReqs:
+    def __init__(self, dllm_config: Optional[DllmConfig] = None):
+        self.dllm_config = dllm_config
+        self.max_running_reqs = (
+            dllm_config.max_running_requests if dllm_config is not None else 1
+        )
+        self.reqs: List[Req] = []
+
+    def add_reqs(self, req: Union[Req, List[Req], "DllmStagingReqs"]):
+        assert self.dllm_config is not None, "Diffusion LLM config is not set."
+
+        if isinstance(req, DllmStagingReqs):
+            reqs_to_add = req.reqs
+        elif isinstance(req, list):
+            reqs_to_add = req
+        else:
+            reqs_to_add = [req]
+
+        num_to_add = len(reqs_to_add)
+
+        # Sanity check:
+        if self.check_redundant_reqs(reqs_to_add):
+            raise RuntimeError("Redundant requests detected in dLLM requests.")
+
+        if len(self.reqs) + num_to_add > self.max_running_reqs:
+            raise RuntimeError(
+                f"Exceeding maximum number of concurrent diffusion LLM requests: {self.max_running_reqs}"
+            )
+
+        self.reqs.extend(reqs_to_add)
+
+    def check_redundant_reqs(self, reqs: List[Req]) -> bool:
+        existing_rids: Set[str] = {r.rid for r in self.reqs}
+        return any(req.rid in existing_rids for req in reqs)
+
+    def init_next_round(self):
+        for req in self.reqs:
+            req.init_next_round_input()
+
+    def non_empty(self) -> bool:
+        return self.dllm_config is not None and len(self.reqs) > 0
+
+    def empty(self) -> bool:
+        return self.dllm_config is None or len(self.reqs) == 0
+
+    def update_chunked_status(self):
+        for req in self.reqs:
+            req.is_chunked += 1
+
+    def filter_finished_reqs(self):
+        self.reqs = [req for req in self.reqs if not req.finished()]
+
+    def __iter__(self):
+        return iter(self.reqs)
+
+
 @dataclasses.dataclass
 class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     """Store all information of a batch on the scheduler."""
@@ -1279,6 +1338,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     hicache_consumer_index: int = -1
 
     # Diffusion LLM
+    dllm_staging_reqs: Optional[DllmStagingReqs] = None
     dllm_config: Optional[DllmConfig] = None
 
     # Metrics
@@ -1295,6 +1355,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         enable_overlap: bool,
         spec_algorithm: SpeculativeAlgorithm,
         chunked_req: Optional[Req] = None,
+        dllm_staging_reqs: Optional[DllmStagingReqs] = None,
         dllm_config: Optional[DllmConfig] = None,
     ):
         return_logprob = any(req.return_logprob for req in reqs)
@@ -1320,6 +1381,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             return_routed_experts=any(req.return_routed_experts for req in reqs),
             is_prefill_only=all(req.is_prefill_only for req in reqs),
             chunked_req=chunked_req,
+            dllm_staging_reqs=dllm_staging_reqs,
             dllm_config=dllm_config,
         )
 
@@ -2204,6 +2266,59 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_seqlens=self.mamba_track_seqlens,
             dp_cooperation_info=self.dp_cooperation_info,
         )
+
+    def maybe_evict_swa(self):
+        if self.tree_cache.supports_swa():
+            sliding_window_size = self.tree_cache.sliding_window_size
+            for idx, req in enumerate(self.reqs):
+                if self.forward_mode.is_decode():
+                    # We set evict_swa condition here with two reasons:
+                    # 1. In overlap scheduler, we cannot evict swa when req.decode_batch_idx == 0 since the prev extend batch is still running.
+                    # 2. Evict swa every window_size tokens to reduce the overhead.
+                    if req.decode_batch_idx % sliding_window_size == 1:
+                        self._evict_swa(req, req.seqlen - 1)
+                elif self.forward_mode.is_extend() and self.tree_cache.is_chunk_cache():
+                    pre_len = self.prefix_lens[idx]
+                    if self.enable_overlap:
+                        # In chunked prefill case, when the second extend batch is scheduling, the first extend batch is still running, so we cannot evict swa tokens
+                        if req.extend_batch_idx < 2:
+                            continue
+                        else:
+                            server_args = get_global_server_args()
+                            pre_len = (
+                                pre_len - server_args.chunked_prefill_size
+                                if server_args.chunked_prefill_size > 0
+                                else pre_len
+                            )
+                            self._evict_swa(req, pre_len)
+                    else:
+                        self._evict_swa(req, pre_len)
+
+    def _evict_swa(self, req: Req, pre_len: int):
+        assert self.tree_cache.supports_swa(), "prefix cache must support swa"
+        sliding_window_size = self.tree_cache.sliding_window_size
+
+        # For swa radix cache, we need to evict the tokens that are not in the tree cache and also not in the sliding window
+        assert (
+            req.cache_protected_len % self.tree_cache.page_size == 0
+        ), "cache_protected_len must be page aligned"
+        req.swa_evicted_seqlen = max(req.swa_evicted_seqlen, req.cache_protected_len)
+
+        new_swa_evicted_seqlen = max(
+            req.swa_evicted_seqlen, pre_len - sliding_window_size
+        )
+
+        if self.tree_cache.page_size > 1:
+            new_swa_evicted_seqlen = (
+                new_swa_evicted_seqlen // self.tree_cache.page_size
+            ) * self.tree_cache.page_size
+
+        if new_swa_evicted_seqlen > req.swa_evicted_seqlen:
+            free_slots = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, req.swa_evicted_seqlen : new_swa_evicted_seqlen
+            ]
+            self.token_to_kv_pool_allocator.free_swa(free_slots)
+            req.swa_evicted_seqlen = new_swa_evicted_seqlen
 
     def _is_available_size_sufficient(self, num_tokens: int) -> bool:
         if self.is_hybrid_swa:

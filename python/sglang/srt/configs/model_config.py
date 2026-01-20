@@ -101,6 +101,7 @@ class ModelConfig:
         is_multi_layer_eagle: bool = False,
         encoder_only: bool = False,
         language_only: bool = False,
+        disable_hybrid_swa_memory: bool = False,
     ) -> None:
         # Parse args
         self.model_path = model_path
@@ -111,6 +112,7 @@ class ModelConfig:
         self.sampling_defaults = sampling_defaults
         self.quantize_and_serve = quantize_and_serve
         self.is_multi_layer_eagle = is_multi_layer_eagle
+        self.disable_hybrid_swa_memory = disable_hybrid_swa_memory
 
         # Validate quantize_and_serve configuration
         self._validate_quantize_and_serve_config()
@@ -257,6 +259,7 @@ class ModelConfig:
             language_only=server_args.language_only,
             encoder_only=server_args.encoder_only,
             is_draft_model=is_draft_model,
+            disable_hybrid_swa_memory=server_args.disable_hybrid_swa_memory,
             **kwargs,
         )
 
@@ -269,7 +272,10 @@ class ModelConfig:
         ):
             self.hf_config.architectures[0] = "DeepseekV3ForCausalLMNextN"
 
-        if is_draft_model and self.hf_config.architectures[0] == "Glm4MoeForCausalLM":
+        if is_draft_model and self.hf_config.architectures[0] in [
+            "Glm4MoeForCausalLM",
+            "Glm4MoeLiteForCausalLM",
+        ]:
             self.hf_config.architectures[0] = "Glm4MoeForCausalLMNextN"
 
         if (
@@ -307,14 +313,16 @@ class ModelConfig:
 
     def _derive_hybrid_model(self):
         # Use self.context_len after it has been initialized to prevent using context_len which may be None.
-        self.is_hybrid_swa = is_hybrid_swa_model(self.hf_config.architectures)
+        self.is_hybrid_swa = (
+            is_hybrid_swa_model(self.hf_config.architectures)
+            and not self.disable_hybrid_swa_memory
+        )
 
         if self.is_hybrid_swa:
             self.swa_attention_layer_ids, self.full_attention_layer_ids = (
                 get_hybrid_layer_ids(
                     self.hf_config.architectures,
-                    self.hf_text_config.num_hidden_layers,
-                    getattr(self.hf_text_config, "hybrid_layer_pattern", None),
+                    self.hf_text_config,
                 )
             )
 
@@ -376,6 +384,7 @@ class ModelConfig:
             or "DeepseekV32ForCausalLM" in self.hf_config.architectures
             or "DeepseekV3ForCausalLM" in self.hf_config.architectures
             or "DeepseekV3ForCausalLMNextN" in self.hf_config.architectures
+            or "Glm4MoeLiteForCausalLM" in self.hf_config.architectures
             or "LongcatFlashForCausalLM" in self.hf_config.architectures
             or "LongcatFlashForCausalLMNextN" in self.hf_config.architectures
             or "DotsVLMForCausalLM" in self.hf_config.architectures
@@ -395,15 +404,21 @@ class ModelConfig:
                 else None
             )
 
-            # Handle rope scaling with yarn
-            self.scaling = 1 / math.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim)
-            if self.hf_config.rope_scaling:
-                mscale_all_dim = self.hf_config.rope_scaling.get(
-                    "mscale_all_dim", False
+            if "Glm4MoeLiteForCausalLM" in self.hf_config.architectures:
+                self.scaling = 1
+                self.hf_config.rope_scaling = None
+            else:
+                # Handle rope scaling with yarn
+                self.scaling = 1 / math.sqrt(
+                    self.qk_nope_head_dim + self.qk_rope_head_dim
                 )
-                scaling_factor = self.hf_config.rope_scaling["factor"]
-                mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
-                self.scaling = self.scaling * mscale * mscale
+                if self.hf_config.rope_scaling:
+                    mscale_all_dim = self.hf_config.rope_scaling.get(
+                        "mscale_all_dim", False
+                    )
+                    scaling_factor = self.hf_config.rope_scaling["factor"]
+                    mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
+                    self.scaling = self.scaling * mscale * mscale
 
         elif "MiniCPM3ForCausalLM" in self.hf_config.architectures:
             self.head_dim = 128
@@ -1197,6 +1212,7 @@ def is_hybrid_swa_model(model_architectures: List[str]):
 
     hybrid_swa_archs = {
         "Llama4ForConditionalGeneration",
+        "GptOssForCausalLM",
         "MiMoV2FlashForCausalLM",
         "MiMoV2MTP",
     }
@@ -1205,9 +1221,9 @@ def is_hybrid_swa_model(model_architectures: List[str]):
 
 def get_hybrid_layer_ids(
     model_architectures: List[str],
-    num_hidden_layers: int,
-    hybrid_layer_pattern: Optional[List[int]] = None,
+    hf_text_config: PretrainedConfig,
 ):
+    num_hidden_layers = hf_text_config.num_hidden_layers
     if "Llama4ForConditionalGeneration" in model_architectures:
         swa_attention_layer_ids = [
             i for i in range(num_hidden_layers) if (i + 1) % 4 != 0
@@ -1215,7 +1231,16 @@ def get_hybrid_layer_ids(
         full_attention_layer_ids = [
             i for i in range(num_hidden_layers) if (i + 1) % 4 == 0
         ]
+    elif "GptOssForCausalLM" in model_architectures:
+        layer_types = getattr(hf_text_config, "layer_types", None)
+        swa_attention_layer_ids = [
+            i for i, x in enumerate(layer_types) if x == "sliding_attention"
+        ]
+        full_attention_layer_ids = [
+            i for i, x in enumerate(layer_types) if x == "full_attention"
+        ]
     elif "MiMoV2FlashForCausalLM" in model_architectures:
+        hybrid_layer_pattern = getattr(hf_text_config, "hybrid_layer_pattern", None)
         swa_attention_layer_ids = [
             i for i in range(num_hidden_layers) if hybrid_layer_pattern[i] == 1
         ]

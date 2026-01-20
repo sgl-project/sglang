@@ -2742,6 +2742,14 @@ def has_hf_quant_config(model_path: str) -> bool:
         return False
 
 
+def get_quantization_config(hf_config) -> str | None:
+    """Extract quantization method from HuggingFace config."""
+    quantization_config = getattr(hf_config, "quantization_config", None)
+    if quantization_config is not None:
+        return quantization_config.get("quant_method")
+    return None
+
+
 def flatten_nested_list(nested_list):
     if isinstance(nested_list, list):
         return [
@@ -2896,6 +2904,7 @@ def is_fa3_default_architecture(hf_config):
         "Olmo2ForCausalLM",
         "Gemma2ForCausalLM",
         "Gemma3ForConditionalGeneration",
+        "MixtralForCausalLM",
         "Qwen2ForCausalLM",
         "Qwen3ForCausalLM",
         "Qwen3MoeForCausalLM",
@@ -2905,6 +2914,7 @@ def is_fa3_default_architecture(hf_config):
         "Glm4vForConditionalGeneration",
         "Glm4vMoeForConditionalGeneration",
         "Step3VLForConditionalGeneration",
+        "MiMoV2FlashForCausalLM",
     }
     return architectures[0] in default_archs
 
