@@ -119,7 +119,10 @@ class RequestLogger:
         ):
             if obj.input_ids and isinstance(obj.input_ids[0], list):
                 # Prefill node warmup while PD disaggregated.
-                decoded = [tokenizer.decode(_input_ids, skip_special_tokens=False) for _input_ids in obj.input_ids]
+                decoded = [
+                    tokenizer.decode(_input_ids, skip_special_tokens=False)
+                    for _input_ids in obj.input_ids
+                ]
             else:
                 decoded = tokenizer.decode(obj.input_ids, skip_special_tokens=False)
             obj.text = decoded
