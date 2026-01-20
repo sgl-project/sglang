@@ -136,6 +136,7 @@ def start_server(
     *,
     repo_dir: str,
     model_path: str,
+    init_expert_location: str,
     bind_host: str,
     port: int,
     tp: int,
@@ -167,10 +168,23 @@ def start_server(
         "--log-level",
         "warning",
     ]
+    extra_flags: List[str] = []
+    if init_expert_location:
+        extra_flags.extend(
+            [
+                "--init-expert-location",
+                init_expert_location,
+                "--ep-dispatch-algorithm",
+                "static",
+            ]
+        )
     if enable_waterfill:
-        flags.insert(flags.index("--host"), "--enable-deepep-waterfill")
+        extra_flags.append("--enable-deepep-waterfill")
     if disable_shared_experts_fusion:
-        flags.insert(flags.index("--host"), "--disable-shared-experts-fusion")
+        extra_flags.append("--disable-shared-experts-fusion")
+    if extra_flags:
+        host_idx = flags.index("--host")
+        flags[host_idx:host_idx] = extra_flags
 
     os.makedirs(os.path.dirname(log_path), exist_ok=True)
     f = open(log_path, "w", encoding="utf-8")
@@ -349,20 +363,27 @@ def run_bench_serving(
         return json.load(f)
 
 
-def _torch_profile_mode_tag(*, mode: str, repo_dir: str) -> str:
+def _torch_profile_mode_tag(*, mode: str, repo_dir: str, eplb: bool = False) -> str:
     name = Path(repo_dir).name
     if mode == "baseline":
         if name.startswith("sglang_baseline_"):
-            return "baseline" + name[len("sglang_baseline_") :]
-        if name.startswith("baseline_"):
-            return "baseline" + name[len("baseline_") :]
-        return "baseline"
-    # mode == "waterfill"
-    if name == "sglang":
-        return "waterfill_current"
-    if name.startswith("sglang_wf_"):
-        return "waterfill_" + name[len("sglang_wf_") :]
-    return "waterfill"
+            tag = "baseline" + name[len("sglang_baseline_") :]
+        elif name.startswith("baseline_"):
+            tag = "baseline" + name[len("baseline_") :]
+        else:
+            tag = "baseline"
+    else:
+        # mode == "waterfill"
+        if name == "sglang":
+            tag = "waterfill_current"
+        elif name.startswith("sglang_wf_"):
+            tag = "waterfill_" + name[len("sglang_wf_") :]
+        else:
+            tag = "waterfill"
+
+    if eplb:
+        tag = f"{tag}_eplb"
+    return tag
 
 
 def run_bench_one_batch_server_profile(
@@ -472,6 +493,12 @@ def main() -> int:
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--tp", type=int, default=DEFAULT_TP)
     parser.add_argument("--ep", type=int, default=DEFAULT_EP)
+    parser.add_argument(
+        "--init-expert-location",
+        type=str,
+        default="",
+        help="Pass --init-expert-location to both baseline and waterfill servers (EPLB).",
+    )
     parser.add_argument(
         "--disable-shared-experts-fusion",
         action="store_true",
@@ -589,6 +616,7 @@ def main() -> int:
             p, f = start_server(
                 repo_dir=repo_dir,
                 model_path=args.model_path,
+                init_expert_location=args.init_expert_location,
                 bind_host=args.bind_host,
                 port=args.port,
                 tp=args.tp,
@@ -666,6 +694,7 @@ def main() -> int:
             p, f = start_server(
                 repo_dir=repo_dir,
                 model_path=args.model_path,
+                init_expert_location=args.init_expert_location,
                 bind_host=args.bind_host,
                 port=args.port,
                 tp=args.tp,
@@ -743,6 +772,7 @@ def main() -> int:
             p, f = start_server(
                 repo_dir=repo_dir,
                 model_path=args.model_path,
+                init_expert_location=args.init_expert_location,
                 bind_host=args.bind_host,
                 port=args.port,
                 tp=args.tp,
@@ -755,7 +785,11 @@ def main() -> int:
                 wait_for_server(args.host_url, args.port, timeout_s=1800)
                 base_url = f"{args.host_url}:{args.port}"
 
-                tag = _torch_profile_mode_tag(mode=mode, repo_dir=repo_dir)
+                tag = _torch_profile_mode_tag(
+                    mode=mode,
+                    repo_dir=repo_dir,
+                    eplb=bool(args.init_expert_location),
+                )
                 profile_out = os.path.join(
                     torch_profile_root, f"{ts}_{tag}_in{in_len}_bs{bs}_o{out_len}"
                 )
