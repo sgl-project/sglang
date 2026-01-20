@@ -70,6 +70,7 @@ from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
 from sglang.srt.managers.io_struct import (
     AbortReq,
+    ActiveRanksOutput,
     BaseBatchReq,
     BaseReq,
     BatchTokenizedEmbeddingReqInput,
@@ -2362,6 +2363,19 @@ class Scheduler(
             current_time = time.perf_counter()
             for req in batch.reqs:
                 req.time_stats.prefill_end_time_host = current_time
+
+        if (
+            self.server_args.enable_dp_attention
+            and self.server_args.elastic_ep_backend == "mooncake"
+        ):
+            # Get the tensors indicating rank activeness
+            tp_active_ranks = self.tp_group.active_ranks.detach().cpu().numpy()
+            tp_active_ranks_cpu = self.tp_group.active_ranks_cpu.detach().numpy()
+            tp_active_ranks &= tp_active_ranks_cpu
+            dp_active_ranks = tp_active_ranks.reshape(self.dp_size, -1).prod(axis=1)
+            self.send_to_tokenizer.send_output(
+                ActiveRanksOutput(status=dp_active_ranks.tolist())
+            )
 
         return ret
 
