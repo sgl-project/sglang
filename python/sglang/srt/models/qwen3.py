@@ -194,9 +194,9 @@ class Qwen3Attention(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         prefill_padding_max = get_bool_env_var("PREFILL_PADDING_MAX")
-            if prefill_padding_max and hasattr(forward_batch, "_original_forward_mode"):
-                if forward_batch._original_forward_mode.is_idle():
-                    return hidden_states
+        if prefill_padding_max and hasattr(forward_batch, "_original_forward_mode"):
+            if forward_batch._original_forward_mode.is_idle():
+                return hidden_states
 
         if get_global_server_args().rl_on_policy_target is not None:
             hidden_states = hidden_states.bfloat16()
