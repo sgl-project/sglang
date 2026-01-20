@@ -1593,6 +1593,7 @@ class ServerArgs:
             and self.nnodes == 1
             and not is_h20_device
             and self.moe_a2a_backend == "none"
+            and not self.enable_symm_mem
         ):
             self.enable_flashinfer_allreduce_fusion = True
 
@@ -4915,6 +4916,11 @@ class ServerArgs:
             raise ValueError(
                 "When enabling two batch overlap, moe_a2a_backend cannot be 'none'."
             )
+
+        if self.enable_flashinfer_allreduce_fusion:
+            assert (
+                not self.enable_symm_mem
+            ), "AllReduce Fusion is incompatible with symmetric memory."
 
     def check_torch_2_9_1_cudnn_compatibility(self):
         if get_bool_env_var("SGLANG_DISABLE_CUDNN_CHECK"):
