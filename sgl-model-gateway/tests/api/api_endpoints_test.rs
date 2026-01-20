@@ -1198,6 +1198,39 @@ mod error_tests {
 
         ctx.shutdown().await;
     }
+
+    #[tokio::test]
+    async fn test_error_content_type_on_model_and_server_info_endpoints() {
+        // Test with no workers, which triggers a Gateway error
+        let ctx = AppTestContext::new(vec![]).await;
+        let app = ctx.create_app().await;
+
+        let endpoints = vec!["/v1/models", "/get_model_info", "/get_server_info"];
+
+        for endpoint in endpoints {
+            let req = Request::builder()
+                .method("GET")
+                .uri(endpoint)
+                .body(Body::empty())
+                .unwrap();
+
+            let resp = app.clone().oneshot(req).await.unwrap();
+
+            // Should be an error (likely 503 or 404 depending on config)
+            assert!(!resp.status().is_success());
+
+            // Check Content-Type header
+            let content_type = resp.headers().get(CONTENT_TYPE).and_then(|v| v.to_str().ok());
+            assert_eq!(
+                content_type,
+                Some("application/json"),
+                "Endpoint {} failed to return application/json on error",
+                endpoint
+            );
+        }
+
+        ctx.shutdown().await;
+    }
 }
 
 #[cfg(test)]
