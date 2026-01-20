@@ -864,20 +864,36 @@ class GDNAttnBackend(MambaAttnBackendBase):
         save_kv_cache: bool = True,
         **kwargs,
     ):
+        # Runtime tensors from kwargs
         mixed_qkv = kwargs["mixed_qkv"]
-        conv_weights = kwargs["conv_weights"]
-        bias = kwargs["bias"]
-        activation = kwargs["activation"]
-        key_dim = kwargs["key_dim"]
-        value_dim = kwargs["value_dim"]
-        attn_tp_size = kwargs["attention_tp_size"]
-        head_k_dim = kwargs["head_k_dim"]
-        head_v_dim = kwargs["head_v_dim"]
         a = kwargs["a"]
         b = kwargs["b"]
-        A_log = kwargs["A_log"]
-        dt_bias = kwargs["dt_bias"]
-        layer_id = kwargs["layer_id"]
+
+        # Extract from layer if available, fallback to kwargs for backward compatibility
+        if layer is not None:
+            conv_weights = layer.conv_weights
+            bias = layer.bias
+            activation = layer.activation
+            key_dim = layer.key_dim
+            value_dim = layer.value_dim
+            attn_tp_size = layer.attention_tp_size
+            head_k_dim = layer.head_k_dim
+            head_v_dim = layer.head_v_dim
+            A_log = layer.A_log
+            dt_bias = layer.dt_bias
+            layer_id = layer.layer_id
+        else:
+            conv_weights = kwargs["conv_weights"]
+            bias = kwargs["bias"]
+            activation = kwargs["activation"]
+            key_dim = kwargs["key_dim"]
+            value_dim = kwargs["value_dim"]
+            attn_tp_size = kwargs["attention_tp_size"]
+            head_k_dim = kwargs["head_k_dim"]
+            head_v_dim = kwargs["head_v_dim"]
+            A_log = kwargs["A_log"]
+            dt_bias = kwargs["dt_bias"]
+            layer_id = kwargs["layer_id"]
 
         layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer_id)
         conv_states = layer_cache.conv[0]
@@ -942,21 +958,40 @@ class GDNAttnBackend(MambaAttnBackendBase):
         save_kv_cache: bool = True,
         **kwargs,
     ):
+        # Runtime tensors from kwargs
         mixed_qkv = kwargs["mixed_qkv"]
-        conv_weights = kwargs["conv_weights"]
-        bias = kwargs["bias"]
-        activation = kwargs["activation"]
-        key_dim = kwargs["key_dim"]
-        value_dim = kwargs["value_dim"]
-        attn_tp_size = kwargs["attention_tp_size"]
-        head_k_dim = kwargs["head_k_dim"]
-        head_v_dim = kwargs["head_v_dim"]
         a = kwargs["a"]
         b = kwargs["b"]
-        A_log = kwargs["A_log"]
-        dt_bias = kwargs["dt_bias"]
-        layer_id = kwargs["layer_id"]
-        seq_len = kwargs["seq_len"]
+        z = kwargs.get("z")  # z is also runtime
+
+        # seq_len can be derived from mixed_qkv or passed explicitly
+        seq_len = kwargs.get("seq_len", mixed_qkv.shape[0])
+
+        # Extract from layer if available, fallback to kwargs for backward compatibility
+        if layer is not None:
+            conv_weights = layer.conv_weights
+            bias = layer.bias
+            activation = layer.activation
+            key_dim = layer.key_dim
+            value_dim = layer.value_dim
+            attn_tp_size = layer.attention_tp_size
+            head_k_dim = layer.head_k_dim
+            head_v_dim = layer.head_v_dim
+            A_log = layer.A_log
+            dt_bias = layer.dt_bias
+            layer_id = layer.layer_id
+        else:
+            conv_weights = kwargs["conv_weights"]
+            bias = kwargs["bias"]
+            activation = kwargs["activation"]
+            key_dim = kwargs["key_dim"]
+            value_dim = kwargs["value_dim"]
+            attn_tp_size = kwargs["attention_tp_size"]
+            head_k_dim = kwargs["head_k_dim"]
+            head_v_dim = kwargs["head_v_dim"]
+            A_log = kwargs["A_log"]
+            dt_bias = kwargs["dt_bias"]
+            layer_id = kwargs["layer_id"]
 
         is_target_verify = forward_batch.forward_mode.is_target_verify()
         forward_metadata = self.forward_metadata
