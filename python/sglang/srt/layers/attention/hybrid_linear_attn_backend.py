@@ -949,7 +949,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
         mixed_qkv = kwargs["mixed_qkv"]
         a = kwargs["a"]
         b = kwargs["b"]
-        z = kwargs.get("z")
 
         # seq_len can be derived from mixed_qkv or passed explicitly
         seq_len = kwargs.get("seq_len", mixed_qkv.shape[0])
