@@ -705,12 +705,16 @@ class VocoderLoader(ComponentLoader):
 
         server_args.model_paths[module_name] = component_model_path
 
-        from sglang.multimodal_gen.configs.models.vocoder.ltx_vocoder import LTXVocoderConfig
+        from sglang.multimodal_gen.configs.models.vocoder.ltx_vocoder import (
+            LTXVocoderConfig,
+        )
 
         vocoder_config = LTXVocoderConfig()
         vocoder_config.update_model_arch(config)
 
-        vocoder_precision = getattr(server_args.pipeline_config, "audio_vae_precision", "fp32")
+        vocoder_precision = getattr(
+            server_args.pipeline_config, "audio_vae_precision", "fp32"
+        )
         vocoder_dtype = PRECISION_TO_TYPE[vocoder_precision]
 
         should_offload = self.should_offload(server_args)

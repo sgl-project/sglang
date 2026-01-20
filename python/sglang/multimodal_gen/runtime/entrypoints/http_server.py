@@ -132,6 +132,7 @@ async def forward_to_scheduler(req_obj, sp):
             fps=sp.fps or 24,
             save_output=True,
             save_file_path=output_file_path,
+            audio_sample_rate=getattr(response, "audio_sample_rate", None),
         )
 
         if hasattr(response, "model_dump"):

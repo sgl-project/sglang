@@ -22,7 +22,7 @@ class LTXVideoVAEArchConfig(VAEArchConfig):
             "LTX2VideoDownBlock3D",
         ]
     )
-    spatio_temporal_scaling: List[float] = field(
+    spatio_temporal_scaling: List[bool] = field(
         default_factory=lambda: [True, True, True, True]
     )
     layers_per_block: List[int] = field(default_factory=lambda: [4, 6, 6, 2, 2])
@@ -43,7 +43,7 @@ class LTXVideoVAEArchConfig(VAEArchConfig):
     decoder_block_out_channels: List[int] = field(
         default_factory=lambda: [256, 512, 1024]
     )
-    decoder_spatio_temporal_scaling: List[float] = field(
+    decoder_spatio_temporal_scaling: List[bool] = field(
         default_factory=lambda: [True, True, True]
     )
     decoder_layers_per_block: List[int] = field(default_factory=lambda: [5, 5, 5, 5])

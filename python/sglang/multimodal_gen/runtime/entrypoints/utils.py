@@ -55,6 +55,7 @@ def post_process_sample(
     fps: int,
     save_output: bool = True,
     save_file_path: Optional[str] = None,
+    audio_sample_rate: Optional[int] = None,
 ):
     """
     Process sample output and save video if necessary
@@ -114,10 +115,6 @@ def post_process_sample(
                 )
 
                 if audio is not None:
-                    # Save audio
-                    import scipy.io.wavfile
-
-                    audio_path = save_file_path.rsplit(".", 1)[0] + ".wav"
                     # Audio is likely (C, L) or (L,). LTX audio is (C, L) latent -> decoded audio (1, L)
                     # We need to check shape.
                     import numpy as np
@@ -130,54 +127,51 @@ def post_process_sample(
                     else:
                         audio_np = None
                     if audio_np is not None:
-                        # Handle potential batch/channel dimensions
-                        # Expected format for wavfile.write is (Samples,) or (Samples, Channels)
-                        # Incoming audio might be (1, L), (C, L), (1, 1, L), etc.
 
                         # 1. Squeeze leading singleton dimensions (Batch, etc.)
                         while audio_np.ndim > 1 and audio_np.shape[0] == 1:
                             audio_np = audio_np.squeeze(0)
 
                         # 2. Handle (C, L) -> (L, C)
-                        # Heuristic: if we have 2 dimensions and the first is smaller than the second,
-                        # it's likely (Channels, Length). We want (Length, Channels).
                         if audio_np.ndim == 2 and audio_np.shape[0] < audio_np.shape[1]:
                             audio_np = audio_np.transpose(1, 0)
 
                         # 3. Final safety check: if still 2D and channels (dim 1) is huge, something is wrong
                         if audio_np.ndim == 2 and audio_np.shape[1] > 256:
-                            # Maybe it was (L, C) but C is actually L? (Should be caught by step 2 unless square)
-                            # Or maybe it's still (1, L) and squeeze failed? (Caught by step 1)
-                            # Fallback: just flatten if it looks like mono
                             if audio_np.shape[0] == 1:
                                 audio_np = audio_np.flatten()
-                            elif audio_np.shape[1] > audio_np.shape[0]:
-                                # This case implies shape[1] is huge and shape[0] is small-ish but > 1?
-                                # Or shape[0] is huge and shape[1] is huge?
+
+                        selected_sr = (
+                            int(audio_sample_rate)
+                            if audio_sample_rate is not None
+                            else None
+                        )
+                        if selected_sr is None or not (8000 <= selected_sr <= 192000):
+                            selected_sr = 24000
+                            try:
+                                duration_s = (
+                                    float(len(frames)) / float(fps) if fps else 0.0
+                                )
+                                if duration_s > 0:
+                                    audio_len = (
+                                        int(audio_np.shape[0])
+                                        if audio_np.ndim == 2
+                                        else int(audio_np.shape[-1])
+                                    )
+                                    inferred_sr = int(
+                                        round(float(audio_len) / duration_s)
+                                    )
+                                    if 8000 <= inferred_sr <= 192000:
+                                        selected_sr = inferred_sr
+                            except Exception:
                                 pass
 
-                        audio_sample_rate = 16000
                         try:
-                            duration_s = float(len(frames)) / float(fps) if fps else 0.0
-                            if duration_s > 0:
-                                audio_len = (
-                                    int(audio_np.shape[0])
-                                    if audio_np.ndim == 2
-                                    else int(audio_np.shape[-1])
-                                )
-                                inferred_sr = int(round(float(audio_len) / duration_s))
-                                if 8000 <= inferred_sr <= 96000:
-                                    audio_sample_rate = inferred_sr
-                        except Exception:
-                            pass
-
-                        scipy.io.wavfile.write(audio_path, audio_sample_rate, audio_np)
-                        logger.info(f"Audio saved to {CYAN}{audio_path}{RESET}")
-
-                        # Try to merge if ffmpeg is available
-                        try:
-                            import subprocess
                             import shutil
+                            import subprocess
+                            import tempfile
+
+                            import scipy.io.wavfile
 
                             ffmpeg_exe = "ffmpeg"
                             ffmpeg_on_path = shutil.which("ffmpeg")
@@ -189,41 +183,65 @@ def post_process_sample(
                                 ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
                             except Exception:
                                 pass
+                            ffmpeg_ok = False
+                            if ffmpeg_exe:
+                                if os.path.isabs(ffmpeg_exe):
+                                    ffmpeg_ok = os.path.exists(ffmpeg_exe)
+                                else:
+                                    ffmpeg_ok = shutil.which(ffmpeg_exe) is not None
+                            if not ffmpeg_ok:
+                                raise RuntimeError("ffmpeg not found")
 
                             merged_path = (
                                 save_file_path.rsplit(".", 1)[0] + ".tmp_mux.mp4"
                             )
-                            subprocess.run(
-                                [
-                                    ffmpeg_exe,
-                                    "-y",
-                                    "-i",
-                                    save_file_path,
-                                    "-i",
-                                    audio_path,
-                                    "-c:v",
-                                    "copy",
-                                    "-c:a",
-                                    "aac",
-                                    "-strict",
-                                    "experimental",
-                                    merged_path,
-                                ],
-                                check=True,
-                                stdout=subprocess.DEVNULL,
-                                stderr=subprocess.DEVNULL,
-                            )
-                            os.replace(merged_path, save_file_path)
+                            tmp_wav_path = None
                             try:
-                                os.remove(audio_path)
-                            except OSError:
-                                pass
+                                with tempfile.NamedTemporaryFile(
+                                    suffix=".wav", delete=False
+                                ) as f:
+                                    tmp_wav_path = f.name
+                                scipy.io.wavfile.write(
+                                    tmp_wav_path, selected_sr, audio_np
+                                )
+                                subprocess.run(
+                                    [
+                                        ffmpeg_exe,
+                                        "-y",
+                                        "-i",
+                                        save_file_path,
+                                        "-i",
+                                        tmp_wav_path,
+                                        "-c:v",
+                                        "copy",
+                                        "-c:a",
+                                        "aac",
+                                        "-strict",
+                                        "experimental",
+                                        merged_path,
+                                    ],
+                                    check=True,
+                                    stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL,
+                                )
+                                os.replace(merged_path, save_file_path)
+                            finally:
+                                if tmp_wav_path:
+                                    try:
+                                        os.remove(tmp_wav_path)
+                                    except OSError:
+                                        pass
+                                if os.path.exists(merged_path):
+                                    try:
+                                        os.remove(merged_path)
+                                    except OSError:
+                                        pass
                             logger.info(
                                 f"Merged video saved to {CYAN}{save_file_path}{RESET}"
                             )
                         except Exception as e:
                             logger.warning(
-                                "Failed to mux audio into mp4 (kept separate wav): %s",
+                                "Failed to mux audio into mp4 (saved silent video): %s",
                                 str(e),
                             )
 

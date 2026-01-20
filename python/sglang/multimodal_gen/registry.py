@@ -425,7 +425,7 @@ def get_model_info(
 
 # Registration of model configs
 def _register_configs():
-    # --- LTX-2 ---
+    # LTX-2
     register_configs(
         sampling_param_cls=LTX2SamplingParams,
         pipeline_config_cls=LTX2PipelineConfig,

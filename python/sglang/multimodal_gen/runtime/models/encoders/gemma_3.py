@@ -3,13 +3,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # Adapted from sglang: python/sglang/srt/models/gemma3_causal.py
 
-import math
 import logging
-from typing import Any, Optional, Tuple, Iterable, Set, List, Dict
 from functools import partial
+from typing import Any, Iterable, Optional, Set, Tuple
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 
 from sglang.multimodal_gen.configs.models.encoders.base import BaseEncoderOutput
@@ -27,11 +25,11 @@ from sglang.multimodal_gen.runtime.layers.quantization import QuantizationConfig
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import get_rope
 from sglang.multimodal_gen.runtime.loader.weight_utils import (
     default_weight_loader,
-    maybe_remap_kv_scale_name,
 )
 from sglang.multimodal_gen.runtime.utils.common import add_prefix
 
 logger = logging.getLogger(__name__)
+
 
 def get_attention_sliding_window_size(config):
     return config.sliding_window - 1
@@ -118,11 +116,11 @@ class Gemma3Attention(nn.Module):
         else:
             assert tp_size % self.total_num_kv_heads == 0
         self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
-        
+
         self.head_dim = getattr(
             config.text_config, "head_dim", self.hidden_size // self.total_num_heads
         )
-        
+
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = config.text_config.query_pre_attn_scalar**-0.5
@@ -145,13 +143,15 @@ class Gemma3Attention(nn.Module):
             prefix=f"{prefix}.o_proj",
         )
 
-        self.is_sliding = config.text_config.layer_types[layer_id] == "sliding_attention"
+        self.is_sliding = (
+            config.text_config.layer_types[layer_id] == "sliding_attention"
+        )
 
         # Initialize the rotary embedding.
         if self.is_sliding:
             # Local attention.
             self.rope_theta = config.text_config.rope_local_base_freq
-            rope_scaling = None # Default
+            rope_scaling = None  # Default
             # sliding window
             self.sliding_window = get_attention_sliding_window_size(config.text_config)
             # (left, right) = (window, 0) effectively for causal
@@ -184,8 +184,12 @@ class Gemma3Attention(nn.Module):
         # )
 
         # Gemma3 adds normalization for q and k
-        self.q_norm = Gemma3RMSNorm(dim=self.head_dim, eps=config.text_config.rms_norm_eps)
-        self.k_norm = Gemma3RMSNorm(dim=self.head_dim, eps=config.text_config.rms_norm_eps)
+        self.q_norm = Gemma3RMSNorm(
+            dim=self.head_dim, eps=config.text_config.rms_norm_eps
+        )
+        self.k_norm = Gemma3RMSNorm(
+            dim=self.head_dim, eps=config.text_config.rms_norm_eps
+        )
 
     def forward(
         self,
@@ -195,7 +199,7 @@ class Gemma3Attention(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        
+
         batch_size, seq_len, _ = q.shape
         q = q.view(batch_size, seq_len, self.num_heads, self.head_dim)
         k = k.view(batch_size, seq_len, self.num_kv_heads, self.head_dim)
@@ -232,9 +236,7 @@ class Gemma3Attention(nn.Module):
             attn_mask = attn_mask.masked_fill(too_far, float("-inf"))
 
         key_pad = ~attention_mask.to(torch.bool)
-        attn_mask = attn_mask[None, None, :, :].expand(
-            batch_size, 1, seq_len, seq_len
-        )
+        attn_mask = attn_mask[None, None, :, :].expand(batch_size, 1, seq_len, seq_len)
         attn_mask = attn_mask.masked_fill(
             key_pad[:, None, None, :].expand(batch_size, 1, seq_len, seq_len),
             float("-inf"),
@@ -252,7 +254,7 @@ class Gemma3Attention(nn.Module):
             query, key, value, **attn_kwargs
         )
         attn_output = attn_output.transpose(1, 2)
-        
+
         attn_output = attn_output.reshape(
             batch_size, seq_len, self.num_heads * self.head_dim
         )
@@ -277,7 +279,9 @@ class Gemma3DecoderLayer(nn.Module):
             hidden_size=self.hidden_size,
             num_heads=config.text_config.num_attention_heads,
             num_kv_heads=getattr(
-                config.text_config, "num_key_value_heads", config.text_config.num_attention_heads
+                config.text_config,
+                "num_key_value_heads",
+                config.text_config.num_attention_heads,
             ),
             quant_config=quant_config,
             prefix=f"{prefix}.self_attn",
@@ -289,7 +293,9 @@ class Gemma3DecoderLayer(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.mlp",
         )
-        self.input_layernorm = Gemma3RMSNorm(config.text_config.hidden_size, eps=config.text_config.rms_norm_eps)
+        self.input_layernorm = Gemma3RMSNorm(
+            config.text_config.hidden_size, eps=config.text_config.rms_norm_eps
+        )
         self.post_attention_layernorm = Gemma3RMSNorm(
             config.text_config.hidden_size, eps=config.text_config.rms_norm_eps
         )
@@ -311,30 +317,30 @@ class Gemma3DecoderLayer(nn.Module):
         # Gemma3 uses "sandwich norm":
         # x = x + norm(attn(norm(x)))
         # So we treat input hidden_states as the residual base.
-        
+
         if residual is not None:
-             hidden_states = hidden_states + residual
-             residual = None
-        
+            hidden_states = hidden_states + residual
+            residual = None
+
         residual_input = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        
+
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
             attention_mask=attention_mask,
         )
-        
+
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = residual_input + hidden_states
-        
+
         # MLP
         residual_mlp = hidden_states
         hidden_states = self.pre_feedforward_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = self.post_feedforward_layernorm(hidden_states)
         hidden_states = residual_mlp + hidden_states
-        
+
         return hidden_states, None
 
 
@@ -354,6 +360,7 @@ class Gemma3TextScaledWordEmbedding(nn.Embedding):
 
 
 # --- Siglip Vision Model Implementation ---
+
 
 class QuickGELU(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -452,7 +459,7 @@ class SiglipAttention(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("qkv_proj", prefix),
         )
-        
+
         self.out_proj = RowParallelLinear(
             input_size=hidden_size,
             output_size=hidden_size,
@@ -460,30 +467,30 @@ class SiglipAttention(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("out_proj", prefix),
         )
-        
+
         self.attn = LocalAttention(
             num_heads=self.num_heads_per_partition,
             head_size=self.head_dim,
             num_kv_heads=self.num_heads_per_partition,
             softmax_scale=self.scaling,
-            causal=False, # Bidirectional for Vision
+            causal=False,  # Bidirectional for Vision
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.hidden_size // get_tp_world_size()] * 3, dim=-1)
-        
+
         batch_size, seq_len, _ = q.shape
         q = q.view(batch_size, seq_len, self.num_heads_per_partition, self.head_dim)
         k = k.view(batch_size, seq_len, self.num_heads_per_partition, self.head_dim)
         v = v.view(batch_size, seq_len, self.num_heads_per_partition, self.head_dim)
 
         attn_output = self.attn(q, k, v)
-        
+
         attn_output = attn_output.reshape(
             batch_size, seq_len, self.hidden_size // get_tp_world_size()
         )
-        
+
         output, _ = self.out_proj(attn_output)
         return output
 
@@ -523,7 +530,7 @@ class SiglipEncoderLayer(nn.Module):
         hidden_states = self.layer_norm1(hidden_states)
         hidden_states = self.self_attn(hidden_states)
         hidden_states = residual + hidden_states
-        
+
         residual = hidden_states
         hidden_states = self.layer_norm2(hidden_states)
         hidden_states = self.mlp(hidden_states)
@@ -615,9 +622,10 @@ class SiglipVisionModel(nn.Module):
 
 class Gemma3MultiModalProjector(nn.Module):
     """Projector for Gemma3 multimodal."""
+
     def __init__(self, config: Gemma3Config):
         super().__init__()
-        
+
         self.mm_input_projection_weight = nn.Parameter(
             torch.zeros(
                 config.vision_config.hidden_size, config.text_config.hidden_size
@@ -669,12 +677,12 @@ class Gemma3TextModel(nn.Module):
         self.config = config
         # TODO(yinfan.1024) support text encoding model quant later
         self.quant_config = None
-        
+
         # Use VocabParallelEmbedding
         from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
             VocabParallelEmbedding,
         )
-        
+
         self.vocab_size = config.text_config.vocab_size
         self.embed_tokens = VocabParallelEmbedding(
             self.vocab_size,
@@ -695,8 +703,10 @@ class Gemma3TextModel(nn.Module):
                 for i in range(config.text_config.num_hidden_layers)
             ]
         )
-        
-        self.norm = Gemma3RMSNorm(config.text_config.hidden_size, eps=config.text_config.rms_norm_eps)
+
+        self.norm = Gemma3RMSNorm(
+            config.text_config.hidden_size, eps=config.text_config.rms_norm_eps
+        )
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids) * self.embed_scale
@@ -715,12 +725,12 @@ class Gemma3TextModel(nn.Module):
             if output_hidden_states is not None
             else self.config.output_hidden_states
         )
-        
+
         if inputs_embeds is not None:
             hidden_states = inputs_embeds
         else:
             hidden_states = self.get_input_embeddings(input_ids)
-            
+
         residual = None
 
         if position_ids is None:
@@ -730,11 +740,11 @@ class Gemma3TextModel(nn.Module):
         position_ids = position_ids + 1
 
         all_hidden_states: tuple[Any, ...] | None = () if output_hidden_states else None
-        
+
         for layer in self.layers:
             if all_hidden_states is not None:
                 all_hidden_states += (hidden_states,)
-            
+
             hidden_states, residual = layer(
                 position_ids,
                 hidden_states,
@@ -743,7 +753,7 @@ class Gemma3TextModel(nn.Module):
             )
 
         hidden_states = self.norm(hidden_states)
-        
+
         if all_hidden_states is not None:
             all_hidden_states += (hidden_states,)
 
@@ -751,16 +761,18 @@ class Gemma3TextModel(nn.Module):
             last_hidden_state=hidden_states,
             hidden_states=all_hidden_states,
         )
-        
+
         return output
 
     def load_weights(self, weights: Any) -> set[str]:
         # Copied from LlamaModel.load_weights but adapted
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
-        
+
         stacked_params_mapping = getattr(
-            getattr(self.config, "arch_config", object()), "stacked_params_mapping", None
+            getattr(self.config, "arch_config", object()),
+            "stacked_params_mapping",
+            None,
         )
         if stacked_params_mapping is None:
             stacked_params_mapping = [
@@ -774,7 +786,7 @@ class Gemma3TextModel(nn.Module):
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
-            
+
             # The config has stacked_params_mapping
             for (
                 param_name,
@@ -784,10 +796,10 @@ class Gemma3TextModel(nn.Module):
                 if weight_name not in name:
                     continue
                 name = name.replace(weight_name, param_name)
-                
+
                 if name not in params_dict:
                     continue
-                
+
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
@@ -795,11 +807,11 @@ class Gemma3TextModel(nn.Module):
             else:
                 if name not in params_dict:
                     continue
-                
+
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
-                
+
             loaded_params.add(name)
         return loaded_params
 
@@ -825,10 +837,10 @@ class Gemma3ForConditionalGeneration(nn.Module):
 
         # Projector
         self.multi_modal_projector = Gemma3MultiModalProjector(config)
-        
+
         # Text Model
         self.language_model = Gemma3TextModel(config)
-        
+
     def get_placeholder_mask(
         self,
         input_ids: torch.LongTensor,
@@ -867,11 +879,14 @@ class Gemma3ForConditionalGeneration(nn.Module):
             llm_input_ids = input_ids
 
         inputs_embeds = self.language_model.get_input_embeddings(llm_input_ids)
-        
+
         if pixel_values is not None:
             if pixel_values.dim() == 5:
                 pixel_values = pixel_values.reshape(
-                    -1, pixel_values.shape[2], pixel_values.shape[3], pixel_values.shape[4]
+                    -1,
+                    pixel_values.shape[2],
+                    pixel_values.shape[3],
+                    pixel_values.shape[4],
                 )
             elif pixel_values.dim() == 3:
                 pixel_values = pixel_values.unsqueeze(0)
@@ -880,26 +895,32 @@ class Gemma3ForConditionalGeneration(nn.Module):
 
             vision_outputs = self.vision_tower(pixel_values)
             image_features = self.multi_modal_projector(vision_outputs)
-            image_features = image_features.to(device=inputs_embeds.device, dtype=inputs_embeds.dtype)
+            image_features = image_features.to(
+                device=inputs_embeds.device, dtype=inputs_embeds.dtype
+            )
             special_image_mask = self.get_placeholder_mask(
                 input_ids, inputs_embeds=inputs_embeds, image_features=image_features
             )
-            inputs_embeds = inputs_embeds.masked_scatter(special_image_mask, image_features)
+            inputs_embeds = inputs_embeds.masked_scatter(
+                special_image_mask, image_features
+            )
 
-        return self.language_model.forward(llm_input_ids, inputs_embeds=inputs_embeds, **kwargs)
+        return self.language_model.forward(
+            llm_input_ids, inputs_embeds=inputs_embeds, **kwargs
+        )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> Set[str]:
         loaded_params: Set[str] = set()
         params_dict = dict(self.named_parameters())
-        
+
         # Separate weights
         language_model_weights: list[tuple[str, torch.Tensor]] = []
         other_weights: list[tuple[str, torch.Tensor]] = []
-        
+
         for name, loaded_weight in weights:
             # Handle prefix mapping if needed
             # HF weights might be "model.vision_tower...", "model.language_model..."
-            
+
             if "vision_tower" in name or "vision_model" in name:
                 # Load vision tower weights
                 # Map name to local name
@@ -907,19 +928,24 @@ class Gemma3ForConditionalGeneration(nn.Module):
                 if "model.vision_tower" in name:
                     local_name = name.replace("model.vision_tower", "vision_tower")
                 elif "vision_tower" in name:
-                    pass # already correct prefix if matching self.vision_tower
+                    pass  # already correct prefix if matching self.vision_tower
                 elif local_name.startswith("vision_model."):
-                    local_name = "vision_tower.vision_model." + local_name[len("vision_model.") :]
-                
+                    local_name = (
+                        "vision_tower.vision_model."
+                        + local_name[len("vision_model.") :]
+                    )
+
                 # We need to map HF Siglip names to our Siglip implementation
                 # Our Siglip: vision_tower.vision_model.encoder.layers...
                 # HF Siglip: vision_model.encoder.layers...
-                
+
                 # If loading from Gemma3 checkpoint, it usually has "model.vision_tower.vision_model..."
-                
+
                 if local_name in params_dict:
                     param = params_dict[local_name]
-                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
                     weight_loader(param, loaded_weight)
                     loaded_params.add(local_name)
                 else:
@@ -943,7 +969,9 @@ class Gemma3ForConditionalGeneration(nn.Module):
 
                     if fused_name is not None and fused_name in params_dict:
                         param = params_dict[fused_name]
-                        weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                        weight_loader = getattr(
+                            param, "weight_loader", default_weight_loader
+                        )
                         weight_loader(param, loaded_weight, qkv_shard_id)
                         loaded_params.add(fused_name)
                         continue
@@ -954,7 +982,9 @@ class Gemma3ForConditionalGeneration(nn.Module):
                         )
                         if candidate in params_dict:
                             param = params_dict[candidate]
-                            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                            weight_loader = getattr(
+                                param, "weight_loader", default_weight_loader
+                            )
                             weight_loader(param, loaded_weight)
                             loaded_params.add(candidate)
                             continue
@@ -964,7 +994,9 @@ class Gemma3ForConditionalGeneration(nn.Module):
                         )
                         if candidate in params_dict:
                             param = params_dict[candidate]
-                            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                            weight_loader = getattr(
+                                param, "weight_loader", default_weight_loader
+                            )
                             weight_loader(param, loaded_weight)
                             loaded_params.add(candidate)
                             continue
@@ -974,33 +1006,39 @@ class Gemma3ForConditionalGeneration(nn.Module):
                     # Try adding vision_model
                     candidate = f"vision_tower.vision_model.{suffix}"
                     if candidate in params_dict:
-                         param = params_dict[candidate]
-                         weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                         weight_loader(param, loaded_weight)
-                         loaded_params.add(candidate)
-            
+                        param = params_dict[candidate]
+                        weight_loader = getattr(
+                            param, "weight_loader", default_weight_loader
+                        )
+                        weight_loader(param, loaded_weight)
+                        loaded_params.add(candidate)
+
             elif "multi_modal_projector" in name:
                 local_name = name
                 if "model.multi_modal_projector" in name:
-                     local_name = name.replace("model.multi_modal_projector", "multi_modal_projector")
-                
+                    local_name = name.replace(
+                        "model.multi_modal_projector", "multi_modal_projector"
+                    )
+
                 if local_name in params_dict:
                     param = params_dict[local_name]
-                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
                     weight_loader(param, loaded_weight)
                     loaded_params.add(local_name)
-            
+
             elif "language_model" in name or "model.language_model" in name:
                 # Strip prefix for language model
                 # If name is "model.language_model.model.layers.0...", we want "model.layers.0..." for Gemma3ForCausalLM
                 # Gemma3ForCausalLM has .model (Gemma3TextModel) and .lm_head
-                
+
                 # HF: model.language_model.model.layers...
                 # Ours: language_model.model.layers...
-                
+
                 # We pass (name, weight) to language_model.load_weights
                 # We should strip "model.language_model." or "language_model."
-                
+
                 suffix = name
                 if "model.language_model." in name:
                     suffix = name.replace("model.language_model.", "")
@@ -1008,9 +1046,9 @@ class Gemma3ForConditionalGeneration(nn.Module):
                     suffix = name.replace("language_model.", "")
                 if suffix.startswith("model."):
                     suffix = suffix[len("model.") :]
-                
+
                 language_model_weights.append((suffix, loaded_weight))
-            
+
             else:
                 # Fallback for other weights (maybe direct lm_head if not nested?)
                 other_weights.append((name, loaded_weight))
@@ -1032,5 +1070,6 @@ class Gemma3ForConditionalGeneration(nn.Module):
         if sliding_window is None:
             return None
         return int(sliding_window) - 1
+
 
 EntryClass = Gemma3ForConditionalGeneration

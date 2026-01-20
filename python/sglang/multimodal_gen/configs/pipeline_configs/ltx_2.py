@@ -180,10 +180,11 @@ class LTX2PipelineConfig(PipelineConfig):
     ] = field(default_factory=lambda: (_gemma_postprocess_func,))
 
     def prepare_sigmas(self, sigmas, num_inference_steps):
-        # For LTX-2 we want the scheduler to own its sigma schedule (dynamic shifting, stretching, etc.).
-        # Only override when the user explicitly provides `sigmas`.
         if sigmas is None:
-            return None
+            steps = int(num_inference_steps)
+            if steps <= 0:
+                raise ValueError(f"num_inference_steps must be positive, got {steps}")
+            return np.linspace(1.0, 1.0 / float(steps), steps).tolist()
         return sigmas
 
     def tokenize_prompt(self, prompt: list[str], tokenizer, tok_kwargs) -> dict:
@@ -230,7 +231,9 @@ class LTX2PipelineConfig(PipelineConfig):
         latents = latents.permute(0, 2, 4, 6, 1, 3, 5, 7).flatten(4, 7).flatten(1, 3)
         return latents
 
-    def _infer_video_latent_frames_and_tokens_per_frame(self, batch, seq_len: int) -> tuple[int, int]:
+    def _infer_video_latent_frames_and_tokens_per_frame(
+        self, batch, seq_len: int
+    ) -> tuple[int, int]:
         """Infer latent-frame count and tokens-per-frame for packed token latents [B, S, D].
 
         Notes:
@@ -256,7 +259,9 @@ class LTX2PipelineConfig(PipelineConfig):
                 "Invalid latent H/W computed from batch.height/width: "
                 f"{batch.height=} {batch.width=} {self.vae_scale_factor=}"
             )
-        if (latent_height % int(self.patch_size)) != 0 or (latent_width % int(self.patch_size)) != 0:
+        if (latent_height % int(self.patch_size)) != 0 or (
+            latent_width % int(self.patch_size)
+        ) != 0:
             raise ValueError(
                 "Invalid spatial patching for packed token latents. Expected latent H/W "
                 "to be divisible by patch_size, got "
@@ -295,8 +300,8 @@ class LTX2PipelineConfig(PipelineConfig):
 
         sp_rank = get_sp_parallel_rank()
         seq_len = int(latents.shape[1])
-        latent_frames, tokens_per_frame = self._infer_video_latent_frames_and_tokens_per_frame(
-            batch, seq_len
+        latent_frames, tokens_per_frame = (
+            self._infer_video_latent_frames_and_tokens_per_frame(batch, seq_len)
         )
 
         # Pad whole frames so `latent_frames` is divisible by `sp_world_size`.
@@ -493,13 +498,6 @@ class LTX2PipelineConfig(PipelineConfig):
             self.patch_size_t,
         )
 
-        # Handle Audio
-        # Calculate audio latent dims
-        # Using the logic from prepare_audio_latent_shape or similar
-        # But we need audio_num_frames (latent length) and latent_mel_bins
-
-        # Re-calculate or pass? prepare_audio_latent_shape returns (B, C, L, M)
-        # We can re-calculate
         sample_rate = self.audio_vae_config.arch_config.sample_rate
         hop_length = self.audio_vae_config.arch_config.mel_hop_length
         temporal_compression = self.audio_vae_temporal_compression_ratio
@@ -516,9 +514,11 @@ class LTX2PipelineConfig(PipelineConfig):
 
         audio_latents_mean = getattr(audio_vae, "latents_mean", None)
         audio_latents_std = getattr(audio_vae, "latents_std", None)
-        if isinstance(audio_latents_mean, torch.Tensor) and isinstance(
-            audio_latents_std, torch.Tensor
-        ) and audio_latents_mean.numel() == audio_latents_std.numel():
+        if (
+            isinstance(audio_latents_mean, torch.Tensor)
+            and isinstance(audio_latents_std, torch.Tensor)
+            and audio_latents_mean.numel() == audio_latents_std.numel()
+        ):
             audio_latents_mean = audio_latents_mean.to(
                 device=audio_latents.device, dtype=audio_latents.dtype
             )
@@ -531,20 +531,18 @@ class LTX2PipelineConfig(PipelineConfig):
                         f"audio_latents last dim {audio_latents.shape[-1]} "
                         f"does not match audio_vae stats {audio_latents_mean.numel()}"
                     )
-                audio_latents = (
-                    audio_latents * audio_latents_std.view(1, 1, -1)
-                    + audio_latents_mean.view(1, 1, -1)
-                )
+                audio_latents = audio_latents * audio_latents_std.view(
+                    1, 1, -1
+                ) + audio_latents_mean.view(1, 1, -1)
             elif audio_latents.ndim == 2:
                 if audio_latents.shape[-1] != audio_latents_mean.numel():
                     raise ValueError(
                         f"audio_latents last dim {audio_latents.shape[-1]} "
                         f"does not match audio_vae stats {audio_latents_mean.numel()}"
                     )
-                audio_latents = (
-                    audio_latents * audio_latents_std.view(1, -1)
-                    + audio_latents_mean.view(1, -1)
-                )
+                audio_latents = audio_latents * audio_latents_std.view(
+                    1, -1
+                ) + audio_latents_mean.view(1, -1)
             else:
                 audio_latents = audio_latents * audio_latents_std + audio_latents_mean
 

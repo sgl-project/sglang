@@ -65,8 +65,8 @@ class Gemma3ArchConfig(TextEncoderArchConfig):
             (".qkv_proj", ".q_proj", "q"),
             (".qkv_proj", ".k_proj", "k"),
             (".qkv_proj", ".v_proj", "v"),
-            (".gate_up_proj", ".gate_proj", 0),  # type: ignore
-            (".gate_up_proj", ".up_proj", 1),  # type: ignore
+            (".gate_up_proj", ".gate_proj", "0"),  # type: ignore
+            (".gate_up_proj", ".up_proj", "1"),  # type: ignore
         ]
     )
     _fsdp_shard_conditions: list = field(

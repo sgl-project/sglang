@@ -33,10 +33,14 @@ class LTX2AVDecodingStage(DecodingStage):
         latents = batch.latents.to(get_local_torch_device())
 
         vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
-        vae_autocast_enabled = (vae_dtype != torch.float32) and not server_args.disable_autocast
+        vae_autocast_enabled = (
+            vae_dtype != torch.float32
+        ) and not server_args.disable_autocast
 
         latents = self.scale_and_shift(latents, server_args)
-        latents = server_args.pipeline_config.preprocess_decoding(latents, server_args, vae=self.vae)
+        latents = server_args.pipeline_config.preprocess_decoding(
+            latents, server_args, vae=self.vae
+        )
 
         with torch.autocast(
             device_type=current_platform.device_type,
@@ -86,7 +90,9 @@ class LTX2AVDecodingStage(DecodingStage):
             audio_latents = audio_latents.to(device, dtype=dtype)
             latents_std = getattr(self.audio_vae, "latents_std", None)
             if isinstance(latents_std, torch.Tensor) and torch.all(latents_std == 0):
-                logger.warning("audio_vae.latents_std is all zeros; audio denorm may be incorrect.")
+                logger.warning(
+                    "audio_vae.latents_std is all zeros; audio denorm may be incorrect."
+                )
 
             with torch.no_grad():
                 # Decode latents to spectrogram
@@ -103,6 +109,17 @@ class LTX2AVDecodingStage(DecodingStage):
                 # Decode spectrogram to waveform
                 waveform = self.vocoder(spectrogram)
             output_batch.audio = waveform.cpu().float()
+            pipeline_audio_cfg = getattr(
+                server_args.pipeline_config, "audio_vae_config", None
+            )
+            pipeline_audio_sr = getattr(
+                getattr(pipeline_audio_cfg, "arch_config", None), "sample_rate", None
+            )
+            output_batch.audio_sample_rate = (
+                getattr(self.vocoder, "sample_rate", None)
+                or getattr(self.audio_vae, "sample_rate", None)
+                or pipeline_audio_sr
+            )
 
         self.offload_model()
         return output_batch

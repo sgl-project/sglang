@@ -71,6 +71,12 @@ class LTX2Vocoder(ABC, nn.Module):
         config: LTXVocoderConfig,
     ):
         super().__init__()
+        self.config = config
+        self.sample_rate = (
+            getattr(config.arch_config, "sample_rate", None)
+            or getattr(config.arch_config, "sampling_rate", None)
+            or getattr(config.arch_config, "audio_sample_rate", None)
+        )
 
         in_channels = config.arch_config.in_channels
         hidden_channels = config.arch_config.hidden_channels

@@ -217,6 +217,7 @@ async def process_generation_batch(
                 f"Model generation returned no output. Error from scheduler: {error_msg}"
             )
         save_file_path_list = []
+        audio_sample_rate = getattr(result, "audio_sample_rate", None)
         if batch.data_type == DataType.VIDEO:
             for idx, output in enumerate(result.output):
                 save_file_path = str(
@@ -236,6 +237,7 @@ async def process_generation_batch(
                     batch.fps,
                     batch.save_output,
                     save_file_path,
+                    audio_sample_rate=audio_sample_rate,
                 )
                 save_file_path_list.append(save_file_path)
         else:
@@ -251,6 +253,7 @@ async def process_generation_batch(
                     batch.fps,
                     batch.save_output,
                     save_file_path,
+                    audio_sample_rate=audio_sample_rate,
                 )
                 save_file_path_list.append(save_file_path)
 
