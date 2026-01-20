@@ -172,8 +172,11 @@ class Envs:
     SGLANG_TEST_MAX_RETRY = EnvInt(None)
 
     # Constrained Decoding (Grammar)
-    SGLANG_GRAMMAR_SIMULATE_TIMEOUT = EnvFloat(-1)
-    SGLANG_GRAMMAR_POLL_INTERVAL = EnvFloat(0.03)
+    SGLANG_GRAMMAR_POLL_INTERVAL = EnvFloat(0.005)
+    SGLANG_GRAMMAR_MAX_POLL_ITERATIONS = EnvInt(10000)
+
+    # CuTe DSL GDN Decode
+    SGLANG_USE_CUTEDSL_GDN_DECODE = EnvBool(False)
 
     # Test & Debug
     SGLANG_DETECT_SLOW_RANK = EnvBool(False)
@@ -242,6 +245,8 @@ class Envs:
     SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES = EnvInt(30)
     SGLANG_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK = EnvFloat(None)
     SGLANG_DATA_PARALLEL_BUDGET_INTERVAL = EnvInt(1)
+    SGLANG_QUEUED_TIMEOUT_MS = EnvInt(-1)
+    SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH = EnvBool(False)
 
     # Test: pd-disaggregation
     SGLANG_TEST_PD_DISAGG_BACKEND = EnvStr("mooncake")
@@ -250,10 +255,6 @@ class Envs:
     # Model Parallel
     SGLANG_USE_MESSAGE_QUEUE_BROADCASTER = EnvBool(True)
     SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS = EnvBool(False)
-
-    # Constrained Decoding
-    SGLANG_DISABLE_OUTLINES_DISK_CACHE = EnvBool(True)
-    SGLANG_GRAMMAR_TIMEOUT = EnvFloat(300)
 
     # Tool Calling
     SGLANG_FORWARD_UNKNOWN_TOOLS = EnvBool(False)
@@ -265,6 +266,7 @@ class Envs:
     SGLANG_MOONCAKE_CUSTOM_MEM_POOL = EnvStr(None)
     ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE = EnvBool(False)
     ASCEND_NPU_PHY_ID = EnvInt(-1)
+    SGLANG_MOONCAKE_SEND_AUX_TCP = EnvBool(False)
 
     # Mooncake Store
     SGLANG_HICACHE_MOONCAKE_CONFIG_PATH = EnvStr(None)
@@ -504,6 +506,10 @@ _warn_deprecated_env_to_cli_flag(
 _warn_deprecated_env_to_cli_flag(
     "SGLANG_SUPPORT_CUTLASS_BLOCK_FP8",
     "It will be completely removed in 0.5.7. Please use '--fp8-gemm-backend=cutlass' instead.",
+)
+_warn_deprecated_env_to_cli_flag(
+    "SGLANG_FLASHINFER_FP4_GEMM_BACKEND",
+    "It will be completely removed in 0.5.9. Please use '--fp4-gemm-backend' instead.",
 )
 _warn_deprecated_env_to_cli_flag(
     "SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE",
