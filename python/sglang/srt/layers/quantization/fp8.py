@@ -385,15 +385,6 @@ class Fp8LinearMethod(LinearMethodBase):
                 layer.register_parameter("input_scale", None)
 
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
-        if self.use_mxfp8:
-            if not self.is_checkpoint_fp8_serialized:
-                self._quantize_mxfp8_weights(layer)
-                return
-            # MXFP8 scales are stored as UE8M0 uint8; no requantization here.
-            layer.weight_scale_inv = torch.nn.Parameter(
-                layer.weight_scale_inv.data, requires_grad=False
-            )
-            return
         # If ROCm, normalize the weights and scales to e4m3fnuz
         if _is_fp8_fnuz:
             # activation_scheme: dynamic
@@ -408,6 +399,15 @@ class Fp8LinearMethod(LinearMethodBase):
                 _is_cpu_amx_available
             ), "Fp8LinearMethod on CPU requires that CPU has AMX support"
             _amx_process_weight_after_loading(layer, ["weight"])
+            layer.weight_scale_inv = torch.nn.Parameter(
+                layer.weight_scale_inv.data, requires_grad=False
+            )
+            return
+        elif self.use_mxfp8:
+            if not self.is_checkpoint_fp8_serialized:
+                self._quantize_mxfp8_weights(layer)
+                return
+            # MXFP8 scales are stored as UE8M0 uint8; no requantization here.
             layer.weight_scale_inv = torch.nn.Parameter(
                 layer.weight_scale_inv.data, requires_grad=False
             )
@@ -850,9 +850,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.w2_input_scale = None
 
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
-        if self.use_mxfp8 and not self.quant_config.is_checkpoint_fp8_serialized:
-            self._quantize_mxfp8_moe_weights(layer)
-            return
         # If ROCm, normalize the weights and scales to e4m3fnuz
         if _is_fp8_fnuz:
             # activation_scheme: dynamic
@@ -899,6 +896,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 _is_cpu_amx_available
             ), "Fp8MoEMethod on CPU requires that CPU has AMX support"
             _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
+        elif self.use_mxfp8 and not self.quant_config.is_checkpoint_fp8_serialized:
+            self._quantize_mxfp8_moe_weights(layer)
         else:
             # For fp8 moe run with deepgemm, the expert weights and scales need be requantized to ue8m0
             from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE
