@@ -310,7 +310,7 @@ RUN --mount=type=cache,target=/root/.cache/pip if [ "${CUDA_VERSION%%.*}" = "12"
 elif [ "${CUDA_VERSION%%.*}" = "13" ]; then \
     python3 -m pip install nvidia-nccl-cu13==2.28.3 --force-reinstall --no-deps ; \
     python3 -m pip install nvidia-cublas==13.1.0.3 --force-reinstall --no-deps ; \
-    python3 -m pip install nixl-cu13 ; \
+    python3 -m pip install nixl-cu13 --no-deps ; \
     python3 -m pip install cuda-python==13.1.1 ; \
 fi
 
