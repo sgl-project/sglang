@@ -26,7 +26,6 @@ from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.code_completion_parser import (
     generate_completion_prompt_from_request,
 )
-from sglang.srt.server_args import get_global_server_args
 from sglang.utils import convert_json_schema_to_str
 
 if TYPE_CHECKING:
@@ -194,7 +193,7 @@ class OpenAIServingCompletion(OpenAIBeamSearchMixin, OpenAIServingBase):
         raw_request: Request,
     ) -> AsyncGenerator[str, None]:
         """Generate streaming completion response"""
-        if get_global_server_args().enable_beam_search and request.n > 1:
+        if self.tokenizer_manager.server_args.enable_beam_search and request.n > 1:
             async for chunk in self._generate_completion_beam_search_stream(
                 adapted_request, request, raw_request
             ):
@@ -378,7 +377,7 @@ class OpenAIServingCompletion(OpenAIBeamSearchMixin, OpenAIServingBase):
         created: int,
     ) -> CompletionResponse:
         """Build completion response from generation results"""
-        if get_global_server_args().enable_beam_search and request.n > 1:
+        if self.tokenizer_manager.server_args.enable_beam_search and request.n > 1:
             return self._build_completion_beam_search_response(request, ret, created)
 
         choices = []
