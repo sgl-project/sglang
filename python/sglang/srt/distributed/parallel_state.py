@@ -239,14 +239,27 @@ class GroupCoordinator:
         self.local_size = get_int_env_var("LOCAL_SIZE", 0)
 
         for ranks in group_ranks:
-            device_group = torch.distributed.new_group(
-                ranks, backend=torch_distributed_backend
-            )
-            # a cpu_group to allow direct coordination between processes through
-            # the CPU. The backend is chosen based on `torch_distributed_backend`
+            active_ranks = torch.ones(len(ranks), dtype=torch.int32, device="cuda")
+            active_ranks_cpu = torch.ones(len(ranks), dtype=torch.int32)
             if "mooncake" in torch_distributed_backend:
-                cpu_group = torch.distributed.new_group(ranks, backend="mooncake-cpu")
+                from mooncake.ep import MooncakeBackendOptions
+
+                device_group = torch.distributed.new_group(
+                    ranks,
+                    backend="mooncake",
+                    pg_options=MooncakeBackendOptions(active_ranks),
+                )
+                cpu_group = torch.distributed.new_group(
+                    ranks,
+                    backend="mooncake-cpu",
+                    pg_options=MooncakeBackendOptions(active_ranks_cpu),
+                )
             else:
+                device_group = torch.distributed.new_group(
+                    ranks, backend=torch_distributed_backend
+                )
+                # a group with `gloo` backend, to allow direct coordination
+                # between processes through the CPU.
                 cpu_group = torch.distributed.new_group(
                     ranks, backend="gloo", timeout=gloo_timeout
                 )
@@ -256,6 +269,8 @@ class GroupCoordinator:
                 self.rank_in_group = ranks.index(self.rank)
                 self.device_group = device_group
                 self.cpu_group = cpu_group
+                self.active_ranks = active_ranks
+                self.active_ranks_cpu = active_ranks_cpu
 
         assert self.cpu_group is not None
         assert self.device_group is not None
@@ -1343,7 +1358,7 @@ def init_model_parallel_group(
         group_ranks=group_ranks,
         local_rank=local_rank,
         torch_distributed_backend=backend,
-        use_pynccl=not (_is_npu or _is_xpu),
+        use_pynccl=not (_is_npu or _is_xpu or backend == "mooncake"),
         use_pymscclpp=use_mscclpp_allreduce,
         use_custom_allreduce=use_custom_allreduce,
         use_torch_symm_mem_all_reduce=use_torch_symm_mem_allreduce,

@@ -1462,6 +1462,11 @@ class AbortReq(BaseReq):
 
 
 @dataclass
+class ActiveRanksOutput(BaseReq):
+    status: List[bool]
+
+
+@dataclass
 class GetInternalStateReq(BaseReq):
     pass
 
