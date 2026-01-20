@@ -36,14 +36,12 @@ fn bench_token_search_comparison(c: &mut Criterion) {
         let ac = AhoCorasick::new(&special_tokens).unwrap();
         group.throughput(Throughput::Bytes(text.len() as u64));
 
-        // Benchmark Naive
         group.bench_function(format!("naive_tokens_{}", token_count), |b| {
             b.iter(|| {
                 find_special_token_boundaries_naive(black_box(&text), black_box(&special_tokens))
             })
         });
 
-        // Benchmark Aho-Corasick
         group.bench_function(format!("aho_tokens_{}", token_count), |b| {
             b.iter(|| find_special_token_boundaries_aho(black_box(&text), black_box(&ac)))
         });
