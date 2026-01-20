@@ -322,11 +322,10 @@ class NativeSparseAttnBackend(
         self.device_sm_major = self.device_capability[0]
 
         # Allocate global workspace buffer for TRT-LLM kernels (ragged attention on SM100/B200, or trtllm_gen decode)
-        # Use torch.zeros() for zero-initialization required by TRT-LLM Gen multi-block reduction
         if self.device_sm_major >= 10 or self.nsa_decode_impl == "trtllm_gen":
             global global_workspace_buffer
             if global_workspace_buffer is None:
-                global_workspace_buffer = torch.zeros(
+                global_workspace_buffer = torch.empty(
                     envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get(),
                     dtype=torch.uint8,
                     device=model_runner.device,
