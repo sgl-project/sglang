@@ -67,6 +67,7 @@ from sglang.srt.utils import (
     BumpAllocator,
     LazyValue,
     add_prefix,
+    get_current_device_stream_fast,
     get_device_sm,
     is_cuda,
     log_info_on_rank0,
@@ -445,7 +446,7 @@ class Glm4MoeLiteModel(DeepseekV2Model):
         else:
             self.embed_tokens = PPMissingLayer()
 
-        self.alt_stream = torch.cuda.Stream() if _is_cuda else None
+        self.alt_stream = get_current_device_stream_fast() if _is_cuda else None
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: Glm4MoeLiteDecoderLayer(
