@@ -11,7 +11,9 @@ register_npu_ci(est_time=400, suite="nightly-1-npu-a3", nightly=True)
 
 MODELS = [
     ("/root/.cache/huggingface/hub/models--Skywork--Skywork-Reward-Llama-3.1-8B-v0.2/snapshots/d4117fbfd81b72f41b96341238baa1e3e90a4ce1/",
-     1, 4e-2),
+     1,
+     4e-2,
+     ),
 ]
 TORCH_DTYPES = [torch.float16]
 
