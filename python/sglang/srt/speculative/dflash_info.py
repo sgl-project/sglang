@@ -41,12 +41,12 @@ class DFlashDraftInput(SpecInput):
     # or default K == draft_num_layers for existing checkpoints).
     target_hidden: torch.Tensor
 
-    # Context lengths on CPU, one per request. Used to slice `target_hidden`.
-    ctx_lens_cpu: List[int]
+    # Context lengths per request, used to slice `target_hidden`. Device tensor (int32).
+    ctx_lens: torch.Tensor
 
-    # Native implementation: how many tokens are already materialized in the draft KV cache.
-    # The next draft step appends `ctx_lens_cpu[i]` tokens starting at `draft_seq_lens_cpu[i]`.
-    draft_seq_lens_cpu: List[int]
+    # How many tokens are already in the draft KV cache per request.
+    # The next draft step appends ctx_lens[i] tokens starting at draft_seq_lens[i].
+    draft_seq_lens: torch.Tensor
 
     def __post_init__(self):
         super().__init__(spec_input_type=SpecInputType.DFLASH_DRAFT)
@@ -56,36 +56,49 @@ class DFlashDraftInput(SpecInput):
         return (1, 1)
 
     def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
-        keep_indices = new_indices.tolist()
-
-        old_ctx_lens_cpu = self.ctx_lens_cpu
+        old_ctx_lens = self.ctx_lens
         old_target_hidden = self.target_hidden
 
         self.verified_id = self.verified_id[new_indices]
-        self.ctx_lens_cpu = [old_ctx_lens_cpu[i] for i in keep_indices]
-        self.draft_seq_lens_cpu = [self.draft_seq_lens_cpu[i] for i in keep_indices]
+        self.ctx_lens = old_ctx_lens[new_indices]
+        self.draft_seq_lens = self.draft_seq_lens[new_indices]
 
         if old_target_hidden is None or old_target_hidden.numel() == 0:
             self.target_hidden = old_target_hidden
             return
 
-        old_offsets: List[int] = [0]
-        for ln in old_ctx_lens_cpu:
-            old_offsets.append(old_offsets[-1] + int(ln))
+        # Rebuild target_hidden for the filtered batch using vectorized indexing.
+        old_bs = int(old_ctx_lens.shape[0])
+        offsets = torch.zeros(
+            (old_bs + 1,), dtype=torch.int64, device=old_ctx_lens.device
+        )
+        offsets[1:].copy_(old_ctx_lens.to(torch.int64).cumsum(0))
 
-        segments: List[torch.Tensor] = []
-        for idx in keep_indices:
-            ln = int(old_ctx_lens_cpu[idx])
-            if ln == 0:
-                continue
-            segments.append(old_target_hidden[old_offsets[idx] : old_offsets[idx + 1]])
+        start = offsets[:-1]
+        seg_start = start[new_indices]
+        seg_lens = old_ctx_lens[new_indices].to(torch.int64)
 
-        self.target_hidden = torch.cat(segments, dim=0) if segments else old_target_hidden[:0]
+        max_len = int(seg_lens.max().item()) if seg_lens.numel() > 0 else 0
+        if max_len <= 0:
+            self.target_hidden = old_target_hidden[:0]
+            return
+
+        r = torch.arange(max_len, device=old_ctx_lens.device, dtype=torch.int64)[None, :]
+        pos2d = seg_start[:, None] + r
+        mask = r < seg_lens[:, None]
+        flat_pos = pos2d[mask]
+        self.target_hidden = (
+            old_target_hidden.index_select(0, flat_pos)
+            if flat_pos.numel() > 0
+            else old_target_hidden[:0]
+        )
 
     def merge_batch(self, spec_info: "DFlashDraftInput"):
         self.verified_id = torch.cat([self.verified_id, spec_info.verified_id], dim=0)
-        self.ctx_lens_cpu.extend(spec_info.ctx_lens_cpu)
-        self.draft_seq_lens_cpu.extend(spec_info.draft_seq_lens_cpu)
+        self.ctx_lens = torch.cat([self.ctx_lens, spec_info.ctx_lens], dim=0)
+        self.draft_seq_lens = torch.cat(
+            [self.draft_seq_lens, spec_info.draft_seq_lens], dim=0
+        )
         if self.target_hidden is None or self.target_hidden.numel() == 0:
             self.target_hidden = spec_info.target_hidden
         elif spec_info.target_hidden is not None and spec_info.target_hidden.numel() > 0:
@@ -285,35 +298,80 @@ class DFlashVerifyInput(SpecInput):
             target_predict=target_predict,
         )
 
-        packed = torch.empty(
-            (bs, self.draft_token_num + 2), dtype=torch.int64, device=device
-        )
-        packed[:, : self.draft_token_num].copy_(candidates)
-        packed[:, self.draft_token_num].copy_(accept_len)
-        packed[:, self.draft_token_num + 1].copy_(bonus)
-        packed_cpu = packed.cpu()
+        # Build output tokens on GPU: accepted drafts + bonus token.
+        out_lens = accept_len.to(torch.int32) + 1
+        accept_len_i64 = accept_len.to(torch.int64)
 
-        candidates_cpu = packed_cpu[:, : self.draft_token_num].tolist()
-        accept_len_cpu = packed_cpu[:, self.draft_token_num].tolist()
-        bonus_cpu = packed_cpu[:, self.draft_token_num + 1].tolist()
+        out_tokens = torch.empty((bs, self.draft_token_num), dtype=torch.int64, device=device)
+        if int(self.draft_token_num) > 1:
+            out_tokens[:, : self.draft_token_num - 1].copy_(candidates[:, 1:])
+        out_tokens[:, self.draft_token_num - 1].fill_(0)
+        out_tokens.scatter_(1, accept_len_i64[:, None], bonus[:, None])
+
+        out_tokens_cpu = out_tokens.cpu()
+        out_lens_cpu = out_lens.cpu()
 
         commit_lens_cpu: List[int] = []
         new_verified_cpu: List[int] = []
         accept_length_per_req_cpu: List[int] = []
 
         for i, req in enumerate(batch.reqs):
-            # Proposed: accepted draft tokens, then the bonus token.
-            proposed = candidates_cpu[i][1 : 1 + accept_len_cpu[i]] + [bonus_cpu[i]]
+            proposed_len = int(out_lens_cpu[i])
+            proposed = out_tokens_cpu[i, :proposed_len].tolist()
 
             appended = 0
-            for tok in proposed:
-                req.output_ids.append(int(tok))
-                appended += 1
-                req.check_finished()
-                if req.finished():
-                    break
-                if req.grammar is not None:
-                    req.grammar.accept_token(int(tok))
+            if (
+                req.grammar is None
+                and not req.sampling_params.stop_strs
+                and not req.sampling_params.stop_regex_strs
+            ):
+                remaining = int(req.sampling_params.max_new_tokens) - len(req.output_ids)
+                if remaining > 0:
+                    tokens = proposed[:remaining]
+                    if not req.sampling_params.ignore_eos:
+                        stop_token_ids = req.sampling_params.stop_token_ids
+                        eos_token_ids = req.eos_token_ids
+                        tokenizer = req.tokenizer
+                        tokenizer_eos = tokenizer.eos_token_id if tokenizer is not None else None
+                        additional_stop = (
+                            tokenizer.additional_stop_token_ids
+                            if tokenizer is not None
+                            else None
+                        )
+                        vocab_size = getattr(req, "vocab_size", None)
+
+                        for j, token_id in enumerate(tokens):
+                            if vocab_size is not None and (
+                                int(token_id) > int(vocab_size) or int(token_id) < 0
+                            ):
+                                tokens = tokens[: j + 1]
+                                break
+                            if stop_token_ids and token_id in stop_token_ids:
+                                tokens = tokens[: j + 1]
+                                break
+                            if eos_token_ids and token_id in eos_token_ids:
+                                tokens = tokens[: j + 1]
+                                break
+                            if tokenizer_eos is not None and int(token_id) == int(tokenizer_eos):
+                                tokens = tokens[: j + 1]
+                                break
+                            if additional_stop and token_id in additional_stop:
+                                tokens = tokens[: j + 1]
+                                break
+
+                    req.output_ids.extend(int(tok) for tok in tokens)
+                    appended = len(tokens)
+                    if appended > 0:
+                        req.check_finished(new_accepted_len=appended)
+            else:
+                for tok in proposed:
+                    req.output_ids.append(int(tok))
+                    appended += 1
+                    req.check_finished()
+                    if req.finished():
+                        break
+                    if req.grammar is not None:
+                        req.grammar.accept_token(int(tok))
 
             # DFlash always treats the last appended token as the new "current token"
             # (uncommitted); therefore we commit exactly `appended` verify-input tokens.

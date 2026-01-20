@@ -826,8 +826,7 @@ class CudaGraphRunner:
             and forward_batch.input_embeds is not None
         ):
             buffers.input_embeds[:raw_num_token].copy_(forward_batch.input_embeds)
-            if bs != raw_bs:
-                buffers.input_embeds[raw_num_token : bs * self.num_tokens_per_bs].zero_()
+            # Padded tokens aren't read, so skip zeroing them.
         if self.enable_two_batch_overlap:
             self.tbo_plugin.replay_prepare(
                 forward_mode=self.capture_forward_mode,
