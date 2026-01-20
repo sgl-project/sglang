@@ -39,6 +39,7 @@ class DummyStream:
 class DummyAsyncClient:
     def __init__(self, responses, *args, **kwargs):
         self._responses = iter(responses)
+        self.calls = []
 
     async def __aenter__(self):
         return self
@@ -46,7 +47,8 @@ class DummyAsyncClient:
     async def __aexit__(self, exc_type, exc, tb):
         return False
 
-    def stream(self, method, url, timeout=None):
+    def stream(self, method, url, **kwargs):
+        self.calls.append((method, url, kwargs))
         return DummyStream(next(self._responses))
 
 
@@ -111,12 +113,14 @@ def test_openai_media_url_redirect_limit(monkeypatch, tmp_path):
         DummyResponse(302, headers={"location": "http://example.com/final"}),
     ]
     monkeypatch.setattr(
+        openai_utils,
+        "_resolve_host_ips",
+        lambda hostname: [ipaddress.ip_address("93.184.216.34")],
+    )
+    monkeypatch.setattr(
         openai_utils.httpx,
         "AsyncClient",
         lambda *args, **kwargs: DummyAsyncClient(responses),
-    )
-    monkeypatch.setattr(
-        openai_utils, "_validate_media_url_with_policy", lambda url, policy: None
     )
     target_path = tmp_path / "image"
     with pytest.raises(ValueError, match="Too many redirects"):
@@ -145,12 +149,14 @@ def test_openai_media_url_size_limit(monkeypatch, tmp_path):
         )
     ]
     monkeypatch.setattr(
+        openai_utils,
+        "_resolve_host_ips",
+        lambda hostname: [ipaddress.ip_address("93.184.216.34")],
+    )
+    monkeypatch.setattr(
         openai_utils.httpx,
         "AsyncClient",
         lambda *args, **kwargs: DummyAsyncClient(responses),
-    )
-    monkeypatch.setattr(
-        openai_utils, "_validate_media_url_with_policy", lambda url, policy: None
     )
     target_path = tmp_path / "image"
     with pytest.raises(ValueError, match="Remote content exceeds max size limit"):
@@ -179,12 +185,14 @@ def test_openai_media_url_stream_limit(monkeypatch, tmp_path):
         )
     ]
     monkeypatch.setattr(
+        openai_utils,
+        "_resolve_host_ips",
+        lambda hostname: [ipaddress.ip_address("93.184.216.34")],
+    )
+    monkeypatch.setattr(
         openai_utils.httpx,
         "AsyncClient",
         lambda *args, **kwargs: DummyAsyncClient(responses),
-    )
-    monkeypatch.setattr(
-        openai_utils, "_validate_media_url_with_policy", lambda url, policy: None
     )
     target_path = tmp_path / "image"
     with pytest.raises(ValueError, match="Remote content exceeds max size limit"):
@@ -193,3 +201,89 @@ def test_openai_media_url_stream_limit(monkeypatch, tmp_path):
                 "http://example.com/image.png", str(target_path), policy=policy
             )
         )
+
+
+def test_openai_media_url_dns_pinning_sets_host_and_sni(monkeypatch, tmp_path):
+    policy = {
+        "enabled": True,
+        "schemes": {"http", "https"},
+        "allow_hosts": set(),
+        "allow_nets": [],
+        "max_bytes": 1024,
+        "max_redirects": 0,
+        "timeout": 1.0,
+    }
+    monkeypatch.setattr(
+        openai_utils,
+        "_resolve_host_ips",
+        lambda hostname: [ipaddress.ip_address("93.184.216.34")],
+    )
+
+    responses = [
+        DummyResponse(
+            200,
+            headers={"content-type": "image/png"},
+            chunks=[b"1234"],
+        )
+    ]
+    holder = {}
+
+    def _make_client(*args, **kwargs):
+        holder["client"] = DummyAsyncClient(responses, *args, **kwargs)
+        return holder["client"]
+
+    monkeypatch.setattr(openai_utils.httpx, "AsyncClient", _make_client)
+    target_path = tmp_path / "image"
+    out_path = asyncio.run(
+        openai_utils._save_url_image_to_path(
+            "https://example.com/image.png", str(target_path), policy=policy
+        )
+    )
+    assert out_path.endswith(".png")
+    method, url, kwargs = holder["client"].calls[0]
+    assert method == "GET"
+    assert url.startswith("https://93.184.216.34/")
+    assert kwargs["headers"]["Host"] == "example.com"
+    assert kwargs["extensions"]["sni_hostname"] == "example.com"
+
+
+def test_openai_media_url_dns_pinning_ipv6_brackets_and_port(monkeypatch, tmp_path):
+    policy = {
+        "enabled": True,
+        "schemes": {"http", "https"},
+        "allow_hosts": set(),
+        "allow_nets": [],
+        "max_bytes": 1024,
+        "max_redirects": 0,
+        "timeout": 1.0,
+    }
+    monkeypatch.setattr(
+        openai_utils,
+        "_resolve_host_ips",
+        lambda hostname: [ipaddress.ip_address("2606:4700:4700::1111")],
+    )
+
+    responses = [
+        DummyResponse(
+            200,
+            headers={"content-type": "image/png"},
+            chunks=[b"1234"],
+        )
+    ]
+    holder = {}
+
+    def _make_client(*args, **kwargs):
+        holder["client"] = DummyAsyncClient(responses, *args, **kwargs)
+        return holder["client"]
+
+    monkeypatch.setattr(openai_utils.httpx, "AsyncClient", _make_client)
+    target_path = tmp_path / "image"
+    asyncio.run(
+        openai_utils._save_url_image_to_path(
+            "https://example.com:8443/image.png", str(target_path), policy=policy
+        )
+    )
+    _, url, kwargs = holder["client"].calls[0]
+    assert url.startswith("https://[2606:4700:4700::1111]:8443/")
+    assert kwargs["headers"]["Host"] == "example.com:8443"
+    assert kwargs["extensions"]["sni_hostname"] == "example.com"

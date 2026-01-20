@@ -218,7 +218,9 @@ def _get_openai_media_url_policy() -> dict[str, Any]:
     }
 
 
-def _validate_media_url_with_policy(url: str, policy: dict[str, Any]) -> None:
+def _validate_media_url_with_policy_and_resolve(
+    url: str, policy: dict[str, Any]
+) -> tuple[Any, str, list[ipaddress._BaseAddress]]:
     parsed = urlparse(url)
     scheme = (parsed.scheme or "").lower()
     hostname = (parsed.hostname or "").lower()
@@ -234,10 +236,43 @@ def _validate_media_url_with_policy(url: str, policy: dict[str, Any]) -> None:
     if not ips:
         raise ValueError("Failed to resolve URL host")
     if _is_host_allowlisted(hostname, ips, policy["allow_hosts"], policy["allow_nets"]):
-        return
+        return parsed, hostname, ips
     for ip in ips:
         if _is_ip_blocked(ip):
             raise ValueError("URL resolves to a private or reserved IP")
+    return parsed, hostname, ips
+
+
+def _build_pinned_media_url_request(
+    parsed: Any, hostname: str, ip: ipaddress._BaseAddress
+) -> tuple[str, dict[str, str], dict[str, Any] | None]:
+    ip_str = str(ip)
+    if ip.version == 6:
+        ip_str = f"[{ip_str}]"
+
+    netloc = ip_str
+    if parsed.port:
+        netloc = f"{netloc}:{parsed.port}"
+
+    if parsed.username:
+        userinfo = parsed.username
+        if parsed.password:
+            userinfo = f"{userinfo}:{parsed.password}"
+        netloc = f"{userinfo}@{netloc}"
+
+    pinned_url = parsed._replace(netloc=netloc).geturl()
+    host_header = hostname
+    if parsed.port:
+        host_header = f"{hostname}:{parsed.port}"
+    headers = {"Host": host_header}
+    extensions = (
+        {"sni_hostname": hostname} if (parsed.scheme or "").lower() == "https" else None
+    )
+    return pinned_url, headers, extensions
+
+
+def _validate_media_url_with_policy(url: str, policy: dict[str, Any]) -> None:
+    _validate_media_url_with_policy_and_resolve(url, policy)
 
 
 def validate_openai_media_url(url: str) -> dict[str, Any]:
@@ -313,9 +348,19 @@ async def _save_url_image_to_path(
 
         async with httpx.AsyncClient(follow_redirects=False) as client:
             for _ in range(policy["max_redirects"] + 1):
-                _validate_media_url_with_policy(current_url, policy)
+                parsed, hostname, ips = _validate_media_url_with_policy_and_resolve(
+                    current_url, policy
+                )
+                pinned_ip = next((ip for ip in ips if ip.version == 4), ips[0])
+                request_url, headers, extensions = _build_pinned_media_url_request(
+                    parsed, hostname, pinned_ip
+                )
                 async with client.stream(
-                    "GET", current_url, timeout=policy["timeout"]
+                    "GET",
+                    request_url,
+                    timeout=policy["timeout"],
+                    headers=headers,
+                    extensions=extensions,
                 ) as response:
                     if response.status_code in {301, 302, 303, 307, 308}:
                         location = response.headers.get("location")
@@ -383,8 +428,10 @@ async def _save_url_image_to_path(
                     return target_path
 
             raise ValueError("Too many redirects when fetching media URL")
+    except ValueError:
+        raise
     except Exception as e:
-        raise Exception(f"Failed to download image from URL: {str(e)}")
+        raise ValueError(f"Failed to download image from URL: {str(e)}") from e
 
 
 async def _save_base64_image_to_path(
