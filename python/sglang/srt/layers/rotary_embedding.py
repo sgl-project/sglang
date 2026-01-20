@@ -1700,11 +1700,12 @@ class MRotaryEmbedding(RotaryEmbedding):
                         video_index += 1
                         remain_videos -= 1
                         ed = ed_video
-                    llm_grid_t, llm_grid_h, llm_grid_w = (
-                        t.item(),
-                        h.item() // spatial_merge_size,
-                        w.item() // spatial_merge_size,
-                    )
+                    # Avoid .item() lookups in repeated context
+                    t_int, h_int, w_int = int(t), int(h), int(w)
+
+                    llm_grid_t = t_int
+                    llm_grid_h = h_int // spatial_merge_size
+                    llm_grid_w = w_int // spatial_merge_size
                     text_len = ed - st
 
                     st_idx = (
@@ -1737,24 +1738,24 @@ class MRotaryEmbedding(RotaryEmbedding):
                         "qwen3_vl_moe",
                     ):
                         t_index = (
-                            torch.arange(llm_grid_t)
+                            torch.arange(llm_grid_t, device=position_ids.device)
                             .view(-1, 1)
-                            .expand(-1, llm_grid_h * llm_grid_w)
-                            .flatten()
+                            .expand(llm_grid_t, llm_grid_h * llm_grid_w)
+                            .reshape(-1)
                         )
                     else:
                         raise RuntimeError(f"Unimplemented model type: {model_type}")
                     h_index = (
-                        torch.arange(llm_grid_h)
+                        torch.arange(llm_grid_h, device=position_ids.device)
                         .view(1, -1, 1)
-                        .expand(llm_grid_t, -1, llm_grid_w)
-                        .flatten()
+                        .expand(llm_grid_t, llm_grid_h, llm_grid_w)
+                        .reshape(-1)
                     )
                     w_index = (
-                        torch.arange(llm_grid_w)
+                        torch.arange(llm_grid_w, device=position_ids.device)
                         .view(1, 1, -1)
-                        .expand(llm_grid_t, llm_grid_h, -1)
-                        .flatten()
+                        .expand(llm_grid_t, llm_grid_h, llm_grid_w)
+                        .reshape(-1)
                     )
                     llm_pos_ids_list.append(
                         torch.stack([t_index, h_index, w_index]) + text_len + st_idx
@@ -1787,10 +1788,9 @@ class MRotaryEmbedding(RotaryEmbedding):
             position_ids = (
                 position_ids.unsqueeze(0).expand(3, -1, -1).to(input_ids.device)
             )
-            max_position_ids = position_ids.max(0, keepdim=False)[0].max(
-                -1, keepdim=True
-            )[0]
-            mrope_position_deltas = max_position_ids + 1 - s
+            max_position_ids = position_ids.amax(dim=0, keepdim=False)
+            mrope_position_deltas = max_position_ids.amax(-1, keepdim=True) + 1 - s
+
             return position_ids, mrope_position_deltas
 
     @staticmethod
@@ -2126,6 +2126,8 @@ class MRotaryEmbedding(RotaryEmbedding):
                 device=input_ids.device,
             )
 
+            image_index, video_index = 0, 0
+            video_group_index = 0
             # Move attention mask to device once to avoid repeated transfers
             attention_mask = attention_mask.to(total_input_ids.device)
 
@@ -2164,8 +2166,6 @@ class MRotaryEmbedding(RotaryEmbedding):
 
                 llm_pos_ids_list = []
                 video_frame_num = 1
-                image_index, video_index = 0, 0
-                video_group_index = 0
 
                 for modality_type, start_idx, end_idx in input_type_group:
                     # st_idx can be computed by torch directly for speed
@@ -2265,9 +2265,8 @@ class MRotaryEmbedding(RotaryEmbedding):
                 # Use advanced indexing for assignment
                 idx_mask = curr_mask == 1
                 position_ids[..., i, idx_mask] = llm_positions.to(position_ids.device)
-                # Avoid .max() materializing the tensor on CPU; use native device
                 mrope_position_deltas.append(
-                    llm_positions.max().item() + 1 - len(total_input_ids[i])
+                    llm_positions.max() + 1 - len(total_input_ids[i])
                 )
             # Build tensor in one call at the end
             mrope_position_deltas = torch.tensor(
@@ -2285,14 +2284,18 @@ class MRotaryEmbedding(RotaryEmbedding):
                     .to(attention_mask.device)
                 )
                 max_position_ids = position_ids.amax(dim=0, keepdim=False)
-                mrope_position_deltas = max_position_ids.amax(
-                    -1, keepdim=True
-                ) + 1 - attention_mask.shape[-1]
+                mrope_position_deltas = (
+                    max_position_ids.amax(-1, keepdim=True)
+                    + 1
+                    - attention_mask.shape[-1]
+                )
             else:
                 length = input_ids.shape[1]
                 batch_size = input_ids.shape[0]
                 # Use torch.arange with in-place expansion
-                arange_ids = torch.arange(length, device=input_ids.device).view(1, 1, -1)
+                arange_ids = torch.arange(length, device=input_ids.device).view(
+                    1, 1, -1
+                )
                 position_ids = arange_ids.expand(3, batch_size, length)
                 mrope_position_deltas = torch.zeros(
                     [batch_size, 1],
