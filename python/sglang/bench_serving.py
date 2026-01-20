@@ -228,16 +228,22 @@ async def async_request_openai_completions(
     prompt = request_func_input.prompt
 
     async with _create_bench_client_session() as session:
+        # Build payload with defaults that can be overridden by extra_request_body
         payload = {
             "model": request_func_input.model,
             "prompt": prompt,
-            "temperature": 0.0,
             "best_of": 1,
             "max_tokens": request_func_input.output_len,
             "stream": not args.disable_stream,
             "ignore_eos": not args.disable_ignore_eos,
-            **request_func_input.extra_request_body,
         }
+
+        # Add temperature default only if not specified in extra_request_body
+        if "temperature" not in request_func_input.extra_request_body:
+            payload["temperature"] = 0.0
+
+        # Merge in extra parameters - these will override defaults if present
+        payload.update(request_func_input.extra_request_body)
 
         # hack to accommodate different LoRA conventions between SGLang and vLLM.
         if request_func_input.lora_name:
@@ -373,15 +379,22 @@ async def async_request_openai_chat_completions(
         messages = [{"role": "user", "content": request_func_input.prompt}]
 
     async with _create_bench_client_session() as session:
+        # Build payload with defaults that can be overridden by extra_request_body
         payload = {
             "model": request_func_input.model,
             "messages": messages,
-            "temperature": 0.0,
             "max_completion_tokens": request_func_input.output_len,
             "stream": not args.disable_stream,
             "ignore_eos": not args.disable_ignore_eos,
-            **request_func_input.extra_request_body,
         }
+
+        # Add temperature default only if not specified in extra_request_body
+        if "temperature" not in request_func_input.extra_request_body:
+            payload["temperature"] = 0.0
+
+        # Merge in extra parameters (tools, temperature, top_p, etc.)
+        # These will override defaults if present
+        payload.update(request_func_input.extra_request_body)
 
         # hack to accommodate different LoRA conventions between SGLang and vLLM.
         if request_func_input.lora_name:
@@ -1041,13 +1054,15 @@ class DatasetRow:
     image_data: Optional[List[str]] = None
     timestamp: Optional[float] = None
     routing_key: Optional[str] = None
-    is_openai_format: bool = False  # True if prompt is pre-formatted OpenAI messages
+    extra_request_body: Optional[Dict[str, Any]] = None  # Per-request API parameters
 
     def __post_init__(self):
         if self.text_prompt_len is None:
             self.text_prompt_len = self.prompt_len
         if self.vision_prompt_len is None:
             self.vision_prompt_len = 0
+        if self.extra_request_body is None:
+            self.extra_request_body = {}
 
 
 async def get_mooncake_request_over_time(
@@ -1320,6 +1335,10 @@ def sample_openai_requests(
     Each line should be a JSON object with:
     - "messages": list of {"role": str, "content": str}
     - "max_tokens": int (used as output_len if fixed_output_len not set)
+    - "tools": optional list of tool definitions
+    - "temperature": optional temperature value
+    - "top_p": optional top_p value
+    - Other OpenAI API parameters are also extracted and passed through
     """
     dataset = []
     with open(dataset_path, "r") as f:
@@ -1333,6 +1352,10 @@ def sample_openai_requests(
                     # Skip invalid JSON lines
                     continue
 
+    # Fields that should NOT be passed through extra_request_body
+    # These are either handled separately or are metadata
+    EXCLUDED_FIELDS = {"messages", "max_tokens", "model"}
+
     filtered_dataset: List[DatasetRow] = []
     for data in dataset:
         messages = data.get("messages", [])
@@ -1342,12 +1365,24 @@ def sample_openai_requests(
         # Use max_tokens from the request, or fall back to fixed_output_len
         output_len = fixed_output_len or data.get("max_tokens", 256)
 
+        # Extract extra request body parameters (tools, temperature, top_p, etc.)
+        extra_body = {k: v for k, v in data.items() if k not in EXCLUDED_FIELDS}
+
         # Calculate prompt length by applying chat template
+        # This includes the messages but not the tools
         prompt_len = len(
             tokenizer.apply_chat_template(
                 messages, tokenize=True, add_generation_prompt=True
             )
         )
+
+        # If tools are present, we need to add their token count
+        # Tools are sent as part of the request and count toward input tokens
+        if "tools" in extra_body:
+            # Encode tools as JSON string to estimate token count
+            tools_str = json.dumps(extra_body["tools"])
+            tools_tokens = len(tokenizer.encode(tools_str))
+            prompt_len += tools_tokens
 
         # Pass messages list directly - bench_serving handles List[Dict] prompts
         filtered_dataset.append(
@@ -1355,7 +1390,7 @@ def sample_openai_requests(
                 prompt=messages,
                 prompt_len=prompt_len,
                 output_len=output_len,
-                is_openai_format=True,  # Mark as pre-formatted OpenAI messages
+                extra_request_body=extra_body,  # Store per-request parameters
             )
         )
 
@@ -2248,9 +2283,15 @@ async def benchmark(
     else:
         raise ValueError(f"Unknown backend: {backend}")
 
-    # Check for multi-turn: prompt is a list BUT not pre-formatted OpenAI messages
-    is_openai_format = getattr(input_requests[0], "is_openai_format", False)
-    is_multi_turn = isinstance(input_requests[0].prompt, list) and not is_openai_format
+    # Check for multi-turn: prompt is a list of strings (not OpenAI messages dicts)
+    # Multi-turn format: ["turn1", "turn2", ...] - list of strings
+    # OpenAI format: [{"role": "user", "content": "..."}, ...] - list of dicts
+    first_prompt = input_requests[0].prompt
+    is_multi_turn = (
+        isinstance(first_prompt, list)
+        and len(first_prompt) > 0
+        and isinstance(first_prompt[0], str)
+    )
     if is_multi_turn:
         request_func = wrap_multi_turn_request_func(request_func, backend=backend)
 
@@ -2407,6 +2448,10 @@ async def benchmark(
         else:
             lora_name = None
 
+        # Merge global extra_request_body with per-request extras
+        # Per-request parameters take precedence over global ones
+        merged_extra_body = {**extra_request_body, **request.extra_request_body}
+
         request_func_input = RequestFuncInput(
             model=model_id,
             prompt=request.prompt,
@@ -2415,7 +2460,7 @@ async def benchmark(
             output_len=request.output_len,
             lora_name=lora_name,
             image_data=request.image_data,
-            extra_request_body=extra_request_body,
+            extra_request_body=merged_extra_body,
             timestamp=request.timestamp,
             routing_key=request.routing_key,
         )
