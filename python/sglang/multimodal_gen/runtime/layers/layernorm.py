@@ -28,11 +28,7 @@ from sglang.multimodal_gen.runtime.layers.triton_ops import (
     norm_infer,
     rms_norm_fn,
 )
-from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
-
-_is_cuda = current_platform.is_cuda()
-
 
 # Copied and adapted from sglang
 
