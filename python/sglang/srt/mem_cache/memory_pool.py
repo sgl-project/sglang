@@ -962,6 +962,8 @@ class MHATokenToKVPoolNVFP4(MHATokenToKVPool):
         end_layer: Optional[int] = None,
         enable_alt_stream: bool = True,
         enable_kv_cache_copy: bool = False,
+        max_context_len: int = None,
+        max_running_request: int = None,
     ):
         super().__init__(
             size,
@@ -986,6 +988,9 @@ class MHATokenToKVPoolNVFP4(MHATokenToKVPool):
         from sglang.srt.layers.quantization.fp4_utils import NVFP4QuantizeUtil
 
         self.fp4_quant_util = NVFP4QuantizeUtil
+
+        # assert max_context_len is not None, "max_context_len must be provided for NVFP4 KV cache"
+        # assert max_running_request is not None, "max_running_request must be provided for NVFP4 KV cache"
 
     def _create_buffers(self):
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
@@ -1036,11 +1041,25 @@ class MHATokenToKVPoolNVFP4(MHATokenToKVPool):
                     for _ in range(self.layer_num)
                 ]
 
+                self.dq_dtype = torch.float8_e4m3fn
+                self.dq_k_buffer = torch.zeros(
+                    (m, n, k),
+                    dtype=self.dq_dtype,
+                    device=self.device,
+                )
+                self.dq_v_buffer = torch.zeros(
+                    (m, n, k),
+                    dtype=self.dq_dtype,
+                    device=self.device,
+                )
+
     def _clear_buffers(self):
         del self.k_buffer
         del self.v_buffer
         del self.k_scale_buffer
         del self.v_scale_buffer
+        del self.dq_k_buffer
+        del self.dq_v_buffer
 
     def _get_key_nvfp4_from_nvfp4_buffer(self, layer_id: int):
         return (
@@ -1132,6 +1151,11 @@ class MHATokenToKVPoolNVFP4(MHATokenToKVPool):
 
             self.k_scale_buffer[layer_id - self.start_layer][loc] = cache_k_fp4_sf
             self.v_scale_buffer[layer_id - self.start_layer][loc] = cache_v_fp4_sf
+
+    def get_dq_kv_buffer_and_page_table(
+        self,
+    ):
+        return (self.dq_k_buffer, self.dq_v_buffer)
 
 
 class MHATokenToKVPoolFP4(MHATokenToKVPool):
@@ -1293,6 +1317,8 @@ class HybridLinearKVPool(KVCache):
         use_mla: bool = False,
         kv_lora_rank: int = None,
         qk_rope_head_dim: int = None,
+        max_context_len: Optional[int] = None,
+        max_running_request: Optional[int] = None,
     ):
         self.size = size
         self.dtype = dtype
@@ -1310,7 +1336,6 @@ class HybridLinearKVPool(KVCache):
         if not use_mla:
 
             if is_float4_e2m1fn_x2(dtype):
-                # TokenToKVPoolClass = MHATokenToKVPoolFP4
                 TokenToKVPoolClass = MHATokenToKVPoolNVFP4
             else:
                 TokenToKVPoolClass = MHATokenToKVPool
@@ -1325,16 +1350,30 @@ class HybridLinearKVPool(KVCache):
 
                 TokenToKVPoolClass = NPUMHATokenToKVPool
 
-            self.full_kv_pool = TokenToKVPoolClass(
-                size=size,
-                page_size=self.page_size,
-                dtype=dtype,
-                head_num=head_num,
-                head_dim=head_dim,
-                layer_num=self.full_layer_nums,
-                device=device,
-                enable_memory_saver=enable_memory_saver,
-            )
+            # 准备基础参数
+            kv_pool_kwargs = {
+                "size": size,
+                "page_size": self.page_size,
+                "dtype": dtype,
+                "head_num": head_num,
+                "head_dim": head_dim,
+                "layer_num": self.full_layer_nums,
+                "device": device,
+                "enable_memory_saver": enable_memory_saver,
+            }
+
+            # 只为 NVFP4 池添加额外参数
+            if is_float4_e2m1fn_x2(dtype):
+                assert (
+                    max_context_len is not None
+                ), "max_context_len must be provided for NVFP4 KV cache"
+                assert (
+                    max_running_request is not None
+                ), "max_running_request must be provided for NVFP4 KV cache"
+                kv_pool_kwargs["max_context_len"] = max_context_len
+                kv_pool_kwargs["max_running_request"] = max_running_request
+
+            self.full_kv_pool = TokenToKVPoolClass(**kv_pool_kwargs)
         else:
 
             TokenToKVPoolClass = MLATokenToKVPool
@@ -1411,6 +1450,14 @@ class HybridLinearKVPool(KVCache):
     def get_fp4_key_buffer(self, layer_id: int):
         layer_id = self._transfer_full_attention_id(layer_id)
         return self.full_kv_pool._get_key_nvfp4_from_nvfp4_buffer(layer_id)
+
+    def get_dq_kv_buffer_and_page_table(
+        self,
+    ):
+        assert is_float4_e2m1fn_x2(
+            self.dtype
+        ), "get_dq_kv_buffer_and_page_table only available for FP4 KV pool"
+        return self.full_kv_pool.get_dq_kv_buffer_and_page_table()
 
     @contextmanager
     def _transfer_id_context(self, layer: RadixAttention):

@@ -1997,8 +1997,15 @@ class ModelRunner:
                 extra_args = {}
                 if self.use_mla_backend:
                     extra_args = {
+                        **extra_args,
                         "kv_lora_rank": self.model_config.kv_lora_rank,
                         "qk_rope_head_dim": self.model_config.qk_rope_head_dim,
+                    }
+                if is_float4_e2m1fn_x2(self.kv_cache_dtype):
+                    extra_args = {
+                        **extra_args,
+                        "max_context_len": self.model_config.context_len,
+                        "max_running_request": self.req_to_token_pool.size,
                     }
                 self.token_to_kv_pool = HybridLinearKVPool(
                     page_size=self.page_size,
