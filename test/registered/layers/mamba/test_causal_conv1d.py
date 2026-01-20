@@ -1,6 +1,7 @@
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=25, suite="stage-b-test-small-1-gpu")
+register_amd_ci(est_time=25, suite="stage-b-test-small-1-gpu-amd")
 
 # Adapted from https://github.com/vllm-project/vllm/blob/main/tests/kernels/mamba/test_causal_conv1d.py
 
@@ -195,9 +196,6 @@ def test_causal_conv1d_update_with_batch_gather(
     if not torch.cuda.is_available():
         pytest.skip("CUDA device not available")
 
-    # TODO: Fix Triton kernel bug - see issue #16714
-    pytest.skip("Triton kernel bug - see issue #16714")
-
     device = "cuda"
     rtol, atol = (3e-4, 1e-3) if itype == torch.float32 else (3e-3, 5e-3)
     if itype == torch.bfloat16:
@@ -277,9 +275,6 @@ def test_causal_conv1d_varlen(
 ):
     if not torch.cuda.is_available():
         pytest.skip("CUDA device not available")
-
-    # TODO: Fix Triton kernel bug - see issue #16714
-    pytest.skip("Triton kernel bug - see issue #16714")
 
     device = "cuda"
     torch.cuda.empty_cache()

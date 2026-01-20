@@ -562,6 +562,255 @@ def popen_with_error_check(command: list[str], allow_exit: bool = False):
     return process
 
 
+def _try_enable_offline_mode_if_cache_complete(
+    model_name_or_path: str, env: dict, other_args: Optional[list[str]] = None
+) -> Optional[str]:
+    """
+    CI helper: Check if model cache is complete and enable offline mode.
+
+    Uses per-run validation markers that are NOT shared across runners.
+    Each runner independently validates its cache using lightweight checks
+    before enabling offline mode.
+
+    IMPORTANT: Even if a per-run marker exists, this function ALWAYS validates
+    the current launch's requirements (e.g., hf_quant_config.json for modelopt).
+    The marker is only a hint that this snapshot was validated earlier in the run.
+
+    Args:
+        model_name_or_path: Model identifier or path
+        env: Environment dict to modify (will add HF_HUB_OFFLINE=1 if validation passes)
+        other_args: Launch command arguments (used to detect quantization requirement)
+
+    Returns:
+        Per-run marker path if offline mode was enabled, None otherwise
+    """
+    from sglang.srt.model_loader.ci_weight_validation import (
+        _get_per_run_marker_path,
+        _read_per_run_marker,
+        _write_per_run_marker,
+        validate_cache_lightweight,
+    )
+    from sglang.srt.utils import find_local_repo_dir
+
+    other_args = other_args or []
+
+    # Skip offline mode for LoRA scenarios (dynamic adapter loading may need online access)
+    is_lora_enabled = "--enable-lora" in other_args or "--lora-paths" in other_args
+    if is_lora_enabled:
+        print(f"CI_OFFLINE: LoRA enabled, skip offline mode - {model_name_or_path}")
+        return None
+
+    # Fast-path: If subprocess env already has HF_HUB_OFFLINE=1, skip
+    if env.get("HF_HUB_OFFLINE") == "1":
+        print(
+            f"CI_OFFLINE: Subprocess env already has HF_HUB_OFFLINE=1, skip - {model_name_or_path}"
+        )
+        return None
+
+    # Skip if already a local path
+    if os.path.isdir(model_name_or_path):
+        return None
+
+    # Try to find local snapshot
+    try:
+        snapshot_dir = find_local_repo_dir(model_name_or_path, revision=None)
+        if not snapshot_dir or not os.path.isdir(snapshot_dir):
+            return None
+    except Exception:
+        return None
+
+    # Detect if quantization requires hf_quant_config.json
+    # Do this BEFORE checking marker to ensure current launch requirements are known
+    requires_hf_quant_config = False
+    for i, arg in enumerate(other_args):
+        if arg == "--quantization" and i + 1 < len(other_args):
+            quant_value = other_args[i + 1].lower()
+            if quant_value in ["modelopt_fp4", "modelopt_fp8", "modelopt"]:
+                requires_hf_quant_config = True
+                break
+
+    # Check per-run marker (fast hint - snapshot validated earlier in this run)
+    per_run_marker = _read_per_run_marker(snapshot_dir)
+    if per_run_marker is not None:
+        # Marker exists, but STILL validate for current launch requirements
+        # This prevents a test without --quantization from enabling offline
+        # for a later test with --quantization that needs hf_quant_config.json
+        is_valid = validate_cache_lightweight(snapshot_dir, requires_hf_quant_config)
+
+        if not is_valid:
+            # Current launch requirements not met, ignore marker
+            print(
+                f"CI_OFFLINE: Per-run marker found but current validation failed "
+                f"(requires_hf_quant_config={requires_hf_quant_config}), "
+                f"will use online mode - {model_name_or_path}"
+            )
+            return None
+
+        # Marker exists and current validation passed
+        env["HF_HUB_OFFLINE"] = "1"
+        marker_path = _get_per_run_marker_path(snapshot_dir)
+        print(
+            f"CI_OFFLINE: Per-run marker found and current validation passed "
+            f"(requires_hf_quant_config={requires_hf_quant_config}), "
+            f"enabling offline mode - {model_name_or_path}"
+        )
+        return marker_path
+
+    # No per-run marker - perform lightweight validation
+    is_valid = validate_cache_lightweight(snapshot_dir, requires_hf_quant_config)
+
+    if not is_valid:
+        # Validation failed - cache is incomplete on this runner
+        print(
+            f"CI_OFFLINE: Cache validation failed "
+            f"(requires_hf_quant_config={requires_hf_quant_config}), "
+            f"will use online mode - {model_name_or_path}"
+        )
+        return None
+
+    # Validation passed - enable offline mode and write per-run marker
+    env["HF_HUB_OFFLINE"] = "1"
+
+    # Write per-run marker for subsequent tests in this run
+    _write_per_run_marker(snapshot_dir, model_name_or_path)
+
+    # Return marker path for potential invalidation if offline launch fails
+    marker_path = _get_per_run_marker_path(snapshot_dir)
+
+    snapshot_basename = os.path.basename(snapshot_dir)
+    print(
+        f"CI_OFFLINE: Enabled HF_HUB_OFFLINE=1 for subprocess - "
+        f"validation passed for {model_name_or_path} "
+        f"(snapshot={snapshot_basename}, requires_hf_quant_config={requires_hf_quant_config})"
+    )
+
+    return marker_path
+
+
+def _create_clean_subprocess_env(env: dict) -> dict:
+    """Create a clean subprocess environment without internal CI keys.
+
+    Removes all keys starting with '_CI_OFFLINE_' or 'CI_OFFLINE' to prevent
+    leaking implementation details to the server subprocess.
+
+    Args:
+        env: Source environment dict
+
+    Returns:
+        Clean copy of environment dict
+    """
+    child_env = env.copy()
+    keys_to_remove = [
+        k for k in child_env if k.startswith(("_CI_OFFLINE_", "CI_OFFLINE_"))
+    ]
+    for k in keys_to_remove:
+        del child_env[k]
+    return child_env
+
+
+def _launch_server_process(
+    command: List[str],
+    env: dict,
+    return_stdout_stderr: Optional[tuple],
+    model: str,
+) -> subprocess.Popen:
+    """Launch server subprocess with clean environment.
+
+    Args:
+        command: Command list for subprocess
+        env: Environment dict (will be cleaned before use)
+        return_stdout_stderr: Optional tuple of (stdout_file, stderr_file) for output capture
+        model: Model name for logging
+
+    Returns:
+        Started subprocess.Popen object
+    """
+    child_env = _create_clean_subprocess_env(env)
+
+    hf_hub_offline = child_env.get("HF_HUB_OFFLINE", "0")
+    print(f"CI_OFFLINE: Launching server HF_HUB_OFFLINE={hf_hub_offline} model={model}")
+
+    if return_stdout_stderr:
+        proc = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=child_env,
+            text=True,
+            bufsize=1,
+        )
+
+        def _dump(src, sinks):
+            for line in iter(src.readline, ""):
+                for sink in sinks:
+                    sink.write(line)
+                    sink.flush()
+            src.close()
+
+        threading.Thread(
+            target=_dump,
+            args=(proc.stdout, [return_stdout_stderr[0], sys.stdout]),
+            daemon=True,
+        ).start()
+        threading.Thread(
+            target=_dump,
+            args=(proc.stderr, [return_stdout_stderr[1], sys.stderr]),
+            daemon=True,
+        ).start()
+    else:
+        proc = subprocess.Popen(command, stdout=None, stderr=None, env=child_env)
+
+    return proc
+
+
+def _wait_for_server_health(
+    proc: subprocess.Popen,
+    base_url: str,
+    api_key: Optional[str],
+    timeout_duration: float,
+) -> Tuple[bool, Optional[str]]:
+    """Wait for server health check to pass.
+
+    Args:
+        proc: Server subprocess
+        base_url: Base URL for health check
+        api_key: Optional API key for authorization
+        timeout_duration: Maximum wait time in seconds
+
+    Returns:
+        Tuple of (success, error_message)
+    """
+    start_time = time.perf_counter()
+    with requests.Session() as session:
+        while time.perf_counter() - start_time < timeout_duration:
+            return_code = proc.poll()
+            if return_code is not None:
+                return False, f"Server process exited with code {return_code}"
+
+            try:
+                headers = {
+                    "Content-Type": "application/json; charset=utf-8",
+                    "Authorization": f"Bearer {api_key}",
+                }
+                response = session.get(
+                    f"{base_url}/health_generate",
+                    headers=headers,
+                    timeout=5,
+                )
+                if response.status_code == 200:
+                    return True, None
+            except requests.RequestException:
+                pass
+
+            return_code = proc.poll()
+            if return_code is not None:
+                return False, f"Server unexpectedly exited (return_code={return_code})"
+
+            time.sleep(10)
+
+    return False, "Server failed to start within the timeout period"
+
+
 def popen_launch_server(
     model: str,
     base_url: str,
@@ -574,11 +823,22 @@ def popen_launch_server(
     pd_separated: bool = False,
     num_replicas: Optional[int] = None,
 ):
-    """Launch a server process with automatic device detection.
+    """Launch a server process with automatic device detection and offline/online retry.
 
     Args:
-        device: Device type ("auto", "cuda", "rocm" or "cpu").
-                If "auto", will detect available platforms automatically.
+        model: Model path or identifier
+        base_url: Base URL for the server
+        timeout: Timeout for server startup
+        api_key: Optional API key for authentication
+        other_args: Additional command line arguments
+        env: Environment dict for subprocess
+        return_stdout_stderr: Optional tuple for output capture
+        device: Device type ("auto", "cuda", "rocm" or "cpu")
+        pd_separated: Whether to use PD separated mode
+        num_replicas: Number of replicas for mixed PD mode
+
+    Returns:
+        Started subprocess.Popen object
     """
     other_args = other_args or []
 
@@ -588,6 +848,25 @@ def popen_launch_server(
         other_args = list(other_args)
         other_args += ["--device", str(device)]
 
+    # CI-specific: Validate cache and enable offline mode if complete
+    if env is None:
+        env = os.environ.copy()
+    else:
+        env = env.copy()
+
+    # Store per-run marker path for potential invalidation
+    per_run_marker_path = None
+    try:
+        from sglang.utils import is_in_ci
+
+        if is_in_ci():
+            per_run_marker_path = _try_enable_offline_mode_if_cache_complete(
+                model, env, other_args
+            )
+    except Exception as e:
+        print(f"CI cache validation failed (non-fatal): {e}")
+
+    # Build server command
     _, host, port = base_url.split(":")
     host = host[2:]
 
@@ -607,104 +886,82 @@ def popen_launch_server(
     ]
 
     if pd_separated or use_mixed_pd_engine:
-        command.extend(
-            [
-                "--lb-host",
-                host,
-                "--lb-port",
-                port,
-            ]
-        )
+        command.extend(["--lb-host", host, "--lb-port", port])
     else:
-        command.extend(
-            [
-                "--host",
-                host,
-                "--port",
-                port,
-            ]
-        )
+        command.extend(["--host", host, "--port", port])
 
     if use_mixed_pd_engine:
-        command.extend(
-            [
-                "--mixed",
-                "--num-replicas",
-                str(num_replicas),
-            ]
-        )
+        command.extend(["--mixed", "--num-replicas", str(num_replicas)])
 
     if api_key:
         command += ["--api-key", api_key]
 
     print(f"command={shlex.join(command)}")
 
-    if return_stdout_stderr:
-        process = subprocess.Popen(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=env,
-            text=True,
-            bufsize=1,
+    # Track if offline mode was enabled for potential retry
+    offline_enabled = env.get("HF_HUB_OFFLINE") == "1"
+
+    # First launch attempt
+    process = _launch_server_process(command, env, return_stdout_stderr, model)
+    success, error_msg = _wait_for_server_health(process, base_url, api_key, timeout)
+
+    # If offline launch failed and offline was enabled, retry with online mode
+    if not success and offline_enabled:
+        print(
+            f"CI_OFFLINE: Offline launch failed ({error_msg}), retrying with online mode..."
         )
 
-        def _dump(src, sinks):
-            for line in iter(src.readline, ""):
-                for sink in sinks:
-                    sink.write(line)
-                    sink.flush()
-            src.close()
+        # Kill failed process
+        try:
+            if process.poll() is None:
+                kill_process_tree(process.pid)
+            else:
+                process.wait(timeout=5)
+        except Exception as e:
+            print(f"CI_OFFLINE: Error cleaning up failed offline process: {e}")
 
-        threading.Thread(
-            target=_dump,
-            args=(process.stdout, [return_stdout_stderr[0], sys.stdout]),
-            daemon=True,
-        ).start()
-        threading.Thread(
-            target=_dump,
-            args=(process.stderr, [return_stdout_stderr[1], sys.stderr]),
-            daemon=True,
-        ).start()
-    else:
-        process = subprocess.Popen(command, stdout=None, stderr=None, env=env)
-
-    start_time = time.perf_counter()
-    with requests.Session() as session:
-        while time.perf_counter() - start_time < timeout:
-            return_code = process.poll()
-            if return_code is not None:
-                # Server failed to start (non-zero exit code) or crashed
-                raise Exception(
-                    f"Server process exited with code {return_code}. "
-                    "Check server logs for errors."
-                )
-
+        # Invalidate per-run marker to prevent subsequent tests from using offline
+        if per_run_marker_path and os.path.exists(per_run_marker_path):
             try:
-                headers = {
-                    "Content-Type": "application/json; charset=utf-8",
-                    "Authorization": f"Bearer {api_key}",
-                }
-                response = session.get(
-                    f"{base_url}/health_generate",
-                    headers=headers,
-                    timeout=5,
-                )
-                if response.status_code == 200:
-                    return process
-            except requests.RequestException:
-                pass
+                os.remove(per_run_marker_path)
+                print("CI_OFFLINE: Invalidated per-run marker due to offline failure")
+            except Exception as e:
+                print(f"CI_OFFLINE: Failed to remove per-run marker: {e}")
 
-            return_code = process.poll()
-            if return_code is not None:
-                raise Exception(
-                    f"Server unexpectedly exits ({return_code=}). Usually there will be error logs describing the cause far above this line."
-                )
+        # Retry with online mode
+        env["HF_HUB_OFFLINE"] = "0"
+        process = _launch_server_process(command, env, return_stdout_stderr, model)
+        success, error_msg = _wait_for_server_health(
+            process, base_url, api_key, timeout
+        )
 
-            time.sleep(10)
+        if success:
+            print("CI_OFFLINE: Online retry succeeded")
+            return process
 
-    kill_process_tree(process.pid)
-    raise TimeoutError("Server failed to start within the timeout period.")
+        # Online retry also failed
+        try:
+            kill_process_tree(process.pid)
+        except Exception as e:
+            print(f"CI_OFFLINE: Error killing process after online retry failure: {e}")
+
+        if "exited" in error_msg:
+            raise Exception(error_msg + ". Check server logs for errors.")
+        raise TimeoutError(error_msg)
+
+    # First attempt succeeded or offline was not enabled
+    if success:
+        return process
+
+    # First attempt failed and offline was not enabled
+    try:
+        kill_process_tree(process.pid)
+    except Exception as e:
+        print(f"CI_OFFLINE: Error killing process after first attempt failure: {e}")
+
+    if "exited" in error_msg:
+        raise Exception(error_msg + ". Check server logs for errors.")
+    raise TimeoutError(error_msg)
 
 
 def popen_launch_pd_server(
