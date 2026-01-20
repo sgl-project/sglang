@@ -12,7 +12,7 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=180, suite="stage-b-test-large-2-gpu-performance")
-register_amd_ci(est_time=180, suite="stage-b-test-large-2-gpu-performance-amd")
+register_amd_ci(est_time=630, suite="stage-b-test-large-2-gpu-performance-amd")
 
 
 class TestBenchOneBatch2GPU(CustomTestCase):
