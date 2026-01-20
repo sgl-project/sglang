@@ -211,18 +211,7 @@ def cutlass_fused_experts_fp8(
     a_sf_layout = torch.empty((num_experts, 5), device=device, dtype=torch.int)
     w_sf_layout = torch.empty((num_experts, 5), device=device, dtype=torch.int)
 
-    if use_mxfp8 and es_up:
-        es_sm100_mxfp8_blockscaled_grouped_mm(
-            c1,
-            rep_a_q,
-            w1_q,
-            rep_a1_scales,
-            w1_scale,
-            problem_sizes1,
-            expert_offsets[:-1],
-            blockscale_offsets[:-1],
-        )
-    elif is_sm90_supported() and es_up:
+    if is_sm90_supported() and es_up:
         es_fp8_blockwise_scaled_grouped_mm(
             c1,
             rep_a_q,
@@ -235,6 +224,17 @@ def cutlass_fused_experts_fp8(
             problem_sizes1,
             expert_offsets[:-1],
             workspace,
+        )
+    elif use_mxfp8 and es_up:
+        es_sm100_mxfp8_blockscaled_grouped_mm(
+            c1,
+            rep_a_q,
+            w1_q,
+            rep_a1_scales,
+            w1_scale,
+            problem_sizes1,
+            expert_offsets[:-1],
+            blockscale_offsets[:-1],
         )
     else:
         fp8_blockwise_scaled_grouped_mm(
@@ -278,18 +278,7 @@ def cutlass_fused_experts_fp8(
     else:
         intemediate_q, a2_scale = sglang_per_token_group_quant_fp8(intermediate, 128)
 
-    if use_mxfp8 and es_down:
-        es_sm100_mxfp8_blockscaled_grouped_mm(
-            c2,
-            intemediate_q,
-            w2_q,
-            a2_scale,
-            w2_scale,
-            problem_sizes2,
-            expert_offsets[:-1],
-            blockscale_offsets[:-1],
-        )
-    elif is_sm90_supported() and es_down:
+    if is_sm90_supported() and es_down:
         es_fp8_blockwise_scaled_grouped_mm(
             c2,
             intemediate_q,
@@ -302,6 +291,17 @@ def cutlass_fused_experts_fp8(
             problem_sizes2,
             expert_offsets[:-1],
             workspace,
+        )
+    elif use_mxfp8 and es_down:
+        es_sm100_mxfp8_blockscaled_grouped_mm(
+            c2,
+            intemediate_q,
+            w2_q,
+            a2_scale,
+            w2_scale,
+            problem_sizes2,
+            expert_offsets[:-1],
+            blockscale_offsets[:-1],
         )
     else:
         fp8_blockwise_scaled_grouped_mm(

@@ -344,6 +344,7 @@ def native_w8a8_block_fp8_matmul(A, B, As, Bs, block_size, output_dtype=torch.fl
 
 
 class TestW8A8BlockFP8Matmul(CustomTestCase):
+
     if not _is_cuda:
         OUT_DTYPES = [torch.float32, torch.half, torch.bfloat16]
         M = [1, 7, 83, 512, 2048]
@@ -733,6 +734,7 @@ class TestW8A8BlockFP8BatchedDeepGemm(CustomTestCase):
         )
 
     def test_w8a8_block_fp8_batched_deep_gemm(self):
+
         for params in itertools.product(
             self.M,
             self.N,
