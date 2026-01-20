@@ -10,6 +10,11 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange, repeat
 
+from sglang.jit_kernel.flash_attention_v4 import flash_attn_varlen_func
+
+# Skip this test on Hopper machine
+skip_condition = torch.cuda.get_device_capability() < (10, 0)
+
 
 def apply_rotary_emb(
     x: torch.Tensor,
@@ -71,14 +76,6 @@ def apply_rotary_emb(
 
     x_rot = x_rot.reshape_as(x[..., :rotary_dim])
     return torch.cat((x_rot, x_pass), dim=-1)
-
-
-from sglang.jit_kernel.flash_attention_v4 import flash_attn_varlen_func
-
-# from utils import is_hopper  # Not used in this test
-
-# Skip this test on Hopper machine
-skip_condition = torch.cuda.get_device_capability() < (10, 0)
 
 
 def unpad_input(hidden_states, attention_mask, unused_mask=None):
