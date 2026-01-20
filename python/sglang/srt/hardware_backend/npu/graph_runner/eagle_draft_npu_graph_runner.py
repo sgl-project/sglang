@@ -80,12 +80,12 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
         return out
 
     def _get_update_attr_name(self):
-        if envs.SGLANG_USE_PAGED_ATTENTION.get():
+        if envs.SGLANG_NPU_USE_PAGED_ATTENTION.get():
             return self.attr_name[AttentionArch.MHA]
         return self.attr_name[AttentionArch.MLA]
 
     def _get_update_attr_type(self):
-        if envs.SGLANG_USE_PAGED_ATTENTION.get():
+        if envs.SGLANG_NPU_USE_PAGED_ATTENTION.get():
             return self.attr_type[AttentionArch.MHA]
         return self.attr_type[AttentionArch.MLA]
 

@@ -289,6 +289,7 @@ class Envs:
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
     SGLANG_NPU_USE_MULTI_STREAM = EnvBool(False)
     SGLANG_NPU_USE_MLAPO = EnvBool(False)
+    SGLANG_NPU_USE_PAGED_ATTENTION = EnvBool(False)
 
     # Quantization
     SGLANG_INT4_WEIGHT = EnvBool(False)
@@ -445,9 +446,6 @@ class Envs:
 
     # TokenizerManager
     SGLANG_REQUEST_STATE_WAIT_TIMEOUT = EnvInt(4)
-
-    # Attention
-    SGLANG_USE_PAGED_ATTENTION = EnvBool(False)
 
     # fmt: on
 

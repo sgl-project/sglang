@@ -1099,7 +1099,7 @@ class AscendAttnBackend(AttentionBackend):
             return attn_out
 
         if not self.use_mla:
-            if envs.SGLANG_USE_PAGED_ATTENTION.get():
+            if envs.SGLANG_NPU_USE_PAGED_ATTENTION.get():
                 k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
                 v_cache = forward_batch.token_to_kv_pool.get_value_buffer(
                     layer.layer_id
