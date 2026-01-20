@@ -33,8 +33,11 @@ from tqdm.auto import tqdm
 
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.distributed import get_tensor_model_parallel_rank
-from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
+from sglang.srt.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
+from sglang.srt.layers.dp_attention import get_attention_tp_rank
 from sglang.srt.layers.quantization import QuantizationConfig, get_quantization_config
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
@@ -997,14 +1000,13 @@ def sharded_weight_loader(shard_axis: int) -> LoaderFunction:
 
     def loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
         tp_rank = get_attention_tp_rank()
-        tp_size = get_attention_tp_size()
 
         shard_size = param.data.shape[shard_axis]
         start_idx = tp_rank * shard_size
 
         if (
             is_cpu()
-            and loaded_weight.size(0) % tp_size != 0
+            and loaded_weight.size(0) % get_tensor_model_parallel_world_size() != 0
             and loaded_weight.dim() == 1
         ):
             param_data = param.data  # view copy on param for uneven padding
