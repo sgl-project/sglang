@@ -61,20 +61,6 @@ FORWARD_ABSORB_CORE_ATTENTION_BACKENDS = [
 ]
 
 
-def enable_nextn_moe_bf16_cast_to_fp8(
-    quant_config: Optional[QuantizationConfig],
-) -> bool:
-    """
-    Determine if BF16 to FP8 casting should be enabled for DeepSeek NextN MoE layers.
-
-    Args:
-        quant_config: Quantization configuration, or None if no quantization is used.
-
-    Returns:
-        True if BF16 to FP8 casting should be enabled, False otherwise.
-    """
-
-
 def awq_dequantize_func():
     """
     Get the AWQ dequantize function for the current device
@@ -103,8 +89,18 @@ def awq_dequantize_func():
         return None
 
 
-def enable_nextn_moe_bf16_cast_to_fp8(quant_config):
+def enable_nextn_moe_bf16_cast_to_fp8(
+    quant_config: Optional[QuantizationConfig],
+) -> bool:
+    """
+    Determine if BF16 to FP8 casting should be enabled for DeepSeek NextN MoE layers.
 
+    Args:
+        quant_config: Quantization configuration, or None if no quantization is used.
+
+    Returns:
+        True if BF16 to FP8 casting should be enabled, False otherwise.
+    """
     return (
         envs.SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE.get()
         and quant_config is not None
