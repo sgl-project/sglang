@@ -1,8 +1,15 @@
 import os
+import subprocess
 import threading
+import time
 import unittest
 
-from sglang.srt.utils import kill_process_tree
+import grpc
+import zmq
+from grpc_health.v1 import health_pb2, health_pb2_grpc
+
+from sglang.srt.grpc import sglang_encoder_pb2, sglang_encoder_pb2_grpc
+from sglang.srt.utils import get_zmq_socket_on_host, kill_process_tree
 from sglang.test.kits.mmmu_vlm_kit import _run_lmms_eval_with_retry
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
@@ -420,6 +427,127 @@ class TestEPDDisaggregationMultiEncoders(PDDisaggregationServerBase):
         print(f"MMMU accuracy (multi encoder): {mmmu_accuracy:.4f}")
         # for qwen2.5-vl-3b-instruct, the accuracy is 0.40
         self.assertGreater(mmmu_accuracy, 0.40)
+
+
+@unittest.skipIf(is_in_ci(), "Skipping in CI to reduce multi-GPU runtime")
+class TestEPDDisaggregationGrpcEncoder(PDDisaggregationServerBase):
+    """Test gRPC encoder server integration with zmq_to_scheduler transfers."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.model = DEFAULT_SMALL_VLM_MODEL_NAME_FOR_TEST
+        cls.encode_port = f"{int(cls.lb_port) + 302}"
+
+        print(
+            f"Setting up gRPC EPD encoder: encode={cls.encode_port}"
+        )
+
+        cls.start_encode()
+        cls.wait_grpc_ready(cls.base_host, cls.encode_port, cls.process_encode)
+
+    @classmethod
+    def start_encode(cls):
+        encode_command = [
+            "python3",
+            "-m",
+            "sglang.launch_server",
+            "--model-path",
+            cls.model,
+            "--host",
+            cls.base_host,
+            "--port",
+            cls.encode_port,
+            "--trust-remote-code",
+            "--encoder-only",
+            "--grpc-mode",
+            "--encoder-transfer-backend",
+            "zmq_to_scheduler",
+            "--tp",
+            "1",
+            "--enable-prefix-mm-cache",
+        ]
+        cls.process_encode = subprocess.Popen(encode_command)
+
+    @staticmethod
+    def wait_grpc_ready(host, port, process, timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH):
+        deadline = time.time() + timeout
+        channel = grpc.insecure_channel(f"{host}:{port}")
+        stub = health_pb2_grpc.HealthStub(channel)
+        try:
+            while time.time() < deadline:
+                if process.poll() is not None:
+                    raise RuntimeError(
+                        f"gRPC encoder server exited with code {process.returncode}"
+                    )
+                try:
+                    response = stub.Check(
+                        health_pb2.HealthCheckRequest(service=""), timeout=2
+                    )
+                    if response.status == health_pb2.HealthCheckResponse.SERVING:
+                        return
+                except grpc.RpcError:
+                    pass
+                time.sleep(1)
+        finally:
+            channel.close()
+
+        raise RuntimeError(
+            f"gRPC encoder server not ready at {host}:{port} within {timeout}s"
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls.process_encode:
+            try:
+                kill_process_tree(cls.process_encode.pid)
+            except Exception as e:
+                print(f"Error killing process: {e}")
+        super().tearDownClass()
+
+    def test_grpc_encoder_zmq_to_scheduler(self):
+        context = zmq.Context()
+        recv_port, recv_socket = get_zmq_socket_on_host(
+            context, zmq.PULL, host=self.base_host
+        )
+        channel = grpc.insecure_channel(f"{self.base_host}:{self.encode_port}")
+        stub = sglang_encoder_pb2_grpc.SglangEncoderStub(channel)
+        req_id = f"grpc-epd-{int(time.time() * 1000)}"
+        image_path = os.path.abspath("examples/assets/example_image.png")
+
+        try:
+            stub.SchedulerReceiveUrl(
+                sglang_encoder_pb2.SchedulerReceiveUrlRequest(
+                    req_id=req_id,
+                    receive_url=f"{self.base_host}:{recv_port}",
+                    receive_count=1,
+                ),
+                timeout=60,
+            )
+            stub.Encode(
+                sglang_encoder_pb2.EncodeRequest(
+                    mm_items=[image_path],
+                    req_id=req_id,
+                    num_parts=1,
+                    part_idx=0,
+                ),
+                timeout=300,
+            )
+
+            poller = zmq.Poller()
+            poller.register(recv_socket, zmq.POLLIN)
+            socks = dict(poller.poll(60000))
+            self.assertIn(
+                recv_socket,
+                socks,
+                "No embedding payload received from gRPC encoder server",
+            )
+            parts = recv_socket.recv_multipart()
+            self.assertTrue(parts, "Empty embedding payload from gRPC encoder server")
+        finally:
+            recv_socket.close()
+            context.term()
+            channel.close()
 
 
 if __name__ == "__main__":
