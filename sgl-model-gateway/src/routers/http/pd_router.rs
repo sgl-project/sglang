@@ -1,4 +1,5 @@
 use std::{sync::Arc, time::Instant};
+use tracing::info;
 
 use async_trait::async_trait;
 use axum::{
@@ -54,7 +55,7 @@ pub struct PDRouter {
     pub enable_igw: bool,
 }
 
-#[derive(Clone)]
+#[derive(Clone,Debug)]
 struct PDRequestContext<'a> {
     route: &'static str,
     batch_size: Option<usize>,
@@ -285,6 +286,8 @@ impl PDRouter {
         let route = context.route;
         let model = context.model_id.unwrap_or(UNKNOWN_MODEL_ID);
         let endpoint = route_to_endpoint(route);
+        info!("execute_dual_dispatch begin");
+        info!("route {} model {} endpoint {}", route, model, endpoint);
 
         // Record request start (Layer 2)
         Metrics::record_router_request(
@@ -1323,9 +1326,11 @@ impl RouterTrait for PDRouter {
         body: &CompletionRequest,
         model_id: Option<&str>,
     ) -> Response {
+        info!("pd_router的route_completion");
         let is_stream = body.stream;
         let return_logprob = body.logprobs.is_some();
 
+        // 这个策略在做决策时是否需要req——text
         let request_text = if self.policies_need_request_text() {
             match &body.prompt {
                 StringOrArray::String(s) => Some(s.clone()),
@@ -1337,6 +1342,7 @@ impl RouterTrait for PDRouter {
 
         // Calculate batch size
         let batch_size = Self::get_completion_batch_size(body);
+        info!("batch_size ==> {:?}", batch_size);
 
         let context = PDRequestContext {
             route: "/v1/completions",
@@ -1347,6 +1353,7 @@ impl RouterTrait for PDRouter {
             model_id,
             headers: headers.cloned(),
         };
+        info!("context ==> {:#?}", context);
 
         self.execute_dual_dispatch(headers, body, context).await
     }

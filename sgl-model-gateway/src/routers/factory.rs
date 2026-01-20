@@ -1,6 +1,7 @@
 //! Factory for creating router instances
 
 use std::sync::Arc;
+use tracing::info;
 
 use super::{
     grpc::{pd_router::GrpcPDRouter, router::GrpcRouter},
@@ -65,6 +66,7 @@ impl RouterFactory {
     pub async fn create_regular_router(
         ctx: &Arc<AppContext>,
     ) -> Result<Box<dyn RouterTrait>, String> {
+        info!("进入create_regular_router方法");
         let router = Router::new(ctx).await?;
 
         Ok(Box::new(router))

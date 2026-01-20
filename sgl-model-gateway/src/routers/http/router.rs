@@ -1,4 +1,5 @@
 use std::{sync::Arc, time::Instant};
+use tracing::info;
 
 use axum::{
     body::{to_bytes, Body},
@@ -68,6 +69,7 @@ impl std::fmt::Debug for Router {
 impl Router {
     /// Create a new router with injected policy and client
     pub async fn new(ctx: &Arc<AppContext>) -> Result<Self, String> {
+        info!("进入这里");
         Ok(Router {
             worker_registry: ctx.worker_registry.clone(),
             policy_registry: ctx.policy_registry.clone(),

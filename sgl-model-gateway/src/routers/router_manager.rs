@@ -279,6 +279,7 @@ impl RouterManager {
 
     pub fn get_router_for_model(&self, model_id: &str) -> Option<Arc<dyn RouterTrait>> {
         let workers = self.worker_registry.get_by_model(model_id);
+        // info!("get_router_for_model == > workers {:#?}", workers);
 
         // Find the best router ID based on worker capabilities
         // Priority: external (OpenAI) > grpc-pd > http-pd > grpc-regular > http-regular
@@ -345,7 +346,7 @@ impl RouterManager {
                 return self.routers.get(default_id).map(|r| r.clone());
             }
         }
-
+        info!("进入路由选择阶段");
         let prefer_pd = headers
             .and_then(|h| {
                 h.get("x-prefer-pd")
@@ -359,12 +360,15 @@ impl RouterManager {
         let mut best_score = -1.0;
 
         // Extract router validity check into a closure to reduce redundancy
+        // TODO 这里还需要加日志看一下
+        info!("prefer_pd == > {}", prefer_pd);
         let is_router_valid =
             |is_pd: bool| (is_pd && num_pd_workers > 0) || (!is_pd && num_regular_workers > 0);
-
+    
         if let Some(model) = model_id {
             // Efficient Single Lookup for Specific Model
             if let Some(router) = self.get_router_for_model(model) {
+                info!("router.is_pd_mode() == > {}", router.is_pd_mode());
                 if is_router_valid(router.is_pd_mode()) {
                     return Some(router);
                 }
@@ -393,6 +397,27 @@ impl RouterManager {
                 }
             }
         }
+
+        // let routers_snapshot = self.routers_snapshot.load();
+        //     for router in routers_snapshot.iter() {
+        //         let mut score = 1.0;
+
+        //         let is_pd = router.is_pd_mode();
+        //         if prefer_pd && is_pd {
+        //             score += 2.0;
+        //         } else if !prefer_pd && !is_pd {
+        //             score += 1.0;
+        //         }
+        //         // TODO: Once routers expose worker stats, we can evaluate:
+        //         // - Average worker priority vs priority_threshold
+        //         // - Average worker cost vs max_cost
+        //         // - Current load and health status
+
+        //         if score > best_score && is_router_valid(is_pd) {
+        //             best_score = score;
+        //             best_router = Some(Arc::clone(router));
+        //         }
+        //     }
 
         best_router
     }
@@ -567,6 +592,7 @@ impl RouterTrait for RouterManager {
     ) -> Response {
         // In IGW mode, resolve model_id and fail fast if not resolvable
         // In non-IGW mode, pass through to router (router handles validation)
+        info!("route_completion 方法");
         let effective_model_id = if self.enable_igw {
             // Use provided model_id or fall back to body.model
             let model = model_id.or(Some(&body.model));
