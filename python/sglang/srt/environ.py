@@ -424,6 +424,8 @@ class Envs:
     SGLANG_BIAS_TOOL_WHEN_NONE = EnvBool(False)
     # Message to insert to prohibit tool calls (inserted into the last message, empty string disables)
     SGLANG_INSERT_TOOL_PROHIBIT = EnvStr("")
+    # Method for inserting tool prohibition: "last_message" (append to last message) or "new_turn" (add new user turn)
+    SGLANG_INSERT_TOOL_PROHIBIT_METHOD = EnvStr("last_message")
 
     # Ngram
     SGLANG_NGRAM_FORCE_GREEDY_VERIFY = EnvBool(False)

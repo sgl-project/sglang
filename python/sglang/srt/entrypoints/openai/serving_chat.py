@@ -328,22 +328,38 @@ class OpenAIServingChat(OpenAIServingBase):
         # Insert tool prohibition text into the last message when tool_choice is "none"
         # and SGLANG_INSERT_TOOL_PROHIBIT is set to a non-empty string
         tool_prohibit_msg = envs.SGLANG_INSERT_TOOL_PROHIBIT.get()
+        tool_prohibit_method = envs.SGLANG_INSERT_TOOL_PROHIBIT_METHOD.get()
         if request.tool_choice == "none" and tool_prohibit_msg and request.messages:
-            last_msg = request.messages[-1]
+            if tool_prohibit_method == "new_turn":
+                from sglang.srt.entrypoints.openai.protocol import (
+                    ChatCompletionMessageUserParam,
+                )
 
-            # Get current content and handle None/empty cases
-            current_content = last_msg.content
-            if current_content is None:
-                current_content = ""
-            elif not isinstance(current_content, str):
-                # If content is a list (e.g., multimodal), convert to string representation
-                current_content = str(current_content)
+                request.messages.append(
+                    ChatCompletionMessageUserParam(
+                        role="user",
+                        content=tool_prohibit_msg,
+                    )
+                )
+                logger.info(
+                    f"Inserted tool prohibition text as new user turn for tool_choice=none"
+                )
+            else:
+                last_msg = request.messages[-1]
 
-            new_content = current_content + tool_prohibit_msg
-            last_msg.content = new_content
-            logger.info(
-                f"Inserted tool prohibition text to last message for tool_choice=none"
-            )
+                # Get current content and handle None/empty cases
+                current_content = last_msg.content
+                if current_content is None:
+                    current_content = ""
+                elif not isinstance(current_content, str):
+                    # If content is a list (e.g., multimodal), convert to string representation
+                    current_content = str(current_content)
+
+                new_content = current_content + tool_prohibit_msg
+                last_msg.content = new_content
+                logger.info(
+                    f"Inserted tool prohibition text to last message for tool_choice=none"
+                )
 
         tool_call_constraint = None
 
