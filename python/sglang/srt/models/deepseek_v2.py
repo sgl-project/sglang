@@ -845,15 +845,23 @@ class DeepseekV2MoE(nn.Module):
             from sglang.srt.distributed import get_moe_expert_parallel_rank
             from sglang.srt.layers.moe.deepep_waterfill import DeepEPWaterfillBalancer
 
+            # In EPLB mode, we may have redundant physical experts (replicas). Waterfill operates
+            # on the *physical* expert-id space used by DeepEP dispatch (after EPLB mapping),
+            # so we must include `ep_num_redundant_experts` in the expert count.
+            num_physical_routed_experts = (
+                config.n_routed_experts
+                + get_global_server_args().ep_num_redundant_experts
+            )
             self.deepep_waterfill_balancer = DeepEPWaterfillBalancer(
-                num_routed_experts=config.n_routed_experts,
+                num_routed_experts=num_physical_routed_experts,
                 world_size=self.moe_ep_size,
                 rank=get_moe_expert_parallel_rank(),  # Use EP rank, not TP rank!
                 routed_scaling_factor=self.routed_scaling_factor,
             )
 
-            # Store old_experts_per_rank for weight copying later
-            self._old_experts_per_rank = config.n_routed_experts // self.moe_ep_size
+            # Store the number of local *physical* routed experts (without the shared slot) for
+            # weight copying and EPLB weight updates later.
+            self._old_experts_per_rank = num_physical_routed_experts // self.moe_ep_size
 
     def _copy_shared_expert_weights_to_moe(self):
         """
