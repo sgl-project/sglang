@@ -766,11 +766,11 @@ class PrefillAdder:
                         branch_trunc_len = branching_seqlen - prefix_len
                         if branch_trunc_len > 0:
                             trunc_len = branch_trunc_len
-
-                if (
-                    self.rem_chunk_tokens is None
-                    or input_tokens <= self.rem_chunk_tokens
-                ):
+                needs_chunking = trunc_len is not None or (
+                    self.rem_chunk_tokens is not None
+                    and input_tokens > self.rem_chunk_tokens
+                )
+                if not needs_chunking:
                     # Non-chunked prefill
                     self.can_run_list.append(req)
 
@@ -784,12 +784,15 @@ class PrefillAdder:
                         ),
                     )
                 else:
+                    if has_chunked_req:
+                        return AddReqResult.OTHER
+
                     # Make sure at least one page is available
                     if trunc_len is None:
                         trunc_len = (
                             self.rem_chunk_tokens // self.page_size * self.page_size
                         )
-                    else:
+                    elif self.rem_chunk_tokens is not None:
                         trunc_len = min(
                             trunc_len,
                             self.rem_chunk_tokens // self.page_size * self.page_size,
