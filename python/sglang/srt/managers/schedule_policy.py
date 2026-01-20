@@ -562,7 +562,7 @@ class PrefillAdder:
             # Therefore, in certain cases where _rem_tokens <= 0, it should be replaced with rem_chunk_tokens.
             if _rem_tokens <= 0:
                 _rem_tokens = self.rem_chunk_tokens
-        if self.is_ssm_radix_cache and req.mamba_branching_seqlen is not None:
+        if self.is_hybrid_ssm_cache and req.mamba_branching_seqlen is not None:
             prefix_len = len(req.prefix_indices)
             if prefix_len < req.mamba_branching_seqlen:
                 _rem_tokens = min(_rem_tokens, req.mamba_branching_seqlen - prefix_len)
@@ -755,7 +755,7 @@ class PrefillAdder:
             else:
                 trunc_len = None
                 branch_trunc_len = None
-                if self.is_ssm_radix_cache:
+                if self.is_hybrid_ssm_cache:
                     branching_seqlen = req.mamba_branching_seqlen
                     prefix_len = len(req.prefix_indices)
                     if (
