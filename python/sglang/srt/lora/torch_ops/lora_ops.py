@@ -103,11 +103,10 @@ def sgemm_lora_b_fwd(
                     idx, slice_start_output:slice_end_output, :rank
                 ]  # (slice_dim, rank)
 
-                result = torch.einsum("si, oi -> so", x_slice, w_slice)
                 output[
                     :,
                     slice_start_output:slice_end_output,
-                ] += result
+                ].add_(torch.mm(x_slice, w_slice.T))
 
         return output
 
