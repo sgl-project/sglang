@@ -1195,12 +1195,12 @@ jobs:
             --total-partitions 2 \
             $CONTINUE_ON_ERROR_FLAG
 
-  unit-test-backend-4-gpu:
+  stage-c-test-4-gpu-h100:
     needs: [check-changes, call-gate, wait-for-stage-b]
     if: |
       always() &&
       (
-        (inputs.target_stage == 'unit-test-backend-4-gpu') ||
+        (inputs.target_stage == 'stage-c-test-4-gpu-h100') ||
         (
           !inputs.target_stage &&
           ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
@@ -1248,12 +1248,12 @@ jobs:
           fi
           python3 run_suite.py --suite per-commit-4-gpu --auto-partition-id ${{ matrix.part }} --auto-partition-size 3 $RETRY_FLAG $CONTINUE_ON_ERROR_FLAG
 
-  unit-test-backend-8-gpu-h200:
+  stage-c-test-8-gpu-h200:
     needs: [check-changes, call-gate, wait-for-stage-b]
     if: |
       always() &&
       (
-        (inputs.target_stage == 'unit-test-backend-8-gpu-h200') ||
+        (inputs.target_stage == 'stage-c-test-8-gpu-h200') ||
         (
           !inputs.target_stage &&
           ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
@@ -1591,9 +1591,9 @@ jobs:
         stage-b-test-large-2-gpu,
         stage-c-test-large-4-gpu,
         stage-b-test-4-gpu-b200,
-        unit-test-backend-4-gpu,
+        stage-c-test-4-gpu-h100,
         unit-test-backend-8-gpu-h20,
-        unit-test-backend-8-gpu-h200,
+        stage-c-test-8-gpu-h200,
         unit-test-deepep-4-gpu,
         unit-test-deepep-8-gpu,
         unit-test-backend-4-gpu-b200,

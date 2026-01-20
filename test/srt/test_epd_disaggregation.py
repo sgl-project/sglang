@@ -3,6 +3,7 @@ import threading
 import unittest
 
 from sglang.srt.utils import kill_process_tree
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.mmmu_vlm_kit import _run_lmms_eval_with_retry
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
@@ -13,6 +14,8 @@ from sglang.test.test_utils import (
     is_in_ci,
     popen_launch_server,
 )
+
+register_cuda_ci(est_time=150, suite="stage-c-test-4-gpu-h100")
 
 
 @unittest.skipIf(is_in_ci(), "Skipping in CI to reduce multi-GPU runtime")
