@@ -7,8 +7,8 @@ from sglang.test.test_utils import CustomTestCase
 register_npu_ci(est_time=400, suite="nightly-1-npu-a3", nightly=True)
 
 
-class TestMistral7B(GSM8KAscendMixin, CustomTestCase):
-    model = "/root/.cache/modelscope/hub/models/LLM-Research/Phi-4-multimodal-instruct"
+class TestPhi4(GSM8KAscendMixin, CustomTestCase):
+    model = "/root/.cache/modelscope/hub/models/microsoft/Phi-4-multimodal-instruct"
     accuracy = 0.8
 
 
