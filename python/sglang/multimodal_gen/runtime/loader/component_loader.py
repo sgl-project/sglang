@@ -149,7 +149,7 @@ class ComponentLoader(ABC):
         """
         gpu_mem_before_loading = current_platform.get_available_gpu_memory()
         logger.info(
-            "Loading %s. avail mem: %.2f GB",
+            "Loading %s from %s. avail mem: %.2f GB",
             module_name,
             component_model_path,
             gpu_mem_before_loading,
