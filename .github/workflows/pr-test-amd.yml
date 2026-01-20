@@ -655,7 +655,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi35x-gpu-8]
+        runner: [linux-mi325-gpu-1]
         part: [0, 1, 2]
     runs-on: ${{matrix.runner}}
     steps:
