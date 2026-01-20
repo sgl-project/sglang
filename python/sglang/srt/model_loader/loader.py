@@ -89,6 +89,7 @@ from sglang.srt.environ import envs
 from sglang.srt.model_loader.weight_utils import (
     download_safetensors_index_file_from_hf,
     download_weights_from_hf,
+    fastsafetensors_weights_iterator,
     filter_duplicate_safetensors_files,
     filter_files_not_needed_for_inference,
     get_gguf_extra_tensor_names,
@@ -257,6 +258,10 @@ def _initialize_model(
     quant_config = _get_quantization_config(
         model_config, load_config, packed_modules_mapping, remap_prefix
     )
+    hf_to_sglang_mapper = getattr(model_class, "hf_to_sglang_mapper", None)
+    # pass mappings by reference to quant_config
+    if hf_to_sglang_mapper is not None and quant_config is not None:
+        quant_config.apply_weight_name_mapper(hf_to_sglang_mapper)
 
     # Build kwargs conditionally
     kwargs = {
@@ -266,7 +271,7 @@ def _initialize_model(
 
     # Only add sparse head kwargs if envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.is_set()
     if envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.is_set():
-        kwargs["sparse_head"] = envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.value
+        kwargs["sparse_head"] = envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.get()
         kwargs["model_path"] = model_config.model_path
 
     return model_class(**kwargs)
@@ -382,7 +387,10 @@ class DefaultModelLoader(BaseModelLoader):
         # Some quantized models use .pt files for storing the weights.
         if load_format == LoadFormat.AUTO:
             allow_patterns = ["*.safetensors", "*.bin"]
-        elif load_format == LoadFormat.SAFETENSORS:
+        elif (
+            load_format == LoadFormat.SAFETENSORS
+            or load_format == LoadFormat.FASTSAFETENSORS
+        ):
             use_safetensors = True
             allow_patterns = ["*.safetensors"]
         elif load_format == LoadFormat.MISTRAL:
@@ -413,6 +421,13 @@ class DefaultModelLoader(BaseModelLoader):
             )
         else:
             hf_folder = model_name_or_path
+
+        server_args = get_global_server_args()
+        if server_args and server_args.model_checksum is not None:
+            from sglang.srt.utils.model_file_verifier import verify
+
+            checksums_source = server_args.model_checksum or model_name_or_path
+            verify(model_path=hf_folder, checksums_source=checksums_source)
 
         hf_weights_files: List[str] = []
         for pattern in allow_patterns:
@@ -470,7 +485,11 @@ class DefaultModelLoader(BaseModelLoader):
                 get_global_server_args().weight_loader_disable_mmap
             )
 
-            if extra_config.get("enable_multithread_load"):
+            if self.load_config.load_format == LoadFormat.FASTSAFETENSORS:
+                weights_iterator = fastsafetensors_weights_iterator(
+                    hf_weights_files,
+                )
+            elif extra_config.get("enable_multithread_load"):
                 weights_iterator = multi_thread_safetensors_weights_iterator(
                     hf_weights_files,
                     max_workers=extra_config.get(
@@ -493,6 +512,23 @@ class DefaultModelLoader(BaseModelLoader):
                 )
             else:
                 weights_iterator = pt_weights_iterator(hf_weights_files)
+
+        if self.load_config.draft_model_idx is not None:
+            import re
+
+            pattern = r"model.mtp.layers.(\d+)."
+            filtered_weights = []
+            for name, tensor in weights_iterator:
+                group = re.match(pattern, name)
+                if group is not None:
+                    idx = int(group.group(1))
+                    if idx != self.load_config.draft_model_idx:
+                        continue
+                    new_name = name.replace(group.group(), "model.mtp.layers.0.")
+                else:
+                    new_name = name
+                filtered_weights.append((source.prefix + new_name, tensor))
+            return tuple(filtered_weights)
 
         # Apply the prefix.
         return ((source.prefix + name, tensor) for (name, tensor) in weights_iterator)
@@ -530,7 +566,9 @@ class DefaultModelLoader(BaseModelLoader):
             )
 
         hf_config = AutoConfig.from_pretrained(
-            model_config.model_path, trust_remote_code=True
+            model_config.model_path,
+            trust_remote_code=True,
+            local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
         )
         with init_empty_weights():
             torch_dtype = getattr(hf_config, "torch_dtype", torch.float16)
@@ -563,6 +601,7 @@ class DefaultModelLoader(BaseModelLoader):
             device_map=device_map,
             **model_kwargs,
             trust_remote_code=True,
+            local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
         )
         # Handle both legacy modelopt_quant and unified quantization flags
         if hasattr(model_config, "modelopt_quant") and model_config.modelopt_quant:
@@ -1211,6 +1250,12 @@ class DummyModelLoader(BaseModelLoader):
             for _, module in model.named_modules():
                 quant_method = getattr(module, "quant_method", None)
                 if quant_method is not None:
+                    # Skip FusedMoE layers already quantized during init (FP8 or FP4)
+                    if (
+                        hasattr(module, "is_weights_quantized")
+                        and module.is_weights_quantized()
+                    ):
+                        continue
                     quant_method.process_weights_after_loading(module)
 
             # NOTE(woosuk): For accurate performance evaluation, we assign
