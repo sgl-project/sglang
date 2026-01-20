@@ -45,7 +45,6 @@ def grouped_gemm_nt_f8f8bf16_masked(
         with configure_deep_gemm_num_sms(
             overlap_args.num_sms if overlap_args is not None else None
         ):
-
             return deep_gemm.fp8_m_grouped_gemm_nt_masked(
                 lhs,
                 rhs,
@@ -108,7 +107,7 @@ def update_deep_gemm_config(gpu_id: int, server_args: ServerArgs):
 
 @contextmanager
 def configure_deep_gemm_num_sms(num_sms):
-    if num_sms is None:
+    if not ENABLE_JIT_DEEPGEMM or num_sms is None:
         yield
     else:
         original_num_sms = deep_gemm.get_num_sms()
