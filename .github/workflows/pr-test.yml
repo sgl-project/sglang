@@ -188,13 +188,16 @@ jobs:
   # For scheduled runs: wait jobs are skipped, enabling parallel execution for easier retry.
 
   wait-for-stage-a:
-    needs: [check-changes]
+    needs: [check-changes, call-gate]
     # Only run for PRs (not scheduled) and when not targeting a specific stage
+    # Skip if call-gate failed (stage-a jobs will be skipped, nothing to wait for)
     if: |
+      always() &&
       github.event_name == 'pull_request' &&
       !inputs.target_stage &&
       inputs.test_parallel_dispatch != true &&
-      (needs.check-changes.outputs.main_package == 'true' || needs.check-changes.outputs.sgl_kernel == 'true')
+      (needs.check-changes.outputs.main_package == 'true' || needs.check-changes.outputs.sgl_kernel == 'true') &&
+      (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped')
     runs-on: ubuntu-latest
     outputs:
       stage_a_result: ${{ steps.wait.outputs.result }}
