@@ -19,7 +19,6 @@ from typing import TYPE_CHECKING, Optional
 import torch
 from torch import nn
 
-
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
