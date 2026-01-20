@@ -5,6 +5,10 @@ from typing import TYPE_CHECKING, List, Optional
 
 import torch
 import torch_npu
+from sgl_kernel_npu.attention.sinks_attention import (
+    attention_sinks_prefill_triton,
+    attention_sinks_triton,
+)
 
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
@@ -87,9 +91,8 @@ class AscendAttnMaskBuilder:
         self.mtp_mask = self.generate_mask_flag(mtp_mask_len).to(self.device)
 
         # Initialize mixed chunk mask cache
-        mixed_chunk_cache_len = 8192
-        self.mix_mask_cache = self.generate_attn_mask(mixed_chunk_cache_len, "mix")
-        self.mix_seq_len_cached = self.mix_mask_cache.shape[0]
+        mixed_mask_len = 2048
+        self.mixed_chunk_attn_mask = self.get_splitfuse_attn_mask(mixed_mask_len)
 
         if use_mla:
             # Initialize RingMla mask
@@ -183,48 +186,19 @@ class AscendAttnMaskBuilder:
     def get_splitfuse_attn_mask(
         self,
         seq_lens: torch.Tensor = None,
-        position: torch.Tensor = None,
-        dtype: torch.dtype = None,
-        device: torch.device = None,
     ) -> torch.Tensor:
         """
         Generate a splitfuse attention mask.
 
         :param seq_lens: Sequence lengths.
-        :param position: Position indices for the mask.
-        :param dtype: Data type of the mask tensor.
-        :param device: Device to run the model on.
         :return: A tensor representing the splitfuse attention mask.
         """
-        if dtype not in [torch.float16, torch.bfloat16]:
-            raise ValueError("splitfuse_attn_mask now only supports bf16 and fp16")
-        max_seq_len = max(seq_lens, default=0)
-        self.mix_mask_cache, self.mix_seq_len_cached = self.update_attn_cache(
-            max_seq_len, self.mix_mask_cache, self.mix_seq_len_cached, dtype, mode="mix"
+        attn_mask = (
+            torch.triu(torch.ones(seq_lens, seq_lens), diagonal=1)
+            .to(torch.int8)
+            .to(self.device)
         )
-        attn_mask = torch.index_select(self.mix_mask_cache, dim=0, index=position)[
-            :, :max_seq_len
-        ]
-        return attn_mask.contiguous().to(device, non_blocking=True)
-
-    def update_mask(self, forward_metadata):
-        """
-        Update the splitfuse attention mask based on forward metadata.
-
-        :param forward_metadata: Forward metadata containing sequence lengths and extended lengths.
-        :return: Updated splitfuse attention mask.
-        """
-        attn_mask_id = self.get_attention_mask_id(
-            forward_metadata.seq_lens_cpu_int,
-            forward_metadata.extend_seq_lens_cpu_int,
-        )
-        mix_mask = self.get_splitfuse_attn_mask(
-            seq_lens=forward_metadata.seq_lens_cpu_int,
-            position=attn_mask_id,
-            dtype=torch.float16,
-            device=self.device,
-        ).to(torch.bfloat16)
-        return mix_mask
+        return attn_mask
 
 
 class AscendAttnBackend(AttentionBackend):
@@ -259,7 +233,7 @@ class AscendAttnBackend(AttentionBackend):
             self.ascend_attn_mask_builder.mask,
             self.ascend_attn_mask_builder.fia_mask,
             self.ascend_attn_mask_builder.mtp_mask,
-            self.ascend_attn_mask_builder.mix_mask_cache,
+            self.ascend_attn_mask_builder.mixed_chunk_attn_mask,
         )
         if self.use_mla:
             self.ringmla_mask = self.ascend_attn_mask_builder.ringmla_mask
@@ -290,9 +264,17 @@ class AscendAttnBackend(AttentionBackend):
             // self.page_size
         )
         if forward_batch.extend_seq_lens is not None:
+            self.forward_metadata.extend_seq_lens = forward_batch.extend_seq_lens
             self.forward_metadata.extend_seq_lens_cpu_int = (
                 forward_batch.extend_seq_lens.cpu().int()
             )
+        if forward_batch.seq_lens is not None:
+            self.forward_metadata.seq_lens = forward_batch.seq_lens.int()
+        else:
+            self.forward_metadata.seq_lens = forward_batch.seq_lens_cpu.to(
+                self.device
+            ).int()
+
         self.forward_metadata.seq_lens_cpu_int = forward_batch.seq_lens_cpu.int()
         if (
             not forward_batch.forward_mode.is_draft_extend_v2()
@@ -333,10 +315,6 @@ class AscendAttnBackend(AttentionBackend):
                     )
                 )
 
-        if forward_batch.forward_mode.is_mixed():
-            self.mix_mask = self.ascend_attn_mask_builder.update_mask(
-                self.forward_metadata
-            )
         self.graph_mode = False
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
@@ -610,6 +588,7 @@ class AscendAttnBackend(AttentionBackend):
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
         topk_indices: Optional[torch.Tensor] = None,
+        sinks: Optional[torch.Tensor] = None,
     ):
         if topk_indices is not None:
             return self.forward_sparse(
@@ -650,6 +629,22 @@ class AscendAttnBackend(AttentionBackend):
 
             k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
             v_cache = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
+
+            if sinks is not None:
+                attn_out = attention_sinks_prefill_triton(
+                    q,
+                    k_cache,
+                    v_cache,
+                    sinks,
+                    self.forward_metadata.extend_seq_lens,
+                    self.forward_metadata.block_tables,
+                    self.forward_metadata.seq_lens,
+                    layer.scaling,
+                    layer.sliding_window_size,
+                    layer.tp_q_head_num,
+                    layer.tp_k_head_num,
+                )
+                return attn_out
 
             if self.use_fia:
                 """FIA will support multi-bs in the later version of CANN"""
@@ -1070,6 +1065,7 @@ class AscendAttnBackend(AttentionBackend):
         save_kv_cache: bool = True,
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
+        sinks: Optional[torch.Tensor] = None,
     ):
         if save_kv_cache:
             if self.use_mla:
@@ -1082,6 +1078,24 @@ class AscendAttnBackend(AttentionBackend):
                 forward_batch.token_to_kv_pool.set_kv_buffer(
                     layer, forward_batch.out_cache_loc, k, v
                 )
+
+        if sinks is not None:
+            k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+            v_cache = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
+
+            attn_out = attention_sinks_triton(
+                q,
+                k_cache,
+                v_cache,
+                sinks,
+                self.forward_metadata.block_tables,
+                self.forward_metadata.seq_lens,
+                layer.scaling,
+                layer.sliding_window_size,
+                layer.tp_q_head_num,
+                layer.tp_k_head_num,
+            )
+            return attn_out
 
         if not self.use_mla:
             num_tokens = q.shape[0]
@@ -1251,6 +1265,7 @@ class AscendAttnBackend(AttentionBackend):
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
         topk_indices: Optional[torch.Tensor] = None,
+        sinks: Optional[torch.Tensor] = None,
     ):
         if is_mla_preprocess_enabled():
             # MLAPO does saving kv_cache
@@ -1278,6 +1293,7 @@ class AscendAttnBackend(AttentionBackend):
                 save_kv_cache,
                 q_rope=q_rope,
                 k_rope=k_rope,
+                sinks=sinks,
             )
 
         if not self.use_mla:
@@ -1288,6 +1304,22 @@ class AscendAttnBackend(AttentionBackend):
             num_tokens = q.shape[0]
             k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
             v_cache = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
+
+            if sinks is not None:
+                attn_out = attention_sinks_triton(
+                    q,
+                    k_cache,
+                    v_cache,
+                    sinks,
+                    self.forward_metadata.block_tables,
+                    self.forward_metadata.seq_lens,
+                    layer.scaling,
+                    layer.sliding_window_size,
+                    layer.tp_q_head_num,
+                    layer.tp_k_head_num,
+                )
+                return attn_out
+
             if self.use_fia:
                 if self.forward_metadata.seq_lens_cpu_int is None:
                     actual_seq_len_kv = self.forward_metadata.seq_lens_cpu_list
@@ -1450,29 +1482,28 @@ class AscendAttnBackend(AttentionBackend):
             )
         k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
         v_cache = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
+        num_block, block_size, _, _ = k_cache.shape
+        key = k_cache.view(num_block, block_size, -1)
+        value = v_cache.view(num_block, block_size, -1)
 
         query = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
 
-        # Initialize the output tensor for attention results
-        attn_output = torch.empty(
-            (query.shape[0], layer.tp_q_head_num, layer.v_head_dim),
-            dtype=query.dtype,
-            device=query.device,
+        attn_output, _ = torch.ops.npu.npu_fused_infer_attention_score(
+            query,
+            key,
+            value,
+            num_heads=layer.tp_q_head_num,
+            num_key_value_heads=layer.tp_k_head_num,
+            input_layout="TND",
+            block_size=block_size,
+            block_table=self.forward_metadata.block_tables,
+            atten_mask=self.mix_mask,
+            sparse_mode=3,
+            actual_seq_lengths=self.forward_metadata.seq_lens_list_cumsum,
+            actual_seq_lengths_kv=self.forward_metadata.seq_lens_cpu_int,
+            scale=layer.scaling,
         )
 
-        torch_npu._npu_paged_attention_splitfuse(
-            query=query,
-            key_cache=k_cache,
-            value_cache=v_cache,
-            block_table=self.forward_metadata.block_tables,
-            context_lens=self.forward_metadata.seq_lens_cpu_int,
-            mask=self.mix_mask,
-            seq_len=self.forward_metadata.extend_seq_lens_cpu_int,
-            scale_value=layer.scaling,
-            num_heads=layer.tp_q_head_num,
-            num_kv_heads=layer.tp_k_head_num,
-            out=attn_output,
-        )
         return attn_output.view(
             attn_output.shape[0], layer.tp_q_head_num * layer.v_head_dim
         )

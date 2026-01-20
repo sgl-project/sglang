@@ -34,10 +34,8 @@ def test_gsm8k(base_url: str):
         port=int(base_url.split(":")[-1]),
     )
     metrics = run_eval_few_shot_gsm8k(args)
-    server_info = requests.get(base_url + "/get_server_info")
-    avg_spec_accept_length = server_info.json()["internal_states"][0][
-        "avg_spec_accept_length"
-    ]
+    server_info = requests.get(base_url + "/server_info").json()
+    avg_spec_accept_length = server_info["internal_states"][0]["avg_spec_accept_length"]
 
     print(f"{metrics=}")
     print(f"{avg_spec_accept_length=}")
@@ -91,8 +89,7 @@ class TestEagleDPAttnServerLarge(CustomTestCase):
         metrics, avg_spec_accept_length = test_gsm8k(self.base_url)
 
         self.assertGreater(metrics["accuracy"], 0.94)
-        # TODO: Update accept len to 2.04 once the bug is fixed
-        self.assertGreater(avg_spec_accept_length, 1.4)
+        self.assertGreater(avg_spec_accept_length, 2.7)
         if is_in_ci():
             write_github_step_summary(
                 f"### test_gsm8k (deepseek-v3-fp4 mtp)\n"
