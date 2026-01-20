@@ -2441,7 +2441,7 @@ class IncModelLoader(DefaultModelLoader):
         device_config: DeviceConfig,
     ) -> nn.Module:
 
-        logger.info("IncModelLoader: Loading base model...")
+        logger.info("IncModelLoader: Loading model...")
 
         # Check if model is already quantized
         if model_config._is_already_quantized():
@@ -2451,8 +2451,44 @@ class IncModelLoader(DefaultModelLoader):
                 model_config=model_config, device_config=device_config
             )
 
-        logger.info("Standard quantization mode: Will quantize and save")
-        return self._autoround_quantization_workflow(model_config, device_config)
+        quant_model = self._autoround_quantization_workflow(model_config, device_config)
+
+        # Return autoround model for offline quantization mode
+        if self.load_config.inc_save_path is not None:
+            return quant_model.eval()
+
+        model_config.hf_config = quant_model.config
+
+        target_device = torch.device(device_config.device)
+        with set_default_torch_dtype(model_config.dtype):
+            with target_device:
+                model = _initialize_model(
+                    model_config,
+                    self.load_config,
+                )
+
+            self.load_weights_and_postprocess(
+                model, iter(quant_model.state_dict().items()), target_device
+            )
+
+        return model.eval()
+
+    @staticmethod
+    def load_weights_and_postprocess(model, weights, target_device):
+        model.load_weights(weights)
+
+        for _, module in model.named_modules():
+            quant_method = getattr(module, "quant_method", None)
+            if quant_method is not None:
+                # When quant methods need to process weights after loading
+                # (for repacking, quantizing, etc), they expect parameters
+                # to be on the global target device. This scope is for the
+                # case where cpu offloading is used, where we will move the
+                # parameters onto device for processing and back off after.
+                with device_loading_context(module, target_device):
+                    quant_method.process_weights_after_loading(module)
+                if _is_npu:
+                    torch.npu.empty_cache()
 
     def _parse_quantization(self, quantization: str):
         """Map quantization to AutoRound's scheme and format."""
@@ -2483,18 +2519,23 @@ class IncModelLoader(DefaultModelLoader):
         scheme, format = self._parse_quantization(model_config.quantization)
 
         try:
+            if self.load_config.inc_save_path is not None:
+                logger.info("Offline quantization mode: Will quantize and save")
+            else:
+                logger.info("Online quantization mode: Will quantize and skip saving")
             autoround = AutoRound(
                 model_config.model_path,
                 scheme=scheme,
                 iters=self.load_config.inc_tuning_iters,
                 disable_opt_rtn=self.load_config.inc_disable_opt_rtn,
             )
-            autoround.quantize_and_save(output_dir=self.load_config.inc_save_path)
-            model = autoround.model
+            model, _ = autoround.quantize_and_save(
+                output_dir=self.load_config.inc_save_path,
+                format=format
+            )
+            return model
         except Exception as e:
             raise ValueError(f"AutoRound quantization failed: {e}")
-
-        return model.eval()
 
 
 class ModelOptModelLoader(DefaultModelLoader):
