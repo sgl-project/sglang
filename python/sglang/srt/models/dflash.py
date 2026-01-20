@@ -26,7 +26,10 @@ from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.utils import apply_qk_norm
-from sglang.srt.speculative.dflash_utils import get_dflash_config
+from sglang.srt.speculative.dflash_utils import (
+    get_dflash_config,
+    resolve_dflash_target_layer_ids,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -275,20 +278,13 @@ class DFlashDraftModel(nn.Module):
         # Project per-token target context features:
         # concat(K * hidden_size) -> hidden_size, where K is the number of target-layer
         # feature tensors concatenated per token (not necessarily equal to num_layers).
-        target_layer_ids = dflash_cfg_dict.get("target_layer_ids", None)
-        if target_layer_ids is None:
-            num_context_features = num_layers
-        else:
-            if not isinstance(target_layer_ids, (list, tuple)):
-                raise ValueError(
-                    "DFLASH dflash_config.target_layer_ids must be a list of ints, "
-                    f"got type={type(target_layer_ids).__name__}."
-                )
-            if len(target_layer_ids) <= 0:
-                raise ValueError(
-                    "DFLASH dflash_config.target_layer_ids must be non-empty, got []."
-                )
-            num_context_features = len(target_layer_ids)
+        target_num_layers = int(getattr(config, "num_target_layers", num_layers))
+        target_layer_ids = resolve_dflash_target_layer_ids(
+            draft_hf_config=config,
+            target_num_layers=target_num_layers,
+            draft_num_layers=num_layers,
+        )
+        num_context_features = len(target_layer_ids)
 
         self.num_context_features = int(num_context_features)
         self.fc = nn.Linear(

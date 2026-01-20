@@ -1014,6 +1014,18 @@ class Qwen3MoeForCausalLM(nn.Module):
         else:
             self.model.set_eagle3_layers_to_capture([val + 1 for val in layer_ids])
 
+    def set_dflash_layers_to_capture(self, layer_ids: List[int]):
+        if not self.pp_group.is_last_rank:
+            return
+
+        if layer_ids is None:
+            raise ValueError(
+                "DFLASH requires explicit layer_ids for aux hidden capture."
+            )
+
+        self.capture_aux_hidden_states = True
+        self.model.set_dflash_layers_to_capture([val + 1 for val in layer_ids])
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)

@@ -73,7 +73,8 @@ def resolve_dflash_target_layer_ids(
 
     Precedence:
       1) `draft_hf_config.dflash_config.target_layer_ids`
-      2) default `build_target_layer_ids(target_num_layers, draft_num_layers)`
+      2) `draft_hf_config.target_layer_ids` (fallback to base config)
+      3) default `build_target_layer_ids(target_num_layers, draft_num_layers)`
 
     Notes:
         The number of draft transformer layers is *not* fundamentally tied to the number
@@ -83,6 +84,8 @@ def resolve_dflash_target_layer_ids(
     """
     cfg = get_dflash_config(draft_hf_config)
     layer_ids = cfg.get("target_layer_ids", None)
+    if layer_ids is None:
+        layer_ids = getattr(draft_hf_config, "target_layer_ids", None)
     if layer_ids is None:
         return build_target_layer_ids(target_num_layers, draft_num_layers)
 
