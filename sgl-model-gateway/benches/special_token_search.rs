@@ -1,6 +1,6 @@
+use aho_corasick::AhoCorasick;
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
 
-/// Naive implementation as described in the issue
 fn find_special_token_boundaries_naive(
     text: &str,
     special_tokens: &[String],
@@ -14,32 +14,42 @@ fn find_special_token_boundaries_naive(
             start = actual_pos + token.len();
         }
     }
-    // Reconstruct the order of tokens as they appear in the text
     boundaries.sort_by_key(|b| b.0);
     boundaries
 }
 
-fn bench_naive_search(c: &mut Criterion) {
-    let mut group = c.benchmark_group("special_token_search_naive");
+fn find_special_token_boundaries_aho(text: &str, ac: &AhoCorasick) -> Vec<(usize, usize)> {
+    ac.find_iter(text)
+        .map(|mat| (mat.start(), mat.end()))
+        .collect()
+}
 
-    // Simulate a typical LLM prompt context (approx 50KB)
+fn bench_token_search_comparison(c: &mut Criterion) {
+    let mut group = c.benchmark_group("token_boundary_search");
     let text = "User: Hello! Assistant: How can I help you today? ".repeat(1000);
 
-    // Test varying complexity of stop sequences
-    for token_count in [5, 20, 50] {
+    for token_count in [5, 50] {
         let special_tokens: Vec<String> = (0..token_count)
             .map(|i| format!("<|stop_sequence_{}|>", i))
             .collect();
 
+        let ac = AhoCorasick::new(&special_tokens).unwrap();
         group.throughput(Throughput::Bytes(text.len() as u64));
+
+        // Benchmark Naive
         group.bench_function(format!("naive_tokens_{}", token_count), |b| {
             b.iter(|| {
                 find_special_token_boundaries_naive(black_box(&text), black_box(&special_tokens))
             })
         });
+
+        // Benchmark Aho-Corasick
+        group.bench_function(format!("aho_tokens_{}", token_count), |b| {
+            b.iter(|| find_special_token_boundaries_aho(black_box(&text), black_box(&ac)))
+        });
     }
     group.finish();
 }
 
-criterion_group!(benches, bench_naive_search);
+criterion_group!(benches, bench_token_search_comparison);
 criterion_main!(benches);

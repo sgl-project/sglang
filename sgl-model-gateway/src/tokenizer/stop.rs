@@ -1,5 +1,6 @@
 use std::{collections::HashSet, sync::Arc};
 
+use aho_corasick::AhoCorasick;
 use anyhow::Result;
 
 use super::{
@@ -64,6 +65,8 @@ pub struct StopSequenceDecoder {
     /// Sequence for incremental decoding (replaces token_buffer + offsets)
     sequence: Sequence,
     config: StopSequenceConfig,
+    aho_corasick: Option<AhoCorasick>,
+    visible_boundary_idx: usize,
     /// Buffer for partial matches (the "jail")
     jail_buffer: String,
     /// Whether we've stopped
@@ -77,9 +80,24 @@ impl StopSequenceDecoder {
         config: StopSequenceConfig,
         skip_special_tokens: bool,
     ) -> Self {
+        let patterns: Vec<String> = config
+            .stop_sequences
+            .iter()
+            .chain(config.visible_stop_sequences.iter())
+            .cloned()
+            .collect();
+        let visible_boundary_idx = config.stop_sequences.len();
+        let aho_corasick = if patterns.is_empty() {
+            None
+        } else {
+            Some(AhoCorasick::new(patterns).expect("Failed to build Aho-Corasick"))
+        };
+        let visible_boundary_idx = config.stop_sequences.len();
         StopSequenceDecoder {
             sequence: Sequence::new_with_options(tokenizer, skip_special_tokens),
             config,
+            aho_corasick,
+            visible_boundary_idx,
             jail_buffer: String::new(),
             stopped: false,
         }
@@ -122,28 +140,25 @@ impl StopSequenceDecoder {
 
         self.jail_buffer.push_str(&new_text);
 
-        // Check for hidden stop sequences
-        for stop_seq in &self.config.stop_sequences {
-            if let Some(pos) = self.jail_buffer.find(stop_seq) {
+        // Check for stop sequences
+        if let Some(ac) = &self.aho_corasick {
+            if let Some(mat) = ac.find(&self.jail_buffer) {
                 self.stopped = true;
-                let output = self.jail_buffer[..pos].to_string();
-                self.jail_buffer.clear();
-                return Ok(if output.is_empty() {
-                    SequenceDecoderOutput::Stopped
-                } else {
-                    SequenceDecoderOutput::StoppedWithText(output)
-                });
-            }
-        }
+                let is_visible = mat.pattern().as_usize() >= self.visible_boundary_idx;
 
-        // Check for visible stop sequences
-        for stop_seq in &self.config.visible_stop_sequences {
-            if let Some(pos) = self.jail_buffer.find(stop_seq) {
-                self.stopped = true;
-                let end_pos = pos + stop_seq.len();
-                let output = self.jail_buffer[..end_pos].to_string();
-                self.jail_buffer.clear();
-                return Ok(SequenceDecoderOutput::StoppedWithText(output));
+                if is_visible {
+                    let output = self.jail_buffer[..mat.end()].to_string();
+                    self.jail_buffer.clear();
+                    return Ok(SequenceDecoderOutput::StoppedWithText(output));
+                } else {
+                    let output = self.jail_buffer[..mat.start()].to_string();
+                    self.jail_buffer.clear();
+                    return Ok(if output.is_empty() {
+                        SequenceDecoderOutput::Stopped
+                    } else {
+                        SequenceDecoderOutput::StoppedWithText(output)
+                    });
+                }
             }
         }
 
