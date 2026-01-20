@@ -1536,6 +1536,8 @@ class HybridLinearKVPool(KVCache):
         scale_v: Optional[float] = None,
     ):
         layer_id = self._transfer_full_attention_id(layer_id)
+        if scale_k is None and scale_v is None:
+            return self.full_kv_pool.get_kv_buffer(layer_id)
         return self.full_kv_pool.get_kv_buffer(layer_id, scale_k, scale_v)
 
     def get_fp4_value_buffer(self, layer_id: int):

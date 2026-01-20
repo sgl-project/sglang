@@ -953,9 +953,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         if not nvfp4_kvcache_path:
             # [num_pages, page_size, num_kv_heads, head_dim] -> [num_pages, num_kv_heads, page_size, head_dim]
             k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
-                layer.layer_id,
-                k_scale,
-                v_scale,
+                layer.layer_id
             )
             k_cache = k_cache.view(
                 -1, self.page_size, layer.tp_k_head_num, layer.head_dim
