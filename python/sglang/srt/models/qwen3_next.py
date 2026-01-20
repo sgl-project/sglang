@@ -61,8 +61,6 @@ _is_npu = is_npu()
 import triton
 import triton.language as tl
 
-from sglang.srt.compilation.piecewise_context_manager import get_forward_context
-
 
 @triton.jit
 def fused_qkvzba_split_reshape_cat_kernel(
@@ -399,8 +397,8 @@ class Qwen3GatedDeltaNet(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
-        output = torch.empty_like(hidden_states)
         if forward_batch.forward_mode.is_extend() and get_forward_context() is not None:
+            output = torch.empty_like(hidden_states)
             gdn_with_output(
                 hidden_states,
                 output,

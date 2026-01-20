@@ -869,7 +869,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
         a = kwargs["a"]
         b = kwargs["b"]
 
-        # Extract from layer if available, fallback to kwargs for backward compatibility
         if layer is not None:
             conv_weights = layer.conv_weights
             bias = layer.bias
@@ -882,18 +881,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
             A_log = layer.A_log
             dt_bias = layer.dt_bias
             layer_id = layer.layer_id
-        else:
-            conv_weights = kwargs["conv_weights"]
-            bias = kwargs["bias"]
-            activation = kwargs["activation"]
-            key_dim = kwargs["key_dim"]
-            value_dim = kwargs["value_dim"]
-            attn_tp_size = kwargs["attention_tp_size"]
-            head_k_dim = kwargs["head_k_dim"]
-            head_v_dim = kwargs["head_v_dim"]
-            A_log = kwargs["A_log"]
-            dt_bias = kwargs["dt_bias"]
-            layer_id = kwargs["layer_id"]
 
         layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer_id)
         conv_states = layer_cache.conv[0]
@@ -962,12 +949,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
         mixed_qkv = kwargs["mixed_qkv"]
         a = kwargs["a"]
         b = kwargs["b"]
-        z = kwargs.get("z")  # z is also runtime
+        z = kwargs.get("z")
 
         # seq_len can be derived from mixed_qkv or passed explicitly
         seq_len = kwargs.get("seq_len", mixed_qkv.shape[0])
 
-        # Extract from layer if available, fallback to kwargs for backward compatibility
         if layer is not None:
             conv_weights = layer.conv_weights
             bias = layer.bias
@@ -980,18 +966,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
             A_log = layer.A_log
             dt_bias = layer.dt_bias
             layer_id = layer.layer_id
-        else:
-            conv_weights = kwargs["conv_weights"]
-            bias = kwargs["bias"]
-            activation = kwargs["activation"]
-            key_dim = kwargs["key_dim"]
-            value_dim = kwargs["value_dim"]
-            attn_tp_size = kwargs["attention_tp_size"]
-            head_k_dim = kwargs["head_k_dim"]
-            head_v_dim = kwargs["head_v_dim"]
-            A_log = kwargs["A_log"]
-            dt_bias = kwargs["dt_bias"]
-            layer_id = kwargs["layer_id"]
 
         is_target_verify = forward_batch.forward_mode.is_target_verify()
         forward_metadata = self.forward_metadata

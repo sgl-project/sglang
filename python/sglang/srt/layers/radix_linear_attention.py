@@ -19,9 +19,6 @@ from typing import TYPE_CHECKING, Optional
 import torch
 from torch import nn
 
-from sglang.srt.compilation.compilation_config import register_split_op
-from sglang.srt.compilation.piecewise_context_manager import get_forward_context
-from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -76,72 +73,11 @@ class RadixLinearAttention(nn.Module):
         forward_batch: ForwardBatch,
         **kwargs,
     ) -> torch.Tensor:
-        # mixed_qkv is expected in kwargs, matching the backend interface
-        mixed_qkv = kwargs["mixed_qkv"]
-
-        if forward_batch.forward_mode.is_extend() and get_forward_context() is not None:
-            # Output dimension is per-TP value dimension
-            output = torch.empty(
-                mixed_qkv.shape[0],
-                self.value_dim_per_tp,
-                device=mixed_qkv.device,
-                dtype=mixed_qkv.dtype,
-            )
-            torch.ops.sglang.unified_linear_attention_with_output(
-                output, self.layer_id, **kwargs
-            )
-            return output
-        else:
-            # Backend extracts layer params from self (layer_id, A_log, dt_bias, etc.)
-            return forward_batch.attn_backend.forward(
-                q=None,
-                k=None,
-                v=None,
-                layer=self,
-                forward_batch=forward_batch,
-                **kwargs,
-            )
-
-
-@register_custom_op(mutates_args=["output"])
-@register_split_op()
-def unified_linear_attention_with_output(
-    output: torch.Tensor,
-    layer_id: int,
-    *,
-    # Runtime tensors - must be passed
-    mixed_qkv: Optional[torch.Tensor] = None,
-    a: Optional[torch.Tensor] = None,
-    b: Optional[torch.Tensor] = None,
-    z: Optional[torch.Tensor] = None,
-) -> None:
-    context = get_forward_context()
-    forward_batch = context.forward_batch
-    attention_layers = context.attention_layers
-    attention_layer = attention_layers[layer_id]
-
-    kwargs = {}
-    if mixed_qkv is not None:
-        kwargs["mixed_qkv"] = mixed_qkv
-    if a is not None:
-        kwargs["a"] = a
-    if b is not None:
-        kwargs["b"] = b
-    if z is not None:
-        kwargs["z"] = z
-
-    ret = forward_batch.attn_backend.forward(
-        q=None,
-        k=None,
-        v=None,
-        layer=attention_layer,
-        forward_batch=forward_batch,
-        **kwargs,
-    )
-
-    assert (
-        output.numel() == ret.numel()
-    ), f"Output tensor element mismatch: {output.numel()} != {ret.numel()}"
-
-    output.view(ret.shape).copy_(ret)
-    return
+        return forward_batch.attn_backend.forward(
+            q=None,
+            k=None,
+            v=None,
+            layer=self,
+            forward_batch=forward_batch,
+            **kwargs,
+        )
