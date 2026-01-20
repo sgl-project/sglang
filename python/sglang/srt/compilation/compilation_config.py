@@ -18,7 +18,7 @@ def register_split_op(op_name: Optional[str] = None):
 class CompilationConfig:
     def __init__(
         self,
-        capture_sizes: List[int] = [],
+        capture_sizes: List[int] = None,
         compiler: str = "eager",
         enable_debug_mode: bool = False,
     ):

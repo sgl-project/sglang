@@ -14,7 +14,9 @@
 
 import torch
 
-import sglang.srt.hardware_backend.npu.graph_runner.compilation.custom_ops  # noqa
+from sglang.srt.hardware_backend.npu.graph_runner.compilation.custom_ops import (
+    split_qkv_rmsnorm_rope,
+)
 
 
 class DivFuse:
@@ -37,19 +39,19 @@ class EraseCopy:
             for node in list(module.graph.nodes):
                 if node.type == torch.nn.parameter.Parameter:
                     continue
-                if node.target == "copy_":
+
+                node_target_str = str(node.target)
+
+                if node_target_str == "copy_":
                     copy_node = node
                     prepare_weight_cache_default_node = None
                     continue
 
-                if (
-                    copy_node
-                    and node.target == torch.ops.sglang.prepare_weight_cache.default
-                ):
+                if copy_node and node_target_str == "sglang.prepare_weight_cache":
                     prepare_weight_cache_default_node = node
                     continue
 
-                if copy_node and node.target == torch.ops.npu.npu_add_rms_norm_quant:
+                if copy_node and node_target_str == "npu.npu_add_rms_norm_quant":
                     arg = copy_node.args[1]
 
                     if prepare_weight_cache_default_node is not None:
@@ -216,7 +218,7 @@ class SplitQkvRmsnormRopeFuse:
         sin_view = sin.view(-1, 1, 1, self.head_dim)
         sin_contiguous = sin_view.contiguous()
 
-        split_qkv_rmsnorm_rope_default = torch.ops.sglang.split_qkv_rmsnorm_rope(
+        split_qkv_rmsnorm_rope_default = split_qkv_rmsnorm_rope(
             output_parallel,
             sin_contiguous,
             cos_contiguous,

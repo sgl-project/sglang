@@ -90,6 +90,11 @@ def set_default_server_args(args: "ServerArgs"):
         )
 
     if args.compilation_config:
+        if not args.enable_torch_compile and not args.enable_npu_torchair_compile:
+            raise ValueError(
+                f"--compilation-config must be used only with --enable-torch-compile or --enable-npu-torchair-compile"
+            )
+
         if args.compilation_config.compiler == "npugraph":
             args.enable_torch_compile = True
 
