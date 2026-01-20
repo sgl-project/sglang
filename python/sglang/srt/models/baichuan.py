@@ -134,6 +134,7 @@ class BaiChuanAttention(nn.Module):
         tp_size = get_tensor_model_parallel_world_size()
         self.total_num_heads = num_heads
         self.total_num_kv_heads = self.total_num_heads
+        assert self.total_num_heads % tp_size == 0
         self.head_dim = hidden_size // self.total_num_heads
         self.position_embedding = position_embedding
         self.rope_theta = rope_theta

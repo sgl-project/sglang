@@ -398,18 +398,9 @@ class AscendAttnBackend(AttentionBackend):
         device: torch.device,
         dtype: torch.dtype = torch.bfloat16,
     ) -> torch.Tensor:
-        position_point = torch.arange(seq_len) - seq_len + 1
-        position_point = (
-            position_point.unsqueeze(0).unsqueeze(0).expand(num_heads, -1, -1)
-        )
-        diag = torch.diag(position_point[0])
-        position_point = position_point - diag.unsqueeze(0).unsqueeze(0).transpose(
-            -1, -2
-        )
-        position_point = position_point.to(device)
-        alibi = slopes.unsqueeze(1).unsqueeze(1) * position_point
-        alibi_bias = alibi.view(num_heads, 1, seq_len)
-        alibi_bias = alibi_bias.to(device).to(dtype)
+        position_point = torch.arange(seq_len).view(1, 1, -1).expand(num_heads, -1, -1).to(device)
+        alibi = slopes.view(-1, 1, 1) * position_point
+        alibi_bias = alibi.view(num_heads, 1, seq_len).to(device).to(dtype)
         return alibi_bias
 
     def generate_alibi_bias(
@@ -423,14 +414,13 @@ class AscendAttnBackend(AttentionBackend):
         dtype: torch.dtype = torch.bfloat16,
     ) -> torch.Tensor:
         MAX_LEN_ALB = 5000
+        max_seq_len = max(kv_seq_len, q_seq_len, MAX_LEN_ALB)
         if getattr(self, "alibi_bias", None) is None:
-            max_seq_len = max(kv_seq_len, q_seq_len, MAX_LEN_ALB)
             self.alibi_bias = self._generate_alibi_bias(
                 max_seq_len, slopes, num_heads, device, dtype
             )
 
         if getattr(self, "super_mask", None) is None:
-            max_seq_len = max(kv_seq_len, q_seq_len, MAX_LEN_ALB)
             super_mask = torch.ones(size=(1, max_seq_len, max_seq_len), dtype=dtype)
             super_mask = super_mask.float().fill_(float("-inf")).type_as(super_mask)
             super_mask = torch.triu(super_mask, 1).to(device)
