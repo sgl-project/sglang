@@ -146,8 +146,8 @@ class SchedulerBeamSearchProcessorMixin:
 
             if req.finished():
                 for beam in req.beam_list.incomplete:
-                    beam.beam_score = self._calculate_beam_score_with_eos_check(
-                        beam, req.stop_token_ids
+                    beam.beam_score = self._calculate_beam_score(
+                        beam.cum_logprob, len(beam.tokens)
                     )
 
                 completed = req.beam_list.completed + req.beam_list.incomplete
@@ -677,8 +677,8 @@ class SchedulerBeamSearchProcessorMixin:
                 )
                 if is_eos:
                     new_beam.finish_reason = FINISH_MATCHED_TOKEN(matched=top_token)
-                    new_beam.beam_score = self._calculate_beam_score_with_eos_check(
-                        new_beam, req.stop_token_ids
+                    new_beam.beam_score = self._calculate_beam_score(
+                        new_beam.cum_logprob, len(new_beam.tokens)
                     )
                     completed.append(new_beam)
                 else:
@@ -698,8 +698,8 @@ class SchedulerBeamSearchProcessorMixin:
                     cum_logprob=cum_logprob,
                 )
                 if self._check_beam_finished(req, new_beam):
-                    new_beam.beam_score = self._calculate_beam_score_with_eos_check(
-                        new_beam, req.stop_token_ids
+                    new_beam.beam_score = self._calculate_beam_score(
+                        new_beam.cum_logprob, len(new_beam.tokens)
                     )
                     completed.append(new_beam)
                 else:
@@ -1099,49 +1099,6 @@ class SchedulerBeamSearchProcessorMixin:
         return beam_decode_kv_indices, beam_pool_indices
 
     @staticmethod
-    def _calculate_beam_score_with_eos_check(
-        beam,
-        stop_token_ids: set[int],
-        length_penalty: float = 1.0,
-    ):
-        """Calculate normalized beam search score with automatic stop token handling.
-
-        Computes the beam search score while automatically excluding stop tokens
-        (EOS, etc.) from the sequence length calculation. This ensures that stop
-        tokens don't unfairly penalize finished sequences during scoring.
-
-        Args:
-            beam: BeamSearchSequence object containing tokens and cum_logprob
-            stop_token_ids: Set of token IDs that indicate sequence termination
-                (e.g., EOS token, custom stop tokens)
-            length_penalty: Exponent for length normalization (default 1.0)
-                - 1.0: No length bias (standard normalization)
-                - >1.0: Favor longer sequences
-                - <1.0: Favor shorter sequences
-
-        Returns:
-            float: Normalized score (cum_logprob / adjusted_seq_len^length_penalty)
-                where adjusted_seq_len excludes the final stop token if present
-
-        Example:
-            >>> beam = BeamSearchSequence(tokens=[1, 2, 3, 50256], cum_logprob=-5.2)
-            >>> stop_token_ids = {50256}  # EOS token
-            >>> score = _calculate_beam_score_with_eos_check(beam, stop_token_ids)
-            # Uses seq_len=3 instead of 4, excluding the EOS token
-
-        Note:
-            This is the recommended function for scoring completed beam sequences,
-            as it handles the common case where sequences end with stop tokens.
-        """
-        seq_len = len(beam.tokens)
-        if beam.tokens[-1] in stop_token_ids:
-            seq_len = len(beam.tokens) - 1
-
-        return SchedulerBeamSearchProcessorMixin._calculate_beam_score(
-            beam.cum_logprob, seq_len, length_penalty
-        )
-
-    @staticmethod
     def _calculate_beam_score(
         cum_logprob: float,
         seq_len: int,
@@ -1150,8 +1107,10 @@ class SchedulerBeamSearchProcessorMixin:
         """Calculate normalized beam search score from raw parameters.
 
         Applies length penalty to cumulative log probability to avoid bias toward
-        shorter sequences. This is a low-level utility function that performs the
-        core scoring calculation.
+        shorter sequences. The scoring uses the actual sequence length without
+        any adjustments, aligning with transformers' behavior:
+        - If sequence ends with EOS token: length includes the EOS token
+        - If sequence ends due to max_new_tokens: length is the actual generated length
 
         Args:
             cum_logprob: Cumulative log probability of the sequence
@@ -1163,10 +1122,5 @@ class SchedulerBeamSearchProcessorMixin:
 
         Returns:
             float: Normalized score (cum_logprob / seq_len^length_penalty)
-
-        Note:
-            This function does not handle stop token adjustments. Use
-            _calculate_beam_score_with_eos_check for automatic handling of
-            stop tokens in finished sequences.
         """
         return cum_logprob / (seq_len**length_penalty)
