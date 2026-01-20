@@ -12,6 +12,7 @@ import signal
 import threading
 import time
 from concurrent import futures
+from datetime import datetime, timezone
 from typing import AsyncIterator, Dict, Optional
 
 import grpc
@@ -40,6 +41,86 @@ from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
 HEALTH_CHECK_TIMEOUT = int(os.getenv("SGLANG_HEALTH_CHECK_TIMEOUT", 20))
+
+
+def _compute_loads_aggregate(load_results):
+    if not load_results:
+        return sglang_scheduler_pb2.AggregateMetrics(
+            total_running_reqs=0,
+            total_waiting_reqs=0,
+            total_reqs=0,
+            avg_token_usage=0.0,
+            avg_throughput=0.0,
+            avg_utilization=0.0,
+        )
+
+    n = len(load_results)
+    total_running = sum(load.num_running_reqs for load in load_results)
+    total_waiting = sum(load.num_waiting_reqs for load in load_results)
+
+    return sglang_scheduler_pb2.AggregateMetrics(
+        total_running_reqs=total_running,
+        total_waiting_reqs=total_waiting,
+        total_reqs=total_running + total_waiting,
+        avg_token_usage=round(
+            sum(load.token_usage for load in load_results) / n, 4
+        ),
+        avg_throughput=round(
+            sum(load.gen_throughput for load in load_results) / n, 2
+        ),
+        avg_utilization=round(
+            sum(load.utilization for load in load_results) / n, 4
+        ),
+    )
+
+
+def _convert_loads_result(load):
+    scheduler_load = sglang_scheduler_pb2.SchedulerLoad(
+        dp_rank=load.dp_rank,
+        num_running_reqs=load.num_running_reqs,
+        num_waiting_reqs=load.num_waiting_reqs,
+        num_total_reqs=load.num_running_reqs + load.num_waiting_reqs,
+        num_used_tokens=load.num_used_tokens,
+        max_total_num_tokens=load.max_total_num_tokens,
+        token_usage=load.token_usage,
+        gen_throughput=load.gen_throughput,
+        cache_hit_rate=load.cache_hit_rate,
+        utilization=load.utilization,
+        max_running_requests=load.max_running_requests,
+    )
+
+    if load.memory:
+        scheduler_load.memory.CopyFrom(
+            sglang_scheduler_pb2.MemoryMetrics(
+                **dataclasses.asdict(load.memory),
+            )
+        )
+    if load.speculative:
+        scheduler_load.speculative.CopyFrom(
+            sglang_scheduler_pb2.SpeculativeMetrics(
+                **dataclasses.asdict(load.speculative),
+            )
+        )
+    if load.lora:
+        scheduler_load.lora.CopyFrom(
+            sglang_scheduler_pb2.LoRAMetrics(
+                **dataclasses.asdict(load.lora),
+            )
+        )
+    if load.disaggregation:
+        scheduler_load.disaggregation.CopyFrom(
+            sglang_scheduler_pb2.DisaggregationMetrics(
+                **dataclasses.asdict(load.disaggregation),
+            )
+        )
+    if load.queues:
+        scheduler_load.queues.CopyFrom(
+            sglang_scheduler_pb2.QueueMetrics(
+                **dataclasses.asdict(load.queues),
+            )
+        )
+
+    return scheduler_load
 
 
 class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer):
@@ -294,6 +375,45 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             sglang_version=sglang.__version__,
             server_type="grpc",
             start_time=start_timestamp,
+        )
+
+    async def GetLoads(
+        self,
+        request: sglang_scheduler_pb2.GetLoadsRequest,
+        context: grpc.aio.ServicerContext,
+    ) -> sglang_scheduler_pb2.GetLoadsResponse:
+        """Get comprehensive load metrics for scheduler DP ranks."""
+        logger.debug("Receive load metrics request")
+
+        include = list(request.include) if request.include else ["all"]
+        dp_rank = request.dp_rank if request.HasField("dp_rank") else None
+
+        try:
+            load_results = await self.request_manager.get_loads(
+                include=include,
+                dp_rank=dp_rank,
+            )
+        except ValueError as e:
+            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+            context.set_details(str(e))
+            return sglang_scheduler_pb2.GetLoadsResponse()
+        except Exception as e:
+            logger.error(
+                f"GetLoads failed: {e}\n{get_exception_traceback()}"
+            )
+            context.set_code(grpc.StatusCode.INTERNAL)
+            context.set_details(str(e))
+            return sglang_scheduler_pb2.GetLoadsResponse()
+
+        loads = [_convert_loads_result(load) for load in load_results]
+        aggregate = _compute_loads_aggregate(load_results)
+
+        return sglang_scheduler_pb2.GetLoadsResponse(
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            version=sglang.__version__,
+            dp_rank_count=len(loads),
+            loads=loads,
+            aggregate=aggregate,
         )
 
     async def shutdown(self):
