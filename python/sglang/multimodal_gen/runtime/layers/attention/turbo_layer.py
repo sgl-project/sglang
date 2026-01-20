@@ -241,7 +241,7 @@ class MinimalA2AAttnOp(DistributedAttention):
         # Maintained for compatibility purposes; can be removed when CI allows setting Attention_backend or when TurboWan supports FA.
         if attn_backend is not SparseLinearAttentionBackend:
             logger.warning(
-                "TurboWan now only supports `sla_attn` and has been automatically set to `sla_attn`. Please set --attention-backend to `sla_attn`."
+                "TurboWan now only supports `sla_attn` or `sage_sla_attn` and has been automatically set to `sla_attn`. Please set --attention-backend to `sla_attn` or `sage_sla_attn`."
             )
             attn_backend = SparseLinearAttentionBackend
         impl_cls: Type["AttentionImpl"] = attn_backend.get_impl_cls()

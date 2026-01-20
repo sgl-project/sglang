@@ -308,13 +308,16 @@ class WanTransformerBlock(nn.Module):
         self.to_v = ColumnParallelLinear(dim, dim, bias=True, gather_output=False)
 
         self.to_out = RowParallelLinear(dim, dim, bias=True, reduce_results=True)
-        if attention_type == "sla":
+        if attention_type in ("sla", "sagesla"):
             self.attn1 = MinimalA2AAttnOp(
                 num_heads=divide(num_heads, get_tensor_model_parallel_world_size()),
                 head_size=dim // num_heads,
                 attention_type=attention_type,
                 topk=sla_topk,
-                supported_attention_backends={AttentionBackendEnum.SLA_ATTN},
+                supported_attention_backends={
+                    AttentionBackendEnum.SLA_ATTN,
+                    AttentionBackendEnum.SAGE_SLA_ATTN,
+                },
             )
         else:
             self.attn1 = USPAttention(
