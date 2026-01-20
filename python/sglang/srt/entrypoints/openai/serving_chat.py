@@ -107,6 +107,17 @@ class OpenAIServingChat(OpenAIServingBase):
                 f"Using default chat sampling params from model generation config: {self.default_sampling_params}",
             )
 
+        # Log tool token suppression configuration
+        tool_tokens_to_suppress = envs.SGLANG_TOOL_TOKENS_TO_SUPPRESS.get()
+        if tool_tokens_to_suppress:
+            logger.info(
+                f"Tool token suppression enabled. Tokens to suppress when tool_choice=none: {tool_tokens_to_suppress}"
+            )
+        if envs.SGLANG_BIAS_TOOL_WHEN_NONE.get():
+            logger.info(
+                f"Tool token logit bias enabled when tool_choice=none"
+            )
+
         # Check if the model is a GPT-OSS model
         self.is_gpt_oss = (
             hasattr(self.tokenizer_manager.model_config, "hf_config")
@@ -333,6 +344,13 @@ class OpenAIServingChat(OpenAIServingBase):
         tool_prohibit_msg = envs.SGLANG_INSERT_TOOL_PROHIBIT.get()
         tool_prohibit_method = envs.SGLANG_INSERT_TOOL_PROHIBIT_METHOD.get()
         if request.tool_choice == "none" and tool_prohibit_msg and request.messages:
+            valid_methods = {"last_message", "new_turn"}
+            if tool_prohibit_method not in valid_methods:
+                logger.warning(
+                    f"Invalid SGLANG_INSERT_TOOL_PROHIBIT_METHOD value: '{tool_prohibit_method}'. "
+                    f"Valid values are: {valid_methods}. Using default 'last_message'."
+                )
+                tool_prohibit_method = "last_message"
             if tool_prohibit_method == "new_turn":
                 from sglang.srt.entrypoints.openai.protocol import (
                     ChatCompletionMessageUserParam,
