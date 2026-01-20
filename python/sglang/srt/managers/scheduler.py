@@ -2244,6 +2244,11 @@ class Scheduler(
                 # TODO(lsyin): delete this branch after unifying the abstraction.
                 worker_batch_or_batch = batch
 
+            not_ngram_spec_v2_decode = not (
+                batch.is_spec_v2
+                and batch.spec_algorithm.is_ngram()
+                and batch.forward_mode.is_decode()
+            )
             if self.enable_overlap:
                 model_worker_batch = worker_batch_or_batch
                 self.record_batch_in_overlap(model_worker_batch)
@@ -2268,17 +2273,7 @@ class Scheduler(
                     # FIXME(lsyin): maybe move this to forward_batch_generation
                     batch_result.copy_done = self.device_module.Event()
                     if batch_result.delay_sample_func is None:
-                        if (
-                            not batch.is_spec_v2
-                            or (
-                                batch.is_spec_v2
-                                and not batch.forward_mode.is_decode()
-                                and batch.spec_algorithm.is_ngram()
-                            )
-                            or (
-                                batch.is_spec_v2 and not batch.spec_algorithm.is_ngram()
-                            )
-                        ):
+                        if not_ngram_spec_v2_decode:
                             self.future_map.store_to_map(future_indices, batch_result)
                             batch_result.copy_to_cpu(
                                 return_logprob=batch.return_logprob
@@ -2287,7 +2282,8 @@ class Scheduler(
                         batch_result.future_indices = future_indices
 
                 # FIXME(lsyin): move this assignment elsewhere
-                future_indices_or_next_token_ids = -future_indices.indices
+                if not_ngram_spec_v2_decode:
+                    future_indices_or_next_token_ids = -future_indices.indices
 
                 if batch.is_spec_v2:
                     # FIXME(lsyin): tmp code for spec v2
@@ -2325,7 +2321,8 @@ class Scheduler(
             #       which can probably be replaced by future_indices later [TODO(lsyin)].
             #       we shall still keep the original outputs, e.g. next_token_ids
             #       in the GenerationBatchOutput for processing after copy_done.
-            batch.output_ids = future_indices_or_next_token_ids
+            if not_ngram_spec_v2_decode:
+                batch.output_ids = future_indices_or_next_token_ids
 
             # These 2 values are needed for processing the output, but the values can be
             # modified by overlap schedule. So we have to copy them here so that
