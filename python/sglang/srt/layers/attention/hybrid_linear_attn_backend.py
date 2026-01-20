@@ -33,6 +33,7 @@ from sglang.srt.layers.attention.mamba.mamba2_metadata import (
     Mamba2Metadata,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, MambaPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
@@ -859,7 +860,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        layer: RadixAttention,
+        layer: RadixLinearAttention,
         forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
         **kwargs,
@@ -869,18 +870,17 @@ class GDNAttnBackend(MambaAttnBackendBase):
         a = kwargs["a"]
         b = kwargs["b"]
 
-        if layer is not None:
-            conv_weights = layer.conv_weights
-            bias = layer.bias
-            activation = layer.activation
-            key_dim = layer.key_dim
-            value_dim = layer.value_dim
-            attn_tp_size = layer.attention_tp_size
-            head_k_dim = layer.head_k_dim
-            head_v_dim = layer.head_v_dim
-            A_log = layer.A_log
-            dt_bias = layer.dt_bias
-            layer_id = layer.layer_id
+        conv_weights = layer.conv_weights
+        bias = layer.bias
+        activation = layer.activation
+        key_dim = layer.key_dim
+        value_dim = layer.value_dim
+        attn_tp_size = layer.attention_tp_size
+        head_k_dim = layer.head_k_dim
+        head_v_dim = layer.head_v_dim
+        A_log = layer.A_log
+        dt_bias = layer.dt_bias
+        layer_id = layer.layer_id
 
         layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer_id)
         conv_states = layer_cache.conv[0]
@@ -940,7 +940,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        layer: RadixAttention,
+        layer: RadixLinearAttention,
         forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
         **kwargs,
@@ -953,18 +953,17 @@ class GDNAttnBackend(MambaAttnBackendBase):
         # seq_len can be derived from mixed_qkv or passed explicitly
         seq_len = kwargs.get("seq_len", mixed_qkv.shape[0])
 
-        if layer is not None:
-            conv_weights = layer.conv_weights
-            bias = layer.bias
-            activation = layer.activation
-            key_dim = layer.key_dim
-            value_dim = layer.value_dim
-            attn_tp_size = layer.attention_tp_size
-            head_k_dim = layer.head_k_dim
-            head_v_dim = layer.head_v_dim
-            A_log = layer.A_log
-            dt_bias = layer.dt_bias
-            layer_id = layer.layer_id
+        conv_weights = layer.conv_weights
+        bias = layer.bias
+        activation = layer.activation
+        key_dim = layer.key_dim
+        value_dim = layer.value_dim
+        attn_tp_size = layer.attention_tp_size
+        head_k_dim = layer.head_k_dim
+        head_v_dim = layer.head_v_dim
+        A_log = layer.A_log
+        dt_bias = layer.dt_bias
+        layer_id = layer.layer_id
 
         is_target_verify = forward_batch.forward_mode.is_target_verify()
         forward_metadata = self.forward_metadata
