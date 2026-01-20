@@ -937,9 +937,9 @@ class DPDraftWorker(EagleDraftWorker):
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
-        single_gpu_args = copy.copy(server_args)
-        self._apply_single_gpu_defaults(single_gpu_args)
-        self._dpdraft_group = _DPDraftGroup(single_gpu_args.device)
+        dp_draft_args = copy.copy(server_args)
+        self._apply_dp_draft_defaults(dp_draft_args)
+        self._dpdraft_group = _DPDraftGroup(dp_draft_args.device)
         with (
             self._dpdraft_context(),
             speculative_moe_backend_context(),
@@ -951,7 +951,7 @@ class DPDraftWorker(EagleDraftWorker):
             prev_moe_a2a = moe_utils.SPECULATIVE_MOE_A2A_BACKEND
             moe_utils.SPECULATIVE_MOE_A2A_BACKEND = moe_utils.MoeA2ABackend.NONE
             super().__init__(
-                server_args=single_gpu_args,
+                server_args=dp_draft_args,
                 gpu_id=gpu_id,
                 tp_rank=0,
                 dp_rank=0,
@@ -970,9 +970,9 @@ class DPDraftWorker(EagleDraftWorker):
             server_args.tp_size,
             server_args.dp_size,
             server_args.ep_size,
-            single_gpu_args.tp_size,
-            single_gpu_args.dp_size,
-            single_gpu_args.ep_size,
+            dp_draft_args.tp_size,
+            dp_draft_args.dp_size,
+            dp_draft_args.ep_size,
             self.draft_runner.attention_tp_group.world_size
             if hasattr(self.draft_runner, "attention_tp_group")
             else "N/A",
@@ -981,7 +981,7 @@ class DPDraftWorker(EagleDraftWorker):
         )
 
     @staticmethod
-    def _apply_single_gpu_defaults(draft_args: ServerArgs) -> None:
+    def _apply_dp_draft_defaults(draft_args: ServerArgs) -> None:
         draft_args.tp_size = 1
         draft_args.dp_size = 1
         draft_args.ep_size = 1
