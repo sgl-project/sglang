@@ -1,0 +1,61 @@
+name: Auto Retry Scheduled Failures
+
+on:
+  workflow_run:
+    workflows: ["PR Test"]
+    types: [completed]
+
+jobs:
+  retry-failed:
+    name: Retry Failed Jobs
+    # Only retry for scheduled runs on main that have failures
+    if: |
+      github.event.workflow_run.event == 'schedule' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.conclusion == 'failure'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Retry failed jobs
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const runId = context.payload.workflow_run.id;
+            const runUrl = context.payload.workflow_run.html_url;
+
+            console.log(`Workflow run ${runId} failed on scheduled main branch run`);
+            console.log(`URL: ${runUrl}`);
+
+            // Get failed jobs
+            const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: runId,
+              filter: 'latest',
+              per_page: 100,
+            });
+
+            const failedJobs = jobs.filter(job => job.conclusion === 'failure');
+
+            if (failedJobs.length === 0) {
+              console.log('No failed jobs found');
+              return;
+            }
+
+            console.log(`Found ${failedJobs.length} failed job(s):`);
+            for (const job of failedJobs) {
+              console.log(`  - ${job.name}`);
+            }
+
+            // Rerun failed jobs
+            try {
+              await github.rest.actions.reRunWorkflowFailedJobs({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                run_id: runId,
+              });
+              console.log('Successfully triggered rerun of failed jobs');
+            } catch (error) {
+              console.log(`Failed to rerun: ${error.message}`);
+              // If rerun fails, it might be because the run is too old or already rerunning
+              core.warning(`Could not rerun failed jobs: ${error.message}`);
+            }
