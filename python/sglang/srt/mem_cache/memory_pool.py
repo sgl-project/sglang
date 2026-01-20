@@ -1362,17 +1362,6 @@ class HybridLinearKVPool(KVCache):
                 "enable_memory_saver": enable_memory_saver,
             }
 
-            # 只为 NVFP4 池添加额外参数
-            if is_float4_e2m1fn_x2(dtype):
-                assert (
-                    max_context_len is not None
-                ), "max_context_len must be provided for NVFP4 KV cache"
-                assert (
-                    max_running_request is not None
-                ), "max_running_request must be provided for NVFP4 KV cache"
-                kv_pool_kwargs["max_context_len"] = max_context_len
-                kv_pool_kwargs["max_running_request"] = max_running_request
-
             self.full_kv_pool = TokenToKVPoolClass(**kv_pool_kwargs)
         else:
 
@@ -1441,6 +1430,8 @@ class HybridLinearKVPool(KVCache):
         scale_v: Optional[float] = None,
     ):
         layer_id = self._transfer_full_attention_id(layer_id)
+        if scale_k is None and scale_v is None:
+            return self.full_kv_pool.get_kv_buffer(layer_id)
         return self.full_kv_pool.get_kv_buffer(layer_id, scale_k, scale_v)
 
     def get_fp4_value_buffer(self, layer_id: int):
