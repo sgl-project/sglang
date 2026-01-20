@@ -333,15 +333,12 @@ class _ScaleResidualNormScaleShift(CustomOp):
             )
             return self.forward_native(residual, x, gate, shift, scale)
 
-        gamma_opt = _ensure_contiguous(getattr(self.norm, "weight", None))
-        beta_opt = _ensure_contiguous(getattr(self.norm, "bias", None))
-        gate_opt = gate.contiguous() if isinstance(gate, torch.Tensor) else None
         return fused_scale_residual_norm_scale_shift(
             residual.contiguous(),
             x.contiguous(),
-            gate_opt,
-            gamma_opt,
-            beta_opt,
+            gate.contiguous() if isinstance(gate, torch.Tensor) else None,
+            _ensure_contiguous(getattr(self.norm, "weight", None)),
+            _ensure_contiguous(getattr(self.norm, "bias", None)),
             scale.contiguous(),
             shift.contiguous(),
             self.norm_type,
@@ -423,19 +420,16 @@ class _NormScaleShift(CustomOp):
     ) -> torch.Tensor:
         if x.shape[-1] % 256 != 0:
             import warnings
-
             warnings.warn(
                 "FusedNormScaleShift cuda not available, using native fallback",
                 stacklevel=2,
             )
             return self.forward_native(x, shift, scale)
 
-        gamma_opt = _ensure_contiguous(getattr(self.norm, "weight", None))
-        beta_opt = _ensure_contiguous(getattr(self.norm, "bias", None))
         return fused_norm_scale_shift(
             x.contiguous(),
-            gamma_opt,
-            beta_opt,
+            _ensure_contiguous(getattr(self.norm, "weight", None)),
+            _ensure_contiguous(getattr(self.norm, "bias", None)),
             scale.contiguous(),
             shift.contiguous(),
             self.norm_type,
