@@ -235,28 +235,28 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 
 ## Expert parallelism
 
-| Argument                                              | Defaults  | Options                                     |                    A2                    |                    A3                    |
-|-------------------------------------------------------|-----------|---------------------------------------------|:----------------------------------------:|:----------------------------------------:|
-| `--expert-parallel-size`<br/>`--ep-size`<br/>`--ep`   | `1`       | Type: int                                   | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--moe-a2a-backend`                                   | `none`    | `none`,<br/> `deepep`,<br/> `ascend_fuseep` | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--moe-runner-backend`                                | `auto`    | `auto`, `triton`                            | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--flashinfer-mxfp4-`<br/>`moe-precision`             | `default` | `default`,<br/> `bf16`                      |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--enable-flashinfer-`<br/>`allreduce-fusion`         | `False`   | bool flag<br/> (set to enable)              |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--deepep-mode`                                       | `auto`    | `normal`, <br/>`low_latency`,<br/> `auto`   | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--deepep-config`                                     | `None`    | Type: str                                   |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--ep-num-redundant-experts`                          | `0`       | Type: int                                   |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--ep-dispatch-algorithm`                             | `None`    | Type: str                                   |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--init-expert-location`                              | `trivial` | Type: str                                   |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--enable-eplb`                                       | `False`   | bool flag<br/> (set to enable)              |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--eplb-algorithm`                                    | `auto`    | Type: str                                   |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--eplb-rebalance-layers-`<br/>`per-chunk`            | `None`    | Type: int                                   |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--eplb-min-rebalancing-`<br/>`utilization-threshold` | `1.0`     | Type: float                                 |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--expert-distribution-`<br/>`recorder-mode`          | `None`    | Type: str                                   |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--expert-distribution-`<br/>`recorder-buffer-size`   | `None`    | Type: int                                   |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--enable-expert-distribution-`<br/>`metrics`         | `False`   | bool flag <br/>(set to enable)              |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--moe-dense-tp-size`                                 | `None`    | Type: int                                   | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--elastic-ep-backend`                                | `None`    | `none`, `mooncake`                          |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--mooncake-ib-device`                                | `None`    | Type: str                                   |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
+| Argument                                              | Defaults  | Options                                     |                    A2                     |                    A3                    |
+|-------------------------------------------------------|-----------|---------------------------------------------|:-----------------------------------------:|:----------------------------------------:|
+| `--expert-parallel-size`<br/>`--ep-size`<br/>`--ep`   | `1`       | Type: int                                   | **<span style="color: green;">√</span>**  | **<span style="color: green;">√</span>** |
+| `--moe-a2a-backend`                                   | `none`    | `none`,<br/> `deepep`,<br/> `ascend_fuseep` | **<span style="color: green;">√</span>**  | **<span style="color: green;">√</span>** |
+| `--moe-runner-backend`                                | `auto`    | `auto`, `triton`                            | **<span style="color: green;">√</span>**  | **<span style="color: green;">√</span>** |
+| `--flashinfer-mxfp4-`<br/>`moe-precision`             | `default` | `default`,<br/> `bf16`                      |  **<span style="color: red;">×</span>**   |  **<span style="color: red;">×</span>**  |
+| `--enable-flashinfer-`<br/>`allreduce-fusion`         | `False`   | bool flag<br/> (set to enable)              |  **<span style="color: red;">×</span>**   |  **<span style="color: red;">×</span>**  |
+| `--deepep-mode`                                       | `auto`    | `normal`, <br/>`low_latency`,<br/> `auto`   | **<span style="color: green;">√</span>**  | **<span style="color: green;">√</span>** |
+| `--deepep-config`                                     | `None`    | Type: str                                   |  **<span style="color: red;">×</span>**   |  **<span style="color: red;">×</span>**  |
+| `--ep-num-redundant-experts`                          | `0`       | Type: int                                   | **<span style="color: green;">√</span>**  | **<span style="color: green;">√</span>** |
+| `--ep-dispatch-algorithm`                             | `None`    | Type: str                                   | **<span style="color: green;">√</span>**  | **<span style="color: green;">√</span>** |
+| `--init-expert-location`                              | `trivial` | Type: str                                   | **<span style="color: green;">√</span>**  | **<span style="color: green;">√</span>** |
+| `--enable-eplb`                                       | `False`   | bool flag<br/> (set to enable)              | **<span style="color: green;">√</span>**  | **<span style="color: green;">√</span>** |
+| `--eplb-algorithm`                                    | `auto`    | Type: str                                   | **<span style="color: green;">√</span>**  | **<span style="color: green;">√</span>** |
+| `--eplb-rebalance-layers-`<br/>`per-chunk`            | `None`    | Type: int                                   | **<span style="color: green;">√</span>**  | **<span style="color: green;">√</span>** |
+| `--eplb-min-rebalancing-`<br/>`utilization-threshold` | `1.0`     | Type: float                                 | **<span style="color: green;">√</span>**  | **<span style="color: green;">√</span>** |
+| `--expert-distribution-`<br/>`recorder-mode`          | `None`    | Type: str                                   | **<span style="color: green;">√</span>**  | **<span style="color: green;">√</span>** |
+| `--expert-distribution-`<br/>`recorder-buffer-size`   | `None`    | Type: int                                   | **<span style="color: green;">√</span>**  | **<span style="color: green;">√</span>** |
+| `--enable-expert-distribution-`<br/>`metrics`         | `False`   | bool flag <br/>(set to enable)              | ***<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| `--moe-dense-tp-size`                                 | `None`    | Type: int                                   | **<span style="color: green;">√</span>**  | **<span style="color: green;">√</span>** |
+| `--elastic-ep-backend`                                | `None`    | `none`, `mooncake`                          |  **<span style="color: red;">×</span>**   |  **<span style="color: red;">×</span>**  |
+| `--mooncake-ib-device`                                | `None`    | Type: str                                   |  **<span style="color: red;">×</span>**   |  **<span style="color: red;">×</span>**  |
 
 ## Mamba Cache
 
