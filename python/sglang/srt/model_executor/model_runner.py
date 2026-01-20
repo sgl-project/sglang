@@ -19,6 +19,7 @@ import inspect
 import json
 import logging
 import os
+import re
 import socket
 import threading
 import time
@@ -90,6 +91,7 @@ from sglang.srt.layers.dp_attention import (
     set_is_extend_in_batch,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.routed_experts_capturer import (
     RoutedExpertsCapturer,
     get_global_experts_capturer,
@@ -176,6 +178,8 @@ from sglang.srt.weight_sync.tensor_bucket import (
     FlattenedTensorMetadata,
 )
 
+from mooncake.engine import TransferEngine
+
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -248,6 +252,14 @@ class RankZeroFilter(logging.Filter):
         if record.levelno == logging.INFO:
             return self.is_rank_zero
         return True
+
+
+def extract_layer_and_expert_id(param_name):
+    pattern = r'layers\.(\d+)\.mlp\.experts\.(\d+)\.'
+    match = re.search(pattern, param_name)
+    if match:
+        return int(match.group(1)), int(match.group(2))
+    return -1, -1
 
 
 @dataclass
@@ -342,6 +354,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             except:
                 # if there is no aux layer, set to None
                 self.eagle_aux_hidden_state_layer_ids = None
+
+        self.engine_num = server_args.nnodes
+        self.dram_map_list = [None] * self.engine_num
+        self.if_backup = False
+        self.session_id_list = [None] * self.engine_num
+        self.transfer_engine = None
+        self.gpu_buffer = None
+        self.buffer_size = None
 
         # Apply the rank zero filter to logger
         if server_args.show_time_cost:
@@ -448,7 +468,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if self.server_args.enable_eplb and (not self.is_draft_worker)
             else None
         )
-        self.expert_location_updater = ExpertLocationUpdater()
+        self.expert_location_updater = ExpertLocationUpdater(self.server_args, self)
 
         (
             ElasticEPStateManager.init(self.server_args)
@@ -1002,6 +1022,68 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 new_expert_location_metadata,
                 update_layer_ids=update_layer_ids,
             )
+            if self.if_backup:
+                # TODO: move to new file
+                global_expert_location_metadata = get_global_expert_location_metadata()
+                num_experts = self.model_config.hf_config.n_routed_experts + self.server_args.ep_num_redundant_experts
+                num_local_experts = num_experts // self.moe_ep_size
+                expert_params_mapping = FusedMoE.make_expert_params_mapping(
+                    ckpt_gate_proj_name="gate_proj",
+                    ckpt_down_proj_name="down_proj",
+                    ckpt_up_proj_name="up_proj",
+                    num_experts=num_experts,
+                )
+                for i in range(self.engine_num):
+                    server_ptr_list = []
+                    local_ptr_list = []
+                    weight_size_list = []
+
+                    for name, weight_info in self.dram_map_list[i].items():
+                        layer_id, expert_id = extract_layer_and_expert_id(name)
+                        if layer_id >= self.model_config.hf_config.num_hidden_layers:
+                            continue
+                        if "mlp.experts" in name and "mlp.shared_experts" not in name:
+                            for mapping in expert_params_mapping:
+                                param_name, weight_name, expert_id, shard_id = mapping
+                                if weight_name not in name:
+                                    continue
+                                physical_expert_ids = global_expert_location_metadata.logical_to_all_physical(
+                                    layer_id, expert_id
+                                )
+                                for physical_expert_id in physical_expert_ids:
+                                    if physical_expert_id not in range(
+                                        num_local_experts * self.moe_ep_rank,
+                                        num_local_experts * (self.moe_ep_rank + 1)
+                                    ):
+                                        continue
+                                    name = name.replace(weight_name, param_name)
+                                    param = self.params_dict[name]
+                                    param = param[physical_expert_id % num_local_experts]
+                                    if shard_id == "w1":
+                                        param = param.narrow(0, 0, param.shape[0] // 2)
+                                    elif shard_id == "w3":
+                                        param = param.narrow(0, param.shape[0] // 2, param.shape[0] // 2)
+                                    weight_info['tensor'] = param
+                                    server_ptr_list.append(weight_info['weight_ptr'])
+                                    local_ptr_list.append(weight_info['tensor'].data_ptr())
+                                    assert weight_info['tensor'].numel() * weight_info['tensor'].element_size() == \
+                                           weight_info['byte_size']
+                                    weight_size_list.append(weight_info['byte_size'])
+
+                    before_transfer = time.time()
+                    ret = self.transfer_engine.batch_transfer_sync_read(
+                        self.session_id_list[i],
+                        local_ptr_list,
+                        server_ptr_list,
+                        weight_size_list
+                    )
+                    after_transfer = time.time()
+                    logger.info(f"transfer time = {after_transfer - before_transfer} s")
+
+                    if ret != 0:
+                        raise RuntimeError(f"Failed to read weights from backup, error code: {ret}")
+                return
+
             self.update_weights_from_disk(
                 self.server_args.model_path,
                 self.server_args.load_format,
@@ -1015,6 +1097,28 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 nnodes=self.server_args.nnodes,
                 rank=self.tp_rank,
             )
+
+    def start_transfer_client(self):
+        HOSTNAME = get_local_ip_auto()
+        METADATA_SERVER = "P2PHANDSHAKE"
+        PROTOCOL = "rdma"
+        DEVICE_NAME = self.server_args.mooncake_ib_device
+        self.transfer_engine = TransferEngine()
+        self.transfer_engine.initialize(
+            HOSTNAME,
+            METADATA_SERVER,
+            PROTOCOL,
+            DEVICE_NAME
+        )
+
+        self.params_dict = dict(self.model.named_parameters())
+        for name, param in self.params_dict.items():
+            param_data = param.data
+            ret_value = self.transfer_engine.register_memory(
+                param_data.data_ptr(), param_data.numel() * param_data.element_size()
+            )
+            if ret_value != 0:
+                raise RuntimeError("GPU buffer memory registration failed.")
 
     def update_weights_from_disk(
         self,

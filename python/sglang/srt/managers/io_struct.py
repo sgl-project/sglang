@@ -1324,6 +1324,19 @@ class SendWeightsToRemoteInstanceReqOutput(BaseReq):
 
 
 @dataclass
+class UpdateExpertBackupReq(BaseReq):
+    pass
+
+
+@dataclass
+class BackupDramReq(BaseReq):
+    _rank: int
+    _map: Dict[str, Any]
+    session_id: str
+    buffer_size: int
+
+
+@dataclass
 class InitWeightsUpdateGroupReqInput(BaseReq):
     # The master address
     master_address: str
