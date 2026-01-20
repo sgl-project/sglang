@@ -690,6 +690,7 @@ class TransformerLoader(ComponentLoader):
         # Config from Diffusers supersedes sgl_diffusion's model config
         dit_config = server_args.pipeline_config.dit_config
         dit_config.update_model_arch(config)
+        dit_config.quant_config = quant_config
 
         model_cls, _ = ModelRegistry.resolve_model_cls(cls_name)
 
@@ -735,7 +736,6 @@ class TransformerLoader(ComponentLoader):
             init_params={
                 "config": dit_config,
                 "hf_config": hf_config,
-                "quant_config": quant_config,
             },
             weight_dir_list=safetensors_list,
             device=get_local_torch_device(),

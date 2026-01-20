@@ -502,7 +502,6 @@ class FluxTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         self,
         config: FluxConfig,
         hf_config: dict[str, Any],
-        quant_config: QuantizationConfig = None,
     ) -> None:
         super().__init__(config=config, hf_config=hf_config)
         self.config = config.arch_config
@@ -541,7 +540,7 @@ class FluxTransformer2DModel(CachableDiT, OffloadableDiTMixin):
                     dim=self.inner_dim,
                     num_attention_heads=self.config.num_attention_heads,
                     attention_head_dim=self.config.attention_head_dim,
-                    quant_config=quant_config,
+                    quant_config=config.quant_config,
                 )
                 for _ in range(self.config.num_layers)
             ]
@@ -553,7 +552,7 @@ class FluxTransformer2DModel(CachableDiT, OffloadableDiTMixin):
                     dim=self.inner_dim,
                     num_attention_heads=self.config.num_attention_heads,
                     attention_head_dim=self.config.attention_head_dim,
-                    quant_config=quant_config,
+                    quant_config=config.quant_config,
                 )
                 for _ in range(self.config.num_single_layers)
             ]
