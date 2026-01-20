@@ -424,6 +424,9 @@ RUN if [ "${CUDA_VERSION%%.*}" = "13" ] && [ -d /usr/local/lib/python3.12/dist-p
         ln -s /usr/local/cuda/bin/ptxas /usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin/ptxas; \
     fi
 
+# Security: Upgrade urllib3 to address CVE-2026-21441 (decompression bomb bypass)
+RUN python3 -m pip install --upgrade "urllib3>=2.6.3"
+
 # Set workspace directory
 WORKDIR /sgl-workspace/sglang
 
