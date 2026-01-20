@@ -2,10 +2,11 @@
 
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use rand::Rng;
 
-use super::{get_healthy_worker_indices, LoadBalancingPolicy};
-use crate::{core::Worker, observability::metrics::RouterMetrics};
+use super::{get_healthy_worker_indices, LoadBalancingPolicy, SelectWorkerInfo};
+use crate::core::Worker;
 
 /// Random selection policy
 ///
@@ -19,11 +20,12 @@ impl RandomPolicy {
     }
 }
 
+#[async_trait]
 impl LoadBalancingPolicy for RandomPolicy {
-    fn select_worker(
+    async fn select_worker(
         &self,
         workers: &[Arc<dyn Worker>],
-        _request_text: Option<&str>,
+        _info: &SelectWorkerInfo<'_>,
     ) -> Option<usize> {
         let healthy_indices = get_healthy_worker_indices(workers);
 
@@ -33,10 +35,7 @@ impl LoadBalancingPolicy for RandomPolicy {
 
         let mut rng = rand::rng();
         let random_idx = rng.random_range(0..healthy_indices.len());
-        let worker = workers[healthy_indices[random_idx]].url();
 
-        RouterMetrics::record_processed_request(worker);
-        RouterMetrics::record_policy_decision(self.name(), worker);
         Some(healthy_indices[random_idx])
     }
 
@@ -56,8 +55,8 @@ mod tests {
     use super::*;
     use crate::core::{BasicWorkerBuilder, WorkerType};
 
-    #[test]
-    fn test_random_selection() {
+    #[tokio::test]
+    async fn test_random_selection() {
         let policy = RandomPolicy::new();
         let workers: Vec<Arc<dyn Worker>> = vec![
             Arc::new(
@@ -79,18 +78,20 @@ mod tests {
 
         let mut counts = HashMap::new();
         for _ in 0..100 {
-            if let Some(idx) = policy.select_worker(&workers, None) {
+            if let Some(idx) = policy
+                .select_worker(&workers, &SelectWorkerInfo::default())
+                .await
+            {
                 *counts.entry(idx).or_insert(0) += 1;
             }
         }
 
-        // All workers should be selected at least once
         assert_eq!(counts.len(), 3);
         assert!(counts.values().all(|&count| count > 0));
     }
 
-    #[test]
-    fn test_random_with_unhealthy_workers() {
+    #[tokio::test]
+    async fn test_random_with_unhealthy_workers() {
         let policy = RandomPolicy::new();
         let workers: Vec<Arc<dyn Worker>> = vec![
             Arc::new(
@@ -105,17 +106,20 @@ mod tests {
             ),
         ];
 
-        // Mark first worker as unhealthy
         workers[0].set_healthy(false);
 
-        // Should always select the healthy worker (index 1)
         for _ in 0..10 {
-            assert_eq!(policy.select_worker(&workers, None), Some(1));
+            assert_eq!(
+                policy
+                    .select_worker(&workers, &SelectWorkerInfo::default())
+                    .await,
+                Some(1)
+            );
         }
     }
 
-    #[test]
-    fn test_random_no_healthy_workers() {
+    #[tokio::test]
+    async fn test_random_no_healthy_workers() {
         let policy = RandomPolicy::new();
         let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(
             BasicWorkerBuilder::new("http://w1:8000")
@@ -124,6 +128,11 @@ mod tests {
         )];
 
         workers[0].set_healthy(false);
-        assert_eq!(policy.select_worker(&workers, None), None);
+        assert_eq!(
+            policy
+                .select_worker(&workers, &SelectWorkerInfo::default())
+                .await,
+            None
+        );
     }
 }

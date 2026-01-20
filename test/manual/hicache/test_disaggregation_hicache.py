@@ -8,7 +8,9 @@ from typing import Dict
 import requests
 
 from sglang.bench_serving import get_tokenizer
-from sglang.test.test_disaggregation_utils import TestDisaggregationBase
+from sglang.test.server_fixtures.disaggregation_fixture import (
+    PDDisaggregationServerBase,
+)
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -16,7 +18,7 @@ from sglang.test.test_utils import (
 )
 
 
-class DisaggregationHiCacheBase(TestDisaggregationBase):
+class DisaggregationHiCacheBase(PDDisaggregationServerBase):
     """Base class for disaggregation with HiCache tests"""
 
     @classmethod
