@@ -269,45 +269,25 @@ class OpenAIServingChat(OpenAIServingBase):
         if self.is_gpt_oss:
             request.skip_special_tokens = False
 
-        # Insert tool prohibition text into the last user message when tool_choice is "none"
-        # and SGLANG_INSERT_TOOL_PROHIBIT_WHEN_NONE is set to a non-empty string
-        tool_prohibit_msg = envs.SGLANG_INSERT_TOOL_PROHIBIT_WHEN_NONE.get()
-        if request.tool_choice == "none" and tool_prohibit_msg:
-            # Find the index of the last user message
-            last_user_idx = None
-            for i, msg in enumerate(request.messages):
-                if msg.role == "user":
-                    last_user_idx = i
+        # Insert tool prohibition text into the last message when tool_choice is "none"
+        # and SGLANG_INSERT_TOOL_PROHIBIT is set to a non-empty string
+        tool_prohibit_msg = envs.SGLANG_INSERT_TOOL_PROHIBIT.get()
+        if request.tool_choice == "none" and tool_prohibit_msg and request.messages:
+            last_msg = request.messages[-1]
 
-            # Append or prepend the prohibition text to the last user message based on SGLANG_INSERT_TOOL_PROHIBIT_LOCATION
-            if last_user_idx is not None:
-                last_user_msg = request.messages[last_user_idx]
-                insert_location = envs.SGLANG_INSERT_TOOL_PROHIBIT_LOCATION.get()
-                insert_location_lower = insert_location.lower()
+            # Get current content and handle None/empty cases
+            current_content = last_msg.content
+            if current_content is None:
+                current_content = ""
+            elif not isinstance(current_content, str):
+                # If content is a list (e.g., multimodal), convert to string representation
+                current_content = str(current_content)
 
-                # Get current content and handle None/empty cases
-                current_content = last_user_msg.content
-                if current_content is None:
-                    current_content = ""
-                elif not isinstance(current_content, str):
-                    # If content is a list (e.g., multimodal), convert to string representation
-                    current_content = str(current_content)
-
-                if insert_location_lower == "after":
-                    new_content = current_content + tool_prohibit_msg
-                elif insert_location_lower == "before":
-                    new_content = tool_prohibit_msg + current_content
-                else:
-                    logger.warning(
-                        f"Invalid SGLANG_INSERT_TOOL_PROHIBIT_LOCATION value: {insert_location}. "
-                        f"Must be 'before' or 'after'. Defaulting to 'before'."
-                    )
-                    new_content = tool_prohibit_msg + current_content
-
-                last_user_msg.content = new_content
-                logger.info(
-                    f"Appended tool prohibition text to last user message for tool_choice=none at location: {insert_location_lower}"
-                )
+            new_content = tool_prohibit_msg + current_content
+            last_msg.content = new_content
+            logger.info(
+                f"Inserted tool prohibition text to last message for tool_choice=none"
+            )
 
         tool_call_constraint = None
 
