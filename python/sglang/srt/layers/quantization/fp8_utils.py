@@ -539,22 +539,6 @@ def triton_w8a8_block_fp8_linear(
     return output.to(dtype=input_2d.dtype).view(*output_shape)
 
 
-def _ceil_to_ue8m0_scale(x: torch.Tensor) -> torch.Tensor:
-    x = x.clamp(min=1e-4)
-    return torch.pow(2.0, torch.ceil(torch.log2(x)))
-
-
-def _float_to_ue8m0(scale: torch.Tensor) -> torch.Tensor:
-    scale = scale.to(torch.float32)
-    invalid = torch.isnan(scale) | torch.isinf(scale) | (scale <= 0)
-    safe_scale = torch.where(invalid, torch.ones_like(scale), scale)
-    exp = torch.floor(torch.log2(safe_scale))
-    exp_biased = (exp + 127).clamp(0, 254).to(torch.int32)
-    out = exp_biased.to(torch.uint8)
-    out = out.masked_fill(invalid, 255)
-    return out
-
-
 @lru_cache(maxsize=1)
 def _get_triton_mxfp8_downcast():
     if not is_triton_kernels_available():
@@ -580,9 +564,15 @@ def _mxfp8_per_token_group_quant(
         return q_input.contiguous(), scale_u8.contiguous()
     x_view = x.view(m, k // 32, 32)
     amax = x_view.abs().float().amax(dim=2).clamp(min=1e-4)
-    scale_f32 = _ceil_to_ue8m0_scale(amax / fp8_max)
+    scale_f32 = (amax / fp8_max).clamp(min=1e-4)
+    scale_f32 = torch.pow(2.0, torch.ceil(torch.log2(scale_f32)))
     q_input = (x_view * (1.0 / scale_f32.unsqueeze(2))).to(torch.float8_e4m3fn)
-    scale_u8 = _float_to_ue8m0(scale_f32)
+    scale_f32 = scale_f32.to(torch.float32)
+    invalid = torch.isnan(scale_f32) | torch.isinf(scale_f32) | (scale_f32 <= 0)
+    safe_scale = torch.where(invalid, torch.ones_like(scale_f32), scale_f32)
+    exp = torch.floor(torch.log2(safe_scale))
+    exp_biased = (exp + 127).clamp(0, 254).to(torch.int32)
+    scale_u8 = exp_biased.to(torch.uint8).masked_fill(invalid, 255)
     return q_input.view(m, k).contiguous(), scale_u8.contiguous()
 
 
