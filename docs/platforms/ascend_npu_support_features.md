@@ -122,7 +122,7 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 | `--prompt-tokens-buckets`                          | `None`            | List[str]                      |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
 | `--generation-tokens-buckets`                      | `None`            | List[str]                      |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
 | `--gc-warning-threshold-secs`                      | `0.0`             | Type: float                    |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--decode-log-interval`                            | `40`              | Type: int                      | **<span style="color: green;">√</span>** | **<span style="color: red;">×</span>**  |
+| `--decode-log-interval`                            | `40`              | Type: int                      |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
 | `--enable-request-time-`<br/>`stats-logging`       | `False`           | bool flag<br/> (set to enable) | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | `--kv-events-config`                               | `None`            | Type: str                      |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
 | `--enable-trace`                                   | `False`           | bool flag<br/> (set to enable) |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
