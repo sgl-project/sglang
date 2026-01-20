@@ -398,7 +398,9 @@ class AscendAttnBackend(AttentionBackend):
         device: torch.device,
         dtype: torch.dtype = torch.bfloat16,
     ) -> torch.Tensor:
-        position_point = torch.arange(seq_len).view(1, 1, -1).expand(num_heads, -1, -1).to(device)
+        position_point = (
+            torch.arange(seq_len).view(1, 1, -1).expand(num_heads, -1, -1).to(device)
+        )
         alibi = slopes.view(-1, 1, 1) * position_point
         alibi_bias = alibi.view(num_heads, 1, seq_len).to(device).to(dtype)
         return alibi_bias
