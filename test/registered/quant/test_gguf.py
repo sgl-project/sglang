@@ -3,7 +3,10 @@ import unittest
 from huggingface_hub import hf_hub_download
 
 import sglang as sgl
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
+
+register_cuda_ci(est_time=96, suite="stage-b-test-small-1-gpu")
 
 
 class TestGGUF(CustomTestCase):
