@@ -30,16 +30,16 @@ This testing tool helps evaluate the performance improvements of the new interfa
 
 ```bash
 # Run all tests (default: compare both old and new interfaces)
-python3 test/srt/hicache/test_hicache_storage_performance_comparison.py
+python3 test/registered/hicache/test_hicache_storage_performance_comparison.py
 
 # Test only the old interface
-python3 test/srt/hicache/test_hicache_storage_performance_comparison.py old
+python3 test/registered/hicache/test_hicache_storage_performance_comparison.py old
 
 # Test only the new interface
-python3 test/srt/hicache/test_hicache_storage_performance_comparison.py new
+python3 test/registered/hicache/test_hicache_storage_performance_comparison.py new
 
 # Compare both old and new interfaces (default behavior)
-python3 test/srt/hicache/test_hicache_storage_performance_comparison.py both
+python3 test/registered/hicache/test_hicache_storage_performance_comparison.py both
 ```
 
 ## Test Case Descriptions

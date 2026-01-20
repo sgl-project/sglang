@@ -4,7 +4,7 @@ Performance comparison test for HiCacheFile storage backend.
 Compares batch_set/batch_get (old) vs batch_set_v1/batch_get_v1 (new zero-copy batch).
 
 Usage:
-    python3 test/srt/hicache/test_hicache_storage_performance_comparison.py
+    python3 test/registered/hicache/test_hicache_storage_performance_comparison.py
 """
 
 import os
@@ -17,6 +17,13 @@ from typing import List, Tuple
 import torch
 
 from sglang.srt.mem_cache.hicache_storage import HiCacheFile, HiCacheStorageConfig
+from sglang.test.ci.ci_register import register_cuda_ci
+
+# This is a performance comparison test, not intended for CI runs
+# File must be in registered/ directory per project convention, but disabled from CI
+register_cuda_ci(
+    est_time=60, suite="stage-a-test-1", disabled="Performance test, not for CI"
+)
 
 
 class MockHostKVCache:
