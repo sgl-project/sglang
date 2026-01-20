@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import copy
+import multiprocessing as mp
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
@@ -391,6 +393,7 @@ class MarconiConfigTuner:
     def __init__(self, weights: Optional[List[float]] = None):
         self.tree_snapshot: Optional[MarconiShadowCache] = None
         self.num_tunings = 0
+        self.executor: Optional[ProcessPoolExecutor] = None
         self.weights = weights or [
             0.0,
             0.1,
@@ -415,16 +418,58 @@ class MarconiConfigTuner:
             2.0,
         ]
 
+    def _ensure_executor(self) -> None:
+        if self.executor is None:
+            ctx = mp.get_context("spawn")
+            self.executor = ProcessPoolExecutor(max_workers=1, mp_context=ctx)
+
     def tune(
         self,
         request_history_windowed: List[Tuple[Optional[str], List[int], List[int]]],
         tuning_interval: int,
     ) -> Optional[float]:
-        if self.tree_snapshot is None:
+        _, best_eff_weight = self._tune_with_snapshot(
+            self.tree_snapshot,
+            self.weights,
+            request_history_windowed,
+            tuning_interval,
+            0,
+        )
+        if best_eff_weight is None:
             return None
+        self.num_tunings += 1
+        return best_eff_weight
+
+    def submit(
+        self,
+        tree_snapshot: Optional[MarconiShadowCache],
+        request_history_windowed: List[Tuple[Optional[str], List[int], List[int]]],
+        tuning_interval: int,
+        generation: int,
+    ):
+        self._ensure_executor()
+        return self.executor.submit(
+            self._tune_with_snapshot,
+            tree_snapshot,
+            list(self.weights),
+            request_history_windowed,
+            tuning_interval,
+            generation,
+        )
+
+    @staticmethod
+    def _tune_with_snapshot(
+        tree_snapshot: Optional[MarconiShadowCache],
+        weights: List[float],
+        request_history_windowed: List[Tuple[Optional[str], List[int], List[int]]],
+        tuning_interval: int,
+        generation: int,
+    ) -> Tuple[int, Optional[float]]:
+        if tree_snapshot is None:
+            return generation, None
         results = {}
-        for weight in self.weights:
-            shadow_cache = self.tree_snapshot.clone()
+        for weight in weights:
+            shadow_cache = tree_snapshot.clone()
             shadow_cache.eff_weight = weight
             for extra_key, input_ids, output_ids in request_history_windowed:
                 shadow_cache.match_prefix(
@@ -436,7 +481,6 @@ class MarconiConfigTuner:
             )
             results[weight] = total_flops_saved
         if not results:
-            return None
+            return generation, None
         best_eff_weight = max(results, key=results.get)
-        self.num_tunings += 1
-        return best_eff_weight
+        return generation, best_eff_weight

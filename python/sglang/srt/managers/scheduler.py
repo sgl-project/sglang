@@ -678,7 +678,6 @@ class Scheduler(
                     )
                 marconi_config = MarconiConfig(
                     enable=True,
-                    eviction_policy=server_args.marconi_eviction_policy,
                     eff_weight=server_args.marconi_eff_weight,
                     bootstrap_window_size=server_args.marconi_bootstrap_window_size,
                     bootstrap_multiplier=server_args.marconi_bootstrap_multiplier,

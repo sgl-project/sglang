@@ -36,6 +36,7 @@ from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.layers.attention.nsa.utils import is_nsa_prefill_cp_in_seq_split
 from sglang.srt.managers.schedule_batch import DllmStagingReqs, Req, ScheduleBatch
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
+from sglang.srt.mem_cache.common import MAMBA_STATE_PER_REQ_PREFIX_CACHE
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.server_args import ServerArgs
@@ -413,6 +414,11 @@ class PrefillAdder:
             self.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator
         )
         self.is_hybrid_ssm_cache = self.tree_cache.supports_mamba()
+        self.req_to_token_pool = getattr(self.tree_cache, "req_to_token_pool", None)
+        self.mamba_state_per_req = (
+            MAMBA_STATE_PER_REQ_PREFIX_CACHE if self.is_hybrid_ssm_cache else 0
+        )
+        self.rem_mamba_state_offset = 0
 
         self.priority_scheduling_preemption_threshold = (
             priority_scheduling_preemption_threshold
@@ -480,11 +486,36 @@ class PrefillAdder:
 
         return available_and_evictable - self.cur_rem_token_offset
 
+    @property
+    def rem_mamba_states(self):
+        if not self.is_hybrid_ssm_cache or self.req_to_token_pool is None:
+            return float("inf")
+        mamba_pool = getattr(self.req_to_token_pool, "mamba_pool", None)
+        if mamba_pool is None:
+            return float("inf")
+        mamba_evictable_size = getattr(self.tree_cache, "mamba_evictable_size", None)
+        evictable = mamba_evictable_size() if mamba_evictable_size is not None else 0
+        available = mamba_pool.available_size()
+        return available + evictable - self.rem_mamba_state_offset
+
     def ceil_paged_tokens(self, tokens: int) -> int:
         return -(-tokens // self.page_size) * self.page_size
 
+    def _needs_mamba_alloc(self, req: Req) -> bool:
+        return (
+            self.is_hybrid_ssm_cache
+            and req.req_pool_idx is None
+            and req.mamba_pool_idx is None
+        )
+
+    def _update_mamba_budget(self, req: Req) -> None:
+        if self._needs_mamba_alloc(req):
+            self.rem_mamba_state_offset += self.mamba_state_per_req
+
     def budget_state(self):
         if self.rem_total_tokens <= 0 or self.cur_rem_tokens <= 0:
+            return AddReqResult.NO_TOKEN
+        if self.rem_mamba_states <= 0:
             return AddReqResult.NO_TOKEN
 
         if self.rem_input_tokens <= 0:
@@ -542,6 +573,7 @@ class PrefillAdder:
         req.fill_ids = req.fill_ids[: prefix_len + trunc_len]
 
         self.can_run_list.append(req)
+        self._update_mamba_budget(req)
         self.dllm_staging_reqs.add_reqs(req)
 
         self._update_prefill_budget(prefix_len, trunc_len, 0)
@@ -554,6 +586,10 @@ class PrefillAdder:
             self.tree_cache.inc_lock_ref(req.last_node)
 
     def add_chunked_req(self, req: Req):
+        if self._needs_mamba_alloc(req) and (
+            self.rem_mamba_states < self.mamba_state_per_req
+        ):
+            return req
         if self.dllm_config is not None:
             _rem_tokens = self._get_dllm_remain_tokens()
         else:
@@ -571,6 +607,7 @@ class PrefillAdder:
         req.set_extend_input_len(min(req.extend_input_len, _rem_tokens))
         req.fill_ids = req.fill_ids[: len(req.prefix_indices) + req.extend_input_len]
         self.can_run_list.append(req)
+        self._update_mamba_budget(req)
         self._update_prefill_budget(
             0,
             req.extend_input_len,
@@ -602,6 +639,10 @@ class PrefillAdder:
         # Early exit if no enough tokens for the input tokens
         if self.ceil_paged_tokens(req.extend_input_len) > min(
             self.cur_rem_tokens, self.rem_total_tokens
+        ):
+            return AddReqResult.NO_TOKEN
+        if self._needs_mamba_alloc(req) and (
+            self.rem_mamba_states < self.mamba_state_per_req
         ):
             return AddReqResult.NO_TOKEN
 
@@ -665,6 +706,7 @@ class PrefillAdder:
         ):
             # Non-chunked prefill
             self.can_run_list.append(req)
+            self._update_mamba_budget(req)
             self._update_prefill_budget(
                 0,
                 req.extend_input_len,
@@ -680,6 +722,7 @@ class PrefillAdder:
             req.set_extend_input_len(trunc_len)
             req.fill_ids = req.fill_ids[:trunc_len]
             self.can_run_list.append(req)
+            self._update_mamba_budget(req)
             self.new_chunked_req = req
             self._update_prefill_budget(0, trunc_len, 0)
 
@@ -699,6 +742,11 @@ class PrefillAdder:
 
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
             return self.add_one_req_ignore_eos(req)
+
+        if self._needs_mamba_alloc(req) and (
+            self.rem_mamba_states < self.mamba_state_per_req
+        ):
+            return AddReqResult.NO_TOKEN
 
         total_tokens = req.extend_input_len + min(
             max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
@@ -773,6 +821,7 @@ class PrefillAdder:
                 if not needs_chunking:
                     # Non-chunked prefill
                     self.can_run_list.append(req)
+                    self._update_mamba_budget(req)
 
                     self._req_inc_lock_ref(req)
                     self._update_prefill_budget(
@@ -817,6 +866,7 @@ class PrefillAdder:
 
                     self.can_run_list.append(req)
                     self.new_chunked_req = req
+                    self._update_mamba_budget(req)
 
                     self._req_inc_lock_ref(req)
                     self._update_prefill_budget(prefix_len, trunc_len, 0)

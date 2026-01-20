@@ -34,6 +34,7 @@ from sglang.srt.mem_cache.allocator import (
     TokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
+from sglang.srt.mem_cache.marconi_admission_cache import MarconiAdmissionTree
 from sglang.srt.mem_cache.marconi_shadow_cache import (
     MarconiConfigTuner,
     MarconiShadowCache,
@@ -385,6 +386,8 @@ class MambaRadixCache(BasePrefixCache):
             self.marconi_config is not None and self.marconi_config.enable
         )
         self.marconi_tuner = None
+        self.marconi_tune_future = None
+        self.marconi_tune_generation = 0
         if self.marconi_enabled:
             self.marconi_model_stats = self.marconi_config.model_stats
             if self.marconi_model_stats is None:
@@ -392,6 +395,9 @@ class MambaRadixCache(BasePrefixCache):
                     "Marconi is enabled but model stats are missing. Disabling Marconi."
                 )
                 self.marconi_enabled = False
+        self.marconi_admission_tree = (
+            MarconiAdmissionTree() if self.marconi_enabled else None
+        )
         if self.marconi_enabled:
             self.marconi_eff_weight = self.marconi_config.eff_weight
             self.marconi_bootstrap_window_size = (
@@ -399,13 +405,12 @@ class MambaRadixCache(BasePrefixCache):
             )
             self.marconi_bootstrap_multiplier = self.marconi_config.bootstrap_multiplier
             self.marconi_tuning_interval = self.marconi_config.tuning_interval
-            if self.marconi_config.eviction_policy == "v3":
-                weights = (
-                    list(self.marconi_config.tuning_weights)
-                    if self.marconi_config.tuning_weights is not None
-                    else None
-                )
-                self.marconi_tuner = MarconiConfigTuner(weights=weights)
+            weights = (
+                list(self.marconi_config.tuning_weights)
+                if self.marconi_config.tuning_weights is not None
+                else None
+            )
+            self.marconi_tuner = MarconiConfigTuner(weights=weights)
 
         self.page_size = params.page_size
         self.disable = params.disable
@@ -459,6 +464,9 @@ class MambaRadixCache(BasePrefixCache):
             self.marconi_num_reqs_before_eviction = None
             if self.marconi_tuner is not None:
                 self.marconi_tuner.tree_snapshot = None
+            self.marconi_tune_future = None
+            self.marconi_tune_generation = 0
+            self.marconi_admission_tree = MarconiAdmissionTree()
 
     def match_prefix(self, key: RadixKey, **kwargs) -> MatchResult:
         """Find the matching prefix from the radix tree.
@@ -512,12 +520,58 @@ class MambaRadixCache(BasePrefixCache):
         else:
             value = torch.empty((0,), dtype=torch.int64, device=self.device)
 
+        if (
+            self.marconi_enabled
+            and req is not None
+            and self.marconi_admission_tree is not None
+        ):
+            admission_len, branchoff_required = (
+                self.marconi_admission_tree.match_prefix(key.token_ids, key.extra_key)
+            )
+            self.marconi_admission_tree.insert(key.token_ids, key.extra_key)
+            cached_prefix_len = len(value)
+            cache_len = admission_len if branchoff_required else 0
+            req.marconi_cache_len = cache_len if cache_len > 0 else None
+            mamba_branching_seqlen = self._marconi_branch_seqlen(
+                cache_len, cached_prefix_len, mamba_branching_seqlen
+            )
+
         return MatchResult(
             device_indices=value,
             last_device_node=last_node,
             last_host_node=last_node,
             mamba_branching_seqlen=mamba_branching_seqlen,
         )
+
+    def _marconi_align_cache_len(self, cache_len: int) -> int:
+        if cache_len <= 0:
+            return 0
+        if self.page_size > 1:
+            return cache_len // self.page_size * self.page_size
+        return cache_len
+
+    def _marconi_align_branch_len(self, cache_len: int) -> Optional[int]:
+        if cache_len <= 0:
+            return None
+        mamba_cache_chunk_size = get_global_server_args().mamba_cache_chunk_size
+        if mamba_cache_chunk_size <= 1:
+            return cache_len
+        aligned = cache_len // mamba_cache_chunk_size * mamba_cache_chunk_size
+        return aligned if aligned > 0 else None
+
+    def _marconi_branch_seqlen(
+        self,
+        cache_len: int,
+        cached_prefix_len: int,
+        existing_branch: Optional[int],
+    ) -> Optional[int]:
+        branch_len = None
+        if cache_len > cached_prefix_len:
+            branch_len = self._marconi_align_branch_len(cache_len)
+        if existing_branch is not None:
+            if branch_len is None or existing_branch < branch_len:
+                branch_len = existing_branch
+        return branch_len
 
     def insert(
         self,
@@ -575,6 +629,10 @@ class MambaRadixCache(BasePrefixCache):
             )
             if cache_len is None:
                 cache_len = 0
+            if cache_len <= 0:
+                is_insert = False
+
+        if is_insert:
             if cache_len != len(token_ids):
                 cache_end_idx = max(cache_len, req.cache_protected_len)
                 self.token_to_kv_pool_allocator.free(kv_indices[cache_end_idx:])
@@ -732,16 +790,35 @@ class MambaRadixCache(BasePrefixCache):
             return
         if self.marconi_request_count < self.marconi_bootstrap_window_size:
             return
+        if self.marconi_tune_future is not None:
+            if not self.marconi_tune_future.done():
+                return
+            try:
+                generation, best_eff_weight = self.marconi_tune_future.result()
+            except Exception:
+                generation, best_eff_weight = None, None
+            self.marconi_tune_future = None
+            if (
+                generation is not None
+                and generation == self.marconi_tune_generation
+                and best_eff_weight is not None
+            ):
+                self.marconi_eff_weight = best_eff_weight
+            self.marconi_tuner.tree_snapshot = self._marconi_build_shadow_cache()
         if len(self.marconi_request_history_windowed) < self.marconi_tuning_interval:
             return
-        best_eff_weight = self.marconi_tuner.tune(
-            self.marconi_request_history_windowed,
-            self.marconi_tuning_interval,
-        )
-        if best_eff_weight is not None:
-            self.marconi_eff_weight = best_eff_weight
+        if self.marconi_tuner.tree_snapshot is None:
+            return
+        self.marconi_tune_generation += 1
+        generation = self.marconi_tune_generation
+        history = self.marconi_request_history_windowed
         self.marconi_request_history_windowed = []
-        self.marconi_tuner.tree_snapshot = self._marconi_build_shadow_cache()
+        self.marconi_tune_future = self.marconi_tuner.submit(
+            self.marconi_tuner.tree_snapshot,
+            history,
+            self.marconi_tuning_interval,
+            generation,
+        )
 
     def cache_unfinished_req(self, req: Req, chunked=False) -> None:
         """Cache request when it is unfinished."""
@@ -761,7 +838,7 @@ class MambaRadixCache(BasePrefixCache):
             if self.enable_mamba_extra_buffer
             else len(token_ids)
         )
-        if self.disable or cache_len is None:
+        if self.disable or cache_len is None or cache_len <= 0:
             return _skip_cache_unfinished_req(req)
 
         kv_indices_orig = self.req_to_token_pool.req_to_token[
@@ -800,12 +877,14 @@ class MambaRadixCache(BasePrefixCache):
             mamba_value = self.req_to_token_pool.get_mamba_indices(
                 req.req_pool_idx
             ).unsqueeze(-1)
-        # radix tree mamba value is forked from req space
-        mamba_value_forked = self.req_to_token_pool.mamba_pool.fork_from(mamba_value)
         branch_checkpoint = (
             req.mamba_branching_seqlen is not None
             and page_aligned_len == req.mamba_branching_seqlen
         )
+        if self.marconi_enabled and not branch_checkpoint:
+            return _skip_cache_unfinished_req(req)
+        # radix tree mamba value is forked from req space
+        mamba_value_forked = self.req_to_token_pool.mamba_pool.fork_from(mamba_value)
 
         # if alloc mamba cache failed, do evict and alloc again
         if mamba_value_forked is None:
@@ -1262,17 +1341,24 @@ class MambaRadixCache(BasePrefixCache):
         # update time for matched nodes, and make nodes closer to root to be least recently used
         # this allows mamba to evict nodes closer to root first
         node_update = best_last_node
-        self.full_lru_list.reset_node_and_parents_mru(node_update, self.root_node)
-        self.mamba_lru_list.reset_node_and_parents_mru(node_update, self.root_node)
+        if self.marconi_enabled:
+            if node_update != self.root_node:
+                self.full_lru_list.reset_node_mru(node_update)
+                if node_update.mamba_value is not None:
+                    self.mamba_lru_list.reset_node_mru(node_update)
+            node_update.last_access_time = get_last_access_time()
+        else:
+            self.full_lru_list.reset_node_and_parents_mru(node_update, self.root_node)
+            self.mamba_lru_list.reset_node_and_parents_mru(node_update, self.root_node)
 
-        # This last_access_time is for sanity check, can be deleted after validation in production
-        cur_time = get_last_access_time()
-        while node_update:
-            node_update.last_access_time = cur_time
-            cur_time -= (
-                0.00001  # assuming less than 100000 nodes in a branch of the tree
-            )
-            node_update = node_update.parent
+            # This last_access_time is for sanity check, can be deleted after validation in production
+            cur_time = get_last_access_time()
+            while node_update:
+                node_update.last_access_time = cur_time
+                cur_time -= (
+                    0.00001  # assuming less than 100000 nodes in a branch of the tree
+                )
+                node_update = node_update.parent
 
         # Calculate the branching point. It is defined as the last aligned position that
         # does not have a mamba value.
