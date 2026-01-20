@@ -1147,11 +1147,25 @@ class MHATokenToKVPoolNVFP4(MHATokenToKVPool):
                     for _ in range(self.layer_num)
                 ]
 
+                self.dq_dtype = torch.float8_e4m3fn
+                self.dq_k_buffer = torch.zeros(
+                    (m, n, k),
+                    dtype=self.dq_dtype,
+                    device=self.device,
+                )
+                self.dq_v_buffer = torch.zeros(
+                    (m, n, k),
+                    dtype=self.dq_dtype,
+                    device=self.device,
+                )
+
     def _clear_buffers(self):
         del self.k_buffer
         del self.v_buffer
         del self.k_scale_buffer
         del self.v_scale_buffer
+        del self.dq_k_buffer
+        del self.dq_v_buffer
 
     def _get_key_nvfp4_from_nvfp4_buffer(self, layer_id: int):
         return (
@@ -1243,6 +1257,11 @@ class MHATokenToKVPoolNVFP4(MHATokenToKVPool):
 
             self.k_scale_buffer[layer_id - self.start_layer][loc] = cache_k_fp4_sf
             self.v_scale_buffer[layer_id - self.start_layer][loc] = cache_v_fp4_sf
+
+    def get_dq_kv_buffer_and_page_table(
+        self,
+    ):
+        return (self.dq_k_buffer, self.dq_v_buffer)
 
 
 class MHATokenToKVPoolFP4(MHATokenToKVPool):
@@ -1526,6 +1545,14 @@ class HybridLinearKVPool(KVCache):
     def get_fp4_key_buffer(self, layer_id: int):
         layer_id = self._transfer_full_attention_id(layer_id)
         return self.full_kv_pool._get_key_nvfp4_from_nvfp4_buffer(layer_id)
+
+    def get_dq_kv_buffer_and_page_table(
+        self,
+    ):
+        assert is_float4_e2m1fn_x2(
+            self.dtype
+        ), "get_dq_kv_buffer_and_page_table only available for FP4 KV pool"
+        return self.full_kv_pool.get_dq_kv_buffer_and_page_table()
 
     @contextmanager
     def _transfer_id_context(self, layer: RadixAttention):
