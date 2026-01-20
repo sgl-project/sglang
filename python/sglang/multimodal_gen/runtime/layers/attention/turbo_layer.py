@@ -13,6 +13,7 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
     AttentionImpl,
 )
 from sglang.multimodal_gen.runtime.layers.attention.backends.sparse_linear_attn import (
+    SageSparseLinearAttentionBackend,
     SparseLinearAttentionBackend,
 )
 from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
@@ -241,7 +242,7 @@ class MinimalA2AAttnOp(DistributedAttention):
         # Maintained for compatibility purposes; can be removed when CI allows setting Attention_backend or when TurboWan supports FA.
         if attn_backend not in (
             SparseLinearAttentionBackend,
-            SparseLinearAttentionBackend,
+            SageSparseLinearAttentionBackend,
         ):
             logger.warning(
                 "TurboWan now only supports `sla_attn` or `sage_sla_attn` and has been automatically set to `sla_attn`. Please set --attention-backend to `sla_attn` or `sage_sla_attn`."
