@@ -681,17 +681,18 @@ class ChatCompletionRequest(BaseModel):
         if (
             self.tool_choice == "none"
             and envs.SGLANG_BIAS_TOOL_WHEN_NONE.get()
-            and (tool_token_id := envs.SGLANG_TOOL_START_TOKEN.get()) is not None
+            and (tool_tokens := envs.SGLANG_TOOL_TOKENS_TO_SUPPRESS.get())
         ):
             existing_bias = sampling_params["logit_bias"] or {}
-            # Use string key for token ID as per OpenAI convention
-            token_key = str(tool_token_id)
-            if token_key not in existing_bias:
-                existing_bias = dict(existing_bias)  # Copy to avoid mutating original
-                existing_bias[token_key] = -100.0
-                sampling_params["logit_bias"] = existing_bias
+            for tool_token_id in tool_tokens:
+                token_key = str(tool_token_id)
+                if token_key not in existing_bias:
+                    existing_bias = dict(existing_bias)
+                    existing_bias[token_key] = -100.0
+            sampling_params["logit_bias"] = existing_bias
+            if existing_bias:
                 logger.info(
-                    f"Applied logit bias of -100.0 to token {tool_token_id} for tool_choice=none"
+                    f"Applied logit bias of -100.0 to tokens {list(existing_bias.keys())} for tool_choice=none"
                 )
 
         if self.response_format and self.response_format.type == "json_schema":

@@ -418,10 +418,9 @@ class Envs:
 
     # Tool-Call behavior
     SGLANG_TOOL_STRICT_LEVEL = EnvInt(ToolStrictLevel.OFF)
-    # Token ID to bias when tool_choice is "none" (e.g., tool start token)
-    # TODO: Validate token ID is >= 0
-    SGLANG_TOOL_START_TOKEN = EnvInt(None)
-    # Whether to apply logit bias to SGLANG_TOOL_START_TOKEN when tool_choice is "none"
+    # Comma-separated list of token IDs to suppress when tool_choice is "none"
+    SGLANG_TOOL_TOKENS_TO_SUPPRESS = EnvTuple(tuple())
+    # Whether to apply logit bias to SGLANG_TOOL_TOKENS_TO_SUPPRESS when tool_choice is "none"
     SGLANG_BIAS_TOOL_WHEN_NONE = EnvBool(False)
     # Message to insert to prohibit tool calls (inserted into the last message, empty string disables)
     SGLANG_INSERT_TOOL_PROHIBIT = EnvStr("")
