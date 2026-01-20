@@ -16,6 +16,8 @@ The definition of objects transferred between different
 processes (TokenizerManager, DetokenizerManager, Scheduler).
 """
 
+from __future__ import annotations
+
 import copy
 import uuid
 from abc import ABC
@@ -241,6 +243,9 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
     # Extra key for classifying the request (e.g. cache_salt)
     extra_key: Optional[Union[List[str], str]] = None
 
+    # Routing key for routing-key schedule policy
+    routing_key: Optional[str] = None
+
     # Whether to disallow logging for this request (e.g. due to ZDR)
     no_logs: bool = False
 
@@ -253,9 +258,18 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
     # Whether to return entropy
     return_entropy: bool = False
 
+    # Propagates trace context via Engine.generate/async_generate
+    external_trace_header: Optional[Dict] = None
+
+    # For EPD-disaggregated inference
     need_wait_for_image: Optional[bool] = None
     num_items_assigned: Optional[List] = None
-    embedding_ports: Optional[List] = None
+
+    # Multimodal tiling controls (extensions)
+    max_dynamic_patch: Optional[int] = None
+    min_dynamic_patch: Optional[int] = None
+    image_max_dynamic_patch: Optional[int] = None
+    video_max_dynamic_patch: Optional[int] = None
 
     def contains_mm_input(self) -> bool:
         return (
@@ -660,6 +674,7 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
             custom_labels=self.custom_labels,
             return_bytes=self.return_bytes,
             return_entropy=self.return_entropy,
+            external_trace_header=self.external_trace_header,
             http_worker_ipc=self.http_worker_ipc,
             **{
                 field: getattr(self, field)
@@ -728,6 +743,9 @@ class TokenizedGenerateReqInput(BaseReq):
     # Extra key for classifying the request (e.g. cache_salt)
     extra_key: Optional[str] = None
 
+    # Routing key for routing-key schedule policy
+    routing_key: Optional[str] = None
+
     # Whether to disallow logging for this request (e.g. due to ZDR)
     no_logs: bool = False
 
@@ -742,7 +760,6 @@ class TokenizedGenerateReqInput(BaseReq):
 
     need_wait_for_image: bool = False
     num_items_assigned: Optional[List] = None
-    embedding_ports: Optional[List] = None
 
 
 @dataclass
@@ -791,12 +808,14 @@ class EmbeddingReqInput(BaseReq, APIServingTimingMixin):
     is_cross_encoder_request: bool = False
     # Priority for the request
     priority: Optional[int] = None
+    # Routing key for routing-key schedule policy
+    routing_key: Optional[str] = None
 
     # For background responses (OpenAI responses API)
     background: bool = False
 
-    # tracing context
-    trace_context: Optional[Dict] = None
+    # Propagates trace context via Engine.encode/async_encode
+    external_trace_header: Optional[Dict] = None
 
     # The number of dimensions the resulting output embeddings should have. It is applicable for Matryoshka Embeddings.
     dimensions: Optional[int] = None
@@ -877,6 +896,7 @@ class EmbeddingReqInput(BaseReq, APIServingTimingMixin):
             video_data=self.video_data[i] if self.video_data is not None else None,
             sampling_params=self.sampling_params[i],
             rid=self.rid[i],
+            external_trace_header=self.external_trace_header,
             dimensions=self.dimensions,
             http_worker_ipc=self.http_worker_ipc,
             **{
@@ -976,6 +996,11 @@ class BatchTokenIDOutput(
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: List[List[int]] = None
 
+    # Load for DP balance
+    load: GetLoadReqOutput = None
+    # Customized info
+    customized_info: Optional[Dict[str, List[Any]]] = None
+
 
 @dataclass
 class BatchMultimodalDecodeReq(BaseBatchReq):
@@ -1057,6 +1082,12 @@ class BatchStrOutput(
 
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: List[List[int]] = None
+
+    # Load for DP balance
+    load: GetLoadReqOutput = None
+
+    # Customized info
+    customized_info: Optional[Dict[str, List[Any]]] = None
 
 
 @dataclass
@@ -1404,6 +1435,11 @@ class AbortReq(BaseReq):
 
 
 @dataclass
+class ActiveRanksOutput(BaseReq):
+    status: List[bool]
+
+
+@dataclass
 class GetInternalStateReq(BaseReq):
     pass
 
@@ -1486,6 +1522,7 @@ class FreezeGCReq(BaseReq):
 class ConfigureLoggingReq(BaseReq):
     log_requests: Optional[bool] = None
     log_requests_level: Optional[int] = None
+    log_requests_format: Optional[str] = None
     dump_requests_folder: Optional[str] = None
     dump_requests_threshold: Optional[int] = None
     crash_dump_folder: Optional[str] = None
@@ -1612,13 +1649,33 @@ class UnloadLoRAAdapterReqInput(BaseReq):
 
 
 @dataclass
+class LoadLoRAAdapterFromTensorsReqInput(BaseReq):
+    lora_name: str
+    config_dict: Dict[str, Any]
+    serialized_tensors: str
+    pinned: bool = False
+    added_tokens_config: Optional[Dict[str, Any]] = None
+    lora_id: Optional[str] = None
+
+    def to_ref(self) -> LoRARef:
+        return LoRARef(
+            lora_id=self.lora_id,
+            lora_name=self.lora_name,
+            lora_path="__tensor__",
+            pinned=self.pinned,
+        )
+
+
+@dataclass
 class LoRAUpdateOutput(BaseReq):
     success: bool
     error_message: Optional[str] = None
     loaded_adapters: Optional[Dict[str, LoRARef]] = None
 
 
-LoadLoRAAdapterReqOutput = UnloadLoRAAdapterReqOutput = LoRAUpdateOutput
+LoadLoRAAdapterReqOutput = UnloadLoRAAdapterReqOutput = (
+    LoadLoRAAdapterFromTensorsReqOutput
+) = LoRAUpdateOutput
 
 
 class BlockReqType(Enum):
@@ -1642,6 +1699,148 @@ class GetLoadReqOutput(BaseReq):
     num_reqs: int
     num_waiting_reqs: int
     num_tokens: int
+    ts_tic: float
+
+
+@dataclass
+class MemoryMetrics:
+    """Memory breakdown metrics."""
+
+    weight_gb: float = field(
+        metadata={"metric": ("gauge", "Model weight memory in GB")}
+    )
+    kv_cache_gb: float = field(metadata={"metric": ("gauge", "KV cache memory in GB")})
+    graph_gb: float = field(metadata={"metric": ("gauge", "CUDA graph memory in GB")})
+    token_capacity: int = field(
+        metadata={"metric": ("gauge", "Max tokens in KV cache")}
+    )
+
+
+@dataclass
+class SpeculativeMetrics:
+    """Speculative decoding metrics."""
+
+    accept_length: float = field(
+        metadata={"metric": ("gauge", "Avg accepted tokens per step")}
+    )
+    accept_rate: float = field(
+        metadata={"metric": ("gauge", "Speculative acceptance rate")}
+    )
+
+
+@dataclass
+class LoRAMetrics:
+    """LoRA adapter pool metrics."""
+
+    slots_used: int = field(metadata={"metric": ("gauge", "LoRA adapter slots in use")})
+    slots_total: int = field(metadata={"metric": ("gauge", "Total LoRA adapter slots")})
+    utilization: float = field(
+        metadata={"metric": ("gauge", "LoRA pool utilization ratio")}
+    )
+
+
+@dataclass
+class DisaggregationMetrics:
+    """PD disaggregation metrics."""
+
+    mode: str  # "prefill", "decode", or "null" - not a metric
+    prefill_prealloc_queue_reqs: int = field(
+        default=0, metadata={"metric": ("gauge", "Prefill prealloc queue requests")}
+    )
+    prefill_inflight_queue_reqs: int = field(
+        default=0, metadata={"metric": ("gauge", "Prefill inflight queue requests")}
+    )
+    decode_prealloc_queue_reqs: int = field(
+        default=0, metadata={"metric": ("gauge", "Decode prealloc queue requests")}
+    )
+    decode_transfer_queue_reqs: int = field(
+        default=0, metadata={"metric": ("gauge", "Decode transfer queue requests")}
+    )
+    decode_retracted_queue_reqs: int = field(
+        default=0, metadata={"metric": ("gauge", "Decode retracted queue requests")}
+    )
+    kv_transfer_speed_gb_s: float = field(
+        default=0.0, metadata={"metric": ("gauge", "KV transfer speed in GB/s")}
+    )
+    kv_transfer_latency_ms: float = field(
+        default=0.0, metadata={"metric": ("gauge", "KV transfer latency in ms")}
+    )
+
+
+@dataclass
+class QueueMetrics:
+    """Detailed queue breakdown."""
+
+    waiting: int = field(metadata={"metric": ("gauge", "Main waiting queue size")})
+    grammar: int = field(
+        metadata={"metric": ("gauge", "Grammar compilation queue size")}
+    )
+    paused: int = field(
+        metadata={"metric": ("gauge", "Requests paused by weight sync")}
+    )
+    retracted: int = field(metadata={"metric": ("gauge", "Retracted requests count")})
+
+
+@dataclass
+class GetLoadsReqInput(BaseReq):
+    """Request for /v1/loads endpoint."""
+
+    VALID_SECTIONS = frozenset(
+        {"core", "memory", "spec", "lora", "disagg", "queues", "all"}
+    )
+
+    include: List[str] = field(default_factory=lambda: ["all"])
+    dp_rank: Optional[int] = None
+
+    def __post_init__(self):
+        """Validate include sections."""
+        if self.include:
+            invalid = set(self.include) - self.VALID_SECTIONS
+            if invalid:
+                raise ValueError(
+                    f"Invalid include sections: {invalid}. "
+                    f"Valid options: {sorted(self.VALID_SECTIONS)}"
+                )
+
+
+@dataclass
+class GetLoadsReqOutput(BaseReq):
+    """Per-DP-rank load metrics for /v1/loads endpoint."""
+
+    dp_rank: int
+    timestamp: float
+
+    num_running_reqs: int = field(
+        metadata={"metric": ("gauge", "Number of running requests")}
+    )
+    num_waiting_reqs: int = field(
+        metadata={"metric": ("gauge", "Number of waiting requests")}
+    )
+    num_used_tokens: int = field(
+        metadata={"metric": ("gauge", "Number of tokens in use")}
+    )
+    max_total_num_tokens: int = field(
+        metadata={"metric": ("gauge", "Maximum token capacity")}
+    )
+    token_usage: float = field(metadata={"metric": ("gauge", "Token pool usage ratio")})
+    gen_throughput: float = field(
+        metadata={"metric": ("gauge", "Generation throughput tokens/sec")}
+    )
+    cache_hit_rate: float = field(
+        metadata={"metric": ("gauge", "Prefix cache hit rate")}
+    )
+    utilization: float = field(
+        metadata={"metric": ("gauge", "Overall utilization ratio")}
+    )
+    max_running_requests: int = field(
+        metadata={"metric": ("gauge", "Maximum running requests capacity")}
+    )
+
+    memory: Optional[MemoryMetrics] = None
+    speculative: Optional[SpeculativeMetrics] = None
+    lora: Optional[LoRAMetrics] = None
+    disaggregation: Optional[DisaggregationMetrics] = None
+    queues: Optional[QueueMetrics] = None
 
 
 @dataclass

@@ -22,7 +22,7 @@ from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
-from sglang.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
+from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import (
@@ -793,6 +793,13 @@ class FlashInferAttnBackend(AttentionBackend):
                 v_scale=layer.v_scale_float,
             )
         else:
+            # If `k`/`v` are not explicitly provided, fall back to the KV cache stored in
+            # `forward_batch.token_to_kv_pool` for this layer. This enables attention over
+            # previously cached context without re-materializing KV tensors (e.g., the
+            # IQuestLoopCoder path uses token_to_kv_pool as the KV source).
+            if k is None and v is None:
+                k = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)[0]
+                v = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)[1]
             causal = True
             if (
                 layer.is_cross_attention
