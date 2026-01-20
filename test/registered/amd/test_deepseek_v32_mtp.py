@@ -44,7 +44,7 @@ class TestDeepseekV32DPMTP(CustomTestCase):
             "--mem-frac",
             "0.7",
             "--model-loader-extra-config",
-            '{"enable_multithread_load": true}',
+            '{"enable_multithread_load": false}',
         ]
         if is_in_amd_ci():
             other_args += [
@@ -137,7 +137,7 @@ class TestDeepseekV32TPMTP(CustomTestCase):
             "--mem-frac",
             "0.7",
             "--model-loader-extra-config",
-            '{"enable_multithread_load": true}',
+            '{"enable_multithread_load": false}',
         ]
         if is_in_amd_ci():
             other_args += [
