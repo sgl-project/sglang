@@ -230,7 +230,15 @@ class TestLoRALoadFromTensor(CustomTestCase):
             mem_fraction_static=0.6,
             enable_lora=True,
             max_lora_rank=64,
-            lora_target_modules=["all"],
+            lora_target_modules=[
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "o_proj",
+                "gate_proj",
+                "up_proj",
+                "down_proj",
+            ],
         ) as srt_runner:
             result = srt_runner.engine.load_lora_adapter_from_tensors(
                 lora_name=lora_name,
