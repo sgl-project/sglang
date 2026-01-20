@@ -281,6 +281,10 @@ class FP32LayerNorm(nn.LayerNorm):
 ################################################################################
 # Fused norm kernel
 ################################################################################
+def _ensure_contiguous(tensor: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    return tensor.contiguous() if tensor is not None else None
+
+
 class _ScaleResidualNormScaleShift(CustomOp):
     """
     Fused kernel that combines:
@@ -328,25 +332,18 @@ class _ScaleResidualNormScaleShift(CustomOp):
                 stacklevel=2,
             )
             return self.forward_native(residual, x, gate, shift, scale)
-        device = x.device
-        x = x.contiguous()
-        residual = residual.contiguous()
-        # gamma/beta
-        gamma_opt = getattr(self.norm, "weight", None)
-        if gamma_opt is not None:
-            gamma_opt = gamma_opt.contiguous().to(device=device)
-        beta_opt = getattr(self.norm, "bias", None)
-        if beta_opt is not None:
-            beta_opt = beta_opt.contiguous().to(device=device)
+
+        gamma_opt = _ensure_contiguous(getattr(self.norm, "weight", None))
+        beta_opt = _ensure_contiguous(getattr(self.norm, "bias", None))
         gate_opt = gate.contiguous() if isinstance(gate, torch.Tensor) else None
         return fused_scale_residual_norm_scale_shift(
-            residual,
-            x,
+            residual.contiguous(),
+            x.contiguous(),
             gate_opt,
             gamma_opt,
             beta_opt,
-            scale,
-            shift,
+            scale.contiguous(),
+            shift.contiguous(),
             self.norm_type,
             self.eps,
         )
@@ -433,15 +430,16 @@ class _NormScaleShift(CustomOp):
             )
             return self.forward_native(x, shift, scale)
 
-        device = x.device
-        gamma_opt = getattr(self.norm, "weight", None)
-        if gamma_opt is not None:
-            gamma_opt = gamma_opt.contiguous().to(device=device)
-        beta_opt = getattr(self.norm, "bias", None)
-        if beta_opt is not None:
-            beta_opt = beta_opt.contiguous().to(device=device)
+        gamma_opt = _ensure_contiguous(getattr(self.norm, "weight", None))
+        beta_opt = _ensure_contiguous(getattr(self.norm, "bias", None))
         return fused_norm_scale_shift(
-            x, gamma_opt, beta_opt, scale, shift, self.norm_type, self.eps
+            x.contiguous(),
+            gamma_opt,
+            beta_opt,
+            scale.contiguous(),
+            shift.contiguous(),
+            self.norm_type,
+            self.eps,
         )
 
     def forward_native(
