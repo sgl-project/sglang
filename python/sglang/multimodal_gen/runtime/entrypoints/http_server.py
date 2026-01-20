@@ -12,13 +12,15 @@ from fastapi.responses import ORJSONResponse
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.entrypoints.openai import image_api, video_api
+from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
+    VertexGenerateReqInput,
+)
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
     post_process_sample,
     prepare_request,
 )
 from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 from sglang.multimodal_gen.runtime.server_args import ServerArgs, get_global_server_args
-from sglang.srt.managers.io_struct import VertexGenerateReqInput
 
 DEFAULT_SEED = 1024
 VERTEX_ROUTE = os.environ.get("AIP_PREDICT_ROUTE", "/vertex_generate")
@@ -55,9 +57,15 @@ async def health():
     return {"status": "ok"}
 
 
-@health_router.get("/models")
+@health_router.get("/models", deprecated=True)
 async def get_models(request: Request):
-    """Get information about the model served by this server."""
+    """
+    Get information about the model served by this server.
+
+    .. deprecated::
+        Use /v1/models instead for OpenAI-compatible model discovery.
+        This endpoint will be removed in a future version.
+    """
     from sglang.multimodal_gen.registry import get_model_info
 
     server_args: ServerArgs = request.app.state.server_args
