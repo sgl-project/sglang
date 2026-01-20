@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Adapted from turbo_layer.py for Attention Backend integration
+# Copy and Adapted from https://github.com/thu-ml/TurboDiffusion/blob/main/turbodiffusion/SLA/core.py and https://github.com/thu-ml/SLA/blob/main/SageSLA/core.py
 
 from collections.abc import Callable
 from dataclasses import dataclass
