@@ -1280,9 +1280,9 @@ class ServerArgs:
                 or decode_attn_backend == "trtllm_mha"
             ):
                 # TODO: support swa kv indices translation for trtllm_mha attention backend
-                self.swa_full_tokens_ratio = 1.0
+                self.disable_hybrid_swa_memory = True
                 logger.warning(
-                    "Set swa_full_tokens_ratio to 1.0 for GPT-OSS model with trtllm_mha attention backend."
+                    "Disable hybrid SWA memory for GPT-OSS model with trtllm_mha attention backend."
                 )
 
             quant_method = get_quantization_config(hf_config)
