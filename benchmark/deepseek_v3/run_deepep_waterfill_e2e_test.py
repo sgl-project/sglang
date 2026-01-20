@@ -33,11 +33,8 @@ DEFAULT_PORT = 30000
 DEFAULT_TP = 8
 DEFAULT_EP = 8
 
-# Same serving cases as the previous experiments
-DEFAULT_CASES = (
-    "256:64,256:128,512:64,512:128,1024:32,1024:64,2048:32,2048:64,"
-    "4096:16,4096:32,8192:16,8192:32,16384:8,16384:16,32768:4,32768:8"
-)
+# Default serving cases (reduced set for faster regression runs)
+DEFAULT_CASES = "256:64,1024:32,4096:16,16384:8"
 
 
 @dataclass(frozen=True)
@@ -352,6 +349,103 @@ def run_bench_serving(
         return json.load(f)
 
 
+def _torch_profile_mode_tag(*, mode: str, repo_dir: str) -> str:
+    name = Path(repo_dir).name
+    if mode == "baseline":
+        if name.startswith("sglang_baseline_"):
+            return "baseline" + name[len("sglang_baseline_") :]
+        if name.startswith("baseline_"):
+            return "baseline" + name[len("baseline_") :]
+        return "baseline"
+    # mode == "waterfill"
+    if name == "sglang":
+        return "waterfill_current"
+    if name.startswith("sglang_wf_"):
+        return "waterfill_" + name[len("sglang_wf_") :]
+    return "waterfill"
+
+
+def run_bench_one_batch_server_profile(
+    *,
+    sglang_dir: str,
+    base_url: str,
+    batch_size: int,
+    input_len: int,
+    output_len: int,
+    profile_steps: int,
+    profile_prefix: str,
+    profile_output_dir: str,
+    result_file: str,
+) -> str:
+    """
+    Run `sglang.bench_one_batch_server` against an already-running server and
+    trigger torch profiling via `--profile`.
+
+    Returns the directory that contains the profiler artifacts.
+    """
+    os.makedirs(profile_output_dir, exist_ok=True)
+    before = set(os.listdir(profile_output_dir))
+
+    _run(
+        [
+            "python3",
+            "-m",
+            "sglang.bench_one_batch_server",
+            # `ServerArgs` requires --model-path even in --base-url mode.
+            # Use a dummy value to bypass model-related validations.
+            "--model-path",
+            "none",
+            "--base-url",
+            base_url,
+            "--batch-size",
+            str(batch_size),
+            "--input-len",
+            str(input_len),
+            "--output-len",
+            str(output_len),
+            "--seed",
+            "1",
+            "--profile",
+            "--profile-by-stage",
+            "--profile-steps",
+            str(profile_steps),
+            "--profile-prefix",
+            profile_prefix,
+            "--profile-output-dir",
+            profile_output_dir,
+            "--result-filename",
+            result_file,
+            "--no-append-to-github-summary",
+        ],
+        cwd=sglang_dir,
+    )
+
+    # `sglang.profiler.run_profile` always creates a time-stamped subdir under
+    # `--profile-output-dir`. Find the newly created one.
+    after = set(os.listdir(profile_output_dir))
+    new_dirs = []
+    for d in sorted(after - before):
+        p = os.path.join(profile_output_dir, d)
+        if os.path.isdir(p):
+            new_dirs.append(p)
+    if not new_dirs:
+        # Fallback: pick the most recently modified directory.
+        all_dirs = [
+            os.path.join(profile_output_dir, d)
+            for d in os.listdir(profile_output_dir)
+            if os.path.isdir(os.path.join(profile_output_dir, d))
+        ]
+        if not all_dirs:
+            raise RuntimeError(
+                f"No profiler output directory found under: {profile_output_dir}"
+            )
+        all_dirs.sort(key=os.path.getmtime)
+        return all_dirs[-1]
+
+    new_dirs.sort(key=os.path.getmtime)
+    return new_dirs[-1]
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
 
@@ -412,6 +506,23 @@ def main() -> int:
     parser.add_argument("--requests-per-concurrency", type=int, default=16)
     parser.add_argument("--max-num-prompts", type=int, default=512)
 
+    # Torch profiling (one-batch server benchmark)
+    parser.add_argument(
+        "--run-torch-profile",
+        action="store_true",
+        help=(
+            "Run a one-batch benchmark with `python -m sglang.bench_one_batch_server "
+            "--profile` (bs=16, input_len=1024, output_len=1) to dump torch profiler "
+            "traces for baseline and waterfill."
+        ),
+    )
+    parser.add_argument(
+        "--torch-profile-root",
+        type=str,
+        default="",
+        help="Directory to store torch profiler traces (defaults to <result-root>/torch_profile).",
+    )
+
     args = parser.parse_args()
 
     repo_root = Path(__file__).resolve().parents[2]
@@ -450,6 +561,7 @@ def main() -> int:
         "out_dir": out_dir,
         "accuracy": {},
         "serving_benchmark": {},
+        "torch_profile": {},
     }
 
     # ---------------- Accuracy ----------------
@@ -588,6 +700,95 @@ def main() -> int:
         if baseline_dir:
             _run_serving_mode("baseline", baseline_dir, enable_waterfill=False)
         _run_serving_mode("waterfill", waterfill_dir, enable_waterfill=True)
+
+    # ---------------- Torch profiler ----------------
+    if args.run_torch_profile:
+        torch_profile_root = (
+            args.torch_profile_root
+            if args.torch_profile_root
+            else os.path.join(result_root, "torch_profile")
+        )
+        os.makedirs(torch_profile_root, exist_ok=True)
+
+        bs = 16
+        in_len = 1024
+        out_len = 1
+        profile_steps = 5
+        summary["torch_profile"]["config"] = {
+            "batch_size": bs,
+            "input_len": in_len,
+            "output_len": out_len,
+            "profile_steps": profile_steps,
+            "root": torch_profile_root,
+        }
+        summary["torch_profile"]["results"] = {"baseline": {}, "waterfill": {}}
+
+        def _run_torch_profile_mode(
+            mode: str, repo_dir: str, enable_waterfill: bool
+        ) -> None:
+            print("\n==========================================", flush=True)
+            print(
+                f"[torch_profile] START mode={mode} waterfill={enable_waterfill}",
+                flush=True,
+            )
+            print("==========================================\n", flush=True)
+
+            _run(
+                ["pip", "install", "-e", "python[dev]", "--no-deps", "-q"],
+                cwd=repo_dir,
+                check=False,
+            )
+
+            server_log = os.path.join(out_dir, f"server_{mode}_torch_profile.log")
+            p, f = start_server(
+                repo_dir=repo_dir,
+                model_path=args.model_path,
+                bind_host=args.bind_host,
+                port=args.port,
+                tp=args.tp,
+                ep=args.ep,
+                enable_waterfill=enable_waterfill,
+                disable_shared_experts_fusion=args.disable_shared_experts_fusion,
+                log_path=server_log,
+            )
+            try:
+                wait_for_server(args.host_url, args.port, timeout_s=1800)
+                base_url = f"{args.host_url}:{args.port}"
+
+                tag = _torch_profile_mode_tag(mode=mode, repo_dir=repo_dir)
+                profile_out = os.path.join(
+                    torch_profile_root, f"{ts}_{tag}_in{in_len}_bs{bs}_o{out_len}"
+                )
+                os.makedirs(profile_out, exist_ok=True)
+
+                result_file = os.path.join(
+                    out_dir,
+                    f"bench_one_batch_{mode}_in{in_len}_bs{bs}_o{out_len}.jsonl",
+                )
+                trace_dir = run_bench_one_batch_server_profile(
+                    sglang_dir=repo_dir,
+                    base_url=base_url,
+                    batch_size=bs,
+                    input_len=in_len,
+                    output_len=out_len,
+                    profile_steps=profile_steps,
+                    profile_prefix=tag,
+                    profile_output_dir=profile_out,
+                    result_file=result_file,
+                )
+                summary["torch_profile"]["results"][mode] = {
+                    "profile_output_dir": profile_out,
+                    "trace_dir": trace_dir,
+                    "server_log": server_log,
+                    "result_file": result_file,
+                }
+                print(f"[torch_profile] {mode} trace_dir={trace_dir}", flush=True)
+            finally:
+                stop_server(p, f)
+
+        if baseline_dir:
+            _run_torch_profile_mode("baseline", baseline_dir, enable_waterfill=False)
+        _run_torch_profile_mode("waterfill", waterfill_dir, enable_waterfill=True)
 
     out_path = os.path.join(out_dir, "summary.json")
     with open(out_path, "w", encoding="utf-8") as f:

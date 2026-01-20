@@ -898,12 +898,6 @@ class DeepseekV2MoE(nn.Module):
                 )
                 return
             self.experts.w13_weight.data[local_shared_idx].copy_(src_weight)
-        else:
-            logger.warning(
-                "DeepEP Waterfill cannot copy shared gate_up (w13) weights: missing "
-                "attrs on experts/shared_experts (layer_id=%s).",
-                self.layer_id,
-            )
 
             # Copy FP8 scale if present (for FP8 models)
             if hasattr(self.experts, "w13_weight_scale_inv") and hasattr(
@@ -921,6 +915,12 @@ class DeepseekV2MoE(nn.Module):
                 # Per-tensor scale
                 src_scale = self.shared_experts.gate_up_proj.weight_scale.data
                 self.experts.w13_weight_scale.data[local_shared_idx].copy_(src_scale)
+        else:
+            logger.warning(
+                "DeepEP Waterfill cannot copy shared gate_up (w13) weights: missing "
+                "attrs on experts/shared_experts (layer_id=%s).",
+                self.layer_id,
+            )
 
         # Copy w2 (down) weights and scales
         if hasattr(self.experts, "w2_weight") and hasattr(
@@ -940,12 +940,6 @@ class DeepseekV2MoE(nn.Module):
                 )
                 return
             self.experts.w2_weight.data[local_shared_idx].copy_(src_weight)
-        else:
-            logger.warning(
-                "DeepEP Waterfill cannot copy shared down (w2) weights: missing "
-                "attrs on experts/shared_experts (layer_id=%s).",
-                self.layer_id,
-            )
 
             # Copy FP8 scale if present
             if hasattr(self.experts, "w2_weight_scale_inv") and hasattr(
@@ -962,6 +956,12 @@ class DeepseekV2MoE(nn.Module):
             ):
                 src_scale = self.shared_experts.down_proj.weight_scale.data
                 self.experts.w2_weight_scale.data[local_shared_idx].copy_(src_scale)
+        else:
+            logger.warning(
+                "DeepEP Waterfill cannot copy shared down (w2) weights: missing "
+                "attrs on experts/shared_experts (layer_id=%s).",
+                self.layer_id,
+            )
 
         # After copying weights, check if we need to requant to ue8m0 format
         # This is needed because process_weights_after_loading() has already
