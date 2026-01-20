@@ -647,10 +647,9 @@ class Scheduler(
             else:
                 from sglang.srt.mem_cache.chunk_cache import SWAChunkCache
 
-                params.sliding_window_size = self.model_config.sliding_window_size
-                params.attention_chunk_size = self.model_config.attention_chunk_size
-
-                self.tree_cache = SWAChunkCache(params)
+                self.tree_cache = SWAChunkCache(
+                    params, sliding_window_size=self.sliding_window_size
+                )
         else:
 
             if envs.SGLANG_EXPERIMENTAL_CPP_RADIX_TREE.get():
