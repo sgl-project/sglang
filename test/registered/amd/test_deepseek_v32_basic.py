@@ -33,6 +33,7 @@ class TestDeepseekV32DP(CustomTestCase):
             "--enable-dp-attention",
             "--model-loader-extra-config",
             '{"enable_multithread_load": false}',
+            "--weight-loader-disable-mmap",
         ]
         if is_in_amd_ci():
             other_args += [
@@ -102,6 +103,7 @@ class TestDeepseekV32TP(CustomTestCase):
             "8",
             "--model-loader-extra-config",
             '{"enable_multithread_load": false}',
+            "--weight-loader-disable-mmap",
         ]
         if is_in_amd_ci():
             other_args += [
