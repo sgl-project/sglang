@@ -399,7 +399,7 @@ class SageSparseLinearAttentionBackend(AttentionBackend):
         return [64, 128]
 
     @staticmethod
-    def get_name() -> str:
+    def get_enum() -> AttentionBackendEnum:
         return AttentionBackendEnum.SAGE_SLA_ATTN
 
     @staticmethod
@@ -463,7 +463,9 @@ class SageSparseLinearAttentionImpl(AttentionImpl, nn.Module):
     ) -> None:
         nn.Module.__init__(self)
 
-        assert SAGESLA_ENABLED, "Install spas_sage_attn first to enable SageSLA."
+        assert (
+            SAGESLA_ENABLED
+        ), "Install spas_sage_attn(pip install git+https://github.com/thu-ml/SpargeAttn.git --no-build-isolation) first to enable SageSLA."
 
         self.num_heads = num_heads
         self.head_size = head_size
