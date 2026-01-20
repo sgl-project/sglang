@@ -100,9 +100,16 @@ class TextEncodingStage(PipelineStage):
                 batch.neg_pooled_embeds = neg_pooler_list
 
         expansion_factors = batch.sampling_params.num_outputs_per_prompt
-        logger.info(f"Expansion factos: {expansion_factors}")
+        factor = expansion_factors
+        if batch.sampling_params.per_prompt_num_outputs:
+            expansion_factors = torch.tensor(
+                batch.sampling_params.per_prompt_num_outputs,
+                dtype=torch.long,
+                device=prompt_embeds_list[0].device,
+            )
+            factor = len(expansion_factors)
 
-        if expansion_factors > 1:
+        if factor > 1:
             batch.prompt_embeds = [
                 pe.repeat_interleave(expansion_factors, dim=0)
                 for pe in prompt_embeds_list

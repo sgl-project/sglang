@@ -100,6 +100,7 @@ class SamplingParams:
 
     # Batch info
     num_outputs_per_prompt: int = 1
+    per_prompt_num_outputs: list[int] | None = None
     seed: int = 42
     generator_device: str = "cuda"  # Device for random generator: "cuda" or "cpu"
 

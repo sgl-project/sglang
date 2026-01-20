@@ -229,6 +229,8 @@ class Req:
     def batch_size(self):
         # Determine batch size
         if isinstance(self.sampling_params.prompt, list):
+            if self.sampling_params.per_prompt_num_outputs:
+                return sum(self.sampling_params.per_prompt_num_outputs)
             batch_size = len(self.sampling_params.prompt)
         elif self.sampling_params.prompt is not None:
             batch_size = 1
@@ -251,10 +253,15 @@ class Req:
     @property
     def negative_prompts_as_list(self) -> list[str]:
         """Always return negative prompts as a list matching batch size."""
+        prompts_count = (
+            len(self.sampling_params.prompt)
+            if isinstance(self.sampling_params.prompt, list)
+            else 1
+        )
         if self.sampling_params.negative_prompt is None:
-            return [""] * self.batch_size
+            return [""] * prompts_count
         if isinstance(self.sampling_params.negative_prompt, str):
-            return [self.sampling_params.negative_prompt] * self.batch_size
+            return [self.sampling_params.negative_prompt] * prompts_count
         return self.sampling_params.negative_prompt
 
     def get_fps_for_index(self, idx: int) -> int:
