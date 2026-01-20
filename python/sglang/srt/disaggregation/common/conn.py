@@ -419,10 +419,13 @@ class CommonKVReceiver(BaseKVReceiver):
             self.required_prefill_response_num
         )
 
-        # It router has not assigned prefill_dp_rank to each request, we will try to fetch it from bootstrap server.
+        # If router has not assigned prefill_dp_rank to each request, we will try to fetch it from bootstrap server.
         if prefill_dp_rank is not None:
             logger.debug(f"Targeting DP rank: {prefill_dp_rank}")
             self.prefill_dp_rank = prefill_dp_rank
+        elif self.prefill_dp_size == 1:
+            self.prefill_dp_rank = 0
+            self.should_notify_dp_rank = False
         else:
             self.should_notify_dp_rank = True
 
@@ -518,10 +521,26 @@ class CommonKVReceiver(BaseKVReceiver):
             logger.error(f"Error fetching prefill parallel info from bootstrap: {e}")
             return None, None, None, None
 
-    def _get_prefill_dp_rank_from_server(self, bootstrap_room):
-        """Fetch request's prefill dp rank info from the bootstrap server."""
+    def _get_prefill_dp_rank_from_server(self, bootstrap_rooms):
+        """Fetch requests' prefill dp rank info from the bootstrap server.
+
+        Args:
+            bootstrap_rooms: List of bootstrap_room IDs to query
+
+        Returns:
+            Dictionary mapping bootstrap_room (as string) to dp rank info
+        """
         try:
-            url = f"http://{self.bootstrap_addr}/route?bootstrap_room={bootstrap_room}&engine_rank={-1}&target_dp_group={-1}&target_pp_rank={-1}"
+            if not isinstance(bootstrap_rooms, (list, tuple)):
+                raise TypeError(
+                    f"bootstrap_rooms must be a list or tuple, got {type(bootstrap_rooms).__name__}"
+                )
+
+            if not bootstrap_rooms:
+                return {}
+
+            rooms_str = ",".join(str(room) for room in bootstrap_rooms)
+            url = f"http://{self.bootstrap_addr}/route?bootstrap_room={rooms_str}&engine_rank={-1}&target_dp_group={-1}&target_pp_rank={-1}"
             response = requests.get(url, timeout=5)
             if response.status_code == 200:
                 bootstrap_table = response.json()
@@ -676,9 +695,36 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
 
     async def _handle_route_get(self, request: web.Request):
         bootstrap_room = request.query.get("bootstrap_room")
-        # Use real bootstrap_room id to get prefill dp rank
-        if int(bootstrap_room) != -1:
-            return web.json_response(self.prefill_dp_rank_table, status=200)
+        # Batch query for prefill dp rank: bootstrap_room is comma-separated list like "1,2,3"
+        # Skip if bootstrap_room is -1 (special value for non-dp-rank queries)
+        if bootstrap_room and bootstrap_room.strip() and bootstrap_room.strip() != "-1":
+            # Parse comma-separated bootstrap_room IDs
+            room_ids = []
+            for rid in bootstrap_room.split(","):
+                rid = rid.strip()
+                if rid:
+                    try:
+                        room_id = int(rid)
+                        if room_id != -1:
+                            room_ids.append(room_id)
+                    except ValueError:
+                        logger.warning(f"Invalid bootstrap_room value: {rid}")
+
+            if room_ids:
+                # Return only the requested bootstrap_rooms and delete them after query
+                result = {}
+                async with self.lock:
+                    for room_id in room_ids:
+                        if room_id in self.prefill_dp_rank_table:
+                            result[str(room_id)] = self.prefill_dp_rank_table[room_id]
+                            # Delete the entry immediately after query
+                            del self.prefill_dp_rank_table[room_id]
+                            logger.debug(
+                                f"Deleted bootstrap_room {room_id} from prefill_dp_rank_table after query"
+                            )
+                return web.json_response(result, status=200)
+            else:
+                return web.json_response({}, status=200)
 
         engine_rank = request.query.get("engine_rank")
         target_dp_group = request.query.get("target_dp_group")
@@ -716,11 +762,12 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         while True:
             await asyncio.sleep(self.entry_cleanup_interval)
             current_time = time.time()
-            expired_keys = [
-                key
-                for key, value in self.prefill_dp_rank_table.items()
-                if current_time - value["timestamp"] > self.entry_cleanup_interval
-            ]
+            async with self.lock:
+                expired_keys = [
+                    key
+                    for key, value in self.prefill_dp_rank_table.items()
+                    if current_time - value["timestamp"] > self.entry_cleanup_interval
+                ]
             if expired_keys:
                 start_time = time.time()
                 async with self.lock:

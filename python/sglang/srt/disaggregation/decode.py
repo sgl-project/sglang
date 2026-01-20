@@ -477,16 +477,36 @@ class DecodePreallocQueue:
                 indices_to_remove.add(i)
 
         # Then, preallocate the remaining requests if possible
-        for i, decode_req in enumerate(self.queue):
-            if decode_req.kv_receiver.should_notify_dp_rank:
-                if hasattr(decode_req.kv_receiver, "_get_prefill_dp_rank_from_server"):
-                    if bootstrap_table is None:
+        # Batch fetch all bootstrap_rooms at once to reduce network overhead
+        if bootstrap_table is None and any(
+            decode_req.kv_receiver.should_notify_dp_rank for decode_req in self.queue
+        ):
+            bootstrap_rooms_to_fetch = []
+            for decode_req in self.queue:
+                if (
+                    decode_req.kv_receiver.should_notify_dp_rank
+                    and hasattr(
+                        decode_req.kv_receiver, "_get_prefill_dp_rank_from_server"
+                    )
+                    and decode_req.req.bootstrap_host != FAKE_BOOTSTRAP_HOST
+                ):
+                    bootstrap_rooms_to_fetch.append(decode_req.req.bootstrap_room)
+
+            if bootstrap_rooms_to_fetch:
+                # Use the first kv_receiver to batch fetch all bootstrap_rooms
+                for decode_req in self.queue:
+                    if hasattr(
+                        decode_req.kv_receiver, "_get_prefill_dp_rank_from_server"
+                    ):
                         bootstrap_table = (
                             decode_req.kv_receiver._get_prefill_dp_rank_from_server(
-                                decode_req.req.bootstrap_room
+                                bootstrap_rooms_to_fetch
                             )
                         )
+                        break
 
+        for i, decode_req in enumerate(self.queue):
+            if decode_req.kv_receiver.should_notify_dp_rank:
                 # Do not check warmup requests with FAKE_BOOTSTRAP_HOST
                 if decode_req.req.bootstrap_host != FAKE_BOOTSTRAP_HOST:
                     if (
