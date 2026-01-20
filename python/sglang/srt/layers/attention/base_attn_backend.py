@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Optional, Union
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
@@ -10,11 +10,8 @@ from sglang.srt.utils.common import is_npu
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.nsa.nsa_indexer import BaseIndexerMetadata
     from sglang.srt.layers.radix_attention import RadixAttention
-    from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
     from sglang.srt.speculative.spec_info import SpecInput
-
-    AttentionLayerType = Union[RadixAttention, RadixLinearAttention]
 
 
 class AttentionBackend(ABC):
@@ -84,7 +81,7 @@ class AttentionBackend(ABC):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        layer: AttentionLayerType,
+        layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
         **kwargs,
@@ -128,7 +125,7 @@ class AttentionBackend(ABC):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        layer: AttentionLayerType,
+        layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
     ):
@@ -140,7 +137,7 @@ class AttentionBackend(ABC):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        layer: AttentionLayerType,
+        layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
     ):
@@ -152,7 +149,7 @@ class AttentionBackend(ABC):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        layer: AttentionLayerType,
+        layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
     ):
