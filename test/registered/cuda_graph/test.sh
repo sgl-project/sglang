@@ -1,4 +1,4 @@
-export CUDA_VISIBLE_DEVICES=2,3
+export CUDA_VISIBLE_DEVICES=4,5
 
 #!/usr/bin/env bash
 set -euo pipefail
