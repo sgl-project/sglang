@@ -21,7 +21,7 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 | `--context-length`                     | `None`   | Type: int                             | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | `--is-embedding`                       | `False`  | bool flag (set to enable)             | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | `--enable-multimodal`                  | `None`   | bool flag (set to enable)             | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--revision`                           | `None`   | Type: str                             |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
+| `--revision`                           | `None`   | Type: str                             | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | `--model-impl`                         | `auto`   | `auto`, `sglang`,<br/> `transformers` | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 
 ## HTTP server
@@ -33,8 +33,8 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 | `--skip-server-warmup`                                            | `False`     | bool flag <br/>(set to enable) | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | `--warmups`                                                       | `None`      | Type: str                      | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | `--nccl-port`                                                     | `None`      | Type: int                      | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--fastapi-root-path`                                             | `None`      | Type: str                      |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--grpc-mode`                                                     | `False`     | bool flag <br/>(set to enable) |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
+| `--fastapi-root-path`                                             | `None`      | Type: str                      | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| `--grpc-mode`                                                     | `False`     | bool flag <br/>(set to enable) | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | `--checkpoint-engine-` <br/> `wait-weights-` <br/> `before-ready` | `False`     | bool flag <br/>(set to enable) |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
 
 ## Quantization and data type
@@ -45,7 +45,7 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 | `--quantization`                            | `None`   | `modelslim`                             | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | `--quantization-param-path`                 | `None`   | Type: str                               |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
 | `--kv-cache-dtype`                          | `auto`   | `auto`                                  | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--enable-fp32-lm-head`                     | `False`  | bool flag <br/> (set to enable)         |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
+| `--enable-fp32-lm-head`                     | `False`  | bool flag <br/> (set to enable)         | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | `--modelopt-quant`                          | `None`   | Type: str                               |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
 | `--modelopt-checkpoint-`<br/>`restore-path` | `None`   | Type: str                               |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
 | `--modelopt-checkpoint-`<br/>`save-path`    | `None`   | Type: str                               |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
@@ -73,7 +73,7 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 | `--hybrid-kvcache-ratio`                            | `None`   | Optional[float]                |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
 | `--swa-full-tokens-ratio`                           | `0.8`    | Type: float                    |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
 | `--disable-hybrid-swa-memory`                       | `False`  | bool flag<br/> (set to enable) |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--abort-on-priority-`<br/>`when-disabled`          | `False`  | bool flag<br/> (set to enable) |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
+| `--abort-on-priority-`<br/>`when-disabled`          | `False`  | bool flag<br/> (set to enable) | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | `--enable-dynamic-chunking`                         | `False`  | bool flag<br/> (set to enable) |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
 
 ## Runtime options
@@ -88,15 +88,15 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 | `--stream-interval`                                | `1`      | Type: int                 | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | `--stream-output`                                  | `False`  | bool flag (set to enable) | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | `--random-seed`                                    | `None`   | Type: int                 | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--constrained-json-`<br/>`whitespace-pattern`     | `None`   | Type: str                 |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--constrained-json-`<br/>`disable-any-whitespace` | `False`  | bool flag (set to enable) |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
+| `--constrained-json-`<br/>`whitespace-pattern`     | `None`   | Type: str                 | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| `--constrained-json-`<br/>`disable-any-whitespace` | `False`  | bool flag (set to enable) | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | `--watchdog-timeout`                               | `300`    | Type: float               | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | `--soft-watchdog-timeout`                          | `300`    | Type: float               | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | `--dist-timeout`                                   | `None`   | Type: int                 | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | `--base-gpu-id`                                    | `0`      | Type: int                 | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | `--gpu-id-step`                                    | `1`      | Type: int                 | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | `--sleep-on-idle`                                  | `False`  | bool flag (set to enable) | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--custom-sigquit-handler`                         | `None`   | Optional[Callable]        |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
+| `--custom-sigquit-handler`                         | `None`   | Optional[Callable]        | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 
 ## Logging
 
@@ -106,32 +106,32 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 | `--log-level-http`                                 | `None`            | Type: str                      | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | `--log-requests`                                   | `False`           | bool flag<br/> (set to enable) | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | `--log-requests-level`                             | `2`               | `0`, `1`, `2`, `3`             | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--log-requests-format`                            | text              | text, json                     |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
+| `--log-requests-format`                            | text              | text, json                     | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | `--crash-dump-folder`                              | `None`            | Type: str                      |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
 | `--crash-on-nan`                                   | `False`           | Type: str                      |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--enable-metrics`                                 | `False`           | bool flag<br/> (set to enable) |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--enable-metrics-for-`<br/>`all-schedulers`       | `False`           | bool flag<br/> (set to enable) |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--tokenizer-metrics-`<br/>`custom-labels-header`  | `x-custom-labels` | Type: str                      |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--tokenizer-metrics-`<br/>`allowed-custom-labels` | `None`            | List[str]                      |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--bucket-time-to-`<br/>`first-token`              | `None`            | List[float]                    |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--bucket-inter-token-`<br/>`latency`              | `None`            | List[float]                    |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--bucket-e2e-request-`<br/>`latency`              | `None`            | List[float]                    |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--collect-tokens-`<br/>`histogram`                | `False`           | bool flag<br/> (set to enable) |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--prompt-tokens-buckets`                          | `None`            | List[str]                      |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--generation-tokens-buckets`                      | `None`            | List[str]                      |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--gc-warning-threshold-secs`                      | `0.0`             | Type: float                    |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
+| `--enable-metrics`                                 | `False`           | bool flag<br/> (set to enable) | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| `--enable-metrics-for-`<br/>`all-schedulers`       | `False`           | bool flag<br/> (set to enable) | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| `--tokenizer-metrics-`<br/>`custom-labels-header`  | `x-custom-labels` | Type: str                      | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| `--tokenizer-metrics-`<br/>`allowed-custom-labels` | `None`            | List[str]                      | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| `--bucket-time-to-`<br/>`first-token`              | `None`            | List[float]                    | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| `--bucket-inter-token-`<br/>`latency`              | `None`            | List[float]                    | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| `--bucket-e2e-request-`<br/>`latency`              | `None`            | List[float]                    | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| `--collect-tokens-`<br/>`histogram`                | `False`           | bool flag<br/> (set to enable) | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| `--prompt-tokens-buckets`                          | `None`            | List[str]                      | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| `--generation-tokens-buckets`                      | `None`            | List[str]                      | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| `--gc-warning-threshold-secs`                      | `0.0`             | Type: float                    | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | `--decode-log-interval`                            | `40`              | Type: int                      | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | `--enable-request-time-`<br/>`stats-logging`       | `False`           | bool flag<br/> (set to enable) | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | `--kv-events-config`                               | `None`            | Type: str                      |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--enable-trace`                                   | `False`           | bool flag<br/> (set to enable) |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--oltp-traces-endpoint`                           | `localhost:4317`  | Type: str                      |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
+| `--enable-trace`                                   | `False`           | bool flag<br/> (set to enable) | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| `--oltp-traces-endpoint`                           | `localhost:4317`  | Type: str                      | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 
 ## RequestMetricsExporter configuration
 
-| Argument                              | Defaults | Options                        |                   A2                   |                   A3                   |
-|---------------------------------------|----------|--------------------------------|:--------------------------------------:|:--------------------------------------:|
-| `--export-metrics-to-`<br/>`file`     | `False`  | bool flag<br/> (set to enable) | **<span style="color: red;">×</span>** | **<span style="color: red;">×</span>** |
-| `--export-metrics-to-`<br/>`file-dir` | `None`   | Type: str                      | **<span style="color: red;">×</span>** | **<span style="color: red;">×</span>** |
+| Argument                              | Defaults | Options                        |                    A2                    |                    A3                    |
+|---------------------------------------|----------|--------------------------------|:----------------------------------------:|:----------------------------------------:|
+| `--export-metrics-to-`<br/>`file`     | `False`  | bool flag<br/> (set to enable) | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| `--export-metrics-to-`<br/>`file-dir` | `None`   | Type: str                      | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 
 ## API related
 
@@ -146,16 +146,16 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 | `--enable-cache-report` | `False`   | bool flag<br/> (set to enable) | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | `--reasoning-parser`    | `None`    | `deepseek-r1`                  | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | `--tool-call-parser`    | `None`    | `llama`,`pythonic`             | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--sampling-defaults`   | `model`   | `openai`, `model`              |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
+| `--sampling-defaults`   | `model`   | `openai`, `model`              | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | `--tool-server`         | `None`    | Type: str                      |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
 
 ## Data parallelism
 
-| Argument                               | Defaults      | Options                                                     |                    A2                    |                    A3                    |
-|----------------------------------------|---------------|-------------------------------------------------------------|:----------------------------------------:|:----------------------------------------:|
-| `--data-parallel-size`<br/>`--dp-size` | `1`           | Type: int                                                   | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| Argument                               | Defaults      | Options                                                   |                    A2                    |                    A3                    |
+|----------------------------------------|---------------|-----------------------------------------------------------|:----------------------------------------:|:----------------------------------------:|
+| `--data-parallel-size`<br/>`--dp-size` | `1`           | Type: int                                                 | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | `--load-balance-method`                | `round_robin` | `round_robin`,<br/> `total_requests`,<br/> `total_tokens` | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--prefill-round-robin-balance`        | `False`       | bool flag<br/> (set to enable)                              | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| `--prefill-round-robin-balance`        | `False`       | bool flag<br/> (set to enable)                            | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 
 ## Multi-node distributed serving
 
@@ -208,13 +208,13 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 | `--speculative-algorithm`                                        | `None`    | `EAGLE3`,<br/> `NEXTN`   | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | `--speculative-draft-model-path`<br/>`--speculative-draft-model` | `None`    | Type: str                | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | `--speculative-draft-model-`<br/>`revision`                      | `None`    | Type: str                | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--speculative-draft-load-format`                                | `None`    | `auto`                   |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
+| `--speculative-draft-load-format`                                | `None`    | `auto`                   | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | `--speculative-num-steps`                                        | `None`    | Type: int                | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | `--speculative-eagle-topk`                                       | `None`    | Type: int                | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | `--speculative-num-draft-tokens`                                 | `None`    | Type: int                | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | `--speculative-accept-`<br/>`threshold-single`                   | `1.0`     | Type: float              |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
 | `--speculative-accept-`<br/>`threshold-acc`                      | `1.0`     | Type: float              |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--speculative-token-map`                                        | `None`    | Type: str                |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
+| `--speculative-token-map`                                        | `None`    | Type: str                | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | `--speculative-attention-`<br/>`mode`                            | `prefill` | `prefill`,<br/> `decode` | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | `--speculative-moe-runner-`<br/>`backend`                        | `None`    | `auto`                   | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | `--speculative-moe-a2a-`<br/>`backend`                           | `None`    | `ascend_fuseep`          | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
@@ -235,28 +235,28 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 
 ## Expert parallelism
 
-| Argument                                              | Defaults  | Options                                     |                    A2                    |                    A3                    |
-|-------------------------------------------------------|-----------|---------------------------------------------|:----------------------------------------:|:----------------------------------------:|
-| `--expert-parallel-size`<br/>`--ep-size`<br/>`--ep`   | `1`       | Type: int                                   | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--moe-a2a-backend`                                   | `none`    | `none`,<br/> `deepep`,<br/> `ascend_fuseep` | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--moe-runner-backend`                                | `auto`    | `auto`, `triton`                            | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--flashinfer-mxfp4-`<br/>`moe-precision`             | `default` | `default`,<br/> `bf16`                      |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--enable-flashinfer-`<br/>`allreduce-fusion`         | `False`   | bool flag<br/> (set to enable)              |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--deepep-mode`                                       | `auto`    | `normal`, <br/>`low_latency`,<br/> `auto`   | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--deepep-config`                                     | `None`    | Type: str                                   |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--ep-num-redundant-experts`                          | `0`       | Type: int                                   |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--ep-dispatch-algorithm`                             | `None`    | Type: str                                   |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--init-expert-location`                              | `trivial` | Type: str                                   |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--enable-eplb`                                       | `False`   | bool flag<br/> (set to enable)              |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--eplb-algorithm`                                    | `auto`    | Type: str                                   |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--eplb-rebalance-layers-`<br/>`per-chunk`            | `None`    | Type: int                                   |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--eplb-min-rebalancing-`<br/>`utilization-threshold` | `1.0`     | Type: float                                 |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--expert-distribution-`<br/>`recorder-mode`          | `None`    | Type: str                                   |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--expert-distribution-`<br/>`recorder-buffer-size`   | `None`    | Type: int                                   |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--enable-expert-distribution-`<br/>`metrics`         | `False`   | bool flag <br/>(set to enable)              |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--moe-dense-tp-size`                                 | `None`    | Type: int                                   | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--elastic-ep-backend`                                | `None`    | `none`, `mooncake`                          |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--mooncake-ib-device`                                | `None`    | Type: str                                   |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
+| Argument                                              | Defaults  | Options                                     |                    A2                     |                    A3                    |
+|-------------------------------------------------------|-----------|---------------------------------------------|:-----------------------------------------:|:----------------------------------------:|
+| `--expert-parallel-size`<br/>`--ep-size`<br/>`--ep`   | `1`       | Type: int                                   | **<span style="color: green;">√</span>**  | **<span style="color: green;">√</span>** |
+| `--moe-a2a-backend`                                   | `none`    | `none`,<br/> `deepep`,<br/> `ascend_fuseep` | **<span style="color: green;">√</span>**  | **<span style="color: green;">√</span>** |
+| `--moe-runner-backend`                                | `auto`    | `auto`, `triton`                            | **<span style="color: green;">√</span>**  | **<span style="color: green;">√</span>** |
+| `--flashinfer-mxfp4-`<br/>`moe-precision`             | `default` | `default`,<br/> `bf16`                      |  **<span style="color: red;">×</span>**   |  **<span style="color: red;">×</span>**  |
+| `--enable-flashinfer-`<br/>`allreduce-fusion`         | `False`   | bool flag<br/> (set to enable)              |  **<span style="color: red;">×</span>**   |  **<span style="color: red;">×</span>**  |
+| `--deepep-mode`                                       | `auto`    | `normal`, <br/>`low_latency`,<br/> `auto`   | **<span style="color: green;">√</span>**  | **<span style="color: green;">√</span>** |
+| `--deepep-config`                                     | `None`    | Type: str                                   |  **<span style="color: red;">×</span>**   |  **<span style="color: red;">×</span>**  |
+| `--ep-num-redundant-experts`                          | `0`       | Type: int                                   | **<span style="color: green;">√</span>**  | **<span style="color: green;">√</span>** |
+| `--ep-dispatch-algorithm`                             | `None`    | Type: str                                   | **<span style="color: green;">√</span>**  | **<span style="color: green;">√</span>** |
+| `--init-expert-location`                              | `trivial` | Type: str                                   | **<span style="color: green;">√</span>**  | **<span style="color: green;">√</span>** |
+| `--enable-eplb`                                       | `False`   | bool flag<br/> (set to enable)              | **<span style="color: green;">√</span>**  | **<span style="color: green;">√</span>** |
+| `--eplb-algorithm`                                    | `auto`    | Type: str                                   | **<span style="color: green;">√</span>**  | **<span style="color: green;">√</span>** |
+| `--eplb-rebalance-layers-`<br/>`per-chunk`            | `None`    | Type: int                                   | **<span style="color: green;">√</span>**  | **<span style="color: green;">√</span>** |
+| `--eplb-min-rebalancing-`<br/>`utilization-threshold` | `1.0`     | Type: float                                 | **<span style="color: green;">√</span>**  | **<span style="color: green;">√</span>** |
+| `--expert-distribution-`<br/>`recorder-mode`          | `None`    | Type: str                                   | **<span style="color: green;">√</span>**  | **<span style="color: green;">√</span>** |
+| `--expert-distribution-`<br/>`recorder-buffer-size`   | `None`    | Type: int                                   | **<span style="color: green;">√</span>**  | **<span style="color: green;">√</span>** |
+| `--enable-expert-distribution-`<br/>`metrics`         | `False`   | bool flag <br/>(set to enable)              | ***<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| `--moe-dense-tp-size`                                 | `None`    | Type: int                                   | **<span style="color: green;">√</span>**  | **<span style="color: green;">√</span>** |
+| `--elastic-ep-backend`                                | `None`    | `none`, `mooncake`                          |  **<span style="color: red;">×</span>**   |  **<span style="color: red;">×</span>**  |
+| `--mooncake-ib-device`                                | `None`    | Type: str                                   |  **<span style="color: red;">×</span>**   |  **<span style="color: red;">×</span>**  |
 
 ## Mamba Cache
 
@@ -342,7 +342,7 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 | `--enable-symm-mem`                                     | `False`  | bool flag<br/> (set to enable) |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
 | `--disable-flashinfer-`<br/>`cutlass-moe-fp4-allgather` | `False`  | bool flag<br/> (set to enable) |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
 | `--enable-tokenizer-`<br/>`batch-encode`                | `False`  | bool flag<br/> (set to enable) | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--disable-tokenizer-`<br/>`batch-encode`               | `False`  | bool flag<br/> (set to enable) |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
+| `--disable-tokenizer-`<br/>`batch-encode`               | `False`  | bool flag<br/> (set to enable) | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | `--disable-outlines-`<br/>`disk-cache`                  | `False`  | bool flag<br/> (set to enable) | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | `--disable-custom-`<br/>`all-reduce`                    | `False`  | bool flag<br/> (set to enable) | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | `--enable-mscclpp`                                      | `False`  | bool flag<br/> (set to enable) |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
@@ -355,7 +355,7 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 | `--enable-single-`<br/>`batch-overlap`                  | `False`  | bool flag<br/> (set to enable) |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
 | `--tbo-token-`<br/>`distribution-threshold`             | `0.48`   | Type: float                    |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
 | `--enable-torch-`<br/>`compile`                         | `False`  | bool flag<br/> (set to enable) | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--enable-torch-`<br/>`compile-debug-mode`              | `False`  | bool flag<br/> (set to enable) |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
+| `--enable-torch-`<br/>`compile-debug-mode`              | `False`  | bool flag<br/> (set to enable) | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | `--enable-piecewise-`<br/>`cuda-graph`                  | `False`  | bool flag<br/> (set to enable) |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
 | `--piecewise-cuda-`<br/>`graph-tokens`                  | `None`   | Type: JSON<br/> list           |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
 | `--piecewise-cuda-`<br/>`graph-compiler`                | `eager`  | ["eager", "inductor"]          |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
@@ -380,13 +380,13 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 | `--disable-fast-`<br/>`image-processor`                 | `False`  | bool flag<br/> (set to enable) |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
 | `--keep-mm-feature-`<br/>`on-device`                    | `False`  | bool flag<br/> (set to enable) |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
 | `--enable-return-`<br/>`hidden-states`                  | `False`  | bool flag<br/> (set to enable) | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--enable-return-`<br/>`routed-experts`                 | `False`  | bool flag<br/> (set to enable) |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
+| `--enable-return-`<br/>`routed-experts`                 | `False`  | bool flag<br/> (set to enable) | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | `--scheduler-recv-`<br/>`interval`                      | `1`      | Type: int                      |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
 | `--numa-node`                                           | `None`   | List[int]                      |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
 | `--rl-on-policy-target`                                 | `None`   | `fsdp`                         |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
 | `--enable-layerwise-`<br/>`nvtx-marker`                 | `False`  | bool flag<br/> (set to enable) |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
 | `--enable-attn-tp-`<br/>`input-scattered`               | `False`  | bool flag<br/> (set to enable) |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--enable-nsa-prefill-`<br/>`context-parallel`          | `False`  | bool flag<br/> (set to enable) |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
+| `--enable-nsa-prefill-`<br/>`context-parallel`          | `False`  | bool flag<br/> (set to enable) | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | `--enable-fused-qk-`<br/>`norm-rope`                    | `False`  | bool flag<br/> (set to enable) |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
 
 ## Dynamic batch tokenizer
@@ -401,10 +401,9 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 
 | Argument                                   | Defaults | Options   |                    A2                    |                    A3                    |
 |--------------------------------------------|----------|-----------|:----------------------------------------:|:----------------------------------------:|
-| `--debug-tensor-dump-`<br/>`output-folder` | `None`   | Type: str |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--debug-tensor-dump-`<br/>`layers`        | `None`   | List[int] |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
+| `--debug-tensor-dump-`<br/>`output-folder` | `None`   | Type: str | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| `--debug-tensor-dump-`<br/>`layers`        | `None`   | List[int] | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | `--debug-tensor-dump-`<br/>`input-file`    | `None`   | Type: str | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--debug-tensor-dump-`<br/>`inject`        | `False`  | Type: str |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
 
 ## PD disaggregation
 
@@ -415,21 +414,20 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 | `--disaggregation-bootstrap-port`                       | `8998`     | Type: int                             | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | `--disaggregation-decode-tp`                            | `None`     | Type: int                             | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | `--disaggregation-decode-dp`                            | `None`     | Type: int                             | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--disaggregation-prefill-pp`                           | `1`        | Type: int                             |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
 | `--disaggregation-ib-device`                            | `None`     | Type: str                             |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--disaggregation-decode-`<br/>`enable-offload-kvcache` | `False`    | bool flag<br/> (set to enable)        |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--disaggregation-decode-`<br/>`enable-fake-auto`       | `False`    | bool flag<br/> (set to enable)        |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
+| `--disaggregation-decode-`<br/>`enable-offload-kvcache` | `False`    | bool flag<br/> (set to enable)        | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| `--disaggregation-decode-`<br/>`enable-fake-auto`       | `False`    | bool flag<br/> (set to enable)        | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | `--num-reserved-decode-tokens`                          | `512`      | Type: int                             | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | `--disaggregation-decode-`<br/>`polling-interval`       | `1`        | Type: int                             | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 
 ## Encode prefill disaggregation
 
-| Argument                     | Defaults           | Options                                                        |                   A2                   |                   A3                   |
-|------------------------------|--------------------|----------------------------------------------------------------|:--------------------------------------:|:--------------------------------------:|
-| `--encoder-only`             | `False`            | bool flag<br/> (set to enable)                                 | **<span style="color: red;">×</span>** | **<span style="color: red;">×</span>** |
-| `--language-only`            | `False`            | bool flag<br/> (set to enable)                                 | **<span style="color: red;">×</span>** | **<span style="color: red;">×</span>** |
-| `--encoder-transfer-backend` | `zmq_to_scheduler` | `zmq_to_scheduler`, <br/> `zmq_to_tokenizer`,<br/>  `mooncake` | **<span style="color: red;">×</span>** | **<span style="color: red;">×</span>** |
-| `--encoder-urls`             | `[]`               | List[str]                                                      | **<span style="color: red;">×</span>** | **<span style="color: red;">×</span>** |
+| Argument                     | Defaults           | Options                                                        |                    A2                    |                    A3                    |
+|------------------------------|--------------------|----------------------------------------------------------------|:----------------------------------------:|:----------------------------------------:|
+| `--encoder-only`             | `False`            | bool flag<br/> (set to enable)                                 | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| `--language-only`            | `False`            | bool flag<br/> (set to enable)                                 | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| `--encoder-transfer-backend` | `zmq_to_scheduler` | `zmq_to_scheduler`, <br/> `zmq_to_tokenizer`,<br/>  `mooncake` | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| `--encoder-urls`             | `[]`               | List[str]                                                      | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 
 ## Custom weight loader
 
@@ -478,12 +476,12 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 
 ## For registering hooks
 
-| Argument          | Defaults | Options         | A2                                     | A3                                     |
-|-------------------|----------|-----------------|----------------------------------------|----------------------------------------|
-| `--forward-hooks` | `None`   | Type: JSON list | **<span style="color: red;">×</span>** | **<span style="color: red;">×</span>** |
+| Argument          | Defaults | Options         | A2                                       | A3                                       |
+|-------------------|----------|-----------------|------------------------------------------|------------------------------------------|
+| `--forward-hooks` | `None`   | Type: JSON list | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 
 ## Configuration file support
 
-| Argument   | Defaults | Options   | A2                                     | A3                                     |
-|------------|----------|-----------|----------------------------------------|----------------------------------------|
-| `--config` | `None`   | Type: str | **<span style="color: red;">×</span>** | **<span style="color: red;">×</span>** |
+| Argument   | Defaults | Options   | A2                                       | A3                                       |
+|------------|----------|-----------|------------------------------------------|------------------------------------------|
+| `--config` | `None`   | Type: str | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
