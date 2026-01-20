@@ -164,7 +164,7 @@ python -m sglang.launch_server \
     --tokenizer-worker-num 4
 ```
 
-3. SGLang Router
+3. SGLang Model Gateway (former Router)
 
 ```shell
 python -m sglang_router.launch_router \
@@ -297,7 +297,7 @@ do
 done
 ```
 
-3. SGLang Router:
+3. SGLang Model Gateway (former Router):
 
 ```shell
 python -m sglang_router.launch_router \
