@@ -3,9 +3,13 @@ import tempfile
 from contextlib import nullcontext
 
 import torch
+from packaging import version
 from torch.cuda.memory import CUDAPluggableAllocator
 
 from sglang.srt.distributed.parallel_state import GroupCoordinator
+from sglang.srt.server_args import get_global_server_args
+
+after_2_8_0 = version.parse(torch.__version__) >= version.parse("2.8.0")
 
 nccl_allocator_source = """
 
@@ -30,10 +34,20 @@ ncclResult_t  ncclCommWindowRegister(ncclComm_t comm, void* buff, size_t size, n
 
 ncclResult_t  ncclMemAlloc(void** ptr, size_t size);
 ncclResult_t  ncclMemFree(void *ptr);
+const char*  ncclGetErrorString(ncclResult_t result);
+
+#define NCCLCHECK(cmd) do {                                               \
+  ncclResult_t res = cmd;                                                 \
+  if (res != ncclSuccess) {                                               \
+    fprintf(stderr, "ERROR: NCCL symmetric memory allocation failed. Most likely out of device memory. '%s'\\n", \
+           ncclGetErrorString(res));                       \
+    return NULL;                                                        \
+  }                                                                       \
+} while(0)
 
 void* nccl_alloc_plug(size_t size, int device, void* stream) {
   void* ptr;
-  ncclResult_t err = ncclMemAlloc(&ptr, size);
+  NCCLCHECK(ncclMemAlloc(&ptr, size));
 
   const char *str_val = getenv("SGLANG_TMP_NCCL_COMM_VALUE");
   char *endptr;
@@ -41,7 +55,7 @@ void* nccl_alloc_plug(size_t size, int device, void* stream) {
 
   ncclComm_t comm = (ncclComm_t)(int_val);
   ncclWindow_t win;
-  ncclResult_t err2 = ncclCommWindowRegister(comm, ptr, size, &win, NCCL_WIN_COLL_SYMMETRIC);
+  NCCLCHECK(ncclCommWindowRegister(comm, ptr, size, &win, NCCL_WIN_COLL_SYMMETRIC));
 
   return ptr;
 }
@@ -57,13 +71,14 @@ _allocator = None
 _mem_pool = None
 _graph_pool_id = None
 _cur_device = None
+_active_symmetric_memory_context = None
 
 
 def is_symmetric_memory_enabled():
-    # Import here to avoid circular import
-    from sglang.srt.server_args import get_global_server_args
-
-    return get_global_server_args().enable_symm_mem
+    try:
+        return get_global_server_args().enable_symm_mem
+    except ValueError:
+        return False
 
 
 def set_graph_pool_id(graph_pool_id):
@@ -71,9 +86,24 @@ def set_graph_pool_id(graph_pool_id):
     _graph_pool_id = graph_pool_id
 
 
+def disable_symmetric_memory_context():
+    if _active_symmetric_memory_context is None:
+        return None
+    saved_context = _active_symmetric_memory_context
+    saved_context.__exit__(None, None, None)
+    return saved_context
+
+
+def restore_symmetric_memory_context(saved_context):
+    if saved_context is not None:
+        saved_context.__enter__()
+
+
 def get_nccl_mem_pool():
     global _allocator, _mem_pool, _cur_device
     if _mem_pool is None:
+        import torch.utils.cpp_extension
+
         out_dir = tempfile.gettempdir()
         nccl_allocator_libname = "nccl_allocator"
         torch.utils.cpp_extension.load_inline(
@@ -112,6 +142,7 @@ class SymmetricMemoryContext:
         self.group_coordinator = group_coordinator
         self._mem_pool_ctx = torch.cuda.use_mem_pool(get_nccl_mem_pool())
         self.is_graph_capture = torch.cuda.is_current_stream_capturing()
+        self.exited = False
 
     def __enter__(self):
         assert (
@@ -123,21 +154,44 @@ class SymmetricMemoryContext:
                 _graph_pool_id is not None
             ), "graph_pool_id is not set under graph capture"
             # Pause graph memory pool to use symmetric memory with cuda graph
-            torch._C._cuda_endAllocateToPool(_cur_device, _graph_pool_id)
+            if after_2_8_0:
+                torch._C._cuda_endAllocateToPool(_cur_device, _graph_pool_id)
+            else:
+                torch._C._cuda_endAllocateCurrentStreamToPool(
+                    _cur_device, _graph_pool_id
+                )
 
+        if self.exited:
+            # mempool ctx (@contextlib.contextmanager) is not re-entrant
+            self._mem_pool_ctx = torch.cuda.use_mem_pool(get_nccl_mem_pool())
+            self.exited = False
         self._mem_pool_ctx.__enter__()
 
         # Set the env var to pass this argument to the C functions.
         os.environ["SGLANG_TMP_NCCL_COMM_VALUE"] = str(
             self.group_coordinator.pynccl_comm.comm.value
         )
+
+        global _active_symmetric_memory_context
+        _active_symmetric_memory_context = self
+
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self._mem_pool_ctx.__exit__(exc_type, exc_val, exc_tb)
 
         if self.is_graph_capture:
-            torch._C._cuda_beginAllocateCurrentThreadToPool(_cur_device, _graph_pool_id)
+            if after_2_8_0:
+                torch._C._cuda_beginAllocateCurrentThreadToPool(
+                    _cur_device, _graph_pool_id
+                )
+            else:
+                torch._C._cuda_beginAllocateToPool(_cur_device, _graph_pool_id)
+
+        global _active_symmetric_memory_context
+        _active_symmetric_memory_context = None
+
+        self.exited = True
 
 
 def use_symmetric_memory(group_coordinator: GroupCoordinator, disabled: bool = False):

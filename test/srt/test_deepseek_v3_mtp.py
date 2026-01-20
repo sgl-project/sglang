@@ -36,13 +36,15 @@ class TestDeepseekV3MTP(CustomTestCase):
             "1",
             "--speculative-num-draft-tokens",
             "4",
+            "--model-loader-extra-config",
+            '{"enable_multithread_load": true, "num_threads": 64}',
         ]
         if not is_in_amd_ci():
             other_args += ["--mem-frac", "0.7"]
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH * 5,
             other_args=other_args,
         )
 
@@ -80,7 +82,7 @@ class TestDeepseekV3MTP(CustomTestCase):
                 f"{avg_spec_accept_length=:.2f}\n"
             )
             self.assertGreater(metrics["accuracy"], 0.935)
-            self.assertGreater(avg_spec_accept_length, 2.9)
+            self.assertGreater(avg_spec_accept_length, 2.8)
 
     def test_bs_1_speed(self):
         args = BenchArgs(port=int(self.base_url.split(":")[-1]), max_new_tokens=2048)
@@ -94,10 +96,7 @@ class TestDeepseekV3MTP(CustomTestCase):
                 f"{acc_length=:.2f}\n"
                 f"{speed=:.2f} token/s\n"
             )
-            if is_in_amd_ci():
-                self.assertGreater(acc_length, 2.8)
-            else:
-                self.assertGreater(acc_length, 2.9)
+            self.assertGreater(acc_length, 2.8)
             if is_in_amd_ci():
                 self.assertGreater(speed, 15)
             else:

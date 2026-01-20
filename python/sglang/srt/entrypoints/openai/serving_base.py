@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 import uuid
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
@@ -10,8 +11,9 @@ import orjson
 from fastapi import HTTPException, Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
 
+from sglang.srt.entrypoints.openai.encoding_dsv32 import DS32EncodingError
 from sglang.srt.entrypoints.openai.protocol import ErrorResponse, OpenAIServingRequest
-from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
@@ -84,10 +86,17 @@ class OpenAIServingBase(ABC):
     async def handle_request(
         self, request: OpenAIServingRequest, raw_request: Request
     ) -> Union[Any, StreamingResponse, ErrorResponse]:
-        """Handle the specific request type with common pattern"""
+        """Handle the specific request type with common pattern
+        If you want to override this method, you should be careful to record the validation time.
+        """
+        received_time = time.time()
+        received_time_perf = time.perf_counter()
+
         try:
             # Validate request
+            validation_start = time.perf_counter()
             error_msg = self._validate_request(request)
+            validation_time = time.perf_counter() - validation_start
             if error_msg:
                 return self.create_error_response(error_msg)
 
@@ -95,6 +104,12 @@ class OpenAIServingBase(ABC):
             adapted_request, processed_request = self._convert_to_internal_request(
                 request, raw_request
             )
+
+            if isinstance(adapted_request, (GenerateReqInput, EmbeddingReqInput)):
+                # Only set timing fields if adapted_request supports them
+                adapted_request.validation_time = validation_time
+                adapted_request.received_time = received_time
+                adapted_request.received_time_perf = received_time_perf
 
             # Note(Xinyuan): raw_request below is only used for detecting the connection of the client
             if hasattr(request, "stream") and request.stream:
@@ -110,6 +125,13 @@ class OpenAIServingBase(ABC):
                 message=e.detail, err_type=str(e.status_code), status_code=e.status_code
             )
         except ValueError as e:
+            return self.create_error_response(
+                message=str(e),
+                err_type="BadRequest",
+                status_code=400,
+            )
+        except DS32EncodingError as e:
+            logger.info(f"DS32EncodingError: {e}")
             return self.create_error_response(
                 message=str(e),
                 err_type="BadRequest",
@@ -157,6 +179,7 @@ class OpenAIServingBase(ABC):
         self,
         request: OpenAIServingRequest,
         raw_request: Request = None,
+        validation_time: float = None,
     ) -> tuple[GenerateReqInput, OpenAIServingRequest]:
         """Convert OpenAI request to internal format"""
         pass
@@ -259,3 +282,8 @@ class OpenAIServingBase(ABC):
                 if label in self.allowed_custom_labels
             }
         return custom_labels
+
+    def extract_routing_key(self, raw_request):
+        if raw_request is None:
+            return None
+        return raw_request.headers.get("x-smg-routing-key")

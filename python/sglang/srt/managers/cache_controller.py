@@ -41,22 +41,25 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+from sglang.srt.utils import get_device_module
 
 logger = logging.getLogger(__name__)
+
+device_module = get_device_module()
 
 
 class LayerLoadingEvent:
     def __init__(self, num_layers: int):
         self._num_layers = num_layers
-        self.load_events = [torch.cuda.Event() for _ in range(num_layers)]
-        self.start_event = torch.cuda.Event()  # start event on controller stream
+        self.load_events = [device_module.Event() for _ in range(num_layers)]
+        self.start_event = device_module.Event()  # start event on controller stream
 
     def complete(self, layer_index: int):
         assert 0 <= layer_index < self._num_layers
         self.load_events[layer_index].record()
 
     def wait(self, layer_index: int):
-        torch.cuda.current_stream().wait_event(self.load_events[layer_index])
+        device_module.current_stream().wait_event(self.load_events[layer_index])
 
     @property
     def finish_event(self):
@@ -136,8 +139,8 @@ class CacheOperation:
 
 
 class HiCacheAck(NamedTuple):
-    start_event: torch.cuda.Event
-    finish_event: torch.cuda.Event
+    start_event: device_module.Event
+    finish_event: device_module.Event
     node_ids: List[int]
 
 
@@ -256,6 +259,8 @@ class HiCacheController:
         prefetch_threshold: int = 256,
         model_name: Optional[str] = None,
         storage_backend_extra_config: Optional[dict] = None,
+        pp_rank: int = 0,
+        pp_size: int = 1,
     ):
         self.mem_pool_device_allocator = token_to_kv_pool_allocator
         self.mem_pool_device = token_to_kv_pool_allocator.get_kvcache()
@@ -264,6 +269,8 @@ class HiCacheController:
         self.page_size = page_size
         self.io_backend = io_backend
         self.enable_storage = False
+        self.pp_rank = pp_rank
+        self.pp_size = pp_size
 
         if storage_backend is not None:
             self.storage_backend_type = storage_backend
@@ -306,16 +313,23 @@ class HiCacheController:
             # create a new communication group for synchronizing storage operations across TP workers
             self.tp_world_size = torch.distributed.get_world_size(group=tp_group)
             if self.tp_world_size > 1:
+                from sglang.srt.distributed.parallel_state import (
+                    create_custom_parallel_group,
+                )
+
                 group_ranks = torch.distributed.get_process_group_ranks(tp_group)
-                self.prefetch_tp_group = torch.distributed.new_group(
-                    group_ranks, backend="gloo"
+                self.prefetch_tp_group = create_custom_parallel_group(
+                    group_ranks=group_ranks, backend="gloo"
                 )
 
             # Select the get and set functions
             self.page_get_func = self._generic_page_get
             self.page_set_func = self._generic_page_set
 
-            if self.storage_backend_type in ["hf3fs", "mooncake", "eic"]:
+            if (self.storage_backend_type in ["hf3fs", "mooncake", "eic"]) or (
+                self.storage_backend_type == "dynamic"
+                and bool(self.storage_config.extra_config.get("interface_v1", 0))
+            ):
                 self.page_get_func = self._page_get_zero_copy
                 self.page_set_func = self._page_set_zero_copy
 
@@ -343,8 +357,8 @@ class HiCacheController:
             self.stop_event, buffer_count=10, max_buffer_size=100
         )
 
-        self.write_stream = torch.cuda.Stream()
-        self.load_stream = torch.cuda.Stream()
+        self.write_stream = device_module.Stream()
+        self.load_stream = device_module.Stream()
 
         if self.enable_storage:
             self.prefetch_thread = threading.Thread(
@@ -378,12 +392,14 @@ class HiCacheController:
             self.tp_size = get_tensor_model_parallel_world_size()
             self.dp_rank = 0
 
-        # Currently, AscendMLAPagedTokenToKVPool is the subclass of MLATokenToKVPool.
+        # Currently, NPUMLATokenToKVPool is the subclass of MLATokenToKVPool.
         is_mla_backend = isinstance(self.mem_pool_device, MLATokenToKVPool)
 
         return HiCacheStorageConfig(
             tp_rank=self.tp_rank,
             tp_size=self.tp_size,
+            pp_rank=self.pp_rank,
+            pp_size=self.pp_size,
             is_mla_model=is_mla_backend,
             is_page_first_layout=self.mem_pool_host.layout == "page_first",
             model_name=model_name,
@@ -445,11 +461,11 @@ class HiCacheController:
         host_indices, device_indices = self.move_indices(op)
         self.write_queue.clear()
 
-        start_event = torch.cuda.Event()
-        finish_event = torch.cuda.Event()
+        start_event = device_module.Event()
+        finish_event = device_module.Event()
 
         start_event.record()
-        with torch.cuda.stream(self.write_stream):
+        with device_module.stream(self.write_stream):
             start_event.wait(self.write_stream)
             self.mem_pool_host.backup_from_device_all_layer(
                 self.mem_pool_device, host_indices, device_indices, self.io_backend
@@ -496,6 +512,8 @@ class HiCacheController:
                 return host_indices, device_indices.index_select(0, idx)
             elif self.mem_pool_host.layout == "page_first_direct":
                 return host_indices, device_indices.cpu()
+        elif self.io_backend == "kernel_ascend":
+            return host_indices, device_indices.cpu()
         else:
             raise ValueError(f"Unsupported io backend")
 
@@ -510,7 +528,7 @@ class HiCacheController:
         producer_event = self.layer_done_counter.events[producer_id]
         producer_event.start_event.record()
 
-        with torch.cuda.stream(self.load_stream):
+        with device_module.stream(self.load_stream):
             producer_event.start_event.wait(self.load_stream)
             for i in range(self.layer_num):
                 self.mem_pool_host.load_to_device_per_layer(
@@ -639,11 +657,6 @@ class HiCacheController:
             if prefix_keys and len(prefix_keys) > 0:
                 prefix_keys += batch_hashes
 
-        # release pre-allocated memory
-        self.append_host_mem_release(
-            operation.host_indices[operation.completed_tokens :]
-        )
-
     def prefetch_io_aux_func(self):
         """
         Auxiliary function conducting IO operations for prefetching.
@@ -713,7 +726,6 @@ class HiCacheController:
                 operation = self.prefetch_queue.get(block=True, timeout=1)
                 if operation is None:
                     continue
-
                 hash_value, storage_hit_count = self._storage_hit_query(operation)
                 if self.tp_world_size > 1:
                     storage_hit_count_tensor = torch.tensor(
