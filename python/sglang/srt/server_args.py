@@ -1531,11 +1531,6 @@ class ServerArgs:
                         logger.info(
                             "Use flashinfer_trtllm as MoE runner backend on sm100 for Glm4MoeForCausalLM"
                         )
-                    else:
-                        logger.warning(
-                            "flashinfer-python version >= 0.6.2 is required for flashinfer_trtllm MoE runner backend. "
-                            "flashinfer_trtllm MoE runner backend is not enabled."
-                        )
 
             # Mamba radix cache v2
             if self.enable_mamba_extra_buffer():
