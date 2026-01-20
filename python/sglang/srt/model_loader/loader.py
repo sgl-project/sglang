@@ -2453,13 +2453,15 @@ class IncModelLoader(DefaultModelLoader):
 
         quant_model = self._autoround_quantization_workflow(model_config, device_config)
 
+        target_device = torch.device(device_config.device)
+
         # Return autoround model for offline quantization mode
         if self.load_config.inc_save_path is not None:
+            quant_model.to(target_device)
             return quant_model.eval()
 
         model_config.hf_config = quant_model.config
 
-        target_device = torch.device(device_config.device)
         with set_default_torch_dtype(model_config.dtype):
             with target_device:
                 model = _initialize_model(
