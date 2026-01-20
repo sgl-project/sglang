@@ -948,9 +948,8 @@ class DPDraftWorker(EagleDraftWorker):
             # Force draft MoE A2A backend to NONE for single-GPU draft.
             from sglang.srt.layers.moe import utils as moe_utils
 
-            prev_a2a = moe_utils.SPECULATIVE_MOE_A2A_BACKEND
+            prev_moe_a2a = moe_utils.SPECULATIVE_MOE_A2A_BACKEND
             moe_utils.SPECULATIVE_MOE_A2A_BACKEND = moe_utils.MoeA2ABackend.NONE
-            final_a2a = moe_utils.SPECULATIVE_MOE_A2A_BACKEND
             super().__init__(
                 server_args=single_gpu_args,
                 gpu_id=gpu_id,
@@ -960,16 +959,13 @@ class DPDraftWorker(EagleDraftWorker):
                 nccl_port=nccl_port,
                 target_worker=target_worker,
             )
-
         self.draft_runner.tp_group = self._dpdraft_group
-
         self.draft_tp_context = empty_context
-
         logger.info(
             "[DP-Draft] Ready: draft model initialized in dp draft mode "
             "(draft_model=%s, target(tp=%s dp=%s ep=%s), "
             "draft(tp=%s dp=%s ep=%s), attn_tp=%s, dp_attn=%s, "
-            "spec_moe_a2a=%s (prev=%s)",
+            "spec_moe_a2a_prev=%s)",
             type(self.draft_runner.model).__name__,
             server_args.tp_size,
             server_args.dp_size,
@@ -981,8 +977,7 @@ class DPDraftWorker(EagleDraftWorker):
             if hasattr(self.draft_runner, "attention_tp_group")
             else "N/A",
             self.server_args.enable_dp_attention,
-            final_a2a,
-            prev_a2a,
+            prev_moe_a2a,
         )
 
     @staticmethod
