@@ -25,7 +25,7 @@ from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_amd_ci
 
 # Wave attention kernel unit tests (AMD only - requires wave_lang)
-register_amd_ci(est_time=60, suite="stage-a-test-1")
+register_amd_ci(est_time=60, suite="stage-a-test-1-amd")
 
 
 class TestWaveAttention(unittest.TestCase):
