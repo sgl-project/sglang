@@ -476,8 +476,6 @@ class SWARadixCache(BasePrefixCache):
         else:
             page_aligned_len = actual_kv_len
             page_aligned_kv_indices = kv_indices.to(dtype=torch.int64, copy=True)
-            if self.is_eagle:
-                self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:])
 
         page_aligned_token_len = (
             page_aligned_len + 1 if self.is_eagle else page_aligned_len
@@ -493,7 +491,7 @@ class SWARadixCache(BasePrefixCache):
         # insert the token_ids and kv_indices into the radix tree
         # Note: the insert function already frees the overlapped kv_indices
         if is_insert:
-            new_prefix_len = self.insert(
+            self.insert(
                 RadixKey(token_ids[:page_aligned_token_len], req.extra_key),
                 page_aligned_kv_indices,
                 old_prefix_len,
@@ -505,8 +503,7 @@ class SWARadixCache(BasePrefixCache):
             )
 
         # free the unaligned tail
-        if not self.is_eagle:
-            self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:])
+        self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:])
 
         # Remove req slot release the cache lock
         self.req_to_token_pool.free(req.req_pool_idx)
