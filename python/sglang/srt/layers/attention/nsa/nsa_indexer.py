@@ -182,7 +182,6 @@ class Indexer(MultiPlatformOp):
             quant_config=quant_config,
             prefix=add_prefix("wk", prefix),
         )
-        # NOTE: weights_proj in the checkpoint is stored in bf16, while the parameters here are stored in fp32 for convenience
         self.weights_proj = ReplicatedLinear(
             self.hidden_size,
             self.n_heads,
