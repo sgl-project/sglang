@@ -13,6 +13,10 @@ if TYPE_CHECKING:
     )
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
+from sglang.srt.layers.moe.utils import get_moe_runner_backend
+from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
+from sglang.srt.hardware_backend.npu.quantization.torch_npu_kernels import TorchNpuKernelsQuantInfo
+
 
 def npu_fused_experts(
     hidden_states: torch.Tensor,
@@ -150,66 +154,52 @@ class _NPUFusedMoEMethodBase(FusedMoEMethodBase):
 
 class NPUW8A8Int8DynamicMoEMethod(_NPUFusedMoEMethodBase):
 
-    def _release_weight_cache(self, weight: torch.Tensor):
-        # .contiguous() introduces additional memory overhead and needs to be released using resize_(0)
-        origin_weight = weight.data.transpose(1, 2)
-        new_weight = origin_weight.contiguous()
-        origin_weight.untyped_storage().resize_(0)
-        return new_weight
-
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        weight_data = self._release_weight_cache(layer.w13_weight.data)
-        layer.w13_weight = torch.nn.Parameter(weight_data, requires_grad=False)
-
-        weight_data = self._release_weight_cache(layer.w2_weight.data)
-        layer.w2_weight = torch.nn.Parameter(weight_data, requires_grad=False)
-
+        layer.w13_weight.data = npu_format_cast(layer.w13_weight.data.transpose(1, 2))
+        layer.w2_weight.data = npu_format_cast(layer.w2_weight.data.transpose(1, 2))
         layer.w13_weight_scale = torch.nn.Parameter(
-            layer.w13_weight_scale.data.squeeze(-1).contiguous().to(torch.float32),
-            requires_grad=False,
+            layer.w13_weight_scale.data.squeeze(-1), requires_grad=False
         )
         layer.w2_weight_scale = torch.nn.Parameter(
-            layer.w2_weight_scale.data.squeeze(-1).contiguous(), requires_grad=False
+            layer.w2_weight_scale.data.squeeze(-1), requires_grad=False
         )
         # Compressed-tensors format doesn't have this field
         if hasattr(layer, "w13_weight_offset"):
             layer.w13_weight_offset = torch.nn.Parameter(
-                layer.w13_weight_offset.data.squeeze(-1).contiguous(),
+                layer.w13_weight_offset.data.squeeze(-1),
                 requires_grad=False,
             )
         if hasattr(layer, "w2_weight_offset"):
             layer.w2_weight_offset = torch.nn.Parameter(
-                layer.w2_weight_offset.data.squeeze(-1).contiguous(),
+                layer.w2_weight_offset.data.squeeze(-1),
                 requires_grad=False,
             )
 
-        layer.w13_weight.data = npu_format_cast(layer.w13_weight.data)
-        layer.w2_weight.data = npu_format_cast(layer.w2_weight.data)
+    def create_moe_runner(
+        self, layer: torch.nn.Module, moe_runner_config: "MoeRunnerConfig"
+    ):
+        self.moe_runner_config = moe_runner_config
+        backend = get_moe_runner_backend()
+        if backend.is_auto():
+            backend = (
+                MoeRunnerBackend.TORCH_NPU_KERNELS
+            )
+        self.runner = MoeRunner(backend, moe_runner_config)
 
     def apply(
         self,
         layer,
         dispatch_output: "StandardDispatchOutput",
     ) -> "CombineInput":
-        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+        backend = self.runner.runner_backend
+        quant_info = TorchNpuKernelsQuantInfo(
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+                w13_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale,
+            )
+        return self.runner.run(dispatch_output, quant_info)
 
-        x = dispatch_output.hidden_states
-        topk_output = dispatch_output.topk_output
-
-        topk_weights, topk_ids, _ = topk_output
-        topk_ids = topk_ids.to(torch.int32)
-        topk_weights = topk_weights.to(x.dtype)
-        output = npu_fused_experts(
-            hidden_states=x,
-            w13=layer.w13_weight,
-            w13_scale=layer.w13_weight_scale,
-            w2=layer.w2_weight,
-            w2_scale=layer.w2_weight_scale,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            top_k=topk_ids.shape[1],
-        )
-        return StandardCombineInput(hidden_states=output)
 
     def apply_without_routing_weights(
         self,
