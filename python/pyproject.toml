@@ -23,7 +23,7 @@ dependencies = [
   "blobfile==3.0.0",
   "build",
   "compressed-tensors",
-  "cuda-python==12.9",
+  "cuda-python==12.9.1",
   "decord2",
   "datasets",
   "einops",
