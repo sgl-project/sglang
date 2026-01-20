@@ -5,10 +5,32 @@ This kernel manages a hot buffer cache for sparse attention, handling:
 - Cache hits (tokens already in device buffer)
 - Cache misses (tokens need to be loaded from host cache)
 - Eviction of unused tokens from the device buffer
+- Round-robin eviction policy for fair slot reuse
+
+Kernel Template Parameters:
+- BLOCK_SIZE: CUDA block size (256 threads)
+- NUM_TOP_K: Number of top-k tokens to process (512 or 2048)
+- HOT_BUFFER_SIZE: Size of the hot buffer cache
 
 Test configurations:
 - top_k: 512, 2048
 - hot_buffer_size: |top_k+1|, 2*|top_k|, 4*|top_k|
+
+Key test scenarios:
+1. Data Loading: Basic functionality for loading cache data
+2. Full Miss: No tokens are in cache, all need loading
+3. Full Hit: All tokens already in cache, no loading needed
+4. Partial Miss: Mix of hits and misses (25%, 50%, 75%)
+5. Data Integrity: Verify transferred data matches source
+6. Extra Slot: Allocation for next token generation
+7. Edge Cases: Minimal buffer sizes, sequential operations
+8. Stress Tests: Random patterns and high load scenarios
+
+The kernel uses warp-level primitives for efficient:
+- Hit detection via warp shuffle operations
+- Evictable slot identification via ballot and popc
+- Inclusive scan for offset calculation
+- Coalesced memory transfers
 """
 
 import os
@@ -1088,6 +1110,229 @@ def test_hit_ratios_2048(hit_ratio):
     )
     
     assert (result["kernel_top_k_locs"][:2048] >= 0).all()
+
+
+@pytest.mark.parametrize("top_k,buffer_mult", [
+    (512, 2),
+    (2048, 2),
+])
+def test_round_robin_eviction(top_k, buffer_mult):
+    """Test that round-robin eviction works correctly across multiple calls."""
+    buffer_size = buffer_mult * top_k
+    device = "cuda"
+    
+    # Create persistent state
+    total_tokens = max(20000, top_k * 8)
+    item_size = 128
+    dtype = torch.float16
+    
+    device_buffer_tokens = torch.full((buffer_size,), -1, dtype=torch.int32, device=device)
+    device_buffer = torch.zeros(buffer_size, item_size, dtype=dtype, device=device)
+    host_cache = torch.randn(total_tokens, item_size, dtype=dtype, device="cpu").pin_memory()
+    host_cache_locs = torch.arange(total_tokens, dtype=torch.int64, device=device)
+    device_buffer_locs = torch.arange(buffer_size, dtype=torch.int64, device=device)
+    last_evicted_slot = torch.zeros(1, dtype=torch.int32, device=device)
+    
+    kernel_fn = get_kernel_function(top_k, buffer_size)
+    
+    evicted_slots_history = []
+    
+    # Run multiple operations and track eviction patterns
+    for op_idx in range(5):
+        initial_evicted = last_evicted_slot.item()
+        
+        all_tokens = torch.randperm(total_tokens, device=device)
+        top_k_tokens = all_tokens[:top_k].to(torch.int32)
+        top_k_device_locs = torch.zeros(top_k + 1, dtype=torch.int64, device=device)
+        
+        kernel_fn(
+            top_k_tokens,
+            device_buffer_tokens,
+            host_cache_locs,
+            device_buffer_locs,
+            host_cache.to("cuda"),
+            device_buffer,
+            top_k_device_locs,
+            item_size * dtype.itemsize,
+            total_tokens + op_idx,
+            last_evicted_slot,
+        )
+        torch.cuda.synchronize()
+        
+        final_evicted = last_evicted_slot.item()
+        evicted_slots_history.append((initial_evicted, final_evicted))
+        
+        # Verify locations are valid
+        assert (top_k_device_locs[:top_k] >= 0).all()
+        assert (top_k_device_locs[:top_k] < buffer_size).all()
+    
+    # The eviction should progress through the buffer
+    # (not all starting from 0 each time)
+    assert len(set(h[0] for h in evicted_slots_history)) > 1, \
+        "Round-robin eviction should start from different positions"
+
+
+@pytest.mark.parametrize("top_k,buffer_size", [
+    (512, 513),
+    (512, 1024),
+    (2048, 2049),
+    (2048, 4096),
+])
+def test_buffer_utilization(top_k, buffer_size):
+    """Test that buffer utilization is efficient."""
+    result = run_kernel_test(
+        top_k=top_k,
+        buffer_size=buffer_size,
+        hit_ratio=0.0,  # All misses
+        total_tokens=max(10000, top_k * 4),
+        item_size=128,
+    )
+    
+    # After full miss, buffer should contain all top_k tokens
+    kernel_buffer_tokens = result["kernel_buffer_tokens"]
+    top_k_tokens = result["top_k_tokens"]
+    
+    top_k_set = set(top_k_tokens.tolist())
+    buffer_tokens_list = kernel_buffer_tokens.tolist()
+    
+    # Count how many top_k tokens are in the buffer
+    found_count = sum(1 for t in buffer_tokens_list if t in top_k_set)
+    
+    assert found_count >= top_k, \
+        f"Buffer should contain all {top_k} top_k tokens, found {found_count}"
+
+
+@pytest.mark.parametrize("top_k,buffer_mult", [
+    (512, 2),
+    (2048, 2),
+])
+def test_location_uniqueness(top_k, buffer_mult):
+    """Test that assigned locations are unique for each top_k token."""
+    buffer_size = buffer_mult * top_k
+    
+    result = run_kernel_test(
+        top_k=top_k,
+        buffer_size=buffer_size,
+        hit_ratio=0.5,
+        total_tokens=max(10000, top_k * 4),
+        item_size=128,
+    )
+    
+    locs = result["kernel_top_k_locs"][:top_k].tolist()
+    
+    # All locations should be unique
+    assert len(locs) == len(set(locs)), \
+        "Each top_k token should have a unique device location"
+
+
+@pytest.mark.parametrize("top_k,buffer_size", [
+    (512, 1024),
+    (2048, 4096),
+])
+def test_empty_initial_buffer(top_k, buffer_size):
+    """Test with completely empty initial buffer (all -1)."""
+    device = "cuda"
+    total_tokens = max(10000, top_k * 4)
+    item_size = 128
+    dtype = torch.float16
+    
+    # Generate random top_k tokens
+    all_tokens = torch.randperm(total_tokens, device=device)
+    top_k_tokens = all_tokens[:top_k].to(torch.int32)
+    
+    # Completely empty buffer
+    device_buffer_tokens = torch.full((buffer_size,), -1, dtype=torch.int32, device=device)
+    device_buffer = torch.zeros(buffer_size, item_size, dtype=dtype, device=device)
+    
+    host_cache = torch.randn(total_tokens, item_size, dtype=dtype, device="cpu").pin_memory()
+    host_cache_locs = torch.arange(total_tokens, dtype=torch.int64, device=device)
+    device_buffer_locs = torch.arange(buffer_size, dtype=torch.int64, device=device)
+    top_k_device_locs = torch.zeros(top_k + 1, dtype=torch.int64, device=device)
+    last_evicted_slot = torch.zeros(1, dtype=torch.int32, device=device)
+    
+    kernel_fn = get_kernel_function(top_k, buffer_size)
+    kernel_fn(
+        top_k_tokens,
+        device_buffer_tokens,
+        host_cache_locs,
+        device_buffer_locs,
+        host_cache.to("cuda"),
+        device_buffer,
+        top_k_device_locs,
+        item_size * dtype.itemsize,
+        total_tokens,
+        last_evicted_slot,
+    )
+    torch.cuda.synchronize()
+    
+    # All should be valid
+    assert (top_k_device_locs[:top_k] >= 0).all()
+    assert (top_k_device_locs[:top_k] < buffer_size).all()
+    
+    # Verify data integrity for first few tokens
+    host_cache_gpu = host_cache.to("cuda")
+    for i in range(min(10, top_k)):
+        token = top_k_tokens[i].item()
+        loc = top_k_device_locs[i].item()
+        torch.testing.assert_close(
+            device_buffer[loc], host_cache_gpu[token],
+            msg=f"Data mismatch for token {token} at location {loc}"
+        )
+
+
+@pytest.mark.parametrize("top_k,buffer_size", [
+    (512, 1024),
+    (2048, 4096),
+])
+def test_duplicate_resistant(top_k, buffer_size):
+    """Test that having duplicate tokens in buffer doesn't cause issues."""
+    device = "cuda"
+    total_tokens = max(10000, top_k * 4)
+    item_size = 128
+    dtype = torch.float16
+    
+    # Generate random top_k tokens
+    all_tokens = torch.randperm(total_tokens, device=device)
+    top_k_tokens = all_tokens[:top_k].to(torch.int32)
+    
+    # Create buffer with some duplicate entries (same token in multiple slots)
+    device_buffer_tokens = torch.full((buffer_size,), -1, dtype=torch.int32, device=device)
+    
+    # Put first token in multiple slots
+    first_token = top_k_tokens[0].item()
+    device_buffer_tokens[0] = first_token
+    device_buffer_tokens[10] = first_token  # Duplicate
+    
+    # Fill rest with random tokens
+    other_tokens = all_tokens[top_k:]
+    for i in range(20, min(buffer_size, len(other_tokens) + 20)):
+        device_buffer_tokens[i] = other_tokens[i - 20].to(torch.int32).item()
+    
+    device_buffer = torch.zeros(buffer_size, item_size, dtype=dtype, device=device)
+    host_cache = torch.randn(total_tokens, item_size, dtype=dtype, device="cpu").pin_memory()
+    host_cache_locs = torch.arange(total_tokens, dtype=torch.int64, device=device)
+    device_buffer_locs = torch.arange(buffer_size, dtype=torch.int64, device=device)
+    top_k_device_locs = torch.zeros(top_k + 1, dtype=torch.int64, device=device)
+    last_evicted_slot = torch.zeros(1, dtype=torch.int32, device=device)
+    
+    kernel_fn = get_kernel_function(top_k, buffer_size)
+    kernel_fn(
+        top_k_tokens,
+        device_buffer_tokens,
+        host_cache_locs,
+        device_buffer_locs,
+        host_cache.to("cuda"),
+        device_buffer,
+        top_k_device_locs,
+        item_size * dtype.itemsize,
+        total_tokens,
+        last_evicted_slot,
+    )
+    torch.cuda.synchronize()
+    
+    # Should still work correctly
+    assert (top_k_device_locs[:top_k] >= 0).all()
+    assert (top_k_device_locs[:top_k] < buffer_size).all()
 
 
 if __name__ == "__main__":
