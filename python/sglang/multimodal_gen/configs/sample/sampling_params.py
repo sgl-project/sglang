@@ -113,7 +113,7 @@ class SamplingParams:
     # NOTE: this is temporary, we need a way to know if width or height is not provided, or do the image resize earlier
     height_not_provided: bool = False
     width_not_provided: bool = False
-    fps: int = 24
+    fps: list[int] | int | None = 24
 
     # Resolution validation
     supported_resolutions: list[tuple[int, int]] | None = (
@@ -321,8 +321,10 @@ class SamplingParams:
         """
         # TODO: SamplingParams should not rely on ServerArgs
         pipeline_config = server_args.pipeline_config
-        if not isinstance(self.prompt, str):
-            raise TypeError(f"`prompt` must be a string, but got {type(self.prompt)}")
+        if not (isinstance(self.prompt, str) or isinstance(self.prompt, list)):
+            raise TypeError(
+                f"`prompt` must be a string or a list, but got {type(self.prompt)}"
+            )
 
         self.data_type = server_args.pipeline_config.task_type.data_type()
 

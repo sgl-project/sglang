@@ -257,8 +257,18 @@ class Req:
             return [self.sampling_params.negative_prompt] * self.batch_size
         return self.sampling_params.negative_prompt
 
+    def get_fps_for_index(self, idx: int) -> int:
+        """Get fps for a specific batch index."""
+        if isinstance(self.sampling_params.fps, list):
+            return (
+                self.sampling_params.fps[idx]
+                if idx < len(self.sampling_params.fps)
+                else self.sampling_params.fps[0]
+            )
+        return self.sampling_params.fps
+
     def output_file_path(self, num_outputs=1, output_idx=None):
-        output_file_name = self.output_file_name
+        output_file_name = self.sampling_params.output_file_name
         if num_outputs > 1 and output_file_name:
             base, ext = os.path.splitext(output_file_name)
             output_file_name = f"{base}_{output_idx}{ext}"

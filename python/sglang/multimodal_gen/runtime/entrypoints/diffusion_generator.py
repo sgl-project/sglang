@@ -194,52 +194,59 @@ class DiffGenerator:
                 prompts.append(prompt)
             elif isinstance(prompt, list):
                 prompts.extend(prompt)
-        sampling_params = SamplingParams.from_user_sampling_params_args(
-            self.server_args.model_path,
-            server_args=self.server_args,
-            **sampling_params_kwargs,
-        )
 
         # Extract diffusers_kwargs if passed
         diffusers_kwargs = sampling_params_kwargs.pop("diffusers_kwargs", None)
 
-        requests: list[Req] = []
-        for output_idx, p in enumerate(prompts):
-            sampling_params.prompt = p
-            req = prepare_request(
-                server_args=self.server_args,
-                sampling_params=sampling_params,
-            )
-            # Add diffusers_kwargs to request's extra dict
-            if diffusers_kwargs:
-                req.extra["diffusers_kwargs"] = diffusers_kwargs
-            requests.append(req)
+        # 2. Create sampling params with ALL prompts as a list
+        sampling_params_kwargs_copy = sampling_params_kwargs.copy()
+        sampling_params_kwargs_copy["prompt"] = prompts  # Pass all prompts
+
+        sampling_params = SamplingParams.from_user_sampling_params_args(
+            self.server_args.model_path,
+            server_args=self.server_args,
+            **sampling_params_kwargs_copy,
+        )
+
+        # 3. Create SINGLE Req with batched prompts
+        batch_req = prepare_request(
+            server_args=self.server_args,
+            sampling_params=sampling_params,
+        )
+        if diffusers_kwargs:
+            batch_req.extra["diffusers_kwargs"] = diffusers_kwargs
 
         results = []
         total_start_time = time.perf_counter()
 
-        # 2. send requests to scheduler, one at a time
-        # TODO: send batch when supported
-        for request_idx, req in enumerate(requests):
-            try:
-                with log_generation_timer(
-                    logger, req.prompt, request_idx + 1, len(requests)
-                ) as timer:
-                    output_batch = self._send_to_scheduler_and_wait_for_response([req])
-                    if output_batch.error:
-                        raise Exception(f"{output_batch.error}")
+        # 4. Send single batched request to scheduler
+        try:
+            with log_generation_timer(
+                logger, f"batch of {len(prompts)} prompts", 1, 1
+            ) as timer:
+                output_batch = self._send_to_scheduler_and_wait_for_response(
+                    [batch_req]
+                )
 
-                    if output_batch.output is None:
-                        logger.error(
-                            "Received empty output from scheduler for prompt %d",
-                            request_idx + 1,
-                        )
-                        continue
+                if output_batch.error:
+                    raise Exception(f"{output_batch.error}")
+
+                if output_batch.output is None:
+                    logger.error("Received empty output from scheduler")
+                else:
+                    # Process each output in the batch
+                    num_outputs = len(output_batch.output)
+
                     audio_sample_rate = output_batch.audio_sample_rate
                     for output_idx, sample in enumerate(output_batch.output):
-                        num_outputs = len(output_batch.output)
+                        prompt_for_sample = (
+                            prompts[output_idx]
+                            if output_idx < len(prompts)
+                            else prompts[0]
+                        )
+
                         audio = output_batch.audio
-                        if req.data_type == DataType.VIDEO:
+                        if batch_req.sampling_params.data_type == DataType.VIDEO:
                             if isinstance(audio, torch.Tensor) and audio.ndim >= 2:
                                 audio = (
                                     audio[output_idx]
@@ -256,25 +263,29 @@ class DiffGenerator:
                                 isinstance(sample, (tuple, list)) and len(sample) == 2
                             ):
                                 sample = (sample, audio)
+
                         frames = post_process_sample(
                             sample,
-                            fps=req.fps,
-                            save_output=req.save_output,
-                            # TODO: output file path for req should be determined
-                            save_file_path=req.output_file_path(
+                            fps=batch_req.get_fps_for_index(output_idx),
+                            save_output=batch_req.sampling_params.save_output,
+                            save_file_path=batch_req.output_file_path(
                                 num_outputs, output_idx
                             ),
-                            data_type=req.data_type,
                             audio_sample_rate=audio_sample_rate,
+                            data_type=batch_req.sampling_params.data_type,
                         )
 
                         result_item: dict[str, Any] = {
                             "samples": sample,
                             "frames": frames,
                             "audio": audio,
-                            "prompts": req.prompt,
-                            "size": (req.height, req.width, req.num_frames),
-                            "generation_time": timer.duration,
+                            "prompts": prompt_for_sample,
+                            "size": (
+                                batch_req.sampling_params.height,
+                                batch_req.sampling_params.width,
+                                batch_req.sampling_params.num_frames
+                            ),
+                            "generation_time": timer.duration / num_outputs,
                             "peak_memory_mb": output_batch.peak_memory_mb,
                             "timings": (
                                 output_batch.timings.to_dict()
@@ -287,8 +298,12 @@ class DiffGenerator:
                             "prompt_index": output_idx,
                         }
                         results.append(result_item)
-            except Exception:
-                continue
+
+        except Exception as e:
+            logger.error(f"Error processing batch: {e}")
+            import traceback
+
+            traceback.print_exc()
 
         total_gen_time = time.perf_counter() - total_start_time
         log_batch_completion(logger, len(results), total_gen_time)
@@ -313,7 +328,7 @@ class DiffGenerator:
         if len(results) == 0:
             return None
         else:
-            if requests[0].return_frames:
+            if batch_req.return_frames:
                 results = [r["frames"] for r in results]
             if len(results) == 1:
                 return results[0]
