@@ -69,6 +69,7 @@ if HAS_TRITON:
         topk_ids_ptr,  # [num_tokens, topk]
         topk_weights_ptr,  # [num_tokens, topk]
         routed_counts_ptr,  # [world_size]
+        rank_weights_ptr,  # [world_size] weight for shared-dest selection
         # Outputs
         expanded_ids_ptr,  # [num_tokens, topk+1]
         expanded_weights_ptr,  # [num_tokens, topk+1]
@@ -78,7 +79,7 @@ if HAS_TRITON:
         topk: tl.constexpr,
         old_experts_per_rank,  # Original experts per rank (e.g., 32)
         new_experts_per_rank,  # New experts per rank (e.g., 33)
-        world_size,
+        world_size: tl.constexpr,
         source_rank,
         shared_weight,
         local_marker,  # LOCAL_SHARED_MARKER = -1
@@ -106,12 +107,20 @@ if HAS_TRITON:
         token_idx = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
         mask = token_idx < num_tokens
 
-        # ===== Step 1: Waterfill - find best destination rank =====
+        # ===== Step 1: Select destination rank for shared expert =====
+        # Prefer balanced total load (routed + shared) by sampling destination among
+        # candidate ranks (routed ranks + source rank) with probability proportional
+        # to `rank_weights_ptr`. If all candidate weights are zero, fall back to the
+        # legacy argmin(routed_counts) logic.
         # Initialize with source rank (always a candidate)
         source_count = tl.load(routed_counts_ptr + source_rank)
         best_count = tl.where(mask, source_count, 2**30)
         best_rank = tl.full([BLOCK_SIZE], source_rank, dtype=tl.int64)
         has_valid = tl.zeros([BLOCK_SIZE], dtype=tl.int1)
+        src_rank_i32 = tl.full([BLOCK_SIZE], source_rank, dtype=tl.int32)
+        candidate_mask = (tl.full([BLOCK_SIZE], 1, dtype=tl.int32) << src_rank_i32).to(
+            tl.int32
+        )
 
         # Check each routed expert and update if better
         for k in range(topk):
@@ -125,6 +134,12 @@ if HAS_TRITON:
             # Compute target rank from ORIGINAL expert ID
             target_rank = expert_id // old_experts_per_rank
             target_rank = tl.minimum(tl.maximum(target_rank, 0), world_size - 1)
+            target_rank_i32 = target_rank.to(tl.int32)
+            shift_amt = tl.where(valid, target_rank_i32, 0)
+            bit = tl.full([BLOCK_SIZE], 1, dtype=tl.int32) << shift_amt
+            candidate_mask = tl.where(
+                valid & mask, candidate_mask | bit, candidate_mask
+            )
 
             # Load routed count for this rank
             target_count = tl.load(
@@ -142,6 +157,48 @@ if HAS_TRITON:
             )
             best_count = tl.where(better, target_count, best_count)
             best_rank = tl.where(better, target_rank, best_rank)
+
+        # Total weight per token across candidate ranks.
+        total_w = tl.zeros([BLOCK_SIZE], dtype=tl.int32)
+        for r in range(world_size):
+            present = ((candidate_mask >> r) & 1) == 1
+            w = tl.load(rank_weights_ptr + r).to(tl.int32)
+            w_vec = tl.full([BLOCK_SIZE], w, dtype=tl.int32)
+            # Apply local preference (scale down remote weights).
+            w_vec = tl.where(
+                src_rank_i32 == r,
+                w_vec,
+                (w_vec * local_pref_denom) // local_pref_numer,
+            )
+            total_w += tl.where(present, w_vec, 0)
+
+        # Deterministic per-token draw in [0, total_w).
+        token_seed = token_idx.to(tl.uint32) ^ (
+            src_rank_i32.to(tl.uint32)
+            * tl.full([BLOCK_SIZE], 0x9E3779B9, dtype=tl.uint32)
+        )
+        token_seed = token_seed * tl.full(
+            [BLOCK_SIZE], 1664525, dtype=tl.uint32
+        ) + tl.full([BLOCK_SIZE], 1013904223, dtype=tl.uint32)
+        u = tl.where(total_w > 0, token_seed % total_w.to(tl.uint32), 0).to(tl.int32)
+
+        chosen = src_rank_i32
+        cum = tl.zeros([BLOCK_SIZE], dtype=tl.int32)
+        for r in range(world_size):
+            present = ((candidate_mask >> r) & 1) == 1
+            w = tl.load(rank_weights_ptr + r).to(tl.int32)
+            w_vec = tl.full([BLOCK_SIZE], w, dtype=tl.int32)
+            w_vec = tl.where(
+                src_rank_i32 == r,
+                w_vec,
+                (w_vec * local_pref_denom) // local_pref_numer,
+            )
+            w_vec = tl.where(present, w_vec, 0)
+            pick = (total_w > 0) & present & (u >= cum) & (u < (cum + w_vec))
+            chosen = tl.where(pick, r, chosen)
+            cum += w_vec
+
+        best_rank = tl.where(total_w > 0, chosen.to(tl.int64), best_rank)
 
         # ===== Step 2: Compute shared expert ID and local mask =====
         is_local = best_rank == source_rank
@@ -254,16 +311,27 @@ if HAS_TRITON:
         local_pref_numer = int(LOCAL_PREFERENCE_FACTOR * 5)
         local_pref_denom = 5
 
+        # Compute per-rank weights for shared-dest selection from the global routed load.
+        routed_counts_i64 = routed_counts.to(torch.int64)
+        total_routed = routed_counts_i64.sum()
+        total_tokens = total_routed // topk
+        target_total = (total_routed + total_tokens + world_size - 1) // world_size
+        rank_weights = torch.clamp(target_total - routed_counts_i64, min=0).to(
+            torch.int32
+        )
+
         _waterfill_expand_topk_fused_kernel[grid](
             topk_ids,
             topk_weights,
             routed_counts,
+            rank_weights,
             expanded_topk_ids,
             expanded_topk_weights,
             local_shared_mask,
             num_tokens,
             topk,
             experts_per_rank,
+            experts_per_rank + 1,
             world_size,
             source_rank,
             shared_weight,
@@ -428,6 +496,7 @@ if HAS_TRITON:
         topk_ids_ptr,  # [num_tokens, topk]
         topk_weights_ptr,  # [num_tokens, topk]
         routed_counts_ptr,  # [world_size]
+        rank_weights_ptr,  # [world_size] weight for shared-dest selection
         # Outputs
         expanded_ids_ptr,  # [num_tokens, topk+1]
         expanded_weights_ptr,  # [num_tokens, topk+1]
@@ -460,11 +529,19 @@ if HAS_TRITON:
         token_idx = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
         mask = token_idx < num_tokens
 
-        # ===== Step 1: Waterfill - find best destination rank =====
+        # ===== Step 1: Select destination rank for shared expert =====
+        # Prefer balanced total load (routed + shared) by sampling destination among
+        # candidate ranks (routed ranks + source rank) with probability proportional
+        # to `rank_weights_ptr`. If all candidate weights are zero, fall back to the
+        # legacy argmin(routed_counts) logic.
         source_count = tl.load(routed_counts_ptr + source_rank)
         best_count = tl.where(mask, source_count, 2**30)
         best_rank = tl.full([BLOCK_SIZE], source_rank, dtype=tl.int64)
         has_valid = tl.zeros([BLOCK_SIZE], dtype=tl.int1)
+        src_rank_i32 = tl.full([BLOCK_SIZE], source_rank, dtype=tl.int32)
+        candidate_mask = (tl.full([BLOCK_SIZE], 1, dtype=tl.int32) << src_rank_i32).to(
+            tl.int32
+        )
 
         for k in range(topk):
             expert_id = tl.load(
@@ -476,6 +553,12 @@ if HAS_TRITON:
             # Use OLD experts_per_rank for rank calculation from original expert IDs
             target_rank = expert_id // old_experts_per_rank
             target_rank = tl.minimum(tl.maximum(target_rank, 0), world_size - 1)
+            target_rank_i32 = target_rank.to(tl.int32)
+            shift_amt = tl.where(valid, target_rank_i32, 0)
+            bit = tl.full([BLOCK_SIZE], 1, dtype=tl.int32) << shift_amt
+            candidate_mask = tl.where(
+                valid & mask, candidate_mask | bit, candidate_mask
+            )
 
             target_count = tl.load(
                 routed_counts_ptr + target_rank, mask=mask & valid, other=2**30
@@ -488,6 +571,48 @@ if HAS_TRITON:
             )
             best_count = tl.where(better, target_count, best_count)
             best_rank = tl.where(better, target_rank, best_rank)
+
+        # Total weight per token across candidate ranks.
+        total_w = tl.zeros([BLOCK_SIZE], dtype=tl.int32)
+        for r in range(world_size):
+            present = ((candidate_mask >> r) & 1) == 1
+            w = tl.load(rank_weights_ptr + r).to(tl.int32)
+            w_vec = tl.full([BLOCK_SIZE], w, dtype=tl.int32)
+            # Apply local preference (scale down remote weights).
+            w_vec = tl.where(
+                src_rank_i32 == r,
+                w_vec,
+                (w_vec * local_pref_denom) // local_pref_numer,
+            )
+            total_w += tl.where(present, w_vec, 0)
+
+        # Deterministic per-token draw in [0, total_w).
+        token_seed = token_idx.to(tl.uint32) ^ (
+            src_rank_i32.to(tl.uint32)
+            * tl.full([BLOCK_SIZE], 0x9E3779B9, dtype=tl.uint32)
+        )
+        token_seed = token_seed * tl.full(
+            [BLOCK_SIZE], 1664525, dtype=tl.uint32
+        ) + tl.full([BLOCK_SIZE], 1013904223, dtype=tl.uint32)
+        u = tl.where(total_w > 0, token_seed % total_w.to(tl.uint32), 0).to(tl.int32)
+
+        chosen = src_rank_i32
+        cum = tl.zeros([BLOCK_SIZE], dtype=tl.int32)
+        for r in range(world_size):
+            present = ((candidate_mask >> r) & 1) == 1
+            w = tl.load(rank_weights_ptr + r).to(tl.int32)
+            w_vec = tl.full([BLOCK_SIZE], w, dtype=tl.int32)
+            w_vec = tl.where(
+                src_rank_i32 == r,
+                w_vec,
+                (w_vec * local_pref_denom) // local_pref_numer,
+            )
+            w_vec = tl.where(present, w_vec, 0)
+            pick = (total_w > 0) & present & (u >= cum) & (u < (cum + w_vec))
+            chosen = tl.where(pick, r, chosen)
+            cum += w_vec
+
+        best_rank = tl.where(total_w > 0, chosen.to(tl.int64), best_rank)
 
         # ===== Step 2: Compute shared expert ID and local mask =====
         is_local = best_rank == source_rank
@@ -668,6 +793,17 @@ if HAS_TRITON:
         local_pref_numer = int(LOCAL_PREFERENCE_FACTOR * 5)
         local_pref_denom = 5
 
+        # Compute per-rank weights for shared-dest selection from the global routed load.
+        routed_counts_i64 = routed_counts.to(torch.int64)
+        total_routed = routed_counts_i64.sum()
+        total_tokens_global = total_routed // topk
+        target_total = (
+            total_routed + total_tokens_global + world_size - 1
+        ) // world_size
+        rank_weights = torch.clamp(target_total - routed_counts_i64, min=0).to(
+            torch.int32
+        )
+
         if min_tokens_per_rank > 0:
             # Use fused kernel with histogram
             dest_counts = torch.zeros(world_size, dtype=torch.int32, device=device)
@@ -676,6 +812,7 @@ if HAS_TRITON:
                 topk_ids,
                 topk_weights,
                 routed_counts,
+                rank_weights,
                 expanded_topk_ids,
                 expanded_topk_weights,
                 local_shared_mask,
@@ -715,6 +852,7 @@ if HAS_TRITON:
                 topk_ids,
                 topk_weights,
                 routed_counts,
+                rank_weights,
                 expanded_topk_ids,
                 expanded_topk_weights,
                 local_shared_mask,
