@@ -1224,7 +1224,7 @@ class ChunkSizePredictor:
 
     def fit(self, seq_lens: List[int], latencies: List[float]):
         """Fit quadratic coefficients f(l) = al^2 + bl + c from data points."""
-        """Skip the first data point to avoid bias, as the first run is usually slower due to warmup."""
+        # Skip the first data point to reduce fitting bias, as the first run is slower without warmup.
         L = np.array(seq_lens[1:], dtype=np.float64)
         T = np.array(latencies[1:], dtype=np.float64)
 
