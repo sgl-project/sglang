@@ -737,7 +737,28 @@ class DecodeTransferQueue:
             output_topk_p,
             output_topk_index,
             output_hidden_states,
+            bootstrap_rooms,
         ) = self.metadata_buffers.get_buf(idx)
+
+        # Validate bootstrap_room to detect context corruption
+        actual_room = bootstrap_rooms[0].item()
+        expected_room = decode_req.req.bootstrap_room if decode_req.req.bootstrap_room is not None else 0
+
+        if actual_room != expected_room:
+            error_msg = (
+                f"Context corruption detected: Request {decode_req.req.rid} "
+                f"(bootstrap_room={expected_room}) received metadata from "
+                f"bootstrap_room={actual_room}. "
+                f"Metadata buffer index: {idx}. "
+                f"This indicates metadata buffer index collision."
+            )
+            logger.error(error_msg)
+            prepare_abort(
+                decode_req.req,
+                "Metadata corruption detected - bootstrap_room mismatch",
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+            return
 
         decode_req.req.output_ids.append(output_id[0].item())
         decode_req.req.cached_tokens = cached_tokens[0].item()
