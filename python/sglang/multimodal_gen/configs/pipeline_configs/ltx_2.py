@@ -17,6 +17,11 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
     PipelineConfig,
     preprocess_text,
 )
+from sglang.multimodal_gen.runtime.distributed import (
+    get_sp_parallel_rank,
+    get_sp_world_size,
+    sequence_model_parallel_all_gather,
+)
 
 
 def pack_text_embeds(
@@ -175,10 +180,10 @@ class LTX2PipelineConfig(PipelineConfig):
     ] = field(default_factory=lambda: (_gemma_postprocess_func,))
 
     def prepare_sigmas(self, sigmas, num_inference_steps):
+        # For LTX-2 we want the scheduler to own its sigma schedule (dynamic shifting, stretching, etc.).
+        # Only override when the user explicitly provides `sigmas`.
         if sigmas is None:
-            return np.linspace(
-                1.0, 1.0 / float(num_inference_steps), int(num_inference_steps)
-            )
+            return None
         return sigmas
 
     def tokenize_prompt(self, prompt: list[str], tokenizer, tok_kwargs) -> dict:
@@ -224,6 +229,108 @@ class LTX2PipelineConfig(PipelineConfig):
         )
         latents = latents.permute(0, 2, 4, 6, 1, 3, 5, 7).flatten(4, 7).flatten(1, 3)
         return latents
+
+    def _infer_video_latent_frames_and_tokens_per_frame(self, batch, seq_len: int) -> tuple[int, int]:
+        """Infer latent-frame count and tokens-per-frame for packed token latents [B, S, D].
+
+        Notes:
+        - This assumes `patch_size_t == 1` (no temporal patching).
+        - Tokens are ordered as (frame, height, width) after packing.
+        """
+        if int(self.patch_size_t) != 1:
+            raise ValueError(
+                "LTX-2 SP time-sharding for packed token latents currently requires "
+                f"{self.patch_size_t=}. (Expected 1)"
+            )
+        if int(seq_len) <= 0:
+            raise ValueError(f"Expected {seq_len=} > 0 for packed token latents.")
+        if int(self.vae_scale_factor) <= 0:
+            raise ValueError(f"Invalid {self.vae_scale_factor=}. Must be > 0.")
+        if int(self.patch_size) <= 0:
+            raise ValueError(f"Invalid {self.patch_size=}. Must be > 0.")
+
+        latent_height = int(batch.height) // int(self.vae_scale_factor)
+        latent_width = int(batch.width) // int(self.vae_scale_factor)
+        if latent_height <= 0 or latent_width <= 0:
+            raise ValueError(
+                "Invalid latent H/W computed from batch.height/width: "
+                f"{batch.height=} {batch.width=} {self.vae_scale_factor=}"
+            )
+        if (latent_height % int(self.patch_size)) != 0 or (latent_width % int(self.patch_size)) != 0:
+            raise ValueError(
+                "Invalid spatial patching for packed token latents. Expected latent H/W "
+                "to be divisible by patch_size, got "
+                f"{latent_height=} {latent_width=} {self.patch_size=}."
+            )
+
+        post_patch_h = latent_height // int(self.patch_size)
+        post_patch_w = latent_width // int(self.patch_size)
+        tokens_per_frame = int(post_patch_h) * int(post_patch_w)
+        if tokens_per_frame <= 0:
+            raise ValueError(
+                f"Invalid tokens_per_frame={tokens_per_frame} from "
+                f"{latent_height=} {latent_width=} {self.patch_size=}"
+            )
+        if int(seq_len) % int(tokens_per_frame) != 0:
+            raise ValueError(
+                f"LTX-2 token latents seq_len={seq_len} is not divisible by "
+                f"tokens_per_frame={tokens_per_frame}. Cannot time-shard for SP."
+            )
+        latent_num_frames = int(seq_len) // int(tokens_per_frame)
+        return int(latent_num_frames), int(tokens_per_frame)
+
+    def shard_latents_for_sp(self, batch, latents):
+        """Shard LTX-2 packed token latents across SP ranks by latent time (frame) dimension."""
+        sp_world_size = get_sp_world_size()
+        if sp_world_size <= 1:
+            return latents, False
+
+        # Default behavior for 5D latents.
+        if isinstance(latents, torch.Tensor) and latents.ndim == 5:
+            return super().shard_latents_for_sp(batch, latents)
+
+        # LTX-2 packed token latents [B, S, D]
+        if not (isinstance(latents, torch.Tensor) and latents.ndim == 3):
+            return latents, False
+
+        sp_rank = get_sp_parallel_rank()
+        seq_len = int(latents.shape[1])
+        latent_frames, tokens_per_frame = self._infer_video_latent_frames_and_tokens_per_frame(
+            batch, seq_len
+        )
+
+        # Pad whole frames so `latent_frames` is divisible by `sp_world_size`.
+        pad_frames = (sp_world_size - (latent_frames % sp_world_size)) % sp_world_size
+        if pad_frames:
+            pad_tokens = int(pad_frames) * int(tokens_per_frame)
+            pad = torch.zeros(
+                (latents.shape[0], pad_tokens, latents.shape[2]),
+                device=latents.device,
+                dtype=latents.dtype,
+            )
+            latents = torch.cat([latents, pad], dim=1)
+            latent_frames = int(latent_frames) + int(pad_frames)
+
+        local_frames = int(latent_frames) // int(sp_world_size)
+        start_frame = int(sp_rank) * int(local_frames)
+        start = int(start_frame) * int(tokens_per_frame)
+        end = int(start) + int(local_frames) * int(tokens_per_frame)
+        latents = latents[:, start:end, :]
+
+        # Store SP metadata for denoising (TI2V gating) and model-side RoPE shift.
+        batch.sp_video_latent_num_frames = int(local_frames)
+        batch.sp_video_start_frame = int(start_frame)
+        batch.sp_video_tokens_per_frame = int(tokens_per_frame)
+
+        return latents, True
+
+    def gather_latents_for_sp(self, latents):
+        """Gather latents after SP. For packed token latents [B, S_local, D], gather on dim=1."""
+        if get_sp_world_size() <= 1:
+            return latents
+        if isinstance(latents, torch.Tensor) and latents.ndim == 3:
+            return sequence_model_parallel_all_gather(latents.contiguous(), dim=1)
+        return super().gather_latents_for_sp(latents)
 
     def maybe_pack_audio_latents(self, latents, batch_size, batch):
         # Audio latents shape: [B, C, L, M], where L is the latent audio length and M is the number of mel bins

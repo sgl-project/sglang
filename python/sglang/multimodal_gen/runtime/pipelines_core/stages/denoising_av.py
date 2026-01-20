@@ -2,9 +2,18 @@ import copy
 import time
 
 import torch
+import PIL.Image
+from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
+from diffusers.models.modeling_outputs import AutoencoderKLOutput
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
+from sglang.multimodal_gen.runtime.models.vision_utils import (
+    load_image,
+    normalize,
+    numpy_to_pt,
+    pil_to_numpy,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import DenoisingStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
@@ -17,6 +26,7 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
+from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
 logger = init_logger(__name__)
 
@@ -81,6 +91,153 @@ class LTX2AVDenoisingStage(DenoisingStage):
             )
         return latents[:, :orig_s, :].contiguous()
 
+    def _maybe_enable_cache_dit(self, num_inference_steps: int) -> None:
+        """Disable cache-dit for TI2V-style requests (image-conditioned), to avoid stale activations."""
+        if getattr(self, "_disable_cache_dit_for_request", False):
+            return
+        return super()._maybe_enable_cache_dit(num_inference_steps)
+
+    @staticmethod
+    def _resize_center_crop(
+        img: PIL.Image.Image, *, width: int, height: int
+    ) -> PIL.Image.Image:
+        # Resize-to-fill then center-crop (native ltx-pipelines resize_and_center_crop)
+        iw, ih = img.size
+        scale = max(width / float(iw), height / float(ih))
+        rw = int(round(iw * scale))
+        rh = int(round(ih * scale))
+        img = img.resize((rw, rh), resample=PIL.Image.Resampling.LANCZOS)
+        left = (rw - width) // 2
+        top = (rh - height) // 2
+        img = img.crop((left, top, left + width, top + height))
+        return img
+
+    @staticmethod
+    def _pil_to_normed_tensor(img: PIL.Image.Image) -> torch.Tensor:
+        # PIL -> numpy [0,1] -> torch [B,C,H,W], then [-1,1]
+        arr = pil_to_numpy(img)
+        t = numpy_to_pt(arr)
+        return normalize(t)
+
+    @staticmethod
+    def _should_apply_ltx2_ti2v(batch: Req) -> bool:
+        """True if we have an image-latent token prefix to condition with.
+
+        SP note: when token latents are time-sharded, only the rank that owns the
+        *global* first latent frame should apply TI2V conditioning (rank with start_frame==0).
+        """
+        if batch.image_latent is None or int(getattr(batch, "ltx2_num_image_tokens", 0)) <= 0:
+            return False
+        did_sp_shard = bool(getattr(batch, "did_sp_shard_latents", False))
+        if not did_sp_shard:
+            return True
+        return int(getattr(batch, "sp_video_start_frame", 0)) == 0
+
+    def _prepare_ltx2_image_latent(self, batch: Req, server_args: ServerArgs) -> None:
+        """Encode `batch.image_path` into packed token latents for LTX-2 TI2V."""
+        if batch.image_latent is not None and int(getattr(batch, "ltx2_num_image_tokens", 0)) > 0:
+            return
+        batch.ltx2_num_image_tokens = 0
+        batch.image_latent = None
+
+        if batch.image_path is None:
+            return
+        if batch.width is None or batch.height is None:
+            raise ValueError("width/height must be provided for LTX-2 TI2V.")
+        if self.vae is None:
+            raise ValueError("VAE must be provided for LTX-2 TI2V.")
+
+        image_path = (
+            batch.image_path[0] if isinstance(batch.image_path, list) else batch.image_path
+        )
+
+        img = load_image(image_path)
+        img = self._resize_center_crop(img, width=int(batch.width), height=int(batch.height))
+        batch.condition_image = img
+
+        latents_device = (
+            batch.latents.device
+            if isinstance(batch.latents, torch.Tensor)
+            else torch.device("cpu")
+        )
+        image_tensor = self._pil_to_normed_tensor(img).to(latents_device, dtype=torch.float32)
+        # [B, C, H, W] -> [B, C, 1, H, W]
+        video_condition = image_tensor.unsqueeze(2)
+
+        self.vae = self.vae.to(latents_device)
+        vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
+        vae_autocast_enabled = (vae_dtype != torch.float32) and not server_args.disable_autocast
+
+        with torch.autocast(
+            device_type=current_platform.device_type,
+            dtype=vae_dtype,
+            enabled=vae_autocast_enabled,
+        ):
+            try:
+                if server_args.pipeline_config.vae_tiling:
+                    self.vae.enable_tiling()
+            except Exception:
+                pass
+            if not vae_autocast_enabled:
+                video_condition = video_condition.to(vae_dtype)
+
+            latent_dist: DiagonalGaussianDistribution = self.vae.encode(video_condition)
+            if isinstance(latent_dist, AutoencoderKLOutput):
+                latent_dist = latent_dist.latent_dist
+
+        mode = server_args.pipeline_config.vae_config.encode_sample_mode()
+        if mode == "argmax":
+            latent = latent_dist.mode()
+        elif mode == "sample":
+            if batch.generator is None:
+                raise ValueError("Generator must be provided for VAE sampling.")
+            latent = latent_dist.sample(batch.generator)
+        else:
+            raise ValueError(f"Unsupported encode_sample_mode: {mode}")
+
+        # Match the normalized latent space used by this pipeline (inverse of DecodingStage.scale_and_shift).
+        scaling_factor, shift_factor = server_args.pipeline_config.get_decode_scale_and_shift(
+            device=latent.device, dtype=latent.dtype, vae=self.vae
+        )
+        if isinstance(shift_factor, torch.Tensor):
+            shift_factor = shift_factor.to(latent.device)
+        if isinstance(scaling_factor, torch.Tensor):
+            scaling_factor = scaling_factor.to(latent.device)
+        if shift_factor is not None:
+            latent = latent - shift_factor
+        latent = latent * scaling_factor
+
+        packed = server_args.pipeline_config.maybe_pack_latents(latent, latent.shape[0], batch)
+        if not (isinstance(packed, torch.Tensor) and packed.ndim == 3):
+            raise ValueError("Expected packed image latents [B, S0, D].")
+
+        # Fail-fast token count: must match one latent frame's tokens.
+        vae_sf = int(server_args.pipeline_config.vae_scale_factor)
+        patch = int(server_args.pipeline_config.patch_size)
+        latent_h = int(batch.height) // vae_sf
+        latent_w = int(batch.width) // vae_sf
+        expected_tokens = (latent_h // patch) * (latent_w // patch)
+        if int(packed.shape[1]) != int(expected_tokens):
+            raise ValueError(
+                "LTX-2 conditioning token count mismatch: "
+                f"{int(packed.shape[1])=} {int(expected_tokens)=}."
+            )
+
+        batch.image_latent = packed
+        batch.ltx2_num_image_tokens = int(packed.shape[1])
+
+        if batch.debug:
+            logger.info(
+                "LTX2 TI2V conditioning prepared: %d tokens (shape=%s) for %sx%s",
+                batch.ltx2_num_image_tokens,
+                tuple(batch.image_latent.shape),
+                batch.width,
+                batch.height,
+            )
+
+        if server_args.vae_cpu_offload:
+            self.vae = self.vae.to("cpu")
+
     @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         """
@@ -93,6 +250,9 @@ class LTX2AVDenoisingStage(DenoisingStage):
         Returns:
             The batch with denoised latents.
         """
+        # Disable cache-dit for image-conditioned requests (TI2V-style) for correctness/debuggability.
+        self._disable_cache_dit_for_request = batch.image_path is not None
+
         # Prepare variables for the denoising loop
 
         prepared_vars = self._prepare_denoising_loop(batch, server_args)
@@ -114,6 +274,9 @@ class LTX2AVDenoisingStage(DenoisingStage):
 
         audio_latents = batch.audio_latents
         audio_scheduler = copy.deepcopy(self.scheduler)
+
+        # Prepare TI2V conditioning once (encode image -> patchify tokens).
+        self._prepare_ltx2_image_latent(batch, server_args)
 
         # For LTX-2 packed token latents, SP sharding happens on the time dimension
         # (frames). The model must see local latent frames (RoPE offset is applied
@@ -138,6 +301,28 @@ class LTX2AVDenoisingStage(DenoisingStage):
         audio_scheduler.set_begin_index(0)
         timesteps_cpu = timesteps.cpu()
         num_timesteps = timesteps_cpu.shape[0]
+
+        do_ti2v = self._should_apply_ltx2_ti2v(batch)
+        num_img_tokens = int(getattr(batch, "ltx2_num_image_tokens", 0))
+        denoise_mask = None
+        clean_latent = None
+        if do_ti2v:
+            if not (isinstance(latents, torch.Tensor) and latents.ndim == 3):
+                raise ValueError("LTX-2 TI2V expects packed token latents [B, S, D].")
+            latents[:, :num_img_tokens, :] = batch.image_latent[:, :num_img_tokens, :].to(
+                device=latents.device, dtype=latents.dtype
+            )
+            denoise_mask = torch.ones(
+                (latents.shape[0], latents.shape[1], 1),
+                device=latents.device,
+                dtype=torch.float32,
+            )
+            denoise_mask[:, :num_img_tokens, :] = 0.0
+            clean_latent = latents.detach().clone()
+            clean_latent[:, :num_img_tokens, :] = batch.image_latent[:, :num_img_tokens, :].to(
+                device=latents.device, dtype=latents.dtype
+            )
+
         with torch.autocast(
             device_type=current_platform.device_type,
             dtype=target_dtype,
@@ -162,114 +347,64 @@ class LTX2AVDenoisingStage(DenoisingStage):
                             )
                         )
 
-                        # Expand latents for I2V
-                        latent_model_input = latents.to(target_dtype)
-                        if batch.image_latent is not None:
-                            assert (
-                                not server_args.pipeline_config.task_type
-                                == ModelTaskType.TI2V
-                            ), "image latents should not be provided for TI2V task"
-                            latent_model_input = torch.cat(
-                                [latent_model_input, batch.image_latent], dim=1
-                            ).to(target_dtype)
-
                         # Predict noise residual
                         attn_metadata = self._build_attn_metadata(i, batch, server_args)
 
-                        # Custom LTX-2 prediction logic handling both video and audio
-                        # We try to follow the structure of _predict_noise_with_cfg in base class
-                        # but adapted for AV inputs/outputs.
-
-                        # 1. Expand inputs for CFG
-                        # NOTE: Base class _predict_noise_with_cfg does NOT concatenate inputs for CFG serial execution,
-                        # it runs two forward passes (cond and uncond) sequentially to save memory.
-                        # However, Diffusers LTX-2 implementation concatenates them [uncond, cond] and runs one pass.
-                        # To align with Diffusers behavior for LTX-2 (which might rely on joint batch norm statistics or similar,
-                        # though usually DiTs don't), we stick to concatenation if that's what Diffusers does.
-                        # Diffusers LTXPipeline L882: torch.cat([latent_model_input] * 2) if do_classifier_free_guidance
-                        # and then passes it to the model.
+                        # === LTX-2 sigma-space Euler step (flow matching) ===
+                        # Use scheduler-generated sigmas (includes terminal sigma=0).
+                        sigmas = getattr(self.scheduler, "sigmas", None)
+                        if sigmas is None or not isinstance(sigmas, torch.Tensor):
+                            raise ValueError("Expected scheduler.sigmas to be a tensor for LTX-2.")
+                        sigma = sigmas[i].to(device=latents.device, dtype=torch.float32)
+                        sigma_next = sigmas[i + 1].to(device=latents.device, dtype=torch.float32)
+                        dt = sigma_next - sigma
 
                         latent_model_input = latents.to(target_dtype)
                         audio_latent_model_input = audio_latents.to(target_dtype)
 
-                        # Re-calculate coordinates and dimensions
                         latent_num_frames = latent_num_frames_for_model
 
                         # Audio latent dims
                         if audio_latent_model_input.ndim == 3:
-                            audio_num_frames_latent = int(
-                                audio_latent_model_input.shape[1]
-                            )
+                            audio_num_frames_latent = int(audio_latent_model_input.shape[1])
                         elif audio_latent_model_input.ndim == 4:
-                            audio_num_frames_latent = int(
-                                audio_latent_model_input.shape[2]
-                            )
+                            audio_num_frames_latent = int(audio_latent_model_input.shape[2])
                         else:
                             raise ValueError(
                                 f"Unexpected audio latents rank: {audio_latent_model_input.ndim}, shape={tuple(audio_latent_model_input.shape)}"
                             )
 
-                        # LTX-2 model handles coordinate generation internally via forward_from_grid
-                        # if coords are not provided.
+                        # LTX-2 model can generate coords internally.
                         video_coords = None
                         audio_coords = None
 
-                        timestep_expand = t_device.expand(
-                            latent_model_input.shape[0]
-                            * (2 if batch.do_classifier_free_guidance else 1)
+                        # Native ltx-core uses timesteps scaled by 1000.
+                        if do_ti2v and denoise_mask is not None:
+                            timestep_video = (sigma * 1000.0) * denoise_mask.squeeze(-1)
+                        else:
+                            timestep_video = (sigma * 1000.0).expand(latent_model_input.shape[0], 1)
+
+                        # Audio timesteps are not masked; expand to audio token length.
+                        timestep_audio = (sigma * 1000.0).expand(
+                            int(audio_latent_model_input.shape[0]),
+                            int(audio_latent_model_input.shape[1]),
                         )
 
-                        # Prepare conditions
+                        # Conditions
                         encoder_hidden_states = batch.prompt_embeds[0]
                         audio_encoder_hidden_states = batch.audio_prompt_embeds[0]
                         encoder_attention_mask = batch.prompt_attention_mask
 
-                        if batch.do_classifier_free_guidance:
-                            # Concatenate for single forward pass (Diffusers style)
-                            latent_model_input = torch.cat([latent_model_input] * 2)
-                            latent_model_input = self.scheduler.scale_model_input(
-                                latent_model_input, t_device
-                            )
-
-                            audio_latent_model_input = torch.cat(
-                                [audio_latent_model_input] * 2
-                            )
-
-                            neg_encoder_hidden_states = batch.negative_prompt_embeds[0]
-                            neg_audio_encoder_hidden_states = (
-                                batch.negative_audio_prompt_embeds[0]
-                            )
-                            neg_encoder_attention_mask = batch.negative_attention_mask
-
-                            # Order: [Negative, Positive] to match Diffusers [uncond, cond] usually?
-                            # Diffusers: prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
-                            # So yes, Negative first.
-                            encoder_hidden_states = torch.cat(
-                                [neg_encoder_hidden_states, encoder_hidden_states]
-                            )
-                            audio_encoder_hidden_states = torch.cat(
-                                [
-                                    neg_audio_encoder_hidden_states,
-                                    audio_encoder_hidden_states,
-                                ]
-                            )
-                            encoder_attention_mask = torch.cat(
-                                [neg_encoder_attention_mask, encoder_attention_mask]
-                            )
-                        else:
-                            latent_model_input = self.scheduler.scale_model_input(
-                                latent_model_input, t_device
-                            )
-
-                        with set_forward_context(
-                            current_timestep=i, attn_metadata=attn_metadata
-                        ):
-                            noise_pred_video, noise_pred_audio = current_model(
+                        # Follow ltx-pipelines structure: separate pos/neg forward passes,
+                        # then apply CFG on denoised (x0) predictions.
+                        with set_forward_context(current_timestep=i, attn_metadata=attn_metadata):
+                            v_pos, a_v_pos = current_model(
                                 hidden_states=latent_model_input,
                                 audio_hidden_states=audio_latent_model_input,
                                 encoder_hidden_states=encoder_hidden_states,
                                 audio_encoder_hidden_states=audio_encoder_hidden_states,
-                                timestep=timestep_expand,
+                                timestep=timestep_video,
+                                audio_timestep=timestep_audio,
                                 encoder_attention_mask=encoder_attention_mask,
                                 audio_encoder_attention_mask=encoder_attention_mask,
                                 num_frames=latent_num_frames,
@@ -283,64 +418,79 @@ class LTX2AVDenoisingStage(DenoisingStage):
                                 return_dict=False,
                             )
 
-                        noise_pred_video = noise_pred_video.float()
-                        noise_pred_audio = noise_pred_audio.float()
+                            if batch.do_classifier_free_guidance:
+                                neg_encoder_hidden_states = batch.negative_prompt_embeds[0]
+                                neg_audio_encoder_hidden_states = batch.negative_audio_prompt_embeds[0]
+                                neg_encoder_attention_mask = batch.negative_attention_mask
 
-                        # CFG Split and Combine
-                        if batch.do_classifier_free_guidance:
-                            noise_pred_video_uncond, noise_pred_video_text = (
-                                noise_pred_video.chunk(2)
-                            )
-                            noise_pred_video = (
-                                noise_pred_video_uncond
-                                + batch.guidance_scale
-                                * (noise_pred_video_text - noise_pred_video_uncond)
-                            )
-
-                            noise_pred_audio_uncond, noise_pred_audio_text = (
-                                noise_pred_audio.chunk(2)
-                            )
-                            noise_pred_audio = (
-                                noise_pred_audio_uncond
-                                + batch.guidance_scale
-                                * (noise_pred_audio_text - noise_pred_audio_uncond)
-                            )
-
-                            if getattr(batch, "guidance_rescale", 0.0) > 0.0:
-                                noise_pred_video = self.rescale_noise_cfg(
-                                    noise_pred_video,
-                                    noise_pred_video_text,
-                                    guidance_rescale=batch.guidance_rescale,
+                                v_neg, a_v_neg = current_model(
+                                    hidden_states=latent_model_input,
+                                    audio_hidden_states=audio_latent_model_input,
+                                    encoder_hidden_states=neg_encoder_hidden_states,
+                                    audio_encoder_hidden_states=neg_audio_encoder_hidden_states,
+                                    timestep=timestep_video,
+                                    audio_timestep=timestep_audio,
+                                    encoder_attention_mask=neg_encoder_attention_mask,
+                                    audio_encoder_attention_mask=neg_encoder_attention_mask,
+                                    num_frames=latent_num_frames,
+                                    height=latent_height,
+                                    width=latent_width,
+                                    fps=batch.frame_rate,
+                                    audio_num_frames=audio_num_frames_latent,
+                                    video_coords=video_coords,
+                                    audio_coords=audio_coords,
+                                    return_latents=False,
+                                    return_dict=False,
                                 )
-                                noise_pred_audio = self.rescale_noise_cfg(
-                                    noise_pred_audio,
-                                    noise_pred_audio_text,
-                                    guidance_rescale=batch.guidance_rescale,
-                                )
+                            else:
+                                v_neg = None
+                                a_v_neg = None
 
-                        noise_pred = noise_pred_video  # For compatibility with step() logic below if we only update video there
-                        # But we need to update both.
+                        v_pos = v_pos.float()
+                        a_v_pos = a_v_pos.float()
+                        if v_neg is not None:
+                            v_neg = v_neg.float()
+                        if a_v_neg is not None:
+                            a_v_neg = a_v_neg.float()
 
-                        # Compute the previous noisy sample
-                        latents = self.scheduler.step(
-                            model_output=noise_pred_video,
-                            timestep=t_device,
-                            sample=latents,
-                            **extra_step_kwargs,
-                            return_dict=False,
-                        )[0]
+                        # Velocity -> denoised (x0): x0 = x - sigma * v
+                        sigma_val = float(sigma.item())
+                        denoised_video = latents.float() - sigma_val * v_pos
+                        denoised_audio = audio_latents.float() - sigma_val * a_v_pos
 
-                        # Audio denoising step
-                        # NOTE: for now duplicate scheduler for audio latents in case self.scheduler sets internal state in
-                        # the step method (such as _step_index)
-                        if audio_latents is not None:
-                            audio_latents = audio_scheduler.step(
-                                model_output=noise_pred_audio,
-                                timestep=t_device,
-                                sample=audio_latents,
-                                **extra_step_kwargs,
-                                return_dict=False,
-                            )[0]
+                        if batch.do_classifier_free_guidance and v_neg is not None and a_v_neg is not None:
+                            denoised_video_neg = latents.float() - sigma_val * v_neg
+                            denoised_audio_neg = audio_latents.float() - sigma_val * a_v_neg
+                            denoised_video = denoised_video + (batch.guidance_scale - 1.0) * (
+                                denoised_video - denoised_video_neg
+                            )
+                            denoised_audio = denoised_audio + (batch.guidance_scale - 1.0) * (
+                                denoised_audio - denoised_audio_neg
+                            )
+
+                        # Apply conditioning mask (keep conditioned tokens clean).
+                        if do_ti2v and denoise_mask is not None and clean_latent is not None:
+                            denoised_video = (
+                                denoised_video * denoise_mask
+                                + clean_latent.float() * (1.0 - denoise_mask)
+                            )
+
+                        # Euler step in sigma space: x_next = x + (sigma_next - sigma) * v,
+                        # where v = (x - x0) / sigma.
+                        if sigma_val == 0.0:
+                            v_video = torch.zeros_like(denoised_video)
+                            v_audio = torch.zeros_like(denoised_audio)
+                        else:
+                            v_video = (latents.float() - denoised_video) / sigma_val
+                            v_audio = (audio_latents.float() - denoised_audio) / sigma_val
+
+                        latents = (latents.float() + v_video * dt).to(dtype=latents.dtype)
+                        audio_latents = (audio_latents.float() + v_audio * dt).to(dtype=audio_latents.dtype)
+
+                        if do_ti2v:
+                            latents[:, :num_img_tokens, :] = batch.image_latent[:, :num_img_tokens, :].to(
+                                device=latents.device, dtype=latents.dtype
+                            )
 
                         latents = self.post_forward_for_ti2v_task(
                             batch, server_args, reserved_frames_mask, latents, z
