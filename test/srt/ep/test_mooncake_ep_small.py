@@ -10,6 +10,7 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    is_in_ci,
     popen_launch_server,
 )
 
@@ -96,6 +97,7 @@ class TestPureDP(TestTP):
         os.system(f"pkill -f {self.pkill_process_1}")
         super().test_gsm8k()
 
+    @unittest.skipIf(is_in_ci(), "To reduce the CI execution time.")
     def test_gsm8k_fault_2(self):
         """
         Kill another rank and the system should remain operational.
@@ -104,6 +106,7 @@ class TestPureDP(TestTP):
         super().test_gsm8k()
 
 
+@unittest.skipIf(is_in_ci(), "To reduce the CI execution time.")
 class TestHybridDPTP(TestPureDP):
     extra_args = [
         "--enable-dp-attention",
