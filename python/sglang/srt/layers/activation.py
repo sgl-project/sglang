@@ -149,6 +149,9 @@ class NewGELU(MultiPlatformOp):
         # TODO: Implement the CUDA kernel for NewGELU in sgl-kernel
         return self.forward_native(x)
 
+    def forward_npu(self, x: torch.Tensor) -> torch.Tensor:
+        return self.forward_native(x)
+
 
 class ReLU2(nn.Module):
     """
