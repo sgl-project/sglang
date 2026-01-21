@@ -472,6 +472,11 @@ def main() -> int:
 
     parser.add_argument("--baseline-sglang-dir", type=str, default="")
     parser.add_argument(
+        "--skip-baseline",
+        action="store_true",
+        help="Skip baseline runs even if --baseline-sglang-dir is provided.",
+    )
+    parser.add_argument(
         "--waterfill-sglang-dir",
         type=str,
         default="",
@@ -554,7 +559,7 @@ def main() -> int:
 
     repo_root = Path(__file__).resolve().parents[2]
     waterfill_dir = args.waterfill_sglang_dir or str(repo_root)
-    baseline_dir = args.baseline_sglang_dir
+    baseline_dir = "" if args.skip_baseline else args.baseline_sglang_dir
 
     if not args.model_path:
         raise ValueError(
@@ -655,9 +660,9 @@ def main() -> int:
             finally:
                 stop_server(p, f)
 
+        _run_accuracy_mode("waterfill", waterfill_dir, enable_waterfill=True)
         if baseline_dir:
             _run_accuracy_mode("baseline", baseline_dir, enable_waterfill=False)
-        _run_accuracy_mode("waterfill", waterfill_dir, enable_waterfill=True)
 
     # ---------------- Serving benchmark ----------------
     if not args.skip_serving:
@@ -726,9 +731,9 @@ def main() -> int:
             finally:
                 stop_server(p, f)
 
+        _run_serving_mode("waterfill", waterfill_dir, enable_waterfill=True)
         if baseline_dir:
             _run_serving_mode("baseline", baseline_dir, enable_waterfill=False)
-        _run_serving_mode("waterfill", waterfill_dir, enable_waterfill=True)
 
     # ---------------- Torch profiler ----------------
     if args.run_torch_profile:
@@ -820,9 +825,9 @@ def main() -> int:
             finally:
                 stop_server(p, f)
 
+        _run_torch_profile_mode("waterfill", waterfill_dir, enable_waterfill=True)
         if baseline_dir:
             _run_torch_profile_mode("baseline", baseline_dir, enable_waterfill=False)
-        _run_torch_profile_mode("waterfill", waterfill_dir, enable_waterfill=True)
 
     out_path = os.path.join(out_dir, "summary.json")
     with open(out_path, "w", encoding="utf-8") as f:

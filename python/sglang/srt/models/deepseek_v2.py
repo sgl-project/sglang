@@ -1314,10 +1314,176 @@ class DeepseekV2MoE(nn.Module):
                 hidden_states,
                 router_logits,
                 num_token_non_padded=forward_batch.num_token_non_padded,
-                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                    layer_id=self.layer_id,
+                expert_location_dispatch_info=(
+                    dispatch_info := ExpertLocationDispatchInfo.init_new(
+                        layer_id=self.layer_id
+                    )
                 ),
             )
+
+            # ---------------- Debug-only: per-rank (shared+routed) totals before/after EPLB ----------------
+            # Enable via env var:
+            #   SGLANG_DEBUG_WATERFILL_EPLB=1
+            #
+            # Optional:
+            #   SGLANG_DEBUG_WATERFILL_EPLB_LAYER=<layer_id|all|-1>   (default: only layer 0)
+            #   SGLANG_DEBUG_WATERFILL_EPLB_MAX_PRINTS=<N>            (default: 1)
+            #   SGLANG_DEBUG_WATERFILL_EPLB_MIN_TOKENS=<N>            (default: MIN_BATCH_FOR_BALANCE)
+            #
+            # This baseline path prints:
+            # - stage=pre_eplb:  (routed pre-EPLB + shared local)
+            # - stage=post_eplb: (routed post-EPLB + shared local)
+            debug_waterfill_eplb = os.environ.get(
+                "SGLANG_DEBUG_WATERFILL_EPLB", ""
+            ) not in (
+                "",
+                "0",
+                "false",
+                "False",
+            )
+            if debug_waterfill_eplb and not torch.cuda.is_current_stream_capturing():
+                layer_filter = os.environ.get("SGLANG_DEBUG_WATERFILL_EPLB_LAYER", "")
+                if layer_filter and layer_filter not in ("all", "-1"):
+                    try:
+                        debug_waterfill_eplb = int(layer_filter) == int(self.layer_id)
+                    except Exception:
+                        debug_waterfill_eplb = False
+                else:
+                    # Default: only layer 0 to avoid log spam.
+                    if not layer_filter:
+                        debug_waterfill_eplb = int(self.layer_id) == 0
+            else:
+                debug_waterfill_eplb = False
+
+            if debug_waterfill_eplb:
+                max_prints = int(
+                    os.environ.get("SGLANG_DEBUG_WATERFILL_EPLB_MAX_PRINTS", "1")
+                )
+                printed = getattr(self, "_debug_waterfill_eplb_print_count", 0)
+                debug_waterfill_eplb = printed < max_prints
+
+            if debug_waterfill_eplb:
+                # Avoid printing on tiny warmups / decode-only steps by default.
+                min_tokens_to_print = int(
+                    os.environ.get(
+                        "SGLANG_DEBUG_WATERFILL_EPLB_MIN_TOKENS",
+                        # Keep default aligned with waterfill balancer when available.
+                        str(
+                            getattr(
+                                getattr(self, "deepep_waterfill_balancer", None),
+                                "MIN_BATCH_FOR_BALANCE",
+                                0,
+                            )
+                        ),
+                    )
+                )
+                debug_waterfill_eplb = hidden_states.shape[0] >= min_tokens_to_print
+
+            if debug_waterfill_eplb:
+                from sglang.srt.distributed import get_moe_ep_group
+
+                group = get_moe_ep_group().device_group
+                ep_rank = torch.distributed.get_rank(group=group)
+                ep_world = torch.distributed.get_world_size(group=group)
+                device = hidden_states.device
+
+                # Shared expert tokens are local before waterfill (1 per valid token).
+                num_tokens_local = hidden_states.shape[0]
+                num_token_non_padded_cpu = getattr(
+                    forward_batch, "num_token_non_padded_cpu", None
+                )
+                num_tokens_for_count = (
+                    int(num_token_non_padded_cpu)
+                    if (
+                        num_token_non_padded_cpu is not None
+                        and isinstance(num_token_non_padded_cpu, int)
+                        and num_token_non_padded_cpu < num_tokens_local
+                    )
+                    else int(num_tokens_local)
+                )
+                local_num_tokens = torch.tensor(
+                    [num_tokens_for_count], device=device, dtype=torch.int64
+                )
+                gather_list = [
+                    torch.empty_like(local_num_tokens) for _ in range(ep_world)
+                ]
+                torch.distributed.all_gather(gather_list, local_num_tokens, group=group)
+                local_tokens_per_rank = torch.cat(gather_list).to(
+                    torch.int64
+                )  # (ep_world,)
+
+                # Routed tokens post-EPLB (physical expert-id space)
+                topk_ids = topk_output.topk_ids.to(torch.int64)
+                valid_topk = topk_ids >= 0
+                num_physical_experts = (
+                    int(dispatch_info.num_physical_experts)
+                    if dispatch_info is not None
+                    else int(self.config.n_routed_experts)
+                )
+                phys_epr = max(num_physical_experts // ep_world, 1)
+                routed_rank = torch.div(topk_ids, phys_epr, rounding_mode="floor")
+                routed_rank_valid = routed_rank[valid_topk].to(torch.int64)
+                local_routed_counts_post = torch.bincount(
+                    routed_rank_valid, minlength=ep_world
+                ).to(torch.int64)
+                routed_counts_post = local_routed_counts_post.clone()
+                torch.distributed.all_reduce(
+                    routed_counts_post,
+                    op=torch.distributed.ReduceOp.SUM,
+                    group=group,
+                )
+
+                # Routed tokens pre-EPLB (logical expert-id space)
+                if dispatch_info is not None:
+                    topk_output_logical = self.topk(
+                        hidden_states,
+                        router_logits,
+                        num_token_non_padded=forward_batch.num_token_non_padded,
+                        expert_location_dispatch_info=None,
+                    )
+                    logical_ids = topk_output_logical.topk_ids.to(torch.int64)
+                    valid_logical = logical_ids >= 0
+                    num_logical_experts = int(self.config.n_routed_experts)
+                    logical_epr = max(
+                        (num_logical_experts + ep_world - 1) // ep_world, 1
+                    )
+                    logical_rank = torch.div(
+                        logical_ids, logical_epr, rounding_mode="floor"
+                    )
+                    logical_rank_valid = logical_rank[valid_logical].to(torch.int64)
+                    local_routed_counts_pre = torch.bincount(
+                        logical_rank_valid, minlength=ep_world
+                    ).to(torch.int64)
+                    routed_counts_pre = local_routed_counts_pre.clone()
+                    torch.distributed.all_reduce(
+                        routed_counts_pre,
+                        op=torch.distributed.ReduceOp.SUM,
+                        group=group,
+                    )
+                else:
+                    routed_counts_pre = routed_counts_post
+
+                total_pre_eplb = routed_counts_pre + local_tokens_per_rank
+                total_post_eplb = routed_counts_post + local_tokens_per_rank
+
+                def _print_total(stage: str, total: torch.Tensor) -> None:
+                    t_this = int(total[ep_rank].item())
+                    t_max = int(total.max().item())
+                    t_avg = float(total.float().mean().item())
+                    imbal = (float(t_max) / t_avg) if t_avg > 0 else 0.0
+                    print(
+                        (
+                            f"[deepep_eplb_load] mode=baseline layer={self.layer_id} "
+                            f"ep_rank={ep_rank}/{ep_world} stage={stage} "
+                            f"total={t_this} max={t_max} avg={t_avg:.2f} "
+                            f"imbal={imbal:.3f}x"
+                        ),
+                        flush=True,
+                    )
+
+                _print_total("pre_eplb", total_pre_eplb)
+                _print_total("post_eplb", total_post_eplb)
+                self._debug_waterfill_eplb_print_count = printed + 1
         else:
             topk_output = self.topk.empty_topk_output(hidden_states.device)
 
@@ -1517,7 +1683,7 @@ class DeepseekV2MoE(nn.Module):
             )
         )
 
-        # ---------------- Debug-only: validate EPLB+Waterfill shared destination ----------------
+        # ---------------- Debug-only: EPLB load logs + validate Waterfill shared destination ----------------
         # Enable via env var:
         #   SGLANG_DEBUG_WATERFILL_EPLB=1
         #
@@ -1526,12 +1692,11 @@ class DeepseekV2MoE(nn.Module):
         #   SGLANG_DEBUG_WATERFILL_EPLB_MAX_PRINTS=<N>            (default: 1)
         #   SGLANG_DEBUG_WATERFILL_EPLB_VALIDATE_MAX_TOKENS=<N>   (default: 4096)
         #
-        # Each EP rank prints a single line (up to MAX_PRINTS) including:
-        # - routed tokens per rank (global_routed_counts)
-        # - shared tokens per rank BEFORE waterfill (local num_tokens per rank)
-        # - shared tokens per rank AFTER waterfill (derived from expanded_topk_ids[:, -1])
-        # - total token load per rank BEFORE vs AFTER: routed + shared
-        # - validation failures count (shared dest rank must be local or among routed ranks)
+        # Each EP rank prints:
+        # - stage=pre_eplb:     (routed pre-EPLB + shared local)
+        # - stage=post_eplb:    (routed post-EPLB + shared local)
+        # - stage=post_waterfill: (routed post-EPLB + shared after waterfill)
+        # Plus validation failures count on stage=post_waterfill.
         debug_waterfill_eplb = os.environ.get(
             "SGLANG_DEBUG_WATERFILL_EPLB", ""
         ) not in (
@@ -1578,14 +1743,53 @@ class DeepseekV2MoE(nn.Module):
             ep_world = torch.distributed.get_world_size(group=group)
 
             # (1) Per-rank local token counts (shared expert local BEFORE waterfill)
+            num_tokens_for_count = (
+                int(num_token_non_padded_cpu)
+                if (
+                    num_token_non_padded_cpu is not None
+                    and isinstance(num_token_non_padded_cpu, int)
+                    and num_token_non_padded_cpu < num_tokens
+                )
+                else int(num_tokens)
+            )
             local_num_tokens = torch.tensor(
-                [num_tokens], device=device, dtype=torch.int64
+                [num_tokens_for_count], device=device, dtype=torch.int64
             )
             gather_list = [torch.empty_like(local_num_tokens) for _ in range(ep_world)]
             torch.distributed.all_gather(gather_list, local_num_tokens, group=group)
             local_tokens_per_rank = torch.cat(gather_list).to(
                 torch.int64
             )  # (ep_world,)
+
+            # (1.5) Routed tokens per rank BEFORE EPLB (logical expert-id space)
+            dispatch_info = ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
+            if dispatch_info is not None:
+                topk_output_logical = self.topk(
+                    hidden_states,
+                    router_logits,
+                    num_token_non_padded=num_token_non_padded,
+                    expert_location_dispatch_info=None,
+                )
+                logical_ids = topk_output_logical.topk_ids.to(torch.int64)
+                valid_logical = logical_ids >= 0
+                num_logical_experts = int(self.config.n_routed_experts)
+                logical_epr = max((num_logical_experts + ep_world - 1) // ep_world, 1)
+                logical_rank = torch.div(
+                    logical_ids, logical_epr, rounding_mode="floor"
+                )
+                logical_rank_valid = logical_rank[valid_logical].to(torch.int64)
+                local_routed_counts_pre = torch.bincount(
+                    logical_rank_valid,
+                    minlength=ep_world,
+                ).to(torch.int64)
+                routed_counts_pre = local_routed_counts_pre.clone()
+                torch.distributed.all_reduce(
+                    routed_counts_pre,
+                    op=torch.distributed.ReduceOp.SUM,
+                    group=group,
+                )
+            else:
+                routed_counts_pre = global_routed_counts.to(torch.int64)
 
             # (2) Shared expert tokens assigned per rank AFTER waterfill
             shared_ids = expanded_topk_ids[:, -1].to(torch.int64)
@@ -1607,9 +1811,10 @@ class DeepseekV2MoE(nn.Module):
                 group=group,
             )
 
-            routed_counts = global_routed_counts.to(torch.int64)
-            total_before = routed_counts + local_tokens_per_rank
-            total_after = routed_counts + shared_counts_after
+            routed_counts_post = global_routed_counts.to(torch.int64)
+            total_pre_eplb = routed_counts_pre + local_tokens_per_rank
+            total_post_eplb = routed_counts_post + local_tokens_per_rank
+            total_post_waterfill = routed_counts_post + shared_counts_after
 
             # (3) Validation: shared id encoding + dest membership (local tokens only)
             validate_max_tokens = int(
@@ -1645,37 +1850,27 @@ class DeepseekV2MoE(nn.Module):
             else:
                 bad_count = 0
 
-            # Per-rank values for this EP rank
-            routed_this = int(routed_counts[ep_rank].item())
-            shared_before_this = int(local_tokens_per_rank[ep_rank].item())
-            shared_after_this = int(shared_counts_after[ep_rank].item())
-            total_before_this = int(total_before[ep_rank].item())
-            total_after_this = int(total_after[ep_rank].item())
+            def _print_total(stage: str, total: torch.Tensor, extra: str = "") -> None:
+                t_this = int(total[ep_rank].item())
+                t_max = int(total.max().item())
+                t_avg = float(total.float().mean().item())
+                imbal = (float(t_max) / t_avg) if t_avg > 0 else 0.0
+                msg = (
+                    f"[deepep_eplb_load] mode=waterfill layer={self.layer_id} "
+                    f"ep_rank={ep_rank}/{ep_world} stage={stage} "
+                    f"total={t_this} max={t_max} avg={t_avg:.2f} "
+                    f"imbal={imbal:.3f}x"
+                )
+                if extra:
+                    msg = f"{msg} {extra}"
+                print(msg, flush=True)
 
-            # Global stats (same on every rank)
-            tb_min = int(total_before.min().item())
-            tb_max = int(total_before.max().item())
-            tb_avg = float(total_before.float().mean().item())
-            ta_min = int(total_after.min().item())
-            ta_max = int(total_after.max().item())
-            ta_avg = float(total_after.float().mean().item())
-            tb_imbal = (float(tb_max) / tb_avg) if tb_avg > 0 else 0.0
-            ta_imbal = (float(ta_max) / ta_avg) if ta_avg > 0 else 0.0
-
-            print(
-                (
-                    f"[waterfill_eplb_debug] layer={self.layer_id} "
-                    f"ep_rank={ep_rank}/{ep_world} num_tokens_local={num_tokens} "
-                    f"routed={routed_this} shared_before={shared_before_this} "
-                    f"shared_after={shared_after_this} total_before={total_before_this} "
-                    f"total_after={total_after_this} "
-                    f"before(min={tb_min} avg={tb_avg:.2f} max={tb_max} "
-                    f"imbal={tb_imbal:.3f}x) "
-                    f"after(min={ta_min} avg={ta_avg:.2f} max={ta_max} "
-                    f"imbal={ta_imbal:.3f}x) "
-                    f"bad_tokens={bad_count}/{n_check}"
-                ),
-                flush=True,
+            _print_total("pre_eplb", total_pre_eplb)
+            _print_total("post_eplb", total_post_eplb)
+            _print_total(
+                "post_waterfill",
+                total_post_waterfill,
+                extra=f"bad_tokens={bad_count}/{n_check}",
             )
 
             self._debug_waterfill_eplb_print_count = printed + 1
