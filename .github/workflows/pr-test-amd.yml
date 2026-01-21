@@ -933,8 +933,8 @@ jobs:
     steps:
       - name: Find RDMA in CI Runner
         run: |
-          set +e  
-          
+          set +e
+
           echo ""
           echo "=== 1. libibverbs provider configs ==="
           find /etc -name "*.driver" 2>/dev/null || true
@@ -1068,7 +1068,7 @@ jobs:
             else
               mknod /dev/infiniband/rdma_cm c 10 113 || true
             fi
-            
+
             chmod 666 /dev/infiniband/*
 
             echo "=== Verification ==="
