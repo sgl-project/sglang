@@ -2,10 +2,6 @@
 requires = ["setuptools>=61.0", "setuptools-scm>=8.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
-[[tool.uv.index]]
-name = "torch"
-url = "https://download.pytorch.org/whl/cu129"
-
 [project]
 name = "sglang"
 dynamic = ["version"]
@@ -84,8 +80,16 @@ dependencies = [
   "grpcio-health-checking==1.75.1", # required for Kubernetes gRPC health probes
 ]
 
+[[tool.uv.index]]
+name = "torch-cu129"
+url = "https://download.pytorch.org/whl/cu129"
+explicit = true
+
 [tool.uv.sources]
-torch = { index = "torch" }
+torch = [
+  { marker = "platform_machine == 'x86_64'"},
+  { index = "torch-cu129", marker = "platform_machine == 'aarch64'" },
+]
 
 [project.optional-dependencies]
 checkpoint-engine = ["checkpoint-engine==0.1.2"]
