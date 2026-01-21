@@ -132,10 +132,7 @@ class MetadataBuffers:
             self.output_hidden_states = torch.zeros(
                 (size, hidden_size), dtype=hidden_states_dtype, device=device
             )
-
             # Request validation: store bootstrap_room to detect metadata corruption
-            # Padded to 64 bytes for RDMA efficiency (8 int64s = 64 bytes)
-            # Only index 0 is used for bootstrap_room, rest is padding
             self.bootstrap_rooms = torch.zeros((size, 8), dtype=torch.int64, device=device)
 
     def get_buf_infos(self):
@@ -192,11 +189,6 @@ class MetadataBuffers:
         )
 
     def set_buf(self, req: Req):
-        # Store bootstrap_room for validation on decode side
-        # Use 0 as sentinel if bootstrap_room is None (shouldn't happen in disagg mode)
-        bootstrap_room_value = req.bootstrap_room if req.bootstrap_room is not None else 0
-        self.bootstrap_rooms[req.metadata_buffer_index, 0] = bootstrap_room_value
-
         self.output_ids[req.metadata_buffer_index][0] = req.output_ids[0]
         self.cached_tokens[req.metadata_buffer_index][0] = req.cached_tokens
         if req.return_logprob:
@@ -235,6 +227,10 @@ class MetadataBuffers:
             self.output_hidden_states[req.metadata_buffer_index].copy_(
                 req.hidden_states_tensor
             )
+        # Store bootstrap_room for validation on decode side
+        self.bootstrap_rooms[req.metadata_buffer_index, 0] = (
+            req.bootstrap_room if req.bootstrap_room is not None else 0
+        )
 
 
 #########################
