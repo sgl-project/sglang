@@ -161,17 +161,6 @@ class ZImageOmniBeforeDenoisingStage(PipelineStage):
 
         return condition_image, resized_images, (target_height, target_width)
 
-        # batch.height = height
-        # batch.width = width
-
-        # # TODO: hard code debug
-        # # should be condition_images(a list)
-        # # condition_images -> prepare_image_latents
-        # batch.condition_image = condition_image
-        # # # prepare for
-        # # # resized_images -> prepare_siglip_embeds
-        # # batch.resized_images = resized_images
-
     def _prepare_siglip(
         self,
         resized_images: Optional[List[torch.Tensor]],
@@ -187,8 +176,6 @@ class ZImageOmniBeforeDenoisingStage(PipelineStage):
 
         siglip_embeds = []
 
-        # TODO: review?
-        # self.siglip_processor = self.siglip_processor.to(device)
         self.siglip = self.siglip.to(device)
 
         for image in resized_images:
@@ -204,13 +191,7 @@ class ZImageOmniBeforeDenoisingStage(PipelineStage):
             hidden_state = hidden_state.view(shape[0], shape[1], C)
             siglip_embeds.append(hidden_state)
 
-        # siglip_embeds = [siglip_embeds] * batch_size
-        # TODO: 2D list.
-        # where
-        #  len(l) == batch size
-        #  len(l[0]) == image nums
-        # TODO: review why?
-        condition_siglip_embeds = [siglip_embeds.copy() for _ in range(batch_size)]
+        condition_siglip_embeds = [siglip_embeds for _ in range(batch_size)]
 
         # TODO: review
         ## ====================
@@ -219,8 +200,6 @@ class ZImageOmniBeforeDenoisingStage(PipelineStage):
             [se for se in sels] for sels in condition_siglip_embeds
         ]
 
-        # TODO: placeholder and end with None
-        # pad None at the end
         condition_siglip_embeds = [
             None if sels == [] else sels + [None] for sels in condition_siglip_embeds
         ]
@@ -244,8 +223,6 @@ class ZImageOmniBeforeDenoisingStage(PipelineStage):
             pos_latents (tensor)
             neg_latents (tensor)
         """
-        # TODO: hard code debug
-        # do nothing and skip
         if condition_images is None:
             return None, None
 
@@ -261,44 +238,21 @@ class ZImageOmniBeforeDenoisingStage(PipelineStage):
         for image in condition_images:
             image = image.to(device=device, dtype=dtype)
             image_latent = (
-                # TODO: hard code to vae(fp32) dtype. reivew
-                self.vae.encode(image.to(torch.float32)).latent_dist.mode()[0]
+                self.vae.encode(image.to(dtype)).latent_dist.mode()[0]
                 - self.vae.config.shift_factor
             ) * self.vae.config.scaling_factor
             image_latent = image_latent.unsqueeze(1).to(dtype)
             image_latents.append(image_latent)  # (16, 128, 128)
 
-        # image_latents = [image_latents] * batch_size
-        # TODO: review no copy?
-        # num_images_per_prompt * batch_size
-        # a 2d list
-        # dim0 = batch_size
-        # dim1 = num_images
-        # condition_latents = [image_latents.copy() for _ in range(batch_size)]
         condition_latents = [image_latents for _ in range(batch_size)]
-        # TODO: review
-        # casting
         condition_latents = [
             [lat.to(dtype) for lat in lats] for lats in condition_latents
         ]
 
-        # negative_condition_latents = [
-        #     [None for lat in lats] for lats in condition_latents
-        # ]
-        # TODO: review, flag by None
         negative_condition_latents = None
         if do_classifier_free_guidance:
-            # negative_condition_latents = [
-            #     [lat.clone() for lat in batch] for batch in condition_latents
-            # ]
-            # TODO: review, readonly assert?
             negative_condition_latents = condition_latents
 
-        # # TODO: comment usage
-        # # for condition_latents_model_input = condition_latents + negative_condition_latents
-        # # in denoising loop
-        # batch.condition_latents = condition_latents
-        # batch.negative_condition_latents = negative_condition_latents
         return condition_latents, negative_condition_latents
 
     def forward(
