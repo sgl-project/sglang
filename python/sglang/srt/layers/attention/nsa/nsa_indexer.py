@@ -10,11 +10,13 @@ from einops import rearrange
 from sglang.srt.layers.layernorm import LayerNorm
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.utils import add_prefix, ceil_align, is_cuda, is_hip, is_npu
+from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 
 global _use_multi_stream
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
+_is_fp8_fnuz = is_fp8_fnuz()
 if _is_cuda:
     try:
         import deep_gemm
@@ -500,8 +502,10 @@ class Indexer(MultiPlatformOp):
             )
             k_fp8_list.append(k_fp8)
             k_scale_list.append(k_scale)
-
-        k_fp8 = torch.cat(k_fp8_list, dim=0).view(torch.float8_e4m3fn)
+        if _is_fp8_fnuz:
+            k_fp8 = torch.cat(k_fp8_list, dim=0).view(torch.float8_e4m3fnuz)
+        else:
+            k_fp8 = torch.cat(k_fp8_list, dim=0).view(torch.float8_e4m3fn)
         k_scale = torch.cat(k_scale_list, dim=0).view(torch.float32).squeeze(-1)
         kv_fp8 = (k_fp8, k_scale)
         ks, ke = metadata.get_indexer_kvcache_range()
@@ -565,9 +569,9 @@ class Indexer(MultiPlatformOp):
                     from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 
                     kv, scale = kv_fp8
-                    logits = fp8_mqa_logits(
+                    logits_chunk = fp8_mqa_logits(
                         q_fp8[start:end],
-                        kv_fp8,
+                        kv,
                         scale,
                         weights[start:end],
                         ks[start:end],
