@@ -79,9 +79,19 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
     is_cuda,
+    is_npu,
     make_layers,
     use_intel_amx_backend,
 )
+
+if is_npu():
+    from sglang.srt.hardware_backend.npu.cmo import (
+        shared_expert_on_independent_stream,
+        routed_expert_on_independent_stream,
+        wait_share_stream,
+        wait_routed_stream,
+    )
+from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
 
@@ -253,11 +263,21 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         return shared_output
 
     def _forward_deepep(self, hidden_states: torch.Tensor, forward_batch: ForwardBatch):
+        enable_dual_stream = (
+            is_npu()
+            and envs.SGLANG_NPU_USE_MULTI_STREAM.get()
+            and forward_batch.forward_mode.is_decode()
+        )
         shared_output = None
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
             router_logits, _ = self.gate(hidden_states)
-            shared_output = self._forward_shared_experts(hidden_states)
+            if enable_dual_stream:
+                shared_output = shared_expert_on_independent_stream(
+                    hidden_states, self._forward_shared_experts
+                )
+            else:
+                shared_output = self._forward_shared_experts(hidden_states)
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
@@ -268,10 +288,18 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             )
         else:
             topk_output = self.topk.empty_topk_output(hidden_states.device)
-        final_hidden_states = self.experts(
-            hidden_states=hidden_states,
-            topk_output=topk_output,
-        )
+
+        if enable_dual_stream:
+            final_hidden_states = routed_expert_on_independent_stream(
+                hidden_states, topk_output, self.experts
+            )
+            wait_routed_stream()
+            wait_share_stream()
+        else:
+            final_hidden_states = self.experts(
+                hidden_states=hidden_states,
+                topk_output=topk_output,
+            )
 
         if shared_output is not None:
             final_hidden_states.add_(shared_output)

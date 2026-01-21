@@ -49,7 +49,7 @@ wget -O "${BISHENG_NAME}" "${BISHENG_URL}" && chmod a+x "${BISHENG_NAME}" && "./
 
 
 ### Install sgl-kernel-npu
-SGL_KERNEL_NPU_TAG="2025.12.31"
+SGL_KERNEL_NPU_TAG="2026.01.21"
 git clone --depth 1 https://github.com/sgl-project/sgl-kernel-npu.git --branch ${SGL_KERNEL_NPU_TAG}
 (cd sgl-kernel-npu && bash ./build.sh && ${PIP_INSTALL} output/deep_ep*.whl output/sgl_kernel_npu*.whl && cd "$(python3 -m pip show deep-ep | grep -E '^Location:' | awk '{print $2}')" && ln -s deep_ep/deep_ep_cpp*.so)
 
