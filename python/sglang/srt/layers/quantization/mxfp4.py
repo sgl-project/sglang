@@ -300,12 +300,18 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 )
         elif _use_aiter:
             pad_align = 256
-            intermediate_size_per_partition_after_pad = (
-                (intermediate_size_per_partition + pad_align - 1)
-                // pad_align
-                * pad_align
+
+            intermediate_size_per_partition_after_pad = round_up(
+                intermediate_size_per_partition, 256
             )
-            hidden_size = (hidden_size + pad_align - 1) // pad_align * pad_align
+            # intermediate_size_per_partition_after_pad = (
+            #    (intermediate_size_per_partition + pad_align - 1)
+            #    // pad_align
+            #    * pad_align
+            # )
+
+            hidden_size = round_up(hidden_size, 256)
+            # hidden_size = (hidden_size + pad_align - 1) // pad_align * pad_align
             self.hidden_pad = hidden_size - layer.hidden_size
             self.intermediate_pad = (
                 intermediate_size_per_partition_after_pad
@@ -751,44 +757,42 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         if _use_aiter:
             topk_weights, topk_ids, _ = topk_output
 
-        if hasattr(torch, "float4_e2m1fn_x2"):
-            w13_weight = layer.w13_weight.view(torch.float4_e2m1fn_x2)
-            w2_weight = layer.w2_weight.view(torch.float4_e2m1fn_x2)
-        else:
-            w13_weight = layer.w13_weight
-            w2_weight = layer.w2_weight
+            if hasattr(torch, "float4_e2m1fn_x2"):
+                w13_weight = layer.w13_weight.view(torch.float4_e2m1fn_x2)
+                w2_weight = layer.w2_weight.view(torch.float4_e2m1fn_x2)
+            else:
+                w13_weight = layer.w13_weight
+                w2_weight = layer.w2_weight
 
-        origi_hidden_size = self.hidden_size - self.hidden_pad
+            origi_hidden_size = self.hidden_size - self.hidden_pad
 
-        x_quant = x
+            x_quant = x
 
-        x_quant = torch.nn.functional.pad(
-            x_quant,
-            (0, self.hidden_pad),
-            mode="constant",
-            value=0.0,
-        )
+            x_quant = torch.nn.functional.pad(
+                x_quant,
+                (0, self.hidden_pad),
+                mode="constant",
+                value=0.0,
+            )
 
-        # logger.info(f"{origi_hidden_size=} {x_quant.shape=} {w13_weight.shape=} {w2_weight.shape=} {topk_weights.shape=} {topk_ids.shape=} {layer.expert_mask_gpu=} {layer.w13_weight_scale.shape=} {layer.w2_weight_scale.shape=} {self.moe_runner_config.apply_router_weight_on_input=} {self.hidden_pad=} {self.intermediate_pad=} {topk_ids=} {layer.w13_weight_bias.shape=} {layer.w2_weight_bias.shape=}")
-
-        output = fused_moe(
-            x_quant,
-            w13_weight,
-            w2_weight,
-            topk_weights,
-            topk_ids,
-            expert_mask=layer.expert_mask_gpu,
-            activation=ActivationType.Swiglu,
-            quant_type=QuantType.per_1x32,
-            w1_scale=layer.w13_weight_scale,
-            w2_scale=layer.w2_weight_scale,
-            doweight_stage1=self.moe_runner_config.apply_router_weight_on_input,
-            hidden_pad=self.hidden_pad,
-            intermediate_pad=self.intermediate_pad,
-            bias1=layer.w13_weight_bias,
-            bias2=layer.w2_weight_bias,
-        )
-        return StandardCombineInput(hidden_states=output)
+            output = fused_moe(
+                x_quant,
+                w13_weight,
+                w2_weight,
+                topk_weights,
+                topk_ids,
+                expert_mask=layer.expert_mask_gpu,
+                activation=ActivationType.Swiglu,
+                quant_type=QuantType.per_1x32,
+                w1_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale,
+                doweight_stage1=self.moe_runner_config.apply_router_weight_on_input,
+                hidden_pad=self.hidden_pad,
+                intermediate_pad=self.intermediate_pad,
+                bias1=layer.w13_weight_bias,
+                bias2=layer.w2_weight_bias,
+            )
+            return StandardCombineInput(hidden_states=output)
 
         backend = self.runner.runner_backend
         if backend.is_triton_kernels():
