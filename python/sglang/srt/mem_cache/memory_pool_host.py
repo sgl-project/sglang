@@ -1124,11 +1124,6 @@ class NSATokenToKVPoolHost(MLATokenToKVPoolHost):
                 page_size=1,
             )
 
-        if layer_id == 0:
-            logger.info(
-                f"NSATokenToKVPoolHost loaded indexer to device for layer {layer_id}, use_kernel: {use_kernel}, host_page_indices: {host_page_indices}, device_page_indices: {device_page_indices}"
-            )
-
     def _backup_indexer_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
     ):
