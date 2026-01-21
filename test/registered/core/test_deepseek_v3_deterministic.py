@@ -25,7 +25,7 @@ class TestFa3Deterministic(TestDeterministicBase):
     # Test with fa3 attention backend
     @classmethod
     def get_server_args(cls):
-        args = COMMON_SERVER_ARGS
+        args = COMMON_SERVER_ARGS.copy()
         args.extend(
             [
                 "--attention-backend",
@@ -43,7 +43,7 @@ class TestTritonDeterministic(TestDeterministicBase):
     # Test with triton attention backend
     @classmethod
     def get_server_args(cls):
-        args = COMMON_SERVER_ARGS
+        args = COMMON_SERVER_ARGS.copy()
         args.extend(
             [
                 "--attention-backend",

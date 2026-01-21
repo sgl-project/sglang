@@ -144,7 +144,7 @@ class TestFlashAttention3SpeculativeDecode(BaseFlashAttentionTest):
 
     @classmethod
     def get_server_args(cls):
-        args = DEFAULT_SERVER_ARGS
+        args = DEFAULT_SERVER_ARGS.copy()
         args.extend(
             [
                 "--cuda-graph-max-bs",
@@ -178,7 +178,7 @@ class TestFlashAttention3SpeculativeDecodeTopk(BaseFlashAttentionTest):
 
     @classmethod
     def get_server_args(cls):
-        args = DEFAULT_SERVER_ARGS
+        args = DEFAULT_SERVER_ARGS.copy()
         args.extend(
             [
                 "--cuda-graph-max-bs",
@@ -210,7 +210,7 @@ class TestFlashAttention3MLASpeculativeDecode(BaseFlashAttentionTest):
 
     @classmethod
     def get_server_args(cls):
-        args = DEFAULT_SERVER_ARGS
+        args = DEFAULT_SERVER_ARGS.copy()
         args.extend(
             [
                 "--cuda-graph-max-bs",
@@ -242,7 +242,7 @@ class TestFlashAttention3MLASpeculativeDecodeTopk(BaseFlashAttentionTest):
 
     @classmethod
     def get_server_args(cls):
-        args = DEFAULT_SERVER_ARGS
+        args = DEFAULT_SERVER_ARGS.copy()
         args.extend(
             [
                 "--cuda-graph-max-bs",

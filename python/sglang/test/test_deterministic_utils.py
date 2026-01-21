@@ -21,7 +21,7 @@ COMMON_SERVER_ARGS = [
 class TestDeterministicBase(CustomTestCase):
     @classmethod
     def get_server_args(cls):
-        return COMMON_SERVER_ARGS
+        return COMMON_SERVER_ARGS.copy()
 
     @classmethod
     def get_model(cls):
