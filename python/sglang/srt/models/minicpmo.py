@@ -53,6 +53,7 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.idefics2 import Idefics2VisionTransformer
 from sglang.srt.models.minicpmv import MiniCPMBaseModel, Resampler2_5
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM
+from sglang.srt.models.qwen3 import Qwen3ForCausalLM
 from sglang.srt.utils import logger
 
 try:
@@ -1415,7 +1416,48 @@ class MultiModalProjector(nn.Module):
         return hidden_states
 
 
-class MiniCPMO(MiniCPMBaseModel):
+class MiniCPMO4_5(MiniCPMBaseModel):
+    """MiniCPM-o 4.5 model using Qwen3 as the LLM backbone."""
+
+    packed_modules_mapping = {
+        "qkv_proj": [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+        ],
+        "gate_up_proj": [
+            "gate_proj",
+            "up_proj",
+        ],
+    }
+    # LoRA specific attributes
+    supported_lora_modules = [
+        # vision encoder
+        "fc1",
+        "fc2",
+        "out_proj",
+        # language model
+        "qkv_proj",
+        "o_proj",
+        "gate_up_proj",
+        "down_proj",
+        # resampler
+        "kv_proj",
+    ]
+
+    # BitandBytes specific attributes
+    bitsandbytes_stacked_params_mapping = {
+        # shard_name, weight_name, index
+        "q_proj": ("qkv_proj", 0),
+        "k_proj": ("qkv_proj", 1),
+        "v_proj": ("qkv_proj", 2),
+        "gate_proj": ("gate_up_proj", 0),
+        "up_proj": ("gate_up_proj", 1),
+    }
+
+    embedding_modules = {}
+    embedding_padding_modules = []
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -1429,7 +1471,6 @@ class MiniCPMO(MiniCPMBaseModel):
 
         # init vision module
         if self.config.init_vision:
-            # print("vision-understanding enabled")
             self.vpm = self.init_vision_module(config=config, quant_config=quant_config)
             self.vision_dim = self.vpm.embed_dim
             self.resampler = self.init_resampler(self.embed_dim, self.vision_dim)
@@ -1437,7 +1478,6 @@ class MiniCPMO(MiniCPMBaseModel):
         # init audio module
         self.config.init_audio = True
         if self.config.init_audio:
-            # print("audio-understanding enabled")
             self.apm = self.init_audio_module()
             audio_output_dim = int(self.apm.config.encoder_ffn_dim // 4)
             self.audio_avg_pooler = nn.AvgPool1d(
@@ -1452,7 +1492,6 @@ class MiniCPMO(MiniCPMBaseModel):
         self.config.init_tts = False
         logger.info("TTS is disabled for now")
         if self.config.init_tts:
-            # print("tts enabled")
             assert (
                 _tts_deps
             ), "please make sure vector_quantize_pytorch and vocos are installed."
@@ -1472,6 +1511,522 @@ class MiniCPMO(MiniCPMBaseModel):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> nn.Module:
+        # MiniCPM-o 4.5 uses Qwen3 as the LLM backbone
+        return Qwen3ForCausalLM(config=config, quant_config=quant_config, prefix=prefix)
+
+    def init_vision_module(
+        self,
+        config: PretrainedConfig,
+        quant_config: Optional[QuantizationConfig],
+        prefix: str = "",
+    ):
+        if self.config._attn_implementation == "flash_attention_2":
+            self.config.vision_config._attn_implementation = "flash_attention_2"
+        else:
+            self.config.vision_config._attn_implementation = "eager"
+        model = Idefics2VisionTransformer(
+            config=config.vision_config, quant_config=quant_config, prefix=prefix
+        )
+        if self.config.drop_vision_last_layer:
+            model.encoder.layers = model.encoder.layers[:-1]
+
+        setattr(model, "embed_dim", model.embeddings.embed_dim)
+        setattr(model, "patch_size", model.embeddings.patch_size)
+
+        return model
+
+    def init_resampler(
+        self,
+        embed_dim: int,
+        vision_dim: int,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> nn.Module:
+        with set_default_torch_dtype(torch.float16):
+            resampler = Resampler2_5(
+                num_queries=self.config.query_num,
+                embed_dim=embed_dim,
+                num_heads=embed_dim // 128,
+                kv_dim=vision_dim,
+                quant_config=quant_config,
+                prefix=prefix,
+            )
+
+        return resampler.to(device="cuda", dtype=torch.get_default_dtype())
+
+    def pad_input_ids(self, input_ids: List[int], mm_input: MultimodalInputs):
+        # Get all special token IDs
+        im_start_id: int = mm_input.im_start_id
+        im_end_id: int = mm_input.im_end_id
+        slice_start_id: int = mm_input.slice_start_id
+        slice_end_id: int = mm_input.slice_end_id
+
+        data_token_pairs = [
+            (im_start_id, im_end_id),
+            (slice_start_id, slice_end_id),
+            (mm_input.audio_start_id, mm_input.audio_end_id),
+        ]
+        data_start_token_ids = [im_start_id, mm_input.audio_start_id]
+        pattern = MultiModalityDataPaddingPatternTokenPairs(
+            data_token_pairs=data_token_pairs, data_start_token_ids=data_start_token_ids
+        )
+
+        return pattern.pad_input_tokens(input_ids, mm_input)
+
+    def _get_feat_extract_output_lengths(self, input_lengths: torch.LongTensor):
+        """
+        Computes the output length of the convolutional layers and the output length of the audio encoder
+        """
+        input_lengths_after_cnn = (input_lengths - 1) // 2 + 1
+        input_lengths_after_pooling = (
+            input_lengths_after_cnn - self.config.audio_pool_step
+        ) // self.config.audio_pool_step + 1
+        input_lengths_after_pooling = input_lengths_after_pooling.to(dtype=torch.int32)
+
+        return input_lengths_after_cnn, input_lengths_after_pooling
+
+    def get_audio_embedding_streaming(self, items: List[MultimodalDataItem]):
+        r"""
+        Extract audio embeddings in a streaming manner using cached key-value pairs.
+        """
+        wavforms = flatten_nested_list([item.feature for item in items if item.feature])
+        audio_feature_lens_raw = flatten_nested_list(
+            [item.audio_feature_lens for item in items if item.audio_feature_lens]
+        )
+
+        if len(wavforms) > 0:
+            audio_feature_lens = torch.hstack(audio_feature_lens_raw)
+            batch_size, _, max_mel_seq_len = wavforms.shape
+            assert batch_size == 1
+            max_seq_len = (max_mel_seq_len - 1) // 2 + 1
+
+            if self.audio_past_key_values is not None:
+                cache_length = self.audio_past_key_values[0][0].shape[2]
+                apm_max_len = self.apm.embed_positions.weight.shape[0]
+                if cache_length + max_seq_len >= apm_max_len:
+                    logger.warning(
+                        f"audio_past_key_values length {cache_length + max_seq_len} exceed {apm_max_len}, reset."
+                    )
+                    self.audio_past_key_values = None
+
+            audio_outputs = self.apm(
+                wavforms, past_key_values=self.audio_past_key_values, use_cache=True
+            )
+            audio_states = audio_outputs.last_hidden_state
+            self.audio_past_key_values = audio_outputs.past_key_values
+
+            audio_embeds = self.audio_projection_layer(audio_states)
+
+            audio_embeds = audio_embeds.transpose(1, 2)
+            audio_embeds = self.audio_avg_pooler(audio_embeds)
+            audio_embeds = audio_embeds.transpose(1, 2)
+
+            _, feature_lens_after_pooling = self._get_feat_extract_output_lengths(
+                audio_feature_lens
+            )
+
+            num_audio_tokens = feature_lens_after_pooling
+
+            final_audio_embeds = []
+            idx = 0
+            for i in range(len(audio_feature_lens_raw)):
+                target_audio_embeds = []
+                for _ in range(len(audio_feature_lens_raw[i])):
+                    target_audio_embeds.append(
+                        audio_embeds[idx, : num_audio_tokens[idx], :]
+                    )
+                    idx += 1
+                final_audio_embeds.append(target_audio_embeds)
+            return final_audio_embeds
+        else:
+            return []
+
+    def subsequent_chunk_mask(
+        self,
+        size: int,
+        chunk_size: int,
+        num_left_chunks: int = -1,
+        device: torch.device = torch.device("cpu"),
+        num_lookhead: int = 0,
+    ) -> torch.Tensor:
+        """Create mask for subsequent steps (size, size) with chunk size,
+        this is for streaming encoder
+        """
+        ret = torch.zeros(size, size, device=device, dtype=torch.bool)
+        for i in range(size):
+            if num_left_chunks < 0:
+                start = 0
+            else:
+                start = max((i // chunk_size - num_left_chunks) * chunk_size, 0)
+            ending = min((i // chunk_size + 1) * chunk_size + num_lookhead, size)
+            ret[i, start:ending] = True
+        return ret
+
+    def get_audio_embedding(self, items: List[MultimodalDataItem], chunk_length=-1):
+        r"""
+        Extract full audio embeddings with optional chunk-based attention.
+        """
+        wavforms = flatten_nested_list([item.feature for item in items if item.feature])
+        audio_feature_lens_raw = flatten_nested_list(
+            [item.audio_feature_lens for item in items if item.audio_feature_lens]
+        )
+
+        if audio_feature_lens_raw:
+            if isinstance(audio_feature_lens_raw[0], torch.Tensor):
+                audio_feature_lens_raw = [[lens] for lens in audio_feature_lens_raw]
+            elif isinstance(audio_feature_lens_raw[0], list):
+                flattened = []
+                for item in audio_feature_lens_raw:
+                    if isinstance(item, list):
+                        flattened.extend(item)
+                    else:
+                        flattened.append(item)
+                audio_feature_lens_raw = [
+                    [item] if not isinstance(item, list) else item for item in flattened
+                ]
+
+        final_audio_embeds = []
+
+        assert isinstance(wavforms, list)
+        assert isinstance(wavforms[0], torch.Tensor)
+        for wavform in wavforms:
+            if len(wavform) > 0:
+                flattened_lens = []
+                for item in audio_feature_lens_raw:
+                    if isinstance(item, list):
+                        flattened_lens.extend(item)
+                    else:
+                        flattened_lens.append(item)
+                audio_feature_lens = torch.hstack(flattened_lens)
+                batch_size, _, max_mel_seq_len = wavform.shape
+                max_seq_len = (max_mel_seq_len - 1) // 2 + 1
+
+                seq_range = (
+                    torch.arange(
+                        0,
+                        max_seq_len,
+                        dtype=audio_feature_lens.dtype,
+                        device=audio_feature_lens.device,
+                    )
+                    .unsqueeze(0)
+                    .expand(batch_size, max_seq_len)
+                )
+                lengths_expand = audio_feature_lens.unsqueeze(1).expand(
+                    batch_size, max_seq_len
+                )
+                padding_mask = seq_range >= lengths_expand
+
+                audio_attention_mask_ = padding_mask.view(
+                    batch_size, 1, 1, max_seq_len
+                ).expand(batch_size, 1, max_seq_len, max_seq_len)
+                audio_attention_mask = audio_attention_mask_.to(
+                    dtype=self.apm.conv1.weight.dtype,
+                    device=self.apm.conv1.weight.device,
+                )
+
+                if chunk_length > 0:
+                    chunk_num_frame = int(chunk_length * 50)
+                    chunk_mask = self.subsequent_chunk_mask(
+                        size=max_seq_len,
+                        chunk_size=chunk_num_frame,
+                        num_left_chunks=-1,
+                        device=audio_attention_mask_.device,
+                    )
+                    audio_attention_mask_ = torch.logical_or(
+                        audio_attention_mask_, torch.logical_not(chunk_mask)
+                    )
+
+                audio_attention_mask[audio_attention_mask_] = float("-inf")
+                audio_states = self.apm(
+                    wavform,
+                    output_hidden_states=True,
+                    attention_mask=audio_attention_mask,
+                ).hidden_states[self.audio_encoder_layer]
+                audio_embeds = self.audio_projection_layer(audio_states)
+
+                audio_embeds = audio_embeds.transpose(1, 2)
+                audio_embeds = self.audio_avg_pooler(audio_embeds)
+                audio_embeds = audio_embeds.transpose(1, 2)
+
+                _, feature_lens_after_pooling = self._get_feat_extract_output_lengths(
+                    audio_feature_lens
+                )
+
+                num_audio_tokens = feature_lens_after_pooling
+
+                idx = 0
+                for i in range(len(audio_feature_lens_raw)):
+                    target_audio_embeds = []
+                    for _ in range(len(audio_feature_lens_raw[i])):
+                        target_audio_embeds.append(
+                            audio_embeds[idx, : num_audio_tokens[idx], :]
+                        )
+                        idx += 1
+                    final_audio_embeds.append(target_audio_embeds)
+            return final_audio_embeds
+
+    def get_audio_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+        embedding = self.get_omni_embedding(
+            items=items,
+            chunk_length=self.config.audio_chunk_length,
+            stream_input=False,
+        )
+        return embedding
+
+    def get_omni_embedding(
+        self,
+        items: List[MultimodalDataItem],
+        chunk_length=-1,
+        stream_input=False,
+    ):
+        """
+        Args:
+            chunk_length: whisper use full attention or chunk attention
+            stream_input: use streaming audio embedding
+        Returns:
+            final embeddings with audio feature
+        """
+
+        if stream_input:
+            audio_embeddings = self.get_audio_embedding_streaming(items)
+        else:
+            audio_embeddings = self.get_audio_embedding(items, chunk_length)
+        bs = len(audio_embeddings)
+        audio_embs = torch.cat(flatten_nested_list(audio_embeddings), dim=0)
+
+        return audio_embs
+
+    def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+        pixel_values = flatten_nested_list([item.feature for item in items])
+        tgt_sizes = torch.stack(
+            flatten_nested_list([item.tgt_size for item in items]), dim=0
+        )
+        assert len(pixel_values) == tgt_sizes.shape[0]
+
+        device = self.vpm.embeddings.position_embedding.weight.device
+        dtype = self.vpm.embeddings.position_embedding.weight.dtype
+        all_pixel_values_lst = [
+            i.flatten(end_dim=1).permute(1, 0) for i in pixel_values
+        ]
+
+        max_patches = (tgt_sizes[:, 0] * tgt_sizes[:, 1]).max().item()
+        assert isinstance(max_patches, int)
+        all_pixel_values = torch.nn.utils.rnn.pad_sequence(
+            all_pixel_values_lst, batch_first=True, padding_value=0.0
+        )
+
+        B, L, _ = all_pixel_values.shape
+        all_pixel_values = all_pixel_values.permute(0, 2, 1).reshape(B, 3, -1, L)
+        patch_attn_mask = torch.zeros(
+            (B, 1, max_patches), dtype=torch.bool, device=device
+        )
+
+        tgt_sizes_tensor = tgt_sizes.clone().to(device=patch_attn_mask.device)
+        mask_shapes = tgt_sizes_tensor[:, 0] * tgt_sizes_tensor[:, 1]
+        patch_attn_mask[:, 0, :] = torch.arange(
+            patch_attn_mask.size(2), device=patch_attn_mask.device
+        ).unsqueeze(0) < mask_shapes.unsqueeze(1)
+
+        vision_embedding = self.vpm(
+            all_pixel_values.type(dtype),
+            patch_attention_mask=patch_attn_mask,
+            tgt_sizes=tgt_sizes,
+        )
+        return self.resampler(vision_embedding, tgt_sizes)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+
+        hidden_states = general_mm_embed_routine(
+            input_ids=input_ids,
+            forward_batch=forward_batch,
+            language_model=self.llm,
+            multimodal_model=self,
+            positions=positions,
+        )
+        return hidden_states
+
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        stacked_params_mapping = [
+            # (param_name, shard_name, shard_id)
+            ("qkv_proj", "q_proj", "q"),
+            ("qkv_proj", "k_proj", "k"),
+            ("qkv_proj", "v_proj", "v"),
+            ("gate_up_proj", "gate_proj", 0),
+            ("gate_up_proj", "up_proj", 1),
+        ]
+
+        params_dict = dict(self.named_parameters())
+        for name, loaded_weight in weights:
+
+            if "rotary_emb.inv_freq~" in name or "projector" in name:
+                continue
+            if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
+                # Models trained using ColossalAI may include these tensors in
+                # the checkpoint. Skip them.
+                continue
+
+            # For weight_norm parametrization, handle both old and new formats
+            if self.config.init_tts and "tts" in name:
+                # Handle loading from older checkpoints with weight_g/weight_v format
+                if ".weight_g" in name or ".weight_v" in name:
+                    name = name.replace(
+                        ".weight_g", ".parametrizations.weight.original0"
+                    )
+                    name = name.replace(
+                        ".weight_v", ".parametrizations.weight.original1"
+                    )
+                elif ".weight" in name and name not in params_dict:
+                    param_name = name.replace(
+                        ".weight", ".parametrizations.weight.original0"
+                    )
+                    if param_name in params_dict:
+                        name = param_name
+
+            # adapt to VisionAttention
+            if "vpm" in name:
+                name = name.replace(r"self_attn.out_proj", r"self_attn.proj")
+
+            if not self.config.init_tts and "tts" in name:
+                continue
+            if not self.config.init_audio and ("apm" in name or "audio" in name):
+                continue
+            if not self.config.init_vision and "vpm" in name:
+                continue
+
+            if (
+                "sampler" in name
+                or "apm" in name
+                or ("tts" in name and "self_attn" in name)
+                or ("tts.model.layers" in name and ".mlp" in name)
+            ):
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
+                continue
+
+            for param_name, weight_name, shard_id in stacked_params_mapping:
+                # replace the name and load with customized loader
+                if weight_name not in name:
+                    continue
+                name = name.replace(weight_name, param_name)
+                # # Skip loading extra bias for GPTQ models.
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+                param = params_dict[name]
+                weight_loader = param.weight_loader
+                weight_loader(param, loaded_weight, shard_id)
+                break
+            else:
+                # Skip loading extra bias for GPTQ models.
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
+
+
+class MiniCPMO2_6(MiniCPMBaseModel):
+    """MiniCPM-o 2.6 model using Qwen2 as the LLM backbone."""
+
+    packed_modules_mapping = {
+        "qkv_proj": [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+        ],
+        "gate_up_proj": [
+            "gate_proj",
+            "up_proj",
+        ],
+    }
+    # LoRA specific attributes
+    supported_lora_modules = [
+        # vision encoder
+        "fc1",
+        "fc2",
+        "out_proj",
+        # language model
+        "qkv_proj",
+        "o_proj",
+        "gate_up_proj",
+        "down_proj",
+        # resampler
+        "kv_proj",
+    ]
+
+    # BitandBytes specific attributes
+    bitsandbytes_stacked_params_mapping = {
+        # shard_name, weight_name, index
+        "q_proj": ("qkv_proj", 0),
+        "k_proj": ("qkv_proj", 1),
+        "v_proj": ("qkv_proj", 2),
+        "gate_proj": ("gate_up_proj", 0),
+        "up_proj": ("gate_up_proj", 1),
+    }
+
+    embedding_modules = {}
+    embedding_padding_modules = []
+
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+    ) -> None:
+        super().__init__(config=config, quant_config=quant_config)
+
+        self.llm = self.init_llm(config=config, quant_config=quant_config)
+
+        self.embed_dim = self.llm.config.hidden_size
+
+        # init vision module
+        if self.config.init_vision:
+            self.vpm = self.init_vision_module(config=config, quant_config=quant_config)
+            self.vision_dim = self.vpm.embed_dim
+            self.resampler = self.init_resampler(self.embed_dim, self.vision_dim)
+
+        # init audio module
+        self.config.init_audio = True
+        if self.config.init_audio:
+            self.apm = self.init_audio_module()
+            audio_output_dim = int(self.apm.config.encoder_ffn_dim // 4)
+            self.audio_avg_pooler = nn.AvgPool1d(
+                self.config.audio_pool_step, stride=self.config.audio_pool_step
+            )
+            self.audio_projection_layer = MultiModalProjector(
+                in_dim=audio_output_dim, out_dim=self.embed_dim
+            )
+            self.audio_encoder_layer = -1
+
+        # init tts module
+        self.config.init_tts = False
+        logger.info("TTS is disabled for now")
+        if self.config.init_tts:
+            assert (
+                _tts_deps
+            ), "please make sure vector_quantize_pytorch and vocos are installed."
+            self.tts = self.init_tts_module()
+
+    def init_tts_module(self):
+        model = ConditionalChatTTS(self.config.tts_config)
+        return model
+
+    def init_audio_module(self):
+        model = MiniCPMWhisperEncoder(self.config.audio_config)
+        return model
+
+    def init_llm(
+        self,
+        config: PretrainedConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> nn.Module:
+        # MiniCPM-o 2.6 uses Qwen2 as the LLM backbone
         return Qwen2ForCausalLM(config=config, quant_config=quant_config, prefix=prefix)
 
     def init_vision_module(
@@ -1923,6 +2478,151 @@ class MiniCPMO(MiniCPMBaseModel):
                     continue
                 name = name.replace(weight_name, param_name)
                 # # Skip loading extra bias for GPTQ models.
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+                param = params_dict[name]
+                weight_loader = param.weight_loader
+                weight_loader(param, loaded_weight, shard_id)
+                break
+            else:
+                # Skip loading extra bias for GPTQ models.
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
+
+
+# Version to class mapping
+_MINICPMO_SUPPORT_VERSION = {
+    (2, 6): MiniCPMO2_6,
+    (4, 5): MiniCPMO4_5,
+}
+
+
+class MiniCPMO:
+    """
+    Different versions of MiniCPM-O use different LLM backbones,
+    which is not conducive to the current integration logic of LoRA and
+    bitsandbytes in SGLang. Therefore, it is necessary to separate them.
+
+    Version 2.6 uses Qwen2 as the LLM backbone.
+    Version 4.5 uses Qwen3 as the LLM backbone.
+    """
+
+    # Ensure that the LoRA support check passes when the class is not
+    # initialized, but set all these attributes to empty.
+    packed_modules_mapping = {}
+    supported_lora_modules = []
+    embedding_modules = {}
+    embedding_padding_modules = []
+
+    minicpmo: nn.Module
+
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__()
+
+        if not hasattr(config, "version"):
+            version = (2, 6)
+        else:
+            version = str(config.version).split(".")
+            version = tuple([int(x) for x in version])
+
+        # Dispatch class based on version
+        instance_class = _MINICPMO_SUPPORT_VERSION.get(version)
+        if instance_class is None:
+            raise ValueError(
+                f"MiniCPM-O version {version} is not supported. "
+                f"Supported versions: {list(_MINICPMO_SUPPORT_VERSION.keys())}"
+            )
+
+        try:
+            minicpmo = instance_class(
+                config=config, quant_config=quant_config, prefix=prefix
+            )
+            self.minicpmo = minicpmo
+        except Exception as e:
+            print(f"Failed to instantiate MiniCPMO: {e}")
+            raise e
+        self.config = config
+
+    def __getattr__(self, name):
+        if name == "minicpmo":
+            return None
+        return getattr(self.minicpmo, name)
+
+    def __call__(self, *args, **kwargs):
+        return self.minicpmo(*args, **kwargs)
+
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        stacked_params_mapping = [
+            # (param_name, shard_name, shard_id)
+            ("qkv_proj", "q_proj", "q"),
+            ("qkv_proj", "k_proj", "k"),
+            ("qkv_proj", "v_proj", "v"),
+            ("gate_up_proj", "gate_proj", 0),
+            ("gate_up_proj", "up_proj", 1),
+        ]
+
+        params_dict = dict(self.minicpmo.named_parameters())
+        for name, loaded_weight in weights:
+            if "rotary_emb.inv_freq~" in name or "projector" in name:
+                continue
+            if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
+                # Models trained using ColossalAI may include these tensors in
+                # the checkpoint. Skip them.
+                continue
+
+            # For weight_norm parametrization, handle both old and new formats
+            if self.config.init_tts and "tts" in name:
+                # Handle loading from older checkpoints with weight_g/weight_v format
+                if ".weight_g" in name or ".weight_v" in name:
+                    name = name.replace(
+                        ".weight_g", ".parametrizations.weight.original0"
+                    )
+                    name = name.replace(
+                        ".weight_v", ".parametrizations.weight.original1"
+                    )
+                elif ".weight" in name and name not in params_dict:
+                    param_name = name.replace(
+                        ".weight", ".parametrizations.weight.original0"
+                    )
+                    if param_name in params_dict:
+                        name = param_name
+
+            # adapt to VisionAttention
+            if "vpm" in name:
+                name = name.replace(r"self_attn.out_proj", r"self_attn.proj")
+
+            if not self.config.init_tts and "tts" in name:
+                continue
+            if not self.config.init_audio and ("apm" in name or "audio" in name):
+                continue
+            if not self.config.init_vision and "vpm" in name:
+                continue
+
+            if (
+                "sampler" in name
+                or "apm" in name
+                or ("tts" in name and "self_attn" in name)
+                or ("tts.model.layers" in name and ".mlp" in name)
+            ):
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
+                continue
+
+            for param_name, weight_name, shard_id in stacked_params_mapping:
+                # replace the name and load with customized loader
+                if weight_name not in name:
+                    continue
+                name = name.replace(weight_name, param_name)
+                # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
                 param = params_dict[name]
