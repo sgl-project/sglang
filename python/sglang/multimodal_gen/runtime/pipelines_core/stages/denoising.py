@@ -93,9 +93,8 @@ class DenoisingStage(PipelineStage):
         attn_head_size = hidden_size // num_attention_heads
 
         # torch compile
-        if self.server_args.enable_torch_compile:
-            for transformer in filter(None, [self.transformer, self.transformer_2]):
-                self._maybe_enable_torch_compile(transformer)
+        for transformer in filter(None, [self.transformer, self.transformer_2]):
+            self._maybe_enable_torch_compile(transformer)
 
         self.scheduler = scheduler
         self.vae = vae
