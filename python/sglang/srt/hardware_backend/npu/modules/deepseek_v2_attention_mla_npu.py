@@ -300,6 +300,7 @@ def forward_dsa_prepare_npu(
             mla_event = torch.npu.Event()
             mla_event.record()
             with torch.npu.stream(m.alt_stream):
+                # alt stream waits for the completion of the event on the main stream to ensure data dependency is complete
                 torch.npu.current_stream().wait_event(mla_event)
                 (
                     q_pe,
@@ -351,6 +352,7 @@ def forward_dsa_prepare_npu(
             m.alt_stream.wait_stream(torch.npu.current_stream())
             with torch.npu.stream(m.alt_stream):
                 q = m.q_b_proj(q_lora)[0].view(-1, m.num_local_heads, m.qk_head_dim)
+                # record q to ensure memory space will not be released
                 q.record_stream(m.alt_stream)
                 q_event = m.alt_stream.record_event()
         else:
@@ -360,6 +362,7 @@ def forward_dsa_prepare_npu(
             [m.kv_lora_rank, m.qk_rope_head_dim], dim=-1
         )
         k_nope = m.kv_a_layernorm(k_nope)
+        # main stream waits for the completion of the event on the alt stream to ensure data dependency is complete
         if q_event is not None:
             torch.npu.current_stream().wait_event(q_event)
 
