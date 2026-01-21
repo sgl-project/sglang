@@ -282,6 +282,8 @@ class GroupCoordinator:
             self.device = torch.device(f"cuda:{device_id}")
         elif _is_npu:
             self.device = torch.device(f"npu:{local_rank}")
+        elif _is_xpu:
+            self.device = torch.device(f"xpu:{local_rank}")
         else:
             self.device = torch.device("cpu")
         self.device_module = torch.get_device_module(self.device)
