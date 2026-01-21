@@ -44,8 +44,6 @@ class ZImageOmniBeforeDenoisingStage(PipelineStage):
         server_args: ServerArgs,
         num_condition_images: int = 0,
     ):
-        """ """
-
         # Normalize input to list[str]
         assert isinstance(text, str | list)
         if isinstance(text, str):
@@ -55,18 +53,13 @@ class ZImageOmniBeforeDenoisingStage(PipelineStage):
 
         target_device = get_local_torch_device()
 
-        # TODO: review in init?
-        preprocess_funcs = server_args.pipeline_config.preprocess_text_funcs
-        postprocess_funcs = server_args.pipeline_config.postprocess_text_funcs
-        text_encoder_extra_args = server_args.pipeline_config.text_encoder_extra_args
-        encoder_cfgs = server_args.pipeline_config.text_encoder_configs
         assert (
             len(server_args.pipeline_config.text_encoder_configs) == 1
         ), "Should be single encoder."
-        preprocess_func = preprocess_funcs[0]
-        postprocess_func = postprocess_funcs[0]
-        encoder_config = encoder_cfgs[0]
-        text_encoder_extra_arg = text_encoder_extra_args[0]
+        preprocess_func = server_args.pipeline_config.preprocess_text_funcs[0]
+        postprocess_func = server_args.pipeline_config.postprocess_text_funcs[0]
+        encoder_config = server_args.pipeline_config.text_encoder_configs[0]
+        text_encoder_extra_arg = server_args.pipeline_config.text_encoder_extra_args[0]
 
         processed_text_list: list[str] = []
         for prompt_str in texts:
@@ -165,14 +158,23 @@ class ZImageOmniBeforeDenoisingStage(PipelineStage):
         self,
         resized_images: Optional[List[torch.Tensor]],
         do_classifier_free_guidance: bool = False,
+        dtype=None,
     ):
+        """
+        Args:
+            resized_images (list[tensor]): processed image
+            do_classifier_free_guidance (bool)
+            dtype (dtype): target dtype
+        Returns
+            pos_latents (tensor)
+            neg_latents (tensor)
+        """
         if resized_images is None:
             return None, None
 
         # TODO: hard code
         batch_size = 1
         device = get_local_torch_device()
-        dtype = torch.bfloat16
 
         siglip_embeds = []
 
@@ -189,16 +191,9 @@ class ZImageOmniBeforeDenoisingStage(PipelineStage):
             B, N, C = hidden_state.shape
             hidden_state = hidden_state[:, : shape[0] * shape[1]]
             hidden_state = hidden_state.view(shape[0], shape[1], C)
-            siglip_embeds.append(hidden_state)
+            siglip_embeds.append(hidden_state.to(dtype))
 
         condition_siglip_embeds = [siglip_embeds for _ in range(batch_size)]
-
-        # TODO: review
-        ## ====================
-        # dtype cast?
-        condition_siglip_embeds = [
-            [se for se in sels] for sels in condition_siglip_embeds
-        ]
 
         condition_siglip_embeds = [
             None if sels == [] else sels + [None] for sels in condition_siglip_embeds
@@ -218,7 +213,9 @@ class ZImageOmniBeforeDenoisingStage(PipelineStage):
     ):
         """
         Args:
-            batch.condition_image
+            condition_images (list[tensor]): processed image
+            do_classifier_free_guidance (bool)
+            dtype (dtype): target dtype
         Returns
             pos_latents (tensor)
             neg_latents (tensor)
@@ -230,24 +227,21 @@ class ZImageOmniBeforeDenoisingStage(PipelineStage):
 
         # TODO: hard code
         batch_size = 1
-        dtype = dtype or torch.bfloat16
         device = get_local_torch_device()
 
         self.vae = self.vae.to(device)
 
         for image in condition_images:
-            image = image.to(device=device, dtype=dtype)
+            # TODO: hard code vae fp32
+            image = image.to(device=device, dtype=torch.float32)
             image_latent = (
-                self.vae.encode(image.to(torch.float32)).latent_dist.mode()[0]
+                self.vae.encode(image).latent_dist.mode()[0]
                 - self.vae.config.shift_factor
             ) * self.vae.config.scaling_factor
             image_latent = image_latent.unsqueeze(1).to(dtype)
             image_latents.append(image_latent)  # (16, 128, 128)
 
         condition_latents = [image_latents for _ in range(batch_size)]
-        condition_latents = [
-            [lat.to(dtype) for lat in lats] for lats in condition_latents
-        ]
 
         negative_condition_latents = None
         if do_classifier_free_guidance:
@@ -274,7 +268,6 @@ class ZImageOmniBeforeDenoisingStage(PipelineStage):
             len(batch.image_path) if batch.image_path is not None else 0
         )
 
-        # TODO: review
         pos_prompt_embeds_list = self.encode_text(
             batch.prompt,
             server_args,
@@ -310,13 +303,14 @@ class ZImageOmniBeforeDenoisingStage(PipelineStage):
         # 4. Prepare latent variables
         # prepare siglip
         condition_siglip_embeds, negative_condition_siglip_embeds = (
-            self._prepare_siglip(resized_images, do_classifier_free_guidance)
+            self._prepare_siglip(
+                resized_images, do_classifier_free_guidance, dtype=torch.float32
+            )
         )
 
         # prepare image latent
         condition_latents, negative_condition_latents = self._prepare_image_latents(
-            condition_image,
-            do_classifier_free_guidance,
+            condition_image, do_classifier_free_guidance, dtype=torch.float32
         )
 
         batch.height = target_height
