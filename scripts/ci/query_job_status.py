@@ -13,7 +13,9 @@ Requirements:
 
 import argparse
 import json
+import os
 import subprocess
+import sys
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -119,21 +121,23 @@ def query_jobs(
 ) -> list[dict]:
     """Query jobs matching the filter."""
 
-    print(f"Fetching workflow runs from last {hours} hours...")
+    print(f"Fetching workflow runs from last {hours} hours...", file=sys.stderr)
     runs = get_workflow_runs(repo, workflow, hours)
-    print(f"Found {len(runs)} workflow runs")
+    print(f"Found {len(runs)} workflow runs", file=sys.stderr)
 
     results = []
     total_runs = len(runs)
 
     for i, run in enumerate(runs):
         if (i + 1) % 20 == 0:
-            print(f"Processing run {i+1}/{total_runs}...")
+            print(f"Processing run {i+1}/{total_runs}...", file=sys.stderr)
 
         try:
             jobs = get_jobs_for_run(repo, run["id"])
         except Exception as e:
-            print(f"Warning: Failed to get jobs for run {run['id']}: {e}")
+            print(
+                f"Warning: Failed to get jobs for run {run['id']}: {e}", file=sys.stderr
+            )
             continue
 
         pr_number = get_pr_number_from_run(run)
@@ -210,27 +214,175 @@ def calculate_duration(started_at: str, completed_at: str) -> str:
     return "-"
 
 
-def calculate_queue_time(created_at: str, started_at: str) -> str:
-    """Calculate queue time between creation and start."""
-    if not created_at or not started_at:
+def calculate_queue_time(
+    created_at: str,
+    started_at: str,
+    status: str = None,
+    report_time: datetime = None,
+) -> str:
+    """
+    Calculate queue time between creation and start.
+
+    For queued/waiting jobs that haven't truly started yet, calculate
+    queue time as (report_time - created_at) and mark as "still queuing".
+    """
+    if not created_at:
         return "-"
+
     created = parse_time(created_at)
-    started = parse_time(started_at)
-    if created and started:
-        queue_seconds = (started - created).total_seconds()
+    if not created:
+        return "-"
+
+    # For queued/waiting jobs, calculate time since creation
+    if status in ("queued", "waiting"):
+        if report_time:
+            queue_seconds = (report_time - created).total_seconds()
+        else:
+            queue_seconds = (datetime.now(timezone.utc) - created).total_seconds()
+
         if queue_seconds < 0:
-            return "-"  # Invalid data
+            return "-"
+
         minutes = int(queue_seconds // 60)
         seconds = int(queue_seconds % 60)
         if minutes >= 60:
             hours = minutes // 60
             minutes = minutes % 60
-            return f"{hours}h{minutes}m"
-        return f"{minutes}m{seconds}s"
-    return "-"
+            return f"{hours}h{minutes}m (queuing)"
+        return f"{minutes}m{seconds}s (queuing)"
+
+    # For completed/in_progress jobs, calculate actual queue time
+    if not started_at:
+        return "-"
+
+    started = parse_time(started_at)
+    if not started:
+        return "-"
+
+    queue_seconds = (started - created).total_seconds()
+    if queue_seconds < 0:
+        return "-"  # Invalid data
+
+    minutes = int(queue_seconds // 60)
+    seconds = int(queue_seconds % 60)
+    if minutes >= 60:
+        hours = minutes // 60
+        minutes = minutes % 60
+        return f"{hours}h{minutes}m"
+    return f"{minutes}m{seconds}s"
 
 
-def print_table(results: list[dict], repo: str, generated_time: str):
+def process_results(
+    results: list[dict], repo: str, report_time: datetime = None
+) -> dict:
+    """
+    Process raw results into structured data for presentation.
+    Returns a dictionary containing:
+    - status_summary: dict of job_name -> status counts
+    - sorted_results: list of results sorted by created_at descending
+    - active_jobs: list of in_progress/queued/waiting jobs (excluding stuck)
+    - stuck_jobs: list of stuck/ghost jobs
+    - failed_jobs: list of failed jobs
+    - processed_jobs: list of jobs with calculated fields (queue_time, duration, etc.)
+    """
+    if report_time is None:
+        report_time = datetime.now(timezone.utc)
+
+    if not results:
+        return {
+            "status_summary": {},
+            "sorted_results": [],
+            "active_jobs": [],
+            "stuck_jobs": [],
+            "failed_jobs": [],
+            "processed_jobs": [],
+        }
+
+    # Group by job name for summary
+    status_summary = {}
+    for r in results:
+        job_name = r["job_name"]
+        status = r["status"]
+        conclusion = r.get("conclusion", "-")
+        is_stuck = r.get("is_stuck", False)
+        if job_name not in status_summary:
+            status_summary[job_name] = {
+                "in_progress": 0,
+                "queued": 0,
+                "waiting": 0,
+                "stuck": 0,
+                "success": 0,
+                "failure": 0,
+                "cancelled": 0,
+            }
+        if is_stuck:
+            status_summary[job_name]["stuck"] += 1
+        elif status == "completed":
+            # For completed jobs, count by conclusion
+            if conclusion == "success":
+                status_summary[job_name]["success"] += 1
+            elif conclusion == "failure":
+                status_summary[job_name]["failure"] += 1
+            elif conclusion in ("cancelled", "timed_out", "action_required"):
+                status_summary[job_name]["cancelled"] += 1
+        elif status in status_summary[job_name]:
+            status_summary[job_name][status] += 1
+
+    # Sort by created_at descending
+    sorted_results = sorted(results, key=lambda x: x["created_at"], reverse=True)
+
+    # Filter into categories
+    active_jobs = [
+        r
+        for r in results
+        if r["status"] in ("in_progress", "queued", "waiting")
+        and not r.get("is_stuck", False)
+    ]
+    stuck_jobs = [r for r in results if r.get("is_stuck", False)]
+    # Include failure, cancelled, timed_out as "failed" jobs
+    failed_jobs = [r for r in results if r["conclusion"] in ("failure", "timed_out")]
+
+    # Process jobs with calculated fields
+    processed_jobs = []
+    for r in sorted_results:
+        processed = r.copy()
+        processed["created_formatted"] = format_time(r["created_at"])
+        processed["started_formatted"] = format_time(r["started_at"])
+        processed["queue_time"] = calculate_queue_time(
+            r["created_at"], r["started_at"], r["status"], report_time
+        )
+        processed["duration"] = calculate_duration(r["started_at"], r["completed_at"])
+        # Use the job's html_url for direct link to the specific job
+        processed["url"] = (
+            r.get("html_url") or f"https://github.com/{repo}/actions/runs/{r['run_id']}"
+        )
+
+        if r["pr_number"]:
+            processed["pr_info"] = f"PR#{r['pr_number']}"
+        else:
+            processed["pr_info"] = r["branch"] if r["branch"] else "-"
+
+        # Status display with stuck marker
+        if r.get("is_stuck", False):
+            processed["status_display"] = f"STUCK ({r['status']})"
+        else:
+            processed["status_display"] = r["status"]
+
+        processed_jobs.append(processed)
+
+    return {
+        "status_summary": status_summary,
+        "sorted_results": sorted_results,
+        "active_jobs": active_jobs,
+        "stuck_jobs": stuck_jobs,
+        "failed_jobs": failed_jobs,
+        "processed_jobs": processed_jobs,
+    }
+
+
+def print_table(
+    results: list[dict], repo: str, generated_time: str, report_time: datetime = None
+):
     """Print results as a formatted table using tabulate."""
     print("")
     print(f"Report generated: {generated_time} UTC")
@@ -241,24 +393,12 @@ def print_table(results: list[dict], repo: str, generated_time: str):
         print("No jobs found matching the filter.")
         return
 
-    # Group by job name for summary
-    status_summary = {}
-    for r in results:
-        job_name = r["job_name"]
-        status = r["status"]
-        is_stuck = r.get("is_stuck", False)
-        if job_name not in status_summary:
-            status_summary[job_name] = {
-                "in_progress": 0,
-                "queued": 0,
-                "completed": 0,
-                "waiting": 0,
-                "stuck": 0,
-            }
-        if is_stuck:
-            status_summary[job_name]["stuck"] += 1
-        elif status in status_summary[job_name]:
-            status_summary[job_name][status] += 1
+    # Process data
+    data = process_results(results, repo, report_time)
+    status_summary = data["status_summary"]
+    processed_jobs = data["processed_jobs"]
+    active_jobs = data["active_jobs"]
+    stuck_jobs = data["stuck_jobs"]
 
     # Print summary table
     print("\n" + "=" * 100)
@@ -274,14 +414,25 @@ def print_table(results: list[dict], repo: str, generated_time: str):
                 counts["queued"],
                 counts["waiting"],
                 counts["stuck"],
-                counts["completed"],
+                counts["success"],
+                counts["failure"],
+                counts["cancelled"],
             ]
         )
 
     print(
         tabulate(
             summary_data,
-            headers=["Job Name", "Running", "Queued", "Waiting", "Stuck", "Completed"],
+            headers=[
+                "Job Name",
+                "Running",
+                "Queued",
+                "Waiting",
+                "Stuck",
+                "Success",
+                "Failure",
+                "Cancelled",
+            ],
             tablefmt="grid",
         )
     )
@@ -291,44 +442,20 @@ def print_table(results: list[dict], repo: str, generated_time: str):
     print("DETAILED JOB LIST")
     print("=" * 100)
 
-    # Sort by created_at descending
-    sorted_results = sorted(results, key=lambda x: x["created_at"], reverse=True)
-
     detail_data = []
-    for r in sorted_results:
-        status = r["status"]
-        conclusion = r["conclusion"]
-        created = format_time(r["created_at"])
-        started = format_time(r["started_at"])
-        queue_time = calculate_queue_time(r["created_at"], r["started_at"])
-        duration = calculate_duration(r["started_at"], r["completed_at"])
-        runner = r["runner_name"] if r["runner_name"] else "-"
-        job_name = r["job_name"]
-        run_id = r["run_id"]
-
-        if r["pr_number"]:
-            pr_info = f"PR#{r['pr_number']}"
-        else:
-            pr_info = r["branch"] if r["branch"] else "-"
-
-        # Mark stuck jobs
-        if r.get("is_stuck", False):
-            status_display = f"STUCK ({status})"
-        else:
-            status_display = status
-
+    for p in processed_jobs:
         detail_data.append(
             [
-                job_name,
-                status_display,
-                conclusion,
-                created,
-                started,
-                queue_time,
-                duration,
-                runner,
-                pr_info,
-                run_id,
+                p["job_name"],
+                p["status_display"],
+                p["conclusion"],
+                p["created_formatted"],
+                p["started_formatted"],
+                p["queue_time"],
+                p["duration"],
+                p["runner_name"] or "-",
+                p["pr_info"],
+                p["run_id"],
             ]
         )
 
@@ -351,14 +478,7 @@ def print_table(results: list[dict], repo: str, generated_time: str):
         )
     )
 
-    # Print links for in_progress and queued jobs
-    active_jobs = [
-        r
-        for r in results
-        if r["status"] in ("in_progress", "queued") and not r.get("is_stuck", False)
-    ]
-    stuck_jobs = [r for r in results if r.get("is_stuck", False)]
-
+    # Print links for active jobs (use processed_jobs for correct queue_time)
     if active_jobs:
         print("\n" + "=" * 100)
         print("ACTIVE JOB LINKS")
@@ -366,20 +486,26 @@ def print_table(results: list[dict], repo: str, generated_time: str):
 
         link_data = []
         for r in active_jobs:
-            pr_info = f"PR#{r['pr_number']}" if r["pr_number"] else r["branch"]
-            queue_time = calculate_queue_time(r["created_at"], r["started_at"])
-            url = f"https://github.com/{repo}/actions/runs/{r['run_id']}"
-
-            link_data.append(
-                [
-                    r["job_name"],
-                    r["status"],
-                    queue_time,
-                    pr_info,
-                    r["runner_name"] or "-",
-                    url,
-                ]
+            # Find the corresponding processed job to get pre-calculated fields
+            p = next(
+                (
+                    p
+                    for p in processed_jobs
+                    if p["run_id"] == r["run_id"] and p["job_name"] == r["job_name"]
+                ),
+                None,
             )
+            if p:
+                link_data.append(
+                    [
+                        p["job_name"],
+                        p["status"],
+                        p["queue_time"],
+                        p["pr_info"],
+                        p["runner_name"] or "-",
+                        p["url"],
+                    ]
+                )
 
         print(
             tabulate(
@@ -389,6 +515,7 @@ def print_table(results: list[dict], repo: str, generated_time: str):
             )
         )
 
+    # Print stuck jobs (use processed_jobs for correct data)
     if stuck_jobs:
         print("\n" + "=" * 100)
         print("STUCK/GHOST JOBS (in_progress but no runner or workflow cancelled)")
@@ -396,20 +523,27 @@ def print_table(results: list[dict], repo: str, generated_time: str):
 
         stuck_data = []
         for r in stuck_jobs:
-            pr_info = f"PR#{r['pr_number']}" if r["pr_number"] else r["branch"]
-            url = f"https://github.com/{repo}/actions/runs/{r['run_id']}"
-            run_info = f"{r.get('run_status', '-')}/{r.get('run_conclusion', '-')}"
-
-            stuck_data.append(
-                [
-                    r["job_name"],
-                    r["status"],
-                    run_info,
-                    pr_info,
-                    r["runner_name"] or "-",
-                    url,
-                ]
+            # Find the corresponding processed job
+            p = next(
+                (
+                    p
+                    for p in processed_jobs
+                    if p["run_id"] == r["run_id"] and p["job_name"] == r["job_name"]
+                ),
+                None,
             )
+            if p:
+                run_info = f"{r.get('run_status', '-')}/{r.get('run_conclusion', '-')}"
+                stuck_data.append(
+                    [
+                        p["job_name"],
+                        p["status"],
+                        run_info,
+                        p["pr_info"],
+                        p["runner_name"] or "-",
+                        p["url"],
+                    ]
+                )
 
         print(
             tabulate(
@@ -428,7 +562,12 @@ def print_table(results: list[dict], repo: str, generated_time: str):
 
 
 def format_markdown(
-    results: list[dict], repo: str, job_filter: str, hours: int, generated_time: str
+    results: list[dict],
+    repo: str,
+    job_filter: str,
+    hours: int,
+    generated_time: str,
+    report_time: datetime = None,
 ) -> str:
     """Format results as markdown for GitHub Actions summary."""
     lines = []
@@ -447,54 +586,43 @@ def format_markdown(
         lines.append("> No jobs found matching the filter.")
         return "\n".join(lines)
 
-    # Group by job name for summary
-    status_summary = {}
-    for r in results:
-        job_name = r["job_name"]
-        status = r["status"]
-        is_stuck = r.get("is_stuck", False)
-        if job_name not in status_summary:
-            status_summary[job_name] = {
-                "in_progress": 0,
-                "queued": 0,
-                "completed": 0,
-                "waiting": 0,
-                "stuck": 0,
-            }
-        if is_stuck:
-            status_summary[job_name]["stuck"] += 1
-        elif status in status_summary[job_name]:
-            status_summary[job_name][status] += 1
+    # Process data using shared function
+    data = process_results(results, repo, report_time)
+    status_summary = data["status_summary"]
+    processed_jobs = data["processed_jobs"]
+    active_jobs = data["active_jobs"]
+    stuck_jobs = data["stuck_jobs"]
+    failed_jobs = data["failed_jobs"]
 
     # Summary table
     lines.append("## Summary by Job Name")
     lines.append("")
     lines.append(
-        "> **Status meanings:** Running = executing, Queued = waiting for runner, Waiting = waiting for dependent jobs, Stuck = ghost job"
+        "> **Status meanings:** Running = executing, Queued = waiting for runner, Waiting = waiting for dependent jobs, Stuck = ghost job, Cancelled = cancelled/timed_out"
     )
     lines.append("")
-    lines.append("| Job Name | Running | Queued | Waiting | Stuck | Completed |")
-    lines.append("|----------|---------|--------|---------|-------|-----------|")
+    lines.append(
+        "| Job Name | Running | Queued | Waiting | Stuck | Success | Failure | Cancelled |"
+    )
+    lines.append(
+        "|----------|---------|--------|---------|-------|---------|---------|-----------|"
+    )
 
     for job_name, counts in sorted(status_summary.items()):
         running = f"**{counts['in_progress']}**" if counts["in_progress"] > 0 else "0"
         queued = f"**{counts['queued']}**" if counts["queued"] > 0 else "0"
         waiting = f"**{counts['waiting']}**" if counts["waiting"] > 0 else "0"
         stuck = f"**{counts['stuck']}**" if counts["stuck"] > 0 else "0"
-        completed = str(counts["completed"])
+        success = str(counts["success"])
+        failure = f"**{counts['failure']}**" if counts["failure"] > 0 else "0"
+        cancelled = str(counts["cancelled"])
         lines.append(
-            f"| `{job_name}` | {running} | {queued} | {waiting} | {stuck} | {completed} |"
+            f"| `{job_name}` | {running} | {queued} | {waiting} | {stuck} | {success} | {failure} | {cancelled} |"
         )
 
     lines.append("")
 
-    # Active jobs section (in_progress and queued, excluding stuck)
-    active_jobs = [
-        r
-        for r in results
-        if r["status"] in ("in_progress", "queued", "waiting")
-        and not r.get("is_stuck", False)
-    ]
+    # Active jobs section
     if active_jobs:
         lines.append("## Active Jobs")
         lines.append("")
@@ -508,23 +636,23 @@ def format_markdown(
         for r in sorted(
             active_jobs, key=lambda x: (x["status"], x["created_at"]), reverse=True
         ):
-            status = r["status"]
-            job_name = r["job_name"]
-            created = format_time(r["created_at"])
-            started = format_time(r["started_at"])
-            queue_time = calculate_queue_time(r["created_at"], r["started_at"])
-            pr_info = f"PR#{r['pr_number']}" if r["pr_number"] else r["branch"]
-            runner = r["runner_name"] or "-"
-            url = f"https://github.com/{repo}/actions/runs/{r['run_id']}"
-
-            lines.append(
-                f"| {status} | `{job_name}` | {created} | {started} | {queue_time} | {pr_info} | `{runner}` | [View]({url}) |"
+            # Find the processed version for this job
+            p = next(
+                (
+                    p
+                    for p in processed_jobs
+                    if p["run_id"] == r["run_id"] and p["job_name"] == r["job_name"]
+                ),
+                None,
             )
+            if p:
+                lines.append(
+                    f"| {p['status']} | `{p['job_name']}` | {p['created_formatted']} | {p['started_formatted']} | {p['queue_time']} | {p['pr_info']} | `{p['runner_name'] or '-'}` | [View]({p['url']}) |"
+                )
 
         lines.append("")
 
     # Stuck/Ghost jobs section
-    stuck_jobs = [r for r in results if r.get("is_stuck", False)]
     if stuck_jobs:
         lines.append("## Stuck/Ghost Jobs")
         lines.append("")
@@ -540,44 +668,46 @@ def format_markdown(
         )
 
         for r in sorted(stuck_jobs, key=lambda x: x["created_at"], reverse=True):
-            job_status = r["status"]
-            run_info = f"{r.get('run_status', '-')}/{r.get('run_conclusion', '-')}"
-            job_name = r["job_name"]
-            pr_info = f"PR#{r['pr_number']}" if r["pr_number"] else r["branch"]
-            runner = r["runner_name"] or "-"
-            url = f"https://github.com/{repo}/actions/runs/{r['run_id']}"
-
-            lines.append(
-                f"| {job_status} | {run_info} | `{job_name}` | {pr_info} | `{runner}` | [View]({url}) |"
+            p = next(
+                (
+                    p
+                    for p in processed_jobs
+                    if p["run_id"] == r["run_id"] and p["job_name"] == r["job_name"]
+                ),
+                None,
             )
+            if p:
+                run_info = f"{r.get('run_status', '-')}/{r.get('run_conclusion', '-')}"
+                lines.append(
+                    f"| {p['status']} | {run_info} | `{p['job_name']}` | {p['pr_info']} | `{p['runner_name'] or '-'}` | [View]({p['url']}) |"
+                )
 
         lines.append("")
 
-    # Failed jobs section (before All Jobs)
-    failed_jobs = [r for r in results if r["conclusion"] == "failure"]
+    # Failed/Cancelled jobs section (before All Jobs)
     if failed_jobs:
-        lines.append(f"## Failed Jobs ({len(failed_jobs)} total)")
+        lines.append(f"## Failed/Cancelled Jobs ({len(failed_jobs)} total)")
         lines.append("")
         lines.append(
-            "| Job Name | Created | Started | Queue | Duration | Runner | PR/Branch | Link |"
+            "| Conclusion | Job Name | Created | Started | Queue | Duration | Runner | PR/Branch | Link |"
         )
         lines.append(
-            "|----------|---------|---------|-------|----------|--------|-----------|------|"
+            "|------------|----------|---------|---------|-------|----------|--------|-----------|------|"
         )
 
         for r in sorted(failed_jobs, key=lambda x: x["created_at"], reverse=True):
-            job_name = r["job_name"]
-            created = format_time(r["created_at"])
-            started = format_time(r["started_at"])
-            queue_time = calculate_queue_time(r["created_at"], r["started_at"])
-            duration = calculate_duration(r["started_at"], r["completed_at"])
-            runner = r["runner_name"] or "-"
-            pr_info = f"PR#{r['pr_number']}" if r["pr_number"] else r["branch"]
-            url = f"https://github.com/{repo}/actions/runs/{r['run_id']}"
-
-            lines.append(
-                f"| `{job_name}` | {created} | {started} | {queue_time} | {duration} | `{runner}` | {pr_info} | [View]({url}) |"
+            p = next(
+                (
+                    p
+                    for p in processed_jobs
+                    if p["run_id"] == r["run_id"] and p["job_name"] == r["job_name"]
+                ),
+                None,
             )
+            if p:
+                lines.append(
+                    f"| {p['conclusion']} | `{p['job_name']}` | {p['created_formatted']} | {p['started_formatted']} | {p['queue_time']} | {p['duration']} | `{p['runner_name'] or '-'}` | {p['pr_info']} | [View]({p['url']}) |"
+                )
 
         lines.append("")
 
@@ -594,32 +724,15 @@ def format_markdown(
         "|----------|--------|------------|---------|---------|-------|----------|--------|-----------|------|"
     )
 
-    sorted_results = sorted(results, key=lambda x: x["created_at"], reverse=True)
-
-    for r in sorted_results:
-        job_name = r["job_name"]
-        status = r["status"]
-        conclusion = r["conclusion"]
-        created = format_time(r["created_at"])
-        started = format_time(r["started_at"])
-        queue_time = calculate_queue_time(r["created_at"], r["started_at"])
-        duration = calculate_duration(r["started_at"], r["completed_at"])
-        runner = r["runner_name"] if r["runner_name"] else "-"
-        url = f"https://github.com/{repo}/actions/runs/{r['run_id']}"
-
-        if r["pr_number"]:
-            pr_info = f"PR#{r['pr_number']}"
+    for p in processed_jobs:
+        # Mark stuck jobs in markdown with bold
+        if p.get("is_stuck", False):
+            status_display = f"**STUCK** ({p['status']})"
         else:
-            pr_info = r["branch"] if r["branch"] else "-"
-
-        # Mark stuck jobs
-        if r.get("is_stuck", False):
-            status_display = f"**STUCK** ({status})"
-        else:
-            status_display = status
+            status_display = p["status"]
 
         lines.append(
-            f"| `{job_name}` | {status_display} | {conclusion} | {created} | {started} | {queue_time} | {duration} | `{runner}` | {pr_info} | [View]({url}) |"
+            f"| `{p['job_name']}` | {status_display} | {p['conclusion']} | {p['created_formatted']} | {p['started_formatted']} | {p['queue_time']} | {p['duration']} | `{p['runner_name'] or '-'}` | {p['pr_info']} | [View]({p['url']}) |"
         )
 
     lines.append("")
@@ -630,10 +743,9 @@ def format_markdown(
 
 
 def main():
-    import os
-
-    # Capture the time when the command is run
-    report_generated_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    # Capture the time when the command is run (both datetime and formatted string)
+    report_time = datetime.now(timezone.utc)
+    report_generated_time = report_time.strftime("%Y-%m-%d %H:%M:%S")
 
     parser = argparse.ArgumentParser(description="Query GitHub Actions job status")
     parser.add_argument(
@@ -691,13 +803,15 @@ def main():
     output_content = None
 
     if args.output == "table":
-        print_table(results, args.repo, report_generated_time)
+        print_table(results, args.repo, report_generated_time, report_time)
     elif args.output == "csv":
         lines = [
             "job_name,status,is_stuck,conclusion,created_at,started_at,queue_time,duration,runner,run_status,run_conclusion,pr_number,branch,url"
         ]
         for r in sorted(results, key=lambda x: x["created_at"], reverse=True):
-            queue_time = calculate_queue_time(r["created_at"], r["started_at"])
+            queue_time = calculate_queue_time(
+                r["created_at"], r["started_at"], r["status"], report_time
+            )
             duration = calculate_duration(r["started_at"], r["completed_at"])
             is_stuck = "true" if r.get("is_stuck", False) else "false"
             lines.append(
@@ -711,7 +825,7 @@ def main():
         for r in sorted(results, key=lambda x: x["created_at"], reverse=True):
             r_copy = r.copy()
             r_copy["queue_time"] = calculate_queue_time(
-                r["created_at"], r["started_at"]
+                r["created_at"], r["started_at"], r["status"], report_time
             )
             r_copy["duration"] = calculate_duration(r["started_at"], r["completed_at"])
             r_copy["created_at_formatted"] = format_time(r["created_at"])
@@ -721,7 +835,7 @@ def main():
         print(output_content)
     elif args.output == "markdown":
         output_content = format_markdown(
-            results, args.repo, args.job, args.hours, report_generated_time
+            results, args.repo, args.job, args.hours, report_generated_time, report_time
         )
         print(output_content)
 
@@ -729,25 +843,23 @@ def main():
     if args.output_file and output_content:
         with open(args.output_file, "w") as f:
             f.write(output_content)
-        print(f"\nOutput written to {args.output_file}", file=__import__("sys").stderr)
+        print(f"\nOutput written to {args.output_file}", file=sys.stderr)
 
     # Write to GITHUB_STEP_SUMMARY if requested
     if args.summary:
         md_content = format_markdown(
-            results, args.repo, args.job, args.hours, report_generated_time
+            results, args.repo, args.job, args.hours, report_generated_time, report_time
         )
         summary_file = os.environ.get("GITHUB_STEP_SUMMARY")
         if summary_file:
             with open(summary_file, "a") as f:
                 f.write(md_content)
                 f.write("\n")
-            print(
-                f"Summary written to GITHUB_STEP_SUMMARY", file=__import__("sys").stderr
-            )
+            print(f"Summary written to GITHUB_STEP_SUMMARY", file=sys.stderr)
         else:
             print(
                 "Warning: GITHUB_STEP_SUMMARY not set, printing markdown instead:",
-                file=__import__("sys").stderr,
+                file=sys.stderr,
             )
             print(md_content)
 

@@ -20,67 +20,6 @@ on:
         type: string
 
 jobs:
-  # AMD Runner status report
-  runner-status:
-    name: Report - AMD CI Runners
-    if: ${{ !inputs.job_filter }}
-    runs-on: ubuntu-latest
-    env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-    steps:
-      - name: Query AMD Runner Status
-        run: |
-          echo "# AMD CI Runner Status Report" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Generated:** $(date -u '+%Y-%m-%d %H:%M:%S') UTC" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-
-          # Try to get runners (requires admin access)
-          RUNNERS=$(gh api repos/${{ github.repository }}/actions/runners --jq '.runners[] | select(.labels[].name | test("amd|mi3"; "i"))' 2>/dev/null) || {
-            echo "> **Note:** Cannot access runners API (requires admin permission). Showing runner info from recent jobs instead." >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-
-            # Fallback: Get runner info from recent jobs
-            echo "## Runners Observed in Recent Jobs (Last 6 hours)" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "| Runner Name | Last Job | Status | Started |" >> $GITHUB_STEP_SUMMARY
-            echo "|-------------|----------|--------|---------|" >> $GITHUB_STEP_SUMMARY
-
-            gh api "repos/${{ github.repository }}/actions/runs?status=in_progress&per_page=50" --jq '.workflow_runs[] | select(.name | test("AMD"; "i")) | .id' | while read run_id; do
-              gh api "repos/${{ github.repository }}/actions/runs/$run_id/jobs" --jq '.jobs[] | select(.runner_name != null) | select(.runner_name | test("mi3"; "i")) | "| \(.runner_name) | \(.name | .[0:50]) | \(.status) | \(.started_at | .[0:16]) |"' 2>/dev/null
-            done | sort -u >> $GITHUB_STEP_SUMMARY
-
-            exit 0
-          }
-
-          # If we have admin access, show full runner status
-          echo "## Runner Status" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Runner Name | Status | Busy | Labels |" >> $GITHUB_STEP_SUMMARY
-          echo "|-------------|--------|------|--------|" >> $GITHUB_STEP_SUMMARY
-
-          gh api repos/${{ github.repository }}/actions/runners --paginate --jq '
-            .runners[] |
-            select(.labels[].name | test("amd|mi3"; "i")) |
-            "| \(.name) | \(.status) | \(.busy) | \([.labels[].name] | join(", ")) |"
-          ' >> $GITHUB_STEP_SUMMARY
-
-          echo "" >> $GITHUB_STEP_SUMMARY
-
-          # Summary counts
-          echo "## Summary" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-
-          ONLINE=$(gh api repos/${{ github.repository }}/actions/runners --paginate --jq '[.runners[] | select(.labels[].name | test("amd|mi3"; "i")) | select(.status == "online")] | length')
-          BUSY=$(gh api repos/${{ github.repository }}/actions/runners --paginate --jq '[.runners[] | select(.labels[].name | test("amd|mi3"; "i")) | select(.busy == true)] | length')
-          IDLE=$((ONLINE - BUSY))
-
-          echo "| Metric | Count |" >> $GITHUB_STEP_SUMMARY
-          echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
-          echo "| Online | $ONLINE |" >> $GITHUB_STEP_SUMMARY
-          echo "| Busy | $BUSY |" >> $GITHUB_STEP_SUMMARY
-          echo "| Idle | $IDLE |" >> $GITHUB_STEP_SUMMARY
-
   # Single job filter mode
   custom-report:
     name: Custom Job Report
