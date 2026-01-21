@@ -250,6 +250,7 @@ def alloc_extend_kernel(
         mask=offset_one_page < num_part3,
     )
 
+
 @triton.jit
 def alloc_extend_kernel_v2(
     pre_lens_ptr,
@@ -311,22 +312,22 @@ def alloc_extend_kernel_v2(
         start_idx = i * step_size
         end_idx = min((i + 1) * step_size, num_part2)
         current_chunk_size = end_idx - start_idx
-        
+
         offset_chunk = tl.arange(0, step_size)
         valid_mask = offset_chunk < current_chunk_size
         global_offset = start_idx + offset_chunk
-        
+
         page_start = tl.load(
             free_page_ptr + new_page_start_loc + global_offset // page_size,
             mask=valid_mask,
         )
-        
+
         tl.store(
             out_indices + output_start_loc + num_part1 + global_offset,
             page_start * page_size + global_offset % page_size,
             mask=valid_mask,
         )
-    
+
     if pre_len + num_part1 + num_part2 == seq_len:
         return
 
@@ -340,7 +341,6 @@ def alloc_extend_kernel_v2(
         start_loc * page_size + offset_one_page,
         mask=offset_one_page < num_part3,
     )
-
 
 
 @triton.jit
@@ -449,7 +449,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
 
         bs = len(prefix_lens)
-        self.max_bs = next_power_of_2(max(bs,self.max_bs))
+        self.max_bs = next_power_of_2(max(bs, self.max_bs))
         if self.need_sort and extend_num_tokens // self.page_size + bs + 1 > len(
             self.free_pages
         ):
@@ -466,7 +466,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             out_indices,
             self.max_bs,
             self.page_size,
-            self.page_process_step ,
+            self.page_process_step,
         )
 
         if self.debug_mode:
