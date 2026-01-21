@@ -65,6 +65,8 @@ def initialize_fp4_gemm_config(server_args: ServerArgs) -> None:
                 "SGLANG_FLASHINFER_FP4_GEMM_BACKEND is deprecated. "
                 f"Please use '--fp4-gemm-backend={env_backend}' instead."
             )
+            if not env_backend.startswith("flashinfer_"):
+                env_backend = "flashinfer_" + env_backend
             backend = env_backend
         else:
             logger.warning(
