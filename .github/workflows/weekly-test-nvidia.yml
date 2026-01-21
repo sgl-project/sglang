@@ -28,6 +28,7 @@ jobs:
   weekly-test-8-gpu-h200:
     if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'weekly-test-8-gpu-h200')
     runs-on: 8-gpu-h200
+    timeout-minutes: 120
     env:
       RUNNER_LABELS: 8-gpu-h200
     steps:
