@@ -14,7 +14,7 @@ use super::{
 };
 use crate::{
     core::{attach_guards_to_response, Worker, WorkerLoadGuard},
-    grpc_client::SglangSchedulerClient,
+    grpc_client::SglangEncoderClient,
     protocols::{
         chat::{ChatCompletionRequest, ChatCompletionResponse},
         classify::{ClassifyRequest, ClassifyResponse},
@@ -153,7 +153,7 @@ pub(crate) enum ClientSelection {
     /// EPD mode: encode, prefill, and decode all use gRPC
     Triple {
         /// gRPC client for encode worker
-        encode: SglangSchedulerClient,
+        encode: SglangEncoderClient,
         prefill: GrpcClient,
         decode: GrpcClient,
     },
@@ -200,9 +200,9 @@ impl LoadGuards {
                 prefill,
                 decode,
             } => LoadGuards::Triple {
-                encode: WorkerLoadGuard::new(encode.clone()),
-                prefill: WorkerLoadGuard::new(prefill.clone()),
-                decode: WorkerLoadGuard::new(decode.clone()),
+                encode: WorkerLoadGuard::new(encode.clone(), headers),
+                prefill: WorkerLoadGuard::new(prefill.clone(), headers),
+                decode: WorkerLoadGuard::new(decode.clone(), headers),
             },
         }
     }
@@ -539,7 +539,7 @@ impl ClientSelection {
         }
     }
 
-    pub fn triple(&self) -> Option<(&SglangSchedulerClient, &GrpcClient, &GrpcClient)> {
+    pub fn triple(&self) -> Option<(&SglangEncoderClient, &GrpcClient, &GrpcClient)> {
         match self {
             Self::Triple {
                 encode,
@@ -550,7 +550,9 @@ impl ClientSelection {
         }
     }
 
-    pub fn triple_mut(&mut self) -> Option<(&SglangSchedulerClient, &mut GrpcClient, &mut GrpcClient)> {
+    pub fn triple_mut(
+        &mut self,
+    ) -> Option<(&SglangEncoderClient, &mut GrpcClient, &mut GrpcClient)> {
         match self {
             Self::Triple {
                 encode,

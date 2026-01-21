@@ -292,7 +292,7 @@ impl RequestExecutionStage {
             )
         })?;
 
-        let request_id = uuid::Uuid::new_v4().to_string();
+        let request_id = proto_request.request_id().to_string();
 
         // Extract multimodal items for encode worker
         let mm_items = helpers::extract_multimodal_items(&proto_request);
