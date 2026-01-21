@@ -197,7 +197,7 @@ class NGRAMWorker:
         batch.spec_info.prepare_for_verify(batch, self.page_size)
 
     def _update_ngram_cache(self, batch: ScheduleBatch):
-        if batch.forward_mode.is_extend():
+        if batch.forward_mode == ForwardMode.EXTEND:
             return
         batch_tokens = []
         for req in batch.reqs:
