@@ -63,12 +63,6 @@ class TextEncodingStage(PipelineStage):
         assert batch.prompt is not None
         prompt_text: str | list[str] = batch.prompt
 
-        # TODO: debug hard code
-        # TODO: review usage
-        num_condition_images: int = (
-            len(batch.image_path) if batch.image_path is not None else 0
-        )
-
         all_indices: list[int] = list(range(len(self.text_encoders)))
 
         prompt_embeds_list, prompt_masks_list, pooler_embeds_list = self.encode_text(
@@ -76,7 +70,6 @@ class TextEncodingStage(PipelineStage):
             server_args,
             encoder_index=all_indices,
             return_attention_mask=True,
-            num_condition_images=num_condition_images,
         )
 
         for pe in prompt_embeds_list:
@@ -96,7 +89,6 @@ class TextEncodingStage(PipelineStage):
                 server_args,
                 encoder_index=all_indices,
                 return_attention_mask=True,
-                num_condition_images=num_condition_images,
             )
 
             assert batch.negative_prompt_embeds is not None
@@ -150,7 +142,6 @@ class TextEncodingStage(PipelineStage):
         max_length: int | None = None,
         truncation: bool | None = None,
         padding: bool | str | None = None,
-        num_condition_images=0,
         return_overflowing_tokens=None,
         return_length=None,
     ):
@@ -253,8 +244,6 @@ class TextEncodingStage(PipelineStage):
                 **text_encoder_extra_arg,
             )
 
-            # TODO: refactor, ugly hard code
-            tok_kwargs["num_condition_images"] = num_condition_images
             text_inputs: dict = server_args.pipeline_config.tokenize_prompt(
                 processed_text_list, tokenizer, tok_kwargs
             ).to(target_device)
