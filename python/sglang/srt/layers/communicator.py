@@ -81,14 +81,17 @@ elif _is_npu:
     from sglang.srt.hardware_backend.npu.cmo import prepare_weight_cache
 
 
-# According to the discussion in https://github.com/flashinfer-ai/flashinfer/issues/1223#issuecomment-3047256465
+# TODO: According to the discussion in https://github.com/flashinfer-ai/flashinfer/issues/1223#issuecomment-3047256465
 # We set the max token num to 128 for allreduce fusion with min-latency case(use_oneshot=True).
-FUSE_ALLREDUCE_MAX_BATCH_SIZE = 128
+FUSE_ALLREDUCE_MAX_BATCH_SIZE = 2048
 
 
 def apply_flashinfer_allreduce_fusion(batch_size: int):
     return (
-        (_is_sm100_supported or _is_sm90_supported)
+        # TODO: flashinfer 0.6.1 caused performance regression on sm100 for allreduce fusion
+        # Temporarily disable it on sm100. Add it back after its performance is restored.
+        # Ref: https://github.com/sgl-project/sglang/issues/17237
+        _is_sm90_supported
         and _is_flashinfer_available
         and batch_size > 0
         and batch_size <= FUSE_ALLREDUCE_MAX_BATCH_SIZE
