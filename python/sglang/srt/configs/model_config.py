@@ -17,6 +17,7 @@ import logging
 import math
 import os
 from enum import Enum, IntEnum, auto
+from pathlib import Path
 from typing import Any, List, Optional, Set, Union
 
 import torch
@@ -94,12 +95,13 @@ class ModelConfig:
         quantization: Optional[str] = None,
         override_config_file: Optional[str] = None,
         is_draft_model: bool = False,
-        hybrid_kvcache_ratio: Optional[
-            float
-        ] = None,  # TODO: remove this, it is not a model config
         model_impl: Union[str, ModelImpl] = ModelImpl.AUTO,
         sampling_defaults: str = "openai",
         quantize_and_serve: bool = False,
+        is_multi_layer_eagle: bool = False,
+        encoder_only: bool = False,
+        language_only: bool = False,
+        disable_hybrid_swa_memory: bool = False,
     ) -> None:
         # Parse args
         self.model_path = model_path
@@ -109,6 +111,8 @@ class ModelConfig:
         self.model_impl = model_impl
         self.sampling_defaults = sampling_defaults
         self.quantize_and_serve = quantize_and_serve
+        self.is_multi_layer_eagle = is_multi_layer_eagle
+        self.disable_hybrid_swa_memory = disable_hybrid_swa_memory
 
         # Validate quantize_and_serve configuration
         self._validate_quantize_and_serve_config()
@@ -156,18 +160,7 @@ class ModelConfig:
         self.attention_chunk_size = getattr(
             self.hf_text_config, "attention_chunk_size", None
         )
-        self.is_hybrid_swa = is_hybrid_model(
-            self.hf_config.architectures,
-            hybrid_kvcache_ratio=hybrid_kvcache_ratio,
-            context_length=context_length,
-            attention_chunk_size=self.attention_chunk_size,
-        )
-        if self.is_hybrid_swa is not None:
-            self.swa_attention_layer_ids, self.full_attention_layer_ids = (
-                get_hybrid_layer_ids(
-                    self.hf_config.architectures, self.hf_text_config.num_hidden_layers
-                )
-            )
+        self.sliding_window_size = self._get_sliding_window_size()
         self.is_generation = is_generation_model(
             self.hf_config.architectures, is_embedding
         )
@@ -196,14 +189,22 @@ class ModelConfig:
             and is_multimodal_chunked_prefill_supported(self.hf_config.architectures)
         )
         self.is_encoder_decoder = is_encoder_decoder_model(self.hf_config.architectures)
+        self.is_local_attention_model = is_local_attention_model(
+            self.hf_config.architectures
+        )
         self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)
 
         # Derive context length and model shapes
         self._derive_context_length(context_length)
         self._derive_model_shapes()
 
+        # Update hybrid model
+        self._derive_hybrid_model()
+
         # Verify quantization
         self._verify_quantization()
+
+        self._verify_transformers_version()
 
         # Verify dual-chunk attention config
         self._verify_dual_chunk_attention_config()
@@ -215,6 +216,9 @@ class ModelConfig:
         self.image_token_id = getattr(
             self.hf_config, "image_token_id", None
         ) or getattr(self.hf_config, "image_token_index", None)
+
+        self.hf_config.encoder_only = encoder_only
+        self.hf_config.language_only = language_only
 
         # matryoshka embeddings
         self.matryoshka_dimensions = getattr(
@@ -229,8 +233,14 @@ class ModelConfig:
         server_args: ServerArgs,
         model_path: str = None,
         model_revision: str = None,
+        is_draft_model: bool = False,
         **kwargs,
     ):
+        quantization = (
+            server_args.speculative_draft_model_quantization
+            if is_draft_model
+            else server_args.quantization
+        )
         return ModelConfig(
             model_path=model_path or server_args.model_path,
             trust_remote_code=server_args.trust_remote_code,
@@ -240,12 +250,16 @@ class ModelConfig:
             is_embedding=server_args.is_embedding,
             enable_multimodal=server_args.enable_multimodal,
             dtype=server_args.dtype,
-            quantization=server_args.quantization,
-            hybrid_kvcache_ratio=server_args.hybrid_kvcache_ratio,
+            quantization=quantization,
             model_impl=server_args.model_impl,
             sampling_defaults=server_args.sampling_defaults,
             quantize_and_serve=server_args.quantize_and_serve,
             override_config_file=server_args.decrypted_config_file,
+            is_multi_layer_eagle=server_args.enable_multi_layer_eagle,
+            language_only=server_args.language_only,
+            encoder_only=server_args.encoder_only,
+            is_draft_model=is_draft_model,
+            disable_hybrid_swa_memory=server_args.disable_hybrid_swa_memory,
             **kwargs,
         )
 
@@ -258,7 +272,10 @@ class ModelConfig:
         ):
             self.hf_config.architectures[0] = "DeepseekV3ForCausalLMNextN"
 
-        if is_draft_model and self.hf_config.architectures[0] == "Glm4MoeForCausalLM":
+        if is_draft_model and self.hf_config.architectures[0] in [
+            "Glm4MoeForCausalLM",
+            "Glm4MoeLiteForCausalLM",
+        ]:
             self.hf_config.architectures[0] = "Glm4MoeForCausalLMNextN"
 
         if (
@@ -270,6 +287,11 @@ class ModelConfig:
 
         if is_draft_model and self.hf_config.architectures[0] == "MiMoForCausalLM":
             self.hf_config.architectures[0] = "MiMoMTP"
+        if (
+            is_draft_model
+            and self.hf_config.architectures[0] == "MiMoV2FlashForCausalLM"
+        ):
+            self.hf_config.architectures[0] = "MiMoV2MTP"
         if is_draft_model and self.hf_config.architectures[0] in [
             "BailingMoeV2ForCausalLM",
             "BailingMoeForCausalLM",
@@ -284,6 +306,30 @@ class ModelConfig:
         if is_draft_model and self.hf_config.architectures[0] == "Qwen3NextForCausalLM":
             self.hf_config.architectures[0] = "Qwen3NextForCausalLMMTP"
             self.hf_config.num_nextn_predict_layers = 1
+
+        if is_draft_model and self.hf_config.architectures[0] == "NemotronHForCausalLM":
+            self.hf_config.architectures[0] = "NemotronHForCausalLMMTP"
+            self.hf_config.num_nextn_predict_layers = 1
+
+    def _derive_hybrid_model(self):
+        # Use self.context_len after it has been initialized to prevent using context_len which may be None.
+        self.is_hybrid_swa = (
+            is_hybrid_swa_model(self.hf_config.architectures)
+            and not self.disable_hybrid_swa_memory
+        )
+
+        if self.is_hybrid_swa:
+            self.swa_attention_layer_ids, self.full_attention_layer_ids = (
+                get_hybrid_layer_ids(
+                    self.hf_config.architectures,
+                    self.hf_text_config,
+                )
+            )
+
+        self.is_hybrid_swa_compress = self.hf_config.architectures[0] in [
+            "MiMoV2FlashForCausalLM",
+            "MiMoV2MTP",
+        ]
 
     def _derive_context_length(self, context_length: int):
         is_draft_model = self.is_draft_model
@@ -326,6 +372,11 @@ class ModelConfig:
             "head_dim",
             self.hf_text_config.hidden_size // self.hf_text_config.num_attention_heads,
         )
+        self.v_head_dim = getattr(
+            self.hf_text_config,
+            "v_head_dim",
+            self.head_dim,
+        )
 
         # FIXME: temporary special judge for MLA architecture
         if (
@@ -333,6 +384,7 @@ class ModelConfig:
             or "DeepseekV32ForCausalLM" in self.hf_config.architectures
             or "DeepseekV3ForCausalLM" in self.hf_config.architectures
             or "DeepseekV3ForCausalLMNextN" in self.hf_config.architectures
+            or "Glm4MoeLiteForCausalLM" in self.hf_config.architectures
             or "LongcatFlashForCausalLM" in self.hf_config.architectures
             or "LongcatFlashForCausalLMNextN" in self.hf_config.architectures
             or "DotsVLMForCausalLM" in self.hf_config.architectures
@@ -352,15 +404,21 @@ class ModelConfig:
                 else None
             )
 
-            # Handle rope scaling with yarn
-            self.scaling = 1 / math.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim)
-            if self.hf_config.rope_scaling:
-                mscale_all_dim = self.hf_config.rope_scaling.get(
-                    "mscale_all_dim", False
+            if "Glm4MoeLiteForCausalLM" in self.hf_config.architectures:
+                self.scaling = 1
+                self.hf_config.rope_scaling = None
+            else:
+                # Handle rope scaling with yarn
+                self.scaling = 1 / math.sqrt(
+                    self.qk_nope_head_dim + self.qk_rope_head_dim
                 )
-                scaling_factor = self.hf_config.rope_scaling["factor"]
-                mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
-                self.scaling = self.scaling * mscale * mscale
+                if self.hf_config.rope_scaling:
+                    mscale_all_dim = self.hf_config.rope_scaling.get(
+                        "mscale_all_dim", False
+                    )
+                    scaling_factor = self.hf_config.rope_scaling["factor"]
+                    mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
+                    self.scaling = self.scaling * mscale * mscale
 
         elif "MiniCPM3ForCausalLM" in self.hf_config.architectures:
             self.head_dim = 128
@@ -425,6 +483,9 @@ class ModelConfig:
         self.num_attention_layers = self.num_hidden_layers
         if "LongcatFlashForCausalLM" in self.hf_config.architectures:
             self.num_attention_layers = self.num_hidden_layers * 2
+        if "IQuestLoopCoderForCausalLM" in self.hf_config.architectures:
+            loop_num = getattr(self.hf_text_config, "loop_num", 1)
+            self.num_attention_layers = int(self.num_hidden_layers * int(loop_num))
         self.num_nextn_predict_layers = getattr(
             self.hf_text_config, "num_nextn_predict_layers", None
         )
@@ -510,6 +571,15 @@ class ModelConfig:
         # parallel size so each GPU has at least one KV head.
         return max(1, total_num_kv_heads // tensor_parallel_size)
 
+    def get_swa_num_kv_heads(self, tensor_parallel_size) -> int:
+        """Similar to get_num_kv_heads(), but for SWA."""
+        if not self.is_hybrid_swa_compress:
+            return 0
+
+        # For MiMoV2FlashForCausalLM models
+        total_num_kv_heads = self.hf_text_config.swa_num_key_value_heads
+        return max(1, total_num_kv_heads // tensor_parallel_size)
+
     # adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/config.py
     def _parse_quant_hf_config(self):
         quant_cfg = getattr(self.hf_config, "quantization_config", None)
@@ -535,39 +605,56 @@ class ModelConfig:
 
                     hf_api = HfApi()
                 try:
-                    # Retry HF API call up to 3 times
-                    file_exists = retry(
-                        lambda: hf_api.file_exists(
-                            self.model_path, "hf_quant_config.json"
-                        ),
-                        max_retry=2,
-                        initial_delay=1.0,
-                        max_delay=5.0,
+                    # In offline mode, skip file_exists check to avoid OfflineModeIsEnabled error
+                    # Instead, directly try to download/read from cache with local_files_only
+                    file_exists = False  # Initialize to avoid UnboundLocalError
+                    if not huggingface_hub.constants.HF_HUB_OFFLINE:
+                        # Online mode: check if file exists before attempting download (optimization)
+                        file_exists = retry(
+                            lambda: hf_api.file_exists(
+                                self.model_path, "hf_quant_config.json"
+                            ),
+                            max_retry=2,
+                            initial_delay=1.0,
+                            max_delay=5.0,
+                        )
+                        if not file_exists:
+                            # File doesn't exist on hub, no need to try downloading
+                            return quant_cfg  # None
+
+                    # Download (online mode) or read from cache (offline mode)
+                    if envs.SGLANG_USE_MODELSCOPE.get():
+                        quant_config_file = model_file_download(
+                            model_id=self.model_path,
+                            file_path="hf_quant_config.json",
+                            revision=self.revision,
+                        )
+                    else:
+                        quant_config_file = hf_hub_download(
+                            repo_id=self.model_path,
+                            filename="hf_quant_config.json",
+                            revision=self.revision,
+                            local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
+                        )
+                    with open(quant_config_file) as f:
+                        quant_config_dict = json.load(f)
+                    quant_cfg = self._parse_modelopt_quant_config(quant_config_dict)
+                except huggingface_hub.errors.LocalEntryNotFoundError:
+                    # Offline mode and file not in cache - this is normal for non-quantized models
+                    logger.debug(
+                        f"hf_quant_config.json not found in cache for {self.model_path} "
+                        "(offline mode, normal for non-quantized models)"
                     )
-                    if file_exists:
-                        # Download and parse the quantization config for remote models
-                        if envs.SGLANG_USE_MODELSCOPE.get():
-                            quant_config_file = model_file_download(
-                                model_id=self.model_path,
-                                file_path="hf_quant_config.json",
-                                revision=self.revision,
-                            )
-                        else:
-                            quant_config_file = hf_hub_download(
-                                repo_id=self.model_path,
-                                filename="hf_quant_config.json",
-                                revision=self.revision,
-                            )
-                        with open(quant_config_file) as f:
-                            quant_config_dict = json.load(f)
-                        quant_cfg = self._parse_modelopt_quant_config(quant_config_dict)
                 except huggingface_hub.errors.OfflineModeIsEnabled:
+                    # Should not reach here after our changes, but keep for safety
                     logger.warning(
                         "Offline mode is enabled, skipping hf_quant_config.json check"
                     )
                 except Exception as e:
                     logger.warning(
-                        f"Failed to check hf_quant_config.json: {self.model_path} {e}"
+                        "Failed to load hf_quant_config.json for model %s: %s",
+                        self.model_path,
+                        e,
                     )
             elif os.path.exists(os.path.join(self.model_path, "hf_quant_config.json")):
                 quant_config_file = os.path.join(
@@ -576,6 +663,18 @@ class ModelConfig:
                 with open(quant_config_file) as f:
                     quant_config_dict = json.load(f)
                 quant_cfg = self._parse_modelopt_quant_config(quant_config_dict)
+        return quant_cfg
+
+    def _find_quant_modelslim_config(self):
+        quant_config_file = Path(self.model_path, "quant_model_description.json")
+        quant_cfg = None
+        if quant_config_file.is_file():
+            with open(quant_config_file) as f:
+                quant_cfg = json.load(f)
+            # This field is required for flagless model loading but is not present in
+            # modelslim model description, so we're adding it here manually.
+            quant_cfg["quant_method"] = "modelslim"
+
         return quant_cfg
 
     def _parse_modelopt_quant_config(self, quant_config_dict: dict) -> Optional[dict]:
@@ -618,6 +717,12 @@ class ModelConfig:
             return "fp8"
         else:
             return "fp8"  # Default fallback
+
+    def _get_sliding_window_size(self) -> Optional[int]:
+        sliding_window_size = getattr(self.hf_text_config, "sliding_window_size", None)
+        if sliding_window_size is None:
+            sliding_window_size = getattr(self.hf_text_config, "sliding_window", None)
+        return sliding_window_size
 
     def _validate_quantize_and_serve_config(self):
         """Validate quantize_and_serve configuration."""
@@ -663,6 +768,7 @@ class ModelConfig:
             "quark",
             "mxfp4",
             "auto-round",
+            "quark_int4fp8_moe",
         ]
         optimized_quantization_methods = [
             "fp8",
@@ -683,6 +789,7 @@ class ModelConfig:
             "w4afp8",
             "petit_nvfp4",
             "quark",
+            "modelslim",
         ]
         compatible_quantization_methods = {
             "modelopt_fp8": ["modelopt"],
@@ -694,8 +801,19 @@ class ModelConfig:
         if self.quantization is not None:
             self.quantization = self.quantization.lower()
 
-        # Parse quantization method from the HF model config, if available.
-        quant_cfg = self._parse_quant_hf_config()
+        # Parse quantization method from the HF and ModelSlim model config, if available.
+        # Only one function should return config, other should return None.
+        cfg_list = []
+        cfg_list.append(self._parse_quant_hf_config())
+        cfg_list.append(self._find_quant_modelslim_config())
+
+        # Filter out None values
+        cfg_list = [item for item in cfg_list if item is not None]
+        if len(cfg_list) > 1:
+            raise ValueError(
+                "Config list contains configs from 2 methods, must be only 1"
+            )
+        quant_cfg = cfg_list[0] if cfg_list else None
 
         if quant_cfg is not None:
             quant_method = quant_cfg.get(
@@ -737,6 +855,15 @@ class ModelConfig:
                         f"({self.quantization})."
                     )
 
+            # Check if the scale_fmt is ue8m0, and warn user if deepgemm is enabled for non-ue8m0 models on blackwell
+            self.use_scale_ue8m0 = quant_cfg.get("scale_fmt", None) == "ue8m0"
+            from sglang.srt.layers import deep_gemm_wrapper
+
+            if not self.use_scale_ue8m0 and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+                logger.warning(
+                    "DeepGemm is enabled but the scale_fmt of checkpoint is not ue8m0. This might cause accuracy degradation on Blackwell."
+                )
+
         if self.quantization is not None:
             if self.quantization not in supported_quantization:
                 raise ValueError(
@@ -772,6 +899,41 @@ class ModelConfig:
                 self.hf_config.dual_chunk_attention_config[
                     "sparse_attention_enabled"
                 ] = True
+
+    def _verify_transformers_version(self):
+        import transformers
+        from packaging import version
+
+        tf_version_str = getattr(transformers, "__version__", None)
+        if tf_version_str is None:
+            return
+
+        vision_config = getattr(self.hf_config, "vision_config", None)
+        is_glm_46vmoe = "glm-4.6v" in self.model_path.lower() or (
+            vision_config is not None
+            and getattr(vision_config, "model_type", None) == "glm4v_moe_vision"
+            # The vision config model type for GLM-4.5v is 'glm4v_moe',
+            # while for GLM-4.6v, it is 'glm4v_moe_vision'.
+        )
+        needs_tf_v5 = is_glm_46vmoe
+
+        tf_version = version.parse(tf_version_str)
+        required_version = version.parse("5.0.0")
+
+        if tf_version < required_version:
+            if needs_tf_v5:
+                raise ValueError(
+                    f"Transformers version {tf_version_str} is not supported for model {self.model_path} "
+                    f"or model type {self.hf_config.model_type}. "
+                    "Please upgrade transformers to >= 5.0.0."
+                )
+        elif not needs_tf_v5:
+            logger.warning(
+                f"Transformers version {tf_version_str} is used for model type {self.hf_config.model_type}. "
+                "If you experience issues related to RoPE parameters, "
+                "they may be due to incompatibilities between Transformers >=5.0.0 and some models. "
+                "You can try downgrading to transformers==4.57.1 as a workaround."
+            )
 
     def _get_hf_eos_token_id(self) -> Optional[Set[int]]:
         eos_ids = getattr(self.hf_config, "eos_token_id", None)
@@ -952,6 +1114,7 @@ multimodal_model_archs = [
     "Gemma3nForConditionalGeneration",
     "Glm4vForConditionalGeneration",
     "Glm4vMoeForConditionalGeneration",
+    "GlmAsrForConditionalGeneration",
     "Grok1VForCausalLM",
     "Grok1AForCausalLM",
     "LlavaLlamaForCausalLM",
@@ -987,10 +1150,11 @@ multimodal_model_archs = [
     "DeepseekOCRForCausalLM",
     "JetVLMForConditionalGeneration",
     "PaddleOCRVLForConditionalGeneration",
+    "MiDashengLMModel",
 ]
 
-if envs.SGLANG_EXTERNAL_MM_MODEL_ARCH.value:
-    multimodal_model_archs.append(envs.SGLANG_EXTERNAL_MM_MODEL_ARCH.value)
+if external_mm_model_arch := envs.SGLANG_EXTERNAL_MM_MODEL_ARCH.get():
+    multimodal_model_archs.append(external_mm_model_arch)
 
 
 def is_multimodal_model(model_architectures: List[str]):
@@ -1019,6 +1183,10 @@ def is_encoder_decoder_model(model_architectures: List[str]):
     return "MllamaForConditionalGeneration" in model_architectures
 
 
+def is_local_attention_model(model_architectures: List[str]):
+    return "Llama4ForConditionalGeneration" in model_architectures
+
+
 def is_multimodal_chunked_prefill_supported(model_architectures: List[str]):
     """Check if chunked prefill is supported for a MultiModal model."""
     unsupported = [
@@ -1040,25 +1208,22 @@ def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
     return 0.1 * mscale * math.log(scale) + 1.0
 
 
-def is_hybrid_model(
+def is_hybrid_swa_model(model_architectures: List[str]):
+
+    hybrid_swa_archs = {
+        "Llama4ForConditionalGeneration",
+        "GptOssForCausalLM",
+        "MiMoV2FlashForCausalLM",
+        "MiMoV2MTP",
+    }
+    return any(arch in hybrid_swa_archs for arch in model_architectures)
+
+
+def get_hybrid_layer_ids(
     model_architectures: List[str],
-    hybrid_kvcache_ratio: Optional[float],
-    context_length: Optional[int],
-    attention_chunk_size: Optional[int],
+    hf_text_config: PretrainedConfig,
 ):
-    if hybrid_kvcache_ratio is None:
-        return None
-    elif (
-        hybrid_kvcache_ratio > 0
-        and model_architectures[0] == "Llama4ForConditionalGeneration"
-        and context_length > attention_chunk_size
-    ):
-        return hybrid_kvcache_ratio
-    else:
-        return None
-
-
-def get_hybrid_layer_ids(model_architectures: List[str], num_hidden_layers: int):
+    num_hidden_layers = hf_text_config.num_hidden_layers
     if "Llama4ForConditionalGeneration" in model_architectures:
         swa_attention_layer_ids = [
             i for i in range(num_hidden_layers) if (i + 1) % 4 != 0
@@ -1066,6 +1231,24 @@ def get_hybrid_layer_ids(model_architectures: List[str], num_hidden_layers: int)
         full_attention_layer_ids = [
             i for i in range(num_hidden_layers) if (i + 1) % 4 == 0
         ]
+    elif "GptOssForCausalLM" in model_architectures:
+        layer_types = getattr(hf_text_config, "layer_types", None)
+        swa_attention_layer_ids = [
+            i for i, x in enumerate(layer_types) if x == "sliding_attention"
+        ]
+        full_attention_layer_ids = [
+            i for i, x in enumerate(layer_types) if x == "full_attention"
+        ]
+    elif "MiMoV2FlashForCausalLM" in model_architectures:
+        hybrid_layer_pattern = getattr(hf_text_config, "hybrid_layer_pattern", None)
+        swa_attention_layer_ids = [
+            i for i in range(num_hidden_layers) if hybrid_layer_pattern[i] == 1
+        ]
+        full_attention_layer_ids = [
+            i for i in range(num_hidden_layers) if hybrid_layer_pattern[i] == 0
+        ]
+    elif "MiMoV2MTP" in model_architectures:
+        return [0], []
     else:
         swa_attention_layer_ids = None
         full_attention_layer_ids = None

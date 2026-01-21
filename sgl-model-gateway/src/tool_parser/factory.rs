@@ -10,7 +10,7 @@ use tokio::sync::Mutex;
 use crate::tool_parser::{
     parsers::{
         DeepSeekParser, Glm4MoeParser, JsonParser, KimiK2Parser, LlamaParser, MinimaxM2Parser,
-        MistralParser, PassthroughParser, PythonicParser, QwenParser, Step3Parser,
+        MistralParser, PassthroughParser, PythonicParser, QwenCoderParser, QwenParser, Step3Parser,
     },
     traits::ToolParser,
 };
@@ -236,10 +236,12 @@ impl ParserFactory {
         registry.register_parser("json", || Box::new(JsonParser::new()));
         registry.register_parser("mistral", || Box::new(MistralParser::new()));
         registry.register_parser("qwen", || Box::new(QwenParser::new()));
+        registry.register_parser("qwen_coder", || Box::new(QwenCoderParser::new()));
         registry.register_parser("pythonic", || Box::new(PythonicParser::new()));
         registry.register_parser("llama", || Box::new(LlamaParser::new()));
         registry.register_parser("deepseek", || Box::new(DeepSeekParser::new()));
-        registry.register_parser("glm4_moe", || Box::new(Glm4MoeParser::new()));
+        registry.register_parser("glm45_moe", || Box::new(Glm4MoeParser::glm45()));
+        registry.register_parser("glm47_moe", || Box::new(Glm4MoeParser::glm47()));
         registry.register_parser("step3", || Box::new(Step3Parser::new()));
         registry.register_parser("kimik2", || Box::new(KimiK2Parser::new()));
         registry.register_parser("minimax_m2", || Box::new(MinimaxM2Parser::new()));
@@ -263,7 +265,15 @@ impl ParserFactory {
         registry.map_model("mistral-*", "mistral");
         registry.map_model("mixtral-*", "mistral");
 
-        // Qwen models
+        // Qwen models (more specific patterns first - longer patterns take precedence)
+        // Qwen Coder models use XML format: <tool_call><function=name><parameter=key>value</parameter></function></tool_call>
+        registry.map_model("Qwen/Qwen3-Coder*", "qwen_coder");
+        registry.map_model("Qwen3-Coder*", "qwen_coder");
+        registry.map_model("qwen3-coder*", "qwen_coder");
+        registry.map_model("Qwen/Qwen2.5-Coder*", "qwen_coder");
+        registry.map_model("Qwen2.5-Coder*", "qwen_coder");
+        registry.map_model("qwen2.5-coder*", "qwen_coder");
+        // Generic Qwen models use JSON format
         registry.map_model("qwen*", "qwen");
         registry.map_model("Qwen*", "qwen");
 
@@ -281,8 +291,9 @@ impl ParserFactory {
         registry.map_model("deepseek-*", "pythonic");
 
         // GLM models
-        registry.map_model("glm-4.5*", "glm4_moe");
-        registry.map_model("glm-4.6*", "glm4_moe");
+        registry.map_model("glm-4.5*", "glm45_moe");
+        registry.map_model("glm-4.6*", "glm45_moe");
+        registry.map_model("glm-4.7*", "glm47_moe");
         registry.map_model("glm-*", "json");
 
         // Step3 models

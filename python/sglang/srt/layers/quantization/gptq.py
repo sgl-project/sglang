@@ -1099,32 +1099,3 @@ if _is_cuda:
     @register_fake_if_exists("sgl_kernel::gptq_shuffle")
     def _(q_weight, q_perm, bit):
         return
-
-    @register_fake_if_exists("sgl_kernel::moe_wna16_marlin_gemm")
-    def _(
-        a,
-        c,
-        b_q_weight,
-        b_scales,
-        b_zeros,
-        g_idx,
-        perm,
-        workspace,
-        sorted_token_ids,
-        expert_ids,
-        num_tokens_post_padded,
-        topk_weights,
-        moe_block_size,
-        top_k,
-        mul_topk_weights,
-        is_ep,
-        b_q_type_id,
-        size_m,
-        size_n,
-        size_k,
-        is_k_full,
-        use_atomic_add,
-        use_fp32_reduce,
-        is_zp_float,
-    ):
-        return c

@@ -1,9 +1,11 @@
 pub mod app_context;
+pub mod auth;
 pub mod config;
 pub mod core;
 pub mod data_connector;
 pub mod grpc_client;
 pub mod mcp;
+pub mod mesh;
 pub mod middleware;
 pub mod multimodal;
 pub mod observability;
@@ -17,3 +19,4 @@ pub mod tokenizer;
 pub mod tool_parser;
 pub mod version;
 pub mod wasm;
+pub mod workflow;
