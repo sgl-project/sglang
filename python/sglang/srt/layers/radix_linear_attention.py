@@ -70,13 +70,14 @@ class RadixLinearAttention(nn.Module):
     def forward(
         self,
         forward_batch: ForwardBatch,
-        **kwargs,
+        mixed_qkv: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
     ) -> torch.Tensor:
         return forward_batch.attn_backend.forward(
-            q=None,
-            k=None,
-            v=None,
             layer=self,
             forward_batch=forward_batch,
-            **kwargs,
+            mixed_qkv=mixed_qkv,
+            a=a,
+            b=b,
         )

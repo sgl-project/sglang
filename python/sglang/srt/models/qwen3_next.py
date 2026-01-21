@@ -304,11 +304,6 @@ class Qwen3GatedDeltaNet(nn.Module):
             prefix=add_prefix("out_proj", prefix),
         )
 
-        # Create the 2D view of conv weights once at init
-        conv_weights = self.conv1d.weight.view(
-            self.conv1d.weight.size(0), self.conv1d.weight.size(2)
-        )
-
         self.linear_attn = RadixLinearAttention(
             layer_id=layer_id,
             num_qk_heads=self.num_k_heads // self.attn_tp_size,
@@ -316,7 +311,7 @@ class Qwen3GatedDeltaNet(nn.Module):
             head_qk_dim=self.head_k_dim,
             head_v_dim=self.head_v_dim,
             attention_tp_size=self.attn_tp_size,
-            conv_weights=conv_weights,
+            conv_weights=self.conv1d.weight.squeeze(1),
             bias=self.conv1d.bias,
             activation=self.activation,
             A_log=self.A_log,
@@ -443,7 +438,6 @@ class Qwen3GatedDeltaNet(nn.Module):
             mixed_qkv=mixed_qkv,
             a=a,
             b=b,
-            z=z,
         )
 
         z_shape_og = z.shape
