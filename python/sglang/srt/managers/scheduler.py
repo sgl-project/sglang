@@ -67,8 +67,10 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
+from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
 from sglang.srt.managers.io_struct import (
     AbortReq,
+    ActiveRanksOutput,
     BaseBatchReq,
     BaseReq,
     BatchTokenizedEmbeddingReqInput,
@@ -287,6 +289,7 @@ class Scheduler(
             server_args.priority_scheduling_preemption_threshold
         )
         self.enable_lora = server_args.enable_lora
+        self.enable_lora_overlap_loading = server_args.enable_lora_overlap_loading
         self.max_loras_per_batch = server_args.max_loras_per_batch
         self.enable_overlap = not server_args.disable_overlap_schedule
         self.enable_pdmux = server_args.enable_pdmux
@@ -294,9 +297,6 @@ class Scheduler(
         self.enable_metrics = server_args.enable_metrics
         self.enable_metrics_for_all_schedulers = (
             server_args.enable_metrics_for_all_schedulers
-        )
-        self.enable_kv_cache_events = bool(
-            server_args.kv_events_config and tp_rank == 0
         )
         self.enable_trace = server_args.enable_trace
         self.stream_interval = server_args.stream_interval
@@ -317,6 +317,10 @@ class Scheduler(
                 self.tp_size,
                 self.dp_size,
             )
+        )
+
+        self.enable_kv_cache_events = bool(
+            server_args.kv_events_config and self.attn_tp_rank == 0
         )
 
         # Init model configs
@@ -376,6 +380,12 @@ class Scheduler(
 
         # Init request dispatcher
         self.init_request_dispatcher()
+
+        # Init LoRA overlap loader
+        if self.enable_lora_overlap_loading:
+            self.lora_overlap_loader = LoRAOverlapLoader(
+                self.tp_worker.model_runner.lora_manager
+            )
 
         # Init the grammar backend for constrained generation
         self.grammar_manager = GrammarManager(self)
@@ -638,10 +648,9 @@ class Scheduler(
             else:
                 from sglang.srt.mem_cache.chunk_cache import SWAChunkCache
 
-                params.sliding_window_size = self.model_config.sliding_window_size
-                params.attention_chunk_size = self.model_config.attention_chunk_size
-
-                self.tree_cache = SWAChunkCache(params)
+                self.tree_cache = SWAChunkCache(
+                    params, sliding_window_size=self.sliding_window_size
+                )
         else:
 
             if envs.SGLANG_EXPERIMENTAL_CPP_RADIX_TREE.get():
@@ -1399,6 +1408,14 @@ class Scheduler(
         else:
             return MultimodalInputs.from_dict(mm_inputs_dict)
 
+    def _maybe_clear_mm_inputs(self, batch: ScheduleBatch) -> None:
+        for req in batch.reqs:
+            if not req.finished() or not (mm_inputs := req.multimodal_inputs):
+                continue
+            for item in mm_inputs.mm_items:
+                item.feature = None
+            req.multimodal_inputs = None
+
     def handle_generate_request(
         self,
         recv_req: TokenizedGenerateReqInput,
@@ -1968,23 +1985,25 @@ class Scheduler(
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
         if self.enable_lora:
-            lora_set = set([req.lora_id for req in self.running_batch.reqs])
+            running_loras = {req.lora_id for req in self.running_batch.reqs}
 
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
-
-            if self.enable_lora:
-                new_lora_set = (
-                    lora_set
-                    | set([req.lora_id for req in adder.can_run_list])
-                    | set([req.lora_id])
-                )
-                if not self.tp_worker.can_run_lora_batch(new_lora_set):
-                    # Batch would exceed the LoRA slot limit.
-                    # Skip this request and try scheduling it in a future iteration.
-                    # Note: When eviction is needed, the eviction policy prefers to
-                    # evict LoRA adapters over base model (None) - see mem_pool.py.
-                    continue
+            if self.enable_lora and req.lora_id not in running_loras:
+                if self.enable_lora_overlap_loading:
+                    # For overlapping loading of LoRA weights with computation, we will load each adapter one at a time,
+                    # as opposed to loading them in one batch
+                    res = self.lora_overlap_loader.try_overlap_load_lora(
+                        req.lora_id, running_loras
+                    )
+                    if not res:
+                        continue
+                else:
+                    new_lora_set = {req.lora_id} | running_loras
+                    if not self.tp_worker.model_runner.lora_manager.validate_lora_batch(
+                        new_lora_set
+                    ):
+                        continue
 
             running_bs = len(self.running_batch.reqs)
             if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
@@ -2015,6 +2034,9 @@ class Scheduler(
                 ),
                 truncation_align_size=self.truncation_align_size,
             )
+
+            if self.enable_lora:
+                running_loras.add(req.lora_id)
 
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:
@@ -2350,6 +2372,19 @@ class Scheduler(
             for req in batch.reqs:
                 req.time_stats.prefill_end_time_host = current_time
 
+        if (
+            self.server_args.enable_dp_attention
+            and self.server_args.elastic_ep_backend == "mooncake"
+        ):
+            # Get the tensors indicating rank activeness
+            tp_active_ranks = self.tp_group.active_ranks.detach().cpu().numpy()
+            tp_active_ranks_cpu = self.tp_group.active_ranks_cpu.detach().numpy()
+            tp_active_ranks &= tp_active_ranks_cpu
+            dp_active_ranks = tp_active_ranks.reshape(self.dp_size, -1).prod(axis=1)
+            self.send_to_tokenizer.send_output(
+                ActiveRanksOutput(status=dp_active_ranks.tolist())
+            )
+
         return ret
 
     def launch_batch_sample_if_needed(
@@ -2386,6 +2421,7 @@ class Scheduler(
             self.process_batch_result_idle(batch, result)
 
         self.log_batch_result_stats(batch, result)
+        self._maybe_clear_mm_inputs(batch)
         self.maybe_send_health_check_signal()
 
     def maybe_send_health_check_signal(self):
