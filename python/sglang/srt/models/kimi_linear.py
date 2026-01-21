@@ -316,14 +316,13 @@ class KimiDeltaAttention(nn.Module):
 
         forget_gate = self.f_b_proj(self.f_a_proj(hidden_states)[0])[0]
 
+        beta = self.b_proj(hidden_states)[0].float()
         # fused_kda_gate is fused to KimiLinearAttentionBackend with decode
         if not forward_batch.forward_mode.is_decode():
             forget_gate = fused_kda_gate(
                 forget_gate, self.A_log, self.head_dim, g_bias=self.dt_bias
             )
-            beta = self.b_proj(hidden_states)[0].float().sigmoid()
-        else:
-            beta = self.b_proj(hidden_states)[0].float()
+            beta = beta.sigmoid()
         beta = beta.unsqueeze(0)
         forget_gate = forget_gate.unsqueeze(0)
 
