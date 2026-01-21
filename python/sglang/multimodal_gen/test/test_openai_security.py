@@ -12,10 +12,13 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
 
 
 class DummyResponse:
-    def __init__(self, status_code=200, headers=None, chunks=None):
+    def __init__(self, status_code=200, headers=None, chunks=None, peername=None):
         self.status_code = status_code
         self.headers = headers or {}
         self._chunks = chunks or []
+        self.extensions = {}
+        if peername is not None:
+            self.extensions["network_stream"] = DummyNetworkStream(peername)
 
     def raise_for_status(self):
         return None
@@ -23,6 +26,16 @@ class DummyResponse:
     async def aiter_bytes(self):
         for chunk in self._chunks:
             yield chunk
+
+
+class DummyNetworkStream:
+    def __init__(self, peername):
+        self._peername = peername
+
+    def get_extra_info(self, name, default=None):
+        if name == "peername":
+            return self._peername
+        return default
 
 
 class DummyStream:
@@ -109,8 +122,16 @@ def test_openai_media_url_redirect_limit(monkeypatch, tmp_path):
         "timeout": 1.0,
     }
     responses = [
-        DummyResponse(302, headers={"location": "http://example.com/next"}),
-        DummyResponse(302, headers={"location": "http://example.com/final"}),
+        DummyResponse(
+            302,
+            headers={"location": "http://example.com/next"},
+            peername=("93.184.216.34", 80),
+        ),
+        DummyResponse(
+            302,
+            headers={"location": "http://example.com/final"},
+            peername=("93.184.216.34", 80),
+        ),
     ]
     monkeypatch.setattr(
         openai_utils,
@@ -144,8 +165,9 @@ def test_openai_media_url_size_limit(monkeypatch, tmp_path):
     responses = [
         DummyResponse(
             200,
-            headers={"content-length": "10", "content-type": "image/png"},
+            headers={"content-length": "10", "content-type": "image/png"},      
             chunks=[b"1234"],
+            peername=("93.184.216.34", 80),
         )
     ]
     monkeypatch.setattr(
@@ -182,6 +204,7 @@ def test_openai_media_url_stream_limit(monkeypatch, tmp_path):
             200,
             headers={"content-type": "image/png"},
             chunks=[b"123", b"456"],
+            peername=("93.184.216.34", 80),
         )
     ]
     monkeypatch.setattr(
@@ -224,6 +247,7 @@ def test_openai_media_url_dns_pinning_sets_host_and_sni(monkeypatch, tmp_path):
             200,
             headers={"content-type": "image/png"},
             chunks=[b"1234"],
+            peername=("93.184.216.34", 443),
         )
     ]
     holder = {}
@@ -242,9 +266,7 @@ def test_openai_media_url_dns_pinning_sets_host_and_sni(monkeypatch, tmp_path):
     assert out_path.endswith(".png")
     method, url, kwargs = holder["client"].calls[0]
     assert method == "GET"
-    assert url.startswith("https://93.184.216.34/")
-    assert kwargs["headers"]["Host"] == "example.com"
-    assert kwargs["extensions"]["sni_hostname"] == "example.com"
+    assert url == "https://example.com/image.png"
 
 
 def test_openai_media_url_dns_pinning_ipv6_brackets_and_port(monkeypatch, tmp_path):
@@ -268,6 +290,7 @@ def test_openai_media_url_dns_pinning_ipv6_brackets_and_port(monkeypatch, tmp_pa
             200,
             headers={"content-type": "image/png"},
             chunks=[b"1234"],
+            peername=("2606:4700:4700::1111", 8443),
         )
     ]
     holder = {}
@@ -284,6 +307,4 @@ def test_openai_media_url_dns_pinning_ipv6_brackets_and_port(monkeypatch, tmp_pa
         )
     )
     _, url, kwargs = holder["client"].calls[0]
-    assert url.startswith("https://[2606:4700:4700::1111]:8443/")
-    assert kwargs["headers"]["Host"] == "example.com:8443"
-    assert kwargs["extensions"]["sni_hostname"] == "example.com"
+    assert url == "https://example.com:8443/image.png"

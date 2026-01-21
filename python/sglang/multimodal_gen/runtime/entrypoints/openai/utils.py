@@ -271,7 +271,26 @@ def _build_pinned_media_url_request(
     return pinned_url, headers, extensions
 
 
-def _validate_media_url_with_policy(url: str, policy: dict[str, Any]) -> None:
+def _response_peername(response: httpx.Response) -> Any:
+    stream = response.extensions.get("network_stream")
+    if stream is None:
+        return None
+    get_extra_info = getattr(stream, "get_extra_info", None)
+    if get_extra_info is None:
+        return None
+    return get_extra_info("peername")
+
+
+def validate_openai_media_url_peer_ip(peername: Any, allowed_ips: set[ipaddress._BaseAddress]) -> None:
+    if not peername:
+        raise ValueError("Failed to determine peer IP")
+    ip_str = peername[0]
+    peer_ip = ipaddress.ip_address(ip_str)
+    if peer_ip not in allowed_ips:
+        raise ValueError("Peer IP does not match DNS-resolved IPs")
+
+
+def _validate_media_url_with_policy(url: str, policy: dict[str, Any]) -> None:  
     _validate_media_url_with_policy_and_resolve(url, policy)
 
 
@@ -351,10 +370,16 @@ async def _save_url_image_to_path(
                 parsed, hostname, ips = _validate_media_url_with_policy_and_resolve(
                     current_url, policy
                 )
-                pinned_ip = next((ip for ip in ips if ip.version == 4), ips[0])
-                request_url, headers, extensions = _build_pinned_media_url_request(
-                    parsed, hostname, pinned_ip
-                )
+                allowed_ips = set(ips)
+                if (parsed.scheme or "").lower() == "https":
+                    request_url = current_url
+                    headers = None
+                    extensions = None
+                else:
+                    pinned_ip = next((ip for ip in ips if ip.version == 4), ips[0])
+                    request_url, headers, extensions = _build_pinned_media_url_request(
+                        parsed, hostname, pinned_ip
+                    )
                 async with client.stream(
                     "GET",
                     request_url,
@@ -362,11 +387,14 @@ async def _save_url_image_to_path(
                     headers=headers,
                     extensions=extensions,
                 ) as response:
-                    if response.status_code in {301, 302, 303, 307, 308}:
+                    validate_openai_media_url_peer_ip(
+                        _response_peername(response), allowed_ips
+                    )
+                    if response.status_code in {301, 302, 303, 307, 308}:       
                         location = response.headers.get("location")
                         if not location:
                             raise ValueError(
-                                "Redirect response missing location header"
+                                "Redirect response missing location header"     
                             )
                         current_url = urljoin(current_url, location)
                         continue
