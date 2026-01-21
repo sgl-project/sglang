@@ -592,7 +592,8 @@ class ChatCompletionRequest(BaseModel):
     @classmethod
     def set_tool_choice_default(cls, values):
         if values.get("tool_choice") is None:
-            if values.get("tools") is None:
+            tools = values.get("tools")
+            if tools is None or (isinstance(tools, list) and len(tools) == 0):
                 values["tool_choice"] = "none"
             else:
                 values["tool_choice"] = "auto"
@@ -1126,6 +1127,17 @@ class ResponsesRequest(BaseModel):
         "min_p": 0.0,
         "repetition_penalty": 1.0,
     }
+
+    @model_validator(mode="before")
+    @classmethod
+    def set_tool_choice_default(cls, values):
+        if values.get("tool_choice") is None:
+            tools = values.get("tools")
+            if tools is None or (isinstance(tools, list) and len(tools) == 0):
+                values["tool_choice"] = "none"
+            else:
+                values["tool_choice"] = "auto"
+        return values
 
     def to_sampling_params(
         self, default_max_tokens: int, default_params: Optional[Dict] = None
