@@ -70,6 +70,7 @@ from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
 from sglang.srt.managers.io_struct import (
     AbortReq,
+    ActiveRanksOutput,
     BaseBatchReq,
     BaseReq,
     BatchTokenizedEmbeddingReqInput,
@@ -605,6 +606,7 @@ class Scheduler(
             or self.tp_worker.model_runner.mamba2_config is not None
         )
 
+        self.sliding_window_size = None
         if self.is_hybrid_swa:
             self.sliding_window_size = self.tp_worker.sliding_window_size
             self.full_tokens_per_layer, self.swa_tokens_per_layer = (
@@ -634,6 +636,7 @@ class Scheduler(
             pp_rank=self.pp_rank,
             pp_size=self.pp_size,
             chunked_prefill_size=server_args.chunked_prefill_size,
+            sliding_window_size=self.sliding_window_size,
         )
 
         if (
@@ -647,9 +650,7 @@ class Scheduler(
             else:
                 from sglang.srt.mem_cache.chunk_cache import SWAChunkCache
 
-                self.tree_cache = SWAChunkCache(
-                    params, sliding_window_size=self.sliding_window_size
-                )
+                self.tree_cache = SWAChunkCache(params)
         else:
 
             if envs.SGLANG_EXPERIMENTAL_CPP_RADIX_TREE.get():
@@ -668,9 +669,7 @@ class Scheduler(
             elif self.is_hybrid_swa:
                 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 
-                self.tree_cache = SWARadixCache(
-                    params=params, sliding_window_size=self.sliding_window_size
-                )
+                self.tree_cache = SWARadixCache(params=params)
             elif self.is_hybrid_ssm:
                 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 
@@ -1406,6 +1405,14 @@ class Scheduler(
             return self._process_and_broadcast_mm_inputs(mm_inputs_dict)
         else:
             return MultimodalInputs.from_dict(mm_inputs_dict)
+
+    def _maybe_clear_mm_inputs(self, batch: ScheduleBatch) -> None:
+        for req in batch.reqs:
+            if not req.finished() or not (mm_inputs := req.multimodal_inputs):
+                continue
+            for item in mm_inputs.mm_items:
+                item.feature = None
+            req.multimodal_inputs = None
 
     def handle_generate_request(
         self,
@@ -2363,6 +2370,19 @@ class Scheduler(
             for req in batch.reqs:
                 req.time_stats.prefill_end_time_host = current_time
 
+        if (
+            self.server_args.enable_dp_attention
+            and self.server_args.elastic_ep_backend == "mooncake"
+        ):
+            # Get the tensors indicating rank activeness
+            tp_active_ranks = self.tp_group.active_ranks.detach().cpu().numpy()
+            tp_active_ranks_cpu = self.tp_group.active_ranks_cpu.detach().numpy()
+            tp_active_ranks &= tp_active_ranks_cpu
+            dp_active_ranks = tp_active_ranks.reshape(self.dp_size, -1).prod(axis=1)
+            self.send_to_tokenizer.send_output(
+                ActiveRanksOutput(status=dp_active_ranks.tolist())
+            )
+
         return ret
 
     def launch_batch_sample_if_needed(
@@ -2399,6 +2419,7 @@ class Scheduler(
             self.process_batch_result_idle(batch, result)
 
         self.log_batch_result_stats(batch, result)
+        self._maybe_clear_mm_inputs(batch)
         self.maybe_send_health_check_signal()
 
     def maybe_send_health_check_signal(self):
