@@ -7,7 +7,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use futures_util::StreamExt;
+use futures_util::{stream, StreamExt};
 use reqwest::Client;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error};
@@ -16,7 +16,7 @@ use crate::{
     app_context::AppContext,
     config::types::RetryConfig,
     core::{
-        is_retryable_status, ConnectionMode, RetryExecutor, Worker, WorkerLoadGuard,
+        is_retryable_status, AttachedBody, ConnectionMode, RetryExecutor, Worker, WorkerLoadGuard,
         WorkerRegistry, WorkerType, UNKNOWN_MODEL_ID,
     },
     observability::{
@@ -130,7 +130,7 @@ impl Router {
     }
 
     /// Select worker for a specific model considering circuit breaker state
-    fn select_worker_for_model(
+    async fn select_worker_for_model(
         &self,
         model_id: Option<&str>,
         text: Option<&str>,
@@ -167,21 +167,23 @@ impl Router {
             .worker_registry
             .get_hash_ring(effective_model_id.unwrap_or(UNKNOWN_MODEL_ID));
 
-        let idx = policy.select_worker(
-            &available,
-            &SelectWorkerInfo {
-                request_text: text,
-                tokens: None, // HTTP doesn't have tokens, use gRPC for PrefixHash
-                headers,
-                hash_ring,
-            },
-        )?;
+        let idx = policy
+            .select_worker(
+                &available,
+                &SelectWorkerInfo {
+                    request_text: text,
+                    tokens: None, // HTTP doesn't have tokens, use gRPC for PrefixHash
+                    headers,
+                    hash_ring,
+                },
+            )
+            .await?;
 
         // Record worker selection metric (Layer 3)
         Metrics::record_worker_selection(
             metrics_labels::WORKER_REGULAR,
             metrics_labels::CONNECTION_HTTP,
-            model_id.unwrap_or("default"),
+            model_id.unwrap_or(UNKNOWN_MODEL_ID),
             policy.name(),
         );
 
@@ -198,7 +200,7 @@ impl Router {
         let start = Instant::now();
         let is_stream = typed_req.is_stream();
         let text = typed_req.extract_text_for_routing();
-        let model = model_id.unwrap_or("default");
+        let model = model_id.unwrap_or(UNKNOWN_MODEL_ID);
         let endpoint = route_to_endpoint(route);
 
         // Record request start (Layer 2)
@@ -276,7 +278,10 @@ impl Router {
         is_stream: bool,
         text: &str,
     ) -> Response {
-        let worker = match self.select_worker_for_model(model_id, Some(text), headers) {
+        let worker = match self
+            .select_worker_for_model(model_id, Some(text), headers)
+            .await
+        {
             Some(w) => w,
             None => {
                 return error::service_unavailable(
@@ -286,15 +291,14 @@ impl Router {
             }
         };
 
-        // Optional load tracking for cache-aware policy
-        // Get the policy for this model to check if it's cache-aware
         let policy = match model_id {
             Some(model) => self.policy_registry.get_policy_or_default(model),
             None => self.policy_registry.get_default_policy(),
         };
 
-        let load_guard =
-            (policy.name() == "cache_aware").then(|| WorkerLoadGuard::new(worker.clone()));
+        let load_guard = ["cache_aware", "manual"]
+            .contains(&policy.name())
+            .then(|| WorkerLoadGuard::new(worker.clone(), headers));
 
         // Note: Using borrowed reference avoids heap allocation
         events::RequestSentEvent { url: worker.url() }.emit();
@@ -362,46 +366,65 @@ impl Router {
             })
             .unwrap_or_default();
 
-        let mut last_response: Option<Response> = None;
-        for worker in workers {
-            let worker_url = worker.url();
-            let base = self.worker_base_url(worker_url);
+        let futures: Vec<_> = workers
+            .into_iter()
+            .map(|worker| {
+                let worker_url = worker.url();
+                let base = self.worker_base_url(worker_url);
+                let url = format!("{}/{}", base, endpoint);
+                let client = self.client.clone();
+                let method = method.clone();
 
-            let url = format!("{}/{}", base, endpoint);
-            let mut request_builder = match method {
-                Method::GET => self.client.get(url),
-                Method::POST => self.client.post(url),
-                _ => {
-                    return error::method_not_allowed(
-                        "unsupported_method",
-                        "Unsupported method for simple routing",
-                    )
+                let headers = filtered_headers.clone();
+
+                let api_key = worker.api_key().clone();
+
+                async move {
+                    let mut request_builder = match method {
+                        Method::GET => client.get(url),
+                        Method::POST => client.post(url),
+                        _ => {
+                            return Err(error::method_not_allowed(
+                                "unsupported_method",
+                                "Unsupported method for simple routing",
+                            ))
+                        }
+                    };
+
+                    if let Some(key) = api_key {
+                        let mut auth_header = String::with_capacity(7 + key.len());
+                        auth_header.push_str("Bearer ");
+                        auth_header.push_str(&key);
+                        request_builder = request_builder.header("Authorization", auth_header);
+                    }
+
+                    for (name, value) in headers {
+                        request_builder = request_builder.header(name.clone(), value.clone());
+                    }
+
+                    request_builder.send().await.map_err(convert_reqwest_error)
                 }
-            };
+            })
+            .collect();
 
-            if let Some(api_key) = worker.api_key() {
-                // Pre-allocate string with capacity to avoid reallocation
-                let mut auth_header = String::with_capacity(7 + api_key.len());
-                auth_header.push_str("Bearer ");
-                auth_header.push_str(api_key);
-                request_builder = request_builder.header("Authorization", auth_header);
-            }
+        // Now execute the collected futures concurrently
+        let mut stream = stream::iter(futures).buffer_unordered(32);
+        let mut last_response: Option<Response> = None;
 
-            // Apply pre-filtered headers
-            for (name, value) in &filtered_headers {
-                request_builder = request_builder.header(*name, *value);
-            }
-
-            match request_builder.send().await {
+        while let Some(result) = stream.next().await {
+            match result {
                 Ok(res) => {
                     let status = StatusCode::from_u16(res.status().as_u16())
                         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+
                     let response_headers = header_utils::preserve_response_headers(res.headers());
+
                     match res.bytes().await {
                         Ok(body) => {
                             let mut response = Response::new(Body::from(body));
                             *response.status_mut() = status;
                             *response.headers_mut() = response_headers;
+
                             if status.is_success() {
                                 return response;
                             }
@@ -416,7 +439,7 @@ impl Router {
                     }
                 }
                 Err(e) => {
-                    last_response = Some(convert_reqwest_error(e));
+                    last_response = Some(e);
                 }
             }
         }
@@ -610,7 +633,7 @@ impl Router {
             // Attach load guard to response body for proper RAII lifecycle
             // Guard is dropped when response body is consumed or client disconnects
             if let Some(guard) = load_guard {
-                response = guard.attach_to_response(response);
+                response = AttachedBody::wrap_response(response, guard);
             }
             response
         }

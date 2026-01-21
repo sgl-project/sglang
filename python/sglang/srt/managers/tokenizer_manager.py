@@ -15,7 +15,6 @@
 
 import asyncio
 import copy
-import ctypes
 import dataclasses
 import logging
 import os
@@ -33,7 +32,6 @@ from http import HTTPStatus
 from typing import Any, Awaitable, Dict, List, Optional, Tuple, Union
 
 import fastapi
-import torch
 import uvloop
 import zmq
 import zmq.asyncio
@@ -49,6 +47,7 @@ from sglang.srt.managers.async_mm_data_processor import AsyncMMDataProcessor
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.io_struct import (
     AbortReq,
+    ActiveRanksOutput,
     BatchEmbeddingOutput,
     BatchMultimodalOutput,
     BatchStrOutput,
@@ -82,6 +81,7 @@ from sglang.srt.managers.tokenizer_manager_multiitem_mixin import (
     TokenizerManagerMultiItemMixin,
 )
 from sglang.srt.metrics.collector import TokenizerMetricsCollector
+from sglang.srt.metrics.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import (
     PortArgs,
@@ -118,30 +118,9 @@ from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
+_REQUEST_STATE_WAIT_TIMEOUT = envs.SGLANG_REQUEST_STATE_WAIT_TIMEOUT.get()
+
 logger = logging.getLogger(__name__)
-
-
-class TensorWrapper:
-    """Wrapper to keep tensor alive while exposing buffer for zero-copy."""
-
-    def __init__(self, tensor):
-        # Ensure tensor is on CPU and contiguous
-        if tensor.is_cuda:
-            tensor = tensor.cpu()
-        if not tensor.is_contiguous():
-            tensor = tensor.contiguous()
-
-        # Keep tensor reference
-        self.tensor = tensor
-        self.shape = list(tensor.shape)
-        self.dtype = tensor.dtype
-
-    def __buffer__(self):
-        data_ptr = self.tensor.data_ptr()
-        total_bytes = self.tensor.numel() * self.tensor.element_size()
-        c_obj = (ctypes.c_char * total_bytes).from_address(data_ptr)
-        c_obj._keep_alive_ref = self
-        return memoryview(c_obj)
 
 
 @dataclasses.dataclass
@@ -186,6 +165,14 @@ class ReqState:
     input_token_ids_logprobs_idx: List = dataclasses.field(default_factory=list)
     output_token_ids_logprobs_val: List = dataclasses.field(default_factory=list)
     output_token_ids_logprobs_idx: List = dataclasses.field(default_factory=list)
+
+    # For detokenized logprobs
+    input_token_logprobs: List[Any] = dataclasses.field(default_factory=list)
+    output_token_logprobs: List[Any] = dataclasses.field(default_factory=list)
+    input_top_logprobs: List[Any] = dataclasses.field(default_factory=list)
+    output_top_logprobs: List[Any] = dataclasses.field(default_factory=list)
+    input_token_ids_logprobs: List[Any] = dataclasses.field(default_factory=list)
+    output_token_ids_logprobs: List[Any] = dataclasses.field(default_factory=list)
 
 
 class InputFormat(Enum):
@@ -238,6 +225,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
         # Init metric collector and watchdog
         self.init_metric_collector_watchdog()
+
+        if self.enable_metrics:
+            start_cpu_monitor_thread("tokenizer")
 
         # Init request dispatcher
         self.init_request_dispatcher()
@@ -484,12 +474,14 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 (FreezeGCReq, lambda x: None),
                 # For handling case when scheduler skips detokenizer and forwards back to the tokenizer manager, we ignore it.
                 (HealthCheckOutput, lambda x: None),
+                (ActiveRanksOutput, self.update_active_ranks),
             ]
         )
         self.init_communicators(self.server_args)
 
         self.sampling_params_class = SamplingParams
         self.signal_handler_class = SignalHandler
+        self.req_state_class = ReqState
 
     async def generate_request(
         self,
@@ -706,6 +698,8 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         if self.mm_processor and obj.contains_mm_input():
             if obj.image_data is not None and not isinstance(obj.image_data, list):
                 obj.image_data = [obj.image_data]
+            if obj.video_data is not None and not isinstance(obj.video_data, list):
+                obj.video_data = [obj.video_data]
             if obj.audio_data is not None and not isinstance(obj.audio_data, list):
                 obj.audio_data = [obj.audio_data]
             self._validate_mm_limits(obj)
@@ -946,6 +940,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 data_parallel_rank=obj.data_parallel_rank,
                 priority=obj.priority,
                 extra_key=obj.extra_key,
+                routing_key=obj.routing_key,
                 need_wait_for_image=obj.need_wait_for_image,
                 num_items_assigned=obj.num_items_assigned,
             )
@@ -1055,88 +1050,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             )
         )
 
-    @staticmethod
-    def extract_feature_tensors(tokenized_obj):
-        if not isinstance(tokenized_obj, TokenizedGenerateReqInput):
-            return False, None, None
-
-        has_feature_tensors = False
-        feature_wrappers = []
-        feature_infos = []
-
-        if hasattr(tokenized_obj, "mm_inputs") and tokenized_obj.mm_inputs:
-            mm_items = tokenized_obj.mm_inputs.get("mm_items", [])
-
-            for idx, item in enumerate(mm_items):
-                if (
-                    hasattr(item, "feature")
-                    and item.feature is not None
-                    and isinstance(item.feature, torch.Tensor)
-                ):
-                    has_feature_tensors = True
-
-                    # Create wrapper (handles CPU/contiguous conversion and keeps tensor alive)
-                    wrapper = TensorWrapper(item.feature)
-                    feature_wrappers.append(wrapper)
-
-                    # Store metadata (from wrapper for consistency)
-                    feature_info = {
-                        "idx": idx,
-                        "shape": wrapper.shape,
-                        "dtype": wrapper.dtype,
-                    }
-                    feature_infos.append(feature_info)
-
-                    # Clear original reference for pickling
-                    item.feature = None
-
-        return has_feature_tensors, feature_wrappers, feature_infos
-
-    def _send_multi_parts(self, sender, obj, copy=False):
-        has_feature_tensors = False
-        feature_wrappers = None
-        feature_infos = None
-        if not self.server_args.skip_tokenizer_init:
-            has_feature_tensors, feature_wrappers, feature_infos = (
-                TokenizerManager.extract_feature_tensors(obj)
-            )
-        if has_feature_tensors:
-            parts = [
-                b"FEAT",
-                pickle.dumps(obj),
-                pickle.dumps(feature_infos),
-            ]
-            # Add wrappers - they keep tensors alive and provide buffer interface
-            for wrapper in feature_wrappers:
-                parts.append(wrapper.__buffer__())
-            sender.send_multipart(parts, copy=copy)
-        else:
-            sender.send_multipart(
-                [
-                    b"NORM",
-                    pickle.dumps(obj),
-                ],
-                copy=False,
-            )
-
-    async def _send_multi_parts_async(self, sender, obj, copy=False):
-        has_feature_tensors = False
-        feature_wrappers = None
-        feature_infos = None
-
-        if not self.server_args.skip_tokenizer_init:
-            has_feature_tensors, feature_wrappers, feature_infos = (
-                TokenizerManager.extract_feature_tensors(obj)
-            )
-
-        if has_feature_tensors:
-            parts = [b"FEAT", pickle.dumps(obj), pickle.dumps(feature_infos)]
-            for wrapper in feature_wrappers:
-                parts.append(wrapper.__buffer__())
-            await sender.send_multipart(parts, copy=copy)
-        else:
-            await sender.send_multipart([b"NORM", pickle.dumps(obj)], copy=copy)
-
     def _send_one_request(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
@@ -1145,8 +1058,10 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
     ):
         trace_slice_start(RequestStage.TOKENIZER_DISPATCH, obj.rid)
         tokenized_obj.trace_context = trace_get_proc_propagate_context(obj.rid)
-        self._send_multi_parts(self.send_to_scheduler, tokenized_obj)
-        state = ReqState([], False, asyncio.Event(), obj, created_time=created_time)
+        self.send_to_scheduler.send_pyobj(tokenized_obj)
+        state = self.req_state_class(
+            [], False, asyncio.Event(), obj, created_time=created_time
+        )
         state.request_sent_to_scheduler_ts = time.time()
         self.rid_to_state[obj.rid] = state
         trace_slice_end(
@@ -1167,11 +1082,12 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             batch_req = BatchTokenizedGenerateReqInput(batch=tokenized_objs)
         else:
             batch_req = BatchTokenizedEmbeddingReqInput(batch=tokenized_objs)
-        self._send_multi_parts(self.send_to_scheduler, batch_req)
+
+        self.send_to_scheduler.send_pyobj(batch_req)
         # Create states for each individual request in the batch
         for i, tokenized_obj in enumerate(tokenized_objs):
             tmp_obj = obj[i]
-            state = ReqState(
+            state = self.req_state_class(
                 [], False, asyncio.Event(), tmp_obj, created_time=created_time
             )
             self.rid_to_state[tmp_obj.rid] = state
@@ -1187,7 +1103,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         is_stream = getattr(obj, "stream", False)
         while True:
             try:
-                await asyncio.wait_for(state.event.wait(), timeout=4)
+                await asyncio.wait_for(
+                    state.event.wait(), timeout=_REQUEST_STATE_WAIT_TIMEOUT
+                )
             except asyncio.TimeoutError:
                 if (
                     request is not None
@@ -1393,7 +1311,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         if not abort_all and rid not in self.rid_to_state:
             return
         req = AbortReq(rid=rid, abort_all=abort_all)
-        self._send_multi_parts(self.send_to_scheduler, req)
+        self.send_to_scheduler.send_pyobj(req)
         if self.enable_metrics:
             # TODO: also use custom_labels from the request
             self.metrics_collector.observe_one_aborted_request(
@@ -1404,7 +1322,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         async with self.is_pause_cond:
             self.is_pause = True
             if obj.mode != "abort":
-                await self._send_multi_parts_async(self.send_to_scheduler, obj)
+                await self.send_to_scheduler.send_pyobj(obj)
             else:
                 # we are using the model_update_lock to check if there is still on-going requests.
                 while True:
@@ -1418,7 +1336,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
     async def continue_generation(self, obj: ContinueGenerationReqInput):
         async with self.is_pause_cond:
             self.is_pause = False
-            await self._send_multi_parts_async(self.send_to_scheduler, obj)
+            await self.send_to_scheduler.send_pyobj(obj)
             self.is_pause_cond.notify_all()
 
     async def update_weights_from_disk(
@@ -1463,7 +1381,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
     async def _wait_for_model_update_from_disk(
         self, obj: UpdateWeightFromDiskReqInput
     ) -> Tuple[bool, str]:
-        self._send_multi_parts(self.send_to_scheduler, obj)
+        self.send_to_scheduler.send_pyobj(obj)
         self.model_update_result = asyncio.Future()
         if self.server_args.dp_size == 1:
             result = await self.model_update_result
@@ -1498,7 +1416,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
     async def freeze_gc(self):
         """Send a freeze_gc message to the scheduler first, then freeze locally."""
-        self._send_multi_parts(self.send_to_scheduler, FreezeGCReq())
+        self.send_to_scheduler.send_pyobj(FreezeGCReq())
         freeze_gc("Tokenizer Manager")
         return None
 
@@ -1701,7 +1619,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             and recv_obj.load is not None
         ):
             load_update_req = WatchLoadUpdateReq(loads=[recv_obj.load])
-            self._send_multi_parts(self.send_to_scheduler, load_update_req)
+            self.send_to_scheduler.send_pyobj(load_update_req)
 
     def add_logprob_to_meta_info(
         self,
@@ -1711,42 +1629,83 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         token_ids_logprob: List[int],
         return_text_in_logprobs: bool,
     ):
-        meta_info["input_token_logprobs"] = self.detokenize_logprob_tokens(
-            state.input_token_logprobs_val,
-            state.input_token_logprobs_idx,
-            return_text_in_logprobs,
-        )
-        meta_info["output_token_logprobs"] = self.detokenize_logprob_tokens(
-            state.output_token_logprobs_val,
-            state.output_token_logprobs_idx,
-            return_text_in_logprobs,
-        )
-
-        if top_logprobs_num > 0:
-            meta_info["input_top_logprobs"] = self.detokenize_top_logprobs_tokens(
-                state.input_top_logprobs_val,
-                state.input_top_logprobs_idx,
-                return_text_in_logprobs,
-            )
-            meta_info["output_top_logprobs"] = self.detokenize_top_logprobs_tokens(
-                state.output_top_logprobs_val,
-                state.output_top_logprobs_idx,
-                return_text_in_logprobs,
-            )
-
-        if token_ids_logprob is not None:
-            meta_info["input_token_ids_logprobs"] = self.detokenize_top_logprobs_tokens(
-                state.input_token_ids_logprobs_val,
-                state.input_token_ids_logprobs_idx,
-                return_text_in_logprobs,
-            )
-            meta_info["output_token_ids_logprobs"] = (
-                self.detokenize_top_logprobs_tokens(
-                    state.output_token_ids_logprobs_val,
-                    state.output_token_ids_logprobs_idx,
+        # 1. Handle regular logprobs
+        if len(state.input_token_logprobs_val) > len(state.input_token_logprobs):
+            state.input_token_logprobs.extend(
+                self.detokenize_logprob_tokens(
+                    state.input_token_logprobs_val[len(state.input_token_logprobs) :],
+                    state.input_token_logprobs_idx[len(state.input_token_logprobs) :],
                     return_text_in_logprobs,
                 )
             )
+
+        if len(state.output_token_logprobs_val) > len(state.output_token_logprobs):
+            state.output_token_logprobs.extend(
+                self.detokenize_logprob_tokens(
+                    state.output_token_logprobs_val[len(state.output_token_logprobs) :],
+                    state.output_token_logprobs_idx[len(state.output_token_logprobs) :],
+                    return_text_in_logprobs,
+                )
+            )
+
+        meta_info["input_token_logprobs"] = state.input_token_logprobs
+        meta_info["output_token_logprobs"] = state.output_token_logprobs
+
+        # 2. Handle top logprobs
+        if top_logprobs_num > 0:
+            if len(state.input_top_logprobs_val) > len(state.input_top_logprobs):
+                state.input_top_logprobs.extend(
+                    self.detokenize_top_logprobs_tokens(
+                        state.input_top_logprobs_val[len(state.input_top_logprobs) :],
+                        state.input_top_logprobs_idx[len(state.input_top_logprobs) :],
+                        return_text_in_logprobs,
+                    )
+                )
+            if len(state.output_top_logprobs_val) > len(state.output_top_logprobs):
+                state.output_top_logprobs.extend(
+                    self.detokenize_top_logprobs_tokens(
+                        state.output_top_logprobs_val[len(state.output_top_logprobs) :],
+                        state.output_top_logprobs_idx[len(state.output_top_logprobs) :],
+                        return_text_in_logprobs,
+                    )
+                )
+
+            meta_info["input_top_logprobs"] = state.input_top_logprobs
+            meta_info["output_top_logprobs"] = state.output_top_logprobs
+
+        # 3. Handle token_ids_logprob
+        if token_ids_logprob is not None:
+            if len(state.input_token_ids_logprobs_val) > len(
+                state.input_token_ids_logprobs
+            ):
+                state.input_token_ids_logprobs.extend(
+                    self.detokenize_top_logprobs_tokens(
+                        state.input_token_ids_logprobs_val[
+                            len(state.input_token_ids_logprobs) :
+                        ],
+                        state.input_token_ids_logprobs_idx[
+                            len(state.input_token_ids_logprobs) :
+                        ],
+                        return_text_in_logprobs,
+                    )
+                )
+            if len(state.output_token_ids_logprobs_val) > len(
+                state.output_token_ids_logprobs
+            ):
+                state.output_token_ids_logprobs.extend(
+                    self.detokenize_top_logprobs_tokens(
+                        state.output_token_ids_logprobs_val[
+                            len(state.output_token_ids_logprobs) :
+                        ],
+                        state.output_token_ids_logprobs_idx[
+                            len(state.output_token_ids_logprobs) :
+                        ],
+                        return_text_in_logprobs,
+                    )
+                )
+
+            meta_info["input_token_ids_logprobs"] = state.input_token_ids_logprobs
+            meta_info["output_token_ids_logprobs"] = state.output_token_ids_logprobs
 
     def convert_logprob_style(
         self,
@@ -1761,7 +1720,10 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         if recv_obj.input_token_logprobs_val is None:
             return
 
-        if len(recv_obj.input_token_logprobs_val) > 0:
+        if (
+            len(recv_obj.input_token_logprobs_val) > 0
+            and recv_obj.input_token_logprobs_val[recv_obj_index] is not None
+        ):
             state.input_token_logprobs_val.extend(
                 recv_obj.input_token_logprobs_val[recv_obj_index]
             )
@@ -2195,6 +2157,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         }
         state.out_list.append(out)
         state.event.set()
+
+    def update_active_ranks(self, ranks: ActiveRanksOutput):
+        self.send_to_scheduler.send_pyobj(ranks)
 
     def _handle_open_session_req_output(self, recv_obj):
         self.session_futures[recv_obj.session_id].set_result(

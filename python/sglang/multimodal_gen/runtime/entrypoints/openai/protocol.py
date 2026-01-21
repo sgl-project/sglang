@@ -1,5 +1,8 @@
 import time
-from typing import Any, Dict, List, Optional
+import uuid
+from abc import ABC
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Union
 
 from pydantic import BaseModel, Field
 
@@ -9,6 +12,7 @@ class ImageResponseData(BaseModel):
     b64_json: Optional[str] = None
     url: Optional[str] = None
     revised_prompt: Optional[str] = None
+    file_path: Optional[str] = None
 
 
 class ImageResponse(BaseModel):
@@ -16,6 +20,7 @@ class ImageResponse(BaseModel):
     created: int = Field(default_factory=lambda: int(time.time()))
     data: List[ImageResponseData]
     peak_memory_mb: Optional[float] = None
+    inference_time_s: Optional[float] = None
 
 
 class ImageGenerationsRequest(BaseModel):
@@ -28,13 +33,18 @@ class ImageGenerationsRequest(BaseModel):
     style: Optional[str] = "vivid"
     background: Optional[str] = "auto"  # transparent | opaque | auto
     output_format: Optional[str] = None  # png | jpeg | webp
+    user: Optional[str] = None
+    # SGLang extensions
+    num_inference_steps: Optional[int] = None
+    guidance_scale: Optional[float] = None
+    true_cfg_scale: Optional[float] = (
+        None  # for CFG vs guidance distillation (e.g., QwenImage)
+    )
     seed: Optional[int] = 1024
     generator_device: Optional[str] = "cuda"
-    user: Optional[str] = None
     negative_prompt: Optional[str] = None
-    guidance_scale: Optional[float] = None
-    num_inference_steps: Optional[int] = None
     enable_teacache: Optional[bool] = False
+    diffusers_kwargs: Optional[Dict[str, Any]] = None  # kwargs for diffusers backend
 
 
 # Video API protocol models
@@ -48,11 +58,14 @@ class VideoResponse(BaseModel):
     size: str = ""
     seconds: str = "4"
     quality: str = "standard"
+    url: Optional[str] = None
     remixed_from_video_id: Optional[str] = None
     completed_at: Optional[int] = None
     expires_at: Optional[int] = None
     error: Optional[Dict[str, Any]] = None
+    file_path: Optional[str] = None
     peak_memory_mb: Optional[float] = None
+    inference_time_s: Optional[float] = None
 
 
 class VideoGenerationsRequest(BaseModel):
@@ -65,11 +78,17 @@ class VideoGenerationsRequest(BaseModel):
     num_frames: Optional[int] = None
     seed: Optional[int] = 1024
     generator_device: Optional[str] = "cuda"
+    # SGLang extensions
     num_inference_steps: Optional[int] = None
     guidance_scale: Optional[float] = None
     guidance_scale_2: Optional[float] = None
+    true_cfg_scale: Optional[float] = (
+        None  # for CFG vs guidance distillation (e.g., QwenImage)
+    )
     negative_prompt: Optional[str] = None
     enable_teacache: Optional[bool] = False
+    output_path: Optional[str] = None
+    diffusers_kwargs: Optional[Dict[str, Any]] = None  # kwargs for diffusers backend
 
 
 class VideoListResponse(BaseModel):
@@ -79,3 +98,23 @@ class VideoListResponse(BaseModel):
 
 class VideoRemixRequest(BaseModel):
     prompt: str
+
+
+@dataclass
+class BaseReq(ABC):
+    rid: Optional[Union[str, List[str]]] = field(default=None, kw_only=True)
+    http_worker_ipc: Optional[str] = field(default=None, kw_only=True)
+
+    def regenerate_rid(self):
+        """Generate a new request ID and return it."""
+        if isinstance(self.rid, list):
+            self.rid = [uuid.uuid4().hex for _ in range(len(self.rid))]
+        else:
+            self.rid = uuid.uuid4().hex
+        return self.rid
+
+
+@dataclass
+class VertexGenerateReqInput(BaseReq):
+    instances: List[dict]
+    parameters: Optional[dict] = None

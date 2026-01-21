@@ -1,27 +1,22 @@
 #!/bin/bash
 set -euo pipefail
 
-# Get version from SGLang version.py file
-SGLANG_VERSION_FILE="$(dirname "$0")/../../python/sglang/version.py"
-SGLANG_VERSION="v0.5.5"   # Default version, will be overridden if version.py is found
+# Get version from git tags
+SGLANG_VERSION="v0.5.5"   # Default version, will be overridden if git tags are found
 
-TMP_VERSION_FILE=$(mktemp)
-if git fetch --depth=1 origin main; then
-  if git show origin/main:python/sglang/version.py >"$TMP_VERSION_FILE" 2>/dev/null; then
-    VERSION_FROM_FILE="v$(cat "$SGLANG_VERSION_FILE" | cut -d'"' -f2)"
-    if [ -n "$VERSION_FROM_FILE" ]; then
-      SGLANG_VERSION="$VERSION_FROM_FILE"
-      echo "Using SGLang version from origin/main: $SGLANG_VERSION"
-    else
-      echo "Warning: Could not parse version from origin/main; using default $SGLANG_VERSION" >&2
-    fi
+# Fetch tags from origin to ensure we have the latest
+if git fetch --tags origin; then
+  # Get the latest version tag sorted by version number (e.g., v0.5.7)
+  VERSION_FROM_TAG=$(git tag -l 'v[0-9]*' --sort=-v:refname | head -1)
+  if [ -n "$VERSION_FROM_TAG" ]; then
+    SGLANG_VERSION="$VERSION_FROM_TAG"
+    echo "Using SGLang version from git tags: $SGLANG_VERSION"
   else
-    echo "Warning: version.py not found on origin/main; using default $SGLANG_VERSION" >&2
+    echo "Warning: No version tags found; using default $SGLANG_VERSION" >&2
   fi
 else
-  echo "Warning: failed to fetch origin/main; using default $SGLANG_VERSION" >&2
+  echo "Warning: Failed to fetch tags from origin; using default $SGLANG_VERSION" >&2
 fi
-rm -f "$TMP_VERSION_FILE"
 
 
 # Default base tags (can be overridden by command line arguments)
@@ -172,6 +167,7 @@ docker run -dt --user root --device=/dev/kfd ${DEVICE_FLAG} \
   -e HF_HUB_DOWNLOAD_TIMEOUT=300 \
   -e MIOPEN_USER_DB_PATH=/sgl-data/miopen-cache \
   -e MIOPEN_CUSTOM_CACHE_DIR=/sgl-data/miopen-cache \
+  -e PYTHONPATH="/opt/tilelang:${PYTHONPATH:-}" \
   --security-opt seccomp=unconfined \
   -w /sglang-checkout \
   --name ci_sglang \

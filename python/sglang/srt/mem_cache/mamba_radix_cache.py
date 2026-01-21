@@ -33,7 +33,11 @@ from sglang.srt.mem_cache.allocator import (
     PagedTokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
 )
-from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
+from sglang.srt.mem_cache.base_prefix_cache import (
+    BasePrefixCache,
+    MatchPrefixParams,
+    MatchResult,
+)
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import (
     RadixKey,
@@ -41,6 +45,7 @@ from sglang.srt.mem_cache.radix_cache import (
     _key_match_paged,
     get_child_key,
 )
+from sglang.srt.server_args import get_global_server_args
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -396,6 +401,9 @@ class MambaRadixCache(BasePrefixCache):
 
     ##### Public API #####
 
+    def supports_mamba(self) -> bool:
+        return True
+
     def reset(self) -> None:
         self.root_node = TreeNode()
         self.root_node.key = RadixKey([], None)
@@ -410,10 +418,10 @@ class MambaRadixCache(BasePrefixCache):
         self.full_lru_list = LRUList(mamba=False)
         self.mamba_lru_list = LRUList(mamba=True)
 
-    def match_prefix(self, key: RadixKey, **kwargs) -> MatchResult:
+    def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         """Find the matching prefix from the radix tree.
         Args:
-            key: A RadixKey contains token IDs to find a matching prefix.
+            params: MatchPrefixParams containing key and optional Mamba-specific parameters.
         Returns:
             A tuple of a tensor of matching prefix token IDs and
             the last node that contains the prefix values. Note that
@@ -421,8 +429,9 @@ class MambaRadixCache(BasePrefixCache):
             The last node create a new child if the prefix is shorter
             than the last node's value.
         """
-        cow_mamba: bool = kwargs.get("cow_mamba", False)
-        req: Req = kwargs.get("req", None)
+        key = params.key
+        cow_mamba = params.cow_mamba
+        req = params.req
 
         if self.disable or len(key) == 0:
             return MatchResult(
@@ -654,7 +663,7 @@ class MambaRadixCache(BasePrefixCache):
 
         # The prefix indices could be updated, reuse it
         match_result = self.match_prefix(
-            RadixKey(page_aligned_token_ids, req.extra_key)
+            MatchPrefixParams(key=RadixKey(page_aligned_token_ids, req.extra_key))
         )
         (new_indices, new_last_node) = (
             match_result.device_indices,
@@ -955,11 +964,14 @@ class MambaRadixCache(BasePrefixCache):
         # Calculate the branching point. It is defined as the last aligned position that
         # does not have a mamba value.
         if len(value) > best_value_len:
-            fla_chunk_aligned_seqlen = (
-                sum(len(v) for v in value) // FLA_CHUNK_SIZE
-            ) * FLA_CHUNK_SIZE
+            mamba_cache_chunk_size = get_global_server_args().mamba_cache_chunk_size
+            mamba_cache_chunk_aligned_seqlen = (
+                sum(len(v) for v in value) // mamba_cache_chunk_size
+            ) * mamba_cache_chunk_size
             mamba_branching_seqlen = (
-                fla_chunk_aligned_seqlen if fla_chunk_aligned_seqlen > 0 else None
+                mamba_cache_chunk_aligned_seqlen
+                if mamba_cache_chunk_aligned_seqlen > 0
+                else None
             )
         else:
             mamba_branching_seqlen = None
@@ -975,7 +987,7 @@ class MambaRadixCache(BasePrefixCache):
         new_node.full_lock_ref = child.full_lock_ref
         new_node.mamba_lock_ref = 0
         new_node.key = child.key[:split_len]
-        new_node.value = child.value[:split_len]
+        new_node.value = child.value[:split_len].clone()
 
         # child time should be later than parent's time for mamba tombstone
         child.last_access_time = get_last_access_time()
@@ -985,7 +997,7 @@ class MambaRadixCache(BasePrefixCache):
             self.mamba_lru_list.remove_node(child)
         child.parent = new_node
         child.key = child.key[split_len:]
-        child.value = child.value[split_len:]
+        child.value = child.value[split_len:].clone()
         new_node.parent.children[self.get_child_key_fn(key)] = new_node
 
         # insert the new node and child into the lru lists, insert
@@ -1040,7 +1052,7 @@ class MambaRadixCache(BasePrefixCache):
             new_node = TreeNode()
             new_node.parent = node
             new_node.key = key
-            new_node.value = value
+            new_node.value = value.clone()
             new_node.mamba_value = mamba_value
             self.full_lru_list.insert_mru(new_node)
             self.mamba_lru_list.insert_mru(new_node)

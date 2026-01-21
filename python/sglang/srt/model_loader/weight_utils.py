@@ -44,7 +44,12 @@ from sglang.srt.model_loader.ci_weight_validation import (
     ci_download_with_validation_and_retry,
     ci_validate_and_cleanup_local_snapshot,
 )
-from sglang.srt.utils import find_local_repo_dir, log_info_on_rank0, print_warning_once
+from sglang.srt.utils import (
+    BAR_FORMAT,
+    find_local_repo_dir,
+    log_info_on_rank0,
+    print_warning_once,
+)
 from sglang.utils import is_in_ci
 
 try:
@@ -589,6 +594,44 @@ def filter_duplicate_safetensors_files(
     return hf_weights_files
 
 
+def maybe_add_mtp_safetensors(
+    hf_weights_files: List[str], hf_folder: str, index_file: str, hf_config
+) -> List[str]:
+    """
+    Auto-detect and add mtp.safetensors for GLM4Moe MTP/NextN models if:
+    1. mtp.safetensors exists in the model directory
+    2. mtp.safetensors is NOT in the index (checkpoint packaging bug)
+    3. Model architecture is Glm4MoeForCausalLM with num_nextn_predict_layers > 0
+
+    This works around incorrectly packaged FP4 checkpoints like
+    baseten-admin/glm-4.7-fp4 where mtp.safetensors exists but
+    isn't referenced in model.safetensors.index.json.
+    """
+    # Only apply for GLM4Moe architecture with nextn layers
+    arch = getattr(hf_config, "architectures", [None])[0]
+    num_nextn_layers = getattr(hf_config, "num_nextn_predict_layers", 0)
+    if not (
+        arch in ["Glm4MoeForCausalLM", "Glm4MoeForCausalLMNextN"]
+        and num_nextn_layers > 0
+    ):
+        return hf_weights_files
+
+    # Check if mtp.safetensors exists and is not already in the file list
+    mtp_path = os.path.join(hf_folder, "mtp.safetensors")
+    if not os.path.isfile(mtp_path) or mtp_path in hf_weights_files:
+        return hf_weights_files
+
+    # mtp.safetensors exists but not in index - this is a bug
+    logger.warning(
+        f"Found mtp.safetensors but it's not referenced in {index_file}. "
+        f"This is a checkpoint packaging bug. Auto-adding it for loading. "
+        f"Please report this to the checkpoint provider."
+    )
+
+    # Add it to the files list
+    return hf_weights_files + [mtp_path]
+
+
 def filter_files_not_needed_for_inference(hf_weights_files: List[str]) -> List[str]:
     """
     Exclude files that are not needed for inference.
@@ -606,13 +649,6 @@ def filter_files_not_needed_for_inference(hf_weights_files: List[str]) -> List[s
         f for f in hf_weights_files if not any(f.endswith(x) for x in blacklist)
     ]
     return hf_weights_files
-
-
-# explicitly use pure text format, with a newline at the end
-# this makes it impossible to see the animation in the progress bar
-# but will avoid messing up with ray or multiprocessing, which wraps
-# each line of output with some prefix.
-_BAR_FORMAT = "{desc}: {percentage:3.0f}% Completed | {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]\n"  # noqa: E501
 
 
 def np_cache_weights_iterator(
@@ -642,7 +678,8 @@ def np_cache_weights_iterator(
                 hf_weights_files,
                 desc="Loading np_cache checkpoint shards",
                 disable=not enable_tqdm,
-                bar_format=_BAR_FORMAT,
+                bar_format=BAR_FORMAT,
+                position=tqdm._get_free_pos(),
             ):
                 state = torch.load(bin_file, map_location="cpu", weights_only=True)
                 for name, param in state.items():
@@ -699,7 +736,8 @@ def safetensors_weights_iterator(
         hf_weights_files,
         desc="Loading safetensors checkpoint shards",
         disable=not enable_tqdm,
-        bar_format=_BAR_FORMAT,
+        bar_format=BAR_FORMAT,
+        position=tqdm._get_free_pos(),
     ):
         if disable_mmap:
             with open(st_file, "rb") as f:
@@ -811,7 +849,7 @@ def multi_thread_safetensors_weights_iterator(
                 total=len(hf_weights_files),
                 desc="Multi-thread loading shards",
                 disable=not enable_tqdm,
-                bar_format=_BAR_FORMAT,
+                bar_format=BAR_FORMAT,
             )
         else:
             futures_iter = concurrent.futures.as_completed(futures)
@@ -820,6 +858,26 @@ def multi_thread_safetensors_weights_iterator(
             state_dict = future.result()
             for name, param in state_dict.items():
                 yield name, param
+
+
+def _load_pt_file(bin_file: str) -> dict:
+    """Load a PyTorch checkpoint file, handling legacy tar format.
+
+    PyTorch 2.6 changed the default of weights_only from False to True.
+    Legacy tar format files cannot be loaded with weights_only=True.
+    This function tries weights_only=True first, then falls back to False
+    for legacy tar format files from trusted sources (HuggingFace Hub).
+    """
+    try:
+        return torch.load(bin_file, map_location="cpu", weights_only=True)
+    except RuntimeError as e:
+        if "legacy .tar format" in str(e):
+            logger.warning(
+                "Loading %s with weights_only=False (legacy tar format)",
+                os.path.basename(bin_file),
+            )
+            return torch.load(bin_file, map_location="cpu", weights_only=False)
+        raise
 
 
 def pt_weights_iterator(
@@ -833,9 +891,10 @@ def pt_weights_iterator(
         hf_weights_files,
         desc="Loading pt checkpoint shards",
         disable=not enable_tqdm,
-        bar_format=_BAR_FORMAT,
+        bar_format=BAR_FORMAT,
+        position=tqdm._get_free_pos(),
     ):
-        state = torch.load(bin_file, map_location="cpu", weights_only=True)
+        state = _load_pt_file(bin_file)
         yield from state.items()
         del state
 
@@ -849,12 +908,9 @@ def multi_thread_pt_weights_iterator(
         not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
     )
 
-    def _load_file(bin_file: str):
-        return torch.load(bin_file, map_location="cpu", weights_only=True)
-
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [
-            executor.submit(_load_file, bin_file) for bin_file in hf_weights_files
+            executor.submit(_load_pt_file, bin_file) for bin_file in hf_weights_files
         ]
 
         if enable_tqdm:
@@ -863,7 +919,7 @@ def multi_thread_pt_weights_iterator(
                 total=len(hf_weights_files),
                 desc="Multi-thread loading pt checkpoint shards",
                 disable=not enable_tqdm,
-                bar_format=_BAR_FORMAT,
+                bar_format=BAR_FORMAT,
             )
         else:
             futures_iter = concurrent.futures.as_completed(futures)
@@ -1016,7 +1072,8 @@ def runai_safetensors_weights_iterator(
             hf_weights_files,
             desc="Loading safetensors using Runai Model Streamer",
             disable=not enable_tqdm,
-            bar_format=_BAR_FORMAT,
+            bar_format=BAR_FORMAT,
+            position=tqdm._get_free_pos(),
         ):
             streamer.stream_file(st_file)
             yield from streamer.get_tensors()
