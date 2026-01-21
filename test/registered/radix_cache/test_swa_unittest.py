@@ -127,8 +127,8 @@ class TestSWA(unittest.TestCase):
                 token_to_kv_pool_allocator=allocator,
                 disable=False,
                 page_size=page_size,
+                sliding_window_size=sliding_window_size,
             ),
-            sliding_window_size=sliding_window_size,
         )
 
         # test
@@ -264,8 +264,8 @@ class TestSWA(unittest.TestCase):
                 page_size=page_size,
                 disable=False,
                 is_eagle=True,
+                sliding_window_size=sliding_window_size,
             ),
-            sliding_window_size=sliding_window_size,
         )
 
         # test
