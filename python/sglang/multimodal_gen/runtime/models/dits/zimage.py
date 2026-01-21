@@ -704,7 +704,7 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
 
         Args:
             all_image (List[tensor]): [condition..., latent]
-            all_cap_feats (List[tensor]): TODO
+            all_cap_feats (List[tensor]): ["...<|vision_start|>", ..., "<|vision_end|><|im_end|>"]
             patch_size (int): patch_size for h and w
             f_patch_size (int): patch_size for f
             all_siglip_feats (List[tensor]): [num_images...] * batch_size
@@ -719,15 +719,12 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
 
         images = all_image[0]  # List of [C, F, H, W]
         cap_feats = all_cap_feats[0]  # List of [L, D]
-        siglips = all_siglip_feats[0]  # List of [H, W, C] TODO: review
+        siglips = all_siglip_feats[0]  # List of [H, W, C]
 
         all_image_out = []
         all_image_size = []
         all_cap_feats_out = []
         all_sig_out = []
-
-        # TODO:
-        # review, usage of mask
 
         all_image_noise_mask = []
         all_cap_noise_mask = []
@@ -778,14 +775,6 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
                 image, patch_size=patch_size, f_patch_size=f_patch_size
             )
             image_sizes.append((F, H, W))
-
-            # image_ori_len = image.size(0)
-            # image_padding_len = (-image_ori_len) % SEQ_MULTI_OF
-            # # padded feature
-            # image_padded_feat = torch.cat(
-            #     [image, image[-1:].repeat(image_padding_len, 1)],
-            #     dim=0,
-            # )
 
             noise_val = images_noise_mask[i][j]
             image_padded_feat, image_len, image_nm = self._pad_and_prepare_noise_mask(
@@ -1216,7 +1205,7 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         token_lens: List[int] = None,
         **kwargs,
     ):
-        # TODO(66ring): ignore control net for now.
+        # TODO: ignore control net for now.
         assert patch_size in self.all_patch_size
         assert f_patch_size in self.all_f_patch_size
 
@@ -1316,16 +1305,6 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
             ) = self.patchify_and_embed(x, cap_feats, patch_size, f_patch_size)
             x_pos_offsets = x_noise_mask = cap_noise_mask = siglip_noise_mask = None
 
-        # TODO: debug assert
-        assert isinstance(x, list) and isinstance(x[0], torch.Tensor), f"{type(x)=}"
-        assert isinstance(cap_feats, list) and isinstance(
-            cap_feats[0], torch.Tensor
-        ), f"{type(cap_feats)=}"
-        assert siglip_feats is None or (
-            isinstance(siglip_feats, list) and isinstance(siglip_feats[0], torch.Tensor)
-        ), f"{type(siglip_feats)=}"
-        assert len(x_size) == 1, f"bsz should be 1. got {len(x_size)=}"
-
         x = torch.cat(x, dim=0)
         x, _ = self.all_x_embedder[f"{patch_size}-{f_patch_size}"](x)
         x_freqs_cis = freqs_cis[1]
@@ -1333,11 +1312,9 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         x = x.unsqueeze(0)
         x_freqs_cis = x_freqs_cis
         x_noise_tensor = None
-        # TODO: ugly hack
         if x_noise_mask is not None:
-            x_noise_tensor = torch.stack(
-                [torch.tensor(m, dtype=torch.long, device=device) for m in x_noise_mask]
-            )
+            x_noise_tensor = torch.tensor(x_noise_mask, dtype=torch.long, device=device)
+
         for layer in self.noise_refiner:
             x = layer(x, x_freqs_cis, adaln_input, x_noise_tensor, t_noisy, t_clean)
 
