@@ -420,19 +420,31 @@ class ZImageOmniPipeline(ZImagePipeline):
             stage_name="input_validation_stage", stage=InputValidationStage()
         )
 
+        # self.add_stage(
+        #     stage_name="prompt_encoding_stage_primary",
+        #     stage=TextEncodingStage(
+        #         text_encoders=[
+        #             self.get_module("text_encoder"),
+        #         ],
+        #         tokenizers=[
+        #             self.get_module("tokenizer"),
+        #         ],
+        #     ),
+        # )
+
+        # self.add_stage(stage_name="conditioning_stage", stage=ConditioningStage())
+
         self.add_stage(
-            stage_name="prompt_encoding_stage_primary",
-            stage=TextEncodingStage(
-                text_encoders=[
-                    self.get_module("text_encoder"),
-                ],
-                tokenizers=[
-                    self.get_module("tokenizer"),
-                ],
+            stage_name="zimage_omni_before_denoising",
+            stage=ZImageOmniBeforeDenoisingStage(
+                vae=self.get_module("vae"),
+                vae_scale_factor=server_args.pipeline_config.vae_config.vae_scale_factor,
+                siglip=self.get_module("siglip"),
+                siglip_processor=self.get_module("siglip_processor"),
+                text_encoder=self.get_module("text_encoder"),
+                tokenizer=self.get_module("tokenizer"),
             ),
         )
-
-        self.add_stage(stage_name="conditioning_stage", stage=ConditioningStage())
 
         self.add_stage(
             stage_name="timestep_preparation_stage",
@@ -449,17 +461,6 @@ class ZImageOmniPipeline(ZImagePipeline):
                 transformer=self.get_module("transformer"),
             ),
         )
-
-        self.add_stage(
-            stage_name="zimage_omni_before_denoising",
-            stage=ZImageOmniBeforeDenoisingStage(
-                vae=self.get_module("vae"),
-                vae_scale_factor=server_args.pipeline_config.vae_config.vae_scale_factor,
-                siglip=self.get_module("siglip"),
-                siglip_processor=self.get_module("siglip_processor"),
-            ),
-        )
-
         self.add_stage(
             stage_name="denoising_stage",
             stage=DenoisingStage(

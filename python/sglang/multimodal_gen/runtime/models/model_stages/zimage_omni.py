@@ -3,7 +3,9 @@ from typing import List, Optional
 import torch
 from diffusers.pipelines.flux2.image_processor import Flux2ImageProcessor
 
+from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.models.vision_utils import load_image
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
@@ -20,6 +22,8 @@ class ZImageOmniBeforeDenoisingStage(PipelineStage):
         vae_scale_factor,
         siglip,
         siglip_processor,
+        tokenizer,
+        text_encoder,
     ):
         self.vae = vae
 
@@ -31,6 +35,67 @@ class ZImageOmniBeforeDenoisingStage(PipelineStage):
         self.vae_scale_factor = vae_scale_factor
         self.siglip = siglip
         self.siglip_processor = siglip_processor
+        self.tokenizer = tokenizer
+        self.text_encoder = text_encoder
+
+    def encode_text(
+        self,
+        text: str | list[str],
+        server_args: ServerArgs,
+        num_condition_images: int = 0,
+    ):
+        """ """
+
+        # Normalize input to list[str]
+        assert isinstance(text, str | list)
+        if isinstance(text, str):
+            texts: list[str] = [text]
+        else:
+            texts = text
+
+        target_device = get_local_torch_device()
+
+        # TODO: review in init?
+        preprocess_funcs = server_args.pipeline_config.preprocess_text_funcs
+        postprocess_funcs = server_args.pipeline_config.postprocess_text_funcs
+        text_encoder_extra_args = server_args.pipeline_config.text_encoder_extra_args
+        encoder_cfgs = server_args.pipeline_config.text_encoder_configs
+        assert (
+            len(server_args.pipeline_config.text_encoder_configs) == 1
+        ), "Should be single encoder."
+        preprocess_func = preprocess_funcs[0]
+        postprocess_func = postprocess_funcs[0]
+        encoder_config = encoder_cfgs[0]
+        text_encoder_extra_arg = text_encoder_extra_args[0]
+
+        processed_text_list: list[str] = []
+        for prompt_str in texts:
+            preprocessed = preprocess_func(prompt_str)
+            processed_text_list.append(preprocessed)
+
+        tok_kwargs = {
+            **encoder_config.tokenizer_kwargs,
+            **text_encoder_extra_arg,
+            "num_condition_images": num_condition_images,
+        }
+
+        text_inputs: dict = server_args.pipeline_config.tokenize_prompt(
+            processed_text_list, self.tokenizer, tok_kwargs
+        ).to(target_device)
+
+        input_ids = text_inputs["input_ids"]
+        attention_mask = text_inputs["attention_mask"]
+
+        with set_forward_context(current_timestep=0, attn_metadata=None):
+            outputs: BaseEncoderOutput = self.text_encoder(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                output_hidden_states=True,
+                use_cache=False,
+            )
+        prompt_embeds = postprocess_func(outputs, text_inputs)
+
+        return [prompt_embeds]
 
     def _preprocess_image(
         self,
@@ -241,10 +306,43 @@ class ZImageOmniBeforeDenoisingStage(PipelineStage):
         batch: Req,
         server_args: ServerArgs,
     ) -> Req:
-        do_classifier_free_guidance = batch.do_classifier_free_guidance
+        # Copied from diffusers.pipeline_z_image_omni
+        do_classifier_free_guidance = batch.guidance_scale > 1
+        batch.do_classifier_free_guidance = do_classifier_free_guidance
 
         # # TODO:
         # (prompt_embeds, negative_prompt_embeds,) = self.encode_prompt()
+
+        # Encode positive prompt with all available encoders
+        assert batch.prompt is not None
+        num_condition_images: int = (
+            len(batch.image_path) if batch.image_path is not None else 0
+        )
+
+        # TODO: review
+        pos_prompt_embeds_list = self.encode_text(
+            batch.prompt,
+            server_args,
+            num_condition_images=num_condition_images,
+        )
+        assert isinstance(batch.prompt_embeds, list)
+        for pe in pos_prompt_embeds_list:
+            batch.prompt_embeds.append(pe)
+
+        # Encode negative prompt if CFG is enabled
+        if batch.do_classifier_free_guidance:
+            # Copied from diffusers.pipeline_z_image_omni
+            if batch.negative_prompt is None:
+                batch.negative_prompt = ""
+
+            neg_prompt_embeds_list = self.encode_text(
+                batch.negative_prompt,
+                server_args,
+                num_condition_images=num_condition_images,
+            )
+            assert isinstance(batch.negative_prompt_embeds, list)
+            for ne in neg_prompt_embeds_list:
+                batch.negative_prompt_embeds.append(ne)
 
         # 3. Process condition images. Copied from diffusers.pipelines.flux2.pipeline_flux2
         condition_image, resized_images, (target_height, target_width) = (
