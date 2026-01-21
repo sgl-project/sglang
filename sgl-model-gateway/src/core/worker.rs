@@ -18,7 +18,7 @@ use super::{
     CircuitBreaker, WorkerError, WorkerResult, UNKNOWN_MODEL_ID,
 };
 use crate::{
-    grpc_client::SglangSchedulerClient,
+    grpc_client::{health::HealthClient, SglangEncoderClient},
     observability::metrics::{metrics_labels, Metrics},
     protocols::worker_spec::WorkerInfo,
     routers::grpc::client::GrpcClient,
@@ -383,7 +383,7 @@ pub trait Worker: Send + Sync + fmt::Debug {
 
     /// Get or create an encoder gRPC client for this worker
     /// Returns None for non-encode workers, Some(client) for encode workers
-    async fn get_encoder_client(&self) -> WorkerResult<Option<Arc<SglangSchedulerClient>>>;
+    async fn get_encoder_client(&self) -> WorkerResult<Option<Arc<SglangEncoderClient>>>;
 
     /// Reset the gRPC client connection (for reconnection scenarios)
     /// No-op for HTTP workers
@@ -646,7 +646,7 @@ pub struct BasicWorker {
     pub grpc_client: Arc<OnceCell<Arc<GrpcClient>>>,
     /// Lazily initialized encoder client for EPD encode workers.
     /// Uses OnceCell for lock-free reads after initialization.
-    pub encoder_client: Arc<OnceCell<Arc<SglangSchedulerClient>>>,
+    pub encoder_client: Arc<OnceCell<Arc<SglangEncoderClient>>>,
     /// Runtime-mutable models override (for lazy discovery)
     /// When set, overrides metadata.models for routing decisions.
     /// Uses std::sync::RwLock for synchronous access in supports_model().
@@ -896,7 +896,7 @@ impl Worker for BasicWorker {
         }
     }
 
-    async fn get_encoder_client(&self) -> WorkerResult<Option<Arc<SglangSchedulerClient>>> {
+    async fn get_encoder_client(&self) -> WorkerResult<Option<Arc<SglangEncoderClient>>> {
         // Only encode workers have encoder clients
         if !matches!(self.metadata.worker_type, WorkerType::Encode { .. }) {
             return Ok(None);
@@ -910,7 +910,7 @@ impl Worker for BasicWorker {
                     "Lazily initializing encoder client for worker: {}",
                     self.metadata.url
                 );
-                match SglangSchedulerClient::connect(&self.metadata.url).await {
+                match SglangEncoderClient::connect(&self.metadata.url).await {
                     Ok(client) => {
                         tracing::info!(
                             "Successfully connected encoder client for worker: {}",
@@ -950,44 +950,37 @@ impl Worker for BasicWorker {
 
         // Use encoder client for encode workers
         if matches!(self.metadata.worker_type, WorkerType::Encode { .. }) {
-            let encoder_client = self
-                .encoder_client
-                .get_or_try_init(|| async {
-                    tracing::info!(
-                        "Lazily initializing encoder client for worker: {}",
+            let health_client = match time::timeout(
+                timeout,
+                HealthClient::connect(&self.metadata.url),
+            )
+            .await
+            {
+                Ok(Ok(client)) => client,
+                Ok(Err(err)) => {
+                    tracing::warn!(
+                        "Encoder gRPC health connect error for {}: {err:?}",
                         self.metadata.url
                     );
-                    match SglangSchedulerClient::connect(&self.metadata.url).await {
-                        Ok(client) => {
-                            tracing::info!(
-                                "Successfully connected encoder client for worker: {}",
-                                self.metadata.url
-                            );
-                            Ok(Arc::new(client))
-                        }
-                        Err(e) => {
-                            tracing::error!(
-                                "Failed to connect encoder client for worker {}: {}",
-                                self.metadata.url,
-                                e
-                            );
-                            Err(WorkerError::ConnectionFailed {
-                                url: self.metadata.url.clone(),
-                                reason: format!("Failed to connect to encoder gRPC server: {}", e),
-                            })
-                        }
-                    }
-                })
-                .await?;
+                    return Ok(false);
+                }
+                Err(_) => {
+                    tracing::warn!("Encoder gRPC health connect timed out for {}", self.metadata.url);
+                    return Ok(false);
+                }
+            };
 
-            match time::timeout(timeout, encoder_client.health_check()).await {
+            match time::timeout(timeout, health_client.check("")).await {
                 Ok(Ok(resp)) => {
+                    let serving = resp.status
+                        == crate::grpc_client::health::proto::health_check_response::ServingStatus::Serving
+                            as i32;
                     tracing::debug!(
-                        "Encoder gRPC health OK for {}: healthy={}",
+                        "Encoder gRPC health OK for {}: serving={}",
                         self.metadata.url,
-                        resp.healthy
+                        serving
                     );
-                    Ok(resp.healthy)
+                    Ok(serving)
                 }
                 Ok(Err(err)) => {
                     tracing::warn!(
@@ -1201,7 +1194,7 @@ impl Worker for DPAwareWorker {
         self.base_worker.get_grpc_client().await
     }
 
-    async fn get_encoder_client(&self) -> WorkerResult<Option<Arc<SglangSchedulerClient>>> {
+    async fn get_encoder_client(&self) -> WorkerResult<Option<Arc<SglangEncoderClient>>> {
         self.base_worker.get_encoder_client().await
     }
 
