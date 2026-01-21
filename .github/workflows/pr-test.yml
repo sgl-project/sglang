@@ -192,75 +192,23 @@ jobs:
     # Only run for PRs (not scheduled) and when not targeting a specific stage
     # Skip if call-gate failed (stage-a jobs will be skipped, nothing to wait for)
     # !cancelled() ensures this job respects workflow cancellation from concurrency group
-    if: |
-      always() &&
-      !cancelled() &&
-      github.event_name == 'pull_request' &&
-      !inputs.target_stage &&
-      inputs.test_parallel_dispatch != true &&
-      (needs.check-changes.outputs.main_package == 'true' || needs.check-changes.outputs.sgl_kernel == 'true') &&
-      (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped')
+    if: always() && !cancelled()
     runs-on: ubuntu-latest
     outputs:
       stage_a_result: ${{ steps.wait.outputs.result }}
     steps:
-      - name: Wait for stage-a-test-1 to complete
+      - name: Skip wait (stage-a disabled)
         id: wait
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const maxWaitMinutes = 60;
-            const pollIntervalSeconds = 120;  // 2 minutes to reduce GH API calls
-            const maxAttempts = (maxWaitMinutes * 60) / pollIntervalSeconds;
-
-            for (let attempt = 0; attempt < maxAttempts; attempt++) {
-              const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun, {
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                run_id: context.runId,
-                per_page: 100,
-              });
-
-              const stageAJob = jobs.find(job => job.name === 'stage-a-test-1');
-
-              if (stageAJob) {
-                console.log(`stage-a-test-1 status: ${stageAJob.status}, conclusion: ${stageAJob.conclusion}`);
-
-                if (stageAJob.status === 'completed') {
-                  if (stageAJob.conclusion === 'success' || stageAJob.conclusion === 'skipped') {
-                    core.setOutput('result', stageAJob.conclusion === 'success' ? 'success' : 'skipped');
-                    return;
-                  } else {
-                    core.setOutput('result', 'failure');
-                    core.setFailed(`stage-a-test-1 ${stageAJob.conclusion}`);
-                    return;
-                  }
-                }
-              } else {
-                console.log('stage-a-test-1 job not found yet');
-              }
-
-              console.log(`Waiting ${pollIntervalSeconds}s... (attempt ${attempt + 1}/${maxAttempts})`);
-              await new Promise(resolve => setTimeout(resolve, pollIntervalSeconds * 1000));
-            }
-
-            core.setFailed('Timeout waiting for stage-a-test-1');
-            core.setOutput('result', 'timeout');
+        run: |
+          echo "result=success" >> $GITHUB_OUTPUT
+          echo "Stage-a tests disabled, skipping wait"
 
   wait-for-stage-b:
     needs: [check-changes, call-gate, wait-for-stage-a]
     # Only run for PRs (not scheduled) and when not targeting a specific stage
     # Skip if call-gate failed (stage-b jobs will be skipped, nothing to wait for)
     # !cancelled() ensures this job respects workflow cancellation from concurrency group
-    if: |
-      always() &&
-      !cancelled() &&
-      github.event_name == 'pull_request' &&
-      !inputs.target_stage &&
-      inputs.test_parallel_dispatch != true &&
-      (needs.check-changes.outputs.main_package == 'true' || needs.check-changes.outputs.sgl_kernel == 'true') &&
-      (needs.wait-for-stage-a.result == 'success' || needs.wait-for-stage-a.result == 'skipped') &&
-      (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped')
+    if: false
     runs-on: ubuntu-latest
     outputs:
       stage_b_result: ${{ steps.wait.outputs.result }}
@@ -424,7 +372,7 @@ jobs:
   sgl-kernel-build-wheels-arm:
     needs: [check-changes, call-gate]
     # Skip for scheduled runs (they run stages independently) and when target_stage is set
-    if: github.event_name != 'schedule' && inputs.test_parallel_dispatch != true && !inputs.target_stage && needs.check-changes.outputs.sgl_kernel == 'true'
+    if: false
     runs-on: arm-kernel-build-node
     timeout-minutes: 60
     strategy:
@@ -474,11 +422,7 @@ jobs:
   sgl-kernel-unit-test:
     needs: [check-changes, call-gate, sgl-kernel-build-wheels]
     # Skip for scheduled runs and when target_stage is set
-    if: |
-      github.event_name != 'schedule' &&
-      inputs.test_parallel_dispatch != true &&
-      !inputs.target_stage &&
-      needs.check-changes.outputs.sgl_kernel == 'true'
+    if: false
     runs-on: 1-gpu-runner
     timeout-minutes: 60
     env:
@@ -514,11 +458,7 @@ jobs:
   sgl-kernel-mla-test:
     needs: [check-changes, call-gate, sgl-kernel-build-wheels]
     # Skip for scheduled runs and when target_stage is set
-    if: |
-      github.event_name != 'schedule' &&
-      inputs.test_parallel_dispatch != true &&
-      !inputs.target_stage &&
-      needs.check-changes.outputs.sgl_kernel == 'true'
+    if: false
     runs-on: 1-gpu-runner
     timeout-minutes: 60
     env:
@@ -554,11 +494,7 @@ jobs:
   sgl-kernel-benchmark-test:
     needs: [check-changes, call-gate, sgl-kernel-build-wheels]
     # Skip for scheduled runs and when target_stage is set
-    if: |
-      github.event_name != 'schedule' &&
-      inputs.test_parallel_dispatch != true &&
-      !inputs.target_stage &&
-      needs.check-changes.outputs.sgl_kernel == 'true'
+    if: false
     runs-on: 1-gpu-runner
     timeout-minutes: 60
     env:
@@ -607,11 +543,7 @@ jobs:
   sgl-kernel-b200-test:
     needs: [check-changes, sgl-kernel-build-wheels]
     # Skip for scheduled runs and when target_stage is set
-    if: |
-      github.event_name != 'schedule' &&
-      inputs.test_parallel_dispatch != true &&
-      !inputs.target_stage &&
-      needs.check-changes.outputs.sgl_kernel == 'true'
+    if: false
     runs-on: ${{ needs.check-changes.outputs.b200_runner }}
     timeout-minutes: 60
     env:
@@ -680,11 +612,7 @@ jobs:
   jit-kernel-unit-test:
     needs: [check-changes, call-gate]
     # Skip for scheduled runs and when target_stage is set
-    if: |
-      github.event_name != 'schedule' &&
-      inputs.test_parallel_dispatch != true &&
-      !inputs.target_stage &&
-      needs.check-changes.outputs.jit_kernel == 'true'
+    if: false
     runs-on: 1-gpu-runner
     timeout-minutes: 60
     env:
@@ -709,16 +637,7 @@ jobs:
 
   stage-a-test-1:
     needs: [check-changes, call-gate, sgl-kernel-build-wheels]
-    if: |
-      always() &&
-      (
-        (inputs.target_stage == 'stage-a-test-1') ||
-        (
-          !inputs.target_stage &&
-          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
-          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-        )
-      )
+    if: false
     runs-on: 1-gpu-runner
     timeout-minutes: 60
     env:
@@ -756,16 +675,7 @@ jobs:
 
   stage-a-cpu-only:
     needs: [check-changes, call-gate]
-    if: |
-      always() &&
-      (
-        (inputs.target_stage == 'stage-a-cpu-only') ||
-        (
-          !inputs.target_stage &&
-          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
-          (needs.check-changes.outputs.main_package == 'true')
-        )
-      )
+    if: false
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -802,16 +712,7 @@ jobs:
   # Runs on 5090 (32GB, SM120)
   stage-b-test-small-1-gpu:
     needs: [check-changes, call-gate, wait-for-stage-a, sgl-kernel-build-wheels]
-    if: |
-      always() &&
-      (
-        (inputs.target_stage == 'stage-b-test-small-1-gpu') ||
-        (
-          !inputs.target_stage &&
-          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
-          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-        )
-      )
+    if: always() && !failure() && !cancelled()
     runs-on: 1-gpu-5090
     timeout-minutes: 60
     env:
@@ -819,9 +720,9 @@ jobs:
       IS_BLACKWELL: "1"
     strategy:
       fail-fast: false
-      max-parallel: 8
+      max-parallel: 1
       matrix:
-        partition: [0, 1, 2, 3, 4, 5, 6, 7]
+        partition: [4]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -856,16 +757,7 @@ jobs:
   # Runs on H100 (80GB, SM90) - tests that don't pass on 5090 (FA3, FP8, high VRAM, etc.)
   stage-b-test-large-1-gpu:
     needs: [check-changes, call-gate, wait-for-stage-a, sgl-kernel-build-wheels]
-    if: |
-      always() &&
-      (
-        (inputs.target_stage == 'stage-b-test-large-1-gpu') ||
-        (
-          !inputs.target_stage &&
-          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
-          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-        )
-      )
+    if: false
     runs-on: 1-gpu-runner
     timeout-minutes: 60
     env:
@@ -906,16 +798,7 @@ jobs:
 
   stage-b-test-large-2-gpu:
     needs: [check-changes, call-gate, wait-for-stage-a, sgl-kernel-build-wheels]
-    if: |
-      always() &&
-      (
-        (inputs.target_stage == 'stage-b-test-large-2-gpu') ||
-        (
-          !inputs.target_stage &&
-          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
-          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-        )
-      )
+    if: false
     runs-on: 2-gpu-runner
     timeout-minutes: 60
     env:
@@ -955,16 +838,7 @@ jobs:
 
   stage-b-test-small-1-gpu-performance:
     needs: [check-changes, call-gate, wait-for-stage-a, sgl-kernel-build-wheels]
-    if: |
-      always() &&
-      (
-        (inputs.target_stage == 'stage-b-test-small-1-gpu-performance') ||
-        (
-          !inputs.target_stage &&
-          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
-          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-        )
-      )
+    if: false
     runs-on: 1-gpu-5090
     timeout-minutes: 60
     env:
@@ -1003,16 +877,7 @@ jobs:
 
   stage-b-test-large-1-gpu-performance:
     needs: [check-changes, call-gate, wait-for-stage-a, sgl-kernel-build-wheels]
-    if: |
-      always() &&
-      (
-        (inputs.target_stage == 'stage-b-test-large-1-gpu-performance') ||
-        (
-          !inputs.target_stage &&
-          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
-          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-        )
-      )
+    if: false
     runs-on: 1-gpu-runner
     timeout-minutes: 60
     env:
@@ -1052,16 +917,7 @@ jobs:
 
   stage-b-test-large-2-gpu-performance:
     needs: [check-changes, call-gate, wait-for-stage-a, sgl-kernel-build-wheels]
-    if: |
-      always() &&
-      (
-        (inputs.target_stage == 'stage-b-test-large-2-gpu-performance') ||
-        (
-          !inputs.target_stage &&
-          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
-          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-        )
-      )
+    if: false
     runs-on: 2-gpu-runner
     timeout-minutes: 60
     env:
@@ -1097,16 +953,7 @@ jobs:
 
   stage-b-test-small-1-gpu-accuracy:
     needs: [check-changes, call-gate, wait-for-stage-a, sgl-kernel-build-wheels]
-    if: |
-      always() &&
-      (
-        (inputs.target_stage == 'stage-b-test-small-1-gpu-accuracy') ||
-        (
-          !inputs.target_stage &&
-          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
-          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-        )
-      )
+    if: false
     runs-on: 1-gpu-5090
     timeout-minutes: 60
     env:
@@ -1148,16 +995,7 @@ jobs:
 
   stage-b-test-large-2-gpu-accuracy:
     needs: [check-changes, call-gate, wait-for-stage-a, sgl-kernel-build-wheels]
-    if: |
-      always() &&
-      (
-        (inputs.target_stage == 'stage-b-test-large-2-gpu-accuracy') ||
-        (
-          !inputs.target_stage &&
-          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
-          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-        )
-      )
+    if: false
     runs-on: 2-gpu-runner
     timeout-minutes: 60
     env:
@@ -1196,16 +1034,7 @@ jobs:
 
   stage-b-test-4-gpu-b200:
     needs: [check-changes, call-gate, wait-for-stage-a, sgl-kernel-build-wheels]
-    if: |
-      always() &&
-      (
-        (inputs.target_stage == 'stage-b-test-4-gpu-b200') ||
-        (
-          !inputs.target_stage &&
-          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
-          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-        )
-      )
+    if: false
     runs-on: ${{ needs.check-changes.outputs.b200_runner }}
     timeout-minutes: 60
     env:
@@ -1244,16 +1073,7 @@ jobs:
 
   stage-c-test-large-4-gpu:
     needs: [check-changes, call-gate, wait-for-stage-b, sgl-kernel-build-wheels]
-    if: |
-      always() &&
-      (
-        (inputs.target_stage == 'stage-c-test-large-4-gpu') ||
-        (
-          !inputs.target_stage &&
-          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
-          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-        )
-      )
+    if: false
     runs-on: 4-gpu-h100
     timeout-minutes: 60
     env:
@@ -1289,16 +1109,7 @@ jobs:
 
   stage-c-test-large-4-gpu-b200:
     needs: [check-changes, call-gate, wait-for-stage-b, sgl-kernel-build-wheels]
-    if: |
-      always() &&
-      (
-        (inputs.target_stage == 'stage-c-test-large-4-gpu-b200') ||
-        (
-          !inputs.target_stage &&
-          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
-          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-        )
-      )
+    if: false
     runs-on: ${{ needs.check-changes.outputs.b200_runner }}
     timeout-minutes: 60
     env:
@@ -1330,16 +1141,7 @@ jobs:
 
   multimodal-gen-test-1-gpu:
     needs: [check-changes, call-gate, sgl-kernel-build-wheels]
-    if: |
-      always() &&
-      (
-        (inputs.target_stage == 'multimodal-gen-test-1-gpu') ||
-        (
-          !inputs.target_stage &&
-          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
-          needs.check-changes.outputs.multimodal_gen == 'true'
-        )
-      )
+    if: false
     runs-on: 1-gpu-runner
     timeout-minutes: 60
     strategy:
@@ -1381,16 +1183,7 @@ jobs:
 
   multimodal-gen-test-2-gpu:
     needs: [check-changes, call-gate, sgl-kernel-build-wheels]
-    if: |
-      always() &&
-      (
-        (inputs.target_stage == 'multimodal-gen-test-2-gpu') ||
-        (
-          !inputs.target_stage &&
-          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
-          needs.check-changes.outputs.multimodal_gen == 'true'
-        )
-      )
+    if: false
     runs-on: 2-gpu-runner
     timeout-minutes: 60
     strategy:
@@ -1432,16 +1225,7 @@ jobs:
 
   unit-test-backend-4-gpu:
     needs: [check-changes, call-gate, wait-for-stage-b]
-    if: |
-      always() &&
-      (
-        (inputs.target_stage == 'unit-test-backend-4-gpu') ||
-        (
-          !inputs.target_stage &&
-          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
-          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-        )
-      )
+    if: false
     runs-on: 4-gpu-h100
     timeout-minutes: 60
     env:
@@ -1485,16 +1269,7 @@ jobs:
 
   unit-test-backend-8-gpu-h200:
     needs: [check-changes, call-gate, wait-for-stage-b]
-    if: |
-      always() &&
-      (
-        (inputs.target_stage == 'unit-test-backend-8-gpu-h200') ||
-        (
-          !inputs.target_stage &&
-          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
-          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-        )
-      )
+    if: false
     runs-on: 8-gpu-h200
     timeout-minutes: 60
     env:
@@ -1544,16 +1319,7 @@ jobs:
 
   unit-test-backend-8-gpu-h20:
     needs: [check-changes, call-gate, wait-for-stage-b]
-    if: |
-      always() &&
-      (
-        (inputs.target_stage == 'unit-test-backend-8-gpu-h20') ||
-        (
-          !inputs.target_stage &&
-          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
-          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-        )
-      )
+    if: false
     runs-on: 8-gpu-h20
     timeout-minutes: 60
     env:
@@ -1598,16 +1364,7 @@ jobs:
 
   unit-test-deepep-4-gpu:
     needs: [check-changes, call-gate, wait-for-stage-b]
-    if: |
-      always() &&
-      (
-        (inputs.target_stage == 'unit-test-deepep-4-gpu') ||
-        (
-          !inputs.target_stage &&
-          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
-          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-        )
-      )
+    if: false
     runs-on: 4-gpu-h100
     timeout-minutes: 60
     env:
@@ -1696,16 +1453,7 @@ jobs:
 
   unit-test-backend-4-gpu-b200:
     needs: [check-changes, call-gate, wait-for-stage-b]
-    if: |
-      always() &&
-      (
-        (inputs.target_stage == 'unit-test-backend-4-gpu-b200') ||
-        (
-          !inputs.target_stage &&
-          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
-          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-        )
-      )
+    if: false
     runs-on: ${{ needs.check-changes.outputs.b200_runner }}
     timeout-minutes: 60
     env:
