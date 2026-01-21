@@ -878,6 +878,7 @@ class CudaGraphRunner:
                     if output.hidden_states is not None
                     else None
                 ),
+                customized_info=output.customized_info,
             )
         else:
             assert isinstance(output, PPProxyTensors)

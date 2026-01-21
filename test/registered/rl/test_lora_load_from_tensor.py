@@ -11,7 +11,7 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=90, suite="stage-b-test-small-1-gpu")
-register_amd_ci(est_time=90, suite="stage-b-test-small-1-gpu")
+register_amd_ci(est_time=90, suite="stage-b-test-small-1-gpu-amd")
 
 MODEL_PATH = "Qwen/Qwen3-0.6B"
 LORA_REPO = "charent/self_cognition_Alice"
@@ -29,15 +29,7 @@ class TestLoRALoadFromTensor(CustomTestCase):
             model_path=MODEL_PATH,
             enable_lora=True,
             max_lora_rank=64,
-            lora_target_modules=[
-                "q_proj",
-                "k_proj",
-                "v_proj",
-                "o_proj",
-                "gate_proj",
-                "up_proj",
-                "down_proj",
-            ],
+            lora_target_modules=["all"],
             mem_fraction_static=0.6,
             log_level="error",
         )
@@ -61,15 +53,7 @@ class TestLoRALoadFromTensor(CustomTestCase):
             model_path=MODEL_PATH,
             enable_lora=True,
             max_lora_rank=64,
-            lora_target_modules=[
-                "q_proj",
-                "k_proj",
-                "v_proj",
-                "o_proj",
-                "gate_proj",
-                "up_proj",
-                "down_proj",
-            ],
+            lora_target_modules=["all"],
             mem_fraction_static=0.6,
             log_level="error",
             max_loaded_loras=MAX_LOADED_LORAS,

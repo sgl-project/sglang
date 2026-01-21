@@ -28,7 +28,11 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 import torch
 from numpy import float64
 
-from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
+from sglang.srt.mem_cache.base_prefix_cache import (
+    BasePrefixCache,
+    MatchPrefixParams,
+    MatchResult,
+)
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.radix_cache import (
     RadixKey,
@@ -363,6 +367,9 @@ class SWARadixCache(BasePrefixCache):
     ##### Public API #####
 
     def supports_swa(self) -> bool:
+        assert (
+            self.sliding_window_size is not None
+        ), "sliding_window_size must be set for SWARadixCache"
         return True
 
     def reset(self) -> None:
@@ -379,10 +386,10 @@ class SWARadixCache(BasePrefixCache):
         self.full_lru_list = LRUList(is_swa_list=False)
         self.swa_lru_list = LRUList(is_swa_list=True)
 
-    def match_prefix(self, key: RadixKey, **kwargs) -> MatchResult:
+    def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         """Find the matching prefix from the radix tree.
         Args:
-            key: A RadixKey contains token IDs to find a matching prefix.
+            params: MatchPrefixParams containing key.
         Returns:
             A tuple of a tensor of matching prefix token IDs and
             the last node that contains the prefix values. Note that
@@ -390,6 +397,7 @@ class SWARadixCache(BasePrefixCache):
             The last node create a new child if the prefix is shorter
             than the last node's value.
         """
+        key = params.key
         key.token_ids = self.key_convert_fn(key.token_ids)
 
         if self.disable or len(key) == 0:
@@ -418,7 +426,13 @@ class SWARadixCache(BasePrefixCache):
             last_host_node=last_node,
         )
 
-    def insert(self, key: RadixKey, value=None, prev_prefix_len: int = 0) -> int:
+    def insert(
+        self,
+        key: RadixKey,
+        value=None,
+        prev_prefix_len: int = 0,
+        swa_evicted_seqlen: int = 0,
+    ) -> int:
         if self.disable:
             return 0
 
@@ -431,7 +445,9 @@ class SWARadixCache(BasePrefixCache):
             # Make sure the value len equal to the EAGLE bigram key len
             value = value[: len(key)]
 
-        return self._insert_helper(self.root_node, key, value, prev_prefix_len)
+        return self._insert_helper(
+            self.root_node, key, value, prev_prefix_len, swa_evicted_seqlen
+        )
 
     def cache_finished_req(self, req: Req, is_insert: bool = True) -> None:
         """Cache request when it finishes."""
@@ -481,6 +497,7 @@ class SWARadixCache(BasePrefixCache):
                 RadixKey(token_ids[:page_aligned_token_len], req.extra_key),
                 page_aligned_kv_indices,
                 old_prefix_len,
+                req.swa_evicted_seqlen,
             )
         else:
             self.token_to_kv_pool_allocator.free(
@@ -546,7 +563,7 @@ class SWARadixCache(BasePrefixCache):
 
         # The prefix indices could be updated, reuse it
         match_result = self.match_prefix(
-            RadixKey(page_aligned_token_ids, req.extra_key)
+            MatchPrefixParams(key=RadixKey(page_aligned_token_ids, req.extra_key))
         )
         (new_indices, new_last_node) = (
             match_result.device_indices,
@@ -878,6 +895,7 @@ class SWARadixCache(BasePrefixCache):
         new_node.full_lock_ref = child.full_lock_ref
         new_node.swa_lock_ref = child.swa_lock_ref
         new_node.key = child.key[:split_len]
+        assert len(new_node.key) > 0, f"new_node.key should not be empty"
         new_node.value = child.value[:split_len].clone()
         # parent inherits the swa_uuid from child for swa lock ref
         new_node.swa_uuid = child.swa_uuid
@@ -891,6 +909,7 @@ class SWARadixCache(BasePrefixCache):
             self.swa_lru_list.remove_node(child)
         child.parent = new_node
         child.key = child.key[split_len:]
+        assert len(child.key) > 0, f"child.key should not be empty"
         child.value = child.value[split_len:].clone()
         new_node.parent.children[self.get_child_key_fn(key)] = new_node
 
@@ -904,7 +923,12 @@ class SWARadixCache(BasePrefixCache):
         return new_node
 
     def _insert_helper(
-        self, node: TreeNode, key: RadixKey, value, update_kv_after_len: int
+        self,
+        node: TreeNode,
+        key: RadixKey,
+        value,
+        update_kv_after_len: int,
+        swa_evicted_seqlen: int = 0,
     ) -> int:
         # Update the last access time from root to leaf, so that
         # swa will tombstone the node closer to root first
@@ -936,23 +960,44 @@ class SWARadixCache(BasePrefixCache):
             # contains tombstone. If this is the case and we don't update the kv value, then
             # the prefill prefix matching will stuck.
             if update_kv_after_len < total_prefix_length + prefix_len:
-                first_diff_idx = max(0, update_kv_after_len - total_prefix_length)
+                # For page_size > 1 and chunked prefill case, update_kv_after_len may be not page-aligned due to a trailing partial page
+                # (kept in the request but not inserted into the radix tree) appended to prefix_indices.
                 if node.swa_tombstone:
                     assert (
                         node.swa_lock_ref == 0
                     ), f"tombstone swa_lock_ref should always be 0, {node.full_lock_ref=}, {node.swa_lock_ref=}, {node.id=}"
-                    self.token_to_kv_pool_allocator.free(node.value[first_diff_idx:])
-                    node.value = value[:prefix_len]
-                    node.swa_tombstone = False
-
-                    # insert the node into the lru lists
-                    self.swa_lru_list.insert_mru(node)
-
-                    self.swa_evictable_size_ += len(node.value)
+                    assert (
+                        swa_evicted_seqlen % self.page_size == 0
+                    ), f"swa_evicted_seqlen must be page aligned, {swa_evicted_seqlen=}, {self.page_size=}"
+                    if swa_evicted_seqlen <= total_prefix_length:
+                        # Branch 1: all swa tokens of value[:prefix_len] are not evicted, so we can insert it to the tree directly.
+                        # Free full tokens in the original tree node.
+                        self.token_to_kv_pool_allocator.free(node.value[:prefix_len])
+                        # Overwrite the new value in request to the tree node.
+                        node.value = value[:prefix_len].clone()
+                        node.swa_tombstone = False
+                        self.swa_lru_list.insert_mru(node)
+                        self.swa_evictable_size_ += len(node.value)
+                    elif swa_evicted_seqlen < total_prefix_length + prefix_len:
+                        # Branch 2: part of swa tokens of value[:prefix_len] are evicted, so we need to split the node and insert the value to new node.
+                        start_update_idx = swa_evicted_seqlen - total_prefix_length
+                        self.token_to_kv_pool_allocator.free(
+                            node.value[start_update_idx:prefix_len]
+                        )
+                        self._split_node(node.key, node, start_update_idx)
+                        # Here node is the new node after split, so we can overwrite the value to the new node.
+                        # The old node is still swa tombstone and the full token is not freed.
+                        node.value = value[start_update_idx:prefix_len].clone()
+                        self.token_to_kv_pool_allocator.free(value[:start_update_idx])
+                        node.swa_tombstone = False
+                        self.swa_lru_list.insert_mru(node)
+                        self.swa_evictable_size_ += len(node.value)
+                    else:
+                        # Branch 3: all swa tokens of value[:prefix_len] are evicted, so we don't need to update the node.
+                        self.token_to_kv_pool_allocator.free(value[:prefix_len])
                 else:
-                    self.token_to_kv_pool_allocator.free(
-                        value[first_diff_idx:prefix_len]
-                    )
+                    # The node is not tombstone, so we don't need to update the node.
+                    self.token_to_kv_pool_allocator.free(value[:prefix_len])
 
             total_prefix_length += prefix_len
             key = key[prefix_len:]
@@ -962,16 +1007,43 @@ class SWARadixCache(BasePrefixCache):
                 child_key = self.get_child_key_fn(key)
 
         if len(key):
-            new_node = TreeNode()
-            new_node.parent = node
-            new_node.key = key
-            new_node.value = value
-            self.full_lru_list.insert_mru(new_node)
-            self.swa_lru_list.insert_mru(new_node)
-            node.children[child_key] = new_node
-            self.full_evictable_size_ += len(value)
-            self.swa_evictable_size_ += len(value)
+            if (
+                swa_evicted_seqlen > total_prefix_length
+                and swa_evicted_seqlen < total_prefix_length + len(key)
+            ):
+                swa_tombstone_len = swa_evicted_seqlen - total_prefix_length
+                node = self._add_new_node(
+                    node,
+                    key[:swa_tombstone_len],
+                    value[:swa_tombstone_len],
+                    swa_tombstone=True,
+                )
+                key = key[swa_tombstone_len:]
+                value = value[swa_tombstone_len:]
+
+            self._add_new_node(node, key, value, swa_tombstone=False)
         return total_prefix_length
+
+    def _add_new_node(
+        self,
+        parent: TreeNode,
+        key: RadixKey,
+        value: torch.Tensor,
+        swa_tombstone: bool = False,
+    ) -> TreeNode:
+        assert len(key) > 0, f"key should not be empty"
+        new_node = TreeNode()
+        new_node.parent = parent
+        new_node.key = key
+        new_node.value = value.clone()
+        new_node.swa_tombstone = swa_tombstone
+        parent.children[self.get_child_key_fn(key)] = new_node
+        self.full_lru_list.insert_mru(new_node)
+        self.full_evictable_size_ += len(value)
+        if not swa_tombstone:
+            self.swa_lru_list.insert_mru(new_node)
+            self.swa_evictable_size_ += len(value)
+        return new_node
 
     def _iteratively_delete_tombstone_leaf(
         self, node: TreeNode
