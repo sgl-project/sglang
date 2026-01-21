@@ -65,7 +65,6 @@ suites = {
             "models/test_qwen3_next_models_pcg.py"
         ),  # Disabled: intermittent failures, see #17039
         TestFile("ep/test_deepep_large.py", 563),  # Disabled: see #17175
-        TestFile("test_gpt_oss_4gpu.py", 700),  # Disabled: flaky on B200, see #17527
     ],
 }
 
