@@ -1132,7 +1132,7 @@ class MHATokenToKVPoolNVFP4(MHATokenToKVPool):
 
                 self.k_scale_buffer = [
                     torch.zeros(
-                        (m, (n * k) // scale_block_size),
+                        (m, n, k // scale_block_size),
                         dtype=self.store_dtype,
                         device=self.device,
                     )
@@ -1140,7 +1140,7 @@ class MHATokenToKVPoolNVFP4(MHATokenToKVPool):
                 ]
                 self.v_scale_buffer = [
                     torch.zeros(
-                        (m, (n * k) // scale_block_size),
+                        (m, n, k // scale_block_size),
                         dtype=self.store_dtype,
                         device=self.device,
                     )
@@ -1226,10 +1226,10 @@ class MHATokenToKVPoolNVFP4(MHATokenToKVPool):
         else:
             layer_id = layer.layer_id
 
-        cache_k, cache_k_fp4_sf, _ = self.fp4_quant_util.batched_quantize(
+        cache_k, cache_k_fp4_sf, _ = self.fp4_quant_util.fi_nvfp4_quantize(
             cache_k, k_scale
         )
-        cache_v, cache_v_fp4_sf, _ = self.fp4_quant_util.batched_quantize(
+        cache_v, cache_v_fp4_sf, _ = self.fp4_quant_util.fi_nvfp4_quantize(
             cache_v, v_scale
         )
 
@@ -1258,7 +1258,7 @@ class MHATokenToKVPoolNVFP4(MHATokenToKVPool):
             self.k_scale_buffer[layer_id - self.start_layer][loc] = cache_k_fp4_sf
             self.v_scale_buffer[layer_id - self.start_layer][loc] = cache_v_fp4_sf
 
-    def get_dq_kv_buffer_and_page_table(
+    def get_dq_kv_buffer(
         self,
     ):
         return (self.dq_k_buffer, self.dq_v_buffer)
@@ -1548,13 +1548,13 @@ class HybridLinearKVPool(KVCache):
         layer_id = self._transfer_full_attention_id(layer_id)
         return self.full_kv_pool._get_key_nvfp4_from_nvfp4_buffer(layer_id)
 
-    def get_dq_kv_buffer_and_page_table(
+    def get_dq_kv_buffer(
         self,
     ):
         assert is_float4_e2m1fn_x2(
             self.dtype
         ), "get_dq_kv_buffer_and_page_table only available for FP4 KV pool"
-        return self.full_kv_pool.get_dq_kv_buffer_and_page_table()
+        return self.full_kv_pool.get_dq_kv_buffer()
 
     @contextmanager
     def _transfer_id_context(self, layer: RadixAttention):
@@ -1592,7 +1592,6 @@ class HybridLinearKVPool(KVCache):
                 layer_id_override=layer_id,
             )
         else:
-            logger.info(f"Calling set_kv_buffer, {k_scale=}, {v_scale=}")
             with self._transfer_id_context(layer):
                 self.full_kv_pool.set_kv_buffer(
                     layer,

@@ -21,6 +21,7 @@ from sglang.srt.layers.attention.triton_ops.trtllm_fp8_kv_kernel import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import is_flashinfer_available
+from sglang.srt.utils.common import is_sm100_supported
 
 logger = logging.getLogger(__name__)
 
@@ -121,6 +122,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         # Forward metadata
         self.forward_metadata: Optional[TRTLLMMHAMetadata] = None
+
+        self.is_sm100_gpu = is_sm100_supported(model_runner.device)
 
     def init_cuda_graph_state(
         self,
@@ -577,11 +580,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             self.dq_page_table = row_offsets + batch_offsets + 1
             self.dq_page_table = self.dq_page_table.to(torch.int32)
 
-            # is_decode = forward_batch.forward_mode.is_decode_or_idle()
-            # is_target_verify = forward_batch.forward_mode.is_target_verify()
-            # is_prefill = not (is_decode or is_target_verify)
-            # logger.info(f"[NVFP4 Init] {is_prefill=}, {metadata.max_seq_len_k=}, {metadata.cu_seqlens_k=}, {num_pages_per_req=}, {self.dq_page_table=}")
-
         self.forward_metadata = metadata
 
     def forward_decode(
@@ -601,13 +599,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         # nvfp4 kv cache path using origin fake nvfp4 path here
         nvfp4_kvcache_path = self.data_type == torch.float4_e2m1fn_x2
-        # nvfp4_kvcache_path = False
-        logger.debug(
-            f"[NVFP4 Decode Path] {nvfp4_kvcache_path=}, {use_fused_fp8_path=}"
-        )
-        logger.debug(
-            f"[NVFP4 Decode Path] q.dtype={q.dtype}, k.dtype={k.dtype}, v.dtype={v.dtype}"
-        )
 
         if not hasattr(layer, "k_scale") or layer.k_scale is None:
             k_scale = 1.0
@@ -617,7 +608,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             v_scale = 1.0
         else:
             v_scale = layer.v_scale
-        logger.debug(f"[NVFP4 Decode Path] {k_scale=}, {v_scale=}")
+        if self.is_sm100_gpu and nvfp4_kvcache_path:
+            # re-scale for requirements of trtllm nvfp4 kv cache kernel
+            k_scale = k_scale * 6.0
+            v_scale = v_scale * 6.0
 
         if use_fused_fp8_path:
             # Use fused FP8 quantization + KV cache write path
@@ -631,15 +625,11 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             k = None
             v = None
         else:
-            logger.debug(f"[NVFP4 Decode Path] saving kv cache")
             # Use original set_kv_buffer path
             if save_kv_cache and k is not None:
-                # logger.debug(f"[NVFP4 Decode Path] Saving kv: k max/min {k.max()},{k.min()}, v max/min {v.max()},{v.min()}")
                 forward_batch.token_to_kv_pool.set_kv_buffer(
                     layer, cache_loc, k, v, k_scale, v_scale
                 )
-
-        # logger.debug(f"[NVFP4 Decode Path] Stage2: q max/min {q.float().max()},{q.float().min()}")
 
         if (
             self.data_type == torch.float8_e4m3fn
@@ -647,12 +637,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         ):
             q = q.to(torch.float8_e4m3fn)
 
-        logger.debug(f"{q.dtype=}")
         q = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
         if nvfp4_kvcache_path:
-            logger.debug(
-                f"[NVFP4 Decode Path] Reshaping kv cache and kv cache block scales"
-            )
+
             k_cache, k_cache_scales = forward_batch.token_to_kv_pool.get_fp4_key_buffer(
                 layer.layer_id
             )
@@ -672,6 +659,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             v_cache_scales = v_cache_scales.view(
                 -1, self.page_size, layer.tp_v_head_num, layer.head_dim // 16
             ).permute(0, 2, 1, 3)
+
             kv_cache = (k_cache, v_cache)
             kv_cache_block_scales = (k_cache_scales, v_cache_scales)
 
@@ -690,8 +678,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             kv_cache = (k_cache, v_cache)
             kv_cache_block_scales = None
 
-        # logger.debug(f"[NVFP4 Decode Path] Stage3: q max/min {q.float().max()},{q.float().min()}")
-
         # TODO: add support for quantization
         q_scale = 1.0
         # k_scale = (
@@ -700,42 +686,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         #     else 1.0
         # )
 
-        if nvfp4_kvcache_path:
-            k_scale *= 6
-            k_cache_scales = (k_cache_scales.float() / 6).to(torch.float8_e4m3fn)
-            v_scale *= 6
-            v_cache_scales = (v_cache_scales.float() / 6).to(torch.float8_e4m3fn)
-            # kv_cache = (k_cache, v_cache)
-            kv_cache_block_scales = (k_cache_scales, v_cache_scales)
-            logger.debug(
-                f"[NVFP4 Decode Path] Adjust kv scales, {k_scale=}, {v_scale=}"
-            )
-
         bmm1_scale = q_scale * k_scale * layer.scaling
-        bmm2_scale = 1.0 * v_scale
+        bmm2_scale = v_scale
         # sink: additional value per head in the denominator of the softmax.
         attention_sink = kwargs.get("sinks", None)
-
-        # logger.debug(f"[NVFP4 Decode Path] Calling trtllm kernel, {layer.scaling=}, {bmm1_scale=}, {bmm2_scale=}, {q.shape=}, {kv_cache[0].shape=}, {kv_cache_block_scales[0].shape=}")
-        # logger.debug(f"[NVFP4 Decode Path] TRTLLM Kernel params: {self.forward_metadata.cache_seqlens_int32=}, q max/min {q.float().max()},{q.float().min()}")
-        # Call TRT-LLM kernel
-        # raw_out: like q, [bs, acc_q_len, num_q_heads, head_dim] but with output dtype
-
-        # torch.cuda.synchronize()
-        # prefix = "./unit_test/"
-        # torch.save(q, f"{prefix}/query.pt")
-        # torch.save(kv_cache, f"{prefix}/kv_cache.pt")
-        # torch.save(self.workspace_buffer, f"{prefix}/workspace_buffer.pt")
-        # torch.save(self.forward_metadata.page_table, f"{prefix}/block_tables.pt")
-        # torch.save(self.forward_metadata.cache_seqlens_int32, f"{prefix}/seq_lens.pt")
-
-        # torch.save(self.max_context_len, f"{prefix}/max_seq_len.pt")
-        # torch.save(bmm1_scale, f"{prefix}/bmm1_scale.pt")
-        # torch.save(bmm2_scale, f"{prefix}/bmm2_scale.pt")
-        # torch.save(layer.sliding_window_size, f"{prefix}/window_left.pt")
-        # torch.save(attention_sink, f"{prefix}/sinks.pt")
-        # torch.save(kv_cache_block_scales, f"{prefix}/kv_block_scales.pt")
-        # exit(0)
 
         o = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
             query=q,
@@ -747,20 +701,12 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             bmm1_scale=bmm1_scale,
             bmm2_scale=bmm2_scale,
             window_left=layer.sliding_window_size,
-            # TODO: add attention_sink operation or nvfp4 scale factor if needed
+            # TODO: add attention_sink operation if needed
             sinks=attention_sink,
             out_dtype=q.dtype,  # model_runner.dtype
             kv_block_scales=kv_cache_block_scales,
         )
         o = o.to(self.q_data_type)
-
-        # print(o)
-        # exit(0)
-        # torch.cuda.synchronize()
-
-        # logger.debug(f"{o.sum()=}")
-        # logger.debug(f"o min/max {o.float().min()}, {o.float().max()}")
-        # logger.debug(f"[NVFP4 Decode Path] ===========Finish trtllm kernel=============")
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
@@ -779,45 +725,37 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         use_fused_fp8_path = self._should_use_fused_fp8_path(save_kv_cache, k)
 
         nvfp4_kvcache_path = self.data_type == torch.float4_e2m1fn_x2
-        # nvfp4_kvcache_path = False
-        logger.debug(f"q.dtype={q.dtype}, k.dtype={k.dtype}, v.dtype={v.dtype}")
 
+        v_scale = layer.v_scale
+        k_scale = layer.k_scale
         if not hasattr(layer, "k_scale") or layer.k_scale is None:
             k_scale = 1.0
-        else:
-            k_scale = layer.k_scale
         if not hasattr(layer, "v_scale") or layer.v_scale is None:
             v_scale = 1.0
-        else:
-            v_scale = layer.v_scale
-
-        # Write current bf16 chunk to nvfp4 buffer for future use
-        if nvfp4_kvcache_path:
-            forward_batch.token_to_kv_pool.set_kv_buffer(
-                layer=layer,
-                loc=cache_loc,
-                cache_k=k,
-                cache_v=v,
-                k_scale=k_scale,
-                v_scale=v_scale,
-            )
-        else:
-            self._fused_fp8_set_kv_buffer(
-                q=q,
-                k=k,
-                v=v,
-                layer=layer,
-                forward_batch=forward_batch,
-            )
-            k = None
-            v = None
 
         if nvfp4_kvcache_path:
+            k_nvfp4_gs = k_scale
+            v_nvfp4_gs = v_scale
+            if self.is_sm100_gpu:
+                # re-scale for requirements of trtllm nvfp4 kv cache kernel
+                # we only apply this rescale for quant kernel, but not fp8 mha kernel
+                k_nvfp4_gs = k_scale * 6.0
+                v_nvfp4_gs = v_scale * 6.0
+
             assert (
                 not forward_batch.forward_mode.is_target_verify()
             ), "only prefill for now"
 
             from sglang.srt.layers.quantization.fp4_utils import NVFP4QuantizeUtil
+
+            forward_batch.token_to_kv_pool.set_kv_buffer(
+                layer=layer,
+                loc=cache_loc,
+                cache_k=k,
+                cache_v=v,
+                k_scale=k_nvfp4_gs,
+                v_scale=v_nvfp4_gs,
+            )
 
             batch_size = forward_batch.batch_size
 
@@ -827,30 +765,26 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             v_buffer_nvfp4, v_scales_buffer = (
                 forward_batch.token_to_kv_pool.get_fp4_value_buffer(layer.layer_id)
             )
-            k_buffer_dq, v_buffer_dq = (
-                forward_batch.token_to_kv_pool.get_dq_kv_buffer_and_page_table()
-            )
+            k_buffer_dq, v_buffer_dq = forward_batch.token_to_kv_pool.get_dq_kv_buffer()
 
             # Convert current k/v to fp8 once
             k_cur_fp8 = k.to(torch.float8_e4m3fn)
             v_cur_fp8 = v.to(torch.float8_e4m3fn)
 
-            # Process each request in batch - continuous write (no paging loops)
+            # Process each request in batch
             cur_batch_start_loc_cpu = 0
-            cur_token_idx_dq_buffer_cpu = (
-                self.page_size
-            )  # skip first page for fummy output
+            # skip first page for dummy output
+            cur_token_idx_dq_buffer_cpu = self.page_size
             for batch_idx in range(batch_size):
                 req_pool_idx = forward_batch.req_pool_indices[batch_idx]
                 prev_len = forward_batch.extend_prefix_lens_cpu[batch_idx]
                 extend_len = forward_batch.extend_seq_lens_cpu[batch_idx]
 
-                # Step 1: Dequantize and copy previous KV
+                # Dequantize and copy previous KV
                 if prev_len > 0:
                     prev_token_indices = forward_batch.req_to_token_pool.req_to_token[
                         req_pool_idx, :prev_len
                     ]
-                    # Get previous kv from nvfp4 buffer
                     k_prev_nvfp4 = k_buffer_nvfp4[prev_token_indices]
                     k_prev_scales = k_scales_buffer[prev_token_indices]
                     v_prev_nvfp4 = v_buffer_nvfp4[prev_token_indices]
@@ -858,15 +792,15 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
                     # Dequantize: [prev_len, num_heads, head_dim]
                     k_prev_bf16 = NVFP4QuantizeUtil.batched_dequantize(
-                        k_prev_nvfp4.view(torch.uint8), k_prev_scales, k_scale
+                        k_prev_nvfp4.view(torch.uint8), k_prev_scales, k_nvfp4_gs
                     )
                     v_prev_bf16 = NVFP4QuantizeUtil.batched_dequantize(
-                        v_prev_nvfp4.view(torch.uint8), v_prev_scales, v_scale
+                        v_prev_nvfp4.view(torch.uint8), v_prev_scales, v_nvfp4_gs
                     )
                     k_prev_fp8 = k_prev_bf16.to(torch.float8_e4m3fn)
                     v_prev_fp8 = v_prev_bf16.to(torch.float8_e4m3fn)
 
-                    # Direct continuous copy (layouts match)
+                    # Direct continuous copy
                     k_buffer_dq[
                         cur_token_idx_dq_buffer_cpu : cur_token_idx_dq_buffer_cpu
                         + prev_len
@@ -875,15 +809,11 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                         cur_token_idx_dq_buffer_cpu : cur_token_idx_dq_buffer_cpu
                         + prev_len
                     ] = v_prev_fp8
-                    # logger.info(f"[NVFP4 Extend {layer.layer_id}] {prev_token_indices=}")
 
-                # Step 2: Continuous write of current chunk
+                # Write of current chunk
                 cur_end = cur_batch_start_loc_cpu + extend_len
                 k_cur_chunk = k_cur_fp8[cur_batch_start_loc_cpu:cur_end]
                 v_cur_chunk = v_cur_fp8[cur_batch_start_loc_cpu:cur_end]
-                # logger.info(f"[NVFP4 Extend {layer.layer_id}] {cur_batch_start_loc_cpu=}, {cur_token_idx_dq_buffer_cpu=}, {req_pool_idx=}, {prev_len=}, {extend_len=}, {cur_end=}")
-
-                # Direct continuous write
                 k_buffer_dq[
                     cur_token_idx_dq_buffer_cpu
                     + prev_len : cur_token_idx_dq_buffer_cpu
@@ -911,25 +841,12 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     * self.page_size
                 )
 
-                # logger.info(f"[NVFP4 Extend For end {layer.layer_id}] {cur_batch_start_loc_cpu=}, {cur_token_idx_dq_buffer_cpu=}")
-
-            # logger.debug(
-            #     f"[NVFP4 Path Optimized] Finished continuous write to cache pool"
-            # )
-
-            # Permute 到 [batch, max_pages, heads, page_size, dim]
             k_paged = k_buffer_dq.view(
                 -1, self.page_size, layer.tp_k_head_num, layer.head_dim
             ).permute(0, 2, 1, 3)
             v_paged = v_buffer_dq.view(
                 -1, self.page_size, layer.tp_v_head_num, layer.head_dim
             ).permute(0, 2, 1, 3)
-            # logger.info(f"[NVFP4 Extend {layer.layer_id}] {k_paged.shape=}, {v_paged.shape=}, {k_buffer_dq.shape=}, {k_buffer_nvfp4.shape=}, {k_scales_buffer.shape=}, {k_cur_fp8.shape=}, {v_cur_fp8.shape=}")
-
-            # logger.debug(
-            #     f"[NVFP4 Path Optimized] Reshaped to paged format: "
-            #     f"k_paged.shape={k_paged.shape}, v_paged.shape={v_paged.shape}"
-            # )
 
             # Use paged KV cache for attention
             kv_cache_nvfp4 = (k_paged, v_paged)
@@ -972,8 +889,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         if self.data_type == torch.float8_e4m3fn or nvfp4_kvcache_path:
             q = q.to(torch.float8_e4m3fn)
 
-        # logger.debug(f"[forward_extend] q.shape={q.shape}, q.dtype={q.dtype}")
-
         # sink: additional value per head in the denominator of the softmax.
         attention_sink = kwargs.get("sinks", None)
         # TODO: add support for quantization
@@ -985,7 +900,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         #     else 1.0
         # )
         bmm1_scale = q_scale * k_scale * layer.scaling
-        bmm2_scale = 1.0
+        bmm2_scale = v_scale
 
         if forward_batch.forward_mode.is_target_verify():
             o = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
@@ -1019,13 +934,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 cum_seq_lens_q=self.forward_metadata.cu_seqlens_q,
                 cum_seq_lens_kv=self.forward_metadata.cu_seqlens_k,
                 window_left=layer.sliding_window_size,
-                # TODO: add attention_sink operation or nvfp4 scale factor if needed
+                # TODO: add attention_sink operation scale factor if needed
                 sinks=attention_sink,
                 out_dtype=self.q_data_type,  # model_runner.dtype
             )
-
-        # logger.debug(f"[forward_extend] o.shape={o.shape}, returning reshaped output")
-        # torch.cuda.synchronize()
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
