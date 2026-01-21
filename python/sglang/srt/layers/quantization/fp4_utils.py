@@ -14,6 +14,7 @@
 
 # Define a enum class for FP4 formats, including MXFP4, NVFP4 and future formats
 from enum import Enum
+from typing import Union
 
 import torch
 
@@ -149,6 +150,40 @@ class NVFP4QuantizeUtil:
     """Utility class for NVFP4 quantization and dequantization with two-level scaling (global FP32 + block FP8)."""
 
     @staticmethod
+    def fi_nvfp4_quantize(
+        tensor: torch.Tensor, global_scale: Union[float, torch.Tensor]
+    ):
+        # input and output shape [B, M, N]
+        # return uint8 cache and fp8 block scales
+        try:
+            from flashinfer import fp4_quantize
+        except ImportError:
+            raise ImportError(
+                "flashinfer is installed correctly. Please install flashinfer to use NVFP4 KV cache."
+            )
+        global_scale_inv = 1.0 / global_scale
+        if isinstance(global_scale_inv, float):
+            global_scale_inv = torch.tensor(
+                global_scale_inv, dtype=torch.float32, device=tensor.device
+            )
+        b, m, n = tensor.shape
+        tensor_reshaped = tensor.reshape(b * m, n)
+        tensor_fp4, tensor_fp4_sf = fp4_quantize(
+            tensor_reshaped,
+            global_scale_inv,
+            sf_vec_size=16,
+            sf_use_ue8m0=False,
+            is_sf_swizzled_layout=False,
+            is_sf_8x4_layout=False,
+            enable_pdl=None,
+        )
+        tensor_fp4 = tensor_fp4.view(b, m, tensor_fp4.shape[-1])
+        tensor_fp4_sf = tensor_fp4_sf.view(b, m, tensor_fp4_sf.shape[-1]).view(
+            torch.float8_e4m3fn
+        )
+        return tensor_fp4, tensor_fp4_sf, global_scale
+
+    @staticmethod
     # @torch.compile
     def batched_quantize(
         tensor: torch.Tensor, global_scale: torch.Tensor | None = None
@@ -237,7 +272,7 @@ class NVFP4QuantizeUtil:
 
         Args:
             quant_tensor: Quantized E2M1 tensor of shape [B, M, N/2] (packed uint8)
-            block_scales: Block scale factors of shape [B, M*N/16] (FP8 E4M3)
+            block_scales: Block scale factors of shape [B, M, N/16] (FP8 E4M3)
             global_scale: Global scale factor (float32 scalar)
             dtype: Target dtype for output
 
@@ -257,7 +292,7 @@ class NVFP4QuantizeUtil:
         float_vals = E2M1_VALUES[fp4_vals.long()]
 
         # Reshape for block-wise scaling
-        reshaped = float_vals.view(b, m * n // 16, 16)
+        reshaped = float_vals.view(b, m, n // 16, 16)
 
         # Apply block scale factors (inverse scaling: divide by FP8 block scales)
         # Convert FP8 back to float32 for computation
