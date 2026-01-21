@@ -216,6 +216,30 @@ class CudaPlatformBase(Platform):
                 raise ImportError(
                     "Video Sparse Attention backend is not installed."
                 ) from e
+        elif selected_backend == AttentionBackendEnum.SPARSE_VIDEO_GEN_2_ATTN:
+            try:
+                from svg.kmeans_utils import (
+                    batch_kmeans_Euclid,
+                    density_calculation,
+                    dynamic_block_sparse_fwd_flashinfer,
+                    identify_dynamic_map,
+                ) # noqa: F401
+                from svg.kernels.triton.permute import apply_inverse_permutation_triton, permute_tensor_by_labels_triton  # noqa: F401
+
+                from sglang.multimodal_gen.runtime.layers.attention.backends.sparse_video_gen_2_attn import (  # noqa: F401
+                    SparseVideoGen2AttentionBackend,
+                )
+
+                logger.info("Using Sparse Video Gen 2 (SAP) Attention backend")
+                return "sglang.multimodal_gen.runtime.layers.attention.backends.sparse_video_gen_2_attn.SparseVideoGen2AttentionBackend"
+            except ImportError as e:
+                logger.error(
+                    "Failed to import Sparse Video Gen 2 (SAP) Attention backend: %s",
+                    str(e),
+                )
+                raise ImportError(
+                    "Sparse Video Gen 2 (SAP) Attention backend is not installed."
+                ) from e
         elif selected_backend == AttentionBackendEnum.VMOBA_ATTN:
             try:
                 from kernel.attn.vmoba_attn.vmoba import moba_attn_varlen  # noqa: F401

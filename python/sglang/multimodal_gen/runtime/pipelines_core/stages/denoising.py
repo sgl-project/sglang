@@ -1016,7 +1016,13 @@ class DenoisingStage(PipelineStage):
                         )
 
                         # Predict noise residual
-                        attn_metadata = self._build_attn_metadata(i, batch, server_args)
+                        attn_metadata = self._build_attn_metadata(
+                            i,
+                            batch,
+                            server_args,
+                            timestep_value=t_int,
+                            timesteps=timesteps_cpu,
+                        )
                         noise_pred = self._predict_noise_with_cfg(
                             current_model=current_model,
                             latent_model_input=latent_model_input,
@@ -1150,7 +1156,13 @@ class DenoisingStage(PipelineStage):
         return noise_cfg
 
     def _build_attn_metadata(
-        self, i: int, batch: Req, server_args: ServerArgs
+        self,
+        i: int,
+        batch: Req,
+        server_args: ServerArgs,
+        *,
+        timestep_value: int | None = None,
+        timesteps: torch.Tensor | None = None,
     ) -> Any | None:
         """
         Build attention metadata for custom attention backends.
@@ -1177,6 +1189,53 @@ class DenoisingStage(PipelineStage):
                 STA_param=batch.STA_param,
                 VSA_sparsity=server_args.VSA_sparsity,
                 device=get_local_torch_device(),
+            )
+        elif self.attn_backend.get_enum() == AttentionBackendEnum.SPARSE_VIDEO_GEN_2_ATTN:
+            if timestep_value is None or timesteps is None:
+                raise ValueError(
+                    "timestep_value and timesteps must be provided for SVG2 attention metadata"
+                )
+            
+            num_layers = server_args.pipeline_config.dit_config.num_layers
+            first_layers_fp = server_args.svg2_first_layers_fp
+            if first_layers_fp <= 1.0:
+                first_layers_fp = math.floor(first_layers_fp * num_layers)
+            first_layers_fp = max(0, min(int(first_layers_fp), num_layers))
+
+            first_times_fp = server_args.svg2_first_times_fp
+            if first_times_fp <= 1.0:
+                num_fp_steps = math.floor(first_times_fp * len(timesteps))
+                if num_fp_steps > 0:
+                    first_times_fp = float(timesteps[num_fp_steps - 1].item() - 1)
+                else:
+                    first_times_fp = float(timesteps.max().item() + 1)
+
+            current_timestep = int(timestep_value)
+
+            cache = batch.extra.get("svg2_cache")
+            if cache is None:
+                from sglang.multimodal_gen.runtime.layers.attention.backends.sparse_video_gen_2_attn import (
+                    Svg2Cache,
+                )
+
+                cache = Svg2Cache()
+                batch.extra["svg2_cache"] = cache
+
+            attn_metadata = self.attn_metadata_builder.build(
+                current_timestep=current_timestep,
+                raw_latent_shape=batch.raw_latent_shape,
+                patch_size=server_args.pipeline_config.dit_config.patch_size,
+                num_q_centroids=server_args.svg2_num_q_centroids,
+                num_k_centroids=server_args.svg2_num_k_centroids,
+                top_p_kmeans=server_args.svg2_top_p_kmeans,
+                min_kc_ratio=server_args.svg2_min_kc_ratio,
+                kmeans_iter_init=server_args.svg2_kmeans_iter_init,
+                kmeans_iter_step=server_args.svg2_kmeans_iter_step,
+                zero_step_kmeans_init=server_args.svg2_zero_step_kmeans_init,
+                first_layers_fp=first_layers_fp,
+                first_times_fp=first_times_fp,
+                cache=cache,
+                calculate_density=False, # only need density when doing head load balancing
             )
         elif self.attn_backend.get_enum() == AttentionBackendEnum.VMOBA_ATTN:
             moba_params = server_args.moba_config.copy()

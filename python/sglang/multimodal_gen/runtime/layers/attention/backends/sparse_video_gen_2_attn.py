@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import torch
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 try:
     from svg.kmeans_utils import (
@@ -97,8 +98,10 @@ class SparseVideoGen2AttentionMetadata(AttentionMetadata):
     context_length: int
     num_frame: int
     frame_size: int
-    cache: Svg2Cache = field(default_factory=Svg2Cache)
+    cache: Svg2Cache
     calculate_density: bool = False
+    max_seqlen_q: int | None = None
+    max_seqlen_k: int | None = None
 
 def _require_kwarg(kwargs: dict[str, Any], name: str) -> Any:
     if name not in kwargs:
@@ -117,16 +120,31 @@ class SparseVideoGen2AttentionMetadataBuilder(AttentionMetadataBuilder):
     def build(  # type: ignore[override]
         self,
         current_timestep: int,
-        raw_latent_shape: tuple[int, int, int],
+        raw_latent_shape: tuple[int, ...],
         patch_size: tuple[int, int, int],
+        cache: Svg2Cache,
+        num_q_centroids: int,
+        num_k_centroids: int,
+        top_p_kmeans: float,
+        min_kc_ratio: float,
+        kmeans_iter_init: int,
+        kmeans_iter_step: int,
+        zero_step_kmeans_init: bool,
+        first_layers_fp: float,
+        first_times_fp: float,
         context_length: int = 0,
-        device: torch.device | None = None,
+        calculate_density: bool = False,
         **kwargs: dict[str, Any],
     ) -> SparseVideoGen2AttentionMetadata:
-        if device is None:
-            device = torch.device("cpu")
-
-        t, h, w = raw_latent_shape
+        raw_shape = tuple(raw_latent_shape)
+        if len(raw_shape) == 5:
+            t, h, w = raw_shape[2:5]
+        elif len(raw_shape) == 3:
+            t, h, w = raw_shape
+        else:
+            raise ValueError(
+                "raw_latent_shape must be (T, H, W) or (B, C, T, H, W) for SAP attention"
+            )
         pt, ph, pw = patch_size
         if t % pt != 0 or h % ph != 0 or w % pw != 0:
             raise ValueError(
@@ -138,19 +156,20 @@ class SparseVideoGen2AttentionMetadataBuilder(AttentionMetadataBuilder):
 
         return SparseVideoGen2AttentionMetadata(
             current_timestep=current_timestep,
-            num_q_centroids=_require_kwarg(kwargs, "num_q_centroids"),
-            num_k_centroids=_require_kwarg(kwargs, "num_k_centroids"),
-            top_p_kmeans=_require_kwarg(kwargs, "top_p_kmeans"),
-            min_kc_ratio=_require_kwarg(kwargs, "min_kc_ratio"),
-            kmeans_iter_init=_require_kwarg(kwargs, "kmeans_iter_init"),
-            kmeans_iter_step=_require_kwarg(kwargs, "kmeans_iter_step"),
-            zero_step_kmeans_init=_require_kwarg(kwargs, "zero_step_kmeans_init"),
-            first_layers_fp=_require_kwarg(kwargs, "first_layers_fp"),
-            first_times_fp=_require_kwarg(kwargs, "first_times_fp"),
+            num_q_centroids=num_q_centroids,
+            num_k_centroids=num_k_centroids,
+            top_p_kmeans=top_p_kmeans,
+            min_kc_ratio=min_kc_ratio,
+            kmeans_iter_init=kmeans_iter_init,
+            kmeans_iter_step=kmeans_iter_step,
+            zero_step_kmeans_init=zero_step_kmeans_init,
+            first_layers_fp=first_layers_fp,
+            first_times_fp=first_times_fp,
             context_length=context_length,
             num_frame=num_frame,
             frame_size=frame_size,
-            calculate_density=kwargs.get("calculate_density", False),
+            cache=cache,
+            calculate_density=calculate_density,
         )
 
 
@@ -275,12 +294,13 @@ class SparseVideoGen2AttentionImpl(AttentionImpl):
         value: torch.Tensor,
         attn_metadata: SparseVideoGen2AttentionMetadata,
     ) -> torch.Tensor:
+        torch.backends.cuda.preferred_linalg_library(backend="magma")
+        res = None
         # bshd -> bhsd
         query = query.transpose(1, 2).contiguous()
         key = key.transpose(1, 2).contiguous()
         value = value.transpose(1, 2).contiguous()
         batch_size, num_heads, seq_len, dim = query.size()
-        assert batch_size == 1, "Sparse Video Gen 2 attention only supports batch size of 1" # TODO: check batch size support
 
         context_length, num_frame, frame_size = attn_metadata.context_length, attn_metadata.num_frame, attn_metadata.frame_size
 
@@ -302,8 +322,11 @@ class SparseVideoGen2AttentionImpl(AttentionImpl):
                 query_video = query[:, :, :video_length, :].contiguous()
                 key_video = key[:, :, :video_length, :].contiguous()
                 self.kmeans_clustering(query_video, key_video, attn_metadata)
-            output_hidden_states = torch.nn.functional.scaled_dot_product_attention(query, key, value, dropout_p=0.0, is_causal=False) # TODO: maybe use flash attention
-            return output_hidden_states.reshape(batch_size, num_heads, seq_len, dim).transpose(1, 2)
+
+            with sdpa_kernel(SDPBackend.CUDNN_ATTENTION): # not sure why we need to force cudnn here, but it's faster than flash attention
+                output_hidden_states = torch.nn.functional.scaled_dot_product_attention(query, key, value, dropout_p=0.0, is_causal=False)
+
+            res = output_hidden_states.reshape(batch_size, num_heads, seq_len, dim).transpose(1, 2)
         else:
             q_perm, k_perm, v_perm, dyn_map, qc_sz_s, kc_sz_s, q_sorted_indices = self.semantic_aware_permutation(
                 query, key, value, attn_metadata
@@ -320,4 +343,7 @@ class SparseVideoGen2AttentionImpl(AttentionImpl):
                 layer_cache = attn_metadata.cache.get_layer(self.layer_idx)
                 layer_cache.density = densities  # [batch_size, num_heads]
 
-            return attn_output.reshape(batch_size, num_heads, seq_len, dim).transpose(1, 2)
+            res = attn_output.reshape(batch_size, num_heads, seq_len, dim).transpose(1, 2)
+        
+        torch.backends.cuda.preferred_linalg_library(backend="default") # reset to default
+        return res
