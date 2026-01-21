@@ -51,7 +51,7 @@ repos:
     rev: v2.4.1
     hooks:
       - id: codespell
-        args: ['--config', '.codespellrc', '-L', 'cann,thi,makro,wil,rouge,PRIS']
+        args: ['--config', '.codespellrc']
         exclude: |
           (?x)^(
             test/srt/test_reasoning_parser\.py|
