@@ -391,10 +391,10 @@ class MambaRadixCache(BasePrefixCache):
         if self.marconi_enabled:
             self.marconi_model_stats = self.marconi_config.model_stats
             if self.marconi_model_stats is None:
-                logger.warning(
-                    "Marconi is enabled but model stats are missing. Disabling Marconi."
+                raise ValueError(
+                    "Marconi is enabled but model stats are missing; "
+                    "cannot compute eviction utilities."
                 )
-                self.marconi_enabled = False
         self.marconi_admission_tree = (
             MarconiAdmissionTree() if self.marconi_enabled else None
         )
@@ -566,7 +566,7 @@ class MambaRadixCache(BasePrefixCache):
         existing_branch: Optional[int],
     ) -> Optional[int]:
         branch_len = None
-        if cache_len > cached_prefix_len:
+        if cache_len > 0 and cache_len >= cached_prefix_len:
             branch_len = self._marconi_align_branch_len(cache_len)
         if existing_branch is not None:
             if branch_len is None or existing_branch < branch_len:
@@ -877,10 +877,19 @@ class MambaRadixCache(BasePrefixCache):
             mamba_value = self.req_to_token_pool.get_mamba_indices(
                 req.req_pool_idx
             ).unsqueeze(-1)
-        branch_checkpoint = (
-            req.mamba_branching_seqlen is not None
-            and page_aligned_len == req.mamba_branching_seqlen
-        )
+        branch_checkpoint_len = None
+        if req.mamba_branching_seqlen is not None:
+            if page_aligned_len == req.mamba_branching_seqlen:
+                branch_checkpoint_len = req.mamba_branching_seqlen
+            else:
+                mamba_cache_chunk_size = get_global_server_args().mamba_cache_chunk_size
+                if (
+                    page_aligned_len < req.mamba_branching_seqlen
+                    and req.mamba_branching_seqlen
+                    <= page_aligned_len + mamba_cache_chunk_size
+                ):
+                    branch_checkpoint_len = page_aligned_len
+        branch_checkpoint = branch_checkpoint_len is not None
         if self.marconi_enabled and not branch_checkpoint:
             return _skip_cache_unfinished_req(req)
         # radix tree mamba value is forked from req space
@@ -898,9 +907,7 @@ class MambaRadixCache(BasePrefixCache):
             page_aligned_kv_indices,
             mamba_value_forked,
             branchoff_mamba_value=mamba_value_forked if branch_checkpoint else None,
-            branch_checkpoint_len=(
-                req.mamba_branching_seqlen if branch_checkpoint else None
-            ),
+            branch_checkpoint_len=branch_checkpoint_len,
         )
         self.token_to_kv_pool_allocator.free(
             kv_indices[req.cache_protected_len : new_prefix_len]

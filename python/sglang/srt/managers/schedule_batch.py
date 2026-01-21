@@ -1747,7 +1747,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     req.mamba_branching_seqlen - len(req.prefix_indices)
                 ) % mamba_cache_chunk_size == 0
                 if (
-                    req.mamba_branching_seqlen > len(req.prefix_indices)
+                    req.mamba_branching_seqlen >= len(req.prefix_indices)
                     and req.mamba_branching_seqlen < mamba_track_seqlen
                     and branching_seqlen_aligned_mask
                 ):
