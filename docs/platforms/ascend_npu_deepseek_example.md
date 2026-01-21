@@ -30,6 +30,7 @@ python3 -m sglang.launch_server \
     --trust-remote-code \
     --attention-backend ascend \
     --device npu \
+    --quantization modelslim \
     --watchdog-timeout 9000 \
     --cuda-graph-bs 8 16 24 28 32 \
     --mem-fraction-static 0.68 \
@@ -87,6 +88,8 @@ python -m sglang.launch_server \
     --mem-fraction-static 0.6 \
     --attention-backend ascend \
     --device npu \
+    --quantization modelslim \
+    --load-balance-method round_robin \
     --max-running-requests 8 \
     --context-length 8192 \
     --disable-radix-cache \
@@ -142,6 +145,8 @@ python -m sglang.launch_server \
     --max-running-requests 352 \
     --attention-backend ascend \
     --device npu \
+    --quantization modelslim \
+    --prefill-round-robin-balance \
     --moe-a2a-backend deepep \
     --enable-dp-attention \
     --deepep-mode low_latency \
@@ -159,7 +164,7 @@ python -m sglang.launch_server \
     --tokenizer-worker-num 4
 ```
 
-3. SGLang Router
+3. SGLang Model Gateway (former Router)
 
 ```shell
 python -m sglang_router.launch_router \
@@ -195,7 +200,7 @@ export ENABLE_MOE_NZ=1
 export TASK_QUEUE_ENABLE=2
 
 #Please list all host ips of Prefill instance
-P_HOST_IP=('xx,xx,xx,xx' 'xx,xx,xx,xx')
+P_HOST_IP=('xx.xx.xx.xx' 'xx.xx.xx.xx')
 
 for i in "${!P_HOST_IP[@]}";
 do
@@ -255,7 +260,7 @@ export SGLANG_USE_FIA_NZ=1
 export ENABLE_MOE_NZ=1
 
 #please list all host ips of Prefill instance
-D_HOST_IP=('xx,xx,xx,xx' 'xx,xx,xx,xx')
+D_HOST_IP=('xx.xx.xx.xx' 'xx.xx.xx.xx')
 
 for i in "${!D_HOST_IP[@]}";
 do
@@ -292,7 +297,7 @@ do
 done
 ```
 
-3. SGLang Router:
+3. SGLang Model Gateway (former Router):
 
 ```shell
 python -m sglang_router.launch_router \
