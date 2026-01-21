@@ -67,7 +67,7 @@ __global__ void fused_qknorm_warp(const QKNormParams __grid_constant__ params) {
   PDLTriggerSecondary<kUsePDL>();  // launch secondary kernel
 }
 
-// CTA-level kernel for head_dim > 256
+// For CTA level, used for head_dim > 256 (512,1024)
 template <int64_t kHeadDim, bool kUsePDL, typename Float>
 __global__ void fused_qknorm_cta(const QKNormParams __grid_constant__ params) {
   using namespace device;
@@ -175,7 +175,7 @@ struct QKNormKernelWarp {
   }
 };
 
-// CTA-level kernel struct for head_dim > 256
+// This goes with fused_qknorm_cta
 template <int64_t kHeadDim, bool kUsePDL, typename DType>
 struct QKNormKernelCTA {
   static_assert(std::is_same_v<DType, fp16_t> || std::is_same_v<DType, bf16_t>);
