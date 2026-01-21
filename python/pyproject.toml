@@ -172,15 +172,15 @@ exclude = [
 [tool.setuptools_scm]
 root = ".."
 version_file = "sglang/_version.py"
-# Hybrid approach: commit count for post number, timestamp for uniqueness
-# Format: v0.5.7-703-g20260121012243
-#   - Tag: v0.5.7
-#   - Distance: 703 (actual commit count, used for .post703)
-#   - Hash: g20260121012243 (timestamp YYYYMMDDHHMMSS for uniqueness)
-# This creates versions like: 0.5.7.post703.dev20260121012243
-# And wheel names like: sglang-0.5.7.post703.dev20260121012243-py3-none-any.whl
-# The timestamp in dev version ensures each build is unique, preventing overwrites
-git_describe_command = ["bash", "-c", "TAG=$(git tag --list --sort=-version:refname 'v*.*.*' | head -1); COMMITS=$(git rev-list ${TAG}..HEAD --count 2>/dev/null || echo 0); TIMESTAMP=$(date -u +%Y%m%d%H%M%S); echo \"${TAG}-${COMMITS}-g${TIMESTAMP}\""]
+# Use timestamp in dev version to ensure unique nightly wheels even when rebuilding same commit
+# Format: v0.5.7-704-g20260121020530 (tag-commits-timestamp_as_hash)
+# This becomes: 0.5.7.post704.dev20260121020530
+# Wheel filename: sglang-0.5.7.post704.dev20260121020530-py3-none-any.whl
+# Benefits:
+# - post704 tracks actual commit count from tag
+# - dev20260121020530 is unique timestamp (YYYYMMDDHHMMSS)
+# - Every build is unique, even rebuilding the same commit
+git_describe_command = ["bash", "-c", "TAG=$(git describe --tags --match 'v*' 2>/dev/null || echo 'v0.0.0'); COMMITS=$(echo $TAG | cut -d'-' -f2); if [ \"$COMMITS\" = \"$TAG\" ]; then COMMITS=0; fi; TIMESTAMP=$(date -u +%Y%m%d%H%M%S); echo \"$(echo $TAG | cut -d'-' -f1)-${COMMITS}-g${TIMESTAMP}\""]
 version_scheme = "post-release"
 local_scheme = "no-local-version"
 # Allow editable installs even when .git metadata is not available.
