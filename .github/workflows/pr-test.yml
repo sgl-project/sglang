@@ -188,13 +188,18 @@ jobs:
   # For scheduled runs: wait jobs are skipped, enabling parallel execution for easier retry.
 
   wait-for-stage-a:
-    needs: [check-changes]
+    needs: [check-changes, call-gate]
     # Only run for PRs (not scheduled) and when not targeting a specific stage
+    # Skip if call-gate failed (stage-a jobs will be skipped, nothing to wait for)
+    # !cancelled() ensures this job respects workflow cancellation from concurrency group
     if: |
+      always() &&
+      !cancelled() &&
       github.event_name == 'pull_request' &&
       !inputs.target_stage &&
       inputs.test_parallel_dispatch != true &&
-      (needs.check-changes.outputs.main_package == 'true' || needs.check-changes.outputs.sgl_kernel == 'true')
+      (needs.check-changes.outputs.main_package == 'true' || needs.check-changes.outputs.sgl_kernel == 'true') &&
+      (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped')
     runs-on: ubuntu-latest
     outputs:
       stage_a_result: ${{ steps.wait.outputs.result }}
@@ -205,7 +210,7 @@ jobs:
         with:
           script: |
             const maxWaitMinutes = 60;
-            const pollIntervalSeconds = 30;
+            const pollIntervalSeconds = 120;  // 2 minutes to reduce GH API calls
             const maxAttempts = (maxWaitMinutes * 60) / pollIntervalSeconds;
 
             for (let attempt = 0; attempt < maxAttempts; attempt++) {
@@ -222,7 +227,7 @@ jobs:
                 console.log(`stage-a-test-1 status: ${stageAJob.status}, conclusion: ${stageAJob.conclusion}`);
 
                 if (stageAJob.status === 'completed') {
-                  if (stageAJob.conclusion === 'success' || stageAJob.conclusion === 'skipped' || stageAJob.conclusion === 'cancelled') {
+                  if (stageAJob.conclusion === 'success' || stageAJob.conclusion === 'skipped') {
                     core.setOutput('result', stageAJob.conclusion === 'success' ? 'success' : 'skipped');
                     return;
                   } else {
@@ -243,15 +248,19 @@ jobs:
             core.setOutput('result', 'timeout');
 
   wait-for-stage-b:
-    needs: [check-changes, wait-for-stage-a]
+    needs: [check-changes, call-gate, wait-for-stage-a]
     # Only run for PRs (not scheduled) and when not targeting a specific stage
+    # Skip if call-gate failed (stage-b jobs will be skipped, nothing to wait for)
+    # !cancelled() ensures this job respects workflow cancellation from concurrency group
     if: |
       always() &&
+      !cancelled() &&
       github.event_name == 'pull_request' &&
       !inputs.target_stage &&
       inputs.test_parallel_dispatch != true &&
       (needs.check-changes.outputs.main_package == 'true' || needs.check-changes.outputs.sgl_kernel == 'true') &&
-      (needs.wait-for-stage-a.result == 'success' || needs.wait-for-stage-a.result == 'skipped')
+      (needs.wait-for-stage-a.result == 'success' || needs.wait-for-stage-a.result == 'skipped') &&
+      (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped')
     runs-on: ubuntu-latest
     outputs:
       stage_b_result: ${{ steps.wait.outputs.result }}
@@ -262,20 +271,24 @@ jobs:
         with:
           script: |
             const maxWaitMinutes = 90;
-            const pollIntervalSeconds = 30;
+            const pollIntervalSeconds = 120;  // 2 minutes to reduce GH API calls
             const maxAttempts = (maxWaitMinutes * 60) / pollIntervalSeconds;
 
-            // Stage-b jobs to wait for
-            // Use exact prefix + ( or end-of-string to avoid matching -performance/-accuracy variants
+            // Stage-b jobs to wait for (all stage-b tests including performance and accuracy)
             const stageBJobs = [
-              { prefix: 'stage-b-test-small-1-gpu', expectedCount: 8 },      // partitions 0-7
-              { prefix: 'stage-b-test-large-1-gpu', expectedCount: 12 },     // partitions 0-11
-              { prefix: 'stage-b-test-large-2-gpu', expectedCount: 2 },      // partitions 0-1
-              { prefix: 'stage-b-test-4-gpu-b200', expectedCount: 1 }
+              { prefix: 'stage-b-test-small-1-gpu', expectedCount: 8 },              // partitions 0-7
+              { prefix: 'stage-b-test-large-1-gpu', expectedCount: 12 },             // partitions 0-11
+              { prefix: 'stage-b-test-large-2-gpu', expectedCount: 2 },              // partitions 0-1
+              { prefix: 'stage-b-test-4-gpu-b200', expectedCount: 1 },
+              { prefix: 'stage-b-test-small-1-gpu-performance', expectedCount: 1 },
+              { prefix: 'stage-b-test-large-1-gpu-performance', expectedCount: 2 },  // partitions 0-1
+              { prefix: 'stage-b-test-large-2-gpu-performance', expectedCount: 1 },
+              { prefix: 'stage-b-test-small-1-gpu-accuracy', expectedCount: 1 },
+              { prefix: 'stage-b-test-large-2-gpu-accuracy', expectedCount: 1 }
             ];
-            const totalExpectedJobs = stageBJobs.reduce((sum, j) => sum + j.expectedCount, 0);
+            const totalExpectedJobs = stageBJobs.reduce((sum, j) => sum + j.expectedCount, 0);  // 29 total
 
-            // Helper to match job names exactly (prefix + optional " (N)" suffix)
+            // Helper to match job names exactly (prefix alone or prefix + " (N)" for matrix jobs)
             const matchesPrefix = (jobName, prefix) => {
               return jobName === prefix || jobName.startsWith(prefix + ' (');
             };
@@ -306,8 +319,7 @@ jobs:
                     allCompleted = false;
                   } else {
                     completedCount++;
-                    // cancelled is not a failure - it means the workflow was stopped (e.g., by concurrency)
-                    if (job.conclusion !== 'success' && job.conclusion !== 'skipped' && job.conclusion !== 'cancelled') {
+                    if (job.conclusion !== 'success' && job.conclusion !== 'skipped') {
                       anyFailed = true;
                       failedJobs.push(job.name);
                     }
