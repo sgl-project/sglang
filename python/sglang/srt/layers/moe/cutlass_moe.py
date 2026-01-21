@@ -131,10 +131,6 @@ def cutlass_fused_experts_fp8(
     m = a.size(0)
     k = w1_q.size(1)
     n = w2_q.size(1)
-    # print(f"@@@ w1_q: {w1_q.shape} {w1_q.dtype}")
-    # print(f"@@@ w2_q: {w2_q.shape} {w2_q.dtype}")
-    # print(f"@@@ w1_scale: {w1_scale.shape} {w1_scale.dtype}")
-    # print(f"@@@ w2_scale: {w2_scale.shape} {w2_scale.dtype}")
 
     topk = topk_ids.size(1)
     device = a.device
