@@ -1000,12 +1000,12 @@ class Indexer(MultiPlatformOp):
                             x_q.to(torch.float32)
                             .view(m, ng, group)
                             .mul_(x_s.to(torch.float32).unsqueeze(-1))
-                            .view(m, n)
+                            .view(m, n).to(torch.bfloat16)
                         )
                     else:
-                        x_for_gate = x_q.to(torch.float32)
+                        x_for_gate = x_q.to(torch.bfloat16)
                 else:
-                    x_for_gate = x_q.to(torch.float32)
+                    x_for_gate = x_q.to(torch.bfloat16)
             else:
                 x_for_gate = x
 
