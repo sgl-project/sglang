@@ -716,7 +716,7 @@ class ChatCompletionRequest(BaseModel):
             sampling_params["logit_bias"] = existing_bias
             if existing_bias:
                 logger.info(
-                    f"Applied logit bias of -100.0 to tokens {list(existing_bias.keys())} for tool_choice=none"
+                    f"Applied logit bias to suppress tool tokens for tool_choice=none"
                 )
 
         if self.response_format and self.response_format.type == "json_schema":
