@@ -900,8 +900,8 @@ async def get_remote_instance_transfer_engine_info(rank: int = None):
         return Response(status_code=HTTPStatus.BAD_REQUEST)
 
 
-@app.get("/get_parallelism_config")
-async def get_parallelism_config(rank: int = 0):
+@app.get("/parallelism_config")
+async def parallelism_config(rank: int = 0):
     """Get parallelism config for a specific TP rank."""
     if rank < 0:
         return Response(status_code=HTTPStatus.BAD_REQUEST)
