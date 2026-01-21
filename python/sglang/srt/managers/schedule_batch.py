@@ -1061,13 +1061,6 @@ class Req(ReqDllmMixin):
             self.to_finish = None
             return
 
-        if len(self.output_ids) >= self.sampling_params.max_new_tokens:
-            self.finished_reason = FINISH_LENGTH(
-                length=self.sampling_params.max_new_tokens
-            )
-            self.finished_len = self.sampling_params.max_new_tokens
-            return
-
         if self.grammar is not None:
             if self.grammar.is_terminated():
                 self.finished_reason = FINISH_MATCHED_TOKEN(matched=self.output_ids[-1])
@@ -1082,6 +1075,15 @@ class Req(ReqDllmMixin):
             return
 
         if self._check_str_based_finish():
+            return
+        
+        # Check length limit last, so that stop tokens/strings take priority
+        # This ensures eos tokens are properly trimmed even when hitting length limit
+        if len(self.output_ids) >= self.sampling_params.max_new_tokens:
+            self.finished_reason = FINISH_LENGTH(
+                length=self.sampling_params.max_new_tokens
+            )
+            self.finished_len = self.sampling_params.max_new_tokens
             return
 
     def reset_for_retract(self):
