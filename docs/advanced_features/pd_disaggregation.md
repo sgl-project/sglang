@@ -23,7 +23,7 @@ When you need to profile prefill or decode workers in PD disaggregation mode, pl
 
 ## Router Integration
 
-For deploying PD disaggregation at scale with load balancing and fault tolerance, SGLang provides a router. The router can distribute requests between prefill and decode instances using various routing policies. For detailed information on setting up routing with PD disaggregation, including configuration options and deployment patterns, see the [SGLang Router documentation](router.md#mode-3-prefill-decode-disaggregation).
+For deploying PD disaggregation at scale with load balancing and fault tolerance, SGLang provides a router. The router can distribute requests between prefill and decode instances using various routing policies. For detailed information on setting up routing with PD disaggregation, including configuration options and deployment patterns, see the [SGLang Model Gateway (former Router)](../advanced_features/sgl_model_gateway.md#prefill-decode-disaggregation).
 
 
 ## Mooncake
