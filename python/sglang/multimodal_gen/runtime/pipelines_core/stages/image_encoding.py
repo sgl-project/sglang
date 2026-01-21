@@ -125,15 +125,16 @@ class ImageEncodingStage(PipelineStage):
         elif self.text_encoder:
             # if a text encoder is provided, e.g. Qwen-Image-Edit
             # 1. neg prompt embeds
-            neg_image_processor_kwargs = (
-                server_args.pipeline_config.prepare_image_processor_kwargs(
-                    batch, neg=True
+            if batch.do_classifier_free_guidance:
+                neg_image_processor_kwargs = (
+                    server_args.pipeline_config.prepare_image_processor_kwargs(
+                        batch, neg=True
+                    )
                 )
-            )
 
-            neg_image_inputs = self.image_processor(
-                images=image, return_tensors="pt", **neg_image_processor_kwargs
-            ).to(cuda_device)
+                neg_image_inputs = self.image_processor(
+                    images=image, return_tensors="pt", **neg_image_processor_kwargs
+                ).to(cuda_device)
 
             with set_forward_context(current_timestep=0, attn_metadata=None):
                 outputs = self.text_encoder(
