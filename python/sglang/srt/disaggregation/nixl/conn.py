@@ -147,10 +147,7 @@ class NixlKVManager(CommonKVManager):
         agent_config = nixl_agent_config(backends=[])
         self.agent = nixl_agent(str(uuid.uuid4()), agent_config)
 
-        if server_args.disaggregation_nixl_backend is not None:
-            backend = server_args.disaggregation_nixl_backend
-        else:
-            backend = "UCX"
+        backend = envs.SGLANG_DISAGGREGATION_NIXL_BACKEND.get()
 
         available_plugins = self.agent.get_plugin_list()
         if backend not in available_plugins:
