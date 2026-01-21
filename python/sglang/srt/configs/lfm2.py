@@ -16,16 +16,11 @@
 
 from typing import List, Optional
 
-import torch
 from transformers import CONFIG_MAPPING
 from transformers import Lfm2Config as HFLfm2Config
 from transformers.utils import logging
 
-from sglang.srt.configs.mamba_utils import (
-    Mamba2CacheParams,
-    Mamba2StateDType,
-    Mamba2StateShape,
-)
+from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
 
 logger = logging.get_logger(__name__)
 
@@ -92,14 +87,11 @@ class Lfm2Config(HFLfm2Config):
             conv_kernel=conv_kernel,
         )
 
-        # Use runtime dtype from model_config (propagated to hf_config.torch_dtype)
-        # Conv state must match model's inference dtype
-        conv_dtype = getattr(self, "torch_dtype", torch.bfloat16)
-
+        # Uses default mamba2_state_dtype() which reads SGLANG_MAMBA_CONV_DTYPE env var
+        # (defaults to bfloat16). Set SGLANG_MAMBA_CONV_DTYPE=float16 for fp16 inference.
         return Mamba2CacheParams(
             shape=shape,
             layers=conv_layer_ids,
-            dtype=Mamba2StateDType(conv=conv_dtype, temporal=torch.float32),
         )
 
 

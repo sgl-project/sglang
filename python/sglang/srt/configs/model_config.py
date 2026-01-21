@@ -192,10 +192,6 @@ class ModelConfig:
         )
         self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)
 
-        # Propagate runtime dtype to hf_config so that hybrid models (mamba, LFM2, etc.)
-        # can use it for conv state cache dtype
-        self.hf_config.torch_dtype = self.dtype
-
         # Derive context length and model shapes
         self._derive_context_length(context_length)
         self._derive_model_shapes()
