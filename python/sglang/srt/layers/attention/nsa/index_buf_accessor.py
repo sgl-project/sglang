@@ -10,9 +10,6 @@ from sglang.srt.utils import is_hip
 _is_hip = is_hip()
 _is_fp8_fnuz = is_fp8_fnuz()
 
-_is_hip = is_hip()
-_is_fp8_fnuz = is_fp8_fnuz()
-
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
 
