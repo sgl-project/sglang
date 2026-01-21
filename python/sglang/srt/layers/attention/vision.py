@@ -724,7 +724,7 @@ class VisionAttention(nn.Module):
                 backend = "triton_attn"
         else:
             backend = "sdpa"
-        if backend == "fa3" and not is_blackwell_supported():
+        if backend == "fa3" and is_blackwell_supported():
             raise ValueError("The 'fa3' backend is not supported on Blackwell GPUs")
 
         return backend
