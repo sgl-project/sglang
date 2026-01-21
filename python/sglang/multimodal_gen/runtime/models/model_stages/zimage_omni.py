@@ -309,12 +309,13 @@ class ZImageOmniBeforeDenoisingStage(PipelineStage):
         # Copied from diffusers.pipeline_z_image_omni
         do_classifier_free_guidance = batch.guidance_scale > 1
         batch.do_classifier_free_guidance = do_classifier_free_guidance
-
-        # # TODO:
-        # (prompt_embeds, negative_prompt_embeds,) = self.encode_prompt()
+        device = get_local_torch_device()
+        batch.generator = torch.Generator(device=device).manual_seed(batch.seed)
 
         # Encode positive prompt with all available encoders
         assert batch.prompt is not None
+        assert isinstance(batch.prompt_embeds, list)
+
         num_condition_images: int = (
             len(batch.image_path) if batch.image_path is not None else 0
         )
@@ -325,7 +326,6 @@ class ZImageOmniBeforeDenoisingStage(PipelineStage):
             server_args,
             num_condition_images=num_condition_images,
         )
-        assert isinstance(batch.prompt_embeds, list)
         for pe in pos_prompt_embeds_list:
             batch.prompt_embeds.append(pe)
 

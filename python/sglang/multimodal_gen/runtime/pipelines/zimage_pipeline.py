@@ -415,25 +415,6 @@ class ZImageOmniPipeline(ZImagePipeline):
 
     def create_pipeline_stages(self, server_args: ServerArgs):
         """Set up pipeline stages with proper dependency injection."""
-
-        self.add_stage(
-            stage_name="input_validation_stage", stage=InputValidationStage()
-        )
-
-        # self.add_stage(
-        #     stage_name="prompt_encoding_stage_primary",
-        #     stage=TextEncodingStage(
-        #         text_encoders=[
-        #             self.get_module("text_encoder"),
-        #         ],
-        #         tokenizers=[
-        #             self.get_module("tokenizer"),
-        #         ],
-        #     ),
-        # )
-
-        # self.add_stage(stage_name="conditioning_stage", stage=ConditioningStage())
-
         self.add_stage(
             stage_name="zimage_omni_before_denoising",
             stage=ZImageOmniBeforeDenoisingStage(
