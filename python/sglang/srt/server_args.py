@@ -45,7 +45,6 @@ from sglang.srt.utils.common import (
     get_quantization_config,
     is_blackwell_supported,
     is_cuda,
-    is_fa3_default_architecture,
     is_flashinfer_available,
     is_hip,
     is_hopper_with_cuda_12_3,
@@ -194,9 +193,9 @@ FP8_GEMM_RUNNER_BACKEND_CHOICES = [
 
 FP4_GEMM_RUNNER_BACKEND_CHOICES = [
     "auto",
-    "cudnn",
-    "cutlass",
-    "trtllm",
+    "flashinfer_cudnn",
+    "flashinfer_cutlass",
+    "flashinfer_trtllm",
 ]
 
 MAMBA_SSM_DTYPE_CHOICES = ["float32", "bfloat16"]
@@ -1280,9 +1279,9 @@ class ServerArgs:
                 or decode_attn_backend == "trtllm_mha"
             ):
                 # TODO: support swa kv indices translation for trtllm_mha attention backend
-                self.swa_full_tokens_ratio = 1.0
+                self.disable_hybrid_swa_memory = True
                 logger.warning(
-                    "Set swa_full_tokens_ratio to 1.0 for GPT-OSS model with trtllm_mha attention backend."
+                    "Disable hybrid SWA memory for GPT-OSS model with trtllm_mha attention backend."
                 )
 
             quant_method = get_quantization_config(hf_config)
@@ -1586,6 +1585,7 @@ class ServerArgs:
                 "DeepseekV3ForCausalLM",
                 "GptOssForCausalLM",
                 "Glm4MoeForCausalLM",
+                "Glm4MoeLiteForCausalLM",
                 "Qwen3MoeForCausalLM",
             ]
             and (is_sm90_supported() or is_sm100_supported())
@@ -1629,11 +1629,10 @@ class ServerArgs:
 
             if not use_mla_backend:
                 # MHA architecture
-                if (
-                    is_hopper_with_cuda_12_3()
-                    and is_no_spec_infer_or_topk_one(self)
-                    and is_fa3_default_architecture(self.model_config.hf_config)
-                ):
+                if is_hopper_with_cuda_12_3() and is_no_spec_infer_or_topk_one(self):
+                    # Note: flashinfer 0.6.1 caused performance regression on Hopper attention kernel
+                    # Before the kernel is fixed, we choose fa3 as the default backend on Hopper MHA
+                    # ref: https://github.com/sgl-project/sglang/issues/17411
                     self.attention_backend = "fa3"
                 elif (
                     is_sm100_supported()
@@ -2147,6 +2146,7 @@ class ServerArgs:
                 "DeepseekV32ForCausalLM",
                 "DeepseekV3ForCausalLM",
                 "Glm4MoeForCausalLM",
+                "Glm4MoeLiteForCausalLM",
                 "BailingMoeForCausalLM",
                 "BailingMoeV2ForCausalLM",
                 "MistralLarge3ForCausalLM",
@@ -3564,10 +3564,10 @@ class ServerArgs:
             default=ServerArgs.fp4_gemm_runner_backend,
             dest="fp4_gemm_runner_backend",
             help="Choose the runner backend for NVFP4 GEMM operations. "
-            "Options: 'auto' (default, selects between cudnn/cutlass based on CUDA/cuDNN version), "
-            "'cudnn' (cuDNN backend, optimal on CUDA 13+ with cuDNN 9.15+), "
-            "'cutlass' (CUTLASS backend, optimal on CUDA 12), "
-            "'trtllm' (TensorRT-LLM backend, requires different weight preparation with shuffling). "
+            "Options: 'auto' (default, selects between flashinfer_cudnn/flashinfer_cutlass based on CUDA/cuDNN version), "
+            "'flashinfer_cudnn' (FlashInfer cuDNN backend, optimal on CUDA 13+ with cuDNN 9.15+), "
+            "'flashinfer_cutlass' (FlashInfer CUTLASS backend, optimal on CUDA 12), "
+            "'flashinfer_trtllm' (FlashInfer TensorRT-LLM backend, requires different weight preparation with shuffling). "
             "NOTE: This replaces the deprecated environment variable "
             "SGLANG_FLASHINFER_FP4_GEMM_BACKEND.",
         )
@@ -5422,6 +5422,7 @@ def auto_choose_speculative_params(self: ServerArgs):
         "DeepseekV2ForCausalLM",
         "GptOssForCausalLM",
         "Glm4MoeForCausalLM",
+        "Glm4MoeLiteForCausalLM",
         "BailingMoeForCausalLM",
         "BailingMoeV2ForCausalLM",
         "MistralLarge3ForCausalLM",
