@@ -210,7 +210,7 @@ jobs:
         with:
           script: |
             const maxWaitMinutes = 60;
-            const pollIntervalSeconds = 30;
+            const pollIntervalSeconds = 120;  // 2 minutes to reduce GH API calls
             const maxAttempts = (maxWaitMinutes * 60) / pollIntervalSeconds;
 
             for (let attempt = 0; attempt < maxAttempts; attempt++) {
@@ -271,7 +271,7 @@ jobs:
         with:
           script: |
             const maxWaitMinutes = 90;
-            const pollIntervalSeconds = 30;
+            const pollIntervalSeconds = 120;  // 2 minutes to reduce GH API calls
             const maxAttempts = (maxWaitMinutes * 60) / pollIntervalSeconds;
 
             // Stage-b jobs to wait for (all stage-b tests including performance and accuracy)
