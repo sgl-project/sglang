@@ -7,6 +7,12 @@ from typing import List, Optional, Tuple
 
 import torch
 
+from sglang.srt.distributed import parallel_state
+from sglang.srt.distributed.parallel_state import (
+    GroupCoordinator,
+    patch_moe_parallel_groups,
+    patch_tensor_parallel_group,
+)
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_extend_npu_graph_runner import (
     EAGLEDraftExtendNpuGraphRunner,
@@ -51,12 +57,6 @@ from sglang.srt.speculative.spec_utils import (
     generate_token_bitmask,
     load_token_map,
     select_top_k_tokens,
-)
-from sglang.srt.distributed import parallel_state
-from sglang.srt.distributed.parallel_state import (
-    GroupCoordinator,
-    patch_moe_parallel_groups,
-    patch_tensor_parallel_group,
 )
 from sglang.srt.utils.common import (
     MultiprocessingSerializer,
@@ -973,9 +973,11 @@ class DPDraftWorker(EagleDraftWorker):
             dp_draft_args.tp_size,
             dp_draft_args.dp_size,
             dp_draft_args.ep_size,
-            self.draft_runner.attention_tp_group.world_size
-            if hasattr(self.draft_runner, "attention_tp_group")
-            else "N/A",
+            (
+                self.draft_runner.attention_tp_group.world_size
+                if hasattr(self.draft_runner, "attention_tp_group")
+                else "N/A"
+            ),
             self.server_args.enable_dp_attention,
             prev_moe_a2a,
         )
@@ -991,7 +993,7 @@ class DPDraftWorker(EagleDraftWorker):
         if draft_args.json_model_override_args:
             try:
                 override_args = json.loads(draft_args.json_model_override_args)
-            except Exception:
+            except json.JSONDecodeError:
                 override_args = {}
         override_args["moe_a2a_backend"] = None
         draft_args.json_model_override_args = json.dumps(override_args)

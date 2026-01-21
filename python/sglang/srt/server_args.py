@@ -2146,9 +2146,7 @@ class ServerArgs:
 
             if self.speculative_dp_draft:
                 if self.speculative_algorithm not in ("EAGLE", "EAGLE3"):
-                    raise ValueError(
-                        "DP-Draft currently only supports EAGLE/EAGLE3."
-                    )
+                    raise ValueError("DP-Draft currently only supports EAGLE/EAGLE3.")
                 if not envs.SGLANG_ENABLE_SPEC_V2.get():
                     raise ValueError(
                         "DP-Draft requires spec v2 overlap worker. "
