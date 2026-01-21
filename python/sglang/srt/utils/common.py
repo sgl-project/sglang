@@ -3652,18 +3652,10 @@ def get_libnuma():
     return libnuma
 
 
-def is_numa_available() -> bool:
-    try:
-        libnuma = get_libnuma()
-        return libnuma.numa_available() >= 0
-    except Exception:
-        return False
-
-
 def numa_bind_to_node(node: int):
     libnuma = get_libnuma()
 
-    if is_numa_available() is False:
+    if libnuma is None or libnuma.numa_available() < 0:
         logger.error("numa not available on this system, skip bind action")
     else:
         libnuma.numa_run_on_node(ctypes.c_int(node))
