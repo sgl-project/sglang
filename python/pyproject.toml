@@ -81,14 +81,19 @@ dependencies = [
 ]
 
 [[tool.uv.index]]
+name = "pypi"
+url = "https://pypi.org/simple"
+default = true
+
+[[tool.uv.index]]
 name = "torch-cu129"
 url = "https://download.pytorch.org/whl/cu129"
 explicit = true
 
 [tool.uv.sources]
 torch = [
-  { marker = "platform_machine == 'x86_64'"},
-  { index = "torch-cu129", marker = "platform_machine == 'aarch64'" },
+  { index = "pypi", marker = "platform_machine == 'x86_64'"},
+  { index = "torch-cu129", marker = "platform_machine == 'aarch64'"},
 ]
 
 [project.optional-dependencies]
