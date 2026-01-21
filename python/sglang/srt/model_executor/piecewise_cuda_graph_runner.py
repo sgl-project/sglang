@@ -240,8 +240,11 @@ class PiecewiseCudaGraphRunner:
         set_graph_pool_id(get_global_graph_memory_pool())
 
         with enable_piecewise_cuda_graph():
+            language_model = getattr(
+                self.model_runner.model, "language_model", self.model_runner.model
+            )
             with patch_model(
-                self.model_runner.model.model, self.compile_config.compiler
+                language_model.model, self.compile_config.compiler
             ) as patched_model:
                 install_torch_compiled(
                     patched_model,
@@ -330,9 +333,9 @@ class PiecewiseCudaGraphRunner:
                 return_logprob=False,
                 extend_num_tokens=num_tokens,
                 extend_seq_lens=torch.tensor([num_tokens], device=self.device),
-                extend_prefix_lens=torch.tensor([num_tokens], device=self.device),
+                extend_prefix_lens=torch.tensor([0], device=self.device),
                 extend_start_loc=torch.tensor([0], device=self.device),
-                extend_prefix_lens_cpu=torch.tensor([num_tokens], device="cpu"),
+                extend_prefix_lens_cpu=torch.tensor([0], device="cpu"),
                 extend_seq_lens_cpu=torch.tensor([num_tokens], device="cpu"),
                 extend_logprob_start_lens_cpu=torch.tensor([num_tokens], device="cpu"),
                 positions=positions,
@@ -477,9 +480,9 @@ class PiecewiseCudaGraphRunner:
                 return_logprob=False,
                 extend_num_tokens=num_tokens,
                 extend_seq_lens=torch.tensor([num_tokens], device=self.device),
-                extend_prefix_lens=torch.tensor([num_tokens], device=self.device),
+                extend_prefix_lens=torch.tensor([0], device=self.device),
                 extend_start_loc=torch.tensor([0], device=self.device),
-                extend_prefix_lens_cpu=torch.tensor([num_tokens], device="cpu"),
+                extend_prefix_lens_cpu=torch.tensor([0], device="cpu"),
                 extend_seq_lens_cpu=torch.tensor([num_tokens], device="cpu"),
                 extend_logprob_start_lens_cpu=torch.tensor([num_tokens], device="cpu"),
                 positions=positions,
