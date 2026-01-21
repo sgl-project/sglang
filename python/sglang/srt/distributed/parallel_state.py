@@ -556,7 +556,11 @@ class GroupCoordinator:
         if self.npu_communicator is not None and not self.npu_communicator.disabled:
             return self.npu_communicator.all_reduce(input_)
 
-        if self.pynccl_comm is not None and self.is_symmetric_memory_enabled():
+        if (
+            self.pynccl_comm is not None
+            and self.is_symmetric_memory_enabled()
+            and not is_hip()
+        ):
             with self.pynccl_comm.change_state(
                 enable=True, stream=get_current_device_stream_fast()
             ):
