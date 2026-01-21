@@ -54,7 +54,7 @@ def check_quant_method(model_path: str, use_marlin_kernel: bool):
         model_config=model_config, load_config=load_config, device_config=device_config
     )
 
-    from sglang.srt.layers.linear import UnquantizedLinearMethod
+    from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
     from sglang.srt.layers.quantization.gptq import (
         GPTQLinearMethod,
         GPTQMarlinLinearMethod,
