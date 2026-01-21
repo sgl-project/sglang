@@ -331,16 +331,23 @@ def process_results(
     # Sort by created_at descending
     sorted_results = sorted(results, key=lambda x: x["created_at"], reverse=True)
 
-    # Filter into categories
+    # Filter into categories (mutually exclusive)
     active_jobs = [
         r
         for r in results
-        if r["status"] in ("in_progress", "queued", "waiting")
+        if r.get("status") in ("in_progress", "queued", "waiting")
         and not r.get("is_stuck", False)
     ]
     stuck_jobs = [r for r in results if r.get("is_stuck", False)]
-    # Include failure, cancelled, timed_out as "failed" jobs
-    failed_jobs = [r for r in results if r["conclusion"] in ("failure", "timed_out")]
+    # Include failure, cancelled, timed_out, action_required as "failed" jobs
+    # Exclude stuck jobs to avoid double-counting
+    failed_jobs = [
+        r
+        for r in results
+        if r.get("conclusion", "-")
+        in ("failure", "cancelled", "timed_out", "action_required")
+        and not r.get("is_stuck", False)
+    ]
 
     # Process jobs with calculated fields
     processed_jobs = []
