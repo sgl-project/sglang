@@ -241,20 +241,11 @@ class MambaPool:
             ]
 
             if _is_cpu and _cpu_has_amx_support:
+                from sglang.srt.layers.amx_utils import _init_amx_conv_state
+
                 # CPU uses a different layout of conv_state for kernel optimization
-                conv_state_cpu = []
-                for conv_shape_t in conv_state:
-                    conv_shape_new = conv_shape_t.as_strided_(
-                        conv_shape_t.size(),
-                        (
-                            conv_shape_t.stride(0),
-                            conv_shape_t.stride(1),
-                            1,
-                            conv_shape_t.size(2),
-                        ),
-                    )
-                    conv_state_cpu.append(conv_shape_new)
-                conv_state = conv_state_cpu
+                conv_state = _init_amx_conv_state(conv_state)
+
             temporal_state = torch.zeros(
                 size=(num_mamba_layers, size + 1) + temporal_state_shape,
                 dtype=ssm_dtype,

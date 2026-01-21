@@ -59,8 +59,6 @@ _is_cuda = is_cuda()
 _is_npu = is_npu()
 _is_cpu = is_cpu()
 _is_amx_available = cpu_has_amx_support()
-if _is_cpu and _is_amx_available:
-    pass
 
 
 import triton

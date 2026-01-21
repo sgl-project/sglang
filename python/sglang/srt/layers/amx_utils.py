@@ -47,6 +47,23 @@ def is_dim_conv_weight(weight):
     return weight.dim() == 3 and weight.size(1) == 1
 
 
+def _init_amx_conv_state(conv_state):
+    # CPU AMX layout for conv_state kernel optimization
+    conv_state_cpu = []
+    for conv_shape_t in conv_state:
+        conv_shape_new = conv_shape_t.as_strided_(
+            conv_shape_t.size(),
+            (
+                conv_shape_t.stride(0),
+                conv_shape_t.stride(1),
+                1,
+                conv_shape_t.size(2),
+            ),
+        )
+        conv_state_cpu.append(conv_shape_new)
+    return conv_state_cpu
+
+
 def _amx_process_weight_after_loading(
     module, weight_names, transpose_dims=None
 ) -> None:
