@@ -307,8 +307,6 @@ def alloc_extend_kernel_v2(
 
     # handle new page chunk by chunk
     num_loops = (num_part2 + step_size - 1) // step_size
-    
-    # 循环处理每个 chunk
     for i in range(num_loops):
         start_idx = i * step_size
         end_idx = min((i + 1) * step_size, num_part2)
