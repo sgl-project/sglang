@@ -339,14 +339,12 @@ def process_results(
         and not r.get("is_stuck", False)
     ]
     stuck_jobs = [r for r in results if r.get("is_stuck", False)]
-    # Include failure, cancelled, timed_out, action_required as "failed" jobs
+    # Only include jobs with conclusion "failure"
     # Exclude stuck jobs to avoid double-counting
     failed_jobs = [
         r
         for r in results
-        if r.get("conclusion", "-")
-        in ("failure", "cancelled", "timed_out", "action_required")
-        and not r.get("is_stuck", False)
+        if r.get("conclusion", "-") == "failure" and not r.get("is_stuck", False)
     ]
 
     # Process jobs with calculated fields
@@ -691,9 +689,9 @@ def format_markdown(
 
         lines.append("")
 
-    # Failed/Cancelled jobs section (before All Jobs)
+    # Failed jobs section (before All Jobs)
     if failed_jobs:
-        lines.append(f"## Failed/Cancelled Jobs ({len(failed_jobs)} total)")
+        lines.append(f"## Failed Jobs ({len(failed_jobs)} total)")
         lines.append("")
         lines.append(
             "| Conclusion | Job Name | Created | Started | Queue | Duration | Runner | PR/Branch | Link |"
