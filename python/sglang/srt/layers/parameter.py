@@ -27,6 +27,52 @@ logger = logging.getLogger(__name__)
 _is_cpu = is_cpu()
 
 
+def _dtype_rank(dtype: torch.dtype) -> Optional[int]:
+    if dtype in (
+        torch.float8_e4m3fn,
+        torch.float8_e4m3fnuz,
+        torch.float8_e5m2,
+        torch.float8_e5m2fnuz,
+    ):
+        return 0
+    if dtype in (torch.float16, torch.bfloat16):
+        return 1
+    if dtype == torch.float32:
+        return 2
+    if dtype == torch.float64:
+        return 3
+    return None
+
+
+def copy_with_check(target: torch.Tensor, loaded_weight: torch.Tensor):
+    """
+    Copy `loaded_weight` into `target` while forbidding downcasts.
+    bf16/fp16 share the same rank, and all fp8 variants share the same rank.
+    """
+
+    assert (
+        target.shape == loaded_weight.shape
+    ), f"{target.shape=}, {loaded_weight.shape=}"
+
+    if target.dtype == loaded_weight.dtype:
+        target.copy_(loaded_weight)
+        return
+
+    target_rank = _dtype_rank(target.dtype)
+    loaded_rank = _dtype_rank(loaded_weight.dtype)
+
+    if target_rank is None or loaded_rank is None:
+        raise ValueError(
+            f"Unsupported copy between dtypes: {target.dtype=}, {loaded_weight.dtype=}"
+        )
+    if target_rank < loaded_rank:
+        raise ValueError(
+            f"Downcasting not allowed: {target.dtype=}, {loaded_weight.dtype=}"
+        )
+
+    target.copy_(loaded_weight)
+
+
 class BasevLLMParameter(Parameter):
     """
     Base parameter for vLLM linear layers. Extends the torch.nn.parameter
@@ -120,8 +166,7 @@ class _ColumnvLLMParameter(BasevLLMParameter):
                     self.output_dim, tp_rank * shard_size, shard_size
                 )
 
-        assert self.data.shape == loaded_weight.shape
-        self.data.copy_(loaded_weight)
+        copy_with_check(self.data, loaded_weight)
 
     def load_merged_column_weight(self, loaded_weight: torch.Tensor, **kwargs):
 

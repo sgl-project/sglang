@@ -1,0 +1,49 @@
+name: Weekly Test (Nvidia)
+
+on:
+  schedule:
+    - cron: '0 0 * * 0'  # Run every Sunday at midnight UTC
+  workflow_dispatch:
+    inputs:
+      job_filter:
+        description: 'Select which job to run (leave empty or "all" to run all jobs)'
+        required: false
+        type: choice
+        default: 'all'
+        options:
+          - 'all'
+          - 'weekly-test-8-gpu-h200'
+
+concurrency:
+  group: weekly-test-nvidia-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SGLANG_IS_IN_CI: true
+  HF_HUB_DOWNLOAD_TIMEOUT: 300
+  HF_HUB_ETAG_TIMEOUT: 300
+
+jobs:
+  # Weekly tests - 8 GPU H200
+  weekly-test-8-gpu-h200:
+    if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'weekly-test-8-gpu-h200')
+    runs-on: 8-gpu-h200
+    timeout-minutes: 120
+    env:
+      RUNNER_LABELS: 8-gpu-h200
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/ci_install_dependency.sh
+
+      - name: Run weekly 8-GPU H200 tests
+        timeout-minutes: 120
+        env:
+          GPU_CONFIG: "8-gpu-h200"
+          IS_H200: "1"
+        run: |
+          cd test
+          python3 run_suite.py --hw cuda --suite weekly-8-gpu-h200 --nightly --continue-on-error --timeout-per-file 7200
