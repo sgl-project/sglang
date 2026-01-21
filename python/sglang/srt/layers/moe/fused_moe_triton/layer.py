@@ -656,7 +656,7 @@ class FusedMoE(torch.nn.Module):
         # TODO (mgoin): check self.quant_method.quant_config.quant_format
         # against known CompressionFormat enum values that have this quality
         if hasattr(self, 'scheme'):
-            method - self.scheme
+            method = self.scheme
         else:
             method = self.quant_method
         if method.__class__.__name__ == "KTEPWrapperMethod":
