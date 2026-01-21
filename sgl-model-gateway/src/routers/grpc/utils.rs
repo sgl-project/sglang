@@ -16,7 +16,10 @@ use super::{
 };
 use crate::{
     core::Worker,
-    grpc_client::{sglang_proto::{InputLogProbs, MultimodalInputs, OutputLogProbs}, SglangSchedulerClient},
+    grpc_client::{
+        sglang_proto::{InputLogProbs, MultimodalInputs, OutputLogProbs},
+        SglangEncoderClient,
+    },
     observability::metrics::metrics_labels,
     protocols::{
         chat::{ChatCompletionRequest, ChatMessage, MessageContent},
@@ -122,7 +125,7 @@ pub(crate) async fn get_grpc_client_from_worker(
 /// Get encoder gRPC client from worker, returning appropriate error response on failure
 pub async fn get_encoder_client_from_worker(
     worker: &Arc<dyn Worker>,
-) -> Result<SglangSchedulerClient, Response> {
+) -> Result<SglangEncoderClient, Response> {
     // Get cached encoder client from worker (or create one if not cached yet)
     let client_arc = worker
         .get_encoder_client()

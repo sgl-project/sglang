@@ -382,7 +382,7 @@ impl WorkerSelectionStage {
         // Record worker selection metrics
         Metrics::record_worker_selection(
             metrics_labels::WORKER_ENCODE,
-            metrics_labels::CONNECTION_HTTP, // Encode uses HTTP
+            metrics_labels::CONNECTION_GRPC,
             model,
             encode_policy.name(),
         );
