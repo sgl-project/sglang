@@ -21,6 +21,7 @@ class LTXVocoderArchConfig(VocoderArchConfig):
         default_factory=lambda: [[1, 3, 5], [1, 3, 5], [1, 3, 5]]
     )
     leaky_relu_negative_slope: float = 0.1
+    sample_rate: int = 24000
 
 
 @dataclass
