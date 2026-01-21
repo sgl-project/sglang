@@ -897,7 +897,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             ), "Fp8MoEMethod on CPU requires that CPU has AMX support"
             _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
         elif self.use_mxfp8 and not self.quant_config.is_checkpoint_fp8_serialized:
-            # Keep weights in FP16/BF16; CUTLASS MXFP8 path will quantize on the fly.
+            # Quantize weights using ES MXFP8 path during loading.
+            self._quantize_mxfp8_moe_weights(layer)
             return
         else:
             # For fp8 moe run with deepgemm, the expert weights and scales need be requantized to ue8m0
@@ -932,25 +933,65 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 layer.w2_weight_scale_inv.format_ue8m0 = True
 
     def _quantize_mxfp8_moe_weights(self, layer: Module) -> None:
-        w13 = layer.w13_weight.data.contiguous()
-        w2 = layer.w2_weight.data.contiguous()
+        if not (_is_cuda and is_sm100_supported()):
+            raise RuntimeError("MXFP8 MoE quantization requires SM100.")
+        if not get_moe_runner_backend().is_cutlass():
+            raise RuntimeError(
+                "MXFP8 MoE quantization is only supported with CUTLASS backend."
+            )
 
-        w13_flat = w13.view(-1, w13.shape[-1])
-        w2_flat = w2.view(-1, w2.shape[-1])
+        from sgl_kernel import es_sm100_mxfp8_blockscaled_grouped_quant
 
-        w13_q_flat, w13_s_flat = mxfp8_group_quantize(w13_flat)
-        w2_q_flat, w2_s_flat = mxfp8_group_quantize(w2_flat)
+        def _quantize_with_es_kernel(weight: torch.Tensor):
+            weight = weight.contiguous()
+            num_experts, m, k = weight.shape
+            assert k % 32 == 0, f"{k=} must be divisible by 32 for MXFP8"
 
-        layer.w13_weight = torch.nn.Parameter(
-            w13_q_flat.view_as(w13), requires_grad=False
-        )
-        layer.w2_weight = torch.nn.Parameter(w2_q_flat.view_as(w2), requires_grad=False)
-        layer.w13_weight_scale_inv = torch.nn.Parameter(
-            w13_s_flat.view(w13.shape[0], w13.shape[1], -1), requires_grad=False
-        )
-        layer.w2_weight_scale_inv = torch.nn.Parameter(
-            w2_s_flat.view(w2.shape[0], w2.shape[1], -1), requires_grad=False
-        )
+            weight_flat = weight.view(-1, k).contiguous()
+            problem_sizes = torch.empty(
+                (num_experts, 3), dtype=torch.int32, device=weight.device
+            )
+            problem_sizes[:, 0] = m
+            problem_sizes[:, 1] = 0
+            problem_sizes[:, 2] = k
+            expert_offsets = torch.arange(
+                0, num_experts * m, m, dtype=torch.int32, device=weight.device
+            )
+            aligned_m = ((m + 127) // 128) * 128
+            blockscale_offsets = torch.arange(
+                0,
+                num_experts * aligned_m,
+                aligned_m,
+                dtype=torch.int32,
+                device=weight.device,
+            )
+            qweight = torch.empty_like(weight_flat, dtype=torch.float8_e4m3fn)
+            scale = torch.empty(
+                (num_experts * aligned_m, k // 32),
+                dtype=torch.uint8,
+                device=weight.device,
+            )
+            es_sm100_mxfp8_blockscaled_grouped_quant(
+                weight_flat,
+                problem_sizes,
+                expert_offsets,
+                blockscale_offsets,
+                qweight,
+                scale,
+            )
+            qweight = qweight.view_as(weight)
+            scale = scale.view(num_experts, aligned_m, k // 32)
+            if aligned_m != m:
+                scale = scale[:, :m, :]
+            return qweight, scale
+
+        w13_q, w13_s = _quantize_with_es_kernel(layer.w13_weight.data)
+        w2_q, w2_s = _quantize_with_es_kernel(layer.w2_weight.data)
+
+        layer.w13_weight = torch.nn.Parameter(w13_q, requires_grad=False)
+        layer.w2_weight = torch.nn.Parameter(w2_q, requires_grad=False)
+        layer.w13_weight_scale_inv = torch.nn.Parameter(w13_s, requires_grad=False)
+        layer.w2_weight_scale_inv = torch.nn.Parameter(w2_s, requires_grad=False)
         layer.w13_weight_scale_inv.format_ue8m0 = True
         layer.w2_weight_scale_inv.format_ue8m0 = True
         layer.w13_input_scale = None

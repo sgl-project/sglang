@@ -148,60 +148,6 @@ def cutlass_fused_experts_fp8(
         assert k % 32 == 0, "MXFP8 requires hidden size to be divisible by 32"
         assert n % 32 == 0, "MXFP8 requires intermediate size to be divisible by 32"
 
-        def _quantize_weight_mxfp8(
-            weight_rm: torch.Tensor,
-        ) -> Tuple[torch.Tensor, torch.Tensor]:
-            print(f"@@@ _quantize_weight_mxfp8 weight_rm.shape: {weight_rm.shape}")
-            num_experts, m_w, k_w = weight_rm.shape
-            weight_flat = weight_rm.view(-1, k_w).contiguous()
-            problem_sizes_w = torch.empty(
-                (num_experts, 3), dtype=torch.int32, device=device
-            )
-            problem_sizes_w[:, 0] = m_w
-            problem_sizes_w[:, 1] = 0
-            problem_sizes_w[:, 2] = k_w
-            expert_offsets_w = torch.arange(
-                0, num_experts * m_w, m_w, dtype=torch.int32, device=device
-            )
-            aligned_m = ((m_w + 127) // 128) * 128
-            blockscale_offsets_w = torch.arange(
-                0,
-                num_experts * aligned_m,
-                aligned_m,
-                dtype=torch.int32,
-                device=device,
-            )
-            qweight = torch.empty_like(weight_flat, dtype=torch.float8_e4m3fn)
-            scale = torch.empty(
-                (num_experts * aligned_m, k_w // 32),
-                dtype=torch.uint8,
-                device=device,
-            )
-            es_sm100_mxfp8_blockscaled_grouped_quant(
-                weight_flat,
-                problem_sizes_w,
-                expert_offsets_w,
-                blockscale_offsets_w,
-                qweight,
-                scale,
-            )
-            qweight = qweight.view_as(weight_rm)
-            scale = scale.view(num_experts, aligned_m, k_w // 32)
-            if aligned_m != m_w:
-                scale = scale[:, :m_w, :]
-            return qweight, scale
-
-        if w1_q.dtype != torch.float8_e4m3fn or w2_q.dtype != torch.float8_e4m3fn:
-            # Mirror unit-test structure: quantize weights on the fly using ES kernel.
-            w1_weight_rm = w1_q.transpose(1, 2).contiguous()  # (E, 2N, K)
-            w2_weight_rm = w2_q.transpose(1, 2).contiguous()  # (E, K, N)
-            w1_q_rm, w1_scale_rm = _quantize_weight_mxfp8(w1_weight_rm)
-            w2_q_rm, w2_scale_rm = _quantize_weight_mxfp8(w2_weight_rm)
-            w1_q = w1_q_rm.transpose(1, 2)
-            w2_q = w2_q_rm.transpose(1, 2)
-            w1_scale = w1_scale_rm.transpose(1, 2)
-            w2_scale = w2_scale_rm.transpose(1, 2)
-
         assert w1_q.dtype == torch.float8_e4m3fn
         assert w2_q.dtype == torch.float8_e4m3fn
         assert w1_scale.dtype == torch.uint8, "MXFP8 w1_scale must be uint8"
