@@ -15,13 +15,13 @@ pip install uv
 uv pip install "sglang"
 ```
 
-For different CUDA versions, you can try to add `--extra-index-url` to find the correct [PyTorch](https://pytorch.org/get-started/locally/) wheel.
-For example, on GB200, you will need to do the following. Otherwise, it will install the CPU version of PyTorch.
-```
-uv pip install "sglang" --extra-index-url https://download.pytorch.org/whl/cu129
-```
+**CUDA13 wheel installation**
 
-For CUDA 13, Docker is recommended (see Method 3 note on B300/GB300/CUDA 13). If you do not have Docker access, installing the matching `sgl_kernel` wheel from [the sgl-project whl releases](https://github.com/sgl-project/whl/releases) after installing SGLang also works. Replace `X.Y.Z` with the `sgl_kernel` version required by your SGLang install (you can find this by running `uv pip show sgl_kernel`). Examples:
+For CUDA 13, Docker is recommended (see Method 3 note on B300/GB300/CUDA 13). If you do not have Docker access, an extra index url needs to be provided when installing wheels:
+```
+uv pip install "sglang" --extra-index-url https://download.pytorch.org/whl/cu130
+```
+The `sgl_kernel` wheel for CUDA 13 can be downloaded from [the sgl-project whl releases](https://github.com/sgl-project/whl/blob/gh-pages/cu130/sgl-kernel/index.html). Replace `X.Y.Z` with the `sgl_kernel` version required by your SGLang install (you can find this by running `uv pip show sgl_kernel`). Examples:
 
 ```bash
 # x86_64
@@ -30,6 +30,7 @@ uv pip install "https://github.com/sgl-project/whl/releases/download/vX.Y.Z/sgl_
 # aarch64
 uv pip install "https://github.com/sgl-project/whl/releases/download/vX.Y.Z/sgl_kernel-X.Y.Z+cu130-cp310-abi3-manylinux2014_aarch64.whl"
 ```
+
 
 **Quick fixes to common problems**
 
