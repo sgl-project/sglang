@@ -8,6 +8,7 @@ import triton  # type: ignore
 import triton.language as tl  # type: ignore
 from torch import Tensor
 
+
 @triton.autotune(
     configs=[
         triton.Config({"BLOCK_N": 64}, num_warps=2),
