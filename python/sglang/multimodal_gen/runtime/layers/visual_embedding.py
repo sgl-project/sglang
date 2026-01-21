@@ -14,14 +14,19 @@ from diffusers.models.embeddings import (
 )
 from diffusers.models.embeddings import PixArtAlphaTextProjection, TimestepEmbedding
 from diffusers.models.embeddings import Timesteps as _Timesteps
+from diffusers.models.embeddings import (
+    get_timestep_embedding as _get_timestep_embedding,
+)
 
 try:
     from sgl_kernel.elementwise import timestep_embedding as timestep_embedding_cuda
 except Exception as _e:
-    pass
+    # Fallback to diffusers implementation so downstream code can still run
+    # even if `sgl_kernel` is not installed/available.
+    timestep_embedding_cuda = _get_timestep_embedding
 
 from sglang.multimodal_gen.runtime.layers.activation import get_act_fn
-from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
+from sglang.multimodal_gen.runtime.layers.linear import ColumnParallelLinear
 from sglang.multimodal_gen.runtime.layers.mlp import MLP
 
 
@@ -219,8 +224,12 @@ class ModulateProjection(nn.Module):
         super().__init__()
         self.factor = factor
         self.hidden_size = hidden_size
-        self.linear = ReplicatedLinear(
-            hidden_size, hidden_size * factor, bias=True, params_dtype=dtype
+        self.linear = ColumnParallelLinear(
+            hidden_size,
+            hidden_size * factor,
+            bias=True,
+            gather_output=True,
+            params_dtype=dtype,
         )
         self.act = get_act_fn(act_layer)
 

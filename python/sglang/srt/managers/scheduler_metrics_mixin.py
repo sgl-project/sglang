@@ -9,13 +9,28 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Union
 from sglang.srt.disaggregation.kv_events import EventPublisherFactory, KVEventBatch
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
-from sglang.srt.managers.io_struct import GetLoadReqInput, GetLoadReqOutput
+from sglang.srt.managers.io_struct import (
+    DisaggregationMetrics,
+    GetLoadReqInput,
+    GetLoadReqOutput,
+    GetLoadsReqInput,
+    GetLoadsReqOutput,
+    LoRAMetrics,
+    MemoryMetrics,
+    QueueMetrics,
+    SpeculativeMetrics,
+)
 from sglang.srt.managers.schedule_policy import PrefillAdder
 from sglang.srt.managers.scheduler import Req, ScheduleBatch
 from sglang.srt.managers.utils import GenerationBatchResult
-from sglang.srt.metrics.collector import SchedulerMetricsCollector, SchedulerStats
+from sglang.srt.metrics.collector import (
+    SchedulerMetricsCollector,
+    SchedulerStats,
+    compute_routing_key_stats,
+)
 from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.device_timer import DeviceTimer
+from sglang.srt.utils.scheduler_status_logger import SchedulerStatusLogger
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import EmbeddingBatchResult, Scheduler
@@ -95,7 +110,9 @@ class SchedulerMetricsMixin:
             if dp_rank is not None:
                 labels["dp_rank"] = dp_rank
             self.metrics_collector = SchedulerMetricsCollector(
-                labels=labels, enable_lora=self.enable_lora
+                labels=labels,
+                enable_lora=self.enable_lora,
+                server_args=self.server_args,
             )
 
             if ENABLE_METRICS_DEVICE_TIMER:
@@ -105,6 +122,8 @@ class SchedulerMetricsMixin:
 
         if self.enable_kv_cache_events:
             self.init_kv_events(self.server_args.kv_events_config)
+
+        self.scheduler_status_logger = SchedulerStatusLogger.maybe_create()
 
     def init_kv_events(self: Scheduler, kv_events_config: Optional[str]):
         if self.enable_kv_cache_events:
@@ -137,7 +156,7 @@ class SchedulerMetricsMixin:
         self.last_input_throughput = self.last_prefill_tokens / gap_latency
         self.last_prefill_tokens = adder.log_input_tokens
 
-        # assert self.temp_prefill_info is None # TODO re-enable
+        assert self.temp_prefill_info is None
         self.temp_prefill_info = dict(
             adder_log_input_tokens=adder.log_input_tokens,
             adder_log_hit_tokens=adder.log_hit_tokens,
@@ -218,7 +237,7 @@ class SchedulerMetricsMixin:
             if self.is_hybrid_ssm:
                 self.stats.mamba_usage = mamba_usage
             self.stats.num_queue_reqs = len(self.waiting_queue)
-            self.stats.num_grammar_queue_reqs = len(self.grammar_queue)
+            self.stats.num_grammar_queue_reqs = len(self.grammar_manager)
             self.stats.cache_hit_rate = cache_hit_rate
 
             self.stats.max_total_num_tokens = self.max_total_num_tokens
@@ -384,7 +403,7 @@ class SchedulerMetricsMixin:
             self.stats.decode_sum_seq_lens = batch.seq_lens_cpu.sum().item()
             self.stats.gen_throughput = self.last_gen_throughput
             self.stats.num_queue_reqs = len(self.waiting_queue)
-            self.stats.num_grammar_queue_reqs = len(self.grammar_queue)
+            self.stats.num_grammar_queue_reqs = len(self.grammar_manager)
             self.stats.cache_hit_rate = cache_hit_rate
 
             self.stats.max_total_num_tokens = self.max_total_num_tokens
@@ -414,6 +433,16 @@ class SchedulerMetricsMixin:
                     self.disagg_decode_transfer_queue.queue
                 )
 
+            running_routing_keys = [r.routing_key for r in batch.reqs]
+            waiting_routing_keys = [r.routing_key for r in self.waiting_queue]
+            (
+                self.stats.num_unique_running_routing_keys,
+                self.stats.routing_key_running_req_counts,
+            ) = compute_routing_key_stats(running_routing_keys)
+            _, self.stats.routing_key_all_req_counts = compute_routing_key_stats(
+                running_routing_keys + waiting_routing_keys
+            )
+
             # Others
             self.calculate_utilization()
             self.update_lora_metrics()
@@ -424,11 +453,15 @@ class SchedulerMetricsMixin:
     def log_decode_stats_every_iteration(
         self: Scheduler, batch: ScheduleBatch, num_accepted_tokens: int
     ):
-        self.metrics_collector.increment_realtime_tokens(
-            # TODO unify this w/ the bumping logic in `Scheduler.num_generated_tokens` accumulator
-            decode_tokens=batch.batch_size() + num_accepted_tokens,
-            dp_cooperation_info=batch.dp_cooperation_info,
-        )
+        if self.enable_metrics:
+            self.metrics_collector.increment_realtime_tokens(
+                # TODO unify this w/ the bumping logic in `Scheduler.num_generated_tokens` accumulator
+                decode_tokens=batch.batch_size() + num_accepted_tokens,
+                dp_cooperation_info=batch.dp_cooperation_info,
+            )
+
+        if x := self.scheduler_status_logger:
+            x.maybe_dump(batch, self.waiting_queue)
 
     def log_batch_result_stats(
         self: Scheduler,
@@ -559,6 +592,144 @@ class SchedulerMetricsMixin:
             num_waiting_reqs=num_waiting_reqs,
             num_tokens=num_tokens,
             ts_tic=time.perf_counter(),
+        )
+
+    def get_loads(self: Scheduler, req: GetLoadsReqInput = None) -> GetLoadsReqOutput:
+        """
+        Get comprehensive load metrics for /v1/loads endpoint.
+
+        Args:
+            req: Request containing include list and optional dp_rank filter
+
+        Returns:
+            GetLoadsReqOutput with core metrics and optional detailed sections
+        """
+        if req is None:
+            req = GetLoadsReqInput()
+
+        include = set(req.include) if req.include else {"core"}
+        include_all = "all" in include
+
+        num_running_reqs = len(self.running_batch.reqs)
+
+        waiting_queues = [self.waiting_queue]
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            waiting_queues.append(self.disagg_prefill_bootstrap_queue.queue)
+        elif self.disaggregation_mode == DisaggregationMode.DECODE:
+            waiting_queues.append(self.disagg_decode_prealloc_queue.queue)
+            waiting_queues.append(self.disagg_decode_transfer_queue.queue)
+            waiting_queues.append(self.disagg_decode_prealloc_queue.retracted_queue)
+
+        num_waiting_reqs = sum(len(queue) for queue in waiting_queues)
+
+        if self.is_hybrid_swa:
+            full_num_used, swa_num_used, *_ = self._get_swa_token_info()
+            num_used_tokens = max(full_num_used, swa_num_used)
+        elif self.is_hybrid_ssm:
+            num_used_tokens = self._get_mamba_token_info()[0]
+        else:
+            num_used_tokens = self._get_token_info()[0]
+
+        token_usage = (
+            num_used_tokens / self.max_total_num_tokens
+            if self.max_total_num_tokens > 0
+            else 0.0
+        )
+
+        memory = None
+        if include_all or "memory" in include:
+            try:
+                memory = MemoryMetrics(
+                    weight_gb=round(
+                        self.tp_worker.model_runner.weight_load_mem_usage, 3
+                    ),
+                    kv_cache_gb=round(
+                        self.token_to_kv_pool_allocator.get_kvcache().mem_usage, 3
+                    ),
+                    graph_gb=round(self.tp_worker.model_runner.graph_mem_usage, 3),
+                    token_capacity=int(self.max_total_num_tokens),
+                )
+            except AttributeError as e:
+                logger.debug(f"Memory metrics not available: {e}")
+
+        speculative = None
+        if include_all or "spec" in include:
+            if not self.spec_algorithm.is_none() and self.spec_total_num_forward_ct > 0:
+                speculative = SpeculativeMetrics(
+                    accept_length=(
+                        self.spec_total_num_accepted_tokens
+                        / self.spec_total_num_forward_ct
+                    ),
+                    accept_rate=self.stats.spec_accept_rate,
+                )
+
+        lora = None
+        if include_all or "lora" in include:
+            if hasattr(self, "lora_scheduler") and self.lora_scheduler is not None:
+                lora = LoRAMetrics(
+                    slots_used=self.stats.lora_pool_slots_used,
+                    slots_total=self.stats.lora_pool_slots_total,
+                    utilization=self.stats.lora_pool_utilization,
+                )
+
+        disaggregation = None
+        if include_all or "disagg" in include:
+            mode_str = "null"
+            prefill_prealloc = 0
+            prefill_inflight = 0
+            decode_prealloc = 0
+            decode_transfer = 0
+            decode_retracted = 0
+
+            if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                mode_str = "prefill"
+                prefill_prealloc = len(self.disagg_prefill_bootstrap_queue.queue)
+                prefill_inflight = len(self.disagg_prefill_inflight_queue)
+            elif self.disaggregation_mode == DisaggregationMode.DECODE:
+                mode_str = "decode"
+                decode_prealloc = len(self.disagg_decode_prealloc_queue.queue)
+                decode_transfer = len(self.disagg_decode_transfer_queue.queue)
+                decode_retracted = len(
+                    self.disagg_decode_prealloc_queue.retracted_queue
+                )
+
+            disaggregation = DisaggregationMetrics(
+                mode=mode_str,
+                prefill_prealloc_queue_reqs=prefill_prealloc,
+                prefill_inflight_queue_reqs=prefill_inflight,
+                decode_prealloc_queue_reqs=decode_prealloc,
+                decode_transfer_queue_reqs=decode_transfer,
+                decode_retracted_queue_reqs=decode_retracted,
+                kv_transfer_speed_gb_s=self.stats.kv_transfer_speed_gb_s,
+                kv_transfer_latency_ms=self.stats.kv_transfer_latency_ms,
+            )
+
+        queues = None
+        if include_all or "queues" in include:
+            queues = QueueMetrics(
+                waiting=len(self.waiting_queue),
+                grammar=self.stats.num_grammar_queue_reqs,
+                paused=self.stats.num_paused_reqs,
+                retracted=self.stats.num_retracted_reqs,
+            )
+
+        return GetLoadsReqOutput(
+            dp_rank=self.dp_rank,
+            timestamp=time.time(),
+            num_running_reqs=num_running_reqs,
+            num_waiting_reqs=num_waiting_reqs,
+            num_used_tokens=num_used_tokens,
+            max_total_num_tokens=self.max_total_num_tokens,
+            token_usage=round(token_usage, 4),
+            gen_throughput=round(self.stats.gen_throughput, 2),
+            cache_hit_rate=round(self.stats.cache_hit_rate, 4),
+            utilization=round(self.stats.utilization, 4),
+            max_running_requests=self.max_running_requests,
+            memory=memory,
+            speculative=speculative,
+            lora=lora,
+            disaggregation=disaggregation,
+            queues=queues,
         )
 
     @contextmanager

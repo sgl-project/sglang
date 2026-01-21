@@ -325,6 +325,7 @@ class FlashAttentionBackend(AttentionBackend):
             and model_runner.model_config.is_encoder_decoder
         ), "Sliding window and cross attention are not supported together"
 
+        self.is_encoder_decoder = model_runner.model_config.is_encoder_decoder
         self.forward_metadata: FlashAttentionMetadata = None
         # extra metadata for handling speculative decoding topk > 1, extended draft decode and verify
         self.forward_metadata_spec_decode_expand: FlashAttentionMetadata = None
@@ -374,8 +375,15 @@ class FlashAttentionBackend(AttentionBackend):
         # If num_splits == 0, we use a heuristic to automatically determine the number of splits.
         # We set nums splits to 1 if deterministic inference is enabled.
         # See https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/ for more details.
+        # Furthermore, FA4 does not support num_splits=0 with CUDA Graph, so we set num_splits to 1 if CUDA Graph is enabled.
         self.num_splits = (
-            1 if model_runner.server_args.enable_deterministic_inference else 0
+            1
+            if model_runner.server_args.enable_deterministic_inference
+            or (
+                self.fa_impl_ver == 4
+                and not model_runner.server_args.disable_cuda_graph
+            )
+            else 0
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -1055,7 +1063,6 @@ class FlashAttentionBackend(AttentionBackend):
         k_rope: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        assert self.fa_impl_ver in [3], "Only FA3 support decoding"
         if k is not None:
             assert v is not None
             if save_kv_cache:
@@ -1574,20 +1581,25 @@ class FlashAttentionBackend(AttentionBackend):
                     ),
                 }
 
-        self.encoder_metadata = {
-            "encoder_page_table": torch.zeros(
-                max_bs,
-                self.max_context_len,
-                dtype=torch.int32,
-                device=self.device,
-            ),
-            "encoder_lens_int32": torch.zeros(
-                max_bs, dtype=torch.int32, device=self.device
-            ),
-            "encoder_cu_seqlens_k": torch.zeros(
-                max_bs + 1, dtype=torch.int32, device=self.device
-            ),
-        }
+        # Only allocate encoder metadata for encoder-decoder models
+        if self.is_encoder_decoder:
+            self.encoder_metadata = {
+                "encoder_page_table": torch.zeros(
+                    max_bs,
+                    self.max_context_len,
+                    dtype=torch.int32,
+                    device=self.device,
+                ),
+                "encoder_lens_int32": torch.zeros(
+                    max_bs, dtype=torch.int32, device=self.device
+                ),
+                "encoder_cu_seqlens_k": torch.zeros(
+                    max_bs + 1, dtype=torch.int32, device=self.device
+                ),
+            }
+        else:
+            # For decoder-only models, skip encoder_metadata allocation
+            self.encoder_metadata = {}
 
     def init_forward_metadata_capture_cuda_graph(
         self,
