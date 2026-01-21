@@ -32,7 +32,6 @@ from sglang.srt.managers.beam_search_type import BeamSearchSequence
 from sglang.srt.managers.schedule_batch import BaseFinishReason
 from sglang.srt.multimodal.mm_utils import has_valid_data
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import ImageData
 
 # Handle serialization of Image for pydantic
@@ -278,6 +277,9 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
     image_max_dynamic_patch: Optional[int] = None
     video_max_dynamic_patch: Optional[int] = None
 
+    # beam search
+    enable_beam_search: bool = False
+
     def contains_mm_input(self) -> bool:
         return (
             has_valid_data(self.image_data)
@@ -350,7 +352,7 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
 
     def _handle_beam_search_parallel_sampling(self) -> int:
         """Override parallel sampling to 1 when beam search is enabled and check that n (beam_width) must be greater than 1."""
-        if not get_global_server_args().enable_beam_search:
+        if not self.enable_beam_search:
             return self.parallel_sample_num
 
         if self.parallel_sample_num <= 1:
