@@ -14,13 +14,16 @@ import torch
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
 try:
+    from svg.kernels.triton.permute import (
+        apply_inverse_permutation_triton,
+        permute_tensor_by_labels_triton,
+    )
     from svg.kmeans_utils import (
         batch_kmeans_Euclid,
         density_calculation,
         dynamic_block_sparse_fwd_flashinfer,
         identify_dynamic_map,
     )
-    from svg.kernels.triton.permute import apply_inverse_permutation_triton, permute_tensor_by_labels_triton
 
     svg2_available = True
 except ImportError:
@@ -62,6 +65,7 @@ class SparseVideoGen2AttentionBackend(AttentionBackend):
     def get_builder_cls() -> type["SparseVideoGen2AttentionMetadataBuilder"]:
         return SparseVideoGen2AttentionMetadataBuilder
 
+
 @dataclass
 class Svg2LayerCache:
     # centroids for kmeans clustering
@@ -71,6 +75,7 @@ class Svg2LayerCache:
 
     # density cache for head reordering (if head parallel is enabled, we need to do load balancing)
     density: torch.Tensor | None = None
+
 
 @dataclass
 class Svg2Cache:
@@ -82,6 +87,7 @@ class Svg2Cache:
             layer_cache = Svg2LayerCache()
             self.layers[layer_idx] = layer_cache
         return layer_cache
+
 
 @dataclass
 class SparseVideoGen2AttentionMetadata(AttentionMetadata):
@@ -103,9 +109,12 @@ class SparseVideoGen2AttentionMetadata(AttentionMetadata):
     max_seqlen_q: int | None = None
     max_seqlen_k: int | None = None
 
+
 def _require_kwarg(kwargs: dict[str, Any], name: str) -> Any:
     if name not in kwargs:
-        raise ValueError(f"Missing required argument for SparseVideoGen2Attention: {name}")
+        raise ValueError(
+            f"Missing required argument for SparseVideoGen2Attention: {name}"
+        )
     return kwargs[name]
 
 
@@ -186,19 +195,30 @@ class SparseVideoGen2AttentionImpl(AttentionImpl):
         **extra_impl_args,
     ) -> None:
         if causal:
-            raise ValueError("Sparse Video Gen 2 attention does not support causal attention")
+            raise ValueError(
+                "Sparse Video Gen 2 attention does not support causal attention"
+            )
         if not svg2_available:
-            raise ImportError("Sparse Video Gen 2 attention backend requires svg package to be installed")
+            raise ImportError(
+                "Sparse Video Gen 2 attention backend requires svg package to be installed"
+            )
         self.prefix = prefix
         self.layer_idx = self._get_layer_idx(prefix)
 
     def _get_layer_idx(self, prefix: str) -> int:
         parts = prefix.split(".")
         if len(parts) < 3:
-            raise ValueError(f"Invalid prefix for SparseVideoGen2AttentionImpl: {prefix}")
+            raise ValueError(
+                f"Invalid prefix for SparseVideoGen2AttentionImpl: {prefix}"
+            )
         return int(parts[-3])
-        
-    def kmeans_init(self, query: torch.Tensor, key: torch.Tensor, attn_metadata: SparseVideoGen2AttentionMetadata):
+
+    def kmeans_init(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        attn_metadata: SparseVideoGen2AttentionMetadata,
+    ):
         cfg, num_heads, seq_len, dim = query.size()
         qlabels, qcentroids, qcluster_sizes, qiter = batch_kmeans_Euclid(
             query.reshape(cfg * num_heads, seq_len, dim),
@@ -215,9 +235,23 @@ class SparseVideoGen2AttentionImpl(AttentionImpl):
         layer_cache.q_centroids = qcentroids
         layer_cache.k_centroids = kcentroids
 
-        return qlabels, qcentroids, qcluster_sizes, qiter, klabels, kcentroids, kcluster_sizes, kiter
-    
-    def kmeans_step(self, query: torch.Tensor, key: torch.Tensor, attn_metadata: SparseVideoGen2AttentionMetadata):
+        return (
+            qlabels,
+            qcentroids,
+            qcluster_sizes,
+            qiter,
+            klabels,
+            kcentroids,
+            kcluster_sizes,
+            kiter,
+        )
+
+    def kmeans_step(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        attn_metadata: SparseVideoGen2AttentionMetadata,
+    ):
         cfg, num_heads, seq_len, dim = query.size()
         layer_cache = attn_metadata.cache.get_layer(self.layer_idx)
         qlabels, qcentroids, qcluster_sizes, qiter = batch_kmeans_Euclid(
@@ -236,14 +270,35 @@ class SparseVideoGen2AttentionImpl(AttentionImpl):
         layer_cache.q_centroids = qcentroids
         layer_cache.k_centroids = kcentroids
 
-        return qlabels, qcentroids, qcluster_sizes, qiter, klabels, kcentroids, kcluster_sizes, kiter
-    
-    def kmeans_clustering(self, query: torch.Tensor, key: torch.Tensor, attn_metadata: SparseVideoGen2AttentionMetadata):
+        return (
+            qlabels,
+            qcentroids,
+            qcluster_sizes,
+            qiter,
+            klabels,
+            kcentroids,
+            kcluster_sizes,
+            kiter,
+        )
+
+    def kmeans_clustering(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        attn_metadata: SparseVideoGen2AttentionMetadata,
+    ):
         layer_cache = attn_metadata.cache.get_layer(self.layer_idx)
         if not layer_cache.centroids_initialized:
-            qlabels, qcentroids, qcluster_sizes, qiter, klabels, kcentroids, kcluster_sizes, kiter = self.kmeans_init(
-                query, key, attn_metadata
-            )
+            (
+                qlabels,
+                qcentroids,
+                qcluster_sizes,
+                qiter,
+                klabels,
+                kcentroids,
+                kcluster_sizes,
+                kiter,
+            ) = self.kmeans_init(query, key, attn_metadata)
             layer_cache.centroids_initialized = True
             logger.debug(
                 "Centroids initialized at layer %s (init iters: %s).",
@@ -251,23 +306,56 @@ class SparseVideoGen2AttentionImpl(AttentionImpl):
                 attn_metadata.kmeans_iter_init,
             )
         else:
-            qlabels, qcentroids, qcluster_sizes, qiter, klabels, kcentroids, kcluster_sizes, kiter = self.kmeans_step(
-                query, key, attn_metadata
-            )
+            (
+                qlabels,
+                qcentroids,
+                qcluster_sizes,
+                qiter,
+                klabels,
+                kcentroids,
+                kcluster_sizes,
+                kiter,
+            ) = self.kmeans_step(query, key, attn_metadata)
 
-        return qlabels, qcentroids, qcluster_sizes, qiter, klabels, kcentroids, kcluster_sizes, kiter
-    
-    def semantic_aware_permutation(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, attn_metadata: SparseVideoGen2AttentionMetadata):
+        return (
+            qlabels,
+            qcentroids,
+            qcluster_sizes,
+            qiter,
+            klabels,
+            kcentroids,
+            kcluster_sizes,
+            kiter,
+        )
+
+    def semantic_aware_permutation(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: SparseVideoGen2AttentionMetadata,
+    ):
         cfg, num_heads, seq_len, dim = query.size()
 
         # 1. Kmeans clustering
-        qlabels, qcentroids, qcluster_sizes, qiter, klabels, kcentroids, kcluster_sizes, kiter = self.kmeans_clustering(
-            query, key, attn_metadata
-        )
+        (
+            qlabels,
+            qcentroids,
+            qcluster_sizes,
+            qiter,
+            klabels,
+            kcentroids,
+            kcluster_sizes,
+            kiter,
+        ) = self.kmeans_clustering(query, key, attn_metadata)
 
         # 2. Identify dynamic map
-        q_cluster_sizes = qcluster_sizes.view(cfg, num_heads, attn_metadata.num_q_centroids)
-        k_cluster_sizes = kcluster_sizes.view(cfg, num_heads, attn_metadata.num_k_centroids)
+        q_cluster_sizes = qcluster_sizes.view(
+            cfg, num_heads, attn_metadata.num_q_centroids
+        )
+        k_cluster_sizes = kcluster_sizes.view(
+            cfg, num_heads, attn_metadata.num_k_centroids
+        )
 
         dynamic_map = identify_dynamic_map(
             qcentroids.view(cfg, num_heads, attn_metadata.num_q_centroids, dim),
@@ -279,13 +367,25 @@ class SparseVideoGen2AttentionImpl(AttentionImpl):
         )
 
         # 3. Permute the query, key, value
-        q_permuted, q_sorted_indices = permute_tensor_by_labels_triton(query, qlabels, dim=2)
-        k_permuted, k_sorted_indices = permute_tensor_by_labels_triton(key, klabels, dim=2)
+        q_permuted, q_sorted_indices = permute_tensor_by_labels_triton(
+            query, qlabels, dim=2
+        )
+        k_permuted, k_sorted_indices = permute_tensor_by_labels_triton(
+            key, klabels, dim=2
+        )
         v_permuted, v_sorted_indices = permute_tensor_by_labels_triton(
             value, klabels, dim=2, sorted_indices=k_sorted_indices
         )
 
-        return q_permuted, k_permuted, v_permuted, dynamic_map, q_cluster_sizes, k_cluster_sizes, q_sorted_indices
+        return (
+            q_permuted,
+            k_permuted,
+            v_permuted,
+            dynamic_map,
+            q_cluster_sizes,
+            k_cluster_sizes,
+            q_sorted_indices,
+        )
 
     def forward(
         self,
@@ -302,7 +402,11 @@ class SparseVideoGen2AttentionImpl(AttentionImpl):
         value = value.transpose(1, 2).contiguous()
         batch_size, num_heads, seq_len, dim = query.size()
 
-        context_length, num_frame, frame_size = attn_metadata.context_length, attn_metadata.num_frame, attn_metadata.frame_size
+        context_length, num_frame, frame_size = (
+            attn_metadata.context_length,
+            attn_metadata.num_frame,
+            attn_metadata.frame_size,
+        )
 
         assert (
             seq_len == context_length + num_frame * frame_size
@@ -323,27 +427,39 @@ class SparseVideoGen2AttentionImpl(AttentionImpl):
                 key_video = key[:, :, :video_length, :].contiguous()
                 self.kmeans_clustering(query_video, key_video, attn_metadata)
 
-            with sdpa_kernel(SDPBackend.CUDNN_ATTENTION): # not sure why we need to force cudnn here, but it's faster than flash attention
-                output_hidden_states = torch.nn.functional.scaled_dot_product_attention(query, key, value, dropout_p=0.0, is_causal=False)
+            with sdpa_kernel(
+                SDPBackend.CUDNN_ATTENTION
+            ):  # not sure why we need to force cudnn here, but it's faster than flash attention
+                output_hidden_states = torch.nn.functional.scaled_dot_product_attention(
+                    query, key, value, dropout_p=0.0, is_causal=False
+                )
 
-            res = output_hidden_states.reshape(batch_size, num_heads, seq_len, dim).transpose(1, 2)
+            res = output_hidden_states.reshape(
+                batch_size, num_heads, seq_len, dim
+            ).transpose(1, 2)
         else:
-            q_perm, k_perm, v_perm, dyn_map, qc_sz_s, kc_sz_s, q_sorted_indices = self.semantic_aware_permutation(
-                query, key, value, attn_metadata
+            q_perm, k_perm, v_perm, dyn_map, qc_sz_s, kc_sz_s, q_sorted_indices = (
+                self.semantic_aware_permutation(query, key, value, attn_metadata)
             )
 
             output_permuted = dynamic_block_sparse_fwd_flashinfer(
                 q_perm, k_perm, v_perm, dyn_map, qc_sz_s, kc_sz_s, is_cpu=False
             )
 
-            attn_output = apply_inverse_permutation_triton(output_permuted, q_sorted_indices, dim=2)
+            attn_output = apply_inverse_permutation_triton(
+                output_permuted, q_sorted_indices, dim=2
+            )
 
             if attn_metadata.calculate_density:
                 densities = density_calculation(dyn_map, qc_sz_s, kc_sz_s)
                 layer_cache = attn_metadata.cache.get_layer(self.layer_idx)
                 layer_cache.density = densities  # [batch_size, num_heads]
 
-            res = attn_output.reshape(batch_size, num_heads, seq_len, dim).transpose(1, 2)
-        
-        torch.backends.cuda.preferred_linalg_library(backend="default") # reset to default
+            res = attn_output.reshape(batch_size, num_heads, seq_len, dim).transpose(
+                1, 2
+            )
+
+        torch.backends.cuda.preferred_linalg_library(
+            backend="default"
+        )  # reset to default
         return res

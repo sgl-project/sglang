@@ -1190,12 +1190,14 @@ class DenoisingStage(PipelineStage):
                 VSA_sparsity=server_args.VSA_sparsity,
                 device=get_local_torch_device(),
             )
-        elif self.attn_backend.get_enum() == AttentionBackendEnum.SPARSE_VIDEO_GEN_2_ATTN:
+        elif (
+            self.attn_backend.get_enum() == AttentionBackendEnum.SPARSE_VIDEO_GEN_2_ATTN
+        ):
             if timestep_value is None or timesteps is None:
                 raise ValueError(
                     "timestep_value and timesteps must be provided for SVG2 attention metadata"
                 )
-            
+
             num_layers = server_args.pipeline_config.dit_config.num_layers
             first_layers_fp = server_args.svg2_first_layers_fp
             if first_layers_fp <= 1.0:
@@ -1235,7 +1237,7 @@ class DenoisingStage(PipelineStage):
                 first_layers_fp=first_layers_fp,
                 first_times_fp=first_times_fp,
                 cache=cache,
-                calculate_density=False, # only need density when doing head load balancing
+                calculate_density=False,  # only need density when doing head load balancing
             )
         elif self.attn_backend.get_enum() == AttentionBackendEnum.VMOBA_ATTN:
             moba_params = server_args.moba_config.copy()

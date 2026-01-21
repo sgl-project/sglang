@@ -218,13 +218,16 @@ class CudaPlatformBase(Platform):
                 ) from e
         elif selected_backend == AttentionBackendEnum.SPARSE_VIDEO_GEN_2_ATTN:
             try:
-                from svg.kmeans_utils import (
+                from svg.kernels.triton.permute import (  # noqa: F401
+                    apply_inverse_permutation_triton,
+                    permute_tensor_by_labels_triton,
+                )
+                from svg.kmeans_utils import (  # noqa: F401
                     batch_kmeans_Euclid,
                     density_calculation,
                     dynamic_block_sparse_fwd_flashinfer,
                     identify_dynamic_map,
-                ) # noqa: F401
-                from svg.kernels.triton.permute import apply_inverse_permutation_triton, permute_tensor_by_labels_triton  # noqa: F401
+                )
 
                 from sglang.multimodal_gen.runtime.layers.attention.backends.sparse_video_gen_2_attn import (  # noqa: F401
                     SparseVideoGen2AttentionBackend,
