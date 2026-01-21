@@ -392,11 +392,11 @@ async def _save_url_image_to_path(
                     validate_openai_media_url_peer_ip(
                         _response_peername(response), allowed_ips
                     )
-                    if response.status_code in {301, 302, 303, 307, 308}:       
+                    if response.status_code in {301, 302, 303, 307, 308}:
                         location = response.headers.get("location")
                         if not location:
                             raise ValueError(
-                                "Redirect response missing location header"     
+                                "Redirect response missing location header"
                             )
                         current_url = urljoin(current_url, location)
                         continue

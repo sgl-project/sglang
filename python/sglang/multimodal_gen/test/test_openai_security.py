@@ -165,7 +165,7 @@ def test_openai_media_url_size_limit(monkeypatch, tmp_path):
     responses = [
         DummyResponse(
             200,
-            headers={"content-length": "10", "content-type": "image/png"},      
+            headers={"content-length": "10", "content-type": "image/png"},
             chunks=[b"1234"],
             peername=("93.184.216.34", 80),
         )
