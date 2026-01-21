@@ -172,11 +172,16 @@ exclude = [
 [tool.setuptools_scm]
 root = ".."
 version_file = "sglang/_version.py"
-# Use timestamp-based dev versions for unique nightly wheels
-# Format: v0.5.7-20260120143022 where 20260120143022 is YYYYMMDDHHMMSS
-# This creates versions like 0.5.7.dev20260120143022
-# And wheel names like: sglang-0.5.7.dev20260120143022-py3-none-any.whl
-git_describe_command = ["bash", "-c", "TAG=$(git tag --list --sort=-version:refname 'v*.*.*' | head -1); TIMESTAMP=$(date -u +%Y%m%d%H%M%S); echo \"${TAG}-${TIMESTAMP}-g000000\""]
+# Hybrid approach: commit count for post number, timestamp for uniqueness
+# Format: v0.5.7-703-g20260121012243
+#   - Tag: v0.5.7
+#   - Distance: 703 (actual commit count, used for .post703)
+#   - Hash: g20260121012243 (timestamp YYYYMMDDHHMMSS for uniqueness)
+# This creates versions like: 0.5.7.post703.dev20260121012243
+# And wheel names like: sglang-0.5.7.post703.dev20260121012243-py3-none-any.whl
+# The timestamp in dev version ensures each build is unique, preventing overwrites
+git_describe_command = ["bash", "-c", "TAG=$(git tag --list --sort=-version:refname 'v*.*.*' | head -1); COMMITS=$(git rev-list ${TAG}..HEAD --count 2>/dev/null || echo 0); TIMESTAMP=$(date -u +%Y%m%d%H%M%S); echo \"${TAG}-${COMMITS}-g${TIMESTAMP}\""]
+version_scheme = "post-release"
 local_scheme = "no-local-version"
 # Allow editable installs even when .git metadata is not available.
 fallback_version = "0.0.0.dev0"
