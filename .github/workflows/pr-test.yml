@@ -274,17 +274,21 @@ jobs:
             const pollIntervalSeconds = 30;
             const maxAttempts = (maxWaitMinutes * 60) / pollIntervalSeconds;
 
-            // Stage-b jobs to wait for
-            // Use exact prefix + ( or end-of-string to avoid matching -performance/-accuracy variants
+            // Stage-b jobs to wait for (all stage-b tests including performance and accuracy)
             const stageBJobs = [
-              { prefix: 'stage-b-test-small-1-gpu', expectedCount: 8 },      // partitions 0-7
-              { prefix: 'stage-b-test-large-1-gpu', expectedCount: 12 },     // partitions 0-11
-              { prefix: 'stage-b-test-large-2-gpu', expectedCount: 2 },      // partitions 0-1
-              { prefix: 'stage-b-test-4-gpu-b200', expectedCount: 1 }
+              { prefix: 'stage-b-test-small-1-gpu', expectedCount: 8 },              // partitions 0-7
+              { prefix: 'stage-b-test-large-1-gpu', expectedCount: 12 },             // partitions 0-11
+              { prefix: 'stage-b-test-large-2-gpu', expectedCount: 2 },              // partitions 0-1
+              { prefix: 'stage-b-test-4-gpu-b200', expectedCount: 1 },
+              { prefix: 'stage-b-test-small-1-gpu-performance', expectedCount: 1 },
+              { prefix: 'stage-b-test-large-1-gpu-performance', expectedCount: 2 },  // partitions 0-1
+              { prefix: 'stage-b-test-large-2-gpu-performance', expectedCount: 1 },
+              { prefix: 'stage-b-test-small-1-gpu-accuracy', expectedCount: 1 },
+              { prefix: 'stage-b-test-large-2-gpu-accuracy', expectedCount: 1 }
             ];
-            const totalExpectedJobs = stageBJobs.reduce((sum, j) => sum + j.expectedCount, 0);
+            const totalExpectedJobs = stageBJobs.reduce((sum, j) => sum + j.expectedCount, 0);  // 29 total
 
-            // Helper to match job names exactly (prefix + optional " (N)" suffix)
+            // Helper to match job names exactly (prefix alone or prefix + " (N)" for matrix jobs)
             const matchesPrefix = (jobName, prefix) => {
               return jobName === prefix || jobName.startsWith(prefix + ' (');
             };
