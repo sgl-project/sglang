@@ -138,6 +138,12 @@ class TestGenerationModels(CustomTestCase):
         )
         max_new_tokens = 32
 
+        # Set conv dtype for hybrid models to match inference dtype
+        dtype_str = {torch.float16: "float16", torch.bfloat16: "bfloat16"}.get(
+            torch_dtype, "bfloat16"
+        )
+        os.environ["SGLANG_MAMBA_CONV_DTYPE"] = dtype_str
+
         with HFRunner(
             model_path,
             torch_dtype=torch_dtype,
