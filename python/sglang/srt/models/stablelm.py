@@ -139,13 +139,12 @@ class StablelmAttention(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("o_proj", prefix),
         )
-        if _is_npu:
+        if not _is_npu:
             self.rotary_emb = get_rope(
                 self.head_dim,
                 rotary_dim=self.rotary_ndims,
                 max_position=self.config.max_position_embeddings,
                 base=self.config.rope_theta,
-                dtype=torch.float32,
             )
         else:
             self.rotary_emb = get_rope(
@@ -153,6 +152,7 @@ class StablelmAttention(nn.Module):
                 rotary_dim=self.rotary_ndims,
                 max_position=self.config.max_position_embeddings,
                 base=self.config.rope_theta,
+                dtype=torch.float32,
             )
         self.attn = RadixAttention(
             self.num_heads,
@@ -172,12 +172,12 @@ class StablelmAttention(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        if _is_npu:
+        if not _is_npu:
+            q, k = self.rotary_emb(positions, q, k)
+        else:
             odtype = q.dtype
             q, k = self.rotary_emb(positions, q.to(torch.float32), k.to(torch.float32))
             q, k = q.to(odtype), k.to(odtype)
-        else:
-            q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v, forward_batch)
         output, _ = self.o_proj(attn_output)
         return output
