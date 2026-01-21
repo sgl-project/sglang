@@ -215,7 +215,7 @@ jobs:
 
       - name: Build wheels
         run: |
-          cp 3rdparty/amd/sgl-kernel/* sgl-kernel/
+          cp 3rdparty/amd/wheel/sgl-kernel/* sgl-kernel/
           cd sgl-kernel
           chmod +x ./build_rocm.sh
           ./build_rocm.sh "${{ matrix.rocm-version }}"
