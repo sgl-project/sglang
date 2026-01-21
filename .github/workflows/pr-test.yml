@@ -1812,6 +1812,9 @@ jobs:
         sgl-kernel-benchmark-test,
         sgl-kernel-b200-test,
 
+        wait-for-stage-a,
+        wait-for-stage-b,
+
         jit-kernel-unit-test,
 
         multimodal-gen-test-1-gpu,
