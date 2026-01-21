@@ -105,7 +105,6 @@ from sglang.srt.layers.moe.utils import RoutingMethodType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.fp8_kernel import (
-    fp8_dtype,
     is_fp8_fnuz,
     per_tensor_quant_mla_fp8,
     per_token_group_quant_mla_deep_gemm_masked_fp8,
@@ -189,7 +188,6 @@ if _use_aiter_gfx95:
     )
     from sglang.srt.layers.rocm_linear_utils import (
         aiter_dsv3_router_gemm,
-        fused_qk_rope_cat_and_cache_mla,
         get_dsv3_gemm_output_zero_allocator_size,
         mutate_kv_cache,
     )
@@ -2025,11 +2023,15 @@ class DeepseekV2AttentionMLA(nn.Module):
                 q_rope=q_pe,
                 k_rope=k_pe,
                 **extra_args,
-                **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
+                **(
+                    dict(topk_indices=topk_indices)
+                    if topk_indices is not None
+                    else {}
+                ),
             )
         else:
             if _use_aiter_gfx95:
-                attn_output = mutate_kv_cache(
+                attn_output = rope_plus_attn_mqa(
                     self,
                     q_nope_out,
                     q_pe,
@@ -2051,11 +2053,17 @@ class DeepseekV2AttentionMLA(nn.Module):
             if not _use_aiter_gfx95:
                 attn_output = self.attn_mqa(
                     q,
-                    forward_batch.token_to_kv_pool.get_key_buffer(self.attn_mqa.layer_id),
+                    forward_batch.token_to_kv_pool.get_key_buffer(
+                        self.attn_mqa.layer_id
+                    ),
                     k_nope,
                     forward_batch,
                     save_kv_cache=True,
-                    **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
+                    **(
+                        dict(topk_indices=topk_indices)
+                        if topk_indices is not None
+                        else {}
+                    ),
                 )
 
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)

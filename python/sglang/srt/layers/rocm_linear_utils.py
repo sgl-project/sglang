@@ -46,8 +46,10 @@ def get_dsv3_gemm_output_zero_allocator_size(
     return num_moe_layers * per_layer_size
 
 
+# fused_qk_rope_cat_and_cache_mla plus attn_mqa both modify KV cache
+# hit out-of-place issue with KV cache the large tensor
 @torch._dynamo.disable()
-def mutate_kv_cache(
+def rope_plus_attn_mqa(
     mla_inst,
     q_nope_out,
     q_pe,
