@@ -43,7 +43,7 @@ if not is_cpu():
     from sglang.srt.layers.attention.fla.chunk_delta_h import (
         CHUNK_SIZE as FLA_CHUNK_SIZE,
     )
-    from sglang.srt.layers.attention.fla.kda import chunk_kda, fused_recurrent_kda
+    from sglang.srt.layers.attention.fla.kda import chunk_kda
 
 if is_cuda():
     from sglang.srt.layers.attention.mamba.causal_conv1d import (
@@ -671,6 +671,9 @@ class KimiLinearAttnBackend(MambaAttnBackendBase):
         beta = kwargs["beta"]
         g = kwargs["gate"]
 
+        A_log = kwargs["A_log"]
+        dt_bias = kwargs["dt_bias"]
+
         layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer_id)
         q_conv_state, k_conv_state, v_conv_state = layer_cache.conv
         ssm_states = layer_cache.temporal
@@ -710,21 +713,23 @@ class KimiLinearAttnBackend(MambaAttnBackendBase):
             lambda x: rearrange(x, "n (h d) -> 1 n h d", d=head_dim), (q, k, v)
         )
 
-        initial_state = ssm_states[cache_indices].contiguous()
-        (
-            core_attn_out,
-            last_recurrent_state,
-        ) = fused_recurrent_kda(
+        core_attn_out = fused_sigmoid_gating_delta_rule_update(
+            A_log=A_log,
+            dt_bias=dt_bias,
             q=q,
             k=k,
             v=v,
-            g=g,
-            beta=beta,
-            initial_state=initial_state,
-            use_qk_l2norm_in_kernel=True,
+            a=g,
+            b=beta,
+            initial_state_source=ssm_states,
+            initial_state_indices=cache_indices,
             cu_seqlens=query_start_loc,
+            use_qk_l2norm_in_kernel=True,
+            softplus_beta=1.0,
+            softplus_threshold=20.0,
+            is_kda=True,
         )
-        ssm_states[cache_indices] = last_recurrent_state
+
         return core_attn_out
 
     def forward_extend(
