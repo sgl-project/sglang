@@ -217,14 +217,23 @@ class Glm4DecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
-        rope_theta = getattr(config, "rope_theta", 1000000)
-        rope_scaling = getattr(config, "rope_scaling", None)
+
+        rp = getattr(config, "rope_parameters", None)
+        if isinstance(rp, dict):
+            rope_theta = rp.get("rope_theta", getattr(config, "rope_theta", 1000000))
+            partial_rotary_factor = rp.get(
+                "partial_rotary_factor",
+                getattr(config, "partial_rotary_factor", 0.5),
+            )
+            rope_scaling = getattr(config, "rope_scaling", None)
+        else:
+            rope_theta = getattr(config, "rope_theta", 1000000)
+            rope_scaling = getattr(config, "rope_scaling", None)
+            partial_rotary_factor = getattr(config, "partial_rotary_factor", 0.5)
+
         bias = getattr(config, "attention_bias", True)
         max_position_embeddings = getattr(config, "max_position_embeddings", 32768)
         head_dim = getattr(config, "head_dim", None)
-        partial_rotary_factor = getattr(
-            getattr(config, "rope_parameters", None), "partial_rotary_factor", None
-        ) or getattr(config, "partial_rotary_factor", 0.5)
         dual_chunk_attention_config = getattr(
             config, "dual_chunk_attention_config", None
         )

@@ -161,7 +161,7 @@ class GlmOcrVisionPatchEmbed(Glm4vVisionPatchEmbed):
     pass
 
 
-class GlmOcrPatchMerger(Glm4vPatchMerger):
+class GlmOcrVisionPatchMerger(Glm4vPatchMerger):
     pass
 
 
@@ -218,10 +218,11 @@ class GlmOcrVisionModel(Glm4vVisionModel):
                 for layer_idx in range(depth)
             ]
         )
-
-        self.merger = GlmOcrPatchMerger(
+        print(vision_config.out_hidden_size * vision_config.in_channels)
+        breakpoint()
+        self.merger = GlmOcrVisionPatchMerger(
             d_model=vision_config.out_hidden_size,
-            context_dim=vision_config.intermediate_size,
+            context_dim=vision_config.out_hidden_size * vision_config.in_channels,
             quant_config=quant_config,
             bias=False,
             prefix=add_prefix("merger", prefix),
