@@ -335,6 +335,7 @@ class Req:
                         seed: {self.seed}
                  infer_steps: {self.num_inference_steps}
       num_outputs_per_prompt: {self.num_outputs_per_prompt}
+      per_prompt_num_outputs: {self.sampling_params.per_prompt_num_outputs}
               guidance_scale: {self.guidance_scale}
      embedded_guidance_scale: {server_args.pipeline_config.embedded_cfg_scale}
                     n_tokens: {self.n_tokens}

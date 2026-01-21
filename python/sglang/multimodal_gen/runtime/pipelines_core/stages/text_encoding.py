@@ -150,7 +150,8 @@ class TextEncodingStage(PipelineStage):
         result.add_check(
             "negative_prompt",
             batch.negative_prompt,
-            lambda x: not batch.do_classifier_free_guidance or V.string_not_none(x),
+            lambda x: not batch.do_classifier_free_guidance
+            or V.string_or_list_strings(x),
         )
         result.add_check(
             "do_classifier_free_guidance",
