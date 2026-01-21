@@ -40,6 +40,8 @@ def flash_attn_varlen_func(
     pack_gqa: Optional[bool] = None,
     score_mod: Optional[Callable] = None,
     aux_tensors: Optional[list] = None,
+    return_softmax_lse: bool = False,
+    **_: object,
 ):
     if _flash_attn_varlen_func is None:  # pragma: no cover
         raise ImportError(
@@ -60,7 +62,7 @@ def flash_attn_varlen_func(
     if window_size == (-1, -1):
         window_size = (None, None)
 
-    return _flash_attn_varlen_func(
+    result = _flash_attn_varlen_func(
         q=q,
         k=k,
         v=v,
@@ -81,6 +83,12 @@ def flash_attn_varlen_func(
         score_mod=score_mod,
         aux_tensors=aux_tensors,
     )
+
+    if return_softmax_lse:
+        return result
+    if isinstance(result, tuple):
+        return result[0]
+    return result
 
 
 def flash_attn_with_kvcache(
@@ -116,6 +124,8 @@ def flash_attn_with_kvcache(
     sinks: Optional[torch.Tensor] = None,
     score_mod: Optional[Callable] = None,
     aux_tensors: Optional[list] = None,
+    return_softmax_lse: bool = False,
+    **_: object,
 ):
     if k is not None or v is not None or qv is not None:
         raise NotImplementedError("FA4 does not support updating KV cache in-place.")
@@ -133,7 +143,7 @@ def flash_attn_with_kvcache(
             (k_cache.shape[0],), cache_seqlens, dtype=torch.int32, device=k_cache.device
         )
 
-    return flash_attn_varlen_func(
+    result = flash_attn_varlen_func(
         q=q,
         k=k_cache,
         v=v_cache,
@@ -150,4 +160,11 @@ def flash_attn_with_kvcache(
         learnable_sink=sinks,
         score_mod=score_mod,
         aux_tensors=aux_tensors,
+        return_softmax_lse=True,
     )
+
+    if return_softmax_lse:
+        return result
+    if isinstance(result, tuple):
+        return result[0]
+    return result
