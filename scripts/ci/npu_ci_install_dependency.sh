@@ -25,7 +25,7 @@ ${PIP_INSTALL} wheel==0.45.1 pybind11
 
 
 ### Install MemFabric
-${PIP_INSTALL} mf-adapter==1.0.0
+${PIP_INSTALL} memfabric-hybrid==1.0.0
 
 
 ### Install PyTorch and PTA
