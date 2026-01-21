@@ -44,8 +44,6 @@ def serve(args, extra_argv):
     model_path = get_model_path(extra_argv)
     try:
         is_diffusion_model = get_is_diffusion_model(model_path)
-        if is_diffusion_model:
-            logger.info("Diffusion model detected")
 
         if is_diffusion_model:
             # Logic for Diffusion Models
@@ -53,6 +51,8 @@ def serve(args, extra_argv):
                 add_multimodal_gen_serve_args,
                 execute_serve_cmd,
             )
+
+            logger.info("Diffusion model detected")
 
             parser = argparse.ArgumentParser(
                 description="SGLang Diffusion Model Serving"
