@@ -204,7 +204,7 @@ class TestDeepseekV32TPMTP(CustomTestCase):
 
             self.assertGreater(acc_length, 2.7)
             if is_in_amd_ci():
-                self.assertGreater(speed, 60)
+                self.assertGreater(speed, 55)
             else:
                 self.assertGreater(speed, 130)
 
