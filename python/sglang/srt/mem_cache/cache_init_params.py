@@ -32,3 +32,5 @@ class CacheInitParams:
     pp_size: int = 1
 
     chunked_prefill_size: Optional[int] = None
+
+    sliding_window_size: Optional[int] = None
