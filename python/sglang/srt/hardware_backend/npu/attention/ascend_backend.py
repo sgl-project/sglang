@@ -208,14 +208,16 @@ class AscendAttnBackend(AttentionBackend):
         if self.use_mla:
             self.kv_lora_rank = model_runner.model_config.kv_lora_rank
             self.qk_rope_head_dim = model_runner.model_config.qk_rope_head_dim
-            self.qk_nope_head_dim = model_runner.model_config.qk_nope_head_dim
-            self.q_head_dim = (
-                self.qk_rope_head_dim + model_runner.model_config.qk_nope_head_dim
-            )
-            if getattr(
-                model_runner.model_config, "not_use_fused_infer_attention_score", False
+            if (
+                "MiniCPM3ForCausalLM"
+                in model_runner.model_config.hf_config.architectures
             ):
-                self.not_use_fused_infer_attention_score = True
+                self.qk_nope_head_dim = (
+                    model_runner.model_config.hf_config.qk_nope_head_dim
+                )
+            else:
+                self.qk_nope_head_dim = model_runner.model_config.qk_nope_head_dim
+            self.q_head_dim = self.qk_rope_head_dim + self.qk_nope_head_dim
         self.native_attn = TorchNativeAttnBackend(model_runner)
         self.graph_metadata = {}
         self.max_context_len = model_runner.model_config.context_len
@@ -810,7 +812,7 @@ class AscendAttnBackend(AttentionBackend):
             assert (
                 layer.qk_head_dim != layer.v_head_dim
             ), "FIA only supports qk_head_dim != v_head_dim"
-            if not getattr(self, "not_use_fused_infer_attention_score", False):
+            if self.use_fia:
                 num_token_padding = q.shape[0]
                 q, k, v = [
                     data[: forward_batch.num_token_non_padded_cpu] for data in [q, k, v]

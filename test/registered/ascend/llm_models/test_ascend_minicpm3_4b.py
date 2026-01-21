@@ -20,7 +20,9 @@ class TestMiniCPM3(GSM8KAscendMixin, CustomTestCase):
         "--disable-radix-cache",
         "--disable-overlap-schedule",
         "--max-running-requests",
-        "8",
+        "128",
+        "--chunked-prefill-size",
+        "-1",
     ]
 
 
