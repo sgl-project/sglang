@@ -477,6 +477,14 @@ def main() -> int:
         help="Skip baseline runs even if --baseline-sglang-dir is provided.",
     )
     parser.add_argument(
+        "--baseline-first",
+        action="store_true",
+        help=(
+            "Run baseline first, then waterfill. Default is waterfill first. "
+            "Useful to reduce order bias from JIT compilation / caching."
+        ),
+    )
+    parser.add_argument(
         "--waterfill-sglang-dir",
         type=str,
         default="",
@@ -660,8 +668,10 @@ def main() -> int:
             finally:
                 stop_server(p, f)
 
+        if args.baseline_first and baseline_dir:
+            _run_accuracy_mode("baseline", baseline_dir, enable_waterfill=False)
         _run_accuracy_mode("waterfill", waterfill_dir, enable_waterfill=True)
-        if baseline_dir:
+        if (not args.baseline_first) and baseline_dir:
             _run_accuracy_mode("baseline", baseline_dir, enable_waterfill=False)
 
     # ---------------- Serving benchmark ----------------
@@ -731,8 +741,10 @@ def main() -> int:
             finally:
                 stop_server(p, f)
 
+        if args.baseline_first and baseline_dir:
+            _run_serving_mode("baseline", baseline_dir, enable_waterfill=False)
         _run_serving_mode("waterfill", waterfill_dir, enable_waterfill=True)
-        if baseline_dir:
+        if (not args.baseline_first) and baseline_dir:
             _run_serving_mode("baseline", baseline_dir, enable_waterfill=False)
 
     # ---------------- Torch profiler ----------------
@@ -825,8 +837,10 @@ def main() -> int:
             finally:
                 stop_server(p, f)
 
+        if args.baseline_first and baseline_dir:
+            _run_torch_profile_mode("baseline", baseline_dir, enable_waterfill=False)
         _run_torch_profile_mode("waterfill", waterfill_dir, enable_waterfill=True)
-        if baseline_dir:
+        if (not args.baseline_first) and baseline_dir:
             _run_torch_profile_mode("baseline", baseline_dir, enable_waterfill=False)
 
     out_path = os.path.join(out_dir, "summary.json")
