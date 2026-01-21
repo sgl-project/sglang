@@ -254,7 +254,9 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
             assert False, f"Unsupported {self.topk_transform_method = }"
 
 
-_NSA_IMPL_T: TypeAlias = Literal["flashmla_sparse", "flashmla_kv", "fa3", "tilelang", "trtllm_gen"]
+_NSA_IMPL_T: TypeAlias = Literal[
+    "flashmla_sparse", "flashmla_kv", "fa3", "tilelang", "trtllm"
+]
 
 
 class NativeSparseAttnBackend(
@@ -321,8 +323,8 @@ class NativeSparseAttnBackend(
         self.device_capability = torch.cuda.get_device_capability()
         self.device_sm_major = self.device_capability[0]
 
-        # Allocate global workspace buffer for TRT-LLM kernels (ragged attention on SM100/B200, or trtllm_gen decode)
-        if self.device_sm_major >= 10 or self.nsa_decode_impl == "trtllm_gen":
+        # Allocate global workspace buffer for TRT-LLM kernels (ragged attention on SM100/B200, or trtllm decode)
+        if self.device_sm_major >= 10 or self.nsa_decode_impl == "trtllm":
             global global_workspace_buffer
             if global_workspace_buffer is None:
                 global_workspace_buffer = torch.empty(
@@ -1457,10 +1459,10 @@ class NativeSparseAttnBackend(
                 bs=forward_batch.batch_size,
             )
 
-        elif self.nsa_decode_impl == "trtllm_gen":
+        elif self.nsa_decode_impl == "trtllm":
             if q_rope is not None:
                 q_all = _concat_mla_absorb_q_general(q_nope, q_rope)
-            return self._forward_trtllm_gen(
+            return self._forward_trtllm(
                 q_all=q_all,
                 kv_cache=kv_cache,
                 page_table_1=page_table_1,
@@ -1727,16 +1729,17 @@ class NativeSparseAttnBackend(
         # kv_cache = kv_cache.view(-1, 1, layer.head_dim)
         return o
 
-    def _forward_trtllm_gen(
+    def _forward_trtllm(
         self,
         q_all: torch.Tensor,
         kv_cache: torch.Tensor,
         page_table_1: torch.Tensor,
         metadata: NSAMetadata,
         sm_scale: float,
-    ) -> torch.Tensor:                                                                                                               
-        """Forward using TRT-LLM Gen sparse MLA kernel."""
+    ) -> torch.Tensor:
+        """Forward using TRT-LLM sparse MLA kernel."""
         import flashinfer.decode
+
         batch_size = page_table_1.shape[0]
         _, num_heads, head_dim = q_all.shape
 
