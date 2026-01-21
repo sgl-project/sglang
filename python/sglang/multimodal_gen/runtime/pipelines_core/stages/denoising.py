@@ -15,6 +15,7 @@ from functools import lru_cache
 from typing import Any
 
 import torch
+import torch.nn as nn
 from einops import rearrange
 from tqdm.auto import tqdm
 
@@ -94,7 +95,7 @@ class DenoisingStage(PipelineStage):
         # torch compile
         if self.server_args.enable_torch_compile:
             for transformer in filter(None, [self.transformer, self.transformer_2]):
-                self.compile_module_with_torch_compile(transformer)
+                self._maybe_enable_torch_compile(transformer)
 
         self.scheduler = scheduler
         self.vae = vae
@@ -116,14 +117,14 @@ class DenoisingStage(PipelineStage):
         self._cached_num_steps = None
         self._is_warmed_up = False
 
-    def compile_module_with_torch_compile(self, module):
+    def _maybe_enable_torch_compile(self, module: object) -> Any | None:
         """
         Compile a module's forward with torch.compile, and enable inductor overlap tweak if available.
         No-op if torch compile is disabled or the object has no forward.
         """
-        if not self.server_args.enable_torch_compile or module is None:
-            return module
-        if not hasattr(module, "forward"):
+        if not self.server_args.enable_torch_compile or not isinstance(
+            module, nn.Module
+        ):
             return module
         try:
             import torch._inductor.config as _inductor_cfg
@@ -133,8 +134,8 @@ class DenoisingStage(PipelineStage):
             pass
         mode = os.environ.get("SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs")
         logger.info(f"Compiling transformer with mode: {mode}")
-        compiled_forward = torch.compile(getattr(module, "forward"), mode=mode)
-        setattr(module, "forward", compiled_forward)
+        # TODO(triple-mu): support customized fullgraph and dynamic in the future
+        module.compile(mode=mode, fullgraph=False, dynamic=None)
         return module
 
     def _maybe_enable_cache_dit(self, num_inference_steps: int, batch: Req) -> None:
@@ -497,7 +498,7 @@ class DenoisingStage(PipelineStage):
             )
             # enable cache-dit before torch.compile (delayed mounting)
             self._maybe_enable_cache_dit(cache_dit_num_inference_steps, batch)
-            self.compile_module_with_torch_compile(self.transformer)
+            self._maybe_enable_torch_compile(self.transformer)
             if pipeline:
                 pipeline.add_module("transformer", self.transformer)
             server_args.model_loaded["transformer"] = True
@@ -801,8 +802,8 @@ class DenoisingStage(PipelineStage):
 
     def _manage_device_placement(
         self,
-        model_to_use: torch.nn.Module,
-        model_to_offload: torch.nn.Module | None,
+        model_to_use: nn.Module,
+        model_to_offload: nn.Module | None,
         server_args: ServerArgs,
     ):
         """
@@ -1218,7 +1219,7 @@ class DenoisingStage(PipelineStage):
 
     def _predict_noise_with_cfg(
         self,
-        current_model: torch.nn.Module,
+        current_model: nn.Module,
         latent_model_input: torch.Tensor,
         timestep,
         batch: Req,
