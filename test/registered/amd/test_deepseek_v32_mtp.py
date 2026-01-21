@@ -18,7 +18,7 @@ from sglang.test.test_utils import (
 )
 
 register_amd_ci(est_time=3600, suite="stage-c-test-large-8-gpu-amd-mi35x")
-FULL_DEEPSEEK_V32_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2-Exp"
+FULL_DEEPSEEK_V32_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2"
 
 
 class TestDeepseekV32DPMTP(CustomTestCase):
@@ -44,7 +44,7 @@ class TestDeepseekV32DPMTP(CustomTestCase):
             "--mem-frac",
             "0.7",
             "--model-loader-extra-config",
-            '{"enable_multithread_load": true, "num_threads": 64}',
+            '{"enable_multithread_load": true}',
         ]
         if is_in_amd_ci():
             other_args += [
@@ -137,7 +137,7 @@ class TestDeepseekV32TPMTP(CustomTestCase):
             "--mem-frac",
             "0.7",
             "--model-loader-extra-config",
-            '{"enable_multithread_load": true, "num_threads": 64}',
+            '{"enable_multithread_load": true}',
         ]
         if is_in_amd_ci():
             other_args += [
