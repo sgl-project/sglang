@@ -319,10 +319,15 @@ class HiCacheHF3FS(HiCacheStorage):
         else:
             # Enable MLA optimization only when using the global metadata client
             if is_mla_model:
-                raise ValueError(mla_unsupported_msg)
-
-            # Use local metadata client for single-machine deployment
-            metadata_client = Hf3fsLocalMetadataClient()
+                model_name = storage_config.model_name
+                tp_size = storage_config.tp_size
+                model_name = "-".join(model_name.split("/")) if model_name else ""
+                metadata_client = Hf3fsLocalMetadataClient(
+                    is_mla_model, tp_size, model_name
+                )
+            else:
+                # Use local metadata client for single-machine deployment
+                metadata_client = Hf3fsLocalMetadataClient()
 
         rank_for_path = 0 if is_mla_model else rank
         return HiCacheHF3FS(
@@ -395,7 +400,7 @@ class HiCacheHF3FS(HiCacheStorage):
     ) -> List[bool]:
         # In MLA backend, only one rank needs to backup the KV cache
         if self.skip_backup:
-            return True
+            return [True for _ in keys]
 
         # Todo: Add prefix block's hash key
         key_with_prefix = [(key, "") for key in keys]
