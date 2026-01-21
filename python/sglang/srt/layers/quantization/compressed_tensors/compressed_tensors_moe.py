@@ -1584,16 +1584,16 @@ class NPUCompressedTensorsW4A8Int8DynamicMoEMethod(CompressedTensorsMoEMethod):
         )
 
     def create_moe_runner(
-        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
-    ):
-        self.moe_runner_config = moe_runner_config
+        self, layer: torch.nn.Module, moe_runner_config: "MoeRunnerConfig"
+    ):  
+        moe_runner_config.quantization = "NPUCompressedTensorsW4A8Int8DynamicMoEMethod"
+        self.kernel.create_moe_runner(layer, moe_runner_config)
 
     def apply(
         self,
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
-
         return self.kernel.apply(layer, dispatch_output)
 
     def apply_without_routing_weights(
@@ -1735,16 +1735,16 @@ class NPUCompressedTensorsW4A16Int4DynamicMoEMethod(CompressedTensorsMoEMethod):
         self.kernel.process_weights_after_loading(layer)
 
     def create_moe_runner(
-        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
-    ):
-        self.moe_runner_config = moe_runner_config
+        self, layer: torch.nn.Module, moe_runner_config: "MoeRunnerConfig"
+    ):  
+        moe_runner_config.quantization = "NPUCompressedTensorsW4A16Int4DynamicMoEMethod"
+        self.kernel.create_moe_runner(layer, moe_runner_config)
 
     def apply(
         self,
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
-
         return self.kernel.apply(layer, dispatch_output)
 
     def apply_without_routing_weights(
