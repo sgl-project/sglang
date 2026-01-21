@@ -17,14 +17,15 @@ sources = [
     "csrc/allreduce/quick_all_reduce.cu",
     "csrc/common_extension_rocm.cc",
     "csrc/elementwise/activation.cu",
+    "csrc/elementwise/pos_enc.cu",
     "csrc/elementwise/topk.cu",
     "csrc/grammar/apply_token_bitmask_inplace_cuda.cu",
+    "csrc/kvcacheio/transfer.cu",
     "csrc/moe/moe_align_kernel.cu",
     "csrc/moe/moe_topk_softmax_kernels.cu",
     "csrc/moe/moe_topk_sigmoid_kernels.cu",
+    "csrc/sgl_diffusion/elementwise/timestep_embedding.cu",
     "csrc/speculative/eagle_utils.cu",
-    "csrc/kvcacheio/transfer.cu",
-    "csrc/elementwise/pos_enc.cu",
 ]
 
 libraries = ["hiprtc", "amdhip64", "c10", "torch", "torch_python"]
