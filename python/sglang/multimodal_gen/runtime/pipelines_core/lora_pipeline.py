@@ -435,6 +435,33 @@ class LoRAPipeline(ComposedPipelineBase):
                     lora_A_name in self.lora_adapters[nickname]
                     and lora_B_name in self.lora_adapters[nickname]
                 ):
+                    # Some LoRA checkpoints (e.g. Lightning distill) store per-layer alpha as "<layer>.alpha".
+                    # If present, we must apply the standard LoRA scaling: scale = alpha / rank.
+                    try:
+                        inferred_rank = int(
+                            self.lora_adapters[nickname][lora_A_name].shape[0]
+                        )
+                    except Exception:
+                        inferred_rank = None
+                    # Default to None for some checkpoints without "<layer>.alpha"
+                    inferred_alpha: int | None = None
+                    alpha_key = name + ".alpha"
+                    if alpha_key in self.lora_adapters[nickname]:
+                        try:
+                            inferred_alpha = int(
+                                self.lora_adapters[nickname][alpha_key].item()
+                            )
+                        except Exception:
+                            inferred_alpha = None
+
+                    if inferred_rank is not None:
+                        layer.lora_rank = inferred_rank
+                        layer.lora_alpha = (
+                            inferred_alpha
+                            if inferred_alpha is not None
+                            else inferred_rank
+                        )
+
                     layer.set_lora_weights(
                         self.lora_adapters[nickname][lora_A_name],
                         self.lora_adapters[nickname][lora_B_name],
@@ -533,17 +560,17 @@ class LoRAPipeline(ComposedPipelineBase):
             name, _, _ = lora_param_names_mapping_fn(name)
             # HF-format (LoRA) -> SGLang-dit-format
             target_name, merge_index, num_params_to_merge = param_names_mapping_fn(name)
-            # for (in_dim, r) @ (r, out_dim), we only merge (r, out_dim * n) where n is the number of linear layers to fuse
+            # for fuse B(out_dim, r) @ A(r, in_dim) -> (N, out_dim, r) @ (N, r, in_dim)
             # see param mapping in HunyuanVideoArchConfig
-            if merge_index is not None and "lora_B" in name:
+            if merge_index is not None:
                 to_merge_params[target_name][merge_index] = weight
                 if len(to_merge_params[target_name]) == num_params_to_merge:
-                    # cat at output dim according to the merge_index order
                     sorted_tensors = [
                         to_merge_params[target_name][i]
                         for i in range(num_params_to_merge)
                     ]
-                    weight = torch.cat(sorted_tensors, dim=1)
+                    # Use stack instead of cat because it needs to be compatible with TP.
+                    weight = torch.stack(sorted_tensors, dim=0)
                     del to_merge_params[target_name]
                 else:
                     continue
