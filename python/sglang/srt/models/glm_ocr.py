@@ -27,8 +27,6 @@ from einops import rearrange
 from transformers.models.glm_ocr.configuration_glm_ocr import (
     GlmOcrConfig,
     GlmOcrVisionConfig,
-    Glm4vVisionModel,
-    Glm4vForConditionalGeneration,
 )
 
 from sglang.srt.distributed import (
@@ -64,6 +62,8 @@ from sglang.srt.models.glm4v import (
     Glm4vVisionMLP,
     Glm4vPatchMerger,
     Glm4vVisionPatchEmbed,
+    Glm4vVisionModel,
+    Glm4vForConditionalGeneration,
 )
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
 from sglang.srt.server_args import get_global_server_args
@@ -107,6 +107,7 @@ class GlmOcrVisionBlock(nn.Module):
             use_qkv_parallel=True,
             proj_bias=True,
             qkv_bias=attn_qkv_bias,
+            qk_normalization=True,
             flatten_batch=True,
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
