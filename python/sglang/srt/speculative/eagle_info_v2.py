@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -32,7 +31,6 @@ from sglang.srt.speculative.spec_utils import (
 )
 from sglang.srt.utils.common import is_cuda, is_hip, is_npu, next_power_of_2
 
-logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
@@ -44,209 +42,12 @@ if TYPE_CHECKING:
     )
     from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 
-# Try to import CUDA kernels, but provide torch fallbacks
-_sgl_kernel_available = False
-top_k_renorm_prob = None
-top_p_renorm_prob = None
-tree_speculative_sampling_target_only = None
-
-if _is_cuda or _is_hip:
-    try:
-        from sgl_kernel import top_k_renorm_prob as _sgl_top_k_renorm_prob
-        from sgl_kernel import top_p_renorm_prob as _sgl_top_p_renorm_prob
-        from sgl_kernel import (
-            tree_speculative_sampling_target_only as _sgl_tree_spec_sampling,
-        )
-
-        # Verify that the torch ops are actually available
-        _ = torch.ops.sgl_kernel.top_k_renorm_probs
-        _ = torch.ops.sgl_kernel.top_p_renorm_probs
-        _ = torch.ops.sgl_kernel.tree_speculative_sampling_target_only
-
-        _sgl_kernel_available = True
-        top_k_renorm_prob = _sgl_top_k_renorm_prob
-        top_p_renorm_prob = _sgl_top_p_renorm_prob
-        tree_speculative_sampling_target_only = _sgl_tree_spec_sampling
-    except (ImportError, AttributeError) as e:
-        logger.info(f"sgl_kernel not available, using torch fallbacks: {e}")
-
-# Try to import aiter top_k_renorm_probs as fallback for top_k_renorm_prob
-if _is_hip:
-    if top_k_renorm_prob is None:
-        try:
-            import aiter.ops.sampling  # noqa: F401
-
-            _aiter_ops = torch.ops.aiter
-
-            def _to_tensor_scalar_tuple(data):
-                """Helper to convert data to (tensor, scalar) tuple for aiter ops"""
-                if isinstance(data, torch.Tensor):
-                    if data.numel() == 1:
-                        # Single element tensor: pass both tensor and scalar
-                        return data, data.item()
-                    else:
-                        # Multi-element tensor: pass tensor, use -1 as placeholder for scalar
-                        return data, -1
-                else:
-                    # Scalar value: pass None for tensor, value for scalar
-                    return None, data
-
-            def _aiter_top_k_renorm_wrapper(probs, top_ks):
-                """Wrapper to use aiter's top_k_renorm_probs"""
-                probs_for_ops = probs.float().contiguous()
-                return _aiter_ops.top_k_renorm_probs(
-                    probs_for_ops,
-                    *_to_tensor_scalar_tuple(top_ks),
-                )
-
-            top_k_renorm_prob = _aiter_top_k_renorm_wrapper
-            logger.info("Using AITER top_k_renorm_probs for top_k filtering")
-        except (ImportError, AttributeError, RuntimeError) as e:
-            # Fallback to torch implementation if aiter also not available
-            logger.info(
-                f"AITER not available ({e}), using torch fallback for top_k_renorm_prob"
-            )
-
-            def _torch_top_k_renorm_prob(probs, top_ks):
-                """Torch native top-k renormalization"""
-                if isinstance(top_ks, (int, float)):
-                    top_ks = torch.tensor(
-                        [top_ks], device=probs.device, dtype=torch.int32
-                    ).expand(probs.shape[0])
-                probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
-                probs_sort[
-                    torch.arange(0, probs.shape[-1], device=probs.device).view(1, -1)
-                    >= top_ks.view(-1, 1)
-                ] = 0.0
-                probs_sort = probs_sort / (probs_sort.sum(dim=-1, keepdim=True) + 1e-8)
-                return torch.zeros_like(probs_sort).scatter_(-1, probs_idx, probs_sort)
-
-            top_k_renorm_prob = _torch_top_k_renorm_prob
-            logger.info("Using torch native top_k_renorm_prob fallback")
-
-    # Torch fallback for top_p_renorm_prob
-    if top_p_renorm_prob is None:
-        # TODO (hubert): add HIP implementation
-        def _torch_top_p_renorm_prob(probs: torch.Tensor, top_ps: torch.Tensor):
-            """Torch native top-p renormalization"""
-            if isinstance(top_ps, (int, float)):
-                top_ps = torch.tensor(
-                    [top_ps], device=probs.device, dtype=torch.float32
-                ).expand(probs.shape[0])
-            probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
-            probs_sum = torch.cumsum(probs_sort, dim=-1)
-            probs_sort[(probs_sum - probs_sort) > top_ps.view(-1, 1)] = 0.0
-            probs_sort = probs_sort / (probs_sort.sum(dim=-1, keepdim=True) + 1e-8)
-            return torch.zeros_like(probs_sort).scatter_(-1, probs_idx, probs_sort)
-
-        top_p_renorm_prob = _torch_top_p_renorm_prob
-        logger.info("Using torch native top_p_renorm_prob fallback")
-
-    # Torch fallback for tree_speculative_sampling_target_only
-    if tree_speculative_sampling_target_only is None:
-        # TODO (hubert): add HIP implementation
-        def _torch_tree_speculative_sampling_target_only(
-            predicts: torch.Tensor,  # mutable
-            accept_index: torch.Tensor,  # mutable
-            accept_token_num: torch.Tensor,  # mutable
-            candidates: torch.Tensor,
-            retrive_index: torch.Tensor,
-            retrive_next_token: torch.Tensor,
-            retrive_next_sibling: torch.Tensor,
-            uniform_samples: torch.Tensor,
-            uniform_samples_for_final_sampling: torch.Tensor,
-            target_probs: torch.Tensor,
-            draft_probs: torch.Tensor,
-            threshold_single: float = 1.0,
-            threshold_acc: float = 1.0,
-            deterministic: bool = True,
-        ):
-            """
-            Torch native implementation of tree speculative sampling.
-            Based on the algorithm from sgl-kernel CUDA implementation.
-
-            Traverses the tree using retrive_next_token and retrive_next_sibling,
-            performs rejection sampling at each node, and records accepted tokens.
-            """
-            batch_size = candidates.shape[0]
-            num_draft_tokens = candidates.shape[1]
-            vocab_size = target_probs.shape[2]
-
-            # Process each batch item
-            for bx in range(batch_size):
-                prob_acc = 0.0
-                cur_token_idx = 0  # Current token index within the batch
-                coin = uniform_samples[bx, 0].item()
-                last_accepted_retrive_idx = retrive_index[bx, 0].item()
-                accept_index[bx, 0] = last_accepted_retrive_idx
-                num_accepted_tokens = 0
-                cur_index = 0
-
-                # Traverse tree depth-first
-                for j in range(1, accept_index.shape[1]):
-                    cur_index = retrive_next_token[bx, cur_index].item()
-
-                    while cur_index != -1:
-                        draft_index = retrive_index[bx, cur_index].item()
-                        draft_token_id = candidates[bx, cur_index].item()
-                        # Access target_probs using batch index and token index
-                        target_prob_single = target_probs[
-                            bx, cur_token_idx, draft_token_id
-                        ].item()
-                        prob_acc += target_prob_single
-
-                        # Acceptance criterion
-                        if (
-                            coin <= prob_acc / threshold_acc
-                            or target_prob_single >= threshold_single
-                        ):
-                            # Accept token
-                            prob_acc = 0.0
-                            cur_token_idx = cur_index
-                            coin = uniform_samples[bx, cur_index].item()
-                            predicts[last_accepted_retrive_idx] = draft_token_id
-                            num_accepted_tokens += 1
-                            accept_index[bx, num_accepted_tokens] = draft_index
-                            last_accepted_retrive_idx = draft_index
-                            break
-                        else:
-                            # Reject: update draft_probs and try sibling
-                            draft_probs[bx, cur_token_idx, draft_token_id] = (
-                                target_probs[bx, cur_token_idx, draft_token_id]
-                            )
-                            cur_index = retrive_next_sibling[bx, cur_index].item()
-
-                    if cur_index == -1:
-                        break
-
-                # Final sampling if needed
-                accept_token_num[bx] = num_accepted_tokens
-                coin = uniform_samples_for_final_sampling[bx].item()
-
-                # Sample from the residual distribution
-                cur_probs = target_probs[bx, cur_token_idx].clone()
-                cur_draft_probs = draft_probs[bx, cur_token_idx]
-                residual = torch.clamp(cur_probs - cur_draft_probs, min=0.0)
-                residual_sum = residual.sum().item()
-
-                if residual_sum > 1e-8:
-                    residual = residual / residual_sum
-                    # Sample using the coin
-                    cumsum = torch.cumsum(residual, dim=0)
-                    sampled_token = torch.searchsorted(cumsum, coin).item()
-                    sampled_token = min(sampled_token, vocab_size - 1)
-                else:
-                    # Fallback: sample from original distribution
-                    sampled_token = torch.multinomial(
-                        cur_probs + 1e-8, num_samples=1
-                    ).item()
-
-                predicts[last_accepted_retrive_idx] = sampled_token
-
-        tree_speculative_sampling_target_only = (
-            _torch_tree_speculative_sampling_target_only
-        )
-        logger.info("Using torch native tree_speculative_sampling_target_only fallback")
+if is_cuda():
+    from sgl_kernel import (
+        top_k_renorm_prob,
+        top_p_renorm_prob,
+        tree_speculative_sampling_target_only,
+    )
 
 
 @triton.jit
