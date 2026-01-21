@@ -138,7 +138,34 @@ class RMSNorm(CustomOp):
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         # ROCm builds of sgl-kernel do not expose rmsnorm custom ops yet.
-        return self.forward_native(x, residual)
+        # Use Triton kernels instead which work on ROCm.
+        shape = x.shape
+        x = x.reshape(-1, shape[-1])
+        if residual is not None:
+            residual_shape = residual.shape
+            residual = residual.view(-1, shape[-1])
+
+        if self.variance_size_override is not None:
+            return self.forward_native(x.view(shape), residual.view(residual_shape) if residual is not None else None)
+
+        if residual is not None:
+            # Use triton fused add + rmsnorm
+            out = rms_norm_fn(
+                x, self.weight, bias=None, residual=residual, eps=self.variance_epsilon
+            )
+            if isinstance(out, tuple):
+                return out[0].view(shape), out[1].view(residual_shape)
+            return out.view(shape), residual.view(residual_shape)
+        else:
+            if x.shape[-1] <= 128:
+                out = triton_one_pass_rms_norm(
+                    x, self.weight.data, self.variance_epsilon
+                )
+            else:
+                out = rms_norm_fn(
+                    x, self.weight, bias=None, residual=None, eps=self.variance_epsilon
+                )
+            return out.view(shape)
 
     def extra_repr(self) -> str:
         s = f"hidden_size={self.weight.data.size(0)}"
