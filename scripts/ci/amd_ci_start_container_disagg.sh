@@ -157,12 +157,8 @@ fi
 echo "Launching container: ci_sglang"
 docker run -dt --user root --device=/dev/kfd ${DEVICE_FLAG} \
   -v "${GITHUB_WORKSPACE:-$PWD}:/sglang-checkout" \
-  -v /dev/infiniband:/dev/infiniband \
   -v /sys/class/infiniband:/sys/class/infiniband:ro \
   -v /sys/class/net:/sys/class/net:ro \
-  -v /etc/libibverbs.d:/etc/libibverbs.d:ro \
-  -v /usr/lib/x86_64-linux-gnu/libibverbs/libionic-rdmav34.so:/usr/lib/x86_64-linux-gnu/libibverbs/libionic-rdmav34.so:ro \
-  -v /usr/local/lib/libionic.so.1:/usr/lib/libionic.so.1:ro \
   $CACHE_VOLUME \
   --privileged \
   --network=host \

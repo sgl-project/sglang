@@ -935,8 +935,6 @@ jobs:
         run: |
           set +e  
           
-          echo "=== Full RDMA Library Search on CI Runner Host ==="
-
           echo ""
           echo "=== 1. libibverbs provider configs ==="
           find /etc -name "*.driver" 2>/dev/null || true
@@ -1037,81 +1035,45 @@ jobs:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Install dependencies
-        run: bash scripts/ci/amd_ci_install_dependency.sh
+        run: bash scripts/ci/amd_ci_install_dependency_disagg.sh
 
       - name: Setup RDMA in Container
         run: |
           echo "=== Setting up RDMA in container ==="
-          docker exec ci_sglang bash -c '
-            set -x
-            
-            # Install rdma-core and dependencies
+          docker exec -u root ci_sglang bash -c '
+            set -ex
+
             apt-get update
-            apt-get install -y rdma-core libibverbs-dev infiniband-diags iproute2 kmod
-            
-            # Create /dev/infiniband directory
+            apt-get install -y rdma-core libibverbs1 ibverbs-providers ibverbs-utils infiniband-diags iproute2 kmod
+
+            rm -rf /dev/infiniband
             mkdir -p /dev/infiniband
-            
-            # Try to load kernel modules (may fail if already loaded or no permission)
-            modprobe ib_uverbs 2>/dev/null || echo "ib_uverbs module load skipped"
-            modprobe rdma_ucm 2>/dev/null || echo "rdma_ucm module load skipped"
-            
-            # Create device nodes from sysfs info
-            # uverbs devices
+
             if [ -d "/sys/class/infiniband_verbs" ]; then
               for uverbs_dir in /sys/class/infiniband_verbs/uverbs*; do
-                if [ -d "$uverbs_dir" ]; then
-                  uverbs_name=$(basename "$uverbs_dir")
-                  dev_info=$(cat "$uverbs_dir/dev" 2>/dev/null)
-                  if [ -n "$dev_info" ]; then
-                    major=$(echo "$dev_info" | cut -d: -f1)
-                    minor=$(echo "$dev_info" | cut -d: -f2)
-                    echo "Creating /dev/infiniband/$uverbs_name with major=$major minor=$minor"
-                    mknod /dev/infiniband/$uverbs_name c $major $minor 2>/dev/null || true
-                    chmod 666 /dev/infiniband/$uverbs_name 2>/dev/null || true
-                  fi
+                uverbs_name=$(basename "$uverbs_dir")
+                if [ -e "$uverbs_dir/dev" ]; then
+                  dev_info=$(cat "$uverbs_dir/dev")
+                  major=$(echo "$dev_info" | cut -d: -f1)
+                  minor=$(echo "$dev_info" | cut -d: -f2)
+                  echo "Creating /dev/infiniband/$uverbs_name ($major:$minor)"
+                  mknod /dev/infiniband/$uverbs_name c $major $minor || true
                 fi
               done
+            fi
+
+            if [ -e "/sys/class/misc/rdma_cm/dev" ]; then
+              dev_info=$(cat /sys/class/misc/rdma_cm/dev)
+              mknod /dev/infiniband/rdma_cm c ${dev_info%:*} ${dev_info#*:} || true
             else
-              echo "WARNING: /sys/class/infiniband_verbs not found, using fallback"
-              # Fallback: create with standard major/minor
-              for i in $(seq 0 7); do
-                mknod /dev/infiniband/uverbs$i c 231 $((192 + i)) 2>/dev/null || true
-              done
+              mknod /dev/infiniband/rdma_cm c 10 113 || true
             fi
             
-            # rdma_cm device
-            if [ -e "/sys/class/infiniband_cm/ucm/dev" ]; then
-              dev_info=$(cat /sys/class/infiniband_cm/ucm/dev 2>/dev/null)
-              if [ -n "$dev_info" ]; then
-                major=$(echo "$dev_info" | cut -d: -f1)
-                minor=$(echo "$dev_info" | cut -d: -f2)
-                mknod /dev/infiniband/rdma_cm c $major $minor 2>/dev/null || true
-              fi
-            else
-              mknod /dev/infiniband/rdma_cm c 10 113 2>/dev/null || true
-            fi
-            chmod 666 /dev/infiniband/rdma_cm 2>/dev/null || true
-            
-            # Set permissions on all devices
-            chmod 666 /dev/infiniband/* 2>/dev/null || true
-            
-            echo ""
+            chmod 666 /dev/infiniband/*
+
             echo "=== Verification ==="
-            echo "1. /dev/infiniband contents:"
-            ls -la /dev/infiniband/ || echo "No devices created"
-            
-            echo ""
-            echo "2. /sys/class/infiniband_verbs:"
-            ls -la /sys/class/infiniband_verbs/ 2>/dev/null || echo "Not found"
-            
-            echo ""
-            echo "3. ibv_devinfo output:"
-            ibv_devinfo 2>&1 || echo "ibv_devinfo failed"
-            
-            echo ""
-            echo "4. Testing mooncake import:"
-            python3 -c "from mooncake.engine import TransferEngine; te = TransferEngine(); print(\"Mooncake TransferEngine created successfully\")" 2>&1 || echo "Mooncake test failed"
+            ibv_devinfo -list
+            ls /usr/lib/x86_64-linux-gnu/libibverbs/
           '
 
       - name: Run Aiter Op Test (RMSNorm)
