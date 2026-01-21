@@ -125,7 +125,10 @@ impl PipelineStage for WorkerSelectionStage {
                 }
             }
             WorkerSelectionMode::EncodePrefillDecode => {
-                match self.select_epd_triple(ctx.input.model_id.as_deref(), text) {
+                match self
+                    .select_epd_triple(ctx.input.model_id.as_deref(), text)
+                    .await
+                {
                     Some((encode, prefill, decode)) => WorkerSelection::Triple {
                         encode,
                         prefill,
@@ -302,7 +305,7 @@ impl WorkerSelectionStage {
         ))
     }
 
-    fn select_epd_triple(
+    async fn select_epd_triple(
         &self,
         model_id: Option<&str>,
         text: Option<&str>,
@@ -373,9 +376,11 @@ impl WorkerSelectionStage {
             headers: None,
             hash_ring: None,
         };
-        let encode_idx = encode_policy.select_worker(&available_encode, &info)?;
-        let prefill_idx = prefill_policy.select_worker(&available_prefill, &info)?;
-        let decode_idx = decode_policy.select_worker(&available_decode, &info)?;
+        let encode_idx = encode_policy.select_worker(&available_encode, &info).await?;
+        let prefill_idx = prefill_policy
+            .select_worker(&available_prefill, &info)
+            .await?;
+        let decode_idx = decode_policy.select_worker(&available_decode, &info).await?;
 
         let model = model_id.unwrap_or("default");
 

@@ -13,7 +13,7 @@ use super::{
     proto_wrapper::{ProtoEmbedComplete, ProtoRequest, ProtoStream},
 };
 use crate::{
-    core::{attach_guards_to_response, Worker, WorkerLoadGuard},
+    core::{AttachedBody, Worker, WorkerLoadGuard},
     grpc_client::SglangEncoderClient,
     protocols::{
         chat::{ChatCompletionRequest, ChatCompletionResponse},
@@ -183,6 +183,13 @@ pub(crate) enum LoadGuards {
         prefill: WorkerLoadGuard,
         decode: WorkerLoadGuard,
     },
+}
+
+fn attach_guards_to_response(
+    guards: Vec<WorkerLoadGuard>,
+    response: axum::response::Response,
+) -> axum::response::Response {
+    AttachedBody::wrap_response(response, guards)
 }
 
 impl LoadGuards {
