@@ -1232,12 +1232,12 @@ class HybridLinearAttnBackend(AttentionBackend):
         mixed_qkv: Optional[torch.Tensor] = None,  # For GDN linear attention
         a: Optional[torch.Tensor] = None,  # For GDN linear attention
         b: Optional[torch.Tensor] = None,  # For GDN linear attention
-        **kwargs,  # For other linear attention backends (e.g., KimiLinearAttnBackend)
+        **kwargs,
     ):
         layer_id = layer.layer_id if layer else kwargs["layer_id"]
         if layer_id in self.full_attn_layers:
             return self.full_attn_backend.forward_decode(
-                q, k, v, layer, forward_batch, save_kv_cache
+                q, k, v, layer, forward_batch, save_kv_cache, **kwargs
             )
         # Linear attention backend
         return self.linear_attn_backend.forward_decode(
@@ -1264,12 +1264,12 @@ class HybridLinearAttnBackend(AttentionBackend):
         mixed_qkv: Optional[torch.Tensor] = None,  # For GDN linear attention
         a: Optional[torch.Tensor] = None,  # For GDN linear attention
         b: Optional[torch.Tensor] = None,  # For GDN linear attention
-        **kwargs,  # For other linear attention backends (e.g., KimiLinearAttnBackend)
+        **kwargs,
     ):
         layer_id = layer.layer_id if layer else kwargs["layer_id"]
         if layer_id in self.full_attn_layers:
             return self.full_attn_backend.forward_extend(
-                q, k, v, layer, forward_batch, save_kv_cache
+                q, k, v, layer, forward_batch, save_kv_cache, **kwargs
             )
         # Linear attention backend
         return self.linear_attn_backend.forward_extend(
@@ -1287,28 +1287,17 @@ class HybridLinearAttnBackend(AttentionBackend):
 
     def forward(
         self,
-        q: Optional[
-            torch.Tensor
-        ] = None,  # For full attention (positional from RadixAttention)
-        k: Optional[
-            torch.Tensor
-        ] = None,  # For full attention (positional from RadixAttention)
-        v: Optional[
-            torch.Tensor
-        ] = None,  # For full attention (positional from RadixAttention)
+        q: Optional[torch.Tensor] = None,  # For full attention
+        k: Optional[torch.Tensor] = None,  # For full attention
+        v: Optional[torch.Tensor] = None,  # For full attention
         layer: RadixAttention = None,
         forward_batch: ForwardBatch = None,
         save_kv_cache: bool = True,
         mixed_qkv: Optional[torch.Tensor] = None,  # For GDN linear attention
         a: Optional[torch.Tensor] = None,  # For GDN linear attention
         b: Optional[torch.Tensor] = None,  # For GDN linear attention
-        **kwargs,  # For other linear attention backends (e.g., KimiLinearAttnBackend)
+        **kwargs,
     ):
-        """Run forward on an attention layer.
-
-        Called by RadixAttention with: forward(q, k, v, self, forward_batch, save_kv_cache, **kwargs)
-        Called by RadixLinearAttention with: forward(layer=self, forward_batch=..., mixed_qkv=..., a=..., b=...)
-        """
         layer_id = layer.layer_id
         is_linear_attn = layer_id not in self.full_attn_layers
 
