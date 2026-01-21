@@ -4039,16 +4039,17 @@ def get_device_numa_node_cuda(gpu_id: int = 0) -> int:
 
 
 def get_numa_node(gpu_id):
+    numa_node = None
     try:
         device = get_device()
         if device == "cuda":
             numa_node = get_device_numa_node_cuda(gpu_id)
         else:
             logger.info(f"Now only supports NVIDIA devices")
-            return None
     except Exception as e:
         logger.error(f"Error: {e}")
-        return None
+
+    return numa_node
 
 
 @lru_cache(maxsize=1)
