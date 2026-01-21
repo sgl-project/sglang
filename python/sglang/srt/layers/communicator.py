@@ -80,7 +80,10 @@ if _use_aiter and _is_gfx95_supported:
 elif _is_npu:
     from sglang.srt.hardware_backend.npu.cmo import prepare_weight_cache
 
-FUSE_ALLREDUCE_MAX_BATCH_SIZE = 2048
+
+# According to the discussion in https://github.com/flashinfer-ai/flashinfer/issues/1223#issuecomment-3047256465
+# We set the max token num to 128 for allreduce fusion with min-latency case(use_oneshot=True).
+FUSE_ALLREDUCE_MAX_BATCH_SIZE = 128
 
 
 def apply_flashinfer_allreduce_fusion(batch_size: int):
@@ -794,8 +797,6 @@ class CommunicateWithAllReduceAndLayerNormFn:
                 if hidden_states.shape[0] != 0:
                     hidden_states = layernorm(hidden_states)
         else:
-            # According to the discussion in https://github.com/flashinfer-ai/flashinfer/issues/1223#issuecomment-3047256465
-            # We set the max token num to 128 for allreduce fusion with min-latency case(use_oneshot=True).
             if apply_flashinfer_allreduce_fusion(hidden_states.shape[0]) and hasattr(
                 layernorm, "forward_with_allreduce_fusion"
             ):
