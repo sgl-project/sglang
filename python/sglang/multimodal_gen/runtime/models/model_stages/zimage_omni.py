@@ -238,7 +238,7 @@ class ZImageOmniBeforeDenoisingStage(PipelineStage):
         for image in condition_images:
             image = image.to(device=device, dtype=dtype)
             image_latent = (
-                self.vae.encode(image.to(dtype)).latent_dist.mode()[0]
+                self.vae.encode(image.to(torch.float32)).latent_dist.mode()[0]
                 - self.vae.config.shift_factor
             ) * self.vae.config.scaling_factor
             image_latent = image_latent.unsqueeze(1).to(dtype)

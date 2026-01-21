@@ -220,12 +220,6 @@ class ZImageOmniPipelineConfig(ZImagePipelineConfig):
         default_factory=lambda: (zimage_omni_postprocess_text,)
     )
 
-    # TODO: review
-    # ugly hack
-    # pos token_lens, neg token_lens, pos token_lens, neg token_lens
-    # token_lens[0] for pos token_lens
-    # token_lens[1] for neg token_lens
-    # maybe bug in serving case
     token_lens = []
 
     def _apply_zimage_omni_template(
@@ -293,12 +287,12 @@ class ZImageOmniPipelineConfig(ZImagePipelineConfig):
             return_tensors="pt",
         )
 
-        # TODO: hack
         # prompt_list_lengths is used to reconstruct flattened_prompt into batching
         inputs.prompt_list_lengths = prompt_list_lengths
         token_lens = inputs.attention_mask.sum(dim=-1).tolist()
 
         self.token_lens.append(token_lens)
+        self.token_lens = self.token_lens[-2:]
 
         return inputs
 
