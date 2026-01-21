@@ -38,7 +38,7 @@ def fused_topk_npu(
             )
         topk_weights = topk_weights.to(torch.float32)
 
-    elif use_grouped_topk and correction_bias is not None:
+    elif use_grouped_topk and correction_bias is not None and router_logits.shape[-1] <= 2048:
         # Force set routed_scaling_factor = 1 to optimize renormalize
         topk_weights, topk_ids, _ = torch.ops.npu.npu_moe_gating_top_k(
             router_logits.to(torch.float32),

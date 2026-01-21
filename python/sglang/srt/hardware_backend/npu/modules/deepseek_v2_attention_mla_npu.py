@@ -64,36 +64,47 @@ def forward_mha_prepare_npu(
     kv_a, _ = latent_cache.split([m.kv_lora_rank, m.qk_rope_head_dim], dim=-1)
     latent_cache = latent_cache.unsqueeze(1)
 
-    B, S = q.shape[0], 1
-    cos, sin = m.rotary_emb.get_cos_sin_cache(
-        positions, hidden_states.dtype, offsets=None
-    )
-    q_pe = torch_npu.npu_interleave_rope(
-        q_pe.reshape(B, -1, S, m.qk_rope_head_dim),
-        cos,
-        sin,
-    )
-    q_pe = q_pe.reshape(B, -1, m.qk_rope_head_dim)
+    if m.use_deepseek_yarn_rope:
+        B, S = q.shape[0], 1
+        cos, sin = m.rotary_emb.get_cos_sin_cache(
+            positions, hidden_states.dtype, offsets=None
+        )
+        q_pe = torch_npu.npu_interleave_rope(
+            q_pe.reshape(B, -1, S, m.qk_rope_head_dim),
+            cos,
+            sin,
+        )
+        q_pe = q_pe.reshape(B, -1, m.qk_rope_head_dim)
 
-    ckv_cache, k_rope_cache = forward_batch.token_to_kv_pool.get_kv_buffer(m.layer_id)
-    _, _, k_pe, kv_a = torch_npu.npu_kv_rmsnorm_rope_cache(
-        latent_cache.view(-1, 1, 1, m.kv_lora_rank + m.qk_rope_head_dim),  # bnsd
-        m.kv_a_layernorm.weight,
-        cos,
-        sin,
-        forward_batch.out_cache_loc.to(torch.int64),
-        k_rope_cache,
-        ckv_cache,
-        k_rope_scale=None,
-        c_kv_scale=None,
-        k_rope_offset=None,
-        c_kv_offset=None,
-        epsilon=m.kv_a_layernorm.variance_epsilon,
-        cache_mode="PA_NZ" if is_fia_nz() else "PA_BNSD",
-        is_output_kv=True,
-    )  # adapter NZ
+        ckv_cache, k_rope_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
+            m.layer_id
+        )
+        _, _, k_pe, kv_a = torch_npu.npu_kv_rmsnorm_rope_cache(
+            latent_cache.view(-1, 1, 1, m.kv_lora_rank + m.qk_rope_head_dim),  # bnsd
+            m.kv_a_layernorm.weight,
+            cos,
+            sin,
+            forward_batch.out_cache_loc.to(torch.int64),
+            k_rope_cache,
+            ckv_cache,
+            k_rope_scale=None,
+            c_kv_scale=None,
+            k_rope_offset=None,
+            c_kv_offset=None,
+            epsilon=m.kv_a_layernorm.variance_epsilon,
+            cache_mode="PA_NZ" if is_fia_nz() else "PA_BNSD",
+            is_output_kv=True,
+        )  # adapter NZ
 
-    k_pe = k_pe.reshape(B, -1, m.qk_rope_head_dim)
+        k_pe = k_pe.reshape(B, -1, m.qk_rope_head_dim)
+    else:
+        kv_a = m.kv_a_layernorm(kv_a)
+        k_pe = latent_cache[:, :, m.kv_lora_rank :]
+        if m.rotary_emb is not None:
+            q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
+        forward_batch.token_to_kv_pool.set_kv_buffer(
+            m, forward_batch.out_cache_loc, kv_a.unsqueeze(1), k_pe
+        )
 
     q[..., m.qk_nope_head_dim :] = q_pe
 
