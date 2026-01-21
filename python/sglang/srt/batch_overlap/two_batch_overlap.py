@@ -79,6 +79,15 @@ def compute_split_seq_index(
     extend_lens: Optional[Sequence[int]],
     token_num_per_seq: Optional[int],
 ) -> Optional[int]:
+    # when batch < 2, disable TBO
+    if token_num_per_seq is not None or extend_lens is not None:  
+        if token_num_per_seq is not None:
+            batch_size = num_tokens // token_num_per_seq 
+        else:
+            batch_size = len(extend_lens)
+        if batch_size < 2:  
+            return None 
+
     if forward_mode == ForwardMode.EXTEND:
         assert extend_lens is not None
         return _split_extend_seqs(extend_lens)
