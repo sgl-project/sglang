@@ -897,7 +897,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             ), "Fp8MoEMethod on CPU requires that CPU has AMX support"
             _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
         elif self.use_mxfp8 and not self.quant_config.is_checkpoint_fp8_serialized:
-            self._quantize_mxfp8_moe_weights(layer)
+            # Keep weights in FP16/BF16; CUTLASS MXFP8 path will quantize on the fly.
+            return
         else:
             # For fp8 moe run with deepgemm, the expert weights and scales need be requantized to ue8m0
             from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE
