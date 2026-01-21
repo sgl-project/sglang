@@ -411,7 +411,7 @@ class DiffusersPipeline(ComposedPipelineBase):
             load_kwargs["device_map"] = device_map
 
         # Add quantization config if provided (e.g., BitsAndBytesConfig for 4/8-bit)
-        config = getattr(server_args, "pipeline_config", None)
+        config = server_args.pipeline_config
         if config is not None:
             quant_config = getattr(config, "quantization_config", None)
             if quant_config is not None:
@@ -479,7 +479,7 @@ class DiffusersPipeline(ComposedPipelineBase):
 
     def _apply_vae_optimizations(self, pipe: Any, server_args: ServerArgs) -> None:
         """Apply VAE memory optimizations (tiling, slicing) from pipeline config."""
-        config = getattr(server_args, "pipeline_config", None)
+        config = server_args.pipeline_config
         if config is None:
             return
 
@@ -503,10 +503,10 @@ class DiffusersPipeline(ComposedPipelineBase):
         See: https://huggingface.co/docs/diffusers/main/en/optimization/attention_backends
         Available backends: flash, _flash_3_hub, sage, xformers, native, etc.
         """
-        backend = getattr(server_args, "attention_backend", None)
+        backend = server_args.attention_backend
 
         if backend is None:
-            config = getattr(server_args, "pipeline_config", None)
+            config = server_args.pipeline_config
             if config is not None:
                 backend = getattr(config, "diffusers_attention_backend", None)
 
@@ -545,7 +545,7 @@ class DiffusersPipeline(ComposedPipelineBase):
 
     def _apply_cache_dit(self, pipe: Any, server_args: ServerArgs) -> Any:
         """Enable cache-dit for diffusers pipeline if configured."""
-        cache_dit_config = getattr(server_args, "cache_dit_config", None)
+        cache_dit_config = server_args.cache_dit_config
         if not cache_dit_config:
             return pipe
 
@@ -596,7 +596,7 @@ class DiffusersPipeline(ComposedPipelineBase):
         dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
 
         if hasattr(server_args, "pipeline_config") and server_args.pipeline_config:
-            dit_precision = getattr(server_args.pipeline_config, "dit_precision", None)
+            dit_precision = server_args.pipeline_config.dit_precision
             if dit_precision == "fp16":
                 dtype = torch.float16
             elif dit_precision == "bf16":
