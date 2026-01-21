@@ -237,16 +237,23 @@ class OpenAIServingCompletion(OpenAIServingBase):
                         input_top_logprobs = None
 
                     n_prev_token = n_prev_tokens.get(index, 0)
-                    logprobs = to_openai_style_logprobs(
-                        input_token_logprobs=input_token_logprobs,
-                        input_top_logprobs=input_top_logprobs,
-                        output_token_logprobs=content["meta_info"][
-                            "output_token_logprobs"
-                        ][n_prev_token:],
-                        output_top_logprobs=content["meta_info"].get(
-                            "output_top_logprobs", []
-                        )[n_prev_token:],
-                    )
+                    output_token_logprobs = content["meta_info"][
+                        "output_token_logprobs"
+                    ][n_prev_token:]
+                    output_top_logprobs = content["meta_info"].get(
+                        "output_top_logprobs", []
+                    )[n_prev_token:]
+
+                    # Only build logprobs if there are actual tokens to report.
+                    # This prevents sending empty logprobs.tokens which causes
+                    # IndexError when clients access tokens[0].
+                    if output_token_logprobs or input_token_logprobs:
+                        logprobs = to_openai_style_logprobs(
+                            input_token_logprobs=input_token_logprobs,
+                            input_top_logprobs=input_top_logprobs,
+                            output_token_logprobs=output_token_logprobs,
+                            output_top_logprobs=output_top_logprobs,
+                        )
                     n_prev_tokens[index] = len(
                         content["meta_info"]["output_token_logprobs"]
                     )
