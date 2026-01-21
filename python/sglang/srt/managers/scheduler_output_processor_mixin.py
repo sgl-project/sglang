@@ -332,24 +332,26 @@ class SchedulerOutputProcessorMixin:
         if result.copy_done is not None:
             result.copy_done.synchronize()
 
-        next_token_ids = result.next_token_ids.tolist()
-        self.num_generated_tokens += len(next_token_ids)
-
         self.token_to_kv_pool_allocator.free_group_begin()
 
-        assert len(batch.reqs) == 1, "batch size is currently expected to be 1"
-        req = batch.reqs[0]
-
-        for next_token_id in next_token_ids:
-            req.output_ids.append(next_token_id)
-            req.check_finished()
-
-            if req.finished():
-                release_kv_cache(req, self.tree_cache)
-                req.time_stats.completion_time = time.perf_counter()
+        for idx in range(batch.batch_size()):
+            # If no new tokens generated, meaning the prefilling stage
+            if not result.next_token_ids:
                 break
 
-            self.tree_cache.cache_unfinished_req(req)
+            req = batch.reqs[idx]
+            next_token_ids = result.next_token_ids[idx].tolist()
+            self.num_generated_tokens += len(next_token_ids)
+
+            for _token_idx, next_token_id in enumerate(next_token_ids):
+                req.output_ids.append(next_token_id)
+                req.check_finished()
+                if req.finished():
+                    release_kv_cache(req, self.tree_cache)
+                    req.time_stats.completion_time = time.perf_counter()
+                    break
+
+                self.tree_cache.cache_unfinished_req(req)
 
         self.stream_output(batch.reqs, batch.return_logprob)
         self.token_to_kv_pool_allocator.free_group_end()
@@ -470,12 +472,9 @@ class SchedulerOutputProcessorMixin:
         self.token_to_kv_pool_allocator.free_group_end()
 
         self.forward_ct_decode = (self.forward_ct_decode + 1) % (1 << 30)
-        if (
-            self.current_scheduler_metrics_enabled
-            and self.forward_ct_decode % self.server_args.decode_log_interval == 0
-        ):
-            self.log_decode_stats(can_run_cuda_graph, running_batch=batch)
-        if self.enable_metrics:
+        if self.current_scheduler_metrics_enabled:
+            if self.forward_ct_decode % self.server_args.decode_log_interval == 0:
+                self.log_decode_stats(can_run_cuda_graph, running_batch=batch)
             self.log_decode_stats_every_iteration(
                 batch, num_accepted_tokens=result.num_accepted_tokens
             )
@@ -1073,7 +1072,6 @@ class SchedulerOutputProcessorMixin:
         if reqs or is_idle_batch:
             if self.model_config.is_multimodal_gen:
                 return
-
             self.send_to_detokenizer.send_output(
                 BatchTokenIDOutput(
                     rids=rids,

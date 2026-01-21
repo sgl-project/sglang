@@ -28,6 +28,8 @@ class TestDeepseekV32DP(CustomTestCase):
             "--dp",
             "8",
             "--enable-dp-attention",
+            "--model-loader-extra-config",
+            '{"enable_multithread_load": true, "num_threads": 64}',
         ]
         cls.process = popen_launch_server(
             cls.model,
@@ -83,6 +85,8 @@ class TestDeepseekV32TP(CustomTestCase):
             "--trust-remote-code",
             "--tp",
             "8",
+            "--model-loader-extra-config",
+            '{"enable_multithread_load": true, "num_threads": 64}',
         ]
         cls.process = popen_launch_server(
             cls.model,

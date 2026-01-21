@@ -87,7 +87,7 @@ impl McpManager {
         }
 
         if static_clients.is_empty() {
-            warn!("No static MCP servers connected");
+            info!("No static MCP servers connected");
         }
 
         Ok(Self {
@@ -159,6 +159,39 @@ impl McpManager {
             .into_iter()
             .map(|(_tool_name, _server_name, tool_info)| tool_info)
             .collect()
+    }
+
+    /// List tools only from specific servers plus all static servers
+    ///
+    /// This method filters tools to only include:
+    /// 1. Tools from static servers (always visible)
+    /// 2. Tools from the specified dynamic servers
+    ///
+    /// This provides request-scoped tool isolation while maintaining
+    /// global visibility for static servers.
+    pub fn list_tools_for_servers(&self, server_keys: &[String]) -> Vec<Tool> {
+        self.inventory
+            .list_tools()
+            .into_iter()
+            .filter(|(_tool_name, server_key, _tool_info)| {
+                // Include if:
+                // 1. It's a static server (check by name in static_clients)
+                // 2. It's in the requested servers list
+                self.is_static_server_by_key(server_key) || server_keys.contains(server_key)
+            })
+            .map(|(_tool_name, _server_key, tool_info)| tool_info)
+            .collect()
+    }
+
+    /// Check if a server key belongs to a static server
+    ///
+    /// Static servers can be identified by checking if their name
+    /// exists in the static_clients map. We need to handle the fact
+    /// that static servers use name as key while dynamic use URL.
+    fn is_static_server_by_key(&self, server_key: &str) -> bool {
+        // For static servers, the server_key in inventory is the server name
+        // Check if this key exists in static_clients
+        self.static_clients.contains_key(server_key)
     }
 
     /// Call a tool by name with automatic type coercion
@@ -735,9 +768,8 @@ impl McpManager {
         }
     }
 
-    /// Generate a unique key for a server config
-    fn server_key(config: &McpServerConfig) -> String {
-        // Extract URL from transport or use name
+    /// Generate a unique key for a server config based on its transport
+    pub fn server_key(config: &McpServerConfig) -> String {
         match &config.transport {
             McpTransport::Streamable { url, .. } => url.clone(),
             McpTransport::Sse { url, .. } => url.clone(),
