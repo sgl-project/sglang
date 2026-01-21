@@ -854,7 +854,7 @@ class SchedulerOutputProcessorMixin:
         retraction_counts = []
         output_hidden_states = None
         load = self.get_load()
-        output_routed_experts = None
+        returned_routed_experts = None
         customized_info = {}
 
         queue_times = []
@@ -1051,9 +1051,9 @@ class SchedulerOutputProcessorMixin:
                         output_hidden_states = []
                     output_hidden_states.append(req.hidden_states)
                 if req.return_routed_experts:
-                    if output_routed_experts is None:
-                        output_routed_experts = []
-                    output_routed_experts.append(req.routed_experts)
+                    if returned_routed_experts is None:
+                        returned_routed_experts = []
+                    returned_routed_experts.append(req.routed_experts)
 
                 if req.customized_info is not None:
                     for k, v in req.customized_info.items():
@@ -1108,7 +1108,7 @@ class SchedulerOutputProcessorMixin:
                     output_token_ids_logprobs_idx=output_token_ids_logprobs_idx,
                     output_token_entropy_val=None,
                     output_hidden_states=output_hidden_states,
-                    output_routed_experts=output_routed_experts,
+                    returned_routed_experts=returned_routed_experts,
                     customized_info=customized_info,
                     placeholder_tokens_idx=None,
                     placeholder_tokens_val=None,
