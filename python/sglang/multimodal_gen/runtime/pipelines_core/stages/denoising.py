@@ -733,10 +733,8 @@ class DenoisingStage(PipelineStage):
         for model in (self.transformer, self.transformer_2):
             if model is None:
                 continue
-            model_param = next(model.parameters(), None)
-            if model_param is None:
-                continue
-            if model_param.device.type == "cuda":
+            first_tensor = next(model.parameters(), next(model.buffers(), None))
+            if first_tensor is not None and first_tensor.is_cuda:
                 model.to("cpu")
                 did_offload = True
 
