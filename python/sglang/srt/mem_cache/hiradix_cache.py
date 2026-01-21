@@ -88,9 +88,11 @@ class HiRadixCache(RadixCache):
             prefetch_timeout_base,
             prefetch_timeout_per_ki_token,
             hicache_storage_pass_prefix_keys,
+            fault_config,
         ) = self._parse_storage_backend_extra_config(
             server_args.hicache_storage_backend_extra_config
         )
+        self.hicache_fault_config_override = fault_config or {}
         self.prefetch_threshold = prefetch_threshold
         self.prefetch_timeout_base = prefetch_timeout_base
         self.prefetch_timeout_per_page = (
@@ -117,6 +119,7 @@ class HiRadixCache(RadixCache):
             pp_rank=self.pp_rank,
             pp_size=self.pp_size,
         )
+        self.fault_manager = None
         if self.enable_storage_metrics:
             # TODO: support pp
             labels = {
@@ -145,6 +148,14 @@ class HiRadixCache(RadixCache):
         atexit.register(self.shutdown)
 
         super().__init__(params=params)
+
+    def set_fault_manager(self, manager):
+        self.fault_manager = manager
+        if hasattr(self, "cache_controller") and self.cache_controller is not None:
+            self.cache_controller.set_fault_reporter(manager)
+
+    def get_fault_config_override(self) -> dict:
+        return getattr(self, "hicache_fault_config_override", {})
 
     def shutdown(self):
         """Best-effort auto-detach of storage backend on process shutdown.
@@ -316,6 +327,7 @@ class HiRadixCache(RadixCache):
                 prefetch_timeout_base,
                 prefetch_timeout_per_ki_token,
                 hicache_storage_pass_prefix_keys,
+                fault_config,
             ) = self._parse_storage_backend_extra_config(
                 storage_backend_extra_config_json
             )
@@ -338,6 +350,8 @@ class HiRadixCache(RadixCache):
                 f"Failed to attach storage backend '{storage_backend}': {e}"
             )
             return False, f"Failed to attach storage backend '{storage_backend}': {e}"
+
+        self.hicache_fault_config_override = fault_config or {}
 
         # Commit/rollback boundary:
         # - After controller attach succeeds, any exception below MUST rollback by
@@ -533,7 +547,7 @@ class HiRadixCache(RadixCache):
             storage_backend_extra_config: JSON string containing extra configuration
 
         Returns:
-            tuple: (extra_config_dict, prefetch_threshold, prefetch_timeout_base, prefetch_timeout_per_ki_token, hicache_storage_pass_prefix_keys)
+            tuple: (extra_config_dict, prefetch_threshold, prefetch_timeout_base, prefetch_timeout_per_ki_token, hicache_storage_pass_prefix_keys, fault_config)
         """
         # Parse extra config JSON if provided
         extra_config = {}
@@ -543,6 +557,10 @@ class HiRadixCache(RadixCache):
             except Exception as e:
                 logger.error(f"Invalid backend extra config JSON: {e}")
                 raise e
+
+        fault_config = extra_config.pop("fault_tolerance", None)
+        if fault_config is not None and not isinstance(fault_config, dict):
+            raise ValueError("fault_tolerance must be a dict if provided.")
 
         prefetch_threshold = extra_config.pop("prefetch_threshold", 256)  # tokens
         prefetch_timeout_base = extra_config.pop("prefetch_timeout_base", 1)  # seconds
@@ -577,6 +595,7 @@ class HiRadixCache(RadixCache):
             float(prefetch_timeout_base),
             float(prefetch_timeout_per_ki_token),
             hicache_storage_pass_prefix_keys,
+            fault_config,
         )
 
     def reset(self):
