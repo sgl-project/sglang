@@ -106,9 +106,8 @@ dev = ["sglang[test]"]
   "srt/mem_cache/cpp_radix_tree/*.h",
   "srt/speculative/cpp_ngram/*.cpp",
   "srt/speculative/cpp_ngram/*.h",
-  "jit_kernel/include/sgl_kernel/*.h",
-  "jit_kernel/include/sgl_kernel/*.cuh",
-  "jit_kernel/csrc/*.cuh"
+  "jit_kernel/include/sgl_kernel/**/*",
+  "jit_kernel/csrc/**/*"
 ]
 
 [tool.setuptools.packages.find]
