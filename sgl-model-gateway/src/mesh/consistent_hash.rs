@@ -64,30 +64,26 @@ impl ConsistentHashRing {
         }
 
         let key_hash = Self::hash(key);
-        let mut owners = Vec::new();
-        let mut seen_nodes = HashSet::new();
+        let mut owners = Vec::with_capacity(NUM_OWNERS);
         let total_unique_nodes = self.node_hashes.len();
 
-        // Find the first node >= key_hash (clockwise)
         let mut iter = self.ring.range(key_hash..);
-        while owners.len() < NUM_OWNERS && seen_nodes.len() < total_unique_nodes {
+
+        while owners.len() < NUM_OWNERS && owners.len() < total_unique_nodes {
             if let Some((_, node)) = iter.next() {
-                if !seen_nodes.contains(node) {
-                    owners.push(node.clone());
-                    seen_nodes.insert(node.clone());
+                if !owners.contains(&node.as_str()) {
+                    owners.push(node.as_str());
                 }
             } else {
-                // Wrap around to the beginning
                 iter = self.ring.range(..);
             }
         }
-
         owners
     }
 
     /// Check if a node is an owner of a key
     pub fn is_owner(&self, key: &str, node_name: &str) -> bool {
-        self.get_owners(key).contains(&node_name.to_string())
+        self.get_owners(key).contains(&node_name)
     }
 
     /// Get all nodes in the ring
