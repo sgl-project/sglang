@@ -65,13 +65,15 @@ jobs:
         id: parse
         run: |
           # Parse pr-test-amd.yml and extract job names (exclude utility jobs)
+          # Excluded: call-gate, check-changes, pr-test-amd-finish, cancel, check-all-jobs
           pr_jobs=$(yq -r '.jobs | keys | .[]' .github/workflows/pr-test-amd.yml | \
-            grep -v -E '^(cancel|check-all-jobs)$' | \
+            grep -v -E '^(call-gate|check-changes|pr-test-amd-finish|cancel|check-all-jobs)$' | \
             jq -R -s -c 'split("\n") | map(select(length > 0))')
           echo "pr_jobs=$pr_jobs" >> $GITHUB_OUTPUT
           echo "PR jobs: $pr_jobs"
 
           # Parse nightly-test-amd.yml and extract job names (exclude utility jobs)
+          # Excluded: check-all-jobs
           nightly_jobs=$(yq -r '.jobs | keys | .[]' .github/workflows/nightly-test-amd.yml | \
             grep -v -E '^(check-all-jobs)$' | \
             jq -R -s -c 'split("\n") | map(select(length > 0))')
