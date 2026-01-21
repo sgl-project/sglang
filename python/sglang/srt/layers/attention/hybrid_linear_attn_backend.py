@@ -1298,7 +1298,7 @@ class HybridLinearAttnBackend(AttentionBackend):
         b: Optional[torch.Tensor] = None,  # For GDN linear attention
         **kwargs,
     ):
-        layer_id = layer.layer_id
+        layer_id = layer.layer_id if layer else kwargs["layer_id"]
         is_linear_attn = layer_id not in self.full_attn_layers
 
         if forward_batch.forward_mode.is_idle():
