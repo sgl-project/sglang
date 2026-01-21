@@ -233,8 +233,9 @@ class ModelSlimW4A8Int8MoE(ModelSlimMoEMethod):
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: "MoeRunnerConfig"
-    ):
-        self.moe_runner_config = moe_runner_config
+    ):  
+        moe_runner_config.quantization = "ModelSlimW4A8Int8MoE"
+        self.kernel.create_moe_runner(layer, moe_runner_config)
 
     def apply(
         self,
