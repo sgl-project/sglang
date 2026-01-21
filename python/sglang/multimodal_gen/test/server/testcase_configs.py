@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
 
 
@@ -148,6 +149,7 @@ class DiffusionServerArgs:
     tp_size: int | None = None
     ulysses_degree: int | None = None
     ring_degree: int | None = None
+    cfg_parallel: bool | None = None
     # LoRA
     lora_path: str | None = (
         None  # LoRA adapter path (HF repo or local path, loaded at startup)
@@ -163,6 +165,7 @@ class DiffusionServerArgs:
 
     dit_layerwise_offload: bool = False
     enable_cache_dit: bool = False
+    text_encoder_cpu_offload: bool = False
 
 
 @dataclass(frozen=True)
@@ -187,6 +190,9 @@ class DiffusionSamplingParams:
     output_format: str | None = None  # "png", "jpeg", "mp4", etc.
 
     num_outputs_per_prompt: int = 1
+
+    # TeaCache acceleration
+    enable_teacache: bool = False
 
 
 @dataclass(frozen=True)
@@ -300,6 +306,15 @@ TI2V_sampling_params = DiffusionSamplingParams(
     direct_url_test=True,
 )
 
+TURBOWAN_I2V_sampling_params = DiffusionSamplingParams(
+    prompt="The man in the picture slowly turns his head, his expression enigmatic and otherworldly. The camera performs a slow, cinematic dolly out, focusing on his face. Moody lighting, neon signs glowing in the background, shallow depth of field.",
+    image_path="https://is1-ssl.mzstatic.com/image/thumb/Music114/v4/5f/fa/56/5ffa56c2-ea1f-7a17-6bad-192ff9b6476d/825646124206.jpg/600x600bb.jpg",
+    direct_url_test=True,
+    output_size="960x960",
+    num_frames=4,
+    fps=4,
+)
+
 # All test cases with clean default values
 # To test different models, simply add more DiffusionCase entries
 ONE_GPU_CASES_A: list[DiffusionTestCase] = [
@@ -333,6 +348,14 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
         "flux_2_image_t2i",
         DiffusionServerArgs(
             model_path="black-forest-labs/FLUX.2-dev",
+            modality="image",
+        ),
+        T2I_sampling_params,
+    ),
+    DiffusionTestCase(
+        "flux_2_klein_image_t2i",
+        DiffusionServerArgs(
+            model_path="black-forest-labs/FLUX.2-klein-4B",
             modality="image",
         ),
         T2I_sampling_params,
@@ -424,6 +447,33 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
             prompt=T2V_PROMPT,
         ),
     ),
+    DiffusionTestCase(
+        "wan2_1_t2v_1.3b_text_encoder_cpu_offload",
+        DiffusionServerArgs(
+            model_path="Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+            modality="video",
+            warmup=0,
+            custom_validator="video",
+            text_encoder_cpu_offload=True,
+        ),
+        DiffusionSamplingParams(
+            prompt=T2V_PROMPT,
+        ),
+    ),
+    # TeaCache acceleration test for Wan video model
+    DiffusionTestCase(
+        "wan2_1_t2v_1.3b_teacache_enabled",
+        DiffusionServerArgs(
+            model_path="Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+            modality="video",
+            warmup=0,
+            custom_validator="video",
+        ),
+        DiffusionSamplingParams(
+            prompt=T2V_PROMPT,
+            enable_teacache=True,
+        ),
+    ),
     # LoRA test case for single transformer + merge/unmerge API test
     # Note: Uses dynamic_lora_path instead of lora_path to test LayerwiseOffload + set_lora interaction
     # Server starts WITHOUT LoRA, then set_lora is called after startup (Wan models auto-enable layerwise offload)
@@ -496,6 +546,23 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
     ),
 ]
 
+# Skip turbowan because Triton requires 81920 shared memory, but AMD only has 65536.
+if not current_platform.is_hip():
+    ONE_GPU_CASES_B.append(
+        DiffusionTestCase(
+            "turbo_wan2_1_t2v_1.3b",
+            DiffusionServerArgs(
+                model_path="IPostYellow/TurboWan2.1-T2V-1.3B-Diffusers",
+                modality="video",
+                warmup=0,
+                custom_validator="video",
+            ),
+            DiffusionSamplingParams(
+                prompt=T2V_PROMPT,
+            ),
+        )
+    )
+
 TWO_GPU_CASES_A = [
     DiffusionTestCase(
         "wan2_2_i2v_a14b_2gpu",
@@ -549,7 +616,38 @@ TWO_GPU_CASES_A = [
             output_size="832x480",
         ),
     ),
+    DiffusionTestCase(
+        "wan2_1_t2v_1.3b_cfg_parallel",
+        DiffusionServerArgs(
+            model_path="Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+            modality="video",
+            warmup=0,
+            custom_validator="video",
+            num_gpus=2,
+            cfg_parallel=True,
+        ),
+        DiffusionSamplingParams(
+            prompt=T2V_PROMPT,
+        ),
+    ),
 ]
+
+# Skip turbowan because Triton requires 81920 shared memory, but AMD only has 65536.
+if not current_platform.is_hip():
+    TWO_GPU_CASES_A.append(
+        DiffusionTestCase(
+            "turbo_wan2_2_i2v_a14b_2gpu",
+            DiffusionServerArgs(
+                model_path="IPostYellow/TurboWan2.2-I2V-A14B-Diffusers",
+                modality="video",
+                warmup=0,
+                custom_validator="video",
+                num_gpus=2,
+                tp_size=2,
+            ),
+            TURBOWAN_I2V_sampling_params,
+        )
+    )
 
 TWO_GPU_CASES_B = [
     DiffusionTestCase(
