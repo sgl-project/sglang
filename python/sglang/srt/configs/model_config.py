@@ -804,8 +804,12 @@ class ModelConfig:
         # Parse quantization method from the HF and ModelSlim model config, if available.
         # Only one function should return config, other should return None.
         cfg_list = []
-        cfg_list.append(self._parse_quant_hf_config())
-        cfg_list.append(self._find_quant_modelslim_config())
+        hf_config = self._parse_quant_hf_config()
+        modelslim_config = self._find_quant_modelslim_config()
+        if modelslim_config is None:
+            cfg_list.append(hf_config)
+        else:
+            cfg_list.append(modelslim_config)
 
         # Filter out None values
         cfg_list = [item for item in cfg_list if item is not None]
