@@ -419,13 +419,20 @@ class Fp8LinearMethod(LinearMethodBase):
 
             # If checkpoint not serialized fp8, quantize the weights.
             if not self.is_checkpoint_fp8_serialized:
-                if self.cutlass_fp8_supported or self.use_marlin:
+                if (
+                    self.cutlass_fp8_supported
+                    or self.use_marlin
+                    or (_use_aiter and self.use_aiter_fp8_per_token)
+                ):
                     # apply per-channel quantization default as
                     # cutlass sgl-kernel and marlin only support per-channel scale
                     qweight, weight_scale = per_token_group_quant_fp8(
                         layer.weight, layer.weight.shape[-1]
                     )
                     weight_scale = weight_scale.t().contiguous()
+                    if _use_aiter and self.use_aiter_fp8_per_token:
+                        self.use_per_token_if_dynamic = True
+                        qweight = shuffle_weight(qweight.contiguous(), (16, 16))
                 else:
                     # per-tensor quantization
                     qweight, weight_scale = input_to_float8(layer.weight)
