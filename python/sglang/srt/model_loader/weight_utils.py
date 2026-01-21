@@ -229,7 +229,6 @@ def get_quant_config(
     # If the quantization config is not found, use the default config.
     if not possible_config_filenames:
         if model_config.quantization == "mxfp8":
-            print("@@@ Using MXFP8 config")
             return Fp8Config(use_mxfp8=True, is_checkpoint_fp8_serialized=False)
         return quant_cls()
 

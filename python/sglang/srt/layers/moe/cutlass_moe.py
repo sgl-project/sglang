@@ -115,10 +115,14 @@ def cutlass_fused_experts_fp8(
     """
     assert use_fp8_blockscale, "Only support fp8 blockscale for now"
     assert topk_weights.shape == topk_ids.shape, "topk shape mismatch"
+    assert w1_q.dtype == torch.float8_e4m3fn
+    assert w2_q.dtype == torch.float8_e4m3fn
     assert a.shape[1] == w1_q.shape[1], "Hidden size mismatch w1"
     assert w1_q.shape[2] == w2_q.shape[1] * 2, "Hidden size mismatch w2"
     assert w1_q.shape[0] == w2_q.shape[0], "Expert number mismatch"
     assert w1_q.shape[0] == w2_q.shape[0], "Weights expert number mismatch"
+    assert w1_q.shape[0] == w1_scale.shape[0], "w1 scales expert number mismatch"
+    assert w1_q.shape[0] == w2_scale.shape[0], "w2 scales expert number mismatch"
     assert a.dtype in [torch.half, torch.bfloat16], "Invalid output dtype"
 
     if is_cuda:
@@ -143,9 +147,6 @@ def cutlass_fused_experts_fp8(
         assert is_sm100_supported(), "MXFP8 requires SM100"
         assert k % 32 == 0, "MXFP8 requires hidden size to be divisible by 32"
         assert n % 32 == 0, "MXFP8 requires intermediate size to be divisible by 32"
-
-        assert w1_q.dtype == torch.float8_e4m3fn
-        assert w2_q.dtype == torch.float8_e4m3fn
         assert w1_scale.dtype == torch.uint8, "MXFP8 w1_scale must be uint8"
         assert w2_scale.dtype == torch.uint8, "MXFP8 w2_scale must be uint8"
         expected_w1_scale_shape = (
@@ -164,11 +165,6 @@ def cutlass_fused_experts_fp8(
         assert (
             w2_scale.shape == expected_w2_scale_shape
         ), f"MXFP8 w2_scale must be {expected_w2_scale_shape}, got {w2_scale.shape}"
-    else:
-        assert w1_q.dtype == torch.float8_e4m3fn
-        assert w2_q.dtype == torch.float8_e4m3fn
-        assert w1_q.shape[0] == w1_scale.shape[0], "w1 scales expert number mismatch"
-        assert w1_q.shape[0] == w2_scale.shape[0], "w2 scales expert number mismatch"
 
     blockscale_offsets = None
     if use_mxfp8 and (es_up or es_down):
