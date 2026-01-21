@@ -36,6 +36,7 @@ endif()
 
 # ROCm/HIP
 enable_language(HIP)
+list(APPEND CMAKE_PREFIX_PATH "/opt/rocm/lib/cmake/hip-lang")
 find_package(hip REQUIRED CONFIG)
 
 # Determine AMDGPU target from environment variable or default to gfx942
