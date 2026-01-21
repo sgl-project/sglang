@@ -333,7 +333,7 @@ class LRUList:
 
 
 class SWARadixCache(BasePrefixCache):
-    def __init__(self, params: CacheInitParams, sliding_window_size: int):
+    def __init__(self, params: CacheInitParams):
         assert isinstance(params.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator)
         self.req_to_token_pool = params.req_to_token_pool
         self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator
@@ -361,7 +361,7 @@ class SWARadixCache(BasePrefixCache):
         if params.enable_metrics:
             self.init_metrics_collector()
 
-        self.sliding_window_size = sliding_window_size
+        self.sliding_window_size = params.sliding_window_size
         self.reset()
 
     ##### Public API #####
