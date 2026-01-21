@@ -469,6 +469,10 @@ def format_markdown(
     # Summary table
     lines.append("## Summary by Job Name")
     lines.append("")
+    lines.append(
+        "> **Status meanings:** Running = executing, Queued = waiting for runner, Waiting = waiting for dependent jobs, Stuck = ghost job"
+    )
+    lines.append("")
     lines.append("| Job Name | Running | Queued | Waiting | Stuck | Completed |")
     lines.append("|----------|---------|--------|---------|-------|-----------|")
 
@@ -494,21 +498,27 @@ def format_markdown(
     if active_jobs:
         lines.append("## Active Jobs")
         lines.append("")
-        lines.append("| Status | Job Name | Queue | PR/Branch | Runner | Link |")
-        lines.append("|--------|----------|-------|-----------|--------|------|")
+        lines.append(
+            "| Status | Job Name | Created | Started | Queue | PR/Branch | Runner | Link |"
+        )
+        lines.append(
+            "|--------|----------|---------|---------|-------|-----------|--------|------|"
+        )
 
         for r in sorted(
             active_jobs, key=lambda x: (x["status"], x["created_at"]), reverse=True
         ):
             status = r["status"]
             job_name = r["job_name"]
+            created = format_time(r["created_at"])
+            started = format_time(r["started_at"])
             queue_time = calculate_queue_time(r["created_at"], r["started_at"])
             pr_info = f"PR#{r['pr_number']}" if r["pr_number"] else r["branch"]
             runner = r["runner_name"] or "-"
             url = f"https://github.com/{repo}/actions/runs/{r['run_id']}"
 
             lines.append(
-                f"| {status} | `{job_name}` | {queue_time} | {pr_info} | `{runner}` | [View]({url}) |"
+                f"| {status} | `{job_name}` | {created} | {started} | {queue_time} | {pr_info} | `{runner}` | [View]({url}) |"
             )
 
         lines.append("")
@@ -543,8 +553,39 @@ def format_markdown(
 
         lines.append("")
 
-    # Detailed table (all jobs)
-    lines.append(f"## All Jobs ({len(results)} total)")
+    # Failed jobs section (before All Jobs)
+    failed_jobs = [r for r in results if r["conclusion"] == "failure"]
+    if failed_jobs:
+        lines.append(f"## Failed Jobs ({len(failed_jobs)} total)")
+        lines.append("")
+        lines.append(
+            "| Job Name | Created | Started | Queue | Duration | Runner | PR/Branch | Link |"
+        )
+        lines.append(
+            "|----------|---------|---------|-------|----------|--------|-----------|------|"
+        )
+
+        for r in sorted(failed_jobs, key=lambda x: x["created_at"], reverse=True):
+            job_name = r["job_name"]
+            created = format_time(r["created_at"])
+            started = format_time(r["started_at"])
+            queue_time = calculate_queue_time(r["created_at"], r["started_at"])
+            duration = calculate_duration(r["started_at"], r["completed_at"])
+            runner = r["runner_name"] or "-"
+            pr_info = f"PR#{r['pr_number']}" if r["pr_number"] else r["branch"]
+            url = f"https://github.com/{repo}/actions/runs/{r['run_id']}"
+
+            lines.append(
+                f"| `{job_name}` | {created} | {started} | {queue_time} | {duration} | `{runner}` | {pr_info} | [View]({url}) |"
+            )
+
+        lines.append("")
+
+    # Detailed table (all jobs) - collapsible
+    lines.append("<details>")
+    lines.append(
+        f"<summary><strong>All Jobs ({len(results)} total)</strong> - Click to expand</summary>"
+    )
     lines.append("")
     lines.append(
         "| Job Name | Status | Conclusion | Created | Started | Queue | Duration | Runner | PR/Branch | Link |"
@@ -582,28 +623,8 @@ def format_markdown(
         )
 
     lines.append("")
-
-    # Failed jobs section
-    failed_jobs = [r for r in results if r["conclusion"] == "failure"]
-    if failed_jobs:
-        lines.append(f"## Failed Jobs ({len(failed_jobs)} total)")
-        lines.append("")
-        lines.append("| Job Name | Created | Duration | Runner | PR/Branch | Link |")
-        lines.append("|----------|---------|----------|--------|-----------|------|")
-
-        for r in sorted(failed_jobs, key=lambda x: x["created_at"], reverse=True):
-            job_name = r["job_name"]
-            created = format_time(r["created_at"])
-            duration = calculate_duration(r["started_at"], r["completed_at"])
-            runner = r["runner_name"] or "-"
-            pr_info = f"PR#{r['pr_number']}" if r["pr_number"] else r["branch"]
-            url = f"https://github.com/{repo}/actions/runs/{r['run_id']}"
-
-            lines.append(
-                f"| `{job_name}` | {created} | {duration} | `{runner}` | {pr_info} | [View]({url}) |"
-            )
-
-        lines.append("")
+    lines.append("</details>")
+    lines.append("")
 
     return "\n".join(lines)
 
