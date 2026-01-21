@@ -910,7 +910,9 @@ def _is_blocked_ip(ip: ipaddress._BaseAddress) -> bool:
     )
 
 
-def _validate_media_url_with_policy(url: str, policy: dict[str, Any]) -> None:
+def _validate_media_url_with_policy_and_resolve(
+    url: str, policy: dict[str, Any]
+) -> set[ipaddress._BaseAddress]:
     parsed = urlparse(url)
     scheme = (parsed.scheme or "").lower()
     hostname = (parsed.hostname or "").lower()
@@ -926,13 +928,18 @@ def _validate_media_url_with_policy(url: str, policy: dict[str, Any]) -> None:
     if not ips:
         raise ValueError("Failed to resolve URL host")
     if hostname in policy["allow_hosts"]:
-        return
+        return set(ips)
     for ip in ips:
         if any(ip in net for net in policy["allow_nets"]):
-            return
+            return set(ips)
     for ip in ips:
         if _is_blocked_ip(ip):
             raise ValueError("URL resolves to a private or reserved IP")
+    return set(ips)
+
+
+def _validate_media_url_with_policy(url: str, policy: dict[str, Any]) -> None:
+    _validate_media_url_with_policy_and_resolve(url, policy)
 
 
 def _get_vlm_media_url_policy(default_timeout: float) -> dict[str, Any]:
@@ -968,6 +975,41 @@ def validate_vlm_media_url(url: str, default_timeout: float) -> dict[str, Any]:
         raise ValueError("Remote media URL fetching is disabled by configuration")
     _validate_media_url_with_policy(url, policy)
     return policy
+
+
+def validate_vlm_media_url_with_policy(
+    url: str, policy: dict[str, Any]
+) -> set[ipaddress._BaseAddress]:
+    return _validate_media_url_with_policy_and_resolve(url, policy)
+
+
+def validate_vlm_media_url_and_get_ips(
+    url: str, default_timeout: float
+) -> tuple[dict[str, Any], set[ipaddress._BaseAddress]]:
+    policy = _get_vlm_media_url_policy(default_timeout)
+    if not policy["enabled"]:
+        raise ValueError("Remote media URL fetching is disabled by configuration")
+    allowed_ips = _validate_media_url_with_policy_and_resolve(url, policy)
+    return policy, allowed_ips
+
+
+def validate_vlm_media_url_peer_ip(
+    peername: Any, allowed_ips: set[ipaddress._BaseAddress]
+) -> None:
+    if not peername:
+        raise ValueError("Failed to determine peer IP for media URL fetch")
+    if isinstance(peername, (list, tuple)):
+        peer_ip = str(peername[0]) if peername else ""
+    else:
+        peer_ip = str(peername)
+    if not peer_ip:
+        raise ValueError("Failed to determine peer IP for media URL fetch")
+    try:
+        ip_obj = ipaddress.ip_address(peer_ip)
+    except ValueError as exc:
+        raise ValueError("Failed to parse peer IP for media URL fetch") from exc
+    if ip_obj not in allowed_ips:
+        raise ValueError("Media URL fetch peer IP is not in the validated set")
 
 
 def _requests_get_with_policy(url: str, policy: dict[str, Any]) -> requests.Response:

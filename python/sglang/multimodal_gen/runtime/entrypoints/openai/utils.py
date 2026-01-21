@@ -5,9 +5,15 @@ import os
 import re
 import time
 from typing import Any, List, Optional, Union
+from urllib.parse import urljoin
 
 import httpx
 from fastapi import UploadFile
+from sglang.srt.utils.common import (
+    validate_vlm_media_url_and_get_ips,
+    validate_vlm_media_url_peer_ip,
+    validate_vlm_media_url_with_policy,
+)
 
 from sglang.multimodal_gen.configs.sample.sampling_params import DataType
 from sglang.multimodal_gen.runtime.entrypoints.utils import post_process_sample
@@ -121,9 +127,14 @@ async def _save_url_image_to_path(image_url: str, target_path: str) -> str:
     os.makedirs(os.path.dirname(target_path), exist_ok=True)
 
     try:
-        async with httpx.AsyncClient(follow_redirects=True) as client:
-            response = await client.get(image_url, timeout=10.0)
-            response.raise_for_status()
+        default_timeout = float(os.getenv("REQUEST_TIMEOUT", "10"))
+        policy, allowed_ips = validate_vlm_media_url_and_get_ips(
+            image_url, default_timeout
+        )
+        async with httpx.AsyncClient(follow_redirects=False) as client:
+            response = await _fetch_url_with_policy(
+                client, image_url, policy, allowed_ips
+            )
 
             # Determine file extension from content type or URL after downloading
             if not os.path.splitext(target_path)[1]:
@@ -155,10 +166,49 @@ async def _save_url_image_to_path(image_url: str, target_path: str) -> str:
 
             with open(target_path, "wb") as f:
                 f.write(response.content)
-
             return target_path
     except Exception as e:
         raise Exception(f"Failed to download image from URL: {str(e)}")
+    finally:
+        if "response" in locals():
+            await response.aclose()
+
+
+def _response_peername(response: httpx.Response) -> Any:
+    network_stream = response.extensions.get("network_stream")
+    if not network_stream or not hasattr(network_stream, "get_extra_info"):
+        raise ValueError("Failed to determine peer IP for media URL fetch")
+    return network_stream.get_extra_info("peername")
+
+
+async def _fetch_url_with_policy(
+    client: httpx.AsyncClient,
+    image_url: str,
+    policy: dict[str, Any],
+    initial_allowed_ips: Optional[set] = None,
+) -> httpx.Response:
+    current_url = image_url
+    allowed_ips = initial_allowed_ips
+    for _ in range(policy["max_redirects"] + 1):
+        if allowed_ips is None:
+            allowed_ips = validate_vlm_media_url_with_policy(current_url, policy)
+        response = await client.get(
+            current_url,
+            timeout=policy["timeout"],
+            follow_redirects=False,
+        )
+        validate_vlm_media_url_peer_ip(_response_peername(response), allowed_ips)
+        if response.status_code in {301, 302, 303, 307, 308}:
+            location = response.headers.get("location")
+            await response.aclose()
+            if not location:
+                raise ValueError("Redirect response missing location header")
+            current_url = urljoin(current_url, location)
+            allowed_ips = None
+            continue
+        response.raise_for_status()
+        return response
+    raise ValueError("Too many redirects when fetching media URL")
 
 
 async def _save_base64_image_to_path(base64_data: str, target_path: str) -> str:
