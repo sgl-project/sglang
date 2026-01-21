@@ -54,6 +54,52 @@ python3 -m sglang.launch_server \
     --kv-cache-dtype fp4_e2m1 \
 ```
 
+### Heterogeneous KV Cache (Per-Layer Dtype)
+
+You can assign different KV cache dtypes to different transformer layers. This is useful when you want
+to mix precision (for example, keep some layers in BF16 while using FP8 or FP4 elsewhere).
+
+#### CLI (Direct Argument)
+
+Use the `--kv-cache-per-layer-dtype` argument with a layer range mapping:
+
+```bash
+python3 -m sglang.launch_server \
+    --model-path Qwen/Qwen3-32B \
+    --kv-cache-dtype bf16 \
+    --kv-cache-per-layer-dtype "0-1:bf16,62-63:bf16"
+```
+
+The format is a comma-separated list of `layer_range:dtype` items:
+- `layer_range` can be a single layer (e.g., `7`) or a range (e.g., `0-3`)
+- `dtype` can be `bf16`, `fp8_e4m3`, `fp8_e5m2`, `fp4_e2m1`, or `auto`
+
+Layers not listed in the mapping use the default `--kv-cache-dtype`.
+
+#### CLI (YAML File)
+
+You can also pass a YAML file path:
+
+```bash
+python3 -m sglang.launch_server \
+    --model-path Qwen/Qwen3-32B \
+    --kv-cache-dtype fp4_e2m1 \
+    --kv-cache-per-layer-dtype per_layer_kv_cache.yaml
+```
+
+
+Example YAML:
+
+```yaml
+# Key: Transformer layer index (int)
+# Value: dtype string, or "auto" to explicitly use the default.
+kv_cache_per_layer_dtype:
+  0: bf16
+  1: bf16
+  62: bf16
+  63: bf16
+```
+
 ### Scaling Factors
 
 FP8 quantization requires scaling factors to properly quantize and dequantize the KV cache.

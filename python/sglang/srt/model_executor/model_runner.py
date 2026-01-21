@@ -13,6 +13,7 @@
 # ==============================================================================
 """ModelRunner runs the forward passes of the models."""
 
+import ast
 import datetime
 import gc
 import inspect
@@ -24,7 +25,7 @@ import threading
 import time
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Callable, List, Optional, Tuple, Union
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -550,6 +551,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # Deduce KV cache dtype
         self.configure_kv_cache_dtype()
+        self.configure_per_layer_kv_cache_dtype()
 
         # Init memory pool and attention backends
         self.init_memory_pool(min_per_gpu_memory)
@@ -1582,7 +1584,164 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 f"Unsupported kv_cache_dtype: {self.server_args.kv_cache_dtype}."
             )
 
-        log_info_on_rank0(logger, f"Using KV cache dtype: {self.kv_cache_dtype}")
+        # Log default dtype - if per-layer config exists, heterogeneous logging will happen in configure_per_layer_kv_cache_dtype()
+        if self.server_args.kv_cache_per_layer_dtype is None:
+            log_info_on_rank0(logger, f"Using KV cache dtype: {self.kv_cache_dtype}")
+        else:
+            # Per-layer config exists - will log detailed heterogeneous info after configure_per_layer_kv_cache_dtype()
+            log_info_on_rank0(
+                logger,
+                f"Using heterogeneous KV cache dtype per layer (default: {self.kv_cache_dtype})",
+            )
+
+    def _resolve_kv_cache_dtype_str(self, dtype_str: str) -> torch.dtype:
+        dtype_str = dtype_str.strip().lower()
+        if dtype_str == "auto":
+            return self.kv_cache_dtype
+        if dtype_str in ("bf16", "bfloat16"):
+            return torch.bfloat16
+        if dtype_str == "fp8_e5m2":
+            return fp8_dtype if _is_hip else torch.float8_e5m2
+        if dtype_str == "fp8_e4m3":
+            return fp8_dtype if _is_hip else torch.float8_e4m3fn
+        if dtype_str == "fp4_e2m1":
+            if hasattr(torch, "float4_e2m1fn_x2"):
+                return torch.float4_e2m1fn_x2
+            logger.warning(
+                "Per-layer kv-cache dtype 'fp4_e2m1' is not supported by this torch "
+                "version. Falling back to default kv cache dtype."
+            )
+            return self.kv_cache_dtype
+        raise ValueError(f"Unsupported kv-cache dtype: {dtype_str}.")
+
+    def _parse_kv_cache_per_layer_dtype_spec(
+        self, spec: Union[str, Dict[int, str], Dict[str, str], None]
+    ) -> Dict[int, str]:
+        if spec is None:
+            return {}
+        if isinstance(spec, dict):
+            raw_map = spec
+        elif isinstance(spec, str):
+            spec = spec.strip()
+            if not spec:
+                return {}
+
+            # Check if it's a YAML file path
+            if spec.endswith((".yaml", ".yml")):
+                import os
+
+                if not os.path.exists(spec):
+                    raise ValueError(f"YAML config file not found: {spec}")
+                try:
+                    import yaml
+                except ImportError:
+                    raise ImportError(
+                        "Please install PyYAML to use YAML config files. "
+                        "`pip install pyyaml`"
+                    )
+                try:
+                    with open(spec, "r") as f:
+                        raw_map = yaml.safe_load(f)
+                except Exception as e:
+                    raise ValueError(
+                        f"Failed to load YAML config file {spec}: {e}"
+                    ) from e
+                # Support YAML files that wrap the mapping in a named key
+                if isinstance(raw_map, dict) and "kv_cache_per_layer_dtype" in raw_map:
+                    raw_map = raw_map["kv_cache_per_layer_dtype"]
+                if not isinstance(raw_map, dict):
+                    raise ValueError(
+                        f"YAML config file {spec} must contain a dictionary at root level"
+                    )
+            else:
+                # Try parsing as JSON/YAML dict string, then fall back to direct format
+                raw_map = None
+                try:
+                    raw_map = json.loads(spec)
+                except Exception:
+                    try:
+                        raw_map = ast.literal_eval(spec)
+                    except Exception:
+                        raw_map = None
+
+                if isinstance(raw_map, dict):
+                    pass
+                else:
+                    # Parse direct format: "0-1:bf16,14-15:bf16"
+                    raw_map = {}
+                    for part in spec.split(","):
+                        part = part.strip()
+                        if not part:
+                            continue
+                        if ":" not in part:
+                            raise ValueError(
+                                f"Invalid kv-cache-per-layer-dtype segment '{part}'."
+                            )
+                        range_part, dtype_part = part.split(":", 1)
+                        dtype_part = dtype_part.strip()
+                        if "-" in range_part:
+                            start_str, end_str = range_part.split("-", 1)
+                            start = int(start_str.strip())
+                            end = int(end_str.strip())
+                        else:
+                            start = end = int(range_part.strip())
+                        if start > end:
+                            raise ValueError(
+                                f"Invalid kv-cache-per-layer-dtype range '{range_part}'."
+                            )
+                        for layer_id in range(start, end + 1):
+                            raw_map[layer_id] = dtype_part
+        else:
+            raise ValueError(
+                f"kv-cache-per-layer-dtype must be a string or dict, got: {type(spec)}."
+            )
+
+        parsed: Dict[int, str] = {}
+        for key, value in raw_map.items():
+            try:
+                layer_id = int(key)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"Invalid layer id in kv-cache-per-layer-dtype: {key}."
+                ) from exc
+            parsed[layer_id] = value
+        return parsed
+
+    def configure_per_layer_kv_cache_dtype(self):
+        spec = self.server_args.kv_cache_per_layer_dtype
+        if spec is None:
+            self.per_layer_kv_cache_dtypes = None
+            return
+
+        raw_map = self._parse_kv_cache_per_layer_dtype_spec(spec)
+        if not raw_map:
+            self.per_layer_kv_cache_dtypes = None
+            return
+
+        num_hidden_layers = self.model_config.num_hidden_layers
+        for layer_id in raw_map.keys():
+            if layer_id < 0 or layer_id >= num_hidden_layers:
+                raise ValueError(
+                    f"kv-cache-per-layer-dtype layer_id {layer_id} is out of range "
+                    f"[0, {num_hidden_layers})."
+                )
+
+        resolved: Dict[int, torch.dtype] = {}
+        for layer_id in range(self.start_layer, self.end_layer + 1):
+            if layer_id in raw_map:
+                value = raw_map[layer_id]
+                if isinstance(value, torch.dtype):
+                    resolved[layer_id] = value
+                elif isinstance(value, str):
+                    resolved[layer_id] = self._resolve_kv_cache_dtype_str(value)
+                else:
+                    raise ValueError(
+                        f"Invalid dtype value for layer {layer_id}: {value}."
+                    )
+            else:
+                resolved[layer_id] = self.kv_cache_dtype
+
+        self.per_layer_kv_cache_dtypes = resolved
 
     def init_cublas(self):
         """We need to run a small matmul to init cublas. Otherwise, it will raise some errors later."""

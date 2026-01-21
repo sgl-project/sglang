@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Dict, Optional
 
 import torch
 
@@ -18,8 +18,10 @@ from sglang.srt.mem_cache.memory_pool import (
     HybridReqToTokenPool,
     MHATokenToKVPool,
     MHATokenToKVPoolFP4,
+    MHATokenToKVPoolMixedPrecision,
     MLATokenToKVPool,
     MLATokenToKVPoolFP4,
+    MLATokenToKVPoolMixedPrecision,
     NSATokenToKVPool,
     ReqToTokenPool,
 )
@@ -44,7 +46,100 @@ _is_npu = is_npu()
 
 
 class ModelRunnerKVCacheMixin:
-    def get_cell_size_per_token(self: ModelRunner, num_layers: int) -> int:
+    def _calculate_single_layer_cell_size(
+        self: ModelRunner, layer_id: int, layer_dtype: torch.dtype
+    ) -> int:
+        """Calculate cell size for a single layer with given dtype."""
+        kv_size = torch._utils._element_size(layer_dtype)
+
+        if self.use_mla_backend:
+            cell_size = (
+                self.model_config.kv_lora_rank + self.model_config.qk_rope_head_dim
+            ) * kv_size
+            if is_float4_e2m1fn_x2(layer_dtype):
+                # kv_scale_buffer for FP4
+                scale_block_size = 16
+                cell_size = (cell_size // 2) + (
+                    (
+                        (
+                            self.model_config.kv_lora_rank
+                            + self.model_config.qk_rope_head_dim
+                        )
+                        // scale_block_size
+                    )
+                    * kv_size
+                )
+
+            # Add indexer KV cache overhead for NSA models (DeepSeek V3.2)
+            if is_deepseek_nsa(self.model_config.hf_config):
+                index_head_dim = get_nsa_index_head_dim(self.model_config.hf_config)
+                indexer_size_per_token = (
+                    index_head_dim
+                    + index_head_dim // NSATokenToKVPool.quant_block_size * 4
+                )
+                element_size = torch._utils._element_size(
+                    NSATokenToKVPool.index_k_with_scale_buffer_dtype
+                )
+                cell_size += indexer_size_per_token * element_size
+        else:
+            # MHA backend
+            cell_size = (
+                self.model_config.get_num_kv_heads(get_attention_tp_size())
+                * (self.model_config.head_dim + self.model_config.v_head_dim)
+                * kv_size
+            )
+
+            if is_float4_e2m1fn_x2(layer_dtype):
+                # kv_scale_buffer for FP4
+                scale_block_size = 16
+                n = self.model_config.get_num_kv_heads(get_attention_tp_size())
+                k = self.model_config.head_dim
+                v_k = self.model_config.v_head_dim
+                # Base KV cache (packed): (n * (k + v_k)) * kv_size // 2
+                # Scale buffers: (n * k) // scale_block_size * kv_size + (n * v_k) // scale_block_size * kv_size
+                cell_size = (cell_size // 2) + (
+                    ((n * k) // scale_block_size + (n * v_k) // scale_block_size)
+                    * kv_size
+                )
+
+            # SWA layers (only for specific architectures)
+            if (
+                "MiMoV2FlashForCausalLM" in self.model_config.hf_config.architectures
+                and layer_id in self.model_config.swa_attention_layer_ids
+            ):
+                cell_size += (
+                    self.model_config.get_swa_num_kv_heads(get_attention_tp_size())
+                    * (
+                        self.model_config.hf_text_config.swa_head_dim
+                        + self.model_config.hf_text_config.swa_v_head_dim
+                    )
+                    * kv_size
+                )
+
+        return cell_size
+
+    def get_cell_size_per_token(
+        self: ModelRunner,
+        num_layers: int,
+        per_layer_dtypes: Optional[Dict[int, torch.dtype]] = None,
+    ) -> int:
+        """Calculate cell size per token.
+
+        If per_layer_dtypes is provided, calculates layer-by-layer since each layer
+        may have different precision. Otherwise, uses homogeneous calculation.
+        """
+        if per_layer_dtypes is not None:
+            # Calculate layer-by-layer for heterogeneous precision
+            cell_size = 0
+            for layer_id in range(self.start_layer, self.start_layer + num_layers):
+                layer_dtype = per_layer_dtypes.get(layer_id, self.kv_cache_dtype)
+                layer_cell_size = self._calculate_single_layer_cell_size(
+                    layer_id, layer_dtype
+                )
+                cell_size += layer_cell_size
+            return cell_size
+
+        # Original homogeneous calculation
         kv_size = torch._utils._element_size(self.kv_cache_dtype)
         if self.use_mla_backend:
             cell_size = (
@@ -128,7 +223,10 @@ class ModelRunnerKVCacheMixin:
         else:
             num_layers = self.num_effective_layers
 
-        cell_size = self.get_cell_size_per_token(num_layers)
+        per_layer_dtypes = getattr(self, "per_layer_kv_cache_dtypes", None)
+        cell_size = self.get_cell_size_per_token(
+            num_layers, per_layer_dtypes=per_layer_dtypes
+        )
 
         rest_memory = available_gpu_memory - total_gpu_memory * (
             1 - self.mem_fraction_static
@@ -443,7 +541,26 @@ class ModelRunnerKVCacheMixin:
             )
         elif self.use_mla_backend and not self.mambaish_config:
             assert not is_nsa_model
-            if is_float4_e2m1fn_x2(self.kv_cache_dtype):
+            use_mixed_precision = False
+            if self.per_layer_kv_cache_dtypes is not None:
+                unique_dtypes = set(self.per_layer_kv_cache_dtypes.values())
+                use_mixed_precision = len(unique_dtypes) > 1
+
+            if use_mixed_precision:
+                self.token_to_kv_pool = MLATokenToKVPoolMixedPrecision(
+                    self.max_total_num_tokens,
+                    page_size=self.page_size,
+                    dtype=self.kv_cache_dtype,
+                    kv_lora_rank=self.model_config.kv_lora_rank,
+                    qk_rope_head_dim=self.model_config.qk_rope_head_dim,
+                    layer_num=self.num_effective_layers,
+                    device=self.device,
+                    enable_memory_saver=self.server_args.enable_memory_saver,
+                    per_layer_dtypes=self.per_layer_kv_cache_dtypes,
+                    start_layer=self.start_layer,
+                    end_layer=self.end_layer,
+                )
+            elif is_float4_e2m1fn_x2(self.kv_cache_dtype):
                 self.token_to_kv_pool = MLATokenToKVPoolFP4(
                     self.max_total_num_tokens,
                     page_size=self.page_size,
@@ -539,7 +656,36 @@ class ModelRunnerKVCacheMixin:
                     **extra_args,
                 )
             else:
-                if is_float4_e2m1fn_x2(self.kv_cache_dtype):
+                # Check if we need heterogeneous pool (multiple dtypes)
+                per_layer_dtypes = getattr(self, "per_layer_kv_cache_dtypes", None)
+                use_heterogeneous = (
+                    per_layer_dtypes is not None
+                    and len(set(per_layer_dtypes.values())) > 1
+                )
+
+                if use_heterogeneous:
+                    # Use mixed precision pool
+                    self.token_to_kv_pool = MHATokenToKVPoolMixedPrecision(
+                        self.max_total_num_tokens,
+                        page_size=self.page_size,
+                        dtype=self.kv_cache_dtype,
+                        head_num=self.model_config.get_num_kv_heads(
+                            get_attention_tp_size()
+                        ),
+                        head_dim=self.model_config.head_dim,
+                        layer_num=self.num_effective_layers,
+                        device=self.device,
+                        enable_memory_saver=self.server_args.enable_memory_saver,
+                        per_layer_dtypes=per_layer_dtypes,
+                        v_head_dim=self.model_config.v_head_dim,
+                        start_layer=self.start_layer,
+                        end_layer=self.end_layer,
+                        enable_alt_stream=not self.server_args.enable_pdmux,
+                        enable_kv_cache_copy=(
+                            self.server_args.speculative_algorithm is not None
+                        ),
+                    )
+                elif is_float4_e2m1fn_x2(self.kv_cache_dtype):
                     self.token_to_kv_pool = MHATokenToKVPoolFP4(
                         self.max_total_num_tokens,
                         page_size=self.page_size,

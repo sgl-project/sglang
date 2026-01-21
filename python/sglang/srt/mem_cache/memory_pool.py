@@ -29,7 +29,7 @@ import dataclasses
 import logging
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -53,6 +53,7 @@ from sglang.srt.mem_cache.utils import (
     set_mla_kv_scale_buffer_triton,
 )
 from sglang.srt.utils import is_cuda, is_hip, is_npu, next_power_of_2
+from sglang.srt.utils.common import log_info_on_rank0
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
@@ -1133,6 +1134,406 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
             self.v_scale_buffer[layer_id - self.start_layer][loc] = cache_v_fp4_sf
 
 
+class MHATokenToKVPoolMixedPrecision(KVCache):
+    """KV cache pool supporting different dtypes per layer.
+
+    This class acts as a manager that groups layers by dtype and creates appropriate sub-pools:
+    - FP4 layers use MHATokenToKVPoolFP4
+    - Other dtypes use MHATokenToKVPool (one pool per unique dtype)
+
+    It maintains a mapping from global layer_id to (pool_index, local_layer_id_in_pool)
+    and routes all KV cache operations to the appropriate sub-pool.
+
+    Note: This class inherits directly from KVCache (not MHATokenToKVPool) since it
+    doesn't allocate its own buffers but instead delegates to sub-pools.
+    """
+
+    def __init__(
+        self,
+        size: int,
+        page_size: int,
+        dtype: torch.dtype,  # Default dtype, used for layers not in per_layer_dtypes
+        head_num: int,
+        head_dim: int,
+        layer_num: int,
+        device: str,
+        enable_memory_saver: bool,
+        per_layer_dtypes: Dict[int, torch.dtype],
+        v_head_dim: Optional[int] = None,
+        swa_head_num: Optional[int] = None,
+        swa_head_dim: Optional[int] = None,
+        swa_v_head_dim: Optional[int] = None,
+        start_layer: Optional[int] = None,
+        end_layer: Optional[int] = None,
+        enable_alt_stream: bool = True,
+        enable_kv_cache_copy: bool = False,
+    ):
+        # This pool acts as a manager and delegates to sub-pools.
+        KVCache.__init__(
+            self,
+            size=size,
+            page_size=page_size,
+            dtype=dtype,
+            layer_num=layer_num,
+            device=device,
+            enable_memory_saver=enable_memory_saver,
+            start_layer=start_layer,
+            end_layer=end_layer,
+        )
+
+        # Set MHA-specific attributes (needed for compatibility but not used for buffer allocation)
+        self.head_num = swa_head_num if swa_head_num is not None else head_num
+        self.head_dim = swa_head_dim if swa_head_dim is not None else head_dim
+        self.v_head_dim = (
+            swa_v_head_dim
+            if swa_v_head_dim is not None
+            else v_head_dim if v_head_dim is not None else head_dim
+        )
+
+        # Store per-layer dtypes
+        self.per_layer_dtypes = per_layer_dtypes
+
+        # Group layers by dtype
+        from sglang.srt.utils.common import is_float4_e2m1fn_x2
+
+        # Build layer groups: {dtype: [layer_ids]}
+        dtype_groups: Dict[torch.dtype, List[int]] = {}
+        for layer_id in range(self.start_layer, self.start_layer + self.layer_num):
+            layer_dtype = per_layer_dtypes.get(layer_id, dtype)
+            if layer_dtype not in dtype_groups:
+                dtype_groups[layer_dtype] = []
+            dtype_groups[layer_dtype].append(layer_id)
+
+        # Create sub-pools and build mapping
+        self.sub_pools: List[KVCache] = []
+        self.layer_to_pool: Dict[int, Tuple[int, int]] = (
+            {}
+        )  # global_layer_id -> (pool_idx, local_layer_id)
+
+        # Temporarily suppress INFO level logging during sub-pool creation
+        # to avoid cluttering logs with individual sub-pool allocation messages
+        original_log_level = logger.level
+        logger.setLevel(logging.ERROR)
+
+        try:
+            for pool_dtype, layer_ids in dtype_groups.items():
+                pool_layer_ids = sorted(layer_ids)
+                pool_layer_num = len(pool_layer_ids)
+
+                # For sub-pools, we use start_layer=0 and map global layer_ids to local indices
+                # The sub-pool will have layers 0..pool_layer_num-1 internally
+                pool_start_layer = 0
+
+                if is_float4_e2m1fn_x2(pool_dtype):
+                    # Use FP4 pool
+                    sub_pool = MHATokenToKVPoolFP4(
+                        size=size,
+                        page_size=page_size,
+                        dtype=pool_dtype,
+                        head_num=head_num,
+                        head_dim=head_dim,
+                        layer_num=pool_layer_num,
+                        device=device,
+                        enable_memory_saver=enable_memory_saver,
+                        v_head_dim=v_head_dim,
+                        swa_head_num=swa_head_num,
+                        swa_head_dim=swa_head_dim,
+                        swa_v_head_dim=swa_v_head_dim,
+                        start_layer=pool_start_layer,
+                        end_layer=pool_layer_num - 1,
+                        enable_alt_stream=enable_alt_stream,
+                        enable_kv_cache_copy=enable_kv_cache_copy,
+                    )
+                else:
+                    # Use regular MHA pool
+                    sub_pool = MHATokenToKVPool(
+                        size=size,
+                        page_size=page_size,
+                        dtype=pool_dtype,
+                        head_num=head_num,
+                        head_dim=head_dim,
+                        layer_num=pool_layer_num,
+                        device=device,
+                        enable_memory_saver=enable_memory_saver,
+                        v_head_dim=v_head_dim,
+                        swa_head_num=swa_head_num,
+                        swa_head_dim=swa_head_dim,
+                        swa_v_head_dim=swa_v_head_dim,
+                        start_layer=pool_start_layer,
+                        end_layer=pool_layer_num - 1,
+                        enable_alt_stream=enable_alt_stream,
+                        enable_kv_cache_copy=enable_kv_cache_copy,
+                    )
+
+                pool_idx = len(self.sub_pools)
+                self.sub_pools.append(sub_pool)
+
+                # Build mapping: for each layer in this pool, map to (pool_idx, local_layer_id)
+                # local_layer_id is the index within the sub-pool (0..pool_layer_num-1)
+                # We also store the mapping from global_layer_id to local_layer_id for routing
+                for local_idx, global_layer_id in enumerate(pool_layer_ids):
+                    self.layer_to_pool[global_layer_id] = (pool_idx, local_idx)
+        finally:
+            # Restore original logging level so mixed precision pool's log appears
+            logger.setLevel(original_log_level)
+
+        # Note: We don't create buffers here since this pool delegates to sub-pools
+        # No need to delete buffers as KVCache.__init__() doesn't create them
+
+        # Log per-layer dtype configuration
+        self._log_per_layer_dtypes()
+
+        # Calculate and log memory usage from sub-pools
+        self._finalize_allocation_log(size)
+
+    def _format_dtype(self, dt: torch.dtype) -> str:
+        """Format dtype name for logging."""
+        if dt == torch.bfloat16:
+            return "bf16"
+        elif dt == torch.float8_e4m3fn:
+            return "fp8_e4m3"
+        elif dt == torch.float8_e5m2:
+            return "fp8_e5m2"
+        elif hasattr(torch, "float4_e2m1fn_x2") and dt == torch.float4_e2m1fn_x2:
+            return "fp4_e2m1"
+        else:
+            return str(dt)
+
+    def _log_per_layer_dtypes(self):
+        """Log per-layer dtype configuration."""
+        # Group layers by dtype for cleaner logging
+        dtype_to_layers: Dict[torch.dtype, List[int]] = {}
+        for layer_id in range(self.start_layer, self.start_layer + self.layer_num):
+            layer_dtype = self.per_layer_dtypes.get(layer_id, self.dtype)
+            if layer_dtype not in dtype_to_layers:
+                dtype_to_layers[layer_dtype] = []
+            dtype_to_layers[layer_dtype].append(layer_id)
+
+        # Log per-dtype layer groups
+        log_info_on_rank0(
+            logger, "Heterogeneous KV Cache Pool - Per-layer dtype configuration:"
+        )
+        for dtype, layer_ids in sorted(
+            dtype_to_layers.items(), key=lambda x: min(x[1])
+        ):
+            layer_ids_sorted = sorted(layer_ids)
+            if len(layer_ids_sorted) == 1:
+                log_info_on_rank0(
+                    logger,
+                    f"  Layer {layer_ids_sorted[0]}: {self._format_dtype(dtype)}",
+                )
+            else:
+                # Group consecutive layers
+                ranges = []
+                start = layer_ids_sorted[0]
+                end = layer_ids_sorted[0]
+                for lid in layer_ids_sorted[1:]:
+                    if lid == end + 1:
+                        end = lid
+                    else:
+                        if start == end:
+                            ranges.append(str(start))
+                        else:
+                            ranges.append(f"{start}-{end}")
+                        start = end = lid
+                if start == end:
+                    ranges.append(str(start))
+                else:
+                    ranges.append(f"{start}-{end}")
+                log_info_on_rank0(
+                    logger,
+                    f"  Layers {', '.join(ranges)}: {self._format_dtype(dtype)}",
+                )
+
+    def _finalize_allocation_log(self, num_tokens: int):
+        """Override to add detailed logging for heterogeneous pool."""
+        kv_size_bytes = self.get_kv_size_bytes()
+        if isinstance(kv_size_bytes, tuple):
+            k_size, v_size = kv_size_bytes
+            k_size_GB = k_size / GB
+            v_size_GB = v_size / GB
+            total_size_GB = k_size_GB + v_size_GB
+
+            logger.info(
+                f"Heterogeneous KV Cache is allocated. #tokens: {num_tokens}, "
+                f"K size: {k_size_GB:.2f} GB, V size: {v_size_GB:.2f} GB, "
+                f"Total: {total_size_GB:.2f} GB"
+            )
+
+            self.mem_usage = total_size_GB
+        else:
+            kv_size_GB = kv_size_bytes / GB
+            logger.info(
+                f"Heterogeneous KV Cache is allocated. #tokens: {num_tokens}, "
+                f"KV size: {kv_size_GB:.2f} GB"
+            )
+            self.mem_usage = kv_size_GB
+
+    def _get_key_buffer(self, layer_id: int):
+        """Route to appropriate sub-pool."""
+        if layer_id not in self.layer_to_pool:
+            raise ValueError(f"Layer {layer_id} not found in mixed precision pool")
+        pool_idx, local_layer_id = self.layer_to_pool[layer_id]
+        sub_pool = self.sub_pools[pool_idx]
+        # Sub-pools use start_layer=0, so local_layer_id is the correct index
+        return sub_pool._get_key_buffer(local_layer_id)
+
+    def _get_value_buffer(self, layer_id: int):
+        """Route to appropriate sub-pool."""
+        if layer_id not in self.layer_to_pool:
+            raise ValueError(f"Layer {layer_id} not found in mixed precision pool")
+        pool_idx, local_layer_id = self.layer_to_pool[layer_id]
+        sub_pool = self.sub_pools[pool_idx]
+        return sub_pool._get_value_buffer(local_layer_id)
+
+    def get_key_buffer(self, layer_id: int):
+        """Route to appropriate sub-pool with synchronization."""
+        if layer_id not in self.layer_to_pool:
+            raise ValueError(f"Layer {layer_id} not found in mixed precision pool")
+        pool_idx, local_layer_id = self.layer_to_pool[layer_id]
+        sub_pool = self.sub_pools[pool_idx]
+        return sub_pool.get_key_buffer(local_layer_id)
+
+    def get_value_buffer(self, layer_id: int):
+        """Route to appropriate sub-pool with synchronization."""
+        if layer_id not in self.layer_to_pool:
+            raise ValueError(f"Layer {layer_id} not found in mixed precision pool")
+        pool_idx, local_layer_id = self.layer_to_pool[layer_id]
+        sub_pool = self.sub_pools[pool_idx]
+        return sub_pool.get_value_buffer(local_layer_id)
+
+    def get_kv_buffer(self, layer_id: int):
+        """Route to appropriate sub-pool."""
+        if layer_id not in self.layer_to_pool:
+            raise ValueError(f"Layer {layer_id} not found in mixed precision pool")
+        pool_idx, local_layer_id = self.layer_to_pool[layer_id]
+        sub_pool = self.sub_pools[pool_idx]
+        return sub_pool.get_kv_buffer(local_layer_id)
+
+    def set_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
+        layer_id_override: Optional[int] = None,
+    ):
+        """Route to appropriate sub-pool."""
+        if layer_id_override is not None:
+            layer_id = layer_id_override
+        else:
+            layer_id = layer.layer_id
+
+        if layer_id not in self.layer_to_pool:
+            raise ValueError(f"Layer {layer_id} not found in mixed precision pool")
+        pool_idx, local_layer_id = self.layer_to_pool[layer_id]
+        sub_pool = self.sub_pools[pool_idx]
+        # Create a temporary layer object with the local layer_id for the sub-pool
+        # Or use layer_id_override to pass the local_layer_id
+        sub_pool.set_kv_buffer(
+            layer,
+            loc,
+            cache_k,
+            cache_v,
+            k_scale,
+            v_scale,
+            layer_id_override=local_layer_id,
+        )
+
+    def get_kv_size_bytes(self):
+        """Sum sizes from all sub-pools."""
+        total_k_size = 0
+        total_v_size = 0
+        for sub_pool in self.sub_pools:
+            kv_size = sub_pool.get_kv_size_bytes()
+            if isinstance(kv_size, tuple):
+                k_size, v_size = kv_size
+                total_k_size += k_size
+                total_v_size += v_size
+            else:
+                # Single value (for MLA pools)
+                total_k_size += kv_size
+                total_v_size += kv_size
+        return total_k_size, total_v_size
+
+    def get_contiguous_buf_infos(self):
+        """Aggregate buffer info ordered by global layer id."""
+        key_buffers = [
+            self._get_key_buffer(layer_id)
+            for layer_id in range(self.start_layer, self.start_layer + self.layer_num)
+        ]
+        value_buffers = [
+            self._get_value_buffer(layer_id)
+            for layer_id in range(self.start_layer, self.start_layer + self.layer_num)
+        ]
+        kv_data_ptrs = [x.data_ptr() for x in key_buffers] + [
+            x.data_ptr() for x in value_buffers
+        ]
+        kv_data_lens = [x.nbytes for x in key_buffers] + [
+            x.nbytes for x in value_buffers
+        ]
+        kv_item_lens = [x[0].nbytes * self.page_size for x in key_buffers] + [
+            x[0].nbytes * self.page_size for x in value_buffers
+        ]
+        return kv_data_ptrs, kv_data_lens, kv_item_lens
+
+    def get_cpu_copy(self, indices):
+        """Handle CPU offloading for heterogeneous pools."""
+        sub_pool_copies: Dict[int, List] = {}
+        kv_cache_cpu = [None] * self.layer_num
+        for layer_id in range(self.start_layer, self.start_layer + self.layer_num):
+            pool_idx, local_layer_id = self.layer_to_pool[layer_id]
+            if pool_idx not in sub_pool_copies:
+                sub_pool_copies[pool_idx] = self.sub_pools[pool_idx].get_cpu_copy(
+                    indices
+                )
+            sub_pool_cpu = sub_pool_copies[pool_idx]
+            kv_cache_cpu[layer_id - self.start_layer] = sub_pool_cpu[local_layer_id]
+        return kv_cache_cpu
+
+    def load_cpu_copy(self, kv_cache_cpu, indices):
+        """Load CPU copy for heterogeneous pools."""
+        pool_cpu_maps: Dict[int, List] = {}
+        for layer_id in range(self.start_layer, self.start_layer + self.layer_num):
+            pool_idx, local_layer_id = self.layer_to_pool[layer_id]
+            if pool_idx not in pool_cpu_maps:
+                pool_cpu_maps[pool_idx] = [None] * self.sub_pools[pool_idx].layer_num
+            pool_cpu_maps[pool_idx][local_layer_id] = kv_cache_cpu[
+                layer_id - self.start_layer
+            ]
+
+        for pool_idx, pool_cpu in pool_cpu_maps.items():
+            if any(item is None for item in pool_cpu):
+                raise ValueError(
+                    "Incomplete CPU KV cache data for mixed precision pool."
+                )
+            self.sub_pools[pool_idx].load_cpu_copy(pool_cpu, indices)
+
+    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        """Route to all sub-pools."""
+        for sub_pool in self.sub_pools:
+            if hasattr(sub_pool, "move_kv_cache"):
+                sub_pool.move_kv_cache(tgt_loc, src_loc)
+
+    def register_layer_transfer_counter(self, layer_transfer_counter):
+        """Register with all sub-pools."""
+        self.layer_transfer_counter = layer_transfer_counter
+        for sub_pool in self.sub_pools:
+            sub_pool.register_layer_transfer_counter(layer_transfer_counter)
+
+    def maybe_get_custom_mem_pool(self):
+        """Return custom mem pool (should be same across sub-pools)."""
+        if not self.sub_pools:
+            raise RuntimeError(
+                "MHATokenToKVPoolMixedPrecision has no sub-pools. "
+                "This indicates an initialization error."
+            )
+        # All sub-pools should share the same custom_mem_pool since they're on the same device
+        return self.sub_pools[0].maybe_get_custom_mem_pool()
+
+
 class HybridLinearKVPool(KVCache):
     """KV cache with separate pools for full and linear attention layers."""
 
@@ -1439,8 +1840,11 @@ class MLATokenToKVPool(KVCache):
         loc: torch.Tensor,
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
+        layer_id_override: Optional[int] = None,
     ):
-        layer_id = layer.layer_id
+        layer_id = (
+            layer_id_override if layer_id_override is not None else layer.layer_id
+        )
         assert not (self.use_nsa and self.nsa_kv_cache_store_fp8)
         if cache_k.dtype != self.dtype:
             cache_k = cache_k.to(self.dtype)
@@ -1458,8 +1862,11 @@ class MLATokenToKVPool(KVCache):
         loc: torch.Tensor,
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
+        layer_id_override: Optional[int] = None,
     ):
-        layer_id = layer.layer_id
+        layer_id = (
+            layer_id_override if layer_id_override is not None else layer.layer_id
+        )
 
         if self.use_nsa and self.nsa_kv_cache_store_fp8:
             # OPTIMIZATION: Quantize k_nope and k_rope separately to avoid concat overhead
@@ -1498,9 +1905,12 @@ class MLATokenToKVPool(KVCache):
         layer: RadixAttention,
         loc: torch.Tensor,
         dst_dtype: Optional[torch.dtype] = None,
+        layer_id_override: Optional[int] = None,
     ):
         # get k nope and k rope from the kv buffer, and optionally cast them to dst_dtype.
-        layer_id = layer.layer_id
+        layer_id = (
+            layer_id_override if layer_id_override is not None else layer.layer_id
+        )
         kv_buffer = self.get_key_buffer(layer_id)
         dst_dtype = dst_dtype or self.dtype
         cache_k_nope = torch.empty(
@@ -1608,8 +2018,11 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
         loc: torch.Tensor,
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
+        layer_id_override: Optional[int] = None,
     ):
-        layer_id = layer.layer_id
+        layer_id = (
+            layer_id_override if layer_id_override is not None else layer.layer_id
+        )
         assert not (self.use_nsa and self.nsa_kv_cache_store_fp8)
         if cache_k.dtype != self.dtype:
             from sglang.srt.layers.quantization.kvfp4_tensor import KVFP4QuantizeUtil
@@ -1632,8 +2045,11 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
         loc: torch.Tensor,
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
+        layer_id_override: Optional[int] = None,
     ):
-        layer_id = layer.layer_id
+        layer_id = (
+            layer_id_override if layer_id_override is not None else layer.layer_id
+        )
 
         if self.use_nsa and self.nsa_kv_cache_store_fp8:
             # original cache_k: (num_tokens, num_heads 1, hidden 576); we unsqueeze the page_size=1 dim here
@@ -1671,6 +2087,342 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
                 cache_k_nope_fp4_sf,
                 cache_k_rope_fp4_sf,
             )
+
+
+class MLATokenToKVPoolMixedPrecision(KVCache):
+    """MLA KV cache pool supporting different dtypes per layer.
+
+    This class acts as a manager that groups layers by dtype and creates appropriate sub-pools:
+    - FP4 layers use MLATokenToKVPoolFP4
+    - Other dtypes use MLATokenToKVPool (one pool per unique dtype)
+
+    It maintains a mapping from global layer_id to (pool_index, local_layer_id_in_pool)
+    and routes all KV cache operations to the appropriate sub-pool.
+
+    Note: This class inherits directly from KVCache (not MLATokenToKVPool) since it
+    doesn't allocate its own buffers but instead delegates to sub-pools.
+    """
+
+    def __init__(
+        self,
+        size: int,
+        page_size: int,
+        dtype: torch.dtype,  # Default dtype, used for layers not in per_layer_dtypes
+        kv_lora_rank: int,
+        qk_rope_head_dim: int,
+        layer_num: int,
+        device: str,
+        enable_memory_saver: bool,
+        per_layer_dtypes: Dict[int, torch.dtype],
+        start_layer: Optional[int] = None,
+        end_layer: Optional[int] = None,
+        use_nsa: bool = False,
+        override_kv_cache_dim: Optional[int] = None,
+    ):
+        # This pool acts as a manager and delegates to sub-pools.
+        KVCache.__init__(
+            self,
+            size=size,
+            page_size=page_size,
+            dtype=dtype,
+            layer_num=layer_num,
+            device=device,
+            enable_memory_saver=enable_memory_saver,
+            start_layer=start_layer,
+            end_layer=end_layer,
+        )
+
+        # Set MLA-specific attributes for compatibility
+        self.kv_lora_rank = kv_lora_rank
+        self.qk_rope_head_dim = qk_rope_head_dim
+        self.use_nsa = use_nsa
+        self.nsa_kv_cache_store_fp8 = use_nsa and dtype == torch.float8_e4m3fn
+        if self.nsa_kv_cache_store_fp8 and override_kv_cache_dim is None:
+            raise ValueError(
+                "override_kv_cache_dim must be provided when using NSA with FP8 kv cache storage"
+            )
+        self.kv_cache_dim = (
+            override_kv_cache_dim
+            if self.use_nsa and self.nsa_kv_cache_store_fp8
+            else (kv_lora_rank + qk_rope_head_dim)
+        )
+
+        # Store per-layer dtypes
+        self.per_layer_dtypes = per_layer_dtypes
+
+        # Group layers by dtype
+        from sglang.srt.utils.common import is_float4_e2m1fn_x2
+
+        # Build layer groups: {dtype: [layer_ids]}
+        dtype_groups: Dict[torch.dtype, List[int]] = {}
+        for layer_id in range(self.start_layer, self.start_layer + self.layer_num):
+            layer_dtype = per_layer_dtypes.get(layer_id, dtype)
+            if layer_dtype not in dtype_groups:
+                dtype_groups[layer_dtype] = []
+            dtype_groups[layer_dtype].append(layer_id)
+
+        # Create sub-pools and build mapping
+        self.sub_pools: List[KVCache] = []
+        self.layer_to_pool: Dict[int, Tuple[int, int]] = (
+            {}
+        )  # global_layer_id -> (pool_idx, local_layer_id)
+
+        # Temporarily suppress INFO level logging during sub-pool creation
+        # to avoid cluttering logs with individual sub-pool allocation messages
+        original_log_level = logger.level
+        logger.setLevel(logging.ERROR)
+
+        try:
+            for pool_dtype, layer_ids in dtype_groups.items():
+                pool_layer_ids = sorted(layer_ids)
+                pool_layer_num = len(pool_layer_ids)
+
+                # For sub-pools, we use start_layer=0 and map global layer_ids to local indices
+                # The sub-pool will have layers 0..pool_layer_num-1 internally
+                pool_start_layer = 0
+
+                if is_float4_e2m1fn_x2(pool_dtype):
+                    # Use FP4 pool
+                    sub_pool = MLATokenToKVPoolFP4(
+                        size=size,
+                        page_size=page_size,
+                        dtype=pool_dtype,
+                        kv_lora_rank=kv_lora_rank,
+                        qk_rope_head_dim=qk_rope_head_dim,
+                        layer_num=pool_layer_num,
+                        device=device,
+                        enable_memory_saver=enable_memory_saver,
+                        start_layer=pool_start_layer,
+                        end_layer=pool_layer_num - 1,
+                        use_nsa=use_nsa,
+                        override_kv_cache_dim=override_kv_cache_dim,
+                    )
+                else:
+                    # Use regular MLA pool
+                    sub_pool = MLATokenToKVPool(
+                        size=size,
+                        page_size=page_size,
+                        dtype=pool_dtype,
+                        kv_lora_rank=kv_lora_rank,
+                        qk_rope_head_dim=qk_rope_head_dim,
+                        layer_num=pool_layer_num,
+                        device=device,
+                        enable_memory_saver=enable_memory_saver,
+                        start_layer=pool_start_layer,
+                        end_layer=pool_layer_num - 1,
+                        use_nsa=use_nsa,
+                        override_kv_cache_dim=override_kv_cache_dim,
+                    )
+
+                pool_idx = len(self.sub_pools)
+                self.sub_pools.append(sub_pool)
+
+                # Build mapping: for each layer in this pool, map to (pool_idx, local_layer_id)
+                for local_idx, global_layer_id in enumerate(pool_layer_ids):
+                    self.layer_to_pool[global_layer_id] = (pool_idx, local_idx)
+        finally:
+            # Restore original logging level so mixed precision pool's log appears
+            logger.setLevel(original_log_level)
+
+        # Log per-layer dtype configuration
+        self._log_per_layer_dtypes()
+
+        # Calculate and log memory usage from sub-pools
+        self._finalize_allocation_log(size)
+
+    def _format_dtype(self, dt: torch.dtype) -> str:
+        """Format dtype name for logging."""
+        if dt == torch.bfloat16:
+            return "bf16"
+        elif dt == torch.float8_e4m3fn:
+            return "fp8_e4m3"
+        elif dt == torch.float8_e5m2:
+            return "fp8_e5m2"
+        elif hasattr(torch, "float4_e2m1fn_x2") and dt == torch.float4_e2m1fn_x2:
+            return "fp4_e2m1"
+        else:
+            return str(dt)
+
+    def _log_per_layer_dtypes(self):
+        """Log per-layer dtype configuration."""
+        from sglang.srt.utils.common import log_info_on_rank0
+
+        dtype_to_layers: Dict[torch.dtype, List[int]] = {}
+        for layer_id in range(self.start_layer, self.start_layer + self.layer_num):
+            layer_dtype = self.per_layer_dtypes.get(layer_id, self.dtype)
+            if layer_dtype not in dtype_to_layers:
+                dtype_to_layers[layer_dtype] = []
+            dtype_to_layers[layer_dtype].append(layer_id)
+
+        log_info_on_rank0(
+            logger, "Heterogeneous MLA KV Cache Pool - Per-layer dtype configuration:"
+        )
+        for dtype, layer_ids in sorted(
+            dtype_to_layers.items(), key=lambda x: min(x[1])
+        ):
+            layer_ids_sorted = sorted(layer_ids)
+            if len(layer_ids_sorted) == 1:
+                log_info_on_rank0(
+                    logger,
+                    f"  Layer {layer_ids_sorted[0]}: {self._format_dtype(dtype)}",
+                )
+            else:
+                # Group consecutive layers
+                ranges = []
+                start = layer_ids_sorted[0]
+                end = layer_ids_sorted[0]
+                for lid in layer_ids_sorted[1:]:
+                    if lid == end + 1:
+                        end = lid
+                    else:
+                        if start == end:
+                            ranges.append(str(start))
+                        else:
+                            ranges.append(f"{start}-{end}")
+                        start = end = lid
+                if start == end:
+                    ranges.append(str(start))
+                else:
+                    ranges.append(f"{start}-{end}")
+                log_info_on_rank0(
+                    logger,
+                    f"  Layers {', '.join(ranges)}: {self._format_dtype(dtype)}",
+                )
+
+    def _finalize_allocation_log(self, num_tokens: int):
+        """Override to add detailed logging for heterogeneous MLA pool."""
+        kv_size_bytes = self.get_kv_size_bytes()
+        kv_size_GB = kv_size_bytes / GB
+        logger.info(
+            f"Heterogeneous MLA KV Cache is allocated. #tokens: {num_tokens}, "
+            f"KV size: {kv_size_GB:.2f} GB"
+        )
+
+        # Log per-sub-pool sizes
+        logger.info("Heterogeneous MLA KV Cache Pool - Sub-pool memory breakdown:")
+        for pool_idx, sub_pool in enumerate(self.sub_pools):
+            sub_kv_size = sub_pool.get_kv_size_bytes()
+            sub_total_GB = sub_kv_size / GB
+            pool_dtype = None
+            for layer_id, (p_idx, _) in self.layer_to_pool.items():
+                if p_idx == pool_idx:
+                    pool_dtype = self.per_layer_dtypes.get(layer_id, self.dtype)
+                    break
+            dtype_str = self._format_dtype(pool_dtype) if pool_dtype else "unknown"
+            logger.info(f"  Sub-pool {pool_idx} ({dtype_str}): {sub_total_GB:.2f} GB")
+
+        self.mem_usage = kv_size_GB
+
+    def _get_sub_pool(self, layer_id: int) -> Tuple[KVCache, int]:
+        if layer_id not in self.layer_to_pool:
+            raise ValueError(f"Layer {layer_id} not found in mixed precision pool")
+        pool_idx, local_layer_id = self.layer_to_pool[layer_id]
+        return self.sub_pools[pool_idx], local_layer_id
+
+    def get_key_buffer(self, layer_id: int):
+        sub_pool, local_layer_id = self._get_sub_pool(layer_id)
+        return sub_pool.get_key_buffer(local_layer_id)
+
+    def get_value_buffer(self, layer_id: int):
+        sub_pool, local_layer_id = self._get_sub_pool(layer_id)
+        return sub_pool.get_value_buffer(local_layer_id)
+
+    def get_kv_buffer(self, layer_id: int):
+        return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
+
+    def set_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+    ):
+        layer_id = layer.layer_id
+        sub_pool, local_layer_id = self._get_sub_pool(layer_id)
+        sub_pool.set_kv_buffer(
+            layer, loc, cache_k, cache_v, layer_id_override=local_layer_id
+        )
+
+    def set_mla_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc: torch.Tensor,
+        cache_k_nope: torch.Tensor,
+        cache_k_rope: torch.Tensor,
+    ):
+        layer_id = layer.layer_id
+        sub_pool, local_layer_id = self._get_sub_pool(layer_id)
+        sub_pool.set_mla_kv_buffer(
+            layer, loc, cache_k_nope, cache_k_rope, layer_id_override=local_layer_id
+        )
+
+    def get_mla_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc: torch.Tensor,
+        dst_dtype: Optional[torch.dtype] = None,
+    ):
+        layer_id = layer.layer_id
+        sub_pool, local_layer_id = self._get_sub_pool(layer_id)
+        return sub_pool.get_mla_kv_buffer(
+            layer, loc, dst_dtype, layer_id_override=local_layer_id
+        )
+
+    def get_kv_size_bytes(self):
+        total_size = 0
+        for sub_pool in self.sub_pools:
+            total_size += sub_pool.get_kv_size_bytes()
+        return total_size
+
+    def get_contiguous_buf_infos(self):
+        """Aggregate buffer info ordered by global layer id."""
+        key_buffers = [
+            self.get_key_buffer(layer_id)
+            for layer_id in range(self.start_layer, self.start_layer + self.layer_num)
+        ]
+        kv_data_ptrs = [x.data_ptr() for x in key_buffers]
+        kv_data_lens = [x.nbytes for x in key_buffers]
+        kv_item_lens = [x[0].nbytes * self.page_size for x in key_buffers]
+        return kv_data_ptrs, kv_data_lens, kv_item_lens
+
+    def get_cpu_copy(self, indices):
+        sub_pool_copies: Dict[int, List] = {}
+        kv_cache_cpu = [None] * self.layer_num
+        for layer_id in range(self.start_layer, self.start_layer + self.layer_num):
+            pool_idx, local_layer_id = self.layer_to_pool[layer_id]
+            if pool_idx not in sub_pool_copies:
+                sub_pool_copies[pool_idx] = self.sub_pools[pool_idx].get_cpu_copy(
+                    indices
+                )
+            sub_pool_cpu = sub_pool_copies[pool_idx]
+            kv_cache_cpu[layer_id - self.start_layer] = sub_pool_cpu[local_layer_id]
+        return kv_cache_cpu
+
+    def load_cpu_copy(self, kv_cache_cpu, indices):
+        sub_pool_data: Dict[int, List] = {}
+        for layer_id in range(self.start_layer, self.start_layer + self.layer_num):
+            pool_idx, local_layer_id = self.layer_to_pool[layer_id]
+            if pool_idx not in sub_pool_data:
+                sub_pool_data[pool_idx] = [None] * self.sub_pools[pool_idx].layer_num
+            sub_pool_data[pool_idx][local_layer_id] = kv_cache_cpu[
+                layer_id - self.start_layer
+            ]
+        for pool_idx, sub_kv_cache in sub_pool_data.items():
+            self.sub_pools[pool_idx].load_cpu_copy(sub_kv_cache, indices)
+
+    def register_layer_transfer_counter(self, layer_transfer_counter):
+        self.layer_transfer_counter = layer_transfer_counter
+        for sub_pool in self.sub_pools:
+            sub_pool.register_layer_transfer_counter(layer_transfer_counter)
+
+    def maybe_get_custom_mem_pool(self):
+        """Return custom mem pool (should be same across sub-pools)."""
+        if not self.sub_pools:
+            raise RuntimeError(
+                "MLATokenToKVPoolMixedPrecision has no sub-pools. "
+                "This indicates an initialization error."
+            )
+        return self.sub_pools[0].maybe_get_custom_mem_pool()
 
 
 class NSATokenToKVPool(MLATokenToKVPool):
