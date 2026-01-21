@@ -78,6 +78,8 @@ class HiRadixCache(RadixCache):
         self.pp_rank = params.pp_rank
         self.pp_size = params.pp_size
         self.enable_storage = server_args.hicache_storage_backend is not None
+        self._storage_io_blocked = threading.Event()
+        self._storage_io_blocked_reason = ""
         self.enable_storage_metrics = self.enable_storage and params.enable_metrics
 
         (
@@ -155,6 +157,80 @@ class HiRadixCache(RadixCache):
                 self.detach_storage_backend()
         except Exception:
             logger.exception("Failed to detach storage backend on process shutdown.")
+
+    def is_storage_io_blocked(self) -> bool:
+        return self._storage_io_blocked.is_set()
+
+    def set_storage_io_blocked(
+        self, blocked: bool, reason: str = ""
+    ) -> tuple[bool, str]:
+        prev_blocked = self._storage_io_blocked.is_set()
+        prev_reason = self._storage_io_blocked_reason
+        try:
+            if blocked:
+                self._storage_io_blocked.set()
+                self._storage_io_blocked_reason = reason
+            else:
+                self._storage_io_blocked.clear()
+                self._storage_io_blocked_reason = ""
+            if hasattr(self, "cache_controller"):
+                self.cache_controller.set_storage_io_blocked(blocked)
+            return True, ""
+        except Exception as e:
+            if prev_blocked:
+                self._storage_io_blocked.set()
+                self._storage_io_blocked_reason = prev_reason
+            else:
+                self._storage_io_blocked.clear()
+                self._storage_io_blocked_reason = ""
+            logger.exception("Failed to set storage IO blocked state.")
+            return False, str(e)
+
+    def _storage_io_allowed(self) -> bool:
+        return self.enable_storage and (not self._storage_io_blocked.is_set())
+
+    def get_storage_pending_counts(self) -> dict:
+        cc = self.cache_controller
+        counts = {
+            "ongoing_backup": len(self.ongoing_backup),
+            "ongoing_prefetch": len(self.ongoing_prefetch),
+        }
+        try:
+            if hasattr(cc, "backup_queue"):
+                counts["backup_queue"] = cc.backup_queue.qsize()
+            if hasattr(cc, "prefetch_queue"):
+                counts["prefetch_queue"] = cc.prefetch_queue.qsize()
+            if hasattr(cc, "prefetch_buffer"):
+                counts["prefetch_buffer"] = cc.prefetch_buffer.qsize()
+            if hasattr(cc, "ack_backup_queue"):
+                counts["ack_backup_queue"] = cc.ack_backup_queue.qsize()
+            if hasattr(cc, "prefetch_revoke_queue"):
+                counts["prefetch_revoke_queue"] = cc.prefetch_revoke_queue.qsize()
+            if hasattr(cc, "host_mem_release_queue"):
+                counts["host_mem_release_queue"] = cc.host_mem_release_queue.qsize()
+        except Exception:
+            logger.exception("Failed to collect storage pending counts.")
+        counts["total"] = sum(counts.values())
+        return counts
+
+    def wait_storage_ops_idle(
+        self, timeout_s: float = 30.0, poll_interval_s: float = 0.05
+    ) -> tuple[bool, str]:
+        start = time.monotonic()
+        while True:
+            try:
+                self._drain_storage_control_queues_local()
+            except Exception:
+                logger.exception("Drain storage control queues failed during wait.")
+            counts = self.get_storage_pending_counts()
+            if counts.get("total", 0) == 0:
+                return True, ""
+            if time.monotonic() - start >= timeout_s:
+                return (
+                    False,
+                    f"Timeout waiting for storage ops to drain: {counts}",
+                )
+            time.sleep(poll_interval_s)
 
     def attach_storage_backend(
         self,
@@ -562,6 +638,8 @@ class HiRadixCache(RadixCache):
         return len(host_indices)
 
     def write_backup_storage(self, node: TreeNode):
+        if not self._storage_io_allowed():
+            return
         prefix_keys = (
             node.get_prefix_hash_values(node.parent)
             if self.hicache_storage_pass_prefix_keys
@@ -571,6 +649,8 @@ class HiRadixCache(RadixCache):
         operation_id = self.cache_controller.write_storage(
             node.host_value, node.key, node.hash_value, prefix_keys
         )
+        if operation_id is None:
+            return
         self.ongoing_backup[operation_id] = node
         node.protect_host()
 
@@ -622,7 +702,7 @@ class HiRadixCache(RadixCache):
             for ack_id in ack_list:
                 backuped_node = self.ongoing_write_through.pop(ack_id)
                 self.dec_lock_ref(backuped_node)
-                if self.enable_storage:
+                if self._storage_io_allowed():
                     self.write_backup_storage(backuped_node)
             finish_count -= 1
 
@@ -1052,7 +1132,7 @@ class HiRadixCache(RadixCache):
         )
         new_input_tokens = new_input_tokens[:prefetch_length]
         if (
-            not self.enable_storage
+            not self._storage_io_allowed()
             or prefetch_length < self.prefetch_threshold
             or self.cache_controller.prefetch_rate_limited()
         ):
@@ -1070,6 +1150,13 @@ class HiRadixCache(RadixCache):
         operation = self.cache_controller.prefetch(
             req_id, host_indices, new_input_tokens, last_hash, prefix_keys
         )
+        if operation is None:
+            last_host_node.release_host()
+            try:
+                self.cache_controller.mem_pool_host.free(host_indices)
+            except Exception:
+                pass
+            return
         self.ongoing_prefetch[req_id] = (
             last_host_node,
             new_input_tokens,

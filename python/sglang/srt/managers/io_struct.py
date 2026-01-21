@@ -1165,6 +1165,7 @@ class AttachHiCacheStorageReqInput(BaseReq):
     hicache_storage_backend_extra_config_json: Optional[str] = None
     hicache_storage_prefetch_policy: Optional[str] = None
     hicache_write_policy: Optional[str] = None
+    force: bool = False
 
     def __post_init__(self):
         if self.hicache_storage_prefetch_policy is None:
@@ -1197,7 +1198,7 @@ class AttachHiCacheStorageReqOutput(BaseReq):
 class DetachHiCacheStorageReqInput(BaseReq):
     """Dynamically detach (disable) HiCache storage backend at runtime."""
 
-    pass
+    force: bool = False
 
 
 @dataclass

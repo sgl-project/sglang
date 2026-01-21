@@ -284,6 +284,7 @@ class HiCacheController:
         # transfer buffers (CPU<->GPU). We want to allow runtime attach/detach of
         # storage without stopping the whole controller.
         self.storage_stop_event = threading.Event()
+        self.storage_io_blocked = threading.Event()
 
         self.device = self.mem_pool_device.device
         self.layer_num = self.mem_pool_device.layer_num
@@ -395,6 +396,15 @@ class HiCacheController:
                 [getattr(t, "name", repr(t)) for t in alive],
             )
             raise RuntimeError("Failed to stop HiCache storage threads cleanly.")
+
+    def set_storage_io_blocked(self, blocked: bool):
+        if blocked:
+            self.storage_io_blocked.set()
+        else:
+            self.storage_io_blocked.clear()
+
+    def is_storage_io_blocked(self) -> bool:
+        return self.storage_io_blocked.is_set()
 
     def attach_storage_backend(
         self,
@@ -769,6 +779,8 @@ class HiCacheController:
         """
         Prefetch KV caches from storage backend to host memory.
         """
+        if self.storage_io_blocked.is_set():
+            return None
         operation = PrefetchOperation(
             request_id, host_indices, new_input_tokens, last_hash, prefix_keys
         )
@@ -967,6 +979,8 @@ class HiCacheController:
         """
         Write KV caches from host memory to storage backend.
         """
+        if self.storage_io_blocked.is_set():
+            return None
         operation = StorageOperation(
             host_indices, token_ids, hash_value=hash_value, prefix_keys=prefix_keys
         )

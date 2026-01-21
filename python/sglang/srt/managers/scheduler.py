@@ -2466,7 +2466,7 @@ class Scheduler(
                 success=False, message="Hierarchical cache is not enabled."
             )
 
-        if not self._is_idle_for_hicache_storage_op():
+        if (not recv_req.force) and (not self._is_idle_for_hicache_storage_op()):
             return AttachHiCacheStorageReqOutput(
                 success=False,
                 message=(
@@ -2482,6 +2482,34 @@ class Scheduler(
                 message="Current tree_cache implementation does not support dynamic attach.",
             )
 
+        prev_blocked = False
+        if recv_req.force:
+            try:
+                prev_blocked = self.tree_cache.is_storage_io_blocked()
+                ok, msg = self.tree_cache.set_storage_io_blocked(
+                    True, reason="force_attach"
+                )
+                if not ok:
+                    return AttachHiCacheStorageReqOutput(
+                        success=False, message=f"Failed to block storage IO: {msg}"
+                    )
+                ok, msg = self.tree_cache.wait_storage_ops_idle()
+                if not ok:
+                    _ok, _msg = self.tree_cache.set_storage_io_blocked(
+                        prev_blocked, reason=""
+                    )
+                    if not _ok and _msg:
+                        msg = f"{msg}; rollback failed: {_msg}"
+                    return AttachHiCacheStorageReqOutput(success=False, message=msg)
+            except Exception as e:
+                logger.exception("Force attach setup failed with exception.")
+                _ok, _msg = self.tree_cache.set_storage_io_blocked(
+                    prev_blocked, reason=""
+                )
+                if not _ok:
+                    logger.error("Force attach rollback failed: %s", _msg)
+                return AttachHiCacheStorageReqOutput(success=False, message=str(e))
+
         try:
             ok, msg = self.tree_cache.attach_storage_backend(
                 storage_backend=recv_req.hicache_storage_backend,
@@ -2492,6 +2520,12 @@ class Scheduler(
             )
         except Exception as e:
             logger.exception("Attach HiCache storage backend failed with exception.")
+            if recv_req.force:
+                _ok, _msg = self.tree_cache.set_storage_io_blocked(
+                    prev_blocked, reason=""
+                )
+                if not _ok:
+                    logger.error("Force attach rollback failed: %s", _msg)
             return AttachHiCacheStorageReqOutput(success=False, message=str(e))
         if ok:
             self.enable_hicache_storage = True
@@ -2509,6 +2543,19 @@ class Scheduler(
             logger.info(
                 f"Attached HiCache storage backend: {recv_req.hicache_storage_backend}"
             )
+            if recv_req.force:
+                _ok, _msg = self.tree_cache.set_storage_io_blocked(
+                    prev_blocked, reason=""
+                )
+                if not _ok:
+                    logger.error("Force attach unblock failed: %s", _msg)
+        else:
+            if recv_req.force:
+                _ok, _msg = self.tree_cache.set_storage_io_blocked(
+                    prev_blocked, reason=""
+                )
+                if not _ok:
+                    logger.error("Force attach rollback failed: %s", _msg)
         return AttachHiCacheStorageReqOutput(success=ok, message=msg)
 
     def detach_hicache_storage_wrapped(
@@ -2519,7 +2566,7 @@ class Scheduler(
                 success=False, message="Hierarchical cache is not enabled."
             )
 
-        if not self._is_idle_for_hicache_storage_op():
+        if (not recv_req.force) and (not self._is_idle_for_hicache_storage_op()):
             return DetachHiCacheStorageReqOutput(
                 success=False,
                 message=(
@@ -2535,12 +2582,46 @@ class Scheduler(
                 message="Current tree_cache implementation does not support dynamic detach.",
             )
 
+        prev_blocked = False
+        if recv_req.force:
+            try:
+                prev_blocked = self.tree_cache.is_storage_io_blocked()
+                ok, msg = self.tree_cache.set_storage_io_blocked(
+                    True, reason="force_detach"
+                )
+                if not ok:
+                    return DetachHiCacheStorageReqOutput(
+                        success=False, message=f"Failed to block storage IO: {msg}"
+                    )
+                ok, msg = self.tree_cache.wait_storage_ops_idle()
+                if not ok:
+                    _ok, _msg = self.tree_cache.set_storage_io_blocked(
+                        prev_blocked, reason=""
+                    )
+                    if not _ok and _msg:
+                        msg = f"{msg}; rollback failed: {_msg}"
+                    return DetachHiCacheStorageReqOutput(success=False, message=msg)
+            except Exception as e:
+                logger.exception("Force detach setup failed with exception.")
+                _ok, _msg = self.tree_cache.set_storage_io_blocked(
+                    prev_blocked, reason=""
+                )
+                if not _ok:
+                    logger.error("Force detach rollback failed: %s", _msg)
+                return DetachHiCacheStorageReqOutput(success=False, message=str(e))
+
         # Idempotent detach: even if scheduler thinks storage is disabled, we still
         # attempt best-effort cleanup in tree_cache (it may have leftover state).
         try:
             ok, msg = self.tree_cache.detach_storage_backend()
         except Exception as e:
             logger.exception("Detach HiCache storage backend failed with exception.")
+            if recv_req.force:
+                _ok, _msg = self.tree_cache.set_storage_io_blocked(
+                    prev_blocked, reason=""
+                )
+                if not _ok:
+                    logger.error("Force detach rollback failed: %s", _msg)
             return DetachHiCacheStorageReqOutput(success=False, message=str(e))
 
         if ok or (not self.enable_hicache_storage):
@@ -2549,10 +2630,20 @@ class Scheduler(
             self.server_args.hicache_storage_backend = None
             self.server_args.hicache_storage_backend_extra_config = None
             logger.info("Detached HiCache storage backend.")
+            if recv_req.force:
+                _ok, _msg = self.tree_cache.set_storage_io_blocked(
+                    prev_blocked, reason=""
+                )
+                if not _ok:
+                    logger.error("Force detach unblock failed: %s", _msg)
             return DetachHiCacheStorageReqOutput(
                 success=True, message=msg or "HiCache storage backend is detached."
             )
 
+        if recv_req.force:
+            _ok, _msg = self.tree_cache.set_storage_io_blocked(prev_blocked, reason="")
+            if not _ok:
+                logger.error("Force detach rollback failed: %s", _msg)
         return DetachHiCacheStorageReqOutput(success=False, message=msg)
 
     def _is_no_request(self):

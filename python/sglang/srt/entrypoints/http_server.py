@@ -99,6 +99,7 @@ from sglang.srt.managers.io_struct import (
     ConfigureLoggingReq,
     ContinueGenerationReqInput,
     DestroyWeightsUpdateGroupReqInput,
+    DetachHiCacheStorageReqInput,
     EmbeddingReqInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
@@ -756,7 +757,8 @@ async def clear_hicache_storage_backend():
 #     "hicache_storage_backend": "file",
 #     "hicache_storage_backend_extra_config_json": "{}",
 #     "hicache_storage_prefetch_policy": "timeout",
-#     "hicache_write_policy": "write_through"
+#     "hicache_write_policy": "write_through",
+#     "force": "false"
 #   }'
 @app.api_route("/hicache/storage-backend", methods=["PUT"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
@@ -773,6 +775,7 @@ async def attach_hicache_storage_backend(obj: AttachHiCacheStorageReqInput):
         hicache_storage_backend_extra_config_json=obj.hicache_storage_backend_extra_config_json,
         hicache_storage_prefetch_policy=obj.hicache_storage_prefetch_policy,
         hicache_write_policy=obj.hicache_write_policy,
+        force=obj.force,
     )
     msg = getattr(ret, "message", "")
     return Response(
@@ -789,10 +792,16 @@ async def attach_hicache_storage_backend(obj: AttachHiCacheStorageReqInput):
 
 
 # example usage:
-# curl -s -X DELETE http://127.0.0.1:30000/hicache/storage-backend
+# curl -s -X DELETE http://127.0.0.1:30000/hicache/storage-backend \
+#  -H 'Content-Type: application/json' \
+#   -d '{
+#     "force": "false"
+#   }'
 @app.api_route("/hicache/storage-backend", methods=["DELETE"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def detach_hicache_storage_backend():
+async def detach_hicache_storage_backend(
+    obj: Optional[DetachHiCacheStorageReqInput] = None,
+):
     """Detach (disable) HiCache storage backend at runtime.
 
     Only allowed when there are NO running / queued requests.
@@ -800,7 +809,10 @@ async def detach_hicache_storage_backend():
     if not _global_state.tokenizer_manager.server_args.admin_api_key:
         return _admin_api_key_missing_response()
 
-    ret = await _global_state.tokenizer_manager.detach_hicache_storage()
+    if obj is None:
+        obj = DetachHiCacheStorageReqInput()
+
+    ret = await _global_state.tokenizer_manager.detach_hicache_storage(force=obj.force)
     msg = getattr(ret, "message", "")
     return Response(
         content=(
