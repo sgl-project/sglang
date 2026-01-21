@@ -24,7 +24,7 @@ from typing import Iterable, List, Optional, Tuple
 import torch
 import torch.nn as nn
 from einops import rearrange
-from transformers.models.Glm_ocr.configuration_glm_ocr import (
+from transformers.models.glm_ocr.configuration_glm_ocr import (
     GlmOcrConfig,
     GlmOcrVisionConfig,
     Glm4vVisionModel,
