@@ -605,7 +605,7 @@ class CompressedTensorsConfig(QuantizationConfig):
 
         if self._is_wNa16_group_channel(weight_quant, input_quant):
             if not _is_npu:
-                logger.info_once("Using CompressedTensorsWNA16MarlinMoE")
+                logger.info_once("Using CompressedTensorsWNA16MoE")
                 return CompressedTensorsWNA16MoE(self)
             else:
                 if (
