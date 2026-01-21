@@ -41,7 +41,9 @@ jobs:
           # Get base version from setuptools_scm
           cd python
           pip install setuptools-scm
-          BASE_VERSION=$(python -c "from setuptools_scm import get_version; print(get_version(root='..'))" | cut -d'+' -f1)
+          FULL_VERSION=$(python -c "from setuptools_scm import get_version; print(get_version(root='..'))")
+          # Strip any existing .dev or + suffix to get clean base version
+          BASE_VERSION=$(echo "$FULL_VERSION" | sed 's/\.dev.*//;s/+.*//')
           cd ..
 
           # Get commit info
@@ -137,9 +139,14 @@ jobs:
             Build date: ${{ needs.build-pr-wheel.outputs.build_date }}
             Version: ${{ needs.build-pr-wheel.outputs.wheel_version }}
 
-            **Installation via index:**
+            **Installation via index (pip):**
             ```bash
-            pip install sglang=={version} --index-url https://sgl-project.github.io/whl/pr/
+            pip install sglang==${{ needs.build-pr-wheel.outputs.wheel_version }} --index-url https://sgl-project.github.io/whl/pr/
+            ```
+
+            **Installation via index (uv):**
+            ```bash
+            uv pip install sglang==${{ needs.build-pr-wheel.outputs.wheel_version }} --index-url https://sgl-project.github.io/whl/pr/ --extra-index-url https://pypi.org/simple --index-strategy unsafe-best-match
             ```
 
             **Direct installation:**
