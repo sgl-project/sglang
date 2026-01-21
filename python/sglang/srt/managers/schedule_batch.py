@@ -800,7 +800,9 @@ class Req:
 
     def get_radix_cache_token_ids(self) -> List[int]:
         """Get token IDs for radix cache key computation."""
-        return self.fill_ids if self.is_dllm() else self.origin_input_ids + self.output_ids
+        return (
+            self.fill_ids if self.is_dllm() else self.origin_input_ids + self.output_ids
+        )
 
     def pop_committed_kv_cache(self) -> int:
         """Return the length of committed KV cache and mark them as freed."""

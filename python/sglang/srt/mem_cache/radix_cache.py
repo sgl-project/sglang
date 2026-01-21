@@ -452,7 +452,9 @@ class RadixCache(BasePrefixCache):
 
         # Maybe convert to bigram keys for EAGLE
         cache_token_ids = req.get_radix_cache_token_ids()
-        keys = convert_to_bigram_key(cache_token_ids) if self.is_eagle else cache_token_ids
+        keys = (
+            convert_to_bigram_key(cache_token_ids) if self.is_eagle else cache_token_ids
+        )
         keys = self._page_align_keys(keys)
         values = kv_indices[: len(keys)].to(dtype=torch.int64, copy=True)
         radix_key = RadixKey(keys, req.extra_key, is_bigram=self.is_eagle)
@@ -488,7 +490,9 @@ class RadixCache(BasePrefixCache):
         ]
 
         # Maybe convert to bigram keys for EAGLE
-        keys = convert_to_bigram_key(cache_token_ids) if self.is_eagle else cache_token_ids
+        keys = (
+            convert_to_bigram_key(cache_token_ids) if self.is_eagle else cache_token_ids
+        )
         keys = self._page_align_keys(keys)
         values = kv_indices[: len(keys)].to(dtype=torch.int64, copy=True)
         radix_key = RadixKey(keys, req.extra_key, is_bigram=self.is_eagle)
