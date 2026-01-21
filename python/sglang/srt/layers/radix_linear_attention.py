@@ -36,9 +36,19 @@ class RadixLinearAttention(nn.Module):
         head_qk_dim: int,
         head_v_dim: int,
         attention_tp_size: int = 1,
+        # GDN Specific Weights
         conv_weights: Optional[torch.Tensor] = None,
         bias: Optional[torch.Tensor] = None,
         activation: str = "silu",
+        # KDA Specific Weights
+        q_conv_weights: Optional[torch.Tensor] = None,
+        k_conv_weights: Optional[torch.Tensor] = None,
+        v_conv_weights: Optional[torch.Tensor] = None,
+        q_conv_bias: Optional[torch.Tensor] = None,
+        k_conv_bias: Optional[torch.Tensor] = None,
+        v_conv_bias: Optional[torch.Tensor] = None,
+        head_dim: Optional[torch.Tensor] = None,
+        # Shared Weights
         A_log: Optional[torch.Tensor] = None,
         dt_bias: Optional[torch.Tensor] = None,
     ):
@@ -64,6 +74,15 @@ class RadixLinearAttention(nn.Module):
         self.conv_weights = conv_weights
         self.bias = bias
         self.activation = activation
+
+        self.q_conv_weights = q_conv_weights
+        self.k_conv_weights = k_conv_weights
+        self.v_conv_weights = v_conv_weights
+        self.q_conv_bias = q_conv_bias
+        self.k_conv_bias = k_conv_bias
+        self.v_conv_bias = v_conv_bias
+        self.head_dim = head_dim
+
         self.A_log = A_log
         self.dt_bias = dt_bias
 

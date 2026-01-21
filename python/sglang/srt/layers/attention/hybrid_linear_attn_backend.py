@@ -624,32 +624,29 @@ class KimiLinearAttnBackend(MambaAttnBackendBase):
 
     def forward_decode(
         self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        layer: RadixAttention,
-        forward_batch: ForwardBatch,
-        save_kv_cache: bool = True,
+        layer: RadixLinearAttention,
+        mixed_qkv: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
         **kwargs,
     ):
-        q_proj_states = kwargs["q_proj_states"]
-        k_proj_states = kwargs["k_proj_states"]
-        v_proj_states = kwargs["v_proj_states"]
-        q_conv_weights = kwargs["q_conv_weights"]
-        k_conv_weights = kwargs["k_conv_weights"]
-        v_conv_weights = kwargs["v_conv_weights"]
+        (q_proj_states, k_proj_states, v_proj_states) = mixed_qkv
 
-        q_conv_bias = kwargs["q_conv_bias"]
-        k_conv_bias = kwargs["k_conv_bias"]
-        v_conv_bias = kwargs["v_conv_bias"]
+        q_conv_weights = layer.q_conv_weights
+        k_conv_weights = layer.k_conv_weights
+        v_conv_weights = layer.v_conv_weights
 
-        head_dim = kwargs["head_dim"]
-        layer_id = kwargs["layer_id"]
-        beta = kwargs["beta"]
-        g = kwargs["gate"]
+        q_conv_bias = layer.q_conv_bias
+        k_conv_bias = layer.k_conv_bias
+        v_conv_bias = layer.v_conv_bias
 
-        A_log = kwargs["A_log"]
-        dt_bias = kwargs["dt_bias"]
+        head_dim = layer.head_dim
+        layer_id = layer.layer_id
+        beta = b
+        g = a
+
+        A_log = layer.A_log
+        dt_bias = layer.dt_bias
 
         layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer_id)
         q_conv_state, k_conv_state, v_conv_state = layer_cache.conv
@@ -711,33 +708,34 @@ class KimiLinearAttnBackend(MambaAttnBackendBase):
 
     def forward_extend(
         self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        layer: RadixAttention,
+        layer: RadixLinearAttention,
         forward_batch: ForwardBatch,
-        save_kv_cache: bool = True,
-        **kwargs,
+        mixed_qkv: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        **kwargs,  # Unused, for compatibility with HybridLinearAttnBackend
     ):
         from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
             causal_conv1d_fn,
         )
 
-        q_proj_states = kwargs["q_proj_states"]
-        k_proj_states = kwargs["k_proj_states"]
-        v_proj_states = kwargs["v_proj_states"]
-        q_conv_weights = kwargs["q_conv_weights"]
-        k_conv_weights = kwargs["k_conv_weights"]
-        v_conv_weights = kwargs["v_conv_weights"]
+        (q_proj_states, k_proj_states, v_proj_states) = mixed_qkv
 
-        q_conv_bias = kwargs["q_conv_bias"]
-        k_conv_bias = kwargs["k_conv_bias"]
-        v_conv_bias = kwargs["v_conv_bias"]
+        q_conv_weights = layer.q_conv_weights
+        k_conv_weights = layer.k_conv_weights
+        v_conv_weights = layer.v_conv_weights
 
-        head_dim = kwargs["head_dim"]
-        layer_id = kwargs["layer_id"]
-        beta = kwargs["beta"]
-        g = kwargs["gate"]
+        q_conv_bias = layer.q_conv_bias
+        k_conv_bias = layer.k_conv_bias
+        v_conv_bias = layer.v_conv_bias
+
+        head_dim = layer.head_dim
+        layer_id = layer.layer_id
+        beta = b
+        g = a
+
+        A_log = layer.A_log
+        dt_bias = layer.dt_bias
 
         query_start_loc = self.forward_metadata.query_start_loc
         cache_indices = self.forward_metadata.mamba_cache_indices
