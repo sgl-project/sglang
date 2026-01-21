@@ -52,8 +52,6 @@ def serve(args, extra_argv):
                 execute_serve_cmd,
             )
 
-            logger.info("Diffusion model detected")
-
             parser = argparse.ArgumentParser(
                 description="SGLang Diffusion Model Serving"
             )
