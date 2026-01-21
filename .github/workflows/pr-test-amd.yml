@@ -1035,7 +1035,7 @@ jobs:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Install dependencies
-        run: bash scripts/ci/amd_ci_install_dependency_disagg.sh
+        run: bash scripts/ci/amd_ci_install_dependency.sh
 
       - name: Setup RDMA in Container
         run: |
