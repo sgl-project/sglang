@@ -655,7 +655,10 @@ class FusedMoE(torch.nn.Module):
         # compressed-tensors checkpoints with packed weights are stored flipped
         # TODO (mgoin): check self.quant_method.quant_config.quant_format
         # against known CompressionFormat enum values that have this quality
-        method = self.quant_method
+        if hasattr(self, 'scheme'):
+            method - self.scheme
+        else:
+            method = self.quant_method
         if method.__class__.__name__ == "KTEPWrapperMethod":
             method = method.gpu_method
 
@@ -664,8 +667,8 @@ class FusedMoE(torch.nn.Module):
             if (
                 method.__class__.__name__
                 in [
-                    "CompressedTensorsWNA16MarlinMoEMethod",
-                    "CompressedTensorsWNA16MoEMethod",
+                    "CompressedTensorsWNA16MarlinMoE",
+                    "CompressedTensorsWNA16MoE",
                 ]
             )
             else loaded_weight
@@ -874,11 +877,15 @@ class FusedMoE(torch.nn.Module):
         # compressed-tensors checkpoints with packed weights are stored flipped
         # TODO: check self.quant_method.quant_config.quant_format
         # against known CompressionFormat enum values that have this quality
+        if hasattr(self, 'scheme'):
+            method - self.scheme
+        else:
+            method = self.quant_method
         loaded_weight = (
             loaded_weight.t().contiguous()
             if (
-                self.quant_method.__class__.__name__
-                == "CompressedTensorsWNA16MoEMethod"
+                method.__class__.__name__
+                == "CompressedTensorsWNA16MoE"
             )
             else loaded_weight
         )
