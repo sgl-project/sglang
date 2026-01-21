@@ -238,12 +238,64 @@ class LMCRadixCache(RadixCache):
         with torch.cuda.stream(self.load_stream):
             offset = value.numel() - prefix_pad
             if self._use_mp_mode:
-                # MP mode uses direct arguments
-                num_retrieved = self.lmcache_connector.start_load_kv(
-                    token_ids=key.token_ids,
-                    slot_mapping=slot_mapping,
-                    offset=offset,
+                # MP mode: First do LOOKUP to check cache hits
+                # This ensures we know what's actually cached before attempting RETRIEVE
+                num_cached = self.lmcache_connector.lookup(key.token_ids)
+                logger.debug(
+                    f"match_prefix: LOOKUP result: num_cached={num_cached}, "
+                    f"offset={offset}, prefix_pad={prefix_pad}, value.numel()={value.numel()}, "
+                    f"uncached_len={uncached_len}"
                 )
+
+                # Only retrieve if we have cached tokens beyond what's already in radix cache
+                # Align num_cached to chunk boundaries
+                num_cached_aligned = (num_cached // chunk_size) * chunk_size
+
+                if num_cached_aligned > value.numel():
+                    # Calculate how many tokens to retrieve
+                    tokens_to_retrieve = num_cached_aligned - value.numel()
+                    # Ensure we don't retrieve more than we allocated
+                    tokens_to_retrieve = min(tokens_to_retrieve, uncached_len)
+                    # Align to chunk boundaries
+                    tokens_to_retrieve = (tokens_to_retrieve // chunk_size) * chunk_size
+
+                    if tokens_to_retrieve > 0:
+                        # For MP mode, we need to construct slot_mapping that matches the key generation
+                        # Keys are generated with offset=0 (to match STORE), so we need to:
+                        # 1. Limit token_ids to num_cached_aligned (what's actually cached)
+                        # 2. Construct slot_mapping: [value.numel() entries of -1, tokens_to_retrieve actual slots]
+                        # 3. Use offset=0 to match STORE key generation
+
+                        # Limit token_ids to what's actually cached
+                        token_ids_to_use = key.token_ids[:num_cached_aligned]
+
+                        actual_slot_mapping = torch.cat(
+                            [
+                                torch.full(
+                                    (value.numel(),),
+                                    -1,
+                                    dtype=torch.int64,
+                                    device=self.device,
+                                ),
+                                token_slots[:tokens_to_retrieve]
+                                .detach()
+                                .clone()
+                                .to(torch.int64)
+                                .to(self.device),
+                            ]
+                        )
+
+                        # RETRIEVE: Use offset=0 to match STORE key generation
+                        # token_ids_to_use is limited to num_cached_aligned, so keys will be generated correctly
+                        num_retrieved = self.lmcache_connector.start_load_kv(
+                            token_ids=token_ids_to_use,
+                            slot_mapping=actual_slot_mapping,
+                            offset=0,  # Use offset=0 to match STORE (which always uses offset=0)
+                        )
+                    else:
+                        num_retrieved = 0
+                else:
+                    num_retrieved = 0
             else:
                 # In-process mode uses LoadMetadata
                 num_retrieved = self.lmcache_connector.start_load_kv(
