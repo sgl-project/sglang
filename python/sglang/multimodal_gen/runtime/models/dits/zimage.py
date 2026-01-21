@@ -622,7 +622,6 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         )
         self.layer_names = ["layers"]
 
-    # TODO: review
     # Copied from diffusers.models.transformers.transformer_z_image.unpatchify
     def unpatchify(
         self,
@@ -712,8 +711,6 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         Returns:
 
         """
-        # TODO: reivew, bsz==1 only
-        # TODO: hard code batch_size == 1 only fow now.
         assert len(all_image) == len(all_cap_feats) == 1
         bsz = len(all_image)
 
@@ -739,7 +736,6 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         all_image_len, all_cap_len, all_sig_len = [], [], []
 
         # ------------ Process Caption ------------
-        # TODO:
         # support bsz==1 only
         i = 0
 
@@ -820,25 +816,7 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
 
             else:
                 sig_H, sig_W, sig_C = sig_item.size()
-                # TODO: review.
-                # why reshape(sig_H * sig_W, sig_C) after permute
-                # "patchify"
                 sig_flat = sig_item.permute(2, 0, 1).reshape(sig_H * sig_W, sig_C)
-
-                # sig_out, sig_pos, sig_mask, sig_len, sig_nm = self._pad_with_ids(
-                #     sig_flat, (1, sig_H, sig_W), (cap_end_pos[j] + 1, 0, 0), device, noise_val
-                # )
-
-                # TODO: nm
-                # noise mask
-
-                # sig_ori_len = sig_flat.size(0)
-                # sig_padding_len = (-sig_ori_len) % SEQ_MULTI_OF
-                # # padded feature
-                # sig_padded_feat = torch.cat(
-                #     [sig_flat, sig_flat[-1:].repeat(sig_padding_len, 1)],
-                #     dim=0,
-                # )
 
                 sig_padded_feat, sig_len, sig_nm = self._pad_and_prepare_noise_mask(
                     sig_flat,
@@ -889,7 +867,6 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
             [feat, feat[-1:].repeat(padding_len, 1)],
             dim=0,
         )
-        # TODO: review
         noise_mask = (
             [noise_mask_val] * total_len if noise_mask_val is not None else None
         )  # token level
@@ -914,9 +891,6 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
             all_image_size (list): List of image size (F, H, W)
         """
         assert len(all_image) == len(all_cap_feats) == 1
-
-        # TODO: reivew
-        # hard code batch size = 1 for now.?
 
         image = all_image[0]  # C, F, H, W
         cap_feat = all_cap_feats[0]  # L, D
@@ -1017,7 +991,7 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         - Omni mode order: [cap, x, siglip]
         """
 
-        # TODO: single batch only for now.
+        # single batch only for now.
         bsz = len(x_seqlens)
         unified = []
         unified_freqs_cos = []
@@ -1034,7 +1008,6 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
                     unified.append(
                         torch.cat([cap[i][:cap_len], x[i][:x_len], siglip[i][:sig_len]])
                     )
-                    # TODO: review, hack
                     unified_freqs_cos.append(
                         torch.cat(
                             [
@@ -1085,8 +1058,6 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
                     torch.cat([x_freqs[1][:x_len], cap_freqs[1][:cap_len]])
                 )
 
-        # TODO: single batch only
-        # no batch pad
         assert len(unified) == 1, "Single batch only for now."
         assert len(unified_freqs_cos) == 1, "Single batch only for now."
         unified = unified[0].unsqueeze(0)
@@ -1182,8 +1153,6 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
                 )
                 image_size.append((F, H, W))
             else:
-                # TODO: review
-                # when will this happen?
                 image_len = SEQ_MULTI_OF
                 image_pos = (
                     self.create_coordinate_grid((1, 1, 1), (0, 0, 0), device)
@@ -1194,12 +1163,8 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
 
             image_pos_ids_list.append(image_pos)
 
-        # TODO: ugly hack
         for j, sig_item in enumerate(siglips if siglips is not None else []):
             if sig_item is not None:
-                # TODO: review
-                # diff
-                # shape = (1, xx , xx)???
                 sig_H, sig_W, sig_C = sig_item.size()
                 sig_flat = sig_item.permute(2, 0, 1).reshape(sig_H * sig_W, sig_C)
                 sig_pos = _get_pos_ids(
@@ -1219,8 +1184,6 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
                     )
                     sig_pos = sig_pos.to(torch.int32)
             else:
-                # TODO: review
-                # when will this happen?
                 sig_len = SEQ_MULTI_OF
                 sig_pos = (
                     self.create_coordinate_grid((1, 1, 1), (0, 0, 0), device)
@@ -1253,19 +1216,19 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         token_lens: List[int] = None,
         **kwargs,
     ):
-        # TODO: ignore control net for now.
+        # TODO(66ring): ignore control net for now.
         assert patch_size in self.all_patch_size
         assert f_patch_size in self.all_f_patch_size
 
-        # TODO: hard code bsz1
         assert len(hidden_states) == 1, f"{len(hidden_states)=}"
         assert len(encoder_hidden_states) == 1, f"{len(encoder_hidden_states)=}"
         assert siglip_feats is None or len(siglip_feats) == 1, f"{len(siglip_feats)=}"
 
         batch_size = len(hidden_states)
         # construct a 2d list for omni mode
-        # dim0 = batch_size
-        # dim1 = latents: condition images + 1 target image
+        #   dim0 = batch_size
+        #   dim1 = latents: condition images + 1 target image
+        # for a single latent[i] = [cond_images, ..., target_image]
         if condition_latents is not None:
             assert batch_size == 1, "Only batch_size=1 is tested for now."
             assert isinstance(condition_latents, list) and isinstance(
@@ -1278,22 +1241,18 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
 
         x = hidden_states
 
-        # TODO: review
-        # ugly?
-        # can be
-        # omni_mode = condition_latents is not None
+        # omni_mode:
+        #  split from a flatten view to a 2D list.
+        #  for a single prompt: embed[i] = ["...<|vision_start|>", "<|vision_start|>", ..., "<|vision_end|><|im_end|>"]
         omni_mode = isinstance(x[0], list)
-        device = x[0][-1].device if omni_mode else x[0].device
-
         if omni_mode:
-            # TODO: review
-            # ugly hack
             encoder_hidden_states = [
                 list(encoder_hidden_states[0].split_with_sizes(token_lens, dim=0))
             ]
         cap_feats = encoder_hidden_states
         timestep = 1000.0 - timestep
         t = timestep
+        device = x[0][-1].device if omni_mode else x[0].device
 
         if omni_mode:
             # Dual embeddings: noisy (t) and clean (t=1)
