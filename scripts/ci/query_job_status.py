@@ -26,13 +26,53 @@ except ImportError:
     exit(1)
 
 
+def check_gh_cli_available() -> bool:
+    """Check if gh CLI is installed and authenticated."""
+    try:
+        result = subprocess.run(
+            ["gh", "--version"],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            return False
+
+        # Check if authenticated
+        auth_result = subprocess.run(
+            ["gh", "auth", "status"],
+            capture_output=True,
+            text=True,
+        )
+        if auth_result.returncode != 0:
+            print(
+                "Error: gh CLI is not authenticated. Please run 'gh auth login' first.",
+                file=sys.stderr,
+            )
+            print(f"Details: {auth_result.stderr}", file=sys.stderr)
+            return False
+
+        return True
+    except FileNotFoundError:
+        print(
+            "Error: gh CLI is not installed. Please install it from https://cli.github.com/",
+            file=sys.stderr,
+        )
+        return False
+
+
 def run_gh_command(args: list[str]) -> dict:
     """Run gh CLI command and return JSON result."""
-    result = subprocess.run(
-        ["gh", "api"] + args,
-        capture_output=True,
-        text=True,
-    )
+    try:
+        result = subprocess.run(
+            ["gh", "api"] + args,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        raise Exception(
+            "gh CLI not found. Please install from https://cli.github.com/"
+        )
+
     if result.returncode != 0:
         raise Exception(f"gh api failed: {result.stderr}")
     return json.loads(result.stdout)
@@ -748,6 +788,10 @@ def format_markdown(
 
 
 def main():
+    # Check gh CLI availability before proceeding
+    if not check_gh_cli_available():
+        sys.exit(1)
+
     # Capture the time when the command is run (both datetime and formatted string)
     report_time = datetime.now(timezone.utc)
     report_generated_time = report_time.strftime("%Y-%m-%d %H:%M:%S")
