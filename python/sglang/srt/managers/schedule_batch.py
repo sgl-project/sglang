@@ -798,6 +798,10 @@ class Req:
             return self.output_ids[: self.finished_len]
         return self.output_ids
 
+    def get_radix_cache_token_ids(self) -> List[int]:
+        """Get token IDs for radix cache key computation."""
+        return self.fill_ids if self.is_dllm() else self.origin_input_ids + self.output_ids
+
     def pop_committed_kv_cache(self) -> int:
         """Return the length of committed KV cache and mark them as freed."""
         assert (
@@ -864,7 +868,7 @@ class Req:
         if self.return_logprob and self.logprob_start_len >= 0:
             max_prefix_len = min(max_prefix_len, self.logprob_start_len)
         max_prefix_len = max(max_prefix_len, 0)
-        token_ids = self.fill_ids[:max_prefix_len]
+        token_ids = self.get_radix_cache_token_ids()[:max_prefix_len]
 
         if tree_cache is not None:
             match_result = tree_cache.match_prefix(

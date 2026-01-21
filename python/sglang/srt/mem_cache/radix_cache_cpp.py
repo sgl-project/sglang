@@ -197,7 +197,7 @@ class RadixCacheCpp(BasePrefixCache):
     def cache_unfinished_req(self, req: Req, chunked=False):
         """Cache request when it is unfinished."""
         assert req.req_pool_idx is not None
-        token_ids = req.fill_ids
+        token_ids = req.get_radix_cache_token_ids()
         prefill_len = len(token_ids)  # prefill only (maybe chunked)
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, :prefill_len
