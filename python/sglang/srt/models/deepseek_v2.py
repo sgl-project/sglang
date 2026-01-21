@@ -105,7 +105,6 @@ from sglang.srt.layers.moe.utils import (
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.fp8_kernel import (
-    is_fp8_fnuz,
     per_tensor_quant_mla_fp8,
     per_token_group_quant_mla_deep_gemm_masked_fp8,
 )
@@ -1770,11 +1769,7 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
                 q_rope=q_pe,
                 k_rope=k_pe,
                 **extra_args,
-                **(
-                    dict(topk_indices=topk_indices)
-                    if topk_indices is not None
-                    else {}
-                ),
+                **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
             )
         else:
             if _use_aiter_gfx95:

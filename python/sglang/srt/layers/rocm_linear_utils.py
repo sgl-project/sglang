@@ -64,9 +64,7 @@ def rope_plus_attn_mqa(
         fp8_dtype if mla_inst.kv_cache_dtype == "fp8_e4m3" else q_nope_out.dtype
     )
 
-    k = forward_batch.token_to_kv_pool.get_key_buffer(
-        mla_inst.attn_mqa.layer_id
-    )
+    k = forward_batch.token_to_kv_pool.get_key_buffer(mla_inst.attn_mqa.layer_id)
 
     q = fused_qk_rope_cat_and_cache_mla(
         q_nope_out,
