@@ -33,7 +33,7 @@ jobs:
 
       - name: Install rust dependencies
         run: |
-          bash scripts/ci/ci_install_rust.sh
+          bash scripts/ci/ci_install_gateway_dependencies.sh
 
       - name: Configure sccache
         uses: mozilla-actions/sccache-action@v0.0.9
@@ -120,7 +120,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          bash scripts/ci/ci_install_rust.sh
+          bash scripts/ci/ci_install_gateway_dependencies.sh
 
       - name: Configure sccache
         uses: mozilla-actions/sccache-action@v0.0.9
