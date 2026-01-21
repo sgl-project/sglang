@@ -166,6 +166,14 @@ def cutlass_fused_experts_fp8(
             w2_scale.shape == expected_w2_scale_shape
         ), f"MXFP8 w2_scale must be {expected_w2_scale_shape}, got {w2_scale.shape}"
 
+        mxfp8_blockscale_align = 128
+        total_tokens = m * topk
+        nonzero_experts = min(num_experts, total_tokens)
+        max_total = total_tokens + (mxfp8_blockscale_align - 1) * nonzero_experts
+        max_blockscale = (
+            (max_total + mxfp8_blockscale_align - 1) // mxfp8_blockscale_align
+        ) * mxfp8_blockscale_align
+
     blockscale_offsets = None
     if use_mxfp8 and (es_up or es_down):
         blockscale_offsets = torch.empty(
@@ -188,9 +196,8 @@ def cutlass_fused_experts_fp8(
     if use_mxfp8 and es_up:
         rep_a = shuffle_rows(a, a_map, (m * topk, k))
         rep_a_q = torch.empty_like(rep_a, dtype=torch.float8_e4m3fn)
-        total_blockscale = int(blockscale_offsets[-1].item())
         rep_a1_scales = torch.empty(
-            (total_blockscale, k // 32), dtype=torch.uint8, device=device
+            (max_blockscale, k // 32), dtype=torch.uint8, device=device
         )
         es_sm100_mxfp8_blockscaled_grouped_quant(
             rep_a,
@@ -263,9 +270,8 @@ def cutlass_fused_experts_fp8(
 
     if use_mxfp8 and es_down:
         intemediate_q = torch.empty_like(intermediate, dtype=torch.float8_e4m3fn)
-        total_blockscale = int(blockscale_offsets[-1].item())
         a2_scale = torch.empty(
-            (total_blockscale, n // 32), dtype=torch.uint8, device=device
+            (max_blockscale, n // 32), dtype=torch.uint8, device=device
         )
         es_sm100_mxfp8_blockscaled_grouped_quant(
             intermediate,
