@@ -281,7 +281,9 @@ def _response_peername(response: httpx.Response) -> Any:
     return get_extra_info("peername")
 
 
-def validate_openai_media_url_peer_ip(peername: Any, allowed_ips: set[ipaddress._BaseAddress]) -> None:
+def validate_openai_media_url_peer_ip(
+    peername: Any, allowed_ips: set[ipaddress._BaseAddress]
+) -> None:
     if not peername:
         raise ValueError("Failed to determine peer IP")
     ip_str = peername[0]
@@ -290,7 +292,7 @@ def validate_openai_media_url_peer_ip(peername: Any, allowed_ips: set[ipaddress.
         raise ValueError("Peer IP does not match DNS-resolved IPs")
 
 
-def _validate_media_url_with_policy(url: str, policy: dict[str, Any]) -> None:  
+def _validate_media_url_with_policy(url: str, policy: dict[str, Any]) -> None:
     _validate_media_url_with_policy_and_resolve(url, policy)
 
 
