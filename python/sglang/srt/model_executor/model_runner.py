@@ -2027,9 +2027,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # Collect attention layers and moe layers from the model
         self.model.model = resolve_language_model(self.model)
+        language_model = getattr(self.model, "language_model", self.model)
         self.attention_layers = []
         self.moe_layers = []
-        for layer in self.model.model.layers:
+        for layer in language_model.model.layers:
             if hasattr(layer, "self_attn"):
                 if hasattr(layer.self_attn, "attn"):
                     self.attention_layers.append(layer.self_attn.attn)
@@ -2238,6 +2239,27 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 reinit_attn_backend,
                 split_forward_count,
             )
+            elastic_ep_state = ElasticEPStateManager.instance()
+            if (
+                elastic_ep_state is not None
+                and not elastic_ep_state.is_active_equal_last()
+            ):
+                elastic_ep_state.snapshot_active_to_last()
+                elastic_ep_state.sync_active_to_cpu()
+                logging.info("EPLB due to rank faults")
+                gen = self.eplb_manager.rebalance()
+                while True:
+                    try:
+                        next(gen)
+                    except StopIteration:
+                        break
+                output = self._forward_raw(
+                    forward_batch,
+                    skip_attn_backend_init,
+                    pp_proxy_tensors,
+                    reinit_attn_backend,
+                    split_forward_count,
+                )
         output.expert_distribution_metrics = recorder_outputs.get("metrics")
 
         # Copy cached routing experts' buffers back to CPU cache
