@@ -22,6 +22,7 @@ You are welcome to enable various models based on your business requirements.
 | vllm-ascend/QWQ-32B-W8A8                   | Qwen                           | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | meta-llama/Llama-4-Scout-17B-16E-Instruct  | Llama                          | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | AI-ModelScope/Llama-3.1-8B-Instruct        | Llama                          | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| LLM-Research/llama-2-7b                    | Llama                          | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | LLM-Research/Llama-3.2-1B-Instruct         | Llama                          | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | mistralai/Mistral-7B-Instruct-v0.2         | Mistral                        | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | google/gemma-3-4b-it                       | Gemma                          | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
@@ -42,11 +43,12 @@ You are welcome to enable various models based on your business requirements.
 | inclusionAI/Ling-lite                      | Ling                           | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | ibm-granite/granite-3.1-8b-instruct        | Granite                        | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | ibm-granite/granite-3.0-3b-a800m-instruct  | Granite MoE                    | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| databricks/dbrx-instruct                   | DBRX (Databricks)              | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| AI-ModelScope/dbrx-instruct                | DBRX (Databricks)              | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | baichuan-inc/Baichuan2-13B-Chat            | Baichuan 2 (7B, 13B)           | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | baidu/ERNIE-4.5-21B-A3B-PT                 | ERNIE-4.5 (4.5, 4.5MoE series) | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | openbmb/MiniCPM3-4B                        | MiniCPM (v3, 4B)               | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| openai/gpt-oss-120b                        | GPTOSS                         | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| Kimi/Kimi-K2-Think                         | Kimi                           | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| openai/gpt-oss-120b                        | GPTOSS                         |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
 
 ## Multimodal Language Models
 
@@ -59,8 +61,10 @@ You are welcome to enable various models based on your business requirements.
 | Qwen/Qwen3-VL-4B-Instruct                     | Qwen-VL                   | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | Qwen/Qwen3-VL-235B-A22B-Instruct              | Qwen-VL                   | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | deepseek-ai/deepseek-vl2                      | DeepSeek-VL2              | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| deepseek-ai/Janus-Pro-1B                      | Janus-Pro (1B, 7B)        | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | deepseek-ai/Janus-Pro-7B                      | Janus-Pro (1B, 7B)        | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | openbmb/MiniCPM-V-2_6                         | MiniCPM-V / MiniCPM-o     | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| openbmb/MiniCPM-o-2_6                         | MiniCPM-V / MiniCPM-o     | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | google/gemma-3-4b-it                          | Gemma 3 (Multimodal)      | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | mistralai/Mistral-Small-3.1-24B-Instruct-2503 | Mistral-Small-3.1-24B     | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | microsoft/Phi-4-multimodal-instruct           | Phi-4-multimodal-instruct | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
@@ -90,7 +94,7 @@ You are welcome to enable various models based on your business requirements.
 | 	Skywork/Skywork-Reward-Llama-3.1-8B-v0.2   | Llama3.1 Reward           | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | 	Shanghai_AI_Laboratory/internlm2-7b-reward | InternLM 2 Reward         | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | 	Qwen/Qwen2.5-Math-RM-72B                   | Qwen2.5 Reward - Math     | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| 	jason9693/Qwen2.5-1.5B-apeach              | Qwen2.5 Reward - Sequence | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| 	Howeee/Qwen2.5-1.5B-apeach                 | Qwen2.5 Reward - Sequence | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | 	Skywork/Skywork-Reward-Gemma-2-27B-v0.2    | Gemma 2-27B Reward        | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 
 ## Rerank Models
