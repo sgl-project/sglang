@@ -80,6 +80,8 @@ __global__ void load_cache_to_device_buffer(
   }
   for (int i = tid; i < NUM_BUFFER_CHUNKS + 1; i += BLOCK_SIZE) {
     s_chunk_offset[i] = 0;
+  }
+  for (int i = tid; i < HOT_BUFFER_SIZE; i += BLOCK_SIZE) {
     s_lru_bitmap[i] = false;
   }
   __syncthreads();
@@ -152,10 +154,11 @@ __global__ void load_cache_to_device_buffer(
     if (is_hit) {
       int hit_offset = s_chunk_offset[chunk_idx] + local_hit_offset;
       // write hit slots from back to front
-      lru_slots_out[HOT_BUFFER_SIZE - hit_offset] = buf_slot;
+      lru_slots_out[HOT_BUFFER_SIZE - 1 - hit_offset] = buf_slot;
       s_lru_bitmap[buf_slot] = true;
     }
   }
+  __syncthreads();
 
   // Second pass to collect evictable slots
   for (int iter = 0; iter < ITERATIONS_PER_WARP_BUFFER; iter++) {
@@ -175,7 +178,7 @@ __global__ void load_cache_to_device_buffer(
         if (evictable_offset < NUM_TOP_K + 1 - s_total_hits) {
           s_evictable_slots[evictable_offset] = buf_slot;
           // fill the to-evict slots next to the hits
-          lru_slots_out[HOT_BUFFER_SIZE - s_total_hits - evictable_offset] = buf_slot;
+          lru_slots_out[HOT_BUFFER_SIZE - 1 - s_total_hits - evictable_offset] = buf_slot;
         } else {
           // remaining evictable slots go to the front of lru_slots_out
           lru_slots_out[evictable_offset + s_total_hits - NUM_TOP_K - 1] = buf_slot;
