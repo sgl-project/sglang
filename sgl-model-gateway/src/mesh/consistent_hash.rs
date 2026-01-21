@@ -57,13 +57,13 @@ impl ConsistentHashRing {
         }
     }
 
-    /// Get K owners for a key
-    pub fn get_owners(&self, key: &str) -> Vec<String> {
+    pub fn get_owners(&self, key: &str) -> Vec<&str> {
         if self.ring.is_empty() {
             return Vec::new();
         }
 
         let key_hash = Self::hash(key);
+
         let mut owners = Vec::with_capacity(NUM_OWNERS);
         let total_unique_nodes = self.node_hashes.len();
 
@@ -78,6 +78,7 @@ impl ConsistentHashRing {
                 iter = self.ring.range(..);
             }
         }
+
         owners
     }
 
@@ -193,8 +194,8 @@ mod tests {
         let owners = ring.get_owners("test_key");
         // Should return all available nodes (2) without infinite loop
         assert_eq!(owners.len(), 2);
-        assert!(owners.contains(&"node1".to_string()));
-        assert!(owners.contains(&"node2".to_string()));
+        assert!(owners.contains(&"node1"));
+        assert!(owners.contains(&"node2"));
     }
 
     #[test]
