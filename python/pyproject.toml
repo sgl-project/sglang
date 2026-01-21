@@ -172,11 +172,11 @@ exclude = [
 [tool.setuptools_scm]
 root = ".."
 version_file = "sglang/_version.py"
-# Custom git command that embeds commit hash in the dev version for unique nightly wheels
-# Generates versions like: 0.5.7.dev701.g1e30903
-# Which creates wheel names like: sglang-0.5.7.dev701.g1e30903-py3-none-any.whl
-# Format breakdown: TAG=v0.5.7, COMMITS=701, HASH=1e30903 -> v0.5.7-701.g1e30903
-git_describe_command = ["bash", "-c", "TAG=$(git tag --list --sort=-version:refname 'v*.*.*' | head -1); COMMITS=$(git rev-list ${TAG}..HEAD --count 2>/dev/null || echo 0); HASH=$(git rev-parse --short=7 HEAD); echo \"${TAG}-${COMMITS}.g${HASH}\""]
+# Use timestamp-based dev versions for unique nightly wheels
+# Format: v0.5.7-20260120143022 where 20260120143022 is YYYYMMDDHHMMSS
+# This creates versions like 0.5.7.dev20260120143022
+# And wheel names like: sglang-0.5.7.dev20260120143022-py3-none-any.whl
+git_describe_command = ["bash", "-c", "TAG=$(git tag --list --sort=-version:refname 'v*.*.*' | head -1); TIMESTAMP=$(date -u +%Y%m%d%H%M%S); echo \"${TAG}-${TIMESTAMP}-g000000\""]
 local_scheme = "no-local-version"
 # Allow editable installs even when .git metadata is not available.
 fallback_version = "0.0.0.dev0"
