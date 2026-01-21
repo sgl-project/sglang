@@ -8,9 +8,9 @@ import torch
 from einops import rearrange
 
 from sglang.srt.layers.layernorm import LayerNorm
+from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.utils import add_prefix, ceil_align, is_cuda, is_hip, is_npu
-from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 
 global _use_multi_stream
 _is_cuda = is_cuda()
@@ -1000,7 +1000,8 @@ class Indexer(MultiPlatformOp):
                             x_q.to(torch.float32)
                             .view(m, ng, group)
                             .mul_(x_s.to(torch.float32).unsqueeze(-1))
-                            .view(m, n).to(torch.bfloat16)
+                            .view(m, n)
+                            .to(torch.bfloat16)
                         )
                     else:
                         x_for_gate = x_q.to(torch.bfloat16)

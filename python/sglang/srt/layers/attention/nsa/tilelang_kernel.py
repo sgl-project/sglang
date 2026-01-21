@@ -4,8 +4,8 @@ import tilelang
 import tilelang.language as T
 import torch
 
-from sglang.srt.utils import is_hip, is_gfx95_supported
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
+from sglang.srt.utils import is_gfx95_supported, is_hip
 
 tilelang.set_log_level("WARNING")
 
@@ -26,6 +26,7 @@ _is_fp8_fnuz = is_fp8_fnuz()
 BF16 = "bfloat16"
 FP8 = "float8_e4m3fnuz" if _is_fp8_fnuz else "float8_e4m3"
 FP32 = "float32"
+
 
 def fast_log2_ceil(x):
     bits_x = T.reinterpret("uint32", x)
@@ -790,9 +791,16 @@ def tilelang_sparse_fwd(
             kernel = sparse_attention_fwd_kernel_v1(
                 num_heads, d_v, tail_dim, topk, sm_scale=sm_scale, num_stages=1
             )
-        else: # reduce LDS usage on gfx942 target
+        else:  # reduce LDS usage on gfx942 target
             kernel = sparse_attention_fwd_kernel_v1(
-                num_heads, d_v, tail_dim, topk, sm_scale=sm_scale, block_I=32, num_stages=1, threads=128
+                num_heads,
+                d_v,
+                tail_dim,
+                topk,
+                sm_scale=sm_scale,
+                block_I=32,
+                num_stages=1,
+                threads=128,
             )
     else:
         kernel = sparse_attention_fwd_kernel_v2(

@@ -4,8 +4,8 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.utils import is_hip
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
+from sglang.srt.utils import is_hip
 
 _is_hip = is_hip()
 _is_fp8_fnuz = is_fp8_fnuz()
