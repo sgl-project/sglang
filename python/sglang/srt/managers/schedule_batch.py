@@ -1940,15 +1940,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req.kv_committed_len += 1
             req.kv_allocated_len += 1
 
-            # delete feature to save memory
-            if req.multimodal_inputs is None:
-                continue
-            for mm_item in req.multimodal_inputs.mm_items:
-                pixel_values = getattr(mm_item, "feature", None)
-                if isinstance(pixel_values, torch.Tensor):
-                    mm_item.feature = None
-                    del pixel_values
-
         # Update seq_lens after allocation
         if self.enable_overlap:
             # Do not use in-place operations in the overlap mode
