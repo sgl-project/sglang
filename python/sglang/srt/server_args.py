@@ -1278,7 +1278,14 @@ class ServerArgs:
                         f"but got '{self.dtype}'. Please use --dtype bfloat16 or remove --dtype to use auto."
                     )
 
-            supported_backends = ["triton", "trtllm_mha", "fa3", "fa4", "ascend", "intel_xpu"]
+            supported_backends = [
+                "triton",
+                "trtllm_mha",
+                "fa3",
+                "fa4",
+                "ascend",
+                "intel_xpu",
+            ]
             prefill_attn_backend, decode_attn_backend = self.get_attention_backends()
             assert (
                 prefill_attn_backend in supported_backends
