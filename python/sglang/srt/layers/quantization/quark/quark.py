@@ -14,7 +14,11 @@ from sglang.srt.layers.quantization.base_config import (  # noqa: E501
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.layers.quantization.quark.quark_moe import QuarkMoEMethod
-from sglang.srt.layers.quantization.quark.schemes import QuarkScheme, QuarkW4A4MXFP4
+from sglang.srt.layers.quantization.quark.schemes import (
+    QuarkScheme,
+    QuarkW4A4MXFP4,
+    QuarkW8A8Fp8,
+)
 from sglang.srt.layers.quantization.quark.utils import deep_compare, should_ignore_layer
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.utils import get_device_capability
@@ -173,6 +177,37 @@ class QuarkConfig(QuantizationConfig):
         else:
             return False
 
+    def _is_fp8_w8a8(
+        self,
+        weight_quant: Optional[dict[str, Any]],
+        input_quant: Optional[dict[str, Any]],
+    ) -> bool:
+        # Confirm weights and input quantized.
+        if weight_quant is None or input_quant is None:
+            return False
+
+        # Confirm weight scheme is supported
+        is_fp8_dtype = (
+            weight_quant.get("dtype") == "fp8_e4m3"
+            and input_quant.get("dtype") == "fp8_e4m3"
+        )
+        is_static_weight = not weight_quant.get("is_dynamic")
+        is_per_tensor_or_channel_weight = weight_quant.get("qscheme") in [
+            "per_tensor",
+            "per_channel",
+        ]
+
+        if not (is_fp8_dtype and is_static_weight and is_per_tensor_or_channel_weight):
+            return False
+
+        # Dynamic quantization is always supported if weights supported.
+        if input_quant.get("is_dynamic"):
+            return True
+
+        # Confirm activation scheme is supported.
+        is_per_tensor_activation = input_quant.get("qscheme") == "per_tensor"
+        return is_per_tensor_activation
+
     def _is_mx_fp4(
         self,
         weight_quant: Optional[dict[str, Any]],
@@ -281,6 +316,12 @@ class QuarkConfig(QuantizationConfig):
 
         if self._is_mx_fp4(weight_config, input_config):
             return QuarkW4A4MXFP4(weight_config, input_config)
+        if self._is_fp8_w8a8(weight_config, input_config):
+            is_fp8_w8a8_supported = self._check_scheme_supported(
+                QuarkW8A8Fp8.get_min_capability(), error=False
+            )
+            if is_fp8_w8a8_supported:
+                return QuarkW8A8Fp8(weight_config, input_config)
 
         raise NotImplementedError(
             "No quark compatible scheme was found. "

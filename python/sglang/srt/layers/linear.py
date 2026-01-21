@@ -49,6 +49,7 @@ logger = logging.getLogger(__name__)
 
 WEIGHT_LOADER_V2_SUPPORTED = [
     "CompressedTensorsLinearMethod",
+    "QuarkLinearMethod",
     "AWQMarlinLinearMethod",
     "AWQLinearMethod",
     "AWQLinearAscendMethod",

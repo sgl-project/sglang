@@ -948,6 +948,9 @@ class Qwen3MoeForCausalLM(nn.Module):
                         weight_loader = getattr(
                             param, "weight_loader", default_weight_loader
                         )
+                        # quark w8a8 fp8 ptpc support 1d weight_scale
+                        if loaded_weight.ndim == 1 and param.data.ndim == 2:
+                            loaded_weight = loaded_weight.unsqueeze(-1)
                         weight_loader(param, loaded_weight)
                     else:
                         logger.warning(f"Parameter {name} not found in params_dict")

@@ -216,7 +216,9 @@ class _ColumnvLLMParameter(BasevLLMParameter):
                 loaded_weight = loaded_weight.narrow(
                     self.output_dim, shard_id * shard_size, shard_size
                 )
-
+        # quark w8a8 fp8 ptpc support 1d weight_scale
+        if loaded_weight.ndim == 1 and param_data.ndim == 2:
+            loaded_weight = loaded_weight.unsqueeze(-1)
         assert (
             param_data.shape == loaded_weight.shape
         ), f"{param_data.shape=}, {loaded_weight.shape=}"
@@ -261,7 +263,9 @@ class RowvLLMParameter(BasevLLMParameter):
                     self.input_dim,
                     shard_size,
                 )
-
+                # quark w8a8 fp8 ptpc support 1d weight_scale
+                if loaded_weight.ndim == 1 and param_data.ndim == 2:
+                    loaded_weight = loaded_weight.unsqueeze(-1)
                 assert param_data.shape == loaded_weight.shape
                 param_data.copy_(loaded_weight)
 

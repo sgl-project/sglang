@@ -856,6 +856,7 @@ def apply_fp8_linear(
             )
 
 
+
 def can_auto_enable_marlin_fp8() -> bool:
     try:
         major, minor = get_device_capability()
