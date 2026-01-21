@@ -119,6 +119,7 @@ class Glm4Attention(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         dual_chunk_attention_config: Optional[dict[str, Any]] = None,
         partial_rotary_factor: float = 0.5,
+        bias: bool = True,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -153,7 +154,7 @@ class Glm4Attention(nn.Module):
             self.head_dim,
             self.total_num_heads,
             self.total_num_kv_heads,
-            bias=True,
+            bias=bias,
             quant_config=quant_config,
             prefix=add_prefix("qkv_proj", prefix),
         )
@@ -218,6 +219,7 @@ class Glm4DecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
         rope_theta = getattr(config, "rope_theta", 1000000)
         rope_scaling = getattr(config, "rope_scaling", None)
+        bias = getattr(config, "attention_bias", True)
         max_position_embeddings = getattr(config, "max_position_embeddings", 32768)
         head_dim = getattr(config, "head_dim", None)
         partial_rotary_factor = getattr(
@@ -238,6 +240,7 @@ class Glm4DecoderLayer(nn.Module):
             quant_config=quant_config,
             dual_chunk_attention_config=dual_chunk_attention_config,
             partial_rotary_factor=partial_rotary_factor,
+            bias=bias,
             prefix=add_prefix("self_attn", prefix),
         )
 
