@@ -117,15 +117,15 @@ class DenoisingStage(PipelineStage):
         self._cached_num_steps = None
         self._is_warmed_up = False
 
-    def _maybe_enable_torch_compile(self, module: object) -> Any | None:
+    def _maybe_enable_torch_compile(self, module: object) -> None:
         """
-        Compile a module's forward with torch.compile, and enable inductor overlap tweak if available.
-        No-op if torch compile is disabled or the object has no forward.
+        Compile a module with torch.compile, and enable inductor overlap tweak if available.
+        No-op if torch compile is disabled or the object is not a nn.Module.
         """
         if not self.server_args.enable_torch_compile or not isinstance(
             module, nn.Module
         ):
-            return module
+            return
         try:
             import torch._inductor.config as _inductor_cfg
 
@@ -136,7 +136,6 @@ class DenoisingStage(PipelineStage):
         logger.info(f"Compiling transformer with mode: {mode}")
         # TODO(triple-mu): support customized fullgraph and dynamic in the future
         module.compile(mode=mode, fullgraph=False, dynamic=None)
-        return module
 
     def _maybe_enable_cache_dit(self, num_inference_steps: int, batch: Req) -> None:
         """Enable cache-dit on the transformers if configured (idempotent).
