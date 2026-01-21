@@ -109,7 +109,7 @@ def test_openai_media_url_revalidates_redirect_hops(monkeypatch, tmp_path):
 
     def handler(request):
         if request.url.host == "example.com":
-                return httpx.Response(
+            return httpx.Response(
                     302,
                     headers={"location": "https://images.example/image.png"},
                     extensions={
