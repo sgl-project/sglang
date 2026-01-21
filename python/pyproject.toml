@@ -99,6 +99,11 @@ diffusion = [
   "cache-dit==1.1.8"
 ]
 
+sonic-moe = [
+  "nvidia-cutlass-dsl==4.2.1",
+  "quack-kernels @ git+https://github.com/Dao-AILab/quack.git@3d0ab3ec2164749caac8f269f771e66a40efd2de",
+]
+
 tracing = [
   "opentelemetry-api",
   "opentelemetry-exporter-otlp",
@@ -144,7 +149,11 @@ sglang = "sglang.cli.main:main"
   "srt/speculative/cpp_ngram/*.h",
   "jit_kernel/include/sgl_kernel/*.h",
   "jit_kernel/include/sgl_kernel/*.cuh",
-  "jit_kernel/csrc/*.cuh"
+  "jit_kernel/csrc/*.cuh",
+  "srt/layers/moe/sonic_moe/**/*.cu",
+  "srt/layers/moe/sonic_moe/**/*.cpp",
+  "srt/layers/moe/sonic_moe/**/*.cuh",
+  "srt/layers/moe/sonic_moe/**/*.h"
 ]
 
 [tool.setuptools.packages.find]
