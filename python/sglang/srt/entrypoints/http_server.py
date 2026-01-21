@@ -494,7 +494,11 @@ async def health_generate(request: Request) -> Response:
             gri.bootstrap_room = 0
     else:
         gri = EmbeddingReqInput(
-            rid=rid, input_ids=[0], sampling_params=sampling_params, log_metrics=False
+            rid=rid,
+            input_ids=[0],
+            token_type_ids=[0],
+            sampling_params=sampling_params,
+            log_metrics=False,
         )
 
     async def gen():
