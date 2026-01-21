@@ -24,7 +24,7 @@ if TYPE_CHECKING:
         StandardDispatchOutput,
     )
 
-from sglang.srt.hardware_backend.npu.moe.npu_fused_experts import npu_fused_experts
+from sglang.srt.hardware_backend.npu.moe.npu_fused_experts import npu_fused_experts_w4a8, npu_fused_experts_w8a8
 
 # ---------------------------------------------------------------------------
 # Runner IO dataclasses
@@ -63,18 +63,54 @@ class TorchNpuKernelsQuantInfo(MoeQuantInfo):
     w2_weight: torch.Tensor
     w13_scale: Optional[torch.Tensor] = None
     w2_scale: Optional[torch.Tensor] = None
-
+    w13_offset: Optional[torch.Tensor] = None
+    w2_offset: Optional[torch.Tensor] = None
+    w13_scale_bias: Optional[torch.Tensor] = None
+    w2_scale_bias: Optional[torch.Tensor] = None
 
 # ---------------------------------------------------------------------------
 # Runner core
 # ---------------------------------------------------------------------------
-def output_w8a8(hidden_states, quant_info, topk_weights, topk_ids):
-    output = npu_fused_experts(
+
+def output_w4a8(hidden_states, quant_info, topk_weights, topk_ids):
+    output = npu_fused_experts_w4a8(
             hidden_states=hidden_states,
             w13=quant_info.w13_weight,
             w13_scale=quant_info.w13_scale,
+            w13_scale_bias=quant_info.w13_scale_bias,
             w2=quant_info.w2_weight,
             w2_scale=quant_info.w2_scale,
+            w2_scale_bias=quant_info.w2_scale_bias,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            top_k=topk_ids.shape[1],
+        )
+    return output
+
+def output_w4a16(hidden_states, quant_info, topk_weights, topk_ids):
+    output = npu_fused_experts_w4a8(
+            hidden_states=hidden_states,
+            w13=quant_info.w13_weight,
+            w13_scale=quant_info.w13_scale,
+            w13_offset=quant_info.w13_offset,
+            w2=quant_info.w2_weight,
+            w2_scale=quant_info.w2_scale,
+            w2_offset=quant_info.w2_offset,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            top_k=topk_ids.shape[1],
+        )
+    return output
+
+def output_w8a8(hidden_states, quant_info, topk_weights, topk_ids):
+    output = npu_fused_experts_w8a8(
+            hidden_states=hidden_states,
+            w13=quant_info.w13_weight,
+            w13_scale=quant_info.w13_scale,
+            w13_offset=quant_info.w13_offset,
+            w2=quant_info.w2_weight,
+            w2_scale=quant_info.w2_scale,
+            w2_offset=quant_info.w2_offset,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
             top_k=topk_ids.shape[1],
@@ -87,9 +123,15 @@ class TorchNpuKernelsRunnerCore(MoeRunnerCore):
 
     def __init__(self, config: MoeRunnerConfig):
         super().__init__(config)
-        if config.quantization == "ModelSlimW8A8Int8MoE":
+        
+        if config.quantization == "ModelSlimW4A8Int8MoE":
+            self.selected_run = output_w4a8
+        elif config.quantization == "NPUCompressedTensorsW4A8Int4DynamicMoEMethod":
+            self.selected_run = output_w4a8
+        elif config.quantization == "NPUCompressedTensorsW4A16Int4DynamicMoEMethod":
+            self.selected_run = output_w4a16
+        elif config.quantization == "ModelSlimW8A8Int8MoE":
             self.selected_run = output_w8a8
-
 
     def run(
         self,
@@ -149,3 +191,4 @@ def post_permute_torch_npu_kernels_to_standard(
     hidden_states = runner_output.hidden_states
 
     return StandardCombineInput(hidden_states=hidden_states)
+
