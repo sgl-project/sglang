@@ -133,7 +133,9 @@ class MetadataBuffers:
                 (size, hidden_size), dtype=hidden_states_dtype, device=device
             )
             # Request validation: store bootstrap_room to detect metadata corruption
-            self.bootstrap_rooms = torch.zeros((size, 8), dtype=torch.int64, device=device)
+            self.bootstrap_rooms = torch.zeros(
+                (size, 8), dtype=torch.int64, device=device
+            )
 
     def get_buf_infos(self):
         ptrs = [

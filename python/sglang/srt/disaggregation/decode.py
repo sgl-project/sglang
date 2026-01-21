@@ -747,7 +747,11 @@ class DecodeTransferQueue:
 
         # Validate bootstrap_room to detect context corruption
         actual_room = bootstrap_rooms[0].item()
-        expected_room = decode_req.req.bootstrap_room if decode_req.req.bootstrap_room is not None else 0
+        expected_room = (
+            decode_req.req.bootstrap_room
+            if decode_req.req.bootstrap_room is not None
+            else 0
+        )
 
         # Case 1: Metadata not ready yet (actual_room == 0)
         # Keep request in queue and wait for next poll
@@ -848,7 +852,9 @@ class DecodeTransferQueue:
                         self.scheduler.stream_output(
                             [decode_req.req], decode_req.req.return_logprob
                         )
-                        release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
+                        release_kv_cache(
+                            decode_req.req, self.tree_cache, is_insert=False
+                        )
                         if self.scheduler.enable_metrics:
                             self.scheduler.metrics_collector.increment_transfer_failed_reqs()
                     else:
