@@ -51,6 +51,9 @@ from lmcache.v1.multiprocess.custom_types import (
     CudaIPCWrapper,
     IPCCacheEngineKey,
     KVCache,
+    KVCacheFormat,
+    KVLayerGroupSpec,
+    L0LayoutSpec,
 )
 from lmcache.v1.multiprocess.mq import MessageQueueClient, MessagingFuture
 from lmcache.v1.multiprocess.protocol import RequestType, get_response_class
@@ -75,6 +78,99 @@ def wrap_kv_caches(kv_caches: List[torch.Tensor]) -> KVCache:
     return [CudaIPCWrapper(tensor) for tensor in kv_caches]
 
 
+def _build_kv_format(
+    model_config: "ModelConfig",
+    k_pool: List[torch.Tensor],
+    v_pool: List[torch.Tensor],
+    block_size: int,
+) -> KVCacheFormat:
+    """
+    Build KVCacheFormat from SGLang model config and KV pool tensors.
+
+    This function creates an engine-agnostic format descriptor that the
+    LMCache server can use to properly handle the KV cache layout.
+
+    Args:
+        model_config: SGLang model configuration
+        k_pool: List of K cache tensors per layer
+        v_pool: List of V cache tensors per layer
+        block_size: Number of tokens per block
+
+    Returns:
+        KVCacheFormat descriptor for this model's KV cache layout
+    """
+    # Determine format family based on tensor shape
+    # MLA shape: [num_blocks, block_size, hidden_dim] - 3D
+    # MHA shape: [num_blocks, block_size, num_heads, head_size] - 4D
+    first_tensor = k_pool[0] if k_pool else v_pool[0]
+
+    if first_tensor.ndim == 3:
+        # MLA format (e.g., DeepSeek)
+        family = "MLA_LATENT"
+        canonical = "KV_MLA_FMT"
+        hidden_dim = first_tensor.shape[2]
+        num_heads = None
+        head_size = None
+    elif first_tensor.ndim == 4:
+        # MHA format (standard attention)
+        family = "MHA_DENSE"
+        canonical = "KV_2LTD"
+        num_heads = first_tensor.shape[2]
+        head_size = first_tensor.shape[3]
+        hidden_dim = num_heads * head_size
+    else:
+        raise ValueError(f"Unsupported KV cache tensor shape: {first_tensor.shape}")
+
+    # Get dtype string
+    dtype_map = {
+        torch.float16: "float16",
+        torch.bfloat16: "bfloat16",
+        torch.float32: "float32",
+    }
+    dtype_str = dtype_map.get(first_tensor.dtype, str(first_tensor.dtype))
+
+    # Build L0 layout spec
+    # SGLang uses separated K/V tensors with K_layers_then_V_layers ordering
+    l0 = L0LayoutSpec(
+        separation="separated",
+        addressing="gpu_block_ids",
+        block_size=block_size,
+        pointer_order="K_layers_then_V_layers",
+    )
+
+    # Build layer groups (SGLang typically has uniform layers)
+    num_layers = len(k_pool)
+    layer_group = KVLayerGroupSpec(
+        start_layer=0,
+        num_layers=num_layers,
+        dtype=dtype_str,
+        hidden_dim=hidden_dim,
+        num_heads=num_heads,
+        head_size=head_size,
+    )
+
+    # Generate stable format_id
+    model_name = getattr(model_config, "model_path", "unknown")
+    # Use just the model family and format for ID
+    format_id = f"{family}/{canonical}/sglang/{dtype_str}/v1"
+
+    kv_format = KVCacheFormat(
+        family=family,
+        canonical=canonical,
+        l0=l0,
+        layer_groups=[layer_group],
+        format_id=format_id,
+    )
+
+    logger.info(
+        f"Built KVCacheFormat: family={family}, canonical={canonical}, "
+        f"num_layers={num_layers}, hidden_dim={hidden_dim}, block_size={block_size}, "
+        f"dtype={dtype_str}, format_id={format_id}"
+    )
+
+    return kv_format
+
+
 def send_lmcache_request(
     mq_client: MessageQueueClient,
     request_type: RequestType,
@@ -92,6 +188,18 @@ def get_lmcache_chunk_size(mq_client: MessageQueueClient) -> int:
     future = send_lmcache_request(mq_client, RequestType.GET_CHUNK_SIZE, [])
     chunk_size = future.result()
     return chunk_size
+
+
+def get_lmcache_config(mq_client: MessageQueueClient) -> dict:
+    """
+    Get server configuration from LMCache server.
+
+    Returns:
+        dict with keys like "hash_seed", "chunk_size", "version", "protocol_version"
+    """
+    future = send_lmcache_request(mq_client, RequestType.GET_CONFIG, [])
+    config = future.result()
+    return config
 
 
 def striding_block_hashes(
@@ -172,8 +280,14 @@ class LMCacheMPAdapter:
         # Registered KV caches
         self.kv_caches: List[torch.Tensor] = []
 
-        # Get chunk size from LMCache server
-        self.chunk_size = get_lmcache_chunk_size(self.mq_client)
+        # Get server configuration
+        self.server_config = get_lmcache_config(self.mq_client)
+        self._verify_hash_config()
+
+        # Get chunk size from config
+        self.chunk_size = self.server_config.get(
+            "chunk_size", get_lmcache_chunk_size(self.mq_client)
+        )
         assert self.chunk_size % sglang_block_size == 0, (
             f"LMCache chunk size ({self.chunk_size}) must be a multiple of "
             f"SGLang block size ({sglang_block_size})"
@@ -196,28 +310,101 @@ class LMCacheMPAdapter:
         logger.info(
             f"LMCache MP Adapter initialized: server={server_url}, "
             f"instance_id={self.instance_id}, chunk_size={self.chunk_size}, "
-            f"blocks_in_chunk={self.blocks_in_chunk}"
+            f"blocks_in_chunk={self.blocks_in_chunk}, "
+            f"protocol_version={self.server_config.get('protocol_version', 1)}"
         )
 
-    def register_kv_caches(self, kv_caches: List[torch.Tensor]) -> None:
+    def _verify_hash_config(self) -> None:
+        """
+        Verify hash configuration matches between client and server.
+
+        This helps catch misconfiguration that would cause cache misses
+        due to inconsistent key generation.
+        """
+        import sys
+
+        server_hash_seed = self.server_config.get("hash_seed")
+        client_hash_seed = os.environ.get("PYTHONHASHSEED")
+
+        if client_hash_seed is not None:
+            try:
+                client_hash_seed = int(client_hash_seed)
+            except ValueError:
+                client_hash_seed = None
+
+        server_hash_random = self.server_config.get("hash_randomization", True)
+        client_hash_random = sys.flags.hash_randomization
+
+        # Log configuration
+        logger.info(
+            f"Hash config - Server: seed={server_hash_seed}, random={server_hash_random}; "
+            f"Client: seed={client_hash_seed}, random={client_hash_random}"
+        )
+
+        # Warn if there's a mismatch that could cause issues
+        if server_hash_seed != client_hash_seed:
+            if server_hash_seed is not None and client_hash_seed is not None:
+                logger.warning(
+                    f"PYTHONHASHSEED mismatch: server={server_hash_seed}, client={client_hash_seed}. "
+                    "This may cause cache misses after restarts."
+                )
+            elif server_hash_seed is None and client_hash_seed is None:
+                logger.warning(
+                    "PYTHONHASHSEED is not set on either server or client. "
+                    "For consistent caching across process restarts, set PYTHONHASHSEED=0."
+                )
+
+        if server_hash_random != client_hash_random:
+            logger.warning(
+                f"Hash randomization mismatch: server={server_hash_random}, client={client_hash_random}. "
+                "This may cause cache key inconsistencies."
+            )
+
+    def register_kv_caches(
+        self,
+        kv_caches: List[torch.Tensor],
+        kv_format: Optional[KVCacheFormat] = None,
+    ) -> None:
         """
         Register KV cache tensors with the LMCache server via CUDA IPC.
 
         Args:
             kv_caches: List of KV cache tensors ordered as [K0, K1, ..., V0, V1, ...]
+            kv_format: Optional KVCacheFormat descriptor for engine-agnostic registration.
+                       If None, server will infer format from tensor shapes (backward compat).
         """
         self.kv_caches = kv_caches
-        logger.info(f"Registering {len(kv_caches)} KV cache tensors")
+        self.kv_format = kv_format
 
-        # Pass "sglang" as backend_type to tell the server to use unilateral kernel
+        if kv_format is not None:
+            logger.info(
+                f"Registering {len(kv_caches)} KV cache tensors with format={kv_format.format_id}, "
+                f"block_size={kv_format.block_size}"
+            )
+        else:
+            logger.info(
+                f"Registering {len(kv_caches)} KV cache tensors with block_size={self.sglang_block_size} "
+                "(legacy mode - format will be inferred)"
+            )
+
+        # Send registration with KVCacheFormat (engine-agnostic)
         future = send_lmcache_request(
             self.mq_client,
             RequestType.REGISTER_KV_CACHE,
-            [self.instance_id, wrap_kv_caches(kv_caches), "sglang"],
+            [
+                self.instance_id,
+                wrap_kv_caches(kv_caches),
+                kv_format,  # Optional[KVCacheFormat] - None triggers backward compat
+            ],
         )
         future.result()  # Wait for registration to complete
 
-        logger.info(f"KV caches registered successfully with backend_type=sglang")
+        if kv_format is not None:
+            logger.info(
+                f"KV caches registered successfully with format={kv_format.format_id}"
+            )
+        else:
+            logger.info("KV caches registered successfully (legacy mode)")
 
     def unregister_kv_caches(self) -> None:
         """Unregister KV cache tensors from the LMCache server."""
@@ -246,7 +433,12 @@ class LMCacheMPAdapter:
         strided = striding_block_hashes(block_hashes, self.blocks_in_chunk)
         return [self._create_key(h) for h in strided]
 
-    def _token_ids_to_chunk_hashes(self, token_ids: List[int]) -> List[bytes]:
+    def _token_ids_to_chunk_hashes(
+        self,
+        token_ids: List[int],
+        start_offset: int = 0,
+        end_offset: Optional[int] = None,
+    ) -> List[bytes]:
         """
         Convert token IDs to chunk hashes.
         Each chunk of token_ids forms one hash.
@@ -256,6 +448,11 @@ class LMCacheMPAdapter:
         process restarts, PYTHONHASHSEED=0 must be set before starting
         both the LMCache server and SGLang.
 
+        Args:
+            token_ids: Full token ID sequence
+            start_offset: Offset to start processing from (for calculating prefix_hash)
+            end_offset: Optional offset to stop processing at (exclusive)
+
         Note: We use 0 as the initial prefix_hash to match LMCache's NONE_HASH
         constant, which defaults to 0 when vLLM is not available.
         """
@@ -264,14 +461,28 @@ class LMCacheMPAdapter:
             _check_pythonhashseed()
             _pythonhashseed_checked = True
 
+        if end_offset is None:
+            end_offset = len(token_ids)
+
         logger.info(
-            f"_token_ids_to_chunk_hashes: input len={len(token_ids)}, chunk_size={self.chunk_size}"
+            f"_token_ids_to_chunk_hashes: input len={len(token_ids)}, chunk_size={self.chunk_size}, start_offset={start_offset}, end_offset={end_offset}"
         )
 
-        hashes = []
-        # Use 0 as initial prefix hash (matches LMCache's NONE_HASH fallback)
+        # Calculate prefix_hash from tokens before start_offset
+        # IMPORTANT: We must process ALL chunks from the beginning to get the correct prefix_hash
+        # This ensures that the hash for a chunk at position i depends on all previous chunks
         prefix_hash = 0
-        for i in range(0, len(token_ids), self.chunk_size):
+        # Process all chunks from the beginning up to (but not including) start_offset
+        for i in range(0, start_offset, self.chunk_size):
+            chunk = token_ids[i : i + self.chunk_size]
+            if len(chunk) == self.chunk_size:
+                # Use Python's builtin hash() to match LMCache server
+                # LMCache uses: hash((prefix_hash, tokens_tuple, extra_keys))
+                prefix_hash = hash((prefix_hash, tuple(chunk), None))
+
+        # Now process chunks from start_offset to end_offset
+        hashes = []
+        for i in range(start_offset, end_offset, self.chunk_size):
             chunk = token_ids[i : i + self.chunk_size]
             logger.info(
                 f"  i={i}: chunk_len={len(chunk)}, is_full={len(chunk) == self.chunk_size}"
@@ -286,9 +497,16 @@ class LMCacheMPAdapter:
         logger.info(f"_token_ids_to_chunk_hashes: output {len(hashes)} hashes")
         return hashes
 
-    def _token_ids_to_keys(self, token_ids: List[int]) -> List[IPCCacheEngineKey]:
+    def _token_ids_to_keys(
+        self,
+        token_ids: List[int],
+        start_offset: int = 0,
+        end_offset: Optional[int] = None,
+    ) -> List[IPCCacheEngineKey]:
         """Convert token IDs directly to cache keys."""
-        chunk_hashes = self._token_ids_to_chunk_hashes(token_ids)
+        chunk_hashes = self._token_ids_to_chunk_hashes(
+            token_ids, start_offset, end_offset
+        )
         return [self._create_key(h) for h in chunk_hashes]
 
     # ==================== Lookup Operations ====================
@@ -304,7 +522,7 @@ class LMCacheMPAdapter:
         if request_id in self.lookup_futures:
             return  # Already submitted
 
-        keys = self._token_ids_to_keys(token_ids)
+        keys = self._token_ids_to_keys(token_ids, start_offset=0)
         if not keys:
             return
 
@@ -351,7 +569,7 @@ class LMCacheMPAdapter:
         Returns:
             Number of cached tokens (prefix-aligned to chunk_size)
         """
-        keys = self._token_ids_to_keys(token_ids)
+        keys = self._token_ids_to_keys(token_ids, start_offset=0)
         if not keys:
             return 0
 
@@ -394,7 +612,7 @@ class LMCacheMPAdapter:
             block_ids: Corresponding GPU block IDs
             event: CUDA event for synchronization
         """
-        keys = self._token_ids_to_keys(token_ids)
+        keys = self._token_ids_to_keys(token_ids, start_offset=0)
         if not keys:
             return
 
@@ -451,7 +669,7 @@ class LMCacheMPAdapter:
             block_ids: Target GPU block IDs
             event: CUDA event for synchronization
         """
-        keys = self._token_ids_to_keys(token_ids)
+        keys = self._token_ids_to_keys(token_ids, start_offset=0)
         if not keys:
             return
 
@@ -653,6 +871,14 @@ class LMCacheMPConnector:
             sglang_block_size=self.block_size,
         )
 
+        # Build engine-agnostic KVCacheFormat
+        kv_format = _build_kv_format(
+            model_config=model_config,
+            k_pool=k_pool,
+            v_pool=v_pool,
+            block_size=self.block_size,
+        )
+
         # Register KV caches for unilateral kernel
         # The kernel expects: [K0, K1, ..., K_n, V0, V1, ..., V_n]
         # NOT interleaved like [K0, V0, K1, V1, ...]
@@ -663,7 +889,7 @@ class LMCacheMPConnector:
         # Then all V tensors
         for v in v_pool:
             kv_caches.append(v)
-        self._adapter.register_kv_caches(kv_caches)
+        self._adapter.register_kv_caches(kv_caches, kv_format=kv_format)
 
         # Store references
         self.k_pool = k_pool
@@ -707,30 +933,45 @@ class LMCacheMPConnector:
         Args:
             token_ids: Token IDs to load
             slot_mapping: Target slot mapping
-            offset: Offset for already loaded tokens
+            offset: Offset for already loaded tokens (0 for MP mode to match STORE)
 
         Returns:
             Number of tokens retrieved
         """
         # Calculate how many tokens to retrieve
         num_tokens = len(token_ids)
-        aligned_end = (
-            num_tokens // self._adapter.chunk_size
-        ) * self._adapter.chunk_size
+        # Calculate remaining tokens after offset
+        remaining_tokens = num_tokens - offset
+        # Align to chunk boundaries based on remaining tokens
+        aligned_end = offset + (
+            (remaining_tokens // self._adapter.chunk_size) * self._adapter.chunk_size
+        )
 
         logger.info(
-            f"start_load_kv: num_tokens={num_tokens}, aligned_end={aligned_end}, offset={offset}"
+            f"start_load_kv: num_tokens={num_tokens}, remaining_tokens={remaining_tokens}, aligned_end={aligned_end}, offset={offset}"
         )
 
         if aligned_end <= offset:
             return 0
 
         # Get keys for the tokens to retrieve
-        retrieve_tokens = token_ids[offset:aligned_end]
-        keys = self._adapter._token_ids_to_keys(retrieve_tokens)
+        # IMPORTANT: For MP mode, we always use offset=0 in key generation to match STORE
+        # The prefix_hash calculation in _token_ids_to_chunk_hashes will handle the offset correctly
+        # by processing all chunks from the beginning up to start_offset
+        # However, we only generate keys for the chunks we actually need to retrieve
+        # Calculate which chunks to retrieve: from offset to aligned_end
+        keys = self._adapter._token_ids_to_keys(
+            token_ids, start_offset=0, end_offset=aligned_end
+        )
+
+        # Filter keys to only include those for tokens we actually need to retrieve (offset to aligned_end)
+        # Each key corresponds to one chunk, so we need to skip keys for chunks before offset
+        chunks_before_offset = offset // self._adapter.chunk_size
+        keys = keys[chunks_before_offset:]
 
         logger.info(
-            f"start_load_kv: num_keys={len(keys)}, retrieve_tokens_len={len(retrieve_tokens)}"
+            f"start_load_kv: num_keys={len(keys)}, retrieve_tokens_len={aligned_end - offset}, "
+            f"chunks_before_offset={chunks_before_offset}"
         )
 
         # Log key hashes for debugging
@@ -743,7 +984,55 @@ class LMCacheMPConnector:
         # Calculate block IDs from slot mapping
         # We need unique block IDs (one per block, not per slot)
         # The server expects: len(block_ids) * block_size = len(keys) * chunk_size
-        retrieve_slot_mapping = slot_mapping[offset:aligned_end]
+        # For MP mode with offset=0:
+        # - Keys are generated for token_ids[0:aligned_end] (to match STORE)
+        # - slot_mapping is constructed in lmc_radix_cache.py as [value.numel() entries of -1, token_slots]
+        # - We need to extract the actual slots (non--1 entries) for the tokens we're retrieving
+        tokens_to_retrieve = aligned_end - offset
+
+        # Find the start of actual slots (first non--1 index)
+        # This corresponds to value.numel() in lmc_radix_cache.py
+        actual_slot_start = 0
+        for i in range(len(slot_mapping)):
+            if slot_mapping[i].item() != -1:
+                actual_slot_start = i
+                break
+
+        # Extract the slot mapping for tokens we're retrieving
+        # We need exactly tokens_to_retrieve slots, starting from actual_slot_start
+        if actual_slot_start + tokens_to_retrieve > len(slot_mapping):
+            logger.warning(
+                f"start_load_kv: slot_mapping too short: need {actual_slot_start + tokens_to_retrieve}, "
+                f"have {len(slot_mapping)}"
+            )
+            tokens_to_retrieve = len(slot_mapping) - actual_slot_start
+            if tokens_to_retrieve <= 0:
+                return 0
+
+        retrieve_slot_mapping = slot_mapping[
+            actual_slot_start : actual_slot_start + tokens_to_retrieve
+        ]
+
+        # Validate that retrieve_slot_mapping has the correct length
+        expected_slot_mapping_len = len(keys) * self._adapter.chunk_size
+        if len(retrieve_slot_mapping) != expected_slot_mapping_len:
+            logger.warning(
+                f"start_load_kv: slot_mapping length mismatch: "
+                f"have {len(retrieve_slot_mapping)}, expected {expected_slot_mapping_len}, "
+                f"keys={len(keys)}, chunk_size={self._adapter.chunk_size}"
+            )
+            # Adjust to the actual length
+            if len(retrieve_slot_mapping) < expected_slot_mapping_len:
+                # Not enough slots, reduce the number of keys
+                actual_chunks = len(retrieve_slot_mapping) // self._adapter.chunk_size
+                keys = keys[:actual_chunks]
+                tokens_to_retrieve = actual_chunks * self._adapter.chunk_size
+                retrieve_slot_mapping = slot_mapping[
+                    actual_slot_start : actual_slot_start + tokens_to_retrieve
+                ]
+                if len(keys) == 0:
+                    return 0
+
         block_ids = []
         chunk_size = self._adapter.chunk_size
         block_size = self.block_size
@@ -752,14 +1041,42 @@ class LMCacheMPConnector:
             chunk_start = i * chunk_size
             chunk_end = min(chunk_start + chunk_size, len(retrieve_slot_mapping))
             chunk_slots = retrieve_slot_mapping[chunk_start:chunk_end]
+
+            # Validate chunk_slots
+            if len(chunk_slots) != chunk_size:
+                logger.warning(
+                    f"start_load_kv: chunk {i} has {len(chunk_slots)} slots, expected {chunk_size}"
+                )
+                # Skip incomplete chunks
+                continue
+
             # Get unique block IDs for this chunk (one per block, not per slot)
+            # slot_mapping values are slot indices, convert to block IDs
+            seen_blocks = set()
             for slot_idx in range(0, len(chunk_slots), block_size):
-                block_id = int(chunk_slots[slot_idx].item() // block_size)
-                block_ids.append(block_id)
+                slot_value = chunk_slots[slot_idx].item()
+                if slot_value < 0:
+                    logger.warning(
+                        f"start_load_kv: chunk {i}, slot {slot_idx} has invalid value {slot_value}"
+                    )
+                    continue
+                block_id = int(slot_value // block_size)
+                if block_id not in seen_blocks:
+                    block_ids.append(block_id)
+                    seen_blocks.add(block_id)
 
         logger.info(
-            f"start_load_kv: num_block_ids={len(block_ids)}, expected={len(keys) * chunk_size // block_size}"
+            f"start_load_kv: num_block_ids={len(block_ids)}, expected={len(keys) * chunk_size // block_size}, "
+            f"num_keys={len(keys)}, chunk_size={chunk_size}, block_size={block_size}"
         )
+
+        # Validate block_ids count
+        expected_block_ids = len(keys) * chunk_size // block_size
+        if len(block_ids) != expected_block_ids:
+            logger.error(
+                f"start_load_kv: block_ids count mismatch: have {len(block_ids)}, expected {expected_block_ids}"
+            )
+            return 0
 
         # Create CUDA event for synchronization
         event = torch.cuda.Event(interprocess=True)
@@ -799,22 +1116,28 @@ class LMCacheMPConnector:
         """
         # Align to chunk boundaries
         chunk_size = self._adapter.chunk_size
-        store_start = (offset // chunk_size) * chunk_size
-        store_end = (len(token_ids) // chunk_size) * chunk_size
+        num_tokens = len(token_ids)
+        # Calculate remaining tokens after offset
+        remaining_tokens = num_tokens - offset
+        # Align to chunk boundaries based on remaining tokens
+        store_start = offset
+        store_end = offset + ((remaining_tokens // chunk_size) * chunk_size)
 
         logger.info(
-            f"store_kv: num_tokens={len(token_ids)}, store_start={store_start}, store_end={store_end}"
+            f"store_kv: num_tokens={num_tokens}, remaining_tokens={remaining_tokens}, store_start={store_start}, store_end={store_end}"
         )
 
         if store_end <= store_start:
             return
 
         # Get keys for the tokens to store
-        store_tokens = token_ids[store_start:store_end]
-        keys = self._adapter._token_ids_to_keys(store_tokens)
+        # Use full token_ids with start_offset and end_offset to calculate correct prefix_hash
+        keys = self._adapter._token_ids_to_keys(
+            token_ids, start_offset=store_start, end_offset=store_end
+        )
 
         logger.info(
-            f"store_kv: num_keys={len(keys)}, store_tokens_len={len(store_tokens)}"
+            f"store_kv: num_keys={len(keys)}, store_tokens_len={store_end - store_start}"
         )
 
         # Log key hashes for debugging
