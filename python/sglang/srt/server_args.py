@@ -194,9 +194,9 @@ FP8_GEMM_RUNNER_BACKEND_CHOICES = [
 
 FP4_GEMM_RUNNER_BACKEND_CHOICES = [
     "auto",
-    "cudnn",
-    "cutlass",
-    "trtllm",
+    "flashinfer_cudnn",
+    "flashinfer_cutlass",
+    "flashinfer_trtllm",
 ]
 
 MAMBA_SSM_DTYPE_CHOICES = ["float32", "bfloat16"]
@@ -415,6 +415,7 @@ class ServerArgs:
 
     # LoRA
     enable_lora: Optional[bool] = None
+    enable_lora_overlap_loading: Optional[bool] = None
     max_lora_rank: Optional[int] = None
     lora_target_modules: Optional[Union[set[str], List[str]]] = None
     lora_paths: Optional[
@@ -1279,9 +1280,9 @@ class ServerArgs:
                 or decode_attn_backend == "trtllm_mha"
             ):
                 # TODO: support swa kv indices translation for trtllm_mha attention backend
-                self.swa_full_tokens_ratio = 1.0
+                self.disable_hybrid_swa_memory = True
                 logger.warning(
-                    "Set swa_full_tokens_ratio to 1.0 for GPT-OSS model with trtllm_mha attention backend."
+                    "Disable hybrid SWA memory for GPT-OSS model with trtllm_mha attention backend."
                 )
 
             quant_method = get_quantization_config(hf_config)
@@ -1585,6 +1586,7 @@ class ServerArgs:
                 "DeepseekV3ForCausalLM",
                 "GptOssForCausalLM",
                 "Glm4MoeForCausalLM",
+                "Glm4MoeLiteForCausalLM",
                 "Qwen3MoeForCausalLM",
             ]
             and (is_sm90_supported() or is_sm100_supported())
@@ -2146,6 +2148,7 @@ class ServerArgs:
                 "DeepseekV32ForCausalLM",
                 "DeepseekV3ForCausalLM",
                 "Glm4MoeForCausalLM",
+                "Glm4MoeLiteForCausalLM",
                 "BailingMoeForCausalLM",
                 "BailingMoeV2ForCausalLM",
                 "MistralLarge3ForCausalLM",
@@ -3422,6 +3425,12 @@ class ServerArgs:
             help="Enable LoRA support for the model. This argument is automatically set to True if `--lora-paths` is provided for backward compatibility.",
         )
         parser.add_argument(
+            "--enable-lora-overlap-loading",
+            default=ServerArgs.enable_lora_overlap_loading,
+            action="store_true",
+            help="Enable asynchronous LoRA weight loading in order to overlap H2D transfers with GPU compute. This should be enabled if you find that your LoRA workloads are bottlenecked by adapter weight loading, for example when frequently loading large LoRA adapters.",
+        )
+        parser.add_argument(
             "--max-lora-rank",
             default=ServerArgs.max_lora_rank,
             type=int,
@@ -3557,10 +3566,10 @@ class ServerArgs:
             default=ServerArgs.fp4_gemm_runner_backend,
             dest="fp4_gemm_runner_backend",
             help="Choose the runner backend for NVFP4 GEMM operations. "
-            "Options: 'auto' (default, selects between cudnn/cutlass based on CUDA/cuDNN version), "
-            "'cudnn' (cuDNN backend, optimal on CUDA 13+ with cuDNN 9.15+), "
-            "'cutlass' (CUTLASS backend, optimal on CUDA 12), "
-            "'trtllm' (TensorRT-LLM backend, requires different weight preparation with shuffling). "
+            "Options: 'auto' (default, selects between flashinfer_cudnn/flashinfer_cutlass based on CUDA/cuDNN version), "
+            "'flashinfer_cudnn' (FlashInfer cuDNN backend, optimal on CUDA 13+ with cuDNN 9.15+), "
+            "'flashinfer_cutlass' (FlashInfer CUTLASS backend, optimal on CUDA 12), "
+            "'flashinfer_trtllm' (FlashInfer TensorRT-LLM backend, requires different weight preparation with shuffling). "
             "NOTE: This replaces the deprecated environment variable "
             "SGLANG_FLASHINFER_FP4_GEMM_BACKEND.",
         )
@@ -4969,6 +4978,20 @@ class ServerArgs:
                 )
 
         if self.enable_lora:
+            if self.enable_lora_overlap_loading is None:
+                self.enable_lora_overlap_loading = False
+
+            if self.enable_lora_overlap_loading:
+                # TODO (glenliu21): use some sort of buffer with eviction instead of enforcing a limit
+                max_loaded_loras_limit = self.max_loras_per_batch * 2
+                assert (
+                    self.max_loaded_loras is not None
+                    and self.max_loaded_loras <= max_loaded_loras_limit
+                ), (
+                    "Enabling LoRA overlap loading requires pinning LoRA adapter weights in CPU memory, "
+                    f"so --max-loaded-loras must be less than or equal to double --max-loras-per-batch: {max_loaded_loras_limit}"
+                )
+
             # Validate compatibility with speculative decoding
             if self.speculative_algorithm not in ["NGRAM", None]:
                 raise ValueError(
@@ -5401,6 +5424,7 @@ def auto_choose_speculative_params(self: ServerArgs):
         "DeepseekV2ForCausalLM",
         "GptOssForCausalLM",
         "Glm4MoeForCausalLM",
+        "Glm4MoeLiteForCausalLM",
         "BailingMoeForCausalLM",
         "BailingMoeV2ForCausalLM",
         "MistralLarge3ForCausalLM",
