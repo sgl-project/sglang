@@ -9,6 +9,7 @@ diffusion models.
 """
 
 import os
+from typing import Any, Optional
 
 import imageio
 import torch
@@ -49,27 +50,53 @@ def prepare_request(
 
 
 def post_process_sample(
-    sample: torch.Tensor,
+    sample: Any,
     data_type: DataType,
     fps: int,
     save_output: bool = True,
-    save_file_path: str = None,
+    save_file_path: Optional[str] = None,
+    audio_sample_rate: Optional[int] = None,
 ):
     """
     Process sample output and save video if necessary
     """
-    # 1. Vectorized processing on GPU/CPU tensor
-    if sample.dim() == 3:
-        # for images, dim t is missing
-        sample = sample.unsqueeze(1)
+    audio = None
+    if isinstance(sample, (tuple, list)) and len(sample) == 2:
+        sample, audio = sample
 
-    # Convert to uint8 and move to CPU in bulk
-    # Shape: [C, T, H, W] -> [T, H, W, C]
-    sample = (sample * 255).clamp(0, 255).to(torch.uint8)
-    videos = sample.permute(1, 2, 3, 0).cpu().numpy()
+    frames = None
+    if isinstance(sample, torch.Tensor):
+        if sample.dim() == 3:
+            sample = sample.unsqueeze(1)
+        sample = (sample * 255).clamp(0, 255).to(torch.uint8)
+        videos = sample.permute(1, 2, 3, 0).cpu().numpy()
+        frames = list(videos)
+    else:
+        import numpy as np
 
-    # Convert to list of frames for imageio
-    frames = list(videos)
+        if not isinstance(sample, np.ndarray):
+            raise TypeError(f"Unsupported sample type: {type(sample)}")
+
+        arr = sample
+        if arr.ndim == 3:
+            if arr.shape[-1] in (1, 3, 4):
+                arr = arr[None, ...]
+            else:
+                arr = arr[..., None]
+        if arr.ndim != 4:
+            raise ValueError(f"Unexpected numpy sample shape: {tuple(arr.shape)}")
+
+        if arr.shape[-1] not in (1, 3, 4) and arr.shape[0] in (1, 3, 4):
+            t = torch.from_numpy(arr)
+            if t.dim() == 3:
+                t = t.unsqueeze(1)
+            t = (t * 255).clamp(0, 255).to(torch.uint8)
+            videos = t.permute(1, 2, 3, 0).cpu().numpy()
+            frames = list(videos)
+        else:
+            if arr.dtype != np.uint8:
+                arr = (np.clip(arr, 0.0, 1.0) * 255.0).astype(np.uint8)
+            frames = list(arr)
 
     # 2. Save outputs if requested
     if save_output:
@@ -86,6 +113,138 @@ def post_process_sample(
                     codec="libx264",
                     quality=quality,
                 )
+
+                if audio is not None:
+                    # Audio is likely (C, L) or (L,). LTX audio is (C, L) latent -> decoded audio (1, L)
+                    # We need to check shape.
+                    import numpy as np
+
+                    if isinstance(audio, torch.Tensor):
+                        audio_np = audio.detach().float().clamp(-1.0, 1.0).cpu().numpy()
+                    elif isinstance(audio, np.ndarray):
+                        audio_np = audio.astype(np.float32, copy=False)
+                        audio_np = np.clip(audio_np, -1.0, 1.0)
+                    else:
+                        audio_np = None
+                    if audio_np is not None:
+
+                        # 1. Squeeze leading singleton dimensions (Batch, etc.)
+                        while audio_np.ndim > 1 and audio_np.shape[0] == 1:
+                            audio_np = audio_np.squeeze(0)
+
+                        # 2. Handle (C, L) -> (L, C)
+                        if audio_np.ndim == 2 and audio_np.shape[0] < audio_np.shape[1]:
+                            audio_np = audio_np.transpose(1, 0)
+
+                        # 3. Final safety check: if still 2D and channels (dim 1) is huge, something is wrong
+                        if audio_np.ndim == 2 and audio_np.shape[1] > 256:
+                            if audio_np.shape[0] == 1:
+                                audio_np = audio_np.flatten()
+
+                        selected_sr = (
+                            int(audio_sample_rate)
+                            if audio_sample_rate is not None
+                            else None
+                        )
+                        if selected_sr is None or not (8000 <= selected_sr <= 192000):
+                            selected_sr = 24000
+                            try:
+                                duration_s = (
+                                    float(len(frames)) / float(fps) if fps else 0.0
+                                )
+                                if duration_s > 0:
+                                    audio_len = (
+                                        int(audio_np.shape[0])
+                                        if audio_np.ndim == 2
+                                        else int(audio_np.shape[-1])
+                                    )
+                                    inferred_sr = int(
+                                        round(float(audio_len) / duration_s)
+                                    )
+                                    if 8000 <= inferred_sr <= 192000:
+                                        selected_sr = inferred_sr
+                            except Exception:
+                                pass
+
+                        try:
+                            import shutil
+                            import subprocess
+                            import tempfile
+
+                            import scipy.io.wavfile
+
+                            ffmpeg_exe = "ffmpeg"
+                            ffmpeg_on_path = shutil.which("ffmpeg")
+                            if ffmpeg_on_path:
+                                ffmpeg_exe = ffmpeg_on_path
+                            try:
+                                import imageio_ffmpeg
+
+                                ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+                            except Exception:
+                                pass
+                            ffmpeg_ok = False
+                            if ffmpeg_exe:
+                                if os.path.isabs(ffmpeg_exe):
+                                    ffmpeg_ok = os.path.exists(ffmpeg_exe)
+                                else:
+                                    ffmpeg_ok = shutil.which(ffmpeg_exe) is not None
+                            if not ffmpeg_ok:
+                                raise RuntimeError("ffmpeg not found")
+
+                            merged_path = (
+                                save_file_path.rsplit(".", 1)[0] + ".tmp_mux.mp4"
+                            )
+                            tmp_wav_path = None
+                            try:
+                                with tempfile.NamedTemporaryFile(
+                                    suffix=".wav", delete=False
+                                ) as f:
+                                    tmp_wav_path = f.name
+                                scipy.io.wavfile.write(
+                                    tmp_wav_path, selected_sr, audio_np
+                                )
+                                subprocess.run(
+                                    [
+                                        ffmpeg_exe,
+                                        "-y",
+                                        "-i",
+                                        save_file_path,
+                                        "-i",
+                                        tmp_wav_path,
+                                        "-c:v",
+                                        "copy",
+                                        "-c:a",
+                                        "aac",
+                                        "-strict",
+                                        "experimental",
+                                        merged_path,
+                                    ],
+                                    check=True,
+                                    stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL,
+                                )
+                                os.replace(merged_path, save_file_path)
+                            finally:
+                                if tmp_wav_path:
+                                    try:
+                                        os.remove(tmp_wav_path)
+                                    except OSError:
+                                        pass
+                                if os.path.exists(merged_path):
+                                    try:
+                                        os.remove(merged_path)
+                                    except OSError:
+                                        pass
+                            logger.info(
+                                f"Merged video saved to {CYAN}{save_file_path}{RESET}"
+                            )
+                        except Exception as e:
+                            logger.warning(
+                                "Failed to mux audio into mp4 (saved silent video): %s",
+                                str(e),
+                            )
+
             else:
                 quality = 75
                 if len(frames) > 1:
