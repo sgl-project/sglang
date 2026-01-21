@@ -10,38 +10,39 @@ SGLang Model Gateway is a high-performance model-routing gateway for large-scale
 2. [Architecture](#architecture)
    - [Control Plane](#control-plane)
    - [Data Plane](#data-plane)
-   - [Storage & Privacy](#storage--privacy)
+   - [Storage and Privacy](#storage-and-privacy)
 3. [Installation](#installation)
 4. [Quick Start](#quick-start)
 5. [Deployment Modes](#deployment-modes)
-   - [Co-launch Router + Workers](#co-launch-router--workers)
+   - [Co-launch Router and Workers](#co-launch-router-and-workers)
    - [Separate Launch (HTTP)](#separate-launch-http)
    - [gRPC Launch](#grpc-launch)
-   - [Prefill/Decode Disaggregation](#prefilldecode-disaggregation)
+   - [Prefill-Decode Disaggregation](#prefill-decode-disaggregation)
    - [OpenAI Backend Proxy](#openai-backend-proxy)
    - [Multi-Model Inference Gateway](#multi-model-inference-gateway)
 6. [API Reference](#api-reference)
    - [Inference Endpoints](#inference-endpoints)
    - [Tokenization Endpoints](#tokenization-endpoints)
    - [Parser Endpoints](#parser-endpoints)
-   - [Conversation & Response APIs](#conversation--response-apis)
+   - [Classification API](#classification-api)
+   - [Conversation and Response APIs](#conversation-and-response-apis)
    - [Worker Management APIs](#worker-management-apis)
-   - [Admin & Health Endpoints](#admin--health-endpoints)
+   - [Admin and Health Endpoints](#admin-and-health-endpoints)
 7. [Load Balancing Policies](#load-balancing-policies)
-8. [Reliability & Flow Control](#reliability--flow-control)
+8. [Reliability and Flow Control](#reliability-and-flow-control)
    - [Retries](#retries)
    - [Circuit Breaker](#circuit-breaker)
-   - [Rate Limiting & Queuing](#rate-limiting--queuing)
+   - [Rate Limiting and Queuing](#rate-limiting-and-queuing)
    - [Health Checks](#health-checks)
 9. [Reasoning Parser Integration](#reasoning-parser-integration)
 10. [Tool Call Parsing](#tool-call-parsing)
 11. [Tokenizer Management](#tokenizer-management)
 12. [MCP Integration](#mcp-integration)
 13. [Service Discovery (Kubernetes)](#service-discovery-kubernetes)
-14. [History & Data Connectors](#history--data-connectors)
+14. [History and Data Connectors](#history-and-data-connectors)
 15. [WASM Middleware](#wasm-middleware)
 16. [Language Bindings](#language-bindings)
-17. [Security & Authentication](#security--authentication)
+17. [Security and Authentication](#security-and-authentication)
     - [TLS (HTTPS) for Gateway Server](#tls-https-for-gateway-server)
     - [mTLS for Worker Communication](#mtls-for-worker-communication)
 18. [Observability](#observability)
@@ -49,7 +50,7 @@ SGLang Model Gateway is a high-performance model-routing gateway for large-scale
     - [OpenTelemetry Tracing](#opentelemetry-tracing)
     - [Logging](#logging)
 19. [Production Recommendations](#production-recommendations)
-    - [Security](#security-1)
+    - [Security Best Practices](#security-best-practices)
     - [High Availability](#high-availability)
     - [Performance](#performance)
     - [Kubernetes Deployment](#kubernetes-deployment)
@@ -85,10 +86,10 @@ SGLang Model Gateway is a high-performance model-routing gateway for large-scale
 ### Data Plane
 
 - **HTTP routers** (regular & PD) implement `/generate`, `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/embeddings`, `/v1/rerank`, `/v1/classify`, `/v1/tokenize`, `/v1/detokenize`, and associated admin endpoints.
-- **gRPC router** streams tokenized requests directly to SRT gRPC workers, running fully in Rust—tokenizer, reasoning parser, and tool parser all reside in-process. Supports both single-stage and PD routing, including embeddings.
+- **gRPC router** streams tokenized requests directly to SRT gRPC workers, running fully in Rust—tokenizer, reasoning parser, and tool parser all reside in-process. Supports both single-stage and PD routing, including embeddings and classification.
 - **OpenAI router** proxies OpenAI-compatible endpoints to external vendors (OpenAI, xAI, etc.) while keeping chat history and multi-turn orchestration local.
 
-### Storage & Privacy
+### Storage and Privacy
 
 - Conversation and response history is stored at the router tier (memory, none, Oracle ATP, or PostgreSQL). The same history can power multiple models or MCP loops without sending data to upstream vendors.
 - `/v1/responses` agentic flows, MCP sessions, and conversation APIs share the same storage layer, enabling compliance for regulated workloads.
@@ -170,7 +171,7 @@ python -m sglang_router.launch_router \
 
 ## Deployment Modes
 
-### Co-launch Router + Workers
+### Co-launch Router and Workers
 
 Launch the router and a fleet of SGLang workers in one process:
 
@@ -238,7 +239,7 @@ python -m sglang_router.launch_router \
 
 The gRPC router supports both regular HTTP-equivalent serving and PD (prefill/decode) serving. Provide `--tokenizer-path` or `--model-path` (HuggingFace ID or local directory) whenever connection mode resolves to gRPC.
 
-### Prefill/Decode Disaggregation
+### Prefill-Decode Disaggregation
 
 Split prefill and decode workers for PD-aware caching and balancing:
 
@@ -420,7 +421,60 @@ The gateway provides admin endpoints for parsing reasoning content and function 
 }
 ```
 
-### Conversation & Response APIs
+### Classification API
+
+The `/v1/classify` endpoint provides text classification using sequence classification models (e.g., `Qwen2ForSequenceClassification`, `BertForSequenceClassification`).
+
+#### Request
+
+```bash
+curl http://localhost:30000/v1/classify \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "jason9693/Qwen2.5-1.5B-apeach",
+    "input": "I love this product!"
+  }'
+```
+
+#### Response
+
+```json
+{
+  "id": "classify-a1b2c3d4-5678-90ab-cdef-1234567890ab",
+  "object": "list",
+  "created": 1767034308,
+  "model": "jason9693/Qwen2.5-1.5B-apeach",
+  "data": [
+    {
+      "index": 0,
+      "label": "positive",
+      "probs": [0.12, 0.88],
+      "num_classes": 2
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 6,
+    "completion_tokens": 0,
+    "total_tokens": 6
+  }
+}
+```
+
+#### Response Fields
+
+| Field | Description |
+|-------|-------------|
+| `label` | Predicted class label (from model's `id2label` config, or `LABEL_N` fallback) |
+| `probs` | Probability distribution over all classes (softmax of logits) |
+| `num_classes` | Number of classification classes |
+
+#### Notes
+
+- Classification reuses the embedding backend—the scheduler returns logits which are converted to probabilities via softmax
+- Labels come from the model's HuggingFace config (`id2label` field); models without this mapping use generic labels (`LABEL_0`, `LABEL_1`, etc.)
+- Both HTTP and gRPC routers support classification
+
+### Conversation and Response APIs
 
 | Method | Path | Description |
 |--------|------|-------------|
@@ -487,7 +541,7 @@ Response:
 }
 ```
 
-### Admin & Health Endpoints
+### Admin and Health Endpoints
 
 | Method | Path | Description |
 |--------|------|-------------|
@@ -537,7 +591,7 @@ Response:
 
 ---
 
-## Reliability & Flow Control
+## Reliability and Flow Control
 
 ### Retries
 
@@ -590,7 +644,7 @@ python -m sglang_router.launch_router \
 - **Open**: Failing, requests rejected immediately
 - **Half-Open**: Testing recovery, limited requests allowed
 
-### Rate Limiting & Queuing
+### Rate Limiting and Queuing
 
 ```bash
 python -m sglang_router.launch_router \
@@ -796,7 +850,7 @@ Prefill pods can expose bootstrap ports via the `sglang.ai/bootstrap-port` annot
 
 ---
 
-## History & Data Connectors
+## History and Data Connectors
 
 | Backend | Description | Usage |
 |---------|-------------|-------|
@@ -804,6 +858,7 @@ Prefill pods can expose bootstrap ports via the `sglang.ai/bootstrap-port` annot
 | `none` | No persistence | `--history-backend none` |
 | `oracle` | Oracle Autonomous Database | `--history-backend oracle` |
 | `postgres` | PostgreSQL Database | `--history-backend postgres` |
+| `redis` | Redis | `--history-backend redis` |
 
 ### Oracle Configuration
 
@@ -837,6 +892,22 @@ python -m sglang_router.launch_router \
   --worker-urls https://api.openai.com \
   --history-backend postgres
 ```
+
+### Redis Configuration
+
+```bash
+export REDIS_URL="redis://localhost:6379"
+export REDIS_POOL_MAX=16
+export REDIS_RETENTION_DAYS=30
+
+python -m sglang_router.launch_router \
+  --backend openai \
+  --worker-urls https://api.openai.com \
+  --history-backend redis \
+  --redis-retention-days 30
+```
+
+Use `--redis-retention-days -1` for persistent storage (default is 30 days).
 
 ---
 
@@ -1042,7 +1113,7 @@ go test -tags=integration -v ./...
 
 ---
 
-## Security & Authentication
+## Security and Authentication
 
 ### Router API Key
 
@@ -1210,7 +1281,7 @@ Responses include `x-request-id` header for correlation.
 
 This section provides guidance for deploying SGLang Model Gateway in production environments.
 
-### Security
+### Security Best Practices
 
 **Always enable TLS in production:**
 
