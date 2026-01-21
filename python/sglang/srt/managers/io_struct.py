@@ -986,7 +986,7 @@ class BatchTokenIDOutput(
     output_hidden_states: List[List[float]]
 
     # The routed experts for each token, including both input and output tokens
-    # (req, (token, layer, top_k))
+    # routed_experts[i] is a tensor of shape (token, layer, top_k) for request i
     routed_experts: List[Optional[torch.Tensor]]
 
     # The information of placeholder tokens (e.g., image token)
@@ -1074,7 +1074,7 @@ class BatchStrOutput(
     output_hidden_states: List[List[float]]
 
     # The routed experts for each token, including both input and output tokens
-    # (req, (token, layer, top_k))
+    # routed_experts[i] is a tensor of shape (token, layer, top_k) for request i
     routed_experts: List[Optional[torch.Tensor]]
 
     # The information of placeholder tokens (e.g., image token)
