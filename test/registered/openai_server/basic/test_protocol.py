@@ -166,6 +166,18 @@ class TestChatCompletionRequest(unittest.TestCase):
         )
         self.assertEqual(request3.tool_choice, "none")
 
+        # Explicit tool_choice='auto' with no tools should be normalized to 'none'
+        request4 = ChatCompletionRequest(
+            model="test-model", messages=messages, tool_choice="auto"
+        )
+        self.assertEqual(request4.tool_choice, "none")
+
+        # Explicit tool_choice='auto' with empty tools list should be normalized to 'none'
+        request5 = ChatCompletionRequest(
+            model="test-model", messages=messages, tools=[], tool_choice="auto"
+        )
+        self.assertEqual(request5.tool_choice, "none")
+
     def test_chat_completion_sglang_extensions(self):
         """Test chat completion with SGLang extensions"""
         messages = [{"role": "user", "content": "Hello"}]

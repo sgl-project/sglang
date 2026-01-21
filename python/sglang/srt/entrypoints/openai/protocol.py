@@ -591,12 +591,19 @@ class ChatCompletionRequest(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def set_tool_choice_default(cls, values):
+        tools = values.get("tools")
+        has_tools = tools is not None and isinstance(tools, list) and len(tools) > 0
+
         if values.get("tool_choice") is None:
-            tools = values.get("tools")
-            if tools is None or (isinstance(tools, list) and len(tools) == 0):
-                values["tool_choice"] = "none"
-            else:
+            # Set default based on whether tools are provided
+            if has_tools:
                 values["tool_choice"] = "auto"
+            else:
+                values["tool_choice"] = "none"
+        elif values.get("tool_choice") == "auto" and not has_tools:
+            # Normalize auto to none when no tools are provided
+            # This ensures tool suppression mechanisms are applied
+            values["tool_choice"] = "none"
         return values
 
     @model_validator(mode="before")
@@ -1131,12 +1138,19 @@ class ResponsesRequest(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def set_tool_choice_default(cls, values):
+        tools = values.get("tools")
+        has_tools = tools is not None and isinstance(tools, list) and len(tools) > 0
+
         if values.get("tool_choice") is None:
-            tools = values.get("tools")
-            if tools is None or (isinstance(tools, list) and len(tools) == 0):
-                values["tool_choice"] = "none"
-            else:
+            # Set default based on whether tools are provided
+            if has_tools:
                 values["tool_choice"] = "auto"
+            else:
+                values["tool_choice"] = "none"
+        elif values.get("tool_choice") == "auto" and not has_tools:
+            # Normalize auto to none when no tools are provided
+            # This ensures tool suppression mechanisms are applied
+            values["tool_choice"] = "none"
         return values
 
     def to_sampling_params(
