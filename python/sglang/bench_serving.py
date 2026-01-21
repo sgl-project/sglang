@@ -235,12 +235,15 @@ async def async_request_openai_completions(
             "best_of": 1,
             "max_tokens": request_func_input.output_len,
             "stream": not args.disable_stream,
-            "ignore_eos": not args.disable_ignore_eos,
         }
 
         # Add temperature default only if not specified in extra_request_body
         if "temperature" not in request_func_input.extra_request_body:
             payload["temperature"] = 0.0
+
+        # Add ignore_eos default only if not specified in extra_request_body
+        if "ignore_eos" not in request_func_input.extra_request_body:
+            payload["ignore_eos"] = not args.disable_ignore_eos
 
         # Merge in extra parameters - these will override defaults if present
         payload.update(request_func_input.extra_request_body)
@@ -385,12 +388,16 @@ async def async_request_openai_chat_completions(
             "messages": messages,
             "max_completion_tokens": request_func_input.output_len,
             "stream": not args.disable_stream,
-            "ignore_eos": not args.disable_ignore_eos,
         }
 
         # Add temperature default only if not specified in extra_request_body
         if "temperature" not in request_func_input.extra_request_body:
             payload["temperature"] = 0.0
+
+        # Add ignore_eos default only if not specified in extra_request_body
+        # Default to False for more realistic behavior (respect EOS tokens)
+        if "ignore_eos" not in request_func_input.extra_request_body:
+            payload["ignore_eos"] = not args.disable_ignore_eos
 
         # Merge in extra parameters (tools, temperature, top_p, etc.)
         # These will override defaults if present
@@ -1354,7 +1361,9 @@ def sample_openai_requests(
 
     # Fields that should NOT be passed through extra_request_body
     # These are either handled separately or are metadata
-    EXCLUDED_FIELDS = {"messages", "max_tokens", "model"}
+    # max_tokens is excluded because it's handled via output_len -> max_completion_tokens
+    # max_completion_tokens is also excluded to avoid conflicts
+    EXCLUDED_FIELDS = {"messages", "max_tokens", "max_completion_tokens", "model"}
 
     filtered_dataset: List[DatasetRow] = []
     for data in dataset:
