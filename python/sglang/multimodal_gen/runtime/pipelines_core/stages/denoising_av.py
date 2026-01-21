@@ -92,11 +92,14 @@ class LTX2AVDenoisingStage(DenoisingStage):
             )
         return latents[:, :orig_s, :].contiguous()
 
-    def _maybe_enable_cache_dit(self, num_inference_steps: int) -> None:
-        """Disable cache-dit for TI2V-style requests (image-conditioned), to avoid stale activations."""
+    def _maybe_enable_cache_dit(self, num_inference_steps: int, batch: Req) -> None:
+        """Disable cache-dit for TI2V-style requests (image-conditioned), to avoid stale activations.
+
+        NOTE: base denoising stage calls this hook with (num_inference_steps, batch).
+        """
         if getattr(self, "_disable_cache_dit_for_request", False):
             return
-        return super()._maybe_enable_cache_dit(num_inference_steps)
+        return super()._maybe_enable_cache_dit(num_inference_steps, batch)
 
     @staticmethod
     def _resize_center_crop(
