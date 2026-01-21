@@ -9,11 +9,6 @@ from urllib.parse import urljoin
 
 import httpx
 from fastapi import UploadFile
-from sglang.srt.utils.common import (
-    validate_vlm_media_url_and_get_ips,
-    validate_vlm_media_url_peer_ip,
-    validate_vlm_media_url_with_policy,
-)
 
 from sglang.multimodal_gen.configs.sample.sampling_params import DataType
 from sglang.multimodal_gen.runtime.entrypoints.utils import post_process_sample
@@ -23,6 +18,11 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     init_logger,
     log_batch_completion,
     log_generation_timer,
+)
+from sglang.srt.utils.common import (
+    validate_vlm_media_url_and_get_ips,
+    validate_vlm_media_url_peer_ip,
+    validate_vlm_media_url_with_policy,
 )
 
 logger = init_logger(__name__)

@@ -1,6 +1,6 @@
 import asyncio
-import ipaddress
 import importlib.util
+import ipaddress
 import os
 
 import httpx
@@ -109,11 +109,13 @@ def test_openai_media_url_revalidates_redirect_hops(monkeypatch, tmp_path):
 
     def handler(request):
         if request.url.host == "example.com":
-            return httpx.Response(
-                302,
-                headers={"location": "https://images.example/image.png"},
-                extensions={"network_stream": DummyNetworkStream(("93.184.216.34", 443))},
-            )
+                return httpx.Response(
+                    302,
+                    headers={"location": "https://images.example/image.png"},
+                    extensions={
+                        "network_stream": DummyNetworkStream(("93.184.216.34", 443))
+                    },
+                )
         return httpx.Response(
             200,
             content=b"fake",
