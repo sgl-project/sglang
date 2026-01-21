@@ -1111,19 +1111,17 @@ class AscendAttnBackend(AttentionBackend):
                     self.forward_metadata.seq_lens_cpu_int.cpu().int().tolist()
                 )
             num_tokens = query.shape[0]
-            workspace = (
-                torch_npu._npu_fused_infer_attention_score_get_max_workspace(
-                    query,
-                    k_cache,
-                    v_cache,
-                    block_table=self.forward_metadata.block_tables,
-                    block_size=self.page_size,
-                    num_heads=layer.tp_q_head_num,
-                    num_key_value_heads=layer.tp_k_head_num,
-                    input_layout="BSH",
-                    scale=layer.scaling,
-                    actual_seq_lengths_kv=actual_seq_len_kv,
-                )
+            workspace = torch_npu._npu_fused_infer_attention_score_get_max_workspace(
+                query,
+                k_cache,
+                v_cache,
+                block_table=self.forward_metadata.block_tables,
+                block_size=self.page_size,
+                num_heads=layer.tp_q_head_num,
+                num_key_value_heads=layer.tp_k_head_num,
+                input_layout="BSH",
+                scale=layer.scaling,
+                actual_seq_lengths_kv=actual_seq_len_kv,
             )
             output = torch.empty(
                 (num_tokens, 1, layer.tp_q_head_num * layer.v_head_dim),
