@@ -28,7 +28,6 @@ import torch
 import sglang
 from sglang.srt.configs.model_config import AttentionArch, is_deepseek_nsa
 from sglang.srt.distributed.parallel_state import GroupCoordinator
-from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 from sglang.srt.utils import (
     empty_context,
@@ -112,13 +111,9 @@ class NPUGraphRunner(CudaGraphRunner):
         return out
 
     def _get_update_attr_name(self):
-        if envs.SGLANG_NPU_USE_PAGED_ATTENTION.get():
-            return self.attr_name[AttentionArch.MHA]
         return self.attr_name[AttentionArch.MLA]
 
     def _get_update_attr_type(self):
-        if envs.SGLANG_NPU_USE_PAGED_ATTENTION.get():
-            return self.attr_type[AttentionArch.MHA]
         return self.attr_type[AttentionArch.MLA]
 
     def _update_inputs(self, seq_lens):

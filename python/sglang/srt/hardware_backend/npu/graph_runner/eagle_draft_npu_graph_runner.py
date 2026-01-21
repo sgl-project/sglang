@@ -23,7 +23,6 @@ import numpy as np
 import torch
 
 from sglang.srt.configs.model_config import AttentionArch, is_deepseek_nsa
-from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
     EAGLEDraftCudaGraphRunner,
@@ -79,13 +78,9 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
         return out
 
     def _get_update_attr_name(self):
-        if envs.SGLANG_NPU_USE_PAGED_ATTENTION.get():
-            return self.attr_name[AttentionArch.MHA]
         return self.attr_name[AttentionArch.MLA]
 
     def _get_update_attr_type(self):
-        if envs.SGLANG_NPU_USE_PAGED_ATTENTION.get():
-            return self.attr_type[AttentionArch.MHA]
         return self.attr_type[AttentionArch.MLA]
 
     def _replay_update(self, seq_lens):
