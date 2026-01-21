@@ -999,7 +999,7 @@ class BatchTokenIDOutput(
     retraction_counts: List[int]
 
     # The trainer step id. Used to know which step's weights are used for sampling.
-    token_steps: List[List[int]]
+    token_steps: List[List[int]] = None
 
     # Load for DP balance
     load: GetLoadReqOutput = None
@@ -1087,7 +1087,7 @@ class BatchStrOutput(
     retraction_counts: List[int]
 
     # The trainer step id. Used to know which step's weights are used for sampling.
-    token_steps: List[List[int]]
+    token_steps: List[List[int]] = None
 
     # Load for DP balance
     load: GetLoadReqOutput = None
