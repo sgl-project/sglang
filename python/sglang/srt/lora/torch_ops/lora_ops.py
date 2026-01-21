@@ -23,7 +23,7 @@ def sgemm_lora_a_fwd(
         rank = lora_ranks[idx]
         scaling = scaling_tensor[idx]
         if rank > 0:
-            output = torch.einsum("si, oi -> so", inputs, weights[idx, :, :]) * scaling
+            output = torch.mm(inputs, weights[idx, :, :].T) * scaling
         else:
             output = torch.zeros(
                 total_seq_len, weight_out_dim, dtype=inputs.dtype, device=inputs.device
