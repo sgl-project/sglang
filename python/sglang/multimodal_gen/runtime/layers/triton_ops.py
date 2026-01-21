@@ -8,6 +8,10 @@ import triton  # type: ignore
 import triton.language as tl  # type: ignore
 from torch import Tensor
 
+from sglang.multimodal_gen.runtime.platforms import current_platform
+
+_is_cuda = current_platform.is_cuda()
+
 
 @triton.autotune(
     configs=[
@@ -224,7 +228,8 @@ def fuse_scale_shift_kernel(
     block_l: int = 128,
     block_c: int = 128,
 ):
-    assert x.is_cuda and scale.is_cuda
+    assert _is_cuda, "fuse_scale_shift_kernel requires CUDA platform"
+    assert x.device.type == "cuda" and scale.device.type == "cuda"
     assert x.is_contiguous()
 
     B, L, C = x.shape
