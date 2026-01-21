@@ -1,0 +1,98 @@
+name: AMD CI Job Monitor
+
+on:
+  schedule:
+    - cron: '0 0 * * *'  # Daily at midnight UTC
+  pull_request:
+    paths:
+      - '.github/workflows/amd-ci-job-monitor.yml'
+      - 'scripts/ci/query_job_status.py'
+  workflow_dispatch:
+    inputs:
+      hours:
+        description: 'Time window in hours'
+        required: false
+        default: '24'
+        type: string
+      job_filter:
+        description: 'Job name filter (leave empty for all AMD jobs)'
+        required: false
+        type: string
+
+jobs:
+  # Single job filter mode
+  custom-report:
+    name: Custom Job Report
+    if: ${{ inputs.job_filter }}
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: pip install tabulate
+
+      - name: Generate Custom Job Report
+        timeout-minutes: 30
+        run: |
+          python scripts/ci/query_job_status.py \
+            --repo ${{ github.repository }} \
+            --job "${{ inputs.job_filter }}" \
+            --workflow "pr-test-amd.yml" \
+            --hours ${{ inputs.hours || '24' }} \
+            --summary
+
+  # All jobs report using matrix for parallel execution
+  all-reports:
+    name: Report - ${{ matrix.job_name }}
+    if: ${{ !inputs.job_filter }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 14
+      matrix:
+        job_name:
+          - sgl-kernel-unit-test-amd
+          - stage-a-test-1-amd
+          - stage-b-test-small-1-gpu-amd
+          - stage-b-test-small-1-gpu-amd-mi35x
+          - stage-b-test-large-2-gpu-amd
+          - multimodal-gen-test-1-gpu-amd
+          - multimodal-gen-test-2-gpu-amd
+          - stage-c-test-large-8-gpu-amd
+          - stage-c-test-large-8-gpu-amd-mi35x
+          - stage-b-test-small-1-gpu-performance-amd
+          - stage-b-test-large-1-gpu-performance-amd
+          - stage-b-test-large-2-gpu-performance-amd
+          - stage-b-test-small-1-gpu-accuracy-amd
+          - stage-b-test-large-2-gpu-accuracy-amd
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: pip install tabulate
+
+      - name: Generate Report
+        timeout-minutes: 15
+        run: |
+          python scripts/ci/query_job_status.py \
+            --repo ${{ github.repository }} \
+            --job "${{ matrix.job_name }}" \
+            --workflow "pr-test-amd.yml" \
+            --hours ${{ inputs.hours || '24' }} \
+            --summary
