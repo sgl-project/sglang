@@ -238,8 +238,19 @@ class GroupCoordinator:
         self.cpu_group = None
         self.local_size = get_int_env_var("LOCAL_SIZE", 0)
 
+        if is_cuda_alike():
+            active_ranks_device = "cuda"
+        elif _is_xpu:
+            active_ranks_device = "xpu"
+        elif _is_npu:
+            active_ranks_device = "npu"
+        else:
+            active_ranks_device = "cpu"
+
         for ranks in group_ranks:
-            active_ranks = torch.ones(len(ranks), dtype=torch.int32, device="cuda")
+            active_ranks = torch.ones(
+                len(ranks), dtype=torch.int32, device=active_ranks_device
+            )
             active_ranks_cpu = torch.ones(len(ranks), dtype=torch.int32)
             if "mooncake" in torch_distributed_backend:
                 from mooncake.ep import MooncakeBackendOptions
@@ -280,6 +291,11 @@ class GroupCoordinator:
                 0 if envs.SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS.get() else local_rank
             )
             self.device = torch.device(f"cuda:{device_id}")
+        elif _is_xpu:
+            device_id = (
+                0 if envs.SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS.get() else local_rank
+            )
+            self.device = torch.device(f"xpu:{device_id}")
         elif _is_npu:
             self.device = torch.device(f"npu:{local_rank}")
         else:

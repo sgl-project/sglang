@@ -48,7 +48,7 @@ RUN source $HOME/.local/bin/env && \
     uv pip install tabulate && \
     cd ../sgl-kernel && \
     cp pyproject_cpu.toml pyproject.toml && \
-    uv pip install .
+    uv pip install . --no-build-isolation
 
 ENV SGLANG_USE_CPU_ENGINE=1
 ENV LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc.so.4:/usr/lib/x86_64-linux-gnu/libtbbmalloc.so:/opt/.venv/lib/libiomp5.so
