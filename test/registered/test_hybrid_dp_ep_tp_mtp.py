@@ -17,7 +17,7 @@ from sglang.test.test_utils import (
 
 # 60 test classes testing hybrid parallelism configurations
 # Each test launches server + runs MMLU eval (~90s per test)
-register_cuda_ci(est_time=5400, suite="nightly-8-gpu-h200", nightly=True)
+register_cuda_ci(est_time=5400, suite="weekly-8-gpu-h200", nightly=True)
 
 
 class Test00(CustomTestCase):
