@@ -1105,7 +1105,7 @@ mod pd_routing_unit_tests {
                         .conversation_item_storage(conversation_item_storage)
                         .load_monitor(load_monitor)
                         .worker_job_queue(worker_job_queue)
-                        .workflow_engine(workflow_engine)
+                        .workflow_engines(workflow_engine)
                         .mcp_manager(mcp_manager)
                         .build()
                         .unwrap(),
