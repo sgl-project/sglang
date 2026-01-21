@@ -139,7 +139,7 @@ class StablelmAttention(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("o_proj", prefix),
         )
-        if _is_npu: 
+        if _is_npu:
             self.rotary_emb = get_rope(
                 self.head_dim,
                 rotary_dim=self.rotary_ndims,
@@ -172,7 +172,7 @@ class StablelmAttention(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        if _is_npu: 
+        if _is_npu:
             odtype = q.dtype
             q, k = self.rotary_emb(positions, q.to(torch.float32), k.to(torch.float32))
             q, k = q.to(odtype), k.to(odtype)
