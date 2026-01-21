@@ -1359,7 +1359,11 @@ def init_model_parallel_group(
         group_ranks=group_ranks,
         local_rank=local_rank,
         torch_distributed_backend=backend,
-        use_pynccl=not (_is_npu or _is_xpu or backend == "mooncake") if use_pynccl is None else use_pynccl,
+        use_pynccl=(
+            not (_is_npu or _is_xpu or backend == "mooncake")
+            if use_pynccl is None
+            else use_pynccl
+        ),
         use_pymscclpp=use_mscclpp_allreduce,
         use_custom_allreduce=use_custom_allreduce,
         use_torch_symm_mem_all_reduce=use_torch_symm_mem_allreduce,
