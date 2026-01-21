@@ -4,6 +4,9 @@
 import torch
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.models.model_stages.zimage_omni import (
+    ZImageOmniBeforeDenoisingStage,
+)
 from sglang.multimodal_gen.runtime.models.vision_utils import load_image, load_video
 from sglang.multimodal_gen.runtime.pipelines_core import LoRAPipeline, Req
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
@@ -195,11 +198,11 @@ class _ImageProcessStage(PipelineStage):
                 f"Please adjust the width to a multiple of {vae_scale}."
             )
 
-        # TODO:
-        # hard code with image size
-        # dulplicate with input_validation_stage
-        batch.height = image_height
-        batch.width = image_width
+        # # TODO:
+        # # hard code with image size
+        # # dulplicate with input_validation_stage
+        # batch.height = image_height
+        # batch.width = image_width
 
         # TODO: hard code debug
         # should be condition_images(a list)
@@ -413,15 +416,6 @@ class ZImageOmniPipeline(ZImagePipeline):
     def create_pipeline_stages(self, server_args: ServerArgs):
         """Set up pipeline stages with proper dependency injection."""
 
-        # copy from diffusers
-        from diffusers.pipelines.flux2.image_processor import Flux2ImageProcessor
-
-        vae_scale_factor = server_args.pipeline_config.vae_config.vae_scale_factor
-        # NOTE: replace vae with Flux in zimage-omni
-        self.image_processor = Flux2ImageProcessor(
-            vae_scale_factor=vae_scale_factor * 2
-        )
-
         self.add_stage(
             stage_name="input_validation_stage", stage=InputValidationStage()
         )
@@ -435,16 +429,6 @@ class ZImageOmniPipeline(ZImagePipeline):
                 tokenizers=[
                     self.get_module("tokenizer"),
                 ],
-            ),
-        )
-
-        # TODO: dulplicate with InputValidationStage:229
-        # refactory later
-        self.add_stage(
-            stage_name="image_process",
-            stage=_ImageProcessStage(
-                image_processor=self.image_processor,
-                vae_scale_factor=vae_scale_factor,
             ),
         )
 
@@ -467,18 +451,12 @@ class ZImageOmniPipeline(ZImagePipeline):
         )
 
         self.add_stage(
-            stage_name="image_siglip_preparation_stage",
-            stage=_PrepareSiglipStage(
-                transformer=self.get_module("transformer"),
+            stage_name="zimage_omni_before_denoising",
+            stage=ZImageOmniBeforeDenoisingStage(
+                vae=self.get_module("vae"),
+                vae_scale_factor=server_args.pipeline_config.vae_config.vae_scale_factor,
                 siglip=self.get_module("siglip"),
                 siglip_processor=self.get_module("siglip_processor"),
-            ),
-        )
-
-        self.add_stage(
-            stage_name="image_latent_preparation_stage",
-            stage=_PrepareImageLatentsStage(
-                vae=self.get_module("vae"),
             ),
         )
 
