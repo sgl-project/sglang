@@ -509,9 +509,9 @@ def _find_nearest_expert(
 
 def _fair_choices(arr: List, k: int, r: random.Random) -> List:
     quotient, remainder = divmod(k, len(arr))
-    ans = arr * quotient + r.sample(arr, k=remainder)
-    r.shuffle(ans)
-    return ans
+    answer = arr * quotient + r.sample(arr, k=remainder)
+    r.shuffle(answer)
+    return answer
 
 
 @dataclass
