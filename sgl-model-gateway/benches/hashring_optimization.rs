@@ -1,16 +1,14 @@
-use std::sync::{
-    atomic::{AtomicBool, AtomicUsize},
-    Arc,
-};
+use std::sync::Arc;
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use parking_lot::RwLock as StdRwLock;
 use smg::core::{
-    model_type::ModelType, worker_registry::HashRing, BasicWorker, ConnectionMode, HealthConfig,
-    RuntimeType, Worker, WorkerMetadata, WorkerType,
+    model_type::ModelType,
+    worker::{WorkerMetadata, WorkerRoutingKeyLoad},
+    worker_registry::HashRing,
+    CircuitBreaker, ConnectionMode, HealthConfig, RuntimeType, Worker, WorkerResult, WorkerType,
 };
-use tokio::sync::OnceCell;
 
+// A minimal mock worker for benchmarking to avoid complex builder overhead
 #[derive(Debug)]
 struct MockWorker {
     url: String,
@@ -35,7 +33,7 @@ impl Worker for MockWorker {
         true
     }
     fn set_healthy(&self, _: bool) {}
-    async fn check_health_async(&self) -> smg::core::WorkerResult<()> {
+    async fn check_health_async(&self) -> WorkerResult<()> {
         Ok(())
     }
     fn load(&self) -> usize {
@@ -43,7 +41,7 @@ impl Worker for MockWorker {
     }
     fn increment_load(&self) {}
     fn decrement_load(&self) {}
-    fn worker_routing_key_load(&self) -> &smg::core::worker::WorkerRoutingKeyLoad {
+    fn worker_routing_key_load(&self) -> &WorkerRoutingKeyLoad {
         unimplemented!()
     }
     fn processed_requests(&self) -> usize {
@@ -53,18 +51,18 @@ impl Worker for MockWorker {
     fn metadata(&self) -> &WorkerMetadata {
         &self.metadata
     }
-    fn circuit_breaker(&self) -> &smg::core::CircuitBreaker {
+    fn circuit_breaker(&self) -> &CircuitBreaker {
         unimplemented!()
     }
     async fn get_grpc_client(
         &self,
-    ) -> smg::core::WorkerResult<Option<Arc<smg::routers::grpc::client::GrpcClient>>> {
+    ) -> WorkerResult<Option<Arc<smg::routers::grpc::client::GrpcClient>>> {
         Ok(None)
     }
-    async fn grpc_health_check(&self) -> smg::core::WorkerResult<bool> {
+    async fn grpc_health_check(&self) -> WorkerResult<bool> {
         Ok(true)
     }
-    async fn http_health_check(&self) -> smg::core::WorkerResult<bool> {
+    async fn http_health_check(&self) -> WorkerResult<bool> {
         Ok(true)
     }
 }
