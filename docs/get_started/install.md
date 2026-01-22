@@ -15,25 +15,20 @@ pip install uv
 uv pip install "sglang"
 ```
 
-For different CUDA versions, you can try to add `--extra-index-url` to find the correct [PyTorch](https://pytorch.org/get-started/locally/) wheel.
-For example, on GB200, you will need to do the following. Otherwise, it will install the CPU version of PyTorch.
-```
-uv pip install "sglang" --extra-index-url https://download.pytorch.org/whl/cu129
-```
-
-For CUDA 13, Docker is recommended (see Method 3 note on B300/GB300/CUDA 13). If you do not have Docker access, installing the matching `sgl_kernel` wheel from [the sgl-project whl releases](https://github.com/sgl-project/whl/releases) after installing SGLang also works. Replace `X.Y.Z` with the `sgl_kernel` version required by your SGLang install (you can find this by running `uv pip show sgl_kernel`). Examples:
-
-```bash
-# x86_64
-uv pip install "https://github.com/sgl-project/whl/releases/download/vX.Y.Z/sgl_kernel-X.Y.Z+cu130-cp310-abi3-manylinux2014_x86_64.whl"
-
-# aarch64
-uv pip install "https://github.com/sgl-project/whl/releases/download/vX.Y.Z/sgl_kernel-X.Y.Z+cu130-cp310-abi3-manylinux2014_aarch64.whl"
-```
-
 **Quick fixes to common problems**
+- In some cases (e.g., GB200), the above command might install a wrong torch version (e.g., the CPU version) due to dependency resolution. To fix this, you can first run the above command and then force-reinstall the correct [PyTorch](https://pytorch.org/get-started/locally/) with the following:
+  ```
+  uv pip install "torch" --extra-index-url https://download.pytorch.org/whl/cu129 --force-reinstall
+  ```
+- For CUDA 13, Docker is recommended (see the Method 3 note on B300/GB300/CUDA 13). If you do not have Docker access, installing the matching `sgl_kernel` wheel from [the sgl-project whl releases](https://github.com/sgl-project/whl/releases) after installing SGLang also works. Replace `X.Y.Z` with the `sgl_kernel` version required by your SGLang (you can find this by running `uv pip show sgl_kernel`). Examples:
+  ```bash
+  # x86_64
+  uv pip install "https://github.com/sgl-project/whl/releases/download/vX.Y.Z/sgl_kernel-X.Y.Z+cu130-cp310-abi3-manylinux2014_x86_64.whl"
 
-- If you encounter `OSError: CUDA_HOME environment variable is not set`. Please set it to your CUDA install root with either of the following solutions:
+  # aarch64
+  uv pip install "https://github.com/sgl-project/whl/releases/download/vX.Y.Z/sgl_kernel-X.Y.Z+cu130-cp310-abi3-manylinux2014_aarch64.whl"
+  ```
+- If you encounter `OSError: CUDA_HOME environment variable is not set`, set it to your CUDA install root with either of the following solutions:
   1. Use `export CUDA_HOME=/usr/local/cuda-<your-cuda-version>` to set the `CUDA_HOME` environment variable.
   2. Install FlashInfer first following [FlashInfer installation doc](https://docs.flashinfer.ai/installation.html), then install SGLang as described above.
 
@@ -84,9 +79,8 @@ docker run --gpus all \
 
 You can also find the nightly docker images [here](https://hub.docker.com/r/lmsysorg/sglang/tags?name=nightly).
 
-On B300/GB300 (SM103) or CUDA 13 environment, we recommend using the nightly image at `lmsysorg/sglang:dev-cu13` or stable image at `lmsysorg/sglang:latest-cu130-runtime`.
-Please, do not re-install the project as editable inside the docker image, since it will override the version of
-libraries specified by the cu13 docker image.
+Notes:
+- On B300/GB300 (SM103) or CUDA 13 environment, we recommend using the nightly image at `lmsysorg/sglang:dev-cu13` or stable image at `lmsysorg/sglang:latest-cu130-runtime`. Please, do not re-install the project as editable inside the docker image, since it will override the version of libraries specified by the cu13 docker image.
 
 ## Method 4: Using Kubernetes
 

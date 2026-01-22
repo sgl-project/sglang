@@ -17,7 +17,7 @@ use minijinja::{
     Environment, Error as MinijinjaError, ErrorKind, Value,
 };
 use serde::Serialize;
-use serde_json::{self, ser::PrettyFormatter, Value as JsonValue};
+use serde_json::{self, ser::PrettyFormatter, Value as JsonValue}; // codespell:ignore ser
 
 /// Chat template content format
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

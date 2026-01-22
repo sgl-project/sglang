@@ -492,7 +492,7 @@ class GptOssModel(nn.Module):
         self.vocab_size = config.vocab_size
         self.pp_group = get_pp_group()
 
-        if is_npu:
+        if _is_npu:
             config.hidden_act = "npu_swiglu_oai"
 
         if self.pp_group.is_first_rank:

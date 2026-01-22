@@ -97,6 +97,7 @@ jobs:
               - ".github/workflows/pr-test-amd.yml"
             sgl_kernel:
               - "sgl-kernel/**"
+              - ".github/workflows/pr-test-amd.yml"
             multimodal_gen:
               - "python/sglang/multimodal_gen/**"
               - "python/sglang/cli/**"
@@ -151,8 +152,6 @@ jobs:
           docker exec -w /sglang-checkout/sgl-kernel/tests/sgl_diffusion ci_sglang python3 -m pytest test_timestep_embedding.py
           docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_moe_topk_sigmoid.py
           docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_torch_defaults_reset.py
-          docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_amd_deterministic_custom_allreduce.py
-          docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_amd_nccl_allreduce_determinism.py
   # =============================================== primary ====================================================
 
   stage-a-test-1-amd:
@@ -616,7 +615,7 @@ jobs:
       fail-fast: false
       matrix:
         runner: [linux-mi35x-gpu-8]
-        part: [0, 1, 2]
+        part: [0, 1]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -638,7 +637,7 @@ jobs:
       - name: Run test
         timeout-minutes: 60
         run: |
-          bash scripts/ci/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-c-test-large-8-gpu-amd-mi35x --auto-partition-id ${{ matrix.part }} --auto-partition-size 3 --timeout-per-file 3600
+          bash scripts/ci/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-c-test-large-8-gpu-amd-mi35x --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --timeout-per-file 3600
 
   performance-test-1-gpu-part-1-amd:
     needs: [check-changes, stage-a-test-1-amd]

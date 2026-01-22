@@ -52,7 +52,7 @@ constexpr int CVT_FP4_SF_VEC_SIZE = 16;
 inline __device__ uint32_t fp32_vec_to_e2m1(float (&array)[8]) {
   // PTX instructions used here requires >= sm100f.
 #if CUTLASS_ARCH_MMA_SM100A_ENABLED || CUTLASS_ARCH_MMA_SM103A_ENABLED || CUTLASS_ARCH_MMA_SM120A_ENABLED || \
-    (defined(__CUDA_ARCH_FAMILY_SPECIFIC__) && (__CUDA_ARCH_FAMILY_SPECIFIC__ > 1000))
+    (defined(__CUDA_ARCH_FAMILY_SPECIFIC__) && (__CUDA_ARCH_FAMILY_SPECIFIC__ >= 1000))
   uint32_t val;
   asm volatile(
       "{\n"
@@ -87,7 +87,7 @@ inline __device__ uint32_t fp32_vec_to_e2m1(float (&array)[8]) {
 inline __device__ uint32_t fp32_vec_to_e2m1(float2 (&array)[4]) {
   // PTX instructions used here requires >= sm100f.
 #if CUTLASS_ARCH_MMA_SM100A_ENABLED || CUTLASS_ARCH_MMA_SM103A_ENABLED || CUTLASS_ARCH_MMA_SM120A_ENABLED || \
-    (defined(__CUDA_ARCH_FAMILY_SPECIFIC__) && (__CUDA_ARCH_FAMILY_SPECIFIC__ > 1000))
+    (defined(__CUDA_ARCH_FAMILY_SPECIFIC__) && (__CUDA_ARCH_FAMILY_SPECIFIC__ >= 1000))
   uint32_t val;
   asm volatile(
       "{\n"

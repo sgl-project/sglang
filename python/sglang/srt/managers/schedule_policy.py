@@ -35,7 +35,11 @@ import torch
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.layers.attention.nsa.utils import is_nsa_prefill_cp_in_seq_split
 from sglang.srt.managers.schedule_batch import DllmStagingReqs, Req, ScheduleBatch
-from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchPrefixParams
+from sglang.srt.mem_cache.base_prefix_cache import (
+    BasePrefixCache,
+    InsertParams,
+    MatchPrefixParams,
+)
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.server_args import ServerArgs
@@ -228,8 +232,10 @@ class SchedulePolicy:
                 else:
                     # Insert with a dummy key
                     self.waiting_queue_radix_tree.insert(
-                        RadixKey(token_ids=prefix_ids, extra_key=extra_key),
-                        torch.empty(len(prefix_ids), dtype=torch.bool),
+                        InsertParams(
+                            key=RadixKey(token_ids=prefix_ids, extra_key=extra_key),
+                            value=torch.empty(len(prefix_ids), dtype=torch.bool),
+                        )
                     )
         return temporary_deprioritized
 

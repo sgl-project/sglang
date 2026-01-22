@@ -448,6 +448,8 @@ class Envs:
     # TokenizerManager
     SGLANG_REQUEST_STATE_WAIT_TIMEOUT = EnvInt(4)
 
+    # Aiter
+    SGLANG_USE_AITER_FP8_PER_TOKEN = EnvBool(False)
     # fmt: on
 
 
