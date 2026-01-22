@@ -186,7 +186,7 @@ class Indexer(MultiPlatformOp):
             self.hidden_size,
             self.n_heads,
             bias=False,
-            params_dtype=torch.bfloat16,
+            params_dtype=torch.bfloat16 if _is_cuda else torch.float32,
             prefix=add_prefix("weights_proj", prefix),
         )
         self.k_norm = LayerNorm(self.head_dim, dtype=torch.float32)
