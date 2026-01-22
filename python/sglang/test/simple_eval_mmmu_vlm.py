@@ -345,8 +345,8 @@ def _parse_multi_choice_response(
                 candidates.append(choice)
     if not candidates and len(response.split()) > 5:
         # try match by option text
-        for idx, ans in index2answer.items():
-            if ans and ans.lower() in response.lower():
+        for idx, answer in index2answer.items():
+            if answer and answer.lower() in response.lower():
                 candidates.append(idx)
     if not candidates:
         # fallback to first choice
