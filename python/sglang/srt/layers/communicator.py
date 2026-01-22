@@ -90,8 +90,7 @@ def apply_flashinfer_allreduce_fusion(batch_size: int):
     return (
         # NOTE: flashinfer 0.6.1 caused performance regression on sm100 for allreduce fusion
         # Ref: https://github.com/sgl-project/sglang/issues/17237
-        _is_sm90_supported
-        and _is_sm100_supported
+        (_is_sm90_supported or _is_sm100_supported)
         and _is_flashinfer_available
         and batch_size > 0
         and batch_size <= FUSE_ALLREDUCE_MAX_BATCH_SIZE
