@@ -227,9 +227,9 @@ def extract_answer(pred_str, exhaust=False):
             pred.append(program_output)
         else:  # use the last number
             pattern = "-?\d*\.?\d+"
-            ans = re.findall(pattern, pred_str.replace(",", ""))
-            if len(ans) >= 1:
-                ans = ans[-1]
+            answers = re.findall(pattern, pred_str.replace(",", ""))
+            if len(answers) >= 1:
+                ans = answers[-1]
             else:
                 ans = ""
             if ans:
