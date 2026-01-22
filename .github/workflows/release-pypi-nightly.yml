@@ -49,25 +49,18 @@ jobs:
           cd python
           cp ../README.md ../LICENSE .
 
-          # Get git describe output and force distance=1 if at exact tag
+          # Parse git describe output to detect exact tag builds (distance=0)
           DESC=$(git describe --tags --long --match 'v*' 2>/dev/null || echo 'v0.0.0-0-g0000000')
-          TAG=$(echo "$DESC" | cut -d- -f1)
           DIST=$(echo "$DESC" | cut -d- -f2)
-          HASH=$(echo "$DESC" | cut -d- -f3-)
 
-          echo "=== Git describe output ==="
-          echo "Original: $DESC"
-          echo "Parsed: TAG=$TAG DIST=$DIST HASH=$HASH"
-
-          # If distance is 0 (building at exact tag), force dev0 version
+          # If building at exact tag (distance=0), force dev0 version for unique wheel names
           if [ "$DIST" = "0" ]; then
-            echo "Distance is 0 - using dev0 to ensure unique wheel name"
-            # Override version for setuptools-scm using environment variable
+            TAG=$(echo "$DESC" | cut -d- -f1)
+            HASH=$(echo "$DESC" | cut -d- -f3-)
             FORCE_VERSION="${TAG#v}.dev0+${HASH}"
-            echo "Forcing version to: $FORCE_VERSION"
+            echo "Building at exact tag, forcing version to: $FORCE_VERSION"
             export SETUPTOOLS_SCM_PRETEND_VERSION="$FORCE_VERSION"
           fi
-          echo "==========================="
 
           # Build wheel
           python3 -m build --wheel
