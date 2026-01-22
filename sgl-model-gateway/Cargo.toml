@@ -155,9 +155,9 @@ serial_test = "3.0"
 rsa = { version = "0.9", features = ["sha2"] }
 
 [[bench]]
-name = "hash_ring_benchmark"
+name = "hashring_optimization"
 harness = false
-path = "benches/hash_ring_benchmark.rs"
+path = "benches/hashring_optimization.rs"
 [[bench]]
 name = "wasm_middleware_latency"
 harness = false
