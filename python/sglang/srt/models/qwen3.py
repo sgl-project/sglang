@@ -500,9 +500,9 @@ class Qwen3ForCausalLM(nn.Module):
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
             if not name.startswith("model.") and (
-                name.startswith("layers.") or 
-                name.startswith("embed_tokens.") or
-                name.startswith("norm.")
+                name.startswith("layers.")
+                or name.startswith("embed_tokens.")
+                or name.startswith("norm.")
             ):
                 name = add_prefix(name, "model")
             layer_id = get_layer_id(name)
