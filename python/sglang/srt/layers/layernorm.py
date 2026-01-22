@@ -455,7 +455,7 @@ class GemmaRMSNorm(MultiPlatformOp):
         residual: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        if get_bool_env_var("SGLANG_ENABLE_TORCH_COMPILE"):
+        if get_bool_env_var("FORWARD_NATIVE_GEMMA_RMS_NORM"):
             return self.forward_native(x, residual)
         if residual is not None:
             x = x + residual

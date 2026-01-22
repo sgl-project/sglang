@@ -3,6 +3,7 @@ import unittest
 
 import torch
 
+import os
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.runners import HFRunner, SRTRunner
 from sglang.test.test_utils import CustomTestCase
@@ -77,4 +78,6 @@ class TestRewardModels(CustomTestCase):
 
 
 if __name__ == "__main__":
+    os.environ["FORWARD_NATIVE_GELUTANH"] = "1"
+    os.environ["FORWARD_NATIVE_GEMMA_RMS_NORM"] = "1"
     unittest.main()
