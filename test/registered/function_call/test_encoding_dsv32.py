@@ -1,4 +1,7 @@
 from sglang.srt.entrypoints.openai.encoding_dsv32 import encode_messages
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(1.0, "default")
 
 
 def test_tool_call_thinking_end_logic():
