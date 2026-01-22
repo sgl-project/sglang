@@ -265,7 +265,7 @@ def get_sampling_params(eval_args):
 
 
 # ----------- Process Multi-choice -------------
-def parse_multi_choice_response(response, all_choices, index2ans):
+def parse_multi_choice_response(response, all_choices, index2answer):
     """
     Parse the prediction from the generated response.
     Return the predicted index e.g., A, B, C, D.
@@ -289,7 +289,7 @@ def parse_multi_choice_response(response, all_choices, index2ans):
 
     # if all above doesn't get candidates, check if the content is larger than 5 tokens and try to parse the example
     if len(candidates) == 0 and len(response.split()) > 5:
-        for index, ans in index2ans.items():
+        for index, ans in index2answer.items():
             if ans.lower() in response.lower():
                 candidates.append(index)
                 index_ans = False  # it's content ans.
@@ -310,7 +310,7 @@ def parse_multi_choice_response(response, all_choices, index2ans):
                     start_indexes.append(index)
         else:
             for can in candidates:
-                index = response.lower().rfind(index2ans[can].lower())
+                index = response.lower().rfind(index2answer[can].lower())
                 start_indexes.append(index)
         # get the last one
         pred_index = candidates[np.argmax(start_indexes)]
