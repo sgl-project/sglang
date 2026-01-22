@@ -35,6 +35,7 @@ from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.utils.common import (
     LORA_TARGET_ALL_MODULES,
     SUPPORTED_LORA_TARGET_MODULES,
+    check_pkg_version_at_least,
     configure_ipv6,
     cpu_has_amx_support,
     get_bool_env_var,
@@ -1284,6 +1285,13 @@ class ServerArgs:
                     "Disable hybrid SWA memory for GPT-OSS model with trtllm_mha attention backend."
                 )
 
+            if self.speculative_algorithm is not None:
+                # TODO: fix spec with SWA memory cache
+                self.disable_hybrid_swa_memory = True
+                logger.warning(
+                    "Disable hybrid SWA memory for GPT-OSS model with speculative decoding."
+                )
+
             quant_method = get_quantization_config(hf_config)
             is_mxfp4_quant_format = quant_method == "mxfp4"
             if is_mxfp4_quant_format:
@@ -1508,6 +1516,27 @@ class ServerArgs:
                     )
                     self.disable_radix_cache = True
                     self.disable_overlap_schedule = False
+        elif model_arch in ["Glm4MoeForCausalLM"]:
+            if is_sm100_supported():
+                quantization_config = getattr(hf_config, "quantization_config", None)
+                quant_method = (
+                    quantization_config.get("quant_method")
+                    if quantization_config is not None
+                    else None
+                )
+                if self.quantization is None and quant_method is not None:
+                    self.quantization = quant_method
+                if (
+                    self.quantization == "modelopt_fp4"
+                    and self.moe_a2a_backend == "none"
+                    and self.moe_runner_backend == "auto"
+                ):
+                    # Only enable flashinfer_trtllm if flashinfer-python version is >= 0.6.2
+                    if check_pkg_version_at_least("flashinfer-python", "0.6.2"):
+                        self.moe_runner_backend = "flashinfer_trtllm"
+                        logger.info(
+                            "Use flashinfer_trtllm as MoE runner backend on sm100 for Glm4MoeForCausalLM"
+                        )
 
             # Mamba radix cache v2
             if self.enable_mamba_extra_buffer():
@@ -1747,10 +1776,6 @@ class ServerArgs:
             )
             self.attention_backend = "triton"
 
-        if self.attention_backend == "fa4" or self.decode_attention_backend == "fa4":
-            raise ValueError(
-                "FA4 backend is only supported for prefill. Please use `--prefill-attention-backend fa4` instead."
-            )
         if self.prefill_attention_backend == "fa4" and not self.use_mla_backend():
             logger.warning(
                 f"FA4 backend only supports page size 128 for non-MLA model architectures, changing page_size from {self.page_size} to 128."
@@ -4428,7 +4453,7 @@ class ServerArgs:
             default=ServerArgs.nsa_prefill_cp_mode,
             choices=NSA_PREFILL_CP_SPLIT_CHOICES,
             help="Token splitting mode for the prefill phase of DeepSeek v3.2 under context parallelism. Optional values: 'in-seq-split' (default), 'round-robin-split'. "
-            "'round-robin-split' distributes tokens across ranks based on token_idx % cp_size. It supports multi-batch prefill, fused MoE, and FP8 KV cache.",
+            "'round-robin-split' distributes tokens across ranks based on token_idx %% cp_size. It supports multi-batch prefill, fused MoE, and FP8 KV cache.",
         )
         parser.add_argument(
             "--enable-fused-qk-norm-rope",

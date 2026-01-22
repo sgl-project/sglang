@@ -54,6 +54,7 @@ from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiT
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
+_is_cuda = current_platform.is_cuda()
 
 
 class WanImageEmbedding(torch.nn.Module):
@@ -444,7 +445,7 @@ class WanTransformerBlock(nn.Module):
 
         # Apply rotary embeddings
         cos, sin = freqs_cis
-        if query.is_cuda and query.shape == key.shape:
+        if _is_cuda and query.shape == key.shape:
             cos_sin_cache = torch.cat(
                 [
                     cos.to(dtype=torch.float32).contiguous(),
@@ -626,7 +627,7 @@ class WanTransformerBlock_VSA(nn.Module):
 
         # Apply rotary embeddings
         cos, sin = freqs_cis
-        if query.is_cuda and query.shape == key.shape:
+        if _is_cuda and query.shape == key.shape:
             cos_sin_cache = torch.cat(
                 [
                     cos.to(dtype=torch.float32).contiguous(),
