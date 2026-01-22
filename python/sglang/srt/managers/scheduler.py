@@ -183,6 +183,7 @@ from sglang.srt.utils import (
     set_random_seed,
     suppress_other_loggers,
 )
+from sglang.srt.utils.common import rank0_log
 from sglang.srt.utils.hf_transformers_utils import (
     get_processor,
     get_tokenizer,
@@ -2118,6 +2119,7 @@ class Scheduler(
 
             if self.enable_overlap or self.spec_algorithm.is_none():
                 # FIXME(lsyin): remove this if and finally unify the abstraction
+                rank0_log(f"DEBUG: run_batch 1: {batch.forward_mode=}")
                 batch_or_worker_batch = batch.get_model_worker_batch()
 
             if self.enable_overlap:
@@ -2205,6 +2207,7 @@ class Scheduler(
             )
             return batch_result
         else:  # embedding or reward model
+            rank0_log(f"DEBUG: run_batch 2: {batch.forward_mode=}")
             model_worker_batch = batch.get_model_worker_batch()
             embeddings = self.tp_worker.forward_batch_embedding(model_worker_batch)
             ret = EmbeddingBatchResult(embeddings=embeddings)

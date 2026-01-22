@@ -75,7 +75,7 @@ from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import flatten_nested_list
-from sglang.srt.utils.common import next_power_of_2
+from sglang.srt.utils.common import next_power_of_2, rank0_log
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -1735,8 +1735,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self, seq_lens_cpu_cache: Optional[torch.Tensor] = None
     ) -> ModelWorkerBatch:
         if self.forward_mode.is_decode_or_idle():
+            rank0_log(f"[DEBUG] get_model_worker_batch 1: {self.forward_mode=}")
             extend_seq_lens = extend_prefix_lens = extend_logprob_start_lens = None
         else:
+            rank0_log(f"[DEBUG] get_model_worker_batch 2: {self.forward_mode=}")
             extend_seq_lens = self.extend_lens
             extend_prefix_lens = self.prefix_lens
             extend_logprob_start_lens = self.extend_logprob_start_lens

@@ -45,7 +45,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_size,
     set_dp_buffer_len,
 )
-from sglang.srt.utils import get_compiler_backend, is_npu, support_triton
+from sglang.srt.utils import get_compiler_backend, is_npu, rank0_log, support_triton
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -401,9 +401,15 @@ class ForwardBatch:
 
         # Init position information
         if ret.forward_mode.is_decode() or ret.forward_mode.is_target_verify():
+            rank0_log(
+                f"[DEBUG] ForwardBatch init_new 1: {batch.extend_seq_lens=}, {batch.forward_mode=}"
+            )
             if ret.positions is None:
                 ret.positions = clamp_position(batch.seq_lens)
         else:
+            rank0_log(
+                f"[DEBUG] ForwardBatch init_new 2: {batch.extend_seq_lens=}, {batch.forward_mode=}"
+            )
             ret.extend_seq_lens = torch.tensor(
                 batch.extend_seq_lens, dtype=torch.int32
             ).to(device, non_blocking=True)

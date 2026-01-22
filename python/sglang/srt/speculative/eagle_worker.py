@@ -55,6 +55,7 @@ from sglang.srt.utils import (
     is_cuda,
     next_power_of_2,
 )
+from sglang.srt.utils.common import rank0_log
 
 if is_cuda():
     from sgl_kernel import segment_packbits
@@ -512,6 +513,7 @@ class EAGLEWorker(TpModelWorker):
         """
         # Forward with the target model and get hidden states.
         # We need the full hidden states to prefill the KV cache of the draft model.
+        rank0_log(f"DEBUG: forward_target_extend 1: {batch.forward_mode=}")
         model_worker_batch = batch.get_model_worker_batch()
         model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
         batch_result = self.target_worker.forward_batch_generation(model_worker_batch)
@@ -668,6 +670,7 @@ class EAGLEWorker(TpModelWorker):
         batch.return_hidden_states = False
 
         # Get forward batch
+        rank0_log(f"DEBUG: draft 1: {batch.forward_mode=}")
         model_worker_batch = batch.get_model_worker_batch()
         assert model_worker_batch.capture_hidden_mode == CaptureHiddenMode.LAST
         forward_batch = ForwardBatch.init_new(
@@ -811,6 +814,7 @@ class EAGLEWorker(TpModelWorker):
         )
         batch.spec_info = spec_info
 
+        rank0_log(f"DEBUG: verify 1: {batch.forward_mode=}")
         model_worker_batch = batch.get_model_worker_batch(
             seq_lens_cpu_cache=spec_info.seq_lens_cpu
         )
@@ -997,6 +1001,7 @@ class EAGLEWorker(TpModelWorker):
         batch.return_hidden_states = False
         batch.spec_info.prepare_for_extend(batch)
         batch.spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
+        rank0_log(f"DEBUG: forward_draft_extend 1: {batch.forward_mode=}")
         model_worker_batch = batch.get_model_worker_batch(
             seq_lens_cpu_cache=seq_lens_cpu
         )
@@ -1065,6 +1070,7 @@ class EAGLEWorker(TpModelWorker):
         )
 
         batch.return_hidden_states = False
+        rank0_log(f"DEBUG: forward_draft_extend_after_decode 1: {batch.forward_mode=}")
         model_worker_batch = batch.get_model_worker_batch()
         assert model_worker_batch.capture_hidden_mode == CaptureHiddenMode.LAST
         forward_batch = ForwardBatch.init_new(
