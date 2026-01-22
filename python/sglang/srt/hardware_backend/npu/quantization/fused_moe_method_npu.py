@@ -190,15 +190,13 @@ class NPUW4A8Int8DynamicMoEMethod(_NPUFusedMoEMethodBase):
         n = n * 2
         per_group_scale = per_group_scale.reshape(group_num, -1, n)
         group_num, quantgroup_num, n = per_group_scale.shape
-        bias = None
 
         scale_fp32 = (scale * per_group_scale).to(torch.float16).to(torch.float32)
         scale_fp32_np = scale_fp32.cpu().numpy()
         scale_fp32_np.dtype = np.uint32
+        
         sscale_uint64 = np.zeros((group_num, quantgroup_num, n * 2), dtype=np.uint32)
-
         sscale_uint64[..., ::2] = scale_fp32_np
-
         sscale_uint64_buffer = np.frombuffer(
             sscale_uint64.tobytes(), dtype=np.int64
         ).copy()
@@ -206,7 +204,7 @@ class NPUW4A8Int8DynamicMoEMethod(_NPUFusedMoEMethodBase):
             group_num, quantgroup_num, n
         )
         sscale_uint64_tensor = sscale_uint64_tensor.npu()
-        return sscale_uint64_tensor, bias
+        return sscale_uint64_tensor
 
     def _update_bias(self, layer):
         layer.w13_scale_bias.data = (
@@ -273,8 +271,6 @@ class NPUW4A8Int8DynamicMoEMethod(_NPUFusedMoEMethodBase):
             # scale_second is no longer used, release this part of the memory
             del layer.w13_weight_scale_second
             del layer.w2_weight_scale_second
-            del layer.w13_weight_offset_second
-            del layer.w2_weight_offset_second
 
         self._update_bias(layer)
 
