@@ -57,6 +57,7 @@ impl HashRing {
         for worker in workers {
             // Create Arc<str> once per worker, share across all virtual nodes
             let url: Arc<str> = Arc::from(worker.url());
+            let url_bytes = url.as_bytes();
 
             // Create multiple virtual nodes per worker
             for vnode in 0..VIRTUAL_NODES_PER_WORKER {
