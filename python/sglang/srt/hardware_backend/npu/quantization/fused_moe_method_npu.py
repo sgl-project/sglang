@@ -547,3 +547,4 @@ class NPUW4A16Int4DynamicMoEMethod(_NPUFusedMoEMethodBase):
             )
 
         return out_hidden
+
