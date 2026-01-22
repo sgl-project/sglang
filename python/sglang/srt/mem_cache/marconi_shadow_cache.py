@@ -245,7 +245,7 @@ class MarconiShadowCache:
                 * self.model_stats.mamba_state_size_bytes
                 + self.model_stats.num_attn_layers
                 * get_kv_cache_size_bytes(
-                    seqlen_child,
+                    seqlen_total,
                     self.model_stats.model_dim,
                     self.model_stats.kv_cache_dtype_size,
                 )

@@ -115,30 +115,45 @@ class SchedulerRuntimeCheckerMixin:
             or mamba_num_used != self.tree_cache.mamba_protected_size()
         )
         if memory_leak:
-            free_full_pages = set(
+            free_full_pages_list = (
                 self.token_to_kv_pool_allocator.free_pages.tolist()
                 + self.token_to_kv_pool_allocator.release_pages.tolist()
             )
-            cached_full_pages = set(self.tree_cache.all_values_flatten().tolist())
+            cached_full_pages_list = self.tree_cache.all_values_flatten().tolist()
+            free_full_pages = set(free_full_pages_list)
+            cached_full_pages = set(cached_full_pages_list)
             expected_full_pages = set(
                 range(1, self.token_to_kv_pool_allocator.size + 1)
             )
             leaked_full_pages = (
                 expected_full_pages - free_full_pages - cached_full_pages
             )
-            free_mamba_pages = set(
+            overlap_full_pages = free_full_pages & cached_full_pages
+            dup_free_full = len(free_full_pages_list) - len(free_full_pages)
+            dup_cached_full = len(cached_full_pages_list) - len(cached_full_pages)
+
+            free_mamba_pages_list = (
                 self.req_to_token_pool.mamba_pool.free_slots.tolist()
             )
-            cached_mamba_pages = set(
+            cached_mamba_pages_list = (
                 self.tree_cache.all_mamba_values_flatten().tolist()
             )
+            free_mamba_pages = set(free_mamba_pages_list)
+            cached_mamba_pages = set(cached_mamba_pages_list)
             expected_mamba_pages = set(range(self.req_to_token_pool.mamba_pool.size))
             leaked_mamba_pages = (
                 expected_mamba_pages - free_mamba_pages - cached_mamba_pages
             )
+            overlap_mamba_pages = free_mamba_pages & cached_mamba_pages
+            dup_free_mamba = len(free_mamba_pages_list) - len(free_mamba_pages)
+            dup_cached_mamba = len(cached_mamba_pages_list) - len(cached_mamba_pages)
             token_msg = (
                 f"{full_available_size=}, {full_evictable_size=}, {self.token_to_kv_pool_allocator.size=}, {self.tree_cache.full_protected_size()=}\n"
-                f"{mamba_available_size=}, {mamba_evictable_size=}, {self.req_to_token_pool.mamba_pool.size=}, {self.tree_cache.mamba_protected_size()=}, leaked_full_pages={leaked_full_pages if len(leaked_full_pages) > 0 else None}, leaked_mamba_pages={leaked_mamba_pages if len(leaked_mamba_pages) > 0 else None}\n"
+                f"{mamba_available_size=}, {mamba_evictable_size=}, {self.req_to_token_pool.mamba_pool.size=}, {self.tree_cache.mamba_protected_size()=}, "
+                f"leaked_full_pages={leaked_full_pages if len(leaked_full_pages) > 0 else None}, "
+                f"leaked_mamba_pages={leaked_mamba_pages if len(leaked_mamba_pages) > 0 else None}, "
+                f"overlap_full_pages={len(overlap_full_pages)}, dup_free_full={dup_free_full}, dup_cached_full={dup_cached_full}, "
+                f"overlap_mamba_pages={len(overlap_mamba_pages)}, dup_free_mamba={dup_free_mamba}, dup_cached_mamba={dup_cached_mamba}\n"
             )
         else:
             token_msg = (

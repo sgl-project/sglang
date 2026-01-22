@@ -20,6 +20,7 @@ The radix tree data structure for managing the hybrid (full and Mamba) KV cache.
 """
 
 import heapq
+import os
 from collections import defaultdict
 from functools import partial
 from typing import TYPE_CHECKING, List, Optional, Tuple
@@ -458,6 +459,14 @@ class MambaRadixCache(BasePrefixCache):
         # LRU lists are used to maintain the order of eviction of the nodes in the tree
         self.full_lru_list = LRUList(mamba=False)
         self.mamba_lru_list = LRUList(mamba=True)
+        # Live stats for Marconi visibility during benchmarks.
+        self.marconi_live_match_count = 0
+        self.marconi_live_hit_count = 0
+        self.marconi_live_token_total = 0
+        self.marconi_live_token_hit = 0
+        self.marconi_live_evict_full = 0
+        self.marconi_live_evict_mamba = 0
+        self.marconi_live_log_interval = 200
         if self.marconi_enabled:
             self.marconi_request_count = 0
             self.marconi_request_history_windowed = []
@@ -467,6 +476,26 @@ class MambaRadixCache(BasePrefixCache):
             self.marconi_tune_future = None
             self.marconi_tune_generation = 0
             self.marconi_admission_tree = MarconiAdmissionTree()
+
+    def _marconi_debug_check_free(self, indices: torch.Tensor, where: str) -> None:
+        if not self.marconi_enabled:
+            return
+        if os.getenv("SGLANG_MARCONI_DEBUG_FREE") != "1":
+            return
+        if indices is None or indices.numel() == 0:
+            return
+        try:
+            cached = set(self.all_values_flatten().tolist())
+            overlap = set(indices.tolist()) & cached
+        except Exception:
+            return
+        if overlap:
+            logger.error(
+                "Marconi debug: freeing cached KV indices at %s overlap=%d sample=%s",
+                where,
+                len(overlap),
+                list(overlap)[:5],
+            )
 
     def match_prefix(self, key: RadixKey, **kwargs) -> MatchResult:
         """Find the matching prefix from the radix tree.
@@ -519,6 +548,35 @@ class MambaRadixCache(BasePrefixCache):
             value = torch.cat(value)
         else:
             value = torch.empty((0,), dtype=torch.int64, device=self.device)
+
+        if self.marconi_enabled:
+            matched_len = int(value.numel())
+            total_len = len(key.token_ids)
+            self.marconi_live_match_count += 1
+            self.marconi_live_token_total += total_len
+            self.marconi_live_token_hit += matched_len
+            if matched_len > 0:
+                self.marconi_live_hit_count += 1
+            if self.marconi_live_match_count % self.marconi_live_log_interval == 0:
+                hit_rate = (
+                    self.marconi_live_hit_count / self.marconi_live_match_count
+                    if self.marconi_live_match_count > 0
+                    else 0.0
+                )
+                token_hit_rate = (
+                    self.marconi_live_token_hit / self.marconi_live_token_total
+                    if self.marconi_live_token_total > 0
+                    else 0.0
+                )
+                logger.info(
+                    "Marconi live stats: matches=%d hit_rate=%.4f token_hit_rate=%.4f "
+                    "evict_full=%d evict_mamba=%d",
+                    self.marconi_live_match_count,
+                    hit_rate,
+                    token_hit_rate,
+                    self.marconi_live_evict_full,
+                    self.marconi_live_evict_mamba,
+                )
 
         if (
             self.marconi_enabled
@@ -609,6 +667,7 @@ class MambaRadixCache(BasePrefixCache):
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, :kv_committed_len
             ]
+            self._marconi_debug_check_free(kv_indices, "cache_finished_req:disable")
             self.token_to_kv_pool_allocator.free(kv_indices)
             self.req_to_token_pool.free(req.req_pool_idx)
             return
@@ -640,6 +699,9 @@ class MambaRadixCache(BasePrefixCache):
         if is_insert:
             if cache_len != len(token_ids):
                 cache_end_idx = max(cache_len, req.cache_protected_len)
+                self._marconi_debug_check_free(
+                    kv_indices[cache_end_idx:], "cache_finished_req:cache_end"
+                )
                 self.token_to_kv_pool_allocator.free(kv_indices[cache_end_idx:])
                 token_ids = token_ids[:cache_len]
                 kv_indices = kv_indices[:cache_len]
@@ -682,10 +744,34 @@ class MambaRadixCache(BasePrefixCache):
                 mamba_value,
             )
 
+            if os.getenv("SGLANG_MARCONI_DEBUG_FREE") == "1":
+                try:
+                    cached = set(self.all_values_flatten().tolist())
+                    dup_slice = kv_indices[req.cache_protected_len : new_prefix_len]
+                    overlap = set(dup_slice.tolist()) & cached
+                    if overlap:
+                        logger.error(
+                            "Marconi debug: freeing cached KV indices at cache_finished_req:dup_prefix "
+                            "overlap=%d sample=%s cache_protected_len=%d new_prefix_len=%d "
+                            "kv_committed_len=%d token_len=%d prefix_indices_len=%d",
+                            len(overlap),
+                            list(overlap)[:5],
+                            req.cache_protected_len,
+                            new_prefix_len,
+                            kv_committed_len,
+                            len(token_ids),
+                            len(req.prefix_indices),
+                        )
+                except Exception:
+                    pass
             self.token_to_kv_pool_allocator.free(
                 kv_indices[req.cache_protected_len : new_prefix_len]
             )
         else:
+            self._marconi_debug_check_free(
+                kv_indices[req.cache_protected_len :],
+                "cache_finished_req:no_insert",
+            )
             self.token_to_kv_pool_allocator.free(kv_indices[req.cache_protected_len :])
             mamba_exist = True
 
@@ -897,6 +983,16 @@ class MambaRadixCache(BasePrefixCache):
         branch_checkpoint = branch_checkpoint_len is not None
         if self.marconi_enabled and not branch_checkpoint:
             return _skip_cache_unfinished_req(req)
+        if self.marconi_enabled and branch_checkpoint_len is not None:
+            # Only cache up to the branch checkpoint when Marconi is enabled.
+            # KV entries beyond the checkpoint are not reusable without a matching
+            # SSM state and should remain request-local.
+            if branch_checkpoint_len < page_aligned_len:
+                page_aligned_token_ids = page_aligned_token_ids[:branch_checkpoint_len]
+                page_aligned_kv_indices = page_aligned_kv_indices[
+                    :branch_checkpoint_len
+                ]
+                page_aligned_len = branch_checkpoint_len
         # radix tree mamba value is forked from req space
         mamba_value_forked = self.req_to_token_pool.mamba_pool.fork_from(mamba_value)
 
@@ -914,6 +1010,26 @@ class MambaRadixCache(BasePrefixCache):
             branchoff_mamba_value=mamba_value_forked if branch_checkpoint else None,
             branch_checkpoint_len=branch_checkpoint_len,
         )
+        if os.getenv("SGLANG_MARCONI_DEBUG_FREE") == "1":
+            try:
+                cached = set(self.all_values_flatten().tolist())
+                dup_slice = kv_indices[req.cache_protected_len : new_prefix_len]
+                overlap = set(dup_slice.tolist()) & cached
+                if overlap:
+                    logger.error(
+                        "Marconi debug: freeing cached KV indices at cache_unfinished_req:dup_prefix "
+                        "overlap=%d sample=%s cache_protected_len=%d new_prefix_len=%d "
+                        "cache_len=%d page_aligned_len=%d token_ids_len=%d",
+                        len(overlap),
+                        list(overlap)[:5],
+                        req.cache_protected_len,
+                        new_prefix_len,
+                        cache_len,
+                        page_aligned_len,
+                        len(token_ids),
+                    )
+            except Exception:
+                pass
         self.token_to_kv_pool_allocator.free(
             kv_indices[req.cache_protected_len : new_prefix_len]
         )
@@ -1033,10 +1149,8 @@ class MambaRadixCache(BasePrefixCache):
                 flops_savings_mamba + flops_savings_attn + flops_savings_mlp
             )
             total_memory = stats.num_mamba_layers * stats.mamba_state_size_bytes
-            # Memory footprint for this entry is the KV cache for the edge (child) tokens,
-            # not the full prefix length.
             total_memory += stats.num_attn_layers * get_kv_cache_size_bytes(
-                seqlen_child, stats.model_dim, stats.kv_cache_dtype_size
+                seqlen_total, stats.model_dim, stats.kv_cache_dtype_size
             )
             if total_memory > 0:
                 efficiency_scores.append(total_flops_savings / total_memory)
@@ -1067,6 +1181,14 @@ class MambaRadixCache(BasePrefixCache):
                 break
             full_evicted_delta, _, _, _ = self._evict_leaf_node(node, False)
             full_num_evicted += full_evicted_delta
+        if full_num_evicted > 0:
+            self.marconi_live_evict_full += full_num_evicted
+            logger.info(
+                "Marconi eviction(full): evicted=%d total_full=%d total_mamba=%d",
+                full_num_evicted,
+                self.marconi_live_evict_full,
+                self.marconi_live_evict_mamba,
+            )
 
     def _marconi_evict_mamba(self, mamba_num: int) -> None:
         mamba_num_evicted = 0
@@ -1085,6 +1207,14 @@ class MambaRadixCache(BasePrefixCache):
                 mamba_num_evicted += len(node.mamba_value)
                 self.mamba_lru_list.remove_node(node)
                 self._tombstone_internal_node(node)
+        if mamba_num_evicted > 0:
+            self.marconi_live_evict_mamba += mamba_num_evicted
+            logger.info(
+                "Marconi eviction(mamba): evicted=%d total_full=%d total_mamba=%d",
+                mamba_num_evicted,
+                self.marconi_live_evict_full,
+                self.marconi_live_evict_mamba,
+            )
 
     def _evict_leaf_node(
         self, x: TreeNode, is_evict_mamba: bool
@@ -1529,13 +1659,18 @@ class MambaRadixCache(BasePrefixCache):
             new_node.parent = node
             new_node.key = key
             new_node.value = value
-            new_node.mamba_value = mamba_value
             new_node.prefix_len = node.prefix_len + len(value)
             self.full_lru_list.insert_mru(new_node)
-            self.mamba_lru_list.insert_mru(new_node)
             node.children[child_key] = new_node
             self.full_evictable_size_ += len(value)
-            self.mamba_evictable_size_ += len(mamba_value)
+            # If we already attached a mamba state at the branch checkpoint, do not
+            # attach (and double-count) the same state at the new leaf.
+            if not mamba_value_attached:
+                new_node.mamba_value = mamba_value
+                self.mamba_lru_list.insert_mru(new_node)
+                self.mamba_evictable_size_ += len(mamba_value)
+            else:
+                new_node.mamba_value = None
             return total_prefix_length, False
 
         # len(key) == 0
