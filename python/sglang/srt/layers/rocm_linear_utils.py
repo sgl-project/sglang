@@ -6,6 +6,7 @@ from aiter.ops.triton.gemm_a16w16_atomic import gemm_a16w16_atomic
 
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
 from sglang.srt.utils import BumpAllocator
+from sglang.srt.utils.common import get_torch_compile_disable_decorator
 
 __all__ = ["fused_qk_rope_cat", "fused_qk_rope_cat_and_cache_mla"]
 
@@ -48,7 +49,7 @@ def get_dsv3_gemm_output_zero_allocator_size(
 
 # fused_qk_rope_cat_and_cache_mla plus attn_mqa both modify KV cache
 # hit out-of-place issue with KV cache the large tensor
-@torch._dynamo.disable()
+@get_torch_compile_disable_decorator(True)
 def rope_plus_attn_mqa(
     mla_inst,
     q_nope_out,
