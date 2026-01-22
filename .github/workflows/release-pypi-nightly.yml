@@ -49,20 +49,27 @@ jobs:
           cd python
           cp ../README.md ../LICENSE .
 
-          # Debug: Show git describe output to diagnose version issues
-          echo "=== Debug: Git describe output ==="
-          git describe --tags --long --match 'v*'
-          echo "=== Debug: Testing custom command ==="
+          # Get git describe output and force distance=1 if at exact tag
           DESC=$(git describe --tags --long --match 'v*' 2>/dev/null || echo 'v0.0.0-0-g0000000')
           TAG=$(echo "$DESC" | cut -d- -f1)
           DIST=$(echo "$DESC" | cut -d- -f2)
           HASH=$(echo "$DESC" | cut -d- -f3-)
-          echo "Parsed: TAG=$TAG DIST=$DIST HASH=$HASH"
-          test "$DIST" = '0' && DIST=1 && echo "Forcing DIST=1 for tag-exact build"
-          echo "Final: ${TAG}-${DIST}-${HASH}"
-          echo "==================================="
 
-          # Build wheel - setuptools-scm automatically generates version from git tags
+          echo "=== Git describe output ==="
+          echo "Original: $DESC"
+          echo "Parsed: TAG=$TAG DIST=$DIST HASH=$HASH"
+
+          # If distance is 0 (building at exact tag), force distance to 1
+          if [ "$DIST" = "0" ]; then
+            echo "Distance is 0 - forcing to 1 to ensure dev version"
+            # Override version for setuptools-scm using environment variable
+            FORCE_VERSION="${TAG#v}.dev1+${HASH}"
+            echo "Forcing version to: $FORCE_VERSION"
+            export SETUPTOOLS_SCM_PRETEND_VERSION="$FORCE_VERSION"
+          fi
+          echo "==========================="
+
+          # Build wheel
           python3 -m build --wheel
 
           # Extract version from built wheel filename
