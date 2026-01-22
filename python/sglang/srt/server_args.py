@@ -2450,8 +2450,12 @@ class ServerArgs:
 
             return valid_devices
 
+        except subprocess.TimeoutExpired as e:
+            raise RuntimeError(
+                "Timeout while validating IB devices using `ibstat -l`."
+            ) from e
         except Exception as e:
-            assert False, f"Error validating IB devices: {e}."
+            raise RuntimeError(f"Error validating IB devices: {e}") from e
 
     def _handle_tokenizer_batching(self):
         if self.enable_tokenizer_batch_encode and self.enable_dynamic_batch_tokenizer:
