@@ -4,9 +4,8 @@
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 
-// Kernel to compute scores and initialize indices for sorting
 template<typename T>
-__global__ void quest_score_kernel_opt(
+__global__ void score_kernel_opt(
     float* __restrict__ scores,           // [bs, max_pages]
     int32_t* __restrict__ indices,        // [bs, max_pages]
     const int32_t* __restrict__ seq_lens, // [bs]
@@ -38,7 +37,6 @@ __global__ void quest_score_kernel_opt(
     int64_t req_idx = blockIdx.x;
     int64_t tid = threadIdx.x;
     
-    // 1. Compute/Load Q_avg into Shared Memory
     // All threads in block cooperate to compute Q_avg for the single request req_idx
     int64_t num_features = kv_heads * head_dim;
     int64_t group_size = q_heads / kv_heads;
@@ -60,7 +58,6 @@ __global__ void quest_score_kernel_opt(
     
     __syncthreads();
 
-    // 2. Process Pages (Warp per Page)
     // Map warps to pages
     int64_t warp_id = tid / 32;
     int64_t lane_id = tid % 32;
@@ -108,18 +105,14 @@ __global__ void quest_score_kernel_opt(
     int64_t k_base_offset = phys_page_idx * page_k_stride_page;
 
     // Iterate over features (kv_heads * head_dim)
-    // Coalesced access: threads 0..31 read consecutive addresses
     for (int64_t i = lane_id; i < num_features; i += 32) {
         float q_val = s_q_avg[i];
         
-        // Calculate k_offset assuming contiguous layout or strided
-        // i = h * head_dim + d
         int64_t h = i / head_dim;
         int64_t d = i % head_dim;
         int64_t k_offset = k_base_offset + h * page_k_stride_head + d * page_k_stride_dim;
         
         float k_val;
-        // Optimization: Conditional Load
         // Only load max or min based on q sign
         if (q_val >= 0.0f) {
             k_val = (float)page_k_max[k_offset];
@@ -140,12 +133,8 @@ __global__ void quest_score_kernel_opt(
     }
 }
 
-// Combine indices kernel
-// - Selects top K from sorted indices
-// - Adds recent pages
-// - Sorts the result row (optional, but usually required for attention kernels)
-__global__ void quest_combine_kernel(
-    const int32_t* __restrict__ sorted_indices, // [bs, max_pages] (sorted by score desc)
+__global__ void combine_kernel(
+    const int32_t* __restrict__ sorted_indices, // [bs, max_pages] sorted by score desc
     int32_t* __restrict__ out_indices,          // [bs, max_out]
     int32_t* __restrict__ out_lengths,          // [bs]
     const int32_t* __restrict__ seq_lens,
@@ -182,36 +171,29 @@ __global__ void quest_combine_kernel(
     
     if (k_target > history_pages) k_target = history_pages;
     if (sparse_mask && sparse_mask[req_idx] == 0) {
-        k_target = 0; // Or handle mask logic. Python: k_per_req * sparse_mask
+        k_target = 0;
     }
     
     // Limit by max_pages
     if (k_target > max_pages) k_target = max_pages;
-    if (k_target > history_pages) k_target = history_pages; // Redundant but safe
+    if (k_target > history_pages) k_target = history_pages;
 
     int64_t out_cnt = 0;
     int32_t* my_out = out_indices + req_idx * max_out;
 
-    // 1. Copy Top K
-    // Since sorted_indices are valid indices into the page list (0..max_pages-1),
-    // and we masked invalid/recent pages with -inf, they should be at the end.
-    // However, we must ensure we don't pick padding or recent pages if they floated up (unlikely with -inf).
-    // The indices in sorted_indices are relative page indices (0..num_pages-1).
-    
+    // Copy Top K
     const int32_t* my_sorted = sorted_indices + req_idx * max_pages;
     
     for (int64_t i = 0; i < k_target; ++i) {
         if (i < max_pages) {
             int32_t p_idx = my_sorted[i];
-            // Verify it is not a recent page (shouldn't be due to -inf score)
-            // Verify it is within range
             if (p_idx >= 0 && p_idx < recent_start) {
                 my_out[out_cnt++] = p_idx;
             }
         }
     }
 
-    // 2. Add Recent Pages
+    // Add Recent Pages
     for (int64_t i = 0; i < num_recent_pages; ++i) {
         int32_t p_idx = recent_start + i;
         if (p_idx < num_pages) {
@@ -219,17 +201,15 @@ __global__ void quest_combine_kernel(
         }
     }
 
-    // 3. Store Length
+    // Store Length
     out_lengths[req_idx] = out_cnt;
 
-    // 4. Pad rest with -1
+    // Pad rest with -1
     for (int64_t i = out_cnt; i < max_out; ++i) {
         my_out[i] = -1;
     }
 
-    // 5. Sort the output indices (ascending) for this request
-    // Bubble sort is fine for small K (e.g. < 256)
-    // If out_cnt is large, this is slow. But usually out_cnt is small.
+    // Sort output indices (ascending) for this request
     for (int64_t i = 0; i < out_cnt; ++i) {
         for (int64_t j = 0; j < out_cnt - 1 - i; ++j) {
             if (my_out[j] > my_out[j + 1]) {
@@ -298,8 +278,8 @@ void retrieval_score_and_combine_indices(
     size_t shared_mem_size = kv_heads * head_dim * sizeof(float);
 
     // Dispatch
-    DISPATCH_FLOAT_TYPES(queries.scalar_type(), "quest_score_kernel_opt", [&] {
-        quest_score_kernel_opt<scalar_t><<<grid, block, shared_mem_size>>>(
+    DISPATCH_FLOAT_TYPES(queries.scalar_type(), "score_kernel_opt", [&] {
+        score_kernel_opt<scalar_t><<<grid, block, shared_mem_size>>>(
             scores.data_ptr<float>(),
             indices.data_ptr<int32_t>(),
             seq_lens.data_ptr<int32_t>(),
@@ -336,7 +316,7 @@ void retrieval_score_and_combine_indices(
     void* d_temp_storage = NULL;
     size_t temp_storage_bytes = 0;
     
-    // 1. Determine temp storage size
+    // Determine temp storage size
     cub::DeviceSegmentedRadixSort::SortPairsDescending(
         d_temp_storage, temp_storage_bytes,
         scores.data_ptr<float>(), scores.data_ptr<float>(),
@@ -348,7 +328,7 @@ void retrieval_score_and_combine_indices(
     auto temp_storage = torch::empty({(int64_t)temp_storage_bytes}, torch::dtype(torch::kByte).device(device));
     d_temp_storage = temp_storage.data_ptr();
     
-    // 2. Run Sort
+    // Run Sort
     cub::DeviceSegmentedRadixSort::SortPairsDescending(
         d_temp_storage, temp_storage_bytes,
         scores.data_ptr<float>(), scores.data_ptr<float>(),
@@ -358,7 +338,6 @@ void retrieval_score_and_combine_indices(
     );
     
     // Determine Output Size
-    // Use the shape of out_indices provided by Python
     int64_t max_out = out_indices.size(1);
 
     // Initialize outputs
@@ -366,7 +345,7 @@ void retrieval_score_and_combine_indices(
     out_lengths.zero_();
     
     // Combine Kernel
-    quest_combine_kernel<<<bs, 128>>>(
+    combine_kernel<<<bs, 128>>>(
         indices.data_ptr<int32_t>(),
         out_indices.data_ptr<int32_t>(),
         out_lengths.data_ptr<int32_t>(),
@@ -419,12 +398,9 @@ __global__ void compute_sparse_seqlens_kernel(
 
     if (sparse_mask[req_idx]) {
         int32_t sl = seq_lens[req_idx];
-        // Python: positions_in_page = (seq_lens - 1) % page_size
         int32_t positions_in_page = (sl - 1) % page_size;
-        // Python: diff = page_size - positions_in_page - 1
         int32_t diff = page_size - positions_in_page - 1;
         int32_t vl = valid_lengths[req_idx];
-        // Python: sparse_seq_lens = (valid_lengths * page_size - diff)
         current_cache_seqlens[req_idx] = vl * page_size - diff;
     } else {
         current_cache_seqlens[req_idx] = original_cache_seqlens[req_idx];
@@ -467,8 +443,8 @@ void update_sparse_metadata(
     auto device = page_table.device();
     
     // Update Page Table
-    // Grid: bs blocks (one per request)
-    // Block: 128 threads (to cover max_selected in loop)
+    // Grid: bs blocks
+    // Block: 128 threads
     update_page_table_kernel<<<bs, 128>>>(
         page_table.data_ptr<int32_t>(),
         physical_pages.data_ptr<int32_t>(),
@@ -480,7 +456,6 @@ void update_sparse_metadata(
     );
     CHECK_CUDA_SUCCESS(cudaGetLastError());
 
-    // Compute Sparse Seqlens
     dim3 block(256);
     dim3 grid((bs + block.x - 1) / block.x);
     
@@ -524,7 +499,6 @@ __global__ void sparse_diff_kernel(
     int64_t load_tokens_stride,
     int64_t physical_pages_stride
 ) {
-    // Use int64_t for shared memory to prevent precision loss / sign extension issues
     extern __shared__ int64_t s_mem[];
     int64_t* s_last_top_k = s_mem;
     int64_t* s_last_page_ids = s_last_top_k + hot_buffer_len;
@@ -661,7 +635,6 @@ __global__ void sparse_diff_kernel(
         }
         __syncthreads();
 
-        // Generate Load Commands
         for (int i = tid; i < top_k * page_size; i += blockDim.x) {
             int page_idx = i / page_size;
             int token_offset = i % page_size;
@@ -682,7 +655,7 @@ __global__ void sparse_diff_kernel(
             }
         }
 
-        // Update State (int64 -> int64)
+        // Update State
         int victims_used = s_fill_count;
         int valid_len = valid_lengths[req_idx_in_batch];
         int remaining_after_used = s_victim_count - victims_used;
@@ -785,7 +758,6 @@ void invoke_sparse_diff_cuda_kernel(
     TORCH_CHECK(load_tokens.size(1) >= top_k * page_size, "load_tokens second dim too small");
     TORCH_CHECK(load_tokens_host.size(1) >= top_k * page_size, "load_tokens_host second dim too small");
     
-    // Use int64 for shared memory size calculation
     size_t shared_mem = (2 * hot_buffer_len + 3 * top_k) * sizeof(int64_t);
     
     sparse_diff_kernel<<<bs, 128, shared_mem>>>(

@@ -17,7 +17,6 @@ from sglang.srt.mem_cache.sparsity.algorithms.base_algorithm import (
 )
 from sglang.srt.mem_cache.sparsity.algorithms.quest_kernels import quest_page_rep_kernel
 
-from sgl_kernel import retrieval_score_and_combine_indices
 
 logger = logging.getLogger(__name__)
 
