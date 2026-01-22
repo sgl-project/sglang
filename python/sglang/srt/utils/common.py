@@ -70,7 +70,7 @@ from typing import (
     Union,
 )
 from unittest import SkipTest
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import numpy as np
 import orjson
@@ -828,9 +828,13 @@ def load_audio(
         )
     elif audio_file.startswith("http://") or audio_file.startswith("https://"):
         timeout = int(os.getenv("REQUEST_TIMEOUT", "5"))
-        response = requests.get(audio_file, stream=True, timeout=timeout)
-        audio_file = BytesIO(response.content)
-        response.close()
+        policy = validate_vlm_media_url(audio_file, float(timeout))
+        response = _requests_get_with_policy(audio_file, policy)
+        try:
+            audio_bytes = _read_response_with_limit(response, policy["max_bytes"])
+        finally:
+            response.close()
+        audio_file = BytesIO(audio_bytes)
         audio, original_sr = sf.read(audio_file)
     elif isinstance(audio_file, str):
         audio, original_sr = sf.read(audio_file)
@@ -856,6 +860,195 @@ class ImageData:
     max_dynamic_patch: Optional[int] = None
 
 
+def _parse_media_allowlist(
+    raw_value: str,
+) -> tuple[set[str], list[ipaddress._BaseNetwork]]:
+    hosts: set[str] = set()
+    networks: list[ipaddress._BaseNetwork] = []
+    for entry in (raw_value or "").split(","):
+        item = entry.strip()
+        if not item:
+            continue
+        if "/" in item:
+            try:
+                networks.append(ipaddress.ip_network(item, strict=False))
+            except ValueError:
+                continue
+        else:
+            hosts.add(item.lower())
+    return hosts, networks
+
+
+def _resolve_media_ips(hostname: str) -> list[ipaddress._BaseAddress]:
+    try:
+        ip = ipaddress.ip_address(hostname)
+        return [ip]
+    except ValueError:
+        pass
+
+    ips: list[ipaddress._BaseAddress] = []
+    try:
+        for family, _, _, _, sockaddr in socket.getaddrinfo(hostname, None):
+            address = sockaddr[0]
+            try:
+                ips.append(ipaddress.ip_address(address))
+            except ValueError:
+                continue
+    except socket.gaierror:
+        return []
+    return ips
+
+
+def _is_blocked_ip(ip: ipaddress._BaseAddress) -> bool:
+    return (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_reserved
+        or ip.is_multicast
+        or ip.is_unspecified
+    )
+
+
+def _validate_media_url_with_policy_and_resolve(
+    url: str, policy: dict[str, Any]
+) -> set[ipaddress._BaseAddress]:
+    parsed = urlparse(url)
+    scheme = (parsed.scheme or "").lower()
+    hostname = (parsed.hostname or "").lower()
+    if scheme not in policy["schemes"]:
+        raise ValueError(f"URL scheme '{scheme}' is not allowed")
+    if not hostname:
+        raise ValueError("URL host is missing")
+    if hostname == "localhost" or hostname.endswith(".localhost"):
+        if hostname not in policy["allow_hosts"]:
+            raise ValueError("Localhost URLs are not allowed")
+
+    ips = _resolve_media_ips(hostname)
+    if not ips:
+        raise ValueError("Failed to resolve URL host")
+    if hostname in policy["allow_hosts"]:
+        return set(ips)
+    for ip in ips:
+        if any(ip in net for net in policy["allow_nets"]):
+            return set(ips)
+    for ip in ips:
+        if _is_blocked_ip(ip):
+            raise ValueError("URL resolves to a private or reserved IP")
+    return set(ips)
+
+
+def _validate_media_url_with_policy(url: str, policy: dict[str, Any]) -> None:
+    _validate_media_url_with_policy_and_resolve(url, policy)
+
+
+def _get_vlm_media_url_policy(default_timeout: float) -> dict[str, Any]:
+    enabled = get_bool_env_var("SGLANG_VLM_MEDIA_URL_FETCH_ENABLED", "true")
+    allowed_schemes = os.getenv("SGLANG_VLM_MEDIA_URL_ALLOWED_SCHEMES", "https,http")
+    allowlist_raw = os.getenv("SGLANG_VLM_MEDIA_URL_ALLOWLIST", "")
+    max_bytes = get_int_env_var("SGLANG_VLM_MEDIA_URL_MAX_BYTES", 50 * 1024 * 1024)
+    max_redirects = get_int_env_var("SGLANG_VLM_MEDIA_URL_MAX_REDIRECTS", 5)
+    timeout = get_float_env_var("SGLANG_VLM_MEDIA_URL_TIMEOUT", default_timeout)
+
+    schemes = {"https"}
+    if allowed_schemes:
+        schemes = {
+            scheme.strip().lower()
+            for scheme in allowed_schemes.split(",")
+            if scheme.strip()
+        }
+    allow_hosts, allow_nets = _parse_media_allowlist(allowlist_raw)
+    return {
+        "enabled": enabled,
+        "schemes": schemes,
+        "allow_hosts": allow_hosts,
+        "allow_nets": allow_nets,
+        "max_bytes": max_bytes,
+        "max_redirects": max_redirects,
+        "timeout": timeout,
+    }
+
+
+def validate_vlm_media_url(url: str, default_timeout: float) -> dict[str, Any]:
+    policy = _get_vlm_media_url_policy(default_timeout)
+    if not policy["enabled"]:
+        raise ValueError("Remote media URL fetching is disabled by configuration")
+    _validate_media_url_with_policy(url, policy)
+    return policy
+
+
+def validate_vlm_media_url_with_policy(
+    url: str, policy: dict[str, Any]
+) -> set[ipaddress._BaseAddress]:
+    return _validate_media_url_with_policy_and_resolve(url, policy)
+
+
+def validate_vlm_media_url_and_get_ips(
+    url: str, default_timeout: float
+) -> tuple[dict[str, Any], set[ipaddress._BaseAddress]]:
+    policy = _get_vlm_media_url_policy(default_timeout)
+    if not policy["enabled"]:
+        raise ValueError("Remote media URL fetching is disabled by configuration")
+    allowed_ips = _validate_media_url_with_policy_and_resolve(url, policy)
+    return policy, allowed_ips
+
+
+def validate_vlm_media_url_peer_ip(
+    peername: Any, allowed_ips: set[ipaddress._BaseAddress]
+) -> None:
+    if not peername:
+        raise ValueError("Failed to determine peer IP for media URL fetch")
+    if isinstance(peername, (list, tuple)):
+        peer_ip = str(peername[0]) if peername else ""
+    else:
+        peer_ip = str(peername)
+    if not peer_ip:
+        raise ValueError("Failed to determine peer IP for media URL fetch")
+    try:
+        ip_obj = ipaddress.ip_address(peer_ip)
+    except ValueError as exc:
+        raise ValueError("Failed to parse peer IP for media URL fetch") from exc
+    if ip_obj not in allowed_ips:
+        raise ValueError("Media URL fetch peer IP is not in the validated set")
+
+
+def _requests_get_with_policy(url: str, policy: dict[str, Any]) -> requests.Response:
+    current_url = url
+    for _ in range(policy["max_redirects"] + 1):
+        _validate_media_url_with_policy(current_url, policy)
+        response = requests.get(
+            current_url,
+            stream=True,
+            timeout=policy["timeout"],
+            allow_redirects=False,
+        )
+        if response.status_code in {301, 302, 303, 307, 308}:
+            location = response.headers.get("location")
+            response.close()
+            if not location:
+                raise ValueError("Redirect response missing location header")
+            current_url = urljoin(current_url, location)
+            continue
+        response.raise_for_status()
+        return response
+    raise ValueError("Too many redirects when fetching media URL")
+
+
+def _read_response_with_limit(response: requests.Response, max_bytes: int) -> bytes:
+    content_length = response.headers.get("content-length")
+    if content_length and int(content_length) > max_bytes:
+        raise ValueError("Remote content exceeds max size limit")
+
+    total = 0
+    chunks: list[bytes] = []
+    for chunk in response.iter_content(chunk_size=8192):
+        total += len(chunk)
+        if total > max_bytes:
+            raise ValueError("Remote content exceeds max size limit")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 def load_image(
     image_file: Union[Image.Image, str, ImageData, bytes],
 ) -> tuple[Image.Image, tuple[int, int]]:
@@ -870,10 +1063,11 @@ def load_image(
         image = Image.open(BytesIO(image_file))
     elif image_file.startswith("http://") or image_file.startswith("https://"):
         timeout = int(os.getenv("REQUEST_TIMEOUT", "3"))
-        response = requests.get(image_file, stream=True, timeout=timeout)
+        policy = validate_vlm_media_url(image_file, float(timeout))
+        response = _requests_get_with_policy(image_file, policy)
         try:
-            response.raise_for_status()
-            image = Image.open(response.raw)
+            image_bytes = _read_response_with_limit(response, policy["max_bytes"])
+            image = Image.open(BytesIO(image_bytes))
             image.load()  # Force loading to avoid issues after closing the stream
         finally:
             response.close()
@@ -895,8 +1089,12 @@ def get_image_bytes(image_file: Union[str, bytes]):
         return image_file
     elif image_file.startswith("http://") or image_file.startswith("https://"):
         timeout = int(os.getenv("REQUEST_TIMEOUT", "3"))
-        response = requests.get(image_file, timeout=timeout)
-        return response.content
+        policy = validate_vlm_media_url(image_file, float(timeout))
+        response = _requests_get_with_policy(image_file, policy)
+        try:
+            return _read_response_with_limit(response, policy["max_bytes"])
+        finally:
+            response.close()
     elif image_file.lower().endswith(("png", "jpg", "jpeg", "webp", "gif")):
         with open(image_file, "rb") as f:
             return f.read()
@@ -932,13 +1130,27 @@ def load_video(video_file: Union[str, bytes], use_gpu: bool = True):
         elif isinstance(video_file, str):
             if video_file.startswith(("http://", "https://")):
                 timeout = int(os.getenv("REQUEST_TIMEOUT", "10"))
-                response = requests.get(video_file, stream=True, timeout=timeout)
-                response.raise_for_status()
-                tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-                for chunk in response.iter_content(chunk_size=8192):
-                    tmp_file.write(chunk)
-                tmp_file.close()
-                vr = VideoReader(tmp_file.name, ctx=ctx)
+                policy = validate_vlm_media_url(video_file, float(timeout))
+                response = _requests_get_with_policy(video_file, policy)
+                try:
+                    content_length = response.headers.get("content-length")
+                    if content_length and int(content_length) > policy["max_bytes"]:
+                        raise ValueError("Remote content exceeds max size limit")
+                    tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+                    try:
+                        total = 0
+                        for chunk in response.iter_content(chunk_size=8192):
+                            total += len(chunk)
+                            if total > policy["max_bytes"]:
+                                raise ValueError(
+                                    "Remote content exceeds max size limit"
+                                )
+                            tmp_file.write(chunk)
+                    finally:
+                        tmp_file.close()
+                    vr = VideoReader(tmp_file.name, ctx=ctx)
+                finally:
+                    response.close()
             elif video_file.startswith("data:"):
                 _, encoded = video_file.split(",", 1)
                 video_bytes = pybase64.b64decode(encoded, validate=True)
