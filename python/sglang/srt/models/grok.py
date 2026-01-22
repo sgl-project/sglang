@@ -247,6 +247,8 @@ class ScalingRotaryEmbedding(RotaryEmbedding):
         self.attn_factor = attn_factor
         self.beta_fast = beta_fast
         self.beta_slow = beta_slow
+        if _is_npu:
+            dtype = torch.float32
         # Get n-d magnitude scaling corrected for interpolation
         self.mscale = float(_yarn_get_mscale(self.scaling_factor) * attn_factor)
         super().__init__(
@@ -381,13 +383,6 @@ class Grok1Attention(nn.Module):
             use_presharded_weights=self.load_presharded_attn,
             prefix=add_prefix("o_proj", prefix),
         )
-        self.rotary_emb = get_rope(
-            self.head_dim,
-            rotary_dim=self.head_dim,
-            max_position=max_position,
-            base=int(self.rope_theta),
-            is_neox_style=True,
-        )
 
         self.rope_rotate_half_dims = getattr(config, "rope_rotate_half_dims", False)
 
@@ -403,7 +398,19 @@ class Grok1Attention(nn.Module):
                 is_neox_style=True,
                 **rope_scaling,
             )
-            pos_encoding_mode = "NONE"
+        elif _is_npu:
+            self.rotary_emb = get_rope(
+                self.head_dim,
+                rotary_dim=(
+                    self.head_dim
+                    if not self.rope_rotate_half_dims
+                    else self.head_dim // 2
+                ),
+                max_position=max_position,
+                base=int(self.rope_theta),
+                is_neox_style=True,
+                dtype=torch.float32,
+            )
         else:
             self.rotary_emb = get_rope(
                 self.head_dim,
@@ -416,7 +423,7 @@ class Grok1Attention(nn.Module):
                 base=int(self.rope_theta),
                 is_neox_style=True,
             )
-            pos_encoding_mode = "NONE"
+        pos_encoding_mode = "NONE"
 
         logit_cap = max(getattr(config, "attn_logit_softcapping", 30.0), 0.0)
         logit_capping_method = getattr(config, "attn_logit_softcapping_method", "tanh")
@@ -444,7 +451,12 @@ class Grok1Attention(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
 
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = self.rotary_emb(positions, q, k)
+        if not _is_npu:
+            q, k = self.rotary_emb(positions, q, k)
+        else:
+            odtype = q.dtype
+            q, k = self.rotary_emb(positions, q.to(torch.float32), k.to(torch.float32))
+            q, k = q.to(odtype), k.to(odtype)
 
         attn_output = self.attn(q, k, v, forward_batch)
 
