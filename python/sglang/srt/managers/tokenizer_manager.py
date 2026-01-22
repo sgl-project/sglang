@@ -41,6 +41,7 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.disaggregation.encode_receiver import MMReceiver
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
+from sglang.srt.lora.lora_config import is_valid_lora_adapter_path
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
 from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchTokenizer
 from sglang.srt.managers.async_mm_data_processor import AsyncMMDataProcessor
@@ -66,6 +67,7 @@ from sglang.srt.managers.io_struct import (
     SessionParams,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
+    UnloadLoRAAdapterReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightFromDiskReqOutput,
     WatchLoadUpdateReq,
@@ -2199,18 +2201,56 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 continue
 
             if lora_path not in self.lora_ref_cache:
+                # Try auto-discovery from filesystem
+                if self.server_args.runtime_lora_cache_dir:
+                    adapter_path = os.path.normpath(
+                        os.path.join(self.server_args.runtime_lora_cache_dir, lora_path)
+                    )
+                    if is_valid_lora_adapter_path(adapter_path):
+                        logger.info(
+                            f"Auto-discovering LoRA adapter '{lora_path}' from {adapter_path}"
+                        )
+                        load_result = await self.load_lora_adapter(
+                            LoadLoRAAdapterReqInput(
+                                lora_name=lora_path,
+                                lora_path=adapter_path,
+                                pinned=False,
+                            )
+                        )
+                        if not load_result.success:
+                            raise ValueError(
+                                f"Failed to auto-load LoRA adapter {lora_path}: {load_result.error_message}"
+                            )
+                        continue
+
                 raise ValueError(
-                    f"Got LoRA adapter that has never been loaded: {lora_path}\n"
-                    f"All loaded adapters: {self.lora_ref_cache.keys()}."
+                    f"LoRA adapter '{lora_path}' not found. "
+                    f"Loaded adapters: {list(self.lora_ref_cache.keys())}"
                 )
 
-            logger.info(f"Reloading evicted adapter: {lora_path}")
-            new_lora_ref = self.lora_ref_cache[lora_path]
+            # Adapter is in cache, reload it
+            cached_ref = self.lora_ref_cache[lora_path]
+            # If adapter is still in registry and runtime_lora_cache_dir is set,
+            # unload it first to pick up updated weights (for RL training scenario)
+            if (
+                self.server_args.runtime_lora_cache_dir
+                and lora_path in self.lora_registry._registry
+            ):
+                logger.info(
+                    f"Reloading adapter '{lora_path}' to pick up updated weights"
+                )
+                async with self.lora_update_lock:
+                    await self._unload_lora_adapter_locked(
+                        UnloadLoRAAdapterReqInput(lora_name=lora_path)
+                    )
+            else:
+                logger.info(f"Reloading evicted adapter: {lora_path}")
+
             load_result = await self.load_lora_adapter(
                 LoadLoRAAdapterReqInput(
-                    lora_name=new_lora_ref.lora_name,
-                    lora_path=new_lora_ref.lora_path,
-                    pinned=new_lora_ref.pinned,
+                    lora_name=cached_ref.lora_name,
+                    lora_path=cached_ref.lora_path,
+                    pinned=cached_ref.pinned,
                 )
             )
             if (

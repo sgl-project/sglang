@@ -426,6 +426,7 @@ class ServerArgs:
     lora_eviction_policy: str = "lru"
     lora_backend: str = "csgmv"
     max_lora_chunk_size: Optional[int] = 16
+    runtime_lora_cache_dir: Optional[str] = None
 
     # Kernel backend
     attention_backend: Optional[str] = None
@@ -3537,6 +3538,16 @@ class ServerArgs:
             choices=[16, 32, 64, 128],
             help="Maximum chunk size for the ChunkedSGMV LoRA backend. Only used when --lora-backend is 'csgmv'. Choosing a larger value might improve performance.",
         )
+        parser.add_argument(
+            "--runtime-lora-cache-dir",
+            type=str,
+            default=os.getenv("SGLANG_RUNTIME_LORA_CACHE_DIR", None),
+            help="Root directory for LoRA adapters. When set, enables automatic discovery and loading of "
+            "adapters from this directory at runtime. When a request specifies an adapter that isn't loaded, "
+            "the system will automatically check this directory and load it if found. "
+            "Adapters will also be automatically reloaded if their weights are updated (useful for RL training scenarios). "
+            "Can also be set via SGLANG_RUNTIME_LORA_CACHE_DIR environment variable.",
+        )
 
         # Kernel backend
         parser.add_argument(
@@ -5014,6 +5025,13 @@ class ServerArgs:
 
     def check_lora_server_args(self):
         assert self.max_loras_per_batch > 0, "max_loras_per_batch must be positive"
+
+        # Validate filesystem resolver configuration
+        if self.runtime_lora_cache_dir:
+            if not os.path.isdir(self.runtime_lora_cache_dir):
+                raise ValueError(
+                    f"--runtime-lora-cache-dir must be a valid directory. Got: {self.runtime_lora_cache_dir}"
+                )
 
         # Enable LoRA if any LoRA paths are provided for backward compatibility.
         if self.lora_paths:
