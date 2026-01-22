@@ -229,11 +229,11 @@ def extract_answer(pred_str, exhaust=False):
             pattern = "-?\d*\.?\d+"
             answers = re.findall(pattern, pred_str.replace(",", ""))
             if len(answers) >= 1:
-                ans = answers[-1]
+                last_ans = answers[-1]
             else:
-                ans = ""
-            if ans:
-                pred.append(ans)
+                last_ans = ""
+            if last_ans:
+                pred.append(last_ans)
 
     # multiple line
     _pred = []
