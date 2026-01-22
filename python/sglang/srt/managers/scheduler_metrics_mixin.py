@@ -123,6 +123,20 @@ class SchedulerMetricsMixin:
         if self.enable_kv_cache_events:
             self.init_kv_events(self.server_args.kv_events_config)
 
+        # reocord iter time
+        self.iter_start_time = 0
+        self.iter_forward_start_time = 0
+        self.iter_forward_finish_time = 0
+        self.iter_finish_time = 0
+
+        if self.enable_metrics:
+            self.stats.num_max_batchs = (
+                self.server_args.max_running_requests
+                if self.server_args.max_running_requests is not None
+                else 0
+            )
+            self.stats.max_total_num_tokens = self.max_total_num_tokens
+
         self.scheduler_status_logger = SchedulerStatusLogger.maybe_create()
 
     def init_kv_events(self: Scheduler, kv_events_config: Optional[str]):
@@ -155,6 +169,11 @@ class SchedulerMetricsMixin:
         self.last_prefill_stats_tic = time.perf_counter()
         self.last_input_throughput = self.last_prefill_tokens / gap_latency
         self.last_prefill_tokens = adder.log_input_tokens
+        self.last_prefill_cache_tokens = adder.log_hit_tokens
+        # In PREFILL disaggregation, `self.running_batch` is decode-only;
+        # use the current prefill batch size to compute running_bs.
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            running_bs = len(can_run_list)
 
         assert self.temp_prefill_info is None
         self.temp_prefill_info = dict(
@@ -288,6 +307,62 @@ class SchedulerMetricsMixin:
                 dp_cooperation_info=batch.dp_cooperation_info,
             )
 
+    def log_prefill_dp_balance_stats(self: Scheduler, batch: ScheduleBatch) -> None:
+        """Log DP-level load-balancing metrics for the prefill stage."""
+        tokens_list = None
+        total_dp = None
+        total_tokens = None
+        dp_balance = 0.0
+        idle_batch_ratio = 1.0
+        prefill_chunk_util = 0.0
+
+        if (
+            batch is not None
+            and self.dp_rank == 0
+            and self.chunked_prefill_size is not None
+        ):
+            # Prepare per-DP worker token counts
+            tokens_list = batch.dp_global_num_tokens_for_metric
+
+            if tokens_list:
+                total_dp = len(tokens_list)
+                total_tokens = sum(tokens_list)
+                token_sorted = sorted(tokens_list)
+
+                # Compute idle ratio and utilization metrics in a unified way
+                idle_batch_ratio = tokens_list.count(0) / total_dp
+                prefill_chunk_util = total_tokens / total_dp / self.chunked_prefill_size
+
+                if total_dp > 1 and total_tokens > 0:
+                    # Compute Gini coefficient and DP balance in the general case
+                    acc = 0
+                    for i, val in enumerate(token_sorted, start=1):
+                        acc += (2 * i - total_dp - 1) * val
+                    gini = acc / (total_dp * total_tokens)
+                    # Derive DP balance score from Gini coefficient
+                    dp_balance = 1.0 - gini
+                else:
+                    # When there is only one DP or no tokens, use a fixed DP balance value
+                    # while keeping idle_batch_ratio and prefill_chunk_util as computed above
+                    dp_balance = 1.0 if total_dp == 1 else 0.0
+
+            logger.info(
+                f"Prefill tokens_list: {tokens_list}, "
+                f"#total_dp: {total_dp}, "
+                f"total_tokens: {total_tokens}, "
+                f"#dp_balance: {dp_balance:.2f}, "
+                f"#idle_batch_ratio: {idle_batch_ratio:.2f}, "
+                f"#prefill_chunk_util: {prefill_chunk_util:.2f}, "
+            )
+
+        if self.enable_metrics:
+            # DP balance
+            self.stats.dp_balance = dp_balance
+            self.stats.idle_batch_ratio = idle_batch_ratio
+            self.stats.prefill_chunk_util = prefill_chunk_util
+            # Others
+            self.metrics_collector.log_stats(self.stats)
+
     def log_decode_stats(
         self: Scheduler, can_run_cuda_graph: bool, running_batch: ScheduleBatch = None
     ):
@@ -300,6 +375,97 @@ class SchedulerMetricsMixin:
         self.num_generated_tokens = 0
         num_running_reqs = len(batch.reqs)
         num_running_reqs_offline_batch = 0
+
+        if RECORD_STEP_TIME:
+            self.step_time_dict[num_running_reqs].append(
+                gap_latency / self.server_args.decode_log_interval
+            )
+
+        iter_msg = f" [{self.forward_ct}]" if LOG_FORWARD_ITERS else ""
+
+        _ = self.log_decode_run_batch_stats(batch)
+
+        dp_balance_msg = self.log_decode_dp_balance_stats(batch)
+        token_usage_msg = self.log_decode_token_usage(batch)
+        spec_msg = self.log_decode_spec_stats(batch)
+        disagg_queue_msg = self.log_decode_disagg_queue_stats(batch)
+
+        msg = f"Decode batch{iter_msg}, #running-req: {num_running_reqs}, {token_usage_msg}"
+        msg += spec_msg
+        msg += disagg_queue_msg
+        msg += (
+            f"{'cuda graph' if self.device == 'cuda' else 'cpu graph'}: {can_run_cuda_graph}, "
+            f"gen throughput (token/s): {self.last_gen_throughput:.2f}, "
+            f"#queue-req: {len(self.waiting_queue)}, "
+        )
+        msg += dp_balance_msg
+
+        logger.info(msg)
+        if self.enable_metrics:
+            # Basics
+            self.stats.num_running_reqs = num_running_reqs
+            self.stats.num_running_reqs_offline_batch = num_running_reqs_offline_batch
+
+            self.stats.decode_sum_seq_lens = batch.seq_lens_cpu.sum().item()
+            self.stats.gen_throughput = self.last_gen_throughput
+            self.stats.num_queue_reqs = len(self.waiting_queue)
+            self.stats.num_grammar_queue_reqs = len(self.grammar_manager)
+            self.stats.cache_hit_rate = 0
+
+            self.stats.max_total_num_tokens = self.max_total_num_tokens
+
+            # Retract
+            self.stats.num_retracted_reqs = self.num_retracted_reqs
+            self.stats.num_paused_reqs = self.num_paused_reqs
+            self.num_retracted_reqs = self.num_paused_reqs = 0
+
+            # Others
+            self.calculate_utilization()
+            self.update_lora_metrics()
+            self.metrics_collector.log_stats(self.stats)
+            self._emit_kv_metrics()
+        self._publish_kv_events()
+
+    def log_decode_spec_stats(self: Scheduler, _: ScheduleBatch) -> str:
+        """Log speculative decoding metrics."""
+        if self.spec_algorithm.is_none():
+            spec_accept_length = 0
+            spec_accept_rate = 0
+            msg = ""
+        else:
+            spec_accept_length = (
+                self.spec_num_accepted_tokens / self.spec_num_forward_ct
+                if self.spec_num_forward_ct > 0
+                else 0
+            )
+            # Calculate acceptance rate: accepted tokens / total draft tokens
+            draft_tokens_fallback = (self.server_args.speculative_num_steps or 0) + 1
+            num_draft_tokens = (
+                self.server_args.speculative_num_draft_tokens or draft_tokens_fallback
+            )
+            total_draft_tokens = self.spec_num_forward_ct * num_draft_tokens
+
+            spec_accept_rate = (
+                self.spec_num_accepted_tokens / total_draft_tokens
+                if total_draft_tokens > 0
+                else 0
+            )
+            self.spec_total_num_accepted_tokens += self.spec_num_accepted_tokens
+            self.spec_total_num_forward_ct += self.spec_num_forward_ct
+            self.spec_num_accepted_tokens = self.spec_num_forward_ct = 0
+            msg = f"accept len: {spec_accept_length:.2f}, accept rate: {spec_accept_rate:.2f}, "
+
+        if self.enable_metrics:
+            # Speculative decoding
+            self.stats.spec_accept_rate = spec_accept_rate
+            self.stats.spec_accept_length = spec_accept_length
+
+        return msg
+
+    def log_decode_token_usage(self: Scheduler, _: ScheduleBatch) -> str:
+        """Log token usage statistics during decode stage."""
+        mamba_usage = 0
+        swa_token_usage = 0
 
         # TODO: generalize this for various memory pools
         if self.is_hybrid_swa:
@@ -344,79 +510,26 @@ class SchedulerMetricsMixin:
             num_used, token_usage, _, _ = self._get_token_info()
             token_usage_msg = f"#token: {num_used}, token usage: {token_usage:.2f}, "
 
-        if RECORD_STEP_TIME:
-            self.step_time_dict[num_running_reqs].append(
-                gap_latency / self.server_args.decode_log_interval
-            )
-
-        iter_msg = f" [{self.forward_ct}]" if LOG_FORWARD_ITERS else ""
-        msg = f"Decode batch{iter_msg}, #running-req: {num_running_reqs}, {token_usage_msg}"
-
-        if self.spec_algorithm.is_none():
-            spec_accept_length = 0
-            spec_accept_rate = 0
-        else:
-            spec_accept_length = (
-                self.spec_num_accepted_tokens / self.spec_num_forward_ct
-            )
-            # Calculate acceptance rate: accepted tokens / total draft tokens
-            draft_tokens_fallback = (self.server_args.speculative_num_steps or 0) + 1
-            num_draft_tokens = (
-                self.server_args.speculative_num_draft_tokens or draft_tokens_fallback
-            )
-            total_draft_tokens = self.spec_num_forward_ct * num_draft_tokens
-
-            spec_accept_rate = (
-                self.spec_num_accepted_tokens / total_draft_tokens
-                if total_draft_tokens > 0
-                else 0
-            )
-            self.spec_total_num_accepted_tokens += self.spec_num_accepted_tokens
-            self.spec_total_num_forward_ct += self.spec_num_forward_ct
-            self.spec_num_accepted_tokens = self.spec_num_forward_ct = 0
-            msg += f"accept len: {spec_accept_length:.2f}, accept rate: {spec_accept_rate:.2f}, "
-        cache_hit_rate = 0.0
-
-        if self.disaggregation_mode == DisaggregationMode.DECODE:
-            msg += f"pre-allocated usage: {self.disagg_decode_prealloc_queue.num_tokens_pre_allocated / self.max_total_num_tokens:.2f}, "
-            msg += f"#prealloc-req: {len(self.disagg_decode_prealloc_queue.queue)}, "
-            msg += f"#transfer-req: {len(self.disagg_decode_transfer_queue.queue)}, "
-            msg += f"#retracted-req: {len(self.disagg_decode_prealloc_queue.retracted_queue)}, "
-
-        msg += (
-            f"{'cuda graph' if self.device == 'cuda' else 'cpu graph'}: {can_run_cuda_graph}, "
-            f"gen throughput (token/s): {self.last_gen_throughput:.2f}, "
-            f"#queue-req: {len(self.waiting_queue)}, "
-        )
-
-        logger.info(msg)
         if self.enable_metrics:
-            # Basics
-            self.stats.num_running_reqs = num_running_reqs
-            self.stats.num_running_reqs_offline_batch = num_running_reqs_offline_batch
             self.stats.num_used_tokens = num_used
             self.stats.token_usage = token_usage
             if self.is_hybrid_swa:
                 self.stats.swa_token_usage = swa_token_usage
             if self.is_hybrid_ssm:
                 self.stats.mamba_usage = mamba_usage
-            self.stats.decode_sum_seq_lens = batch.seq_lens_cpu.sum().item()
-            self.stats.gen_throughput = self.last_gen_throughput
-            self.stats.num_queue_reqs = len(self.waiting_queue)
-            self.stats.num_grammar_queue_reqs = len(self.grammar_manager)
-            self.stats.cache_hit_rate = cache_hit_rate
 
-            self.stats.max_total_num_tokens = self.max_total_num_tokens
+        return token_usage_msg
 
-            # Speculative decoding
-            self.stats.spec_accept_rate = spec_accept_rate
-            self.stats.spec_accept_length = spec_accept_length
+    def log_decode_disagg_queue_stats(self: Scheduler, batch: ScheduleBatch) -> str:
+        """Log disaggregation queue statistics during decode stage."""
+        msg = ""
+        if self.disaggregation_mode == DisaggregationMode.DECODE:
+            msg += f"pre-allocated usage: {self.disagg_decode_prealloc_queue.num_tokens_pre_allocated / self.max_total_num_tokens:.2f}, "
+            msg += f"#prealloc-req: {len(self.disagg_decode_prealloc_queue.queue)}, "
+            msg += f"#transfer-req: {len(self.disagg_decode_transfer_queue.queue)}, "
+            msg += f"#retracted-req: {len(self.disagg_decode_prealloc_queue.retracted_queue)}, "
 
-            # Retract
-            self.stats.num_retracted_reqs = self.num_retracted_reqs
-            self.stats.num_paused_reqs = self.num_paused_reqs
-            self.num_retracted_reqs = self.num_paused_reqs = 0
-
+        if self.enable_metrics:
             # PD disaggregation
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 self.stats.num_prefill_prealloc_queue_reqs = len(
@@ -442,13 +555,84 @@ class SchedulerMetricsMixin:
             _, self.stats.routing_key_all_req_counts = compute_routing_key_stats(
                 running_routing_keys + waiting_routing_keys
             )
+        return msg
 
-            # Others
-            self.calculate_utilization()
-            self.update_lora_metrics()
-            self.metrics_collector.log_stats(self.stats)
-            self._emit_kv_metrics()
-        self._publish_kv_events()
+    def log_decode_run_batch_stats(self: Scheduler, _: ScheduleBatch) -> str:
+        """Log runtime stats of running a single iteration"""
+        self.iter_finish_time = time.perf_counter()
+        generation_time = self.iter_finish_time - self.iter_start_time
+        run_batch_time = self.iter_forward_finish_time - self.iter_forward_start_time
+        iter_token_process_time = generation_time - run_batch_time
+
+        if self.enable_metrics:
+            # Run batch
+            self.stats.generation_time = generation_time
+            self.stats.run_batch_time = run_batch_time
+            self.stats.iter_token_process_time = iter_token_process_time
+
+        return ""
+
+    def log_decode_dp_balance_stats(self: Scheduler, batch: ScheduleBatch) -> str:
+        """Log DP-level load-balancing metrics for the decode stage."""
+        num_tokens_list: List[int] = []
+
+        num_total_tokens: int = 0
+        # DP all_gather latency
+        all_gather_latency_us = 0.0
+
+        if batch is None or self.dp_rank != 0:
+            return ""
+
+        assert batch.dp_global_num_tokens_for_metric is not None
+        num_tokens_list = batch.dp_global_num_tokens_for_metric
+        all_gather_latency_us = batch.all_gather_latency
+
+        if num_tokens_list:
+            total_dp = len(num_tokens_list)
+            num_total_tokens = sum(num_tokens_list)
+
+            # Compute idle ratio and utilization metrics in a unified way.
+            idle_batch_ratio = num_tokens_list.count(0) / total_dp
+            decode_bs_util: float = (
+                num_total_tokens / total_dp / self.max_running_requests
+            )
+
+            if total_dp > 1 and num_total_tokens > 0:
+                # Compute Gini coefficient and DP balance in the general case.
+                acc = 0
+                for i, val in enumerate(sorted(num_tokens_list), start=1):
+                    acc += (2 * i - total_dp - 1) * val
+                gini = acc / (total_dp * num_total_tokens)
+                # Derive DP balance score from Gini coefficient
+                dp_balance = 1.0 - gini
+            else:
+                # When there is only one DP or no tokens, use a fixed DP balance value
+                # while keeping idle_batch_ratio and decode_bs_util as computed above.
+                dp_balance = 1.0 if total_dp == 1 else 0.0
+        else:
+            total_dp = 0
+            dp_balance = 0.0
+            idle_batch_ratio = 1.0
+            decode_bs_util = 0.0
+
+        msg = (
+            f"Decode tokens_list: {num_tokens_list}, "
+            f"#total_dp: {total_dp}, "
+            f"total_tokens: {num_total_tokens}, "
+            f"#dp_balance: {dp_balance:.2f}, "
+            f"#idle_batch_ratio: {idle_batch_ratio:.2f}, "
+            f"#decode_bs_util: {decode_bs_util:.2f}, "
+        )
+
+        if self.enable_metrics:
+            self.stats.dp_balance = dp_balance
+            self.stats.idle_batch_ratio = idle_batch_ratio
+            self.stats.decode_bs_util = decode_bs_util
+
+            # DP all_gather latency
+            self.stats.all_gather_latency_us = all_gather_latency_us
+
+        return msg
 
     def log_decode_stats_every_iteration(
         self: Scheduler, batch: ScheduleBatch, num_accepted_tokens: int

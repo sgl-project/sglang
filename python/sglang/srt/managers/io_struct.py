@@ -720,6 +720,9 @@ class TokenizedGenerateReqInput(BaseReq):
     # Session info for continual prompting
     session_params: Optional[SessionParams] = None
 
+    # Timestamp when tokenizer dispatches the request to the scheduler
+    dispatch_to_scheduler_time: Optional[float] = None
+
     # LoRA related
     lora_id: Optional[str] = None  # None means just use the base model
 
@@ -928,6 +931,8 @@ class TokenizedEmbeddingReqInput(BaseReq):
     priority: Optional[int] = None
     # The number of dimensions the resulting output embeddings should have. It is applicable for Matryoshka Embeddings.
     dimensions: Optional[int] = None
+    # Timestamp when tokenizer dispatches the request to the scheduler
+    dispatch_to_scheduler_time: Optional[float] = None
 
 
 @dataclass

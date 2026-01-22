@@ -1216,8 +1216,10 @@ async def continue_generation(obj: ContinueGenerationReqInput, request: Request)
 @app.post("/v1/completions", dependencies=[Depends(validate_json_request)])
 async def openai_v1_completions(request: CompletionRequest, raw_request: Request):
     """OpenAI-compatible text completion endpoint."""
+    # Timestamp when the HTTP request is received and handed off to the tokenizer
+    tokenizer_rev_request_time = time.time()
     return await raw_request.app.state.openai_serving_completion.handle_request(
-        request, raw_request
+        request, raw_request, tokenizer_rev_request_time
     )
 
 
@@ -1226,8 +1228,10 @@ async def openai_v1_chat_completions(
     request: ChatCompletionRequest, raw_request: Request
 ):
     """OpenAI-compatible chat completion endpoint."""
+    # Timestamp when the HTTP request is received and handed off to the tokenizer
+    tokenizer_rev_request_time = time.time()
     return await raw_request.app.state.openai_serving_chat.handle_request(
-        request, raw_request
+        request, raw_request, tokenizer_rev_request_time
     )
 
 

@@ -511,6 +511,7 @@ class Req:
         return_hidden_states: bool = False,
         return_routed_experts: bool = False,
         eos_token_ids: Optional[Set[int]] = None,
+        dispatch_to_scheduler_time: Optional[float] = None,
         bootstrap_host: Optional[str] = None,
         bootstrap_port: Optional[int] = None,
         bootstrap_room: Optional[int] = None,
@@ -747,6 +748,12 @@ class Req:
         self.time_stats: TimeStats = TimeStats(disagg_mode=disagg_mode)
         self.has_log_time_stats: bool = False
         self.last_tic = time.monotonic()
+
+        # Timestamp when tokenizer dispatches the request to the scheduler
+        self.dispatch_to_scheduler_time = dispatch_to_scheduler_time
+        # TODO (suhang): Move the dispatch_to_scheduler_time synchronization into Req’s own initializer:
+        # Once dispatch_to_scheduler_time is passed into Req
+        # TimeStats can synchronize it automatically, so the scheduler no longer needs that extra getattr check.
 
         # For disaggregation
         self.bootstrap_host: str = bootstrap_host
@@ -1272,10 +1279,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     inner_idle_batch: Optional[ScheduleBatch] = None
     global_num_tokens: Optional[List[int]] = None
     global_num_tokens_for_logprob: Optional[List[int]] = None
+    dp_global_num_tokens_for_metric: Optional[List[int]] = None
     is_extend_in_batch: bool = False
     can_run_dp_cuda_graph: bool = False
     tbo_split_seq_index: Optional[int] = None
     global_forward_mode: Optional[ForwardMode] = None
+
+    # DP all_gather latency for this batch
+    all_gather_latency: float = 0.0
 
     # For processing logprobs
     return_logprob: bool = False
@@ -2256,6 +2267,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             spec_algorithm=self.spec_algorithm,
             global_num_tokens=self.global_num_tokens,
             global_num_tokens_for_logprob=self.global_num_tokens_for_logprob,
+            dp_global_num_tokens_for_metric=self.dp_global_num_tokens_for_metric,
+            all_gather_latency=self.all_gather_latency,
             can_run_dp_cuda_graph=self.can_run_dp_cuda_graph,
             is_extend_in_batch=self.is_extend_in_batch,
             is_prefill_only=self.is_prefill_only,
