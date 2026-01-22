@@ -250,6 +250,17 @@ class TRTLLMMLADecodeMetadata:
     cu_seqlens_q: Optional[torch.Tensor] = None
     seq_lens_q: Optional[torch.Tensor] = None
     seq_lens_k: Optional[torch.Tensor] = None
+    batch_size: Optional[int] = None
+
+    # The following fields are used for fused RoPE + FP8 quantization + KV cache update
+    # kv_indices: page indices for each token
+    kv_indices: Optional[torch.Tensor] = None
+    # kv_indptr: cumulative token count per request (arange for MLA where each token is its own "batch")
+    kv_indptr: Optional[torch.Tensor] = None
+    # batch_indices: which request each token belongs to (arange for MLA)
+    batch_indices: Optional[torch.Tensor] = None
+    # positions: position of each token within its page (out_cache_loc % page_size)
+    positions: Optional[torch.Tensor] = None
 
 
 class TRTLLMMLABackend(FlashInferMLAAttnBackend):
@@ -321,23 +332,39 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         # Set to True to use the fused kernel instead of separate calls
         self.use_fused_rope_quantize_append = True  # PERF TEST: fused path
 
-        # Pre-allocated buffers for fused kernel (set in _init_fused_static_buffers)
-        self._fused_batch_indices: Optional[torch.Tensor] = None
-        self._fused_kv_indptr: Optional[torch.Tensor] = None
-        self._fused_max_nnz: int = 0
+    def _init_forward_metadata_for_rope_fusion(
+        self,
+        metadata: TRTLLMMLADecodeMetadata,
+        out_cache_loc: torch.Tensor,
+        update_inplace: bool = False,
+    ):
+        """
+        Initialize metadata for RoPE + FP8 quantization + KV cache update kernel.
+        For MLA, each token is its own "batch" element.
+        """
+        nnz = out_cache_loc.shape[0]
+        device = out_cache_loc.device
 
-    def _init_fused_static_buffers(self, max_nnz: int, device: torch.device):
-        """Initialize static buffers for fused kernel. Called once when max_nnz grows."""
-        if max_nnz <= self._fused_max_nnz:
-            return  # Already have enough capacity
-
-        # TODO(ljn):  See if nnz really varies for different batches.
-        self._fused_max_nnz = max_nnz
-
-        self._fused_batch_indices = torch.arange(max_nnz, dtype=torch.int32, device=device)
-        self._fused_kv_indptr = torch.arange(max_nnz + 1, dtype=torch.int32, device=device)
-
-        print(f"[FUSED] Allocated static buffers: max_nnz={max_nnz}")
+        if update_inplace:
+            # In-place update: write directly to pre-allocated buffers (CUDA graph replay)
+            torch.div(
+                out_cache_loc,
+                self.page_size,
+                rounding_mode="floor",
+                out=metadata.kv_indices[:nnz],
+            )
+            torch.remainder(
+                out_cache_loc,
+                self.page_size,
+                out=metadata.positions[:nnz],
+            )
+            # kv_indptr and batch_indices are arange - unchanging, no update needed
+        else:
+            # Fresh allocation (normal mode or CUDA graph capture)
+            metadata.kv_indices = (out_cache_loc // self.page_size).to(torch.int32)
+            metadata.positions = (out_cache_loc % self.page_size).to(torch.int32)
+            metadata.kv_indptr = torch.arange(nnz + 1, dtype=torch.int32, device=device)
+            metadata.batch_indices = torch.arange(nnz, dtype=torch.int32, device=device)
 
     def _calc_padded_blocks(self, max_seq_len: int) -> int:
         """
@@ -445,6 +472,21 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 device=self.device,
             )
 
+        # Pre-allocate fused kernel buffers for CUDA graph
+        if self.use_fused_rope_quantize_append:
+            self._cuda_graph_fused_kv_indices = torch.zeros(
+                max_num_tokens, dtype=torch.int32, device=self.device
+            )
+            self._cuda_graph_fused_kv_indptr = torch.arange(
+                max_num_tokens + 1, dtype=torch.int32, device=self.device
+            )
+            self._cuda_graph_fused_batch_indices = torch.arange(
+                max_num_tokens, dtype=torch.int32, device=self.device
+            )
+            self._cuda_graph_fused_positions = torch.zeros(
+                max_num_tokens, dtype=torch.int32, device=self.device
+            )
+
         super().init_cuda_graph_state(max_bs, max_num_tokens, kv_indices_buf)
 
     def init_forward_metadata_capture_cuda_graph(
@@ -527,6 +569,15 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         metadata.block_kv_indices = block_kv_indices
         metadata.max_seq_len_k = self.max_context_len
 
+        # Set pre-allocated fused kernel buffers (sliced to num_tokens)
+        # NOTE: Values are initialized during replay via _init_forward_metadata_for_rope_fusion.
+        # During capture, only tensor shapes/references matter for CUDA graph recording.
+        if self.use_fused_rope_quantize_append:
+            metadata.kv_indices = self._cuda_graph_fused_kv_indices[:num_tokens]
+            metadata.kv_indptr = self._cuda_graph_fused_kv_indptr[:num_tokens + 1]
+            metadata.batch_indices = self._cuda_graph_fused_batch_indices[:num_tokens]
+            metadata.positions = self._cuda_graph_fused_positions[:num_tokens]
+
         self.decode_cuda_graph_metadata[bs] = metadata
         self.forward_decode_metadata = metadata
 
@@ -540,6 +591,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
+        out_cache_loc: Optional[torch.Tensor] = None,
     ):
         """Replay CUDA graph with new inputs."""
         # Delegate to parent for non-decode modes.
@@ -594,6 +646,14 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             metadata.block_kv_indices.shape[1],
             PAGED_SIZE=self.page_size,
         )
+
+        # Initialize fused kernel metadata for CUDA graph replay
+        if self.use_fused_rope_quantize_append and out_cache_loc is not None:
+            self._init_forward_metadata_for_rope_fusion(
+                metadata,
+                out_cache_loc,
+                update_inplace=True,
+            )
 
     def get_cuda_graph_seq_len_fill_value(self) -> int:
         """Get the fill value for sequence lengths in CUDA graph."""
@@ -682,6 +742,13 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             self.forward_decode_metadata.block_kv_indices = block_kv_indices
             self.forward_decode_metadata.max_seq_len_k = int(max_seq)
             self.forward_decode_metadata.batch_size = bs
+
+            # Initialize fused kernel metadata (computed once per forward pass, used by all layers)
+            if self.use_fused_rope_quantize_append and forward_batch.out_cache_loc is not None:
+                self._init_forward_metadata_for_rope_fusion(
+                    self.forward_decode_metadata,
+                    forward_batch.out_cache_loc,
+                )
 
             forward_batch.decode_trtllm_mla_metadata = self.forward_decode_metadata
         else:
@@ -781,28 +848,31 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
     ) -> torch.Tensor:
         """Fused RoPE application, FP8 quantization, and KV cache append.
 
-        This combines mla_rope_quantize_fp8 and append_paged_mla_kv_cache into
-        a single fused kernel call using rope_quantize_fp8_append_paged_kv_cache.
+        This combines RoPE application, FP8 quantization, and paged KV cache append
+        into a single fused kernel call using flashinfer.rope.rope_quantize_fp8_append_paged_kv_cache.
+
+        Note: self.forward_decode_metadata must be initialized (via init_forward_metadata
+        or init_forward_metadata_replay_cuda_graph) before calling this function.
 
         Args:
-            q_nope: Query no-position-encoding component [seq_len, num_heads, kv_lora_rank]
-            q_rope: Query RoPE component [seq_len, num_heads, qk_rope_head_dim]
-            k_nope: Key no-position-encoding component [seq_len, kv_lora_rank]
-            k_rope: Key RoPE component [seq_len, qk_rope_head_dim]
-            layer: The attention layer
-            forward_batch: Forward batch containing position and cache info
+            q_nope: Query no-position-encoding component [nnz, num_heads, kv_lora_rank]
+            q_rope: Query RoPE component [nnz, num_heads, qk_rope_head_dim]
+            k_nope: Key no-position-encoding component [nnz, kv_lora_rank]
+            k_rope: Key RoPE component [nnz, qk_rope_head_dim]
+            layer: The attention layer (used to get layer_id for KV cache)
+            forward_batch: Forward batch containing positions and token_to_kv_pool
             cos_sin_cache: Precomputed cosine/sine cache for RoPE
-            is_neox: Whether to use NeoX-style RoPE
+            is_neox: Whether to use NeoX-style RoPE (True) or GPT-J style (False)
 
         Returns:
-            merged_q_out: [seq_len, num_heads, kv_lora_rank + qk_rope_head_dim], dtype=FP8
+            merged_q_out: [nnz, num_heads, kv_lora_rank + qk_rope_head_dim], dtype=FP8
+
+        Side Effects:
+            Writes quantized K (k_nope, k_rope) to the paged KV cache at locations
+            specified by forward_decode_metadata.kv_indices and positions.
         """
         nnz = forward_batch.out_cache_loc.shape[0]
 
-        # Ensure static buffers are allocated
-        self._init_fused_static_buffers(nnz, forward_batch.out_cache_loc.device)
-
-        # TODO(ljn):  Should this be moved into _init_fused_static_buffers above?
         # Allocate output tensor with FP8 dtype
         q_out = q_rope.new_empty(
             nnz,
@@ -833,10 +903,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             cos_sin_cache=cos_sin_cache,
             pos_ids=forward_batch.positions,
             paged_kv_cache=(ckv_cache, kpe_cache),
-            kv_indices=forward_batch.out_cache_loc // self.page_size,
-            kv_indptr=self._fused_kv_indptr[:nnz + 1],
-            batch_indices=self._fused_batch_indices[:nnz],
-            positions=torch.remainder(forward_batch.out_cache_loc, self.page_size),
+            kv_indices=self.forward_decode_metadata.kv_indices,
+            kv_indptr=self.forward_decode_metadata.kv_indptr,
+            batch_indices=self.forward_decode_metadata.batch_indices,
+            positions=self.forward_decode_metadata.positions,
             is_neox=is_neox,
             quantize_dtype=torch.float8_e4m3fn,
             quant_scale_q=1.0,
