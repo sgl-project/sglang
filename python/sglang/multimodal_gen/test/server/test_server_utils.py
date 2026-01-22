@@ -900,12 +900,18 @@ def get_generate_fn(
         req_output_format = None  # Not specified in current request
         req_background = None  # Not specified in current request
 
+        # Build extra_body for optional features
+        extra_body = {}
+        if sampling_params.enable_teacache:
+            extra_body["enable_teacache"] = True
+
         response = client.images.with_raw_response.generate(
             model=model_path,
             prompt=sampling_params.prompt,
             n=n,
             size=output_size,
             response_format="b64_json",
+            extra_body=extra_body if extra_body else None,
         )
         result = response.parse()
         validate_image(result.data[0].b64_json)
@@ -968,6 +974,11 @@ def get_generate_fn(
         )  # Not specified in current request
         req_background = None  # Not specified in current request
 
+        # Build extra_body for optional features
+        extra_body = {"num_frames": sampling_params.num_frames}
+        if sampling_params.enable_teacache:
+            extra_body["enable_teacache"] = True
+
         images = [open(image_path, "rb") for image_path in image_paths]
         try:
             response = client.images.with_raw_response.edit(
@@ -978,7 +989,7 @@ def get_generate_fn(
                 size=output_size,
                 response_format="b64_json",
                 output_format=req_output_format,
-                extra_body={"num_frames": sampling_params.num_frames},
+                extra_body=extra_body,
             )
         finally:
             for img in images:
@@ -1093,6 +1104,11 @@ def get_generate_fn(
         if not sampling_params.prompt:
             pytest.skip(f"{id}: no text prompt configured")
 
+        # Build extra_body for optional features
+        extra_body = {}
+        if sampling_params.enable_teacache:
+            extra_body["enable_teacache"] = True
+
         return _create_and_download_video(
             client,
             case_id,
@@ -1100,6 +1116,7 @@ def get_generate_fn(
             prompt=sampling_params.prompt,
             size=output_size,
             seconds=video_seconds,
+            extra_body=extra_body if extra_body else None,
         )
 
     def generate_image_to_video(case_id, client) -> str:
@@ -1114,6 +1131,11 @@ def get_generate_fn(
             if not image_path.exists():
                 pytest.skip(f"{id}: file missing: {image_path}")
 
+        # Build extra_body for optional features
+        extra_body = {}
+        if sampling_params.enable_teacache:
+            extra_body["enable_teacache"] = True
+
         with image_path.open("rb") as fh:
             return _create_and_download_video(
                 client,
@@ -1123,11 +1145,18 @@ def get_generate_fn(
                 size=output_size,
                 seconds=video_seconds,
                 input_reference=fh,
+                extra_body=extra_body if extra_body else None,
             )
 
     def generate_text_url_image_to_video(case_id, client) -> str:
         if not sampling_params.prompt or not sampling_params.image_path:
             pytest.skip(f"{id}: no edit config")
+
+        # Build extra_body for optional features
+        extra_body = {"reference_url": sampling_params.image_path}
+        if sampling_params.enable_teacache:
+            extra_body["enable_teacache"] = True
+
         return _create_and_download_video(
             client,
             case_id,
@@ -1153,6 +1182,11 @@ def get_generate_fn(
             image_path = Path(sampling_params.image_path)
             if not image_path.exists():
                 pytest.skip(f"{id}: file missing: {image_path}")
+
+        # Build extra_body for optional features
+        extra_body = {}
+        if sampling_params.enable_teacache:
+            extra_body["enable_teacache"] = True
 
         with image_path.open("rb") as fh:
             return _create_and_download_video(
