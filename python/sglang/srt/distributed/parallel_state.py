@@ -136,6 +136,7 @@ def inplace_all_reduce(tensor: torch.Tensor, group_name: str) -> None:
 
 
 @register_custom_op(out_shape="tensor")
+# @register_split_op()
 def outplace_all_reduce(
     tensor: torch.Tensor, group_name: str, outplace_all_reduce_method: str
 ) -> torch.Tensor:
@@ -574,19 +575,22 @@ class GroupCoordinator:
             self.qr_comm is not None
             and not self.qr_comm.disabled
             and self.qr_comm.should_quick_allreduce(input_)
-        ):
+        ):  
+            print(f"we use qr allreduce")
             outplace_all_reduce_method = "qr"
         elif (
             self.pymscclpp_comm is not None
             and not self.pymscclpp_comm.disabled
             and self.pymscclpp_comm.should_mscclpp_allreduce(input_)
         ):
+            print(f"we use pymscclpp allreduce")
             outplace_all_reduce_method = "pymscclpp"
         elif (
             self.torch_symm_mem_comm is not None
             and not self.torch_symm_mem_comm.disabled
             and self.torch_symm_mem_comm.should_torch_symm_mem_allreduce(input_)
         ):
+            print(f"we use torch_symm_mem allreduce")
             outplace_all_reduce_method = "torch_symm_mem"
         if outplace_all_reduce_method is not None:
             return outplace_all_reduce(

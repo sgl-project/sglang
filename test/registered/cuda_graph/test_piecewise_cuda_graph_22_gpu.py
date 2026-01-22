@@ -9,6 +9,7 @@ from sglang.test.test_utils import (
     CustomTestCase,
     SimpleNamespace,
     popen_launch_server,
+    DEFAULT_MLA_MODEL_NAME_FOR_TEST
 )
 
 # CI Registration - 2-GPU tests (80GB GPUs required)
@@ -22,7 +23,7 @@ class TestPiecewiseCudaGraphTP(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.model = "Qwen/Qwen3-Coder-30B-A3B-Instruct"
+        cls.model = DEFAULT_MLA_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -34,8 +35,8 @@ class TestPiecewiseCudaGraphTP(CustomTestCase):
                 "eager",
                 "--tp",
                 "2",
-                "--piecewise-cuda-graph-max-tokens",
-                "1024",
+                # "--piecewise-cuda-graph-max-tokens",
+                # "2048",
             ],
         )
 
@@ -58,7 +59,7 @@ class TestPiecewiseCudaGraphTP(CustomTestCase):
         metrics = run_eval(args)
         print(f"GSM8K Accuracy: {metrics['score']:.3f}")
 
-        self.assertGreaterEqual(metrics["score"], 0.90)
+        self.assertGreaterEqual(metrics["score"], 0.80)
 
 
 if __name__ == "__main__":

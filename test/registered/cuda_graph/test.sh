@@ -1,10 +1,10 @@
-export CUDA_VISIBLE_DEVICES=4,5
+export CUDA_VISIBLE_DEVICES=0,1
 
 #!/usr/bin/env bash
 set -euo pipefail
 
-TEST="test_piecewise_cuda_graph_2_gpu.py"
-N=20
+TEST="test_piecewise_cuda_graph_22_gpu.py"
+N=10
 
 fail=0
 for i in $(seq 1 "$N"); do

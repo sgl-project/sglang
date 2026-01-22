@@ -34,6 +34,9 @@ class TestPiecewiseCudaGraphTP(CustomTestCase):
                 "eager",
                 "--tp",
                 "2",
+                "--piecewise-cuda-graph-max-tokens",
+                "2048"
+                # "--disable-custom-all-reduce",
             ],
         )
 
