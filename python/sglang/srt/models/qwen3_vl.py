@@ -63,7 +63,7 @@ from sglang.srt.models.utils import (
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
 from sglang.srt.multimodal.vit_cuda_graph_runner import ViTCudaGraphRunner
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix, get_int_env_var
+from sglang.srt.utils import add_prefix, get_int_env_var, is_npu
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
 logger = logging.getLogger(__name__)
@@ -446,9 +446,12 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
 
         # compute cu_seqlens
         cu_seqlens = compute_cu_seqlens_from_grid_numpy(grid_thw)
-
+        # cu_seqlens must be on cpu because of npu_flash_attention_unpad operator restriction
+        if not is_npu():
+            cu_seqlens = cu_seqlens.to(self.device, non_blocking=True)
+        else:
+            cu_seqlens = cu_seqlens.to("cpu")
         x = x.unsqueeze(1)
-        cu_seqlens = cu_seqlens.to(self.device, non_blocking=True)
 
         deepstack_feature_lists = []
         num_deepstack_captured = 0
@@ -849,10 +852,18 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         return torch.cat(all_chunk_embeds, dim=0)
 
     def get_video_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+        for item in items:
+            item.feature = item.feature.to(self.visual.device)
         # in qwen-vl, last dim is the same
         pixel_values = torch.cat([item.feature for item in items], dim=0).type(
             self.visual.dtype
         )
+        # Memory optimization for item.feature:
+        # 1. item.feature is released when request finished
+        # 2. High concurrency may cause device OOM due to delayed release
+        # 3. Fix: Offload item.feature to CPU, move to device only when needed
+        for item in items:
+            item.feature = item.feature.to("cpu")
         video_grid_thw = torch.concat([item.video_grid_thw for item in items], dim=0)
         assert pixel_values.dim() == 2, pixel_values.dim()
         assert video_grid_thw.dim() == 2, video_grid_thw.dim()
@@ -959,6 +970,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             if (
                 not is_visual
                 and layer_id is not None
+                and hasattr(self, "model")
                 and hasattr(self.model, "start_layer")
                 and (
                     layer_id < self.model.start_layer

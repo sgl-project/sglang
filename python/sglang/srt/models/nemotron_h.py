@@ -138,6 +138,10 @@ class NemotronHMoE(nn.Module):
         self.ep_size = self.ep_group.size()
         self.n_routed_experts = config.n_routed_experts
         self.n_shared_experts = config.n_shared_experts
+        self.use_latent_moe = getattr(config, "moe_latent_size", None) is not None
+        self.moe_hidden_size = (
+            config.moe_latent_size if self.use_latent_moe else config.hidden_size
+        )
 
         self.gate = ReplicatedLinear(
             config.hidden_size,
@@ -165,7 +169,7 @@ class NemotronHMoE(nn.Module):
             num_experts=config.n_routed_experts
             + get_global_server_args().ep_num_redundant_experts,
             top_k=config.num_experts_per_tok,
-            hidden_size=config.hidden_size,
+            hidden_size=self.moe_hidden_size,
             intermediate_size=config.moe_intermediate_size,
             reduce_results=False,
             quant_config=quant_config,
@@ -185,6 +189,25 @@ class NemotronHMoE(nn.Module):
             )
         else:
             self.shared_experts = None
+
+        if self.use_latent_moe:
+            self.fc1_latent_proj = ReplicatedLinear(
+                input_size=config.hidden_size,
+                output_size=self.moe_hidden_size,
+                bias=config.mlp_bias,
+                quant_config=quant_config,
+                prefix=f"{prefix}.fc1_latent_proj",
+            )
+            self.fc2_latent_proj = ReplicatedLinear(
+                input_size=self.moe_hidden_size,
+                output_size=config.hidden_size,
+                bias=config.mlp_bias,
+                quant_config=quant_config,
+                prefix=f"{prefix}.fc2_latent_proj",
+            )
+        else:
+            self.fc1_latent_proj = None
+            self.fc2_latent_proj = None
 
     def _forward_core(
         self,
@@ -206,6 +229,8 @@ class NemotronHMoE(nn.Module):
         else:
             shared_output = None
         topk_output = self.topk(hidden_states, router_logits)
+        if self.use_latent_moe:
+            hidden_states, _ = self.fc1_latent_proj(hidden_states)
         final_hidden_states = self.experts(hidden_states, topk_output)
         return final_hidden_states, shared_output
 
@@ -226,6 +251,8 @@ class NemotronHMoE(nn.Module):
             # router_scores: [num_tokens, num_experts]
             router_logits, _ = self.gate(hidden_states.to(dtype=torch.float32))
             topk_output = self.topk(hidden_states, router_logits)
+            if self.use_latent_moe:
+                hidden_states, _ = self.fc1_latent_proj(hidden_states)
             final_hidden_states = self.experts(hidden_states, topk_output)
         get_current_device_stream_fast().wait_stream(alt_stream)
 
@@ -241,6 +268,9 @@ class NemotronHMoE(nn.Module):
         elif self.shared_experts is not None:
             assert shared_output is not None
             shared_output *= 1.0 / self.routed_scaling_factor
+
+        if self.use_latent_moe:
+            final_hidden_states, _ = self.fc2_latent_proj(final_hidden_states)
 
         if shared_output is not None:
             final_hidden_states += shared_output
@@ -697,7 +727,20 @@ class NemotronHForCausalLM(nn.Module):
     def get_seqlen_agnostic_capture_inputs(self, batch_size: int):
         return self.mamba_cache.get_seqlen_agnostic_capture_inputs(batch_size)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> None:
+    def get_embed_and_head(self):
+        return self.model.embed_tokens.weight, self.lm_head.weight
+
+    def set_embed_and_head(self, embed, head):
+        del self.model.embed_tokens.weight
+        del self.lm_head.weight
+        self.model.embed_tokens.weight = embed
+        self.lm_head.weight = head
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+    def load_weights(
+        self, weights: Iterable[tuple[str, torch.Tensor]], is_mtp: bool = False
+    ) -> None:
         updated_weights = []
         for name, loaded_weight in weights:
             name = replace_prefix(name, self.remap_prefix)
@@ -718,6 +761,20 @@ class NemotronHForCausalLM(nn.Module):
         params_dict = dict(self.named_parameters())
 
         for name, loaded_weight in updated_weights:
+            if is_mtp:
+                if "mtp" not in name:
+                    continue
+
+                name = name.replace("mtp.layers.", "model.layers.")
+
+                if "embeddings" in name:
+                    name = name.replace("embeddings", "model.embed_tokens")
+                    if name.startswith("backbone."):
+                        name = name.replace("backbone.", "")
+
+            if not is_mtp and "mtp" in name:
+                continue
+
             if "scale" in name:
                 name = maybe_remap_kv_scale_name(name, params_dict)
                 if name is None:
