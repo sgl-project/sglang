@@ -194,6 +194,46 @@ class ScaleResidualNormScaleShift:
         return num_of_frame
 
 
+def validate_x(t: torch.Tensor, B: int, S: int, D: int):
+    if t.shape != (B, S, D):
+        raise ValueError(f"validate failed: unsupported tensor shape: {t.shape}.")
+    if t.stride()[-1] != 1:
+        raise ValueError(f"validate failed: not contiguous on dim D.")
+
+
+def validate_weight_bias(t: Optional[torch.Tensor], B: int, S: int, D: int):
+    if t is None:
+        return
+    if t.shape != (D,):
+        raise ValueError(f"validate failed: unsupported tensor shape: {t.shape}.")
+    if t.stride()[-1] != 1:
+        raise ValueError(f"validate failed: not contiguous on dim D.")
+
+
+def validate_scale_shift(t: torch.Tensor, B: int, S: int, D: int):
+    failed = False
+    if t.ndim == 1 and (t.shape[0] not in (1, D)):
+        failed = True
+    elif t.ndim == 2 and ((t.shape[0] not in (1, B)) or t.shape[1] != D):
+        failed = True
+    elif t.ndim == 3 and (
+        (t.shape[0] not in (1, B)) or (t.shape[1] not in (1, S) or t.shape[2] != D)
+    ):
+        failed = True
+    elif t.ndim == 4 and (t.shape[0] != B or t.shape[2] != 1 or t.shape[3] != D):
+        failed = True
+    if failed:
+        raise ValueError(f"validate failed: unsupported tensor shape: {t.shape}.")
+    if t.stride()[-1] != 1:
+        raise ValueError(f"validate failed: not contiguous on dim D.")
+
+
+def validate_gate(t: Union[torch.Tensor, int], B: int, S: int, D: int):
+    if isinstance(t, int):
+        return
+    validate_scale_shift(t, B, S, D)
+
+
 def fused_norm_scale_shift(
     x: torch.Tensor,
     weight: Optional[torch.Tensor],
@@ -210,12 +250,20 @@ def fused_norm_scale_shift(
     Expects:
       - x: B, S, D]
       - weight/bias: None, [D]
-      - scale/shift: [D], [1/B, D], [1/B, 1/S, D] or [B, F, 1, D]
+      - scale/shift: [1], [D], [1/B, D], [1/B, 1/S, D] or [B, F, 1, D]
       - norm_type: str, "layer" or "rms"
       - eps: Optional[float], default: 1e-5
 
     Supported D values (must be 256's multiple and <= 8192, etc.)
     """
+    # Tensor Validation
+    BSD = x.shape
+    validate_x(x, *BSD)
+    validate_weight_bias(weight, *BSD)
+    validate_weight_bias(bias, *BSD)
+    validate_scale_shift(scale, *BSD)
+    validate_scale_shift(shift, *BSD)
+
     if norm_type == "layer" or norm_type == "rms":
         D = x.shape[-1]
         if D % 256 != 0 or D > 8192:
@@ -271,14 +319,24 @@ def fused_scale_residual_norm_scale_shift(
 
     Expects:
       - residual, x: [B, S, D]
-      - gate: 1, [D], [1/B, D], [1/B, 1/S, D] or [B, F, 1, D]
+      - gate: 1, [1], [D], [1/B, D], [1/B, 1/S, D] or [B, F, 1, D]
       - weight/bias: None, [D]
-      - scale/shift: [D], [1/B, D], [1/B, 1/S, D] or [B, F, 1, D]
+      - scale/shift: [1], [D], [1/B, D], [1/B, 1/S, D] or [B, F, 1, D]
       - norm_type: str, "layer" or "rms"
       - eps: Optional[float], default: 1e-5
 
-    Supported D values (must be 256's multiple and <= 8192, etc.
+    Supported D values (must be 256's multiple and <= 8192, etc).
     """
+    # Tensor Validation
+    BSD = x.shape
+    validate_x(x, *BSD)
+    validate_x(residual, *BSD)
+    validate_gate(gate, *BSD)
+    validate_weight_bias(weight, *BSD)
+    validate_weight_bias(bias, *BSD)
+    validate_scale_shift(scale, *BSD)
+    validate_scale_shift(shift, *BSD)
+
     if norm_type == "layer" or norm_type == "rms":
         D = x.shape[-1]
         if D % 256 != 0 or D > 8192:
