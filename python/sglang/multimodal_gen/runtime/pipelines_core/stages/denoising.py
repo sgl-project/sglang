@@ -1236,6 +1236,11 @@ class DenoisingStage(PipelineStage):
 
             svg2_cfg = server_args.attention_backend_config or {}
             num_layers = server_args.pipeline_config.dit_config.num_layers
+            if (
+                server_args.pipeline_config.dit_config.prefix.lower() == "hunyuan"
+                and hasattr(server_args.pipeline_config.dit_config, "num_single_layers")
+            ):
+                num_layers += server_args.pipeline_config.dit_config.num_single_layers
             first_layers_fp = svg2_cfg.get("svg2_first_layers_fp", 0.03)
             if first_layers_fp <= 1.0:
                 first_layers_fp = math.floor(first_layers_fp * num_layers)
@@ -1260,10 +1265,39 @@ class DenoisingStage(PipelineStage):
                 cache = Svg2Cache()
                 batch.extra["svg2_cache"] = cache
 
+            patch_size = server_args.pipeline_config.dit_config.patch_size
+            if isinstance(patch_size, list):
+                patch_size = tuple(patch_size)
+            if isinstance(patch_size, int):
+                patch_size_t = getattr(
+                    server_args.pipeline_config.dit_config, "patch_size_t", None
+                )
+                if patch_size_t is not None:
+                    patch_size = (patch_size_t, patch_size, patch_size)
+
+            context_length = 0
+            prompt_length = None
+            if server_args.pipeline_config.dit_config.prefix.lower() == "hunyuan":
+                prompt_embeds = server_args.pipeline_config.get_pos_prompt_embeds(batch)
+                if isinstance(prompt_embeds, list):
+                    text_embeds = prompt_embeds[0] if prompt_embeds else None
+                else:
+                    text_embeds = prompt_embeds
+                if isinstance(text_embeds, torch.Tensor) and text_embeds.ndim >= 2:
+                    context_length = int(text_embeds.shape[1])
+                if context_length > 0 and batch.prompt_attention_mask:
+                    mask = batch.prompt_attention_mask[0]
+                    if isinstance(mask, torch.Tensor):
+                        if mask.shape[-1] > context_length:
+                            mask = mask[:, -context_length:]
+                        prompt_length = int(mask[0].sum().item())
+                if prompt_length is None:
+                    prompt_length = context_length
+
             attn_metadata = self.attn_metadata_builder.build(
                 current_timestep=current_timestep,
                 raw_latent_shape=batch.raw_latent_shape,
-                patch_size=server_args.pipeline_config.dit_config.patch_size,
+                patch_size=patch_size,
                 num_q_centroids=svg2_cfg.get("svg2_num_q_centroids", 300),
                 num_k_centroids=svg2_cfg.get("svg2_num_k_centroids", 1000),
                 top_p_kmeans=svg2_cfg.get("svg2_top_p_kmeans", 0.9),
@@ -1275,6 +1309,8 @@ class DenoisingStage(PipelineStage):
                 ),
                 first_layers_fp=first_layers_fp,
                 first_times_fp=first_times_fp,
+                context_length=context_length,
+                prompt_length=prompt_length,
                 cache=cache,
                 calculate_density=False,  # only need density when doing head load balancing
             )

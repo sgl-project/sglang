@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
 try:
@@ -105,6 +106,7 @@ class SparseVideoGen2AttentionMetadata(AttentionMetadata):
     num_frame: int
     frame_size: int
     cache: Svg2Cache
+    prompt_length: int | None = None
     calculate_density: bool = False
     max_seqlen_q: int | None = None
     max_seqlen_k: int | None = None
@@ -142,6 +144,7 @@ class SparseVideoGen2AttentionMetadataBuilder(AttentionMetadataBuilder):
         first_layers_fp: float,
         first_times_fp: float,
         context_length: int = 0,
+        prompt_length: int | None = None,
         calculate_density: bool = False,
         **kwargs: dict[str, Any],
     ) -> SparseVideoGen2AttentionMetadata:
@@ -175,6 +178,7 @@ class SparseVideoGen2AttentionMetadataBuilder(AttentionMetadataBuilder):
             first_layers_fp=first_layers_fp,
             first_times_fp=first_times_fp,
             context_length=context_length,
+            prompt_length=prompt_length,
             num_frame=num_frame,
             frame_size=frame_size,
             cache=cache,
@@ -387,6 +391,57 @@ class SparseVideoGen2AttentionImpl(AttentionImpl):
             q_sorted_indices,
         )
 
+    def _hunyuan_dynamic_map_post_processing(
+        self,
+        q_perm: torch.Tensor,
+        k_perm: torch.Tensor,
+        v_perm: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        dyn_map: torch.Tensor,
+        qc_sz_s: torch.Tensor,
+        kc_sz_s: torch.Tensor,
+        q_sorted_indices: torch.Tensor,
+        video_length: int,
+        context_length: int,
+        prompt_length: int,
+        unprompt_length: int,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        # Place the permuted video tokens back and keep text tokens at the tail.
+        query[:, :, :-context_length, :] = q_perm
+        key[:, :, :-context_length, :] = k_perm
+        value[:, :, :-context_length, :] = v_perm
+
+        # Add prompt/unprompt clusters to the dynamic map.
+        dyn_map = F.pad(dyn_map, (0, 2, 0, 2), value=0)
+        dyn_map[:, :, -2, :-1] = True
+        dyn_map[:, :, :-1, -2] = True
+        dyn_map[:, :, -1, -1] = True
+
+        qc_sz_s = F.pad(qc_sz_s, (0, 2), value=0)
+        qc_sz_s[:, :, -2] = prompt_length
+        qc_sz_s[:, :, -1] = unprompt_length
+        kc_sz_s = F.pad(kc_sz_s, (0, 2), value=0)
+        kc_sz_s[:, :, -2] = prompt_length
+        kc_sz_s[:, :, -1] = unprompt_length
+
+        q_sorted_indices = F.pad(q_sorted_indices, (0, context_length), value=0)
+        q_sorted_indices[:, video_length:] = torch.arange(
+            video_length,
+            video_length + context_length,
+            device=q_sorted_indices.device,
+        )
+        return query, key, value, dyn_map, qc_sz_s, kc_sz_s, q_sorted_indices
+
     def forward(
         self,
         query: torch.Tensor,
@@ -407,6 +462,9 @@ class SparseVideoGen2AttentionImpl(AttentionImpl):
             attn_metadata.num_frame,
             attn_metadata.frame_size,
         )
+        prompt_length = attn_metadata.prompt_length
+        if prompt_length is None:
+            prompt_length = context_length
 
         assert (
             seq_len == context_length + num_frame * frame_size
@@ -438,9 +496,58 @@ class SparseVideoGen2AttentionImpl(AttentionImpl):
                 batch_size, num_heads, seq_len, dim
             ).transpose(1, 2)
         else:
-            q_perm, k_perm, v_perm, dyn_map, qc_sz_s, kc_sz_s, q_sorted_indices = (
-                self.semantic_aware_permutation(query, key, value, attn_metadata)
-            )
+            if context_length > 0:
+                video_length = num_frame * frame_size
+                unprompt_length = max(context_length - prompt_length, 0)
+                query_video = query[:, :, :video_length, :].contiguous()
+                key_video = key[:, :, :video_length, :].contiguous()
+                value_video = value[:, :, :video_length, :].contiguous()
+
+                (
+                    q_perm,
+                    k_perm,
+                    v_perm,
+                    dyn_map,
+                    qc_sz_s,
+                    kc_sz_s,
+                    q_sorted_indices,
+                ) = self.semantic_aware_permutation(
+                    query_video, key_video, value_video, attn_metadata
+                )
+                (
+                    q_perm,
+                    k_perm,
+                    v_perm,
+                    dyn_map,
+                    qc_sz_s,
+                    kc_sz_s,
+                    q_sorted_indices,
+                ) = self._hunyuan_dynamic_map_post_processing(
+                    q_perm,
+                    k_perm,
+                    v_perm,
+                    query,
+                    key,
+                    value,
+                    dyn_map,
+                    qc_sz_s,
+                    kc_sz_s,
+                    q_sorted_indices,
+                    video_length,
+                    context_length,
+                    prompt_length,
+                    unprompt_length,
+                )
+            else:
+                (
+                    q_perm,
+                    k_perm,
+                    v_perm,
+                    dyn_map,
+                    qc_sz_s,
+                    kc_sz_s,
+                    q_sorted_indices,
+                ) = self.semantic_aware_permutation(query, key, value, attn_metadata)
 
             output_permuted = dynamic_block_sparse_fwd_flashinfer(
                 q_perm, k_perm, v_perm, dyn_map, qc_sz_s, kc_sz_s, is_cpu=False
@@ -462,4 +569,4 @@ class SparseVideoGen2AttentionImpl(AttentionImpl):
         torch.backends.cuda.preferred_linalg_library(
             backend="default"
         )  # reset to default
-        return res
+        return res.contiguous()
