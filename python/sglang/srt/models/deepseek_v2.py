@@ -882,6 +882,52 @@ class DeepseekV2MoE(nn.Module):
             post_combine_hook_handle = (
                 self.experts.dispatcher.register_post_combine_hook(_post_combine_hook)
             )
+        elif envs.SGLANG_BLACKWELL_OVERLAP_SHARED_EXPERTS_OUTSIDE_SBO.get():
+            # On GB200: Shared experts overlapped on alt_stream, down gemm overlapped with DeepEP Combine
+
+            def _post_dispatch_hook(
+                dispatcher: BaseDispatcher, dispatch_output: DispatchOutput
+            ):
+
+                combine_overlap_args, down_gemm_overlap_args, meta_overlap_args = (
+                    compute_overlap_args(dispatch_output, self.alt_stream)
+                )
+                dispatcher.set_overlap_args(
+                    combine_overlap_args=combine_overlap_args,
+                    meta_overlap_args=meta_overlap_args,
+                )
+                self.experts.set_overlap_args(
+                    down_gemm_overlap_args=down_gemm_overlap_args,
+                    meta_overlap_args=meta_overlap_args,
+                )
+
+                post_dispatch_hook_handle.remove()
+
+            def _pre_combine_hook(
+                dispatcher: BaseDispatcher, combine_input: CombineInput
+            ):
+                if (
+                    e := dispatcher.meta_overlap_args.get("record_event_after_down")
+                ) is not None:
+                    e.record()
+                pre_combine_hook_handle.remove()
+
+            def _post_combine_hook(
+                dispatcher: BaseDispatcher, hidden_states: torch.Tensor
+            ):
+                dispatcher.clear_overlap_args()
+                self.experts.clear_overlap_args()
+                post_combine_hook_handle.remove()
+
+            post_dispatch_hook_handle = (
+                self.experts.dispatcher.register_post_dispatch_hook(_post_dispatch_hook)
+            )
+            pre_combine_hook_handle = self.experts.dispatcher.register_pre_combine_hook(
+                _pre_combine_hook
+            )
+            post_combine_hook_handle = (
+                self.experts.dispatcher.register_post_combine_hook(_post_combine_hook)
+            )
 
         final_hidden_states = self.experts(
             hidden_states=hidden_states,
@@ -2474,7 +2520,7 @@ class DeepseekV2Model(nn.Module):
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
-                enable_tp=not is_dp_attention_enabled(),
+                use_attn_tp_group=is_dp_attention_enabled(),
             )
         else:
             self.embed_tokens = PPMissingLayer()
