@@ -43,7 +43,7 @@ ${PIP_INSTALL} ${TRITON_ASCEND_URL}
 
 
 ### Install sgl-kernel-npu
-SGLANG_KERNEL_NPU_TAG="2026.01.19"
+SGLANG_KERNEL_NPU_TAG="2026.01.21"
 mkdir sgl-kernel-npu
 (cd sgl-kernel-npu && wget https://github.com/sgl-project/sgl-kernel-npu/releases/download/${SGLANG_KERNEL_NPU_TAG}/sgl-kernel-npu_${SGLANG_KERNEL_NPU_TAG}_8.5.0_${DEVICE_TYPE}.zip \
 && unzip sgl-kernel-npu_${SGLANG_KERNEL_NPU_TAG}_8.5.0_${DEVICE_TYPE}.zip \

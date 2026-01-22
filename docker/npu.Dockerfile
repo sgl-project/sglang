@@ -67,9 +67,8 @@ RUN (${PIP_INSTALL} torch==${PYTORCH_VERSION} torchvision==${TORCHVISION_VERSION
     && (${PIP_INSTALL} ${PTA_URL})
 
 
-# TODO: install from pypi released triton-ascend
 RUN (${PIP_INSTALL} pybind11) \
-    && (${PIP_INSTALL} -i https://test.pypi.org/simple/ triton-ascend==3.2.0.dev20251230)
+    && (${PIP_INSTALL} triton-ascend)
 
 # Install SGLang
 RUN git clone https://github.com/sgl-project/sglang --branch $SGLANG_TAG && \
