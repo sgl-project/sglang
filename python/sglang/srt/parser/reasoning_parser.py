@@ -411,8 +411,7 @@ class ReasoningParser:
         if force_reasoning is not None:
             kwargs["force_reasoning"] = force_reasoning
 
-        if getattr(request, "continue_final_message", False):
-            if request.messages[-1].role == "assistant":
+        if request.continue_final_message and request.messages[-1].role == "assistant":
                 kwargs["continue_final_message"] = True
                 kwargs["previous_content"] = request.messages[-1].content
 
