@@ -31,7 +31,7 @@ class SessionReqNode:
             parent.children.append(self)
         self.children = [] if not childs else childs
 
-    def clear_childs(self, req_dict):
+    def clear_children(self, req_dict):
         for req_node in self.children:
             req_node.clear(req_dict)
         self.children = []
@@ -88,7 +88,7 @@ class Session:
                     last_req_node = self.req_nodes[session_params.rid]
                     last_req_node.abort()
                     last_req = last_req_node.req
-                    last_req_node.clear_childs(self.req_nodes)
+                    last_req_node.clear_children(self.req_nodes)
         else:
             if session_params.rid is not None:
                 if session_params.rid not in self.req_nodes:
