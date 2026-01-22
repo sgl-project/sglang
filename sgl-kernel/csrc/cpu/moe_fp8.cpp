@@ -299,8 +299,7 @@ void fused_experts_fp_kernel_impl(
   const int64_t stride_n = packed_K;
 
   int64_t avg_M = std::max(int64_t(1), M * topk / E);
-  // const bool use_brgemm = can_use_brgemm<packed_t>(avg_M);
-  const bool use_brgemm = true;
+  const bool use_brgemm = can_use_brgemm<packed_t>(avg_M);
 
   int64_t B_tmp_offset_per_thread = MAX_CACHE_BLOCK_SIZE * BLOCK_N * 2 * N * K;
   int64_t B_tmp_size_per_thread = MAX_CACHE_BLOCK_SIZE * BLOCK_N * 3 * N * K;
