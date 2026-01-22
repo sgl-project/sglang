@@ -463,7 +463,9 @@ class SamplingParams:
                 # Re-raise if it's not a safetensors file issue
                 raise
 
-        user_sampling_params = SamplingParams(*args, **kwargs)
+        user_kwargs = dict(kwargs)
+        user_kwargs.pop("diffusers_kwargs", None)
+        user_sampling_params = SamplingParams(*args, **user_kwargs)
         # TODO: refactor
         sampling_params._merge_with_user_params(user_sampling_params)
         sampling_params._adjust(server_args)
