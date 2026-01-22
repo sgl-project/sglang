@@ -1,5 +1,11 @@
 import torch
 
+def prepare()
+    pass
+
+def finalize()
+    pass
+
 def npu_fused_experts_unquant(
     hidden_states: torch.Tensor,
     w13: torch.Tensor,
