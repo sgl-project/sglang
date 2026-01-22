@@ -101,6 +101,11 @@ def _amx_process_weight_after_loading(
         )
         packed_weight.__dict__ = weight_tensor.__dict__
         setattr(module, weight_name, packed_weight)
+        if is_conv_weight:
+            # need to use inplace copy for conv weight amx packing,
+            # as its usage in radix_linear_attention will use the original conv weight.
+            weight_tensor = weight_tensor.view(-1, weight_tensor.size(-1))
+            weight_tensor.copy_(packed_weight)
 
     module.use_intel_amx_backend = (
         device == torch.device("cpu") and cpu_has_amx_support()
