@@ -28,16 +28,16 @@ class SessionReqNode:
         self.req = req
         self.parent = parent
         if parent is not None:
-            parent.childs.append(self)
-        self.childs = [] if not childs else childs
+            parent.children.append(self)
+        self.children = [] if not childs else childs
 
     def clear_childs(self, req_dict):
-        for req_node in self.childs:
+        for req_node in self.children:
             req_node.clear(req_dict)
-        self.childs = []
+        self.children = []
 
     def clear(self, req_dict):
-        for req_node in self.childs:
+        for req_node in self.children:
             req_node.clear(req_dict)
 
         if self.req.finished_reason is None:
@@ -52,13 +52,13 @@ class SessionReqNode:
         return self._str_helper(self.req.rid)
 
     def _str_helper(self, prefix=""):
-        if len(self.childs) == 0:
+        if len(self.children) == 0:
             return prefix + "\n"
         else:
             origin_prefix = prefix
-            prefix += " -- " + self.childs[0].req.rid
-            ret = self.childs[0]._str_helper(prefix)
-            for child in self.childs[1:]:
+            prefix += " -- " + self.children[0].req.rid
+            ret = self.children[0]._str_helper(prefix)
+            for child in self.children[1:]:
                 prefix = " " * len(origin_prefix) + " \\- " + child.req.rid
                 ret += child._str_helper(prefix)
             return ret
