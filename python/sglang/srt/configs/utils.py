@@ -14,8 +14,7 @@ def register_image_processor(
     """
     register customized hf image processor while removing hf impl
     """
-    # AutoImageProcessor.register(config, None, image_processor, None, exist_ok=True)
-    pass
+    AutoImageProcessor.register(config, None, image_processor, None, exist_ok=True)
 
 
 def register_processor(config: Type[PretrainedConfig], processor: Type[ProcessorMixin]):
