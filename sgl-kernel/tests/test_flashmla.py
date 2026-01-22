@@ -342,12 +342,12 @@ def test_flashmla_prefill(
     sm_scale = 1 / math.sqrt(576)
     torch.cuda.synchronize()
 
-    ans_out, ans_max_logits, ans_lse = flash_mla_sparse_fwd(
+    answer_out, ans_max_logits, ans_lse = flash_mla_sparse_fwd(
         q.squeeze(0), kv.squeeze(0), indices.squeeze(0), sm_scale=sm_scale
     )
 
-    ans_out, ans_max_logits, ans_lse = (
-        ans_out.float(),
+    answer_out, ans_max_logits, ans_lse = (
+        answer_out.float(),
         ans_max_logits.float(),
         ans_lse.float(),
     )
@@ -358,7 +358,7 @@ def test_flashmla_prefill(
     )
     torch.cuda.synchronize()
 
-    torch.testing.assert_close(ans_out, ref_out, atol=8e-4, rtol=2.01 / 128)
+    torch.testing.assert_close(answer_out, ref_out, atol=8e-4, rtol=2.01 / 128)
     torch.testing.assert_close(
         ans_max_logits,
         ref_max_logits,
