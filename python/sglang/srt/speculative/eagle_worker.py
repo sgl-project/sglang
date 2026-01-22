@@ -445,7 +445,7 @@ class EAGLEWorker(TpModelWorker):
             # todo uncomment these lines to integrate, disable for the bs controlled by bs=32 and bs=64
             # if self.auto_spec:
             # if self.auto_spec and (batch.batch_size() <= 12 or (batch.batch_size() > 12 and self.speculative_num_steps != 3)):
-            if self.auto_spec and (batch.batch_size() <= 6 or (batch.batch_size() > 6 and batch.batch_size() <= 12 and self.speculative_num_steps != 4) or (batch.batch_size() > 12 and batch.batch_size() <= 48 and self.speculative_num_steps != 3) or batch.batch_size() > 48):
+            if self.auto_spec:
                 # logger.info(f"[MY LOG] bs {batch.batch_size()}, speculative_num_steps before change: {self.speculative_num_steps}")
                 best_params = self.spec_auto_tuner.get_best_parameters(batch.batch_size())
                 if self.speculative_num_steps != best_params.num_steps:  # if same as last step, no need to update

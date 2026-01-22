@@ -2439,8 +2439,8 @@ class Scheduler(
         elif batch.forward_mode.is_idle():
             self.process_batch_result_idle(batch, result)
 
-        if self.auto_spec and (batch.batch_size() <= 6 or batch.batch_size() > 48) and batch.forward_mode.is_decode():
-                # logger.info(f"[MY LOG] auto_spec enabled, batchsize: {batch.batch_size()}. tune_interval: {self.tune_interval}, interval_counter: {self.interval_counter}")
+        if self.auto_spec and batch.forward_mode.is_decode() and self.model_worker.spec_auto_tuner.enable_watch_for_batch(batch.batch_size()):
+            # logger.info(f"[MY LOG] auto_spec enabled, batchsize: {batch.batch_size()}. tune_interval: {self.tune_interval}, interval_counter: {self.interval_counter}")
             if self.tune_interval == 1:
                 # logger.info(f"[MY LOG] auto_spec tune_interval set to 1, tune in every forward pass.")
                 # accept_length, accept_rate, throughput = self.get_metrics()

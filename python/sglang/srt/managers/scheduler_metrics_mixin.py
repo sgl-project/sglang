@@ -486,10 +486,8 @@ class SchedulerMetricsMixin:
         return avg_spec_accept_length, avg_spec_accept_rate, 0
 
     def get_metrics_v3(self, bs: int, num_accepted_tokens: int, speculative_num_draft_tokens: int, reset: bool = False):
-        # logger.info(f"[MY LOG] SchedulerMetricsMixin get_metrics_v3, bs={bs}, num_accepted_tokens={num_accepted_tokens}, speculative_num_draft_tokens={speculative_num_draft_tokens}")
         self.interval_accept_length += num_accepted_tokens + bs
         self.interval_forward_count += bs
-        # logger.info(f"[MY LOG] SchedulerMetricsMixin get_metrics_v3, current interval self.interval_accept_length: {self.interval_accept_length}, self.interval_forward_count: {self.interval_forward_count}")
         if reset:
             avg_spec_accept_length = self.interval_accept_length / self.interval_forward_count
             total_draft_tokens = self.interval_forward_count * speculative_num_draft_tokens

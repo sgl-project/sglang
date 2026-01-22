@@ -63,25 +63,20 @@ class AutoTunerEagle:
         self.max_num_graphs = int((available_memory - 4) // 2)  # alloc 2GB for each step(verify + draft), 2GB to avoid overflow
         logger.info(f"AutoTunerEagle, num_graphs to capture for different steps: {self.max_num_graphs}")
 
-        # todo: enable config file
+        # load config file
         self._init_speculative_config()
 
-        # todo: enable bs lookup for all bs
+        # init original_bs: bs lookup for all bs, since parameters are only recorded for bs in --cuda-graph-bs
         self._generate_closest_bs_mapping()
 
         # 2. calculate the thres_accept_length_growth_rate for each num_steps, need to get the eagle draft model size ratio with respect to target model
         # todo fill in the calculation
         self.thres_accept_length_growth_rate = {step: 0.2 for step in self.step_range}  # todo need calculation
-        # self.thres_positive_accept_rate = 0.55
-        # self.thres_negative_accept_rate = 0.5
 
         # todo increase accept rate for larger batchsize
         self.thres_positive_accept_rate = {bs: 0.55 for bs in self.bs_steps_mapping.keys()}
-        # self.thres_positive_accept_rate = {bs: 0.6 for bs in self.bs_steps_mapping.keys()}
         self.thres_negative_accept_rate = {bs: 0.5 for bs in self.bs_steps_mapping.keys()}
-        # self.thres_negative_accept_rate = {bs: 0.55 for bs in self.bs_steps_mapping.keys()}
         for k in self.thres_positive_accept_rate.keys():
-            # if k >= 8 and k <= 32:
             if k == 4:
                 self.thres_positive_accept_rate[k] = 0.6
                 self.thres_negative_accept_rate[k] = 0.5
@@ -127,8 +122,6 @@ class AutoTunerEagle:
                 self.best_speculative_parameters[bs] = TuningParams(self.bs_steps_mapping[bs][-1], 1, self.bs_steps_mapping[bs][-1] + 1)  # if intuitive params not in setting, reset
         # 4. initialise throughput and speculative_num_step recording
         self.last_throughput = {bs: 0. for bs in self.cuda_graph_bs}
-        # self.last_accept_length = {bs: 0. for bs in server_args.cuda_graph_bs}
-        # self.last_num_steps = {bs: 0 for bs in server_args.cuda_graph_bs}
         self.last_accept_length = {step: 0. for step in self.step_range}
         self.last_time_num_steps_increase_flag = False
         logger.info(f"[MY LOG] AutoTunerEagle, best_speculative_parameters init: {self._print_params()}")
@@ -190,6 +183,10 @@ class AutoTunerEagle:
 
         self.bs_list = list(self.bs_steps_mapping.keys())
         self.bs_list.sort()
+
+        self.bs_range_dict = {}
+        for i in range(len(self.bs_list) - 1):
+            self.bs_range_dict[self.bs_list[i]] = int((self.bs_list[i] + self.bs_list[i + 1]) // 2)
 
         # Build reverse mapping: steps -> batch sizes
         self.steps_bs_mapping = {}
@@ -364,10 +361,11 @@ class AutoTunerEagle:
             if accept_length > 1.7:
                 self._update_speculative_params(32, True)
         return
-        # # 参数3
-        # self.best_speculative_parameters[32].num_steps = 3
-        # self.best_speculative_parameters[32].num_draft = 4
-        # self.best_speculative_parameters[32].topk = 1
+
+    def enable_watch_for_batch(self, bs: int):
+        if bs > self.bs_range_dict[32] or bs <= self.bs_range_dict[4]:  # bs <= 6 or bs > 48, tune num_steps
+            return True
+        return False  # bs > 6 and bs <= 48, fix num_steps
 
     def compute_and_update_best_parameters(self, bs, accept_length, accept_rate, throughput):
         """
@@ -387,48 +385,8 @@ class AutoTunerEagle:
         current_num_steps = self.best_speculative_parameters[bs].num_steps  # 假设当前num_steps=2
         small_compare_num_steps = current_num_steps - 1  # 则应该和num_steps=1是的接受长度比增长率
         accept_length_flag = 1
-        # todo bs=1/2特殊处理，连续两次才触发决策
-        # todo bs=32的特殊处理，但是对于不同的部署形态不能通用
-        # if bs == 32:
-        #     self.compute_batchsize32(current_num_steps, accept_length)
-        #     return
-        # todo 先取消growth length规则
-        # if self.last_time_num_steps_increase_flag:  # 有上次的记录, 且当前的num_steps相较于上次是增加的, 否则计算这个参数没有意义; last_num_steps>=current_num_steps，都只看accept_rate
-        #     logger.info(f"[MY LOG] AutoTunerEagle compute_and_update_parameters, find metric record")
-        #     last_accept_length = self.last_accept_length[small_compare_num_steps]
-        #     accept_length_growth_rate = (accept_length - last_accept_length) / last_accept_length
-        #     accept_length_flag = accept_length_growth_rate >= self.thres_accept_length_growth_rate[small_compare_num_steps]
-        #     logger.info(f"[MY LOG] AutoTunerEagle compute_and_update_parameters, bs: {bs}, "
-        #                 f"accept_length_growth_rate: {accept_length_growth_rate} vs threshold: {self.thres_accept_length_growth_rate[current_num_steps - 1]}")
         accept_rate_pos_flag = accept_rate >= self.thres_positive_accept_rate[bs]
         accept_rate_neg_flag = accept_rate < self.thres_negative_accept_rate[bs]
-        # if bs == 1 or bs == 2:  # bs=1或2时，连续两次触发阈值才调整参数
-        #     if accept_rate_pos_flag and (not self.last_pos_thres):
-        #         # 第一次触发pos
-        #         # logger.info(f"[MY LOG] bs={bs} 1st exceeds pos thres")
-        #         accept_rate_pos_flag = False
-        #         self.last_pos_thres = True
-        #     elif accept_rate_pos_flag and self.last_pos_thres:
-        #         # 第二次触发pos
-        #         # logger.info(f"[MY LOG] bs={bs} 2nd exceeds pos thres")
-        #         self.last_pos_thres = False
-        #     elif accept_rate_neg_flag and (not self.last_neg_thres):
-        #         # 第一次触发neg
-        #         # logger.info(f"[MY LOG] bs={bs} 1st exceeds neg thres")
-        #         accept_rate_neg_flag = False
-        #         self.last_neg_thres = True
-        #     elif accept_rate_neg_flag and self.last_neg_thres:
-        #         # 第二次触发neg
-        #         # logger.info(f"[MY LOG] bs={bs} 2nd exceeds neg thres")
-        #         self.last_neg_thres = False
-        #     elif self.last_pos_thres:
-        #         # 第一次触发，第二次没触发，置0
-        #         # logger.info(f"[MY LOG] bs={bs} 2nd didn't exceeds pos thres")
-        #         self.last_pos_thres = False
-        #     elif self.last_neg_thres:
-        #         # 第一次触发，第二次没触发，置0
-        #         # logger.info(f"[MY LOG] bs={bs} 2nd didn't exceeds neg thres")
-        #         self.last_neg_thres = False
         # logger.info(f"[MY LOG] AutoTunerEagle compute_and_update_parameters, bs: {bs}, accept_rate: {accept_rate} vs threshold_neg: {self.thres_negative_accept_rate} vs threshold_pos: {self.thres_positive_accept_rate}")
         self._update_metrics(bs, current_num_steps, accept_length, throughput)
         if accept_length_flag and accept_rate_pos_flag:  # increase parameter
