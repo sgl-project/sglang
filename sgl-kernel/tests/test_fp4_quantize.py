@@ -136,11 +136,11 @@ def test_quantize_to_fp4(
     out_ref, scale_ref = ref_nvfp4_quant(x, global_scale)
 
     out, out_scale = scaled_fp4_quant(x, global_scale)
-    scale_ans = recover_swizzled_scales(out_scale, m, n)
+    scale_answer = recover_swizzled_scales(out_scale, m, n)
     out_ans = cast_from_fp4(out, m, n)
 
     torch.testing.assert_close(out_ans, out_ref)
-    torch.testing.assert_close(scale_ans, scale_ref)
+    torch.testing.assert_close(scale_answer, scale_ref)
 
 
 @pytest.mark.skipif(
