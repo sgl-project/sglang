@@ -90,11 +90,11 @@ class ChunkCache(BasePrefixCache):
 class SWAChunkCache(ChunkCache):
     """ChunkCache with support for sliding window attention."""
 
-    def __init__(self, params: CacheInitParams, sliding_window_size: int):
+    def __init__(self, params: CacheInitParams):
         assert isinstance(params.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator)
         super().__init__(params)
 
-        self.sliding_window_size = sliding_window_size
+        self.sliding_window_size = params.sliding_window_size
         self.chunked_prefill_size = params.chunked_prefill_size
 
     def supports_swa(self) -> bool:

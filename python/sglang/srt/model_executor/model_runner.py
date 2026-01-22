@@ -35,6 +35,7 @@ from sglang.srt.configs import (
     JetNemotronConfig,
     JetVLMConfig,
     KimiLinearConfig,
+    Lfm2Config,
     NemotronH_Nano_VL_V2_Config,
     NemotronHConfig,
     Qwen3NextConfig,
@@ -1495,7 +1496,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             pattern = getattr(config, "mtp_hybrid_override_pattern", None)
             if pattern is not None and "M" not in pattern:
                 return None
-        if isinstance(config, FalconH1Config | NemotronHConfig):
+        if isinstance(config, FalconH1Config | NemotronHConfig | Lfm2Config):
             return config
         if isinstance(config, NemotronH_Nano_VL_V2_Config):
             return config.llm_config
@@ -2036,9 +2037,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # Collect attention layers and moe layers from the model
         self.model.model = resolve_language_model(self.model)
+        language_model = getattr(self.model, "language_model", self.model)
         self.attention_layers = []
         self.moe_layers = []
-        for layer in self.model.model.layers:
+        for layer in language_model.model.layers:
             if hasattr(layer, "self_attn"):
                 if hasattr(layer.self_attn, "attn"):
                     self.attention_layers.append(layer.self_attn.attn)
