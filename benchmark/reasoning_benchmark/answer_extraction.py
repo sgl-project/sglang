@@ -252,18 +252,18 @@ def extract_answer(pred_str, exhaust=False):
 
 def extract_math_answer(question, reasoning, task):
     answers = []
-    for ans in extract_answer(reasoning, exhaust=True):
-        if "separated by commas" in question and all(ch not in ans for ch in "()[]"):
-            answers.extend([a.strip() for a in ans.split(",")])
-        elif regex.search(r"\\text\{\s*and\s*\}", ans):
+    for answer in extract_answer(reasoning, exhaust=True):
+        if "separated by commas" in question and all(ch not in answer for ch in "()[]"):
+            answers.extend([a.strip() for a in answer.split(",")])
+        elif regex.search(r"\\text\{\s*and\s*\}", answer):
             answers.extend(
                 [
                     a.strip()
-                    for a in regex.sub(r"\\text\{\s*and\s*\}", "[SEP]", ans).split(
+                    for a in regex.sub(r"\\text\{\s*and\s*\}", "[SEP]", answer).split(
                         "[SEP]"
                     )
                 ]
             )
         else:
-            answers.append(ans.strip())
+            answers.append(answer.strip())
     return answers
