@@ -429,8 +429,6 @@ class FusedMoE(torch.nn.Module):
                 loaded_weight = loaded_weight.narrow(
                     shard_dim, shard_size * tp_rank, shard_size
                 )
-                #  in this
-                print('in not use_presharded_weights',loaded_weight.shape)
 
             expert_data = expert_data.narrow(shard_dim, start, shard_size)
         print(expert_data.shape, loaded_weight.shape) 
