@@ -42,9 +42,7 @@ class LatentPreparationStage(PipelineStage):
         """
         Prepare initial latent variables for the diffusion process.
 
-        Args:
-            batch: The current batch information.
-            server_args: The inference arguments.
+
 
         Returns:
             The batch with prepared latent variables.
@@ -87,6 +85,12 @@ class LatentPreparationStage(PipelineStage):
             latents = randn_tensor(
                 shape, generator=generator, device=device, dtype=dtype
             )
+
+            latent_ids = server_args.pipeline_config.maybe_prepare_latent_ids(latents)
+
+            if latent_ids is not None:
+                batch.latent_ids = latent_ids.to(device=device)
+
             latents = server_args.pipeline_config.maybe_pack_latents(
                 latents, batch_size, batch
             )
@@ -105,9 +109,7 @@ class LatentPreparationStage(PipelineStage):
         """
         Adjust video length based on VAE version.
 
-        Args:
-            batch: The current batch information.
-            server_args: The inference arguments.
+
 
         Returns:
             The batch with adjusted video length.
@@ -122,8 +124,6 @@ class LatentPreparationStage(PipelineStage):
                 server_args.pipeline_config.vae_config.arch_config.temporal_compression_ratio
             )
             latent_num_frames = (video_length - 1) // temporal_scale_factor + 1
-        else:  # stepvideo only
-            latent_num_frames = video_length // 17 * 3
         return int(latent_num_frames)
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:

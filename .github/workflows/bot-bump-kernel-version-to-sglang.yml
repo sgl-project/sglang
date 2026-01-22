@@ -59,10 +59,42 @@ jobs:
         run: |
           bash scripts/release/commit_and_pr_kernel_to_sglang.sh "$KERNEL_VERSION" "$BRANCH_NAME"
 
-  run-nightly-tests:
+  run-nightly-tests-nvidia:
     needs: bump-kernel-version-to-sglang
     if: needs.bump-kernel-version-to-sglang.outputs.needs_sync == 'true'
     uses: ./.github/workflows/nightly-test-nvidia.yml
+    with:
+      ref: ${{ needs.bump-kernel-version-to-sglang.outputs.branch_name }}
+    secrets: inherit
+
+  run-nightly-tests-amd:
+    needs: bump-kernel-version-to-sglang
+    if: needs.bump-kernel-version-to-sglang.outputs.needs_sync == 'true'
+    uses: ./.github/workflows/nightly-test-amd.yml
+    with:
+      ref: ${{ needs.bump-kernel-version-to-sglang.outputs.branch_name }}
+    secrets: inherit
+
+  run-nightly-tests-npu:
+    needs: bump-kernel-version-to-sglang
+    if: needs.bump-kernel-version-to-sglang.outputs.needs_sync == 'true'
+    uses: ./.github/workflows/nightly-test-npu.yml
+    with:
+      ref: ${{ needs.bump-kernel-version-to-sglang.outputs.branch_name }}
+    secrets: inherit
+
+  run-pr-tests-xeon:
+    needs: bump-kernel-version-to-sglang
+    if: needs.bump-kernel-version-to-sglang.outputs.needs_sync == 'true'
+    uses: ./.github/workflows/pr-test-xeon.yml
+    with:
+      ref: ${{ needs.bump-kernel-version-to-sglang.outputs.branch_name }}
+    secrets: inherit
+
+  run-pr-tests-xpu:
+    needs: bump-kernel-version-to-sglang
+    if: needs.bump-kernel-version-to-sglang.outputs.needs_sync == 'true'
+    uses: ./.github/workflows/pr-test-xpu.yml
     with:
       ref: ${{ needs.bump-kernel-version-to-sglang.outputs.branch_name }}
     secrets: inherit

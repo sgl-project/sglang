@@ -8,52 +8,6 @@ from typing import Any
 import torch
 
 
-# TODO(PY): move it elsewhere
-def auto_attributes(init_func):
-    """
-    Decorator that automatically adds all initialization arguments as object attributes.
-
-    Example:
-        @auto_attributes
-        def __init__(self, a=1, b=2):
-            pass
-
-        # This will automatically set:
-        # - self.a = 1 and self.b = 2
-        # - self.config.a = 1 and self.config.b = 2
-    """
-
-    def wrapper(self, *args, **kwargs):
-        # Get the function signature
-        import inspect
-
-        signature = inspect.signature(init_func)
-        parameters = signature.parameters
-
-        # Get parameter names (excluding 'self')
-        param_names = list(parameters.keys())[1:]
-
-        # Bind arguments to parameters
-        bound_args = signature.bind(self, *args, **kwargs)
-        bound_args.apply_defaults()
-
-        # Create config object if it doesn't exist
-        if not hasattr(self, "config"):
-            self.config = type("Config", (), {})()
-
-        # Set attributes on self and self.config
-        for name in param_names:
-            if name in bound_args.arguments:
-                value = bound_args.arguments[name]
-                setattr(self, name, value)
-                setattr(self.config, name, value)
-
-        # Call the original __init__ function
-        return init_func(self, *args, **kwargs)
-
-    return wrapper
-
-
 def set_weight_attrs(
     weight: torch.Tensor,
     weight_attrs: dict[str, Any] | None,
@@ -124,16 +78,7 @@ def modulate(
     shift: torch.Tensor | None = None,
     scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """modulate by shift and scale
-
-    Args:
-        x (torch.Tensor): input tensor.
-        shift (torch.Tensor, optional): shift tensor. Defaults to None.
-        scale (torch.Tensor, optional): scale tensor. Defaults to None.
-
-    Returns:
-        torch.Tensor: the output tensor after modulate.
-    """
+    """modulate by shift and scale"""
     if scale is None and shift is None:
         return x
     elif shift is None:

@@ -15,7 +15,7 @@ from sglang.srt.distributed import (
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
-from sglang.srt.layers.attention.fla.kda import FusedRMSNormGated
+from sglang.srt.layers.attention.fla.kda import FusedRMSNormGated, fused_kda_gate
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -125,13 +125,11 @@ class KimiMoE(nn.Module):
         hidden_states = hidden_states.view(-1, hidden_size)
 
         shared_output = None
-        DUAL_STREAM_TOKEN_THRESHOLD = 1024
 
         if (
             self.alt_stream is not None
             and self.num_shared_experts is not None
             and hidden_states.shape[0] > 0
-            and hidden_states.shape[0] <= DUAL_STREAM_TOKEN_THRESHOLD
             and get_is_capture_mode()
         ):
             current_stream = torch.cuda.current_stream()
@@ -316,6 +314,17 @@ class KimiDeltaAttention(nn.Module):
             self.v_conv1d.weight.size(0), self.v_conv1d.weight.size(2)
         )
 
+        beta = self.b_proj(hidden_states)[0].float().sigmoid()
+        forget_gate = self.f_b_proj(self.f_a_proj(hidden_states)[0])[0]
+
+        # fused_kda_gate is fused to KimiLinearAttentionBackend with decode
+        if not forward_batch.forward_mode.is_decode():
+            forget_gate = fused_kda_gate(
+                forget_gate, self.A_log, self.head_dim, g_bias=self.dt_bias
+            )
+        beta = beta.unsqueeze(0)
+        forget_gate = forget_gate.unsqueeze(0)
+
         kwargs = {
             "q_proj_states": q_proj_states,
             "k_proj_states": k_proj_states,
@@ -326,14 +335,12 @@ class KimiDeltaAttention(nn.Module):
             "q_conv_bias": self.q_conv1d.bias,
             "k_conv_bias": self.k_conv1d.bias,
             "v_conv_bias": self.v_conv1d.bias,
-            "dt_bias": self.dt_bias,
-            "b_proj": self.b_proj,
-            "f_a_proj": self.f_a_proj,
-            "f_b_proj": self.f_b_proj,
-            "A_log": self.A_log,
             "head_dim": self.head_dim,
-            "hidden_states": hidden_states,
             "layer_id": self.layer_idx,
+            "beta": beta,
+            "gate": forget_gate,
+            "A_log": self.A_log,
+            "dt_bias": self.dt_bias,
         }
 
         core_attn_out = forward_batch.attn_backend.forward(
@@ -346,8 +353,8 @@ class KimiDeltaAttention(nn.Module):
         )
 
         g_proj_states = self.g_b_proj(self.g_a_proj(hidden_states)[0])[0]
-        g = rearrange(g_proj_states, "... (h d) -> ... h d", d=self.head_dim)
-        core_attn_out = self.o_norm(core_attn_out, g)
+        norm_gate = rearrange(g_proj_states, "... (h d) -> ... h d", d=self.head_dim)
+        core_attn_out = self.o_norm(core_attn_out, norm_gate)
         core_attn_out = rearrange(core_attn_out, "1 n h d -> n (h d)")
 
         return self.o_proj(core_attn_out)[0]
