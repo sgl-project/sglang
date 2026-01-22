@@ -175,7 +175,7 @@ def _execute_test(info: _TestInfo, rank: int, num_gpus: int, device: str):
 
     def _create_physical_to_logical_map():
         if rank == 0:
-            ans = torch.concat(
+            answer = torch.concat(
                 [
                     torch.arange(0, info.num_logical_experts),
                     torch.randint(
@@ -185,15 +185,17 @@ def _execute_test(info: _TestInfo, rank: int, num_gpus: int, device: str):
                     ),
                 ]
             )
-            ans = ans[torch.randperm(ans.shape[0])]
+            answer = answer[torch.randperm(answer.shape[0])]
         else:
-            ans = torch.empty((info.num_physical_experts,), dtype=torch.int64)
+            answer = torch.empty((info.num_physical_experts,), dtype=torch.int64)
 
-        assert ans.dtype == torch.int64 and ans.shape == (info.num_physical_experts,)
-        ans = ans.to(device)
-        torch.distributed.broadcast(ans, src=0)
+        assert answer.dtype == torch.int64 and answer.shape == (
+            info.num_physical_experts,
+        )
+        answer = answer.to(device)
+        torch.distributed.broadcast(answer, src=0)
 
-        return ans.cpu()
+        return answer.cpu()
 
     physical_to_logical_map = _create_physical_to_logical_map()
     routed_experts_weights = _create_routed_experts_weights(physical_to_logical_map)
