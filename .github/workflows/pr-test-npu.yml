@@ -57,13 +57,13 @@ jobs:
           filters: |
             main_package:
               - "python/sglang/!(multimodal_gen)/**"
-              - "python/*.toml"
+              - "python/pyproject_npu.toml"
               - "scripts/ci/npu_ci_install_dependency.sh"
               - "test/srt/ascend/**"
               - ".github/workflows/pr-test-npu.yml"
             multimodal_gen:
               - "python/sglang/multimodal_gen/**"
-              - "python/*.toml"
+              - "python/pyproject_npu.toml"
               - "scripts/ci/npu_ci_install_dependency.sh"
               - ".github/workflows/pr-test-npu.yml"
 
