@@ -840,8 +840,39 @@ class AscendAttnBackend(AttentionBackend):
             assert (
                 layer.qk_head_dim != layer.v_head_dim
             ), "FIA only supports qk_head_dim != v_head_dim"
-            if not layer.v_head_dim in [256]:
-                "Currently, in NO_QUANT situation, qk_nope_head_dim == v_head_dim, and rope exists, v_head_dim only support 512 and 128"
+            if layer.v_head_dim in [256]:
+                """Currently, in NO_QUANT situation, qk_nope_head_dim == v_head_dim, and rope exists, v_head_dim only support 512 and 128"""
+                kv_lora_rank = k.shape[-1] - self.qk_rope_head_dim
+                kv_c, k_rope = k.split([kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+                if save_kv_cache:
+                    forward_batch.token_to_kv_pool.set_kv_buffer(
+                        layer, forward_batch.out_cache_loc, kv_c, k_rope
+                    )
+                attn_output = q.new_empty(
+                    (q.shape[0], layer.tp_q_head_num, kv_lora_rank)
+                )
+                use_gqa = layer.tp_q_head_num != layer.tp_k_head_num
+
+                k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+                v_cache = forward_batch.token_to_kv_pool.get_value_buffer(
+                    layer.layer_id
+                )
+                kv_cache = torch.cat([k_cache, v_cache], dim=-1)
+                attn_output = self.native_attn._run_sdpa_forward_extend(
+                    q,
+                    attn_output,
+                    kv_cache.view(-1, layer.tp_k_head_num, layer.qk_head_dim),
+                    k_cache.view(-1, layer.tp_v_head_num, layer.v_head_dim),
+                    forward_batch.req_to_token_pool.req_to_token,
+                    forward_batch.req_pool_indices,
+                    forward_batch.seq_lens,
+                    forward_batch.extend_prefix_lens,
+                    forward_batch.extend_seq_lens,
+                    scaling=layer.scaling,
+                    enable_gqa=use_gqa,
+                    causal=True,
+                )
+            else:
                 num_token_padding = q.shape[0]
                 q, k, v = [
                     data[: forward_batch.num_token_non_padded_cpu] for data in [q, k, v]
@@ -884,37 +915,6 @@ class AscendAttnBackend(AttentionBackend):
                         ],
                         dim=0,
                     )
-            else:
-                kv_lora_rank = k.shape[-1] - self.qk_rope_head_dim
-                kv_c, k_rope = k.split([kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-                if save_kv_cache:
-                    forward_batch.token_to_kv_pool.set_kv_buffer(
-                        layer, forward_batch.out_cache_loc, kv_c, k_rope
-                    )
-                attn_output = q.new_empty(
-                    (q.shape[0], layer.tp_q_head_num, kv_lora_rank)
-                )
-                use_gqa = layer.tp_q_head_num != layer.tp_k_head_num
-
-                k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
-                v_cache = forward_batch.token_to_kv_pool.get_value_buffer(
-                    layer.layer_id
-                )
-                kv_cache = torch.cat([k_cache, v_cache], dim=-1)
-                attn_output = self.native_attn._run_sdpa_forward_extend(
-                    q,
-                    attn_output,
-                    kv_cache.view(-1, layer.tp_k_head_num, layer.qk_head_dim),
-                    k_cache.view(-1, layer.tp_v_head_num, layer.v_head_dim),
-                    forward_batch.req_to_token_pool.req_to_token,
-                    forward_batch.req_pool_indices,
-                    forward_batch.seq_lens,
-                    forward_batch.extend_prefix_lens,
-                    forward_batch.extend_seq_lens,
-                    scaling=layer.scaling,
-                    enable_gqa=use_gqa,
-                    causal=True,
-                )
 
         return attn_output
 
