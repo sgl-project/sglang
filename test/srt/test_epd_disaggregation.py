@@ -3,12 +3,12 @@ import subprocess
 import threading
 import time
 import unittest
+from pathlib import Path
+import sys
 
 import grpc
 import zmq
 from grpc_health.v1 import health_pb2, health_pb2_grpc
-
-from sglang.srt.grpc import sglang_encoder_pb2, sglang_encoder_pb2_grpc
 from sglang.srt.utils import get_zmq_socket_on_host, kill_process_tree
 from sglang.test.kits.mmmu_vlm_kit import _run_lmms_eval_with_retry
 from sglang.test.server_fixtures.disaggregation_fixture import (
@@ -20,6 +20,39 @@ from sglang.test.test_utils import (
     is_in_ci,
     popen_launch_server,
 )
+
+
+def _ensure_grpc_proto_generated():
+    root = Path(__file__).resolve().parents[2]
+    grpc_dir = root / "python" / "sglang" / "srt" / "grpc"
+    expected = [
+        grpc_dir / "sglang_encoder_pb2.py",
+        grpc_dir / "sglang_encoder_pb2_grpc.py",
+        grpc_dir / "sglang_encoder_pb2.pyi",
+        grpc_dir / "sglang_scheduler_pb2.py",
+        grpc_dir / "sglang_scheduler_pb2_grpc.py",
+        grpc_dir / "sglang_scheduler_pb2.pyi",
+    ]
+    if all(path.exists() for path in expected):
+        return
+
+    compile_script = grpc_dir / "compile_proto.py"
+    if not compile_script.exists():
+        raise unittest.SkipTest("compile_proto.py missing; cannot generate gRPC stubs")
+
+    for proto_file in ("sglang_scheduler.proto", "sglang_encoder.proto"):
+        try:
+            subprocess.run(
+                [sys.executable, str(compile_script), "--proto-file", proto_file],
+                cwd=grpc_dir,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except subprocess.CalledProcessError as e:
+            raise unittest.SkipTest(
+                f"Failed to generate gRPC stubs: {e.stderr.strip()}"
+            )
 
 
 @unittest.skipIf(is_in_ci(), "Skipping in CI to reduce multi-GPU runtime")
@@ -465,6 +498,7 @@ class TestEPDDisaggregationGrpcEncoderMMMU(PDDisaggregationServerBase):
 
     @classmethod
     def start_encode(cls):
+        _ensure_grpc_proto_generated()
         encode_command = [
             "python3",
             "-m",
@@ -651,6 +685,7 @@ class TestEPDDisaggregationGrpcEncoder(PDDisaggregationServerBase):
 
     @classmethod
     def start_encode(cls):
+        _ensure_grpc_proto_generated()
         encode_command = [
             "python3",
             "-m",
@@ -709,6 +744,9 @@ class TestEPDDisaggregationGrpcEncoder(PDDisaggregationServerBase):
         super().tearDownClass()
 
     def test_grpc_encoder_zmq_to_scheduler(self):
+        _ensure_grpc_proto_generated()
+        from sglang.srt.grpc import sglang_encoder_pb2, sglang_encoder_pb2_grpc
+
         context = zmq.Context()
         recv_port, recv_socket = get_zmq_socket_on_host(
             context, zmq.PULL, host=self.base_host
