@@ -22,7 +22,7 @@ import logging
 import os
 from contextlib import contextmanager
 from functools import partial
-from typing import TYPE_CHECKING, Callable, Optional, Union
+from typing import TYPE_CHECKING, Callable, Optional, Union, List
 
 import torch
 import tqdm

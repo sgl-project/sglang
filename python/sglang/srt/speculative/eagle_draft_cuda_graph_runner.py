@@ -402,8 +402,7 @@ class EAGLEDraftCudaGraphRunner:
 
 class EAGLEDraftCudaGraphRunnerAuto(EAGLEDraftCudaGraphRunner):
     def __init__(self, eagle_worker: EAGLEWorker, speculative_num_steps: int):
-        # super(EAGLEDraftCudaGraphRunnerAuto, self).__init__(eagle_worker)
-        """todo use the parameter for each num_step"""
+        """use the parameter for each num_step"""
         # Parse args
         self.eagle_worker = eagle_worker
         if not hasattr(eagle_worker, "model_runner"):
@@ -504,88 +503,3 @@ class EAGLEDraftCudaGraphRunnerAuto(EAGLEDraftCudaGraphRunner):
                 f"Capture cuda graph failed: {e}\n{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
             )
         logger.info(f"[MY LOG] EAGLEDraftCudaGraphRunnerAuto __init__, num_steps: {self.speculative_num_steps} done")
-        # todo add other init implementations
-
-    # def replay(self, forward_batch: ForwardBatch):
-    #     """todo: replay should be rewritten because the model_runner.draft_attn_backend_for_steps is a dict
-    #     and should be set to current speculative_num_steps"""
-    #     assert forward_batch.out_cache_loc is not None
-    #     self.deepep_adapter.replay()
-    #
-    #     raw_bs = forward_batch.batch_size
-    #     raw_num_token = raw_bs * self.num_tokens_per_bs
-    #
-    #     # Pad
-    #     if self.require_mlp_tp_gather:
-    #         max_num_tokens = max(forward_batch.global_num_tokens_cpu)
-    #         max_batch_size = (
-    #             max_num_tokens // self.num_tokens_per_bs
-    #             if self.model_runner.spec_algorithm.is_eagle()
-    #             else max_num_tokens
-    #         )
-    #         index = bisect.bisect_left(self.capture_bs, max_batch_size)
-    #     else:
-    #         index = bisect.bisect_left(self.capture_bs, raw_bs)
-    #
-    #     bs = self.capture_bs[index]
-    #     if bs != raw_bs:
-    #         self.seq_lens.fill_(self.seq_len_fill_value)
-    #         self.out_cache_loc.zero_()
-    #         self.positions.zero_()
-    #
-    #     num_tokens = bs * self.num_tokens_per_bs
-    #
-    #     # Common inputs
-    #     self.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
-    #     self.out_cache_loc[: raw_num_token * self.speculative_num_steps].copy_(
-    #         forward_batch.out_cache_loc
-    #     )
-    #     self.positions[:raw_num_token].copy_(forward_batch.positions)
-    #     self.topk_p[:raw_bs].copy_(forward_batch.spec_info.topk_p)
-    #     self.topk_index[:raw_bs].copy_(forward_batch.spec_info.topk_index)
-    #     self.hidden_states[:raw_bs].copy_(forward_batch.spec_info.hidden_states)
-    #     self.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
-    #
-    #     # TODO(ch-wan): support num_token_non_padded
-    #     if self.require_gathered_buffer:
-    #         self.global_num_tokens_gpu.fill_(bs * self.num_tokens_per_bs)
-    #         self.global_num_tokens_for_logprob_gpu.fill_(bs * self.num_tokens_per_bs)
-    #
-    #     # Attention backend
-    #     if bs != raw_bs:
-    #         forward_batch.batch_size = bs
-    #         forward_batch.seq_lens = self.seq_lens[:bs]
-    #         forward_batch.req_pool_indices = self.req_pool_indices[:bs]
-    #         forward_batch.positions = self.positions[:num_tokens]
-    #
-    #     if forward_batch.seq_lens_cpu is not None:
-    #         if bs != raw_bs:
-    #             self.seq_lens_cpu.fill_(self.seq_len_fill_value)
-    #         self.seq_lens_cpu[:raw_bs].copy_(forward_batch.seq_lens_cpu)
-    #         forward_batch.seq_lens_cpu = self.seq_lens_cpu[:bs]
-    #
-    #     # todo autospec draft_attn_backend should be set to current speculative_num_steps
-    #     self.model_runner.draft_attn_backend = self.model_runner.draft_attn_backend_for_steps[
-    #         self.speculative_num_steps]
-    #
-    #     self.model_runner.draft_attn_backend.init_forward_metadata_replay_cuda_graph(
-    #         forward_batch, bs
-    #     )
-    #     self.raw_bs = raw_bs
-    #     self.bs = bs
-    #     # TODO: The forward_batch.seq_len_sum might need to be updated to reflect the padding in the cuda graph
-    #
-    #     # Replay
-    #     self._replay(forward_batch)
-    #     out = self.output_buffers[bs]
-    #
-    #     if bs != raw_bs:
-    #         out = self._postprocess_output_to_raw_bs(out, raw_bs)
-    #         forward_batch.batch_size = raw_bs
-    #         forward_batch.positions = self.positions[:raw_num_token]
-    #         forward_batch.seq_lens = self.seq_lens[:raw_bs]
-    #         forward_batch.req_pool_indices = self.req_pool_indices[:raw_bs]
-    #         if forward_batch.seq_lens_cpu is not None:
-    #             forward_batch.seq_lens_cpu = self.seq_lens_cpu[:raw_bs]
-    #
-    #     return out

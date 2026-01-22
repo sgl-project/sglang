@@ -261,11 +261,10 @@ class EAGLEWorker(TpModelWorker):
             )
 
             self.draft_model_runner.draft_attn_backend_for_steps[num_steps] = self.draft_attn_backend_for_steps[num_steps]
-        # todo set current backend
+        # set current backend
         for num_steps, attn_backend in self.draft_model_runner.draft_attn_backend_for_steps.items():
             logger.info(f"[MY LOG] EAGLEWorker.init_attention_backend_for_steps, step={num_steps}, id attn_backend={id(attn_backend)}")
         assert len(self.spec_auto_tuner.step_range) > 0  # make sure the step_range has values to avoid index out of range
-        # initial_step = self.spec_auto_tuner.step_range[int(len(self.spec_auto_tuner.step_range) // 2)]  # use the medium value as the start point
         initial_step = self.spec_auto_tuner.step_range[-1]
         self.draft_attn_backend = self.draft_attn_backend_for_steps[initial_step]
         self.draft_extend_attn_backend = self.draft_extend_attn_backend_for_steps[initial_step]
@@ -330,19 +329,19 @@ class EAGLEWorker(TpModelWorker):
         # Capture draft
         for num_steps in self.spec_auto_tuner.step_range:
             logger.info(f"[MY LOG] EAGLEWorker.init_cuda_graphs_for_steps, num_steps={num_steps}")
-            # eagle_worker参数
+            # eagle_worker parameters
             self.speculative_num_steps = num_steps
             self.topk = 1
             self.speculative_num_draft_tokens = num_steps + 1
-            # model_runner参数
-            self.draft_model_runner.server_args.speculative_num_steps = num_steps  # todo changing server_args here because in CudaGraphRunner, capture function would get_eagle_info from server_args
+            # draft_model_runner parameters
+            self.draft_model_runner.server_args.speculative_num_steps = num_steps
             self.draft_model_runner.server_args.speculative_eagle_topk = 1
             self.draft_model_runner.server_args.speculative_num_draft_tokens = num_steps + 1
-            # self attn_backend
+            # eagle_worker attn_backend
             self.draft_attn_backend = self.draft_attn_backend_for_steps[num_steps]
             self.draft_extend_attn_backend = self.draft_extend_attn_backend_for_steps[num_steps]
-            # model_runner attn_backend
-            self.draft_model_runner.draft_attn_backend = self.draft_model_runner.draft_attn_backend_for_steps[num_steps]  # todo will be used in EAGLEDraftCudaGraphRunner.capture_one_batch_size
+            # draft_model_runner attn_backend
+            self.draft_model_runner.draft_attn_backend = self.draft_model_runner.draft_attn_backend_for_steps[num_steps]
             if num_steps > 1:  # num_steps = 1 will not be captured
                 tic = time.perf_counter()
                 before_mem = get_available_gpu_memory(self.device, self.gpu_id)
@@ -374,18 +373,17 @@ class EAGLEWorker(TpModelWorker):
                     f"Capture draft extend cuda graph end, num_step: {num_steps}. Time elapsed: {time.perf_counter() - tic:.2f} s. mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB."
                 )
             logger.info(f"[MY LOG] EAGLEWorker.init_cuda_graphs_for_steps, num_steps={num_steps} capture ends")
-        # todo match the graph_runner step with the attn_backend step
+
         assert len(
             self.spec_auto_tuner.step_range) > 0  # make sure the step_range has values to avoid index out of range
-        # initial_step = self.spec_auto_tuner.step_range[
-        #     int(len(self.spec_auto_tuner.step_range) // 2)]  # use the medium value as the start point
+
         initial_step = self.spec_auto_tuner.step_range[-1]
         # set eagle_worker
         self.speculative_num_steps = initial_step
         self.topk = 1
         self.speculative_num_draft_tokens = initial_step + 1
         # set draft
-        self.draft_model_runner.server_args.speculative_num_steps = initial_step  # todo changing server_args here because in CudaGraphRunner, capture function would get_eagle_info from server_args
+        self.draft_model_runner.server_args.speculative_num_steps = initial_step
         self.draft_model_runner.server_args.speculative_eagle_topk = 1
         self.draft_model_runner.server_args.speculative_num_draft_tokens = initial_step + 1
         # set draft attn_backend
@@ -441,10 +439,6 @@ class EAGLEWorker(TpModelWorker):
                 can_run_cuda_graph=False,
             )
         else:
-            # todo get the configured batchsize for current batchsize
-            # todo uncomment these lines to integrate, disable for the bs controlled by bs=32 and bs=64
-            # if self.auto_spec:
-            # if self.auto_spec and (batch.batch_size() <= 12 or (batch.batch_size() > 12 and self.speculative_num_steps != 3)):
             if self.auto_spec:
                 # logger.info(f"[MY LOG] bs {batch.batch_size()}, speculative_num_steps before change: {self.speculative_num_steps}")
                 best_params = self.spec_auto_tuner.get_best_parameters(batch.batch_size())
@@ -1155,15 +1149,11 @@ class EAGLEWorker(TpModelWorker):
 
     def update_member_spec_parameter(self, best_params):
         """
-        todo: get current best parameter and update all parameters relative to spec_num_steps
+        get current best parameter and update all parameters relative to spec_num_steps
         """
-        # self.cuda_graph_runner.speculative_num_steps = self.speculative_num_steps
-        # self.cuda_graph_runner_for_draft_extend.speculative_num_steps = self.speculative_num_steps
         # set eagle_worker params
         self.speculative_num_steps, self.topk, self.speculative_num_draft_tokens = best_params.num_steps, best_params.topk, best_params.num_draft
-        # self.model_runner.speculative_num_steps = self.speculative_num_steps
-        # self.model_runner.attn_backend.speculative_num_steps = self.speculative_num_steps
-        # self.model_runner.attn_backend.speculative_num_draft_tokens = self.speculative_num_draft_tokens
+
         # draft: set draft model_runner params
         self.model_runner.server_args.speculative_num_steps = self.speculative_num_steps
         self.model_runner.server_args.speculative_eagle_topk = self.topk
@@ -1173,9 +1163,6 @@ class EAGLEWorker(TpModelWorker):
         self.target_worker.model_runner.server_args.speculative_num_steps = self.speculative_num_steps
         self.target_worker.model_runner.server_args.speculative_eagle_topk = self.topk
         self.target_worker.model_runner.server_args.speculative_num_draft_tokens = self.speculative_num_draft_tokens
-        # self.target_worker.model_runner.graph_runner.num_tokens_per_bs = self.speculative_num_draft_tokens
-        # # verify - target_worker
-        # self.target_worker.model_runner.attn_backend.speculative_num_draft_tokens = self.speculative_num_draft_tokens
 
 @torch.compile(dynamic=True, disable=_is_npu)
 def get_last_loc_large_page_size_top_k_1(
