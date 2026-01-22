@@ -61,11 +61,21 @@ class TestProcessPrefillResult(unittest.TestCase):
         """Set up test fixtures."""
         self.scheduler = create_mock_scheduler()
 
-    @patch.object(
-        SchedulerBeamSearchProcessorMixin,
-        "_process_beam_search_prefill_result_single_req",
-    )
-    def test_process_prefill_result_basic(self, mock_process_prefill):
+        self.patcher_process_prefill = patch.object(
+            SchedulerBeamSearchProcessorMixin,
+            "_process_beam_search_prefill_result_single_req",
+        )
+        self.patcher_release_kv = patch(
+            "sglang.srt.managers.scheduler_beam_search_processor_mixin.release_kv_cache"
+        )
+
+        self.mock_process_prefill = self.patcher_process_prefill.start()
+        self.mock_release_kv_cache = self.patcher_release_kv.start()
+
+        self.addCleanup(self.patcher_process_prefill.stop)
+        self.addCleanup(self.patcher_release_kv.stop)
+
+    def test_process_prefill_result_basic(self):
         """Test basic prefill result processing with one request."""
         device = torch.device("cpu")
 
@@ -84,17 +94,10 @@ class TestProcessPrefillResult(unittest.TestCase):
 
         self.scheduler.process_beam_search_prefill_result(batch, logits_output)
 
-        mock_process_prefill.assert_called_once()
+        self.mock_process_prefill.assert_called_once()
         self.scheduler.tree_cache.cache_unfinished_req.assert_called_once_with(req)
 
-    @patch("sglang.srt.managers.scheduler_beam_search_processor_mixin.release_kv_cache")
-    @patch.object(
-        SchedulerBeamSearchProcessorMixin,
-        "_process_beam_search_prefill_result_single_req",
-    )
-    def test_process_prefill_result_two_reqs(
-        self, mock_process_prefill, mock_release_kv_cache
-    ):
+    def test_process_prefill_result_two_reqs(self):
         """Test prefill result processing with two requests: one unfinished (cached) and one finished (released)."""
         device = torch.device("cpu")
 
@@ -122,18 +125,13 @@ class TestProcessPrefillResult(unittest.TestCase):
             self.scheduler, batch, logits_output
         )
 
-        self.assertEqual(mock_process_prefill.call_count, len(batch.reqs))
+        self.assertEqual(self.mock_process_prefill.call_count, len(batch.reqs))
         self.scheduler.tree_cache.cache_unfinished_req.assert_called_once_with(req1)
-        mock_release_kv_cache.assert_called_once_with(req2, self.scheduler.tree_cache)
+        self.mock_release_kv_cache.assert_called_once_with(
+            req2, self.scheduler.tree_cache
+        )
 
-    @patch("sglang.srt.managers.scheduler_beam_search_processor_mixin.release_kv_cache")
-    @patch.object(
-        SchedulerBeamSearchProcessorMixin,
-        "_process_beam_search_prefill_result_single_req",
-    )
-    def test_process_prefill_result_retracted(
-        self, mock_process_prefill, mock_release_kv_cache
-    ):
+    def test_process_prefill_result_retracted(self):
         """Test prefill result processing when request is retracted (should skip processing)."""
         device = torch.device("cpu")
 
@@ -156,9 +154,9 @@ class TestProcessPrefillResult(unittest.TestCase):
             self.scheduler, batch, logits_output
         )
 
-        mock_process_prefill.assert_not_called()
+        self.mock_process_prefill.assert_not_called()
         self.scheduler.tree_cache.cache_unfinished_req.assert_not_called()
-        mock_release_kv_cache.assert_not_called()
+        self.mock_release_kv_cache.assert_not_called()
 
 
 class TestProcessDecodeResult(unittest.TestCase):
@@ -171,30 +169,44 @@ class TestProcessDecodeResult(unittest.TestCase):
         self.scheduler.token_to_kv_pool_allocator.free_group_begin = Mock()
         self.scheduler.token_to_kv_pool_allocator.free_group_end = Mock()
 
-    @patch.object(SchedulerBeamSearchProcessorMixin, "_handle_beam_kv_cache")
-    @patch.object(SchedulerBeamSearchProcessorMixin, "_cache_finished_beam_search")
-    @patch.object(
-        SchedulerBeamSearchProcessorMixin, "_calculate_beam_score_with_eos_check"
-    )
-    @patch.object(SchedulerBeamSearchProcessorMixin, "_process_beam_search_expansion")
-    @patch.object(SchedulerBeamSearchProcessorMixin, "_extract_beam_topk_data")
-    def test_process_decode_result_basic(
-        self,
-        mock_extract_topk,
-        mock_process_expansion,
-        mock_calculate_score,
-        mock_cache_finished,
-        mock_handle_kv,
-    ):
+        self.patcher_handle_kv = patch.object(
+            SchedulerBeamSearchProcessorMixin, "_handle_beam_kv_cache"
+        )
+        self.patcher_cache_finished = patch.object(
+            SchedulerBeamSearchProcessorMixin, "_cache_finished_beam_search"
+        )
+        self.patcher_calculate_score = patch.object(
+            SchedulerBeamSearchProcessorMixin, "_calculate_beam_score"
+        )
+        self.patcher_process_expansion = patch.object(
+            SchedulerBeamSearchProcessorMixin, "_process_beam_search_expansion"
+        )
+        self.patcher_extract_topk = patch.object(
+            SchedulerBeamSearchProcessorMixin, "_extract_beam_topk_data"
+        )
+
+        self.mock_handle_kv = self.patcher_handle_kv.start()
+        self.mock_cache_finished = self.patcher_cache_finished.start()
+        self.mock_calculate_score = self.patcher_calculate_score.start()
+        self.mock_process_expansion = self.patcher_process_expansion.start()
+        self.mock_extract_topk = self.patcher_extract_topk.start()
+
+        self.addCleanup(self.patcher_handle_kv.stop)
+        self.addCleanup(self.patcher_cache_finished.stop)
+        self.addCleanup(self.patcher_calculate_score.stop)
+        self.addCleanup(self.patcher_process_expansion.stop)
+        self.addCleanup(self.patcher_extract_topk.stop)
+
+    def test_process_decode_result_basic(self):
         """Test basic decode result processing with one unfinished request."""
         device = torch.device("cpu")
 
-        mock_extract_topk.return_value = (
+        self.mock_extract_topk.return_value = (
             torch.tensor([[1, 2, 3]], device=device),
             torch.tensor([[-1.0, -2.0, -3.0]], device=device),
         )
 
-        mock_process_expansion.return_value = None
+        self.mock_process_expansion.return_value = None
 
         batch = Mock()
         batch.req_pool_indices = torch.tensor([0], device=device)
@@ -215,40 +227,28 @@ class TestProcessDecodeResult(unittest.TestCase):
             self.scheduler, batch, result
         )
 
-        mock_extract_topk.assert_called_once()
-        mock_process_expansion.assert_called_once()
-        mock_calculate_score.assert_not_called()
-        mock_cache_finished.assert_not_called()
-        mock_handle_kv.assert_not_called()
+        self.mock_extract_topk.assert_called_once()
+        self.mock_process_expansion.assert_called_once()
+        self.mock_calculate_score.assert_not_called()
+        self.mock_cache_finished.assert_not_called()
+        self.mock_handle_kv.assert_not_called()
 
-    @patch.object(SchedulerBeamSearchProcessorMixin, "_handle_beam_kv_cache")
-    @patch.object(SchedulerBeamSearchProcessorMixin, "_cache_finished_beam_search")
-    @patch.object(
-        SchedulerBeamSearchProcessorMixin, "_calculate_beam_score_with_eos_check"
-    )
-    @patch.object(SchedulerBeamSearchProcessorMixin, "_process_beam_search_expansion")
-    @patch.object(SchedulerBeamSearchProcessorMixin, "_extract_beam_topk_data")
-    def test_process_decode_result_finished_request_without_incomplete(
-        self,
-        mock_extract_topk,
-        mock_process_expansion,
-        mock_calculate_score,
-        mock_cache_finished,
-        mock_handle_kv,
-    ):
+    def test_process_decode_result_finished_request_without_incomplete(self):
         """Test decode result processing with a finished request."""
         device = torch.device("cpu")
 
-        mock_extract_topk.return_value = (
+        self.mock_extract_topk.return_value = (
             torch.tensor([[1, 2, 3]], device=device),
             torch.tensor([[-1.0, -2.0, -3.0]], device=device),
         )
-        mock_process_expansion.return_value = None
-        mock_calculate_score.return_value = -1.0
+        self.mock_process_expansion.return_value = None
+        self.mock_calculate_score.return_value = -1.0
 
         batch = Mock()
         batch.req_pool_indices = torch.tensor([0], device=device)
         batch.return_logprob = False
+        batch.device = device
+        batch.sampling_info = None
 
         req = Mock()
         req.is_retracted = False
@@ -269,33 +269,19 @@ class TestProcessDecodeResult(unittest.TestCase):
             self.scheduler, batch, result
         )
 
-        mock_calculate_score.assert_not_called()
-        mock_cache_finished.assert_called_once()
+        self.mock_calculate_score.assert_not_called()
+        self.mock_cache_finished.assert_called_once()
 
-    @patch.object(SchedulerBeamSearchProcessorMixin, "_handle_beam_kv_cache")
-    @patch.object(SchedulerBeamSearchProcessorMixin, "_cache_finished_beam_search")
-    @patch.object(
-        SchedulerBeamSearchProcessorMixin, "_calculate_beam_score_with_eos_check"
-    )
-    @patch.object(SchedulerBeamSearchProcessorMixin, "_process_beam_search_expansion")
-    @patch.object(SchedulerBeamSearchProcessorMixin, "_extract_beam_topk_data")
-    def test_process_decode_result_finished_with_incomplete_beams(
-        self,
-        mock_extract_topk,
-        mock_process_expansion,
-        mock_calculate_score,
-        mock_cache_finished,
-        mock_handle_kv,
-    ):
+    def test_process_decode_result_finished_with_incomplete_beams(self):
         """Test decode result processing with a finished request that has incomplete beams."""
         device = torch.device("cpu")
 
-        mock_extract_topk.return_value = (
+        self.mock_extract_topk.return_value = (
             torch.tensor([[1, 2, 3]], device=device),
             torch.tensor([[-1.0, -2.0, -3.0]], device=device),
         )
-        mock_process_expansion.return_value = None
-        mock_calculate_score.return_value = -1.0
+        self.mock_process_expansion.return_value = None
+        self.mock_calculate_score.return_value = -1.0
 
         batch = Mock()
         batch.req_pool_indices = torch.tensor([0], device=device)
@@ -309,8 +295,12 @@ class TestProcessDecodeResult(unittest.TestCase):
         req.beam_list = Mock()
         beam1 = Mock()
         beam1.beam_score = None
+        beam1.tokens = [1, 2, 3]  # Mock tokens for length calculation
+        beam1.cum_logprob = -1.5  # Mock cumulative log probability
         beam2 = Mock()
         beam2.beam_score = None
+        beam2.tokens = [4, 5, 6, 7]  # Mock tokens for length calculation
+        beam2.cum_logprob = -2.0  # Mock cumulative log probability
         req.beam_list.incomplete = [beam1, beam2]
         req.beam_list.completed = []
         req.stop_token_ids = set()
@@ -322,33 +312,19 @@ class TestProcessDecodeResult(unittest.TestCase):
 
         self.scheduler.process_beam_search_decode_result(batch, result)
 
-        self.assertEqual(mock_calculate_score.call_count, 2)
-        mock_cache_finished.assert_called_once()
+        self.assertEqual(self.mock_calculate_score.call_count, 2)
+        self.mock_cache_finished.assert_called_once()
 
-    @patch.object(SchedulerBeamSearchProcessorMixin, "_handle_beam_kv_cache")
-    @patch.object(SchedulerBeamSearchProcessorMixin, "_cache_finished_beam_search")
-    @patch.object(
-        SchedulerBeamSearchProcessorMixin, "_calculate_beam_score_with_eos_check"
-    )
-    @patch.object(SchedulerBeamSearchProcessorMixin, "_process_beam_search_expansion")
-    @patch.object(SchedulerBeamSearchProcessorMixin, "_extract_beam_topk_data")
-    def test_process_decode_result_with_kv_copy(
-        self,
-        mock_extract_topk,
-        mock_process_expansion,
-        mock_calculate_score,
-        mock_cache_finished,
-        mock_handle_kv,
-    ):
+    def test_process_decode_result_with_kv_copy(self):
         """Test decode result processing when KV cache copy is needed (last_batch_slot_indices is not None)."""
         device = torch.device("cpu")
 
-        mock_extract_topk.return_value = (
+        self.mock_extract_topk.return_value = (
             torch.tensor([[1, 2, 3]], device=device),
             torch.tensor([[-1.0, -2.0, -3.0]], device=device),
         )
         mock_last_batch_slot_indices = torch.tensor([0, 1], device=device)
-        mock_process_expansion.return_value = mock_last_batch_slot_indices
+        self.mock_process_expansion.return_value = mock_last_batch_slot_indices
 
         batch = Mock()
         batch.req_pool_indices = torch.tensor([0], device=device)
@@ -367,25 +343,15 @@ class TestProcessDecodeResult(unittest.TestCase):
 
         self.scheduler.process_beam_search_decode_result(batch, result)
 
-        mock_process_expansion.assert_called_once()
-        mock_cache_finished.assert_not_called()
-        mock_handle_kv.assert_called_once()
+        self.mock_process_expansion.assert_called_once()
+        self.mock_cache_finished.assert_not_called()
+        self.mock_handle_kv.assert_called_once()
 
-    @patch.object(SchedulerBeamSearchProcessorMixin, "_handle_beam_kv_cache")
-    @patch.object(SchedulerBeamSearchProcessorMixin, "_cache_finished_beam_search")
-    @patch.object(SchedulerBeamSearchProcessorMixin, "_process_beam_search_expansion")
-    @patch.object(SchedulerBeamSearchProcessorMixin, "_extract_beam_topk_data")
-    def test_process_decode_result_retracted(
-        self,
-        mock_extract_topk,
-        mock_process_expansion,
-        mock_cache_finished,
-        mock_handle_kv,
-    ):
+    def test_process_decode_result_retracted(self):
         """Test decode result processing when request is retracted (should skip processing)."""
         device = torch.device("cpu")
 
-        mock_extract_topk.return_value = (
+        self.mock_extract_topk.return_value = (
             torch.tensor([[1, 2, 3]], device=device),
             torch.tensor([[-1.0, -2.0, -3.0]], device=device),
         )
@@ -406,7 +372,7 @@ class TestProcessDecodeResult(unittest.TestCase):
 
         self.scheduler.process_beam_search_decode_result(batch, result)
 
-        mock_process_expansion.assert_not_called()
+        self.mock_process_expansion.assert_not_called()
 
 
 class TestSumBeamCompletionTokens(unittest.TestCase):
@@ -481,14 +447,27 @@ class TestInternalProcessPrefillResult(unittest.TestCase):
         """Set up test fixtures."""
         self.scheduler = create_mock_scheduler()
 
-    @patch.object(SchedulerBeamSearchProcessorMixin, "_create_initial_beam_sequences")
-    @patch.object(
-        SchedulerBeamSearchProcessorMixin,
-        "_batch_check_prefill_generated_tokens_stop_conditions",
-    )
-    def test_internal_process_prefill_result_normal_path(
-        self, mock_check_stop, mock_create_beams
-    ):
+        self.patcher_create_beams = patch.object(
+            SchedulerBeamSearchProcessorMixin, "_create_initial_beam_sequences"
+        )
+        self.patcher_check_stop = patch.object(
+            SchedulerBeamSearchProcessorMixin,
+            "_batch_check_prefill_generated_tokens_stop_conditions",
+        )
+        self.patcher_create_completed = patch.object(
+            SchedulerBeamSearchProcessorMixin,
+            "_create_completed_beams_for_insufficient_candidates",
+        )
+
+        self.mock_create_beams = self.patcher_create_beams.start()
+        self.mock_check_stop = self.patcher_check_stop.start()
+        self.mock_create_completed = self.patcher_create_completed.start()
+
+        self.addCleanup(self.patcher_create_beams.stop)
+        self.addCleanup(self.patcher_check_stop.stop)
+        self.addCleanup(self.patcher_create_completed.stop)
+
+    def test_internal_process_prefill_result_normal_path(self):
         """Test normal path with sufficient unfinished candidates.
 
         This tests the case where there are enough unfinished candidates (>= beam_width),
@@ -522,16 +501,16 @@ class TestInternalProcessPrefillResult(unittest.TestCase):
             finish_mask[1:] = False
             return finish_mask
 
-        mock_check_stop.side_effect = mock_check_stop_func
+        self.mock_check_stop.side_effect = mock_check_stop_func
 
         self.scheduler._process_beam_search_prefill_result_single_req(
             req, batch, logprobs, device
         )
 
-        mock_check_stop.assert_called_once()
-        mock_create_beams.assert_called_once()
+        self.mock_check_stop.assert_called_once()
+        self.mock_create_beams.assert_called_once()
 
-        call_args = mock_create_beams.call_args
+        call_args = self.mock_create_beams.call_args
         self.assertEqual(call_args[0][0], req)
         self.assertIsInstance(call_args[0][1], list)  # top_logprobs_val
         self.assertEqual(len(call_args[0][1]), req.beam_candidates)
@@ -541,13 +520,7 @@ class TestInternalProcessPrefillResult(unittest.TestCase):
         self.assertEqual(len(call_args[0][3]), req.beam_candidates)
         self.assertEqual(call_args[0][4], device)  # device
 
-    @patch.object(
-        SchedulerBeamSearchProcessorMixin,
-        "_create_completed_beams_for_insufficient_candidates",
-    )
-    def test_internal_process_prefill_result_finish_by_len_1(
-        self, mock_create_completed
-    ):
+    def test_internal_process_prefill_result_finish_by_len_1(self):
         """Test finish_by_len=True when max_new_tokens <= 1.
 
         When max_new_tokens <= 1, all candidates should be marked as finished,
@@ -578,9 +551,9 @@ class TestInternalProcessPrefillResult(unittest.TestCase):
             req, batch, logprobs, device
         )
 
-        mock_create_completed.assert_called_once()
+        self.mock_create_completed.assert_called_once()
 
-        call_args = mock_create_completed.call_args
+        call_args = self.mock_create_completed.call_args
         self.assertEqual(call_args[0][0], req)
         self.assertIsInstance(call_args[0][1], list)  # top_logprobs_val
         self.assertIsInstance(call_args[0][2], list)  # top_logprobs_idx
@@ -588,17 +561,7 @@ class TestInternalProcessPrefillResult(unittest.TestCase):
         self.assertTrue(all(call_args[0][3]))
         self.assertTrue(call_args[0][4])  # finish_by_len should be True
 
-    @patch.object(
-        SchedulerBeamSearchProcessorMixin,
-        "_batch_check_prefill_generated_tokens_stop_conditions",
-    )
-    @patch.object(
-        SchedulerBeamSearchProcessorMixin,
-        "_create_completed_beams_for_insufficient_candidates",
-    )
-    def test_internal_process_prefill_result_insufficient_candidates(
-        self, mock_create_completed, mock_check_stop
-    ):
+    def test_internal_process_prefill_result_insufficient_candidates(self):
         """Test internal prefill processing when insufficient candidates (< beam_width).
 
         This tests the branch where (~finish_mask).sum().item() < req.beam_width,
@@ -631,15 +594,15 @@ class TestInternalProcessPrefillResult(unittest.TestCase):
             finish_mask[3] = False
             return finish_mask
 
-        mock_check_stop.side_effect = mock_check_stop_func
+        self.mock_check_stop.side_effect = mock_check_stop_func
 
         self.scheduler._process_beam_search_prefill_result_single_req(
             req, batch, logprobs, device
         )
 
-        mock_check_stop.assert_called_once()
-        mock_create_completed.assert_called_once()
-        call_args = mock_create_completed.call_args
+        self.mock_check_stop.assert_called_once()
+        self.mock_create_completed.assert_called_once()
+        call_args = self.mock_create_completed.call_args
         self.assertEqual(call_args[0][0], req)
         self.assertEqual(len(call_args[0][1]), req.beam_candidates)
         self.assertEqual(len(call_args[0][2]), req.beam_candidates)
@@ -851,6 +814,14 @@ class TestCheckBeamFinished(unittest.TestCase):
         """Set up test fixtures."""
         self.scheduler = create_mock_scheduler()
 
+        self.patcher_tail_str = patch.object(
+            SchedulerBeamSearchProcessorMixin, "_tail_str"
+        )
+
+        self.mock_tail_str = self.patcher_tail_str.start()
+
+        self.addCleanup(self.patcher_tail_str.stop)
+
     def test_check_beam_finished_with_stop_token(self):
         """Test beam finish check with stop token."""
         req = Mock()
@@ -872,10 +843,9 @@ class TestCheckBeamFinished(unittest.TestCase):
         self.assertIsInstance(beam.finish_reason, FINISH_MATCHED_TOKEN)
         self.assertEqual(beam.finish_reason.matched, 50256)
 
-    @patch.object(SchedulerBeamSearchProcessorMixin, "_tail_str")
-    def test_check_beam_finished_with_stop_string(self, mock_tail_str):
+    def test_check_beam_finished_with_stop_string(self):
         """Test beam finish check with stop string."""
-        mock_tail_str.return_value = "This is STOP"
+        self.mock_tail_str.return_value = "This is STOP"
 
         req = Mock()
         req.sampling_params = Mock()
@@ -895,12 +865,11 @@ class TestCheckBeamFinished(unittest.TestCase):
         self.assertTrue(is_finished)
         self.assertIsInstance(beam.finish_reason, FINISH_MATCHED_STR)
         self.assertEqual(beam.finish_reason.matched, "STOP")
-        mock_tail_str.assert_called_once_with(req, beam.tokens)
+        self.mock_tail_str.assert_called_once_with(req, beam.tokens)
 
-    @patch.object(SchedulerBeamSearchProcessorMixin, "_tail_str")
-    def test_check_beam_finished_with_regex(self, mock_tail_str):
+    def test_check_beam_finished_with_regex(self):
         """Test beam finish check with regex pattern."""
-        mock_tail_str.return_value = "Call 123-4567 now"
+        self.mock_tail_str.return_value = "Call 123-4567 now"
 
         req = Mock()
         req.sampling_params = Mock()
@@ -921,12 +890,11 @@ class TestCheckBeamFinished(unittest.TestCase):
         self.assertTrue(is_finished)
         self.assertIsInstance(beam.finish_reason, FINISHED_MATCHED_REGEX)
         self.assertEqual(beam.finish_reason.matched, r"\d{3}-\d{4}")
-        mock_tail_str.assert_called_once_with(req, beam.tokens)
+        self.mock_tail_str.assert_called_once_with(req, beam.tokens)
 
-    @patch.object(SchedulerBeamSearchProcessorMixin, "_tail_str")
-    def test_check_beam_not_finished(self, mock_tail_str):
+    def test_check_beam_not_finished(self):
         """Test beam that should not be marked as finished."""
-        mock_tail_str.return_value = "Continue"
+        self.mock_tail_str.return_value = "Continue"
 
         req = Mock()
         req.sampling_params = Mock()
@@ -946,12 +914,11 @@ class TestCheckBeamFinished(unittest.TestCase):
 
         self.assertFalse(is_finished)
         self.assertIsNone(beam.finish_reason)
-        mock_tail_str.assert_called_once_with(req, beam.tokens)
+        self.mock_tail_str.assert_called_once_with(req, beam.tokens)
 
-    @patch.object(SchedulerBeamSearchProcessorMixin, "_tail_str")
-    def test_check_beam_not_finished_with_ignore_eos(self, mock_tail_str):
+    def test_check_beam_not_finished_with_ignore_eos(self):
         """Test beam not finished when ignore_eos=True even with EOS token."""
-        mock_tail_str.return_value = "Text without stop"
+        self.mock_tail_str.return_value = "Text without stop"
 
         req = Mock()
         req.sampling_params = Mock()
@@ -971,12 +938,11 @@ class TestCheckBeamFinished(unittest.TestCase):
 
         self.assertFalse(is_finished)
         self.assertIsNone(beam.finish_reason)
-        mock_tail_str.assert_called_once_with(req, beam.tokens)
+        self.mock_tail_str.assert_called_once_with(req, beam.tokens)
 
-    @patch.object(SchedulerBeamSearchProcessorMixin, "_tail_str")
-    def test_check_beam_finished_with_empty_tail_str(self, mock_tail_str):
+    def test_check_beam_finished_with_empty_tail_str(self):
         """Test beam finish check when tail_str is empty (returns False early)."""
-        mock_tail_str.return_value = ""  # Key: empty tail_str
+        self.mock_tail_str.return_value = ""  # Key: empty tail_str
 
         req = Mock()
         req.sampling_params = Mock()
@@ -997,7 +963,7 @@ class TestCheckBeamFinished(unittest.TestCase):
         # Should return False early when tail_str is empty
         self.assertFalse(is_finished)
         self.assertIsNone(beam.finish_reason)
-        mock_tail_str.assert_called_once_with(req, beam.tokens)
+        self.mock_tail_str.assert_called_once_with(req, beam.tokens)
 
 
 class TestTailStr(unittest.TestCase):
@@ -1081,14 +1047,21 @@ class TestProcessBeamSearchExpansion(unittest.TestCase):
         """Set up test fixtures."""
         self.scheduler = create_mock_scheduler()
 
-    @patch.object(SchedulerBeamSearchProcessorMixin, "_expand_and_prune_beams")
-    @patch.object(
-        SchedulerBeamSearchProcessorMixin,
-        "_create_completed_beams_for_finished_request",
-    )
-    def test_process_beam_search_expansion_normal_path(
-        self, mock_create_completed, mock_expand_prune
-    ):
+        self.patcher_expand_prune = patch.object(
+            SchedulerBeamSearchProcessorMixin, "_expand_and_prune_beams"
+        )
+        self.patcher_create_completed = patch.object(
+            SchedulerBeamSearchProcessorMixin,
+            "_create_completed_beams_for_finished_request",
+        )
+
+        self.mock_expand_prune = self.patcher_expand_prune.start()
+        self.mock_create_completed = self.patcher_create_completed.start()
+
+        self.addCleanup(self.patcher_expand_prune.stop)
+        self.addCleanup(self.patcher_create_completed.stop)
+
+    def test_process_beam_search_expansion_normal_path(self):
         """Test normal expansion path (not finished, continues beam search)."""
         device = torch.device("cpu")
 
@@ -1116,25 +1089,18 @@ class TestProcessBeamSearchExpansion(unittest.TestCase):
             [[-1.0, -2.0, -3.0, -4.0], [-1.5, -2.5, -3.5, -4.5]], device=device
         )
 
-        mock_expand_prune.return_value = [0, 1]
+        self.mock_expand_prune.return_value = [0, 1]
 
         result = self.scheduler._process_beam_search_expansion(
             req, batch, 2, 4, beam_output_top_tokens, beam_output_top_logprobs
         )
 
-        mock_expand_prune.assert_called_once()
-        mock_create_completed.assert_not_called()
+        self.mock_expand_prune.assert_called_once()
+        self.mock_create_completed.assert_not_called()
         self.assertIsNotNone(result)
         self.assertEqual(result.cpu().tolist(), [0, 1])
 
-    @patch.object(SchedulerBeamSearchProcessorMixin, "_expand_and_prune_beams")
-    @patch.object(
-        SchedulerBeamSearchProcessorMixin,
-        "_create_completed_beams_for_finished_request",
-    )
-    def test_process_beam_search_expansion_finished_by_length(
-        self, mock_create_completed, mock_expand_prune
-    ):
+    def test_process_beam_search_expansion_finished_by_length(self):
         """Test expansion when request finishes due to max_new_tokens."""
         device = torch.device("cpu")
 
@@ -1165,19 +1131,12 @@ class TestProcessBeamSearchExpansion(unittest.TestCase):
             req, batch, 2, 4, beam_output_top_tokens, beam_output_top_logprobs
         )
 
-        mock_create_completed.assert_called_once()
-        mock_expand_prune.assert_not_called()
+        self.mock_create_completed.assert_called_once()
+        self.mock_expand_prune.assert_not_called()
         self.assertIsInstance(req.finished_reason, FINISH_LENGTH)
         self.assertIsNone(result)
 
-    @patch.object(SchedulerBeamSearchProcessorMixin, "_expand_and_prune_beams")
-    @patch.object(
-        SchedulerBeamSearchProcessorMixin,
-        "_create_completed_beams_for_finished_request",
-    )
-    def test_process_beam_search_expansion_with_to_finish(
-        self, mock_create_completed, mock_expand_prune
-    ):
+    def test_process_beam_search_expansion_with_to_finish(self):
         """Test expansion when request has to_finish set."""
         device = torch.device("cpu")
 
@@ -1208,21 +1167,14 @@ class TestProcessBeamSearchExpansion(unittest.TestCase):
             req, batch, 2, 4, beam_output_top_tokens, beam_output_top_logprobs
         )
 
-        mock_create_completed.assert_called_once()
-        call_args = mock_create_completed.call_args[0]
+        self.mock_create_completed.assert_called_once()
+        call_args = self.mock_create_completed.call_args[0]
         self.assertIsInstance(call_args[6], FINISH_MATCHED_TOKEN)
-        mock_expand_prune.assert_not_called()
+        self.mock_expand_prune.assert_not_called()
         self.assertEqual(req.finished_reason, req.to_finish)
         self.assertIsNone(result)
 
-    @patch.object(SchedulerBeamSearchProcessorMixin, "_expand_and_prune_beams")
-    @patch.object(
-        SchedulerBeamSearchProcessorMixin,
-        "_create_completed_beams_for_finished_request",
-    )
-    def test_process_beam_search_expansion_with_empty_keep_indices(
-        self, mock_create_completed, mock_expand_prune
-    ):
+    def test_process_beam_search_expansion_with_empty_keep_indices(self):
         """Test expansion when _expand_and_prune_beams returns None (keep_last_beam_indices is empty)."""
         device = torch.device("cpu")
 
@@ -1250,14 +1202,14 @@ class TestProcessBeamSearchExpansion(unittest.TestCase):
         )
 
         # Mock _expand_and_prune_beams to return None (insufficient candidates)
-        mock_expand_prune.return_value = None
+        self.mock_expand_prune.return_value = None
 
         result = self.scheduler._process_beam_search_expansion(
             req, batch, 2, 4, beam_output_top_tokens, beam_output_top_logprobs
         )
 
-        mock_expand_prune.assert_called_once()
-        mock_create_completed.assert_not_called()
+        self.mock_expand_prune.assert_called_once()
+        self.mock_create_completed.assert_not_called()
         self.assertIsNone(result)
 
 
@@ -1267,6 +1219,21 @@ class TestExpandAndPruneBeams(unittest.TestCase):
     def setUp(self):
         """Set up test fixtures."""
         self.scheduler = create_mock_scheduler()
+
+        self.patcher_calc_score = patch.object(
+            SchedulerBeamSearchProcessorMixin,
+            "_calculate_beam_score",
+            return_value=0.5,
+        )
+        self.patcher_check_finished = patch.object(
+            SchedulerBeamSearchProcessorMixin, "_check_beam_finished"
+        )
+
+        self.mock_calc_score = self.patcher_calc_score.start()
+        self.mock_check_finished = self.patcher_check_finished.start()
+
+        self.addCleanup(self.patcher_calc_score.stop)
+        self.addCleanup(self.patcher_check_finished.stop)
 
     def test_expand_and_prune_beams_no_stop_conditions(self):
         """Test beam expansion without stop conditions (fast path)."""
@@ -1327,12 +1294,7 @@ class TestExpandAndPruneBeams(unittest.TestCase):
             )
         )
 
-    @patch.object(
-        SchedulerBeamSearchProcessorMixin,
-        "_calculate_beam_score_with_eos_check",
-        return_value=0.5,
-    )
-    def test_expand_and_prune_beams_with_eos(self, mock_calc_score):
+    def test_expand_and_prune_beams_with_eos(self):
         """Test beam expansion with EOS tokens (vectorized path)."""
         device = torch.device("cpu")
 
@@ -1380,19 +1342,13 @@ class TestExpandAndPruneBeams(unittest.TestCase):
         self.assertEqual(req.beam_list.incomplete[1].tokens, [3, 4, 500])
         self.assertEqual(req.beam_list.incomplete[1].cum_logprob, -3.5)
 
-        mock_calc_score.assert_called_once()
+        self.mock_calc_score.assert_called_once()
 
-    @patch.object(
-        SchedulerBeamSearchProcessorMixin,
-        "_calculate_beam_score_with_eos_check",
-        return_value=0.8,
-    )
-    @patch.object(SchedulerBeamSearchProcessorMixin, "_check_beam_finished")
-    def test_expand_and_prune_beams_with_stop_strs(
-        self, mock_check_finished, mock_calc_score
-    ):
+    def test_expand_and_prune_beams_with_stop_strs(self):
         """Test beam expansion with stop_strs (sequential check path)."""
         device = torch.device("cpu")
+
+        self.mock_calc_score.return_value = 0.8
 
         req = Mock()
         req.sampling_params = Mock()
@@ -1430,7 +1386,7 @@ class TestExpandAndPruneBeams(unittest.TestCase):
             # Last 2 beams incomplete (tokens 700, 800)
             return False
 
-        mock_check_finished.side_effect = check_finished_side_effect
+        self.mock_check_finished.side_effect = check_finished_side_effect
 
         result = self.scheduler._expand_and_prune_beams(
             req, beam_width, topk, topk_indices, topk_values, all_tokens_flat
@@ -1439,7 +1395,7 @@ class TestExpandAndPruneBeams(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertEqual(len(result), beam_width)
 
-        self.assertEqual(mock_check_finished.call_count, 8)
+        self.assertEqual(self.mock_check_finished.call_count, 8)
 
         self.assertEqual(len(req.beam_list.completed), 6)
         self.assertEqual(req.beam_list.completed[0].tokens, [1, 2, 100])
@@ -1469,19 +1425,13 @@ class TestExpandAndPruneBeams(unittest.TestCase):
             )
         )
 
-        self.assertEqual(mock_calc_score.call_count, 6)
+        self.assertEqual(self.mock_calc_score.call_count, 6)
 
-    @patch.object(
-        SchedulerBeamSearchProcessorMixin,
-        "_calculate_beam_score_with_eos_check",
-        return_value=-1.0,
-    )
-    @patch.object(SchedulerBeamSearchProcessorMixin, "_check_beam_finished")
-    def test_expand_and_prune_beams_insufficient_candidates(
-        self, mock_check_finished, mock_calc_score
-    ):
+    def test_expand_and_prune_beams_insufficient_candidates(self):
         """Test beam expansion when insufficient candidates remain."""
         device = torch.device("cpu")
+
+        self.mock_calc_score.return_value = -1.0
 
         req = Mock()
         req.sampling_params = Mock()
@@ -1511,7 +1461,7 @@ class TestExpandAndPruneBeams(unittest.TestCase):
         self.assertIsNone(result)
         self.assertEqual(len(req.beam_list.completed), 6)
         self.assertEqual(len(req.beam_list.incomplete), 0)
-        self.assertEqual(mock_calc_score.call_count, 6)
+        self.assertEqual(self.mock_calc_score.call_count, 6)
         for beam in req.beam_list.completed:
             self.assertEqual(beam.beam_score, -1.0)
 
@@ -1581,11 +1531,20 @@ class TestHandleBeamKVCache(unittest.TestCase):
 
         self.scheduler = create_mock_scheduler()
 
-    @patch.object(SchedulerBeamSearchProcessorMixin, "_batch_collect_range_kv_indices")
-    @patch.object(SchedulerBeamSearchProcessorMixin, "_copy_kvcache_for_beams")
-    def test_handle_beam_kv_cache_beam_pruning(
-        self, mock_copy_kvcache, mock_collect_kv
-    ):
+        self.patcher_collect_kv = patch.object(
+            SchedulerBeamSearchProcessorMixin, "_batch_collect_range_kv_indices"
+        )
+        self.patcher_copy_kvcache = patch.object(
+            SchedulerBeamSearchProcessorMixin, "_copy_kvcache_for_beams"
+        )
+
+        self.mock_collect_kv = self.patcher_collect_kv.start()
+        self.mock_copy_kvcache = self.patcher_copy_kvcache.start()
+
+        self.addCleanup(self.patcher_collect_kv.stop)
+        self.addCleanup(self.patcher_copy_kvcache.stop)
+
+    def test_handle_beam_kv_cache_beam_pruning(self):
         """Test KV cache handling when beams are pruned (some beams not kept).
 
         Scenario: Last round had 2 beams at req_to_token slots [0, 1].
@@ -1613,20 +1572,20 @@ class TestHandleBeamKVCache(unittest.TestCase):
         req_to_token_pool.req_to_token = torch.arange(20, device=device).reshape(2, 10)
         self.scheduler.req_to_token_pool = req_to_token_pool
 
-        mock_collect_kv.return_value = torch.tensor(
+        self.mock_collect_kv.return_value = torch.tensor(
             [100, 101, 102, 103, 104, 200, 201, 202, 203, 204], device=device
         )
 
-        mock_copy_kvcache.return_value = torch.tensor(
+        self.mock_copy_kvcache.return_value = torch.tensor(
             [100, 101, 102, 103, 104], device=device
         )
 
         self.scheduler._handle_beam_kv_cache(batch, [req], [last_batch_slot_indices])
 
-        mock_collect_kv.assert_called_once()
+        self.mock_collect_kv.assert_called_once()
 
-        mock_copy_kvcache.assert_called_once()
-        copy_args = mock_copy_kvcache.call_args[0]
+        self.mock_copy_kvcache.assert_called_once()
+        copy_args = self.mock_copy_kvcache.call_args[0]
         self.assertTrue(torch.equal(copy_args[0], torch.tensor([0, 0], device=device)))
         self.assertTrue(torch.equal(copy_args[1], torch.tensor([0, 1], device=device)))
 
@@ -1635,11 +1594,7 @@ class TestHandleBeamKVCache(unittest.TestCase):
         expected_freed = torch.tensor([200, 201, 202, 203, 204], device=device)
         self.assertTrue(torch.equal(torch.sort(freed_indices)[0], expected_freed))
 
-    @patch.object(SchedulerBeamSearchProcessorMixin, "_batch_collect_range_kv_indices")
-    @patch.object(SchedulerBeamSearchProcessorMixin, "_copy_kvcache_for_beams")
-    def test_handle_beam_kv_cache_multiple_requests(
-        self, mock_copy_kvcache, mock_collect_kv
-    ):
+    def test_handle_beam_kv_cache_multiple_requests(self):
         """Test KV cache handling for multiple beam search requests."""
         device = torch.device("cpu")
 
@@ -1667,12 +1622,12 @@ class TestHandleBeamKVCache(unittest.TestCase):
         req_to_token_pool.req_to_token = torch.arange(60, device=device).reshape(5, 12)
         self.scheduler.req_to_token_pool = req_to_token_pool
 
-        mock_collect_kv.return_value = torch.tensor(
+        self.mock_collect_kv.return_value = torch.tensor(
             [100, 101, 102, 103, 104, 105, 200, 201, 202, 203, 204, 205],
             device=device,
         )
 
-        mock_copy_kvcache.return_value = torch.tensor(
+        self.mock_copy_kvcache.return_value = torch.tensor(
             [100, 101, 104, 105, 200, 201, 202, 203, 204, 205],
             device=device,
         )
@@ -1681,8 +1636,8 @@ class TestHandleBeamKVCache(unittest.TestCase):
             batch, [req1, req2], [last_batch_slot_indices_1, last_batch_slot_indices_2]
         )
 
-        self.assertEqual(mock_collect_kv.call_count, 1)
-        call_args = mock_collect_kv.call_args
+        self.assertEqual(self.mock_collect_kv.call_count, 1)
+        call_args = self.mock_collect_kv.call_args
         self.assertTrue(
             torch.equal(call_args[0][0], torch.tensor([0, 1, 2, 3, 4], device=device))
         )
@@ -1693,8 +1648,8 @@ class TestHandleBeamKVCache(unittest.TestCase):
         expected_prompt_lens = torch.tensor([5, 5, 6, 6, 6], device=device)
         self.assertTrue(torch.equal(call_args[0][3], expected_prompt_lens))
 
-        mock_copy_kvcache.assert_called_once()
-        copy_call_args = mock_copy_kvcache.call_args
+        self.mock_copy_kvcache.assert_called_once()
+        copy_call_args = self.mock_copy_kvcache.call_args
         self.assertTrue(
             torch.equal(
                 copy_call_args[0][0], torch.tensor([0, 0, 2, 3, 4], device=device)
@@ -1782,11 +1737,21 @@ class TestBatchCollectRangeKVIndices(unittest.TestCase):
 class TestCacheFinishedBeamSearch(unittest.TestCase):
     """Test caching finished beam search requests."""
 
-    @patch("sglang.srt.managers.scheduler_beam_search_processor_mixin.release_kv_cache")
-    @patch.object(
-        SchedulerBeamSearchProcessorMixin, "_collect_beam_req_decode_kv_indices"
-    )
-    def test_cache_finished_beam_search(self, mock_collect_kv, mock_release_kv_cache):
+    def setUp(self):
+        self.patcher_release_kv = patch(
+            "sglang.srt.managers.scheduler_beam_search_processor_mixin.release_kv_cache"
+        )
+        self.patcher_collect_kv = patch.object(
+            SchedulerBeamSearchProcessorMixin, "_collect_beam_req_decode_kv_indices"
+        )
+
+        self.mock_release_kv_cache = self.patcher_release_kv.start()
+        self.mock_collect_kv = self.patcher_collect_kv.start()
+
+        self.addCleanup(self.patcher_release_kv.stop)
+        self.addCleanup(self.patcher_collect_kv.stop)
+
+    def test_cache_finished_beam_search(self):
         """Test releasing KV cache for finished beam search."""
         device = torch.device("cpu")
 
@@ -1805,7 +1770,7 @@ class TestCacheFinishedBeamSearch(unittest.TestCase):
 
         expected_kv = [105, 106, 205, 206, 305, 306]
         expected_pool = [0, 1, 2]
-        mock_collect_kv.return_value = (
+        self.mock_collect_kv.return_value = (
             torch.tensor(expected_kv, device=device),
             torch.tensor(expected_pool, device=device),
         )
@@ -1814,7 +1779,7 @@ class TestCacheFinishedBeamSearch(unittest.TestCase):
 
         SchedulerBeamSearchProcessorMixin._cache_finished_beam_search(scheduler, batch)
 
-        mock_collect_kv.assert_called_once()
+        self.mock_collect_kv.assert_called_once()
 
         kv_indices = (
             scheduler.token_to_kv_pool_allocator.free.call_args[0][0].cpu().tolist()
@@ -1824,7 +1789,7 @@ class TestCacheFinishedBeamSearch(unittest.TestCase):
         pool_indices = scheduler.req_to_token_pool.free.call_args[0][0]
         self.assertEqual(pool_indices, [0, 1, 2])
 
-        mock_release_kv_cache.assert_called_once()
+        self.mock_release_kv_cache.assert_called_once()
 
 
 class TestCopyKVCacheForBeams(unittest.TestCase):
@@ -2053,39 +2018,6 @@ class TestCalculateBeamScore(unittest.TestCase):
             cum_logprob, seq_len, length_penalty=0.5
         )
         expected = -10.0 / (4**0.5)  # -10.0 / 2 = -5.0
-        self.assertAlmostEqual(score, expected, places=5)
-
-    def test_calculate_beam_score_with_eos_check(self):
-        """Test beam score calculation with EOS token handling."""
-        # Create a beam with EOS token at the end
-        beam = BeamSearchSequence(
-            tokens=[1, 2, 3, 50256],  # 50256 is EOS token
-            cum_logprob=-8.0,
-        )
-        stop_token_ids = {50256}
-
-        score = SchedulerBeamSearchProcessorMixin._calculate_beam_score_with_eos_check(
-            beam, stop_token_ids, length_penalty=1.0
-        )
-
-        # Should use seq_len=3 (excluding EOS), so score = -8.0 / 3
-        expected = -8.0 / 3.0
-        self.assertAlmostEqual(score, expected, places=5)
-
-    def test_calculate_beam_score_without_eos(self):
-        """Test beam score calculation when last token is not EOS."""
-        beam = BeamSearchSequence(
-            tokens=[1, 2, 3, 4],
-            cum_logprob=-12.0,
-        )
-        stop_token_ids = {50256}
-
-        score = SchedulerBeamSearchProcessorMixin._calculate_beam_score_with_eos_check(
-            beam, stop_token_ids, length_penalty=1.0
-        )
-
-        # Should use seq_len=4 (no EOS to exclude), so score = -12.0 / 4
-        expected = -12.0 / 4.0
         self.assertAlmostEqual(score, expected, places=5)
 
 

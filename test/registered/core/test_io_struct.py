@@ -24,15 +24,12 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         cls.base_url = DEFAULT_URL_FOR_TEST
 
         # Mock get_global_server_args once for all tests
-        cls.patcher = patch(
+        cls.mock_get_global_server_args = patch(
             "sglang.srt.managers.io_struct.get_global_server_args",
             return_value=SimpleNamespace(enable_beam_search=False),
         )
-        cls.patcher.start()
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.patcher.stop()
+        cls.mock_get_global_server_args.start()
+        cls.addClassCleanup(cls.mock_get_global_server_args.stop)
 
     def setUp(self):
         # Common setup for all tests
