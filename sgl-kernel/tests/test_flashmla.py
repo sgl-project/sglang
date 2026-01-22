@@ -342,14 +342,14 @@ def test_flashmla_prefill(
     sm_scale = 1 / math.sqrt(576)
     torch.cuda.synchronize()
 
-    answer_out, answer_max_logits, ans_lse = flash_mla_sparse_fwd(
+    answer_out, answer_max_logits, answer_lse = flash_mla_sparse_fwd(
         q.squeeze(0), kv.squeeze(0), indices.squeeze(0), sm_scale=sm_scale
     )
 
-    answer_out, answer_max_logits, ans_lse = (
+    answer_out, answer_max_logits, answer_lse = (
         answer_out.float(),
         answer_max_logits.float(),
-        ans_lse.float(),
+        answer_lse.float(),
     )
 
     torch.cuda.synchronize()
@@ -365,7 +365,7 @@ def test_flashmla_prefill(
         atol=1e-6,
         rtol=2.01 / 65536,
     )
-    torch.testing.assert_close(ans_lse, ref_lse, atol=1e-6, rtol=2.01 / 65536)
+    torch.testing.assert_close(answer_lse, ref_lse, atol=1e-6, rtol=2.01 / 65536)
 
 
 @pytest.mark.skipif(not is_sm90_supported(), reason="SM90 required for FP8 support")
