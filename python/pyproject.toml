@@ -69,6 +69,7 @@ dependencies = [
   "torchaudio==2.9.1",
   "torchcodec==0.8.0 ; sys_platform != 'linux' or (sys_platform == 'linux' and platform_machine != 'aarch64' and platform_machine != 'arm64' and platform_machine != 'armv7l')", # torchcodec does not exist in those systems. If not provided, transformer will use torchvision instead by default.
   "torchvision",
+  "torchao==0.9.0",
   "tqdm",
   "transformers==4.57.1",
   "uvicorn",
