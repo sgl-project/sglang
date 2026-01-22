@@ -117,8 +117,15 @@ class RequestLogger:
             and obj.input_ids is not None
             and tokenizer is not None
         ):
-            decoded = tokenizer.decode(obj.input_ids, skip_special_tokens=False)
-            obj.text = decoded
+            if obj.is_single:
+                # Single request: input_ids is List[int]
+                decoded = tokenizer.decode(obj.input_ids, skip_special_tokens=False)
+                obj.text = decoded
+            else:
+                # Batch request (including parallel sampling): input_ids is List[List[int]]
+                # Decode each individual request's input_ids
+                decoded_list = tokenizer.batch_decode(obj.input_ids, skip_special_tokens=False)
+                obj.text = decoded_list
 
     def log_finished_request(
         self,
