@@ -499,7 +499,7 @@ def test_flash_mla_decode(
     )
     torch.cuda.synchronize()
 
-    out_answer, lse_ans = flash_mla_with_kvcache(
+    out_answer, lse_answer = flash_mla_with_kvcache(
         q,
         blocked_k if not is_fp8 else blocked_k_quantized,  # type: ignore
         block_table,
@@ -516,7 +516,7 @@ def test_flash_mla_decode(
         cache_seqlens, block_table, q, blocked_k, dv, is_causal, abs_indices
     )
     torch.testing.assert_close(out_answer, out_ref, atol=8e-4, rtol=2.01 / 128)
-    torch.testing.assert_close(lse_ans, lse_ref, atol=1e-6, rtol=8.01 / 65536)
+    torch.testing.assert_close(lse_answer, lse_ref, atol=1e-6, rtol=8.01 / 65536)
 
 
 @pytest.mark.skipif(not is_sm90_supported(), reason="SM90 required for FP8 support")
