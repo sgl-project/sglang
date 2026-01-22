@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple, Type, Union
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ModelWorkerBatch
     from sglang.srt.managers.tp_worker import TpModelWorker
+    from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
     from sglang.srt.speculative.ngram_worker import NGRAMWorker
 
@@ -49,12 +50,29 @@ class SpeculativeAlgorithm(Enum):
         return self.is_eagle() or self.is_standalone()
 
     def create_worker(
-        self, enable_overlap: bool = False
+        self, server_args: ServerArgs
     ) -> Optional[Union[Type[BaseSpecWorker], Type[TpModelWorker], Type[NGRAMWorker]]]:
-        if self.is_none():
-            return None
+        assert (
+            not self.is_none()
+        ), "Cannot create worker for NONE speculative algorithm."
 
-        if self.is_eagle():
+        enable_overlap = not server_args.disable_overlap_schedule
+        if self.is_eagle() and server_args.enable_multi_layer_eagle:
+            # FIXME: migrate to EagleWorker
+            if enable_overlap:
+                from sglang.srt.speculative.multi_layer_eagle_worker_v2 import (
+                    MultiLayerEagleWorkerV2,
+                )
+
+                return MultiLayerEagleWorkerV2
+
+            from sglang.srt.speculative.multi_layer_eagle_worker import (
+                MultiLayerEagleWorker,
+            )
+
+            return MultiLayerEagleWorker
+
+        elif self.is_eagle():
             if enable_overlap:
                 from sglang.srt.speculative.eagle_worker_v2 import EAGLEWorkerV2
 

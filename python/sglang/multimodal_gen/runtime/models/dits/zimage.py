@@ -6,6 +6,7 @@ import torch.nn as nn
 
 from sglang.jit_kernel.norm import can_use_fused_inplace_qknorm
 from sglang.multimodal_gen.configs.models.dits.zimage import ZImageDitConfig
+from sglang.multimodal_gen.runtime.distributed import get_tp_world_size
 from sglang.multimodal_gen.runtime.layers.activation import SiluAndMul
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
 from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm, apply_qk_norm
@@ -25,6 +26,7 @@ from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiT
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
+_is_cuda = current_platform.is_cuda()
 
 ADALN_EMBED_DIM = 256
 SEQ_MULTI_OF = 32
@@ -118,9 +120,23 @@ class ZImageAttention(nn.Module):
         self.num_kv_heads = num_kv_heads
         self.qk_norm = qk_norm
 
-        self.to_q = ReplicatedLinear(dim, dim, bias=False)
-        self.to_k = ReplicatedLinear(dim, self.head_dim * num_kv_heads, bias=False)
-        self.to_v = ReplicatedLinear(dim, self.head_dim * num_kv_heads, bias=False)
+        tp_size = get_tp_world_size()
+        assert (
+            num_heads % tp_size == 0
+        ), f"num_heads {num_heads} must be divisible by tp world size {tp_size}"
+        assert (
+            num_kv_heads % tp_size == 0
+        ), f"num_kv_heads {num_kv_heads} must be divisible by tp world size {tp_size}"
+        self.local_num_heads = num_heads // tp_size
+        self.local_num_kv_heads = num_kv_heads // tp_size
+
+        self.to_q = ColumnParallelLinear(dim, dim, bias=False, gather_output=False)
+        self.to_k = ColumnParallelLinear(
+            dim, self.head_dim * num_kv_heads, bias=False, gather_output=False
+        )
+        self.to_v = ColumnParallelLinear(
+            dim, self.head_dim * num_kv_heads, bias=False, gather_output=False
+        )
 
         if self.qk_norm:
             self.norm_q = RMSNorm(self.head_dim, eps=eps)
@@ -134,9 +150,9 @@ class ZImageAttention(nn.Module):
         )
 
         self.attn = USPAttention(
-            num_heads=num_heads,
+            num_heads=self.local_num_heads,
             head_size=self.head_dim,
-            num_kv_heads=num_kv_heads,
+            num_kv_heads=self.local_num_kv_heads,
             dropout_rate=0,
             softmax_scale=None,
             causal=False,
@@ -150,14 +166,13 @@ class ZImageAttention(nn.Module):
         q, _ = self.to_q(hidden_states)
         k, _ = self.to_k(hidden_states)
         v, _ = self.to_v(hidden_states)
-
-        q = q.view(*q.shape[:-1], self.num_heads, self.head_dim)
-        k = k.view(*k.shape[:-1], self.num_kv_heads, self.head_dim)
-        v = v.view(*v.shape[:-1], self.num_kv_heads, self.head_dim)
+        q = q.view(*q.shape[:-1], self.local_num_heads, self.head_dim)
+        k = k.view(*k.shape[:-1], self.local_num_kv_heads, self.head_dim)
+        v = v.view(*v.shape[:-1], self.local_num_kv_heads, self.head_dim)
 
         if self.qk_norm:
             if (
-                q.is_cuda
+                _is_cuda
                 and (self.norm_q.variance_epsilon == self.norm_k.variance_epsilon)
                 and can_use_fused_inplace_qknorm(self.head_dim, q.dtype)
             ):
@@ -175,7 +190,7 @@ class ZImageAttention(nn.Module):
 
         if freqs_cis is not None:
             cos, sin = freqs_cis
-            if q.is_cuda and q.shape == k.shape:
+            if _is_cuda and q.shape == k.shape:
                 cos_sin_cache = torch.cat(
                     [
                         cos.to(dtype=torch.float32).contiguous(),
