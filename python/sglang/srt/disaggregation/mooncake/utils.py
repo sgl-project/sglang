@@ -14,7 +14,6 @@
 """Mooncake-specific utilities for custom memory pool management."""
 
 import logging
-import os
 from typing import Any, Optional, Tuple
 
 import torch
@@ -48,8 +47,7 @@ def init_mooncake_custom_mem_pool(
     if enable_custom_mem_pool:
         try:
             if custom_mem_pool_type == "NVLINK":
-                from mooncake.allocator import NVLinkAllocator
-                from mooncake.allocator import MemoryBackend
+                from mooncake.allocator import NVLinkAllocator, MemoryBackend
                 mem_backend = NVLinkAllocator.detect_mem_backend()
                 if mem_backend == MemoryBackend.USE_CUMEMCREATE:
                     logger.info("I support fabric mem, using NVLink memory pool")
@@ -93,7 +91,6 @@ def init_mooncake_custom_mem_pool(
             )
             return False, None, None
     else:
-        logger.debug("Custom memory pool is disabled; using default allocator (cudaMalloc).")
         return False, None, None
 
 
