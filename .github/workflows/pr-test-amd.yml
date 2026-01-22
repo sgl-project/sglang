@@ -936,6 +936,18 @@ jobs:
           set +e
 
           echo ""
+          echo "=== 0. Checking standard path for Ionic driver ==="
+          ls -l /usr/lib/x86_64-linux-gnu/libibverbs/libionic* 2>/dev/null || echo "libionic not found in standard path"
+
+          echo ""
+          echo "=== 0. Deep search for libionic-rdmav34.so ==="
+          find /usr /lib /opt -name "libionic-rdmav34.so" 2>/dev/null || echo "libionic-rdmav34.so not found anywhere"
+
+          echo ""
+          echo "=== 0. Search for any ionic related libraries ==="
+          find /usr /lib /opt -name "*libionic*" 2>/dev/null || echo "No ionic related files found"
+
+          echo ""
           echo "=== 1. libibverbs provider configs ==="
           find /etc -name "*.driver" 2>/dev/null || true
           ls -la /etc/libibverbs.d/ 2>/dev/null || echo "/etc/libibverbs.d not found"
