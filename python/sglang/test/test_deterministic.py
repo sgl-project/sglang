@@ -670,10 +670,10 @@ def test_deterministic(args):
 
     elif args.test_mode == "p_vs_d":
         # TODO also extract other modes to functions
-        ans = []
+        answer = []
         for i in range(1, args.n_trials + 1):
-            ans += _test_mode_p_vs_d(args, batch_size=i)
-        return ans
+            answer += _test_mode_p_vs_d(args, batch_size=i)
+        return answer
 
     else:
         raise ValueError(f"Invalid test mode: {args.test_mode}")
