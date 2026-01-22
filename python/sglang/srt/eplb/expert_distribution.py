@@ -595,11 +595,11 @@ def _convert_local_to_global_physical_count(
     device = local_physical_count.device
     num_layers, _ = local_physical_count.shape
 
-    ans = torch.zeros((num_layers, num_physical_experts), dtype=dtype, device=device)
-    ans[
+    answer = torch.zeros((num_layers, num_physical_experts), dtype=dtype, device=device)
+    answer[
         :, num_local_physical_experts * rank : num_local_physical_experts * (rank + 1)
     ] = local_physical_count
-    return ans
+    return answer
 
 
 # --------------------------------------- Accumulator -----------------------------------------
