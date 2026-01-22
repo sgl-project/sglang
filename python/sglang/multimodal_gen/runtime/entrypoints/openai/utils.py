@@ -212,19 +212,19 @@ async def process_generation_batch(
         result = await scheduler_client.forward([batch])
 
         if result.output is None:
-            error_msg = getattr(result, "error", "Unknown error")
+            error_msg = result.error or "Unknown error"
             raise RuntimeError(
                 f"Model generation returned no output. Error from scheduler: {error_msg}"
             )
         save_file_path_list = []
-        audio_sample_rate = getattr(result, "audio_sample_rate", None)
+        audio_sample_rate = result.audio_sample_rate
         if batch.data_type == DataType.VIDEO:
             for idx, output in enumerate(result.output):
                 save_file_path = str(
                     os.path.join(batch.output_path, batch.output_file_name)
                 )
                 sample = result.output[idx]
-                audio = getattr(result, "audio", None)
+                audio = result.audio
                 if isinstance(audio, torch.Tensor) and audio.ndim >= 2:
                     audio = audio[idx] if audio.shape[0] > idx else None
                 if audio is not None and not (

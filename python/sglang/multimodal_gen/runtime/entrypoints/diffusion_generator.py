@@ -235,10 +235,10 @@ class DiffGenerator:
                             request_idx + 1,
                         )
                         continue
-                    audio_sample_rate = getattr(output_batch, "audio_sample_rate", None)
+                    audio_sample_rate = output_batch.audio_sample_rate
                     for output_idx, sample in enumerate(output_batch.output):
                         num_outputs = len(output_batch.output)
-                        audio = getattr(output_batch, "audio", None)
+                        audio = output_batch.audio
                         if req.data_type == DataType.VIDEO:
                             if isinstance(audio, torch.Tensor) and audio.ndim >= 2:
                                 audio = (

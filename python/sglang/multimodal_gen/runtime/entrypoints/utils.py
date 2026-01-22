@@ -9,10 +9,24 @@ diffusion models.
 """
 
 import os
+import shutil
+import subprocess
+import tempfile
 from typing import Any, Optional
 
 import imageio
+import numpy as np
 import torch
+
+try:
+    import scipy.io.wavfile as scipy_wavfile
+except ImportError:  # pragma: no cover
+    scipy_wavfile = None
+
+try:
+    import imageio_ffmpeg as _imageio_ffmpeg
+except ImportError:  # pragma: no cover
+    _imageio_ffmpeg = None
 
 from sglang.multimodal_gen.configs.sample.sampling_params import (
     DataType,
@@ -33,7 +47,10 @@ def prepare_request(
     Create a Req object with sampling_params as a parameter.
     """
     req = Req(sampling_params=sampling_params, VSA_sparsity=server_args.VSA_sparsity)
-    diffusers_kwargs = getattr(sampling_params, "diffusers_kwargs", None)
+    try:
+        diffusers_kwargs = sampling_params.diffusers_kwargs
+    except AttributeError:
+        diffusers_kwargs = None
     if diffusers_kwargs:
         req.extra["diffusers_kwargs"] = diffusers_kwargs
 
@@ -72,8 +89,6 @@ def post_process_sample(
         videos = sample.permute(1, 2, 3, 0).cpu().numpy()
         frames = list(videos)
     else:
-        import numpy as np
-
         if not isinstance(sample, np.ndarray):
             raise TypeError(f"Unsupported sample type: {type(sample)}")
 
@@ -117,8 +132,6 @@ def post_process_sample(
                 if audio is not None:
                     # Audio is likely (C, L) or (L,). LTX audio is (C, L) latent -> decoded audio (1, L)
                     # We need to check shape.
-                    import numpy as np
-
                     if isinstance(audio, torch.Tensor):
                         audio_np = audio.detach().float().clamp(-1.0, 1.0).cpu().numpy()
                     elif isinstance(audio, np.ndarray):
@@ -167,20 +180,13 @@ def post_process_sample(
                                 pass
 
                         try:
-                            import shutil
-                            import subprocess
-                            import tempfile
-
-                            import scipy.io.wavfile
-
                             ffmpeg_exe = "ffmpeg"
                             ffmpeg_on_path = shutil.which("ffmpeg")
                             if ffmpeg_on_path:
                                 ffmpeg_exe = ffmpeg_on_path
                             try:
-                                import imageio_ffmpeg
-
-                                ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+                                if _imageio_ffmpeg is not None:
+                                    ffmpeg_exe = _imageio_ffmpeg.get_ffmpeg_exe()
                             except Exception:
                                 pass
                             ffmpeg_ok = False
@@ -197,13 +203,15 @@ def post_process_sample(
                             )
                             tmp_wav_path = None
                             try:
+                                if scipy_wavfile is None:
+                                    raise RuntimeError(
+                                        "scipy is required to mux audio into mp4 (pip install scipy)"
+                                    )
                                 with tempfile.NamedTemporaryFile(
                                     suffix=".wav", delete=False
                                 ) as f:
                                     tmp_wav_path = f.name
-                                scipy.io.wavfile.write(
-                                    tmp_wav_path, selected_sr, audio_np
-                                )
+                                scipy_wavfile.write(tmp_wav_path, selected_sr, audio_np)
                                 subprocess.run(
                                     [
                                         ffmpeg_exe,
