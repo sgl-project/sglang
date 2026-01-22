@@ -254,6 +254,12 @@ class OpenAIServingCompletion(OpenAIServingBase):
                             output_token_logprobs=output_token_logprobs,
                             output_top_logprobs=output_top_logprobs,
                         )
+                    else:
+                        logger.debug(
+                            "Skipping logprobs for streaming chunk %d: "
+                            "no tokens available yet (race condition)",
+                            index,
+                        )
                     n_prev_tokens[index] = len(
                         content["meta_info"]["output_token_logprobs"]
                     )
