@@ -292,7 +292,7 @@ def parse_multi_choice_response(response, all_choices, index2answer):
         for index, answer in index2answer.items():
             if answer.lower() in response.lower():
                 candidates.append(index)
-                index_answer = False  # it's content ans.
+                index_answer = False  # it's content answer.
 
     if len(candidates) == 0:  # still not get answer, randomly choose one.
         pred_index = random.choice(all_choices)
