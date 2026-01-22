@@ -109,6 +109,10 @@ ALL_MODELS = [
         trust_remote_code=True,
         skip_long_prompt=True,
     ),
+    ModelCase(
+        "LiquidAI/LFM2.5-1.2B-Instruct",
+        trust_remote_code=True,
+    ),
 ]
 
 TORCH_DTYPES = [torch.float16]
@@ -133,6 +137,12 @@ class TestGenerationModels(CustomTestCase):
             model_case.rouge_l_tolerance,
         )
         max_new_tokens = 32
+
+        # Set conv dtype for hybrid models to match inference dtype
+        dtype_str = {torch.float16: "float16", torch.bfloat16: "bfloat16"}.get(
+            torch_dtype, "bfloat16"
+        )
+        os.environ["SGLANG_MAMBA_CONV_DTYPE"] = dtype_str
 
         with HFRunner(
             model_path,
