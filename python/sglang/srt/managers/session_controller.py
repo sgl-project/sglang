@@ -19,7 +19,12 @@ from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req
 
 
 class SessionReqNode:
-    def __init__(self, req: Req, parent=None, childs=None):
+    def __init__(
+        self,
+        req: Req,
+        parent=None,
+        childs=None,
+    ):
         self.req = req
         self.parent = parent
         if parent is not None:
