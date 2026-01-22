@@ -1783,7 +1783,6 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
                     forward_batch,
                     topk_indices,
                 )
-
             else:
                 q = torch.cat([q_nope_out, q_pe], dim=-1)
                 k = torch.cat([k_nope, k_pe], dim=-1)

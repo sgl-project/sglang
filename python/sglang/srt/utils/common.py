@@ -4058,3 +4058,10 @@ def bind_to_closest_numa_node_cuda():
     if is_numa_available() and nvgpu_available():
         node_id = get_current_device_numa_node_cuda()
         numa_bind_to_node(node_id)
+
+
+def get_torch_compile_disable_decorator(is_disable) -> Callable:
+    if is_disable:
+        return torch._dynamo.disable
+    else:
+        return lambda func: func
