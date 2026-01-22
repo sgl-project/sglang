@@ -278,7 +278,129 @@ class GlmOcrVisionModel(Glm4vVisionModel):
 
 
 class GlmOcrForConditionalGeneration(Glm4vForConditionalGeneration):
-    pass
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        if is_nextn:
+            if hasattr(self.config, "num_nextn_predict_layers"):
+                num_nextn_layers = self.config.num_nextn_predict_layers
+                assert num_nextn_layers == 1, "Only 1 nextn layer is supported"
+                # compatible with old design
+                nextn_layer_id = (
+                    0
+                    if self.config.num_hidden_layers == 1
+                    else self.config.num_hidden_layers
+                )
+            else:
+                raise ValueError("num_nextn_predict_layers is not in the config")
+
+        stacked_params_mapping = [
+            # (param_name, shard_name, shard_id)
+            (".qkv_proj", ".q_proj", "q"),
+            (".qkv_proj", ".k_proj", "k"),
+            (".qkv_proj", ".v_proj", "v"),
+            (".gate_up_proj", ".up_proj", 1),
+            (".gate_up_proj", ".gate_proj", 0),
+        ]
+
+        if is_nextn:
+            nextn_layer_prefix = f"model.layers.{nextn_layer_id}"
+            nextn_spec_weight_names = [
+                "shared_head.norm",
+                "eh_proj",
+                "enorm",
+                "hnorm",
+            ]
+
+        params_dict = dict(self.named_parameters(remove_duplicate=False))
+
+        # For the PP case, we add special handling for lm_head.weight,
+        # - On non–last ranks: we continue, because this stage is supposed to
+        #   be just an empty PPMissingLayer shell.
+        # - On the last rank: params_dict is expected to contain lm_head.weight,
+        #   so it will never hit the branch "if name not in params_dict".
+        #
+        # For all other parameters, such like
+        # "model.visual.blocks.20.mlp.gate_proj.weight", the unified rule is:
+        # If this name does not exist in the current rank’s params_dict,
+        # it does not belong to this pipeline stage, thus we simply continue.
+        for name, loaded_weight in weights:
+            if not is_nextn:
+                if hasattr(self.config, "num_nextn_predict_layers"):
+                    num_nextn_layers = self.config.num_nextn_predict_layers
+                    if num_nextn_layers > 0 and name.startswith("model.layers"):
+                        name_list = name.split(".")
+                        if (
+                            len(name_list) >= 3
+                            and int(name_list[2]) >= self.config.num_hidden_layers
+                        ):
+                            continue
+            else:
+                if not name.startswith(nextn_layer_prefix):
+                    continue
+
+                # Use shared head and embed weights from target model
+                if "shared_head.head" in name or "embed_tokens" in name:
+                    continue
+
+                is_decoder = True
+                # For nextn specific weights
+                for weight_name in nextn_spec_weight_names:
+                    if weight_name in name:
+                        name = name.replace(nextn_layer_prefix, "model")
+                        is_decoder = False
+                        break
+                # For decoder layer weights
+                if is_decoder:
+                    name = name.replace(nextn_layer_prefix, "model.decoder")
+
+            if "rotary_emb.inv_freq" in name:
+                continue
+            if "language_model" in name:
+                name = name.replace(r"model.language_model.", r"model.")
+            if "model.visual." in name:
+                name = name.replace("model.visual.", "visual.")
+            if name.startswith("lm_head.") and not self.pp_group.is_last_rank:
+                continue
+
+            for param_name, weight_name, shard_id in stacked_params_mapping:
+                if weight_name not in name:
+                    continue
+                name = name.replace(weight_name, param_name)
+
+                # Skip loading extra bias for GPTQ models.
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+
+                if name not in params_dict:
+                    continue
+
+                param = params_dict[name]
+                weight_loader = param.weight_loader
+                weight_loader(param, loaded_weight, shard_id)
+                break
+            else:
+                if "visual" in name:
+                    # adapt to VisionAttention
+                    name = name.replace(r"attn.qkv.", r"attn.qkv_proj.")
+
+                try:
+                    # Skip loading extra bias for GPTQ models.
+                    if name.endswith(".bias") and name not in params_dict:
+                        continue
+
+                    if name not in params_dict:
+                        continue
+
+                    param = params_dict[name]
+                except KeyError:
+                    print(params_dict.keys())
+                    raise
+
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                if "visual" in name:
+                    loaded_weight = vision_utils.pad_vit_attn_dummy_heads(
+                        self.config, name, loaded_weight
+                    )
+                weight_loader(param, loaded_weight)
 
 
 EntryClass = [GlmOcrForConditionalGeneration]
