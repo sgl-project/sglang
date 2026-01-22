@@ -558,14 +558,14 @@ def process_result(response, sample, answer_dict, out_samples):
     if response is None:
         return
     if sample["question_type"] == "multiple-choice":
-        pred_ans = parse_multi_choice_response(
+        pred_answer = parse_multi_choice_response(
             response, sample["all_choices"], sample["index2answer"]
         )
     else:  # open question
-        pred_ans = response
+        pred_answer = response
 
     out_samples[sample["id"]] = {
-        "pred_ans": pred_ans,
+        "pred_ans": pred_answer,
         "original_response": sample["original_response"],
         "ground_truth": sample["answer"],
         "question_type": sample["question_type"],
