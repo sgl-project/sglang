@@ -24,7 +24,7 @@ if TYPE_CHECKING:
         StandardDispatchOutput,
     )
 
-from sglang.srt.hardware_backend.npu.moe.npu_fused_experts import npu_fused_experts_w4a8, npu_fused_experts_w8a8
+from sglang.srt.hardware_backend.npu.moe.npu_fused_experts import npu_fused_experts_w4a8, npu_fused_experts_wna16, npu_fused_experts_w8a8, npu_fused_experts_unquant
 
 # ---------------------------------------------------------------------------
 # Runner IO dataclasses
@@ -72,6 +72,22 @@ class TorchNpuKernelsQuantInfo(MoeQuantInfo):
 # Runner core
 # ---------------------------------------------------------------------------
 
+def output_unquant(hidden_states, quant_info, topk_weights, topk_ids):
+    output = npu_fused_experts_unquant(
+            hidden_states=hidden_states,
+            w13=quant_info.w13_weight,
+            w13_scale=quant_info.w13_scale,
+            w13_scale_bias=quant_info.w13_scale_bias,
+            w2=quant_info.w2_weight,
+            w2_scale=quant_info.w2_scale,
+            w2_scale_bias=quant_info.w2_scale_bias,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            top_k=topk_ids.shape[1],
+        )
+    return output
+
+
 def output_w4a8(hidden_states, quant_info, topk_weights, topk_ids):
     output = npu_fused_experts_w4a8(
             hidden_states=hidden_states,
@@ -87,8 +103,8 @@ def output_w4a8(hidden_states, quant_info, topk_weights, topk_ids):
         )
     return output
 
-def output_w4a16(hidden_states, quant_info, topk_weights, topk_ids):
-    output = npu_fused_experts_w4a8(
+def output_wna16(hidden_states, quant_info, topk_weights, topk_ids):
+    output = npu_fused_experts_wna16(
             hidden_states=hidden_states,
             w13=quant_info.w13_weight,
             w13_scale=quant_info.w13_scale,
@@ -128,10 +144,12 @@ class TorchNpuKernelsRunnerCore(MoeRunnerCore):
             self.selected_run = output_w4a8
         elif config.quantization == "NPUCompressedTensorsW4A8Int4DynamicMoEMethod":
             self.selected_run = output_w4a8
-        elif config.quantization == "NPUCompressedTensorsW4A16Int4DynamicMoEMethod":
-            self.selected_run = output_w4a16
         elif config.quantization == "ModelSlimW8A8Int8MoE":
             self.selected_run = output_w8a8
+        elif config.quantization == "NPUCompressedTensorsW4A16Int4DynamicMoEMethod":
+            self.selected_run = output_wna16
+        elif config.quantization == "AWQMoEAscendMethod":
+            self.selected_run = output_wna16
 
     def run(
         self,
