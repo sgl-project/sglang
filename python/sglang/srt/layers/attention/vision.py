@@ -235,9 +235,6 @@ class VisionSdpaAttention(nn.Module):
 
         q, k, v = [rearrange(x, "(b s) h d -> b h s d", b=bsz) for x in [q, k, v]]
 
-        if self.qk_normalization and self.qk_normalization_by_head_size:
-            q, k = self._apply_qk_norm_head_size(q, k)
-
 
         if self.softmax_in_single_precision:
             k = rearrange(k, "b h s d -> b h d s")
@@ -592,6 +589,26 @@ class VisionAttention(nn.Module):
                 **norm_kwargs,
             )
 
+        elif self.qk_normalization_by_head_size:
+            norm_kwargs = (
+                dict(
+                    weight_dtype=torch.float32,
+                    cast_x_before_out_mul=True,
+                )
+                if get_global_server_args().rl_on_policy_target is not None
+                else {}
+            )
+            self.q_norm = RMSNorm(
+                self.head_size,
+                eps=layer_norm_eps,
+                **norm_kwargs,
+            )
+            self.k_norm = RMSNorm(
+                self.head_size,
+                eps=layer_norm_eps,
+                **norm_kwargs,
+            )
+
         # Select attention backend via a unified method
         _passed_backend = qkv_backend
         qkv_backend = self._determine_attention_backend(_passed_backend)
@@ -774,7 +791,7 @@ class VisionAttention(nn.Module):
             q = q.reshape(bsz * s, head, -1).contiguous()
             k = k.reshape(bsz * s, kv_head, -1).contiguous()
             v = v.reshape(bsz * s, kv_head, -1).contiguous()
-            if self.qk_normalization and self.qk_normalization_by_head_size:
+            if self.qk_normalization_by_head_size:
                 q, k = self._apply_qk_norm_head_size(q, k)
         else:
             # [b, s, embed_dim] --> [s, b, embed_dim]
@@ -796,6 +813,9 @@ class VisionAttention(nn.Module):
             q, k, v = [
                 rearrange(x, "s b ... -> b s ...").contiguous() for x in (q, k, v)
             ]
+
+            if self.qk_norm_by_head_size:
+                q, k = self._apply_qk_norm_head_size(q, k)
 
         cos = None
         sin = None

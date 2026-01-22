@@ -99,15 +99,13 @@ class GlmOcrVisionBlock(nn.Module):
         super().__init__()
         self.norm1 = RMSNorm(dim, eps=rms_norm_eps)
         self.norm2 = RMSNorm(dim, eps=rms_norm_eps)
-
         self.attn = VisionAttention(
             embed_dim=dim,
             num_heads=num_heads,
             projection_size=dim,
             use_qkv_parallel=True,
-            proj_bias=True,
             qkv_bias=attn_qkv_bias,
-            qk_normalization=True,
+            proj_bias=True,
             qk_normalization_by_head_size=True,
             flatten_batch=True,
             quant_config=quant_config,
@@ -174,7 +172,7 @@ class GlmOcrVisionModel(Glm4vVisionModel):
         prefix: str = "",
         use_data_parallel: bool = False,
     ) -> None:
-        super().__init__()
+        super().__init__(vision_config, quant_config, prefix, use_data_parallel)
 
         patch_size = vision_config.patch_size
         temporal_patch_size = vision_config.temporal_patch_size
@@ -186,6 +184,7 @@ class GlmOcrVisionModel(Glm4vVisionModel):
         self.patch_size = vision_config.patch_size
         self.spatial_merge_size = vision_config.spatial_merge_size
         self.out_hidden_size = vision_config.out_hidden_size
+        self.intermediate_size = vision_config.intermediate_size
         self.use_data_parallel = use_data_parallel
 
         self.patch_embed = GlmOcrVisionPatchEmbed(
@@ -208,7 +207,7 @@ class GlmOcrVisionModel(Glm4vVisionModel):
             [
                 GlmOcrVisionBlock(
                     dim=self.hidden_size,
-                    intermediate_dim=self.out_hidden_size,
+                    intermediate_dim=self.intermediate_size,
                     num_heads=self.num_heads,
                     quant_config=quant_config,
                     prefix=add_prefix(f"blocks.{layer_idx}", prefix),
@@ -278,6 +277,54 @@ class GlmOcrVisionModel(Glm4vVisionModel):
 
 
 class GlmOcrForConditionalGeneration(Glm4vForConditionalGeneration):
+    def __init__(
+        self,
+        config: GlmOcrConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__(config, quant_config, prefix)
+
+        self.pp_group = get_pp_group()
+        self.config = config
+        self.use_data_parallel = get_global_server_args().mm_enable_dp_encoder
+        self.visual = GlmOcrVisionModel(
+            vision_config=config.vision_config,
+            quant_config=quant_config,
+            prefix=add_prefix("visual", prefix),
+            use_data_parallel=self.use_data_parallel,
+        )
+
+        vision_utils.update_vit_attn_dummy_heads_config(self.config)
+
+        self.model = Glm4Model(
+            config,
+            quant_config=quant_config,
+            prefix=add_prefix("model", prefix),
+        )
+
+        if self.pp_group.is_last_rank:
+            if self.pp_group.world_size == 1 and self.config.tie_word_embeddings:
+                self.lm_head = self.model.embed_tokens
+            else:
+                self.lm_head = ParallelLMHead(
+                    self.config.vocab_size,
+                    self.config.hidden_size,
+                    quant_config=quant_config,
+                    prefix=add_prefix("lm_head", prefix),
+                )
+        else:
+            # ranks other than the last rank will have a placeholder layer
+            self.lm_head = PPMissingLayer()
+
+        self.is_mrope_enabled = "mrope_section" in self.config.rope_scaling
+
+        self.logits_processor = LogitsProcessor(config)
+        self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
+
+        # For EAGLE3 support
+        self.capture_aux_hidden_states = False
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
         if is_nextn:
             if hasattr(self.config, "num_nextn_predict_layers"):
@@ -322,7 +369,15 @@ class GlmOcrForConditionalGeneration(Glm4vForConditionalGeneration):
         # "model.visual.blocks.20.mlp.gate_proj.weight", the unified rule is:
         # If this name does not exist in the current rank’s params_dict,
         # it does not belong to this pipeline stage, thus we simply continue.
+
         for name, loaded_weight in weights:
+            if "rotary_emb.inv_freq" in name:
+                continue
+            if "language_model" in name:
+                name = name.replace(r"model.language_model.", r"model.")
+            if "model.visual." in name:
+                name = name.replace("model.visual.", "visual.")
+
             if not is_nextn:
                 if hasattr(self.config, "num_nextn_predict_layers"):
                     num_nextn_layers = self.config.num_nextn_predict_layers
@@ -351,15 +406,6 @@ class GlmOcrForConditionalGeneration(Glm4vForConditionalGeneration):
                 # For decoder layer weights
                 if is_decoder:
                     name = name.replace(nextn_layer_prefix, "model.decoder")
-
-            if "rotary_emb.inv_freq" in name:
-                continue
-            if "language_model" in name:
-                name = name.replace(r"model.language_model.", r"model.")
-            if "model.visual." in name:
-                name = name.replace("model.visual.", "visual.")
-            if name.startswith("lm_head.") and not self.pp_group.is_last_rank:
-                continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:

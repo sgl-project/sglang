@@ -275,6 +275,11 @@ class ModelConfig:
         ]:
             self.hf_config.architectures[0] = "Glm4MoeForCausalLMNextN"
 
+        if is_draft_model and self.hf_config.architectures[0] in [
+            "GlmOcrForConditionalGeneration",
+        ]:
+            self.hf_config.architectures[0] = "GlmOcrForConditionalGenerationNextN"
+
         if (
             is_draft_model
             and self.hf_config.architectures[0] == "LongcatFlashForCausalLM"
