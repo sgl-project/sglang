@@ -195,6 +195,8 @@ class ScaleResidualNormScaleShift:
 
 
 def validate_x(t: torch.Tensor, B: int, S: int, D: int):
+    if t.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        raise ValueError(f"validate failed: unsupported dtype: {t.dtype}")
     if t.shape != (B, S, D):
         raise ValueError(f"validate failed: unsupported tensor shape: {t.shape}.")
     if t.stride()[-1] != 1:
@@ -204,6 +206,8 @@ def validate_x(t: torch.Tensor, B: int, S: int, D: int):
 def validate_weight_bias(t: Optional[torch.Tensor], B: int, S: int, D: int):
     if t is None:
         return
+    if t.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        raise ValueError(f"validate failed: unsupported dtype: {t.dtype}")
     if t.shape != (D,):
         raise ValueError(f"validate failed: unsupported tensor shape: {t.shape}.")
     if t.stride()[-1] != 1:
@@ -211,6 +215,8 @@ def validate_weight_bias(t: Optional[torch.Tensor], B: int, S: int, D: int):
 
 
 def validate_scale_shift(t: torch.Tensor, B: int, S: int, D: int):
+    if t.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        raise ValueError(f"validate failed: unsupported dtype: {t.dtype}")
     failed = False
     if t.ndim == 1 and (t.shape[0] not in (1, D)):
         failed = True
@@ -229,7 +235,7 @@ def validate_scale_shift(t: torch.Tensor, B: int, S: int, D: int):
 
 
 def validate_gate(t: Union[torch.Tensor, int], B: int, S: int, D: int):
-    if isinstance(t, int):
+    if not isinstance(t, torch.Tensor):
         return
     validate_scale_shift(t, B, S, D)
 
