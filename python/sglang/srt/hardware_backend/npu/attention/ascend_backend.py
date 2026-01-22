@@ -840,7 +840,7 @@ class AscendAttnBackend(AttentionBackend):
             assert (
                 layer.qk_head_dim != layer.v_head_dim
             ), "FIA only supports qk_head_dim != v_head_dim"
-            if layer.v_head_dim in [512, 128]:
+            if not layer.v_head_dim in [256]:
                 "Currently, in NO_QUANT situation, qk_nope_head_dim == v_head_dim, and rope exists, v_head_dim only support 512 and 128"
                 num_token_padding = q.shape[0]
                 q, k, v = [
