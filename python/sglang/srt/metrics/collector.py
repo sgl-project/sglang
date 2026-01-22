@@ -250,6 +250,9 @@ class SchedulerStats:
     lora_pool_slots_total: int = 0
     lora_pool_utilization: float = 0.0
 
+    # GPU memory metrics
+    available_gpu_memory_gb: float = 0.0
+
     # Routing key metrics
     num_unique_running_routing_keys: int = 0
     routing_key_running_req_counts: List[int] = field(default_factory=list)
@@ -376,6 +379,14 @@ class SchedulerMetricsCollector:
         self.max_total_num_tokens = Gauge(
             name="sglang:max_total_num_tokens",
             documentation="Maximum total number of tokens in the KV cache pool.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+
+        # GPU memory metrics
+        self.available_gpu_memory_gb = Gauge(
+            name="sglang:available_gpu_memory_gb",
+            documentation="Available GPU memory in GB.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
@@ -976,6 +987,9 @@ class SchedulerMetricsCollector:
         self._log_gauge(self.cache_hit_rate, stats.cache_hit_rate)
 
         self._log_gauge(self.max_total_num_tokens, stats.max_total_num_tokens)
+
+        # GPU memory metrics
+        self._log_gauge(self.available_gpu_memory_gb, stats.available_gpu_memory_gb)
 
         # Speculative decoding
         self._log_gauge(self.spec_accept_length, stats.spec_accept_length)

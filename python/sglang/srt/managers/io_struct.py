@@ -1720,6 +1720,10 @@ class MemoryMetrics:
     token_capacity: int = field(
         metadata={"metric": ("gauge", "Max tokens in KV cache")}
     )
+    available_gpu_memory_gb: float = field(
+        default=0.0,
+        metadata={"metric": ("gauge", "Available GPU memory in GB")},
+    )
 
 
 @dataclass
