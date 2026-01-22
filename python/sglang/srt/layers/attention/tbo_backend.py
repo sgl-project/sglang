@@ -174,10 +174,10 @@ class TboAttnBackend(AttentionBackend):
         getattr(child_right, fn_name)(**args_right)
 
     def get_cuda_graph_seq_len_fill_value(self):
-        ans = self.primary.get_cuda_graph_seq_len_fill_value()
+        answer = self.primary.get_cuda_graph_seq_len_fill_value()
         for child in self.children:
-            assert ans == child.get_cuda_graph_seq_len_fill_value()
-        return ans
+            assert answer == child.get_cuda_graph_seq_len_fill_value()
+        return answer
 
     def forward_extend(self, *args, **kwargs):
         return self.primary.forward_extend(*args, **kwargs)
