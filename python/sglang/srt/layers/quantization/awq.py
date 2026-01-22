@@ -855,6 +855,9 @@ class AWQMoEAscendMethod(AWQMoEMethod):
     def __init__(self, quant_config: AWQConfig):
         self.quant_config = quant_config
         self.kernel = NPUW4A16Int4DynamicMoEMethod()
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        self.kernel.process_weights_after_loading(layer)
         
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: "MoeRunnerConfig"
