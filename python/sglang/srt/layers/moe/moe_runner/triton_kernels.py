@@ -20,7 +20,12 @@ from sglang.srt.layers.moe.utils import MoeRunnerBackend
 
 if TYPE_CHECKING:
     from triton_kernels.matmul_ogs import PrecisionConfig
-    from triton_kernels.routing import GatherIndx, RoutingData, ScatterIndx
+
+    from sglang.srt.layers.moe.triton_kernels_compat import (
+        GatherIndx,
+        RoutingData,
+        ScatterIndx,
+    )
 
     from sglang.srt.layers.moe.token_dispatcher.standard import (
         StandardCombineInput,
