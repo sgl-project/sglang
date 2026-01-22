@@ -629,6 +629,7 @@ class Scheduler(
                 if self.server_args.enable_dp_attention
                 else self.tp_cpu_group
             ),
+            pp_cache_group=self.pp_group.cpu_group,
             eviction_policy=server_args.radix_eviction_policy,
             enable_metrics=self.enable_metrics,
             enable_kv_cache_events=self.enable_kv_cache_events,

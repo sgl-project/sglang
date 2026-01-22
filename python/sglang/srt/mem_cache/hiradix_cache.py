@@ -79,6 +79,7 @@ class HiRadixCache(RadixCache):
             raise ValueError(f"HiRadixCache only supports MHA and MLA yet")
 
         self.tp_group = params.tp_cache_group
+        self.pp_group = params.pp_cache_group
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
         self.pp_rank = params.pp_rank
         self.pp_size = params.pp_size
@@ -110,6 +111,7 @@ class HiRadixCache(RadixCache):
             self.token_to_kv_pool_host,
             self.page_size,
             self.tp_group,
+            self.pp_group,
             load_cache_event=self.load_cache_event,
             write_policy=server_args.hicache_write_policy,
             io_backend=server_args.hicache_io_backend,

@@ -252,6 +252,7 @@ class HiCacheController:
         mem_pool_host: HostKVCache,
         page_size: int,
         tp_group: torch.distributed.ProcessGroup,
+        pp_group: Optional[torch.distributed.ProcessGroup],
         load_cache_event: threading.Event,
         write_policy: str = "write_through_selective",
         io_backend: str = "",
@@ -713,6 +714,35 @@ class HiCacheController:
                 prefix_keys += batch_hashes
 
         return hash_value, storage_query_count
+
+    def _sync_storage_hit_count(self, storage_hit_count: int) -> int:
+        if self.pp_size <= 1 and self.tp_world_size <= 1:
+            return storage_hit_count
+
+        storage_hit_count_tensor = torch.tensor(storage_hit_count, dtype=torch.int)
+        if self.pp_size > 1:
+            assert (
+                self.prefetch_pp_group is not None
+            ), "prefetch_pp_group must be provided when pp_size > 1"
+            torch.distributed.all_reduce(
+                storage_hit_count_tensor,
+                op=torch.distributed.ReduceOp.MIN,
+                group=self.prefetch_pp_group,
+            )
+
+        if self.tp_world_size > 1:
+            assert (
+                self.prefetch_tp_group is not None
+            ), "prefetch_tp_group must be provided when tp_world_size > 1"
+            torch.distributed.all_reduce(
+                storage_hit_count_tensor,
+                op=torch.distributed.ReduceOp.MIN,
+                group=self.prefetch_tp_group,
+            )
+
+        storage_hit_count = storage_hit_count_tensor.item()
+        logger.info(f"Synced storage hit count: {storage_hit_count}")
+        return storage_hit_count
 
     def prefetch_thread_func(self):
         """
