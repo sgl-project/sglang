@@ -193,6 +193,10 @@ To enable DeepSeek MTP for large batch sizes (>48), you need to adjust some para
 - Set `--cuda-graph-bs`. It's a list of batch sizes for cuda graph capture. The [default captured batch sizes for speculative decoding](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/server_args.py#L888-L895) is 48. You can customize this by including more batch sizes.
 ```
 
+```{tip}
+To enable the experimental overlap scheduler for EAGLE speculative decoding, set the environment variable `SGLANG_ENABLE_SPEC_V2=1`. This can improve performance by enabling overlap scheduling between draft and verification stages.
+```
+
 
 ### Reasoning Content for DeepSeek R1 & V3.1
 
