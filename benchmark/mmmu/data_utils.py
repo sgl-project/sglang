@@ -78,7 +78,7 @@ CAT_SHORT2LONG = {
 def get_multi_choice_info(options):
     """
     Given the list of options for multiple choice question
-    Return the index2ans and all_choices
+    Return the index2answer and all_choices
     """
 
     start_chr = "A"
