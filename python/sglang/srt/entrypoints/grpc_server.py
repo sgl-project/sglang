@@ -31,96 +31,112 @@ from sglang.srt.grpc.health_servicer import SGLangHealthServicer
 from sglang.srt.grpc.scheduler_launcher import launch_scheduler_process_only
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.io_struct import (
+    GenerateReqInput,
+    GetLoadsReqOutput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
 )
 from sglang.srt.sampling.sampling_params import SamplingParams as SGLSamplingParams
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils import ImageData, kill_process_tree
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
 HEALTH_CHECK_TIMEOUT = int(os.getenv("SGLANG_HEALTH_CHECK_TIMEOUT", 20))
 
 
-def _compute_loads_aggregate(load_results):
-    if not load_results:
-        return sglang_scheduler_pb2.AggregateMetrics(
-            total_running_reqs=0,
-            total_waiting_reqs=0,
-            total_reqs=0,
-            avg_token_usage=0.0,
-            avg_throughput=0.0,
-            avg_utilization=0.0,
+def _convert_loads_to_protobuf(
+    result: GetLoadsReqOutput,
+) -> sglang_scheduler_pb2.SchedulerLoad:
+    """Convert GetLoadsReqOutput dataclass to protobuf SchedulerLoad message."""
+    scheduler_load = sglang_scheduler_pb2.SchedulerLoad(
+        dp_rank=result.dp_rank,
+        num_running_reqs=result.num_running_reqs,
+        num_waiting_reqs=result.num_waiting_reqs,
+        num_total_reqs=result.num_running_reqs + result.num_waiting_reqs,
+        num_used_tokens=result.num_used_tokens,
+        max_total_num_tokens=result.max_total_num_tokens,
+        token_usage=result.token_usage,
+        gen_throughput=result.gen_throughput,
+        cache_hit_rate=result.cache_hit_rate,
+        utilization=result.utilization,
+        max_running_requests=result.max_running_requests,
+    )
+
+    # Add optional sections using CopyFrom for proper protobuf assignment
+    if result.memory:
+        scheduler_load.memory.CopyFrom(
+            sglang_scheduler_pb2.MemoryMetrics(
+                weight_gb=result.memory.weight_gb,
+                kv_cache_gb=result.memory.kv_cache_gb,
+                graph_gb=result.memory.graph_gb,
+                token_capacity=result.memory.token_capacity,
+            )
         )
 
-    n = len(load_results)
-    total_running = sum(load.num_running_reqs for load in load_results)
-    total_waiting = sum(load.num_waiting_reqs for load in load_results)
+    if result.speculative:
+        scheduler_load.speculative.CopyFrom(
+            sglang_scheduler_pb2.SpeculativeMetrics(
+                accept_length=result.speculative.accept_length,
+                accept_rate=result.speculative.accept_rate,
+            )
+        )
+
+    if result.lora:
+        scheduler_load.lora.CopyFrom(
+            sglang_scheduler_pb2.LoRAMetrics(
+                slots_used=result.lora.slots_used,
+                slots_total=result.lora.slots_total,
+                utilization=result.lora.utilization,
+            )
+        )
+
+    if result.disaggregation:
+        scheduler_load.disaggregation.CopyFrom(
+            sglang_scheduler_pb2.DisaggregationMetrics(
+                mode=result.disaggregation.mode,
+                prefill_prealloc_queue_reqs=result.disaggregation.prefill_prealloc_queue_reqs,
+                prefill_inflight_queue_reqs=result.disaggregation.prefill_inflight_queue_reqs,
+                decode_prealloc_queue_reqs=result.disaggregation.decode_prealloc_queue_reqs,
+                decode_transfer_queue_reqs=result.disaggregation.decode_transfer_queue_reqs,
+                decode_retracted_queue_reqs=result.disaggregation.decode_retracted_queue_reqs,
+                kv_transfer_speed_gb_s=result.disaggregation.kv_transfer_speed_gb_s,
+                kv_transfer_latency_ms=result.disaggregation.kv_transfer_latency_ms,
+            )
+        )
+
+    if result.queues:
+        scheduler_load.queues.CopyFrom(
+            sglang_scheduler_pb2.QueueMetrics(
+                waiting=result.queues.waiting,
+                grammar=result.queues.grammar,
+                paused=result.queues.paused,
+                retracted=result.queues.retracted,
+            )
+        )
+
+    return scheduler_load
+
+
+def _compute_aggregate_protobuf(
+    loads: list,
+) -> sglang_scheduler_pb2.AggregateMetrics:
+    """Compute aggregate metrics from list of SchedulerLoad protobuf messages."""
+    if not loads:
+        return sglang_scheduler_pb2.AggregateMetrics()
+
+    n = len(loads)
+    total_running = sum(load.num_running_reqs for load in loads)
+    total_waiting = sum(load.num_waiting_reqs for load in loads)
 
     return sglang_scheduler_pb2.AggregateMetrics(
         total_running_reqs=total_running,
         total_waiting_reqs=total_waiting,
         total_reqs=total_running + total_waiting,
-        avg_token_usage=round(
-            sum(load.token_usage for load in load_results) / n, 4
-        ),
-        avg_throughput=round(
-            sum(load.gen_throughput for load in load_results) / n, 2
-        ),
-        avg_utilization=round(
-            sum(load.utilization for load in load_results) / n, 4
-        ),
+        avg_token_usage=round(sum(load.token_usage for load in loads) / n, 4),
+        avg_throughput=round(sum(load.gen_throughput for load in loads) / n, 2),
+        avg_utilization=round(sum(load.utilization for load in loads) / n, 4),
     )
-
-
-def _convert_loads_result(load):
-    scheduler_load = sglang_scheduler_pb2.SchedulerLoad(
-        dp_rank=load.dp_rank,
-        num_running_reqs=load.num_running_reqs,
-        num_waiting_reqs=load.num_waiting_reqs,
-        num_total_reqs=load.num_running_reqs + load.num_waiting_reqs,
-        num_used_tokens=load.num_used_tokens,
-        max_total_num_tokens=load.max_total_num_tokens,
-        token_usage=load.token_usage,
-        gen_throughput=load.gen_throughput,
-        cache_hit_rate=load.cache_hit_rate,
-        utilization=load.utilization,
-        max_running_requests=load.max_running_requests,
-    )
-
-    if load.memory:
-        scheduler_load.memory.CopyFrom(
-            sglang_scheduler_pb2.MemoryMetrics(
-                **dataclasses.asdict(load.memory),
-            )
-        )
-    if load.speculative:
-        scheduler_load.speculative.CopyFrom(
-            sglang_scheduler_pb2.SpeculativeMetrics(
-                **dataclasses.asdict(load.speculative),
-            )
-        )
-    if load.lora:
-        scheduler_load.lora.CopyFrom(
-            sglang_scheduler_pb2.LoRAMetrics(
-                **dataclasses.asdict(load.lora),
-            )
-        )
-    if load.disaggregation:
-        scheduler_load.disaggregation.CopyFrom(
-            sglang_scheduler_pb2.DisaggregationMetrics(
-                **dataclasses.asdict(load.disaggregation),
-            )
-        )
-    if load.queues:
-        scheduler_load.queues.CopyFrom(
-            sglang_scheduler_pb2.QueueMetrics(
-                **dataclasses.asdict(load.queues),
-            )
-        )
-
-    return scheduler_load
 
 
 class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer):
@@ -144,6 +160,14 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         self.scheduler_info = scheduler_info
         self.start_time = time.time()
         self.health_servicer = health_servicer
+        self.mm_receiver = None
+        if (
+            self.server_args.language_only
+            and self.server_args.encoder_transfer_backend == "zmq_to_scheduler"
+        ):
+            from sglang.srt.disaggregation.encode_receiver import MMReceiver
+
+            self.mm_receiver = MMReceiver(self.server_args)
 
         # Start the request manager's event loop using auto_create_handle_loop
         self.request_manager.auto_create_handle_loop()
@@ -157,10 +181,70 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
     ) -> AsyncIterator[sglang_scheduler_pb2.GenerateResponse]:
         """Handle generation requests with streaming responses."""
         logger.info(f"Receive generation request: {request.request_id}")
-        async for response in self.request_manager.handle_generate_request(
-            request, context
-        ):
-            yield response
+
+        try:
+            # Convert gRPC request to internal format
+            tokenized_req = self._convert_generate_request(request)
+            self._handle_epd_disaggregation_encode_request(request, tokenized_req)
+
+            # Submit to request manager (automatically handles n>1)
+            response_generator = self.request_manager.generate_request(
+                obj=tokenized_req,
+                request_id=request.request_id,
+                grpc_context=context,
+            )
+
+            async for output in response_generator:
+                # Handle batch responses (for n>1 non-streaming)
+                if isinstance(output, list):
+                    for batch_output in output:
+                        if "error" in batch_output:
+                            yield sglang_scheduler_pb2.GenerateResponse(
+                                request_id=request.request_id,
+                                error=sglang_scheduler_pb2.GenerateError(
+                                    message=batch_output["error"],
+                                    http_status_code=(
+                                        "500" if "abort" not in batch_output else "499"
+                                    ),
+                                ),
+                            )
+                        else:
+                            # All non-error batch outputs are final responses
+                            yield self._create_completion_response(
+                                request.request_id, batch_output
+                            )
+                else:
+                    # Handle single response (for streaming or n=1 non-streaming)
+                    if "error" in output:
+                        yield sglang_scheduler_pb2.GenerateResponse(
+                            request_id=request.request_id,
+                            error=sglang_scheduler_pb2.GenerateError(
+                                message=output["error"],
+                                http_status_code=(
+                                    "500" if "abort" not in output else "499"
+                                ),
+                            ),
+                        )
+                    elif output.get("finished", False):
+                        yield self._create_completion_response(
+                            request.request_id, output
+                        )
+                    else:
+                        yield self._create_chunk_response(request.request_id, output)
+
+        except Exception as e:
+            logger.error(
+                f"Generate failed for request {request.request_id}: {e}\n"
+                f"{get_exception_traceback()}"
+            )
+            yield sglang_scheduler_pb2.GenerateResponse(
+                request_id=request.request_id,
+                error=sglang_scheduler_pb2.GenerateError(
+                    message=str(e),
+                    http_status_code="500",
+                    details=get_exception_traceback(),
+                ),
+            )
 
     async def Embed(
         self,
@@ -169,7 +253,44 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
     ) -> sglang_scheduler_pb2.EmbedResponse:
         """Handle embedding requests."""
         logger.info(f"Receive embedding request: {request.request_id}")
-        return await self.request_manager.handle_embed_request(request)
+
+        try:
+            # Convert request
+            tokenized_req = self._convert_embed_request(request)
+
+            # Submit to request manager
+            future = await self.request_manager.embedding_request(
+                obj=tokenized_req,
+                request_id=request.request_id,
+            )
+
+            # Wait for result
+            result = await future
+
+            # Create response
+            return sglang_scheduler_pb2.EmbedResponse(
+                request_id=request.request_id,
+                complete=sglang_scheduler_pb2.EmbedComplete(
+                    embedding=result["embedding"],
+                    prompt_tokens=result.get("prompt_tokens", 0),
+                    cached_tokens=0,
+                    embedding_dim=len(result["embedding"]),
+                ),
+            )
+
+        except Exception as e:
+            logger.error(
+                f"Embed failed for request {request.request_id}: {e}\n"
+                f"{get_exception_traceback()}"
+            )
+            return sglang_scheduler_pb2.EmbedResponse(
+                request_id=request.request_id,
+                error=sglang_scheduler_pb2.EmbedError(
+                    message=str(e),
+                    code="INTERNAL_ERROR",
+                    details=get_exception_traceback(),
+                ),
+            )
 
     async def HealthCheck(
         self,
@@ -382,38 +503,380 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         request: sglang_scheduler_pb2.GetLoadsRequest,
         context: grpc.aio.ServicerContext,
     ) -> sglang_scheduler_pb2.GetLoadsResponse:
-        """Get comprehensive load metrics for scheduler DP ranks."""
-        logger.debug("Receive load metrics request")
+        """
+        Get comprehensive load metrics for all DP ranks.
+
+        Uses the communicator pattern to fetch real-time metrics,
+        providing full parity with the HTTP /v1/loads endpoint.
+        """
+        logger.debug("Receive get loads request")
 
         include = list(request.include) if request.include else ["all"]
         dp_rank = request.dp_rank if request.HasField("dp_rank") else None
 
         try:
-            load_results = await self.request_manager.get_loads(
-                include=include,
-                dp_rank=dp_rank,
+            results = await self.request_manager.get_loads(
+                include=include, dp_rank=dp_rank
             )
         except ValueError as e:
+            # Validation error (e.g., invalid include sections)
             context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
             context.set_details(str(e))
             return sglang_scheduler_pb2.GetLoadsResponse()
+        except asyncio.TimeoutError:
+            context.set_code(grpc.StatusCode.DEADLINE_EXCEEDED)
+            context.set_details("Timeout waiting for scheduler response")
+            return sglang_scheduler_pb2.GetLoadsResponse()
         except Exception as e:
-            logger.error(
-                f"GetLoads failed: {e}\n{get_exception_traceback()}"
-            )
+            logger.error(f"GetLoads failed: {e}\n{get_exception_traceback()}")
             context.set_code(grpc.StatusCode.INTERNAL)
-            context.set_details(str(e))
+            context.set_details(f"Failed to get load metrics: {e}")
             return sglang_scheduler_pb2.GetLoadsResponse()
 
-        loads = [_convert_loads_result(load) for load in load_results]
-        aggregate = _compute_loads_aggregate(load_results)
+        loads = [_convert_loads_to_protobuf(r) for r in results]
 
         return sglang_scheduler_pb2.GetLoadsResponse(
             timestamp=datetime.now(timezone.utc).isoformat(),
             version=sglang.__version__,
             dp_rank_count=len(loads),
             loads=loads,
-            aggregate=aggregate,
+            aggregate=_compute_aggregate_protobuf(loads),
+        )
+
+    def _handle_epd_disaggregation_encode_request(
+        self,
+        grpc_req: sglang_scheduler_pb2.GenerateRequest,
+        tokenized_req: TokenizedGenerateReqInput,
+    ) -> None:
+        if not self.mm_receiver:
+            return
+
+        image_urls = list(grpc_req.mm_inputs.image_urls)
+        if not image_urls:
+            return
+
+        encode_req = GenerateReqInput(
+            image_data=[ImageData(url=url) for url in image_urls],
+            rid=grpc_req.request_id,
+        )
+        self.mm_receiver.send_encode_request(encode_req)
+        tokenized_req.need_wait_for_image = bool(encode_req.need_wait_for_image)
+        tokenized_req.num_items_assigned = encode_req.num_items_assigned
+
+    # Helper methods for request/response conversion
+
+    def _convert_generate_request(
+        self, grpc_req: sglang_scheduler_pb2.GenerateRequest
+    ) -> TokenizedGenerateReqInput:
+        """Convert gRPC GenerateRequest to internal format."""
+
+        # Extract tokenized input
+        if not grpc_req.HasField("tokenized"):
+            raise ValueError("Tokenized input must be provided")
+
+        input_text = grpc_req.tokenized.original_text
+        input_ids = list(grpc_req.tokenized.input_ids)
+
+        # Convert sampling params
+        sampling_params = self._convert_sampling_params(grpc_req.sampling_params)
+        sampling_params.normalize(tokenizer=None)
+
+        # Extract disaggregated params if present
+        bootstrap_host = None
+        bootstrap_port = None
+        bootstrap_room = None
+        if grpc_req.HasField("disaggregated_params"):
+            # Don't use 'or None' as it treats 0 as falsy
+            bootstrap_host = (
+                grpc_req.disaggregated_params.bootstrap_host
+                if grpc_req.disaggregated_params.bootstrap_host
+                else None
+            )
+            bootstrap_port = (
+                grpc_req.disaggregated_params.bootstrap_port
+                if grpc_req.disaggregated_params.bootstrap_port
+                else None
+            )
+            bootstrap_room = (
+                grpc_req.disaggregated_params.bootstrap_room
+            )  # Can be 0, don't use 'or None'
+
+        # Create request
+        return TokenizedGenerateReqInput(
+            rid=grpc_req.request_id,
+            input_text=input_text,
+            input_ids=input_ids,
+            mm_inputs=None,  # TODO: implement mm support
+            sampling_params=sampling_params,
+            return_logprob=grpc_req.return_logprob,
+            logprob_start_len=(
+                grpc_req.logprob_start_len
+                if grpc_req.logprob_start_len is not None
+                else -1
+            ),
+            top_logprobs_num=grpc_req.top_logprobs_num or 0,
+            stream=grpc_req.stream or False,
+            lora_id=grpc_req.lora_id if grpc_req.lora_id else None,
+            token_ids_logprob=(
+                list(grpc_req.token_ids_logprob) if grpc_req.token_ids_logprob else None
+            ),
+            bootstrap_host=bootstrap_host,
+            bootstrap_port=bootstrap_port,
+            bootstrap_room=bootstrap_room,
+        )
+
+    def _convert_embed_request(
+        self, grpc_req: sglang_scheduler_pb2.EmbedRequest
+    ) -> TokenizedEmbeddingReqInput:
+        """Convert gRPC EmbedRequest to internal format."""
+
+        # Extract tokenized input
+        if not grpc_req.HasField("tokenized"):
+            raise ValueError("Tokenized input must be provided")
+
+        input_text = grpc_req.tokenized.original_text
+        input_ids = list(grpc_req.tokenized.input_ids)
+
+        # Convert sampling params
+        sampling_params = self._convert_sampling_params(grpc_req.sampling_params)
+
+        # For embedding requests, max_new_tokens should be 0.
+        # The scheduler logic expects an integer, not None.
+        sampling_params.max_new_tokens = 0
+
+        sampling_params.normalize(tokenizer=None)
+
+        return TokenizedEmbeddingReqInput(
+            rid=grpc_req.request_id,
+            input_text=input_text,
+            input_ids=input_ids,
+            image_inputs={"mm_items": []},
+            token_type_ids=list(grpc_req.token_type_ids),
+            sampling_params=sampling_params,
+        )
+
+    def _convert_sampling_params(
+        self, grpc_params: sglang_scheduler_pb2.SamplingParams
+    ) -> SGLSamplingParams:
+        """Convert gRPC SamplingParams to internal format."""
+
+        # Handle constraint types
+        regex = None
+        json_schema = None
+        ebnf_grammar = None
+        structural_tag = None
+
+        if grpc_params.HasField("regex"):
+            regex = grpc_params.regex
+        elif grpc_params.HasField("json_schema"):
+            json_schema = grpc_params.json_schema
+        elif grpc_params.HasField("ebnf_grammar"):
+            ebnf_grammar = grpc_params.ebnf_grammar
+        elif grpc_params.HasField("structural_tag"):
+            structural_tag = grpc_params.structural_tag
+
+        # Handle optional parameters conversion
+        custom_params = (
+            MessageToDict(grpc_params.custom_params)
+            if grpc_params.HasField("custom_params")
+            else None
+        )
+        max_new_tokens = (
+            grpc_params.max_new_tokens
+            if grpc_params.HasField("max_new_tokens")
+            else None
+        )
+        stream_interval = (
+            grpc_params.stream_interval
+            if grpc_params.HasField("stream_interval")
+            else None
+        )
+        logit_bias = dict(grpc_params.logit_bias) if grpc_params.logit_bias else None
+        stop = list(grpc_params.stop) if grpc_params.stop else None
+        stop_token_ids = (
+            list(grpc_params.stop_token_ids) if grpc_params.stop_token_ids else None
+        )
+
+        return SGLSamplingParams(
+            temperature=grpc_params.temperature,
+            top_p=grpc_params.top_p,
+            top_k=grpc_params.top_k,
+            min_p=grpc_params.min_p,
+            frequency_penalty=grpc_params.frequency_penalty,
+            presence_penalty=grpc_params.presence_penalty,
+            repetition_penalty=grpc_params.repetition_penalty,
+            max_new_tokens=max_new_tokens,
+            min_new_tokens=grpc_params.min_new_tokens,
+            stop=stop,
+            stop_token_ids=stop_token_ids,
+            skip_special_tokens=grpc_params.skip_special_tokens,
+            spaces_between_special_tokens=grpc_params.spaces_between_special_tokens,
+            no_stop_trim=grpc_params.no_stop_trim,
+            regex=regex,
+            json_schema=json_schema,
+            ebnf=ebnf_grammar,
+            structural_tag=structural_tag,
+            n=grpc_params.n,
+            ignore_eos=grpc_params.ignore_eos,
+            stream_interval=stream_interval,
+            logit_bias=logit_bias,
+            custom_params=custom_params,
+        )
+
+    def _convert_output_logprobs_to_proto(
+        self, logprobs_data: Dict
+    ) -> Optional[sglang_scheduler_pb2.OutputLogProbs]:
+        """Convert output logprobs dict to proto (no None values, plain floats)."""
+        if not logprobs_data:
+            return None
+
+        token_logprobs_val = logprobs_data.get("token_logprobs_val", [])
+        token_logprobs_idx = logprobs_data.get("token_logprobs_idx", [])
+        top_logprobs_val = logprobs_data.get("top_logprobs_val", [])
+        top_logprobs_idx = logprobs_data.get("top_logprobs_idx", [])
+
+        # Build TopLogProbs entries
+        top_logprobs_proto = []
+        if top_logprobs_val and top_logprobs_idx:
+            for val_list, idx_list in zip(top_logprobs_val, top_logprobs_idx):
+                top_logprobs_proto.append(
+                    sglang_scheduler_pb2.TopLogProbs(
+                        values=val_list,
+                        token_ids=idx_list,
+                    )
+                )
+
+        return sglang_scheduler_pb2.OutputLogProbs(
+            token_logprobs=token_logprobs_val,  # Plain float array
+            token_ids=token_logprobs_idx,
+            top_logprobs=top_logprobs_proto,
+        )
+
+    def _convert_input_logprobs_to_proto(
+        self, logprobs_data: Dict
+    ) -> Optional[sglang_scheduler_pb2.InputLogProbs]:
+        """Convert input logprobs dict to proto (first token is None, wrapped in InputTokenLogProb)."""
+        if not logprobs_data:
+            return None
+
+        token_logprobs_val = logprobs_data.get("token_logprobs_val", [])
+        token_logprobs_idx = logprobs_data.get("token_logprobs_idx", [])
+        top_logprobs_val = logprobs_data.get("top_logprobs_val", [])
+        top_logprobs_idx = logprobs_data.get("top_logprobs_idx", [])
+
+        # Wrap values in InputTokenLogProb (None for first token, value for others)
+        token_logprobs_wrapped = [
+            (
+                sglang_scheduler_pb2.InputTokenLogProb()
+                if x is None
+                else sglang_scheduler_pb2.InputTokenLogProb(value=x)
+            )
+            for x in token_logprobs_val
+        ]
+
+        # Build TopLogProbs entries
+        top_logprobs_proto = []
+        if top_logprobs_val and top_logprobs_idx:
+            for val_list, idx_list in zip(top_logprobs_val, top_logprobs_idx):
+                top_logprobs_proto.append(
+                    sglang_scheduler_pb2.TopLogProbs(
+                        values=val_list,
+                        token_ids=idx_list,
+                    )
+                )
+
+        return sglang_scheduler_pb2.InputLogProbs(
+            token_logprobs=token_logprobs_wrapped,
+            token_ids=token_logprobs_idx,
+            top_logprobs=top_logprobs_proto,
+        )
+
+    def _create_chunk_response(
+        self, request_id: str, output: Dict
+    ) -> sglang_scheduler_pb2.GenerateResponse:
+        """Create a streaming chunk response."""
+        meta_info = output.get("meta_info", {})
+
+        # Convert output logprobs if present
+        output_logprobs_proto = self._convert_output_logprobs_to_proto(
+            output.get("output_logprobs")
+        )
+
+        # Convert input logprobs if present (only in first chunk)
+        input_logprobs_proto = self._convert_input_logprobs_to_proto(
+            output.get("input_logprobs")
+        )
+
+        return sglang_scheduler_pb2.GenerateResponse(
+            request_id=request_id,
+            chunk=sglang_scheduler_pb2.GenerateStreamChunk(
+                token_ids=output.get("token_ids", []),
+                prompt_tokens=meta_info.get("prompt_tokens", 0),
+                completion_tokens=meta_info.get("completion_tokens", 0),
+                cached_tokens=meta_info.get("cached_tokens", 0),
+                output_logprobs=output_logprobs_proto,
+                input_logprobs=input_logprobs_proto,
+                index=output.get("index", 0),
+            ),
+        )
+
+    def _create_completion_response(
+        self, request_id: str, output: Dict
+    ) -> sglang_scheduler_pb2.GenerateResponse:
+        """Create a completion response."""
+
+        # Extract meta info and finish reason details
+        meta_info = output.get("meta_info", {})
+        finish_reason_data = meta_info.get("finish_reason")
+
+        # Determine finish reason, default is stop
+        finish_reason = "stop"
+        if finish_reason_data:
+            if isinstance(finish_reason_data, dict):
+                finish_reason_type = finish_reason_data.get("type")
+            else:
+                # Handle legacy string format
+                finish_reason_type = finish_reason_data
+
+            if finish_reason_type == "length":
+                finish_reason = "length"
+            elif finish_reason_type == "abort":
+                finish_reason = "abort"
+
+        # Extract matched_stop information
+        matched_stop_kwargs = {}
+        if isinstance(finish_reason_data, dict) and "matched" in finish_reason_data:
+            matched = finish_reason_data["matched"]
+            if isinstance(matched, int):
+                matched_stop_kwargs["matched_token_id"] = matched
+            elif isinstance(matched, str):
+                matched_stop_kwargs["matched_stop_str"] = matched
+
+        # Convert output logprobs if present
+        output_logprobs_proto = self._convert_output_logprobs_to_proto(
+            output.get("output_logprobs")
+        )
+
+        # Convert input logprobs if present
+        input_logprobs_proto = self._convert_input_logprobs_to_proto(
+            output.get("input_logprobs")
+        )
+
+        return sglang_scheduler_pb2.GenerateResponse(
+            request_id=request_id,
+            complete=sglang_scheduler_pb2.GenerateComplete(
+                output_ids=output.get("token_ids", []),
+                finish_reason=finish_reason,
+                prompt_tokens=meta_info.get("prompt_tokens", 0),
+                completion_tokens=meta_info.get(
+                    "completion_tokens", len(output.get("token_ids", []))
+                ),
+                cached_tokens=meta_info.get("cached_tokens", 0),
+                output_logprobs=output_logprobs_proto,
+                input_logprobs=input_logprobs_proto,
+                index=output.get("index", 0),
+                **matched_stop_kwargs,
+            ),
         )
 
     async def shutdown(self):
