@@ -19,7 +19,7 @@ HW_MAPPING = {
 PER_COMMIT_SUITES = {
     HWBackend.CPU: ["default", "stage-a-cpu-only"],
     HWBackend.AMD: [
-        "stage-a-test-1",
+        "stage-a-test-1-amd",
         "stage-b-test-small-1-gpu-amd",
         "stage-b-test-small-1-gpu-amd-mi35x",
         "stage-b-test-large-2-gpu-amd",
@@ -28,8 +28,12 @@ PER_COMMIT_SUITES = {
     HWBackend.CUDA: [
         "stage-a-test-1",
         "stage-b-test-small-1-gpu",
+        "stage-b-test-small-1-gpu-performance",
+        "stage-b-test-small-1-gpu-accuracy",
         "stage-b-test-large-1-gpu",
+        "stage-b-test-large-1-gpu-performance",
         "stage-b-test-large-2-gpu",
+        "stage-b-test-large-2-gpu-performance",
         "stage-c-test-large-4-gpu",
         "stage-b-test-4-gpu-b200",
         "stage-c-test-large-4-gpu-b200",

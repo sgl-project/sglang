@@ -227,11 +227,15 @@ pub async fn add_tokenizer(context: &Arc<AppContext>, request: AddTokenizerReque
     let tokenizer_id = TokenizerRegistry::generate_id();
 
     // Create the job with the pre-generated ID
+    // Note: API-initiated tokenizer loads don't use caching by default
+    // Caching is applied for startup and worker-initiated loads based on router config
     let config = TokenizerConfigRequest {
         id: tokenizer_id.clone(),
         name: request.name.clone(),
         source: request.source.clone(),
         chat_template_path: request.chat_template_path.clone(),
+        cache_config: None,
+        fail_on_duplicate: true,
     };
 
     let job = Job::AddTokenizer {
