@@ -268,15 +268,15 @@ def _test_mode_p_vs_d(args, batch_size):
     }
 
     def _create_prompts():
-        ans = [PROMPT_1, PROMPT_2]
-        for i in range(batch_size - len(ans)):
+        answers = [PROMPT_1, PROMPT_2]
+        for i in range(batch_size - len(answers)):
             end = random.randrange(1, 4096)
             if random.random() < 0.5:
                 begin = 0
             else:
                 begin = random.randrange(0, end)
-            ans.append(LONG_PROMPT[begin:end])
-        return ans[:batch_size]
+            answers.append(LONG_PROMPT[begin:end])
+        return answers[:batch_size]
 
     # warmup + flush
     send_single(args, input_ids=[1] * 64, max_new_tokens=65, return_full_response=True)
