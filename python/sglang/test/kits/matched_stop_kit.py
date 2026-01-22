@@ -148,6 +148,41 @@ What is 2 + 2?<|eot_id|><|start_header_id|>assistant<|end_header_id|>
             matched_stop=eos_token_ids,
         )
 
+    def test_finish_stop_eos_priority_over_length(self):
+        """Test that eos token takes priority over max_new_tokens when both conditions are met.
+
+        This test verifies the fix that ensures when a request hits both eos token and
+        max_new_tokens limit simultaneously, the finish_reason should be "stop" (not "length"),
+        and the eos token should be properly trimmed from the output.
+        """
+        # Use Llama format prompt with a simple question that generates a short answer
+        llama_format_prompt = """\
+<|begin_of_text|><|start_header_id|>system<|end_header_id|>
+You are a helpful assistant. Answer briefly.<|eot_id|><|start_header_id|>user<|end_header_id|>
+What is 2 + 2?<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+        """
+        eos_token_ids = [128000, 128009, 2]
+
+        # Set max_tokens to exactly match the expected completion length.
+        # This tests the boundary case: when completion_tokens == max_tokens
+        # and the last token is eos, finish_reason should be "stop" (not "length").
+        # The model answers " 4" + eos = 3 tokens for completions API.
+        self._run_completions_generation(
+            prompt=llama_format_prompt,
+            max_tokens=3,
+            finish_reason="stop",
+            matched_stop=eos_token_ids,
+        )
+
+        # For chat completions, the model answers "The answer to 2 + 2 is 4." + eos = 13 tokens.
+        # When completion_tokens == max_tokens and eos is hit, should return "stop".
+        self._run_chat_completions_generation(
+            prompt="What is 2 + 2?",
+            max_tokens=13,
+            finish_reason="stop",
+            matched_stop=eos_token_ids,
+        )
+
     def test_finish_length(self):
         self._run_completions_generation(
             max_tokens=5, finish_reason="length", matched_stop=None
