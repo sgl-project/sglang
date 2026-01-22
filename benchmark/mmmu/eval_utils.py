@@ -275,12 +275,12 @@ def parse_multi_choice_response(response, all_choices, index2answer):
     response = " " + response + " "  # add space to avoid partial match
 
     index_answer = True
-    ans_with_brack = False
+    answer_with_brack = False
     candidates = []
     for choice in all_choices:  # e.g., (A) (B) (C) (D)
         if f"({choice})" in response:
             candidates.append(choice)
-            ans_with_brack = True
+            answer_with_brack = True
 
     if len(candidates) == 0:
         for choice in all_choices:  # e.g., A B C D
@@ -299,7 +299,7 @@ def parse_multi_choice_response(response, all_choices, index2answer):
     elif len(candidates) > 1:
         start_indexes = []
         if index_answer:
-            if ans_with_brack:
+            if answer_with_brack:
                 for can in candidates:
                     index = response.rfind(f"({can})")
                     start_indexes.append(index)  # -1 will be ignored anyway
