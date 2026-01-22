@@ -92,6 +92,11 @@ class _DpGatheredBufferWrapper:
     _dp_max_padding: bool
     _global_num_tokens: Optional[List[int]]
     _is_extend_in_batch: bool
+    _cached_global_buffer: Optional[torch.Tensor] = None
+
+    @classmethod
+    def clear_buffer(cls):
+        cls._cached_global_buffer = None
 
     @classmethod
     def set_metadata(cls, hidden_size: int, dtype: torch.dtype, device: torch.device):
@@ -107,6 +112,11 @@ class _DpGatheredBufferWrapper:
         dp_max_padding: bool,
         global_num_tokens: Optional[List[int]] = None,
     ):
+        if (
+            not hasattr(cls, "_global_dp_buffer_len")
+            or global_dp_buffer_len != cls._global_dp_buffer_len
+        ):
+            cls.clear_buffer()
         cls._global_dp_buffer_len = global_dp_buffer_len
         cls._local_dp_buffer_len = local_dp_buffer_len
         cls._dp_max_padding = dp_max_padding
@@ -114,13 +124,14 @@ class _DpGatheredBufferWrapper:
 
     @classmethod
     def get_global_dp_buffer(cls) -> torch.Tensor:
-        with use_symmetric_memory(get_tp_group()):
-            buffer = torch.empty(
-                (cls._global_dp_buffer_len, cls._hidden_size),
-                dtype=cls._dtype,
-                device=cls._device,
-            )
-        return buffer
+        if cls._cached_global_buffer is None:
+            with use_symmetric_memory(get_tp_group()):
+                cls._cached_global_buffer = torch.empty(
+                    (cls._global_dp_buffer_len, cls._hidden_size),
+                    dtype=cls._dtype,
+                    device=cls._device,
+                )
+        return cls._cached_global_buffer
 
     @classmethod
     def get_local_dp_buffer(cls) -> torch.Tensor:
