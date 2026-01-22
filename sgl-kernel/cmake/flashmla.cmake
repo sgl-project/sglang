@@ -9,6 +9,62 @@ FetchContent_Declare(
 )
 FetchContent_Populate(repo-flashmla)
 
+# ============================================================================
+# Patch FlashMLA for SM103a (Blackwell B300/GB300) support
+# These patches are applied after FetchContent downloads the source
+# ============================================================================
+
+# Patch 1: flashmla_utils.h - Expand IS_SM100 to cover SM100 family (sm100, sm101, sm103)
+set(FLASHMLA_UTILS_FILE "${repo-flashmla_SOURCE_DIR}/csrc/flashmla_utils.h")
+file(READ "${FLASHMLA_UTILS_FILE}" FLASHMLA_UTILS_CONTENT)
+string(REPLACE
+    "#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1000)
+#define IS_SM100 1"
+    "// SM100 family includes sm_100, sm_101, sm_103 (Blackwell variants)
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000) && (__CUDA_ARCH__ < 1100)
+#define IS_SM100 1"
+    FLASHMLA_UTILS_CONTENT "${FLASHMLA_UTILS_CONTENT}")
+file(WRITE "${FLASHMLA_UTILS_FILE}" "${FLASHMLA_UTILS_CONTENT}")
+message(STATUS "Patched flashmla_utils.h for SM103a support")
+
+# Patch 2: cutlass/arch/config.h - Add SM103 architecture support
+set(CUTLASS_CONFIG_FILE "${repo-flashmla_SOURCE_DIR}/csrc/cutlass/include/cutlass/arch/config.h")
+file(READ "${CUTLASS_CONFIG_FILE}" CUTLASS_CONFIG_CONTENT)
+# Check if already patched (avoid double-patching on reconfigure)
+string(FIND "${CUTLASS_CONFIG_CONTENT}" "SM103" SM103_FOUND)
+if(SM103_FOUND EQUAL -1)
+    string(REPLACE
+"// SM101 and SM101a"
+"// SM103 and SM103a (Blackwell B300/GB300) - treat as SM100 family
+#if !CUTLASS_CLANG_CUDA && (__CUDACC_VER_MAJOR__ >= 13)
+  #define CUTLASS_ARCH_MMA_SM103_SUPPORTED 1
+  #if (!defined(CUTLASS_ARCH_MMA_SM103_ENABLED) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1030)
+    #define CUTLASS_ARCH_MMA_SM103_ENABLED 1
+
+    // SM103a has same features as SM100a - enable SM100A for compatibility
+    #if !defined(CUTLASS_ARCH_MMA_SM100A_ENABLED)
+      #define CUTLASS_ARCH_MMA_SM100A_ENABLED 1
+    #endif
+    #if !defined(CUTLASS_ARCH_MMA_SM100F_ENABLED)
+      #define CUTLASS_ARCH_MMA_SM100F_ENABLED 1
+    #endif
+  #endif
+#endif
+
+/////////////////////////////////////////////////////////////////////////////////////////////////
+
+// SM101 and SM101a"
+        CUTLASS_CONFIG_CONTENT "${CUTLASS_CONFIG_CONTENT}")
+    file(WRITE "${CUTLASS_CONFIG_FILE}" "${CUTLASS_CONFIG_CONTENT}")
+    message(STATUS "Patched cutlass/arch/config.h for SM103a support")
+else()
+    message(STATUS "cutlass/arch/config.h already patched for SM103a")
+endif()
+
+# ============================================================================
+# End of SM103a patches
+# ============================================================================
+
 set(FLASHMLA_CUDA_FLAGS
     "--expt-relaxed-constexpr"
     "--expt-extended-lambda"
@@ -28,6 +84,11 @@ endif()
 if(${CUDA_VERSION} VERSION_GREATER 12.8)
     list(APPEND FLASHMLA_CUDA_FLAGS
         "-gencode=arch=compute_100a,code=sm_100a"
+    )
+endif()
+if(${CUDA_VERSION} VERSION_GREATER_EQUAL "13.0")
+    list(APPEND FLASHMLA_CUDA_FLAGS
+        "-gencode=arch=compute_103a,code=sm_103a"
     )
 endif()
 
