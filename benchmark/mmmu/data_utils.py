@@ -83,12 +83,12 @@ def get_multi_choice_info(options):
 
     start_chr = "A"
     all_choices = []
-    index2ans = {}
+    index2answer = {}
     for i, option in enumerate(options):
-        index2ans[chr(ord(start_chr) + i)] = option
+        index2answer[chr(ord(start_chr) + i)] = option
         all_choices.append(chr(ord(start_chr) + i))
 
-    return index2ans, all_choices
+    return index2answer, all_choices
 
 
 def load_yaml(file_path):
