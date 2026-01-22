@@ -236,7 +236,7 @@ def render_message(
             prompt += "\n\n<function_results>"
 
         prompt += tool_output_template.format(content=content)
-        
+
         if tool_call_order == len(assistant_tool_calls):
             prompt += "\n</function_results>"
 
