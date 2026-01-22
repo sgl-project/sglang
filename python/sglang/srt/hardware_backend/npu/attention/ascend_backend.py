@@ -681,7 +681,14 @@ class AscendAttnBackend(AttentionBackend):
                 )
 
             else:
-                if layer.qk_head_dim <= 128:
+                causal = True
+                if (
+                    layer.is_cross_attention
+                    or layer.attn_type == AttentionType.ENCODER_ONLY
+                ):
+                    causal = False
+
+                if layer.qk_head_dim <= 128 and causal:
                     query = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
                     attn_output = torch.empty(
                         (query.shape[0], layer.tp_q_head_num * layer.v_head_dim),
@@ -714,13 +721,6 @@ class AscendAttnBackend(AttentionBackend):
 
                     q_ = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
                     o_ = attn_output.view(-1, layer.tp_q_head_num, layer.v_head_dim)
-
-                    causal = True
-                    if (
-                        layer.is_cross_attention
-                        or layer.attn_type == AttentionType.ENCODER_ONLY
-                    ):
-                        causal = False
 
                     self.native_attn._run_sdpa_forward_extend(
                         q_,
