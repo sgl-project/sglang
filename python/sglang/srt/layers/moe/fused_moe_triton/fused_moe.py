@@ -59,7 +59,7 @@ elif _is_hip:
     else:
         from vllm import _custom_ops as vllm_ops
 elif _is_xpu:
-    from sgl_kernel import moe_sum, silu_and_mul
+    from sgl_kernel import moe_sum_reduce, silu_and_mul
 
 padding_size = 128 if bool(int(os.getenv("SGLANG_MOE_PADDING", "0"))) else 0
 
@@ -612,9 +612,10 @@ def fused_experts_impl(
                         routed_scaling_factor,
                     )
         elif _is_xpu:
-            moe_sum(
+            moe_sum_reduce(
                 intermediate_cache3.view(*intermediate_cache3.shape),
                 out_hidden_states[begin_chunk_idx:end_chunk_idx],
+                routed_scaling_factor,
             )
         else:
             vllm_ops.moe_sum(
