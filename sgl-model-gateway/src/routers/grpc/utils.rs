@@ -27,7 +27,7 @@ use crate::{
             ChatLogProbs, ChatLogProbsContent, ContentPart, FunctionCallResponse, StringOrArray,
             Tool, ToolCall, ToolChoice, ToolChoiceValue, TopLogProb,
         },
-        generate::GenerateFinishReason,
+        generate::{GenerateFinishReason, GenerateRequest},
     },
     reasoning_parser::{
         ParserFactory as ReasoningParserFactory, PooledParser as ReasoningPooledParser,
@@ -513,6 +513,52 @@ fn extract_multimodal_from_messages(messages: &[ChatMessage]) -> Option<Multimod
         video_data,
         audio_data: Vec::new(),
         modalities,
+    })
+}
+
+fn extract_urls_from_value(value: &Value, urls: &mut Vec<String>) {
+    match value {
+        Value::String(url) => urls.push(url.clone()),
+        Value::Array(items) => {
+            for item in items {
+                extract_urls_from_value(item, urls);
+            }
+        }
+        Value::Object(map) => {
+            if let Some(Value::String(url)) = map.get("url") {
+                urls.push(url.clone());
+            }
+        }
+        _ => {}
+    }
+}
+
+pub(crate) fn build_multimodal_inputs_from_generate(
+    request: &GenerateRequest,
+) -> Option<MultimodalInputs> {
+    let mut image_urls = Vec::new();
+    let mut video_urls = Vec::new();
+
+    if let Some(image_data) = request.image_data.as_ref() {
+        extract_urls_from_value(image_data, &mut image_urls);
+    }
+    if let Some(video_data) = request.video_data.as_ref() {
+        extract_urls_from_value(video_data, &mut video_urls);
+    }
+
+    if image_urls.is_empty() && video_urls.is_empty() {
+        return None;
+    }
+
+    let mut modalities = Vec::new();
+    modalities.extend(std::iter::repeat("image".to_string()).take(image_urls.len()));
+    modalities.extend(std::iter::repeat("video".to_string()).take(video_urls.len()));
+
+    Some(MultimodalInputs {
+        image_urls,
+        video_urls,
+        modalities,
+        ..Default::default()
     })
 }
 
