@@ -65,9 +65,9 @@ def create_per_token_group_quant_test_data(num_tokens, hidden_dim, num_ranks, fl
 def _compute_balanced_split(total: int, arr_len: int):
     base = total // arr_len
     remainder = total % arr_len
-    ans = [base + 1 if i < remainder else base for i in range(arr_len)]
-    assert sum(ans) == total
-    return torch.tensor(ans, dtype=torch.int)
+    answer = [base + 1 if i < remainder else base for i in range(arr_len)]
+    assert sum(answer) == total
+    return torch.tensor(answer, dtype=torch.int)
 
 
 def _compute_imbalanced_split(
