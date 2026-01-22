@@ -187,15 +187,11 @@ class TestAbortAllWithRetraction(CustomTestCase):
                     if len(output_ids) > 0:
                         abort_in_queue_with_partial_gen += 1
 
-                        # Validate completion_tokens matches output_ids length
                         self.assertEqual(
                             meta_info.get("completion_tokens"), len(output_ids)
                         )
-                        # Validate text is non-empty
                         self.assertGreater(len(result.get("text", "")), 0)
-                        # Validate weight_version is set
                         self.assertIsNotNone(meta_info.get("weight_version"))
-                        # Validate logprobs lengths match output_ids
                         self.assertEqual(
                             len(meta_info.get("output_token_logprobs", [])),
                             len(output_ids),
