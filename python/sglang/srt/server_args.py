@@ -2055,7 +2055,8 @@ class ServerArgs:
                     self.eplb_algorithm == "elasticity_aware"
                 ), "Elastic EP requires eplb_algorithm to be set to 'auto' or 'elasticity_aware'."
 
-        self._validate_ib_devices(self.mooncake_ib_device)
+            if self.elastic_ep_backend == "mooncake":
+                self._validate_ib_devices(self.mooncake_ib_device)
 
     def _handle_expert_distribution_metrics(self):
         if self.enable_expert_distribution_metrics and (
