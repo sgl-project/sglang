@@ -53,7 +53,8 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
-from sglang.srt.utils import add_prefix, is_cuda, is_npu, set_weight_attrs
+from sglang.srt.server_args import get_global_server_args
+from sglang.srt.utils import add_prefix, set_weight_attrs
 
 
 class DbrxRouter(nn.Module):
@@ -127,18 +128,13 @@ class DbrxExperts(nn.Module):
             self.top_k,
             renormalize=True,
         )
-        if is_npu():
-            devices = "npu"
-        elif is_cuda():
-            devices = "cuda"
-        else:
-            devices = "cpu"
+        device = get_global_server_args().device
         self.w13_weight = nn.Parameter(
             torch.empty(
                 self.num_total_experts,
                 2 * self.intermediate_size,
                 self.d_model,
-                device=devices,
+                device=device,
                 dtype=self.params_dtype,
             )
         )
@@ -147,7 +143,7 @@ class DbrxExperts(nn.Module):
                 self.num_total_experts,
                 self.d_model,
                 self.intermediate_size,
-                device=devices,
+                device=device,
                 dtype=self.params_dtype,
             )
         )
