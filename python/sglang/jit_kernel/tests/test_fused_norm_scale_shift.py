@@ -5,10 +5,8 @@ import torch
 from einops import rearrange
 from torch import Tensor
 
-from sglang.jit_kernel.diffusion.norm_fusion.fused_norm_scale_shift import (
+from sglang.jit_kernel.cutedsl.scale_residual_norm_scale_shift import (
     fused_norm_scale_shift,
-)
-from sglang.jit_kernel.diffusion.norm_fusion.fused_scale_residual_norm_scale_shift import (
     fused_scale_residual_norm_scale_shift,
 )
 
@@ -26,21 +24,20 @@ SHAPE_MAP = {
 }
 SHAPES = [
     # (B, S, F, D)
-    (1, 384, 8, 3072),
     (1, 1024, 8, 3072),
     (4, 512, 16, 3072),
     (1, 115200, 1, 3072),  # Hunyuan
     (1, 32760, 1, 1536),  # Wan
     (1, 6, 1, 3072),  # Qwen
 ]
-DTYPES = [torch.float16, torch.bfloat16]
+DTYPES = [torch.float16, torch.bfloat16, torch.float32]
 NORM_TYPES = ["layer", "rms"]
 AFFINE_MODES = ["D", "NAT"]
 INDEX_MODES = ["BSD", "1", "1SD", "BD", "B1D", "D", "1D", "11D", "BF1D"]
 
 
 def _tol(dtype: torch.dtype):
-    return 2e-5 if dtype == torch.float32 else 5e-2
+    return 1e-5 if dtype == torch.float32 else 5e-2
 
 
 @pytest.fixture(autouse=True)
@@ -86,7 +83,7 @@ def fused_norm_scale_shift_ref(
 def fused_scale_residual_norm_scale_shift_ref(
     residual: Tensor,
     x: Tensor,
-    gate: Optional[Tensor],
+    gate: Optional[Tensor] | int,
     weight: Optional[Tensor],
     bias: Optional[Tensor],
     scale: Tensor,
@@ -96,11 +93,11 @@ def fused_scale_residual_norm_scale_shift_ref(
 ):
     original_dtype = x.dtype
     residual, x, gate, weight, bias, scale, shift = (
-        v.float() if v is not None else v
+        v.float() if isinstance(v, Tensor) else v
         for v in [residual, x, gate, weight, bias, scale, shift]
     )
-    if gate is None:
-        x = residual + 1 * x
+    if isinstance(gate, int):
+        x = residual + gate * x
     else:
         if gate.ndim == 4:
             num_frame = gate.shape[1]
@@ -118,6 +115,8 @@ def fused_scale_residual_norm_scale_shift_ref(
 
 
 def _make_tensor(index_mode: str, shape: Tuple, dtype: torch.dtype):
+    if index_mode == "int1":
+        return 1
     if index_mode == "NAT":
         return None
     return torch.randn(*SHAPE_MAP[index_mode](*shape), device=DEVICE, dtype=dtype)
@@ -127,16 +126,20 @@ def _make_tensor(index_mode: str, shape: Tuple, dtype: torch.dtype):
 def run_norm_scale_shift(
     shape=SHAPES[0],
     dtype=DTYPES[0],
+    affine_dtype=DTYPES[0],
+    scale_dtype=DTYPES[0],
+    shift_dtype=DTYPES[0],
     norm_type=NORM_TYPES[0],
     affine_mode=AFFINE_MODES[0],
     scale_mode="BSD",
     shift_mode="BSD",
     eps=1e-5,
 ):
-    x, weight, bias, scale, shift = (
-        _make_tensor(mode, shape, dtype)
-        for mode in ["BSD", affine_mode, affine_mode, scale_mode, shift_mode]
-    )
+    x = _make_tensor("BSD", shape, dtype)
+    weight = _make_tensor(affine_mode, shape, affine_dtype)
+    bias = _make_tensor(affine_mode, shape, affine_dtype)
+    scale = _make_tensor(scale_mode, shape, scale_dtype)
+    shift = _make_tensor(shift_mode, shape, shift_dtype)
     y_dev = fused_norm_scale_shift(x, weight, bias, scale, shift, norm_type, eps)
     y_ref = fused_norm_scale_shift_ref(x, weight, bias, scale, shift, norm_type, eps)
     torch.testing.assert_close(y_dev, y_ref, atol=_tol(dtype), rtol=_tol(dtype))
@@ -146,6 +149,9 @@ def run_norm_scale_shift(
 def run_scale_resi_norm_scale_shift(
     shape=SHAPES[0],
     dtype=DTYPES[0],
+    affine_dtype=DTYPES[0],
+    scale_dtype=DTYPES[0],
+    shift_dtype=DTYPES[0],
     norm_type=NORM_TYPES[0],
     affine_mode=AFFINE_MODES[0],
     gate_mode="B1D",
@@ -153,18 +159,13 @@ def run_scale_resi_norm_scale_shift(
     shift_mode="BSD",
     eps=1e-5,
 ):
-    residual, x, gate, weight, bias, scale, shift = (
-        _make_tensor(mode, shape, dtype)
-        for mode in [
-            "BSD",
-            "BSD",
-            gate_mode,
-            affine_mode,
-            affine_mode,
-            scale_mode,
-            shift_mode,
-        ]
-    )
+    residual = _make_tensor("BSD", shape, dtype)
+    x = _make_tensor("BSD", shape, dtype)
+    gate = _make_tensor(gate_mode, shape, dtype)
+    weight = _make_tensor(affine_mode, shape, affine_dtype)
+    bias = _make_tensor(affine_mode, shape, affine_dtype)
+    scale = _make_tensor(scale_mode, shape, scale_dtype)
+    shift = _make_tensor(shift_mode, shape, shift_dtype)
     y_dev, res_dev = fused_scale_residual_norm_scale_shift(
         residual, x, gate, weight, bias, scale, shift, norm_type, eps
     )
@@ -181,6 +182,16 @@ class TestFusedNormScaleShift:
     @pytest.mark.parametrize("dtype", DTYPES)
     def test_shape_dtype(self, shape, dtype, norm_type):
         run_norm_scale_shift(shape=shape, dtype=dtype, norm_type=norm_type)
+
+    @pytest.mark.parametrize("dtype", DTYPES)
+    def test_dtype_0(self, dtype, norm_type):
+        run_norm_scale_shift(affine_dtype=dtype, norm_type=norm_type)
+
+    @pytest.mark.parametrize("dtype", DTYPES)
+    def test_dtype_1(self, dtype, norm_type):
+        run_norm_scale_shift(
+            scale_dtype=dtype, shift_dtype=dtype, norm_type=norm_type
+        )
 
     @pytest.mark.parametrize("affine_mode", AFFINE_MODES)
     def test_normtype_affine(self, affine_mode, norm_type):
@@ -200,6 +211,16 @@ class TestFusedScaleResidualNormScaleShift:
     def test_shape_dtype(self, shape, dtype, norm_type):
         run_scale_resi_norm_scale_shift(shape=shape, dtype=dtype, norm_type=norm_type)
 
+    @pytest.mark.parametrize("dtype", DTYPES)
+    def test_dtype_0(self, dtype, norm_type):
+        run_scale_resi_norm_scale_shift(affine_dtype=dtype, norm_type=norm_type)
+
+    @pytest.mark.parametrize("dtype", DTYPES)
+    def test_dtype_1(self, dtype, norm_type):
+        run_scale_resi_norm_scale_shift(
+            scale_dtype=dtype, shift_dtype=dtype, norm_type=norm_type
+        )
+
     @pytest.mark.parametrize("affine_mode", AFFINE_MODES)
     def test_normtype_affine(self, affine_mode, norm_type):
         run_scale_resi_norm_scale_shift(affine_mode=affine_mode, norm_type=norm_type)
@@ -210,7 +231,7 @@ class TestFusedScaleResidualNormScaleShift:
             scale_mode=index_mode, shift_mode=index_mode, norm_type=norm_type
         )
 
-    @pytest.mark.parametrize("index_mode", INDEX_MODES + ["NAT"])
+    @pytest.mark.parametrize("index_mode", INDEX_MODES + ["int1"])
     def test_gate_index_mode(self, index_mode, norm_type):
         run_scale_resi_norm_scale_shift(gate_mode=index_mode, norm_type=norm_type)
 

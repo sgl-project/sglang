@@ -10,10 +10,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from sgl_kernel import fused_add_rmsnorm, rmsnorm
 
-from sglang.jit_kernel.diffusion.norm_fusion.fused_norm_scale_shift import (
+from sglang.jit_kernel.cutedsl.scale_residual_norm_scale_shift import (
     fused_norm_scale_shift,
-)
-from sglang.jit_kernel.diffusion.norm_fusion.fused_scale_residual_norm_scale_shift import (
     fused_scale_residual_norm_scale_shift,
 )
 from sglang.jit_kernel.norm import can_use_fused_inplace_qknorm, fused_inplace_qknorm
@@ -323,15 +321,27 @@ class _ScaleResidualNormScaleShift(CustomOp):
         shift: torch.Tensor,
         scale: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if x.shape[-1] % 256 != 0 or x.dtype == torch.float32:
+        # print("residual.dtype:", residual.dtype)
+        # if isinstance(gate, torch.Tensor):
+        #     print("gate.dtype:", gate.dtype)
+        # print("x.dtype:", x.dtype)
+        if (
+            x.shape[-1] % 256 != 0
+            or x.dtype == torch.float32
+            or scale.dtype == torch.float32
+            or shift.dtype == torch.float32
+        ):
             import warnings
 
             warnings.warn(
                 "FusedScaleResidualNormScaleShift cuda not available, using native fallback",
                 stacklevel=2,
             )
+            # print("fallback")
             return self.forward_native(residual, x, gate, shift, scale)
-
+        # weight = getattr(self.norm, "weight", None)
+        # if weight is not None:
+        #     print("weight dtype:", weight.dtype)
         return fused_scale_residual_norm_scale_shift(
             residual.contiguous(),
             x.contiguous(),
@@ -415,7 +425,18 @@ class _NormScaleShift(CustomOp):
     def forward_cuda(
         self, x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor
     ) -> torch.Tensor:
-        if x.shape[-1] % 256 != 0 or x.dtype == torch.float32:
+        # print("x.dtype:", x.dtype)
+        # weight = getattr(self.norm, "weight", None)
+        # if weight is not None:
+        #     print("weight dtype:", weight.dtype)
+        # print("scale.dtype:", scale.dtype)
+        # print("shift.dtype:", shift.dtype)
+        if (
+            x.shape[-1] % 256 != 0
+            or x.dtype == torch.float32
+            or scale.dtype == torch.float32
+            or shift.dtype == torch.float32
+        ):
             import warnings
 
             warnings.warn(
