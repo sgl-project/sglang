@@ -278,7 +278,7 @@ class GlmOcrVisionModel(Glm4vVisionModel):
 
 
 class GlmOcrForConditionalGeneration(Glm4vForConditionalGeneration):
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
         if is_nextn:
             if hasattr(self.config, "num_nextn_predict_layers"):
                 num_nextn_layers = self.config.num_nextn_predict_layers
