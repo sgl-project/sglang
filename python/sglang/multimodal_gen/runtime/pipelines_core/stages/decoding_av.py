@@ -73,7 +73,10 @@ class LTX2AVDecodingStage(DecodingStage):
         )
 
         # 2. Decode Audio
-        audio_latents = getattr(batch, "audio_latents", None)
+        try:
+            audio_latents = batch.audio_latents
+        except AttributeError:
+            audio_latents = None
         if audio_latents is not None:
             # Ensure device/dtype
             device = get_local_torch_device()
@@ -81,14 +84,20 @@ class LTX2AVDecodingStage(DecodingStage):
             self.vocoder = self.vocoder.to(device)
             self.audio_vae.eval()
             self.vocoder.eval()
-            dtype = getattr(self.audio_vae, "dtype", None)
+            try:
+                dtype = self.audio_vae.dtype
+            except AttributeError:
+                dtype = None
             if dtype is None:
                 try:
                     dtype = next(self.audio_vae.parameters()).dtype
                 except StopIteration:
                     dtype = torch.float32
             audio_latents = audio_latents.to(device, dtype=dtype)
-            latents_std = getattr(self.audio_vae, "latents_std", None)
+            try:
+                latents_std = self.audio_vae.latents_std
+            except AttributeError:
+                latents_std = None
             if isinstance(latents_std, torch.Tensor) and torch.all(latents_std == 0):
                 logger.warning(
                     "audio_vae.latents_std is all zeros; audio denorm may be incorrect."
@@ -109,16 +118,29 @@ class LTX2AVDecodingStage(DecodingStage):
                 # Decode spectrogram to waveform
                 waveform = self.vocoder(spectrogram)
             output_batch.audio = waveform.cpu().float()
-            pipeline_audio_cfg = getattr(
-                server_args.pipeline_config, "audio_vae_config", None
-            )
-            pipeline_audio_sr = getattr(
-                getattr(pipeline_audio_cfg, "arch_config", None), "sample_rate", None
-            )
+            try:
+                pipeline_audio_cfg = server_args.pipeline_config.audio_vae_config
+            except AttributeError:
+                pipeline_audio_cfg = None
+            try:
+                pipeline_audio_arch = pipeline_audio_cfg.arch_config  # type: ignore[union-attr]
+            except AttributeError:
+                pipeline_audio_arch = None
+            try:
+                pipeline_audio_sr = pipeline_audio_arch.sample_rate  # type: ignore[union-attr]
+            except AttributeError:
+                pipeline_audio_sr = None
+
+            try:
+                vocoder_sr = self.vocoder.sample_rate
+            except AttributeError:
+                vocoder_sr = None
+            try:
+                audio_vae_sr = self.audio_vae.sample_rate
+            except AttributeError:
+                audio_vae_sr = None
             output_batch.audio_sample_rate = (
-                getattr(self.vocoder, "sample_rate", None)
-                or getattr(self.audio_vae, "sample_rate", None)
-                or pipeline_audio_sr
+                vocoder_sr or audio_vae_sr or pipeline_audio_sr
             )
 
         self.offload_model()

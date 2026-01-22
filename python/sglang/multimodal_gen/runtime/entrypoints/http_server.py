@@ -119,7 +119,10 @@ async def forward_to_scheduler(req_obj, sp):
 
         output_file_path = sp.output_file_path()
         sample = response.output[0]
-        audio = getattr(response, "audio", None)
+        try:
+            audio = response.audio
+        except AttributeError:
+            audio = None
         if isinstance(audio, torch.Tensor) and audio.ndim >= 2:
             audio = audio[0]
         if audio is not None and not (
@@ -132,7 +135,11 @@ async def forward_to_scheduler(req_obj, sp):
             fps=sp.fps or 24,
             save_output=True,
             save_file_path=output_file_path,
-            audio_sample_rate=getattr(response, "audio_sample_rate", None),
+            audio_sample_rate=(
+                response.audio_sample_rate
+                if hasattr(response, "audio_sample_rate")
+                else None
+            ),
         )
 
         if hasattr(response, "model_dump"):

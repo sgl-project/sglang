@@ -60,7 +60,10 @@ class LTX2AVLatentPreparationStage(LatentPreparationStage):
 
         # 2. Prepare Audio Latents (optional)
         # Default to True if not specified
-        generate_audio = getattr(batch, "generate_audio", True)
+        try:
+            generate_audio = batch.generate_audio
+        except AttributeError:
+            generate_audio = True
         if not generate_audio:
             batch.audio_latents = None
             batch.raw_audio_latent_shape = None

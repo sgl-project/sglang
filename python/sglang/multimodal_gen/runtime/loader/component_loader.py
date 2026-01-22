@@ -712,9 +712,10 @@ class VocoderLoader(ComponentLoader):
         vocoder_config = LTXVocoderConfig()
         vocoder_config.update_model_arch(config)
 
-        vocoder_precision = getattr(
-            server_args.pipeline_config, "audio_vae_precision", "fp32"
-        )
+        try:
+            vocoder_precision = server_args.pipeline_config.audio_vae_precision
+        except AttributeError:
+            vocoder_precision = "fp32"
         vocoder_dtype = PRECISION_TO_TYPE[vocoder_precision]
 
         should_offload = self.should_offload(server_args)
@@ -730,13 +731,24 @@ class VocoderLoader(ComponentLoader):
         ), f"Found {len(safetensors_list)} safetensors files in {component_model_path}"
         loaded = safetensors_load_file(safetensors_list[0])
         incompatible = vocoder.load_state_dict(loaded, strict=False)
-        if getattr(incompatible, "missing_keys", None) or getattr(
-            incompatible, "unexpected_keys", None
-        ):
+        missing_keys = []
+        unexpected_keys = []
+        try:
+            missing_keys = incompatible.missing_keys
+            unexpected_keys = incompatible.unexpected_keys
+        except AttributeError:
+            # Best-effort fallback in case older torch returns a tuple-like.
+            try:
+                missing_keys = incompatible[0]
+                unexpected_keys = incompatible[1]
+            except Exception:
+                pass
+
+        if missing_keys or unexpected_keys:
             logger.warning(
                 "Loaded vocoder with missing_keys=%d unexpected_keys=%d",
-                len(getattr(incompatible, "missing_keys", []) or []),
-                len(getattr(incompatible, "unexpected_keys", []) or []),
+                len(missing_keys),
+                len(unexpected_keys),
             )
         return vocoder.eval()
 
