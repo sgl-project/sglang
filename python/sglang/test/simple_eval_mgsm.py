@@ -29,8 +29,8 @@ LATIN_SCRIPT_LANGUAGES = [
 ]
 
 NON_LATIN_SCRIPT_LANGUAGES = [
-    "bn",
     "ru",
+    "bn",
     "te",
     "th",
     "ja",
