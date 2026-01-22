@@ -23,9 +23,7 @@ from sglang.multimodal_gen.runtime.layers.linear import (
 )
 from sglang.multimodal_gen.runtime.layers.quantization import QuantizationConfig
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import get_rope
-from sglang.multimodal_gen.runtime.loader.weight_utils import (
-    default_weight_loader,
-)
+from sglang.multimodal_gen.runtime.loader.weight_utils import default_weight_loader
 from sglang.multimodal_gen.runtime.utils.common import add_prefix
 
 logger = logging.getLogger(__name__)
