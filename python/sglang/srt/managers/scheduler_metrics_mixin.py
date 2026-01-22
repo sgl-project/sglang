@@ -343,8 +343,9 @@ class SchedulerMetricsMixin:
         self.num_generated_tokens = 0
         num_running_reqs = len(batch.reqs)
         num_running_reqs_by_priority: dict[int, int] = defaultdict(int)
-        for req in batch.reqs:
-            num_running_reqs_by_priority[req.priority] += 1
+        if self.enable_priority_scheduling:
+            for req in batch.reqs:
+                num_running_reqs_by_priority[req.priority] += 1
         num_running_reqs_offline_batch = 0
 
         # TODO: generalize this for various memory pools
