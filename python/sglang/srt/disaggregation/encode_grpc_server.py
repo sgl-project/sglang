@@ -104,12 +104,22 @@ class SglangEncoderServicer(sglang_encoder_pb2_grpc.SglangEncoderServicer):
                 socket.send_pyobj(request_dict)
 
             # Perform encoding
-            nbytes, embedding_len, embedding_dim = await self.encoder.encode(
+            (
+                nbytes,
+                embedding_len,
+                embedding_dim,
+                error_msg,
+                error_code,
+            ) = await self.encoder.encode(
                 mm_items=list(request.mm_items),
                 req_id=request.req_id,
                 num_parts=request.num_parts,
                 part_idx=request.part_idx,
             )
+            if error_msg is not None:
+                context.set_code(grpc.StatusCode.INTERNAL)
+                context.set_details(error_msg)
+                return sglang_encoder_pb2.EncodeResponse()
 
             # Handle different transfer backends
             if self.server_args.encoder_transfer_backend == "mooncake":
