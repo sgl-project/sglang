@@ -196,10 +196,10 @@ class BaiChuanAttention(nn.Module):
                 max_position=self.max_position_embeddings,
                 base=self.rope_theta,
             )
-        
+
         self.attn_kwargs = {}
         if self.position_embedding == "ALIBI" and _is_npu:
-            attn_kwargs["slopes"] = self.alibi_slopes
+            self.attn_kwargs["slopes"] = self.alibi_slopes
 
     def forward(
         self,
