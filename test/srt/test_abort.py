@@ -149,6 +149,8 @@ class TestAbortAllWithRetraction(CustomTestCase):
                     "max_new_tokens": 4000,
                     "ignore_eos": True,
                 },
+                "return_logprob": True,
+                "top_logprobs_num": 3,
             },
         )
         return response.json()
@@ -169,21 +171,42 @@ class TestAbortAllWithRetraction(CustomTestCase):
             )
 
             abort_in_queue_count = 0
-            abort_in_queue_with_none_empty_text = 0
+            abort_in_queue_with_partial_gen = 0
 
             for future in as_completed(futures):
-                self.assertEqual(
-                    future.result()["meta_info"]["finish_reason"]["type"], "abort"
-                )
-                if (
-                    future.result()["meta_info"]["finish_reason"]["message"]
-                    == "Abort in waiting queue"
-                ):
+                result = future.result()
+                meta_info = result["meta_info"]
+                finish_reason = meta_info.get("finish_reason", {})
+
+                self.assertEqual(finish_reason.get("type"), "abort")
+
+                if finish_reason.get("message") == "Abort in waiting queue":
                     abort_in_queue_count += 1
-                    if len(future.result()["output_ids"]) > 0:
-                        abort_in_queue_with_none_empty_text += 1
-            assert abort_in_queue_count > 0
-            assert abort_in_queue_with_none_empty_text > 0
+                    output_ids = result.get("output_ids", [])
+
+                    if len(output_ids) > 0:
+                        abort_in_queue_with_partial_gen += 1
+
+                        # Validate completion_tokens matches output_ids length
+                        self.assertEqual(
+                            meta_info.get("completion_tokens"), len(output_ids)
+                        )
+                        # Validate text is non-empty
+                        self.assertGreater(len(result.get("text", "")), 0)
+                        # Validate weight_version is set
+                        self.assertIsNotNone(meta_info.get("weight_version"))
+                        # Validate logprobs lengths match output_ids
+                        self.assertEqual(
+                            len(meta_info.get("output_token_logprobs", [])),
+                            len(output_ids),
+                        )
+                        self.assertEqual(
+                            len(meta_info.get("output_top_logprobs", [])),
+                            len(output_ids),
+                        )
+
+            self.assertGreater(abort_in_queue_count, 0)
+            self.assertGreater(abort_in_queue_with_partial_gen, 0)
             print("Finished test_abort_all_with_retraction")
 
 

@@ -2046,7 +2046,11 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         }
         if recv_obj.finished_reason:
             finish_reason = recv_obj.finished_reason
-        meta_info = {"id": recv_obj.rid, "finish_reason": finish_reason}
+        meta_info = {
+            "id": recv_obj.rid,
+            "finish_reason": finish_reason,
+            "weight_version": self.server_args.weight_version,
+        }
         is_stream = getattr(state.obj, "stream", False)
         if getattr(state.obj, "return_logprob", False):
             self.add_logprob_to_meta_info(
