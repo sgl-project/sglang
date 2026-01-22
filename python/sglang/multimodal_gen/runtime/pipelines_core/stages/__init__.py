@@ -8,9 +8,6 @@ This package contains the various stages that can be composed to create
 complete diffusion pipelines.
 """
 
-from sglang.multimodal_gen.runtime.pipelines_core.stages.text_connector import (
-    LTX2TextConnectorStage,
-)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.causal_denoising import (
     CausalDMDDenoisingStage,
@@ -45,6 +42,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.latent_preparation impo
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.latent_preparation_av import (
     LTX2AVLatentPreparationStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.text_connector import (
+    LTX2TextConnectorStage,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.text_encoding import (
     TextEncodingStage,

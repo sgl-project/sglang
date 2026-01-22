@@ -81,7 +81,9 @@ def _pick_audio_sample_rate(
             duration_s = float(num_frames) / float(fps) if fps else 0.0
             if duration_s > 0:
                 audio_len = (
-                    int(audio_np.shape[0]) if audio_np.ndim == 2 else int(audio_np.shape[-1])
+                    int(audio_np.shape[0])
+                    if audio_np.ndim == 2
+                    else int(audio_np.shape[-1])
                 )
                 inferred_sr = int(round(float(audio_len) / duration_s))
                 if 8000 <= inferred_sr <= 192000:
@@ -124,7 +126,9 @@ def _mux_audio_np_into_mp4(
     tmp_wav_path = None
     try:
         if scipy_wavfile is None:
-            raise RuntimeError("scipy is required to mux audio into mp4 (pip install scipy)")
+            raise RuntimeError(
+                "scipy is required to mux audio into mp4 (pip install scipy)"
+            )
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
             tmp_wav_path = f.name
         scipy_wavfile.write(tmp_wav_path, sample_rate, audio_np)
@@ -178,7 +182,10 @@ def _maybe_mux_audio_into_mp4(
     if audio_np is None:
         return
     selected_sr = _pick_audio_sample_rate(
-        audio_np=audio_np, audio_sample_rate=audio_sample_rate, fps=fps, num_frames=len(frames)
+        audio_np=audio_np,
+        audio_sample_rate=audio_sample_rate,
+        fps=fps,
+        num_frames=len(frames),
     )
 
     try:
