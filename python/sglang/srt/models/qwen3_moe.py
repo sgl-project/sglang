@@ -32,6 +32,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
@@ -660,6 +661,11 @@ class Qwen3MoeAttention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
+        if envs.SGLANG_NPU_PREFILL_PADDING_MAX.get() and hasattr(
+            forward_batch, "_original_forward_mode"
+        ):
+            if forward_batch._original_forward_mode.is_idle():
+                return hidden_states
         s = self.forward_prepare(
             positions=positions,
             hidden_states=hidden_states,

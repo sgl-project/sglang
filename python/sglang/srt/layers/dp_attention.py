@@ -20,6 +20,7 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.environ import envs
 from sglang.srt.utils import get_bool_env_var, is_hip
 
 if TYPE_CHECKING:
@@ -62,7 +63,10 @@ class DpPaddingMode(IntEnum):
         cls, is_extend_in_batch, global_num_tokens: List[int]
     ) -> DpPaddingMode:
         if is_extend_in_batch:
-            return DpPaddingMode.SUM_LEN
+            if envs.SGLANG_NPU_PREFILL_PADDING_MAX.get():
+                return DpPaddingMode.MAX_LEN
+            else:
+                return DpPaddingMode.SUM_LEN
 
         # we choose the mode that minimizes the communication cost
         max_len = max(global_num_tokens)
