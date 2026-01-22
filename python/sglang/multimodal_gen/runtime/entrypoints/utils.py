@@ -39,6 +39,164 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import CYAN, RESET, init_
 logger = init_logger(__name__)
 
 
+def _normalize_audio_to_numpy(audio: Any) -> np.ndarray | None:
+    """Convert audio (torch / numpy) into a float32 numpy array in [-1, 1], best-effort."""
+    if audio is None:
+        return None
+    if isinstance(audio, torch.Tensor):
+        audio_np = audio.detach().float().clamp(-1.0, 1.0).cpu().numpy()
+    elif isinstance(audio, np.ndarray):
+        audio_np = audio.astype(np.float32, copy=False)
+        audio_np = np.clip(audio_np, -1.0, 1.0)
+    else:
+        return None
+
+    # 1. Squeeze leading singleton dimensions (Batch, etc.)
+    while audio_np.ndim > 1 and audio_np.shape[0] == 1:
+        audio_np = audio_np.squeeze(0)
+
+    # 2. Handle (C, L) -> (L, C)
+    if audio_np.ndim == 2 and audio_np.shape[0] < audio_np.shape[1]:
+        audio_np = audio_np.transpose(1, 0)
+
+    # 3. Final safety check: if still 2D and channels (dim 1) is huge, something is wrong
+    if audio_np.ndim == 2 and audio_np.shape[1] > 256 and audio_np.shape[0] == 1:
+        audio_np = audio_np.flatten()
+
+    return audio_np
+
+
+def _pick_audio_sample_rate(
+    *,
+    audio_np: np.ndarray,
+    audio_sample_rate: Optional[int],
+    fps: int,
+    num_frames: int,
+) -> int:
+    """Pick a plausible sample rate, falling back to inferring from video duration."""
+    selected_sr = int(audio_sample_rate) if audio_sample_rate is not None else None
+    if selected_sr is None or not (8000 <= selected_sr <= 192000):
+        selected_sr = 24000
+        try:
+            duration_s = float(num_frames) / float(fps) if fps else 0.0
+            if duration_s > 0:
+                audio_len = (
+                    int(audio_np.shape[0]) if audio_np.ndim == 2 else int(audio_np.shape[-1])
+                )
+                inferred_sr = int(round(float(audio_len) / duration_s))
+                if 8000 <= inferred_sr <= 192000:
+                    selected_sr = inferred_sr
+        except Exception:
+            pass
+    return selected_sr
+
+
+def _resolve_ffmpeg_exe() -> str:
+    ffmpeg_exe = "ffmpeg"
+    ffmpeg_on_path = shutil.which("ffmpeg")
+    if ffmpeg_on_path:
+        ffmpeg_exe = ffmpeg_on_path
+    try:
+        if _imageio_ffmpeg is not None:
+            ffmpeg_exe = _imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        pass
+
+    ffmpeg_ok = False
+    if ffmpeg_exe:
+        if os.path.isabs(ffmpeg_exe):
+            ffmpeg_ok = os.path.exists(ffmpeg_exe)
+        else:
+            ffmpeg_ok = shutil.which(ffmpeg_exe) is not None
+    if not ffmpeg_ok:
+        raise RuntimeError("ffmpeg not found")
+    return ffmpeg_exe
+
+
+def _mux_audio_np_into_mp4(
+    *,
+    save_file_path: str,
+    audio_np: np.ndarray,
+    sample_rate: int,
+    ffmpeg_exe: str,
+) -> None:
+    merged_path = save_file_path.rsplit(".", 1)[0] + ".tmp_mux.mp4"
+    tmp_wav_path = None
+    try:
+        if scipy_wavfile is None:
+            raise RuntimeError("scipy is required to mux audio into mp4 (pip install scipy)")
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            tmp_wav_path = f.name
+        scipy_wavfile.write(tmp_wav_path, sample_rate, audio_np)
+        subprocess.run(
+            [
+                ffmpeg_exe,
+                "-y",
+                "-i",
+                save_file_path,
+                "-i",
+                tmp_wav_path,
+                "-c:v",
+                "copy",
+                "-c:a",
+                "aac",
+                "-strict",
+                "experimental",
+                merged_path,
+            ],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        os.replace(merged_path, save_file_path)
+    finally:
+        if tmp_wav_path:
+            try:
+                os.remove(tmp_wav_path)
+            except OSError:
+                pass
+        if os.path.exists(merged_path):
+            try:
+                os.remove(merged_path)
+            except OSError:
+                pass
+
+
+def _maybe_mux_audio_into_mp4(
+    *,
+    save_file_path: str,
+    audio: Any,
+    frames: list,
+    fps: int,
+    audio_sample_rate: Optional[int],
+) -> None:
+    """Best-effort mux audio into an already-written mp4 at save_file_path.
+
+    Any failure should keep the silent video and only log a warning.
+    """
+    audio_np = _normalize_audio_to_numpy(audio)
+    if audio_np is None:
+        return
+    selected_sr = _pick_audio_sample_rate(
+        audio_np=audio_np, audio_sample_rate=audio_sample_rate, fps=fps, num_frames=len(frames)
+    )
+
+    try:
+        ffmpeg_exe = _resolve_ffmpeg_exe()
+        _mux_audio_np_into_mp4(
+            save_file_path=save_file_path,
+            audio_np=audio_np,
+            sample_rate=selected_sr,
+            ffmpeg_exe=ffmpeg_exe,
+        )
+        logger.info(f"Merged video saved to {CYAN}{save_file_path}{RESET}")
+    except Exception as e:
+        logger.warning(
+            "Failed to mux audio into mp4 (saved silent video): %s",
+            str(e),
+        )
+
+
 def prepare_request(
     server_args: ServerArgs,
     sampling_params: SamplingParams,
@@ -129,129 +287,13 @@ def post_process_sample(
                     quality=quality,
                 )
 
-                if audio is not None:
-                    # Audio is likely (C, L) or (L,). LTX audio is (C, L) latent -> decoded audio (1, L)
-                    # We need to check shape.
-                    if isinstance(audio, torch.Tensor):
-                        audio_np = audio.detach().float().clamp(-1.0, 1.0).cpu().numpy()
-                    elif isinstance(audio, np.ndarray):
-                        audio_np = audio.astype(np.float32, copy=False)
-                        audio_np = np.clip(audio_np, -1.0, 1.0)
-                    else:
-                        audio_np = None
-                    if audio_np is not None:
-
-                        # 1. Squeeze leading singleton dimensions (Batch, etc.)
-                        while audio_np.ndim > 1 and audio_np.shape[0] == 1:
-                            audio_np = audio_np.squeeze(0)
-
-                        # 2. Handle (C, L) -> (L, C)
-                        if audio_np.ndim == 2 and audio_np.shape[0] < audio_np.shape[1]:
-                            audio_np = audio_np.transpose(1, 0)
-
-                        # 3. Final safety check: if still 2D and channels (dim 1) is huge, something is wrong
-                        if audio_np.ndim == 2 and audio_np.shape[1] > 256:
-                            if audio_np.shape[0] == 1:
-                                audio_np = audio_np.flatten()
-
-                        selected_sr = (
-                            int(audio_sample_rate)
-                            if audio_sample_rate is not None
-                            else None
-                        )
-                        if selected_sr is None or not (8000 <= selected_sr <= 192000):
-                            selected_sr = 24000
-                            try:
-                                duration_s = (
-                                    float(len(frames)) / float(fps) if fps else 0.0
-                                )
-                                if duration_s > 0:
-                                    audio_len = (
-                                        int(audio_np.shape[0])
-                                        if audio_np.ndim == 2
-                                        else int(audio_np.shape[-1])
-                                    )
-                                    inferred_sr = int(
-                                        round(float(audio_len) / duration_s)
-                                    )
-                                    if 8000 <= inferred_sr <= 192000:
-                                        selected_sr = inferred_sr
-                            except Exception:
-                                pass
-
-                        try:
-                            ffmpeg_exe = "ffmpeg"
-                            ffmpeg_on_path = shutil.which("ffmpeg")
-                            if ffmpeg_on_path:
-                                ffmpeg_exe = ffmpeg_on_path
-                            try:
-                                if _imageio_ffmpeg is not None:
-                                    ffmpeg_exe = _imageio_ffmpeg.get_ffmpeg_exe()
-                            except Exception:
-                                pass
-                            ffmpeg_ok = False
-                            if ffmpeg_exe:
-                                if os.path.isabs(ffmpeg_exe):
-                                    ffmpeg_ok = os.path.exists(ffmpeg_exe)
-                                else:
-                                    ffmpeg_ok = shutil.which(ffmpeg_exe) is not None
-                            if not ffmpeg_ok:
-                                raise RuntimeError("ffmpeg not found")
-
-                            merged_path = (
-                                save_file_path.rsplit(".", 1)[0] + ".tmp_mux.mp4"
-                            )
-                            tmp_wav_path = None
-                            try:
-                                if scipy_wavfile is None:
-                                    raise RuntimeError(
-                                        "scipy is required to mux audio into mp4 (pip install scipy)"
-                                    )
-                                with tempfile.NamedTemporaryFile(
-                                    suffix=".wav", delete=False
-                                ) as f:
-                                    tmp_wav_path = f.name
-                                scipy_wavfile.write(tmp_wav_path, selected_sr, audio_np)
-                                subprocess.run(
-                                    [
-                                        ffmpeg_exe,
-                                        "-y",
-                                        "-i",
-                                        save_file_path,
-                                        "-i",
-                                        tmp_wav_path,
-                                        "-c:v",
-                                        "copy",
-                                        "-c:a",
-                                        "aac",
-                                        "-strict",
-                                        "experimental",
-                                        merged_path,
-                                    ],
-                                    check=True,
-                                    stdout=subprocess.DEVNULL,
-                                    stderr=subprocess.DEVNULL,
-                                )
-                                os.replace(merged_path, save_file_path)
-                            finally:
-                                if tmp_wav_path:
-                                    try:
-                                        os.remove(tmp_wav_path)
-                                    except OSError:
-                                        pass
-                                if os.path.exists(merged_path):
-                                    try:
-                                        os.remove(merged_path)
-                                    except OSError:
-                                        pass
-                            logger.info(
-                                f"Merged video saved to {CYAN}{save_file_path}{RESET}"
-                            )
-                        except Exception as e:
-                            logger.warning(
-                                "Failed to mux audio into mp4 (saved silent video): %s",
-                                str(e),
-                            )
+                _maybe_mux_audio_into_mp4(
+                    save_file_path=save_file_path,
+                    audio=audio,
+                    frames=frames,
+                    fps=fps,
+                    audio_sample_rate=audio_sample_rate,
+                )
 
             else:
                 quality = 75
