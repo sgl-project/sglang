@@ -80,15 +80,15 @@ class MMMUVLMEval(Eval):
 
     @staticmethod
     def _build_mc_mapping(options: List[str]) -> Tuple[dict, List[str]]:
-        index2ans = {}
+        index2answer = {}
         all_choices = []
         ch = ord("A")
         for opt in options:
             letter = chr(ch)
-            index2ans[letter] = opt
+            index2answer[letter] = opt
             all_choices.append(letter)
             ch += 1
-        return index2ans, all_choices
+        return index2answer, all_choices
 
     def _prepare_mmmu_samples(self, k: int) -> List[dict]:
         # Subjects and domains copied from MMMU data_utils to categorize results
