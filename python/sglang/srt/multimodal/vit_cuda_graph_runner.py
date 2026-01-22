@@ -141,7 +141,7 @@ class ViTCudaGraphRunner:
         override_backend = get_global_server_args().mm_attention_backend
 
         tp_group = get_tp_group()
-        ca_comm = getattr(tp_group, "ca_comm", None)
+        ca_comm = tp_group.ca_comm
         capture_ctx = ca_comm.capture() if ca_comm is not None else nullcontext()
 
         with capture_ctx, torch.cuda.graph(graph):
