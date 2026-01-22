@@ -35,6 +35,7 @@ from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiT
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)  # pylint: disable=invalid-name
+_is_cuda = current_platform.is_cuda()
 
 
 def _get_qkv_projections(
@@ -198,7 +199,7 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
         value = value.unflatten(-1, (self.heads, -1))
 
         if (
-            query.is_cuda
+            _is_cuda
             and (self.norm_q.variance_epsilon == self.norm_k.variance_epsilon)
             and can_use_fused_inplace_qknorm(self.head_dim, query.dtype)
         ):
@@ -220,7 +221,7 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
             encoder_value = encoder_value.unflatten(-1, (self.heads, -1))
 
             if (
-                encoder_query.is_cuda
+                _is_cuda
                 and (
                     self.norm_added_q.variance_epsilon
                     == self.norm_added_k.variance_epsilon
