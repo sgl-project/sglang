@@ -576,13 +576,13 @@ def _convert_per_token_to_global_physical_count(
     index = topk_ids_layer_major.masked_fill(~mask, 0).long()
     src = mask.int()
 
-    ans = torch.zeros(
+    answer = torch.zeros(
         (num_layers, num_physical_experts),
         dtype=_topk_ids_of_layer.dtype,
         device=_topk_ids_of_layer.device,
     )
-    ans.scatter_add_(dim=1, index=index, src=src)
-    return ans
+    answer.scatter_add_(dim=1, index=index, src=src)
+    return answer
 
 
 def _convert_local_to_global_physical_count(
