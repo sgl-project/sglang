@@ -1045,6 +1045,24 @@ def assert_pkg_version(pkg: str, min_version: str, message: str):
         )
 
 
+def check_pkg_version_at_least(pkg: str, min_version: str) -> bool:
+    """
+    Check if a package is installed and meets the minimum version requirement.
+
+    Args:
+        pkg: Package name (distribution name, e.g., "flashinfer-python")
+        min_version: Minimum version required (e.g., "0.6.2")
+
+    Returns:
+        True if package is installed and version >= min_version, False otherwise
+    """
+    try:
+        installed_version = version(pkg)
+        return pkg_version.parse(installed_version) >= pkg_version.parse(min_version)
+    except PackageNotFoundError:
+        return False
+
+
 def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = None):
     """Kill the process and all its child processes."""
     # Remove sigchld handler to avoid spammy logs.
@@ -2880,6 +2898,8 @@ def is_fa3_default_architecture(hf_config):
         "Glm4vForConditionalGeneration",
         "Glm4vMoeForConditionalGeneration",
         "Step3VLForConditionalGeneration",
+        "StepVLForConditionalGeneration",
+        "MiMoV2FlashForCausalLM",
     }
     return architectures[0] in default_archs
 

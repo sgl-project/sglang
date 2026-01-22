@@ -17,8 +17,10 @@ from sglang.srt.function_call.deepseekv32_detector import DeepSeekV32Detector
 from sglang.srt.function_call.glm4_moe_detector import Glm4MoeDetector
 from sglang.srt.function_call.glm47_moe_detector import Glm47MoeDetector
 from sglang.srt.function_call.gpt_oss_detector import GptOssDetector
+from sglang.srt.function_call.hermes_detector import HermesDetector
 from sglang.srt.function_call.internlm_detector import InternlmDetector
 from sglang.srt.function_call.kimik2_detector import KimiK2Detector
+from sglang.srt.function_call.lfm2_detector import Lfm2Detector
 from sglang.srt.function_call.llama32_detector import Llama32Detector
 from sglang.srt.function_call.mimo_detector import MiMoDetector
 from sglang.srt.function_call.minimax_m2 import MinimaxM2Detector
@@ -51,6 +53,7 @@ class FunctionCallParser:
         "glm47": Glm47MoeDetector,
         "gpt-oss": GptOssDetector,
         "kimi_k2": KimiK2Detector,
+        "lfm2": Lfm2Detector,
         "llama3": Llama32Detector,
         "mimo": MiMoDetector,
         "mistral": MistralDetector,
@@ -62,6 +65,7 @@ class FunctionCallParser:
         "minimax-m2": MinimaxM2Detector,
         "trinity": TrinityDetector,
         "interns1": InternlmDetector,
+        "hermes": HermesDetector,
     }
 
     def __init__(self, tools: List[Tool], tool_call_parser: str):
