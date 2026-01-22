@@ -716,6 +716,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                         img_data=obj.image_data,
                         mm_processor=self.mm_processor,
                         prompt=(input_text or input_ids),
+                        need_wait_for_image=obj.need_wait_for_image,
                     )
                 if mm_inputs is None:
                     mm_inputs: Dict = await self.mm_data_processor.process(
@@ -725,6 +726,20 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                         request_obj=obj,
                         max_req_input_len=self.max_req_input_len,
                     )
+            elif (
+                self.server_args.language_only
+                and self.server_args.encoder_transfer_backend == "zmq_to_scheduler"
+                and not obj.need_wait_for_image
+            ):
+                # In language_only mode with zmq_to_scheduler, if we didn't dispatch
+                # to encoder (e.g., only one image), process locally like non-language_only mode
+                mm_inputs: Dict = await self.mm_data_processor.process(
+                    image_data=obj.image_data,
+                    audio_data=obj.audio_data,
+                    input_text_or_ids=(input_text or input_ids),
+                    request_obj=obj,
+                    max_req_input_len=self.max_req_input_len,
+                )
 
             if mm_inputs and "input_ids" in mm_inputs:
                 input_ids = mm_inputs["input_ids"]
@@ -2272,16 +2287,48 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     "", obj.rid[i], ts=int(created_time * 1e9), anonymous=True
                 )
 
+    def _should_dispatch_to_encoder(
+        self, obj: Union[GenerateReqInput, EmbeddingReqInput]
+    ) -> bool:
+        """Check if the request should be dispatched to encoder for processing.
+
+        Returns True if the request should be dispatched to encoder (multiple images),
+        False if it should be processed locally (single image or no images).
+
+        Args:
+            obj: The request input object
+
+        Returns:
+            bool: True if should dispatch to encoder, False otherwise
+        """
+        if obj.batch_size > 1:
+            raise ValueError(
+                "Batch request is not supported in epd disaggregation mode."
+            )
+        if not isinstance(obj, GenerateReqInput) or not obj.contains_mm_input():
+            return False
+
+        if isinstance(obj.image_data, list):
+            return len(obj.image_data) > 1
+        return False
+
     def _handle_epd_disaggregation_encode_request(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput]
     ):
         """Handle EPD-disaggregation mode encoding request."""
-        if (
-            isinstance(obj, GenerateReqInput)
-            and self.server_args.encoder_transfer_backend == "zmq_to_scheduler"
-            and obj.contains_mm_input()
-        ):
-            self.mm_receiver.send_encode_request(obj)
+        if isinstance(obj, GenerateReqInput) and obj.contains_mm_input():
+            # Check if we should dispatch to encoder
+            should_dispatch = self._should_dispatch_to_encoder(obj)
+
+            # Set need_wait_for_image flag based on whether we dispatch to encoder
+            # This flag will be used in _tokenize_one_request to determine processing path
+            if should_dispatch:
+                obj.need_wait_for_image = True
+                if self.server_args.encoder_transfer_backend == "zmq_to_scheduler":
+                    self.mm_receiver.send_encode_request(obj)
+            else:
+                # Only one image or no images - don't dispatch to encoder, use local processing
+                obj.need_wait_for_image = False
 
 
 class ServerStatus(Enum):

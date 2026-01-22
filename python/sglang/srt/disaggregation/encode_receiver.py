@@ -552,8 +552,6 @@ class MMReceiver:
             obj.rid = uuid.uuid4().hex
         if image_urls and len(image_urls) > 0:
             logger.info(f"Processing {len(image_urls)} images for request {obj.rid}")
-            obj.need_wait_for_image = True
-
             encode_idx = list(range(len(self.encode_urls)))
             random.shuffle(encode_idx)
             obj.num_items_assigned = [
@@ -573,9 +571,9 @@ class MMReceiver:
             encode_thread.start()
 
     # For zmq_to_tokenizer and mooncake
-    async def recv_mm_data(self, img_data, mm_processor, prompt):
+    async def recv_mm_data(self, img_data, mm_processor, prompt, need_wait_for_image):
         try:
-            if len(self.encode_urls) == 0:
+            if len(self.encode_urls) == 0 or not need_wait_for_image:
                 return None
             req_id = uuid.uuid4().hex
             embedding_port, recv_socket = get_zmq_socket_on_host(self.context, zmq.PULL)
