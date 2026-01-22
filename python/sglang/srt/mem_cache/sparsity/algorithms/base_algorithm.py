@@ -3,7 +3,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sgl_kernel import quest_retrieval_score_and_combine_indices
+from sgl_kernel import retrieval_score_and_combine_indices
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -305,7 +305,7 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
         out_indices = torch.empty((bs, max_out), dtype=torch.int32, device=device)
         out_lengths = torch.empty((bs,), dtype=torch.int32, device=device)
 
-        quest_retrieval_score_and_combine_indices(
+        retrieval_score_and_combine_indices(
             bs,
             seq_lens.to(torch.int32),
             self.page_size,

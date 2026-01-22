@@ -1,7 +1,7 @@
 import torch
 from typing import Optional
 
-def quest_retrieval_score_and_combine_indices(
+def retrieval_score_and_combine_indices(
     bs: int,
     seq_lens: torch.Tensor,
     page_size: int,
@@ -37,7 +37,7 @@ def quest_retrieval_score_and_combine_indices(
         out_lengths: Output lengths tensor [bs] (int32)
     """
     
-    return torch.ops.sgl_kernel.quest_retrieval_score_and_combine_indices.default(
+    return torch.ops.sgl_kernel.retrieval_score_and_combine_indices.default(
         bs,
         seq_lens,
         page_size,

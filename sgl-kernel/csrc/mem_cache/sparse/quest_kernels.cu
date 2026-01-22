@@ -241,7 +241,7 @@ __global__ void quest_combine_kernel(
     }
 }
 
-void quest_retrieval_score_and_combine_indices(
+void retrieval_score_and_combine_indices(
     int64_t bs,
     torch::Tensor seq_lens,
     int64_t page_size,
