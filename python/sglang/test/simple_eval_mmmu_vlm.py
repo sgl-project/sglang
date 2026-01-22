@@ -327,7 +327,7 @@ class MMMUVLMEval(Eval):
 
 
 def _parse_multi_choice_response(
-    response: str, all_choices: List[str], index2ans: dict
+    response: str, all_choices: List[str], index2answer: dict
 ) -> str:
     # loosely adapted from benchmark mmmu eval
     for char in [",", ".", "!", "?", ";", ":", "'"]:
@@ -345,7 +345,7 @@ def _parse_multi_choice_response(
                 candidates.append(choice)
     if not candidates and len(response.split()) > 5:
         # try match by option text
-        for idx, ans in index2ans.items():
+        for idx, ans in index2answer.items():
             if ans and ans.lower() in response.lower():
                 candidates.append(idx)
     if not candidates:
@@ -359,8 +359,8 @@ def _parse_multi_choice_response(
         pos = response.rfind(f"({can})")
         if pos == -1:
             pos = response.rfind(f" {can} ")
-        if pos == -1 and index2ans.get(can):
-            pos = response.lower().rfind(index2ans[can].lower())
+        if pos == -1 and index2answer.get(can):
+            pos = response.lower().rfind(index2answer[can].lower())
         starts.append(pos)
     return candidates[int(max(range(len(starts)), key=lambda i: starts[i]))]
 
