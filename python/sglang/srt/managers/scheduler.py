@@ -172,6 +172,7 @@ from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import PortArgs, ServerArgs, get_global_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.auto_eagle import AutoTunerEagle
 from sglang.srt.tracing.trace import (
     process_tracing_init,
     trace_event_batch,
@@ -308,6 +309,16 @@ class Scheduler(
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
         self.enable_hicache_storage = server_args.hicache_storage_backend is not None
         self.max_recv_per_poll = envs.SGLANG_SCHEDULER_MAX_RECV_PER_POLL.get()
+
+        # auto_spec server args
+        self.auto_spec = server_args.auto_spec
+        self.tune_interval = server_args.tune_interval
+        self.interval_counter = 0
+        if self.auto_spec:
+            self.spec_auto_tuner = AutoTunerEagle(server_args)
+            server_args.spec_auto_tuner = self.spec_auto_tuner
+        # todo: add idle flag to identify when to start auto tuning
+        self.last_loop_is_idle = True
 
         # Distributed rank info
         self.attn_tp_rank, self.attn_tp_size, self.attn_dp_rank = (
@@ -2427,6 +2438,24 @@ class Scheduler(
             self.process_batch_result_prebuilt(batch)
         elif batch.forward_mode.is_idle():
             self.process_batch_result_idle(batch, result)
+
+        if self.auto_spec and (batch.batch_size() <= 6 or batch.batch_size() > 48) and batch.forward_mode.is_decode():
+                # logger.info(f"[MY LOG] auto_spec enabled, batchsize: {batch.batch_size()}. tune_interval: {self.tune_interval}, interval_counter: {self.interval_counter}")
+            if self.tune_interval == 1:
+                # logger.info(f"[MY LOG] auto_spec tune_interval set to 1, tune in every forward pass.")
+                # accept_length, accept_rate, throughput = self.get_metrics()
+                accept_length, accept_rate, throughput = self.get_metrics_v2(batch.batch_size(), result.num_accepted_tokens, self.model_worker.speculative_num_draft_tokens)
+                self.model_worker.spec_auto_tuner.compute_and_update_best_parameters(batch.batch_size(), accept_length, accept_rate, throughput)
+            elif (self.interval_counter + 1) % self.tune_interval != 0:
+                # logger.info(f"[MY LOG] auto_spec, tune_interval: {self.tune_interval}, interval_counter: {self.interval_counter}, only update info.")
+                self.interval_counter += 1
+                self.get_metrics_v3(batch.batch_size(), result.num_accepted_tokens, self.model_worker.speculative_num_draft_tokens)
+            elif (self.interval_counter + 1) % self.tune_interval == 0:
+                # logger.info(f"[MY LOG] auto_spec, tune_interval: {self.tune_interval}, interval_counter: {self.interval_counter}, compute spec info best params.")
+                accept_length, accept_rate, throughput = self.get_metrics_v3(batch.batch_size(), result.num_accepted_tokens, self.model_worker.speculative_num_draft_tokens, True)
+                self.model_worker.spec_auto_tuner.compute_and_update_best_parameters(batch.batch_size(), accept_length,
+                                                                                     accept_rate, throughput)
+                self.interval_counter = 0
 
         self.log_batch_result_stats(batch, result)
         self._maybe_clear_mm_inputs(batch)

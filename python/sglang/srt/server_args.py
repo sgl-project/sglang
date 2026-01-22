@@ -465,6 +465,13 @@ class ServerArgs:
     speculative_ngram_branch_length: int = 18
     speculative_ngram_capacity: int = 10 * 1000 * 1000
     enable_multi_layer_eagle: bool = False
+    # for auto_spec
+    auto_spec: bool = False
+    tune_interval: int = 0
+    speculative_config_file: Optional[str] = None
+    save_tune_results: Optional[str] = None
+    neg_threshold: Optional[List[int]] = None
+    pos_threshold: Optional[List[int]] = None
 
     # Expert parallelism
     ep_size: int = 1
@@ -2203,6 +2210,11 @@ class ServerArgs:
                     "speculative_eagle_topk > 1 with page_size > 1 is unstable and produces incorrect results for paged attention backends. This combination is only supported for the 'flashinfer' backend."
                 )
 
+            if self.auto_spec:
+                self.speculative_num_steps = 3
+                self.speculative_eagle_topk = 1
+                self.speculative_num_draft_tokens = self.speculative_num_steps + 1
+
         if self.speculative_algorithm == "NGRAM":
             if not self.device.startswith("cuda"):
                 raise ValueError(
@@ -3729,6 +3741,43 @@ class ServerArgs:
             "--enable-multi-layer-eagle",
             action="store_true",
             help="Enable multi-layer Eagle speculative decoding.",
+        )
+
+        # auto_spec
+        parser.add_argument(
+            "--auto-spec",
+            action="store_true",
+            help="Enable dynamic parameter adjustment for speculative inference.",
+        )
+        parser.add_argument(
+            "--neg-threshold",
+            type=float,
+            nargs="+",
+            help="Threshold of negative threshold for auto-spec"
+        )
+        parser.add_argument(
+            "--pos-threshold",
+            type=float,
+            nargs="+",
+            help="Threshold of positive threshold for auto-spec"
+        )
+        parser.add_argument(
+            "--tune-interval",
+            type=int,
+            default=1,
+            help="Dynamic specinfer tuning interval, default to tune in every forward pass.",
+        )
+        parser.add_argument(
+            "--speculative-config-file",
+            type=str,
+            default=ServerArgs.speculative_config_file,
+            help="Path to a JSON file containing speculative decoding configuration for different models. Optional.",
+        )
+        parser.add_argument(
+            "--save-tune-results",
+            type=str,
+            default=ServerArgs.save_tune_results,
+            help="Save tune results to a JSON file if given a file path.",
         )
 
         # Expert parallelism

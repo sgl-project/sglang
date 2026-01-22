@@ -12,6 +12,7 @@ from sglang.srt.model_executor.cuda_graph_runner import (
     DeepEPCudaGraphRunnerAdapter,
     LogitsProcessorOutput,
     get_batch_sizes_to_capture,
+    get_batch_sizes_to_capture_for_steps,
     get_global_graph_memory_pool,
     model_capture_mode,
     set_global_graph_memory_pool,
@@ -491,3 +492,148 @@ class EAGLEDraftExtendCudaGraphRunner:
             out.topk_p = out_copy.topk_p[:unpadding_bs]
             out.topk_index = out_copy.topk_index[:unpadding_bs]
         return out
+
+
+class EAGLEDraftExtendCudaGraphRunnerAuto(EAGLEDraftExtendCudaGraphRunner):
+    def __init__(self, eagle_worker: EAGLEWorker, speculative_num_steps: int):
+        # Parse args
+        self.eagle_worker = eagle_worker
+        if not hasattr(eagle_worker, "model_runner"):
+            # V2: EagleDraftWorker
+            self.model_runner = model_runner = eagle_worker.draft_runner
+            self.forward_mode = ForwardMode.DRAFT_EXTEND_V2
+        else:
+            self.model_runner = model_runner = eagle_worker.model_runner
+            self.forward_mode = ForwardMode.DRAFT_EXTEND
+
+        self.graphs = {}
+        self.output_buffers = {}
+        self.enable_torch_compile = model_runner.server_args.enable_torch_compile
+        self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
+        self.require_gathered_buffer = require_gathered_buffer(model_runner.server_args)
+        self.require_mlp_tp_gather = require_mlp_tp_gather(model_runner.server_args)
+        self.require_mlp_sync = require_mlp_sync(model_runner.server_args)
+        self.require_attn_tp_gather = require_attn_tp_gather(model_runner.server_args)
+        self.tp_size = self.model_runner.tp_size
+        self.dp_size = self.model_runner.dp_size
+        self.speculative_num_steps = speculative_num_steps  # todo use current num_step for the parameter
+        self.topk = 1  # todo use current topk for the parameter
+        self.enable_profile_cuda_graph = (
+            model_runner.server_args.enable_profile_cuda_graph
+        )
+        self.enable_pdmux = False
+        self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
+
+        self.capture_bs, self.compile_bs = get_batch_sizes_to_capture_for_steps(model_runner)  # use batchsizes to be captured for current step
+        self.padded_static_len = -1
+
+        # Attention backend
+        self.num_tokens_per_bs = self.speculative_num_steps + 1
+        self.max_bs = max(self.capture_bs)
+        self.max_num_token = self.max_bs * self.num_tokens_per_bs
+
+        self.eagle_worker.draft_extend_attn_backend.init_cuda_graph_state(
+            self.max_bs, self.max_num_token
+        )
+        self.seq_len_fill_value = (
+            self.eagle_worker.draft_extend_attn_backend.get_cuda_graph_seq_len_fill_value()
+        )
+        self.seq_lens_cpu = torch.full(
+            (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
+        )
+        self.extend_seq_lens_cpu = [self.num_tokens_per_bs] * self.max_bs
+
+        if self.enable_torch_compile:
+            set_torch_compile_config()
+
+        # Graph inputs
+        with torch.device(model_runner.device):
+            self.input_ids = torch.zeros((self.max_num_token,), dtype=torch.int64)
+            self.req_pool_indices = torch.zeros((self.max_bs,), dtype=torch.int32)
+            self.out_cache_loc = torch.ones((self.max_num_token,), dtype=torch.int64)
+            self.positions = torch.zeros((self.max_num_token,), dtype=torch.int64)
+            self.mrope_positions = torch.zeros(
+                (3, self.max_num_token), dtype=torch.int64
+            )
+
+            if self.eagle_worker.speculative_algorithm.is_eagle3():
+                self.hidden_states = torch.zeros(
+                    (
+                        self.max_num_token,
+                        (
+                            self.model_runner.model_config.hf_config.target_hidden_size
+                            * 3
+                            if hasattr(
+                                self.model_runner.model_config.hf_config,
+                                "target_hidden_size",
+                            )
+                            else self.model_runner.model_config.hidden_size * 3
+                        ),
+                    ),
+                    dtype=self.model_runner.dtype,
+                )
+            else:
+                self.hidden_states = torch.zeros(
+                    (self.max_num_token, self.model_runner.model_config.hidden_size),
+                    dtype=self.model_runner.dtype,
+                )
+            self.seq_len_fill_value = (
+                self.model_runner.attn_backend.get_cuda_graph_seq_len_fill_value()
+            )
+            self.seq_lens = torch.full(
+                (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
+            )
+            self.extend_seq_lens = torch.ones((self.max_bs,), dtype=torch.int32)
+            self.accept_length = torch.full(
+                (self.max_bs,), self.num_tokens_per_bs, dtype=torch.int32
+            )
+
+            if self.require_gathered_buffer:
+                if self.require_mlp_tp_gather:
+                    self.global_num_tokens_gpu = torch.zeros(
+                        (self.dp_size,), dtype=torch.int32
+                    )
+                    self.global_num_tokens_for_logprob_gpu = torch.zeros(
+                        (self.dp_size,), dtype=torch.int32
+                    )
+                else:
+                    assert self.require_attn_tp_gather
+                    self.global_num_tokens_gpu = torch.zeros((1,), dtype=torch.int32)
+                    self.global_num_tokens_for_logprob_gpu = torch.zeros(
+                        (1,), dtype=torch.int32
+                    )
+            else:
+                self.global_num_tokens_gpu = None
+                self.global_num_tokens_for_logprob_gpu = None
+
+            if hasattr(
+                self.model_runner.model_config.hf_config, "draft_vocab_size"
+            ):  # llama_eagle
+                vocab_size = self.model_runner.model_config.hf_config.draft_vocab_size
+            elif hasattr(
+                self.model_runner.model_config.hf_config, "hot_vocab_size"
+            ):  # llama_eagle3
+                vocab_size = self.model_runner.model_config.hf_config.hot_vocab_size
+            else:
+                vocab_size = self.model_runner.model_config.vocab_size
+
+            self.next_token_logits_buffer = torch.zeros(
+                (
+                    (
+                        self.max_bs * self.num_tokens_per_bs
+                        if self.forward_mode == ForwardMode.DRAFT_EXTEND_V2
+                        else self.max_bs
+                    ),
+                    vocab_size,
+                ),
+                dtype=torch.float,
+            )
+
+        # Capture
+        try:
+            with model_capture_mode():
+                self.capture()
+        except RuntimeError as e:
+            raise Exception(
+                f"Capture cuda graph failed: {e}\n{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
+            )

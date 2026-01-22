@@ -302,6 +302,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.spec_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
+        self.auto_spec = server_args.auto_spec
         self.page_size = server_args.page_size
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -570,9 +571,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if self.device == "cuda":
             self.init_cublas()
-            self.init_attention_backend()
-            self.kernel_warmup()
-            self.init_device_graphs()
+            if not self.auto_spec:
+                self.init_attention_backend()
+                self.kernel_warmup()
+                self.init_device_graphs()
+            else:
+                if not self.is_draft_worker:
+                    server_args.spec_auto_tuner.initialize(self.gpu_id)  # todo: at this time, calculate how many graph gpu is able to capture for diff num_steps
+                self.step_range = server_args.spec_auto_tuner.step_range
+                self.init_attention_backend_for_steps()
+                self.kernel_warmup()
+                self.init_device_graphs_for_steps()
         elif self.device in ["npu", "cpu"]:
             self.init_attention_backend()
             self.init_device_graphs()
@@ -1606,6 +1615,30 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         else:
             self.attn_backend = self._get_attention_backend()
 
+    def init_attention_backend_for_steps(self):
+        """todo: auto_spec. Init attention kernel backend for different num_steps."""
+        self.attn_backend_for_steps = {}
+        for num_steps in self.step_range:  # todo 暂时不支持另外两个分支
+            if self.server_args.enable_pdmux:
+                self.attn_backend = self._get_attention_backend(init_new_workspace=True)
+                self.decode_attn_backend_group = []
+                for _ in range(self.server_args.sm_group_num):
+                    self.decode_attn_backend_group.append(self._get_attention_backend())
+                self.decode_attn_backend = self.decode_attn_backend_group[0]
+            elif self.server_args.enable_two_batch_overlap and not self.is_draft_worker:
+                self.attn_backend = TboAttnBackend.init_new(self._get_attention_backend)
+            else:
+                self.server_args.speculative_num_steps = num_steps
+                self.server_args.speculative_num_draft_tokens = 1
+                self.server_args.speculative_num_draft_tokens = num_steps + 1
+                logger.info(f"[MY LOG] init_attention_backend_for_steps: num_steps={num_steps}")
+                self.attn_backend_for_steps[num_steps] = self._get_attention_backend()
+        initial_steps = self.step_range[-1]
+        self.server_args.speculative_num_steps = initial_steps
+        self.server_args.speculative_num_draft_tokens = 1
+        self.server_args.speculative_num_draft_tokens = initial_steps + 1
+        self.attn_backend = self.attn_backend_for_steps[initial_steps]
+
     def _get_attention_backend(self, init_new_workspace: bool = False):
         """Init attention kernel backend."""
         draft_attn_backend = self.server_args.speculative_draft_attention_backend
@@ -2012,6 +2045,65 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.graph_mem_usage = before_mem - after_mem
         logger.info(
             f"Capture {'cpu graph' if self.device == 'cpu' else 'cuda graph'} end. Time elapsed: {time.perf_counter() - tic:.2f} s. "
+            f"mem usage={self.graph_mem_usage:.2f} GB. avail mem={after_mem:.2f} GB."
+        )
+
+    def init_device_graphs_for_steps(self):
+        """todo: auto_spec. Capture device graphs for different num_steps."""
+        self.graph_runner_for_steps = {}
+        self.graph_runner = None
+        self.graph_mem_usage = 0
+
+        if not self.is_generation:
+            # TODO: Currently, cuda graph only captures decode steps, which only exists for generation models
+            return
+
+        if self.server_args.model_impl.lower() == ModelImpl.MINDSPORE:
+            return
+
+        if self.device != "cpu" and self.server_args.disable_cuda_graph:
+            return
+
+        if self.device == "cpu" and not self.server_args.enable_torch_compile:
+            return
+
+        tic = time.perf_counter()
+        before_mem = get_available_gpu_memory(self.device, self.gpu_id)
+        logger.info(
+            f"[SpanLogs] Capture {'cpu graph' if self.device == 'cpu' else 'cuda graph'} begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
+        )
+        graph_runners = defaultdict(
+            lambda: CudaGraphRunner,
+            {
+                "cpu": CPUGraphRunner,
+                "npu": NPUGraphRunner,
+            },
+        )
+        for num_steps in self.step_range:
+            logger.info(f"[MY LOG] ModelRunner init graph for num_steps={num_steps}")
+            before_mem_n = get_available_gpu_memory(self.device, self.gpu_id)
+            self.server_args.speculative_num_steps = num_steps
+            self.server_args.speculative_num_draft_tokens = 1
+            self.server_args.speculative_num_draft_tokens = num_steps + 1
+            self.attn_backend = self.attn_backend_for_steps[num_steps]
+            self.graph_runner_for_steps[num_steps] = graph_runners[self.device](self)
+            after_mem_n = get_available_gpu_memory(self.device, self.gpu_id)
+            graph_mem_usage = before_mem_n - after_mem_n
+            logger.info(
+                f"[MY LOG] Capture num_step: {num_steps}, {'cpu graph' if self.device == 'cpu' else 'cuda graph'} end. Time elapsed: {time.perf_counter() - tic:.2f} s. "
+                f"mem usage={graph_mem_usage:.2f} GB. avail mem={after_mem_n:.2f} GB."
+            )
+        initial_steps = self.step_range[-1]
+        self.server_args.speculative_num_steps = initial_steps
+        self.server_args.speculative_num_draft_tokens = 1
+        self.server_args.speculative_num_draft_tokens = initial_steps + 1
+        self.attn_backend = self.attn_backend_for_steps[initial_steps]
+        self.graph_runner = self.graph_runner_for_steps[initial_steps]
+
+        after_mem = get_available_gpu_memory(self.device, self.gpu_id)
+        self.graph_mem_usage = before_mem - after_mem
+        logger.info(
+            f"[SpanLogs] Capture {'cpu graph' if self.device == 'cpu' else 'cuda graph'} end. Time elapsed: {time.perf_counter() - tic:.2f} s. "
             f"mem usage={self.graph_mem_usage:.2f} GB. avail mem={after_mem:.2f} GB."
         )
 

@@ -479,6 +479,34 @@ class SchedulerMetricsMixin:
                 balancedness=m.eplb_balancedness.item(),
             )
 
+    def get_metrics_v2(self, bs: int, num_accepted_tokens: int, speculative_num_draft_tokens: int):
+        # logger.info(f"[MY LOG] SchedulerMetricsMixin get_metrics_v2, bs={bs}, num_accepted_tokens={num_accepted_tokens}, speculative_num_draft_tokens={speculative_num_draft_tokens}")
+        avg_spec_accept_length = (num_accepted_tokens + bs) / bs
+        avg_spec_accept_rate = avg_spec_accept_length / speculative_num_draft_tokens
+        return avg_spec_accept_length, avg_spec_accept_rate, 0
+
+    def get_metrics_v3(self, bs: int, num_accepted_tokens: int, speculative_num_draft_tokens: int, reset: bool = False):
+        # logger.info(f"[MY LOG] SchedulerMetricsMixin get_metrics_v3, bs={bs}, num_accepted_tokens={num_accepted_tokens}, speculative_num_draft_tokens={speculative_num_draft_tokens}")
+        self.interval_accept_length += num_accepted_tokens + bs
+        self.interval_forward_count += bs
+        # logger.info(f"[MY LOG] SchedulerMetricsMixin get_metrics_v3, current interval self.interval_accept_length: {self.interval_accept_length}, self.interval_forward_count: {self.interval_forward_count}")
+        if reset:
+            avg_spec_accept_length = self.interval_accept_length / self.interval_forward_count
+            total_draft_tokens = self.interval_forward_count * speculative_num_draft_tokens
+
+            avg_spec_accept_rate = (
+                self.interval_accept_length / total_draft_tokens
+                if total_draft_tokens > 0
+                else 0
+            )
+            # logger.info(
+            #     f"[MY LOG] SchedulerMetricsMixin get_metrics_v3, return results: avg_spec_accept_length: {avg_spec_accept_length}, avg_spec_accept_rate: {avg_spec_accept_rate}")
+            # reset after finish
+            self.interval_accept_length = 0
+            self.interval_forward_count = 0
+            return avg_spec_accept_length, avg_spec_accept_rate, 0
+        return None, None, 0
+
     def _emit_kv_metrics(self: Scheduler):
         if not self.enable_kv_cache_events:
             return

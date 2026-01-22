@@ -218,6 +218,43 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner, num_tokens_per_bs=1):
     return capture_bs, compile_bs
 
 
+def get_batch_sizes_to_capture_for_steps(model_runner: ModelRunner, batchsizes: List[int] = None):
+    # todo autospec: get batchsizes for the given step to capture instead of all cuda graph batchsize
+    # todo this function can be merged with the original function
+    # information can be get from AutoTunerEagle
+    server_args = model_runner.server_args
+    if batchsizes:
+        capture_bs = batchsizes  # todo if batchsizes given for current step, do not get from server args
+    else:
+        capture_bs = server_args.cuda_graph_bs
+
+    if max(capture_bs) > model_runner.req_to_token_pool.size:
+        # In some cases (e.g., with a small GPU or --max-running-requests), the #max-running-requests
+        # is very small. We add more values here to make sure we capture the maximum bs.
+        capture_bs += [model_runner.req_to_token_pool.size]
+
+    mul_base = 1
+
+    if server_args.enable_two_batch_overlap:
+        mul_base *= 2
+
+    if require_gathered_buffer(server_args):
+        mul_base *= get_attention_tp_size()
+
+    capture_bs = [bs for bs in capture_bs if bs % mul_base == 0]
+
+    capture_bs = [bs for bs in capture_bs if bs <= model_runner.req_to_token_pool.size]
+    capture_bs = list(sorted(set(capture_bs)))
+    assert len(capture_bs) > 0 and capture_bs[0] > 0, f"{capture_bs=}"
+    compile_bs = (
+        [bs for bs in capture_bs if bs <= server_args.torch_compile_max_bs]
+        if server_args.enable_torch_compile
+        else []
+    )
+    server_args.cuda_graph_bs = capture_bs
+    return capture_bs, compile_bs
+
+
 # Reuse this memory pool across all cuda graph runners.
 global_graph_memory_pool = None
 
