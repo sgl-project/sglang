@@ -24,7 +24,7 @@ def load_questions(filename):
 def write_answers(filename, model_id, questions, answers):
     with open(os.path.expanduser(filename), "w") as fout:
         for i in range(len(answers)):
-            ans_json = {
+            answer_json = {
                 "question_id": questions[i]["question_id"],
                 "answer_id": uuid.uuid4().hex,
                 "model_id": model_id,
@@ -34,7 +34,7 @@ def write_answers(filename, model_id, questions, answers):
                 },
                 "tstamp": time.time(),
             }
-            fout.write(json.dumps(ans_json) + "\n")
+            fout.write(json.dumps(answer_json) + "\n")
 
 
 @sgl.function
