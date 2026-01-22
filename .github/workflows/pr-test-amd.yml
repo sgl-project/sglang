@@ -1055,9 +1055,22 @@ jobs:
           docker exec -u root ci_sglang bash -c '
             set -ex
 
+            echo "=== Step 1: Install base RDMA packages ==="
             apt-get update
             apt-get install -y rdma-core libibverbs1 ibverbs-providers ibverbs-utils infiniband-diags iproute2 kmod
 
+            echo "=== Step 2: Install AMD Ionic RDMA driver ==="
+            # The libionic1 deb package is included in the repository
+            if [ -f /sglang-checkout/scripts/ci/rdma-drivers/libionic1_54.0-149.g3304be71_amd64.deb ]; then
+              echo "Installing AMD Ionic driver from repository..."
+              dpkg -i /sglang-checkout/scripts/ci/rdma-drivers/libionic1_54.0-149.g3304be71_amd64.deb
+              echo "AMD Ionic driver installed successfully"
+            else
+              echo "WARNING: AMD Ionic driver package not found in repository"
+              echo "RDMA may not work for AMD/Pensando NICs"
+            fi
+
+            echo "=== Step 3: Create device nodes ==="
             rm -rf /dev/infiniband
             mkdir -p /dev/infiniband
 
@@ -1083,9 +1096,28 @@ jobs:
 
             chmod 666 /dev/infiniband/*
 
-            echo "=== Verification ==="
+            echo "=== Step 4: Verification ==="
+            echo "Device nodes:"
+            ls -la /dev/infiniband/
+            echo ""
+            echo "Driver config:"
+            cat /etc/libibverbs.d/ionic.driver 2>/dev/null || echo "No ionic.driver config"
+            echo ""
+            echo "Provider libraries:"
+            ls /usr/lib/x86_64-linux-gnu/libibverbs/ | grep -E "ionic|mlx" || echo "No Ionic/Mellanox providers"
+            echo ""
+            echo "ibv_devinfo:"
             ibv_devinfo -list
-            ls /usr/lib/x86_64-linux-gnu/libibverbs/
+
+            # Verify HCAs are detected
+            HCA_COUNT=$(ibv_devinfo -list 2>&1 | grep -oE "^[0-9]+ HCAs? found" | grep -oE "^[0-9]+" || echo "0")
+            if [ "$HCA_COUNT" -gt 0 ]; then
+              echo ""
+              echo "=== SUCCESS: RDMA setup complete. Found $HCA_COUNT HCA(s) ==="
+            else
+              echo ""
+              echo "=== WARNING: No HCAs detected. RDMA tests may fail ==="
+            fi
           '
 
       - name: Run Aiter Op Test (RMSNorm)
