@@ -113,6 +113,18 @@ async fn readiness(State(state): State<Arc<AppState>>) -> Response {
                     .any(|w| matches!(w.worker_type(), WorkerType::Decode));
                 has_prefill && has_decode
             }
+            RoutingMode::EncodePrefillDecode { .. } => {
+                let has_encode = healthy_workers
+                    .iter()
+                    .any(|w| matches!(w.worker_type(), WorkerType::Encode { .. }));
+                let has_prefill = healthy_workers
+                    .iter()
+                    .any(|w| matches!(w.worker_type(), WorkerType::Prefill { .. }));
+                let has_decode = healthy_workers
+                    .iter()
+                    .any(|w| matches!(w.worker_type(), WorkerType::Decode));
+                has_encode && has_prefill && has_decode
+            }
             RoutingMode::Regular { .. } => !healthy_workers.is_empty(),
             RoutingMode::OpenAI { .. } => !healthy_workers.is_empty(),
         }
