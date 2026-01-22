@@ -237,13 +237,13 @@ def extract_answer(pred_str, exhaust=False):
 
     # multiple line
     _pred = []
-    for each_ans in pred:
-        each_ans = each_ans.strip().split("\n")[0]
-        each_ans = each_ans.lstrip(":")
-        each_ans = each_ans.rstrip(".")
-        each_ans = each_ans.rstrip("/")
-        each_ans = strip_string(each_ans)
-        _pred.append(each_ans)
+    for each_answer in pred:
+        each_answer = each_answer.strip().split("\n")[0]
+        each_answer = each_answer.lstrip(":")
+        each_answer = each_answer.rstrip(".")
+        each_answer = each_answer.rstrip("/")
+        each_answer = strip_string(each_answer)
+        _pred.append(each_answer)
     if exhaust:
         return _pred
     else:
