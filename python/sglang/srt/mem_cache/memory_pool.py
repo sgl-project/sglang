@@ -1080,7 +1080,7 @@ class MHATokenToKVPoolNVFP4(MHATokenToKVPool):
             torch.float8_e4m3fn
         )
 
-        cache_k_nope_fp4_dequant = self.fp4_quant_util.batched_dequantize(
+        cache_k_nope_fp4_dequant = self.fp4_quant_util.cuda_nvfp4_dequantize(
             cache_k_nope_fp4, cache_k_nope_fp4_sf, k_global_scale
         )
         return cache_k_nope_fp4_dequant
@@ -1092,7 +1092,7 @@ class MHATokenToKVPoolNVFP4(MHATokenToKVPool):
             torch.float8_e4m3fn
         )
 
-        cache_v_nope_fp4_dequant = self.fp4_quant_util.batched_dequantize(
+        cache_v_nope_fp4_dequant = self.fp4_quant_util.cuda_nvfp4_dequantize(
             cache_v_nope_fp4, cache_v_nope_fp4_sf, v_global_scale
         )
         return cache_v_nope_fp4_dequant
@@ -1120,10 +1120,10 @@ class MHATokenToKVPoolNVFP4(MHATokenToKVPool):
         else:
             layer_id = layer.layer_id
 
-        cache_k, cache_k_fp4_sf, _ = self.fp4_quant_util.fi_nvfp4_quantize(
+        cache_k, cache_k_fp4_sf, _ = self.fp4_quant_util.cuda_nvfp4_quantize_sm100(
             cache_k, k_scale
         )
-        cache_v, cache_v_fp4_sf, _ = self.fp4_quant_util.fi_nvfp4_quantize(
+        cache_v, cache_v_fp4_sf, _ = self.fp4_quant_util.cuda_nvfp4_quantize_sm100(
             cache_v, v_scale
         )
 
@@ -1226,7 +1226,7 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
             )
             cache_k_nope_fp4_sf = self.k_scale_buffer[layer_id - self.start_layer]
 
-            cache_k_nope_fp4_dequant = self.fp4_quant_util.batched_dequantize(
+            cache_k_nope_fp4_dequant = self.fp4_quant_util.cuda_nvfp4_dequantize(
                 cache_k_nope_fp4, cache_k_nope_fp4_sf
             )
             return cache_k_nope_fp4_dequant
@@ -1240,7 +1240,7 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
             )
             cache_v_nope_fp4_sf = self.v_scale_buffer[layer_id - self.start_layer]
 
-            cache_v_nope_fp4_dequant = self.fp4_quant_util.batched_dequantize(
+            cache_v_nope_fp4_dequant = self.fp4_quant_util.cuda_nvfp4_dequantize(
                 cache_v_nope_fp4, cache_v_nope_fp4_sf
             )
             return cache_v_nope_fp4_dequant
