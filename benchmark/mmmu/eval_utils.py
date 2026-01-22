@@ -274,7 +274,7 @@ def parse_multi_choice_response(response, all_choices, index2answer):
         response = response.strip(char)
     response = " " + response + " "  # add space to avoid partial match
 
-    index_ans = True
+    index_answer = True
     ans_with_brack = False
     candidates = []
     for choice in all_choices:  # e.g., (A) (B) (C) (D)
@@ -292,13 +292,13 @@ def parse_multi_choice_response(response, all_choices, index2answer):
         for index, ans in index2answer.items():
             if ans.lower() in response.lower():
                 candidates.append(index)
-                index_ans = False  # it's content ans.
+                index_answer = False  # it's content ans.
 
     if len(candidates) == 0:  # still not get answer, randomly choose one.
         pred_index = random.choice(all_choices)
     elif len(candidates) > 1:
         start_indexes = []
-        if index_ans:
+        if index_answer:
             if ans_with_brack:
                 for can in candidates:
                     index = response.rfind(f"({can})")
