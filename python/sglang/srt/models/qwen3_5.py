@@ -21,7 +21,7 @@ import torch
 import torch.nn as nn
 
 from sglang.srt.distributed import get_pp_group
-from sglang.srt.configs.qwen3_5 import Qwen3NextVLConfig, Qwen3NextVLTextConfig
+from sglang.srt.configs.qwen3_next_vl import Qwen3NextVLConfig, Qwen3NextVLTextConfig
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -107,7 +107,7 @@ class Qwen3VLNextLLMModel(Qwen3NextModel):
         return hidden_states
 
 
-class Qwen3NextVLForConditionalGeneration(Qwen3VLForConditionalGeneration):
+class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
     def __init__(
         self,
         config: Qwen3NextVLConfig,
@@ -228,4 +228,4 @@ class Qwen3NextVLForConditionalGeneration(Qwen3VLForConditionalGeneration):
             loaded_params.add(name)
         return loaded_params
 
-EntryClass = Qwen3NextVLForConditionalGeneration
+EntryClass = Qwen3_5ForConditionalGeneration
