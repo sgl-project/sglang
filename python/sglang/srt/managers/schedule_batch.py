@@ -1076,7 +1076,7 @@ class Req(ReqDllmMixin):
 
         if self._check_str_based_finish():
             return
-        
+
         # Check length limit last, so that stop tokens/strings take priority
         # This ensures eos tokens are properly trimmed even when hitting length limit
         if len(self.output_ids) >= self.sampling_params.max_new_tokens:
