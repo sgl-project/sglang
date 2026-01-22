@@ -14,6 +14,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     CompletionResponseStreamChoice,
     CompletionStreamResponse,
     ErrorResponse,
+    SglExt,
 )
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
@@ -326,7 +327,9 @@ class OpenAIServingCompletion(OpenAIServingBase):
                                 CompletionResponseStreamChoice(
                                     index=index,
                                     text="",
-                                    routed_experts=choice_routed_experts,
+                                    sgl_ext=SglExt(
+                                        routed_experts=choice_routed_experts
+                                    ),
                                     finish_reason=None,
                                 )
                             ],
@@ -447,7 +450,9 @@ class OpenAIServingCompletion(OpenAIServingBase):
                     else None
                 ),
                 hidden_states=hidden_states,
-                routed_experts=routed_experts,
+                sgl_ext=(
+                    SglExt(routed_experts=routed_experts) if routed_experts else None
+                ),
             )
             choices.append(choice_data)
 

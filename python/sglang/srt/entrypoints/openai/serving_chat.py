@@ -28,6 +28,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     FunctionResponse,
     LogProbs,
     MessageProcessingResult,
+    SglExt,
     ToolCall,
     ToolCallProcessingResult,
     ToolChoice,
@@ -815,7 +816,9 @@ class OpenAIServingChat(OpenAIServingBase):
                                 ChatCompletionResponseStreamChoice(
                                     index=index,
                                     delta=DeltaMessage(
-                                        routed_experts=choice_routed_experts
+                                        sgl_ext=SglExt(
+                                            routed_experts=choice_routed_experts
+                                        )
                                     ),
                                     finish_reason=None,
                                 )
@@ -950,7 +953,9 @@ class OpenAIServingChat(OpenAIServingBase):
                     else None
                 ),
                 hidden_states=hidden_states,
-                routed_experts=routed_experts,
+                sgl_ext=(
+                    SglExt(routed_experts=routed_experts) if routed_experts else None
+                ),
             )
             choices.append(choice_data)
 

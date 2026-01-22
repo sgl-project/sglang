@@ -281,6 +281,22 @@ class CompletionRequest(BaseModel):
         return v
 
 
+class SglExt(BaseModel):
+    """SGLang extension fields for OpenAI-compatible responses.
+
+    Future SGLang-specific extensions to OpenAI-compatible response objects
+    should be added as fields here rather than directly on the choice object.
+    """
+
+    routed_experts: Optional[str] = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        # Remove None fields to keep response clean
+        return {k: v for k, v in data.items() if v is not None}
+
+
 class CompletionResponseChoice(BaseModel):
     index: int
     text: str
@@ -288,15 +304,15 @@ class CompletionResponseChoice(BaseModel):
     finish_reason: Optional[Literal["stop", "length", "content_filter", "abort"]] = None
     matched_stop: Union[None, int, str] = None
     hidden_states: Optional[object] = None
-    routed_experts: Optional[str] = None
+    sgl_ext: Optional[SglExt] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
         if self.hidden_states is None:
             data.pop("hidden_states", None)
-        if self.routed_experts is None:
-            data.pop("routed_experts", None)
+        if self.sgl_ext is None:
+            data.pop("sgl_ext", None)
         return data
 
 
@@ -317,15 +333,15 @@ class CompletionResponseStreamChoice(BaseModel):
     finish_reason: Optional[Literal["stop", "length", "content_filter", "abort"]] = None
     matched_stop: Union[None, int, str] = None
     hidden_states: Optional[object] = None
-    routed_experts: Optional[str] = None
+    sgl_ext: Optional[SglExt] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
         if self.hidden_states is None:
             data.pop("hidden_states", None)
-        if self.routed_experts is None:
-            data.pop("routed_experts", None)
+        if self.sgl_ext is None:
+            data.pop("sgl_ext", None)
         return data
 
 
@@ -739,15 +755,15 @@ class ChatCompletionResponseChoice(BaseModel):
     ] = None
     matched_stop: Union[None, int, str] = None
     hidden_states: Optional[object] = None
-    routed_experts: Optional[str] = None
+    sgl_ext: Optional[SglExt] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
         if self.hidden_states is None:
             data.pop("hidden_states", None)
-        if self.routed_experts is None:
-            data.pop("routed_experts", None)
+        if self.sgl_ext is None:
+            data.pop("sgl_ext", None)
         return data
 
 
@@ -767,15 +783,15 @@ class DeltaMessage(BaseModel):
     reasoning_content: Optional[str] = None
     tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
     hidden_states: Optional[object] = None
-    routed_experts: Optional[str] = None
+    sgl_ext: Optional[SglExt] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
         if self.hidden_states is None:
             data.pop("hidden_states", None)
-        if self.routed_experts is None:
-            data.pop("routed_experts", None)
+        if self.sgl_ext is None:
+            data.pop("sgl_ext", None)
         return data
 
 

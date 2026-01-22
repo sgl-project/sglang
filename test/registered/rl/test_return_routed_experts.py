@@ -218,9 +218,12 @@ def extract_routed_experts_from_openai_response(response):
     choices = response.get("choices", [])
     if not choices:
         raise ValueError("OpenAI response has no choices.")
-    routed_experts = choices[0].get("routed_experts", None)
+    sgl_ext = choices[0].get("sgl_ext", None)
+    if sgl_ext is None:
+        raise ValueError("OpenAI response missing sgl_ext.")
+    routed_experts = sgl_ext.get("routed_experts", None)
     if routed_experts is None:
-        raise ValueError("OpenAI response missing routed_experts.")
+        raise ValueError("OpenAI response sgl_ext missing routed_experts.")
     return extract_routed_experts_from_meta_info(
         {"meta_info": {"routed_experts": routed_experts}}
     )
