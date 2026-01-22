@@ -1,9 +1,9 @@
 import torch
 
-def prepare()
+def prepare():
     pass
 
-def finalize()
+def finalize():
     pass
 
 def npu_fused_experts_unquant(
