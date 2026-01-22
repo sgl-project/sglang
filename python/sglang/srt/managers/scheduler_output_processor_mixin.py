@@ -861,7 +861,7 @@ class SchedulerOutputProcessorMixin:
         retraction_counts = []
         output_hidden_states = None
         load = self.get_load()
-        output_routed_experts = None
+        routed_experts = None
         customized_info = {}
 
         queue_times = []
@@ -1061,9 +1061,10 @@ class SchedulerOutputProcessorMixin:
                         output_hidden_states = []
                     output_hidden_states.append(req.hidden_states)
                 if req.return_routed_experts:
-                    if output_routed_experts is None:
-                        output_routed_experts = []
-                    output_routed_experts.append(req.routed_experts)
+                    if routed_experts is None:
+                        routed_experts = []
+                    routed_experts.append(req.routed_experts)
+
                 if req.is_beam_search:
                     completion_tokens[-1] = (
                         SchedulerBeamSearchProcessorMixin.sum_beam_completion_tokens(
@@ -1129,7 +1130,7 @@ class SchedulerOutputProcessorMixin:
                     output_token_ids_logprobs_idx=output_token_ids_logprobs_idx,
                     output_token_entropy_val=None,
                     output_hidden_states=output_hidden_states,
-                    output_routed_experts=output_routed_experts,
+                    routed_experts=routed_experts,
                     customized_info=customized_info,
                     placeholder_tokens_idx=None,
                     placeholder_tokens_val=None,

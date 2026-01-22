@@ -209,6 +209,8 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
     return_hidden_states: Union[List[bool], bool] = False
     # Whether to return captured routed experts
     return_routed_experts: bool = False
+    # The start location in the prompt for returning routed experts.
+    routed_experts_start_len: int = 0
 
     # The modalities of the image data [image, multi-images, video]
     modalities: Optional[List[str]] = None
@@ -730,6 +732,8 @@ class TokenizedGenerateReqInput(BaseReq):
 
     # Whether to return captured routed experts
     return_routed_experts: bool = False
+    # The start location in the prompt for returning routed experts.
+    routed_experts_start_len: int = 0
 
     # The input embeds
     input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None
@@ -1002,8 +1006,9 @@ class BatchTokenIDOutput(
     # Hidden states
     output_hidden_states: List[List[float]]
 
-    # The routed experts for each output token
-    output_routed_experts: List[torch.Tensor]
+    # The routed experts for each token, including both input and output tokens
+    # routed_experts[i] is a tensor of shape (token, layer, top_k) for request i
+    routed_experts: List[Optional[torch.Tensor]]
 
     # The information of placeholder tokens (e.g., image token)
     # idx is the index of the token in the prompt after expansion.
@@ -1092,8 +1097,9 @@ class BatchStrOutput(
     # Hidden states
     output_hidden_states: List[List[float]]
 
-    # The routed experts for each output token
-    output_routed_experts: List[List[int]]
+    # The routed experts for each token, including both input and output tokens
+    # routed_experts[i] is a tensor of shape (token, layer, top_k) for request i
+    routed_experts: List[Optional[torch.Tensor]]
 
     # The information of placeholder tokens (e.g., image token)
     # idx is the index of the token in the prompt after expansion.
