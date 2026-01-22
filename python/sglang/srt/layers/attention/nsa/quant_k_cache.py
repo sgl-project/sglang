@@ -442,8 +442,8 @@ if __name__ == "__main__":
             num_blocks * block_size, dtype=torch.int32, device="cuda"
         )
 
-        def run_ans():
+        def run_answer():
             return dequant_k_cache.dequantize_k_cache_paged(actual_quant, page_table_1)
 
-        ans_time: float = triton.testing.do_bench(run_ans, warmup=10, rep=20) / 1000  # type: ignore
+        ans_time: float = triton.testing.do_bench(run_answer, warmup=10, rep=20) / 1000  # type: ignore
         print(f"seq_kv: {num_blocks * block_size}, time: {ans_time * 1e6: 4.0f} us")
