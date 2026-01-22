@@ -12,6 +12,7 @@ use crate::routers::{
         common::stages::{helpers, PipelineStage},
         context::{ClientSelection, RequestContext, WorkerSelection},
         proto_wrapper::ProtoGenerateRequest,
+        utils,
     },
 };
 
@@ -68,7 +69,7 @@ impl PipelineStage for GenerateRequestBuildingStage {
         // Dispatch to the appropriate client based on backend type
         let mut proto_request = match builder_client {
             GrpcClient::Sglang(sglang_client) => {
-                let req = sglang_client
+                let mut req = sglang_client
                     .build_plain_generate_request(
                         request_id,
                         &generate_request,
@@ -79,6 +80,7 @@ impl PipelineStage for GenerateRequestBuildingStage {
                         error!(function = "GenerateRequestBuildingStage::execute", error = %e, "Failed to build SGLang generate request");
                         error::bad_request("build_request_failed", e)
                     })?;
+                req.mm_inputs = utils::build_multimodal_inputs_from_generate(&generate_request);
                 ProtoGenerateRequest::Sglang(Box::new(req))
             }
             GrpcClient::Vllm(vllm_client) => {
