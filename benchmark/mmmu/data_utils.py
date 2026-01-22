@@ -177,16 +177,16 @@ def construct_prompt(sample, config):
     if sample["question_type"] == "multiple-choice":
         start_chr = "A"
         prediction_range = []
-        index2ans = {}
+        index2answer = {}
         for option in options:
             prediction_range.append(start_chr)
             example += f"({start_chr}) {option}\n"
-            index2ans[start_chr] = option
+            index2answer[start_chr] = option
             start_chr = chr(ord(start_chr) + 1)
         empty_prompt_sample_structure = config["multi_choice_example_format"]
         empty_prompt = empty_prompt_sample_structure.format(question, example)
         res_dict = {}
-        res_dict["index2ans"] = index2ans
+        res_dict["index2ans"] = index2answer
         res_dict["correct_choice"] = sample["answer"]
         res_dict["all_choices"] = prediction_range
         res_dict["empty_prompt"] = empty_prompt
