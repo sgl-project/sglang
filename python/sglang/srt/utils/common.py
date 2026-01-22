@@ -89,6 +89,8 @@ from torch import nn
 from torch.library import Library
 from torch.profiler import ProfilerActivity, profile, record_function
 from torch.utils._contextlib import _DecoratorContextManager
+from torchvision.io import ImageReadMode, decode_image, read_image
+from torchvision.transforms.v2 import functional as F
 from typing_extensions import Literal
 
 from sglang.srt.environ import envs
@@ -888,6 +890,134 @@ def load_image(
         raise ValueError(f"Invalid image: {image_file}")
 
     return image, image_size
+
+
+def _decode_image_from_bytes(
+    img_bytes: bytes, discard_alpha_channel: bool = True
+) -> torch.Tensor:
+    """
+    Decode image from bytes, prioritizing torchvision for hardware acceleration.
+
+    Args:
+        img_bytes: Raw image bytes
+        discard_alpha_channel: If True, force RGB mode (no alpha channel)
+
+    Returns:
+        Image tensor in shape [C, H, W]
+    """
+    # Try torchvision first (faster, hardware-accelerated)
+    try:
+        img_tensor_bytes = torch.frombuffer(bytearray(img_bytes), dtype=torch.uint8)
+        # ImageReadMode.RGB automatically discards alpha channel
+        read_mode = (
+            ImageReadMode.RGB if discard_alpha_channel else ImageReadMode.UNCHANGED
+        )
+        return decode_image(img_tensor_bytes, mode=read_mode)
+    except Exception:
+        # Fallback to PIL
+        image = Image.open(BytesIO(img_bytes))
+        if discard_alpha_channel and image.mode != "RGB":
+            image = image.convert("RGB")
+        return F.pil_to_tensor(image)
+
+
+def _decode_image_from_file(
+    file_path: str, discard_alpha_channel: bool = True
+) -> torch.Tensor:
+    """
+    Decode image from file path, prioritizing torchvision for hardware acceleration.
+
+    Args:
+        file_path: Path to image file
+        discard_alpha_channel: If True, force RGB mode (no alpha channel)
+
+    Returns:
+        Image tensor in shape [C, H, W]
+    """
+    # Try torchvision first (fastest for local files)
+    try:
+        read_mode = (
+            ImageReadMode.RGB if discard_alpha_channel else ImageReadMode.UNCHANGED
+        )
+        return read_image(file_path, mode=read_mode)
+    except Exception:
+        # Fallback to PIL
+        image = Image.open(file_path)
+        if discard_alpha_channel and image.mode != "RGB":
+            image = image.convert("RGB")
+        return F.pil_to_tensor(image)
+
+
+def load_image_tensor(
+    image_file: Union[Image.Image, str, ImageData, bytes],
+    discard_alpha_channel: bool = True,
+) -> tuple[torch.Tensor, tuple[int, int]]:
+    """
+    Load image from various sources and return as tensor.
+
+    Args:
+        image_file: Image source (PIL Image, file path, URL, bytes, or base64)
+        discard_alpha_channel: If True, convert to RGB (no alpha channel)
+
+    Returns:
+        tuple: (image_tensor [C, H, W], image_size (width, height))
+    """
+    # Normalize ImageData to string
+    if isinstance(image_file, ImageData):
+        image_file = image_file.url
+
+    img_tensor = image_size = None
+
+    # Handle PIL Image object
+    if isinstance(image_file, Image.Image):
+        # Already a PIL Image object
+        image = image_file
+        image_size = (image.width, image.height)
+        if discard_alpha_channel and image.mode != "RGB":
+            image = image.convert("RGB")
+        img_tensor = F.pil_to_tensor(image)
+
+    # Handle bytes
+    elif isinstance(image_file, bytes):
+        img_tensor = _decode_image_from_bytes(image_file, discard_alpha_channel)
+
+    # Handle string types
+    elif isinstance(image_file, str):
+        # Handle HTTP/HTTPS URL
+        if image_file.startswith("http://") or image_file.startswith("https://"):
+            timeout = int(os.getenv("REQUEST_TIMEOUT", "3"))
+            response = requests.get(image_file, stream=True, timeout=timeout)
+            try:
+                response.raise_for_status()
+                img_bytes = response.content
+                img_tensor = _decode_image_from_bytes(img_bytes, discard_alpha_channel)
+            finally:
+                response.close()
+
+        # Handle local file path
+        elif image_file.lower().endswith(("png", "jpg", "jpeg", "webp", "gif")):
+            img_tensor = _decode_image_from_file(image_file, discard_alpha_channel)
+
+        # Handle data URL format: data:image/jpeg;base64,/9j/4AAQ...
+        elif image_file.startswith("data:"):
+            base64_str = image_file.split(",")[1]
+            img_bytes = pybase64.b64decode(base64_str, validate=True)
+            img_tensor = _decode_image_from_bytes(img_bytes, discard_alpha_channel)
+
+        # Handle pure base64 string
+        else:
+            img_bytes = pybase64.b64decode(image_file, validate=True)
+            img_tensor = _decode_image_from_bytes(img_bytes, discard_alpha_channel)
+
+    else:
+        raise ValueError(f"Invalid image: {image_file}")
+
+    # Calculate image_size from tensor if not already set
+    if image_size is None and img_tensor is not None:
+        # Tensor shape: [C, H, W] -> size: (width, height)
+        image_size = (img_tensor.shape[2], img_tensor.shape[1])
+
+    return img_tensor, image_size
 
 
 def get_image_bytes(image_file: Union[str, bytes]):
