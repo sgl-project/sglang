@@ -203,8 +203,8 @@ def test_quantize_to_fp4_grouped(shape):
         # Recover swizzled scales to linear layout and drop padded values, so
         # no extra checks on padding are needed.
         scale_ref = recover_swizzled_scales(a_scale_interleaved, m, k)
-        scale_ans = recover_swizzled_scales(output_scales[i], m, k)
-        torch.testing.assert_close(scale_ref[: mask[i]], scale_ans[: mask[i]])
+        scale_answer = recover_swizzled_scales(output_scales[i], m, k)
+        torch.testing.assert_close(scale_ref[: mask[i]], scale_answer[: mask[i]])
 
 
 @pytest.mark.skipif(
