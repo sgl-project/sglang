@@ -10,12 +10,13 @@ This test compares:
 2. Default all-reduce (different batch size) - typically NON-DETERMINISTIC for bfloat16
 
 Usage:
-    python test_ar.py
+    pytest test_amd_nccl_allreduce_determinism.py
 """
 
 import multiprocessing as mp
 import socket
 
+import pytest
 import torch
 import torch.distributed as dist
 
@@ -192,6 +193,15 @@ def main():
 
     for p in procs:
         p.join()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.device_count() < 2,
+    reason="Requires at least 2 CUDA GPUs",
+)
+def test_nccl_allreduce_determinism():
+    """Test NCCL all-reduce determinism behavior with varying batch sizes."""
+    main()
 
 
 if __name__ == "__main__":
