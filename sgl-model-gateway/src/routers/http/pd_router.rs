@@ -8,35 +8,38 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use futures_util::StreamExt;
+use memchr::memmem;
 use reqwest::Client;
 use serde::Serialize;
 use serde_json::{json, Value};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error, warn};
 
-use super::{
-    events::{self, Event},
-    pd_types::api_path,
-};
+use super::pd_types::api_path;
 use crate::{
     config::types::RetryConfig,
     core::{
-        is_retryable_status, RetryExecutor, Worker, WorkerLoadGuard, WorkerRegistry, WorkerType,
+        is_retryable_status, HashRing, RetryExecutor, Worker, WorkerLoadGuard, WorkerRegistry,
+        WorkerType, UNKNOWN_MODEL_ID,
     },
-    metrics::RouterMetrics,
-    otel_trace::inject_trace_context_http,
-    policies::{LoadBalancingPolicy, PolicyRegistry},
+    observability::{
+        events::{self, Event},
+        metrics::{bool_to_static_str, metrics_labels, Metrics},
+        otel_trace::inject_trace_context_http,
+    },
+    policies::{LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo},
     protocols::{
         chat::{ChatCompletionRequest, ChatMessage, MessageContent},
-        classify::ClassifyRequest,
         common::{InputIds, StringOrArray},
         completion::CompletionRequest,
-        embedding::EmbeddingRequest,
         generate::GenerateRequest,
         rerank::RerankRequest,
-        responses::{ResponsesGetParams, ResponsesRequest},
     },
-    routers::{header_utils, RouterTrait},
+    routers::{
+        error,
+        grpc::utils::{error_type_from_status, route_to_endpoint},
+        header_utils, RouterTrait,
+    },
 };
 
 #[derive(Debug)]
@@ -57,6 +60,7 @@ struct PDRequestContext<'a> {
     return_logprob: bool,
     request_text: Option<String>,
     model_id: Option<&'a str>,
+    headers: Option<HeaderMap>,
 }
 
 impl PDRouter {
@@ -71,11 +75,7 @@ impl PDRouter {
         if let Some(worker_url) = first_worker_url {
             self.proxy_to_worker(worker_url, endpoint, headers).await
         } else {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "No prefill servers available".to_string(),
-            )
-                .into_response()
+            error::service_unavailable("no_prefill_servers", "No prefill servers available")
         }
     }
 
@@ -107,26 +107,50 @@ impl PDRouter {
                     }
                     Err(e) => {
                         error!("Failed to read response body: {}", e);
-                        (
-                            StatusCode::INTERNAL_SERVER_ERROR,
+                        error::internal_error(
+                            "read_response_body_failed",
                             format!("Failed to read response body: {}", e),
                         )
-                            .into_response()
                     }
                 }
             }
             Ok(res) => {
                 let status = StatusCode::from_u16(res.status().as_u16())
                     .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                (status, format!("{} server returned status: ", res.status())).into_response()
+                // Use the status code to determine which error function to use
+                match status {
+                    StatusCode::BAD_REQUEST => error::bad_request(
+                        "server_bad_request",
+                        format!("Server returned status: {}", res.status()),
+                    ),
+                    StatusCode::NOT_FOUND => error::not_found(
+                        "server_not_found",
+                        format!("Server returned status: {}", res.status()),
+                    ),
+                    StatusCode::INTERNAL_SERVER_ERROR => error::internal_error(
+                        "server_internal_error",
+                        format!("Server returned status: {}", res.status()),
+                    ),
+                    StatusCode::SERVICE_UNAVAILABLE => error::service_unavailable(
+                        "server_unavailable",
+                        format!("Server returned status: {}", res.status()),
+                    ),
+                    StatusCode::BAD_GATEWAY => error::bad_gateway(
+                        "server_bad_gateway",
+                        format!("Server returned status: {}", res.status()),
+                    ),
+                    _ => error::internal_error(
+                        "server_error",
+                        format!("Server returned status: {}", res.status()),
+                    ),
+                }
             }
             Err(e) => {
                 error!("Failed to proxy request server: {}", e);
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
+                error::internal_error(
+                    "proxy_request_failed",
                     format!("Failed to proxy request: {}", e),
                 )
-                    .into_response()
             }
         }
     }
@@ -144,21 +168,15 @@ impl PDRouter {
 
     fn handle_server_selection_error(error: String) -> Response {
         error!("Failed to select PD pair error={}", error);
-        RouterMetrics::record_pd_error("server_selection");
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
+        error::service_unavailable(
+            "server_selection_failed",
             format!("No available servers: {}", error),
         )
-            .into_response()
     }
 
     fn handle_serialization_error(error: impl std::fmt::Display) -> Response {
         error!("Failed to serialize request error={}", error);
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to serialize request",
-        )
-            .into_response()
+        error::internal_error("serialization_failed", "Failed to serialize request")
     }
 
     fn get_generate_batch_size(req: &GenerateRequest) -> Option<usize> {
@@ -189,6 +207,11 @@ impl PDRouter {
         None
     }
 
+    // Static key strings to avoid per-request allocations
+    const BOOTSTRAP_HOST_KEY: &'static str = "bootstrap_host";
+    const BOOTSTRAP_PORT_KEY: &'static str = "bootstrap_port";
+    const BOOTSTRAP_ROOM_KEY: &'static str = "bootstrap_room";
+
     fn inject_bootstrap_into_value(
         mut original: Value,
         prefill_worker: &dyn Worker,
@@ -207,12 +230,13 @@ impl PDRouter {
                 ports.push(prefill_worker.bootstrap_port());
                 rooms.push(super::pd_types::generate_room_id());
             }
+            // Use static string keys to avoid per-request allocations
             obj.insert(
-                "bootstrap_host".to_string(),
+                Self::BOOTSTRAP_HOST_KEY.to_string(),
                 Value::Array(hosts.into_iter().map(Value::from).collect()),
             );
             obj.insert(
-                "bootstrap_port".to_string(),
+                Self::BOOTSTRAP_PORT_KEY.to_string(),
                 Value::Array(
                     ports
                         .into_iter()
@@ -224,23 +248,24 @@ impl PDRouter {
                 ),
             );
             obj.insert(
-                "bootstrap_room".to_string(),
+                Self::BOOTSTRAP_ROOM_KEY.to_string(),
                 Value::Array(rooms.into_iter().map(Value::from).collect()),
             );
         } else {
+            // Use static string keys to avoid per-request allocations
             obj.insert(
-                "bootstrap_host".to_string(),
+                Self::BOOTSTRAP_HOST_KEY.to_string(),
                 Value::from(prefill_worker.bootstrap_host()),
             );
             obj.insert(
-                "bootstrap_port".to_string(),
+                Self::BOOTSTRAP_PORT_KEY.to_string(),
                 match prefill_worker.bootstrap_port() {
                     Some(v) => Value::from(v),
                     None => Value::Null,
                 },
             );
             obj.insert(
-                "bootstrap_room".to_string(),
+                Self::BOOTSTRAP_ROOM_KEY.to_string(),
                 Value::from(super::pd_types::generate_room_id()),
             );
         }
@@ -256,21 +281,39 @@ impl PDRouter {
         let start_time = Instant::now();
 
         let route = context.route;
-        RetryExecutor::execute_response_with_retry(
+        let model = context.model_id.unwrap_or(UNKNOWN_MODEL_ID);
+        let endpoint = route_to_endpoint(route);
+
+        // Record request start (Layer 2)
+        Metrics::record_router_request(
+            metrics_labels::ROUTER_HTTP,
+            metrics_labels::BACKEND_PD,
+            metrics_labels::CONNECTION_HTTP,
+            model,
+            endpoint,
+            bool_to_static_str(context.is_stream),
+        );
+        // Clone request once outside the retry loop, then use Arc to share across attempts
+        // This avoids O(retries) clones by sharing the same data
+        let shared_request = Arc::new(original_request.clone());
+        let response = RetryExecutor::execute_response_with_retry(
             &self.retry_config,
             {
-                let original_request = original_request.clone();
                 move |attempt: u32| {
-                    let original_request = original_request.clone();
+                    // Clone Arc (cheap reference count increment) instead of cloning the entire request
+                    let shared_request = Arc::clone(&shared_request);
                     let context = context.clone();
                     async move {
                         let (prefill, decode) = match self
-                            .select_pd_pair(context.request_text.as_deref(), context.model_id)
+                            .select_pd_pair(
+                                context.request_text.as_deref(),
+                                context.model_id,
+                                context.headers.as_ref(),
+                            )
                             .await
                         {
                             Ok(pair) => pair,
                             Err(e) => {
-                                RouterMetrics::record_pd_error("server_selection");
                                 return Self::handle_server_selection_error(e);
                             }
                         };
@@ -282,7 +325,7 @@ impl PDRouter {
                             decode.url()
                         );
 
-                        let mut json_request = match serde_json::to_value(&original_request) {
+                        let mut json_request = match serde_json::to_value(shared_request.as_ref()) {
                             Ok(v) => v,
                             Err(e) => return Self::handle_serialization_error(e),
                         };
@@ -301,16 +344,31 @@ impl PDRouter {
                                 headers,
                                 json_request,
                                 context,
-                                prefill.as_ref(),
-                                decode.as_ref(),
+                                Arc::clone(&prefill),
+                                Arc::clone(&decode),
                                 start_time,
                             )
                             .await;
 
-                        let _status = response.status();
-                        let not_error = _status.is_success() || _status.is_client_error();
+                        let status = response.status();
+                        let not_error = status.is_success() || status.is_client_error();
                         prefill.record_outcome(not_error);
                         decode.record_outcome(not_error);
+
+                        // Record worker errors for server errors (5xx)
+                        if status.is_server_error() {
+                            let error_type = error_type_from_status(status);
+                            Metrics::record_worker_error(
+                                metrics_labels::WORKER_PREFILL,
+                                metrics_labels::CONNECTION_HTTP,
+                                error_type,
+                            );
+                            Metrics::record_worker_error(
+                                metrics_labels::WORKER_DECODE,
+                                metrics_labels::CONNECTION_HTTP,
+                                error_type,
+                            );
+                        }
 
                         response
                     }
@@ -318,20 +376,49 @@ impl PDRouter {
             },
             |res, _attempt| is_retryable_status(res.status()),
             |delay, attempt| {
-                RouterMetrics::record_retry(route);
-                RouterMetrics::record_retry_backoff_duration(delay, attempt);
+                // Layer 3 worker metrics (PD mode uses both prefill and decode workers)
+                Metrics::record_worker_retry(metrics_labels::WORKER_PREFILL, endpoint);
+                Metrics::record_worker_retry(metrics_labels::WORKER_DECODE, endpoint);
+                Metrics::record_worker_retry_backoff(attempt, delay);
             },
-            || RouterMetrics::record_retries_exhausted(route),
+            || {
+                Metrics::record_worker_retries_exhausted(metrics_labels::WORKER_PREFILL, endpoint);
+                Metrics::record_worker_retries_exhausted(metrics_labels::WORKER_DECODE, endpoint);
+            },
         )
-        .await
+        .await;
+
+        // Record Layer 2 metrics
+        let duration = start_time.elapsed();
+        if response.status().is_success() {
+            Metrics::record_router_duration(
+                metrics_labels::ROUTER_HTTP,
+                metrics_labels::BACKEND_PD,
+                metrics_labels::CONNECTION_HTTP,
+                model,
+                endpoint,
+                duration,
+            );
+        } else if !is_retryable_status(response.status()) {
+            Metrics::record_router_error(
+                metrics_labels::ROUTER_HTTP,
+                metrics_labels::BACKEND_PD,
+                metrics_labels::CONNECTION_HTTP,
+                model,
+                endpoint,
+                error_type_from_status(response.status()),
+            );
+        }
+
+        response
     }
 
     async fn handle_decode_error_response(
         &self,
         res: reqwest::Response,
         context: &PDRequestContext<'_>,
-        prefill: &dyn Worker,
-        decode: &dyn Worker,
+        prefill: Arc<dyn Worker>,
+        decode: Arc<dyn Worker>,
     ) -> Response {
         let status = res.status();
 
@@ -371,8 +458,71 @@ impl PDRouter {
         } else {
             // Handle non-streaming error response
             match res.bytes().await {
-                Ok(error_body) => (status, error_body).into_response(),
-                Err(e) => (status, format!("Decode server error: {}", e)).into_response(),
+                Ok(error_body) => {
+                    // Try to parse error message from body, fallback to status-based error
+                    let error_message = if let Ok(error_json) =
+                        serde_json::from_slice::<Value>(&error_body)
+                    {
+                        if let Some(msg) = error_json
+                            .get("error")
+                            .and_then(|e| e.get("message"))
+                            .and_then(|m| m.as_str())
+                        {
+                            msg.to_string()
+                        } else if let Some(msg) = error_json.get("message").and_then(|m| m.as_str())
+                        {
+                            msg.to_string()
+                        } else {
+                            String::from_utf8_lossy(&error_body).to_string()
+                        }
+                    } else {
+                        String::from_utf8_lossy(&error_body).to_string()
+                    };
+
+                    let status_code = StatusCode::from_u16(status.as_u16())
+                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                    match status_code {
+                        StatusCode::BAD_REQUEST => {
+                            error::bad_request("decode_bad_request", error_message)
+                        }
+                        StatusCode::NOT_FOUND => {
+                            error::not_found("decode_not_found", error_message)
+                        }
+                        StatusCode::INTERNAL_SERVER_ERROR => {
+                            error::internal_error("decode_internal_error", error_message)
+                        }
+                        StatusCode::SERVICE_UNAVAILABLE => {
+                            error::service_unavailable("decode_unavailable", error_message)
+                        }
+                        StatusCode::BAD_GATEWAY => {
+                            error::bad_gateway("decode_bad_gateway", error_message)
+                        }
+                        _ => error::internal_error("decode_error", error_message),
+                    }
+                }
+                Err(e) => {
+                    let error_message = format!("Decode server error: {}", e);
+                    let status_code = StatusCode::from_u16(status.as_u16())
+                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                    match status_code {
+                        StatusCode::BAD_REQUEST => {
+                            error::bad_request("decode_read_failed", error_message)
+                        }
+                        StatusCode::NOT_FOUND => {
+                            error::not_found("decode_read_failed", error_message)
+                        }
+                        StatusCode::INTERNAL_SERVER_ERROR => {
+                            error::internal_error("decode_read_failed", error_message)
+                        }
+                        StatusCode::SERVICE_UNAVAILABLE => {
+                            error::service_unavailable("decode_read_failed", error_message)
+                        }
+                        StatusCode::BAD_GATEWAY => {
+                            error::bad_gateway("decode_read_failed", error_message)
+                        }
+                        _ => error::internal_error("decode_read_failed", error_message),
+                    }
+                }
             }
         }
     }
@@ -383,23 +533,20 @@ impl PDRouter {
         headers: Option<&HeaderMap>,
         json_request: Value,
         context: PDRequestContext<'_>,
-        prefill: &dyn Worker,
-        decode: &dyn Worker,
-        start_time: Instant,
+        prefill: Arc<dyn Worker>,
+        decode: Arc<dyn Worker>,
+        _start_time: Instant,
     ) -> Response {
         // For non-streaming: use guard for automatic load management
         // For streaming: load will be managed in create_streaming_response
-        let _guard = if !context.is_stream {
-            Some(WorkerLoadGuard::new_multi(vec![prefill, decode]))
-        } else {
-            None
-        };
+        let _prefill_guard =
+            (!context.is_stream).then(|| WorkerLoadGuard::new(prefill.clone(), headers));
+        let _decode_guard =
+            (!context.is_stream).then(|| WorkerLoadGuard::new(decode.clone(), headers));
 
         let mut headers_with_trace = headers.cloned().unwrap_or_default();
-        let headers = match inject_trace_context_http(&mut headers_with_trace) {
-            Ok(()) => Some(&headers_with_trace),
-            Err(_) => headers,
-        };
+        inject_trace_context_http(&mut headers_with_trace);
+        let headers = Some(&headers_with_trace);
 
         // Build both requests
         let prefill_request = self.build_post_with_headers(
@@ -420,9 +567,10 @@ impl PDRouter {
         );
 
         // Send both requests concurrently and wait for both
+        // Note: Using borrowed references avoids heap allocation
         events::RequestPDSentEvent {
-            prefill_url: prefill.url().to_string(),
-            decode_url: decode.url().to_string(),
+            prefill_url: prefill.url(),
+            decode_url: decode.url(),
         }
         .emit();
 
@@ -430,12 +578,6 @@ impl PDRouter {
             tokio::join!(prefill_request.send(), decode_request.send());
 
         events::RequestReceivedEvent {}.emit();
-
-        let duration = start_time.elapsed();
-        RouterMetrics::record_pd_request_duration(context.route, duration);
-        RouterMetrics::record_pd_request(context.route);
-        RouterMetrics::record_pd_prefill_request(prefill.url());
-        RouterMetrics::record_pd_decode_request(decode.url());
 
         // Process decode response
         match decode_result {
@@ -445,7 +587,6 @@ impl PDRouter {
                 debug!("Decode response status: {}", status);
 
                 if !status.is_success() {
-                    RouterMetrics::record_pd_decode_error(decode.url());
                     error!(
                         "Decode server returned error status decode_url={} status={}",
                         decode.url(),
@@ -530,8 +671,10 @@ impl PDRouter {
                             }
                             Err(e) => {
                                 error!("Failed to read decode response: {}", e);
-                                (StatusCode::INTERNAL_SERVER_ERROR, "Failed to read response")
-                                    .into_response()
+                                error::internal_error(
+                                    "read_response_failed",
+                                    "Failed to read response",
+                                )
                             }
                         }
                     }
@@ -543,12 +686,7 @@ impl PDRouter {
                     error = %e,
                     "Decode request failed"
                 );
-                RouterMetrics::record_pd_decode_error(decode.url());
-                (
-                    StatusCode::BAD_GATEWAY,
-                    format!("Decode server error: {}", e),
-                )
-                    .into_response()
+                error::bad_gateway("decode_server_error", format!("Decode server error: {}", e))
             }
         }
     }
@@ -563,6 +701,7 @@ impl PDRouter {
         &self,
         request_text: Option<&str>,
         model_id: Option<&str>,
+        headers: Option<&HeaderMap>,
     ) -> Result<(Arc<dyn Worker>, Arc<dyn Worker>), String> {
         let effective_model_id = if !self.enable_igw { None } else { model_id };
 
@@ -573,9 +712,10 @@ impl PDRouter {
 
         let prefill_workers = if let Some(model) = effective_model_id {
             self.worker_registry
-                .get_by_model_fast(model)
-                .into_iter()
+                .get_by_model(model)
+                .iter()
                 .filter(|w| matches!(w.worker_type(), WorkerType::Prefill { .. }))
+                .cloned()
                 .collect()
         } else {
             self.worker_registry.get_prefill_workers()
@@ -583,9 +723,10 @@ impl PDRouter {
 
         let decode_workers = if let Some(model) = effective_model_id {
             self.worker_registry
-                .get_by_model_fast(model)
-                .into_iter()
+                .get_by_model(model)
+                .iter()
                 .filter(|w| matches!(w.worker_type(), WorkerType::Decode))
+                .cloned()
                 .collect()
         } else {
             self.worker_registry.get_decode_workers()
@@ -594,27 +735,55 @@ impl PDRouter {
         let prefill_policy = self.policy_registry.get_prefill_policy();
         let decode_policy = self.policy_registry.get_decode_policy();
 
+        // Get cached hash ring for consistent hashing
+        let hash_ring = self
+            .worker_registry
+            .get_hash_ring(effective_model_id.unwrap_or(UNKNOWN_MODEL_ID));
+
         let prefill = Self::pick_worker_by_policy_arc(
             &prefill_workers,
             &*prefill_policy,
             request_text,
+            headers,
+            hash_ring.clone(),
             "prefill",
-        )?;
+        )
+        .await?;
 
         let decode = Self::pick_worker_by_policy_arc(
             &decode_workers,
             &*decode_policy,
             request_text,
+            headers,
+            hash_ring,
             "decode",
-        )?;
+        )
+        .await?;
+
+        // Record worker selection metrics (Layer 3)
+        let model = model_id.unwrap_or(UNKNOWN_MODEL_ID);
+        Metrics::record_worker_selection(
+            metrics_labels::WORKER_PREFILL,
+            metrics_labels::CONNECTION_HTTP,
+            model,
+            prefill_policy.name(),
+        );
+        Metrics::record_worker_selection(
+            metrics_labels::WORKER_DECODE,
+            metrics_labels::CONNECTION_HTTP,
+            model,
+            decode_policy.name(),
+        );
 
         Ok((prefill, decode))
     }
 
-    fn pick_worker_by_policy_arc(
+    async fn pick_worker_by_policy_arc(
         workers: &[Arc<dyn Worker>],
         policy: &dyn LoadBalancingPolicy,
         request_text: Option<&str>,
+        headers: Option<&HeaderMap>,
+        hash_ring: Option<Arc<HashRing>>,
         worker_type: &str,
     ) -> Result<Arc<dyn Worker>, String> {
         if workers.is_empty() {
@@ -638,7 +807,16 @@ impl PDRouter {
         }
 
         let selected_idx = policy
-            .select_worker(&available_workers, request_text)
+            .select_worker(
+                &available_workers,
+                &SelectWorkerInfo {
+                    request_text,
+                    tokens: None, // HTTP doesn't have tokens, use gRPC for PrefixHash
+                    headers,
+                    hash_ring,
+                },
+            )
+            .await
             .ok_or_else(|| {
                 format!(
                     "Policy {} failed to select a {} worker",
@@ -659,30 +837,19 @@ impl PDRouter {
         return_logprob: bool,
         decode_url: Option<String>,
         headers: Option<HeaderMap>,
-        prefill: &dyn Worker,
-        decode: &dyn Worker,
+        prefill: Arc<dyn Worker>,
+        decode: Arc<dyn Worker>,
     ) -> Response {
-        prefill.increment_load();
-        decode.increment_load();
-
-        let prefill_url = prefill.url().to_string();
-        let decode_url_str = decode.url().to_string();
+        use crate::core::AttachedBody;
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
-        let registry = self.worker_registry.clone();
-
         tokio::spawn(async move {
-            let mut stream_completed = false;
-
             futures_util::pin_mut!(stream);
             while let Some(chunk_result) = stream.next().await {
                 match chunk_result {
                     Ok(chunk) => {
-                        let is_done = chunk
-                            .as_ref()
-                            .windows(12)
-                            .any(|window| window == b"data: [DONE]");
+                        let is_done = memmem::find(&chunk, b"data: [DONE]").is_some();
 
                         let result = if return_logprob && prefill_logprobs.is_some() {
                             Self::merge_streaming_logprobs(prefill_logprobs.clone(), &chunk)
@@ -696,49 +863,36 @@ impl PDRouter {
                         }
 
                         if is_done {
-                            stream_completed = true;
                             break;
                         }
                     }
                     Err(e) => {
                         if let Some(ref url) = decode_url {
                             error!("Stream error from decode server {}: {}", url, e);
-                            RouterMetrics::record_pd_stream_error(url);
                         }
                         let _ = tx.send(Err(format!("Stream error: {}", e)));
                         break;
                     }
                 }
             }
-
-            if let Some(worker) = registry.get_by_url(&prefill_url) {
-                worker.decrement_load();
-                debug!(
-                    "Decremented load for prefill worker: {} (stream_completed: {})",
-                    prefill_url, stream_completed
-                );
-            }
-
-            if let Some(worker) = registry.get_by_url(&decode_url_str) {
-                worker.decrement_load();
-                debug!(
-                    "Decremented load for decode worker: {} (stream_completed: {})",
-                    decode_url_str, stream_completed
-                );
-            }
         });
 
         let stream = UnboundedReceiverStream::new(rx);
         let body = Body::from_stream(stream);
 
+        let guards = vec![
+            WorkerLoadGuard::new(prefill, headers.as_ref()),
+            WorkerLoadGuard::new(decode, headers.as_ref()),
+        ];
+
         let mut response = Response::new(body);
         *response.status_mut() = status;
 
-        let mut headers = headers.unwrap_or_default();
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
-        *response.headers_mut() = headers;
+        let mut response_headers = headers.unwrap_or_default();
+        response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+        *response.headers_mut() = response_headers;
 
-        response
+        AttachedBody::wrap_response(response, guards)
     }
 
     // Helper to process non-streaming decode response with logprob merging
@@ -754,8 +908,7 @@ impl PDRouter {
             Ok(decode_body) => decode_body,
             Err(e) => {
                 error!("Failed to read decode response: {}", e);
-                return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to read response")
-                    .into_response();
+                return error::internal_error("read_response_failed", "Failed to read response");
             }
         };
 
@@ -799,7 +952,6 @@ impl PDRouter {
         let prefill_response = match prefill_result {
             Ok(response) => response,
             Err(e) => {
-                RouterMetrics::record_pd_prefill_error(prefill_url);
                 error!(
                     "Prefill server failed (CRITICAL) prefill_url={} error={}. Decode will timeout without prefill KV cache.",
                     prefill_url,
@@ -807,14 +959,13 @@ impl PDRouter {
                 );
 
                 // Return error immediately - don't wait for decode to timeout
-                return Err((
-                    StatusCode::BAD_GATEWAY,
+                return Err(error::bad_gateway(
+                    "prefill_server_error",
                     format!(
                         "Prefill server error: {}. This will cause decode timeout.",
                         e
                     ),
-                )
-                    .into_response());
+                ));
             }
         };
 
@@ -823,8 +974,6 @@ impl PDRouter {
 
         // Check if prefill succeeded
         if !prefill_status.is_success() {
-            RouterMetrics::record_pd_prefill_error(prefill_url);
-
             // Get error body from prefill
             let error_msg = prefill_response
                 .text()
@@ -836,11 +985,34 @@ impl PDRouter {
                 prefill_url, prefill_status, error_msg
             );
 
-            return Err((
-                prefill_status,
-                format!("Prefill server error ({}): {}", prefill_status, error_msg),
-            )
-                .into_response());
+            // Map prefill_status to appropriate error function
+            let error_response = match prefill_status {
+                StatusCode::BAD_REQUEST => error::bad_request(
+                    "prefill_bad_request",
+                    format!("Prefill server error ({}): {}", prefill_status, error_msg),
+                ),
+                StatusCode::NOT_FOUND => error::not_found(
+                    "prefill_not_found",
+                    format!("Prefill server error ({}): {}", prefill_status, error_msg),
+                ),
+                StatusCode::INTERNAL_SERVER_ERROR => error::internal_error(
+                    "prefill_internal_error",
+                    format!("Prefill server error ({}): {}", prefill_status, error_msg),
+                ),
+                StatusCode::SERVICE_UNAVAILABLE => error::service_unavailable(
+                    "prefill_unavailable",
+                    format!("Prefill server error ({}): {}", prefill_status, error_msg),
+                ),
+                StatusCode::BAD_GATEWAY => error::bad_gateway(
+                    "prefill_bad_gateway",
+                    format!("Prefill server error ({}): {}", prefill_status, error_msg),
+                ),
+                _ => error::internal_error(
+                    "prefill_error",
+                    format!("Prefill server error ({}): {}", prefill_status, error_msg),
+                ),
+            };
+            return Err(error_response);
         }
 
         // Read prefill body if needed for logprob merging
@@ -869,7 +1041,7 @@ impl PDRouter {
         &self,
         client: &Client,
         url: &str,
-        route: &str,
+        route: &'static str,
         json_request: &Value,
         headers: Option<&HeaderMap>,
         connection_close: bool,
@@ -880,17 +1052,7 @@ impl PDRouter {
         }
         if let Some(headers) = headers {
             for (name, value) in headers.iter() {
-                let name_lc = name.as_str().to_ascii_lowercase();
-                // Whitelist important end-to-end headers, skip hop-by-hop
-                let forward = matches!(
-                    name_lc.as_str(),
-                    "authorization"
-                    | "x-request-id"
-                    | "x-correlation-id"
-                    | "traceparent"      // W3C Trace Context
-                    | "tracestate" // W3C Trace Context
-                ) || name_lc.starts_with("x-request-id-");
-                if forward {
+                if header_utils::should_forward_request_header(name.as_str()) {
                     if let Ok(val) = value.to_str() {
                         request = request.header(name, val);
                     }
@@ -901,6 +1063,7 @@ impl PDRouter {
     }
 
     // Helper to merge logprobs from prefill and decode responses
+    // Optimized to avoid double cloning by taking ownership of decode array
     fn merge_logprobs_in_json(prefill_json: &Value, decode_json: &mut Value) -> bool {
         if let (Some(prefill_meta), Some(decode_meta)) = (
             prefill_json.get("meta_info"),
@@ -910,13 +1073,17 @@ impl PDRouter {
                 prefill_meta.get("input_token_logprobs"),
                 decode_meta.get_mut("input_token_logprobs"),
             ) {
-                if let (Some(prefill_arr), Some(decode_arr)) =
-                    (prefill_logprobs.as_array(), decode_logprobs.as_array_mut())
-                {
-                    let mut merged = prefill_arr.clone();
-                    merged.extend(decode_arr.clone());
-                    decode_meta["input_token_logprobs"] = Value::Array(merged);
-                    return true;
+                if let Some(prefill_arr) = prefill_logprobs.as_array() {
+                    // Take ownership of decode array to avoid cloning it
+                    let decode_arr = std::mem::take(decode_logprobs);
+                    if let Value::Array(decode_vec) = decode_arr {
+                        // Pre-allocate merged array with exact capacity
+                        let mut merged = Vec::with_capacity(prefill_arr.len() + decode_vec.len());
+                        merged.extend(prefill_arr.iter().cloned());
+                        merged.extend(decode_vec);
+                        decode_meta["input_token_logprobs"] = Value::Array(merged);
+                        return true;
+                    }
                 }
             }
         }
@@ -924,6 +1091,7 @@ impl PDRouter {
     }
 
     // Simple helper to merge logprobs in streaming responses
+    // Optimized to reduce allocations in the merge path
     fn merge_streaming_logprobs(
         prefill_logprobs: Option<Value>,
         decode_chunk: &[u8],
@@ -942,12 +1110,16 @@ impl PDRouter {
         if let Some(ref p_logprobs) = prefill_logprobs {
             if let Some(meta) = decode_json.get_mut("meta_info") {
                 if let Some(d_logprobs) = meta.get_mut("input_token_logprobs") {
-                    if let (Some(p_arr), Some(d_arr)) =
-                        (p_logprobs.as_array(), d_logprobs.as_array())
-                    {
-                        let mut merged = p_arr.clone();
-                        merged.extend(d_arr.clone());
-                        *d_logprobs = Value::Array(merged);
+                    if let Some(p_arr) = p_logprobs.as_array() {
+                        // Take ownership of decode array to avoid cloning it
+                        let decode_arr = std::mem::take(d_logprobs);
+                        if let Value::Array(d_vec) = decode_arr {
+                            // Pre-allocate merged array with exact capacity
+                            let mut merged = Vec::with_capacity(p_arr.len() + d_vec.len());
+                            merged.extend(p_arr.iter().cloned());
+                            merged.extend(d_vec);
+                            *d_logprobs = Value::Array(merged);
+                        }
                     }
                 }
             }
@@ -972,14 +1144,13 @@ impl RouterTrait for PDRouter {
         // Note: This endpoint actually causes the model to generate tokens, so we only test one pair
 
         // Select a random worker pair using the policy
-        let (prefill, decode) = match self.select_pd_pair(None, None).await {
+        let (prefill, decode) = match self.select_pd_pair(None, None, None).await {
             Ok(pair) => pair,
             Err(e) => {
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
+                return error::service_unavailable(
+                    "no_healthy_worker_pair",
                     format!("No healthy worker pair available: {}", e),
-                )
-                    .into_response();
+                );
             }
         };
 
@@ -1040,11 +1211,10 @@ impl RouterTrait for PDRouter {
             )
                 .into_response()
         } else {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
+            error::service_unavailable(
+                "health_generate_failed",
                 format!("Health generate failed: {:?}", errors),
             )
-                .into_response()
         }
     }
 
@@ -1097,6 +1267,7 @@ impl RouterTrait for PDRouter {
             return_logprob,
             request_text,
             model_id,
+            headers: headers.cloned(),
         };
 
         self.execute_dual_dispatch(headers, body, context).await
@@ -1117,6 +1288,10 @@ impl RouterTrait for PDRouter {
                     MessageContent::Text(text) => Some(text.clone()),
                     MessageContent::Parts(_) => None,
                 },
+                ChatMessage::Developer { content, .. } => match content {
+                    MessageContent::Text(text) => Some(text.clone()),
+                    MessageContent::Parts(_) => None,
+                },
                 ChatMessage::System { content, .. } => Some(content.to_simple_string()),
                 _ => None,
             })
@@ -1134,6 +1309,7 @@ impl RouterTrait for PDRouter {
             return_logprob,
             request_text,
             model_id,
+            headers: headers.cloned(),
         };
 
         self.execute_dual_dispatch(headers, body, context).await
@@ -1167,69 +1343,10 @@ impl RouterTrait for PDRouter {
             return_logprob,
             request_text,
             model_id,
+            headers: headers.cloned(),
         };
 
         self.execute_dual_dispatch(headers, body, context).await
-    }
-
-    async fn route_responses(
-        &self,
-        _headers: Option<&HeaderMap>,
-        _body: &ResponsesRequest,
-        _model_id: Option<&str>,
-    ) -> Response {
-        (
-            StatusCode::NOT_IMPLEMENTED,
-            "Responses endpoint not implemented for PD router",
-        )
-            .into_response()
-    }
-
-    async fn get_response(
-        &self,
-        _headers: Option<&HeaderMap>,
-        _response_id: &str,
-        _params: &ResponsesGetParams,
-    ) -> Response {
-        (
-            StatusCode::NOT_IMPLEMENTED,
-            "Responses retrieve endpoint not implemented for PD router",
-        )
-            .into_response()
-    }
-
-    async fn cancel_response(&self, _headers: Option<&HeaderMap>, _response_id: &str) -> Response {
-        (
-            StatusCode::NOT_IMPLEMENTED,
-            "Responses cancel endpoint not implemented for PD router",
-        )
-            .into_response()
-    }
-
-    async fn route_classify(
-        &self,
-        _headers: Option<&HeaderMap>,
-        _body: &ClassifyRequest,
-        _model_id: Option<&str>,
-    ) -> Response {
-        (
-            StatusCode::NOT_IMPLEMENTED,
-            "Classify endpoint not implemented for PD router",
-        )
-            .into_response()
-    }
-
-    async fn route_embeddings(
-        &self,
-        _headers: Option<&HeaderMap>,
-        _body: &EmbeddingRequest,
-        _model_id: Option<&str>,
-    ) -> Response {
-        (
-            StatusCode::NOT_IMPLEMENTED,
-            "Embeddings endpoint not implemented for PD router",
-        )
-            .into_response()
     }
 
     async fn route_rerank(
@@ -1252,6 +1369,7 @@ impl RouterTrait for PDRouter {
             return_logprob: false,
             request_text: req_text,
             model_id,
+            headers: headers.cloned(),
         };
 
         self.execute_dual_dispatch(headers, body, context).await
@@ -1315,7 +1433,7 @@ mod tests {
         router.worker_registry.register(Arc::from(healthy_worker));
         router.worker_registry.register(Arc::from(decode_worker));
 
-        let result = router.select_pd_pair(None, None).await;
+        let result = router.select_pd_pair(None, None, None).await;
 
         assert!(result.is_ok());
         let (prefill, _decode) = result.unwrap();
@@ -1328,7 +1446,7 @@ mod tests {
     async fn test_empty_worker_lists() {
         let router = create_test_pd_router();
 
-        let result = router.select_pd_pair(None, None).await;
+        let result = router.select_pd_pair(None, None, None).await;
 
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("No prefill workers available"));
@@ -1336,23 +1454,27 @@ mod tests {
 
     #[test]
     fn test_worker_load_metrics() {
-        let prefill_worker = create_test_worker(
+        let prefill_worker: Arc<dyn Worker> = Arc::from(create_test_worker(
             "http://prefill".to_string(),
             WorkerType::Prefill {
                 bootstrap_port: None,
             },
             true,
-        );
-        let decode_worker =
-            create_test_worker("http://decode".to_string(), WorkerType::Decode, true);
+        ));
+        let decode_worker: Arc<dyn Worker> = Arc::from(create_test_worker(
+            "http://decode".to_string(),
+            WorkerType::Decode,
+            true,
+        ));
 
-        let _guard =
-            WorkerLoadGuard::new_multi(vec![prefill_worker.as_ref(), decode_worker.as_ref()]);
+        let _prefill_guard = WorkerLoadGuard::new(prefill_worker.clone(), None);
+        let _decode_guard = WorkerLoadGuard::new(decode_worker.clone(), None);
 
         assert_eq!(prefill_worker.load(), 1);
         assert_eq!(decode_worker.load(), 1);
 
-        drop(_guard);
+        drop(_prefill_guard);
+        drop(_decode_guard);
 
         assert_eq!(prefill_worker.load(), 0);
         assert_eq!(decode_worker.load(), 0);
@@ -1390,31 +1512,37 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let stream = UnboundedReceiverStream::new(rx);
 
-        let _response = router.create_streaming_response(
-            stream.map(Ok),
-            StatusCode::OK,
-            None,
-            false,
-            None,
-            None,
-            prefill_ref.as_ref(),
-            decode_ref.as_ref(),
-        );
+        {
+            let response = router.create_streaming_response(
+                stream.map(Ok),
+                StatusCode::OK,
+                None,
+                false,
+                None,
+                None,
+                prefill_ref.clone(),
+                decode_ref.clone(),
+            );
 
-        assert_eq!(prefill_ref.load(), 1);
-        assert_eq!(decode_ref.load(), 1);
+            // Guards are now attached to response body, so load should be 1
+            assert_eq!(prefill_ref.load(), 1);
+            assert_eq!(decode_ref.load(), 1);
 
-        tx.send(bytes::Bytes::from("test data")).unwrap();
+            tx.send(bytes::Bytes::from("test data")).unwrap();
 
-        sleep(Duration::from_millis(10)).await;
+            sleep(Duration::from_millis(10)).await;
 
-        assert_eq!(prefill_ref.load(), 1);
-        assert_eq!(decode_ref.load(), 1);
+            // Load still 1 while response body exists
+            assert_eq!(prefill_ref.load(), 1);
+            assert_eq!(decode_ref.load(), 1);
 
-        drop(tx);
+            drop(tx);
 
-        sleep(Duration::from_millis(100)).await;
+            // Response (and its body with guards) dropped here
+            drop(response);
+        }
 
+        // Guards dropped when response dropped
         assert_eq!(prefill_ref.load(), 0);
         assert_eq!(decode_ref.load(), 0);
     }

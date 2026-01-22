@@ -86,11 +86,13 @@ impl Sequence {
     }
 
     /// Check if the sequence is empty
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.token_ids.is_empty()
     }
 
     /// Get the length of the sequence
+    #[inline]
     pub fn len(&self) -> usize {
         self.token_ids.len()
     }
@@ -103,14 +105,18 @@ impl Sequence {
     }
 
     /// Append text to the sequence by encoding it
-    pub fn append_text(&mut self, input: &str) -> Result<()> {
-        let encoding = self.tokenizer.encode(input)?;
+    ///
+    /// Set `add_special_tokens` to `true` for embeddings, or `false` for chat completion
+    /// where the chat template already handles special tokens.
+    pub fn append_text(&mut self, input: &str, add_special_tokens: bool) -> Result<()> {
+        let encoding = self.tokenizer.encode(input, add_special_tokens)?;
         self.token_ids.extend(encoding.token_ids());
         Ok(())
     }
 
     /// Append a single token to the sequence and return newly decoded text
     /// Based on HuggingFace TGI incremental decoding
+    #[inline]
     pub fn append_token(&mut self, token_id: TokenIdType) -> Result<String> {
         // Store the old read offset before adding the new token
         let old_read_offset = self.read_offset;
@@ -165,11 +171,13 @@ impl Sequence {
     }
 
     /// Get a reference to the tokenizer
+    #[inline]
     pub fn tokenizer(&self) -> &Arc<dyn TokenizerTrait> {
         &self.tokenizer
     }
 
     /// Get the current token ids
+    #[inline]
     pub fn token_ids(&self) -> &[TokenIdType] {
         &self.token_ids
     }
@@ -181,16 +189,19 @@ impl Sequence {
     }
 
     /// Get the prefix offset
+    #[inline]
     pub fn prefix_offset(&self) -> usize {
         self.prefix_offset
     }
 
     /// Get the read offset
+    #[inline]
     pub fn read_offset(&self) -> usize {
         self.read_offset
     }
 
     /// Get whether special tokens are skipped during decoding
+    #[inline]
     pub fn skip_special_tokens(&self) -> bool {
         self.skip_special_tokens
     }
@@ -214,7 +225,7 @@ mod tests {
         let tokenizer = Arc::new(MockTokenizer::new());
         let mut seq = Sequence::new(tokenizer);
 
-        seq.append_text("Hello").unwrap();
+        seq.append_text("Hello", false).unwrap();
         assert!(!seq.is_empty());
         assert!(!seq.is_empty());
 
@@ -245,7 +256,7 @@ mod tests {
         let tokenizer = Arc::new(MockTokenizer::new());
         let mut seq = Sequence::new(tokenizer);
 
-        seq.append_text("Hello world").unwrap();
+        seq.append_text("Hello world", false).unwrap();
         assert!(!seq.is_empty());
 
         seq.clear();
@@ -260,7 +271,7 @@ mod tests {
         let tokenizer = Arc::new(MockTokenizer::new());
         let mut seq = Sequence::new(tokenizer);
 
-        seq.append_text("Test").unwrap();
+        seq.append_text("Test", false).unwrap();
         let debug_str = format!("{:?}", seq);
         assert!(debug_str.contains("Sequence"));
         assert!(debug_str.contains("token count"));

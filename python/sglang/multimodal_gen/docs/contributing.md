@@ -39,7 +39,7 @@ For PRs that impact **latency**, **throughput**, or **memory usage**, you **shou
 
 3.  **Compare**: run the compare script, which will print a Markdown table to the console
     ```bash
-    $ python python/sglang/multimodal_gen/benchmarks/compare_perf.py baseline.json new.json
+    $ python python/sglang/multimodal_gen/benchmarks/compare_perf.py baseline.json new.json [new2.json ...]
     ### Performance Comparison Report
     ...
     ```
@@ -49,8 +49,11 @@ For PRs that impact **latency**, **throughput**, or **memory usage**, you **shou
 
 Consider adding tests to the `pr-test` or `nightly-test` suites to safeguard your changes, especially for PRs that:
 
-1. support a new model
-2. support or fix important features
-3. significantly improve performance
+- support a new model
+    - add a testcase for this new model to `testcase_configs.py`
+- support or fix important features
+- significantly improve performance
+
+Please run the according testcase, then update/add the baseline to `perf_baselines.json` by following the instruction in console if applicable.
 
 See [test](https://github.com/sgl-project/sglang/tree/main/python/sglang/multimodal_gen/test) for examples

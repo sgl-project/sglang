@@ -101,11 +101,31 @@ def rocm_platform_plugin() -> str | None:
     )
 
 
+def musa_platform_plugin() -> str | None:
+    is_musa = False
+
+    try:
+        import pymtml
+
+        pymtml.mtmlLibraryInit()
+        try:
+            is_musa = pymtml.mtmlLibraryCountDevice() > 0
+        finally:
+            pymtml.mtmlLibraryShutDown()
+    except Exception as e:
+        logger.info("MUSA platform is unavailable: %s", e)
+
+    return (
+        "sglang.multimodal_gen.runtime.platforms.musa.MusaPlatform" if is_musa else None
+    )
+
+
 builtin_platform_plugins = {
     "cuda": cuda_platform_plugin,
     "rocm": rocm_platform_plugin,
     "mps": mps_platform_plugin,
     "cpu": cpu_platform_plugin,
+    "musa": musa_platform_plugin,
 }
 
 
@@ -128,6 +148,11 @@ def resolve_current_platform_cls_qualname() -> str:
     if platform_cls_qualname is not None:
         return platform_cls_qualname
 
+    # Fall back to MUSA
+    platform_cls_qualname = musa_platform_plugin()
+    if platform_cls_qualname is not None:
+        return platform_cls_qualname
+
     # Fall back to CPU as last resort
     platform_cls_qualname = cpu_platform_plugin()
     if platform_cls_qualname is not None:
@@ -139,8 +164,7 @@ def resolve_current_platform_cls_qualname() -> str:
 _current_platform: Platform | None = None
 _init_trace: str = ""
 
-if TYPE_CHECKING:
-    current_platform: Platform
+current_platform: Platform
 
 
 def __getattr__(name: str):
@@ -150,12 +174,6 @@ def __getattr__(name: str):
         #    Platform` so that they can inherit `Platform` class. Therefore,
         #    we cannot resolve `current_platform` during the import of
         #    `sglang.multimodal_gen.runtime.platforms`.
-        # 2. when users use out-of-tree platform plugins, they might run
-        #    `import sgl_diffusion`, some sgl_diffusion internal code might access
-        #    `current_platform` during the import, and we need to make sure
-        #    `current_platform` is only resolved after the plugins are loaded
-        #    (we have tests for this, if any developer violate this, they will
-        #    see the test failures).
         global _current_platform
         if _current_platform is None:
             platform_cls_qualname = resolve_current_platform_cls_qualname()

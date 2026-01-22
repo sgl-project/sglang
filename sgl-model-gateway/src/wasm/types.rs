@@ -3,7 +3,7 @@
 //! Provides generic input/output types for WASM component execution
 //! based on attach points.
 
-use wasmtime::component::ResourceTable;
+use wasmtime::{component::ResourceTable, StoreLimits};
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 
 use crate::wasm::{
@@ -89,6 +89,7 @@ impl WasmComponentOutput {
 pub struct WasiState {
     pub ctx: WasiCtx,
     pub table: ResourceTable,
+    pub limits: StoreLimits,
 }
 
 impl WasiView for WasiState {

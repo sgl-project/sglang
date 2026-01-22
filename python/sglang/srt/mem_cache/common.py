@@ -7,17 +7,19 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
-from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
-from sglang.srt.mem_cache.chunk_cache import ChunkCache, SWAChunkCache
-from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
+from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
+from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import support_triton
 from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+
+# Needs 2 + 1 slots for mamba request with prefix cache. 2 for ping pong cache, 1 for running mamba state.
+MAMBA_STATE_PER_REQ_PREFIX_CACHE = 3
+MAMBA_STATE_PER_REQ_NO_CACHE = 1
 
 logger = logging.getLogger(__name__)
 
@@ -228,7 +230,7 @@ def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
     if tree_cache is None:
         return
 
-    if isinstance(tree_cache, (SWAChunkCache, ChunkCache)):
+    if tree_cache.is_chunk_cache():
         return
 
     allocator = tree_cache.token_to_kv_pool_allocator
@@ -242,11 +244,13 @@ def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
         if full_available_size < num_tokens or swa_available_size < num_tokens:
             full_num_tokens = max(0, num_tokens - full_available_size)
             swa_num_tokens = max(0, num_tokens - swa_available_size)
-            tree_cache.evict(full_num_tokens, swa_num_tokens)
+            tree_cache.evict(
+                EvictParams(num_tokens=full_num_tokens, swa_num_tokens=swa_num_tokens)
+            )
     else:
         # Standard allocator
         if allocator.available_size() < num_tokens:
-            tree_cache.evict(num_tokens)
+            tree_cache.evict(EvictParams(num_tokens=num_tokens))
 
 
 def alloc_paged_token_slots_extend(
@@ -300,10 +304,16 @@ def alloc_req_slots(
     """Allocate request slots from the pool."""
     if isinstance(req_to_token_pool, HybridReqToTokenPool):
         mamba_available_size = req_to_token_pool.mamba_pool.available_size()
-        if mamba_available_size < num_reqs:
-            if tree_cache is not None and isinstance(tree_cache, MambaRadixCache):
-                mamba_num = max(0, num_reqs - mamba_available_size)
-                tree_cache.evict_mamba(mamba_num)
+        factor = (
+            MAMBA_STATE_PER_REQ_PREFIX_CACHE
+            if tree_cache.supports_mamba()
+            else MAMBA_STATE_PER_REQ_NO_CACHE
+        )
+        mamba_state_needed = num_reqs * factor
+        if mamba_available_size < mamba_state_needed:
+            if tree_cache is not None and tree_cache.supports_mamba():
+                mamba_num = max(0, mamba_state_needed - mamba_available_size)
+                tree_cache.evict(EvictParams(num_tokens=0, mamba_num=mamba_num))
         req_pool_indices = req_to_token_pool.alloc(num_reqs, reqs)
     else:
         req_pool_indices = req_to_token_pool.alloc(num_reqs)
@@ -330,11 +340,7 @@ def alloc_for_extend(
         req_pool_indices: request pool indices as list
     """
     # free out-of-window swa tokens
-    if isinstance(batch.tree_cache, SWAChunkCache):
-        for req, pre_len in zip(batch.reqs, batch.prefix_lens):
-            batch.tree_cache.evict_swa(
-                req, pre_len, batch.model_config.attention_chunk_size
-            )
+    batch.maybe_evict_swa()
 
     bs = len(batch.reqs)
     prefix_tensors = [r.prefix_indices for r in batch.reqs]
@@ -425,11 +431,8 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     Returns:
         out_cache_loc: allocated cache locations
     """
-    if isinstance(batch.tree_cache, SWAChunkCache):
-        for req in batch.reqs:
-            batch.tree_cache.evict_swa(
-                req, req.seqlen - 1, batch.model_config.attention_chunk_size
-            )
+
+    batch.maybe_evict_swa()
 
     bs = batch.seq_lens.shape[0]
 
@@ -465,6 +468,14 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
 
 def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
     tree_cache.cache_finished_req(req, is_insert=is_insert)
+
+    # MambaRadixCache may alloc mamba state before alloc KV cache
+    if req.req_pool_idx is None:
+        assert (
+            tree_cache.supports_mamba()
+        ), "Only MambaRadixCache can handle abort with prefix cache hit before alloc"
+        return
+
     start_p, end_p = req.pop_overallocated_kv_cache()
 
     global_server_args = get_global_server_args()

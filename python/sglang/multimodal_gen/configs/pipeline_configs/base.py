@@ -2,6 +2,7 @@
 
 # SPDX-License-Identifier: Apache-2.0
 import json
+import os
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, fields
 from enum import Enum, auto
@@ -19,6 +20,7 @@ from sglang.multimodal_gen.configs.models import (
     VAEConfig,
 )
 from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput
+from sglang.multimodal_gen.configs.sample.sampling_params import DataType
 from sglang.multimodal_gen.configs.utils import update_config_from_args
 from sglang.multimodal_gen.runtime.distributed import (
     get_sp_parallel_rank,
@@ -36,17 +38,42 @@ from sglang.multimodal_gen.utils import (
 logger = init_logger(__name__)
 
 
-# NOTE: possible duplication with DataType, WorkloadType
+# NOTE: possible duplication with DataType
 # this may focus on the model's original ability
 class ModelTaskType(Enum):
+    # TODO: check if I2V/TI2V models can work w/wo text
+
     I2V = auto()  # Image to Video
     T2V = auto()  # Text to Video
     TI2V = auto()  # Text and Image to Video
+
     T2I = auto()  # Text to Image
     I2I = auto()  # Image to Image
+    TI2I = auto()  # Image to Image or Text-Image to Image
 
-    def is_image_gen(self):
-        return self == ModelTaskType.T2I or self == ModelTaskType.I2I
+    def is_image_gen(self) -> bool:
+        return (
+            self == ModelTaskType.T2I
+            or self == ModelTaskType.I2I
+            or self == ModelTaskType.TI2I
+        )
+
+    def requires_image_input(self) -> bool:
+        return self == ModelTaskType.I2V or self == ModelTaskType.I2I
+
+    def accepts_image_input(self) -> bool:
+        return (
+            self == ModelTaskType.I2V
+            or self == ModelTaskType.I2I
+            or self == ModelTaskType.TI2I
+            or self == ModelTaskType.TI2V
+        )
+
+    def data_type(self) -> DataType:
+        if self.is_image_gen():
+            return DataType.IMAGE
+        else:
+            return DataType.VIDEO
 
 
 class STA_Mode(str, Enum):
@@ -102,6 +129,15 @@ def shard_rotary_emb_for_sp(emb):
         return emb
 
 
+def maybe_unpad_latents(latents, batch):
+    # If SP padding was applied, remove extra tokens before reshaping
+    width, height = batch.raw_latent_shape[-1], batch.raw_latent_shape[-2]
+    target_tokens = width * height
+    if latents.shape[1] > target_tokens:
+        latents = latents[:, :target_tokens, :]
+    return latents
+
+
 # config for a single pipeline
 @dataclass
 class PipelineConfig:
@@ -111,6 +147,9 @@ class PipelineConfig:
 
     model_path: str = ""
     pipeline_config_path: str | None = None
+
+    # precision and autocast
+    enable_autocast: bool = True
 
     # generation parameters
     # controls the timestep embedding generation
@@ -157,11 +196,6 @@ class PipelineConfig:
         field(default_factory=lambda: (postprocess_text,))
     )
 
-    # StepVideo specific parameters
-    pos_magic: str | None = None
-    neg_magic: str | None = None
-    timesteps_scale: bool | None = None
-
     # STA (Sliding Tile Attention) parameters
     mask_strategy_file_path: str | None = None
     STA_mode: STA_Mode = STA_Mode.STA_INFERENCE
@@ -200,7 +234,10 @@ class PipelineConfig:
             (target_width, target_height), PIL.Image.Resampling.LANCZOS
         ), (target_width, target_height)
 
-    def prepare_image_processor_kwargs(self, batch):
+    def prepare_calculated_size(self, image):
+        return self.calculate_condition_image_size(image, image.width, image.height)
+
+    def prepare_image_processor_kwargs(self, batch, neg=False):
         return {}
 
     def postprocess_image_latent(self, latent_condition, batch):
@@ -258,6 +295,9 @@ class PipelineConfig:
 
         return shape
 
+    def allow_set_num_frames(self):
+        return False
+
     def get_decode_scale_and_shift(self, device, dtype, vae):
         vae_arch_config = self.vae_config.arch_config
         scaling_factor = getattr(vae_arch_config, "scaling_factor", None)
@@ -289,19 +329,32 @@ class PipelineConfig:
         latents = sequence_model_parallel_all_gather(latents, dim=2)
         return latents
 
+    def preprocess_vae_image(self, batch, vae_image_processor):
+        pass
+
     def shard_latents_for_sp(self, batch, latents):
         # general logic for video models
         sp_world_size, rank_in_sp_group = get_sp_world_size(), get_sp_parallel_rank()
         if latents.dim() != 5:
             return latents, False
         time_dim = latents.shape[2]
-        if time_dim > 0 and time_dim % sp_world_size == 0:
-            sharded_tensor = rearrange(
-                latents, "b c (n t) h w -> b c n t h w", n=sp_world_size
-            ).contiguous()
-            sharded_tensor = sharded_tensor[:, :, rank_in_sp_group, :, :, :]
-            return sharded_tensor, True
-        return latents, False
+
+        # Pad to next multiple of SP degree if needed
+        if time_dim > 0 and time_dim % sp_world_size != 0:
+            pad_len = sp_world_size - (time_dim % sp_world_size)
+            pad = torch.zeros(
+                (*latents.shape[:2], pad_len, *latents.shape[3:]),
+                dtype=latents.dtype,
+                device=latents.device,
+            )
+            latents = torch.cat([latents, pad], dim=2)
+
+        assert latents.shape[2] % sp_world_size == 0
+        sharded_tensor = rearrange(
+            latents, "b c (n t) h w -> b c n t h w", n=sp_world_size
+        ).contiguous()
+        sharded_tensor = sharded_tensor[:, :, rank_in_sp_group, :, :, :]
+        return sharded_tensor, True
 
     def get_pos_prompt_embeds(self, batch):
         return batch.prompt_embeds
@@ -310,7 +363,11 @@ class PipelineConfig:
         return batch.negative_prompt_embeds
 
     def post_denoising_loop(self, latents, batch):
+        latents = maybe_unpad_latents(latents, batch)
         return latents
+
+    def post_decoding(self, frames, server_args):
+        return frames
 
     def prepare_pos_cond_kwargs(self, batch, device, rotary_emb, dtype):
         return {}
@@ -410,27 +467,6 @@ class PipelineConfig:
             choices=["fp32", "fp16", "bf16"],
             help="Precision for image encoder",
         )
-        parser.add_argument(
-            f"--{prefix_with_dot}pos_magic",
-            type=str,
-            dest=f"{prefix_with_dot.replace('-', '_')}pos_magic",
-            default=PipelineConfig.pos_magic,
-            help="Positive magic prompt for sampling, used in stepvideo",
-        )
-        parser.add_argument(
-            f"--{prefix_with_dot}neg_magic",
-            type=str,
-            dest=f"{prefix_with_dot.replace('-', '_')}neg_magic",
-            default=PipelineConfig.neg_magic,
-            help="Negative magic prompt for sampling, used in stepvideo",
-        )
-        parser.add_argument(
-            f"--{prefix_with_dot}timesteps_scale",
-            type=bool,
-            dest=f"{prefix_with_dot.replace('-', '_')}timesteps_scale",
-            default=PipelineConfig.timesteps_scale,
-            help="Bool for applying scheduler scale in set_timesteps, used in stepvideo",
-        )
 
         # DMD parameters
         parser.add_argument(
@@ -486,15 +522,55 @@ class PipelineConfig:
         if model_path is None:
             raise ValueError("model_path is required in kwargs")
 
+        # Check if model_path is a safetensors file and pipeline_class_name is specified
+        pipeline_class_name = kwargs.get(
+            prefix_with_dot + "pipeline_class_name"
+        ) or kwargs.get("pipeline_class_name")
+        is_safetensors_file = os.path.isfile(model_path) and model_path.endswith(
+            ".safetensors"
+        )
+
         # 1. Get the pipeline config class from the registry
         from sglang.multimodal_gen.configs.pipeline_configs.flux import (
             Flux2PipelineConfig,
         )
+        from sglang.multimodal_gen.registry import get_pipeline_config_classes
 
-        model_info = get_model_info(model_path)
+        # If model_path is a safetensors file and pipeline_class_name is specified,
+        # try to get PipelineConfig from the registry first
+        if is_safetensors_file and pipeline_class_name:
+            config_classes = get_pipeline_config_classes(pipeline_class_name)
+            if config_classes is not None:
+                pipeline_config_cls, _ = config_classes
+                logger.info(
+                    f"Detected safetensors file with {pipeline_class_name}, "
+                    f"using {pipeline_config_cls.__name__} directly without model_index.json"
+                )
+            else:
+                model_info = get_model_info(model_path)
+                if model_info is None:
+                    from sglang.multimodal_gen.registry import (
+                        _PIPELINE_CONFIG_REGISTRY,
+                        _discover_and_register_pipelines,
+                    )
 
-        # 1.5. Adjust pipeline config for fine-tuned VAE if needed
-        pipeline_config_cls = model_info.pipeline_config_cls
+                    _discover_and_register_pipelines()
+                    available_pipelines = list(_PIPELINE_CONFIG_REGISTRY.keys())
+                    raise ValueError(
+                        f"Could not get model info for '{model_path}'. "
+                        f"If using a safetensors file, please specify a valid pipeline_class_name. "
+                        f"Available pipelines with config classes: {available_pipelines}"
+                    )
+                pipeline_config_cls = model_info.pipeline_config_cls
+        else:
+            model_info = get_model_info(model_path)
+            if model_info is None:
+                raise ValueError(
+                    f"Could not get model info for '{model_path}'. "
+                    f"If using a safetensors file, please specify pipeline_class_name"
+                )
+            # 1.5. Adjust pipeline config for fine-tuned VAE if needed
+            pipeline_config_cls = model_info.pipeline_config_cls
         vae_path = kwargs.get(prefix_with_dot + "vae_path") or kwargs.get("vae_path")
 
         # Check if this is a Flux2 model with fal/FLUX.2-Tiny-AutoEncoder
@@ -621,20 +697,20 @@ class ImagePipelineConfig(PipelineConfig):
         return sigmas
 
     def shard_latents_for_sp(self, batch, latents):
+        # latents: [B, H * W, C]
         sp_world_size, rank_in_sp_group = get_sp_world_size(), get_sp_parallel_rank()
         seq_len = latents.shape[1]
 
+        # TODO: reuse code in PipelineConfig::shard_latents_for_sp
         # Pad to next multiple of SP degree if needed
         if seq_len % sp_world_size != 0:
             pad_len = sp_world_size - (seq_len % sp_world_size)
             pad = torch.zeros(
-                (latents.shape[0], pad_len, latents.shape[2]),
+                (*latents.shape[:1], pad_len, *latents.shape[2:]),
                 dtype=latents.dtype,
                 device=latents.device,
             )
             latents = torch.cat([latents, pad], dim=1)
-            # Record padding length for later unpad
-            batch.sp_seq_pad = int(getattr(batch, "sp_seq_pad", 0)) + pad_len
 
         sharded_tensor = rearrange(
             latents, "b (n s) d -> b n s d", n=sp_world_size
@@ -655,10 +731,7 @@ class ImagePipelineConfig(PipelineConfig):
         height = 2 * (int(batch.height) // (vae_scale_factor * 2))
         width = 2 * (int(batch.width) // (vae_scale_factor * 2))
 
-        # If SP padding was applied, remove extra tokens before reshaping
-        target_tokens = (height // 2) * (width // 2)
-        if latents.shape[1] > target_tokens:
-            latents = latents[:, :target_tokens, :]
+        latents = maybe_unpad_latents(latents, batch)
 
         latents = latents.view(batch_size, height // 2, width // 2, channels // 4, 2, 2)
         latents = latents.permute(0, 3, 1, 4, 2, 5)

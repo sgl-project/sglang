@@ -24,3 +24,12 @@ class CacheInitParams:
 
     enable_metrics: bool = False
     enable_kv_cache_events: bool = False
+
+    enable_mamba_extra_buffer: bool = False
+
+    pp_rank: int = 0
+    pp_size: int = 1
+
+    chunked_prefill_size: Optional[int] = None
+
+    sliding_window_size: Optional[int] = None

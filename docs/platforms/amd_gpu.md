@@ -44,7 +44,7 @@ You can install SGLang using one of the methods below.
 
 ```bash
 # Use the last release branch
-git clone -b v0.5.6 https://github.com/sgl-project/sglang.git
+git clone -b v0.5.6.post2 https://github.com/sgl-project/sglang.git
 cd sglang
 
 # Compile sgl-kernel
@@ -52,10 +52,10 @@ pip install --upgrade pip
 cd sgl-kernel
 python setup_rocm.py install
 
-# Install sglang python package
+# Install sglang python package along with diffusion support
 cd ..
 rm -rf python/pyproject.toml && mv python/pyproject_other.toml python/pyproject.toml
-pip install -e "python[all_hip]"
+pip install -e "python[all_hip,diffusion_hip]"
 ```
 
 ### Install Using Docker (Recommended)
