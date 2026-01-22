@@ -500,9 +500,9 @@ def eval_open(gold_i, pred_i):
         norm_answers = normalize_str(gold_i)
     for pred in pred_i:  # pred is already normalized in parse response phase
         if isinstance(pred, str):  # if it's a string, then find if ans in the pred_i
-            for norm_ans in norm_answers:
+            for norm_answer in norm_answers:
                 # only see if the string answer in the string pred
-                if isinstance(norm_ans, str) and norm_ans in pred:
+                if isinstance(norm_answer, str) and norm_answer in pred:
                     if not correct:
                         correct = True
                     break
