@@ -49,6 +49,19 @@ jobs:
           cd python
           cp ../README.md ../LICENSE .
 
+          # Debug: Show git describe output to diagnose version issues
+          echo "=== Debug: Git describe output ==="
+          git describe --tags --long --match 'v*'
+          echo "=== Debug: Testing custom command ==="
+          DESC=$(git describe --tags --long --match 'v*' 2>/dev/null || echo 'v0.0.0-0-g0000000')
+          TAG=$(echo "$DESC" | cut -d- -f1)
+          DIST=$(echo "$DESC" | cut -d- -f2)
+          HASH=$(echo "$DESC" | cut -d- -f3-)
+          echo "Parsed: TAG=$TAG DIST=$DIST HASH=$HASH"
+          test "$DIST" = '0' && DIST=1 && echo "Forcing DIST=1 for tag-exact build"
+          echo "Final: ${TAG}-${DIST}-${HASH}"
+          echo "==================================="
+
           # Build wheel - setuptools-scm automatically generates version from git tags
           python3 -m build --wheel
 
