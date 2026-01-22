@@ -21,6 +21,8 @@ The SGLang-diffusion CLI provides a quick way to access the inference pipeline f
 - `--sp-degree {SP_SIZE}`: Sequence parallelism size (typically should match the number of GPUs)
 - `--ulysses-degree {ULYSSES_DEGREE}`: The degree of DeepSpeed-Ulysses-style SP in USP
 - `--ring-degree {RING_DEGREE}`: The degree of ring attention-style SP in USP
+- `--attention-backend {BACKEND}`: Attention backend to use. For SGLang-native pipelines use `fa`, `torch_sdpa`, `sage_attn`, etc. For diffusers pipelines use diffusers backend names like `flash`, `_flash_3_hub`, `sage`, `xformers`.
+- `--cache-dit-config {PATH}`: Path to a Cache-DiT YAML/JSON config (diffusers backend only)
 
 
 ### Sampling Parameters
