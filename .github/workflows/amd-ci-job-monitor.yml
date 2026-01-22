@@ -49,34 +49,6 @@ jobs:
             --hours ${{ inputs.hours || '24' }} \
             --summary
 
-  # AMD Runner Usage - catches ALL jobs using AMD runners (including unmerged new jobs)
-  amd-runner-usage:
-    name: AMD Runner Usage
-    if: ${{ !inputs.job_filter }}
-    runs-on: ubuntu-latest
-    env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
-
-      - name: Install dependencies
-        run: pip install tabulate
-
-      - name: Generate AMD Runner Usage Report
-        timeout-minutes: 30
-        run: |
-          python scripts/ci/query_job_status.py \
-            --repo ${{ github.repository }} \
-            --runner-filter "mi325,mi35x" \
-            --hours ${{ inputs.hours || '24' }} \
-            --summary
-
   # Parse workflow files to get job names dynamically
   parse-workflows:
     name: Parse Workflow Jobs

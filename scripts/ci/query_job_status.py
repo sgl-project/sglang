@@ -69,7 +69,9 @@ def run_gh_command(args: list[str]) -> dict:
             text=True,
         )
     except FileNotFoundError:
-        raise Exception("gh CLI not found. Please install from https://cli.github.com/")
+        raise Exception(
+            "gh CLI not found. Please install from https://cli.github.com/"
+        )
 
     if result.returncode != 0:
         raise Exception(f"gh api failed: {result.stderr}")
@@ -150,56 +152,14 @@ def get_pr_number_from_run(run: dict) -> Optional[int]:
     return None
 
 
-def matches_runner_filter(job: dict, runner_filters: list[str]) -> bool:
-    """Check if a job matches any of the runner filters (fuzzy match on labels or runner_name)."""
-    if not runner_filters:
-        return True
-
-    # Check job labels (requested runner labels)
-    job_labels = job.get("labels", [])
-    for label in job_labels:
-        for rf in runner_filters:
-            if rf.lower() in label.lower():
-                return True
-
-    # Check actual runner name
-    runner_name = job.get("runner_name") or ""
-    for rf in runner_filters:
-        if rf.lower() in runner_name.lower():
-            return True
-
-    return False
-
-
-def get_runner_label_for_job(job: dict, runner_filters: list[str]) -> str:
-    """Get the matching runner label for a job (for grouping)."""
-    # First try to find a matching label from job labels
-    job_labels = job.get("labels", [])
-    for label in job_labels:
-        for rf in runner_filters:
-            if rf.lower() in label.lower():
-                return label
-
-    # Fall back to runner_name
-    runner_name = job.get("runner_name") or "-"
-    return runner_name
-
-
 def query_jobs(
     repo: str,
     job_filter: str,
     workflow: str = None,
     hours: int = 24,
     status_filter: str = None,
-    runner_filter: str = None,
 ) -> list[dict]:
     """Query jobs matching the filter."""
-
-    # Parse runner filter into list
-    runner_filters = []
-    if runner_filter:
-        runner_filters = [rf.strip() for rf in runner_filter.split(",") if rf.strip()]
-        print(f"Runner filter: {runner_filters}", file=sys.stderr)
 
     print(f"Fetching workflow runs from last {hours} hours...", file=sys.stderr)
     runs = get_workflow_runs(repo, workflow, hours)
@@ -228,12 +188,8 @@ def query_jobs(
         for job in jobs:
             job_name = job.get("name", "")
 
-            # Filter by job name (if provided)
-            if job_filter and job_filter.lower() not in job_name.lower():
-                continue
-
-            # Filter by runner (if provided)
-            if runner_filters and not matches_runner_filter(job, runner_filters):
+            # Filter by job name
+            if job_filter.lower() not in job_name.lower():
                 continue
 
             # Filter by status if specified
@@ -242,11 +198,6 @@ def query_jobs(
 
             job_status = job.get("status", "unknown")
             runner_name = job.get("runner_name") or "-"
-
-            # Get runner label for grouping
-            runner_label = (
-                get_runner_label_for_job(job, runner_filters) if runner_filters else "-"
-            )
 
             # Detect stuck/ghost jobs:
             # - Job is in_progress but no runner assigned
@@ -270,7 +221,6 @@ def query_jobs(
                     "started_at": job.get("started_at", ""),
                     "completed_at": job.get("completed_at", ""),
                     "runner_name": runner_name,
-                    "runner_label": runner_label,
                     "run_id": run["id"],
                     "run_status": run_status,
                     "run_conclusion": run_conclusion,
@@ -363,21 +313,17 @@ def calculate_queue_time(
 
 
 def process_results(
-    results: list[dict],
-    repo: str,
-    report_time: datetime = None,
-    group_by_runner: bool = False,
+    results: list[dict], repo: str, report_time: datetime = None
 ) -> dict:
     """
     Process raw results into structured data for presentation.
     Returns a dictionary containing:
-    - status_summary: dict of job_name (or runner_label) -> status counts
+    - status_summary: dict of job_name -> status counts
     - sorted_results: list of results sorted by created_at descending
     - active_jobs: list of in_progress/queued/waiting jobs (excluding stuck)
     - stuck_jobs: list of stuck/ghost jobs
     - failed_jobs: list of failed jobs
     - processed_jobs: list of jobs with calculated fields (queue_time, duration, etc.)
-    - runner_summary: dict of runner_label -> status counts (only when group_by_runner=True)
     """
     if report_time is None:
         report_time = datetime.now(timezone.utc)
@@ -390,21 +336,15 @@ def process_results(
             "stuck_jobs": [],
             "failed_jobs": [],
             "processed_jobs": [],
-            "runner_summary": {},
         }
 
     # Group by job name for summary
     status_summary = {}
-    runner_summary = {}
-
     for r in results:
         job_name = r["job_name"]
         status = r["status"]
         conclusion = r.get("conclusion", "-")
         is_stuck = r.get("is_stuck", False)
-        runner_label = r.get("runner_label", "-")
-
-        # Job name summary
         if job_name not in status_summary:
             status_summary[job_name] = {
                 "in_progress": 0,
@@ -415,42 +355,18 @@ def process_results(
                 "failure": 0,
                 "cancelled": 0,
             }
-
-        # Runner label summary (when grouping by runner)
-        if group_by_runner and runner_label != "-":
-            if runner_label not in runner_summary:
-                runner_summary[runner_label] = {
-                    "in_progress": 0,
-                    "queued": 0,
-                    "waiting": 0,
-                    "stuck": 0,
-                    "success": 0,
-                    "failure": 0,
-                    "cancelled": 0,
-                }
-
         if is_stuck:
             status_summary[job_name]["stuck"] += 1
-            if group_by_runner and runner_label in runner_summary:
-                runner_summary[runner_label]["stuck"] += 1
         elif status == "completed":
             # For completed jobs, count by conclusion
             if conclusion == "success":
                 status_summary[job_name]["success"] += 1
-                if group_by_runner and runner_label in runner_summary:
-                    runner_summary[runner_label]["success"] += 1
             elif conclusion == "failure":
                 status_summary[job_name]["failure"] += 1
-                if group_by_runner and runner_label in runner_summary:
-                    runner_summary[runner_label]["failure"] += 1
             elif conclusion in ("cancelled", "timed_out", "action_required"):
                 status_summary[job_name]["cancelled"] += 1
-                if group_by_runner and runner_label in runner_summary:
-                    runner_summary[runner_label]["cancelled"] += 1
         elif status in status_summary[job_name]:
             status_summary[job_name][status] += 1
-            if group_by_runner and runner_label in runner_summary:
-                runner_summary[runner_label][status] += 1
 
     # Sort by created_at descending
     sorted_results = sorted(results, key=lambda x: x["created_at"], reverse=True)
@@ -506,7 +422,6 @@ def process_results(
         "stuck_jobs": stuck_jobs,
         "failed_jobs": failed_jobs,
         "processed_jobs": processed_jobs,
-        "runner_summary": runner_summary,
     }
 
 
@@ -698,18 +613,12 @@ def format_markdown(
     hours: int,
     generated_time: str,
     report_time: datetime = None,
-    runner_filter: str = None,
 ) -> str:
     """Format results as markdown for GitHub Actions summary."""
     lines = []
 
-    # Header - different title for runner filter mode
-    if runner_filter:
-        lines.append(f"# AMD Runner Usage Report")
-        lines.append("")
-        lines.append(f"**Runner filter:** `{runner_filter}`")
-    else:
-        lines.append(f"# Job Status Report: `{job_filter}`")
+    # Header
+    lines.append(f"# Job Status Report: `{job_filter}`")
     lines.append("")
     lines.append(f"**Time window:** Last {hours} hours")
     lines.append(f"**Generated:** {generated_time} UTC")
@@ -723,46 +632,14 @@ def format_markdown(
         return "\n".join(lines)
 
     # Process data using shared function
-    group_by_runner = bool(runner_filter)
-    data = process_results(results, repo, report_time, group_by_runner)
+    data = process_results(results, repo, report_time)
     status_summary = data["status_summary"]
-    runner_summary = data.get("runner_summary", {})
     processed_jobs = data["processed_jobs"]
     active_jobs = data["active_jobs"]
     stuck_jobs = data["stuck_jobs"]
     failed_jobs = data["failed_jobs"]
 
-    # Runner summary table (when using runner filter)
-    if runner_filter and runner_summary:
-        lines.append("## Summary by Runner Label")
-        lines.append("")
-        lines.append(
-            "> **Status meanings:** Running = executing, Queued = waiting for runner, Waiting = waiting for dependent jobs, Stuck = ghost job"
-        )
-        lines.append("")
-        lines.append(
-            "| Runner Label | Running | Queued | Waiting | Stuck | Success | Failure | Cancelled |"
-        )
-        lines.append(
-            "|--------------|---------|--------|---------|-------|---------|---------|-----------|"
-        )
-
-        for runner_label, counts in sorted(runner_summary.items()):
-            running = (
-                f"**{counts['in_progress']}**" if counts["in_progress"] > 0 else "0"
-            )
-            queued = f"**{counts['queued']}**" if counts["queued"] > 0 else "0"
-            waiting = f"**{counts['waiting']}**" if counts["waiting"] > 0 else "0"
-            stuck = f"**{counts['stuck']}**" if counts["stuck"] > 0 else "0"
-            success = str(counts["success"])
-            failure = f"**{counts['failure']}**" if counts["failure"] > 0 else "0"
-            cancelled = str(counts["cancelled"])
-            lines.append(
-                f"| `{runner_label}` | {running} | {queued} | {waiting} | {stuck} | {success} | {failure} | {cancelled} |"
-            )
-        lines.append("")
-
-    # Summary table by job name
+    # Summary table
     lines.append("## Summary by Job Name")
     lines.append("")
     lines.append(
@@ -927,13 +804,13 @@ def main():
     )
     parser.add_argument(
         "--job",
-        default="",
-        help="Job name filter (e.g., 'stage-c-test-large-8-gpu-amd-mi35x'). Optional if --runner-filter is provided.",
+        required=True,
+        help="Job name filter (e.g., 'stage-c-test-large-8-gpu-amd-mi35x')",
     )
     parser.add_argument(
         "--workflow",
-        default="",
-        help="Workflow file name (e.g., 'pr-test-amd.yml'). Empty = all workflows.",
+        default="pr-test-amd.yml",
+        help="Workflow file name (default: pr-test-amd.yml)",
     )
     parser.add_argument(
         "--hours",
@@ -945,11 +822,6 @@ def main():
         "--status",
         choices=["in_progress", "queued", "completed", "waiting"],
         help="Filter by job status",
-    )
-    parser.add_argument(
-        "--runner-filter",
-        type=str,
-        help="Filter by runner label (comma-separated, fuzzy match). E.g., 'mi325,mi35x'",
     )
     parser.add_argument(
         "--output",
@@ -969,17 +841,12 @@ def main():
     )
     args = parser.parse_args()
 
-    # Validate: at least one of --job or --runner-filter must be provided
-    if not args.job and not args.runner_filter:
-        parser.error("At least one of --job or --runner-filter must be provided")
-
     results = query_jobs(
         args.repo,
         args.job,
-        args.workflow if args.workflow else None,
+        args.workflow,
         args.hours,
         args.status,
-        args.runner_filter,
     )
 
     output_content = None
@@ -1017,13 +884,7 @@ def main():
         print(output_content)
     elif args.output == "markdown":
         output_content = format_markdown(
-            results,
-            args.repo,
-            args.job,
-            args.hours,
-            report_generated_time,
-            report_time,
-            runner_filter=args.runner_filter,
+            results, args.repo, args.job, args.hours, report_generated_time, report_time
         )
         print(output_content)
 
@@ -1036,13 +897,7 @@ def main():
     # Write to GITHUB_STEP_SUMMARY if requested
     if args.summary:
         md_content = format_markdown(
-            results,
-            args.repo,
-            args.job,
-            args.hours,
-            report_generated_time,
-            report_time,
-            runner_filter=args.runner_filter,
+            results, args.repo, args.job, args.hours, report_generated_time, report_time
         )
         summary_file = os.environ.get("GITHUB_STEP_SUMMARY")
         if summary_file:
