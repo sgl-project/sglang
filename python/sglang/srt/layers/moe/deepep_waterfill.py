@@ -1251,13 +1251,11 @@ class DeepEPWaterfillBalancer:
     # Below this threshold, all shared experts are computed locally
     MIN_BATCH_FOR_BALANCE = 64
 
-    # Minimum global shared tokens for a rank to accept *remote* shared-expert dispatch.
-    # If after aggregating destinations across all ranks a destination rank would get
-    # < this many shared tokens, we redirect those remote shared tokens back to their
-    # source ranks (i.e., that rank does not receive remote shared expert work).
+    # Minimum shared tokens for a rank to accept *remote* shared-expert dispatch.
     #
-    # Note: shared expert compute uses 128-token blocks; <64 tokens would waste >50% padding.
-    MIN_TOKENS_PER_RANK = 64
+    # Note: shared expert compute uses 128-token blocks. Keeping the minimum at 128
+    # avoids sending tiny shards that waste padding and can regress end-to-end perf.
+    MIN_TOKENS_PER_RANK = 128
 
     def __init__(
         self,
@@ -1394,14 +1392,9 @@ class DeepEPWaterfillBalancer:
 
         # ===== Use Triton on GPU =====
         if HAS_TRITON and topk_ids.is_cuda:
-            # When routed imbalance is mild (max_routed <= mean_total_load), allow shared tokens
-            # to be dispatched to any rank to better approach perfect balance.
-            # This aligns with the theoretical case where Max_Routed <= Mean_Load can reach Score=1.
-            total_routed = int(routed_counts.to(torch.int64).sum().item())
-            max_routed = int(routed_counts.to(torch.int64).max().item())
-            total_tokens_global = total_routed // topk
-            target_total = (total_routed + total_tokens_global + self.world_size - 1) // self.world_size
-            allow_all_ranks = max_routed <= target_total
+            # NOTE(perf): Keep the assignment constrained to routed ranks (+ local).
+            # Allowing dispatch to any rank can increase communication and regress serving perf.
+            allow_all_ranks = False
 
             expanded_topk_ids, expanded_topk_weights, local_shared_mask, dest_counts = (
                 waterfill_prepare_dispatch_fused(
@@ -1417,22 +1410,7 @@ class DeepEPWaterfillBalancer:
             )
 
             if self.MIN_TOKENS_PER_RANK > 0:
-                # Globalize dest_counts across EP ranks, then redirect sparse remote destinations.
-                try:
-                    import torch.distributed as dist
-
-                    if dist.is_initialized() and self.world_size > 1:
-                        from sglang.srt.distributed.parallel_state import get_moe_ep_group
-
-                        dist.all_reduce(
-                            dest_counts,
-                            op=dist.ReduceOp.SUM,
-                            group=get_moe_ep_group().device_group,
-                        )
-                except Exception:
-                    # If distributed is not available/initialized, fall back to local counts.
-                    pass
-
+                # Redirect sparse remote destinations to local (based on per-rank local histogram).
                 BLOCK_SIZE = 256
                 grid = ((num_tokens + BLOCK_SIZE - 1) // BLOCK_SIZE,)
                 _sparse_redirect_kernel[grid](
@@ -1451,11 +1429,7 @@ class DeepEPWaterfillBalancer:
                 )
         else:
             # Fallback to PyTorch implementation
-            total_routed = int(routed_counts.to(torch.int64).sum().item())
-            max_routed = int(routed_counts.to(torch.int64).max().item())
-            total_tokens_global = total_routed // topk
-            target_total = (total_routed + total_tokens_global + self.world_size - 1) // self.world_size
-            allow_all_ranks = max_routed <= target_total
+            allow_all_ranks = False
 
             shared_destination = assign_shared_destination_pytorch(
                 topk_ids,
@@ -1486,20 +1460,6 @@ class DeepEPWaterfillBalancer:
                 dest_counts = torch.bincount(
                     dest_from_shared.to(torch.int64), minlength=self.world_size
                 ).to(torch.int32)
-
-                try:
-                    import torch.distributed as dist
-
-                    if dist.is_initialized() and self.world_size > 1:
-                        from sglang.srt.distributed.parallel_state import get_moe_ep_group
-
-                        dist.all_reduce(
-                            dest_counts,
-                            op=dist.ReduceOp.SUM,
-                            group=get_moe_ep_group().device_group,
-                        )
-                except Exception:
-                    pass
 
                 sparse_ranks_mask = dest_counts < self.MIN_TOKENS_PER_RANK
                 token_goes_to_sparse = (
