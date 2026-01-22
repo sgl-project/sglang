@@ -168,6 +168,17 @@ class BaiChuanAttention(nn.Module):
             prefix=add_prefix("o_proj", prefix),
         )
         self.scaling = self.head_dim**-0.5
+
+        self.attn = RadixAttention(
+            self.num_heads,
+            self.head_dim,
+            self.scaling,
+            num_kv_heads=self.num_kv_heads,
+            layer_id=layer_id,
+            quant_config=quant_config,
+            prefix=add_prefix("attn", prefix),
+        )
+
         # Create the alibi slopes and slice them.
         if self.position_embedding == "ALIBI":
             tp_rank = get_tensor_model_parallel_rank()
@@ -178,33 +189,12 @@ class BaiChuanAttention(nn.Module):
             self.alibi_slopes = torch.tensor(
                 alibi_slopes, dtype=dtype, device="npu" if _is_npu else "cuda"
             )
-
-            self.attn = RadixAttention(
-                self.num_heads,
-                self.head_dim,
-                self.scaling,
-                num_kv_heads=self.num_kv_heads,
-                layer_id=layer_id,
-                quant_config=quant_config,
-                slopes=self.alibi_slopes,
-                prefix=add_prefix("attn", prefix),
-            )
         else:
             self.rotary_emb = get_rope(
                 self.head_dim,
                 rotary_dim=self.head_dim,
                 max_position=self.max_position_embeddings,
                 base=self.rope_theta,
-            )
-
-            self.attn = RadixAttention(
-                self.num_heads,
-                self.head_dim,
-                self.scaling,
-                num_kv_heads=self.num_kv_heads,
-                layer_id=layer_id,
-                quant_config=quant_config,
-                prefix=add_prefix("attn", prefix),
             )
 
     def forward(
@@ -217,8 +207,12 @@ class BaiChuanAttention(nn.Module):
         q, k, v = qkv.chunk(chunks=3, dim=-1)
         if self.position_embedding != "ALIBI":
             q, k = self.rotary_emb(positions, q, k)
-        attn_output = self.attn(q, k, v, forward_batch)
-
+            attn_output = self.attn(q, k, v, forward_batch)
+        else:
+            if not _is_npu:
+                attn_output = self.attn(q, k, v, forward_batch)
+            else:
+                attn_output = self.attn(q, k, v, forward_batch, slopes=self.alibi_slopes)
         output, _ = self.o_proj(attn_output)
         return output
 

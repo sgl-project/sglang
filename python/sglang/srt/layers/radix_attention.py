@@ -61,7 +61,6 @@ class RadixAttention(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         attn_type: AttentionType = AttentionType.DECODER,
         use_irope: bool = False,
-        slopes: Optional[torch.Tensor] = None,
         prefix: str = "",
     ):
         super().__init__()
@@ -82,7 +81,6 @@ class RadixAttention(nn.Module):
         self.k_scale_float = None
         self.v_scale_float = None
         self.quant_method = None
-        self.slopes = slopes
 
         if quant_config is not None:
             self.quant_method = quant_config.get_quant_method(self, prefix=prefix)
