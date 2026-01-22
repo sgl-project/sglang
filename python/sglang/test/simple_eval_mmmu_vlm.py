@@ -443,8 +443,8 @@ def _parse_open_response(response: str) -> List[str]:
 def _eval_open(gold, preds: List[str]) -> bool:
     if isinstance(gold, list):
         norm_answers = []
-        for ans in gold:
-            norm_answers.extend(_normalize_str(ans))
+        for answer in gold:
+            norm_answers.extend(_normalize_str(answer))
     else:
         norm_answers = _normalize_str(gold)
     for p in preds:
