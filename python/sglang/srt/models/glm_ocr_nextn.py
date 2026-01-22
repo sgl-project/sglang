@@ -72,7 +72,6 @@ class GlmOcrModelNextN(nn.Module):
             config,
             0,
             quant_config=quant_config,
-            is_nextn=True,
             prefix=add_prefix("decoder", prefix),
         )
 
