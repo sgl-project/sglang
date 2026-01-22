@@ -551,8 +551,8 @@ pub(crate) fn build_multimodal_inputs_from_generate(
     }
 
     let mut modalities = Vec::new();
-    modalities.extend(std::iter::repeat("image".to_string()).take(image_urls.len()));
-    modalities.extend(std::iter::repeat("video".to_string()).take(video_urls.len()));
+    modalities.extend(std::iter::repeat_n("image".to_string(), image_urls.len()));
+    modalities.extend(std::iter::repeat_n("video".to_string(), video_urls.len()));
 
     Some(MultimodalInputs {
         image_urls,
