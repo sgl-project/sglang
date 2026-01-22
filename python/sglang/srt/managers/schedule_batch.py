@@ -906,6 +906,9 @@ class Req(ReqDllmMixin):
             )
             self.cache_protected_len = len(self.prefix_indices)
 
+            if self.is_dllm():
+                self._update_block_offset_for_dllm()
+
         if (
             self.is_retracted
             and self.multimodal_inputs is not None
