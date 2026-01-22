@@ -46,11 +46,12 @@ _group_name_counter: dict[str, int] = {}
 def get_local_torch_device() -> torch.device:
     """Return the torch device for the current rank."""
 
-    return (
-        torch.device(f"cuda:{envs.LOCAL_RANK}")
-        if current_platform.is_cuda_alike()
-        else torch.device("mps")
-    )
+    if current_platform.is_cuda_alike():
+        return torch.device(f"cuda:{envs.LOCAL_RANK}")
+    elif current_platform.is_xpu():
+        return torch.device(f"xpu:{envs.LOCAL_RANK}")
+    else:
+        return torch.device("mps")
 
 
 def _get_unique_name(name: str) -> str:

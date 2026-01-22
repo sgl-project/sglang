@@ -227,7 +227,10 @@ def fuse_scale_shift_kernel(
     block_l: int = 128,
     block_c: int = 128,
 ):
-    assert x.is_cuda and scale.is_cuda
+    # Check if tensors are on GPU device (CUDA or XPU)
+    assert (x.is_cuda or (hasattr(x, "is_xpu") and x.is_xpu)) and (
+        scale.is_cuda or (hasattr(scale, "is_xpu") and scale.is_xpu)
+    ), "Tensors must be on GPU device (CUDA or XPU)"
     assert x.is_contiguous()
 
     B, L, C = x.shape
@@ -523,9 +526,14 @@ def triton_autotune_configs():
     # Maximum threads per block is architecture-dependent in theory, but in reality all are 1024
     max_threads_per_block = 1024
     # Default to warp size 32 if not defined by device
-    warp_size = getattr(
-        torch.cuda.get_device_properties(torch.cuda.current_device()), "warp_size", 32
-    )
+    warp_size = 32  # Default warp size
+    if torch.cuda.is_available():
+        warp_size = getattr(
+            torch.cuda.get_device_properties(torch.cuda.current_device()),
+            "warp_size",
+            32,
+        )
+    # Note: Intel XPU uses different execution model; triton ops may need separate handling
     # Autotune for warp counts which are powers of 2 and do not exceed thread per block limit
     return [
         triton.Config({}, num_warps=warp_count)

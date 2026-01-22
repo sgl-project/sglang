@@ -230,7 +230,7 @@ class CLIPAttention(nn.Module):
             key_states = key_states.transpose(1, 2)
             value_states = value_states.transpose(1, 2)
 
-            if current_platform.is_rocm():
+            if current_platform.is_rocm() or current_platform.is_xpu():
                 # ROCm: Using both is_causal=True and attn_mask causes NaN.
                 # Use is_causal=True alone (padding mask not needed for CLIP
                 # since pooler_output comes from EOS token before padding).
