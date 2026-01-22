@@ -58,18 +58,15 @@ impl HashRing {
             // Create Arc<str> once per worker, share across all virtual nodes
             let url: Arc<str> = Arc::from(worker.url());
             let url_bytes = url.as_bytes();
-            let mut base_hasher = blake3::Hasher::new();
-            base_hasher.update(url_bytes);
-            base_hasher.update(b"#");
 
             // Create multiple virtual nodes per worker
             for vnode in 0..VIRTUAL_NODES_PER_WORKER {
-                let mut hasher = base_hasher.clone();
+                let mut hasher = blake3::Hasher::new();
+                hasher.update(url_bytes);
+                hasher.update(b"#");
                 hasher.update(&(vnode as u64).to_le_bytes());
-
                 let hash = hasher.finalize();
                 let pos = u64::from_le_bytes(hash.as_bytes()[..8].try_into().unwrap());
-
                 entries.push((pos, Arc::clone(&url)));
             }
         }
