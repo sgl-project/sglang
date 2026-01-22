@@ -45,9 +45,11 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     get_config,
     get_diffusers_component_config,
     get_hf_config,
+    get_quant_config,
+    maybe_download_model,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.runtime.layers.quantization import get_quantization_config, get_quantization_dtype
+from sglang.multimodal_gen.runtime.layers.quantization import get_quantization_config
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
 logger = init_logger(__name__)
@@ -662,10 +664,45 @@ class VAELoader(ComponentLoader):
 class TransformerLoader(ComponentLoader):
     """Loader for transformer."""
 
+    def _get_nvfp4_model_path(self, model_path: str) -> str:
+        """
+        Get the NVFP4 model path by appending '-NVFP4' suffix.
+
+        For example:
+            black-forest-labs/FLUX.2-dev -> black-forest-labs/FLUX.2-dev-NVFP4
+        """
+        # Handle both HuggingFace repo IDs and local paths
+        if "/" in model_path and not os.path.exists(model_path):
+            # HuggingFace repo ID format: org/model-name
+            nvfp4_path = f"{model_path}-NVFP4"
+        else:
+            # Local path: append -NVFP4 to the directory name
+            nvfp4_path = f"{model_path.rstrip('/')}-NVFP4"
+        return nvfp4_path
+
     def load_customized(
         self, component_model_path: str, server_args: ServerArgs, *args
     ):
         """Load the transformer based on the model path, and inference args."""
+        # Get dit_config first to check for quantization settings
+        dit_config = server_args.pipeline_config.dit_config
+
+        # Check if modelopt_fp4 quantization is requested
+        quant_config_str = dit_config.quant_config
+        use_nvfp4 = isinstance(quant_config_str, str) and quant_config_str == "modelopt_fp4"
+
+        if use_nvfp4:
+            # Compute the NVFP4 model path
+            nvfp4_model_path = self._get_nvfp4_model_path(component_model_path)
+            logger.info(
+                "NVFP4 quantization requested. Loading transformer from: %s",
+                nvfp4_model_path,
+            )
+            # Download the NVFP4 model if needed
+            nvfp4_model_path = maybe_download_model(nvfp4_model_path)
+            # Use the NVFP4 model path for loading
+            component_model_path = nvfp4_model_path
+
         config = get_diffusers_component_config(model_path=component_model_path)
         hf_config = deepcopy(config)
         cls_name = config.pop("_class_name")
@@ -676,16 +713,34 @@ class TransformerLoader(ComponentLoader):
             )
 
         server_args.model_paths["transformer"] = component_model_path
-        quant_dtype = get_quantization_dtype(dit_config.quant_config)
-        print(f"line 679: {server_args.model_paths}")
+
+        # Handle quantization config
+        if use_nvfp4:
+            # Load quantization config from the NVFP4 model
+            quant_config_obj = get_quant_config(config)
+            if quant_config_obj is None:
+                # If no quantization_config in model config, try to create from the model's hf_quant_config.json
+                quant_cls = get_quantization_config("modelopt_fp4")
+                # Read hf_quant_config.json if it exists
+                hf_quant_config_path = os.path.join(component_model_path, "hf_quant_config.json")
+                if os.path.exists(hf_quant_config_path):
+                    with open(hf_quant_config_path) as f:
+                        hf_quant_config = json.load(f)
+                    quant_config_obj = quant_cls.from_config(hf_quant_config)
+                else:
+                    raise ValueError(
+                        f"NVFP4 quantization requested but no quantization config found in {component_model_path}. "
+                        "Expected either 'quantization_config' in config.json or hf_quant_config.json file."
+                    )
+            dit_config.quant_config = quant_config_obj
+            logger.info("Loaded NVFP4 quantization config: %s", type(quant_config_obj).__name__)
+        elif quant_config_str is not None:
+            # Handle other quantization types
+            quant_cls = get_quantization_config(quant_config_str)
+            dit_config.quant_config = quant_cls()
 
         # Config from Diffusers supersedes sgl_diffusion's model config
-        dit_config = server_args.pipeline_config.dit_config
-        quant_cls = get_quantization_config(dit_config.quant_config)
-        dit_config.quant_config = quant_cls()
         dit_config.update_model_arch(config)
-        print(f"line 683: {dit_config.quant_config}")
-        raise ValueError("test")
 
         model_cls, _ = ModelRegistry.resolve_model_cls(cls_name)
 
