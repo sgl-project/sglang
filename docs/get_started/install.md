@@ -15,25 +15,19 @@ pip install uv
 uv pip install "sglang"
 ```
 
-**CUDA13 wheel installation**
-
-For CUDA 13, Docker is recommended (see Method 3 note on B300/GB300/CUDA 13). If you do not have Docker access, an extra index url needs to be provided when installing wheels:
+**Quick fixes to common problems**
+- For CUDA 13, Docker is recommended (see Method 3 note on B300/GB300/CUDA 13). If you do not have Docker access, an extra index url needs to be provided when installing wheels:
 ```
 uv pip install "sglang" --extra-index-url https://download.pytorch.org/whl/cu130
 ```
-The `sgl_kernel` wheel for CUDA 13 can be downloaded from [the sgl-project whl releases](https://github.com/sgl-project/whl/blob/gh-pages/cu130/sgl-kernel/index.html). Replace `X.Y.Z` with the `sgl_kernel` version required by your SGLang install (you can find this by running `uv pip show sgl_kernel`). Examples:
+- The `sgl_kernel` wheel for CUDA 13 can be downloaded from [the sgl-project whl releases](https://github.com/sgl-project/whl/blob/gh-pages/cu130/sgl-kernel/index.html). Replace `X.Y.Z` with the `sgl_kernel` version required by your SGLang install (you can find this by running `uv pip show sgl_kernel`). Examples:
+  ```bash
+  # x86_64
+  uv pip install "https://github.com/sgl-project/whl/releases/download/vX.Y.Z/sgl_kernel-X.Y.Z+cu130-cp310-abi3-manylinux2014_x86_64.whl"
 
-```bash
-# x86_64
-uv pip install "https://github.com/sgl-project/whl/releases/download/vX.Y.Z/sgl_kernel-X.Y.Z+cu130-cp310-abi3-manylinux2014_x86_64.whl"
-
-# aarch64
-uv pip install "https://github.com/sgl-project/whl/releases/download/vX.Y.Z/sgl_kernel-X.Y.Z+cu130-cp310-abi3-manylinux2014_aarch64.whl"
-```
-
-
-**Quick fixes to common problems**
-
+  # aarch64
+  uv pip install "https://github.com/sgl-project/whl/releases/download/vX.Y.Z/sgl_kernel-X.Y.Z+cu130-cp310-abi3-manylinux2014_aarch64.whl"
+  ```
 - If you encounter `OSError: CUDA_HOME environment variable is not set`. Please set it to your CUDA install root with either of the following solutions:
   1. Use `export CUDA_HOME=/usr/local/cuda-<your-cuda-version>` to set the `CUDA_HOME` environment variable.
   2. Install FlashInfer first following [FlashInfer installation doc](https://docs.flashinfer.ai/installation.html), then install SGLang as described above.
