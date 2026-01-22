@@ -108,6 +108,7 @@ class GlmOcrVisionBlock(nn.Module):
             proj_bias=True,
             qkv_bias=attn_qkv_bias,
             qk_normalization=True,
+            qk_normalization_by_head_size=True,
             flatten_batch=True,
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),

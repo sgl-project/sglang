@@ -235,6 +235,10 @@ class VisionSdpaAttention(nn.Module):
 
         q, k, v = [rearrange(x, "(b s) h d -> b h s d", b=bsz) for x in [q, k, v]]
 
+        if self.qk_normalization and self.qk_normalization_by_head_size:
+            q, k = self._apply_qk_norm_head_size(q, k)
+
+
         if self.softmax_in_single_precision:
             k = rearrange(k, "b h s d -> b h d s")
             attn_weights = torch.matmul(q, k) * self.scale
@@ -533,6 +537,7 @@ class VisionAttention(nn.Module):
         num_dummy_heads: int = 0,
         qkv_bias: bool = True,
         qk_normalization: bool = False,
+        qk_normalization_by_head_size: bool = False,
         layer_norm_eps: float = 1e-06,
         customized_position_embedding_applier: Callable[
             [torch.Tensor, torch.Tensor, Any, Any], Tuple[torch.Tensor, torch.Tensor]
@@ -560,6 +565,7 @@ class VisionAttention(nn.Module):
         self.kv_size = self.num_attention_kv_heads_per_partition * self.head_size
 
         self.qk_normalization = qk_normalization
+        self.qk_normalization_by_head_size = qk_normalization_by_head_size
 
         # Additional dummy heads are used to enable TP for common GPU counts.
         self.dummy_dim = (num_dummy_heads + num_heads) * self.head_size
@@ -676,6 +682,16 @@ class VisionAttention(nn.Module):
 
         return backend
 
+    def _apply_qk_norm_head_size(self, q: torch.Tensor, k: torch.Tensor):
+        """apply qk norm for GLM-OCR vit attn"""
+        q_by_head = q.reshape(-1, self.head_size)
+        q_by_head = self.q_norm(q_by_head)
+        k_by_head = k.reshape(-1, self.head_size)
+        k_by_head = self.k_norm(k_by_head)
+        q = q_by_head.view(q.shape)
+        k = k_by_head.view(k.shape)
+        return q, k
+
     def _apply_qk_norm(self, q: torch.Tensor, k: torch.Tensor):
         """apply qk norm for internvl vit attn"""
 
@@ -758,6 +774,8 @@ class VisionAttention(nn.Module):
             q = q.reshape(bsz * s, head, -1).contiguous()
             k = k.reshape(bsz * s, kv_head, -1).contiguous()
             v = v.reshape(bsz * s, kv_head, -1).contiguous()
+            if self.qk_normalization and self.qk_normalization_by_head_size:
+                q, k = self._apply_qk_norm_head_size(q, k)
         else:
             # [b, s, embed_dim] --> [s, b, embed_dim]
             x = rearrange(x, "b s ... -> s b ...")
@@ -823,7 +841,7 @@ class VisionAttention(nn.Module):
         assert v.dim() == 3, v.dim()
 
         # internvl
-        if self.qk_normalization:
+        if self.qk_normalization and not self.qk_normalization_by_head_size:
             # jit kernel
             if can_use_jit_qk_norm(self.head_size, q.dtype):
 
