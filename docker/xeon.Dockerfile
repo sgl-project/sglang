@@ -7,6 +7,7 @@ ARG VER_SGLANG=main
 ARG VER_TORCH=2.9.0
 ARG VER_TORCHVISION=0.24.0
 ARG VER_TORCHAUDIO=2.9.0
+ARG VER_TORCHAO=0.14.1
 ARG VER_TRITON=3.5.0
 
 RUN apt-get update && \
@@ -45,7 +46,7 @@ RUN source $HOME/.local/bin/env && \
     cd python && \
     cp pyproject_cpu.toml pyproject.toml && \
     uv pip install . && \
-    uv pip install torch==${VER_TORCH} torchvision==${VER_TORCHVISION} torchaudio==${VER_TORCHAUDIO} triton==${VER_TRITON} --force-reinstall && \
+    uv pip install torch==${VER_TORCH} torchvision==${VER_TORCHVISION} torchaudio==${VER_TORCHAUDIO} torchao==${VER_TORCHAO} triton==${VER_TRITON} --force-reinstall && \
     uv pip install tabulate && \
     cd ../sgl-kernel && \
     cp pyproject_cpu.toml pyproject.toml && \
