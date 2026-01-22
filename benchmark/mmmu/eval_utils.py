@@ -289,8 +289,8 @@ def parse_multi_choice_response(response, all_choices, index2answer):
 
     # if all above doesn't get candidates, check if the content is larger than 5 tokens and try to parse the example
     if len(candidates) == 0 and len(response.split()) > 5:
-        for index, ans in index2answer.items():
-            if ans.lower() in response.lower():
+        for index, answer in index2answer.items():
+            if answer.lower() in response.lower():
                 candidates.append(index)
                 index_answer = False  # it's content ans.
 
