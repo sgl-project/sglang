@@ -1,5 +1,3 @@
-import torch
-
 def npu_fused_experts_w4a16( ##w4a16
         self,
         layer,
@@ -64,17 +62,20 @@ def npu_fused_experts_w4a8(
         )
     )
 
+    expanded_row_idx = expanded_row_idx.view(-1, top_k).permute(1, 0).reshape(-1)
+
     expert_tokens = expert_tokens.to(torch.int64)
+    _output_dtype = torch.bfloat16
 
     w1_scale = [w13_scale]
     w2_scale = [w2_scale]
-    _output_dtype = torch.bfloat16
+    w1_scale[0] = w1_scale[0].to(w2_scale[0].dtype)
 
     hidden_states = torch.ops.npu.npu_grouped_matmul(
         x=[sorted_hidden_states],
         weight=[w13],
         scale=w1_scale,
-        bias=w13_scale_bias,
+        bias=[w13_scale_bias],
         per_token_scale=[pertoken_scale],
         group_list=expert_tokens,
         split_item=2,
@@ -90,8 +91,8 @@ def npu_fused_experts_w4a8(
     output = torch.ops.npu.npu_grouped_matmul(
         x=[hidden_states],
         weight=[w2],
-        scale=w2_scale,
-        bias=w2_scale_bias,
+        scale=w1_scale,
+        bias=[w2_scale_bias],
         per_token_scale=[swiglu_out_scale],
         group_list=expert_tokens,
         split_item=2,
