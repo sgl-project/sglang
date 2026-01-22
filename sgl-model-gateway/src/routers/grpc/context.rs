@@ -13,7 +13,7 @@ use super::{
     proto_wrapper::{ProtoEmbedComplete, ProtoRequest, ProtoStream},
 };
 use crate::{
-    core::{AttachedBody, Worker, WorkerLoadGuard},
+    core::{Worker, WorkerLoadGuard},
     grpc_client::SglangEncoderClient,
     protocols::{
         chat::{ChatCompletionRequest, ChatCompletionResponse},
@@ -185,13 +185,6 @@ pub(crate) enum LoadGuards {
     },
 }
 
-fn attach_guards_to_response(
-    guards: Vec<WorkerLoadGuard>,
-    response: axum::response::Response,
-) -> axum::response::Response {
-    AttachedBody::wrap_response(response, guards)
-}
-
 impl LoadGuards {
     pub fn new(selection: &WorkerSelection, headers: Option<&HeaderMap>) -> Self {
         match selection {
@@ -216,17 +209,8 @@ impl LoadGuards {
 }
 
 impl LoadGuards {
-    /// Attach these load guards to a Response, tying their lifetime to the response body.
-    ///
-    /// When the response body is fully consumed or dropped (e.g., client disconnects),
-    /// the guards are dropped and worker load is decremented automatically.
-    ///
-    /// This is the proper RAII pattern for SSE/streaming responses.
-    pub fn attach_to_response(
-        self,
-        response: axum::response::Response,
-    ) -> axum::response::Response {
-        let guards = match self {
+    pub fn into_vec(self) -> Vec<WorkerLoadGuard> {
+        match self {
             LoadGuards::Single { _guard } => vec![_guard],
             LoadGuards::Dual { _prefill, _decode } => vec![_prefill, _decode],
             LoadGuards::Triple {
@@ -234,9 +218,7 @@ impl LoadGuards {
                 prefill,
                 decode,
             } => vec![encode, prefill, decode],
-        };
-
-        attach_guards_to_response(guards, response)
+        }
     }
 }
 

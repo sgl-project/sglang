@@ -103,7 +103,7 @@ impl GenerateResponseProcessingStage {
 
             // Attach load guards to response body for proper RAII lifecycle
             let response = match ctx.state.load_guards.take() {
-                Some(guards) => AttachedBody::wrap_response(response, guards),
+                Some(guards) => AttachedBody::wrap_response(response, guards.into_vec()),
                 None => response,
             };
 
