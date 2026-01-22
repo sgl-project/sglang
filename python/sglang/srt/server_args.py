@@ -2447,7 +2447,7 @@ class ServerArgs:
             unique_valid_devices = set(valid_devices)
             assert len(valid_devices) <= len(
                 unique_valid_devices
-            ), f"Some of the specified IB devices are duplicate."
+            ), f"Some of the specified IB devices are duplicates."
 
             return valid_devices
 
