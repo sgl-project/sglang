@@ -15,17 +15,17 @@
 """Inference-only GLM-Lite model compatible with HuggingFace weights"""
 
 import logging
-from typing import Any, Dict, Iterable, Optional, Tuple
+from typing import Iterable, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.srt.batch_overlap.single_batch_overlap import SboFlags
 from sglang.srt.distributed import (
     get_moe_expert_parallel_world_size,
     get_pp_group,
-    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
 from sglang.srt.layers.activation import SiluAndMul
@@ -35,16 +35,11 @@ from sglang.srt.layers.communicator import (
     enable_moe_dense_fully_dp,
 )
 from sglang.srt.layers.dp_attention import (
-    get_attention_tp_rank,
     get_attention_tp_size,
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layernorm import RMSNorm
-from sglang.srt.layers.linear import (
-    MergedColumnParallelLinear,
-    QKVParallelLinear,
-    RowParallelLinear,
-)
+from sglang.srt.layers.linear import MergedColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
@@ -54,15 +49,11 @@ from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import (
     DeepseekV2AttentionMLA,
@@ -72,7 +63,6 @@ from sglang.srt.models.deepseek_v2 import (
     DeepseekV2MoE,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.single_batch_overlap import SboFlags
 from sglang.srt.utils import (
     BumpAllocator,
     LazyValue,
@@ -129,174 +119,42 @@ class Glm4MoeLiteMLP(nn.Module):
             )
         self.act_fn = SiluAndMul()
 
-
-class Glm4MoeLiteAttention(nn.Module):
-    def __init__(
-        self,
-        hidden_size: int,
-        num_heads: int,
-        num_kv_heads: int,
-        layer_id: int = 0,
-        rope_theta: float = 10000,
-        partial_rotary_factor: float = 0.5,
-        rope_scaling: Optional[Dict[str, Any]] = None,
-        max_position_embeddings: int = 8192,
-        head_dim: Optional[int] = None,
-        rms_norm_eps: float = 1e-05,
-        attention_bias: bool = True,
-        quant_config: Optional[QuantizationConfig] = None,
-        use_qk_norm: bool = False,
-        prefix: str = "",
-        alt_stream: Optional[torch.cuda.Stream] = None,
-    ) -> None:
-        super().__init__()
-        self.hidden_size = hidden_size
-
-        attn_tp_rank = get_attention_tp_rank()
-        attn_tp_size = get_attention_tp_size()
-
-        self.total_num_heads = num_heads
-        assert self.total_num_heads % attn_tp_size == 0
-        self.num_heads = self.total_num_heads // attn_tp_size
-        self.total_num_kv_heads = num_kv_heads
-        if self.total_num_kv_heads >= attn_tp_size:
-            # Number of KV heads is greater than TP size, so we partition
-            # the KV heads across multiple tensor parallel GPUs.
-            assert self.total_num_kv_heads % attn_tp_size == 0
-        else:
-            # Number of KV heads is less than TP size, so we replicate
-            # the KV heads across multiple tensor parallel GPUs.
-            assert attn_tp_size % self.total_num_kv_heads == 0
-        self.num_kv_heads = max(1, self.total_num_kv_heads // attn_tp_size)
-        self.head_dim = head_dim or hidden_size // self.total_num_heads
-        self.q_size = self.num_heads * self.head_dim
-        self.kv_size = self.num_kv_heads * self.head_dim
-        self.scaling = self.head_dim**-0.5
-        self.rope_theta = rope_theta
-        self.use_qk_norm = use_qk_norm
-        self.max_position_embeddings = max_position_embeddings
-        self.tp_rank = get_tensor_model_parallel_rank()
-
-        self.qkv_proj = QKVParallelLinear(
-            hidden_size,
-            self.head_dim,
-            self.total_num_heads,
-            self.total_num_kv_heads,
-            bias=attention_bias,
-            quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
-            prefix=add_prefix("qkv_proj", prefix),
-        )
-
-        self.o_proj = RowParallelLinear(
-            self.total_num_heads * self.head_dim,
-            hidden_size,
-            bias=False,
-            quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
-            reduce_results=False,
-            prefix=add_prefix("o_proj", prefix),
-        )
-
-        self.rotary_emb = get_rope(
-            self.head_dim,
-            rotary_dim=self.head_dim,
-            max_position=max_position_embeddings,
-            partial_rotary_factor=partial_rotary_factor,
-            base=rope_theta,
-            rope_scaling=rope_scaling,
-        )
-        self.attn = RadixAttention(
-            self.num_heads,
-            self.head_dim,
-            self.scaling,
-            num_kv_heads=self.num_kv_heads,
-            layer_id=layer_id,
-            prefix=add_prefix("attn", prefix),
-        )
-
-        if self.use_qk_norm:
-            self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
-            self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
-        self.alt_stream = alt_stream
-
-    def _apply_qk_norm(
-        self, q: torch.Tensor, k: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # overlap qk norm
-        if self.alt_stream is not None and get_is_capture_mode():
-            current_stream = torch.cuda.current_stream()
-            self.alt_stream.wait_stream(current_stream)
-            q_by_head = q.reshape(-1, self.head_dim)
-            q_by_head = self.q_norm(q_by_head)
-            with torch.cuda.stream(self.alt_stream):
-                k_by_head = k.reshape(-1, self.head_dim)
-                k_by_head = self.k_norm(k_by_head)
-            current_stream.wait_stream(self.alt_stream)
-        else:
-            q_by_head = q.reshape(-1, self.head_dim)
-            q_by_head = self.q_norm(q_by_head)
-            k_by_head = k.reshape(-1, self.head_dim)
-            k_by_head = self.k_norm(k_by_head)
-        q = q_by_head.view(q.shape)
-        k = k_by_head.view(k.shape)
-        return q, k
-
-    def op_prepare(self, state):
-        state.attn_intermediate_state = self.forward_prepare(
-            positions=state.positions,
-            hidden_states=state.pop("hidden_states_after_comm_pre_attn"),
-            forward_batch=state.forward_batch,
-        )
-
-    def op_core(self, state):
-        state.hidden_states_after_attn = self.forward_core(
-            state.pop("attn_intermediate_state")
-        )
-
-    def forward_prepare(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        forward_batch: ForwardBatch,
-        zero_allocator: BumpAllocator,
-    ):
-        if hidden_states.shape[0] == 0:
-            return hidden_states, forward_batch, None
-        qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        if self.use_qk_norm:
-            q, k = self._apply_qk_norm(q, k)
-        q, k = self.rotary_emb(positions, q, k)
-        inner_state = q, k, v, forward_batch
-        return None, forward_batch, inner_state
-
-    def forward_core(self, intermediate_state):
-        hidden_states, forward_batch, inner_state = intermediate_state
-        if inner_state is None:
-            return hidden_states
-        original_dtype = inner_state[0].dtype
-        attn_output = self.attn(*inner_state)
-        attn_output = attn_output.to(original_dtype)
-        output, _ = self.o_proj(attn_output)
-        return output
-
     def forward(
         self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        forward_batch: ForwardBatch,
-        zero_allocator: BumpAllocator,
-    ) -> torch.Tensor:
-        s = self.forward_prepare(
-            positions=positions,
-            hidden_states=hidden_states,
-            forward_batch=forward_batch,
-            zero_allocator=zero_allocator,
+        x,
+        forward_batch=None,
+        should_allreduce_fusion: bool = False,
+        use_reduce_scatter: bool = False,
+        gemm_output_zero_allocator: BumpAllocator = None,
+    ):
+        # Keep parity with DeepseekV2MLP.forward signature since DeepseekV2DecoderLayer
+        # invokes MLP modules with these extra arguments.
+        if (self.tp_size == 1) and x.shape[0] == 0:
+            return x
+
+        # Some quantization wrappers store the underlying parameter as `weight_packed`.
+        if not hasattr(self.gate_up_proj, "weight"):
+            self.gate_up_proj.weight = getattr(self.gate_up_proj, "weight_packed")
+        if not hasattr(self.down_proj, "weight"):
+            self.down_proj.weight = getattr(self.down_proj, "weight_packed")
+
+        if (
+            gemm_output_zero_allocator is not None
+            and x.shape[0] <= 256
+            and self.gate_up_proj.weight.dtype == torch.uint8
+        ):
+            y = gemm_output_zero_allocator.allocate(
+                x.shape[0] * self.gate_up_proj.output_size_per_partition
+            ).view(x.shape[0], self.gate_up_proj.output_size_per_partition)
+            x = (x, None, y)
+
+        gate_up, _ = self.gate_up_proj(x)
+        x = self.act_fn(gate_up)
+        x, _ = self.down_proj(
+            x,
+            skip_all_reduce=should_allreduce_fusion or use_reduce_scatter,
         )
-        return self.forward_core(s)
+        return x
 
 
 class Glm4MoeLiteGate(nn.Module):
@@ -392,6 +250,7 @@ class Glm4MoeLiteSparseMoeBlock(DeepseekV2MoE):
 
         self.topk = TopK(
             top_k=config.num_experts_per_tok + self.num_fused_shared_experts,
+            layer_id=self.layer_id,
             renormalize=config.norm_topk_prob,
             use_grouped_topk=True,
             num_expert_group=config.n_group,
@@ -476,11 +335,14 @@ class Glm4MoeLiteDecoderLayer(DeepseekV2DecoderLayer):
         nn.Module.__init__(self)
         self.hidden_size = config.hidden_size
         self.config = config
-        rope_theta = getattr(config, "rope_theta", 10000)
-        rope_scaling = getattr(config, "rope_scaling", None)
-        max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
+
+        from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
+
+        self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
+        rope_theta = 1000000
+        rope_scaling = None
+        max_position_embeddings = getattr(config, "max_position_embeddings", 202752)
         self.layer_id = layer_id
-        self.mla = getattr(config, "mla", False)
 
         self.self_attn = DeepseekV2AttentionMLA(
             config=config,
@@ -502,12 +364,14 @@ class Glm4MoeLiteDecoderLayer(DeepseekV2DecoderLayer):
 
         self.is_layer_sparse = self._is_layer_sparse(layer_id, is_nextn=is_nextn)
         is_previous_layer_sparse = self._is_layer_sparse(layer_id - 1, is_nextn=False)
+        is_next_layer_sparse = self._is_layer_sparse(layer_id + 1, is_nextn=False)
 
         self.layer_scatter_modes = LayerScatterModes.init_new(
             layer_id=layer_id,
             num_layers=1 if is_nextn else config.num_hidden_layers,
             is_layer_sparse=self.is_layer_sparse,
             is_previous_layer_sparse=is_previous_layer_sparse,
+            is_next_layer_sparse=is_next_layer_sparse,
         )
 
         if self.is_layer_sparse:
@@ -547,6 +411,7 @@ class Glm4MoeLiteDecoderLayer(DeepseekV2DecoderLayer):
             is_last_layer=(
                 is_nextn or (self.layer_id == self.config.num_hidden_layers - 1)
             ),
+            qkv_latent_func=self.self_attn.prepare_qkv_latent,
         )
 
 
@@ -562,6 +427,14 @@ class Glm4MoeLiteModel(DeepseekV2Model):
         self.vocab_size = config.vocab_size
         self.first_k_dense_replace = config.first_k_dense_replace
         self.pp_group = get_pp_group()
+
+        # DeepseekV2Model.forward expects these attributes to exist.
+        from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
+
+        self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
+        self.cp_size = get_attention_tp_size() if self.nsa_enable_prefill_cp else None
+        self.gemm_output_zero_allocator_size = 0
+        self.llama_4_scaling_config = getattr(config, "llama_4_scaling", None)
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -627,6 +500,20 @@ class Glm4MoeLiteForCausalLM(DeepseekV2ForCausalLM):
             }
         )
         self.capture_aux_hidden_states = False
+
+        from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
+
+        self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
+        if self.nsa_enable_prefill_cp:
+            from sglang.srt.layers.dp_attention import (
+                get_attention_tp_rank,
+                get_attention_tp_size,
+            )
+
+            self.cp_rank = get_attention_tp_rank()
+            self.cp_size = get_attention_tp_size()
+        else:
+            self.cp_rank = self.cp_size = None
 
     def determine_num_fused_shared_experts(
         self, architecture: str = "Glm4MoeLiteForCausalLM"
@@ -908,8 +795,14 @@ class Glm4MoeLiteForCausalLM(DeepseekV2ForCausalLM):
                     else:
                         logger.warning(f"Parameter {name} not found in params_dict")
 
-        if getattr(self.config, "mla", False):
-            self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
+        # DeepseekV2AttentionMLA.forward_* expects post_load_weights() to populate
+        # per-layer packed weights like `w_kc`/`w_vc` (used during CUDA graph capture).
+        # GLM-Lite configs may not set `config.mla`, but this model always uses
+        # DeepseekV2AttentionMLA, so we must run the post-load processing.
+        # Use weight_names=None to ensure we always process all layers. Some checkpoints /
+        # naming schemes may not include "kv_b_proj" in `weight_names`, but `w_kc`/`w_vc`
+        # are still required by DeepseekV2AttentionMLA at runtime.
+        self.post_load_weights(is_nextn=is_nextn, weight_names=None)
 
 
 EntryClass = [Glm4MoeLiteForCausalLM]
