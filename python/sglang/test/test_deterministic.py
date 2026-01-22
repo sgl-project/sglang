@@ -306,13 +306,13 @@ def _test_mode_p_vs_d(args, batch_size):
     )
     info_b = _extract_ids_and_logprobs(resp_b)
 
-    ans = []
+    answers = []
     for i, (info_a_item, info_b_item) in enumerate(zip(info_a, info_b, strict=True)):
         print(f"Compare sequence {i} in batch...")
         correct = TokenIdsAndLogprobs.compare(info_a_item["io"], info_b_item["input"])
-        ans.append(int(correct))
+        answers.append(int(correct))
 
-    return ans
+    return answers
 
 
 @dataclasses.dataclass
