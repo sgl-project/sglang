@@ -1,6 +1,7 @@
 from typing import Type
 
 from transformers import (
+    AutoImageProcessor,
     AutoProcessor,
     BaseImageProcessor,
     PretrainedConfig,
