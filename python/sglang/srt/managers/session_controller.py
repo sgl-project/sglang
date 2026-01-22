@@ -23,13 +23,13 @@ class SessionReqNode:
         self,
         req: Req,
         parent: Optional["SessionReqNode"] = None,
-        childs=None,
+        children=None,
     ):
         self.req = req
         self.parent = parent
         if parent is not None:
             parent.children.append(self)
-        self.children = [] if not childs else childs
+        self.children = [] if not children else children
 
     def clear_children(self, req_dict):
         for req_node in self.children:
