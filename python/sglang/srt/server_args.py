@@ -1285,6 +1285,13 @@ class ServerArgs:
                     "Disable hybrid SWA memory for GPT-OSS model with trtllm_mha attention backend."
                 )
 
+            if self.speculative_algorithm is not None:
+                # TODO: fix spec with SWA memory cache
+                self.disable_hybrid_swa_memory = True
+                logger.warning(
+                    "Disable hybrid SWA memory for GPT-OSS model with speculative decoding."
+                )
+
             quant_method = get_quantization_config(hf_config)
             is_mxfp4_quant_format = quant_method == "mxfp4"
             if is_mxfp4_quant_format:
@@ -4446,7 +4453,7 @@ class ServerArgs:
             default=ServerArgs.nsa_prefill_cp_mode,
             choices=NSA_PREFILL_CP_SPLIT_CHOICES,
             help="Token splitting mode for the prefill phase of DeepSeek v3.2 under context parallelism. Optional values: 'in-seq-split' (default), 'round-robin-split'. "
-            "'round-robin-split' distributes tokens across ranks based on token_idx % cp_size. It supports multi-batch prefill, fused MoE, and FP8 KV cache.",
+            "'round-robin-split' distributes tokens across ranks based on token_idx %% cp_size. It supports multi-batch prefill, fused MoE, and FP8 KV cache.",
         )
         parser.add_argument(
             "--enable-fused-qk-norm-rope",
