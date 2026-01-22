@@ -173,6 +173,7 @@ impl WorkerManager {
                     WorkerType::Regular => None,
                     WorkerType::Prefill { .. } => Some("prefill".to_string()),
                     WorkerType::Decode => Some("decode".to_string()),
+                    WorkerType::Encode { .. } => Some("encode".to_string()),
                 };
                 let is_http = matches!(worker.connection_mode(), ConnectionMode::Http);
                 let client = client.clone();
