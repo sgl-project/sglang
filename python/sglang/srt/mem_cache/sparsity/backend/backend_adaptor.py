@@ -3,12 +3,6 @@ from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
-import triton
-from sglang.srt.utils.common import is_cuda, is_hip
-from sglang.srt.mem_cache.sparsity.kernel.flashattn_metadata_kernels import (
-    update_page_table_triton,
-    compute_sparse_seqlens_triton,
-)
 
 from sgl_kernel import invoke_sparse_diff_cuda_kernel, update_sparse_metadata
 
