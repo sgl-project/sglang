@@ -10,7 +10,14 @@ from typing import TYPE_CHECKING, List, Optional
 import torch
 
 from sglang.srt.managers.cache_controller import HiCacheController, PrefetchOperation
-from sglang.srt.mem_cache.base_prefix_cache import MatchResult
+from sglang.srt.mem_cache.base_prefix_cache import (
+    EvictParams,
+    EvictResult,
+    InsertParams,
+    InsertResult,
+    MatchPrefixParams,
+    MatchResult,
+)
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
 from sglang.srt.mem_cache.memory_pool_host import (
     MHATokenToKVPoolHost,
@@ -24,7 +31,7 @@ from sglang.srt.mem_cache.radix_cache import (
     split_node_hash_value,
 )
 from sglang.srt.metrics.collector import StorageMetricsCollector
-from sglang.srt.utils import bind_to_closest_numa_node, is_numa_available
+from sglang.srt.utils import bind_to_closest_numa_node_cuda
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -44,12 +51,8 @@ class HiRadixCache(RadixCache):
                     "Page first layout is not supported with direct IO backend, switching to page first direct layout"
                 )
 
-        if (
-            not server_args.disable_hicache_numa_detect
-            and is_numa_available()
-            and torch.cuda.is_available()
-        ):
-            bind_to_closest_numa_node()
+        if not server_args.disable_hicache_numa_detect:
+            bind_to_closest_numa_node_cuda()
 
         self.page_size = params.page_size
         self.kv_cache = params.token_to_kv_pool_allocator.get_kvcache()
@@ -335,8 +338,9 @@ class HiRadixCache(RadixCache):
     def evictable_size(self):
         return self.evictable_size_
 
-    def evict(self, num_tokens: int):
+    def evict(self, params: EvictParams) -> EvictResult:
         start_time = time.perf_counter()
+        num_tokens = params.num_tokens
         leaves = self._collect_leaves_device()
         eviction_heap = [
             (self.eviction_strategy.get_priority(node), node) for node in leaves
@@ -378,6 +382,7 @@ class HiRadixCache(RadixCache):
                 self._evict_backuped(node)
 
         self.update_eviction_metrics(num_evicted, start_time)
+        return EvictResult(num_tokens_evicted=num_evicted)
 
     def _evict_backuped(self, node: TreeNode):
         # evict a node already written to host
@@ -457,7 +462,7 @@ class HiRadixCache(RadixCache):
             host_indices=host_indices, node_id=last_hit_node.id
         )
         if device_indices is None:
-            self.evict(len(host_indices))
+            self.evict(EvictParams(num_tokens=len(host_indices)))
             device_indices = self.cache_controller.load(
                 host_indices=host_indices, node_id=last_hit_node.id
             )
@@ -692,7 +697,8 @@ class HiRadixCache(RadixCache):
             return
         operation.mark_terminate()
 
-    def match_prefix(self, key: RadixKey, **kwargs):
+    def match_prefix(self, params: MatchPrefixParams):
+        key = params.key
         empty_value = torch.empty((0,), dtype=torch.int64, device=self.device)
         key, _ = self.maybe_bigram_convert(key)
         if self.disable or len(key) == 0:
@@ -799,7 +805,7 @@ class HiRadixCache(RadixCache):
             new_node.parent = node
             new_node.key = key
             new_node.value = None
-            new_node.host_value = host_value
+            new_node.host_value = host_value.clone()
             new_node.hash_value = hash_value
             node.children[child_key] = new_node
         return matched_length
@@ -843,11 +849,11 @@ class HiRadixCache(RadixCache):
         if child.evicted:
             new_node.value = None
         else:
-            new_node.value = child.value[:split_len]
-            child.value = child.value[split_len:]
+            new_node.value = child.value[:split_len].clone()
+            child.value = child.value[split_len:].clone()
         if child.backuped:
-            new_node.host_value = child.host_value[:split_len]
-            child.host_value = child.host_value[split_len:]
+            new_node.host_value = child.host_value[:split_len].clone()
+            child.host_value = child.host_value[split_len:].clone()
 
         new_node.hash_value, child.hash_value = split_node_hash_value(
             child.hash_value, split_len, self.page_size
@@ -857,19 +863,18 @@ class HiRadixCache(RadixCache):
         new_node.parent.children[self.get_child_key_fn(key)] = new_node
         return new_node
 
-    def insert(
-        self,
-        key: RadixKey,
-        value=None,
-        chunked: bool = False,
-        priority: int | None = None,
-    ):
+    def insert(self, params: InsertParams) -> InsertResult:
+        key = params.key
+        value = params.value
+        chunked = params.chunked
+        priority = params.priority
+
         if priority is None:
             priority = 0
         key, value = self.maybe_bigram_convert(key, value)
 
         if len(key) == 0:
-            return 0
+            return InsertResult(prefix_len=0)
 
         if self.is_eagle and value is not None:
             # Make sure the value len equal to the EAGLE bigram key len
@@ -900,7 +905,7 @@ class HiRadixCache(RadixCache):
                 # shared-prefix node should also reflect max priority
                 new_node.priority = max(new_node.priority, priority)
                 if new_node.evicted:
-                    new_node.value = value[:prefix_len]
+                    new_node.value = value[:prefix_len].clone()
                     self.evictable_size_ += len(new_node.value)
                 else:
                     self._inc_hit_count(new_node, chunked)
@@ -917,7 +922,7 @@ class HiRadixCache(RadixCache):
             new_node = TreeNode(priority=priority)
             new_node.parent = node
             new_node.key = key
-            new_node.value = value
+            new_node.value = value.clone()
             node.children[child_key] = new_node
             self.evictable_size_ += len(value)
 
@@ -927,7 +932,7 @@ class HiRadixCache(RadixCache):
 
             if self.cache_controller.write_policy != "write_back":
                 self._inc_hit_count(new_node, chunked)
-        return total_prefix_length
+        return InsertResult(prefix_len=total_prefix_length)
 
     def _collect_leaves_device(self):
         def is_leaf(node):
