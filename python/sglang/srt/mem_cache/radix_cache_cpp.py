@@ -6,7 +6,11 @@ from typing import TYPE_CHECKING, List, Set
 
 import torch
 
-from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
+from sglang.srt.mem_cache.base_prefix_cache import (
+    BasePrefixCache,
+    MatchPrefixParams,
+    MatchResult,
+)
 from sglang.srt.mem_cache.cpp_radix_tree.radix_tree import (
     IOHandle,
     RadixTreeCpp,
@@ -89,7 +93,8 @@ class RadixCacheCpp(BasePrefixCache):
             raise NotImplementedError("Host cache is not supported yet")
         self.tree.reset()
 
-    def match_prefix(self, key: RadixKey, **kwargs) -> MatchResult:
+    def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
+        key = params.key
         device_indices_vec, host_indices_length, node_gpu, node_cpu = (
             self.tree.match_prefix(key.token_ids)
         )
