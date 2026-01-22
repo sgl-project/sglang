@@ -24,9 +24,8 @@ from sglang.srt.eplb.expert_location import (
     ExpertLocationMetadata,
     get_global_expert_location_metadata,
 )
-from sglang.srt.managers.io_struct import UpdateExpertBackupReq
-from sglang.srt.server_args import get_global_server_args, ServerArgs
-from sglang.srt.utils import get_bool_env_var, get_local_ip_auto, get_zmq_socket
+from sglang.srt.server_args import get_global_server_args
+from sglang.srt.utils import get_bool_env_var
 
 logger = logging.getLogger(__name__)
 

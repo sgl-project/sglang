@@ -11,6 +11,7 @@ import threading
 import time
 import numpy as np
 from mooncake.engine import TransferEngine
+from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.distributed.parallel_state import (
     get_world_group,
     get_world_rank,
