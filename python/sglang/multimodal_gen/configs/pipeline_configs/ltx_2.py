@@ -141,7 +141,7 @@ class LTX2PipelineConfig(PipelineConfig):
 
     def prepare_audio_latent_shape(self, batch, batch_size, num_frames):
         # Adapted from diffusers pipeline prepare_audio_latents
-        duration_s = num_frames / batch.frame_rate
+        duration_s = num_frames / batch.fps
 
         sample_rate = self.audio_vae_config.arch_config.sample_rate
         hop_length = self.audio_vae_config.arch_config.mel_hop_length
@@ -501,7 +501,7 @@ class LTX2PipelineConfig(PipelineConfig):
         sample_rate = self.audio_vae_config.arch_config.sample_rate
         hop_length = self.audio_vae_config.arch_config.mel_hop_length
         temporal_compression = self.audio_vae_temporal_compression_ratio
-        duration_s = num_frames / batch.frame_rate
+        duration_s = num_frames / batch.fps
 
         latents_per_second = (
             float(sample_rate) / float(hop_length) / float(temporal_compression)
