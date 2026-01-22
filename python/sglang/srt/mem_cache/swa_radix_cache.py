@@ -30,6 +30,10 @@ from numpy import float64
 
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
+    EvictParams,
+    EvictResult,
+    InsertParams,
+    InsertResult,
     MatchPrefixParams,
     MatchResult,
 )
@@ -426,15 +430,14 @@ class SWARadixCache(BasePrefixCache):
             last_host_node=last_node,
         )
 
-    def insert(
-        self,
-        key: RadixKey,
-        value=None,
-        prev_prefix_len: int = 0,
-        swa_evicted_seqlen: int = 0,
-    ) -> int:
+    def insert(self, params: InsertParams) -> InsertResult:
         if self.disable:
-            return 0
+            return InsertResult(prefix_len=0)
+
+        key = params.key
+        value = params.value
+        prev_prefix_len = params.prev_prefix_len
+        swa_evicted_seqlen = params.swa_evicted_seqlen
 
         key.token_ids = self.key_convert_fn(key.token_ids)
 
@@ -445,9 +448,10 @@ class SWARadixCache(BasePrefixCache):
             # Make sure the value len equal to the EAGLE bigram key len
             value = value[: len(key)]
 
-        return self._insert_helper(
+        prefix_len = self._insert_helper(
             self.root_node, key, value, prev_prefix_len, swa_evicted_seqlen
         )
+        return InsertResult(prefix_len=prefix_len)
 
     def cache_finished_req(self, req: Req, is_insert: bool = True) -> None:
         """Cache request when it finishes."""
@@ -492,10 +496,12 @@ class SWARadixCache(BasePrefixCache):
         # Note: the insert function already frees the overlapped kv_indices
         if is_insert:
             self.insert(
-                RadixKey(token_ids[:page_aligned_token_len], req.extra_key),
-                page_aligned_kv_indices,
-                old_prefix_len,
-                req.swa_evicted_seqlen,
+                InsertParams(
+                    key=RadixKey(token_ids[:page_aligned_token_len], req.extra_key),
+                    value=page_aligned_kv_indices,
+                    prev_prefix_len=old_prefix_len,
+                    swa_evicted_seqlen=req.swa_evicted_seqlen,
+                )
             )
         else:
             self.token_to_kv_pool_allocator.free(
@@ -552,11 +558,14 @@ class SWARadixCache(BasePrefixCache):
 
         # Radix Cache takes one ref in memory pool
         # Note: the insert function already frees the overlapped kv_indices
-        new_prefix_len = self.insert(
-            RadixKey(page_aligned_token_ids, req.extra_key),
-            page_aligned_kv_indices,
-            old_prefix_len,
+        result = self.insert(
+            InsertParams(
+                key=RadixKey(page_aligned_token_ids, req.extra_key),
+                value=page_aligned_kv_indices,
+                prev_prefix_len=old_prefix_len,
+            )
         )
+        new_prefix_len = result.prefix_len
 
         # The prefix indices could be updated, reuse it
         match_result = self.match_prefix(
@@ -605,10 +614,12 @@ class SWARadixCache(BasePrefixCache):
     def total_size(self) -> Tuple[int, int]:
         return self._total_size_helper()
 
-    def evict(self, full_num_tokens: int, swa_num_tokens: int = 0) -> None:
+    def evict(self, params: EvictParams) -> EvictResult:
         if self.disable:
-            return
+            return EvictResult()
         start_time = time.perf_counter()
+        full_num_tokens = params.num_tokens
+        swa_num_tokens = params.swa_num_tokens
         full_num_evicted = 0
         swa_num_evicted = 0
         if full_num_tokens > 0:
@@ -689,6 +700,9 @@ class SWARadixCache(BasePrefixCache):
                 x = x_next
 
         self.update_eviction_metrics(full_num_evicted + swa_num_evicted, start_time)
+        return EvictResult(
+            num_tokens_evicted=full_num_evicted, swa_num_tokens_evicted=swa_num_evicted
+        )
 
     def inc_lock_ref(self, node: TreeNode) -> Optional[int]:
         """
