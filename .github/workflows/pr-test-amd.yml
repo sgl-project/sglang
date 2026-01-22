@@ -1000,12 +1000,12 @@ jobs:
 
 
   # =============================================== Disaggregation ====================================================
-  stage-b-test-large-8-gpu-35x-disaggregation-amd:
+  stage-b-test-large-2-gpu-35x-disaggregation-amd:
     needs: [check-changes]
     if: |
       always() &&
       (
-        (inputs.target_stage == 'stage-b-test-large-8-gpu-disaggregation-amd') ||
+        (inputs.target_stage == 'stage-b-test-large-2-gpu-disaggregation-amd') ||
         (
           !inputs.target_stage &&
           (!failure() && !cancelled()) &&
@@ -1015,8 +1015,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi35x-gpu-8]
-        part: [0, 1]
+        runner: [linux-mi35x-gpu-2]
+        part: [0]
 
     runs-on: ${{matrix.runner}}
 
@@ -1129,12 +1129,148 @@ jobs:
             ci_sglang \
             python /sgl-workspace/aiter/op_tests/test_rmsnorm2d.py
 
-      - name: Run test_disaggregation_basic and test_disaggregation_pp
+      - name: Run test_disaggregation_basic
         timeout-minutes: 60
         run: |
           bash scripts/ci/amd_ci_exec.sh \
             -e SGLANG_TEST_RDMA_DEVICE="${{ env.SGLANG_TEST_RDMA_DEVICE }}" \
-            -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-large-8-gpu-35x-disaggregation-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --timeout-per-file 3600
+            -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-large-2-gpu-35x-disaggregation-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 1 --timeout-per-file 3600
+
+  stage-b-test-large-8-gpu-35x-disaggregation-amd:
+    needs: [check-changes]
+    if: |
+      always() &&
+      (
+        (inputs.target_stage == 'stage-b-test-large-8-gpu-disaggregation-amd') ||
+        (
+          !inputs.target_stage &&
+          (!failure() && !cancelled()) &&
+          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+        )
+      )
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [linux-mi35x-gpu-8]
+        part: [0]
+
+    runs-on: ${{matrix.runner}}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ensure_vram_clear.sh rocm
+
+      - name: Detect RDMA Devices
+        id: rdma_detect
+        run: |
+          if [ -d "/sys/class/infiniband" ]; then
+            RDMA_DEVS=$(ls /sys/class/infiniband | paste -sd "," -)
+            echo "Detected RDMA Devices: $RDMA_DEVS"
+            echo "SGLANG_TEST_RDMA_DEVICE=$RDMA_DEVS" >> $GITHUB_ENV
+          else
+            echo "No RDMA devices found in /sys/class/infiniband"
+            echo "SGLANG_TEST_RDMA_DEVICE=" >> $GITHUB_ENV
+          fi
+
+      - name: Start Special Container
+        run: bash scripts/ci/amd_ci_start_container_disagg.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: bash scripts/ci/amd_ci_install_dependency.sh
+
+      - name: Setup RDMA in Container
+        run: |
+          echo "=== Setting up RDMA in container ==="
+          docker exec -u root ci_sglang bash -c '
+            set -ex
+
+            echo "=== Step 1: Install base RDMA packages ==="
+            apt-get update
+            apt-get install -y rdma-core libibverbs1 ibverbs-providers ibverbs-utils infiniband-diags iproute2 kmod
+
+            echo "=== Step 2: Install AMD Ionic RDMA driver ==="
+            # The libionic1 deb package is included in the repository
+            if [ -f /sglang-checkout/scripts/ci/rdma-drivers/libionic1_54.0-149.g3304be71_amd64.deb ]; then
+              echo "Installing AMD Ionic driver from repository..."
+              dpkg -i /sglang-checkout/scripts/ci/rdma-drivers/libionic1_54.0-149.g3304be71_amd64.deb
+              echo "AMD Ionic driver installed successfully"
+            else
+              echo "WARNING: AMD Ionic driver package not found in repository"
+              echo "RDMA may not work for AMD/Pensando NICs"
+            fi
+
+            echo "=== Step 3: Create device nodes ==="
+            rm -rf /dev/infiniband
+            mkdir -p /dev/infiniband
+
+            if [ -d "/sys/class/infiniband_verbs" ]; then
+              for uverbs_dir in /sys/class/infiniband_verbs/uverbs*; do
+                uverbs_name=$(basename "$uverbs_dir")
+                if [ -e "$uverbs_dir/dev" ]; then
+                  dev_info=$(cat "$uverbs_dir/dev")
+                  major=$(echo "$dev_info" | cut -d: -f1)
+                  minor=$(echo "$dev_info" | cut -d: -f2)
+                  echo "Creating /dev/infiniband/$uverbs_name ($major:$minor)"
+                  mknod /dev/infiniband/$uverbs_name c $major $minor || true
+                fi
+              done
+            fi
+
+            if [ -e "/sys/class/misc/rdma_cm/dev" ]; then
+              dev_info=$(cat /sys/class/misc/rdma_cm/dev)
+              mknod /dev/infiniband/rdma_cm c ${dev_info%:*} ${dev_info#*:} || true
+            else
+              mknod /dev/infiniband/rdma_cm c 10 113 || true
+            fi
+
+            chmod 666 /dev/infiniband/*
+
+            echo "=== Step 4: Verification ==="
+            echo "Device nodes:"
+            ls -la /dev/infiniband/
+            echo ""
+            echo "Driver config:"
+            cat /etc/libibverbs.d/ionic.driver 2>/dev/null || echo "No ionic.driver config"
+            echo ""
+            echo "Provider libraries:"
+            ls /usr/lib/x86_64-linux-gnu/libibverbs/ | grep -E "ionic|mlx" || echo "No Ionic/Mellanox providers"
+            echo ""
+            echo "ibv_devinfo:"
+            ibv_devinfo -list
+
+            # Verify HCAs are detected
+            HCA_COUNT=$(ibv_devinfo -list 2>&1 | grep -oE "^[0-9]+ HCAs? found" | grep -oE "^[0-9]+" || echo "0")
+            if [ "$HCA_COUNT" -gt 0 ]; then
+              echo ""
+              echo "=== SUCCESS: RDMA setup complete. Found $HCA_COUNT HCA(s) ==="
+            else
+              echo ""
+              echo "=== WARNING: No HCAs detected. RDMA tests may fail ==="
+            fi
+          '
+
+      - name: Run Aiter Op Test (RMSNorm)
+        timeout-minutes: 10
+        run: |
+          echo "Running pre-check: test_rmsnorm2d.py"
+          docker exec \
+            -e MAX_JOBS=192 \
+            ci_sglang \
+            python /sgl-workspace/aiter/op_tests/test_rmsnorm2d.py
+
+      - name: Run test_disaggregation_pp
+        timeout-minutes: 60
+        run: |
+          bash scripts/ci/amd_ci_exec.sh \
+            -e SGLANG_TEST_RDMA_DEVICE="${{ env.SGLANG_TEST_RDMA_DEVICE }}" \
+            -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-large-8-gpu-35x-disaggregation-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 1 --timeout-per-file 3600
 
       # - name: Run test_disaggregation_pp
       #   timeout-minutes: 15
