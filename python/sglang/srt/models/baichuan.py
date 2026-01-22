@@ -196,6 +196,10 @@ class BaiChuanAttention(nn.Module):
                 max_position=self.max_position_embeddings,
                 base=self.rope_theta,
             )
+        
+        self.attn_kwargs = {}
+        if self.position_embedding == "ALIBI" and _is_npu:
+            attn_kwargs["slopes"] = self.alibi_slopes
 
     def forward(
         self,
@@ -207,12 +211,7 @@ class BaiChuanAttention(nn.Module):
         q, k, v = qkv.chunk(chunks=3, dim=-1)
         if self.position_embedding != "ALIBI":
             q, k = self.rotary_emb(positions, q, k)
-            attn_output = self.attn(q, k, v, forward_batch)
-        else:
-            if not _is_npu:
-                attn_output = self.attn(q, k, v, forward_batch)
-            else:
-                attn_output = self.attn(q, k, v, forward_batch, slopes=self.alibi_slopes)
+        attn_output = self.attn(q, k, v, forward_batch, **self.attn_kwargs)
         output, _ = self.o_proj(attn_output)
         return output
 
