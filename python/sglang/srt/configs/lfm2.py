@@ -33,6 +33,14 @@ class Lfm2Config(HFLfm2Config):
     LFM2 uses a hybrid architecture mixing full attention and ShortConv layers.
     """
 
+    _logged_override = False
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if not Lfm2Config._logged_override:
+            Lfm2Config._logged_override = True
+            logger.info("Using SGLang Lfm2Config to override HuggingFace's version")
+
     @property
     def full_attention_layer_ids(self) -> List[int]:
         """Return indices of attention layers for KV cache."""
@@ -99,4 +107,3 @@ class Lfm2Config(HFLfm2Config):
 # Cannot use .register() because lfm2 is already registered by transformers
 # Directly modify the internal _extra_content dict instead
 CONFIG_MAPPING._extra_content["lfm2"] = Lfm2Config
-logger.info("Registered SGLang Lfm2Config to override HuggingFace's version")
