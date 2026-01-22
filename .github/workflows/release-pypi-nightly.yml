@@ -59,11 +59,11 @@ jobs:
           echo "Original: $DESC"
           echo "Parsed: TAG=$TAG DIST=$DIST HASH=$HASH"
 
-          # If distance is 0 (building at exact tag), force distance to 1
+          # If distance is 0 (building at exact tag), force dev0 version
           if [ "$DIST" = "0" ]; then
-            echo "Distance is 0 - forcing to 1 to ensure dev version"
+            echo "Distance is 0 - using dev0 to ensure unique wheel name"
             # Override version for setuptools-scm using environment variable
-            FORCE_VERSION="${TAG#v}.dev1+${HASH}"
+            FORCE_VERSION="${TAG#v}.dev0+${HASH}"
             echo "Forcing version to: $FORCE_VERSION"
             export SETUPTOOLS_SCM_PRETEND_VERSION="$FORCE_VERSION"
           fi

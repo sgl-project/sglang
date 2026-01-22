@@ -172,10 +172,10 @@ exclude = [
 [tool.setuptools_scm]
 root = ".."
 version_file = "sglang/_version.py"
-# Force a minimum distance of 1 to ensure dev version is always present
-# This prevents tags at distance=0 from producing plain versions like "0.5.7"
-# Instead we get "0.5.7.dev1" which creates unique wheel names
-git_describe_command = ["bash", "-c", "DESC=$(git describe --tags --long --match 'v*' 2>/dev/null || echo 'v0.0.0-0-g0000000'); TAG=$(echo \"$DESC\" | cut -d- -f1); DIST=$(echo \"$DESC\" | cut -d- -f2); HASH=$(echo \"$DESC\" | cut -d- -f3-); test \"$DIST\" = '0' && DIST=1; echo \"${TAG}-${DIST}-${HASH}\""]
+# Standard setuptools-scm configuration
+# For nightly builds at exact tags, the GitHub Actions workflow uses
+# SETUPTOOLS_SCM_PRETEND_VERSION environment variable to force a dev version
+git_describe_command = ["git", "describe", "--tags", "--long", "--match", "v*"]
 # Allow editable installs even when .git metadata is not available.
 fallback_version = "0.0.0.dev0"
 
