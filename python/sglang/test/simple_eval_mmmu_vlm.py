@@ -131,7 +131,7 @@ class MMMUVLMEval(Eval):
             answer = ex.get("answer")
             raw_options = ex.get("options")
             question_type = "open"
-            index2ans = None
+            index2answer = None
             all_choices = None
             options = None
             if raw_options:
@@ -142,7 +142,7 @@ class MMMUVLMEval(Eval):
                         else list(eval(raw_options))
                     )
                     if isinstance(options, list) and len(options) > 0:
-                        index2ans, all_choices = self._build_mc_mapping(options)
+                        index2answer, all_choices = self._build_mc_mapping(options)
                         question_type = "multiple-choice"
                 except Exception:
                     options = None
@@ -162,7 +162,7 @@ class MMMUVLMEval(Eval):
                     "image_data": data_uri,
                     "answer": answer,
                     "question_type": question_type,
-                    "index2ans": index2ans,
+                    "index2ans": index2answer,
                     "all_choices": all_choices,
                     "category": subject,
                 }
