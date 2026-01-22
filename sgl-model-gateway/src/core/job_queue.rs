@@ -517,6 +517,28 @@ impl JobQueue {
 
                         prefill_workers.chain(decode_workers).collect()
                     }
+                    RoutingMode::EncodePrefillDecode {
+                        encode_urls,
+                        prefill_urls,
+                        decode_urls,
+                        ..
+                    } => {
+                        let encode_workers = encode_urls
+                            .iter()
+                            .map(|(url, port)| (url.clone(), "encode", *port));
+
+                        let prefill_workers = prefill_urls
+                            .iter()
+                            .map(|(url, port)| (url.clone(), "prefill", *port));
+
+                        let decode_workers =
+                            decode_urls.iter().map(|url| (url.clone(), "decode", None));
+
+                        encode_workers
+                            .chain(prefill_workers)
+                            .chain(decode_workers)
+                            .collect()
+                    }
                     RoutingMode::OpenAI { worker_urls } => {
                         // OpenAI mode: submit AddWorker jobs with runtime: "external"
                         // The external_worker_registration workflow handles model discovery
@@ -601,13 +623,16 @@ impl JobQueue {
                         api_key: api_key.clone(),
                         worker_type: Some(worker_type.to_string()),
                         labels: HashMap::new(),
-                        model_id: None,
+                        // Use router's model_path as default model_id for all workers.
+                        // This ensures workers are indexed under the correct model name
+                        // even if metadata discovery doesn't return served_model_name.
+                        model_id: router_config.model_path.clone(),
                         priority: None,
                         cost: None,
                         runtime: None,
-                        tokenizer_path: None,
-                        reasoning_parser: None,
-                        tool_parser: None,
+                        tokenizer_path: router_config.tokenizer_path.clone(),
+                        reasoning_parser: router_config.reasoning_parser.clone(),
+                        tool_parser: router_config.tool_call_parser.clone(),
                         chat_template: router_config.chat_template.clone(),
                         bootstrap_port,
                         health_check_timeout_secs: router_config.health_check.timeout_secs,
