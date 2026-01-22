@@ -172,17 +172,11 @@ exclude = [
 [tool.setuptools_scm]
 root = ".."
 version_file = "sglang/_version.py"
-# Use timestamp in dev version to ensure unique nightly wheels even when rebuilding same commit
-# Format: v0.5.7-704-g20260121020530 (tag-commits-timestamp_as_hash)
-# This becomes: 0.5.7.post704.dev20260121020530
-# Wheel filename: sglang-0.5.7.post704.dev20260121020530-py3-none-any.whl
-# Benefits:
-# - post704 tracks actual commit count from tag
-# - dev20260121020530 is unique timestamp (YYYYMMDDHHMMSS)
-# - Every build is unique, even rebuilding the same commit
-git_describe_command = ["bash", "-c", "TAG=$(git describe --tags --match 'v*' 2>/dev/null || echo 'v0.0.0'); COMMITS=$(echo $TAG | cut -d'-' -f2); if [ \"$COMMITS\" = \"$TAG\" ]; then COMMITS=0; fi; TIMESTAMP=$(date -u +%Y%m%d%H%M%S); echo \"$(echo $TAG | cut -d'-' -f1)-${COMMITS}-g${TIMESTAMP}\""]
-version_scheme = "post-release"
-local_scheme = "no-local-version"
+# Standard git describe with default version scheme
+# This generates versions like: 0.5.6.post3.dev1258+ge486a4dac
+# Wheel names like: sglang-0.5.6.post3.dev1258-py3-none-any.whl
+# The +ge486a4dac part is stripped from wheel names but the dev number ensures uniqueness
+git_describe_command = ["git", "describe", "--tags", "--long", "--match", "v*"]
 # Allow editable installs even when .git metadata is not available.
 fallback_version = "0.0.0.dev0"
 
