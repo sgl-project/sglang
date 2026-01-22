@@ -45,7 +45,7 @@ __global__ void rmsnorm_cta(const RMSNormParams __grid_constant__ params) {
       gmem.store(output_ptr, output_vec);
     }
     output_ptr = pointer::offset<Float>(output, i * output_stride);
-    output_vec = norm::apply_rmsnorm_cta<kDim>(input_vec, weight_vec, eps, smem, kNumWarps);
+    output_vec = norm::apply_norm_cta<kDim>(input_vec, weight_vec, eps, smem, kNumWarps);
   }
   gmem.store(output_ptr, output_vec);
 

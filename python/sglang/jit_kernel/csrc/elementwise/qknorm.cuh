@@ -59,7 +59,7 @@ __global__ void fused_qknorm(const QKNormParams __grid_constant__ params) {
     const auto weight = load_q ? q_weight : k_weight;
     const auto input_vec = gmem.load(input);
     const auto weight_vec = gmem.load(weight);
-    const auto output_vec = norm::apply_rmsnorm_warp<kHeadDim>(input_vec, weight_vec, eps);
+    const auto output_vec = norm::apply_norm_warp<kHeadDim>(input_vec, weight_vec, eps);
     gmem.store(input, output_vec);
   }
 

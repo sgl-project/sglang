@@ -26,6 +26,7 @@ from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiT
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
+_is_cuda = current_platform.is_cuda()
 
 ADALN_EMBED_DIM = 256
 SEQ_MULTI_OF = 32
@@ -171,7 +172,7 @@ class ZImageAttention(nn.Module):
 
         if self.qk_norm:
             if (
-                q.is_cuda
+                _is_cuda
                 and (self.norm_q.variance_epsilon == self.norm_k.variance_epsilon)
                 and can_use_fused_inplace_qknorm(self.head_dim, q.dtype)
             ):
@@ -189,7 +190,7 @@ class ZImageAttention(nn.Module):
 
         if freqs_cis is not None:
             cos, sin = freqs_cis
-            if q.is_cuda and q.shape == k.shape:
+            if _is_cuda and q.shape == k.shape:
                 cos_sin_cache = torch.cat(
                     [
                         cos.to(dtype=torch.float32).contiguous(),

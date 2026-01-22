@@ -15,6 +15,7 @@ from sglang.multimodal_gen.runtime.layers.layernorm import (
     ScaleResidualLayerNormScaleShift,
     ScaleResidualRMSNormScaleShift,
 )
+
 if is_in_ci():
     B_RANGE, S_RANGE, D_RANGE = [1], [128], [1024]
 else:

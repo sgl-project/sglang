@@ -1,4 +1,4 @@
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -7,9 +7,9 @@ import torch
 from cutlass.cute.runtime import from_dlpack
 
 from sglang.jit_kernel.cutedsl.common.norm_fusion import (
-    apply_norm,
-    preprocess_tensor,
-    tensor_slice,
+    apply_norm_cta,
+    broadcast_tensor_for_bsfd,
+    tensor_slice_for_bsfd,
 )
 
 _COMPILE_CACHE = {}
@@ -42,7 +42,7 @@ class ScaleResidualNormScaleShift:
         mResOut: Optional[cute.Tensor],
         mRes: Optional[cute.Tensor],
         mX: cute.Tensor,
-        mGate: Optional[cute.Tensor] | cutlass.Int32 | int,
+        mGate: Union[Optional[cute.Tensor], cutlass.Int32, int],
         mWeight: Optional[cute.Tensor],
         mBias: Optional[cute.Tensor],
         mScale: Optional[cute.Tensor],
@@ -95,7 +95,7 @@ class ScaleResidualNormScaleShift:
         mResOut: Optional[cute.Tensor],
         mRes: Optional[cute.Tensor],
         mX: cute.Tensor,
-        mGate: Optional[cute.Tensor] | cutlass.Int32,
+        mGate: Union[Optional[cute.Tensor], cutlass.Int32],
         mWeight: Optional[cute.Tensor],
         mBias: Optional[cute.Tensor],
         mScale: Optional[cute.Tensor],
@@ -113,7 +113,9 @@ class ScaleResidualNormScaleShift:
         @cute.jit
         def slice_if(mV):
             if cutlass.const_expr(isinstance(mV, cute.Tensor)):
-                return tensor_slice(mV, thr_copy, bidx, bidy, self.D, self.len_f)
+                return tensor_slice_for_bsfd(
+                    mV, thr_copy, bidx, bidy, self.D, self.len_f
+                )
             return mV, mV
 
         @cute.jit
@@ -125,7 +127,7 @@ class ScaleResidualNormScaleShift:
 
         @cute.jit
         def norm(x, weight, bias):
-            return apply_norm(
+            return apply_norm_cta(
                 self.norm_type, self.num_threads, tidx, x, weight, bias, self.D, eps
             )
 
@@ -221,8 +223,8 @@ def fused_norm_scale_shift(
                 f"D={D} not supported, must be multiple of 256 and <= 8192"
             )
         y = torch.empty_like(x)
-        scale = preprocess_tensor(scale, *x.shape)
-        shift = preprocess_tensor(shift, *x.shape)
+        scale = broadcast_tensor_for_bsfd(scale, *x.shape)
+        shift = broadcast_tensor_for_bsfd(shift, *x.shape)
         # Use None as placeholders for ResOut, Residual, and Gate
         torch_tensors = [y, None, None, x, None, weight, bias, scale, shift]
         cute_tensors = [
@@ -255,7 +257,7 @@ def fused_norm_scale_shift(
 def fused_scale_residual_norm_scale_shift(
     residual: torch.Tensor,
     x: torch.Tensor,
-    gate: torch.Tensor | int,
+    gate: Union[torch.Tensor, int],
     weight: Optional[torch.Tensor],
     bias: Optional[torch.Tensor],
     scale: torch.Tensor,
@@ -285,9 +287,9 @@ def fused_scale_residual_norm_scale_shift(
             )
         y = torch.empty_like(x)
         resi_out = torch.empty_like(x)
-        gate = preprocess_tensor(gate, *x.shape)
-        scale = preprocess_tensor(scale, *x.shape)
-        shift = preprocess_tensor(shift, *x.shape)
+        gate = broadcast_tensor_for_bsfd(gate, *x.shape)
+        scale = broadcast_tensor_for_bsfd(scale, *x.shape)
+        shift = broadcast_tensor_for_bsfd(shift, *x.shape)
         torch_tensors = [y, resi_out, residual, x, gate, weight, bias, scale, shift]
         cute_tensors = [
             # TODO: Enable tvm ffi to reduce host-side overhead of `from_dlpack`

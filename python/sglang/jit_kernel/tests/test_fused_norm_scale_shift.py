@@ -189,9 +189,7 @@ class TestFusedNormScaleShift:
 
     @pytest.mark.parametrize("dtype", DTYPES)
     def test_dtype_1(self, dtype, norm_type):
-        run_norm_scale_shift(
-            scale_dtype=dtype, shift_dtype=dtype, norm_type=norm_type
-        )
+        run_norm_scale_shift(scale_dtype=dtype, shift_dtype=dtype, norm_type=norm_type)
 
     @pytest.mark.parametrize("affine_mode", AFFINE_MODES)
     def test_normtype_affine(self, affine_mode, norm_type):

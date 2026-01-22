@@ -25,8 +25,12 @@ from sglang.multimodal_gen.runtime.layers.triton_ops import (
     fuse_scale_shift_kernel,
     norm_infer,
     rms_norm_fn,
+    triton_one_pass_rms_norm,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
+
+_is_cuda = current_platform.is_cuda()
 
 
 # Copied and adapted from sglang
@@ -81,7 +85,12 @@ class RMSNorm(CustomOp):
             fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
             return x.view(shape), residual.view(residual_shape)
         else:
-            out = rmsnorm(x, self.weight.data.to(device), self.variance_epsilon)
+            if x.shape[-1] <= 128:
+                out = triton_one_pass_rms_norm(
+                    x, self.weight.data, self.variance_epsilon
+                )
+            else:
+                out = rmsnorm(x, self.weight.data, self.variance_epsilon)
         out = out.view(shape)
         return out
 
@@ -321,27 +330,14 @@ class _ScaleResidualNormScaleShift(CustomOp):
         shift: torch.Tensor,
         scale: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # print("residual.dtype:", residual.dtype)
-        # if isinstance(gate, torch.Tensor):
-        #     print("gate.dtype:", gate.dtype)
-        # print("x.dtype:", x.dtype)
-        if (
-            x.shape[-1] % 256 != 0
-            or x.dtype == torch.float32
-            or scale.dtype == torch.float32
-            or shift.dtype == torch.float32
-        ):
+        if x.shape[-1] % 256 != 0 and x.shape[-1] <= 8192:
             import warnings
 
             warnings.warn(
                 "FusedScaleResidualNormScaleShift cuda not available, using native fallback",
                 stacklevel=2,
             )
-            # print("fallback")
             return self.forward_native(residual, x, gate, shift, scale)
-        # weight = getattr(self.norm, "weight", None)
-        # if weight is not None:
-        #     print("weight dtype:", weight.dtype)
         return fused_scale_residual_norm_scale_shift(
             residual.contiguous(),
             x.contiguous(),
@@ -425,18 +421,7 @@ class _NormScaleShift(CustomOp):
     def forward_cuda(
         self, x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor
     ) -> torch.Tensor:
-        # print("x.dtype:", x.dtype)
-        # weight = getattr(self.norm, "weight", None)
-        # if weight is not None:
-        #     print("weight dtype:", weight.dtype)
-        # print("scale.dtype:", scale.dtype)
-        # print("shift.dtype:", shift.dtype)
-        if (
-            x.shape[-1] % 256 != 0
-            or x.dtype == torch.float32
-            or scale.dtype == torch.float32
-            or shift.dtype == torch.float32
-        ):
+        if x.shape[-1] % 256 != 0 and x.shape[-1] <= 8192:
             import warnings
 
             warnings.warn(
@@ -489,7 +474,7 @@ def apply_qk_norm(
     k_eps = k_norm.variance_epsilon
     # Only try fused path on CUDA and when it won't introduce implicit copies.
     if (
-        q.is_cuda
+        _is_cuda
         and allow_inplace
         and (q_eps == k_eps)
         and can_use_fused_inplace_qknorm(head_dim, q.dtype)

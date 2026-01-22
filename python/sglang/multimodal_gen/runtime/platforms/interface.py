@@ -34,6 +34,7 @@ class AttentionBackendEnum(enum.Enum):
     VMOBA_ATTN = enum.auto()
     AITER = enum.auto()
     SLA_ATTN = enum.auto()
+    SAGE_SLA_ATTN = enum.auto()
     NO_ATTENTION = enum.auto()
 
     def __str__(self):
@@ -46,6 +47,7 @@ class PlatformEnum(enum.Enum):
     TPU = enum.auto()
     CPU = enum.auto()
     MPS = enum.auto()
+    MUSA = enum.auto()
     OOT = enum.auto()
     UNSPECIFIED = enum.auto()
 
@@ -155,7 +157,7 @@ class Platform:
     @lru_cache(maxsize=1)
     def is_cuda_alike(self) -> bool:
         """Stateless version of :func:`torch.cuda.is_available`."""
-        return self._enum in (PlatformEnum.CUDA, PlatformEnum.ROCM)
+        return self._enum in (PlatformEnum.CUDA, PlatformEnum.ROCM, PlatformEnum.MUSA)
 
     @lru_cache(maxsize=1)
     def is_mps(self) -> bool:

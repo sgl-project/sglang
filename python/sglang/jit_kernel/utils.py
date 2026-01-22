@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import functools
 import pathlib
-from enum import Enum
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Callable, List, Tuple, TypeAlias, TypeVar, Union
 
@@ -43,7 +42,7 @@ DEFAULT_INCLUDE = [str(KERNEL_PATH / "include")]
 DEFAULT_CFLAGS = ["-std=c++20", "-O3"]
 DEFAULT_CUDA_CFLAGS = ["-std=c++20", "-O3", "--expt-relaxed-constexpr"]
 DEFAULT_LDFLAGS = []
-CPP_TEMPLATE_TYPE: TypeAlias = Union[int, float, bool, torch.dtype, Enum]
+CPP_TEMPLATE_TYPE: TypeAlias = Union[int, float, bool, torch.dtype]
 
 
 class CPPArgList(list[str]):
@@ -66,13 +65,7 @@ def make_cpp_args(*args: CPP_TEMPLATE_TYPE) -> CPPArgList:
             return str(arg)
         if isinstance(arg, torch.dtype):
             return CPP_DTYPE_MAP[arg]
-        if isinstance(arg, Enum):
-            # Note: Python Enum must mirror the corresponding C++ enum class exactly.
-            enum_type = arg.__class__.__name__
-            return f"{enum_type}::{arg.name}"
-        raise TypeError(
-            f"Unsupported argument type for cpp template: {type(arg)}, arg={arg}"
-        )
+        raise TypeError(f"Unsupported argument type for cpp template: {type(arg)}")
 
     return CPPArgList(_convert(arg) for arg in args)
 
@@ -140,11 +133,8 @@ def load_jit(
     cuda_sources = [f'#include "{path}"' for path in cuda_paths]
     cuda_sources += [_make_wrapper(tup) for tup in cuda_wrappers]
 
-    # Sanitize name for cpp identifier (replace invalid chars with '_').
-    sanitize = lambda s: s.replace(":", "_")
-
     return load_inline(
-        "sgl_kernel_jit_" + "_".join(sanitize(str(arg)) for arg in args),
+        "sgl_kernel_jit_" + "_".join(str(arg) for arg in args),
         cpp_sources=cpp_sources,
         cuda_sources=cuda_sources,
         extra_cflags=DEFAULT_CFLAGS + extra_cflags,
