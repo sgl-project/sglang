@@ -209,7 +209,7 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
-            const maxWaitMinutes = 60;
+            const maxWaitMinutes = 240;
             const pollIntervalSeconds = 120;  // 2 minutes to reduce GH API calls
             const maxAttempts = (maxWaitMinutes * 60) / pollIntervalSeconds;
 
@@ -270,7 +270,7 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
-            const maxWaitMinutes = 90;
+            const maxWaitMinutes = 480;
             const pollIntervalSeconds = 120;  // 2 minutes to reduce GH API calls
             const maxAttempts = (maxWaitMinutes * 60) / pollIntervalSeconds;
 
@@ -1811,6 +1811,9 @@ jobs:
         sgl-kernel-mla-test,
         sgl-kernel-benchmark-test,
         sgl-kernel-b200-test,
+
+        wait-for-stage-a,
+        wait-for-stage-b,
 
         jit-kernel-unit-test,
 
