@@ -3,6 +3,7 @@ from __future__ import annotations
 import heapq
 import json
 import logging
+import os
 import threading
 import time
 from typing import TYPE_CHECKING, List, Optional
@@ -158,11 +159,32 @@ class HiRadixCache(RadixCache):
         Returns:
             tuple: (extra_config_dict, prefetch_threshold, prefetch_timeout_base, prefetch_timeout_per_ki_token, hicache_storage_pass_prefix_keys)
         """
-        # Parse extra config JSON if provided
+        # Parse extra config if provided. Extra config can be a JSON string or a json/toml/yaml file path prefixed with "@".
         extra_config = {}
         if storage_backend_extra_config:
             try:
-                extra_config = json.loads(storage_backend_extra_config)
+                if storage_backend_extra_config.startswith("@"):
+                    # Read config from a json/toml/yaml file
+                    path = storage_backend_extra_config[1:]
+                    ext = os.path.splitext(path)[1].lower()
+                    with open(path, "rb" if ext == ".toml" else "r") as f:
+                        if ext == ".json":
+                            extra_config = json.load(f)
+                        elif ext == ".toml":
+                            import tomllib
+
+                            extra_config = tomllib.load(f)
+                        elif ext in (".yaml", ".yml"):
+                            import yaml
+
+                            extra_config = yaml.safe_load(f)
+                        else:
+                            raise ValueError(
+                                f"Unsupported config file {path} (config format: {ext})"
+                            )
+                else:
+                    # read config from JSON string
+                    extra_config = json.loads(storage_backend_extra_config)
             except Exception as e:
                 logger.error(f"Invalid backend extra config JSON: {e}")
                 raise e
