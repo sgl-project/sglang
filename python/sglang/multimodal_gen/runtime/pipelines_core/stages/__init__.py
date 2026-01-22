@@ -8,7 +8,7 @@ This package contains the various stages that can be composed to create
 complete diffusion pipelines.
 """
 
-from sglang.multimodal_gen.runtime.pipelines_core.stages.adapter import (
+from sglang.multimodal_gen.runtime.pipelines_core.stages.text_connector import (
     LTX2TextConnectorStage,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
