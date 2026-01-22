@@ -38,6 +38,8 @@ from sglang.srt.configs import (
     NemotronH_Nano_VL_V2_Config,
     NemotronHConfig,
     Qwen3NextConfig,
+    Qwen3NextVLConfig,
+    Qwen3NextVLMoEConfig,
 )
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
@@ -1477,8 +1479,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
     @property
     def hybrid_gdn_config(self):
-        config = self.model_config.hf_config
-        if isinstance(config, Qwen3NextConfig | JetNemotronConfig | JetVLMConfig):
+        config = self.model_config.hf_config.get_text_config()
+        if isinstance(config, Qwen3NextConfig | Qwen3NextVLConfig | Qwen3NextVLMoEConfig | JetNemotronConfig | JetVLMConfig):
             return config
         return None
 
