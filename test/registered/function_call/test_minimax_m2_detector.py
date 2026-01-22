@@ -187,12 +187,71 @@ class TestMinimaxM2DetectorBugs(unittest.TestCase):
         result = self.detector.detect_and_parse(text, tools)
 
         # BUG: Currently truncates at first </parameter>
+        self.assertGreater(len(result.calls), 0, "Should detect tool call")
         if result.calls:
             params = json.loads(result.calls[0].parameters)
             self.assertEqual(
                 params.get("content"),
                 "This text contains </parameter> in it",
                 "Parameter value should preserve </parameter> substring",
+            )
+
+    def test_parameter_value_with_multiple_closing_tags(self):
+        """
+        Test parameter values with multiple </parameter> occurrences.
+        """
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="test_func",
+                    parameters={
+                        "type": "object",
+                        "properties": {"doc": {"type": "string"}},
+                    },
+                ),
+            )
+        ]
+
+        text = '<minimax:tool_call><invoke name="test_func"><parameter name="doc">Example: </parameter> and </parameter> tags</parameter></invoke></minimax:tool_call>'
+
+        result = self.detector.detect_and_parse(text, tools)
+
+        if result.calls:
+            params = json.loads(result.calls[0].parameters)
+            self.assertEqual(
+                params.get("doc"),
+                "Example: </parameter> and </parameter> tags",
+                "Should handle multiple </parameter> substrings",
+            )
+
+    def test_parameter_value_with_invoke_closing_tag(self):
+        """
+        Test parameter values containing </invoke> substring.
+        """
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="test_func",
+                    parameters={
+                        "type": "object",
+                        "properties": {"code": {"type": "string"}},
+                    },
+                ),
+            )
+        ]
+
+        text = '<minimax:tool_call><invoke name="test_func"><parameter name="code">Code with </invoke> tag</parameter></invoke></minimax:tool_call>'
+
+        result = self.detector.detect_and_parse(text, tools)
+
+        if result.calls:
+            params = json.loads(result.calls[0].parameters)
+            self.assertEqual(
+                params.get("code"),
+                "Code with </invoke> tag",
+                "Should handle </invoke> substring in parameter value",
             )
 
     def test_parameter_value_with_xml_content(self):

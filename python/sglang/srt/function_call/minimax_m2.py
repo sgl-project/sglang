@@ -41,7 +41,8 @@ class MinimaxM2Detector(BaseFormatDetector):
             r"<invoke name=\"(.*?)</invoke>|<invoke name=\"(.*)$", re.DOTALL
         )
         self.tool_call_parameter_regex = re.compile(
-            r"<parameter name=\"(.*?)</parameter>|<parameter name=\"(.*?)$", re.DOTALL
+            r'<parameter name="([^">]+)">(.*?)(?:</parameter>(?=\s*(?:</invoke>|<parameter |$))|$)',
+            re.DOTALL,
         )
         self._buf: str = ""
 
@@ -63,9 +64,6 @@ class MinimaxM2Detector(BaseFormatDetector):
 
     def _convert_param_value(self, value: str, param_type: str) -> Any:
         """Convert parameter value to the correct type based on inferred JSON schema type."""
-        if value.lower() in ("null", "none", "nil"):
-            return None
-
         if param_type == "string":
             return value
         elif param_type == "integer":
@@ -259,7 +257,7 @@ class MinimaxM2Detector(BaseFormatDetector):
         # Find all complete parameter patterns
         param_matches = list(
             re.finditer(
-                r"<parameter name=\"([^>]+)\">(.*?)</parameter>",
+                r'<parameter name="([^">]+)">(.*?)(?:</parameter>(?=\s*(?:</invoke>|<parameter |$))|$)',
                 text_to_parse,
                 re.DOTALL,
             )
@@ -366,13 +364,10 @@ class MinimaxM2Detector(BaseFormatDetector):
             body = txt[idx + 2 :]
             params: Dict[str, Any] = {}
             for pm in self.tool_call_parameter_regex.findall(body):
-                ptxt = pm[0] if pm[0] else pm[1]
-                if '">' not in ptxt:
-                    continue
-                pidx = ptxt.index('">')
-                pname = ptxt[:pidx].strip()
-                pval = ptxt[pidx + 2 :].lstrip("\n").rstrip("\n")
-                params[pname] = self._parse_parameter(fname, pname, pval, tools)
+                pname = pm[0].strip() if pm[0] else ""
+                pval = pm[1].lstrip("\n").rstrip("\n") if pm[1] else ""
+                if pname:
+                    params[pname] = self._parse_parameter(fname, pname, pval, tools)
             raw = {"name": fname, "arguments": params}
             try:
                 # TODO: fix idx in function call, the index for a function

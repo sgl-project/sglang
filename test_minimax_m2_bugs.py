@@ -176,6 +176,62 @@ def test_streaming_leak_bug():
         return True
 
 
+def test_regex_closing_tag_bug():
+    """
+    BUG #4: Regex cannot handle parameter values containing </parameter> substring
+    """
+    print("\n" + "=" * 70)
+    print("TEST 4: Regex bug - Parameter value contains </parameter> substring")
+    print("=" * 70)
+
+    detector = MinimaxM2Detector()
+    tools = [
+        Tool(
+            type="function",
+            function=Function(
+                name="test_func",
+                description="Test",
+                parameters={
+                    "type": "object",
+                    "properties": {"content": {"type": "string"}},
+                },
+            ),
+        )
+    ]
+
+    text = '<minimax:tool_call><invoke name="test_func"><parameter name="content">This text contains </parameter> in it</parameter></invoke></minimax:tool_call>'
+
+    result = detector.detect_and_parse(text, tools)
+
+    print(
+        "Input: '<parameter name=\"content\">This text contains </parameter> in it</parameter>'"
+    )
+    print(f"\nResult calls: {len(result.calls)}")
+
+    if result.calls:
+        params = json.loads(result.calls[0].parameters)
+        print(f"Parsed parameters: {params}")
+        print(f"params['content'] = {params['content']!r}")
+
+        expected = "This text contains </parameter> in it"
+        actual = params.get("content", "")
+
+        if actual == expected:
+            print(f"\n✅ PASS: Value correctly preserved as {expected!r}")
+            return True
+        else:
+            print("\n❌ BUG CONFIRMED: Regex truncated at first </parameter>!")
+            print(f"   Expected: {expected!r}")
+            print(f"   Actual:   {actual!r}")
+            print(
+                "   Root cause: regex r'<parameter name=\"(.*?)</parameter>' uses non-greedy match"
+            )
+            return False
+    else:
+        print("\n❌ ERROR: No tool calls detected")
+        return False
+
+
 def main():
     print("\n" + "=" * 70)
     print("MiniMax M2 Detector - Bug Reproduction Tests")
@@ -210,6 +266,15 @@ def main():
 
         traceback.print_exc()
         results.append(("streaming leak", False))
+
+    try:
+        results.append(("regex closing tag bug", test_regex_closing_tag_bug()))
+    except Exception as e:
+        print(f"\n❌ Test failed with exception: {e}")
+        import traceback
+
+        traceback.print_exc()
+        results.append(("regex closing tag bug", False))
 
     print("\n" + "=" * 70)
     print("SUMMARY")
