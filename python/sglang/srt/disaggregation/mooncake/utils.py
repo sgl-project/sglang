@@ -57,7 +57,7 @@ def init_mooncake_custom_mem_pool(
                         f"Initialized NVLink memory pool on device {device}"
                     )
                     return True, custom_mem_pool, custom_mem_pool_type
-                elif  mem_backend == MemoryBackend.USE_CUDAMALLOC:
+                elif mem_backend == MemoryBackend.USE_CUDAMALLOC:
                     logger.info("Fabric memory not supported, falling back to default cudaMalloc")
                     return False, None, None
                 else:
@@ -74,8 +74,9 @@ def init_mooncake_custom_mem_pool(
                 return True, custom_mem_pool, custom_mem_pool_type
 
             else:
-                logger.error(f"Unsupported custom mem pool type: {custom_mem_pool_type}")
-                return False, None, None
+                raise ValueError(
+                    f"Unsupported custom mem pool type: {custom_mem_pool_type}"
+                )
 
         except ImportError as e:
             logger.warning(
