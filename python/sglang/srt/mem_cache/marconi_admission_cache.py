@@ -31,24 +31,20 @@ class MarconiAdmissionTree:
         node = self.root_node
         key = tuple(token_ids)
         matched_len = 0
-        branchoff_required = False
+        reusable_len = 0
         while key:
             child_key = self._child_key(extra_key, key)
             child = node.children.get(child_key)
             if child is None:
-                if matched_len > 0 and len(node.children) == 0:
-                    branchoff_required = True
                 break
             prefix_len = _key_match(child.key, key)
             matched_len += prefix_len
             if prefix_len < len(child.key):
-                branchoff_required = True
                 break
+            reusable_len += prefix_len
             key = key[prefix_len:]
             node = child
-            if key and len(child.children) == 0:
-                branchoff_required = True
-                break
+        branchoff_required = matched_len > reusable_len
         return matched_len, branchoff_required
 
     def insert(self, token_ids: List[int], extra_key: Optional[str]) -> None:

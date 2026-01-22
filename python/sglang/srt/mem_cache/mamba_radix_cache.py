@@ -528,7 +528,6 @@ class MambaRadixCache(BasePrefixCache):
             admission_len, branchoff_required = (
                 self.marconi_admission_tree.match_prefix(key.token_ids, key.extra_key)
             )
-            self.marconi_admission_tree.insert(key.token_ids, key.extra_key)
             cached_prefix_len = len(value)
             cache_len = admission_len if branchoff_required else 0
             req.marconi_cache_len = cache_len if cache_len > 0 else None
@@ -620,6 +619,12 @@ class MambaRadixCache(BasePrefixCache):
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, :kv_committed_len
         ]
+        if (
+            self.marconi_enabled
+            and self.marconi_admission_tree is not None
+            and kv_committed_len > 0
+        ):
+            self.marconi_admission_tree.insert(token_ids, req.extra_key)
 
         if is_insert:
             cache_len = (
@@ -1028,8 +1033,10 @@ class MambaRadixCache(BasePrefixCache):
                 flops_savings_mamba + flops_savings_attn + flops_savings_mlp
             )
             total_memory = stats.num_mamba_layers * stats.mamba_state_size_bytes
+            # Memory footprint for this entry is the KV cache for the edge (child) tokens,
+            # not the full prefix length.
             total_memory += stats.num_attn_layers * get_kv_cache_size_bytes(
-                seqlen_total, stats.model_dim, stats.kv_cache_dtype_size
+                seqlen_child, stats.model_dim, stats.kv_cache_dtype_size
             )
             if total_memory > 0:
                 efficiency_scores.append(total_flops_savings / total_memory)
