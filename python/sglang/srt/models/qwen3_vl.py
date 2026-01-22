@@ -703,9 +703,9 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             # encoder_only mode: no language model, so no lm_head needed
             self.lm_head = None
 
-        #[TODO] need fix qwen3 vl and qwen3.5 vl
-        # self.is_mrope_enabled = "mrope_section" in self.config.rope_scaling
-        self.is_mrope_enabled = "mrope_section" in self.config.rope_parameters
+        rope_config = getattr(self.config, "rope_parameters", None) or \
+                      getattr(self.config, "rope_scaling", {})
+        self.is_mrope_enabled = "mrope_section" in rope_config
 
         self.logits_processor = LogitsProcessor(self.config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
