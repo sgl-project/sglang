@@ -32,8 +32,8 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.models.glm_ocr import GlmOcrForConditionalGeneration
 from sglang.srt.models.glm4 import Glm4DecoderLayer
+from sglang.srt.models.glm_ocr import GlmOcrForConditionalGeneration
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix
 

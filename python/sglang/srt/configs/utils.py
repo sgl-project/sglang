@@ -1,7 +1,6 @@
 from typing import Type
 
 from transformers import (
-    AutoImageProcessor,
     AutoProcessor,
     BaseImageProcessor,
     PretrainedConfig,
@@ -17,6 +16,7 @@ def register_image_processor(
     """
     # AutoImageProcessor.register(config, None, image_processor, None, exist_ok=True)
     pass
+
 
 def register_processor(config: Type[PretrainedConfig], processor: Type[ProcessorMixin]):
     """

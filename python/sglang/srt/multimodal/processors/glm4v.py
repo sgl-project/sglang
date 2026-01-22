@@ -11,7 +11,11 @@ from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTok
 
 
 class Glm4vImageProcessor(SGLangBaseProcessor):
-    models = [Glm4vForConditionalGeneration, Glm4vMoeForConditionalGeneration, GlmOcrForConditionalGeneration]
+    models = [
+        Glm4vForConditionalGeneration,
+        Glm4vMoeForConditionalGeneration,
+        GlmOcrForConditionalGeneration,
+    ]
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)

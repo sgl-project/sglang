@@ -19,7 +19,7 @@
 
 import logging
 from functools import lru_cache
-from typing import Iterable, List, Optional, Tuple
+from typing import Iterable, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -29,43 +29,26 @@ from transformers.models.glm_ocr.configuration_glm_ocr import (
     GlmOcrVisionConfig,
 )
 
-from sglang.srt.distributed import (
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-)
 from sglang.srt.distributed.parallel_state import get_pp_group
-from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.attention import vision_utils
 from sglang.srt.layers.attention.vision import VisionAttention
-from sglang.srt.layers.layernorm import LayerNorm, RMSNorm
-from sglang.srt.layers.linear import (
-    MergedColumnParallelLinear,
-    ReplicatedLinear,
-    RowParallelLinear,
-)
+from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
-from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternMultimodalTokens,
-    general_mm_embed_routine,
-)
-from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.glm4 import Glm4Model
 from sglang.srt.models.glm4v import (
+    Glm4vForConditionalGeneration,
+    Glm4vPatchMerger,
     Glm4vRMSNorm,
     Glm4vVisionMLP,
-    Glm4vPatchMerger,
-    Glm4vVisionPatchEmbed,
     Glm4vVisionModel,
-    Glm4vForConditionalGeneration,
+    Glm4vVisionPatchEmbed,
 )
-from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix
 from sglang.srt.utils.hf_transformers_utils import get_processor
