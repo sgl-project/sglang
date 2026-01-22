@@ -13,7 +13,6 @@ macro_rules! set_env {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Rebuild triggers
     println!("cargo:rerun-if-changed=src/proto/sglang_scheduler.proto");
-    println!("cargo:rerun-if-changed=src/proto/sglang_encoder.proto");
     println!("cargo:rerun-if-changed=src/proto/vllm_engine.proto");
     println!("cargo:rerun-if-changed=Cargo.toml");
 
@@ -26,7 +25,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .compile_protos(
             &[
                 "src/proto/sglang_scheduler.proto",
-                "src/proto/sglang_encoder.proto",
                 "src/proto/vllm_engine.proto",
             ],
             &["src/proto"],
