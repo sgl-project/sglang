@@ -376,11 +376,15 @@ impl WorkerSelectionStage {
             headers: None,
             hash_ring: None,
         };
-        let encode_idx = encode_policy.select_worker(&available_encode, &info).await?;
+        let encode_idx = encode_policy
+            .select_worker(&available_encode, &info)
+            .await?;
         let prefill_idx = prefill_policy
             .select_worker(&available_prefill, &info)
             .await?;
-        let decode_idx = decode_policy.select_worker(&available_decode, &info).await?;
+        let decode_idx = decode_policy
+            .select_worker(&available_decode, &info)
+            .await?;
 
         let model = model_id.unwrap_or("default");
 

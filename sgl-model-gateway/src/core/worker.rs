@@ -950,25 +950,24 @@ impl Worker for BasicWorker {
 
         // Use encoder client for encode workers
         if matches!(self.metadata.worker_type, WorkerType::Encode { .. }) {
-            let health_client = match time::timeout(
-                timeout,
-                HealthClient::connect(&self.metadata.url),
-            )
-            .await
-            {
-                Ok(Ok(client)) => client,
-                Ok(Err(err)) => {
-                    tracing::warn!(
-                        "Encoder gRPC health connect error for {}: {err:?}",
-                        self.metadata.url
-                    );
-                    return Ok(false);
-                }
-                Err(_) => {
-                    tracing::warn!("Encoder gRPC health connect timed out for {}", self.metadata.url);
-                    return Ok(false);
-                }
-            };
+            let health_client =
+                match time::timeout(timeout, HealthClient::connect(&self.metadata.url)).await {
+                    Ok(Ok(client)) => client,
+                    Ok(Err(err)) => {
+                        tracing::warn!(
+                            "Encoder gRPC health connect error for {}: {err:?}",
+                            self.metadata.url
+                        );
+                        return Ok(false);
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            "Encoder gRPC health connect timed out for {}",
+                            self.metadata.url
+                        );
+                        return Ok(false);
+                    }
+                };
 
             match time::timeout(timeout, health_client.check("")).await {
                 Ok(Ok(resp)) => {
