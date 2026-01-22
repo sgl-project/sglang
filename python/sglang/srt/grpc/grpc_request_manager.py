@@ -21,10 +21,12 @@ import zmq.asyncio
 from google.protobuf.json_format import MessageToDict
 
 from sglang.srt.grpc import sglang_scheduler_pb2
+from sglang.srt.disaggregation.encode_receiver import MMReceiver
 from sglang.srt.managers.io_struct import (
     AbortReq,
     BatchEmbeddingOutput,
     BatchTokenIDOutput,
+    GenerateReqInput,
     GetLoadsReqInput,
     GetLoadsReqOutput,
     HealthCheckOutput,
@@ -33,7 +35,12 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.sampling.sampling_params import SamplingParams as SGLSamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.utils import get_or_create_event_loop, get_zmq_socket, kill_process_tree
+from sglang.srt.utils import (
+    ImageData,
+    get_or_create_event_loop,
+    get_zmq_socket,
+    kill_process_tree,
+)
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -220,6 +227,12 @@ class GrpcRequestManager:
 
         # Bootstrap server (passed from serve_grpc, not started here)
         self.bootstrap_server = bootstrap_server
+        self.mm_receiver: Optional[MMReceiver] = None
+        if (
+            self.server_args.language_only
+            and self.server_args.encoder_transfer_backend == "zmq_to_scheduler"
+        ):
+            self.mm_receiver = MMReceiver(self.server_args)
 
         # Communicators for request/response patterns with scheduler
         # Note: These must be initialized after send_to_scheduler socket is created
@@ -946,6 +959,30 @@ class GrpcRequestManager:
             bootstrap_room=bootstrap_room,
         )
 
+    def _handle_epd_disaggregation_encode_request(
+        self,
+        grpc_req: sglang_scheduler_pb2.GenerateRequest,
+        tokenized_req: TokenizedGenerateReqInput,
+    ) -> None:
+        if (
+            not self.mm_receiver
+            or not self.server_args.language_only
+            or self.server_args.encoder_transfer_backend != "zmq_to_scheduler"
+        ):
+            return
+
+        image_urls = list(grpc_req.mm_inputs.image_urls)
+        if not image_urls:
+            return
+
+        encode_req = GenerateReqInput(
+            image_data=[ImageData(url=url) for url in image_urls],
+            rid=grpc_req.request_id,
+        )
+        self.mm_receiver.send_encode_request(encode_req)
+        tokenized_req.need_wait_for_image = bool(encode_req.need_wait_for_image)
+        tokenized_req.num_items_assigned = encode_req.num_items_assigned
+
     def convert_embed_request(
         self, grpc_req: sglang_scheduler_pb2.EmbedRequest
     ) -> TokenizedEmbeddingReqInput:
@@ -1220,6 +1257,7 @@ class GrpcRequestManager:
         """Handle a gRPC generate request end-to-end."""
         try:
             tokenized_req = self.convert_generate_request(grpc_req)
+            self._handle_epd_disaggregation_encode_request(grpc_req, tokenized_req)
 
             response_generator = self.generate_request(
                 obj=tokenized_req,
