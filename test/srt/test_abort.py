@@ -193,14 +193,15 @@ class TestAbortAllWithRetraction(CustomTestCase):
                         self.assertGreater(len(result.get("text", "")), 0)
                         self.assertIsNotNone(meta_info.get("weight_version"))
                         self.assertGreater(meta_info.get("e2e_latency"), 0)
-                        self.assertEqual(
-                            len(meta_info.get("output_token_logprobs", [])),
-                            len(output_ids),
-                        )
-                        self.assertEqual(
-                            len(meta_info.get("output_top_logprobs", [])),
-                            len(output_ids),
-                        )
+                        for logprob_key in [
+                            "output_token_logprobs",
+                            "output_top_logprobs",
+                        ]:
+                            self.assertEqual(
+                                len(meta_info.get(logprob_key, [])),
+                                len(output_ids),
+                                f"Length of '{logprob_key}' should match output_ids length",
+                            )
 
             self.assertGreater(abort_in_queue_count, 0)
             self.assertGreater(abort_in_queue_with_partial_gen, 0)
