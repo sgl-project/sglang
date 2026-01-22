@@ -47,7 +47,7 @@ You are welcome to enable various models based on your business requirements.
 | baichuan-inc/Baichuan2-13B-Chat            | Baichuan 2 (7B, 13B)           | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | baidu/ERNIE-4.5-21B-A3B-PT                 | ERNIE-4.5 (4.5, 4.5MoE series) | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | openbmb/MiniCPM3-4B                        | MiniCPM (v3, 4B)               | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| Kimi/Kimi-K2-Think                         | Kimi                           | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| Kimi/Kimi-K2-Thinking                      | Kimi                           | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | openai/gpt-oss-120b                        | GPTOSS                         |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
 
 ## Multimodal Language Models
