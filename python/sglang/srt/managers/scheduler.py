@@ -959,9 +959,10 @@ class Scheduler(
             self.mm_receiver = MMReceiver(
                 self.server_args,
                 hf_config=self.model_config.hf_config,
-                tp_rank=self.tp_rank,
                 pp_rank=self.pp_rank,
+                tp_rank=self.tp_rank,
                 tp_group=self.tp_group,
+                scheduler=self,
             )
 
     def init_overlap(self):
@@ -1260,7 +1261,16 @@ class Scheduler(
             and self.server_args.language_only
             and self.server_args.encoder_transfer_backend == "zmq_to_scheduler"
         ):
-            recv_reqs = self.mm_receiver.process_waiting_requests(recv_reqs)
+            recv_reqs, abort_reqs = self.mm_receiver.process_waiting_requests(recv_reqs)
+            for req, error_msg, error_code in abort_reqs:
+
+                status_code = (
+                    HTTPStatus.BAD_REQUEST
+                    if error_code == 400
+                    else HTTPStatus.INTERNAL_SERVER_ERROR
+                )
+                prepare_abort(req, error_msg, status_code=status_code)
+                self.stream_output([req], req.return_logprob)
 
         if self.enable_trace:
             for req in recv_reqs:
