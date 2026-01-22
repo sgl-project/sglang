@@ -565,7 +565,7 @@ def process_result(response, sample, answer_dict, out_samples):
         pred_answer = response
 
     out_samples[sample["id"]] = {
-        "pred_ans": pred_answer,
+        "pred_answer": pred_answer,
         "original_response": sample["original_response"],
         "ground_truth": sample["answer"],
         "question_type": sample["question_type"],
@@ -591,7 +591,7 @@ def eval_result(model_answer_path, answer_dict, eval_output_path=None):
         if isinstance(parsed_pred, str):
             parsed_pred = parsed_pred
         elif isinstance(parsed_pred, dict):
-            parsed_pred = parsed_pred["pred_ans"]
+            parsed_pred = parsed_pred["pred_answer"]
         else:
             raise ValueError(f"Unknown type of parsed_pred: {type(parsed_pred)}")
         category = "_".join(data_id.split("_")[1:-1])
