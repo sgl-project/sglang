@@ -172,13 +172,10 @@ exclude = [
 [tool.setuptools_scm]
 root = ".."
 version_file = "sglang/_version.py"
-# Custom git describe that ensures unique versions even when building at exact tags
-# When distance=0 (at tag), use timestamp as distance to ensure dev number is present
-# Examples:
-#   v0.5.6.post2-1344-ghash → 0.5.6.post2.dev1344+ghash (normal case)
-#   v0.5.7-0-ghash → 0.5.7.dev20260122002631+ghash (at tag, uses timestamp)
-# This ensures wheel names are always unique: sglang-0.5.x.postY.devZ-py3-none-any.whl
-git_describe_command = ["bash", "-c", "DESC=$(git describe --tags --long --match 'v*'); TAG=$(echo $DESC | cut -d- -f1); DIST=$(echo $DESC | cut -d- -f2); HASH=$(echo $DESC | cut -d- -f3); if [ \"$DIST\" = \"0\" ]; then DIST=$(date -u +%Y%m%d%H%M%S); fi; echo \"${TAG}-${DIST}-${HASH}\""]
+# Force a minimum distance of 1 to ensure dev version is always present
+# This prevents tags at distance=0 from producing plain versions like "0.5.7"
+# Instead we get "0.5.7.dev1" which creates unique wheel names
+git_describe_command = ["bash", "-c", "DESC=$(git describe --tags --long --match 'v*' 2>/dev/null || echo 'v0.0.0-0-g0000000'); TAG=$(echo \"$DESC\" | cut -d- -f1); DIST=$(echo \"$DESC\" | cut -d- -f2); HASH=$(echo \"$DESC\" | cut -d- -f3-); test \"$DIST\" = '0' && DIST=1; echo \"${TAG}-${DIST}-${HASH}\""]
 # Allow editable installs even when .git metadata is not available.
 fallback_version = "0.0.0.dev0"
 
