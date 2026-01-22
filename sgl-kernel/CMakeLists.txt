@@ -315,6 +315,7 @@ set(SOURCES
 
     "csrc/kvcacheio/transfer.cu"
     "csrc/mamba/causal_conv1d.cu"
+    "csrc/mem_cache/sparse/quest_kernels.cu"
     "csrc/memory/store.cu"
     "csrc/memory/weak_ref_tensor.cpp"
 
