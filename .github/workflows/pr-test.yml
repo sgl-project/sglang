@@ -1307,12 +1307,12 @@ jobs:
           fi
           python3 run_suite.py --suite per-commit-8-gpu-h200 --auto-partition-id ${{ matrix.part }} --auto-partition-size 4 $RETRY_FLAG $CONTINUE_ON_ERROR_FLAG
 
-  unit-test-backend-8-gpu-h20:
+  stage-c-test-8-gpu-h20:
     needs: [check-changes, call-gate, wait-for-stage-b]
     if: |
       always() &&
       (
-        (inputs.target_stage == 'unit-test-backend-8-gpu-h20') ||
+        (inputs.target_stage == 'stage-c-test-8-gpu-h20') ||
         (
           !inputs.target_stage &&
           ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
@@ -1359,14 +1359,14 @@ jobs:
           if [[ "${{ needs.check-changes.outputs.continue_on_error }}" == "true" ]]; then
             CONTINUE_ON_ERROR_FLAG="--continue-on-error"
           fi
-          python3 run_suite.py --suite per-commit-8-gpu-h20 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 $RETRY_FLAG $CONTINUE_ON_ERROR_FLAG
+          python3 run_suite.py --suite stage-c-test-8-gpu-h20 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 $RETRY_FLAG $CONTINUE_ON_ERROR_FLAG
 
-  unit-test-deepep-4-gpu:
+  stage-c-test-deepep-4-gpu:
     needs: [check-changes, call-gate, wait-for-stage-b]
     if: |
       always() &&
       (
-        (inputs.target_stage == 'unit-test-deepep-4-gpu') ||
+        (inputs.target_stage == 'stage-c-test-deepep-4-gpu') ||
         (
           !inputs.target_stage &&
           ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
@@ -1408,7 +1408,7 @@ jobs:
           if [[ "${{ needs.check-changes.outputs.continue_on_error }}" == "true" ]]; then
             CONTINUE_ON_ERROR_FLAG="--continue-on-error"
           fi
-          python3 run_suite.py --suite per-commit-4-gpu-deepep $RETRY_FLAG $CONTINUE_ON_ERROR_FLAG
+          python3 run_suite.py --suite stage-c-test-deepep-4-gpu $RETRY_FLAG $CONTINUE_ON_ERROR_FLAG
 
   unit-test-deepep-8-gpu:
     needs: [check-changes, call-gate, wait-for-stage-b]
@@ -1459,12 +1459,12 @@ jobs:
           fi
           python3 run_suite.py --suite per-commit-8-gpu-h200-deepep $RETRY_FLAG $CONTINUE_ON_ERROR_FLAG
 
-  unit-test-backend-4-gpu-b200:
+  stage-c-test-4-gpu-b200:
     needs: [check-changes, call-gate, wait-for-stage-b]
     if: |
       always() &&
       (
-        (inputs.target_stage == 'unit-test-backend-4-gpu-b200') ||
+        (inputs.target_stage == 'stage-c-test-4-gpu-b200') ||
         (
           !inputs.target_stage &&
           ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
@@ -1511,7 +1511,7 @@ jobs:
           if [[ "${{ needs.check-changes.outputs.continue_on_error }}" == "true" ]]; then
             CONTINUE_ON_ERROR_FLAG="--continue-on-error"
           fi
-          IS_BLACKWELL=1 python3 run_suite.py --suite per-commit-4-gpu-b200 --auto-partition-id ${{ matrix.part }} --auto-partition-size 3 --timeout-per-file 1800 $RETRY_FLAG $CONTINUE_ON_ERROR_FLAG
+          IS_BLACKWELL=1 python3 run_suite.py --suite stage-c-test-4-gpu-b200 --auto-partition-id ${{ matrix.part }} --auto-partition-size 3 --timeout-per-file 1800 $RETRY_FLAG $CONTINUE_ON_ERROR_FLAG
 
   unit-test-backend-4-gpu-gb200:
     needs: [check-changes, call-gate, wait-for-stage-b, sgl-kernel-build-wheels-arm]
@@ -1592,12 +1592,12 @@ jobs:
         stage-c-test-large-4-gpu,
         stage-b-test-4-gpu-b200,
         stage-c-test-4-gpu-h100,
-        unit-test-backend-8-gpu-h20,
+        stage-c-test-8-gpu-h20,
         stage-c-test-8-gpu-h200,
-        unit-test-deepep-4-gpu,
-        unit-test-deepep-8-gpu,
-        unit-test-backend-4-gpu-b200,
-        unit-test-backend-4-gpu-gb200,
+        stage-c-test-deepep-4-gpu,
+        # unit-test-deepep-8-gpu,  # Disabled, see #17175
+        stage-c-test-4-gpu-b200,
+        # unit-test-backend-4-gpu-gb200,  # Disabled: GB200 runner needs repair
       ]
     if: always()
     runs-on: ubuntu-latest

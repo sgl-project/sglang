@@ -49,9 +49,11 @@ suites = {
         TestFile("ep/test_deepep_small.py", 531),
         TestFile("ep/test_mooncake_ep_small.py", 660),
     ],
-    "per-commit-8-gpu-h200-deepep": [
-        TestFile("ep/test_deepep_large.py", 563),
-    ],
+    # Disabled: IBGDA/cudaHostRegister environment issues on 8-GPU runner, see #17175
+    # 4-GPU DeepEP tests provide sufficient coverage
+    # "per-commit-8-gpu-h200-deepep": [
+    #     TestFile("ep/test_deepep_large.py", 563),
+    # ],
     # quantization_test suite migrated to test/registered/quant/
     "__not_in_ci__": [
         TestFile("test_release_memory_occupation.py", 200),  # Temporarily disabled
