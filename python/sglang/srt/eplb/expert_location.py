@@ -57,9 +57,9 @@ class ExpertLocationMetadata:
 
     @property
     def num_local_physical_experts(self) -> int:
-        ans, remainder = divmod(self.num_physical_experts, self.ep_size)
+        answer, remainder = divmod(self.num_physical_experts, self.ep_size)
         assert remainder == 0
-        return ans
+        return answer
 
     @property
     def num_logical_experts(self) -> int:
