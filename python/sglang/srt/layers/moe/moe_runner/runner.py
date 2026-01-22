@@ -12,7 +12,7 @@ from sglang.srt.layers.moe.moe_runner.base import (
 from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmRunnerCore
 from sglang.srt.layers.moe.moe_runner.triton import TritonRunnerCore
 from sglang.srt.layers.moe.moe_runner.triton_kernels import TritonKernelsRunnerCore
-from sglang.srt.hardware_backend.npu.quantization.torch_npu_kernels import TorchNpuKernelsRunnerCore
+from sglang.srt.hardware_backend.npu.moe.torch_npu_kernels import TorchNpuKernelsRunnerCore
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 
 if TYPE_CHECKING:
