@@ -60,8 +60,12 @@ impl HashRing {
 
             // Create multiple virtual nodes per worker
             for vnode in 0..VIRTUAL_NODES_PER_WORKER {
-                let vnode_key = format!("{}#{}", url, vnode);
-                let pos = Self::hash_position(&vnode_key);
+                let mut hasher = blake3::Hasher::new();
+                hasher.update(url_bytes);
+                hasher.update(b"#");
+                hasher.update(&(vnode as u64).to_le_bytes());
+                let hash = hasher.finalize();
+                let pos = u64::from_le_bytes(hash.as_bytes()[..8].try_into().unwrap());
                 entries.push((pos, Arc::clone(&url)));
             }
         }
