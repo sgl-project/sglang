@@ -414,7 +414,7 @@ class MMEncoder:
 
             if mm_embedding is None:
                 with torch.inference_mode():
-                    mm_embedding: torch.Tensor = self.model.get_feature_fn([mm_item])
+                    mm_embedding: torch.Tensor = get_feature_fn([mm_item])
                     mm_embedding = mm_embedding.cpu()
                 if len(mm_embedding.shape) != 2:
                     mm_embedding = mm_embedding.reshape(-1, mm_embedding.shape[-1])
@@ -503,6 +503,7 @@ class MMEncoder:
                     num_parts,
                     part_idx,
                     None,
+                    modality,
                     error_msg=error_msg,
                     error_code=error_code,
                 )
