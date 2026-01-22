@@ -192,6 +192,7 @@ class TestAbortAllWithRetraction(CustomTestCase):
                         )
                         self.assertGreater(len(result.get("text", "")), 0)
                         self.assertIsNotNone(meta_info.get("weight_version"))
+                        self.assertGreater(meta_info.get("e2e_latency"), 0)
                         self.assertEqual(
                             len(meta_info.get("output_token_logprobs", [])),
                             len(output_ids),
