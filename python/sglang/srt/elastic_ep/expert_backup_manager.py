@@ -47,17 +47,16 @@ class ExpertBackupManager:
         self.idmx = (self.expert_num // self.engine_num) * (self.engine_rank + 1)
         context = zmq.Context(2)
         # TODO (stage 100): stop using localhost and extend to real multinode
-        self.recv_from_expert_location_updater = get_zmq_socket(
+        self.recv_from_expert_backup_client = get_zmq_socket(
             context, zmq.PULL, f"tcp://127.0.0.1:{10000 + server_args.node_rank * 2}", True
         )
-        self.send_to_expert_location_updater = context.socket(zmq.PUB)
-        self.send_to_expert_location_updater.bind(f"tcp://{get_local_ip_auto()}:{10000 + server_args.node_rank * 2 + 1}")
+        self.send_to_expert_backup_client = context.socket(zmq.PUB)
+        self.send_to_expert_backup_client.bind(f"tcp://{get_local_ip_auto()}:{10000 + server_args.node_rank * 2 + 1}")
 
     def backup_weights_from_disk(self):
         load_config = LoadConfig(load_format=self.load_format)
         loader = get_model_loader(load_config, self.model_config)
 
-        # TODO (stage 2): only load a subset of the experts
         with set_default_torch_dtype(self.model_config.dtype):
             iter = loader._get_weights_iterator(
                 DefaultModelLoader.Source.init_new(self.model_config, None)
@@ -140,7 +139,7 @@ class ExpertBackupManager:
         while True:
             while True:
                 try:
-                    recv_req = self.recv_from_expert_location_updater.recv_pyobj(zmq.NOBLOCK)
+                    recv_req = self.recv_from_expert_backup_client.recv_pyobj(zmq.NOBLOCK)
                 except zmq.ZMQError:
                     break
                 logger.info("recv_req: %s", recv_req)
@@ -152,7 +151,7 @@ class ExpertBackupManager:
                     session_id=self.session_id,
                     buffer_size=self.continuous_buffer.numel() * self.continuous_buffer.element_size()
                 )
-                self.send_to_expert_location_updater.send_pyobj(back_req)
+                self.send_to_expert_backup_client.send_pyobj(back_req)
 
 
 def run_expert_backup_manager_process(
