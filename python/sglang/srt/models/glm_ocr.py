@@ -218,8 +218,6 @@ class GlmOcrVisionModel(Glm4vVisionModel):
                 for layer_idx in range(depth)
             ]
         )
-        print(vision_config.out_hidden_size * vision_config.in_channels)
-        breakpoint()
         self.merger = GlmOcrVisionPatchMerger(
             d_model=vision_config.out_hidden_size,
             context_dim=vision_config.out_hidden_size * vision_config.in_channels,
