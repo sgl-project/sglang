@@ -15,7 +15,7 @@ if TYPE_CHECKING:
 
 from sglang.srt.layers.moe.utils import get_moe_runner_backend
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
-from sglang.srt.hardware_backend.npu.quantization.torch_npu_kernels import TorchNpuKernelsQuantInfo
+from sglang.srt.hardware_backend.npu.moe.torch_npu_kernels import TorchNpuKernelsQuantInfo
 
 
 def npu_fused_moe_without_routing_weights_bf16(
