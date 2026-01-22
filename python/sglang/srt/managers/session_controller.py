@@ -22,7 +22,7 @@ class SessionReqNode:
     def __init__(
         self,
         req: Req,
-        parent=None,
+        parent: Optional["SessionReqNode"] = None,
         childs=None,
     ):
         self.req = req
