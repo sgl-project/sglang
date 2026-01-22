@@ -1,10 +1,10 @@
 # Comprehensive test for hybrid parallelism (DP/TP attention, DP/TP Dense FFN, TP/EP Sparse FFN, DP/VP LM head) plus speculative decoding.
-# These tests are not run by default but can be launched on demand.
 
 import unittest
 from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST,
@@ -14,6 +14,10 @@ from sglang.test.test_utils import (
     CustomTestCase,
     popen_launch_server,
 )
+
+# 60 test classes testing hybrid parallelism configurations
+# Each test launches server + runs MMLU eval (~90s per test)
+register_cuda_ci(est_time=5400, suite="weekly-8-gpu-h200", nightly=True)
 
 
 class Test00(CustomTestCase):
