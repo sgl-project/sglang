@@ -23,7 +23,10 @@ from sglang.multimodal_gen.runtime.layers.triton_ops import (
     rms_norm_fn,
     triton_one_pass_rms_norm,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
+
+_is_cuda = current_platform.is_cuda()
 
 
 # Copied and adapted from sglang
@@ -453,7 +456,7 @@ def apply_qk_norm(
     k_eps = k_norm.variance_epsilon
     # Only try fused path on CUDA and when it won't introduce implicit copies.
     if (
-        q.is_cuda
+        _is_cuda
         and allow_inplace
         and (q_eps == k_eps)
         and can_use_fused_inplace_qknorm(head_dim, q.dtype)

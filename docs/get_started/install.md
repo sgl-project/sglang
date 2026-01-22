@@ -79,9 +79,8 @@ docker run --gpus all \
 
 You can also find the nightly docker images [here](https://hub.docker.com/r/lmsysorg/sglang/tags?name=nightly).
 
-On B300/GB300 (SM103) or CUDA 13 environment, we recommend using the nightly image at `lmsysorg/sglang:dev-cu13` or stable image at `lmsysorg/sglang:latest-cu130-runtime`.
-Please, do not re-install the project as editable inside the docker image, since it will override the version of
-libraries specified by the cu13 docker image.
+Notes:
+- On B300/GB300 (SM103) or CUDA 13 environment, we recommend using the nightly image at `lmsysorg/sglang:dev-cu13` or stable image at `lmsysorg/sglang:latest-cu130-runtime`. Please, do not re-install the project as editable inside the docker image, since it will override the version of libraries specified by the cu13 docker image.
 
 ## Method 4: Using Kubernetes
 
