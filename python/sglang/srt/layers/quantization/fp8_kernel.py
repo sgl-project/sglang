@@ -22,7 +22,11 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 import triton
 import triton.language as tl
-from triton.tools.tensor_descriptor import TensorDescriptor
+
+try:
+    from triton.tools.tensor_descriptor import TensorDescriptor
+except:
+    pass
 
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.utils import (
