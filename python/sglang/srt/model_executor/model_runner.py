@@ -347,13 +347,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 # if there is no aux layer, set to None
                 self.eagle_aux_hidden_state_layer_ids = None
 
-        self.engine_num = server_args.nnodes
-        self.dram_map_list = [None] * self.engine_num
         self.if_backup = False
-        self.session_id_list = [None] * self.engine_num
-        self.transfer_engine = None
-        self.gpu_buffer = None
-        self.buffer_size = None
 
         # Apply the rank zero filter to logger
         if server_args.show_time_cost:
