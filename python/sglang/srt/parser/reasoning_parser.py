@@ -412,8 +412,8 @@ class ReasoningParser:
             kwargs["force_reasoning"] = force_reasoning
 
         if request.continue_final_message and request.messages[-1].role == "assistant":
-                kwargs["continue_final_message"] = True
-                kwargs["previous_content"] = request.messages[-1].content
+            kwargs["continue_final_message"] = True
+            kwargs["previous_content"] = request.messages[-1].content
 
         self.detector = detector_class(**kwargs)
 
