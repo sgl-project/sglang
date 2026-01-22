@@ -236,14 +236,11 @@ def render_message(
             prompt += "\n\n<function_results>"
 
         prompt += tool_output_template.format(content=content)
-
+        
         if tool_call_order == len(assistant_tool_calls):
             prompt += "\n</function_results>"
 
-            if index >= last_user_idx and thinking_mode == "thinking":
-                prompt += "\n\n" + thinking_start_token
-            else:
-                prompt += "\n\n" + thinking_end_token
+            prompt += "\n\n" + thinking_end_token
 
     elif role == "assistant":
         prev_assistant_idx = index
