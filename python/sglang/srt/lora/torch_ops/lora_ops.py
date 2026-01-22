@@ -18,6 +18,8 @@ def sgemm_lora_a_fwd(
 
     num_loras, weight_out_dim, _ = weights.shape
 
+    # Special case optimize: optimize for the case where all LoRA IDs in a batch are the same.
+    # Remove the outer for loop and reduce some slice operations.
     if len(weight_indices) == 1:
         idx = weight_indices[0]
         rank = lora_ranks[idx]
@@ -89,6 +91,8 @@ def sgemm_lora_b_fwd(
             total_seq_len, total_output_dim, dtype=inputs.dtype, device=inputs.device
         )
 
+    # Special case optimize: optimize for the case where all LoRA IDs in a batch are the same.
+    # Remove the outer for loop and reduce some slice operations.
     if len(weight_indices) == 1:
         idx = weight_indices[0]
         rank = lora_ranks[idx]
