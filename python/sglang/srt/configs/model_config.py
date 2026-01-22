@@ -934,7 +934,7 @@ class ModelConfig:
         needs_tf_v5 = is_glm_46vmoe
 
         tf_version = version.parse(tf_version_str)
-        required_version = version.parse("5.0.0")
+        required_version = version.parse("5.0.0dev0")
 
         if tf_version < required_version:
             if needs_tf_v5:
