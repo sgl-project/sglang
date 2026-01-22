@@ -440,12 +440,14 @@ class EAGLEWorker(TpModelWorker):
             )
         else:
             if self.auto_spec:
-                # logger.info(f"[MY LOG] bs {batch.batch_size()}, speculative_num_steps before change: {self.speculative_num_steps}")
                 best_params = self.spec_auto_tuner.get_best_parameters(batch.batch_size())
                 if self.speculative_num_steps != best_params.num_steps:  # if same as last step, no need to update
+                    logger.info(f"[MY LOG] bs {batch.batch_size()}, speculative_num_steps before change: {self.speculative_num_steps}")
                     self.update_member_spec_parameter(best_params)
-                    # logger.info(f"[MY LOG] bs {batch.batch_size()}, speculative_num_steps after change: {self.speculative_num_steps}")
+                    logger.info(f"[MY LOG] bs {batch.batch_size()}, speculative_num_steps after change: {self.speculative_num_steps}")
                     self.set_current_graph_and_backend_by_spec_parameter()
+                else:
+                    logger.info(f"[MY LOG] bs {batch.batch_size()}, speculative_num_steps fixed to {self.speculative_num_steps}")
             with self.draft_tp_context(
                 self.draft_model_runner.tp_group
             ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():

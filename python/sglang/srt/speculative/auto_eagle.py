@@ -41,6 +41,8 @@ class AutoTunerEagle:
             64: TuningParams(3, 1, 4),
             128: TuningParams(1, 1, 2),
         }
+        self.exp_pos_threshold = {1: 0.55, 2: 0.55, 4: 0.6, 8: 0.8, 16: 0.95, 32: 0.91, 64: 0.95, 128: 0.95}
+        self.exp_neg_threshold = {1: 0.5, 2: 0.5, 4: 0.5, 8: 0.5, 16: 0.6, 32: 0.66, 64: 0.65, 128: 0.65}
         # for memory control
         self.step_thres = 6  # control maximum graph number, graph whose num_steps > threshold will be deleted first
         self.reserve_mem = 4
@@ -58,7 +60,7 @@ class AutoTunerEagle:
         # 1. get remaining memory size, determines how many cuda graphs to capture
         available_memory = get_available_gpu_memory(self.device_id, gpu_id, empty_cache=False)
         self.max_num_graphs = int((available_memory - self.reserve_mem) // self.mem_each_graph)
-        logger.info(f"AutoTunerEagle, num_graphs to capture for different steps: {self.max_num_graphs}")
+        logger.info(f"AutoTunerEagle, max num_graphs to capture for different steps: {self.max_num_graphs}")
 
         # load speculative config file
         self._init_speculative_config()
@@ -67,54 +69,26 @@ class AutoTunerEagle:
         self._generate_closest_bs_mapping()
 
         # 2. set accept rate to increase or decrease num_steps for different batchsizes
-        self.thres_positive_accept_rate = {bs: 0.55 for bs in self.bs_steps_mapping.keys()}
-        self.thres_negative_accept_rate = {bs: 0.5 for bs in self.bs_steps_mapping.keys()}
-        for k in self.thres_positive_accept_rate.keys():
-            if k == 4:
-                self.thres_positive_accept_rate[k] = 0.6
-                self.thres_negative_accept_rate[k] = 0.5
-                if self.pos_threshold is not None:
-                    self.thres_positive_accept_rate[k] = self.pos_threshold[0]
-                if self.neg_threshold is not None:
-                    self.thres_negative_accept_rate[k] = self.neg_threshold[0]
-            if k == 8:
-                self.thres_positive_accept_rate[k] = 0.8
-                self.thres_negative_accept_rate[k] = 0.5
-                if self.pos_threshold is not None:
-                    self.thres_positive_accept_rate[k] = self.pos_threshold[1]
-                if self.neg_threshold is not None:
-                    self.thres_negative_accept_rate[k] = self.neg_threshold[1]
-            elif k == 16:
-                self.thres_positive_accept_rate[k] = 0.95
-                self.thres_negative_accept_rate[k] = 0.6
-                if self.pos_threshold is not None:
-                    self.thres_positive_accept_rate[k] = self.pos_threshold[2]
-                if self.neg_threshold is not None:
-                    self.thres_negative_accept_rate[k] = self.neg_threshold[2]
-            elif k == 32:
-                self.thres_positive_accept_rate[k] = 0.91
-                self.thres_negative_accept_rate[k] = 0.66
-                if self.pos_threshold is not None:
-                    self.thres_positive_accept_rate[k] = self.pos_threshold[3]
-                if self.neg_threshold is not None:
-                    self.thres_negative_accept_rate[k] = self.neg_threshold[3]
-            elif k >= 64:
-                self.thres_positive_accept_rate[k] = 0.95
-                self.thres_negative_accept_rate[k] = 0.65
-                if self.pos_threshold is not None:
-                    self.thres_positive_accept_rate[k] = self.pos_threshold[4]
-                if self.neg_threshold is not None:
-                    self.thres_negative_accept_rate[k] = self.neg_threshold[4]
+        self.thres_positive_accept_rate = {bs: self.exp_pos_threshold[bs] for bs in self.bs_steps_mapping.keys()}
+        self.thres_negative_accept_rate = {bs: self.exp_neg_threshold[bs] for bs in self.bs_steps_mapping.keys()}
+        if self.pos_threshold is not None:
+            assert len(self.pos_threshold) == len(self.thres_positive_accept_rate)
+            for i, bs in enumerate(self.thres_positive_accept_rate.keys()):
+                self.thres_positive_accept_rate[bs] = self.pos_threshold[i]
+        if self.neg_threshold is not None:
+            assert len(self.neg_threshold) == len(self.thres_negative_accept_rate)
+            for i, bs in enumerate(self.thres_negative_accept_rate.keys()):
+                self.thres_negative_accept_rate[bs] = self.neg_threshold[i]
         logger.info(f"[MY LOG] AutoTunerEagle, pos_thresholds: {self.thres_positive_accept_rate}; neg_thresholds: {self.thres_negative_accept_rate}")
 
         # 3. initialise recorded speculative parameters
-        self.best_speculative_parameters: Dict[int, TuningParams] = {bs: self.exp_setting[bs] for bs in self.cuda_graph_bs}
+        self.best_speculative_parameters: Dict[int, TuningParams] = {bs: self.exp_setting[bs] for bs in self.bs_list}
         for bs, params in self.best_speculative_parameters.items():
             if params.num_steps not in self.bs_steps_mapping[bs]:
                 self.best_speculative_parameters[bs] = TuningParams(self.bs_steps_mapping[bs][-1], 1, self.bs_steps_mapping[bs][-1] + 1)  # if intuitive params not in setting, reset
         logger.info(f"[MY LOG] AutoTunerEagle, best_speculative_parameters init: {self._print_params()}")
         if self.save_tune_results:
-            self.results = {bs: {num_steps: 0 for num_steps in self.bs_steps_mapping[bs]} for bs in self.cuda_graph_bs}
+            self.results = {bs: {num_steps: 0 for num_steps in self.bs_steps_mapping[bs]} for bs in self.bs_list}
 
     def _init_speculative_config(self):
         """Initialize speculative configuration from config file or use defaults."""
@@ -172,6 +146,8 @@ class AutoTunerEagle:
 
         self.bs_list = list(self.bs_steps_mapping.keys())
         self.bs_list.sort()
+        if self.cuda_graph_bs != self.bs_list:
+            logger.warning(f"AutoTunerEagle, cuda_graph_bs parameter different from speculative config dict, will capture graph according to speculative config.")
 
         self.bs_range_dict = {}
         for i in range(len(self.bs_list) - 1):
@@ -274,6 +250,15 @@ class AutoTunerEagle:
             if closest is not None:
                 self.raw_bs_to_bs[i] = closest
 
+        self.bs_param_fix = {bs: False for bs in self.raw_bs_to_bs.keys()}
+        bs_single_param = []
+        for bs, num_steps in self.bs_steps_mapping.items():
+            if len(num_steps) == 1:
+                bs_single_param.append(bs)
+        for bs in self.bs_param_fix.keys():
+            if self.raw_bs_to_bs[bs] in bs_single_param:
+                self.bs_param_fix[bs] = True
+
     def _print_params(self, bs: int = None):
         msg = ""
         if bs:
@@ -301,9 +286,10 @@ class AutoTunerEagle:
                 self.best_speculative_parameters[bs].num_draft -= 1
 
     def enable_watch_for_batch(self, bs: int):
-        if bs > self.bs_range_dict[32] or bs <= self.bs_range_dict[4]:  # bs <= 6 or bs > 48, tune num_steps
-            return True
-        return False  # bs > 6 and bs <= 48, fix num_steps
+        if bs not in self.bs_param_fix.keys():
+            bs = self.bs_list[-1]
+        logger.info(f"[MY LOG] batchsize {bs} enable_watch: {not self.bs_param_fix[bs]}")
+        return not self.bs_param_fix[bs]
 
     def compute_and_update_best_parameters(self, bs, accept_length, accept_rate, throughput):
         """

@@ -467,7 +467,6 @@ class ServerArgs:
     enable_multi_layer_eagle: bool = False
     # for auto_spec
     auto_spec: bool = False
-    tune_interval: int = 0
     speculative_config_file: Optional[str] = None
     save_tune_results: Optional[str] = None
     neg_threshold: Optional[List[int]] = None
@@ -3760,12 +3759,6 @@ class ServerArgs:
             type=float,
             nargs="+",
             help="Threshold of positive threshold for auto-spec"
-        )
-        parser.add_argument(
-            "--tune-interval",
-            type=int,
-            default=1,
-            help="Dynamic specinfer tuning interval, default to tune in every forward pass.",
         )
         parser.add_argument(
             "--speculative-config-file",
