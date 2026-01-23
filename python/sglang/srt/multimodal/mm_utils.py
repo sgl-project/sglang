@@ -795,7 +795,7 @@ def run_dp_sharded_mrope_vision_model_optimized(
     return out_embeddings
 
 
-def _prepare_local_image_data(
+def prepare_local_image_data(
     items,
     dtype,
 ) -> tuple[torch.Tensor, list, list[int], list[int], list[int]]:

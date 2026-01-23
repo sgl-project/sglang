@@ -73,7 +73,7 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2Model
 from sglang.srt.models.utils import RotaryPosMixin, WeightsMapper, permute_inv
 from sglang.srt.multimodal.mm_utils import (
-    _prepare_local_image_data,
+    prepare_local_image_data,
     run_dp_sharded_mrope_vision_model,
     run_dp_sharded_mrope_vision_model_optimized,
 )
@@ -640,7 +640,7 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
                 grid_thw_list_all,
                 shuffle_indices,
                 gpu_sample_counts,
-            ) = _prepare_local_image_data(items, self.visual.dtype)
+            ) = prepare_local_image_data(items, self.visual.dtype)
 
             # Run DP sharded vision model
             return run_dp_sharded_mrope_vision_model_optimized(
@@ -698,7 +698,7 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
                 grid_thw_list_all,
                 shuffle_indices,
                 gpu_sample_counts,
-            ) = _prepare_local_image_data(items, self.visual.dtype)
+            ) = prepare_local_image_data(items, self.visual.dtype)
 
             # Run DP sharded vision model
             return run_dp_sharded_mrope_vision_model_optimized(
