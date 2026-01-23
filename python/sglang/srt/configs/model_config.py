@@ -806,10 +806,9 @@ class ModelConfig:
         cfg_list = []
         hf_config = self._parse_quant_hf_config()
         modelslim_config = self._find_quant_modelslim_config()
-        if modelslim_config is None:
-            cfg_list.append(hf_config)
-        else:
-            cfg_list.append(modelslim_config)
+        quant_config = modelslim_config or hf_config
+        if quant_config is not None:
+            cfg_list.append(quant_config)
 
         # Filter out None values
         cfg_list = [item for item in cfg_list if item is not None]
