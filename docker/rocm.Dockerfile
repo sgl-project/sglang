@@ -162,6 +162,16 @@ RUN if [ "$BUILD_MOONCAKE" = "1" ]; then \
     fi
 
 # -----------------------
+# FlashInfer with HIP patches (optional, experimental)
+ARG BUILD_FLASHINFER_HIP="0"
+ARG FLASHINFER_REPO="https://github.com/flashinfer-ai/flashinfer.git"
+ARG FLASHINFER_VERSION="main"
+
+RUN if [ "$BUILD_FLASHINFER_HIP" = "1" ]; then \
+        echo "[FlashInfer] Building FlashInfer with HIP patches for ${GPU_ARCH_LIST}"; \
+    fi
+
+# -----------------------
 # Build SGLang
 ARG BUILD_TYPE=all
 
@@ -199,6 +209,20 @@ RUN python -m pip cache purge
 RUN find /sgl-workspace/sglang/python/sglang/srt/layers/quantization/configs/ \
          /sgl-workspace/sglang/python/sglang/srt/layers/moe/fused_moe_triton/configs/ \
          -type f -name '*MI300X*' | xargs -I {} sh -c 'vf_config=$(echo "$1" | sed "s/MI300X/MI300X_VF/"); cp "$1" "$vf_config"' -- {}
+
+# -----------------------
+# Build FlashInfer with HIP patches (if enabled)
+RUN if [ "$BUILD_FLASHINFER_HIP" = "1" ]; then \
+        echo "[FlashInfer HIP] Building FlashInfer with HIP patches..." && \
+        cd /sgl-workspace && \
+        git clone ${FLASHINFER_REPO} flashinfer-hip && \
+        cd flashinfer-hip && \
+        git checkout ${FLASHINFER_VERSION} && \
+        git apply /sgl-workspace/sglang/sgl-kernel/third_party/flashinfer_hip_patches/*.patch && \
+        git submodule update --init --recursive && \
+        AMDGPU_TARGET=$GPU_ARCH_LIST pip install . --no-build-isolation && \
+        echo "[FlashInfer HIP] Build complete!"; \
+    fi
 
 # Install Rust toolchain for sgl-model-gateway
 ENV PATH="/root/.cargo/bin:${PATH}"

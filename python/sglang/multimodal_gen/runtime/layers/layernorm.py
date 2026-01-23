@@ -8,7 +8,6 @@ from typing import Optional, Tuple, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from sgl_kernel import fused_add_rmsnorm, rmsnorm
 
 from sglang.jit_kernel.norm import can_use_fused_inplace_qknorm, fused_inplace_qknorm
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
@@ -25,6 +24,34 @@ from sglang.multimodal_gen.runtime.layers.triton_ops import (
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
+
+# Try to import FlashInfer RMSNorm (works on CUDA, experimental on HIP)
+# Set SGLANG_DISABLE_FLASHINFER=1 to force Triton fallback for comparison
+import os
+
+_flashinfer_rmsnorm_available = False
+if os.environ.get("SGLANG_DISABLE_FLASHINFER", "0") != "1":
+    try:
+        from flashinfer.norm import rmsnorm as flashinfer_rmsnorm
+
+        _flashinfer_rmsnorm_available = True
+        logger.debug("FlashInfer RMSNorm available")
+    except ImportError:
+        flashinfer_rmsnorm = None
+        logger.debug("FlashInfer RMSNorm not available")
+else:
+    flashinfer_rmsnorm = None
+    logger.info("FlashInfer disabled via SGLANG_DISABLE_FLASHINFER=1")
+
+# Import sgl_kernel RMSNorm (CUDA only)
+try:
+    from sgl_kernel import fused_add_rmsnorm, rmsnorm
+except ImportError:
+    fused_add_rmsnorm = None
+    rmsnorm = None
 
 _is_cuda = current_platform.is_cuda()
 
@@ -140,8 +167,39 @@ class RMSNorm(CustomOp):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        # ROCm builds of sgl-kernel do not expose rmsnorm custom ops yet.
-        return self.forward_native(x, residual)
+        # Try FlashInfer first (if built with HIP patches), fall back to Triton
+        if _flashinfer_rmsnorm_available:
+            if not getattr(self.__class__, "_logged_flashinfer", False):
+                import os
+                if os.environ.get("SGLANG_LOG_KERNEL", "0") == "1":
+                    logger.info("[FlashInfer] Using FlashInfer RMSNorm kernel on HIP")
+                self.__class__._logged_flashinfer = True
+            if residual is not None:
+                x = x + residual
+                residual = x
+            # FlashInfer only supports 2D/3D input, handle 4D by reshaping
+            orig_shape = x.shape
+            if x.dim() == 4:
+                # [batch, seq, heads, head_dim] -> [batch*seq, heads, head_dim]
+                x = x.reshape(-1, x.shape[2], x.shape[3])
+            # Ensure weight dtype matches input dtype
+            weight = self.weight.data
+            if weight.dtype != x.dtype:
+                weight = weight.to(x.dtype)
+            out = flashinfer_rmsnorm(x, weight, self.variance_epsilon)
+            # Reshape back if needed
+            if len(orig_shape) == 4:
+                out = out.reshape(orig_shape)
+            if residual is None:
+                return out
+            return out, residual
+        # Triton fallback - works well on AMD GPUs
+        if not getattr(self.__class__, "_logged_triton", False):
+            import os
+            if os.environ.get("SGLANG_LOG_KERNEL", "0") == "1":
+                logger.info("[Triton] Using Triton RMSNorm fallback on HIP")
+            self.__class__._logged_triton = True
+        return self.forward_triton(x, residual)
 
     def extra_repr(self) -> str:
         s = f"hidden_size={self.weight.data.size(0)}"
