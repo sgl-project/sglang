@@ -4022,7 +4022,7 @@ class ServerArgs:
             "--hicache-storage-backend-extra-config",
             type=str,
             default=ServerArgs.hicache_storage_backend_extra_config,
-            help="A dictionary in JSON string format containing extra configuration for the storage backend.",
+            help="A dictionary in JSON string format, or a string starting with a leading '@' and a config file in JSON/YAML/TOML format, containing extra configuration for the storage backend.",
         )
 
         # Hierarchical sparse attention
