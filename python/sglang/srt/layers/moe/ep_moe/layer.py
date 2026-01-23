@@ -9,16 +9,17 @@ from sglang.srt.batch_overlap.per_expert_overlap import PeoOverlapArgs
 
 from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
-    NPUW4A16Int4DynamicMoEMethod,
-)
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.moe import (
     get_deepep_mode,
     get_moe_a2a_backend,
     get_moe_runner_backend,
 )
-from sglang.srt.layers.moe.fused_moe_triton.layer import FlashInferFusedMoE, FusedMoE
+from sglang.srt.layers.moe.fused_moe_triton.layer import (
+    FlashInferFusedMoE,
+    FusedMoE,
+    moe_forward_piecewise_cuda_graph_impl,
+)
 from sglang.srt.layers.moe.token_dispatcher.deepep import (
     DeepEPLLCombineInput,
     DeepEPNormalCombineInput,
@@ -33,6 +34,9 @@ from sglang.srt.layers.moe.utils import (
     get_peo_down_deepgemm_num_sms,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors_moe import (
+    NPUCompressedTensorsW4A16Int4DynamicMoEMethod,
+)
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config, W4AFp8MoEMethod
@@ -167,7 +171,7 @@ class DeepEPMoE(FusedMoE):
             assert TopKOutputChecker.format_is_standard(
                 topk_output
             ), "Only standard topk output is supported for piecewise cuda graph"
-            return torch.ops.sglang.moe_forward_piecewise_cuda_graph_impl(
+            return moe_forward_piecewise_cuda_graph_impl(
                 hidden_states,
                 topk_output.topk_weights,
                 topk_output.topk_ids,
@@ -381,7 +385,7 @@ class DeepEPMoE(FusedMoE):
             else:
                 input_quant = get_bool_env_var("DEEP_NORMAL_MODE_USE_INT8_QUANT")
                 if not input_quant and not isinstance(
-                    self.quant_method, NPUW4A16Int4DynamicMoEMethod
+                    self.quant_method, NPUCompressedTensorsW4A16Int4DynamicMoEMethod
                 ):
                     hidden_states, hidden_states_scale = torch_npu.npu_dynamic_quant(
                         hidden_states

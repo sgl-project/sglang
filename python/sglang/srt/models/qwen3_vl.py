@@ -32,13 +32,17 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.vision import VisionAttention
+from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
-from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
+from sglang.srt.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
@@ -59,7 +63,7 @@ from sglang.srt.models.utils import (
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
 from sglang.srt.multimodal.vit_cuda_graph_runner import ViTCudaGraphRunner
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix, get_int_env_var
+from sglang.srt.utils import add_prefix, get_int_env_var, is_npu
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
 logger = logging.getLogger(__name__)
@@ -278,6 +282,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         use_data_parallel: bool = False,
     ) -> None:
         super().__init__()
+        self.pp_group = get_pp_group()
         self.hidden_size = vision_config.hidden_size
         self.num_heads = vision_config.num_heads
         self.num_position_embeddings = vision_config.num_position_embeddings
@@ -297,7 +302,17 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             1 + len(self.deepstack_visual_indexes)
         )
         self.patch_embed = Qwen3VLVisionPatchEmbed(config=vision_config)
-        self.pos_embed = nn.Embedding(self.num_position_embeddings, self.hidden_size)
+        if self.pp_group.is_first_rank:
+            self.pos_embed = VocabParallelEmbedding(
+                self.num_position_embeddings,
+                self.hidden_size,
+                quant_config=quant_config,
+                enable_tp=not is_dp_attention_enabled(),
+                prefix=add_prefix("pos_embed", prefix),
+            )
+        else:
+            self.pos_embed = PPMissingLayer()
+
         norm_layer = partial(nn.LayerNorm, eps=norm_eps)
         head_dim = self.hidden_size // self.num_heads
         self.rotary_pos_emb = get_rope(
@@ -431,9 +446,12 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
 
         # compute cu_seqlens
         cu_seqlens = compute_cu_seqlens_from_grid_numpy(grid_thw)
-
+        # cu_seqlens must be on cpu because of npu_flash_attention_unpad operator restriction
+        if not is_npu():
+            cu_seqlens = cu_seqlens.to(self.device, non_blocking=True)
+        else:
+            cu_seqlens = cu_seqlens.to("cpu")
         x = x.unsqueeze(1)
-        cu_seqlens = cu_seqlens.to(self.device, non_blocking=True)
 
         deepstack_feature_lists = []
         num_deepstack_captured = 0
@@ -549,6 +567,18 @@ class Qwen3LLMModel(Qwen3Model):
             len(config.vision_config.deepstack_visual_indexes)
         )
 
+    def get_deepstack_embeds(
+        self, layer_idx: int, input_deepstack_embeds: Optional[torch.Tensor]
+    ) -> Optional[torch.Tensor]:
+        """Get deepstack embeddings for a given layer index, or None if not applicable."""
+        if (
+            input_deepstack_embeds is None
+            or layer_idx not in self.deepstack_embed_to_decoder_layer
+        ):
+            return None
+        sep = self.hidden_size * layer_idx
+        return input_deepstack_embeds[:, sep : sep + self.hidden_size]
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -580,20 +610,26 @@ class Qwen3LLMModel(Qwen3Model):
                     hidden_states + residual if residual is not None else hidden_states
                 )
 
+            # SGLang applies residual at the START of the next layer, not at the END like HuggingFace.
+            # See: https://github.com/huggingface/transformers/blob/v5.0.0rc0/src/transformers/models/qwen3_vl/modeling_qwen3_vl.py#L549
+            # To match HF behavior, deepstack must be added AFTER residual: (hidden_states + residual) + deepstack
+            # The order matters because addition with different tensors is not associative in practice.
+            # Deepstack for prev_layer is applied at the start of current layer via post_residual_addition.
+            deepstack_embeds = self.get_deepstack_embeds(
+                layer_idx - 1, input_deepstack_embeds
+            )
             hidden_states, residual = layer(
                 positions,
                 hidden_states,
                 forward_batch,
                 residual,
+                post_residual_addition=deepstack_embeds,
             )
 
-            # process deepstack
-            if (
-                input_deepstack_embeds is not None
-                and layer_idx in self.deepstack_embed_to_decoder_layer
-            ):
-                sep = self.hidden_size * layer_idx
-                hidden_states += input_deepstack_embeds[:, sep : sep + self.hidden_size]
+        # Handle deepstack for the last processed layer if it exists.
+        last_deepstack = self.get_deepstack_embeds(
+            self.end_layer - 1, input_deepstack_embeds
+        )
 
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
@@ -607,7 +643,9 @@ class Qwen3LLMModel(Qwen3Model):
                 if residual is None:
                     hidden_states = self.norm(hidden_states)
                 else:
-                    hidden_states, _ = self.norm(hidden_states, residual)
+                    hidden_states, _ = self.norm(
+                        hidden_states, residual, post_residual_addition=last_deepstack
+                    )
 
         if len(aux_hidden_states) == 0:
             return hidden_states
@@ -814,10 +852,18 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         return torch.cat(all_chunk_embeds, dim=0)
 
     def get_video_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+        for item in items:
+            item.feature = item.feature.to(self.visual.device)
         # in qwen-vl, last dim is the same
         pixel_values = torch.cat([item.feature for item in items], dim=0).type(
             self.visual.dtype
         )
+        # Memory optimization for item.feature:
+        # 1. item.feature is released when request finished
+        # 2. High concurrency may cause device OOM due to delayed release
+        # 3. Fix: Offload item.feature to CPU, move to device only when needed
+        for item in items:
+            item.feature = item.feature.to("cpu")
         video_grid_thw = torch.concat([item.video_grid_thw for item in items], dim=0)
         assert pixel_values.dim() == 2, pixel_values.dim()
         assert video_grid_thw.dim() == 2, video_grid_thw.dim()
@@ -924,6 +970,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             if (
                 not is_visual
                 and layer_id is not None
+                and hasattr(self, "model")
                 and hasattr(self.model, "start_layer")
                 and (
                     layer_id < self.model.start_layer

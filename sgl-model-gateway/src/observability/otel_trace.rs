@@ -29,6 +29,11 @@ use tracing_subscriber::{
 
 use super::events::get_module_path as events_module_path;
 
+/// Whether OpenTelemetry tracing is enabled.
+///
+/// This flag guards access to TRACER and PROVIDER. We use Release/Acquire
+/// ordering to ensure proper synchronization: writes to TRACER/PROVIDER
+/// happen-before the Release store, and Acquire loads happen-before reads.
 static ENABLED: AtomicBool = AtomicBool::new(false);
 static TRACER: OnceLock<SdkTracer> = OnceLock::new();
 static PROVIDER: OnceLock<TracerProvider> = OnceLock::new();
@@ -38,8 +43,8 @@ static ALLOWED_TARGETS: OnceLock<[&'static str; 3]> = OnceLock::new();
 fn get_allowed_targets() -> &'static [&'static str; 3] {
     ALLOWED_TARGETS.get_or_init(|| {
         [
-            "sgl_model_gateway::otel-trace",
-            "sgl_model_gateway::observability::otel_trace",
+            "smg::otel-trace",
+            "smg::observability::otel_trace",
             events_module_path(),
         ]
     })
@@ -47,7 +52,7 @@ fn get_allowed_targets() -> &'static [&'static str; 3] {
 
 /// Filter that only allows specific module targets to be exported to OTEL.
 #[derive(Clone, Copy, Default)]
-pub struct CustomOtelFilter;
+pub(crate) struct CustomOtelFilter;
 
 impl CustomOtelFilter {
     #[inline]
@@ -84,7 +89,8 @@ where
 
 pub fn otel_tracing_init(enable: bool, otlp_endpoint: Option<&str>) -> Result<()> {
     if !enable {
-        ENABLED.store(false, Ordering::Relaxed);
+        // Use Release to ensure any prior OTEL state changes are visible
+        ENABLED.store(false, Ordering::Release);
         return Ok(());
     }
 
@@ -116,10 +122,8 @@ pub fn otel_tracing_init(enable: bool, otlp_endpoint: Option<&str>) -> Result<()
         .with_batch_config(batch_config)
         .build();
 
-    let resource = Resource::default().merge(&Resource::new(vec![KeyValue::new(
-        "service.name",
-        "sgl-router",
-    )]));
+    let resource =
+        Resource::default().merge(&Resource::new(vec![KeyValue::new("service.name", "smg")]));
 
     let provider = TracerProvider::builder()
         .with_span_processor(span_processor)
@@ -130,7 +134,7 @@ pub fn otel_tracing_init(enable: bool, otlp_endpoint: Option<&str>) -> Result<()
         .set(provider.clone())
         .map_err(|_| anyhow::anyhow!("Provider already initialized"))?;
 
-    let tracer = provider.tracer("sgl-router");
+    let tracer = provider.tracer("smg");
 
     TRACER
         .set(tracer)
@@ -138,7 +142,9 @@ pub fn otel_tracing_init(enable: bool, otlp_endpoint: Option<&str>) -> Result<()
 
     let _ = global::set_tracer_provider(provider);
 
-    ENABLED.store(true, Ordering::Relaxed);
+    // Use Release ordering: all writes to TRACER/PROVIDER happen-before this store,
+    // so any thread that loads ENABLED with Acquire will see the initialized state.
+    ENABLED.store(true, Ordering::Release);
 
     eprintln!("[tracing] OpenTelemetry initialized successfully");
     Ok(())
@@ -165,9 +171,13 @@ where
     Ok(Box::new(layer))
 }
 
+/// Check if OpenTelemetry tracing is enabled.
+///
+/// Uses Acquire ordering to synchronize with the Release store in `otel_tracing_init`,
+/// ensuring that if this returns true, TRACER and PROVIDER are fully initialized.
 #[inline]
 pub fn is_otel_enabled() -> bool {
-    ENABLED.load(Ordering::Relaxed)
+    ENABLED.load(Ordering::Acquire)
 }
 
 pub async fn flush_spans_async() -> Result<()> {
@@ -188,9 +198,11 @@ pub async fn flush_spans_async() -> Result<()> {
 }
 
 pub fn shutdown_otel() {
-    if ENABLED.load(Ordering::Relaxed) {
+    // Use Acquire to ensure we see any prior OTEL operations
+    if ENABLED.load(Ordering::Acquire) {
         global::shutdown_tracer_provider();
-        ENABLED.store(false, Ordering::Relaxed);
+        // Use Release to ensure shutdown completes before flag is cleared
+        ENABLED.store(false, Ordering::Release);
         eprintln!("[tracing] OpenTelemetry shut down");
     }
 }

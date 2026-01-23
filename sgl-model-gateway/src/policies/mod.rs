@@ -5,7 +5,12 @@
 
 use std::{fmt::Debug, sync::Arc};
 
-use crate::core::{HashRing, Worker};
+use async_trait::async_trait;
+
+use crate::{
+    core::{HashRing, Worker},
+    mesh::OptionalMeshSyncManager,
+};
 
 mod bucket;
 mod cache_aware;
@@ -23,7 +28,7 @@ pub use bucket::BucketPolicy;
 pub use cache_aware::CacheAwarePolicy;
 pub use consistent_hashing::ConsistentHashingPolicy;
 pub use factory::PolicyFactory;
-pub use manual::ManualPolicy;
+pub use manual::{ManualConfig, ManualPolicy};
 pub use power_of_two::PowerOfTwoPolicy;
 pub use prefix_hash::{PrefixHashConfig, PrefixHashPolicy};
 pub use random::RandomPolicy;
@@ -35,6 +40,7 @@ pub use tree::PrefixMatchResult;
 ///
 /// This trait provides a unified interface for implementing routing algorithms
 /// that can work with both regular single-worker selection and PD dual-worker selection.
+#[async_trait]
 pub trait LoadBalancingPolicy: Send + Sync + Debug {
     /// Select a single worker from the available workers
     ///
@@ -44,7 +50,11 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
     /// # Arguments
     /// * `workers` - Available workers to select from
     /// * `info` - Additional information for routing decisions
-    fn select_worker(&self, workers: &[Arc<dyn Worker>], info: &SelectWorkerInfo) -> Option<usize>;
+    async fn select_worker(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo<'_>,
+    ) -> Option<usize>;
 
     /// Update policy state after request completion
     ///
@@ -67,6 +77,11 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
     /// This is called periodically with current load information for load-aware policies.
     fn update_loads(&self, _loads: &std::collections::HashMap<String, isize>) {
         // Default: no-op for policies that don't use load information
+    }
+
+    /// Set mesh sync manager
+    fn set_mesh_sync(&mut self, _mesh_sync: OptionalMeshSyncManager) {
+        // Default: no-op for policies that don't use mesh sync
     }
 
     /// Reset any internal state
@@ -165,8 +180,8 @@ mod tests {
     use super::*;
     use crate::core::{BasicWorkerBuilder, WorkerType};
 
-    #[test]
-    fn test_get_healthy_worker_indices() {
+    #[tokio::test]
+    async fn test_get_healthy_worker_indices() {
         let workers: Vec<Arc<dyn Worker>> = vec![
             Arc::new(
                 BasicWorkerBuilder::new("http://w1:8000")
