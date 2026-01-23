@@ -7,7 +7,9 @@ register_npu_ci(est_time=400, suite="nightly-1-npu-a3", nightly=True)
 
 
 class TestLlama3211BVisionInstruct(TestVLMModels):
-    model = "/root/.cache/modelscope/hub/models/LLM-Research/Llama-3.2-11B-Vision-Instruct"
+    model = (
+        "/root/.cache/modelscope/hub/models/LLM-Research/Llama-3.2-11B-Vision-Instruct"
+    )
     mmmu_accuracy = 0.2
     other_args = [
         "--trust-remote-code",
