@@ -1134,7 +1134,7 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
             self.v_scale_buffer[layer_id - self.start_layer][loc] = cache_v_fp4_sf
 
 
-class MHATokenToKVPoolMixedPrecision(KVCache):
+class MHATokenToKVPoolMixedPrecision(MHATokenToKVPool):
     """KV cache pool supporting different dtypes per layer.
 
     This class acts as a manager that groups layers by dtype and creates appropriate sub-pools:
@@ -2089,7 +2089,7 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
             )
 
 
-class MLATokenToKVPoolMixedPrecision(KVCache):
+class MLATokenToKVPoolMixedPrecision(MLATokenToKVPool):
     """MLA KV cache pool supporting different dtypes per layer.
 
     This class acts as a manager that groups layers by dtype and creates appropriate sub-pools:
