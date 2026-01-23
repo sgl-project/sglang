@@ -58,6 +58,24 @@ impl ChatPreparationStage {
                 error!("Multimodal tracking failed: {}", e);
                 error::internal_error("multimodal_tracking_failed", e.to_string())
             })?;
+            if let Some(media_vec) = output.data.get(&Modality::Image) {
+                let frames = media_vec
+                    .iter()
+                    .filter_map(|m| {
+                        if let TrackedMedia::Image(frame) = m {
+                            Some(frame.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>();
+
+                if !frames.is_empty() {
+                    let mut map = std::collections::HashMap::new();
+                    map.insert(Modality::Image, frames);
+                    multimodal_data = Some(map);
+                }
+            }
             multimodal_data = Some(output.data);
         }
         // Step 1: Filter tools if needed

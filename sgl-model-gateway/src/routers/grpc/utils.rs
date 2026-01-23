@@ -526,7 +526,7 @@ pub(crate) fn process_chat_messages(
     });
 
     Ok(ProcessedMessages {
-        text: rendered,
+        text: formatted_text,
         multimodal_inputs,
         stop_sequences: request.stop.clone(),
     })

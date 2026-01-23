@@ -57,6 +57,7 @@ pub(crate) enum RequestType {
 /// Shared components (injected once at creation)
 pub(crate) struct SharedComponents {
     pub tokenizer_registry: Arc<TokenizerRegistry>,
+    pub media_connector: Arc<crate::multimodal::MediaConnector>,
     #[allow(dead_code)]
     pub tool_parser_factory: ToolParserFactory,
     #[allow(dead_code)]
