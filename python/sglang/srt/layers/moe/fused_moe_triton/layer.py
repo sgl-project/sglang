@@ -431,8 +431,6 @@ class FusedMoE(torch.nn.Module):
                 )
 
             expert_data = expert_data.narrow(shard_dim, start, shard_size)
-        print(expert_data.shape, loaded_weight.shape) 
-        # torch.Size([512, 2048]) torch.Size([512, 1024])
         expert_data.copy_(loaded_weight)
 
     def _load_w2(
