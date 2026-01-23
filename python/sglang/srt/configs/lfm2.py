@@ -99,4 +99,3 @@ class Lfm2Config(HFLfm2Config):
 # Cannot use .register() because lfm2 is already registered by transformers
 # Directly modify the internal _extra_content dict instead
 CONFIG_MAPPING._extra_content["lfm2"] = Lfm2Config
-logger.info("Registered SGLang Lfm2Config to override HuggingFace's version")
