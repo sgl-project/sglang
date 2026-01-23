@@ -108,7 +108,8 @@ jobs:
             main_package:
               - "python/sglang/!(multimodal_gen)/**"
               - "python/pyproject.toml"
-              - "scripts/ci/*"
+              - "scripts/ci/cuda/*"
+              - "scripts/ci/utils/*"
               - "test/**"
               - ".github/workflows/pr-test.yml"
             sgl_kernel:

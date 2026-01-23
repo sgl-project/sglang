@@ -93,6 +93,7 @@ jobs:
               - "python/pyproject_rocm.toml"
               - "python/pyproject_other.toml"
               - "scripts/ci/amd/*"
+              - "scripts/ci/utils/*"
               - "test/**"
               - ".github/workflows/pr-test-amd.yml"
             sgl_kernel:
