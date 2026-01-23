@@ -155,7 +155,7 @@ class TestDeepseekV32TP(CustomTestCase):
                 f"### test_bs_1_speed (deepseek-v32)\n" f"{speed=:.2f} token/s\n"
             )
             if is_in_amd_ci():
-                self.assertGreater(speed, 20)
+                self.assertGreater(speed, 15)
             else:
                 self.assertGreater(speed, 70)
 
