@@ -1280,9 +1280,25 @@ class MHATokenToKVPoolMixedPrecision(MHATokenToKVPool):
         # Note: We don't create buffers here since this pool delegates to sub-pools
         # No need to delete buffers as KVCache.__init__() doesn't create them
 
+        # Initialize data_ptrs for HiCache compatibility
+        data_ptr_list = []
+        for layer_id in range(self.start_layer, self.start_layer + self.layer_num):
+            pool_idx, local_layer_id = self.layer_to_pool[layer_id]
+            sub_pool = self.sub_pools[pool_idx]
+            data_ptr_list.append(sub_pool._get_key_buffer(local_layer_id).data_ptr())
+        for layer_id in range(self.start_layer, self.start_layer + self.layer_num):
+            pool_idx, local_layer_id = self.layer_to_pool[layer_id]
+            sub_pool = self.sub_pools[pool_idx]
+            data_ptr_list.append(sub_pool._get_value_buffer(local_layer_id).data_ptr())
+
+        self.data_ptrs = torch.tensor(
+            data_ptr_list,
+            dtype=torch.uint64,
+            device=self.device,
+        )
+
         # Log per-layer dtype configuration
         self._log_per_layer_dtypes()
-
         # Calculate and log memory usage from sub-pools
         self._finalize_allocation_log(size)
 
@@ -2223,6 +2239,19 @@ class MLATokenToKVPoolMixedPrecision(MLATokenToKVPool):
         finally:
             # Restore original logging level so mixed precision pool's log appears
             logger.setLevel(original_log_level)
+
+        # Initialize data_ptrs for HiCache compatibility
+        data_ptr_list = []
+        for layer_id in range(self.start_layer, self.start_layer + self.layer_num):
+            pool_idx, local_layer_id = self.layer_to_pool[layer_id]
+            sub_pool = self.sub_pools[pool_idx]
+            data_ptr_list.append(sub_pool.get_key_buffer(local_layer_id).data_ptr())
+
+        self.data_ptrs = torch.tensor(
+            data_ptr_list,
+            dtype=torch.uint64,
+            device=self.device,
+        )
 
         # Log per-layer dtype configuration
         self._log_per_layer_dtypes()
