@@ -2049,7 +2049,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             elif hasattr(layer, "attn"):
                 self.attention_layers.append(layer.attn)
             elif hasattr(layer, "linear_attn"):
-                self.attention_layers.append(layer.linear_attn)
+                if hasattr(layer.linear_attn, "attn"):
+                    self.attention_layers.append(layer.linear_attn.attn)
+                else:
+                    self.attention_layers.append(layer.linear_attn)
             # For InternVL model
             elif hasattr(layer, "attention"):
                 if hasattr(layer.attention, "attn"):

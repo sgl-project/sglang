@@ -119,19 +119,7 @@ def unified_linear_attention_with_output(
     context = get_forward_context()
     forward_batch = context.forward_batch
     attention_layers = context.attention_layers
-    parent_layer = attention_layers[layer_id]
-
-    # For models like Qwen3Next, the RadixLinearAttention is stored
-    # as a sub-component (parent_layer.linear_attn.linear_attn)
-    # Navigate to get the actual RadixLinearAttention
-    if hasattr(parent_layer, "linear_attn"):
-        gdn_layer = parent_layer.linear_attn
-        if hasattr(gdn_layer, "linear_attn"):
-            attention_layer = gdn_layer.linear_attn
-        else:
-            attention_layer = gdn_layer
-    else:
-        attention_layer = parent_layer
+    attention_layer = attention_layers[layer_id]
 
     ret = forward_batch.attn_backend.forward(
         layer=attention_layer,

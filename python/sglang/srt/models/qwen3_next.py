@@ -301,7 +301,7 @@ class Qwen3GatedDeltaNet(nn.Module):
             prefix=add_prefix("out_proj", prefix),
         )
 
-        self.linear_attn = RadixLinearAttention(
+        self.attn = RadixLinearAttention(
             layer_id=layer_id,
             num_qk_heads=self.num_k_heads // self.attn_tp_size,
             num_v_heads=self.num_v_heads // self.attn_tp_size,
@@ -413,7 +413,7 @@ class Qwen3GatedDeltaNet(nn.Module):
             )
             mixed_qkv = torch.cat((query, key, value), dim=-1)
 
-        core_attn_out = self.linear_attn(
+        core_attn_out = self.attn(
             forward_batch,
             mixed_qkv=mixed_qkv,
             a=a,
