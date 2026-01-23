@@ -135,6 +135,7 @@ from sglang.srt.managers.template_manager import TemplateManager
 from sglang.srt.managers.tokenizer_manager import ServerStatus, TokenizerManager
 from sglang.srt.metrics.func_timer import enable_func_timer
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
+    parse_parallelism_config_from_scheduler_infos,
     parse_remote_instance_transfer_engine_info_from_scheduler_infos,
 )
 from sglang.srt.parser.reasoning_parser import ReasoningParser
@@ -175,6 +176,7 @@ class _GlobalState:
     #         )
     # }
     remote_instance_transfer_engine_info: Optional[Dict] = None
+    parallelism_config_info: Optional[Dict] = None
 
 
 _global_state: Optional[_GlobalState] = None
@@ -861,6 +863,30 @@ async def get_remote_instance_transfer_engine_info(rank: int = None):
             "remote_instance_transfer_engine_info": _global_state.remote_instance_transfer_engine_info[
                 rank
             ],
+        }
+        return result
+    except Exception as e:
+        logger.error(f"Exception: {e}")
+        return Response(status_code=HTTPStatus.BAD_REQUEST)
+
+
+@app.get("/parallelism_config")
+async def parallelism_config(rank: int = 0):
+    """Get parallelism config for a specific TP rank."""
+    if rank < 0:
+        return Response(status_code=HTTPStatus.BAD_REQUEST)
+
+    if (
+        _global_state.parallelism_config_info is None
+        or len(_global_state.parallelism_config_info) == 0
+    ):
+        logger.error("Parallelism config info is not available.")
+        return Response(status_code=HTTPStatus.BAD_REQUEST)
+
+    try:
+        result = {
+            "rank": rank,
+            **dataclasses.asdict(_global_state.parallelism_config_info[rank]),
         }
         return result
     except Exception as e:
@@ -1732,6 +1758,9 @@ def launch_server(
     remote_instance_transfer_engine_info = (
         parse_remote_instance_transfer_engine_info_from_scheduler_infos(scheduler_infos)
     )
+    parallelism_config_info = parse_parallelism_config_from_scheduler_infos(
+        scheduler_infos
+    )
 
     # Set global states
     set_global_state(
@@ -1740,6 +1769,7 @@ def launch_server(
             template_manager=template_manager,
             scheduler_info=scheduler_infos[0],
             remote_instance_transfer_engine_info=remote_instance_transfer_engine_info,
+            parallelism_config_info=parallelism_config_info,
         )
     )
 

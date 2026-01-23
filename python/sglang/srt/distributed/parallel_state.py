@@ -29,11 +29,11 @@ import pickle
 import weakref
 from collections import namedtuple
 from contextlib import contextmanager, nullcontext
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import timedelta
 from multiprocessing import shared_memory
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import torch
 import torch.distributed
@@ -1995,3 +1995,228 @@ def monkey_patch_vllm_parallel_state(reverse: bool = False):
         setattr(vllm_parrlel_state, "get_pp_group", get_pp_group)
         setattr(vllm_parrlel_state, "get_tp_group", get_tp_group)
         setattr(vllm_parrlel_state, "get_world_group", get_world_group)
+
+
+@dataclass
+class RankParallelismConfig:
+    """
+    Complete parallelism configuration for a single inference rank.
+
+    This configuration captures all the parallelism settings needed to recreate
+    a model shard outside of sglang. It supports:
+    - TP/PP/EP for model parallelism
+    - MoE-TP/Attn-TP/Attn-DP for MoE and DP attention.
+    """
+
+    tp_size: int = 1
+    tp_rank: int = 0
+    pp_size: int = 1
+    pp_rank: int = 0
+    ep_size: int = 1
+    ep_rank: int = 0
+    moe_tp_size: int = 1
+    moe_tp_rank: int = 0
+    attn_tp_size: int = 1
+    attn_tp_rank: int = 0
+    attn_dp_size: int = 1
+    attn_dp_rank: int = 0
+
+    world_size: int = 1
+    global_rank: int = 0
+    local_rank: int = 0
+
+    @property
+    def has_dp_attention(self) -> bool:
+        """Check if DP attention is enabled."""
+        return self.attn_dp_size > 1
+
+    @property
+    def has_expert_parallelism(self) -> bool:
+        """Check if expert parallelism is enabled."""
+        return self.ep_size > 1
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for serialization."""
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "RankParallelismConfig":
+        """Create from dictionary, filtering unknown fields."""
+        import dataclasses
+
+        valid_fields = {f.name for f in dataclasses.fields(cls)}
+        filtered_data = {k: v for k, v in data.items() if k in valid_fields}
+        return cls(**filtered_data)
+
+    @classmethod
+    def from_parallel_state(cls, local_rank: int = 0) -> "RankParallelismConfig":
+        """Extract current parallelism settings from the global parallel state."""
+        tp_size = get_tensor_model_parallel_world_size()
+        tp_rank = get_tensor_model_parallel_rank()
+
+        # Import dp_attention lazily to avoid circular imports
+        from sglang.srt.layers.dp_attention import (
+            get_attention_dp_rank,
+            get_attention_dp_size,
+            get_attention_tp_rank,
+            get_attention_tp_size,
+        )
+
+        return cls(
+            tp_size=tp_size,
+            tp_rank=tp_rank,
+            pp_size=get_pipeline_model_parallel_world_size(),
+            pp_rank=get_pipeline_model_parallel_rank(),
+            ep_size=get_moe_expert_parallel_world_size(),
+            ep_rank=get_moe_expert_parallel_rank(),
+            moe_tp_size=get_moe_tensor_parallel_world_size(),
+            moe_tp_rank=get_moe_tensor_parallel_rank(),
+            attn_tp_size=get_attention_tp_size(),
+            attn_tp_rank=get_attention_tp_rank(),
+            attn_dp_size=get_attention_dp_size(),
+            attn_dp_rank=get_attention_dp_rank(),
+            world_size=(
+                torch.distributed.get_world_size()
+                if torch.distributed.is_initialized()
+                else 1
+            ),
+            global_rank=(
+                torch.distributed.get_rank()
+                if torch.distributed.is_initialized()
+                else 0
+            ),
+            local_rank=local_rank,
+        )
+
+    def __repr__(self) -> str:
+        parts = [
+            f"TP={self.tp_rank}/{self.tp_size}",
+            f"PP={self.pp_rank}/{self.pp_size}",
+        ]
+        if self.has_expert_parallelism:
+            parts.append(f"EP={self.ep_rank}/{self.ep_size}")
+            parts.append(f"MoE-TP={self.moe_tp_rank}/{self.moe_tp_size}")
+        if self.has_dp_attention:
+            parts.append(f"AttnTP={self.attn_tp_rank}/{self.attn_tp_size}")
+            parts.append(f"AttnDP={self.attn_dp_rank}/{self.attn_dp_size}")
+        parts.append(f"Global={self.global_rank}/{self.world_size}")
+        return f"RankParallelismConfig({', '.join(parts)})"
+
+
+class ParallelismContext:
+    """
+    Context manager for creating model replicas with specific parallelism settings.
+
+    This context manager temporarily sets global variables to allow creating model
+    shards outside of a real distributed environment.
+    Usage:
+        server_args = ...  # Get from engine.get_server_info()
+        parallelism_info = engine.get_parallelism_config(rank)
+        sglang.srt.server_args._global_server_args = server_args
+
+        with ParallelismContext(RankParallelismConfig.from_dict(parallelism_info)):
+            model = get_model(
+                model_config=model_config,
+                load_config=load_config,
+                device_config=device_config,
+            )
+    """
+
+    def __init__(self, parallelism_config: RankParallelismConfig):
+        self.config = parallelism_config
+        self._original_globals: Dict[str, Any] = {}
+
+    def _create_mock_group(self, world_size: int, rank_in_group: int):
+        """Create a mock group coordinator with all necessary properties."""
+        mock_group = MagicMock()
+        mock_group.world_size = world_size
+        mock_group.rank_in_group = rank_in_group
+        mock_group.rank = rank_in_group  # Use rank_in_group for .rank as well
+        mock_group.local_rank = rank_in_group
+        mock_group.ranks = list(range(world_size))
+        mock_group.first_rank = 0
+        mock_group.last_rank = world_size - 1
+        mock_group.is_first_rank = rank_in_group == 0
+        mock_group.is_last_rank = rank_in_group == world_size - 1
+        mock_group.next_rank = mock_group.ranks[(rank_in_group + 1) % world_size]
+        mock_group.prev_rank = mock_group.ranks[(rank_in_group - 1) % world_size]
+        return mock_group
+
+    def __enter__(self):
+        conf = self.config
+
+        # Import the modules we need to modify
+        from sglang.srt.distributed import parallel_state
+        from sglang.srt.layers import dp_attention
+
+        # Save original global variables to restore later
+        self._original_globals["_TP"] = getattr(parallel_state, "_TP", None)
+        self._original_globals["_PP"] = getattr(parallel_state, "_PP", None)
+        self._original_globals["_MOE_EP"] = getattr(parallel_state, "_MOE_EP", None)
+        self._original_globals["_MOE_TP"] = getattr(parallel_state, "_MOE_TP", None)
+        self._original_globals["_ATTN_TP_RANK"] = getattr(
+            dp_attention, "_ATTN_TP_RANK", None
+        )
+        self._original_globals["_ATTN_TP_SIZE"] = getattr(
+            dp_attention, "_ATTN_TP_SIZE", None
+        )
+        self._original_globals["_ATTN_DP_RANK"] = getattr(
+            dp_attention, "_ATTN_DP_RANK", None
+        )
+        self._original_globals["_ATTN_DP_SIZE"] = getattr(
+            dp_attention, "_ATTN_DP_SIZE", None
+        )
+        self._original_globals["_ENABLE_DP_ATTENTION_FLAG"] = getattr(
+            dp_attention, "_ENABLE_DP_ATTENTION_FLAG", False
+        )
+
+        # Create mock group objects with the correct attributes
+        mock_tp_group = self._create_mock_group(conf.tp_size, conf.tp_rank)
+        mock_pp_group = self._create_mock_group(conf.pp_size, conf.pp_rank)
+        mock_ep_group = self._create_mock_group(conf.ep_size, conf.ep_rank)
+        mock_moe_tp_group = self._create_mock_group(conf.moe_tp_size, conf.moe_tp_rank)
+
+        # Set the global group objects directly on parallel_state module
+        parallel_state._TP = mock_tp_group
+        parallel_state._PP = mock_pp_group
+        parallel_state._MOE_EP = mock_ep_group
+        parallel_state._MOE_TP = mock_moe_tp_group
+
+        # Set dp_attention globals directly
+        dp_attention._ATTN_TP_RANK = conf.attn_tp_rank
+        dp_attention._ATTN_TP_SIZE = conf.attn_tp_size
+        dp_attention._ATTN_DP_RANK = conf.attn_dp_rank
+        dp_attention._ATTN_DP_SIZE = conf.attn_dp_size
+        # Enable DP attention flag if attn_dp_size > 1
+        dp_attention._ENABLE_DP_ATTENTION_FLAG = conf.attn_dp_size > 1
+
+        logger.info(
+            f"[ParallelismContext] Activated: TP={conf.tp_rank}/{conf.tp_size}, "
+            f"PP={conf.pp_rank}/{conf.pp_size}, EP={conf.ep_rank}/{conf.ep_size}, "
+            f"MoE-TP={conf.moe_tp_rank}/{conf.moe_tp_size}, "
+            f"AttnTP={conf.attn_tp_rank}/{conf.attn_tp_size}, "
+            f"AttnDP={conf.attn_dp_rank}/{conf.attn_dp_size}"
+        )
+        return self
+
+    def __exit__(self, *args):
+        from sglang.srt.distributed import parallel_state
+        from sglang.srt.layers import dp_attention
+
+        # Restore original parallel_state globals
+        parallel_state._TP = self._original_globals.get("_TP")
+        parallel_state._PP = self._original_globals.get("_PP")
+        parallel_state._MOE_EP = self._original_globals.get("_MOE_EP")
+        parallel_state._MOE_TP = self._original_globals.get("_MOE_TP")
+
+        # Restore original dp_attention globals
+        dp_attention._ATTN_TP_RANK = self._original_globals.get("_ATTN_TP_RANK")
+        dp_attention._ATTN_TP_SIZE = self._original_globals.get("_ATTN_TP_SIZE")
+        dp_attention._ATTN_DP_RANK = self._original_globals.get("_ATTN_DP_RANK")
+        dp_attention._ATTN_DP_SIZE = self._original_globals.get("_ATTN_DP_SIZE")
+        dp_attention._ENABLE_DP_ATTENTION_FLAG = self._original_globals.get(
+            "_ENABLE_DP_ATTENTION_FLAG", False
+        )
+
+        logger.info("[ParallelismContext] Deactivated")
+        return False

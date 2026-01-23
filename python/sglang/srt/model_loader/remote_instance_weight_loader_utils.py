@@ -120,6 +120,14 @@ def parse_remote_instance_transfer_engine_info_from_scheduler_infos(scheduler_in
     return remote_instance_transfer_engine_info
 
 
+def parse_parallelism_config_from_scheduler_infos(scheduler_infos):
+    parallelism_config_info = {}
+    for data in scheduler_infos:
+        if "tp_rank" in data and "parallelism_config_info" in data:
+            parallelism_config_info[data["tp_rank"]] = data["parallelism_config_info"]
+    return parallelism_config_info
+
+
 def register_memory_region(model, transfer_engine):
     if importlib.util.find_spec("torch") is None:
         return register_memory_region_v1(model, transfer_engine)
