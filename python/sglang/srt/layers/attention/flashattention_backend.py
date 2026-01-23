@@ -10,6 +10,7 @@ import triton.language as tl
 
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.dp_attention import attn_cp_all_gather_into_tensor
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -837,6 +838,21 @@ class FlashAttentionBackend(AttentionBackend):
             key_cache, value_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
                 layer.layer_id
             )
+
+            # If enable context parallelism, the key cache and value cache are split into multiple parts.
+            # We need to allgather the key cache and value cache to get the full cache.
+            if self.attn_cp_size > 1:
+                key_cache_full = key_cache.new_empty(
+                    key_cache.shape[0] * self.attn_cp_size, *key_cache.shape[1:]
+                )
+                value_cache_full = value_cache.new_empty(
+                    value_cache.shape[0] * self.attn_cp_size, *value_cache.shape[1:]
+                )
+                attn_cp_all_gather_into_tensor(key_cache_full, key_cache)
+                attn_cp_all_gather_into_tensor(value_cache_full, value_cache)
+                key_cache = key_cache_full
+                value_cache = value_cache_full
+
             key_cache = key_cache.view(
                 -1, self.page_size, layer.tp_k_head_num, layer.head_dim
             )

@@ -53,6 +53,7 @@ from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
+from sglang.srt.layers.utils.cp_utils import is_prefill_context_parallel_enabled
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -102,6 +103,9 @@ class ScatterMode(Enum):
     def model_input_output():
         """The scatter mode for model forward pass input and output data"""
         if is_nsa_enable_prefill_cp():
+            return ScatterMode.SCATTERED
+
+        if is_prefill_context_parallel_enabled():
             return ScatterMode.SCATTERED
         return ScatterMode.TP_ATTN_FULL
 
