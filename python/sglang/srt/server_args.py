@@ -163,6 +163,7 @@ NSA_CHOICES = [
     "fa3",
     "tilelang",
     "aiter",
+    "trtllm",
 ]
 
 RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu"]
@@ -436,8 +437,12 @@ class ServerArgs:
     mm_attention_backend: Optional[str] = None
     fp8_gemm_runner_backend: str = "auto"
     fp4_gemm_runner_backend: str = "auto"
-    nsa_prefill_backend: str = "flashmla_sparse"
-    nsa_decode_backend: str = "fa3"
+    nsa_prefill_backend: Optional[str] = (
+        None  # None = auto-detect based on hardware/kv_cache_dtype
+    )
+    nsa_decode_backend: Optional[str] = (
+        None  # auto-detect based on hardware/kv_cache_dtype
+    )
     disable_flashinfer_autotune: bool = False
 
     # Speculative decoding
@@ -1036,6 +1041,17 @@ class ServerArgs:
             if model_config.is_multimodal:
                 self.adjust_mem_fraction_for_vlm(model_config)
 
+            # If symm mem is enabled and prealloc size is not set, set it to 4GB
+            if (
+                self.enable_symm_mem
+                and not envs.SGLANG_SYMM_MEM_PREALLOC_GB_SIZE.is_set()
+            ):
+                envs.SGLANG_SYMM_MEM_PREALLOC_GB_SIZE.set(4)
+                logger.warning(
+                    "Symmetric memory is enabled, setting symmetric memory prealloc size to 4GB as default."
+                    "Use environment variable SGLANG_SYMM_MEM_PREALLOC_GB_SIZE to change the prealloc size."
+                )
+
     def _generate_cuda_graph_batch_sizes(self):
         """
         Generate the list of batch sizes for CUDA graph capture based on cuda_graph_max_bs.
@@ -1085,6 +1101,59 @@ class ServerArgs:
         ]
 
         return capture_sizes
+
+    def _set_default_nsa_kv_cache_dtype(self, major: int) -> str:
+        user_set_prefill = self.nsa_prefill_backend is not None
+        user_set_decode = self.nsa_decode_backend is not None
+
+        # If user specified a backend but didn't explicitly set kv_cache_dtype,
+        # suggest them to be explicit about kv_cache_dtype to avoid surprises
+        if (user_set_prefill or user_set_decode) and self.kv_cache_dtype == "auto":
+            logger.warning(
+                f"When specifying --nsa-prefill-backend or --nsa-decode-backend, "
+                f"you should also explicitly set --kv-cache-dtype (e.g., 'fp8_e4m3' or 'bfloat16'). "
+                f"DeepSeek V3.2 defaults to FP8 KV cache which may not be compatible with all backends."
+            )
+
+        if self.kv_cache_dtype == "auto":
+            self.kv_cache_dtype = "fp8_e4m3" if major >= 10 else "bfloat16"
+            logger.warning(
+                f"Setting KV cache dtype to {self.kv_cache_dtype} for DeepSeek DSA on SM{major} device."
+            )
+        if self.kv_cache_dtype == "bf16":
+            self.kv_cache_dtype = "bfloat16"
+        assert self.kv_cache_dtype in [
+            "bfloat16",
+            "fp8_e4m3",
+        ], "DeepSeek DSA only supports bf16/bfloat16 or fp8_e4m3 kv_cache_dtype"
+
+    def _set_default_nsa_backends(self, kv_cache_dtype: str, major: int) -> str:
+        user_set_prefill = self.nsa_prefill_backend is not None
+        user_set_decode = self.nsa_decode_backend is not None
+
+        if kv_cache_dtype == "fp8_e4m3":
+            # flashmla_auto dispatches to flashmla_sparse/flashmla_kv based on hardware and heuristics
+            if not user_set_prefill:
+                self.nsa_prefill_backend = "flashmla_auto"
+            if not user_set_decode:
+                self.nsa_decode_backend = "flashmla_kv"
+        else:
+            # set prefill/decode backends based on hardware architecture.
+            if major >= 10:
+                if not user_set_prefill:
+                    self.nsa_prefill_backend = "flashmla_sparse"
+                if not user_set_decode:
+                    self.nsa_decode_backend = "trtllm"
+            else:
+                # Hopper defaults for bfloat16
+                if not user_set_prefill:
+                    self.nsa_prefill_backend = "flashmla_sparse"
+                if not user_set_decode:
+                    self.nsa_decode_backend = "fa3"
+
+        logger.warning(
+            f"Set NSA backends for {self.kv_cache_dtype} KV Cache: prefill={self.nsa_prefill_backend}, decode={self.nsa_decode_backend}."
+        )
 
     def _handle_model_specific_adjustments(self):
         from sglang.srt.configs.model_config import is_deepseek_nsa
@@ -1158,35 +1227,11 @@ class ServerArgs:
                         self.page_size = 64
                         logger.warning("Setting page size to 64 for DeepSeek DSA.")
 
-                    # For Hopper, we support both bf16 and fp8 kv cache; for Blackwell, we support fp8 only currently
                     import torch
 
                     major, _ = torch.cuda.get_device_capability()
-                    if self.kv_cache_dtype == "auto":
-                        self.kv_cache_dtype = "fp8_e4m3" if major >= 10 else "bfloat16"
-                        logger.warning(
-                            f"Setting KV cache dtype to {self.kv_cache_dtype} for DeepSeek DSA on SM{major} device."
-                        )
-                    if self.kv_cache_dtype == "bf16":
-                        self.kv_cache_dtype = "bfloat16"
-                    assert self.kv_cache_dtype in [
-                        "bfloat16",
-                        "fp8_e4m3",
-                    ], "DeepSeek DSA only supports bf16/bfloat16 or fp8_e4m3 kv_cache_dtype"
-
-                    if self.kv_cache_dtype == "fp8_e4m3":
-                        # flashmla_auto dispatches to flashmla_sparse/flashmla_kv based on hardware and heuristics
-                        self.nsa_prefill_backend = "flashmla_auto"
-                        self.nsa_decode_backend = "flashmla_kv"
-                        logger.warning(
-                            "Setting DSA backend to flashmla_auto for prefill and flashmla_kv for decode for FP8 KV Cache."
-                        )
-                    else:
-                        # set prefill/decode backends to flashmla_sparse for Blackwell.
-                        # The default settings (P=flashmla_sparse, D=fa3) are for Hopper.
-                        if major >= 10:
-                            self.nsa_prefill_backend = "flashmla_sparse"
-                            self.nsa_decode_backend = "flashmla_sparse"
+                    self._set_default_nsa_kv_cache_dtype(major)
+                    self._set_default_nsa_backends(self.kv_cache_dtype, major)
 
                 if self.enable_nsa_prefill_context_parallel:
                     assert (
@@ -2412,14 +2457,12 @@ class ServerArgs:
                 self.enable_dynamic_batch_tokenizer = False
 
     def _handle_environment_variables(self):
-        os.environ["SGLANG_ENABLE_TORCH_COMPILE"] = (
-            "1" if self.enable_torch_compile else "0"
-        )
-        os.environ["SGLANG_MAMBA_SSM_DTYPE"] = self.mamba_ssm_dtype
-        os.environ["SGLANG_DISABLE_OUTLINES_DISK_CACHE"] = (
+        envs.SGLANG_ENABLE_TORCH_COMPILE.set("1" if self.enable_torch_compile else "0")
+        envs.SGLANG_MAMBA_SSM_DTYPE.set(self.mamba_ssm_dtype)
+        envs.SGLANG_DISABLE_OUTLINES_DISK_CACHE.set(
             "1" if self.disable_outlines_disk_cache else "0"
         )
-        os.environ["SGLANG_ENABLE_DETERMINISTIC_INFERENCE"] = (
+        envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.set(
             "1" if self.enable_deterministic_inference else "0"
         )
         # Set the highest strict level for Kimi K2 tool calls
@@ -2557,11 +2600,6 @@ class ServerArgs:
                 )
                 self.attention_backend = "triton"
         elif not self.disable_cuda_graph:
-            if self.cuda_graph_bs != [1]:
-                logger.warning(
-                    "Cuda graph bs is set to [1] because of using diffusion LLM inference"
-                )
-                self.cuda_graph_bs = [1]
             if self.attention_backend != "flashinfer":
                 logger.warning(
                     "Attention backend is set to flashinfer because of enabling cuda graph in diffusion LLM inference"
@@ -3577,7 +3615,7 @@ class ServerArgs:
         parser.add_argument(
             "--mm-attention-backend",
             type=str,
-            choices=["sdpa", "fa3", "triton_attn", "ascend_attn", "aiter_attn"],
+            choices=["sdpa", "fa3", "fa4", "triton_attn", "ascend_attn", "aiter_attn"],
             default=ServerArgs.mm_attention_backend,
             help="Set multimodal attention backend.",
         )
@@ -3586,12 +3624,14 @@ class ServerArgs:
             default=ServerArgs.nsa_prefill_backend,
             type=str,
             choices=NSA_CHOICES,
+            help="NSA prefill backend. If not specified, auto-detects based on hardware and kv_cache_dtype.",
         )
         parser.add_argument(
             "--nsa-decode-backend",
             default=ServerArgs.nsa_decode_backend,
             type=str,
             choices=NSA_CHOICES,
+            help="NSA decode backend. If not specified, auto-detects based on hardware and kv_cache_dtype.",
         )
         parser.add_argument(
             "--fp8-gemm-backend",
@@ -4031,7 +4071,7 @@ class ServerArgs:
             "--hicache-storage-backend-extra-config",
             type=str,
             default=ServerArgs.hicache_storage_backend_extra_config,
-            help="A dictionary in JSON string format containing extra configuration for the storage backend.",
+            help="A dictionary in JSON string format, or a string starting with a leading '@' and a config file in JSON/YAML/TOML format, containing extra configuration for the storage backend.",
         )
 
         # Hierarchical sparse attention
