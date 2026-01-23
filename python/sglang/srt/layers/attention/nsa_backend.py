@@ -372,25 +372,10 @@ class NativeSparseAttnBackend(
             extend_seq_lens_cpu = [self.speculative_num_draft_tokens] * batch_size
             forward_batch.extend_seq_lens_cpu = extend_seq_lens_cpu
 
-            seqlens_int32_cpu = [
-                self.speculative_num_draft_tokens + kv_len
-                for kv_len in forward_batch.seq_lens_cpu.tolist()
-            ]
-            seqlens_expanded = torch.cat(
-                [
-                    torch.arange(
-                        kv_len - qo_len + 1,
-                        kv_len + 1,
-                        dtype=torch.int32,
-                        device=device,
-                    )
-                    for qo_len, kv_len in zip(
-                        extend_seq_lens_cpu,
-                        seqlens_int32_cpu,
-                        strict=True,
-                    )
-                ]
-            )
+            starts = cache_seqlens_int32 - self.speculative_num_draft_tokens + 1  # (B,)
+            offsets = torch.arange(self.speculative_num_draft_tokens, dtype=torch.int32, device=device)  # (Q,)
+            seqlens_expanded = (starts[:, None] + offsets[None, :]).reshape(-1)
+
             page_table = torch.repeat_interleave(
                 page_table, repeats=self.speculative_num_draft_tokens, dim=0
             )
@@ -412,21 +397,14 @@ class NativeSparseAttnBackend(
                 dtype=torch.int32,
                 device=device,
             )
-            seqlens_expanded = torch.cat(
-                [
-                    torch.arange(
-                        kv_len - qo_len + 1,
-                        kv_len + 1,
-                        dtype=torch.int32,
-                        device=device,
-                    )
-                    for qo_len, kv_len in zip(
-                        forward_batch.extend_seq_lens_cpu,
-                        forward_batch.seq_lens_cpu.tolist(),
-                        strict=True,
-                    )
-                ]
-            )
+
+            starts = cache_seqlens_int32 - forward_batch.extend_seq_lens + 1  # (B,)
+            max_qlen = forward_batch.extend_seq_lens.max()
+            offsets = torch.arange(max_qlen, dtype=torch.int32, device=device)  # (Q,)
+            seqlens_expanded = (starts[:, None] + offsets[None, :])
+            mask = offsets.unsqueeze(0) < forward_batch.extend_seq_lens.unsqueeze(1)
+            seqlens_expanded = seqlens_expanded.masked_select(mask)
+
             if forward_batch.forward_mode.is_draft_extend_v2():
                 # DRAFT_EXTEND_V2: V2 worker pre-fills draft KV cache with ALL speculated
                 # tokens upfront. All requests extend by the same fixed
@@ -841,25 +819,10 @@ class NativeSparseAttnBackend(
             metadata.page_table_1[:, :max_seqlen_k].copy_(page_indices)
             extend_seq_lens_cpu = [self.speculative_num_draft_tokens] * bs
 
-            seqlens_int32_cpu = [
-                self.speculative_num_draft_tokens + kv_len
-                for kv_len in seq_lens_cpu.tolist()
-            ]
-            seqlens_expanded = torch.cat(
-                [
-                    torch.arange(
-                        kv_len - qo_len + 1,
-                        kv_len + 1,
-                        dtype=torch.int32,
-                        device=self.device,
-                    )
-                    for qo_len, kv_len in zip(
-                        extend_seq_lens_cpu,
-                        seqlens_int32_cpu,
-                        strict=True,
-                    )
-                ]
-            )
+            starts = cache_seqlens - self.speculative_num_draft_tokens + 1  # (B,)
+            offsets = torch.arange(self.speculative_num_draft_tokens, dtype=torch.int32, device=self.device)  # (Q,)
+            seqlens_expanded = (starts[:, None] + offsets[None, :]).reshape(-1)
+
             metadata.nsa_seqlens_expanded.copy_(seqlens_expanded)
             nsa_cache_seqlens = compute_nsa_seqlens(
                 seqlens_expanded, self.nsa_index_topk
@@ -884,21 +847,13 @@ class NativeSparseAttnBackend(
                 page_indices
             )
 
-            seqlens_expanded = torch.cat(
-                [
-                    torch.arange(
-                        kv_len - qo_len + 1,
-                        kv_len + 1,
-                        dtype=torch.int32,
-                        device=self.device,
-                    )
-                    for qo_len, kv_len in zip(
-                        extend_seq_lens_cpu,
-                        seq_lens_cpu.tolist(),
-                        strict=True,
-                    )
-                ]
-            )
+            starts = cache_seqlens - extend_seq_lens + 1  # (B,)
+            max_qlen = extend_seq_lens.max()
+            offsets = torch.arange(max_qlen, dtype=torch.int32, device=self.device)  # (Q,)
+            seqlens_expanded = (starts[:, None] + offsets[None, :])
+            mask = offsets.unsqueeze(0) < extend_seq_lens.unsqueeze(1)
+            seqlens_expanded = seqlens_expanded.masked_select(mask)
+
             metadata.nsa_seqlens_expanded[: seqlens_expanded.shape[0]].copy_(
                 seqlens_expanded
             )
