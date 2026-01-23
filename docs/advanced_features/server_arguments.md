@@ -31,7 +31,7 @@ You can find all arguments by `python3 -m sglang.launch_server --help`
   python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --tp 2
   ```
 
-- To enable multi-GPU data parallelism, add `--dp 2`. Data parallelism is better for throughput if there is enough memory. It can also be used together with tensor parallelism. The following command uses 4 GPUs in total. We recommend [SGLang Router](../advanced_features/router.md) for data parallelism.
+- To enable multi-GPU data parallelism, add `--dp 2`. Data parallelism is better for throughput if there is enough memory. It can also be used together with tensor parallelism. The following command uses 4 GPUs in total. We recommend [SGLang Model Gateway (former Router)](../advanced_features/sgl_model_gateway.md) for data parallelism.
 
   ```bash
   python -m sglang_router.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --dp 2 --tp 2
@@ -353,7 +353,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--hicache-mem-layout` | The layout of host memory pool for hierarchical cache. | `layer_first` | `layer_first`, `page_first`, `page_first_direct`, `page_first_kv_split`, `page_head` |
 | `--hicache-storage-backend` | The storage backend for hierarchical KV cache. Built-in backends: file, mooncake, hf3fs, nixl, aibrix. For dynamic backend, use --hicache-storage-backend-extra-config to specify: backend_name (custom name), module_path (Python module path), class_name (backend class name). | `None` | `file`, `mooncake`, `hf3fs`, `nixl`, `aibrix`, `dynamic`, `eic` |
 | `--hicache-storage-prefetch-policy` | Control when prefetching from the storage backend should stop. | `best_effort` | `best_effort`, `wait_complete`, `timeout` |
-| `--hicache-storage-backend-extra-config` | A dictionary in JSON string format containing extra configuration for the storage backend. | `None` | Type: str |
+| `--hicache-storage-backend-extra-config` | A dictionary in JSON string format, or a string starting with a `@` followed by a config file in JSON/YAML/TOML format, containing extra configuration for the storage backend. | `None` | Type: str |
 
 ## Hierarchical sparse attention
 | Argument | Description | Defaults | Options |
