@@ -69,64 +69,24 @@ runtime_common = [
   "bidict",
 ]
 
+checkpoint-engine = ["checkpoint-engine==0.1.2"]
+diffusion = [
+    "PyYAML==6.0.1",
+    "cloudpickle",
+    "diffusers==0.36.0",
+    "imageio==2.36.0",
+    "imageio-ffmpeg==0.5.1",
+    "moviepy>=2.0.0",
+    "opencv-python==4.10.0.84",
+    "remote-pdb",
+    "cache-dit==1.1.8"
+]
+
 tracing = [
-  "opentelemetry-sdk",
   "opentelemetry-api",
   "opentelemetry-exporter-otlp",
   "opentelemetry-exporter-otlp-proto-grpc",
-]
-
-# HIP (Heterogeneous-computing Interface for Portability) for AMD
-# => base docker rocm/vllm-dev:20250114, not from public vllm whl
-srt_hip = [
-  "sglang[runtime_common]",
-  "torch",
-  "petit_kernel==0.0.2",
-  "wave-lang==3.8.2",
-]
-
-diffusion_hip = [
-  "diffusers @ git+https://github.com/huggingface/diffusers.git@6290fdfda40610ce7b99920146853614ba529c6e",
-  "opencv-python-headless==4.10.0.84",
-  "imageio==2.36.0",
-  "imageio-ffmpeg==0.5.1",
-  "PyYAML==6.0.1",
-  "moviepy>=2.0.0",
-  "cloudpickle",
-  "remote-pdb",
-  "torchcodec==0.5.0",
-  "st_attn==0.0.7",
-  "vsa==0.0.4",
-  "runai_model_streamer",
-]
-
-# For Intel Gaudi(device : hpu) follow the installation guide
-# https://docs.vllm.ai/en/latest/getting_started/gaudi-installation.html
-srt_hpu = ["sglang[runtime_common]"]
-
-# https://docs.sglang.io/platforms/mthreads_gpu.md
-srt_musa = [
-    "sglang[runtime_common]",
-    "torch",
-    "torch_musa",
-    "torchada>=0.1.15",
-    "mthreads-ml-py",
-    "numpy<2.0",
-]
-
-diffusion_musa = [
-  "PyYAML==6.0.1",
-  "cloudpickle",
-  "diffusers==0.36.0",
-  "imageio==2.36.0",
-  "imageio-ffmpeg==0.5.1",
-  "moviepy>=2.0.0",
-  "opencv-python-headless==4.10.0.84",
-  "remote-pdb",
-  "st_attn==0.0.7",
-  "vsa==0.0.4",
-  "runai_model_streamer",
-  "cache-dit==1.1.8"
+  "opentelemetry-sdk",
 ]
 
 test = [
@@ -142,13 +102,10 @@ test = [
   "tabulate",
 ]
 
-all_hip = ["sglang[srt_hip]"]
-all_hpu = ["sglang[srt_hpu]"]
-all_musa = ["sglang[srt_musa]", "sglang[diffusion_musa]"]
-
-dev_hip = ["sglang[all_hip]", "sglang[test]"]
-dev_hpu = ["sglang[all_hpu]", "sglang[test]"]
-dev_musa = ["sglang[all_musa]", "sglang[test]"]
+# https://docs.sglang.io/platforms/ascend_npu.html
+srt_npu = ["sglang[runtime_common]"]
+all_npu = ["sglang[srt_npu, diffusion]"]
+dev_npu = ["sglang[all_npu]", "sglang[test]"]
 
 [project.urls]
 "Homepage" = "https://github.com/sgl-project/sglang"
