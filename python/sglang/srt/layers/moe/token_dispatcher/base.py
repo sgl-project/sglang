@@ -25,6 +25,8 @@ if TYPE_CHECKING:
         DeepEPLLDispatchOutput,
         DeepEPNormalCombineInput,
         DeepEPNormalDispatchOutput,
+        PPLXCombineInput,
+        PPLXDispatchOutput,
         StandardCombineInput,
         StandardDispatchOutput,
     )
@@ -149,12 +151,19 @@ class DispatchOutputChecker:
     ) -> TypeGuard[Union[DeepEPNormalDispatchOutput, DeepEPLLDispatchOutput]]:
         return dispatch_output.format.is_deepep()
 
+    @staticmethod
+    def format_is_pplx(
+        dispatch_output: DispatchOutput,
+    ) -> TypeGuard[PPLXDispatchOutput]:
+        return dispatch_output.format.is_pplx()
+
 
 class DispatchOutputFormat(Enum):
 
     STANDARD = "standard"
     DEEPEP_NORMAL = "deepep_normal"
     DEEPEP_LL = "deepep_ll"
+    PPLX = "pplx"
 
     def is_standard(self) -> bool:
         return self == DispatchOutputFormat.STANDARD
@@ -170,6 +179,9 @@ class DispatchOutputFormat(Enum):
             DispatchOutputFormat.DEEPEP_NORMAL,
             DispatchOutputFormat.DEEPEP_LL,
         ]
+
+    def is_pplx(self) -> bool:
+        return self == DispatchOutputFormat.PPLX
 
 
 @runtime_checkable
@@ -213,11 +225,18 @@ class CombineInputChecker:
             CombineInputFormat.DEEPEP_LL,
         ]
 
+    @staticmethod
+    def format_is_pplx(
+        combine_input: CombineInput,
+    ) -> TypeGuard[PPLXCombineInput]:
+        return combine_input.format == CombineInputFormat.PPLX
+
 
 class CombineInputFormat(Enum):
     STANDARD = "standard"
     DEEPEP_NORMAL = "deepep_normal"
     DEEPEP_LL = "deepep_ll"
+    PPLX = "pplx"
 
 
 @runtime_checkable

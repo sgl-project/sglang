@@ -117,6 +117,16 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
             hidden_size=moe_runner_config.hidden_size,
             params_dtype=moe_runner_config.params_dtype,
         )
+    elif a2a_backend.is_pplx():
+        from sglang.srt.layers.moe.token_dispatcher.pplx import PPLXDispatcher
+
+        return PPLXDispatcher(
+            num_experts=moe_runner_config.num_experts,
+            num_local_experts=moe_runner_config.num_local_experts,
+            experts_per_token=moe_runner_config.top_k,
+            hidden_dim=moe_runner_config.hidden_size,
+            params_dtype=moe_runner_config.params_dtype,
+        )
     else:
         raise NotImplementedError(f"Unsupported a2a backend: {a2a_backend}")
 

@@ -22,6 +22,11 @@ from sglang.srt.layers.moe.token_dispatcher.mooncake import (
     MooncakeDispatchOutput,
     MooncakeEPDispatcher,
 )
+from sglang.srt.layers.moe.token_dispatcher.pplx import (
+    PPLXCombineInput,
+    PPLXDispatcher,
+    PPLXDispatchOutput,
+)
 from sglang.srt.layers.moe.token_dispatcher.standard import (
     StandardCombineInput,
     StandardDispatcher,
@@ -50,4 +55,7 @@ __all__ = [
     "DeepEPLLCombineInput",
     "DeepEPNormalCombineInput",
     "NpuFuseEPDispatcher",
+    "PPLXDispatcher",
+    "PPLXDispatchOutput",
+    "PPLXCombineInput",
 ]

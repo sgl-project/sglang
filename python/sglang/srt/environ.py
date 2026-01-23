@@ -348,6 +348,10 @@ class Envs:
     SGLANG_NSA_FUSE_TOPK = EnvBool(True)
     SGLANG_NSA_ENABLE_MTP_PRECOMPUTE_METADATA = EnvBool(True)
 
+    # PPLX
+    SGLANG_PPLX_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(4096)
+    SGLANG_PPLX_INTERNODE = EnvBool(False)  # True for multi-node, False for single-node
+
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)
 
