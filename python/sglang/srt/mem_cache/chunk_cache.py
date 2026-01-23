@@ -7,7 +7,15 @@ from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
-from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
+from sglang.srt.mem_cache.base_prefix_cache import (
+    BasePrefixCache,
+    EvictParams,
+    EvictResult,
+    InsertParams,
+    InsertResult,
+    MatchPrefixParams,
+    MatchResult,
+)
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 
 if TYPE_CHECKING:
@@ -43,12 +51,16 @@ class ChunkCache(BasePrefixCache):
     def reset(self):
         pass
 
-    def match_prefix(self, **unused_kwargs) -> MatchResult:
+    def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         return MatchResult(
             device_indices=torch.empty((0,), dtype=torch.int64),
             last_device_node=None,
             last_host_node=None,
         )
+
+    def insert(self, params: InsertParams) -> InsertResult:
+        # ChunkCache does not support prefix caching, so insert is a no-op
+        return InsertResult(prefix_len=0)
 
     def cache_finished_req(self, req: Req, is_insert: bool = True):
         kv_committed_len = req.pop_committed_kv_cache()
@@ -66,8 +78,8 @@ class ChunkCache(BasePrefixCache):
         # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
         req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
 
-    def evict(self, num_tokens: int):
-        pass
+    def evict(self, params: EvictParams) -> EvictResult:
+        return EvictResult()
 
     def inc_lock_ref(self, node: Any):
         return 0
@@ -84,62 +96,20 @@ class ChunkCache(BasePrefixCache):
 
 
 class SWAChunkCache(ChunkCache):
-    """ChunkCache with support for hybrid KV cache operations."""
+    """ChunkCache with support for sliding window attention."""
 
     def __init__(self, params: CacheInitParams):
         assert isinstance(params.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator)
         super().__init__(params)
 
-        assert (
-            params.sliding_window_size is not None
-            or params.attention_chunk_size is not None
-        ), "Sliding window size or attention chunk size must be set for SWAChunkCache"
-
-        if (
-            params.sliding_window_size is not None
-            and params.attention_chunk_size is not None
-        ):
-            logger.warning(
-                "Sliding window size and attention chunk size are both set, use sliding window size for chunk cache eviction."
-            )
-
         self.sliding_window_size = params.sliding_window_size
-        self.attention_chunk_size = params.attention_chunk_size
-        self.window_size = self.sliding_window_size or self.attention_chunk_size
-
         self.chunked_prefill_size = params.chunked_prefill_size
 
     def supports_swa(self) -> bool:
+        assert (
+            self.sliding_window_size is not None
+        ), "sliding_window_size must be set for SWAChunkCache"
         return True
 
-    def evict_swa(
-        self,
-        req: Req,
-        prelen: int,
-    ):
-        if self.sliding_window_size is not None:
-            # Sliding window attention (e.g. mimo-v2-flash, gpt-oss)
-            new_evicted_seqlen_local = max(
-                req.evicted_seqlen_local, prelen - self.sliding_window_size
-            )
-        elif self.attention_chunk_size is not None:
-            # Local attention (e.g. llama4)
-            new_evicted_seqlen_local = max(
-                req.evicted_seqlen_local,
-                prelen // self.attention_chunk_size * self.attention_chunk_size,
-            )
-
-        if self.page_size > 1:
-            new_evicted_seqlen_local = (
-                new_evicted_seqlen_local // self.page_size
-            ) * self.page_size
-
-        if new_evicted_seqlen_local > req.evicted_seqlen_local:
-            free_slots = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, req.evicted_seqlen_local : new_evicted_seqlen_local
-            ]
-            self.token_to_kv_pool_allocator.free_swa(free_slots)
-            req.evicted_seqlen_local = new_evicted_seqlen_local
-
-    def evict(self, num_tokens: int):
-        pass
+    def evict(self, params: EvictParams) -> EvictResult:
+        return EvictResult()

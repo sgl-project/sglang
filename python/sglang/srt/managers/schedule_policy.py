@@ -35,7 +35,11 @@ import torch
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.layers.attention.nsa.utils import is_nsa_prefill_cp_in_seq_split
 from sglang.srt.managers.schedule_batch import DllmStagingReqs, Req, ScheduleBatch
-from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
+from sglang.srt.mem_cache.base_prefix_cache import (
+    BasePrefixCache,
+    InsertParams,
+    MatchPrefixParams,
+)
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.server_args import ServerArgs
@@ -190,7 +194,9 @@ class SchedulePolicy:
             extra_key = r.extra_key
             # NOTE: the prefix_indices must always be aligned with last_node
             match_result = self.tree_cache.match_prefix(
-                rid=r.rid, key=RadixKey(token_ids=prefix_ids, extra_key=extra_key)
+                MatchPrefixParams(
+                    key=RadixKey(token_ids=prefix_ids, extra_key=extra_key)
+                )
             )
             (
                 r.prefix_indices,
@@ -213,8 +219,9 @@ class SchedulePolicy:
             # It is kind of common when the engine is long running (e.g., imagine the prefix "the").
             if len(r.prefix_indices) <= IN_BATCH_PREFIX_CACHING_CHECK_THRESHOLD:
                 match_result = self.waiting_queue_radix_tree.match_prefix(
-                    rid=r.rid,
-                    key=RadixKey(token_ids=prefix_ids, extra_key=extra_key),
+                    MatchPrefixParams(
+                        key=RadixKey(token_ids=prefix_ids, extra_key=extra_key)
+                    )
                 )
                 in_batch_matching_prefixes = match_result.device_indices
                 if (
@@ -225,8 +232,10 @@ class SchedulePolicy:
                 else:
                     # Insert with a dummy key
                     self.waiting_queue_radix_tree.insert(
-                        RadixKey(token_ids=prefix_ids, extra_key=extra_key),
-                        torch.empty(len(prefix_ids), dtype=torch.bool),
+                        InsertParams(
+                            key=RadixKey(token_ids=prefix_ids, extra_key=extra_key),
+                            value=torch.empty(len(prefix_ids), dtype=torch.bool),
+                        )
                     )
         return temporary_deprioritized
 
@@ -345,9 +354,9 @@ class SchedulePolicy:
         last_node_to_reqs: Dict[TreeNode, List[Req]],
         q: List,
     ) -> None:
-        childs = [child for child in cur_node.children.values()]
-        childs.sort(key=lambda x: -node_to_priority[x])
-        for child in childs:
+        children = [child for child in cur_node.children.values()]
+        children.sort(key=lambda x: -node_to_priority[x])
+        for child in children:
             SchedulePolicy._get_dfs_priority(
                 child, node_to_priority, last_node_to_reqs, q
             )
