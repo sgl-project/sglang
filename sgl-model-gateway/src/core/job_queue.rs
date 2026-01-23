@@ -578,7 +578,7 @@ impl JobQueue {
                                 tokenizer_path: None,
                                 reasoning_parser: None,
                                 tool_parser: None,
-                                chat_template: None,
+                                chat_template: router_config.chat_template.clone(),
                                 bootstrap_port: None,
                                 health_check_timeout_secs: router_config.health_check.timeout_secs,
                                 health_check_interval_secs: router_config
@@ -649,7 +649,7 @@ impl JobQueue {
                         tokenizer_path: None,
                         reasoning_parser: None,
                         tool_parser: None,
-                        chat_template: None,
+                        chat_template: router_config.chat_template.clone(),
                         bootstrap_port,
                         health_check_timeout_secs: router_config.health_check.timeout_secs,
                         health_check_interval_secs: router_config.health_check.check_interval_secs,
