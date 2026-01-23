@@ -111,6 +111,16 @@ class CachedTokensDetails(BaseModel):
     storage: Optional[int] = None  # Tokens from L3 storage backend
     storage_backend: Optional[str] = None  # Type of storage backend used
 
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        # Remove None fields so they don't appear in response when L3 is disabled
+        if self.storage is None:
+            data.pop("storage", None)
+        if self.storage_backend is None:
+            data.pop("storage_backend", None)
+        return data
+
 
 class PromptTokensDetails(BaseModel):
     """Details about prompt tokens including cache breakdown."""
