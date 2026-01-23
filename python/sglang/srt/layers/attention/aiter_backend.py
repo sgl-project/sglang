@@ -998,6 +998,7 @@ class AiterAttnBackend(AttentionBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache=True,
+        sinks=None,
     ):
         cache_loc = (
             forward_batch.out_cache_loc
@@ -1293,6 +1294,10 @@ class AiterAttnBackend(AttentionBackend):
                 k_cache = k_cache.to(dtype)
                 v_cache = v_cache.to(dtype)
 
+            window_size = (-1, -1)
+            if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
+                window_size = (layer.sliding_window_size, -1)
+
             o = mha_batch_prefill_func(
                 q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                 k_cache,
@@ -1307,6 +1312,8 @@ class AiterAttnBackend(AttentionBackend):
                 alibi_slopes=None,
                 return_lse=False,
                 return_attn_probs=False,
+                window_size=window_size,
+                sink_ptr=sinks,
             )
 
             return o.view(-1, layer.tp_q_head_num * layer.head_dim)
