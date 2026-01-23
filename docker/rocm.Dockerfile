@@ -324,10 +324,12 @@ RUN /bin/bash -lc 'set -euo pipefail; \
   \
   # NIC backend deps
   case "${NIC_BACKEND}" in \
+    # default: mlx5
     none) \
       export USE_IONIC="OFF"; \
       export USE_BNXT="OFF"; \
       ;; \
+    # AMD NIC
     ainic) \
       export USE_IONIC="ON"; \
       export USE_BNXT="OFF"; \
@@ -342,8 +344,14 @@ RUN /bin/bash -lc 'set -euo pipefail; \
       ; \
       rm -rf /var/lib/apt/lists/*; \
       ;; \
+    # TODO: Add Broadcom bnxt packages/repos here later.
+    # bnxt) \
+    #   export USE_IONIC="OFF"; \
+    #   export USE_BNXT="ON"; \
+    #   echo "[MORI] NIC_BACKEND=bnxt: USE_BNXT=ON. Add Broadcom bnxt packages/repos here later."; \
+    #   ;; \
     *) \
-      echo "ERROR: unknown NIC_BACKEND=${NIC_BACKEND}. Use one of: none, ainic, bnxt"; \
+      echo "ERROR: unknown NIC_BACKEND=${NIC_BACKEND}. Use one of: none, ainic"; \
       exit 2; \
       ;; \
   esac; \
