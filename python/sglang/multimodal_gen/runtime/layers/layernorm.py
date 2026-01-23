@@ -323,8 +323,8 @@ class ScaleResidualLayerNormScaleShift(nn.Module):
         residual: torch.Tensor,
         x: torch.Tensor,
         gate: torch.Tensor | int,
-        shift: torch.Tensor,
-        scale: torch.Tensor,
+        shift: Optional[torch.Tensor] = None,
+        scale: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Apply gated residual connection, followed by layernorm and
@@ -360,12 +360,10 @@ class ScaleResidualLayerNormScaleShift(nn.Module):
 
         # Apply normalization
         normalized = self.norm(residual_output)
+        if scale is None and shift is None:
+            return normalized, residual_output
 
-        # modulated = fused_scale_shift(
-        #     normalized,
-        #     scale,
-        #     shift,
-        # )
+        assert scale is not None and shift is not None
         modulated = fuse_scale_shift_kernel(
             normalized,
             scale,
