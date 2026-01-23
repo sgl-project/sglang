@@ -1584,7 +1584,7 @@ class ServerArgs:
             )
             self.disable_radix_cache = True
             return
-        
+
         if not support_mamba_cache_extra_buffer:
             assert (
                 not self.enable_mamba_extra_buffer()
