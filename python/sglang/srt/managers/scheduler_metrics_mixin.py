@@ -138,7 +138,8 @@ class SchedulerMetricsMixin:
             return get_available_gpu_memory(
                 self.device, self.gpu_id, empty_cache=False
             )
-        except Exception:
+        except Exception as e:
+            logger.exception("Failed to get available GPU memory")
             return 0.0
 
     def update_spec_metrics(self: Scheduler, bs: int, num_accepted_tokens: int):
