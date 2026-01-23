@@ -118,10 +118,20 @@ def parse_cases(
     return cases
 
 
-def wait_for_server(host_url: str, port: int, timeout_s: int = 1200) -> None:
+def wait_for_server(
+    host_url: str,
+    port: int,
+    timeout_s: int = 1200,
+    proc: Optional[subprocess.Popen] = None,
+) -> None:
     url = f"{host_url}:{port}/health"
     start = time.time()
     while time.time() - start < timeout_s:
+        # Bail out early on startup failures to avoid waiting the full timeout.
+        if proc is not None and proc.poll() is not None:
+            raise RuntimeError(
+                f"Server exited early (code={proc.returncode}) while waiting for: {url}"
+            )
         try:
             r = requests.get(url, timeout=5)
             if r.status_code == 200:
@@ -143,6 +153,7 @@ def start_server(
     ep: int,
     enable_waterfill: bool,
     disable_shared_experts_fusion: bool,
+    mem_fraction_static: Optional[float],
     log_path: str,
 ) -> Tuple[subprocess.Popen, object]:
     flags = [
@@ -185,6 +196,8 @@ def start_server(
     if extra_flags:
         host_idx = flags.index("--host")
         flags[host_idx:host_idx] = extra_flags
+    if mem_fraction_static is not None:
+        flags.extend(["--mem-fraction-static", str(mem_fraction_static)])
 
     os.makedirs(os.path.dirname(log_path), exist_ok=True)
     f = open(log_path, "w", encoding="utf-8")
@@ -201,6 +214,14 @@ def stop_server(proc: subprocess.Popen, log_fh: object) -> None:
     try:
         if proc.poll() is None:
             proc.kill()
+    except Exception:
+        pass
+    # launch_server can leave behind worker/scheduler processes with custom proctitles
+    # like `sglang::scheduler_TP0_EP0` which may not include the port in argv. These
+    # can hold onto large GPU allocations and cause OOM/hangs on subsequent runs.
+    try:
+        subprocess.run(["pkill", "-9", "-f", r"sglang::scheduler_TP"], check=False)
+        subprocess.run(["pkill", "-9", "-f", r"sglang::worker_TP"], check=False)
     except Exception:
         pass
     try:
@@ -517,6 +538,15 @@ def main() -> int:
         action="store_true",
         help="Pass --disable-shared-experts-fusion to both baseline and waterfill servers.",
     )
+    parser.add_argument(
+        "--mem-fraction-static",
+        type=float,
+        default=None,
+        help=(
+            "Pass --mem-fraction-static to both baseline and waterfill servers. "
+            "If unset, use the server's auto-tuned default."
+        ),
+    )
 
     # Accuracy
     # Default: run accuracy. Use --skip-accuracy to opt out.
@@ -595,6 +625,7 @@ def main() -> int:
     print(f"model_path: {args.model_path}")
     print(f"tp={args.tp}, ep={args.ep}, port={args.port}")
     print(f"disable_shared_experts_fusion={args.disable_shared_experts_fusion}")
+    print(f"mem_fraction_static={args.mem_fraction_static}")
     print("")
 
     summary: dict = {
@@ -636,10 +667,11 @@ def main() -> int:
                 ep=args.ep,
                 enable_waterfill=enable_waterfill,
                 disable_shared_experts_fusion=args.disable_shared_experts_fusion,
+                mem_fraction_static=args.mem_fraction_static,
                 log_path=server_log,
             )
             try:
-                wait_for_server(args.host_url, args.port, timeout_s=1800)
+                wait_for_server(args.host_url, args.port, timeout_s=1800, proc=p)
                 gsm_path = run_gsm8k(
                     repo_dir=repo_dir,
                     out_dir=out_dir,
@@ -716,10 +748,11 @@ def main() -> int:
                 ep=args.ep,
                 enable_waterfill=enable_waterfill,
                 disable_shared_experts_fusion=args.disable_shared_experts_fusion,
+                mem_fraction_static=args.mem_fraction_static,
                 log_path=server_log,
             )
             try:
-                wait_for_server(args.host_url, args.port, timeout_s=1800)
+                wait_for_server(args.host_url, args.port, timeout_s=1800, proc=p)
 
                 for c in cases:
                     key = c.key
@@ -796,6 +829,7 @@ def main() -> int:
                 ep=args.ep,
                 enable_waterfill=enable_waterfill,
                 disable_shared_experts_fusion=args.disable_shared_experts_fusion,
+                mem_fraction_static=args.mem_fraction_static,
                 log_path=server_log,
             )
             try:
