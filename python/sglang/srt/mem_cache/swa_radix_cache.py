@@ -563,6 +563,7 @@ class SWARadixCache(BasePrefixCache):
         )
 
         req.cache_protected_len = len(new_indices)
+        req.kv_cache_protected_len = req.cache_protected_len
 
         self.dec_lock_ref(req.last_node, req.swa_uuid_for_lock)
         swa_uuid_for_lock = self.inc_lock_ref(new_last_node)

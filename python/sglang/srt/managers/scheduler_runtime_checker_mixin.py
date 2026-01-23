@@ -182,10 +182,13 @@ class SchedulerRuntimeCheckerMixin:
             uncached_len = 0
             if not req.kv_committed_freed:
                 allocated_len = req.kv_allocated_len
+                cache_protected_len = getattr(
+                    req, "kv_cache_protected_len", req.cache_protected_len
+                )
                 if self.page_size > 1:
                     allocated_len = ceil_align(allocated_len, self.page_size)
-                    assert req.cache_protected_len % self.page_size == 0
-                uncached_len = allocated_len - req.cache_protected_len
+                    assert cache_protected_len % self.page_size == 0
+                uncached_len = allocated_len - cache_protected_len
 
             ret += uncached_len
 

@@ -777,6 +777,7 @@ class PrefillAdder:
                 req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
                 prefix_len = len(req.prefix_indices)
                 req.cache_protected_len = prefix_len
+                req.kv_cache_protected_len = prefix_len
 
             input_tokens = self.ceil_paged_tokens(req.extend_input_len)
 
