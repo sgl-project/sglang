@@ -86,10 +86,18 @@ class VocabIntersectionMapper:
     def map_draft_to_target(self, draft_token_ids: torch.Tensor) -> torch.Tensor:
         return self.draft_to_target_tensor[draft_token_ids]
 
-    def map_target_to_draft(self, target_token_ids: torch.Tensor) -> torch.Tensor:
+    def map_target_to_draft(
+        self, target_token_ids: torch.Tensor, fallback_id: int = 0
+    ) -> torch.Tensor:
+        """Map target vocab token IDs to draft vocab token IDs.
+
+        For tokens not in the intersection, returns fallback_id (default: 0).
+        This can happen when target model predicts a token outside the intersection.
+        """
         if not hasattr(self, "_target_to_draft_tensor"):
+            # Use fallback_id for tokens not in intersection instead of -1
             self._target_to_draft_tensor = torch.full(
-                (self.target_vocab_size,), -1, dtype=torch.long, device=self.device
+                (self.target_vocab_size,), fallback_id, dtype=torch.long, device=self.device
             )
             for target_id, draft_id in self.target_to_draft_map.items():
                 self._target_to_draft_tensor[target_id] = draft_id
