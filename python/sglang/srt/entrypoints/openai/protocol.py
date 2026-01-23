@@ -102,12 +102,28 @@ class ChoiceLogprobs(BaseModel):
     content: List[ChatCompletionTokenLogprob]
 
 
+class CachedTokensDetails(BaseModel):
+    """Detailed breakdown of cached tokens by cache source."""
+
+    device: int = 0  # Tokens from device cache (GPU)
+    host: int = 0  # Tokens from host cache (CPU memory)
+    storage: int = 0  # Tokens from L3 storage backend
+    storage_backend: str = "none"  # Type of storage backend used
+
+
+class PromptTokensDetails(BaseModel):
+    """Details about prompt tokens including cache breakdown."""
+
+    cached_tokens: int = 0
+    cached_tokens_details: Optional[CachedTokensDetails] = None
+
+
 class UsageInfo(BaseModel):
     prompt_tokens: int = 0
     total_tokens: int = 0
     completion_tokens: Optional[int] = 0
-    # only used to return cached tokens when --enable-cache-report is set
-    prompt_tokens_details: Optional[Dict[str, int]] = None
+    # Used to return cached tokens info when --enable-cache-report is set
+    prompt_tokens_details: Optional[PromptTokensDetails] = None
     reasoning_tokens: Optional[int] = 0
 
 

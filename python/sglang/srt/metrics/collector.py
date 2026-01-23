@@ -17,7 +17,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
@@ -1148,8 +1148,8 @@ class TokenizerMetricsCollector:
 
         self.cached_tokens_total = Counter(
             name="sglang:cached_tokens_total",
-            documentation="Number of cached prompt tokens.",
-            labelnames=labels.keys(),
+            documentation="Number of cached prompt tokens by source (device/host/storage).",
+            labelnames=list(labels.keys()) + ["cache_source"],
         )
 
         self.num_requests_total = Counter(
@@ -1303,11 +1303,36 @@ class TokenizerMetricsCollector:
         e2e_latency: float,
         has_grammar: bool,
         retraction_count: int,
+        cached_tokens_details: Optional[Dict[str, Any]] = None,
     ):
         self.prompt_tokens_total.labels(**labels).inc(prompt_tokens)
         self.generation_tokens_total.labels(**labels).inc(generation_tokens)
+
+        # Report cached tokens with detailed source breakdown
         if cached_tokens > 0:
-            self.cached_tokens_total.labels(**labels).inc(cached_tokens)
+            if cached_tokens_details:
+                # Report by cache source (device/host/storage)
+                device_tokens = cached_tokens_details.get("device", 0)
+                host_tokens = cached_tokens_details.get("host", 0)
+                storage_tokens = cached_tokens_details.get("storage", 0)
+
+                if device_tokens > 0:
+                    labels_device = {**labels, "cache_source": "device"}
+                    self.cached_tokens_total.labels(**labels_device).inc(device_tokens)
+                if host_tokens > 0:
+                    labels_host = {**labels, "cache_source": "host"}
+                    self.cached_tokens_total.labels(**labels_host).inc(host_tokens)
+                if storage_tokens > 0:
+                    backend = cached_tokens_details.get("storage_backend", "unknown")
+                    labels_storage = {**labels, "cache_source": f"storage_{backend}"}
+                    self.cached_tokens_total.labels(**labels_storage).inc(
+                        storage_tokens
+                    )
+            else:
+                # Fallback for backward compatibility
+                labels_total = {**labels, "cache_source": "total"}
+                self.cached_tokens_total.labels(**labels_total).inc(cached_tokens)
+
         self.num_requests_total.labels(**labels).inc(1)
         if has_grammar:
             self.num_so_requests_total.labels(**labels).inc(1)
