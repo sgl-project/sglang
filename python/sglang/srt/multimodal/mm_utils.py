@@ -44,6 +44,11 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
+from sglang.srt.layers.dp_attention import (
+    get_attention_tp_group,
+    get_attention_tp_rank,
+    get_attention_tp_size,
+)
 from sglang.srt.utils import flatten_nested_list
 
 
@@ -495,12 +500,6 @@ def run_dp_sharded_mrope_vision_model(
         ```
 
     """
-    from sglang.srt.layers.dp_attention import (
-        get_attention_tp_group,
-        get_attention_tp_rank,
-        get_attention_tp_size,
-    )
-
     tp_size = get_attention_tp_size()
     if tp_size == 1:
         return vision_model(pixel_values, grid_thw=torch.tensor(grid_thw_list))
