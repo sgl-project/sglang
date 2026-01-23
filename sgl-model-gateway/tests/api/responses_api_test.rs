@@ -1,5 +1,7 @@
 // Integration test for Responses API
 
+use std::collections::HashSet;
+
 use axum::http::StatusCode;
 use smg::{
     config::RouterConfig,
@@ -86,6 +88,7 @@ async fn test_non_streaming_mcp_minimal_e2e_with_persistence() {
             function: None,
             server_url: Some(mcp.url()),
             authorization: None,
+            headers: None,
             server_label: Some("mock".to_string()),
             server_description: None,
             require_approval: None,
@@ -217,6 +220,315 @@ async fn test_non_streaming_mcp_minimal_e2e_with_persistence() {
     // Cleanup
     worker.stop().await;
     mcp.stop().await;
+}
+
+#[tokio::test]
+async fn test_non_streaming_mcp_multi_server_e2e() {
+    let mut mcp1 = MockMCPServer::start().await.expect("start mcp1");
+    let mut mcp2 = MockMCPServer::start().await.expect("start mcp2");
+
+    let mcp_yaml = format!(
+        "servers:\n  - name: mock\n    protocol: streamable\n    url: {}\n  - name: mock2\n    protocol: streamable\n    url: {}\n",
+        mcp1.url(),
+        mcp2.url()
+    );
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let cfg_path = dir.path().join("mcp.yaml");
+    std::fs::write(&cfg_path, mcp_yaml).expect("write mcp cfg");
+
+    let mut worker = MockWorker::new(MockWorkerConfig {
+        port: 0,
+        worker_type: WorkerType::Regular,
+        health_status: HealthStatus::Healthy,
+        response_delay_ms: 0,
+        fail_rate: 0.0,
+    });
+    let worker_url = worker.start().await.expect("start worker");
+
+    let router_cfg = RouterConfig::builder()
+        .openai_mode(vec![worker_url])
+        .random_policy()
+        .host("127.0.0.1")
+        .port(0)
+        .max_payload_size(8 * 1024 * 1024)
+        .request_timeout_secs(60)
+        .worker_startup_timeout_secs(5)
+        .worker_startup_check_interval_secs(1)
+        .log_level("warn")
+        .max_concurrent_requests(32)
+        .queue_timeout_secs(5)
+        .build_unchecked();
+
+    let ctx =
+        crate::common::create_test_context_with_mcp_config(router_cfg, cfg_path.to_str().unwrap())
+            .await;
+    let router = RouterFactory::create_router(&ctx).await.expect("router");
+
+    let req = ResponsesRequest {
+        background: Some(false),
+        include: None,
+        input: ResponseInput::Text("search something".to_string()),
+        instructions: Some("Be brief".to_string()),
+        max_output_tokens: Some(64),
+        max_tool_calls: None,
+        metadata: None,
+        model: "mock-model".to_string(),
+        parallel_tool_calls: Some(true),
+        previous_response_id: None,
+        reasoning: None,
+        service_tier: Some(ServiceTier::Auto),
+        store: Some(true),
+        stream: Some(false),
+        temperature: Some(0.2),
+        tool_choice: Some(ToolChoice::default()),
+        tools: Some(vec![
+            ResponseTool {
+                r#type: ResponseToolType::Mcp,
+                function: None,
+                server_url: Some(mcp1.url()),
+                authorization: None,
+                headers: None,
+                server_label: Some("mock".to_string()),
+                server_description: None,
+                require_approval: None,
+                allowed_tools: None,
+            },
+            ResponseTool {
+                r#type: ResponseToolType::Mcp,
+                function: None,
+                server_url: Some(mcp2.url()),
+                authorization: None,
+                headers: None,
+                server_label: Some("mock2".to_string()),
+                server_description: None,
+                require_approval: None,
+                allowed_tools: None,
+            },
+        ]),
+        top_logprobs: Some(0),
+        top_p: None,
+        truncation: Some(Truncation::Disabled),
+        text: None,
+        user: None,
+        request_id: Some("resp_test_mcp_multi_e2e".to_string()),
+        priority: 0,
+        frequency_penalty: Some(0.0),
+        presence_penalty: Some(0.0),
+        stop: None,
+        top_k: -1,
+        min_p: 0.0,
+        repetition_penalty: 1.0,
+        conversation: None,
+    };
+
+    let resp = router
+        .route_responses(None, &req, Some(req.model.as_str()))
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("Failed to read response body");
+    let body_json: serde_json::Value =
+        serde_json::from_slice(&body_bytes).expect("Failed to parse response JSON");
+
+    let output = body_json
+        .get("output")
+        .and_then(|v| v.as_array())
+        .expect("response output missing");
+    let list_tools_items: Vec<_> = output
+        .iter()
+        .filter(|entry| {
+            entry.get("type") == Some(&serde_json::Value::String("mcp_list_tools".into()))
+        })
+        .collect();
+    assert_eq!(list_tools_items.len(), 2, "expected two list_tools items");
+
+    let labels: HashSet<&str> = list_tools_items
+        .iter()
+        .filter_map(|entry| entry.get("server_label").and_then(|v| v.as_str()))
+        .collect();
+    assert_eq!(labels, HashSet::from(["mock", "mock2"]));
+
+    let mcp_call_item = output
+        .iter()
+        .find(|entry| entry.get("type") == Some(&serde_json::Value::String("mcp_call".into())))
+        .expect("missing mcp_call output item");
+    assert_eq!(
+        mcp_call_item.get("server_label").and_then(|v| v.as_str()),
+        Some("mock")
+    );
+
+    worker.stop().await;
+    mcp1.stop().await;
+    mcp2.stop().await;
+}
+
+#[tokio::test]
+async fn test_streaming_mcp_multi_server_e2e() {
+    let mut mcp1 = MockMCPServer::start().await.expect("start mcp1");
+    let mut mcp2 = MockMCPServer::start().await.expect("start mcp2");
+
+    let mcp_yaml = format!(
+        "servers:\n  - name: mock\n    protocol: streamable\n    url: {}\n  - name: mock2\n    protocol: streamable\n    url: {}\n",
+        mcp1.url(),
+        mcp2.url()
+    );
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let cfg_path = dir.path().join("mcp.yaml");
+    std::fs::write(&cfg_path, mcp_yaml).expect("write mcp cfg");
+
+    let mut worker = MockWorker::new(MockWorkerConfig {
+        port: 0,
+        worker_type: WorkerType::Regular,
+        health_status: HealthStatus::Healthy,
+        response_delay_ms: 0,
+        fail_rate: 0.0,
+    });
+    let worker_url = worker.start().await.expect("start worker");
+
+    let router_cfg = RouterConfig::builder()
+        .openai_mode(vec![worker_url])
+        .random_policy()
+        .host("127.0.0.1")
+        .port(0)
+        .max_payload_size(8 * 1024 * 1024)
+        .request_timeout_secs(60)
+        .worker_startup_timeout_secs(5)
+        .worker_startup_check_interval_secs(1)
+        .log_level("warn")
+        .max_concurrent_requests(32)
+        .queue_timeout_secs(5)
+        .build_unchecked();
+
+    let ctx =
+        crate::common::create_test_context_with_mcp_config(router_cfg, cfg_path.to_str().unwrap())
+            .await;
+    let router = RouterFactory::create_router(&ctx).await.expect("router");
+
+    let req = ResponsesRequest {
+        background: Some(false),
+        include: None,
+        input: ResponseInput::Text("search something".to_string()),
+        instructions: Some("Be brief".to_string()),
+        max_output_tokens: Some(64),
+        max_tool_calls: None,
+        metadata: None,
+        model: "mock-model".to_string(),
+        parallel_tool_calls: Some(true),
+        previous_response_id: None,
+        reasoning: None,
+        service_tier: Some(ServiceTier::Auto),
+        store: Some(true),
+        stream: Some(true),
+        temperature: Some(0.2),
+        tool_choice: Some(ToolChoice::default()),
+        tools: Some(vec![
+            ResponseTool {
+                r#type: ResponseToolType::Mcp,
+                function: None,
+                server_url: Some(mcp1.url()),
+                authorization: None,
+                headers: None,
+                server_label: Some("mock".to_string()),
+                server_description: None,
+                require_approval: None,
+                allowed_tools: None,
+            },
+            ResponseTool {
+                r#type: ResponseToolType::Mcp,
+                function: None,
+                server_url: Some(mcp2.url()),
+                authorization: None,
+                headers: None,
+                server_label: Some("mock2".to_string()),
+                server_description: None,
+                require_approval: None,
+                allowed_tools: None,
+            },
+        ]),
+        top_logprobs: Some(0),
+        top_p: None,
+        truncation: Some(Truncation::Disabled),
+        text: None,
+        user: None,
+        request_id: Some("resp_test_mcp_multi_stream".to_string()),
+        priority: 0,
+        frequency_penalty: Some(0.0),
+        presence_penalty: Some(0.0),
+        stop: None,
+        top_k: -1,
+        min_p: 0.0,
+        repetition_penalty: 1.0,
+        conversation: None,
+    };
+
+    let resp = router
+        .route_responses(None, &req, Some(req.model.as_str()))
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("Failed to read response body");
+    let body_text = String::from_utf8(body_bytes.to_vec()).expect("invalid utf8");
+
+    let events: Vec<serde_json::Value> = body_text
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter(|data| *data != "[DONE]")
+        .map(|data| serde_json::from_str(data).expect("invalid json event"))
+        .collect();
+
+    let list_tools_items: Vec<_> = events
+        .iter()
+        .filter_map(|event| {
+            let is_done =
+                event.get("type").and_then(|v| v.as_str()) == Some("response.output_item.done");
+            if !is_done {
+                return None;
+            }
+            let item = event.get("item")?;
+            let item_type = item.get("type").and_then(|v| v.as_str());
+            if item_type == Some("mcp_list_tools") {
+                Some(item)
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(list_tools_items.len(), 2, "expected two list_tools items");
+
+    let labels: HashSet<&str> = list_tools_items
+        .iter()
+        .filter_map(|entry| entry.get("server_label").and_then(|v| v.as_str()))
+        .collect();
+    assert_eq!(labels, HashSet::from(["mock", "mock2"]));
+
+    let mcp_call_item = events.iter().find_map(|event| {
+        let is_done =
+            event.get("type").and_then(|v| v.as_str()) == Some("response.output_item.done");
+        if !is_done {
+            return None;
+        }
+        let item = event.get("item")?;
+        let item_type = item.get("type").and_then(|v| v.as_str());
+        if item_type == Some("mcp_call") {
+            Some(item)
+        } else {
+            None
+        }
+    });
+    assert_eq!(
+        mcp_call_item
+            .and_then(|item| item.get("server_label"))
+            .and_then(|v| v.as_str()),
+        Some("mock")
+    );
+
+    worker.stop().await;
+    mcp1.stop().await;
+    mcp2.stop().await;
 }
 
 #[tokio::test]

@@ -11,8 +11,8 @@ use tracing::{debug, error, warn};
 
 use super::{
     common::{
-        build_mcp_tool_names_set, build_next_request_with_tools, inject_mcp_metadata,
-        load_previous_messages, McpCallTracking,
+        build_mcp_tool_names_set, build_next_request_with_tools, build_server_label_map,
+        inject_mcp_metadata, load_previous_messages, McpCallTracking, McpToolLookup,
     },
     execution::{convert_mcp_tools_to_response_tools, execute_mcp_tools, ToolResult},
 };
@@ -33,7 +33,7 @@ use crate::{
             },
             harmony::processor::ResponsesIterationResult,
         },
-        mcp_utils::{extract_server_label, DEFAULT_MAX_ITERATIONS},
+        mcp_utils::DEFAULT_MAX_ITERATIONS,
     },
 };
 
@@ -96,29 +96,35 @@ async fn execute_with_mcp_loop(
 ) -> Result<ResponsesResponse, Response> {
     let mut iteration_count = 0;
 
-    // Extract server_label from request tools
-    let server_label = extract_server_label(current_request.tools.as_deref(), "sglang-mcp");
-    let mut mcp_tracking = McpCallTracking::new(server_label.clone());
+    let request_tools = current_request.tools.clone();
+    let response_request = current_request.clone();
+
+    let servers = ctx.requested_servers.read().unwrap().clone();
+    let server_labels = build_server_label_map(request_tools.as_deref());
+    let mut mcp_tracking = McpCallTracking::new(McpToolLookup::default());
 
     // Extract user's max_tool_calls limit (if set)
     let max_tool_calls = current_request.max_tool_calls.map(|n| n as usize);
 
     // Add filtered MCP tools (static + requested dynamic) to the request
-    let mcp_tools = {
-        let servers = ctx.requested_servers.read().unwrap();
-        ctx.mcp_manager.list_tools_for_servers(&servers)
-    };
-    if !mcp_tools.is_empty() {
-        let mcp_response_tools = convert_mcp_tools_to_response_tools(&mcp_tools);
+    let (mcp_response_tools, tool_lookup) = convert_mcp_tools_to_response_tools(
+        &ctx.mcp_manager,
+        &servers,
+        &server_labels,
+        request_tools.as_deref(),
+    );
+    if !mcp_response_tools.is_empty() {
+        let mcp_tool_count = mcp_response_tools.len();
+        mcp_tracking.tool_lookup = tool_lookup;
 
         let mut all_tools = current_request.tools.clone().unwrap_or_default();
         all_tools.extend(mcp_response_tools);
         current_request.tools = Some(all_tools);
 
         debug!(
-            mcp_tool_count = mcp_tools.len(),
+            mcp_tool_count,
             total_tool_count = current_request.tools.as_ref().map(|t| t.len()).unwrap_or(0),
-            "MCP client available - added static MCP tools to Harmony Responses request"
+            "Added MCP tools to request"
         );
     }
 
@@ -172,8 +178,8 @@ async fn execute_with_mcp_loop(
                 );
 
                 // Separate MCP and function tool calls based on tool type
-                let request_tools = current_request.tools.as_deref().unwrap_or(&[]);
-                let mcp_tool_names = build_mcp_tool_names_set(request_tools);
+                let request_tools_slice = current_request.tools.as_deref().unwrap_or(&[]);
+                let mcp_tool_names = build_mcp_tool_names_set(request_tools_slice);
                 let (mcp_tool_calls, function_tool_calls): (Vec<_>, Vec<_>) = tool_calls
                     .into_iter()
                     .partition(|tc| mcp_tool_names.contains(tc.function.name.as_str()));
@@ -209,6 +215,7 @@ async fn execute_with_mcp_loop(
                         .collect();
 
                     // Build response with incomplete status - no tools executed due to limit
+                    let request_tools = current_request.tools.clone();
                     let mut response = build_tool_response(
                         vec![],         // No MCP tools executed
                         vec![],         // No MCP results
@@ -217,7 +224,7 @@ async fn execute_with_mcp_loop(
                         partial_text,
                         usage,
                         request_id,
-                        Arc::new(current_request),
+                        Arc::new(response_request.clone()),
                     );
 
                     // Mark as completed with incomplete_details
@@ -226,7 +233,14 @@ async fn execute_with_mcp_loop(
 
                     // Inject MCP metadata if any calls were executed
                     if mcp_tracking.total_calls() > 0 {
-                        inject_mcp_metadata(&mut response, &mcp_tracking, &mcp_tools);
+                        inject_mcp_metadata(
+                            &mut response,
+                            &mcp_tracking,
+                            &ctx.mcp_manager,
+                            &servers,
+                            &server_labels,
+                            request_tools.as_deref(),
+                        );
                     }
 
                     return Ok(response);
@@ -263,12 +277,19 @@ async fn execute_with_mcp_loop(
                         partial_text,
                         usage,
                         request_id,
-                        Arc::new(current_request),
+                        Arc::new(response_request.clone()),
                     );
 
                     // Inject MCP metadata for all executed calls
                     if mcp_tracking.total_calls() > 0 {
-                        inject_mcp_metadata(&mut response, &mcp_tracking, &mcp_tools);
+                        inject_mcp_metadata(
+                            &mut response,
+                            &mcp_tracking,
+                            &ctx.mcp_manager,
+                            &servers,
+                            &server_labels,
+                            request_tools.as_deref(),
+                        );
                     }
 
                     return Ok(response);
@@ -300,8 +321,22 @@ async fn execute_with_mcp_loop(
                     "MCP loop completed - no more tool calls"
                 );
 
+                response.tools = response_request.tools.clone().unwrap_or_default();
+                response.tool_choice = if let Some(ref tool_choice) = response_request.tool_choice {
+                    to_string(tool_choice).unwrap_or_else(|_| "auto".to_string())
+                } else {
+                    "auto".to_string()
+                };
+
                 // Inject MCP metadata into final response
-                inject_mcp_metadata(&mut response, &mcp_tracking, &mcp_tools);
+                inject_mcp_metadata(
+                    &mut response,
+                    &mcp_tracking,
+                    &ctx.mcp_manager,
+                    &servers,
+                    &server_labels,
+                    request_tools.as_deref(),
+                );
 
                 debug!(
                     mcp_calls = mcp_tracking.total_calls(),

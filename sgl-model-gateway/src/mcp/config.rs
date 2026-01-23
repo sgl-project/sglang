@@ -62,11 +62,15 @@ pub enum McpTransport {
         url: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         token: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        headers: Option<HashMap<String, String>>,
     },
     Streamable {
         url: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         token: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        headers: Option<HashMap<String, String>>,
     },
 }
 
@@ -83,15 +87,25 @@ impl fmt::Debug for McpTransport {
                 .field("args", args)
                 .field("envs", envs)
                 .finish(),
-            McpTransport::Sse { url, token } => f
+            McpTransport::Sse {
+                url,
+                token,
+                headers,
+            } => f
                 .debug_struct("Sse")
                 .field("url", url)
                 .field("token", &token.as_ref().map(|_| "****"))
+                .field("headers", &headers.as_ref().map(|h| h.len()))
                 .finish(),
-            McpTransport::Streamable { url, token } => f
+            McpTransport::Streamable {
+                url,
+                token,
+                headers,
+            } => f
                 .debug_struct("Streamable")
                 .field("url", url)
                 .field("token", &token.as_ref().map(|_| "****"))
+                .field("headers", &headers.as_ref().map(|h| h.len()))
                 .finish(),
         }
     }
@@ -497,9 +511,45 @@ token: "secret"
         assert_eq!(config.name, "test");
 
         match config.transport {
-            McpTransport::Sse { url, token } => {
+            McpTransport::Sse {
+                url,
+                token,
+                headers,
+            } => {
                 assert_eq!(url, "http://localhost:3000/sse");
                 assert_eq!(token.unwrap(), "secret");
+                assert!(headers.is_none());
+            }
+            _ => panic!("Expected Sse transport"),
+        }
+    }
+
+    #[test]
+    fn test_transport_sse_with_headers() {
+        let yaml = r#"
+name: "test"
+protocol: sse
+url: "http://localhost:3000/sse"
+token: "secret"
+headers:
+  X-Request-ID: "abc123"
+  X-Custom: "value"
+"#;
+
+        let config: McpServerConfig = serde_yaml::from_str(yaml).expect("Failed to parse sse");
+        assert_eq!(config.name, "test");
+
+        match config.transport {
+            McpTransport::Sse {
+                url,
+                token,
+                headers,
+            } => {
+                assert_eq!(url, "http://localhost:3000/sse");
+                assert_eq!(token.unwrap(), "secret");
+                let headers = headers.expect("Expected headers");
+                assert_eq!(headers.get("X-Request-ID").unwrap(), "abc123");
+                assert_eq!(headers.get("X-Custom").unwrap(), "value");
             }
             _ => panic!("Expected Sse transport"),
         }
@@ -518,9 +568,14 @@ url: "http://localhost:3000"
         assert_eq!(config.name, "test");
 
         match config.transport {
-            McpTransport::Streamable { url, token } => {
+            McpTransport::Streamable {
+                url,
+                token,
+                headers,
+            } => {
                 assert_eq!(url, "http://localhost:3000");
                 assert!(token.is_none());
+                assert!(headers.is_none());
             }
             _ => panic!("Expected Streamable transport"),
         }

@@ -638,6 +638,7 @@ fn test_validate_tools_function_missing() {
             function: None, // Missing function definition
             server_url: None,
             authorization: None,
+            headers: None,
             server_label: None,
             server_description: None,
             require_approval: None,
@@ -662,6 +663,7 @@ fn test_validate_tools_mcp_missing_url() {
             function: None,
             server_url: None, // Missing server_url
             authorization: None,
+            headers: None,
             server_label: None,
             server_description: None,
             require_approval: None,
@@ -673,6 +675,94 @@ fn test_validate_tools_mcp_missing_url() {
     assert!(
         result.is_err(),
         "MCP tool without server_url should be invalid"
+    );
+}
+
+/// Test MCP tool requires server_label when server_url provided
+#[test]
+fn test_validate_tools_mcp_missing_label() {
+    let request = ResponsesRequest {
+        input: ResponseInput::Text("test".to_string()),
+        tools: Some(vec![ResponseTool {
+            r#type: ResponseToolType::Mcp,
+            function: None,
+            server_url: Some("http://localhost:3000".to_string()),
+            authorization: None,
+            headers: None,
+            server_label: None,
+            server_description: None,
+            require_approval: None,
+            allowed_tools: None,
+        }]),
+        ..Default::default()
+    };
+    let result = request.validate();
+    assert!(
+        result.is_err(),
+        "MCP tool without server_label should be invalid"
+    );
+}
+
+/// Test MCP tool server_label must not include '__'
+#[test]
+fn test_validate_tools_mcp_invalid_label() {
+    let request = ResponsesRequest {
+        input: ResponseInput::Text("test".to_string()),
+        tools: Some(vec![ResponseTool {
+            r#type: ResponseToolType::Mcp,
+            function: None,
+            server_url: Some("http://localhost:3000".to_string()),
+            authorization: None,
+            headers: None,
+            server_label: Some("bad__label".to_string()),
+            server_description: None,
+            require_approval: None,
+            allowed_tools: None,
+        }]),
+        ..Default::default()
+    };
+    let result = request.validate();
+    assert!(
+        result.is_err(),
+        "MCP tool with invalid server_label should be invalid"
+    );
+}
+
+/// Test MCP tool server_label must be unique
+#[test]
+fn test_validate_tools_mcp_duplicate_label() {
+    let request = ResponsesRequest {
+        input: ResponseInput::Text("test".to_string()),
+        tools: Some(vec![
+            ResponseTool {
+                r#type: ResponseToolType::Mcp,
+                function: None,
+                server_url: Some("http://localhost:3000".to_string()),
+                authorization: None,
+                headers: None,
+                server_label: Some("dup".to_string()),
+                server_description: None,
+                require_approval: None,
+                allowed_tools: None,
+            },
+            ResponseTool {
+                r#type: ResponseToolType::Mcp,
+                function: None,
+                server_url: Some("http://localhost:4000".to_string()),
+                authorization: None,
+                headers: None,
+                server_label: Some("dup".to_string()),
+                server_description: None,
+                require_approval: None,
+                allowed_tools: None,
+            },
+        ]),
+        ..Default::default()
+    };
+    let result = request.validate();
+    assert!(
+        result.is_err(),
+        "MCP tools with duplicate server_label should be invalid"
     );
 }
 
@@ -718,6 +808,7 @@ fn test_validate_tool_choice_requires_tools() {
             }),
             server_url: None,
             authorization: None,
+            headers: None,
             server_label: None,
             server_description: None,
             require_approval: None,
@@ -977,6 +1068,7 @@ fn test_normalize_tool_choice_auto() {
             }),
             server_url: None,
             authorization: None,
+            headers: None,
             server_label: None,
             server_description: None,
             require_approval: None,
@@ -1045,6 +1137,7 @@ fn test_normalize_tool_choice_no_override() {
             }),
             server_url: None,
             authorization: None,
+            headers: None,
             server_label: None,
             server_description: None,
             require_approval: None,
@@ -1082,6 +1175,7 @@ fn test_normalize_parallel_tool_calls() {
             }),
             server_url: None,
             authorization: None,
+            headers: None,
             server_label: None,
             server_description: None,
             require_approval: None,
@@ -1141,6 +1235,7 @@ fn test_normalize_parallel_tool_calls_no_override() {
             }),
             server_url: None,
             authorization: None,
+            headers: None,
             server_label: None,
             server_description: None,
             require_approval: None,

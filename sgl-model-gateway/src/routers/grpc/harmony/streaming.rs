@@ -866,9 +866,12 @@ impl HarmonyStreamingProcessor {
 
                                 // Add server_label for MCP calls
                                 if tool_mode.emits_status_events() {
-                                    if let Some(ref server_label) = emitter.mcp_server_label {
-                                        item["server_label"] = json!(server_label);
-                                    }
+                                    let server_label = emitter
+                                        .mcp_tool_labels
+                                        .as_ref()
+                                        .and_then(|labels| labels.get(tool_name).cloned())
+                                        .unwrap_or_else(|| "mcp".to_string());
+                                    item["server_label"] = json!(server_label);
                                 }
 
                                 let event = emitter.emit_output_item_added(output_index, &item);
@@ -980,10 +983,12 @@ impl HarmonyStreamingProcessor {
 
                                 // Add server_label for MCP calls
                                 if tool_mode.emits_status_events() {
-                                    // MCP mode - include server_label
-                                    if let Some(ref server_label) = emitter.mcp_server_label {
-                                        item["server_label"] = json!(server_label);
-                                    }
+                                    let server_label = emitter
+                                        .mcp_tool_labels
+                                        .as_ref()
+                                        .and_then(|labels| labels.get(tool_name).cloned())
+                                        .unwrap_or_else(|| "mcp".to_string());
+                                    item["server_label"] = json!(server_label);
                                 }
 
                                 let event = emitter.emit_output_item_done(*output_index, &item);
@@ -1101,9 +1106,12 @@ impl HarmonyStreamingProcessor {
 
                         // Add server_label for MCP calls
                         if tool_mode.emits_status_events() {
-                            if let Some(ref server_label) = emitter.mcp_server_label {
-                                item["server_label"] = json!(server_label);
-                            }
+                            let server_label = emitter
+                                .mcp_tool_labels
+                                .as_ref()
+                                .and_then(|labels| labels.get(tool_name).cloned())
+                                .unwrap_or_else(|| "mcp".to_string());
+                            item["server_label"] = json!(server_label);
                         }
 
                         let event = emitter.emit_output_item_done(*output_index, &item);

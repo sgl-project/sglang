@@ -128,11 +128,15 @@ impl StepExecutor<McpWorkflowData> for DiscoverMcpInventoryStep {
                 })?;
 
         let inventory = mcp_manager.inventory();
+        let server_key = McpManager::server_key(&config_request.config);
 
-        // Use the public load_server_inventory method
-        McpManager::load_server_inventory(&inventory, &config_request.name, mcp_client).await;
+        // Discover and load inventory
+        McpManager::load_server_inventory(&inventory, &server_key, mcp_client).await;
 
-        info!("Completed inventory discovery for {}", config_request.name);
+        info!(
+            "Completed inventory discovery for {} (key: {})",
+            config_request.name, server_key
+        );
 
         Ok(StepResult::Success)
     }
@@ -179,13 +183,18 @@ impl StepExecutor<McpWorkflowData> for RegisterMcpServerStep {
                     message: "MCP manager not initialized".to_string(),
                 })?;
 
+        let server_key = McpManager::server_key(&config_request.config);
+
         // Register the client in the manager's client map
-        mcp_manager.register_static_server(config_request.name.clone(), mcp_client);
+        mcp_manager.register_static_server(server_key.clone(), mcp_client);
 
         // Update active MCP servers metric
         Metrics::set_mcp_servers_active(mcp_manager.list_servers().len());
 
-        info!("Registered MCP server: {}", config_request.name);
+        info!(
+            "Registered MCP server: {} (key: {})",
+            config_request.name, server_key
+        );
 
         Ok(StepResult::Success)
     }

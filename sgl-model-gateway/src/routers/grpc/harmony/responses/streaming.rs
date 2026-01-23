@@ -11,8 +11,9 @@ use uuid::Uuid;
 
 use super::{
     common::{
-        build_mcp_tool_names_set, build_next_request_with_tools, load_previous_messages,
-        McpCallTracking,
+        build_mcp_tool_names_set, build_next_request_with_tools, build_server_label_map,
+        build_tool_label_map, list_tools_by_server, load_previous_messages, McpCallTracking,
+        McpToolLookup,
     },
     execution::{convert_mcp_tools_to_response_tools, execute_mcp_tools},
 };
@@ -28,7 +29,10 @@ use crate::{
             },
             harmony::{processor::ResponsesIterationResult, streaming::HarmonyStreamingProcessor},
         },
-        mcp_utils::{extract_server_label, DEFAULT_MAX_ITERATIONS},
+        mcp_utils::{
+            build_allowed_tools_map, filter_tools_for_server, resolve_server_label,
+            DEFAULT_MAX_ITERATIONS,
+        },
     },
 };
 
@@ -118,35 +122,42 @@ async fn execute_mcp_tool_loop_streaming(
     emitter: &mut ResponseStreamEventEmitter,
     tx: &mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
 ) {
-    // Extract server_label from request tools
-    let server_label = extract_server_label(current_request.tools.as_deref(), "sglang-mcp");
+    let servers = ctx.requested_servers.read().unwrap().clone();
+    let server_labels = build_server_label_map(current_request.tools.as_deref());
+    let allowed_tools = build_allowed_tools_map(current_request.tools.as_deref());
+    let tool_labels = build_tool_label_map(&ctx.mcp_manager, &servers, &server_labels);
 
-    // Set server label in emitter for MCP call items
-    emitter.set_mcp_server_label(server_label.clone());
+    // Set tool labels in emitter for MCP call items
+    emitter.set_mcp_tool_labels(tool_labels.clone());
 
     // Initialize MCP call tracking
-    let mut mcp_tracking = McpCallTracking::new(server_label.clone());
-
+    let mut mcp_tracking = McpCallTracking::new(McpToolLookup::default());
     // Extract user's max_tool_calls limit (if set)
     let max_tool_calls = current_request.max_tool_calls.map(|n| n as usize);
 
     // Add filtered MCP tools (static + requested dynamic) to the request
-    let mcp_tools = {
-        let servers = ctx.requested_servers.read().unwrap();
-        ctx.mcp_manager.list_tools_for_servers(&servers)
-    };
-    if !mcp_tools.is_empty() {
-        let mcp_response_tools = convert_mcp_tools_to_response_tools(&mcp_tools);
+    let (mcp_response_tools, tool_lookup) = convert_mcp_tools_to_response_tools(
+        &ctx.mcp_manager,
+        &servers,
+        &server_labels,
+        current_request.tools.as_deref(),
+    );
+    let mcp_tool_count = mcp_response_tools.len();
+    if !mcp_response_tools.is_empty() {
+        mcp_tracking.tool_lookup = tool_lookup;
+
         let mut all_tools = current_request.tools.clone().unwrap_or_default();
         all_tools.extend(mcp_response_tools);
         current_request.tools = Some(all_tools);
 
         debug!(
-            mcp_tool_count = mcp_tools.len(),
+            mcp_tool_count,
             total_tool_count = current_request.tools.as_ref().map(|t| t.len()).unwrap_or(0),
-            "MCP client available - added static MCP tools to Harmony Responses streaming request"
+            "Added MCP tools to request"
         );
     }
+
+    let tools_by_server = list_tools_by_server(&ctx.mcp_manager, &servers);
 
     // Build HashSet of MCP tool names for O(1) lookup during streaming
     // Clone tool names to owned strings to avoid borrowing current_request
@@ -163,68 +174,77 @@ async fn execute_mcp_tool_loop_streaming(
         .unwrap_or_default();
 
     // Emit mcp_list_tools on first iteration
-    let (output_index, item_id) = emitter.allocate_output_index(OutputItemType::McpListTools);
+    for (server_key, tools) in tools_by_server.iter() {
+        let server_label = resolve_server_label(server_key, &server_labels);
+        let filtered_tools = filter_tools_for_server(tools, &server_label, &allowed_tools);
 
-    // Build tools list for item structure
-    let tool_items: Vec<_> = mcp_tools
-        .iter()
-        .map(|t| {
-            json!({
-                "name": t.name,
-                "description": t.description,
-                "input_schema": Value::Object((*t.input_schema).clone())
+        if filtered_tools.is_empty() {
+            continue;
+        }
+
+        let (output_index, item_id) = emitter.allocate_output_index(OutputItemType::McpListTools);
+
+        // Build tools list for item structure
+        let tool_items: Vec<_> = filtered_tools
+            .iter()
+            .map(|t| {
+                json!({
+                    "name": t.name,
+                    "description": t.description,
+                    "input_schema": Value::Object((*t.input_schema).clone())
+                })
             })
-        })
-        .collect();
+            .collect();
 
-    // Build final item with completed status and tools
-    let item_done = json!({
-        "id": item_id,
-        "type": "mcp_list_tools",
-        "server_label": server_label,
-        "status": "completed",
-        "tools": tool_items
-    });
+        // Build final item with completed status and tools
+        let item_done = json!({
+            "id": item_id,
+            "type": "mcp_list_tools",
+            "server_label": server_label,
+            "status": "completed",
+            "tools": tool_items
+        });
 
-    // Store the completed item data and mark as completed FIRST
-    // This ensures it appears in final response even if event sending fails
-    emitter.emit_output_item_done(output_index, &item_done);
-    emitter.complete_output_item(output_index);
+        // Store the completed item data and mark as completed FIRST
+        // This ensures it appears in final response even if event sending fails
+        emitter.emit_output_item_done(output_index, &item_done);
+        emitter.complete_output_item(output_index);
 
-    // Now emit all the events (failures won't affect the stored data)
-    // Emit output_item.added
-    let item = json!({
-        "id": item_id,
-        "type": "mcp_list_tools",
-        "server_label": server_label,
-        "status": "in_progress",
-        "tools": []
-    });
-    let event = emitter.emit_output_item_added(output_index, &item);
-    if emitter.send_event(&event, tx).is_err() {
-        return;
-    }
+        // Now emit all the events (failures won't affect the stored data)
+        // Emit output_item.added
+        let item = json!({
+            "id": item_id,
+            "type": "mcp_list_tools",
+            "server_label": server_label,
+            "status": "in_progress",
+            "tools": []
+        });
+        let event = emitter.emit_output_item_added(output_index, &item);
+        if emitter.send_event(&event, tx).is_err() {
+            return;
+        }
 
-    // Emit mcp_list_tools.in_progress
-    let event = emitter.emit_mcp_list_tools_in_progress(output_index);
-    if emitter.send_event(&event, tx).is_err() {
-        return;
-    }
+        // Emit mcp_list_tools.in_progress
+        let event = emitter.emit_mcp_list_tools_in_progress(output_index);
+        if emitter.send_event(&event, tx).is_err() {
+            return;
+        }
 
-    // Emit mcp_list_tools.completed
-    let event = emitter.emit_mcp_list_tools_completed(output_index, &mcp_tools);
-    if emitter.send_event(&event, tx).is_err() {
-        return;
-    }
+        // Emit mcp_list_tools.completed
+        let event = emitter.emit_mcp_list_tools_completed(output_index, &filtered_tools);
+        if emitter.send_event(&event, tx).is_err() {
+            return;
+        }
 
-    // Emit output_item.done
-    let event = emitter.emit_output_item_done(output_index, &item_done);
-    if emitter.send_event(&event, tx).is_err() {
-        return;
+        // Emit output_item.done
+        let event = emitter.emit_output_item_done(output_index, &item_done);
+        if emitter.send_event(&event, tx).is_err() {
+            return;
+        }
     }
 
     debug!(
-        tool_count = mcp_tools.len(),
+        tool_count = mcp_tool_count,
         "Emitted mcp_list_tools on first iteration"
     );
 
