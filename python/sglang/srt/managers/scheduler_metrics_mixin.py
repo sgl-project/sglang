@@ -672,7 +672,7 @@ class SchedulerMetricsMixin:
                     ),
                     graph_gb=round(self.tp_worker.model_runner.graph_mem_usage, 3),
                     token_capacity=int(self.max_total_num_tokens),
-                    available_gpu_memory_gb=round(self._get_available_gpu_memory_gb(), 3),
+                    available_gpu_memory_gb=self._get_available_gpu_memory_gb(),
                 )
             except AttributeError as e:
                 logger.debug(f"Memory metrics not available: {e}")
