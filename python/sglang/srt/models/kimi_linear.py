@@ -181,7 +181,7 @@ class KimiDeltaAttention(nn.Module):
         self.num_k_heads = config.linear_attn_config["num_heads"]
         self.num_v_heads = config.linear_attn_config["num_heads"]
         self.head_k_dim = config.linear_attn_config["head_dim"]
-        self.head_v_dim = config.linear_attn_config["head_dim"]
+        self.head_v_dim = config.v_head_dim
         self.layer_idx = layer_idx
         self.prefix = prefix
         assert self.num_heads % self.tp_size == 0
@@ -310,6 +310,9 @@ class KimiDeltaAttention(nn.Module):
             self.v_conv1d.weight.size(0), self.v_conv1d.weight.size(2)
         )
 
+        conv_weights = (self.q_conv_weights, self.k_conv_weights, self.v_conv_weights)
+        bias = (self.q_conv1d.bias, self.k_conv1d.bias, self.v_conv1d.bias)
+
         self.linear_attn = RadixLinearAttention(
             layer_id=self.layer_idx,
             num_qk_heads=self.num_k_heads // self.attn_tp_size,
@@ -317,13 +320,8 @@ class KimiDeltaAttention(nn.Module):
             head_qk_dim=self.head_k_dim,
             head_v_dim=self.head_v_dim,
             attention_tp_size=self.attn_tp_size,
-            q_conv_weights=self.q_conv_weights,
-            k_conv_weights=self.k_conv_weights,
-            v_conv_weights=self.v_conv_weights,
-            q_conv_bias=self.q_conv1d.bias,
-            k_conv_bias=self.k_conv1d.bias,
-            v_conv_bias=self.v_conv1d.bias,
-            head_dim=self.head_dim,
+            conv_weights=conv_weights,
+            bias=bias,
             A_log=self.A_log,
             dt_bias=self.dt_bias,
         )
