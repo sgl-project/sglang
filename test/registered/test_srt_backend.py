@@ -1,3 +1,4 @@
+import os
 import unittest
 
 import sglang as sgl
@@ -17,7 +18,9 @@ from sglang.test.test_programs import (
     test_stream,
     test_tool_use,
 )
-from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST, CustomTestCase
+from sglang.test.test_utils import CustomTestCase
+
+MODEL_FOR_TEST = "hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4"
 
 register_cuda_ci(est_time=80, suite="stage-a-test-1")
 register_amd_ci(est_time=120, suite="stage-a-test-1-amd")
@@ -28,9 +31,7 @@ class TestSRTBackend(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.backend = sgl.Runtime(
-            model_path=DEFAULT_MODEL_NAME_FOR_TEST, cuda_graph_max_bs=4
-        )
+        cls.backend = sgl.Runtime(model_path=MODEL_FOR_TEST, cuda_graph_max_bs=4)
         sgl.set_default_backend(cls.backend)
 
     @classmethod
@@ -71,6 +72,10 @@ class TestSRTBackend(CustomTestCase):
     def test_dtype_gen(self):
         test_dtype_gen()
 
+    @unittest.skipIf(
+        os.environ.get("IS_BLACKWELL") == "1",
+        "Skip on Blackwell due to memory constraints",
+    )
     def test_hellaswag_select(self):
         # Run twice to capture more bugs
         for _ in range(2):
