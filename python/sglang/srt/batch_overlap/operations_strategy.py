@@ -54,7 +54,7 @@ class OperationsStrategy:
         elif layer_name == "MiMoV2DecoderLayer":
             return OperationsStrategy.concat(
                 [
-                    _compute_moe_mimov2_hybrid_layer_operations_strategy_tbo(
+                    _compute_moe_mimov2_layer_operations_strategy_tbo(
                         layer, forward_mode
                     )
                     for layer in layers
@@ -225,7 +225,7 @@ def _compute_moe_qwen3_decode(layer):
 
 # TODO: unstable, current strategy is almost the same as DeepSeek, keep redundant code here for
 # convenience to adjust strategy
-def _compute_moe_mimov2_hybrid_layer_operations_strategy_tbo(
+def _compute_moe_mimov2_layer_operations_strategy_tbo(
     layer: torch.nn.Module,
     forward_mode: ForwardMode,
 ) -> OperationsStrategy:
