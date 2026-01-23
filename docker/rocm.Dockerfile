@@ -30,7 +30,7 @@ ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT="v0.1.9.post1"
+ENV AITER_COMMIT="v0.1.10"
 
 # ===============================
 # Base image 950 and args
@@ -40,7 +40,7 @@ ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="0"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT="v0.1.9.post1"
+ENV AITER_COMMIT="v0.1.10"
 # ===============================
 # Chosen arch and args
 FROM ${GPU_ARCH}
