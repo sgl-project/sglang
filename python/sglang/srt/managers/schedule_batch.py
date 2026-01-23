@@ -896,7 +896,6 @@ class Req:
             self.cache_protected_len = len(self.prefix_indices)
             self.kv_cache_protected_len = self.cache_protected_len
             self.mamba_branching_seqlen = match_result.mamba_branching_seqlen
-
         if (
             self.is_retracted
             and self.multimodal_inputs is not None

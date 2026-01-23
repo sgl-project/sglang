@@ -20,7 +20,6 @@ The radix tree data structure for managing the hybrid (full and Mamba) KV cache.
 """
 
 import heapq
-import os
 from collections import defaultdict
 from functools import partial
 from typing import TYPE_CHECKING, List, Optional, Tuple
@@ -477,40 +476,13 @@ class MambaRadixCache(BasePrefixCache):
             self.marconi_tune_generation = 0
             self.marconi_admission_tree = MarconiAdmissionTree()
 
-    def _marconi_debug_check_free(self, indices: torch.Tensor, where: str) -> None:
-        if not self.marconi_enabled:
-            return
-        debug_mode = os.getenv("SGLANG_MARCONI_DEBUG_FREE")
-        if debug_mode not in ("1", "2"):
-            return
-        if indices is None or indices.numel() == 0:
-            return
-        try:
-            cached = set(self.all_values_flatten().tolist())
-            overlap = set(indices.tolist()) & cached
-        except Exception:
-            return
-        if overlap:
-            logger.error(
-                "Marconi debug: freeing cached KV indices at %s overlap=%d sample=%s",
-                where,
-                len(overlap),
-                list(overlap)[:5],
-            )
-
     def _marconi_filter_free_indices(
         self, indices: torch.Tensor, where: str
     ) -> Optional[torch.Tensor]:
         if not self.marconi_enabled:
             return indices
-        debug_mode = os.getenv("SGLANG_MARCONI_DEBUG_FREE")
-        if debug_mode not in ("1", "2"):
-            return indices
         if indices is None or indices.numel() == 0:
             return None
-        if debug_mode != "2":
-            # Log-only mode: do not change behavior.
-            return indices
         try:
             cached = set(self.all_values_flatten().tolist())
         except Exception:
@@ -519,45 +491,9 @@ class MambaRadixCache(BasePrefixCache):
             return indices
         idx_list = indices.tolist()
         free_list = [i for i in idx_list if i not in cached]
-        if len(free_list) != len(idx_list):
-            logger.warning(
-                "Marconi: skip freeing %d cached KV indices at %s",
-                len(idx_list) - len(free_list),
-                where,
-            )
         if not free_list:
             return None
         return torch.tensor(free_list, dtype=indices.dtype, device=indices.device)
-
-    def _marconi_debug_check_overlap(self, where: str) -> None:
-        if not self.marconi_enabled:
-            return
-        debug_mode = os.getenv("SGLANG_MARCONI_DEBUG_FREE")
-        if debug_mode not in ("1", "2"):
-            return
-        try:
-            free_pages = []
-            free_attr = getattr(self.token_to_kv_pool_allocator, "free_pages", None)
-            if free_attr is not None:
-                free_pages.extend(free_attr.tolist())
-            release_attr = getattr(
-                self.token_to_kv_pool_allocator, "release_pages", None
-            )
-            if release_attr is not None:
-                free_pages.extend(release_attr.tolist())
-            cached_pages = self.all_values_flatten().tolist()
-            if not free_pages or not cached_pages:
-                return
-            overlap = set(free_pages) & set(cached_pages)
-            if overlap:
-                logger.error(
-                    "Marconi debug: free/cached overlap at %s overlap=%d sample=%s",
-                    where,
-                    len(overlap),
-                    list(overlap)[:5],
-                )
-        except Exception:
-            return
 
     def match_prefix(self, key: RadixKey, **kwargs) -> MatchResult:
         """Find the matching prefix from the radix tree.
@@ -732,7 +668,6 @@ class MambaRadixCache(BasePrefixCache):
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, :kv_committed_len
             ]
-            self._marconi_debug_check_free(kv_indices, "cache_finished_req:disable")
             self.token_to_kv_pool_allocator.free(kv_indices)
             self.req_to_token_pool.free(req.req_pool_idx)
             return
@@ -764,9 +699,6 @@ class MambaRadixCache(BasePrefixCache):
         if is_insert:
             if cache_len != len(token_ids):
                 cache_end_idx = max(cache_len, kv_cache_protected_len)
-                self._marconi_debug_check_free(
-                    kv_indices[cache_end_idx:], "cache_finished_req:cache_end"
-                )
                 self.token_to_kv_pool_allocator.free(kv_indices[cache_end_idx:])
                 token_ids = token_ids[:cache_len]
                 kv_indices = kv_indices[:cache_len]
@@ -809,18 +741,6 @@ class MambaRadixCache(BasePrefixCache):
                 mamba_value,
             )
 
-            if os.getenv("SGLANG_MARCONI_DEBUG_PREFIX") == "1" and self.marconi_enabled:
-                if new_prefix_len > req.cache_protected_len:
-                    logger.warning(
-                        "Marconi prefix grow at cache_finished_req: rid=%s "
-                        "mamba_prefix=%d kv_prefix=%d new_prefix_len=%d "
-                        "prefix_indices_len=%d",
-                        req.rid,
-                        req.cache_protected_len,
-                        kv_cache_protected_len,
-                        new_prefix_len,
-                        len(req.prefix_indices),
-                    )
             inserted_start = getattr(req, "kv_cache_inserted_start", None)
             inserted_end = getattr(req, "kv_cache_inserted_end", None)
             dup_ranges = []
@@ -858,7 +778,6 @@ class MambaRadixCache(BasePrefixCache):
 
             for start, end, where in dup_ranges:
                 dup_slice = kv_indices[start:end]
-                self._marconi_debug_check_free(dup_slice, where)
                 if self.marconi_enabled:
                     safe = self._marconi_filter_free_indices(dup_slice, where)
                     if safe is not None:
@@ -868,10 +787,6 @@ class MambaRadixCache(BasePrefixCache):
             if self.marconi_enabled:
                 req.kv_cache_protected_len = max(kv_cache_protected_len, new_prefix_len)
         else:
-            self._marconi_debug_check_free(
-                kv_indices[kv_cache_protected_len:],
-                "cache_finished_req:no_insert",
-            )
             self.token_to_kv_pool_allocator.free(kv_indices[kv_cache_protected_len:])
             mamba_exist = True
 
@@ -887,7 +802,6 @@ class MambaRadixCache(BasePrefixCache):
         )
 
         self.dec_lock_ref(req.last_node)
-        self._marconi_debug_check_overlap("cache_finished_req:end")
 
     def _marconi_record_request(self, req: Req, total_tokens: int) -> None:
         self.marconi_request_count += 1
@@ -1125,20 +1039,6 @@ class MambaRadixCache(BasePrefixCache):
                     req.kv_cache_inserted_end = max(
                         req.kv_cache_inserted_end, page_aligned_len
                     )
-        if os.getenv("SGLANG_MARCONI_DEBUG_PREFIX") == "1" and self.marconi_enabled:
-            if new_prefix_len > req.cache_protected_len:
-                logger.warning(
-                    "Marconi prefix grow at cache_unfinished_req: rid=%s "
-                    "mamba_prefix=%d kv_prefix=%d new_prefix_len=%d "
-                    "cache_len=%d page_aligned_len=%d token_ids_len=%d",
-                    req.rid,
-                    req.cache_protected_len,
-                    kv_cache_protected_len,
-                    new_prefix_len,
-                    cache_len,
-                    page_aligned_len,
-                    len(token_ids),
-                )
         # there is a mamba cache in radix cache, release it
         if mamba_exist:
             self.req_to_token_pool.mamba_pool.free(mamba_value_forked)
@@ -1151,16 +1051,6 @@ class MambaRadixCache(BasePrefixCache):
             match_result.device_indices,
             match_result.last_device_node,
         )
-        if os.getenv("SGLANG_MARCONI_DEBUG_PREFIX") == "1" and self.marconi_enabled:
-            if len(new_indices) < req.cache_protected_len:
-                logger.warning(
-                    "Marconi mamba prefix shrink at cache_unfinished_req: rid=%s "
-                    "prev_mamba_prefix=%d new_mamba_prefix=%d kv_prefix=%d",
-                    req.rid,
-                    req.cache_protected_len,
-                    len(new_indices),
-                    kv_cache_protected_len,
-                )
 
         if not mamba_exist:
             assert torch.equal(new_last_node.mamba_value, mamba_value_forked)
@@ -1193,25 +1083,6 @@ class MambaRadixCache(BasePrefixCache):
             new_indices[kv_cache_protected_len:],
         )
 
-        if dup_slice is not None and os.getenv("SGLANG_MARCONI_DEBUG_FREE") == "1":
-            try:
-                cached = set(self.all_values_flatten().tolist())
-                overlap = set(dup_slice.tolist()) & cached
-                if overlap:
-                    logger.error(
-                        "Marconi debug: freeing cached KV indices at cache_unfinished_req:dup_prefix "
-                        "overlap=%d sample=%s cache_protected_len=%d free_end=%d "
-                        "cache_len=%d page_aligned_len=%d token_ids_len=%d",
-                        len(overlap),
-                        list(overlap)[:5],
-                        kv_cache_protected_len,
-                        free_end,
-                        cache_len,
-                        page_aligned_len,
-                        len(token_ids),
-                    )
-            except Exception:
-                pass
         if dup_slice is not None:
             if self.marconi_enabled:
                 safe = self._marconi_filter_free_indices(
@@ -1237,7 +1108,6 @@ class MambaRadixCache(BasePrefixCache):
             req.kv_cache_protected_len = req.cache_protected_len
         req.mamba_last_track_seqlen = None
         req.last_node = new_last_node
-        self._marconi_debug_check_overlap("cache_unfinished_req:end")
 
     def pretty_print(self) -> None:
         self._print_helper(self.root_node, 0)
