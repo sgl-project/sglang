@@ -1551,7 +1551,7 @@ def wrap_shm_features(obj):
     """
     Scan the object for multimodal tensors and wrap them in SHM pointers.
     """
-    if _get_is_default_transport():
+    if _get_is_default_transport() or get_global_server_args().skip_tokenizer_init:
         return obj
 
     if hasattr(obj, "mm_inputs") and obj.mm_inputs:
@@ -1570,7 +1570,7 @@ def unwrap_shm_features(obj):
     """
     Restore ShmPointerMMData wrappers back into standard torch.Tensors.
     """
-    if _get_is_default_transport():
+    if _get_is_default_transport() or get_global_server_args().skip_tokenizer_init:
         return obj
     if hasattr(obj, "mm_inputs") and obj.mm_inputs:
         mm_items = obj.mm_inputs.get("mm_items", [])
