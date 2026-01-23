@@ -148,7 +148,7 @@ class SamplingParams:
     # if True, disallow user params to override subclass-defined protected fields
     no_override_protected_fields: bool = False
     # whether to adjust num_frames for multi-GPU friendly splitting (default: True)
-    adjust_frames: bool = False
+    adjust_frames: bool = True
 
     def _set_output_file_ext(self):
         # add extension if needed

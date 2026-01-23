@@ -611,7 +611,9 @@ class DiagonalGaussianDistribution:
         return x
 
     def kl(
-        self, other: Optional["DiagonalGaussianDistribution"] = None
+        self,
+        other: Optional["DiagonalGaussianDistribution"] = None,
+        dims: tuple[int, ...] = (1, 2, 3),
     ) -> torch.Tensor:
         if self.deterministic:
             return torch.Tensor([0.0])
@@ -619,7 +621,7 @@ class DiagonalGaussianDistribution:
             if other is None:
                 return 0.5 * torch.sum(
                     torch.pow(self.mean, 2) + self.var - 1.0 - self.logvar,
-                    dim=[1, 2, 3],
+                    dim=dims,
                 )
             else:
                 return 0.5 * torch.sum(
@@ -628,7 +630,7 @@ class DiagonalGaussianDistribution:
                     - 1.0
                     - self.logvar
                     + other.logvar,
-                    dim=[1, 2, 3],
+                    dim=dims,
                 )
 
     def nll(

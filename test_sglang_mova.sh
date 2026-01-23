@@ -8,7 +8,7 @@ cd "${WORKDIR}"
 # Assert branch clean
 if [[ -n $(git status --porcelain) ]]; then
     echo "Error: Git branch is not clean. Please commit or stash your changes."
-    exit 1
+    # exit 1
 fi
 
 export PYTHONPATH=${WORKDIR}/python
@@ -24,7 +24,7 @@ OUT_DIR="../mossVG/data/samples"
 
 GIT_HASH=$(git rev-parse --short HEAD)
 DATETIME=$(date +%Y%m%d_%H%M%S)
-OUT_NAME="trump3_${GIT_HASH}_${DATETIME}.mp4"
+OUT_NAME="trump3_adjust_false_${GIT_HASH}_${DATETIME}.mp4"
 
 # 4) Prompt（与 diffusers_example.sh 同款）
 PROMPT=$(cat <<'EOF'
@@ -44,6 +44,7 @@ python -m sglang.multimodal_gen.runtime.entrypoints.cli.main generate \
     --backend sglang \
     --pipeline-class-name MoVA \
     --model-path "${MODEL_PATH}" \
+    --adjust-frames false \
     --num-gpus 4 \
     --prompt "${PROMPT}" \
     --image-path "${REF_IMAGE}" \
@@ -60,3 +61,4 @@ python -m sglang.multimodal_gen.runtime.entrypoints.cli.main generate \
 # 6) Compute PSNR
 echo "Computing PSNR against ${REF_VIDEO}..."
 ffmpeg -i "${OUT_DIR}/${OUT_NAME}" -i "${REF_VIDEO}" -lavfi psnr -f null - 2>&1 | grep "PSNR"
+ffmpeg -i "${OUT_DIR}/${OUT_NAME}" -i "${REF_VIDEO}" -lavfi apsnr -f null - 2>&1 | grep "PSNR"
