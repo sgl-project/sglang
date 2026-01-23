@@ -22,7 +22,6 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
     MultimodalInputs,
 )
-from sglang.srt.managers.tokenizer_manager import _determine_tensor_transport_mode
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.multimodal.evs import EVSEmbeddingResult
@@ -1538,6 +1537,10 @@ class ShmPointerMMData:
 def _get_is_default_transport():
     global _is_default_tensor_transport
     if _is_default_tensor_transport is None:
+        from sglang.srt.managers.tokenizer_manager import (
+            _determine_tensor_transport_mode,
+        )
+
         _is_default_tensor_transport = (
             _determine_tensor_transport_mode(get_global_server_args()) == "default"
         )
