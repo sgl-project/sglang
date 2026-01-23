@@ -11,18 +11,55 @@ import torch
 from sglang.srt.managers.io_struct import ProfileReqOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import is_npu
+from sglang.srt.utils import is_mindspore, is_npu
 
 _is_npu = is_npu()
 if _is_npu:
     import torch_npu
 
-    patches = [
-        ["profiler.profile", torch_npu.profiler.profile],
-        ["profiler.ProfilerActivity.CUDA", torch_npu.profiler.ProfilerActivity.NPU],
-        ["profiler.ProfilerActivity.CPU", torch_npu.profiler.ProfilerActivity.CPU],
-    ]
-    torch_npu._apply_patches(patches)
+
+def init_npu_profiler():
+    if not _is_npu:
+        return
+
+    # Check if already initialized
+    if getattr(init_npu_profiler, "_initialized", False):
+        return
+    init_npu_profiler._initialized = True
+
+    if is_mindspore():
+        import mindspore
+
+        mindspore_patches = [
+            ["profiler.profile", mindspore.profiler.profile],
+            ["profiler.ProfilerActivity.CUDA", mindspore.profiler.ProfilerActivity.NPU],
+            ["profiler.ProfilerActivity.CPU", mindspore.profiler.ProfilerActivity.CPU],
+        ]
+        torch_npu._apply_patches(mindspore_patches)
+    else:
+        patches = [
+            ["profiler.profile", torch_npu.profiler.profile],
+            ["profiler.ProfilerActivity.CUDA", torch_npu.profiler.ProfilerActivity.NPU],
+            ["profiler.ProfilerActivity.CPU", torch_npu.profiler.ProfilerActivity.CPU],
+        ]
+        torch_npu._apply_patches(patches)
+
+
+def get_npu_trace_handler(output_dir):
+    if not _is_npu:
+        return None
+
+    if is_mindspore():
+        return mindspore.profiler.tensorboard_trace_handler(output_dir)
+    else:
+        return torch_npu.profiler.tensorboard_trace_handler(output_dir)
+
+
+if _is_npu:
+    try:
+        init_npu_profiler()
+    except Exception:
+        pass
 
 logger = logging.getLogger(__name__)
 
@@ -278,7 +315,7 @@ class _ProfilerTorch(_ProfilerConcreteBase):
             on_trace_ready=(
                 None
                 if not _is_npu
-                else torch_npu.profiler.tensorboard_trace_handler(self.output_dir)
+                else get_npu_trace_handler(self.output_dir)
             ),
         )
         self.torch_profiler.start()
