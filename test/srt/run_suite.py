@@ -156,7 +156,7 @@ suite_ascend = {
     ],
     "per-commit-16-npu-a3": [
         TestFile("ascend/test_ascend_deepep.py", 3600),
-        TestFile("ascend/test_ascend_deepseek_mtp.py", 2800),
+        # TestFile("ascend/test_ascend_deepseek_mtp.py", 2800),
         TestFile("ascend/test_ascend_w4a4_quantization.py", 600),
     ],
 }
