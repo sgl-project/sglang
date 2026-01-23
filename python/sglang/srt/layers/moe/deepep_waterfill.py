@@ -1374,39 +1374,72 @@ class DeepEPWaterfillBalancer:
 
             if self.MIN_TOKENS_PER_RANK > 0:
                 # Globalize dest_counts across EP ranks, then redirect sparse remote destinations.
+                # Optimization: skip the all_reduce (and redirect kernel) if this rank does not
+                # send any potentially-sparse remote shard. This preserves correctness because
+                # global_count[dest] < MIN_TOKENS_PER_RANK implies local_count[dest] < MIN_TOKENS_PER_RANK
+                # for any dest we actually send to (local_count>0).
+                local_maybe_sparse_remote = None
                 try:
-                    import torch.distributed as dist
-
-                    if dist.is_initialized() and self.world_size > 1:
-                        from sglang.srt.distributed.parallel_state import (
-                            get_moe_ep_group,
-                        )
-
-                        dist.all_reduce(
-                            dest_counts,
-                            op=dist.ReduceOp.SUM,
-                            group=get_moe_ep_group().device_group,
-                        )
+                    local_maybe_sparse_remote = (dest_counts > 0) & (
+                        dest_counts < self.MIN_TOKENS_PER_RANK
+                    )
+                    local_maybe_sparse_remote[self.rank] = False
                 except Exception:
-                    # If distributed is not available/initialized, fall back to local counts.
-                    pass
+                    local_maybe_sparse_remote = None
 
-                BLOCK_SIZE = 256
-                grid = ((num_tokens + BLOCK_SIZE - 1) // BLOCK_SIZE,)
-                _sparse_redirect_kernel[grid](
-                    expanded_topk_ids,
-                    local_shared_mask,
-                    dest_counts,
-                    num_tokens,
-                    topk + 1,
-                    self.old_experts_per_rank,
-                    self.new_experts_per_rank,
-                    self.world_size,
-                    self.rank,
-                    self.MIN_TOKENS_PER_RANK,
-                    LOCAL_SHARED_MARKER,
-                    BLOCK_SIZE=BLOCK_SIZE,
-                )
+                need_global = False
+                if local_maybe_sparse_remote is None:
+                    need_global = True
+                else:
+                    # Note: tiny sync on a length-`world_size` tensor; cheaper than an all_reduce.
+                    need_global = bool(local_maybe_sparse_remote.any().item())
+
+                if need_global:
+                    try:
+                        import torch.distributed as dist
+
+                        if dist.is_initialized() and self.world_size > 1:
+                            from sglang.srt.distributed.parallel_state import (
+                                get_moe_ep_group,
+                            )
+
+                            dist.all_reduce(
+                                dest_counts,
+                                op=dist.ReduceOp.SUM,
+                                group=get_moe_ep_group().device_group,
+                            )
+                    except Exception:
+                        # If distributed is not available/initialized, fall back to local counts.
+                        pass
+
+                    global_sparse_remote = None
+                    try:
+                        global_sparse_remote = (dest_counts > 0) & (
+                            dest_counts < self.MIN_TOKENS_PER_RANK
+                        )
+                        global_sparse_remote[self.rank] = False
+                    except Exception:
+                        global_sparse_remote = None
+
+                    if global_sparse_remote is None or bool(
+                        global_sparse_remote.any().item()
+                    ):
+                        BLOCK_SIZE = 256
+                        grid = ((num_tokens + BLOCK_SIZE - 1) // BLOCK_SIZE,)
+                        _sparse_redirect_kernel[grid](
+                            expanded_topk_ids,
+                            local_shared_mask,
+                            dest_counts,
+                            num_tokens,
+                            topk + 1,
+                            self.old_experts_per_rank,
+                            self.new_experts_per_rank,
+                            self.world_size,
+                            self.rank,
+                            self.MIN_TOKENS_PER_RANK,
+                            LOCAL_SHARED_MARKER,
+                            BLOCK_SIZE=BLOCK_SIZE,
+                        )
         else:
             # Fallback to PyTorch implementation
             shared_destination = assign_shared_destination_pytorch(
@@ -1438,21 +1471,37 @@ class DeepEPWaterfillBalancer:
                     dest_from_shared.to(torch.int64), minlength=self.world_size
                 ).to(torch.int32)
 
+                local_maybe_sparse_remote = None
                 try:
-                    import torch.distributed as dist
-
-                    if dist.is_initialized() and self.world_size > 1:
-                        from sglang.srt.distributed.parallel_state import (
-                            get_moe_ep_group,
-                        )
-
-                        dist.all_reduce(
-                            dest_counts,
-                            op=dist.ReduceOp.SUM,
-                            group=get_moe_ep_group().device_group,
-                        )
+                    local_maybe_sparse_remote = (dest_counts > 0) & (
+                        dest_counts < self.MIN_TOKENS_PER_RANK
+                    )
+                    local_maybe_sparse_remote[self.rank] = False
                 except Exception:
-                    pass
+                    local_maybe_sparse_remote = None
+
+                need_global = False
+                if local_maybe_sparse_remote is None:
+                    need_global = True
+                else:
+                    need_global = bool(local_maybe_sparse_remote.any().item())
+
+                if need_global:
+                    try:
+                        import torch.distributed as dist
+
+                        if dist.is_initialized() and self.world_size > 1:
+                            from sglang.srt.distributed.parallel_state import (
+                                get_moe_ep_group,
+                            )
+
+                            dist.all_reduce(
+                                dest_counts,
+                                op=dist.ReduceOp.SUM,
+                                group=get_moe_ep_group().device_group,
+                            )
+                    except Exception:
+                        pass
 
                 sparse_ranks_mask = dest_counts < self.MIN_TOKENS_PER_RANK
                 token_goes_to_sparse = (
