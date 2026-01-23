@@ -51,7 +51,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import activations
 
-from sglang.srt.configs.kimi_k25 import KimiK25VisionConfig, KimiK25Config
+from sglang.srt.configs.kimi_k25 import KimiK25Config, KimiK25VisionConfig
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
@@ -65,7 +65,6 @@ except ImportError:
 
     activations.PytorchGELUTanh = GELUTanh
     PytorchGELUTanh = GELUTanh
-from transformers import PretrainedConfig
 
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.linear import ReplicatedLinear
@@ -84,13 +83,6 @@ KIMIV_VT_INFER_MAX_PATCH_NUM = 16328
 logger = logging.getLogger(__name__)
 
 
-# def _apply_rope_input_validation(x, freqs_cis):
-#     assert x.ndim == freqs_cis.ndim + 1, (x.shape, freqs_cis.shape)
-#     assert x.shape[:-2] == freqs_cis.shape[:-1], (x.shape, freqs_cis.shape)
-#     assert x.shape[-1] == 2 * freqs_cis.shape[-1], (x.shape, freqs_cis.shape)
-#     assert freqs_cis.dtype == torch.complex64, freqs_cis.dtype
-
-
 def apply_rope(
     xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor, x_shape=None
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -102,8 +94,6 @@ def apply_rope(
     Returns:
         xq_out, xk_out: tensors of shape (..., num_heads, head_dim)
     """
-    # _apply_rope_input_validation(xq, freqs_cis)
-    # _apply_rope_input_validation(xk, freqs_cis)
 
     freqs_cis = freqs_cis.unsqueeze(-2)  # ..., 1, head_dim/2
     # ..., num_heads, head_dim/2
@@ -213,7 +203,6 @@ def get_rope_shape_decorate(func):
     def wrapper(org, interpolation_mode, shape):
         key = (org.requires_grad, torch.is_grad_enabled(), interpolation_mode)
         if key not in _get_rope_shape_first_call_flag:
-            # 强制触发一次指定shape的编译，具体参考：https://moonshot.feishu.cn/wiki/Zr59wOJXtiIMSZkscvEcadGbnpb
             _get_rope_shape_first_call_flag.add(key)
             _ = func(org, interpolation_mode, shape=(64, 64))
         return func(org, interpolation_mode, shape)
@@ -509,17 +498,6 @@ class MoonViT3dEncoder(nn.Module):
         max_seqlen = lengths.max()
         cu_seqlens = lengths.to(hidden_states.device).cumsum(dim=0, dtype=torch.int32)
 
-        # def custom(start, end):
-
-        #     def custom_forward(*args, **kwargs):
-        #         hidden_states_, *args = args
-        #         for index in range(start, end):
-        #             layer = self.blocks[index]
-        #             hidden_states_ = layer(hidden_states_, *args, **kwargs)
-        #         return hidden_states_
-
-        #     return custom_forward
-
         for block in self.blocks:
             hidden_states = block(
                 hidden_states, cu_seqlens, max_seqlen, rope_freqs_cis=rope_freqs_cis
@@ -583,7 +561,6 @@ class MoonViT3dPretrainedModel(nn.Module):
         Returns:
             torch.Tensor: The output tokens.
         """
-        # grid_thws = grid_thws.to('cpu')  # 不再强制移到CPU，保持在输入设备上
         assert grid_thws.ndim == 2, f"grid_thws should be 2D, got {grid_thws.ndim}"
         assert grid_thws.size(1) == 3, f"No support for _thw: {grid_thws}"
         hidden_states = self.patch_embed(pixel_values, grid_thws)
@@ -781,11 +758,8 @@ class KimiK25ForConditionalGeneration(nn.Module):
 
         for name, loaded_weight in weights:
             if "vision_tower" in name or "mm_projector" in name:
-                # vision_name = name.replace(r"attn.qkv.", r"attn.qkv_proj.")
                 name = name.replace(r"wqkv.", r"attn.qkv_proj.")
                 name = name.replace(r"wo.", r"attn.proj.")
-                # "mm_projector.proj.0": "mm_projector.linear_1",
-                # "mm_projector.proj.2": "mm_projector.linear_2",
                 name = name.replace("mm_projector.proj.0", "mm_projector.linear_1")
                 name = name.replace("mm_projector.proj.2", "mm_projector.linear_2")
                 vision_weights.append((name, loaded_weight))

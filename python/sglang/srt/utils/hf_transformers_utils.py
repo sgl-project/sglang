@@ -54,9 +54,9 @@ from sglang.srt.configs import (
     FalconH1Config,
     JetNemotronConfig,
     JetVLMConfig,
+    KimiK25Config,
     KimiLinearConfig,
     KimiVLConfig,
-    KimiK25Config,
     LongcatFlashConfig,
     MultiModalityConfig,
     NemotronH_Nano_VL_V2_Config,
@@ -64,9 +64,7 @@ from sglang.srt.configs import (
     Olmo3Config,
     Qwen3NextConfig,
     Step3VLConfig,
-
 )
-
 from sglang.srt.configs.deepseek_ocr import DeepseekVLV2Config
 from sglang.srt.configs.internvl import InternVLChatConfig
 from sglang.srt.connector import create_remote_connector
