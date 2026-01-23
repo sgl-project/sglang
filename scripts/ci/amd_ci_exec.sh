@@ -53,8 +53,11 @@ for key in "${!ENV_MAP[@]}"; do
   ENV_ARGS+=("-e" "$key=${ENV_MAP[$key]}")
 done
 
-# Run docker exec with retry logic for HF network issues
-# First attempt: normal mode
+# Run docker exec with retry logic for HuggingFace network/download issues
+# When HF model downloads fail due to network timeouts or rate limits,
+# retrying with HF_HUB_OFFLINE=1 uses cached models from previous downloads.
+#
+# First attempt: normal mode (allows HF downloads)
 if docker exec \
   -w "$WORKDIR" \
   "${ENV_ARGS[@]}" \
@@ -65,7 +68,18 @@ else
 fi
 
 echo "First attempt failed with exit code $FIRST_EXIT_CODE"
-echo "Retrying with HF_HUB_OFFLINE=1 (offline mode)..."
+
+# Skip retry for test failures that won't be fixed by offline mode:
+#   - Exit 1: Test assertion failures (accuracy below threshold)
+#   - Exit 137 (128+9): Process killed by OOM
+#   - Exit 255: Test suite completed with test errors
+# Only retry for other exit codes (e.g., network timeouts, HF download failures)
+if [[ "$FIRST_EXIT_CODE" -eq 1 || "$FIRST_EXIT_CODE" -eq 137 || "$FIRST_EXIT_CODE" -eq 255 ]]; then
+  echo "Exit code $FIRST_EXIT_CODE indicates test failure (not network issue), not retrying"
+  exit $FIRST_EXIT_CODE
+fi
+
+echo "Retrying with HF_HUB_OFFLINE=1 (offline mode to use cached models)..."
 
 # Second attempt: force HF offline mode to avoid network timeouts
 docker exec \
