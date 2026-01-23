@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use serde_json::json;
 
 use crate::{
     protocols::common::Tool,
@@ -47,6 +48,67 @@ pub trait ToolParser: Send + Sync {
     fn reset(&mut self) {
         // Default no-op implementation
     }
+
+    /// Build xgrammar structural tag for this parser's format.
+    ///
+    /// # Arguments
+    /// * `tools` - List of available tools
+    /// * `at_least_one` - Require at least one tool call (for tool_choice="required")
+    /// * `stop_after_first` - Stop after first tool call (for parallel_tool_calls=false)
+    ///
+    /// # Returns
+    /// JSON string of structural tag in xgrammar format
+    ///
+    /// # Default Implementation
+    /// Returns `triggered_tags` format using parser-specific begin/end/trigger patterns.
+    fn build_structural_tag(
+        &self,
+        tools: &[Tool],
+        at_least_one: bool,
+        stop_after_first: bool,
+    ) -> Result<String, String> {
+        let mut tags = Vec::new();
+        let mut triggers = std::collections::HashSet::new();
+
+        for tool in tools {
+            let name = &tool.function.name;
+
+            let (begin, end, trigger) = self.get_format_info(name);
+
+            let schema = tool.function.parameters.clone();
+
+            tags.push(json!({
+                "format": "tag",
+                "begin": begin,
+                "content": {
+                    "format": "json_schema",
+                    "schema": schema
+                },
+                "end": end
+            }));
+
+            triggers.insert(trigger);
+        }
+
+        let structural_tag = json!({
+            "format": "triggered_tags",
+            "triggers": triggers.into_iter().collect::<Vec<_>>(),
+            "tags": tags,
+            "at_least_one": at_least_one,
+            "stop_after_first": stop_after_first
+        });
+
+        serde_json::to_string(&structural_tag)
+            .map_err(|e| format!("Failed to serialize structural tag: {}", e))
+    }
+
+    /// Get format-specific begin/end/trigger patterns for a tool.
+    ///
+    /// # Returns
+    /// Tuple of (begin, end, trigger)
+    ///
+    /// This method must be implemented by each parser to provide model-specific formats.
+    fn get_format_info(&self, tool_name: &str) -> (String, String, String);
 }
 
 /// Trait for partial JSON parsing

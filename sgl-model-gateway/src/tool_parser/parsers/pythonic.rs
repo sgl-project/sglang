@@ -216,6 +216,15 @@ impl ToolParser for PythonicParser {
 
         false
     }
+
+    fn reset(&mut self) {
+        self.buffer.clear();
+    }
+
+    fn get_format_info(&self, _tool_name: &str) -> (String, String, String) {
+        // PythonicParser doesn't support structural tags - return empty markers
+        (String::new(), String::new(), String::new())
+    }
 }
 
 /// Find the matching closing bracket for the opening bracket at start position.

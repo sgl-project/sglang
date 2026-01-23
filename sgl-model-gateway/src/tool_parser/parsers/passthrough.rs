@@ -11,7 +11,7 @@ use crate::{
     tool_parser::{
         errors::ParserResult,
         traits::ToolParser,
-        types::{StreamingParseResult, ToolCall, ToolCallItem},
+        types::{StreamingParseResult, ToolCall},
     },
 };
 
@@ -28,7 +28,6 @@ impl PassthroughParser {
 #[async_trait]
 impl ToolParser for PassthroughParser {
     async fn parse_complete(&self, output: &str) -> ParserResult<(String, Vec<ToolCall>)> {
-        // Return text unchanged with no tool calls
         Ok((output.to_string(), vec![]))
     }
 
@@ -49,7 +48,8 @@ impl ToolParser for PassthroughParser {
         false
     }
 
-    fn get_unstreamed_tool_args(&self) -> Option<Vec<ToolCallItem>> {
-        None
+    fn get_format_info(&self, _tool_name: &str) -> (String, String, String) {
+        // Passthrough doesn't support structural tags - return empty markers
+        (String::new(), String::new(), String::new())
     }
 }

@@ -337,4 +337,11 @@ impl ToolParser for Glm4MoeParser {
         self.current_tool_id = -1;
         self.streamed_args_for_tool.clear();
     }
+
+    fn get_format_info(&self, tool_name: &str) -> (String, String, String) {
+        let begin = format!(r#"{{"name":"{}", "arguments":"#, tool_name);
+        let end = "\"}".to_string();
+        let trigger = "<tool_call>".to_string();
+        (begin, end, trigger)
+    }
 }
