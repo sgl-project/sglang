@@ -2,6 +2,7 @@ use std::{collections::HashSet, path::PathBuf, sync::Arc, time::Duration};
 
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine};
 use bytes::Bytes;
+use image::DynamicImage;
 use reqwest::Client;
 use tokio::{fs, task};
 use url::Url;
