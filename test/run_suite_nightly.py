@@ -25,6 +25,7 @@ suites = {
         TestFile("test_flashinfer_trtllm_gen_attn_backend.py", 300),
         TestFile("test_fp4_moe.py", 300),
         TestFile("test_qwen3_fp4_trtllm_gen_moe.py", 300),
+        TestFile("test_qwen3_next_models_fp4.py", 500),
         TestFile("test_eagle_infer_beta_dp_attention_large.py", 600),
     ],
     "nightly-8-gpu-b200": [
