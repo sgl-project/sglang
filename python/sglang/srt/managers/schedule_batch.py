@@ -736,6 +736,9 @@ class Req:
         self.cached_tokens_device = 0  # Tokens from device cache (GPU)
         self.cached_tokens_host = 0  # Tokens from host cache (CPU memory)
         self.cached_tokens_storage = 0  # Tokens from L3 storage backend
+        self._cache_breakdown_computed = (
+            False  # Track if breakdown was already computed
+        )
 
         # The number of verification forward passes in the speculative decoding.
         # This is used to compute the average acceptance length per request.
@@ -1565,25 +1568,28 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 req.cached_tokens += new_cached
 
                 # Calculate detailed breakdown of cached tokens by source (for HiCache)
-                # At this point, prefix_indices has been extended with host data
-                # via init_load_back in schedule_policy, so:
-                # - len(prefix_indices) = device_original + host_loaded
-                # - host_hit_length = total tokens from host cache (including storage-prefetched)
-                # - storage_hit_length = tokens loaded from storage backend (L3 hits)
-                # - device_portion = len(prefix_indices) - host_hit_length
-                #
-                # Storage hits are now tracked via scheduler after prefetch completes.
-                # storage_hit_length is set by scheduler.pop_prefetch_loaded_tokens()
-                host_total = req.host_hit_length
-                # Clamp storage to host_total to handle edge cases
-                storage_portion = min(host_total, req.storage_hit_length)
-                host_portion = host_total - storage_portion
-                device_portion = max(0, len(req.prefix_indices) - host_total)
+                # Only compute once on FIRST chunk - subsequent chunks in chunked prefill
+                # would incorrectly count previously computed tokens as cache hits.
+                if not req._cache_breakdown_computed:
+                    # At this point, prefix_indices has been extended with host data
+                    # via init_load_back in schedule_policy, so:
+                    # - len(prefix_indices) = device_original + host_loaded
+                    # - host_hit_length = total tokens from host cache (including storage-prefetched)
+                    # - storage_hit_length = tokens loaded from storage backend (L3 hits)
+                    # - device_portion = len(prefix_indices) - host_hit_length
+                    #
+                    # Storage hits are now tracked via scheduler after prefetch completes.
+                    # storage_hit_length is set by scheduler.pop_prefetch_loaded_tokens()
+                    host_total = req.host_hit_length
+                    # Clamp storage to host_total to handle edge cases
+                    storage_portion = min(host_total, req.storage_hit_length)
+                    host_portion = host_total - storage_portion
+                    device_portion = max(0, len(req.prefix_indices) - host_total)
 
-                # Assign breakdown (executed once due to retracted_stain check)
-                req.cached_tokens_device = device_portion
-                req.cached_tokens_host = host_portion
-                req.cached_tokens_storage = storage_portion
+                    req.cached_tokens_device = device_portion
+                    req.cached_tokens_host = host_portion
+                    req.cached_tokens_storage = storage_portion
+                    req._cache_breakdown_computed = True
 
                 req.already_computed = seq_len
             req.is_retracted = False
