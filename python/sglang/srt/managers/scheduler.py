@@ -1588,12 +1588,6 @@ class Scheduler(
     def _prefetch_kvcache(self, req: Req):
         if self.enable_hicache_storage:
             req.init_next_round_input(self.tree_cache)
-            logger.info(
-                f"[DEBUG] _prefetch_kvcache: req={req.rid}, "
-                f"last_node.backuped={req.last_node.backuped}, "
-                f"prefix_indices_len={len(req.prefix_indices)}, "
-                f"host_hit_length={req.host_hit_length}"
-            )
             if req.last_node.backuped:
                 # only to initiate the prefetch if the last node is backuped
                 # otherwise, the allocated GPU memory must be locked for integrity
@@ -2048,9 +2042,6 @@ class Scheduler(
                 # Pop the number of tokens loaded from storage (L3 hits)
                 req.storage_hit_length = self.tree_cache.pop_prefetch_loaded_tokens(
                     req.rid
-                )
-                logger.info(
-                    f"[DEBUG] Scheduler: req={req.rid}, storage_hit_length={req.storage_hit_length}"
                 )
 
             req.init_next_round_input(self.tree_cache)

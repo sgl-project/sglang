@@ -635,9 +635,6 @@ class HiRadixCache(RadixCache):
     def check_prefetch_progress(self, req_id: str) -> bool:
         if req_id not in self.ongoing_prefetch:
             # there is no ongoing prefetch for this request or it has been revoked
-            logger.info(
-                f"[DEBUG] check_prefetch_progress: req={req_id} NOT in ongoing_prefetch"
-            )
             return True
 
         # todo: more policies for prefetch progress such as timeout
@@ -692,11 +689,6 @@ class HiRadixCache(RadixCache):
         # Track tokens actually loaded from storage for this request (L3 hits)
         loaded_from_storage = min_completed_tokens - matched_length
         self.prefetch_loaded_tokens_by_reqid[req_id] = loaded_from_storage
-        logger.info(
-            f"[DEBUG] check_prefetch_progress COMPLETE: req={req_id}, "
-            f"completed_tokens={min_completed_tokens}, matched_length={matched_length}, "
-            f"loaded_from_storage={loaded_from_storage}"
-        )
 
         if self.enable_storage_metrics:
             self.storage_metrics_collector.log_prefetched_tokens(loaded_from_storage)
@@ -775,16 +767,7 @@ class HiRadixCache(RadixCache):
             or prefetch_length < self.prefetch_threshold
             or self.cache_controller.prefetch_rate_limited()
         ):
-            logger.info(
-                f"[DEBUG] prefetch_from_storage SKIPPED: req={req_id}, "
-                f"enable_storage={self.enable_storage}, prefetch_length={prefetch_length}, "
-                f"threshold={self.prefetch_threshold}, rate_limited={self.cache_controller.prefetch_rate_limited()}"
-            )
             return
-        logger.info(
-            f"[DEBUG] prefetch_from_storage STARTING: req={req_id}, "
-            f"prefetch_length={prefetch_length}, last_hash={last_hash}"
-        )
 
         last_host_node.protect_host()
         host_indices = self.cache_controller.mem_pool_host.alloc(prefetch_length)

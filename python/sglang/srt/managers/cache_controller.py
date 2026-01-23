@@ -305,11 +305,6 @@ class HiCacheController:
             self.prefetch_capacity_limit = int(
                 0.8 * (self.mem_pool_host.size - self.mem_pool_device.size)
             )
-            logger.info(
-                f"[DEBUG] HiCache init: host_pool_size={self.mem_pool_host.size}, "
-                f"device_pool_size={self.mem_pool_device.size}, "
-                f"prefetch_capacity_limit={self.prefetch_capacity_limit}"
-            )
             # granularity of batch storage IO operations, in number of pages
             self.storage_batch_size = 128
             # tracking the number of tokens locked in prefetching, updated by the main scheduler thread
@@ -704,15 +699,10 @@ class HiCacheController:
             batch_tokens = tokens_to_fetch[start:end]
             batch_hashes = []
             for i in range(0, len(batch_tokens), self.page_size):
-                page_tokens = batch_tokens[i : i + self.page_size]
-                last_hash = self.get_hash_str(page_tokens, last_hash)
+                last_hash = self.get_hash_str(
+                    batch_tokens[i : i + self.page_size], last_hash
+                )
                 batch_hashes.append(last_hash)
-                # Debug: log first page hash computation
-                if start == 0 and i == 0:
-                    logger.info(
-                        f"[DEBUG] _storage_hit_query first page: tokens[:10]={page_tokens[:10]}, "
-                        f"page_size={self.page_size}, hash={last_hash[:16]}..."
-                    )
             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
             hit_page_num = self.storage_backend.batch_exists(batch_hashes, extra_info)
             hash_value.extend(batch_hashes[:hit_page_num])
@@ -752,9 +742,8 @@ class HiCacheController:
                     # not to prefetch if not enough benefits
                     self.prefetch_revoke_queue.put(operation.request_id)
                     self.append_host_mem_release(operation.host_indices)
-                    logger.info(
-                        f"[DEBUG] Prefetch REVOKED: req={operation.request_id}, "
-                        f"storage_hit_count={storage_hit_count}, threshold={self.prefetch_threshold}"
+                    logger.debug(
+                        f"Revoking prefetch for request {operation.request_id} due to insufficient hits ({storage_hit_count})."
                     )
                 else:
                     operation.hash_value = hash_value[
@@ -765,9 +754,8 @@ class HiCacheController:
                         operation.host_indices[storage_hit_count:]
                     )
                     operation.host_indices = operation.host_indices[:storage_hit_count]
-                    logger.info(
-                        f"[DEBUG] Prefetch PROCEEDING: req={operation.request_id}, "
-                        f"storage_hit_count={storage_hit_count}, pages={len(operation.hash_value)}"
+                    logger.debug(
+                        f"Prefetching {len(operation.hash_value)} pages for request {operation.request_id}."
                     )
                     self.prefetch_buffer.put(operation)
 
