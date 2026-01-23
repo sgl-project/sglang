@@ -54,7 +54,7 @@ class ExpertBackupClient:
         self.session_id_list = [None] * self.engine_num
         self.transfer_engine = None
         self.gpu_buffer = None
-        self.buffer_size = None
+        self.buffer_size = 0
 
         local_ip = get_local_ip_auto()
         all_ips = [None] * get_world_size()
