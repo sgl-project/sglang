@@ -107,8 +107,9 @@ class CachedTokensDetails(BaseModel):
 
     device: int = 0  # Tokens from device cache (GPU)
     host: int = 0  # Tokens from host cache (CPU memory)
-    storage: int = 0  # Tokens from L3 storage backend
-    storage_backend: str = "none"  # Type of storage backend used
+    # L3 storage fields are only present when storage backend is enabled
+    storage: Optional[int] = None  # Tokens from L3 storage backend
+    storage_backend: Optional[str] = None  # Type of storage backend used
 
 
 class PromptTokensDetails(BaseModel):

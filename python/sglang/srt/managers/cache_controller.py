@@ -742,8 +742,9 @@ class HiCacheController:
                     # not to prefetch if not enough benefits
                     self.prefetch_revoke_queue.put(operation.request_id)
                     self.append_host_mem_release(operation.host_indices)
-                    logger.debug(
-                        f"Revoking prefetch for request {operation.request_id} due to insufficient hits ({storage_hit_count})."
+                    logger.info(
+                        f"[DEBUG] Prefetch REVOKED: req={operation.request_id}, "
+                        f"storage_hit_count={storage_hit_count}, threshold={self.prefetch_threshold}"
                     )
                 else:
                     operation.hash_value = hash_value[
@@ -754,8 +755,9 @@ class HiCacheController:
                         operation.host_indices[storage_hit_count:]
                     )
                     operation.host_indices = operation.host_indices[:storage_hit_count]
-                    logger.debug(
-                        f"Prefetching {len(operation.hash_value)} pages for request {operation.request_id}."
+                    logger.info(
+                        f"[DEBUG] Prefetch PROCEEDING: req={operation.request_id}, "
+                        f"storage_hit_count={storage_hit_count}, pages={len(operation.hash_value)}"
                     )
                     self.prefetch_buffer.put(operation)
 

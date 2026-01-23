@@ -1311,10 +1311,9 @@ class TokenizerMetricsCollector:
         # Report cached tokens with detailed source breakdown
         if cached_tokens > 0:
             if cached_tokens_details:
-                # Report by cache source (device/host/storage)
+                # Report by cache source (device/host, and storage if L3 enabled)
                 device_tokens = cached_tokens_details.get("device", 0)
                 host_tokens = cached_tokens_details.get("host", 0)
-                storage_tokens = cached_tokens_details.get("storage", 0)
 
                 if device_tokens > 0:
                     labels_device = {**labels, "cache_source": "device"}
@@ -1322,12 +1321,21 @@ class TokenizerMetricsCollector:
                 if host_tokens > 0:
                     labels_host = {**labels, "cache_source": "host"}
                     self.cached_tokens_total.labels(**labels_host).inc(host_tokens)
-                if storage_tokens > 0:
-                    backend = cached_tokens_details.get("storage_backend", "unknown")
-                    labels_storage = {**labels, "cache_source": f"storage_{backend}"}
-                    self.cached_tokens_total.labels(**labels_storage).inc(
-                        storage_tokens
-                    )
+
+                # Storage fields are only present when L3 storage backend is enabled
+                if "storage" in cached_tokens_details:
+                    storage_tokens = cached_tokens_details.get("storage", 0)
+                    if storage_tokens > 0:
+                        backend = (
+                            cached_tokens_details.get("storage_backend") or "unknown"
+                        )
+                        labels_storage = {
+                            **labels,
+                            "cache_source": f"storage_{backend}",
+                        }
+                        self.cached_tokens_total.labels(**labels_storage).inc(
+                            storage_tokens
+                        )
             else:
                 # Fallback for backward compatibility
                 labels_total = {**labels, "cache_source": "total"}
