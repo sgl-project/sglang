@@ -9,17 +9,13 @@ def finalize():
 def npu_fused_experts_unquant(
     hidden_states: torch.Tensor,
     w13: torch.Tensor,
-    w13_scale: torch.Tensor,
-    w13_offset: torch.Tensor,
+    w13_weight_bias: torch.Tensor,
     w2: torch.Tensor,
-    w2_scale: torch.Tensor,
-    w2_offset: torch.Tensor,
+    w2_weight_bias: torch.Tensor,
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     top_k: int,
 ):
-    x = dispatch_output.hidden_states
-    topk_weights, topk_ids, _ = dispatch_output.topk_output
 
     original_dtype = x.dtype
     num_tokens = x.shape[0]
@@ -67,13 +63,11 @@ def npu_fused_experts_unquant(
     # act_fn:
     if self.moe_runner_config.activation == "npu_swiglu_oai":
         from sgl_kernel_npu.activation.swiglu_oai import swiglu_oai
-
         hidden_states = swiglu_oai(layer, hidden_states)
     elif self.moe_runner_config.activation == "silu":
         hidden_states = torch_npu.npu_swiglu(hidden_states)
     else:
         from sglang.srt.layers.activation import GeluAndMul
-
         hidden_states = GeluAndMul()(hidden_states)
 
     # gmm2: down_proj
