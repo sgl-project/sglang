@@ -16,6 +16,7 @@ from sglang.srt.entrypoints.openai.protocol import ErrorResponse, OpenAIServingR
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 from sglang.srt.server_args import ServerArgs
 
+from sglang.srt.tracing.clock import now_mono_s, now_wall_s
 if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
@@ -89,14 +90,14 @@ class OpenAIServingBase(ABC):
         """Handle the specific request type with common pattern
         If you want to override this method, you should be careful to record the validation time.
         """
-        received_time = time.time()
-        received_time_perf = time.perf_counter()
+        received_time = now_wall_s()
+        received_time_perf = now_mono_s()
 
         try:
             # Validate request
-            validation_start = time.perf_counter()
+            validation_start = now_mono_s()
             error_msg = self._validate_request(request)
-            validation_time = time.perf_counter() - validation_start
+            validation_time = now_mono_s() - validation_start
             if error_msg:
                 return self.create_error_response(error_msg)
 

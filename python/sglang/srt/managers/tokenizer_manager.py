@@ -1,3 +1,4 @@
+from sglang.srt.tracing.clock import now_mono_s, now_wall_s
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -488,7 +489,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         request: Optional[fastapi.Request] = None,
     ):
-        created_time = obj.received_time if obj.received_time else time.time()
+        created_time = obj.received_time if obj.received_time else now_wall_s()
         self.auto_create_handle_loop()
 
         # Normalize the request
@@ -1062,7 +1063,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         state = self.req_state_class(
             [], False, asyncio.Event(), obj, created_time=created_time
         )
-        state.request_sent_to_scheduler_ts = time.time()
+        state.request_sent_to_scheduler_ts = now_wall_s()
         self.rid_to_state[obj.rid] = state
         trace_slice_end(
             RequestStage.TOKENIZER_DISPATCH, obj.rid, thread_finish_flag=True
@@ -1127,7 +1128,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 # For non-streaming cases, response has not been sent yet (`response_sent_to_client_ts` has not been set yet).
                 # Record response sent time right before we log finished results and metrics.
                 if not state.response_sent_to_client_ts:
-                    state.response_sent_to_client_ts = time.time()
+                    state.response_sent_to_client_ts = now_wall_s()
                     out["meta_info"][
                         "response_sent_to_client_ts"
                     ] = state.response_sent_to_client_ts
@@ -1188,7 +1189,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             if is_stream:
                 # Record response sent time right before we send response.
                 if not state.response_sent_to_client_ts:
-                    state.response_sent_to_client_ts = time.time()
+                    state.response_sent_to_client_ts = now_wall_s()
                     out["meta_info"][
                         "response_sent_to_client_ts"
                     ] = state.response_sent_to_client_ts
@@ -1471,7 +1472,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             with self.soft_watchdog.disable():
                 recv_obj = await self.recv_from_detokenizer.recv_pyobj()
             self._result_dispatcher(recv_obj)
-            self.last_receive_tstamp = time.time()
+            self.last_receive_tstamp = now_wall_s()
             self.soft_watchdog.feed()
 
     def _handle_batch_output(
@@ -1583,8 +1584,8 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
             state.finished = recv_obj.finished_reasons[i] is not None
             if state.finished:
-                state.finished_time = time.time()
-                state.finished_time_perf = time.perf_counter()
+                state.finished_time = now_wall_s()
+                state.finished_time_perf = now_mono_s()
                 meta_info["e2e_latency"] = state.finished_time - state.created_time
 
                 if self.server_args.speculative_algorithm:
@@ -1938,8 +1939,8 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             state.first_token_time == 0.0
             and self.disaggregation_mode != DisaggregationMode.PREFILL
         ):
-            state.first_token_time = state.last_time = time.time()
-            state.first_token_time_perf = time.perf_counter()
+            state.first_token_time = state.last_time = now_wall_s()
+            state.first_token_time_perf = now_mono_s()
             state.last_completion_tokens = completion_tokens
             self.metrics_collector.observe_time_to_first_token(
                 labels, state.first_token_time - state.created_time
@@ -1947,7 +1948,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         else:
             num_new_tokens = completion_tokens - state.last_completion_tokens
             if num_new_tokens:
-                new_time = time.time()
+                new_time = now_wall_s()
                 interval = new_time - state.last_time
                 self.metrics_collector.observe_inter_token_latency(
                     labels,
@@ -1977,7 +1978,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
     def dump_requests(self, state: ReqState, out_dict: dict):
         self.dump_request_list.append(
-            (state.obj, out_dict, state.created_time, time.time())
+            (state.obj, out_dict, state.created_time, now_wall_s())
         )
 
         if len(self.dump_request_list) >= self.dump_requests_threshold:
@@ -1993,7 +1994,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             self.dump_request_list = []
 
     def record_request_for_crash_dump(self, state: ReqState, out_dict: dict):
-        current_time = time.time()
+        current_time = now_wall_s()
         self.crash_dump_request_list.append(
             (state.obj, out_dict, state.created_time, current_time)
         )
@@ -2050,7 +2051,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                         state.obj,
                         state.out_list[-1] if state.out_list else {},
                         state.created_time,
-                        time.time(),
+                        now_wall_s(),
                     )
                 )
         if unfinished_requests:
