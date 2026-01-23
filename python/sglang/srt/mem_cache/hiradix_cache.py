@@ -96,12 +96,6 @@ class HiRadixCache(RadixCache):
         ) = self._parse_storage_backend_extra_config(
             server_args.hicache_storage_backend_extra_config
         )
-        self.prefetch_threshold = prefetch_threshold
-        self.prefetch_timeout_base = prefetch_timeout_base
-        self.prefetch_timeout_per_page = (
-            self.page_size / 1024 * prefetch_timeout_per_ki_token
-        )
-        self.hicache_storage_pass_prefix_keys = hicache_storage_pass_prefix_keys
         # TODO: support more timeout check functions
         self.is_prefetch_timeout = self._prefetch_timeout_check_linear_func
         self.prefetch_stop_policy = server_args.hicache_storage_prefetch_policy
@@ -116,22 +110,21 @@ class HiRadixCache(RadixCache):
             write_policy=server_args.hicache_write_policy,
             io_backend=server_args.hicache_io_backend,
             storage_backend=server_args.hicache_storage_backend,
-            prefetch_threshold=self.prefetch_threshold,
+            prefetch_threshold=prefetch_threshold,
             model_name=server_args.served_model_name,
             storage_backend_extra_config=extra_config,
             pp_rank=self.pp_rank,
             pp_size=self.pp_size,
         )
-        if self.enable_storage_metrics:
-            # TODO: support pp
-            labels = {
-                "storage_backend": server_args.hicache_storage_backend,
-                "tp_rank": self.cache_controller.tp_rank,
-                "dp_rank": self.cache_controller.dp_rank,
-                "pp_rank": self.cache_controller.pp_rank,
-                "pp_size": self.cache_controller.pp_size,
-            }
-            self.storage_metrics_collector = StorageMetricsCollector(labels=labels)
+        self._apply_storage_runtime_config(
+            storage_backend=server_args.hicache_storage_backend,
+            prefetch_threshold=prefetch_threshold,
+            prefetch_timeout_base=prefetch_timeout_base,
+            prefetch_timeout_per_ki_token=prefetch_timeout_per_ki_token,
+            hicache_storage_pass_prefix_keys=hicache_storage_pass_prefix_keys,
+            enable_storage=self.enable_storage,
+            enable_storage_metrics=self.enable_storage_metrics,
+        )
 
         # record the nodes with ongoing write through
         self.ongoing_write_through = {}
@@ -162,6 +155,43 @@ class HiRadixCache(RadixCache):
                 self.detach_storage_backend()
         except Exception:
             logger.exception("Failed to detach storage backend on process shutdown.")
+
+    def _apply_storage_runtime_config(
+        self,
+        *,
+        storage_backend: Optional[str],
+        prefetch_threshold: int,
+        prefetch_timeout_base: float,
+        prefetch_timeout_per_ki_token: float,
+        hicache_storage_pass_prefix_keys: bool,
+        enable_storage: bool,
+        enable_storage_metrics: bool,
+    ) -> None:
+        prefetch_timeout_per_page = (
+            self.page_size / 1024 * prefetch_timeout_per_ki_token
+        )
+
+        storage_metrics_collector = None
+        if enable_storage_metrics:
+            labels = {
+                "storage_backend": storage_backend,
+                "tp_rank": self.cache_controller.tp_rank,
+                "dp_rank": self.cache_controller.dp_rank,
+                "pp_rank": self.cache_controller.pp_rank,
+                "pp_size": self.cache_controller.pp_size,
+            }
+            storage_metrics_collector = StorageMetricsCollector(labels=labels)
+
+        self.enable_storage = enable_storage
+        self.prefetch_threshold = prefetch_threshold
+        self.prefetch_timeout_base = prefetch_timeout_base
+        self.prefetch_timeout_per_page = prefetch_timeout_per_page
+        self.hicache_storage_pass_prefix_keys = hicache_storage_pass_prefix_keys
+        self.enable_storage_metrics = enable_storage_metrics
+        if self.enable_storage_metrics:
+            self.storage_metrics_collector = storage_metrics_collector
+        else:
+            self.storage_metrics_collector = None
 
     def attach_storage_backend(
         self,
@@ -270,57 +300,16 @@ class HiRadixCache(RadixCache):
             )
             return False, f"Failed to attach storage backend '{storage_backend}': {e}"
 
-        # Commit/rollback boundary:
-        # - After controller attach succeeds, any exception below MUST rollback by
-        #   detaching controller, otherwise threads may keep running while scheduler
-        #   believes storage is disabled.
-        try:
-            # Compute runtime knobs first.
-            prefetch_timeout_per_page = (
-                self.page_size / 1024 * prefetch_timeout_per_ki_token
-            )
-
-            # Metrics is optional, but if enabled and creation fails, treat attach as failed
-            # to keep the system state consistent.
-            storage_metrics_collector = None
-            enable_storage_metrics = self._enable_metrics_flag
-            if enable_storage_metrics:
-                labels = {
-                    "storage_backend": storage_backend,
-                    "tp_rank": self.cache_controller.tp_rank,
-                    "dp_rank": self.cache_controller.dp_rank,
-                }
-                storage_metrics_collector = StorageMetricsCollector(labels=labels)
-
-            # All steps succeeded: now atomically flip flags/state.
-            self.enable_storage = True
-            self.prefetch_threshold = prefetch_threshold
-            self.prefetch_timeout_base = prefetch_timeout_base
-            self.prefetch_timeout_per_page = prefetch_timeout_per_page
-            self.hicache_storage_pass_prefix_keys = hicache_storage_pass_prefix_keys
-
-            self.enable_storage_metrics = enable_storage_metrics
-            if self.enable_storage_metrics:
-                self.storage_metrics_collector = storage_metrics_collector
-            return True, "Attached HiCache storage backend successfully."
-        except Exception as e:
-            logger.exception(
-                "Attach storage backend post-init failed; rolling back detach."
-            )
-            # Best-effort rollback to avoid state inconsistency.
-            try:
-                self.cache_controller.detach_storage_backend()
-            except Exception:
-                logger.exception("Rollback detach_storage_backend failed.")
-
-            self.enable_storage = False
-            self.enable_storage_metrics = False
-            if hasattr(self, "storage_metrics_collector"):
-                self.storage_metrics_collector = None
-            return (
-                False,
-                f"Failed to finalize attach storage backend '{storage_backend}': {e}",
-            )
+        self._apply_storage_runtime_config(
+            storage_backend=storage_backend,
+            prefetch_threshold=prefetch_threshold,
+            prefetch_timeout_base=prefetch_timeout_base,
+            prefetch_timeout_per_ki_token=prefetch_timeout_per_ki_token,
+            hicache_storage_pass_prefix_keys=hicache_storage_pass_prefix_keys,
+            enable_storage=True,
+            enable_storage_metrics=self._enable_metrics_flag,
+        )
+        return True, "Attached HiCache storage backend successfully."
 
     def detach_storage_backend(self) -> tuple[bool, str]:
         """Detach (disable) storage backend at runtime.

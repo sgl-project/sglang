@@ -2471,7 +2471,7 @@ class Scheduler(
             return False
         if len(self.waiting_queue) != 0:
             return False
-        if hasattr(self, "grammar_queue") and len(self.grammar_queue) != 0:
+        if len(self.grammar_manager.grammar_queue) != 0:
             return False
         return True
 
