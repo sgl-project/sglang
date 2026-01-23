@@ -137,6 +137,7 @@ class TestDeepSeekV31EvalAMD(unittest.TestCase):
             )
             passed = acc >= self.accuracy_threshold
             status = "✅ PASS" if passed else "❌ FAIL"
+            print(f"  accuracy={acc:.3f} threshold={self.accuracy_threshold} {status}")
 
             summary = f"### DeepSeek-V3.1 (MI300X)\n\n"
             summary += f"| Model | Accuracy | Threshold | Status |\n"

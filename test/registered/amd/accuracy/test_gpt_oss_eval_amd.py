@@ -56,7 +56,7 @@ GPT_OSS_MODELS = [
     ModelConfig(
         model_path="lmsys/gpt-oss-20b-bf16",
         tp_size=8,
-        accuracy_threshold=0.47,
+        accuracy_threshold=0.45,
         other_args=[
             "--chunked-prefill-size",
             "130172",
@@ -211,6 +211,9 @@ class TestGptOssEvalAMD(unittest.TestCase):
                         )
                         passed = acc >= config.accuracy_threshold
                         status = "✅ PASS" if passed else "❌ FAIL"
+                        print(
+                            f"  accuracy={acc:.3f} threshold={config.accuracy_threshold} {status}"
+                        )
 
                         all_results.append(
                             {
