@@ -225,6 +225,13 @@ impl AppContextBuilder {
         self.wasm_manager = wasm_manager;
         self
     }
+    pub fn media_connector(
+        mut self,
+        media_connector: Option<Arc<crate::multimodal::MediaConnector>>,
+    ) -> Self {
+        self.media_connector = media_connector;
+        self
+    }
     fn with_media_connector(mut self) -> Self {
         let config = crate::multimodal::MediaConnectorConfig::default();
         let connector =
