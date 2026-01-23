@@ -1,6 +1,6 @@
 //! Harmony Preparation Stage: Harmony encoding for chat and generate requests
 
-use std::{collections::HashMap, sync::Arc};
+use std::collections::HashMap;
 
 use async_trait::async_trait;
 use axum::response::Response;
