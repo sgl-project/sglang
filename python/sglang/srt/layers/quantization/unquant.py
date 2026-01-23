@@ -488,13 +488,12 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
 
         backend = self.runner.runner_backend
         if backend.is_triton():
-            from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 
             quant_info = TritonMoeQuantInfo(
                 w13_weight=layer.w13_weight,
                 w2_weight=layer.w2_weight,
-                w13_bias=getattr(layer, "w13_weight_bias", None),
-                w2_bias=getattr(layer, "w2_weight_bias", None),
+                b13=getattr(layer, "w13_weight_bias", None),
+                b2=getattr(layer, "w2_weight_bias", None),
             )
             return self.runner.run(dispatch_output, quant_info)
         else:
