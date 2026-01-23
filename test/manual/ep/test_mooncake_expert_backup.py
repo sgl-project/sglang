@@ -26,57 +26,63 @@ class TestBackup(CustomTestCase):
         cls.base_port = 20000
         cls.num_processes = 2
         # TODO (stage 100): in the future, implement a specified multiprocess launcher
-        cls.processes = [popen_launch_pd_server(
-            cls.model,
-            f"http://127.0.0.1:{cls.base_port + i}",
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--trust-remote-code",
-                "--tp",
-                "4",
-                "--enable-dp-attention",
-                "--dp",
-                "4",
-                "--elastic-ep-backend",
-                "mooncake",
-                "--mooncake-ib-device",
-                ib_devices,
-                "--moe-a2a-backend",
-                "mooncake",
-                "--deepep-mode",
-                "low_latency",
-                "--moe-dense-tp-size",
-                "1",
-                "--enable-dp-lm-head",
-                "--enable-two-batch-overlap",
-                "--disable-custom-all-reduce",
-                "--enable-elastic-expert-backup",
-                "--enable-eplb",
-                "--eplb-rebalance-num-iterations",
-                "50",
-                "--chunked-prefill-size",
-                "512",
-                "--cuda-graph-max-bs",
-                "128",
-                "--max-running-requests",
-                "512",
-                "--mem-fraction-static",
-                "0.5",
-                "--dist-init-addr",
-                "127.0.0.1:5000",
-                "--nnodes",
-                f"{cls.num_processes}",
-                "--node-rank",
-                f"{i}",
-                "--base-gpu-id",
-                f"{i * 2}",
-            ],
-        ) for i in range(cls.num_processes)]
+        cls.processes = [
+            popen_launch_pd_server(
+                cls.model,
+                f"http://127.0.0.1:{cls.base_port + i}",
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                other_args=[
+                    "--trust-remote-code",
+                    "--tp",
+                    "4",
+                    "--enable-dp-attention",
+                    "--dp",
+                    "4",
+                    "--elastic-ep-backend",
+                    "mooncake",
+                    "--mooncake-ib-device",
+                    ib_devices,
+                    "--moe-a2a-backend",
+                    "mooncake",
+                    "--deepep-mode",
+                    "low_latency",
+                    "--moe-dense-tp-size",
+                    "1",
+                    "--enable-dp-lm-head",
+                    "--enable-two-batch-overlap",
+                    "--disable-custom-all-reduce",
+                    "--enable-elastic-expert-backup",
+                    "--enable-eplb",
+                    "--eplb-rebalance-num-iterations",
+                    "50",
+                    "--chunked-prefill-size",
+                    "512",
+                    "--cuda-graph-max-bs",
+                    "128",
+                    "--max-running-requests",
+                    "512",
+                    "--mem-fraction-static",
+                    "0.5",
+                    "--dist-init-addr",
+                    "127.0.0.1:5000",
+                    "--nnodes",
+                    f"{cls.num_processes}",
+                    "--node-rank",
+                    f"{i}",
+                    "--base-gpu-id",
+                    f"{i * 2}",
+                ],
+            )
+            for i in range(cls.num_processes)
+        ]
 
         server_ready = [False] * cls.num_processes
         start_time = time.perf_counter()
         with requests.Session() as session:
-            while time.perf_counter() - start_time < DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH and not all(server_ready):
+            while (
+                time.perf_counter() - start_time < DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
+                and not all(server_ready)
+            ):
                 for i, process in enumerate(cls.processes):
                     return_code = process.poll()
                     if return_code is not None:
@@ -110,7 +116,6 @@ class TestBackup(CustomTestCase):
             for process in cls.processes:
                 kill_process_tree(process.pid)
             raise TimeoutError("Server failed to start within the timeout period.")
-
 
     @classmethod
     def tearDownClass(cls):

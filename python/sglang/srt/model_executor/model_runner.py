@@ -344,8 +344,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 # if there is no aux layer, set to None
                 self.eagle_aux_hidden_state_layer_ids = None
 
-        self.if_backup = False
-
         # Apply the rank zero filter to logger
         if server_args.show_time_cost:
             enable_show_time_cost()
@@ -1006,7 +1004,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 new_expert_location_metadata,
                 update_layer_ids=update_layer_ids,
             )
-            if self.if_backup:
+            if self.expert_backup_client.use_backup:
                 self.expert_backup_client.update_weights()
                 return
 
