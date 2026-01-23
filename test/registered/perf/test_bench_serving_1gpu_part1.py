@@ -9,7 +9,7 @@ import unittest
 
 import requests
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     CustomTestCase,
@@ -20,6 +20,7 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=1000, suite="stage-b-test-large-1-gpu-performance")
+register_amd_ci(est_time=1100, suite="stage-b-test-large-1-gpu-performance-amd")
 
 
 class TestBenchServing1GPUPart1(CustomTestCase):

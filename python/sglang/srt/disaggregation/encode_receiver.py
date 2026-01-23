@@ -303,7 +303,11 @@ class MMReceiver:
                     else:
                         raise e
                 self.mm_processor = get_mm_processor(
-                    hf_config, server_args, _processor, transport_mode
+                    hf_config,
+                    server_args,
+                    _processor,
+                    transport_mode,
+                    skip_mm_pool=True,
                 )
 
     def create_req(self, recv_req):

@@ -12,7 +12,6 @@
 # limitations under the License.
 """Common config utils for mamba2 - NemotronH, FalconH1, Qwen3Next, LFM2, etc."""
 
-import os
 from abc import ABC
 from dataclasses import dataclass, field
 from typing import List, Optional
@@ -21,6 +20,7 @@ import numpy as np
 import torch
 
 from sglang.srt.distributed.utils import divide
+from sglang.srt.environ import envs
 
 
 def extra_groups_for_head_shards(ngroups: int, tp_size: int):
@@ -47,12 +47,8 @@ def mamba2_state_dtype() -> Mamba2StateDType:
         "bfloat16": torch.bfloat16,
         "float16": torch.float16,
     }
-    conv_dtype = dtype_map.get(
-        os.environ.get("SGLANG_MAMBA_CONV_DTYPE", "bfloat16"), torch.bfloat16
-    )
-    ssm_dtype = dtype_map.get(
-        os.environ.get("SGLANG_MAMBA_SSM_DTYPE", "float32"), torch.float32
-    )
+    conv_dtype = dtype_map.get(envs.SGLANG_MAMBA_CONV_DTYPE.get(), torch.bfloat16)
+    ssm_dtype = dtype_map.get(envs.SGLANG_MAMBA_SSM_DTYPE.get(), torch.float32)
     return Mamba2StateDType(conv=conv_dtype, temporal=ssm_dtype)
 
 

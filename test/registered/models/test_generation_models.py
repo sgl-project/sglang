@@ -29,10 +29,12 @@ import dataclasses
 import multiprocessing as mp
 import os
 import unittest
+from contextlib import nullcontext
 from typing import List, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.utils import is_hip
 from sglang.test.runners import (
     DEFAULT_PROMPTS,
@@ -115,6 +117,10 @@ ALL_MODELS = [
     ),
 ]
 
+MAMBA_MODEL_PATHS = [
+    "LiquidAI/LFM2.5-1.2B-Instruct",
+]
+
 TORCH_DTYPES = [torch.float16]
 
 
@@ -131,18 +137,17 @@ class TestGenerationModels(CustomTestCase):
         torch_dtype: torch.dtype,
     ) -> None:
         model_path = model_case.model_path
-        prefill_tolerance, decode_tolerance, rouge_l_tolerance = (
-            model_case.prefill_tolerance,
-            model_case.decode_tolerance,
-            model_case.rouge_l_tolerance,
-        )
         max_new_tokens = 32
 
         # Set conv dtype for hybrid models to match inference dtype
         dtype_str = {torch.float16: "float16", torch.bfloat16: "bfloat16"}.get(
             torch_dtype, "bfloat16"
         )
-        os.environ["SGLANG_MAMBA_CONV_DTYPE"] = dtype_str
+
+        if model_case.model_path in MAMBA_MODEL_PATHS:
+            env_ctx = envs.SGLANG_MAMBA_CONV_DTYPE.override(dtype_str)
+        else:
+            env_ctx = nullcontext()
 
         with HFRunner(
             model_path,
@@ -152,7 +157,7 @@ class TestGenerationModels(CustomTestCase):
         ) as hf_runner:
             hf_outputs = hf_runner.forward(prompts, max_new_tokens=max_new_tokens)
 
-        with SRTRunner(
+        with env_ctx, SRTRunner(
             model_path,
             tp_size=model_case.tp_size,
             torch_dtype=torch_dtype,
