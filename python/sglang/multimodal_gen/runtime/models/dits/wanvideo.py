@@ -317,6 +317,10 @@ class WanTransformerBlock(nn.Module):
         ):
             cross_attn_backends = supported_attention_backends.copy()
             cross_attn_backends.remove(AttentionBackendEnum.SPARSE_VIDEO_GEN_2_ATTN)
+            logger.warning_once(
+                "Sparse Video Gen 2 attention backend is not supported for cross-attention; "
+                "removing SPARSE_VIDEO_GEN_2_ATTN from cross-attention backends."
+            )
         if attention_type in ("sla", "sagesla"):
             self.attn1 = MinimalA2AAttnOp(
                 num_heads=divide(num_heads, get_tensor_model_parallel_world_size()),
