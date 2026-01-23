@@ -124,9 +124,9 @@ def unified_linear_attention_with_output(
     # For models like Qwen3Next, the RadixLinearAttention is stored
     # as a sub-component (parent_layer.linear_attn.linear_attn)
     # Navigate to get the actual RadixLinearAttention
-    if hasattr(parent_layer, 'linear_attn'):
+    if hasattr(parent_layer, "linear_attn"):
         gdn_layer = parent_layer.linear_attn
-        if hasattr(gdn_layer, 'linear_attn'):
+        if hasattr(gdn_layer, "linear_attn"):
             attention_layer = gdn_layer.linear_attn
         else:
             attention_layer = gdn_layer
