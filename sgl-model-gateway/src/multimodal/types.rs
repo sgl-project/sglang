@@ -199,7 +199,6 @@ pub struct PlaceholderRange {
 pub struct MultiModalTensor {
     pub shape: Vec<usize>,
     pub dtype: String,
-    #[serde(with = "serde_bytes")]
     pub data: Bytes,
 }
 
