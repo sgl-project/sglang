@@ -1,10 +1,10 @@
 //! Chat preparation stage: Filter tools, process messages, tokenize, build constraints
 
-use std::{borrow::Cow, collections::HashMap, sync::Arc};
+use std::{borrow::Cow, collections::HashMap};
 
 use async_trait::async_trait;
 use axum::response::Response;
-use tracing::{error, info};
+use tracing::error;
 
 use crate::{
     multimodal::{
@@ -24,8 +24,8 @@ use crate::{
 
 /// Chat preparation stage
 ///
-/// Extracts chat-specific preparation logic from the old unified PreparationStage.
-/// This is a direct extraction without architectural changes.
+/// Processes chat-specific logic including multimodal tracking,
+/// tool filtering, and template rendering.
 pub(crate) struct ChatPreparationStage;
 
 #[async_trait]
@@ -52,6 +52,7 @@ impl ChatPreparationStage {
             utils::resolve_tokenizer(ctx, "ChatPreparationStage::prepare_chat").map_err(|e| *e)?;
 
         // Step 1: Handle Multimodal Tracking for zero-copy extraction
+        // We use the tracker to process the messages and extract shared Bytes
         let mut multimodal_data = None;
         if request.is_multimodal() {
             let mut tracker = AsyncMultiModalTracker::new(
@@ -84,6 +85,12 @@ impl ChatPreparationStage {
                                         }),
                                         uuid: None,
                                     },
+                                    crate::protocols::common::ContentPart::VideoUrl { .. } => {
+                                        return Err(error::bad_request(
+                                            "unsupported_media_type",
+                                            "Video inputs are not yet supported in gRPC chat",
+                                        ));
+                                    }
                                 };
                                 tracker.push_part(chat_part).map_err(|e| {
                                     error!(error = %e, "Failed to push multimodal part to tracker");
@@ -130,7 +137,7 @@ impl ChatPreparationStage {
                 error::internal_error("multimodal_tracking_failed", e.to_string())
             })?;
 
-            // Convert TrackedMedia enum (internal) toconcrete Arc<ImageFrame> expected by utils
+            // Convert TrackedMedia enum (internal) to concrete Arc<ImageFrame> expected by utils
             if let Some(media_vec) = output.data.get(&Modality::Image) {
                 let frames = media_vec
                     .iter()

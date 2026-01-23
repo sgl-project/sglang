@@ -127,7 +127,7 @@ impl AppContextBuilder {
             worker_job_queue: None,
             workflow_engines: None,
             mcp_manager: None,
-            wasm_manager: None,
+            media_connector: None,
         }
     }
 

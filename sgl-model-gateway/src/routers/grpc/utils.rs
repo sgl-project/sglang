@@ -17,7 +17,7 @@ use super::{
 use crate::{
     core::Worker,
     grpc_client::sglang_proto::{InputLogProbs, MultimodalInputs, OutputLogProbs},
-    multimodal::types::{ImageFrame, Modality},
+    multimodal::types::Modality,
     observability::metrics::metrics_labels,
     protocols::{
         chat::{ChatCompletionRequest, ChatMessage},
@@ -400,12 +400,7 @@ pub(crate) fn filter_chat_request_by_tool_choice(
 pub(crate) fn process_chat_messages(
     request: &ChatCompletionRequest,
     tokenizer: &dyn Tokenizer,
-    multimodal_data: Option<
-        std::collections::HashMap<
-            crate::multimodal::Modality,
-            Vec<std::sync::Arc<crate::multimodal::types::ImageFrame>>,
-        >,
-    >,
+    multimodal_data: Option<HashMap<Modality, Vec<Arc<crate::multimodal::types::ImageFrame>>>>,
 ) -> Result<ProcessedMessages, String> {
     // Use the tokenizer's chat template - we require HuggingFace tokenizer for gRPC
     // First try direct downcast, then try via CachedTokenizer wrapper
