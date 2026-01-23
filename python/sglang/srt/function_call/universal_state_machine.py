@@ -169,16 +169,16 @@ class UniversalXmlStateMachine(ToolParserStateMachine):
                         break
 
                 case UniversalToolParserState.TOOL_START:
-                    # Skip leading whitespace or junk
-                    self.buffer = self.buffer.lstrip()
-
                     if self.name_start_marker and self.name_start_marker in self.buffer:
                         pos = self.buffer.find(self.name_start_marker)
                         # Ensure we consume junk before the name start marker
                         self.buffer = self.buffer[pos + len(self.name_start_marker) :]
                         self.state = UniversalToolParserState.IN_TOOL_NAME
                         continue
-                    elif self.buffer.startswith(">"):
+
+                    # Skip leading whitespace or junk if we are not looking for an attribute name
+                    self.buffer = self.buffer.lstrip()
+                    if self.buffer.startswith(">"):
                         self.buffer = self.buffer[1:]
                         if (
                             not self.config.tool_name_tag
