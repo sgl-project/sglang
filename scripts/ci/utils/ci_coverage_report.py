@@ -6,7 +6,7 @@ Collects all CI test registrations from test/registered/ and generates
 a coverage report organized by folder, backend, and suite.
 
 Usage:
-    python scripts/ci/ci_coverage_report.py [--output-format markdown|json]
+    python scripts/ci/utils/ci_coverage_report.py [--output-format markdown|json]
 """
 
 import argparse
