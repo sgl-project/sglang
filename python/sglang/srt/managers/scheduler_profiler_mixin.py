@@ -14,7 +14,11 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import is_npu
 from sglang.srt.utils.profile_merger import ProfileMerger
-from sglang.srt.utils.profile_utils import ProfileManager
+from sglang.srt.utils.profile_utils import (
+    ProfileManager,
+    get_npu_trace_handler,
+    init_npu_profiler,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -22,14 +26,7 @@ if TYPE_CHECKING:
 
 _is_npu = is_npu()
 if _is_npu:
-    import torch_npu
-
-    patches = [
-        ["profiler.profile", torch_npu.profiler.profile],
-        ["profiler.ProfilerActivity.CUDA", torch_npu.profiler.ProfilerActivity.NPU],
-        ["profiler.ProfilerActivity.CPU", torch_npu.profiler.ProfilerActivity.CPU],
-    ]
-    torch_npu._apply_patches(patches)
+    init_npu_profiler()
 
 logger = logging.getLogger(__name__)
 
@@ -195,9 +192,7 @@ class SchedulerProfilerMixin:
                 on_trace_ready=(
                     None
                     if not _is_npu
-                    else torch_npu.profiler.tensorboard_trace_handler(
-                        self.torch_profiler_output_dir
-                    )
+                    else get_npu_trace_handler(self.torch_profiler_output_dir)
                 ),
             )
             self.torch_profiler.start()
