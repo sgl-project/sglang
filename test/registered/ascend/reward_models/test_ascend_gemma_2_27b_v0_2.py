@@ -1,9 +1,9 @@
 import multiprocessing as mp
+import os
 import unittest
 
 import torch
 
-import os
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.runners import HFRunner, SRTRunner
 from sglang.test.test_utils import CustomTestCase
@@ -11,7 +11,11 @@ from sglang.test.test_utils import CustomTestCase
 register_npu_ci(est_time=400, suite="nightly-1-npu-a3", nightly=True)
 
 MODELS = [
-    ("/root/.cache/modelscope/hub/models/AI-ModelScope/Skywork-Reward-Gemma-2-27B-v0.2", 1, 4e-2),
+    (
+        "/root/.cache/modelscope/hub/models/AI-ModelScope/Skywork-Reward-Gemma-2-27B-v0.2",
+        1,
+        4e-2,
+    ),
 ]
 TORCH_DTYPES = [torch.bfloat16]
 

@@ -49,6 +49,7 @@ _is_npu = is_npu()
 def get_attention_sliding_window_size(config):
     return config.sliding_window - 1
 
+
 class Gemma2MLP(nn.Module):
     def __init__(
         self,
@@ -143,7 +144,10 @@ class Gemma2Attention(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("o_proj", prefix),
         )
-        if not _is_npu or 'Gemma2ForSequenceClassification' not in self.config.architectures:
+        if (
+            not _is_npu
+            or 'Gemma2ForSequenceClassification' not in self.config.architectures
+        ):
             self.rotary_emb = get_rope(
                 self.head_dim,
                 rotary_dim=self.head_dim,
