@@ -30,8 +30,7 @@ import sys
 import time
 from collections import defaultdict
 from datetime import datetime
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 # ===================== Configuration =====================
 
@@ -61,16 +60,33 @@ def kill_server_processes(port: int):
         ["pkill", "-9", "-f", rf"sglang\.launch_server.*--port={port}\b"],
         check=False,
     )
+    # launch_server can leave behind worker/scheduler processes with custom proctitles
+    # like `sglang::scheduler_TP0_EP0` which may not include the port in argv. These
+    # can hold onto large GPU allocations and cause OOM on subsequent runs.
+    subprocess.run(
+        ["pkill", "-9", "-f", r"sglang::scheduler_TP"],
+        check=False,
+    )
     time.sleep(2)
 
 
-def wait_for_server(port: int, timeout: int = SERVER_TIMEOUT) -> bool:
-    """Wait for server to be ready."""
+def wait_for_server(
+    port: int,
+    timeout: int = SERVER_TIMEOUT,
+    proc: Optional[subprocess.Popen] = None,
+) -> bool:
+    """Wait for server to be ready.
+
+    If `proc` is provided, return early when the process exits to avoid waiting
+    the full timeout on startup failures (e.g. OOM).
+    """
     import requests
 
     start = time.time()
     url = f"http://127.0.0.1:{port}/health"
     while time.time() - start < timeout:
+        if proc is not None and proc.poll() is not None:
+            return False
         try:
             resp = requests.get(url, timeout=5)
             if resp.status_code == 200:
@@ -84,12 +100,12 @@ def wait_for_server(port: int, timeout: int = SERVER_TIMEOUT) -> bool:
 def parse_imbalance_logs(log_content: str) -> Dict[str, Dict[str, List[float]]]:
     """
     Parse imbalance logs from server output.
-    
+
     Returns:
         Dict[stage, Dict[layer_id, List[imbalance_values]]]
-    
+
     Log format:
-        [deepep_eplb_load] mode=<mode> layer=<layer_id> ep_rank=<rank>/<world_size> 
+        [deepep_eplb_load] mode=<mode> layer=<layer_id> ep_rank=<rank>/<world_size>
         stage=<stage> total=<total> max=<max> avg=<avg> imbal=<imbal>x
     """
     # Pattern to match the log lines
@@ -101,10 +117,10 @@ def parse_imbalance_logs(log_content: str) -> Dict[str, Dict[str, List[float]]]:
         r"stage=(\w+).*?"
         r"imbal=([\d.]+)x"
     )
-    
+
     # Collect imbalance values per stage per layer (only from rank 0)
     result = defaultdict(lambda: defaultdict(list))
-    
+
     for line in log_content.split("\n"):
         # Some ranks can flush multiple log entries without a newline boundary,
         # so a single physical line may contain multiple `[deepep_eplb_load]` entries.
@@ -113,7 +129,7 @@ def parse_imbalance_logs(log_content: str) -> Dict[str, Dict[str, List[float]]]:
             # Only collect from rank 0 to avoid duplicates
             if ep_rank == "0":
                 result[stage][layer_id].append(float(imbal))
-    
+
     return result
 
 
@@ -122,7 +138,7 @@ def compute_average_imbalance(
 ) -> Dict[str, float]:
     """
     Compute average imbalance across all layers for each stage.
-    
+
     Returns:
         Dict[stage, avg_imbalance]
     """
@@ -153,24 +169,24 @@ def run_experiment(
 ) -> Dict[str, float]:
     """
     Run a single experiment configuration.
-    
+
     Returns:
         Dict[stage, avg_imbalance]
     """
     mode = "waterfill" if enable_waterfill else "baseline"
     eplb_str = "eplb" if enable_eplb else "no_eplb"
-    
+
     print(f"\n{'='*60}")
     print(f"Running: mode={mode}, eplb={eplb_str}, input_len={input_len}")
     print(f"{'='*60}")
-    
+
     # Kill any existing server
     kill_server_processes(port)
-    
+
     # Use the appropriate sglang directory
     sglang_dir = waterfill_sglang_dir if enable_waterfill else baseline_sglang_dir
     python_path = os.path.join(sglang_dir, "python")
-    
+
     # Reinstall the sglang package from the appropriate directory
     print(f"Installing sglang from {sglang_dir}...")
     subprocess.run(
@@ -178,27 +194,35 @@ def run_experiment(
         cwd=sglang_dir,
         check=False,
     )
-    
+
     # Build server command
-    
+
     server_cmd = [
-        sys.executable, "-m", "sglang.launch_server",
-        "--model-path", model_path,
-        "--tp", "8",
-        "--ep-size", "8",
-        "--port", str(port),
+        sys.executable,
+        "-m",
+        "sglang.launch_server",
+        "--model-path",
+        model_path,
+        "--tp",
+        "8",
+        "--ep-size",
+        "8",
+        "--port",
+        str(port),
         "--trust-remote-code",
-        "--moe-a2a-backend", "deepep",
-        "--deepep-mode", "normal",
+        "--moe-a2a-backend",
+        "deepep",
+        "--deepep-mode",
+        "normal",
         "--disable-radix-cache",
     ]
-    
+
     if enable_waterfill:
         server_cmd.append("--enable-deepep-waterfill")
-    
+
     if enable_eplb and init_expert_location:
         server_cmd.extend(["--init-expert-location", init_expert_location])
-    
+
     # Environment variables for debug logging
     env = os.environ.copy()
     env["PYTHONPATH"] = python_path + ":" + env.get("PYTHONPATH", "")
@@ -208,7 +232,7 @@ def run_experiment(
     env["SGLANG_DEBUG_WATERFILL_EPLB_MAX_PRINTS"] = "1"
     # Filter out decode-only steps so we only log prefill.
     env["SGLANG_DEBUG_WATERFILL_EPLB_MIN_TOKENS"] = "64"
-    
+
     # Start server
     print(f"Starting server: {' '.join(server_cmd)}")
     with open(log_file, "w") as log_f:
@@ -219,41 +243,48 @@ def run_experiment(
             env=env,
             start_new_session=True,
         )
-    
+
     try:
         # Wait for server to be ready
         print("Waiting for server to start...")
-        if not wait_for_server(port):
+        if not wait_for_server(port, proc=server_proc):
             print(f"ERROR: Server failed to start within {SERVER_TIMEOUT}s")
             return {}
-        
+
         print("Server is ready. Running benchmark...")
-        
+
         # Run bench_one_batch_server
         bench_cmd = [
-            sys.executable, "-m", "sglang.bench_one_batch_server",
-            "--model", "None",
-            "--base-url", f"http://127.0.0.1:{port}",
-            "--batch-size", str(batch_size),
-            "--input-len", str(input_len),
-            "--output-len", str(output_len),
+            sys.executable,
+            "-m",
+            "sglang.bench_one_batch_server",
+            "--model",
+            "None",
+            "--base-url",
+            f"http://127.0.0.1:{port}",
+            "--batch-size",
+            str(batch_size),
+            "--input-len",
+            str(input_len),
+            "--output-len",
+            str(output_len),
             "--skip-warmup",
         ]
-        
+
         bench_result = subprocess.run(
             bench_cmd,
             capture_output=True,
             text=True,
             env=env,
         )
-        
+
         print(f"Benchmark stdout:\n{bench_result.stdout}")
         if bench_result.returncode != 0:
             print(f"Benchmark stderr:\n{bench_result.stderr}")
-        
+
         # Give time for logs to be flushed
         time.sleep(5)
-        
+
     finally:
         # Kill server (entire process group).
         try:
@@ -272,77 +303,91 @@ def run_experiment(
             except subprocess.TimeoutExpired:
                 pass
         kill_server_processes(port)
-    
+
     # Parse logs
     print(f"Parsing logs from {log_file}...")
     with open(log_file, "r") as f:
         log_content = f.read()
-    
+
     stage_data = parse_imbalance_logs(log_content)
     avg_imbalance = compute_average_imbalance(stage_data)
-    
+
     print(f"Parsed imbalance data:")
     for stage, avg in sorted(avg_imbalance.items()):
         num_layers = len(stage_data.get(stage, {}))
         print(f"  {stage}: avg={avg:.4f}x (from {num_layers} layers)")
-    
+
     return avg_imbalance
 
 
 def main():
     parser = argparse.ArgumentParser(description="Evaluate imbalance score")
-    parser.add_argument("--model-path", type=str, required=True,
-                        help="Path to model")
-    parser.add_argument("--result-root", type=str, required=True,
-                        help="Root directory for results")
-    parser.add_argument("--init-expert-location", type=str, default=None,
-                        help="Path to EPLB expert location file")
-    parser.add_argument("--port", type=int, default=31000,
-                        help="Server port")
-    parser.add_argument("--input-lens", type=int, nargs="+", default=INPUT_LENS,
-                        help="Input lengths to test")
-    parser.add_argument("--batch-size", type=int, default=BATCH_SIZE,
-                        help="Batch size")
-    parser.add_argument("--output-len", type=int, default=OUTPUT_LEN,
-                        help="Output length")
-    parser.add_argument("--waterfill-sglang-dir", type=str, 
-                        default="/home/xutingz/workspace/gitsrc/sglang",
-                        help="Path to SGLang source directory for Waterfill")
-    parser.add_argument("--baseline-sglang-dir", type=str, 
-                        default="/home/xutingz/workspace/gitsrc/sglang_baseline_98a107d",
-                        help="Path to SGLang source directory for Baseline")
+    parser.add_argument("--model-path", type=str, required=True, help="Path to model")
+    parser.add_argument(
+        "--result-root", type=str, required=True, help="Root directory for results"
+    )
+    parser.add_argument(
+        "--init-expert-location",
+        type=str,
+        default=None,
+        help="Path to EPLB expert location file",
+    )
+    parser.add_argument("--port", type=int, default=31000, help="Server port")
+    parser.add_argument(
+        "--input-lens",
+        type=int,
+        nargs="+",
+        default=INPUT_LENS,
+        help="Input lengths to test",
+    )
+    parser.add_argument("--batch-size", type=int, default=BATCH_SIZE, help="Batch size")
+    parser.add_argument(
+        "--output-len", type=int, default=OUTPUT_LEN, help="Output length"
+    )
+    parser.add_argument(
+        "--waterfill-sglang-dir",
+        type=str,
+        default="/home/xutingz/workspace/gitsrc/sglang",
+        help="Path to SGLang source directory for Waterfill",
+    )
+    parser.add_argument(
+        "--baseline-sglang-dir",
+        type=str,
+        default="/home/xutingz/workspace/gitsrc/sglang_baseline_98a107d",
+        help="Path to SGLang source directory for Baseline",
+    )
     args = parser.parse_args()
-    
+
     # Create output directory
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_dir = os.path.join(args.result_root, f"imbalance_eval_{timestamp}")
     os.makedirs(out_dir, exist_ok=True)
-    
+
     print(f"Results will be saved to: {out_dir}")
-    
+
     # Store all results
     all_results = []
     results_file = os.path.join(out_dir, "results.json")
-    
+
     # Test configurations:
     # 1. Waterfill with EPLB
     # 2. Waterfill without EPLB
     # 3. Baseline with EPLB
     # 4. Baseline without EPLB
-    
+
     configs = [
-        ("waterfill", True, True),   # enable_waterfill, enable_eplb
+        ("waterfill", True, True),  # enable_waterfill, enable_eplb
         ("waterfill", True, False),
         ("baseline", False, True),
         ("baseline", False, False),
     ]
-    
+
     for input_len in args.input_lens:
         for name, enable_waterfill, enable_eplb in configs:
             eplb_str = "eplb" if enable_eplb else "no_eplb"
             log_filename = f"server_{name}_{eplb_str}_in{input_len}.log"
             log_file = os.path.join(out_dir, log_filename)
-            
+
             # Run experiment
             avg_imbalance = run_experiment(
                 waterfill_sglang_dir=args.waterfill_sglang_dir,
@@ -357,7 +402,7 @@ def main():
                 init_expert_location=args.init_expert_location if enable_eplb else None,
                 log_file=log_file,
             )
-            
+
             result = {
                 "mode": name,
                 "enable_eplb": enable_eplb,
@@ -370,48 +415,58 @@ def main():
             # Save partial progress so a long run can be resumed / inspected.
             with open(results_file, "w") as f:
                 json.dump(all_results, f, indent=2)
-    
+
     # Save results
     with open(results_file, "w") as f:
         json.dump(all_results, f, indent=2)
-    
+
     # Print summary table
-    print("\n" + "="*80)
+    print("\n" + "=" * 80)
     print("SUMMARY")
-    print("="*80)
-    
+    print("=" * 80)
+
     # Group by input_len
     by_input_len = defaultdict(list)
     for r in all_results:
         by_input_len[r["input_len"]].append(r)
-    
+
     for input_len in sorted(by_input_len.keys()):
         print(f"\n=== input_len={input_len} ===")
-        print(f"{'Mode':<15} {'EPLB':<8} {'pre_eplb':<12} {'post_eplb':<12} {'post_waterfill':<15}")
-        print("-"*65)
-        
+        print(
+            f"{'Mode':<15} {'EPLB':<8} {'pre_eplb':<12} {'post_eplb':<12} {'post_waterfill':<15}"
+        )
+        print("-" * 65)
+
         for r in by_input_len[input_len]:
             mode = r["mode"]
             eplb = "Yes" if r["enable_eplb"] else "No"
             avg = r["avg_imbalance"]
-            pre_eplb = f"{avg.get('pre_eplb', 0):.4f}x" if avg.get('pre_eplb') else "N/A"
-            post_eplb = f"{avg.get('post_eplb', 0):.4f}x" if avg.get('post_eplb') else "N/A"
-            post_wf = f"{avg.get('post_waterfill', 0):.4f}x" if avg.get('post_waterfill') else "N/A"
+            pre_eplb = (
+                f"{avg.get('pre_eplb', 0):.4f}x" if avg.get("pre_eplb") else "N/A"
+            )
+            post_eplb = (
+                f"{avg.get('post_eplb', 0):.4f}x" if avg.get("post_eplb") else "N/A"
+            )
+            post_wf = (
+                f"{avg.get('post_waterfill', 0):.4f}x"
+                if avg.get("post_waterfill")
+                else "N/A"
+            )
             print(f"{mode:<15} {eplb:<8} {pre_eplb:<12} {post_eplb:<12} {post_wf:<15}")
-    
+
     # Calculate improvement metrics
-    print("\n" + "="*80)
+    print("\n" + "=" * 80)
     print("IMPROVEMENT ANALYSIS")
-    print("="*80)
-    
+    print("=" * 80)
+
     for input_len in sorted(by_input_len.keys()):
         print(f"\n=== input_len={input_len} ===")
-        
+
         results_by_config = {}
         for r in by_input_len[input_len]:
             key = (r["mode"], r["enable_eplb"])
             results_by_config[key] = r["avg_imbalance"]
-        
+
         # 1. EPLB improvement (comparing pre_eplb vs post_eplb)
         for mode in ["waterfill", "baseline"]:
             with_eplb = results_by_config.get((mode, True), {})
@@ -419,24 +474,30 @@ def main():
                 pre = with_eplb["pre_eplb"]
                 post = with_eplb["post_eplb"]
                 improvement = (pre - post) / pre * 100
-                print(f"  {mode} EPLB improvement: {pre:.4f}x -> {post:.4f}x ({improvement:+.2f}%)")
-        
+                print(
+                    f"  {mode} EPLB improvement: {pre:.4f}x -> {post:.4f}x ({improvement:+.2f}%)"
+                )
+
         # 2. Waterfill improvement (comparing post_eplb vs post_waterfill)
         wf_with_eplb = results_by_config.get(("waterfill", True), {})
         if wf_with_eplb.get("post_eplb") and wf_with_eplb.get("post_waterfill"):
             post_eplb = wf_with_eplb["post_eplb"]
             post_wf = wf_with_eplb["post_waterfill"]
             improvement = (post_eplb - post_wf) / post_eplb * 100
-            print(f"  Waterfill improvement over EPLB: {post_eplb:.4f}x -> {post_wf:.4f}x ({improvement:+.2f}%)")
-        
+            print(
+                f"  Waterfill improvement over EPLB: {post_eplb:.4f}x -> {post_wf:.4f}x ({improvement:+.2f}%)"
+            )
+
         # 3. Waterfill without EPLB improvement
         wf_no_eplb = results_by_config.get(("waterfill", False), {})
         if wf_no_eplb.get("pre_eplb") and wf_no_eplb.get("post_waterfill"):
             pre = wf_no_eplb["pre_eplb"]
             post_wf = wf_no_eplb["post_waterfill"]
             improvement = (pre - post_wf) / pre * 100
-            print(f"  Waterfill (no EPLB) improvement: {pre:.4f}x -> {post_wf:.4f}x ({improvement:+.2f}%)")
-    
+            print(
+                f"  Waterfill (no EPLB) improvement: {pre:.4f}x -> {post_wf:.4f}x ({improvement:+.2f}%)"
+            )
+
     print(f"\nResults saved to: {results_file}")
 
 
