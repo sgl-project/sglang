@@ -955,6 +955,7 @@ class ServerArgs:
             if (
                 "wan" in self.pipeline_config.__class__.__name__.lower()
                 and self.dit_layerwise_offload is None
+                and current_platform.enable_dit_layerwise_offload_for_wan_by_default()
             ):
                 logger.info(
                     "Automatically enable dit_layerwise_offload for Wan for best performance"
