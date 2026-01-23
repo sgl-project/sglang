@@ -31,6 +31,7 @@ use smg::{
         MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
     },
     middleware::TokenBucket,
+    multimodal::{MediaConnector, MediaConnectorConfig},
     policies::PolicyRegistry,
     protocols::common::{Function, Tool},
     reasoning_parser::ParserFactory as ReasoningParserFactory,
@@ -327,6 +328,10 @@ pub async fn create_test_context(config: RouterConfig) -> Arc<AppContext> {
     let worker_job_queue = Arc::new(OnceLock::new());
     let workflow_engines = Arc::new(OnceLock::new());
     let mcp_manager_lock = Arc::new(OnceLock::new());
+    let media_connector = Arc::new(
+        MediaConnector::new(client.clone(), MediaConnectorConfig::default())
+            .expect("Failed to create test media connector"),
+    );
 
     let app_context = Arc::new(
         AppContext::builder()
@@ -345,6 +350,7 @@ pub async fn create_test_context(config: RouterConfig) -> Arc<AppContext> {
             .worker_job_queue(worker_job_queue)
             .workflow_engines(workflow_engines)
             .mcp_manager(mcp_manager_lock)
+            .media_connector(Some(media_connector))
             .build()
             .unwrap(),
     );
@@ -451,7 +457,10 @@ pub async fn create_test_context_with_parsers(config: RouterConfig) -> Arc<AppCo
     // Initialize parser factories
     let reasoning_parser_factory = Some(ReasoningParserFactory::new());
     let tool_parser_factory = Some(ToolParserFactory::new());
-
+    let media_connector = Arc::new(
+        MediaConnector::new(client.clone(), MediaConnectorConfig::default())
+            .expect("Failed to create test media connector"),
+    );
     let app_context = Arc::new(
         AppContext::builder()
             .router_config(config.clone())
@@ -469,6 +478,7 @@ pub async fn create_test_context_with_parsers(config: RouterConfig) -> Arc<AppCo
             .worker_job_queue(worker_job_queue)
             .workflow_engines(workflow_engines)
             .mcp_manager(mcp_manager_lock)
+            .media_connector(Some(media_connector))
             .build()
             .unwrap(),
     );
@@ -575,7 +585,10 @@ pub async fn create_test_context_with_mcp_config(
     let worker_job_queue = Arc::new(OnceLock::new());
     let workflow_engines = Arc::new(OnceLock::new());
     let mcp_manager_lock = Arc::new(OnceLock::new());
-
+    let media_connector = Arc::new(
+        MediaConnector::new(client.clone(), MediaConnectorConfig::default())
+            .expect("Failed to create test media connector"),
+    );
     let app_context = Arc::new(
         AppContext::builder()
             .router_config(config.clone())
@@ -593,6 +606,7 @@ pub async fn create_test_context_with_mcp_config(
             .worker_job_queue(worker_job_queue)
             .workflow_engines(workflow_engines)
             .mcp_manager(mcp_manager_lock)
+            .media_connector(Some(media_connector))
             .build()
             .unwrap(),
     );
