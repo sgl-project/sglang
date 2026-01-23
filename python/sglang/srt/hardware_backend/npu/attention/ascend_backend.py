@@ -693,6 +693,7 @@ class AscendAttnBackend(AttentionBackend):
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
         topk_indices: Optional[torch.Tensor] = None,
+        sinks: Optional[torch.Tensor] = None,
         slopes: Optional[torch.Tensor] = None,
     ):
         if topk_indices is not None:
@@ -765,7 +766,14 @@ class AscendAttnBackend(AttentionBackend):
                 )
 
             else:
-                if layer.qk_head_dim <= 128:
+                causal = True
+                if (
+                    layer.is_cross_attention
+                    or layer.attn_type == AttentionType.ENCODER_ONLY
+                ):
+                    causal = False
+
+                if layer.qk_head_dim <= 128 and causal:
                     if not self.use_alibi:
                         query = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
                         attn_output = torch.empty(
@@ -1349,6 +1357,7 @@ class AscendAttnBackend(AttentionBackend):
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
         topk_indices: Optional[torch.Tensor] = None,
+        sinks: Optional[torch.Tensor] = None,
         slopes: Optional[torch.Tensor] = None,
     ):
         if is_mla_preprocess_enabled():
