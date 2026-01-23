@@ -29,6 +29,7 @@ For SGLang-native pipelines, the CLI accepts the lowercase names of `AttentionBa
 | `video_sparse_attn` | `VIDEO_SPARSE_ATTN` | Requires `vsa`. |
 | `vmoba_attn` | `VMOBA_ATTN` | Requires `kernel.attn.vmoba_attn.vmoba`. |
 | `aiter` | `AITER` | Requires `aiter`. |
+| `sparse_video_gen_2_attn` | `SPARSE_VIDEO_GEN_2_ATTN` | Requires `svg`. See installation instructions at https://github.com/svg-project/Sparse-VideoGen. |
 
 ## Selection priority
 
@@ -50,6 +51,7 @@ The selection order in `runtime/layers/attention/selector.py` is:
 | `video_sparse_attn` | ✅ | ❌ | ❌ | CUDA-only. Requires `vsa`. |
 | `vmoba_attn` | ✅ | ❌ | ❌ | CUDA-only. Requires `kernel.attn.vmoba_attn.vmoba`. |
 | `aiter` | ✅ | ❌ | ❌ | Requires `aiter`. |
+| `sparse_video_gen_2_attn` | ✅ | ❌ | ❌ | CUDA-only. Requires `svg`. |
 
 ## Usage
 
