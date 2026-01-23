@@ -1222,8 +1222,8 @@ class DeepEPWaterfillBalancer:
     # < this many shared tokens, we redirect those remote shared tokens back to their
     # source ranks (i.e., that rank does not receive remote shared expert work).
     #
-    # Note: shared expert compute uses 128-token blocks; <64 tokens would waste >50% padding.
-    MIN_TOKENS_PER_RANK = 64
+    # Note: shared expert compute uses 128-token blocks; <128 tokens would waste padding.
+    MIN_TOKENS_PER_RANK = 128
 
     def __init__(
         self,
@@ -1373,73 +1373,25 @@ class DeepEPWaterfillBalancer:
             )
 
             if self.MIN_TOKENS_PER_RANK > 0:
-                # Globalize dest_counts across EP ranks, then redirect sparse remote destinations.
-                # Optimization: skip the all_reduce (and redirect kernel) if this rank does not
-                # send any potentially-sparse remote shard. This preserves correctness because
-                # global_count[dest] < MIN_TOKENS_PER_RANK implies local_count[dest] < MIN_TOKENS_PER_RANK
-                # for any dest we actually send to (local_count>0).
-                local_maybe_sparse_remote = None
-                try:
-                    local_maybe_sparse_remote = (dest_counts > 0) & (
-                        dest_counts < self.MIN_TOKENS_PER_RANK
-                    )
-                    local_maybe_sparse_remote[self.rank] = False
-                except Exception:
-                    local_maybe_sparse_remote = None
-
-                need_global = False
-                if local_maybe_sparse_remote is None:
-                    need_global = True
-                else:
-                    # Note: tiny sync on a length-`world_size` tensor; cheaper than an all_reduce.
-                    need_global = bool(local_maybe_sparse_remote.any().item())
-
-                if need_global:
-                    try:
-                        import torch.distributed as dist
-
-                        if dist.is_initialized() and self.world_size > 1:
-                            from sglang.srt.distributed.parallel_state import (
-                                get_moe_ep_group,
-                            )
-
-                            dist.all_reduce(
-                                dest_counts,
-                                op=dist.ReduceOp.SUM,
-                                group=get_moe_ep_group().device_group,
-                            )
-                    except Exception:
-                        # If distributed is not available/initialized, fall back to local counts.
-                        pass
-
-                    global_sparse_remote = None
-                    try:
-                        global_sparse_remote = (dest_counts > 0) & (
-                            dest_counts < self.MIN_TOKENS_PER_RANK
-                        )
-                        global_sparse_remote[self.rank] = False
-                    except Exception:
-                        global_sparse_remote = None
-
-                    if global_sparse_remote is None or bool(
-                        global_sparse_remote.any().item()
-                    ):
-                        BLOCK_SIZE = 256
-                        grid = ((num_tokens + BLOCK_SIZE - 1) // BLOCK_SIZE,)
-                        _sparse_redirect_kernel[grid](
-                            expanded_topk_ids,
-                            local_shared_mask,
-                            dest_counts,
-                            num_tokens,
-                            topk + 1,
-                            self.old_experts_per_rank,
-                            self.new_experts_per_rank,
-                            self.world_size,
-                            self.rank,
-                            self.MIN_TOKENS_PER_RANK,
-                            LOCAL_SHARED_MARKER,
-                            BLOCK_SIZE=BLOCK_SIZE,
-                        )
+                # Local sparse redirect: if this rank would send < MIN_TOKENS_PER_RANK shared
+                # tokens to a remote destination, compute those shared tokens locally instead.
+                # This avoids tiny remote shards (padding waste + extra communication).
+                BLOCK_SIZE = 256
+                grid = ((num_tokens + BLOCK_SIZE - 1) // BLOCK_SIZE,)
+                _sparse_redirect_kernel[grid](
+                    expanded_topk_ids,
+                    local_shared_mask,
+                    dest_counts,
+                    num_tokens,
+                    topk + 1,
+                    self.old_experts_per_rank,
+                    self.new_experts_per_rank,
+                    self.world_size,
+                    self.rank,
+                    self.MIN_TOKENS_PER_RANK,
+                    LOCAL_SHARED_MARKER,
+                    BLOCK_SIZE=BLOCK_SIZE,
+                )
         else:
             # Fallback to PyTorch implementation
             shared_destination = assign_shared_destination_pytorch(
@@ -1470,38 +1422,6 @@ class DeepEPWaterfillBalancer:
                 dest_counts = torch.bincount(
                     dest_from_shared.to(torch.int64), minlength=self.world_size
                 ).to(torch.int32)
-
-                local_maybe_sparse_remote = None
-                try:
-                    local_maybe_sparse_remote = (dest_counts > 0) & (
-                        dest_counts < self.MIN_TOKENS_PER_RANK
-                    )
-                    local_maybe_sparse_remote[self.rank] = False
-                except Exception:
-                    local_maybe_sparse_remote = None
-
-                need_global = False
-                if local_maybe_sparse_remote is None:
-                    need_global = True
-                else:
-                    need_global = bool(local_maybe_sparse_remote.any().item())
-
-                if need_global:
-                    try:
-                        import torch.distributed as dist
-
-                        if dist.is_initialized() and self.world_size > 1:
-                            from sglang.srt.distributed.parallel_state import (
-                                get_moe_ep_group,
-                            )
-
-                            dist.all_reduce(
-                                dest_counts,
-                                op=dist.ReduceOp.SUM,
-                                group=get_moe_ep_group().device_group,
-                            )
-                    except Exception:
-                        pass
 
                 sparse_ranks_mask = dest_counts < self.MIN_TOKENS_PER_RANK
                 token_goes_to_sparse = (
