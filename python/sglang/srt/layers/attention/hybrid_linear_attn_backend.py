@@ -846,7 +846,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
         activation = layer.activation
         head_qk_dim = layer.head_qk_dim
         head_v_dim = layer.head_v_dim
-        # Precomputed for torch.compile compatibility
         qk_dim = layer.qk_dim
         value_dim = layer.value_dim
 
@@ -915,7 +914,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
         activation = layer.activation
         head_qk_dim = layer.head_qk_dim
         head_v_dim = layer.head_v_dim
-        # Precomputed for torch.compile compatibility
         qk_dim = layer.qk_dim
         value_dim = layer.value_dim
 

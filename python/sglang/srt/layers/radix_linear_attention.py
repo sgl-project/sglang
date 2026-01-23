@@ -47,7 +47,6 @@ class RadixLinearAttention(nn.Module):
         self.num_v_heads = num_v_heads
         self.head_qk_dim = head_qk_dim
         self.head_v_dim = head_v_dim
-        # Precomputed for torch.compile
         self.qk_dim = num_qk_heads * head_qk_dim
         self.value_dim = num_v_heads * head_v_dim
 
