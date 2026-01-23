@@ -49,7 +49,6 @@ from sglang.srt.layers.linear import (
 
 # Layers - Others
 from sglang.srt.layers.layernorm import GemmaRMSNorm
-from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
