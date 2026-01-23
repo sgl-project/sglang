@@ -151,7 +151,7 @@ class CudaPlatformBase(Platform):
         # if distributed is False, we always try to use Flash attn
         if selected_backend == AttentionBackendEnum.SLIDING_TILE_ATTN:
             try:
-                from st_attn import sliding_tile_attention  # noqa: F401
+                from fastvideo_kernel import sliding_tile_attention  # noqa: F401
 
                 from sglang.multimodal_gen.runtime.layers.attention.backends.sliding_tile_attn import (  # noqa: F401
                     SlidingTileAttentionBackend,

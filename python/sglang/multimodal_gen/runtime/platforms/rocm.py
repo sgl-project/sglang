@@ -109,6 +109,25 @@ class RocmPlatform(Platform):
             logger.info("Using AITer backend on ROCm.")
             return "sglang.multimodal_gen.runtime.layers.attention.backends.aiter.AITerBackend"
 
+        elif selected_backend == AttentionBackendEnum.SLIDING_TILE_ATTN:
+            try:
+                from fastvideo_kernel import sliding_tile_attention  # noqa: F401
+
+                from sglang.multimodal_gen.runtime.layers.attention.backends.sliding_tile_attn import (  # noqa: F401
+                    SlidingTileAttentionBackend,
+                )
+
+                logger.info("Using Sliding Tile Attention backend")
+
+                return "sglang.multimodal_gen.runtime.layers.attention.backends.sliding_tile_attn.SlidingTileAttentionBackend"
+            except ImportError as e:
+                logger.error(
+                    "Failed to import Sliding Tile Attention backend: %s", str(e)
+                )
+                raise ImportError(
+                    "Sliding Tile Attention backend is not installed. "
+                ) from e
+
         elif selected_backend in (
             AttentionBackendEnum.SLIDING_TILE_ATTN,
             AttentionBackendEnum.SAGE_ATTN,

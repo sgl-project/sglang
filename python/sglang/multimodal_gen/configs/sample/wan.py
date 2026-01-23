@@ -73,6 +73,8 @@ class WanT2V_14B_SamplingParams(SamplingParams):
             (720, 1280),  # 9:16
             (832, 480),  # 16:9
             (480, 832),  # 9:16
+            # STA resolution
+            (1280, 768),
         ]
     )
 
@@ -148,6 +150,8 @@ class WanI2V_14B_720P_SamplingParam(WanT2V_14B_SamplingParams):
             (720, 1280),  # 9:16
             (832, 480),  # 16:9
             (480, 832),  # 9:16
+            # STA resolution
+            (1280, 768),
         ]
     )
 
