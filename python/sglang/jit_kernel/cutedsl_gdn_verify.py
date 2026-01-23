@@ -155,11 +155,10 @@ def _define_kernels():
         # ===================================================================
         sData = smem.allocate_tensor(cutlass.Float32, smem_layout_staged, 128)
         sOutput = smem.allocate_tensor(cutlass.Float32, cute.make_layout((T, V)), 16)
-        # Pre-computed shared memory for all time steps (with padding for bank conflict avoidance)
-        # stride=(K+8, 1) shifts each row by 8 banks
-        sQ = smem.allocate_tensor(cutlass.Float32, cute.make_layout((T, K), stride=(K + 8, 1)), 16)
-        sK = smem.allocate_tensor(cutlass.Float32, cute.make_layout((T, K), stride=(K + 8, 1)), 16)
-        sV = smem.allocate_tensor(cutlass.Float32, cute.make_layout((T, V), stride=(V + 8, 1)), 16)
+        # Pre-computed shared memory for all time steps
+        sQ = smem.allocate_tensor(cutlass.Float32, cute.make_layout((T, K), stride=(K, 1)), 16)
+        sK = smem.allocate_tensor(cutlass.Float32, cute.make_layout((T, K), stride=(K, 1)), 16)
+        sV = smem.allocate_tensor(cutlass.Float32, cute.make_layout((T, V), stride=(V, 1)), 16)
         sG = smem.allocate_tensor(cutlass.Float32, cute.make_layout((T,)), 16)
         sBeta = smem.allocate_tensor(cutlass.Float32, cute.make_layout((T,)), 16)
 
@@ -331,6 +330,7 @@ def _define_kernels():
                 # Inner loop: all time steps for this v_tile
                 for i_t in range(T):
                     # Load pre-computed values from shared memory
+                    # todo: put q,k compute into main loop instread of pre-compute. and also to reduce shared memory usage.
                     for i in range(vec_size):
                         r_q[i] = sQ[(i_t, i * 32 + lane_id)]
                         r_k[i] = sK[(i_t, i * 32 + lane_id)]
@@ -492,14 +492,13 @@ def _create_jit_function():
         val_layout = cute.make_layout((1, 4))
         tiled_copy_load = cute.make_tiled_copy_tv(copy_atom, thread_layout, val_layout)
 
-        # smem: sData + sOutput + sQ (padded) + sK (padded) + sV (padded) + sG + sBeta + padding
-        # sQ/sK padding: +8 per row, sV padding: +8 per row
+        # smem: sData + sOutput + sQ + sK + sV + sG + sBeta + padding
         smem_bytes = (
             4 * TILE_V * TILE_K * NUM_STAGES
             + 4 * T * v_dim
-            + 4 * T * (k_dim + 8)
-            + 4 * T * (k_dim + 8)
-            + 4 * T * (v_dim + 8)
+            + 4 * T * k_dim
+            + 4 * T * k_dim
+            + 4 * T * v_dim
             + 4 * T
             + 4 * T
             + 128
