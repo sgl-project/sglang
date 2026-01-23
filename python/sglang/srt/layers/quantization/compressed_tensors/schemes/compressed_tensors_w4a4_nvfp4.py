@@ -15,8 +15,8 @@ from sglang.srt.layers.parameter import (
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsScheme,
 )
+from sglang.srt.layers.quantization.fp4_utils import get_fp4_gemm_runner_backend
 from sglang.srt.layers.quantization.modelopt_quant import (
-    FLASHINFER_FP4_GEMM_BACKEND,
     enable_flashinfer_fp4_gemm,
     fp4_gemm,
     fp4_quantize,
@@ -98,7 +98,7 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
             layer.weight_global_scale.max().to(torch.float32), requires_grad=False
         )
 
-        if FLASHINFER_FP4_GEMM_BACKEND == "trtllm":
+        if get_fp4_gemm_runner_backend().is_flashinfer_trtllm():
             # FlashInfer TRTLLM FP4 GEMM requires a different weight layout.
             # FlashInfer provides nvfp4_quantize to quantize + shuffle the
             # layout but we use our own quantization so we have to call
