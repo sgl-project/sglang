@@ -1,12 +1,13 @@
 //! Chat preparation stage: Filter tools, process messages, tokenize, build constraints
 
-use std::borrow::Cow;
+use std::{borrow::Cow, sync::Arc};
 
 use async_trait::async_trait;
 use axum::response::Response;
 use tracing::error;
 
 use crate::{
+    multimodal::{AsyncMultiModalTracker, Modality, TrackerConfig},
     protocols::chat::ChatCompletionRequest,
     routers::{
         error,
@@ -46,12 +47,28 @@ impl ChatPreparationStage {
         // Step 0: Resolve tokenizer from registry (cached for reuse in response processing)
         let tokenizer =
             utils::resolve_tokenizer(ctx, "ChatPreparationStage::prepare_chat").map_err(|e| *e)?;
-
+        let mut multimodal_data = None;
+        if request.is_multimodal() {
+            let mut tracker = AsyncMultiModalTracker::new(
+                ctx.components.media_connector.clone(),
+                TrackerConfig::default(),
+            );
+            for message in &request.messages {}
+            let output = tracker.finalize().await.map_err(|e| {
+                error!("Multimodal tracking failed: {}", e);
+                error::internal_error("multimodal_tracking_failed", e.to_string())
+            })?;
+            multimodal_data = Some(output.data);
+        }
         // Step 1: Filter tools if needed
         let body_ref = utils::filter_chat_request_by_tool_choice(request);
 
         // Step 2: Process messages and apply chat template
-        let processed_messages = match utils::process_chat_messages(&body_ref, &*tokenizer) {
+        let processed_messages = match utils::process_chat_messages(
+            &body_ref,
+            &*tokenizer,
+            multimodal_data,
+        ) {
             Ok(msgs) => msgs,
             Err(e) => {
                 error!(function = "ChatPreparationStage::execute", error = %e, "Failed to process chat messages");

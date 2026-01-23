@@ -16,7 +16,7 @@ use super::{
 };
 use crate::{
     core::Worker,
-    grpc_client::sglang_proto::{InputLogProbs, OutputLogProbs},
+    grpc_client::sglang_proto::{InputLogProbs, MultimodalInputs, OutputLogProbs},
     observability::metrics::metrics_labels,
     protocols::{
         chat::{ChatCompletionRequest, ChatMessage},
@@ -400,7 +400,10 @@ pub(crate) fn process_chat_messages(
     request: &ChatCompletionRequest,
     tokenizer: &dyn Tokenizer,
     multimodal_data: Option<
-        HashMap<crate::multimodal::Modality, Vec<Arc<crate::multimodal::types::ImageFrame>>>,
+        std::collections::HashMap<
+            crate::multimodal::Modality,
+            Vec<std::sync::Arc<crate::multimodal::types::ImageFrame>>,
+        >,
     >,
 ) -> Result<ProcessedMessages, String> {
     // Use the tokenizer's chat template - we require HuggingFace tokenizer for gRPC
@@ -510,7 +513,7 @@ pub(crate) fn process_chat_messages(
     };
 
     // Placeholder for multimodal inputs
-    let multimodal_inputs = None;
+
     let multimodal_inputs = multimodal_data.map(|data| {
         let mut proto_mm = MultimodalInputs::default();
         if let Some(images) = data.get(&crate::multimodal::Modality::Image) {
