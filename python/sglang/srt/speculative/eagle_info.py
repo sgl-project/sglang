@@ -525,9 +525,14 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             batch.seq_lens.add_(accept_length + 1)
             batch.seq_lens_cpu.add_(accept_length_cpu + 1)
 
+            # Map verified_id from target vocab to draft vocab for   vocab
+            draft_verified_id = verified_id
+            if vocab_mapper is not None:
+                draft_verified_id = vocab_mapper.map_target_to_draft(verified_id)
+
             draft_input = EagleDraftInput(
                 hidden_states=batch.spec_info.hidden_states[accept_index],
-                verified_id=verified_id,
+                verified_id=draft_verified_id,
                 accept_length=accept_length,
                 accept_length_cpu=accept_length_list,
                 seq_lens_for_draft_extend=batch.seq_lens,
@@ -586,11 +591,18 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                         next_power_of_2(self.draft_token_num),
                     )
 
+                # Map verified_id from target vocab to draft vocab for heterogeneous vocab
+                unfinished_verified_id = predict[unfinished_accept_index]
+                if vocab_mapper is not None:
+                    unfinished_verified_id = vocab_mapper.map_target_to_draft(
+                        unfinished_verified_id
+                    )
+
                 draft_input = EagleDraftInput(
                     hidden_states=batch.spec_info.hidden_states[
                         unfinished_accept_index
                     ],
-                    verified_id=predict[unfinished_accept_index],
+                    verified_id=unfinished_verified_id,
                     accept_length_cpu=draft_input_accept_length_cpu,
                     accept_length=accept_length[unfinished_index_device],
                     seq_lens_for_draft_extend=batch.seq_lens[unfinished_index_device],
