@@ -5,6 +5,7 @@ use std::{
     sync::{Arc, LazyLock},
 };
 
+use bytes::Bytes;
 use image::DynamicImage;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -65,7 +66,7 @@ pub enum ChatContentPart {
         uuid: Option<String>,
     },
     ImageData {
-        data: Vec<u8>,
+        data: Bytes,
         #[serde(skip_serializing_if = "Option::is_none")]
         mime_type: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -124,7 +125,7 @@ pub enum ImageSource {
 #[derive(Debug)]
 pub struct ImageFrame {
     image: DynamicImage,
-    raw_bytes: Arc<Vec<u8>>,
+    raw_bytes: Bytes,
     pub detail: ImageDetail,
     pub source: ImageSource,
 }
@@ -132,7 +133,7 @@ pub struct ImageFrame {
 impl ImageFrame {
     pub fn new(
         image: DynamicImage,
-        raw_bytes: Arc<Vec<u8>>,
+        raw_bytes: Bytes,
         detail: ImageDetail,
         source: ImageSource,
     ) -> Self {
@@ -149,7 +150,7 @@ impl ImageFrame {
     }
 
     pub fn raw_bytes(&self) -> &[u8] {
-        self.raw_bytes.as_slice()
+        &self.raw_bytes
     }
 
     pub fn source(&self) -> &ImageSource {
@@ -199,7 +200,7 @@ pub struct MultiModalTensor {
     pub shape: Vec<usize>,
     pub dtype: String,
     #[serde(with = "serde_bytes")]
-    pub data: Vec<u8>,
+    pub data: Bytes,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
