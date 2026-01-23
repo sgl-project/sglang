@@ -38,6 +38,7 @@ from sglang.srt.layers.quantization.base_config import (
 from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
+    get_bool_env_var,
     get_torch_compile_disable_decorator,
     is_cuda,
     is_flashinfer_available,
@@ -76,7 +77,10 @@ if TYPE_CHECKING:
     )
 
 _is_hip = is_hip()
-_is_shuffle_moe_mxfp4 = is_gfx95_supported()
+_is_shuffle_moe_mxfp4 = _is_gfx95_supported = is_gfx95_supported()
+
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_aiter_gfx95 = _use_aiter and _is_gfx95_supported
 
 if _is_hip:
     # import aiter
@@ -596,7 +600,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         )
         self.runner = MoeRunner(backend, moe_runner_config)
 
-    @get_torch_compile_disable_decorator(_is_hip)
     def apply(
         self,
         layer: torch.nn.Module,
@@ -817,6 +820,7 @@ class Mxfp4DynamicQuantMoEMethod(FusedMoEMethodBase):
     ):
         self.moe_runner_config = moe_runner_config
 
+    @get_torch_compile_disable_decorator(_use_aiter_gfx95)
     def apply(
         self,
         layer: torch.nn.Module,

@@ -1,14 +1,11 @@
 import torch
 from aiter.ops.triton.fused_kv_cache import fused_qk_rope_cat_and_cache_mla
-from aiter.ops.triton.fused_qk_concat import fused_qk_rope_cat
 from aiter.ops.triton.gemm_a16w16 import gemm_a16w16
 from aiter.ops.triton.gemm_a16w16_atomic import gemm_a16w16_atomic
 
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
 from sglang.srt.utils import BumpAllocator
 from sglang.srt.utils.common import get_torch_compile_disable_decorator
-
-__all__ = ["fused_qk_rope_cat", "fused_qk_rope_cat_and_cache_mla"]
 
 
 def aiter_dsv3_router_gemm(
@@ -81,8 +78,6 @@ def rope_plus_attn_mqa(
         mla_inst.rotary_emb.is_neox_style,
         q_out_dtype=kv_cache_dtype,
     )[0]
-
-    save_kv_cache = False
 
     attn_output = mla_inst.attn_mqa(
         q,
