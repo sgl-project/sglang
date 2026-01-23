@@ -569,20 +569,15 @@ impl ChatCompletionRequest {
             | ChatMessage::System { content, .. }
             | ChatMessage::Tool { content, .. }
             | ChatMessage::Developer { content, .. } => match content {
-                MessageContent::Parts(parts) => parts
-                    .iter()
-                    .any(|p| !matches!(p, super::common::ContentPart::Text { .. })),
+                MessageContent::Parts(parts) => {
+                    parts.iter().any(|p| !matches!(p, ContentPart::Text { .. }))
+                }
                 _ => false,
             },
-            ChatMessage::Assistant { content, .. } => {
-                if let Some(MessageContent::Parts(parts)) = content {
-                    parts
-                        .iter()
-                        .any(|p| !matches!(p, super::common::ContentPart::Text { .. }))
-                } else {
-                    false
-                }
-            }
+            ChatMessage::Assistant {
+                content: Some(MessageContent::Parts(parts)),
+                ..
+            } => parts.iter().any(|p| !matches!(p, ContentPart::Text { .. })),
             _ => false,
         })
     }

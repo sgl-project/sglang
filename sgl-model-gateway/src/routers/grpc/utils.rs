@@ -17,6 +17,7 @@ use super::{
 use crate::{
     core::Worker,
     grpc_client::sglang_proto::{InputLogProbs, MultimodalInputs, OutputLogProbs},
+    multimodal::types::{ImageFrame, Modality},
     observability::metrics::metrics_labels,
     protocols::{
         chat::{ChatCompletionRequest, ChatMessage},
@@ -516,7 +517,7 @@ pub(crate) fn process_chat_messages(
 
     let multimodal_inputs = multimodal_data.map(|data| {
         let mut proto_mm = MultimodalInputs::default();
-        if let Some(images) = data.get(&crate::multimodal::Modality::Image) {
+        if let Some(images) = data.get(&Modality::Image) {
             proto_mm.image_data = images
                 .iter()
                 .map(|f| f.raw_bytes_handle().clone())

@@ -58,6 +58,7 @@ pub struct AppContext {
     pub wasm_manager: Option<Arc<WasmModuleManager>>,
     pub worker_service: Arc<WorkerService>,
     pub inflight_tracker: Arc<InFlightRequestTracker>,
+    pub media_connector: Arc<crate::multimodal::MediaConnector>,
 }
 
 impl std::fmt::Debug for AppContext {
@@ -86,6 +87,7 @@ pub struct AppContextBuilder {
     workflow_engines: Option<Arc<OnceLock<WorkflowEngines>>>,
     mcp_manager: Option<Arc<OnceLock<Arc<McpManager>>>>,
     wasm_manager: Option<Arc<WasmModuleManager>>,
+    media_connector: Option<Arc<crate::multimodal::MediaConnector>>,
 }
 
 impl AppContext {
@@ -222,6 +224,14 @@ impl AppContextBuilder {
         self.wasm_manager = wasm_manager;
         self
     }
+    fn with_media_connector(mut self) -> Self {
+        let config = crate::multimodal::MediaConnectorConfig::default();
+        let connector =
+            crate::multimodal::MediaConnector::new(self.client.clone().unwrap(), config)
+                .expect("Failed to create media connector");
+        self.media_connector = Some(Arc::new(connector));
+        self
+    }
 
     pub fn build(self) -> Result<AppContext, AppContextBuildError> {
         let router_config = self
@@ -279,6 +289,9 @@ impl AppContextBuilder {
                 .ok_or(AppContextBuildError("mcp_manager"))?,
             wasm_manager: self.wasm_manager,
             worker_service,
+            media_connector: self
+                .media_connector
+                .ok_or(AppContextBuildError("media_connector"))?,
             inflight_tracker: InFlightRequestTracker::new(),
         })
     }
@@ -304,6 +317,7 @@ impl AppContextBuilder {
             .with_mcp_manager(&router_config)
             .await?
             .with_wasm_manager(&router_config)?
+            .with_media_connector()
             .router_config(router_config))
     }
 
