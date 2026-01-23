@@ -713,6 +713,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                         self.config.vocab_size,
                         self.config.hidden_size,
                         quant_config=quant_config,
+                        use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
                         prefix=add_prefix("lm_head", prefix),
                     )
             else:
