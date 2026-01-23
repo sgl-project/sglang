@@ -3,6 +3,7 @@ from __future__ import annotations
 import heapq
 import json
 import logging
+import os
 import threading
 import time
 from typing import TYPE_CHECKING, List, Optional
@@ -11,7 +12,14 @@ import torch
 
 from sglang.srt.managers.cache_controller import HiCacheController, PrefetchOperation
 from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams, MatchResult
+from sglang.srt.mem_cache.base_prefix_cache import (
+    EvictParams,
+    EvictResult,
+    InsertParams,
+    InsertResult,
+    MatchPrefixParams,
+    MatchResult,
+)
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
 from sglang.srt.mem_cache.memory_pool_host import (
     MHATokenToKVPoolHost,
@@ -152,11 +160,32 @@ class HiRadixCache(RadixCache):
         Returns:
             tuple: (extra_config_dict, prefetch_threshold, prefetch_timeout_base, prefetch_timeout_per_ki_token, hicache_storage_pass_prefix_keys)
         """
-        # Parse extra config JSON if provided
+        # Parse extra config if provided. Extra config can be a JSON string or a json/toml/yaml file path prefixed with "@".
         extra_config = {}
         if storage_backend_extra_config:
             try:
-                extra_config = json.loads(storage_backend_extra_config)
+                if storage_backend_extra_config.startswith("@"):
+                    # Read config from a json/toml/yaml file
+                    path = storage_backend_extra_config[1:]
+                    ext = os.path.splitext(path)[1].lower()
+                    with open(path, "rb" if ext == ".toml" else "r") as f:
+                        if ext == ".json":
+                            extra_config = json.load(f)
+                        elif ext == ".toml":
+                            import tomllib
+
+                            extra_config = tomllib.load(f)
+                        elif ext in (".yaml", ".yml"):
+                            import yaml
+
+                            extra_config = yaml.safe_load(f)
+                        else:
+                            raise ValueError(
+                                f"Unsupported config file {path} (config format: {ext})"
+                            )
+                else:
+                    # read config from JSON string
+                    extra_config = json.loads(storage_backend_extra_config)
             except Exception as e:
                 logger.error(f"Invalid backend extra config JSON: {e}")
                 raise e
@@ -280,7 +309,9 @@ class HiRadixCache(RadixCache):
                 for _, finish_event, ack_list in self.cache_controller.ack_write_queue:
                     finish_event.synchronize()
                     for ack_id in ack_list:
-                        del self.ongoing_write_through[ack_id]
+                        backuped_node = self.ongoing_write_through.pop(ack_id)
+                        if self.enable_storage:
+                            self.write_backup_storage(backuped_node)
                 self.cache_controller.ack_write_queue.clear()
                 assert len(self.ongoing_write_through) == 0
             return
@@ -332,8 +363,9 @@ class HiRadixCache(RadixCache):
     def evictable_size(self):
         return self.evictable_size_
 
-    def evict(self, num_tokens: int):
+    def evict(self, params: EvictParams) -> EvictResult:
         start_time = time.perf_counter()
+        num_tokens = params.num_tokens
         leaves = self._collect_leaves_device()
         eviction_heap = [
             (self.eviction_strategy.get_priority(node), node) for node in leaves
@@ -375,6 +407,7 @@ class HiRadixCache(RadixCache):
                 self._evict_backuped(node)
 
         self.update_eviction_metrics(num_evicted, start_time)
+        return EvictResult(num_tokens_evicted=num_evicted)
 
     def _evict_backuped(self, node: TreeNode):
         # evict a node already written to host
@@ -454,7 +487,7 @@ class HiRadixCache(RadixCache):
             host_indices=host_indices, node_id=last_hit_node.id
         )
         if device_indices is None:
-            self.evict(len(host_indices))
+            self.evict(EvictParams(num_tokens=len(host_indices)))
             device_indices = self.cache_controller.load(
                 host_indices=host_indices, node_id=last_hit_node.id
             )
@@ -801,7 +834,7 @@ class HiRadixCache(RadixCache):
             new_node.parent = node
             new_node.key = key
             new_node.value = None
-            new_node.host_value = host_value
+            new_node.host_value = host_value.clone()
             new_node.hash_value = hash_value
             node.children[child_key] = new_node
         return matched_length
@@ -859,19 +892,18 @@ class HiRadixCache(RadixCache):
         new_node.parent.children[self.get_child_key_fn(key)] = new_node
         return new_node
 
-    def insert(
-        self,
-        key: RadixKey,
-        value=None,
-        chunked: bool = False,
-        priority: int | None = None,
-    ):
+    def insert(self, params: InsertParams) -> InsertResult:
+        key = params.key
+        value = params.value
+        chunked = params.chunked
+        priority = params.priority
+
         if priority is None:
             priority = 0
         key, value = self.maybe_bigram_convert(key, value)
 
         if len(key) == 0:
-            return 0
+            return InsertResult(prefix_len=0)
 
         if self.is_eagle and value is not None:
             # Make sure the value len equal to the EAGLE bigram key len
@@ -902,7 +934,7 @@ class HiRadixCache(RadixCache):
                 # shared-prefix node should also reflect max priority
                 new_node.priority = max(new_node.priority, priority)
                 if new_node.evicted:
-                    new_node.value = value[:prefix_len]
+                    new_node.value = value[:prefix_len].clone()
                     self.evictable_size_ += len(new_node.value)
                 else:
                     self._inc_hit_count(new_node, chunked)
@@ -919,7 +951,7 @@ class HiRadixCache(RadixCache):
             new_node = TreeNode(priority=priority)
             new_node.parent = node
             new_node.key = key
-            new_node.value = value
+            new_node.value = value.clone()
             node.children[child_key] = new_node
             self.evictable_size_ += len(value)
 
@@ -929,7 +961,7 @@ class HiRadixCache(RadixCache):
 
             if self.cache_controller.write_policy != "write_back":
                 self._inc_hit_count(new_node, chunked)
-        return total_prefix_length
+        return InsertResult(prefix_len=total_prefix_length)
 
     def _collect_leaves_device(self):
         def is_leaf(node):
