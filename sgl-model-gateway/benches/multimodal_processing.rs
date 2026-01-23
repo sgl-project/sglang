@@ -47,21 +47,21 @@ fn bench_multimodal_overhead(c: &mut Criterion) {
 
         group.throughput(Throughput::Bytes(size_bytes as u64));
 
-        // 1. Ingestion Latency (Now measuring the zero-copy clone)
+        // Ingestion Latency
         group.bench_with_input(
             BenchmarkId::new("ingestion_clone", format!("{}MB", size_mb)),
             &bytes_data,
             |b, data| b.iter(|| current_image_ingestion_path(black_box(data))),
         );
 
-        // 2. Payload Creation Latency (Now measuring the zero-copy clone)
+        // Payload Creation Latency
         group.bench_with_input(
             BenchmarkId::new("payload_creation_clone", format!("{}MB", size_mb)),
             &bytes_data,
             |b, data| b.iter(|| create_multimodal_payload(black_box(data))),
         );
 
-        // 3. Serialization Latency (Should still see benefits from allocator pressure reduction)
+        // Serialization Latency
         let payload = create_multimodal_payload(&bytes_data);
         group.bench_with_input(
             BenchmarkId::new("serialization_cost", format!("{}MB", size_mb)),
