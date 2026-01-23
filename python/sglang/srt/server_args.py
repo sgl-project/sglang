@@ -1285,13 +1285,6 @@ class ServerArgs:
                     "Disable hybrid SWA memory for GPT-OSS model with trtllm_mha attention backend."
                 )
 
-            if self.speculative_algorithm is not None:
-                # TODO: fix spec with SWA memory cache
-                self.disable_hybrid_swa_memory = True
-                logger.warning(
-                    "Disable hybrid SWA memory for GPT-OSS model with speculative decoding."
-                )
-
             quant_method = get_quantization_config(hf_config)
             is_mxfp4_quant_format = quant_method == "mxfp4"
             if is_mxfp4_quant_format:
