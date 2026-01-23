@@ -69,7 +69,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightFromDiskReqOutput,
     WatchLoadUpdateReq,
 )
-from sglang.srt.managers.mm_utils import TensorTransportMode, wrap_shm_features
+from sglang.srt.managers.mm_utils import wrap_shm_features
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.request_metrics_exporter import RequestMetricsExporterManager
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, RequestStage
@@ -2326,7 +2326,7 @@ def _get_processor_wrapper(server_args):
     return processor
 
 
-def _determine_tensor_transport_mode(server_args: ServerArgs) -> TensorTransportMode:
+def _determine_tensor_transport_mode(server_args: ServerArgs):
     is_cross_node = server_args.dist_init_addr
 
     if is_cross_node:
