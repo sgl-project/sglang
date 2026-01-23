@@ -45,7 +45,6 @@ class ExpertBackupManager:
         self.idmn = (self.expert_num // self.engine_num) * self.engine_rank
         self.idmx = (self.expert_num // self.engine_num) * (self.engine_rank + 1)
         context = zmq.Context(2)
-        # TODO (stage 100): stop using localhost and extend to real multinode
         self.recv_from_expert_backup_client = get_zmq_socket(
             context,
             zmq.PULL,
