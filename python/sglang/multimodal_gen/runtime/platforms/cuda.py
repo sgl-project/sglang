@@ -241,7 +241,9 @@ class CudaPlatformBase(Platform):
                     str(e),
                 )
                 raise ImportError(
-                    "Sparse Video Gen 2 (SAP) Attention backend is not installed."
+                    "Sparse Video Gen 2 (SAP) Attention backend is not installed. "
+                    "Please install it by following the instructions at "
+                    "https://github.com/svg-project/Sparse-VideoGen"
                 ) from e
         elif selected_backend == AttentionBackendEnum.VMOBA_ATTN:
             try:
