@@ -13,6 +13,7 @@ from sglang.srt.layers.moe import (
     MoeRunnerConfig,
     get_moe_runner_backend,
 )
+from sglang.srt.hardware_backend.npu.moe.torch_npu_kernels import TorchNpuKernelsQuantInfo
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
@@ -301,6 +302,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
+        moe_runner_config.quantization = "UnquantizedFusedMoEMethod"
         self.moe_runner_config = moe_runner_config
         backend = (
             MoeRunnerBackend.TRITON_KERNELS
@@ -460,91 +462,16 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
-        import torch_npu
-
-        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
-
-        x = dispatch_output.hidden_states
-        topk_weights, topk_ids, _ = dispatch_output.topk_output
-
-        original_dtype = x.dtype
-        num_tokens = x.shape[0]
-        topk_weights = topk_weights.to(x.dtype)
-        topk_ids = topk_ids.to(torch.int32)
-        num_experts = layer.num_experts
-        top_k = layer.top_k
-        row_idx_len = num_tokens * top_k
-        row_idx = (
-            torch.arange(0, row_idx_len, dtype=torch.int32, device=topk_weights.device)
-            .view(top_k, -1)
-            .permute(1, 0)
-            .contiguous()
-        )
-
-        hidden_states, expanded_row_idx, expanded_expert_idx = (
-            torch_npu.npu_moe_init_routing(
-                x, row_idx=row_idx, expert_idx=topk_ids, active_num=num_tokens
+        backend = self.runner.runner_backend
+        quant_info = TorchNpuKernelsQuantInfo(
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+                w13_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale,
+                w13_offset=layer.w13_weight_offset,
+                w2_offset=layer.w2_weight_offset,
             )
-        )
-
-        expert_tokens = torch_npu.npu_moe_compute_expert_tokens(
-            expanded_expert_idx, num_experts
-        )
-
-        expert_tokens = expert_tokens.to(torch.int64)
-        w13_bias = [layer.w13_weight_bias] if self.with_bias else None
-        w2_bias = [layer.w2_weight_bias] if self.with_bias else None
-        if layer.w13_weight.shape[-1] == layer.hidden_size:
-            w13 = layer.w13_weight.transpose(1, 2)
-            w2 = layer.w2_weight.transpose(1, 2)
-
-        # gmm1: gate_up_proj
-        hidden_states = torch_npu.npu_grouped_matmul(
-            x=[hidden_states],
-            weight=[w13],
-            bias=w13_bias,
-            split_item=2,
-            group_list_type=0,
-            group_type=0,
-            group_list=expert_tokens,
-            output_dtype=original_dtype,
-        )[0]
-
-        # act_fn:
-        if self.moe_runner_config.activation == "npu_swiglu_oai":
-            from sgl_kernel_npu.activation.swiglu_oai import swiglu_oai
-
-            hidden_states = swiglu_oai(layer, hidden_states)
-        elif self.moe_runner_config.activation == "silu":
-            hidden_states = torch_npu.npu_swiglu(hidden_states)
-        else:
-            from sglang.srt.layers.activation import GeluAndMul
-
-            hidden_states = GeluAndMul()(hidden_states)
-
-        # gmm2: down_proj
-        hidden_states = torch_npu.npu_grouped_matmul(
-            x=[hidden_states],
-            weight=[w2],
-            bias=w2_bias,
-            split_item=2,
-            group_list_type=0,
-            group_type=0,
-            group_list=expert_tokens,
-            output_dtype=original_dtype,
-        )[0]
-
-        final_hidden_states = torch_npu.npu_moe_finalize_routing(
-            hidden_states,
-            skip1=None,
-            skip2=None,
-            bias=None,
-            scales=topk_weights,
-            expanded_src_to_dst_row=expanded_row_idx,
-            export_for_source_row=topk_ids,
-        )
-
-        return StandardCombineInput(hidden_states=final_hidden_states)
+        return self.runner.run(dispatch_output, quant_info)
 
     def forward_tpu(self, *args, **kwargs) -> CombineInput:
         raise NotImplementedError("The TPU backend currently does not support MoE.")
