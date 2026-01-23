@@ -687,15 +687,15 @@ def fused_moe(
     - torch.Tensor: The output tensor after applying the MoE layer.
     """
     if _use_sgl_xpu:
-        topk_ids, topk_weight, _ = topk_output
+        topk_weight, topk_ids, _ = topk_output
         from sgl_kernel import fused_experts as sgl_fused_experts
 
         return sgl_fused_experts(
             hidden_states,
             w1,
             w2,
-            topk_ids,
             topk_weight,
+            topk_ids,
             b1=b1,
             b2=b2,
             use_fp8_w8a8=use_fp8_w8a8,

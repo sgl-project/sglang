@@ -94,5 +94,28 @@ class TestDeepSeekOCR(CustomTestCase):
         self.run_decode()
 
 
+class TestDeepSeekOCRTriton(TestDeepSeekOCR):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = "deepseek-ai/DeepSeek-OCR"
+        cls.tokenizer = AutoTokenizer.from_pretrained(cls.model, use_fast=False)
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.common_args = [
+            "--device",
+            "xpu",
+            "--attention-backend",
+            "intel_xpu",
+        ]
+        os.environ["SGLANG_USE_SGL_XPU"] = "0"
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                *cls.common_args,
+            ],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

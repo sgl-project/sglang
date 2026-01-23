@@ -53,7 +53,7 @@ if _is_cuda or _is_hip:
 elif _is_cpu and _is_cpu_amx_available:
     pass
 elif _is_xpu:
-    from sgl_kernel import moe_sum, silu_and_mul
+    from sgl_kernel import moe_sum_reduce, silu_and_mul
 
 
 if _is_cuda or _is_hip or _is_xpu:
@@ -317,9 +317,10 @@ class TritonRunnerCore(MoeRunnerCore):
                     out_hidden_states,
                 )
         elif _is_xpu:
-            moe_sum(
+            moe_sum_reduce(
                 intermediate_cache3.view(*intermediate_cache3.shape),
                 out_hidden_states,
+                routed_scaling_factor,
             )
         else:
             vllm_ops.moe_sum(
