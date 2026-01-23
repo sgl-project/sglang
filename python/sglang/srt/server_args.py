@@ -2600,11 +2600,6 @@ class ServerArgs:
                 )
                 self.attention_backend = "triton"
         elif not self.disable_cuda_graph:
-            if self.cuda_graph_bs != [1]:
-                logger.warning(
-                    "Cuda graph bs is set to [1] because of using diffusion LLM inference"
-                )
-                self.cuda_graph_bs = [1]
             if self.attention_backend != "flashinfer":
                 logger.warning(
                     "Attention backend is set to flashinfer because of enabling cuda graph in diffusion LLM inference"
