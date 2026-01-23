@@ -860,9 +860,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             )
 
         if self.mrope_positions is not None:
-            self.mrope_positions = self._pad_tensor_to_size(
-                self.mrope_positions.transpose(0, 1), num_tokens
-            ).transpose(0, 1)
+            self.mrope_positions = (
+                self._pad_tensor_to_size(
+                    self.mrope_positions.transpose(0, 1), num_tokens
+                )
+                .transpose(0, 1)
+                .contiguous()
+            )
 
         # TODO: check if we need to pad other tensors
         if self.extend_seq_lens is not None:
