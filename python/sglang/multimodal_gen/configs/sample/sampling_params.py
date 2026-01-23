@@ -95,7 +95,7 @@ class SamplingParams:
         "Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards"
     )
     prompt_path: str | None = None
-    output_path: str = "outputs/"
+    output_path: str | None = None
     output_file_name: str | None = None
 
     # Batch info
@@ -318,6 +318,12 @@ class SamplingParams:
 
         self.data_type = server_args.pipeline_config.task_type.data_type()
 
+        if self.output_path is None and server_args.output_path is not None:
+            self.output_path = server_args.output_path
+            logger.debug(
+                f"Overriding output_path with server configuration: {self.output_path}"
+            )
+
         # Process negative prompt
         if self.negative_prompt is not None and not self.negative_prompt.isspace():
             # avoid stripping default negative prompt: ' ' for qwen-image
@@ -346,11 +352,10 @@ class SamplingParams:
                         [f"{w}x{h}" for w, h in self.supported_resolutions]
                     )
                     error_msg = (
-                        f"Unsupported resolution: {self.width}x{self.height}. "
+                        f"Unsupported resolution: {self.width}x{self.height}, output quality may suffer. "
                         f"Supported resolutions: {supported_str}"
                     )
-                    logger.error(error_msg)
-                    raise ValueError(error_msg)
+                    logger.warning(error_msg)
 
         if pipeline_config.task_type.is_image_gen():
             # settle num_frames
@@ -458,7 +463,9 @@ class SamplingParams:
                 # Re-raise if it's not a safetensors file issue
                 raise
 
-        user_sampling_params = SamplingParams(*args, **kwargs)
+        user_kwargs = dict(kwargs)
+        user_kwargs.pop("diffusers_kwargs", None)
+        user_sampling_params = SamplingParams(*args, **user_kwargs)
         # TODO: refactor
         sampling_params._merge_with_user_params(user_sampling_params)
         sampling_params._adjust(server_args)
@@ -533,12 +540,6 @@ class SamplingParams:
             type=str,
             default=SamplingParams.prompt_path,
             help="Path to a text file containing the prompt",
-        )
-        parser.add_argument(
-            "--output-path",
-            type=str,
-            default=SamplingParams.output_path,
-            help="Path to save the generated image/video",
         )
         parser.add_argument(
             "--output-file-name",
