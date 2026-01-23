@@ -148,7 +148,10 @@ def _log_process_aware(
     if should_log:
         # stacklevel=3 to show the original caller's location,
         # as this function is called by the patched methods.
-        logger_self.log(level, msg, *args, stacklevel=3, **kwargs)
+        if "stacklevel" in kwargs:
+            logger_self.log(level, msg, *args, **kwargs)
+        else:
+            logger_self.log(level, msg, *args, stacklevel=3, **kwargs)
 
 
 class _SGLDiffusionLogger(Logger):
