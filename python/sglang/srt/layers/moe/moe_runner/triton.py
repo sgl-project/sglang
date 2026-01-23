@@ -47,8 +47,8 @@ if _is_cuda or _is_hip:
                 raise ImportError(
                     "aiter is required when SGLANG_USE_AITER is set to True"
                 )
-        else:
-            from vllm import _custom_ops as vllm_ops  # moe_sum
+        # For HIP without AITER, use Triton implementations instead of vLLM
+        # No vLLM dependency needed
 elif _is_cpu and _is_cpu_amx_available:
     pass
 
@@ -211,8 +211,10 @@ class TritonRunnerCore(MoeRunnerCore):
             elif _is_cuda or _is_hip:
                 silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
             else:
-                vllm_ops.silu_and_mul(
-                    intermediate_cache2, intermediate_cache1.view(-1, N)
+                # For CPU/other platforms, use native PyTorch implementation
+                gate, up = intermediate_cache1.view(-1, N).chunk(2, dim=-1)
+                intermediate_cache2.copy_(
+                    (gate * torch.nn.functional.silu(up)).to(intermediate_cache2.dtype)
                 )
         elif activation == "gelu":
             assert gemm1_alpha is None, "gemm1_alpha is not supported for gelu"
@@ -220,8 +222,10 @@ class TritonRunnerCore(MoeRunnerCore):
             if _is_cuda or _is_hip:
                 gelu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
             else:
-                vllm_ops.gelu_and_mul(
-                    intermediate_cache2, intermediate_cache1.view(-1, N)
+                # For CPU/other platforms, use native PyTorch implementation
+                gate, up = intermediate_cache1.view(-1, N).chunk(2, dim=-1)
+                intermediate_cache2.copy_(
+                    (gate * torch.nn.functional.gelu(up)).to(intermediate_cache2.dtype)
                 )
         else:
             raise ValueError(f"Unsupported activation: {activation=}")
@@ -307,16 +311,39 @@ class TritonRunnerCore(MoeRunnerCore):
                     intermediate_cache3.view(*intermediate_cache3.shape),
                     out_hidden_states,
                 )
+                # AITER's moe_sum doesn't support routed_scaling_factor, so apply it manually
+                if routed_scaling_factor != 1.0:
+                    out_hidden_states.mul_(routed_scaling_factor)
             else:
-                vllm_ops.moe_sum(
+                # Use Triton implementations instead of vLLM to avoid dependency
+                # According to micro benchmark results, torch.compile can get better performance for small token.
+                if M <= 32:
+                    moe_sum_reduce_torch_compile(
+                        intermediate_cache3.view(*intermediate_cache3.shape),
+                        out_hidden_states,
+                        routed_scaling_factor,
+                    )
+                else:
+                    moe_sum_reduce_triton(
+                        intermediate_cache3.view(*intermediate_cache3.shape),
+                        out_hidden_states,
+                        routed_scaling_factor,
+                    )
+        else:
+            # For CPU and other platforms, use torch.compile implementation
+            # (works on CPU, no vLLM dependency needed)
+            if M <= 32:
+                moe_sum_reduce_torch_compile(
                     intermediate_cache3.view(*intermediate_cache3.shape),
                     out_hidden_states,
+                    routed_scaling_factor,
                 )
-        else:
-            vllm_ops.moe_sum(
-                intermediate_cache3.view(*intermediate_cache3.shape),
-                out_hidden_states,
-            )
+            else:
+                moe_sum_reduce_triton(
+                    intermediate_cache3.view(*intermediate_cache3.shape),
+                    out_hidden_states,
+                    routed_scaling_factor,
+                )
 
         return TritonRunnerOutput(
             hidden_states=out_hidden_states,

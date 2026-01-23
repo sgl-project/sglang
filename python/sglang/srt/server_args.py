@@ -1504,10 +1504,13 @@ class ServerArgs:
                         )
                         self.disable_radix_cache = True
                         self.disable_overlap_schedule = False
-            assert self.attention_backend != "triton", (
-                "NemotronHForCausalLM does not support triton attention backend,"
-                "as the first layer might not be an attention layer"
-            )
+            # NOTE: Removed overly restrictive check - triton backend actually
+            # handles hybrid models (see triton_backend.py mambaish_config check)
+            # assert self.attention_backend != "triton", (
+            #     "NemotronHForCausalLM does not support triton attention backend,"
+            #     "as the first layer might not be an attention layer"
+            # )
+            pass
         elif model_arch in [
             "Qwen3MoeForCausalLM",
             "Qwen3VLMoeForConditionalGeneration",

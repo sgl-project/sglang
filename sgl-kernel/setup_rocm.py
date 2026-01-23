@@ -73,21 +73,29 @@ if torch.cuda.is_available():
 else:
     print(f"Warning: torch.cuda not available. Using default target: {amdgpu_target}")
 
-if amdgpu_target not in ["gfx942", "gfx950"]:
+if amdgpu_target not in ["gfx942", "gfx950", "gfx90a"]:
     print(
-        f"Warning: Unsupported GPU architecture detected '{amdgpu_target}'. Expected 'gfx942' or 'gfx950'."
+        f"Warning: Unsupported GPU architecture detected '{amdgpu_target}'. Expected 'gfx942', 'gfx950', or 'gfx90a'."
     )
     sys.exit(1)
 
 fp8_macro = (
-    "-DHIP_FP8_TYPE_FNUZ" if amdgpu_target == "gfx942" else "-DHIP_FP8_TYPE_E4M3"
+    "-DHIP_FP8_TYPE_FNUZ"
+    if amdgpu_target in ["gfx942", "gfx950"]
+    else "-DHIP_FP8_TYPE_E4M3"
 )
 
 # Dynamic shared-memory budget for the TopK kernels.
 # - gfx942 (MI300/MI325): LDS is typically 64KB per workgroup -> keep dynamic smem <= ~48KB
 #   (leaves room for static shared allocations in the kernel).
+# - gfx90a (MI210): LDS is 96KB per CU -> use 64KB dynamic smem (conservative, leaves room for static allocations).
 # - gfx95x (MI350): LDS is larger (e.g. 160KB per CU) -> allow the original 128KB dynamic smem.
-topk_dynamic_smem_bytes = 48 * 1024 if amdgpu_target == "gfx942" else 32 * 1024 * 4
+if amdgpu_target == "gfx942":
+    topk_dynamic_smem_bytes = 48 * 1024
+elif amdgpu_target == "gfx90a":
+    topk_dynamic_smem_bytes = 64 * 1024
+else:  # gfx950
+    topk_dynamic_smem_bytes = 32 * 1024 * 4  # 128KB
 
 hipcc_flags = [
     "-DNDEBUG",
