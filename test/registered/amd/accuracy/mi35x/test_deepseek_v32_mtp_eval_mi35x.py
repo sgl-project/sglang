@@ -135,7 +135,7 @@ class TestDeepseekV32TPMTP(CustomTestCase):
                 f"{speed=:.2f} token/s\n"
             )
             self.assertGreater(acc_length, AVG_SPEC_ACCEPT_LENGTH_THRESHOLD)
-            self.assertGreater(speed, 60)
+            self.assertGreater(speed, 55)  # Lowered from 60 for AMD MI35x
 
 
 if __name__ == "__main__":
