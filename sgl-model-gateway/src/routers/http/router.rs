@@ -130,7 +130,7 @@ impl Router {
     }
 
     /// Select worker for a specific model considering circuit breaker state
-    fn select_worker_for_model(
+    async fn select_worker_for_model(
         &self,
         model_id: Option<&str>,
         text: Option<&str>,
@@ -167,21 +167,23 @@ impl Router {
             .worker_registry
             .get_hash_ring(effective_model_id.unwrap_or(UNKNOWN_MODEL_ID));
 
-        let idx = policy.select_worker(
-            &available,
-            &SelectWorkerInfo {
-                request_text: text,
-                tokens: None, // HTTP doesn't have tokens, use gRPC for PrefixHash
-                headers,
-                hash_ring,
-            },
-        )?;
+        let idx = policy
+            .select_worker(
+                &available,
+                &SelectWorkerInfo {
+                    request_text: text,
+                    tokens: None, // HTTP doesn't have tokens, use gRPC for PrefixHash
+                    headers,
+                    hash_ring,
+                },
+            )
+            .await?;
 
         // Record worker selection metric (Layer 3)
         Metrics::record_worker_selection(
             metrics_labels::WORKER_REGULAR,
             metrics_labels::CONNECTION_HTTP,
-            model_id.unwrap_or("default"),
+            model_id.unwrap_or(UNKNOWN_MODEL_ID),
             policy.name(),
         );
 
@@ -198,7 +200,7 @@ impl Router {
         let start = Instant::now();
         let is_stream = typed_req.is_stream();
         let text = typed_req.extract_text_for_routing();
-        let model = model_id.unwrap_or("default");
+        let model = model_id.unwrap_or(UNKNOWN_MODEL_ID);
         let endpoint = route_to_endpoint(route);
 
         // Record request start (Layer 2)
@@ -276,7 +278,10 @@ impl Router {
         is_stream: bool,
         text: &str,
     ) -> Response {
-        let worker = match self.select_worker_for_model(model_id, Some(text), headers) {
+        let worker = match self
+            .select_worker_for_model(model_id, Some(text), headers)
+            .await
+        {
             Some(w) => w,
             None => {
                 return error::service_unavailable(
@@ -286,15 +291,14 @@ impl Router {
             }
         };
 
-        // Optional load tracking for cache-aware policy
-        // Get the policy for this model to check if it's cache-aware
         let policy = match model_id {
             Some(model) => self.policy_registry.get_policy_or_default(model),
             None => self.policy_registry.get_default_policy(),
         };
 
-        let load_guard =
-            (policy.name() == "cache_aware").then(|| WorkerLoadGuard::new(worker.clone()));
+        let load_guard = ["cache_aware", "manual"]
+            .contains(&policy.name())
+            .then(|| WorkerLoadGuard::new(worker.clone(), headers));
 
         // Note: Using borrowed reference avoids heap allocation
         events::RequestSentEvent { url: worker.url() }.emit();

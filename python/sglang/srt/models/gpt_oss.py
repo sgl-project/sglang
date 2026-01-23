@@ -54,6 +54,7 @@ from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
+from sglang.srt.layers.moe.utils import filter_moe_weight_param_global_expert
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_utils import dequant_mxfp4
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -70,9 +71,10 @@ from sglang.srt.models.utils import (
     enable_fused_set_kv_buffer,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import LazyValue, add_prefix, is_cuda, make_layers
+from sglang.srt.utils import LazyValue, add_prefix, is_cuda, is_npu, make_layers
 
 _is_cuda = is_cuda()
+_is_npu = is_npu()
 
 
 if _is_cuda:
@@ -128,6 +130,7 @@ class GptOssSparseMoeBlock(nn.Module):
                 "use_weight_loader_fused": quant_config_name
                 != "mxfp4"
             }
+
         self.experts = experts_type(
             num_experts=config.num_local_experts
             + get_global_server_args().ep_num_redundant_experts,
@@ -169,6 +172,9 @@ class GptOssSparseMoeBlock(nn.Module):
             x.data
             for name, x in self.experts.named_parameters()
             if name not in ["correction_bias"]
+            and filter_moe_weight_param_global_expert(
+                name, x, self.experts.num_local_experts
+            )
         ]
 
     def forward_normal(
@@ -301,20 +307,20 @@ class GptOssAttention(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
-        q, k = self.rotary_emb(
-            positions,
-            q,
-            k,
-            fused_set_kv_buffer_arg=(
-                create_fused_set_kv_buffer_arg(
-                    value=v,
-                    layer=self.attn,
-                    forward_batch=forward_batch,
-                )
-                if enable_fused_set_kv_buffer(forward_batch)
-                else None
-            ),
-        )
+        extra_args = {}
+        if not _is_npu:
+            extra_args = {
+                "fused_set_kv_buffer_arg": (
+                    create_fused_set_kv_buffer_arg(
+                        value=v,
+                        layer=self.attn,
+                        forward_batch=forward_batch,
+                    )
+                    if enable_fused_set_kv_buffer(forward_batch)
+                    else None
+                ),
+            }
+        q, k = self.rotary_emb(positions, q, k, **extra_args)
         inner_state = q, k, v, forward_batch
         return None, forward_batch, inner_state
 
@@ -485,6 +491,9 @@ class GptOssModel(nn.Module):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.pp_group = get_pp_group()
+
+        if _is_npu:
+            config.hidden_act = "npu_swiglu_oai"
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
