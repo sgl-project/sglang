@@ -64,10 +64,6 @@ from sglang.srt.managers.multi_tokenizer_mixin import MultiTokenizerRouter
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.managers.template_manager import TemplateManager
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
-from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
-    merge_transfer_engine_infos_from_all_nodes,
-    parse_remote_instance_transfer_engine_info_from_scheduler_infos,
-)
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.tracing.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.utils import (
@@ -158,7 +154,7 @@ class Engine(EngineBase):
         atexit.register(self.shutdown)
 
         # Launch subprocesses
-        tokenizer_manager, template_manager, scheduler_infos, port_args, _ = (
+        tokenizer_manager, template_manager, scheduler_infos, port_args = (
             _launch_subprocesses(
                 server_args=server_args,
                 init_tokenizer_manager_func=self.init_tokenizer_manager_func,
@@ -170,8 +166,6 @@ class Engine(EngineBase):
         self.template_manager = template_manager
         self.scheduler_info = scheduler_infos[0]
         self.port_args = port_args
-        # Note: transfer_engine_info is returned but not stored here since
-        # Engine class doesn't expose HTTP endpoints - only http_server uses it.
 
         # Initialize ZMQ sockets
         context = zmq.Context(2)
@@ -838,7 +832,7 @@ def _wait_for_scheduler_ready(
     scheduler_pipe_readers: List,
     scheduler_procs: List,
 ) -> List[Dict]:
-    """Wait for the model to finish loading and return scheduler infos."""
+    """Wait for the model to finish loading and return flattened scheduler infos."""
     scheduler_infos = []
     for i in range(len(scheduler_pipe_readers)):
         try:
@@ -855,34 +849,34 @@ def _wait_for_scheduler_ready(
             raise RuntimeError(
                 "Initialization failed. Please see the error messages above."
             )
-        scheduler_infos.append(data)
+
+        if "_dp_scheduler_infos" in data:
+            scheduler_infos.extend(data["_dp_scheduler_infos"])
+        else:
+            scheduler_infos.append(data)
     return scheduler_infos
 
 
-def _sync_transfer_engine_info_across_nodes(
+def _sync_scheduler_infos_across_nodes(
     server_args: ServerArgs,
-    local_transfer_engine_info: Dict,
-) -> Dict:
+    local_scheduler_infos: List[Dict],
+) -> List[Dict]:
     """
-    Gather transfer engine info from all nodes using Gloo collective.
-
-    In multi-node setups, each node only has local scheduler info. This function
-    creates a temporary Gloo process group among parent processes (one per node)
-    and gathers all info to node 0.
+    Gather scheduler_infos from all nodes using Gloo collective.
+    Returns merged list containing scheduler info from all ranks across all nodes.
     """
     from datetime import timedelta
 
     import torch.distributed as dist
 
-    # Use a different port to avoid conflict with scheduler NCCL init
     METADATA_SYNC_PORT_OFFSET = 10000
     dist_host, dist_port = server_args.dist_init_addr.rsplit(":", 1)
     sync_port = int(dist_port) + METADATA_SYNC_PORT_OFFSET
     sync_init_method = f"tcp://{dist_host}:{sync_port}"
 
     logger.info(
-        f"Syncing transfer engine info across {server_args.nnodes} nodes "
-        f"(node_rank={server_args.node_rank}, init_method={sync_init_method})"
+        f"Syncing scheduler_infos across {server_args.nnodes} nodes "
+        f"(node_rank={server_args.node_rank}, local_ranks={len(local_scheduler_infos)})"
     )
 
     try:
@@ -895,20 +889,24 @@ def _sync_transfer_engine_info_across_nodes(
         )
 
         all_node_infos = [None] * server_args.nnodes
-        dist.all_gather_object(all_node_infos, local_transfer_engine_info)
+        dist.all_gather_object(all_node_infos, local_scheduler_infos)
 
-        merged_info = merge_transfer_engine_infos_from_all_nodes(all_node_infos)
+        merged_scheduler_infos = []
+        for node_infos in all_node_infos:
+            if node_infos:
+                merged_scheduler_infos.extend(node_infos)
+
         logger.info(
-            f"Transfer engine info sync complete: {len(merged_info)} ranks total"
+            f"Scheduler info sync complete: {len(merged_scheduler_infos)} total ranks"
         )
-        return merged_info
+        return merged_scheduler_infos
 
     except Exception as e:
         logger.error(
-            f"Failed to sync transfer engine info across nodes: {e}. "
-            f"Only local ranks will be available for cross-node weight loading."
+            f"Failed to sync scheduler_infos across nodes: {e}. "
+            f"Only local ranks will be available."
         )
-        return local_transfer_engine_info
+        return local_scheduler_infos
 
     finally:
         if dist.is_initialized():
@@ -999,14 +997,14 @@ def _launch_subprocesses(
     run_scheduler_process_func: Callable,
     run_detokenizer_process_func: Callable,
     port_args: Optional[PortArgs] = None,
-) -> Tuple[TokenizerManager, TemplateManager, Tuple[Dict], PortArgs, Dict]:
+) -> Tuple[TokenizerManager, TemplateManager, List[Dict], PortArgs]:
     """
-    Launch the TokenizerManager in the main process, the Scheduler in a subprocess, and the DetokenizerManager in another subprocess.
+    Launch TokenizerManager, Scheduler subprocess, and DetokenizerManager subprocess.
 
     Returns:
-        Tuple of (tokenizer_manager, template_manager, scheduler_infos, port_args, transfer_engine_info)
+        Tuple of (tokenizer_manager, template_manager, scheduler_infos, port_args).
         For node_rank >= 1, tokenizer_manager and template_manager are None.
-        transfer_engine_info contains merged info from all nodes (for multi-node with transfer engine).
+        scheduler_infos contains info from all ranks across all nodes (after cross-node sync).
     """
     # Configure global environment
     configure_logger(server_args)
@@ -1026,31 +1024,15 @@ def _launch_subprocesses(
     )
 
     if server_args.node_rank >= 1:
-        # In multi-node cases, non-zero rank nodes do not need to run tokenizer or detokenizer,
-        # so they can just wait here.
-
         scheduler_infos = _wait_for_scheduler_ready(
             scheduler_pipe_readers, scheduler_procs
         )
 
-        # Participate in cross-node transfer engine info sync if needed.
-        # Node 0 also participates (see below), so all nodes sync together.
-        transfer_engine_info = None
-        if (
-            server_args.nnodes > 1
-            and server_args.remote_instance_weight_loader_use_transfer_engine()
-        ):
-            local_info = (
-                parse_remote_instance_transfer_engine_info_from_scheduler_infos(
-                    scheduler_infos
-                )
-            )
-            # Result is discarded for non-zero nodes (only node 0 serves HTTP requests)
-            _sync_transfer_engine_info_across_nodes(server_args, local_info)
+        if server_args.nnodes > 1:
+            _sync_scheduler_infos_across_nodes(server_args, scheduler_infos)
 
         if os.getenv("SGLANG_BLOCK_NONZERO_RANK_CHILDREN") == "0":
-            # When using `Engine` as a Python API, we don't want to block here.
-            return None, None, scheduler_infos, port_args, transfer_engine_info
+            return None, None, scheduler_infos, port_args
 
         launch_dummy_health_check_server(
             server_args.host, server_args.port, server_args.enable_metrics
@@ -1061,7 +1043,7 @@ def _launch_subprocesses(
             logger.error(
                 f"Scheduler or DataParallelController {proc.pid} terminated with {proc.exitcode}"
             )
-        return None, None, scheduler_infos, port_args, transfer_engine_info
+        return None, None, scheduler_infos, port_args
 
     # Launch detokenizer process
     detoken_proc = mp.Process(
@@ -1089,17 +1071,9 @@ def _launch_subprocesses(
     # Get back some info from scheduler to tokenizer_manager
     tokenizer_manager.max_req_input_len = scheduler_infos[0]["max_req_input_len"]
 
-    # Sync transfer engine info across nodes if multi-node with transfer engine.
-    # This must happen for ALL nodes (including node 0) since it's a collective operation.
-    transfer_engine_info = (
-        parse_remote_instance_transfer_engine_info_from_scheduler_infos(scheduler_infos)
-    )
-    if (
-        server_args.nnodes > 1
-        and server_args.remote_instance_weight_loader_use_transfer_engine()
-    ):
-        transfer_engine_info = _sync_transfer_engine_info_across_nodes(
-            server_args, transfer_engine_info
+    if server_args.nnodes > 1:
+        scheduler_infos = _sync_scheduler_infos_across_nodes(
+            server_args, scheduler_infos
         )
 
     return (
@@ -1107,5 +1081,4 @@ def _launch_subprocesses(
         template_manager,
         scheduler_infos,
         port_args,
-        transfer_engine_info,
     )

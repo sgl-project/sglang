@@ -120,23 +120,6 @@ def parse_remote_instance_transfer_engine_info_from_scheduler_infos(scheduler_in
     return remote_instance_transfer_engine_info
 
 
-def merge_transfer_engine_infos_from_all_nodes(
-    info_list: List[dict],
-) -> dict:
-    """Merge transfer engine info dicts from multiple nodes into one."""
-    merged = {}
-    for node_info in info_list:
-        if node_info is None:
-            continue
-        for rank, info in node_info.items():
-            if rank in merged:
-                raise ValueError(
-                    f"Duplicate rank {rank} in transfer engine info across nodes"
-                )
-            merged[rank] = info
-    return merged
-
-
 def register_memory_region(model, transfer_engine):
     if importlib.util.find_spec("torch") is None:
         return register_memory_region_v1(model, transfer_engine)
