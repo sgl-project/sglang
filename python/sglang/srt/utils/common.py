@@ -161,6 +161,22 @@ def is_npu() -> bool:
 
 
 @lru_cache(maxsize=1)
+def is_mindspore() -> bool:
+    if not is_npu():
+        return False
+
+    from sglang.srt.server_args import get_global_server_args
+
+    try:
+        args = get_global_server_args()
+        model_impl = args.model_impl
+    except ValueError:
+        model_impl = None
+
+    return model_impl == "mindspore"
+
+
+@lru_cache(maxsize=1)
 def is_host_cpu_x86() -> bool:
     machine = platform.machine().lower()
     return (

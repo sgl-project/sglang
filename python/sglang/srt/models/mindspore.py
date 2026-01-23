@@ -278,7 +278,8 @@ class MindSporeForCausalLM(torch.nn.Module):
         block_tables = tensor_torch2ms(
             (
                 forward_batch.req_to_token_pool.req_to_token[
-                    forward_batch.req_pool_indices, : forward_batch.seq_lens.max()
+                    forward_batch.req_pool_indices, : batch_valid_length.max()
+                    # forward_batch.req_pool_indices, : forward_batch.seq_lens.max()
                 ][:, ::page_size]
                 // page_size
             )
