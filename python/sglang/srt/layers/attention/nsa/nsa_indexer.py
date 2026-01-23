@@ -21,8 +21,7 @@ if _is_cuda:
     except ImportError as e:
         deep_gemm = e
 
-if _is_npu:
-    import custom_ops  # noqa: F401
+if is_npu():
     import torch_npu
     from sglang.srt.hardware_backend.npu.utils import get_indexer_weight_stream
 
@@ -182,12 +181,11 @@ class Indexer(MultiPlatformOp):
             quant_config=quant_config,
             prefix=add_prefix("wk", prefix),
         )
-        # NOTE: weights_proj in the checkpoint is stored in bf16, while the parameters here are stored in fp32 for convenience
         self.weights_proj = ReplicatedLinear(
             self.hidden_size,
             self.n_heads,
             bias=False,
-            params_dtype=torch.float32,
+            params_dtype=torch.bfloat16,
             prefix=add_prefix("weights_proj", prefix),
         )
         self.k_norm = LayerNorm(self.head_dim, dtype=torch.float32)
@@ -221,13 +219,15 @@ class Indexer(MultiPlatformOp):
 
     @torch.compile(dynamic=True) if not _is_hip else lambda f: f
     def _project_and_scale_head_gates(self, x: torch.Tensor):
-        weights, _ = self.weights_proj(x.float())
+        weights, _ = self.weights_proj(x)
+        weights = weights.float()
         weights = weights * self.n_heads**-0.5
         return weights
 
     @torch.compile(dynamic=True) if not _is_hip else lambda f: f
     def _get_logits_head_gate(self, x: torch.Tensor, q_scale: torch.Tensor):
-        weights, _ = self.weights_proj(x.float())
+        weights, _ = self.weights_proj(x)
+        weights = weights.float()
         weights = weights * self.n_heads**-0.5
         weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
         return weights
@@ -1262,6 +1262,7 @@ class Indexer(MultiPlatformOp):
                 actual_seq_lengths_kv,
                 block_table,
             )
+            return topk_indices
         else:
             block_table = (
                 block_table[: actual_seq_lengths_q.size()[0]]
@@ -1269,7 +1270,7 @@ class Indexer(MultiPlatformOp):
                 else block_table
             )
 
-            topk_indices = torch.ops.custom.npu_lightning_indexer(
+            topk_indices = torch_npu.npu_lightning_indexer(
                 query=q.view(-1, self.n_heads, self.head_dim),
                 key=past_key_states,
                 weights=weights,
@@ -1283,8 +1284,7 @@ class Indexer(MultiPlatformOp):
                 sparse_count=self.index_topk,
                 sparse_mode=3,
             )
-
-        return topk_indices
+            return topk_indices[0]
 
     def do_npu_cp_balance_indexer(
         self,
@@ -1307,7 +1307,7 @@ class Indexer(MultiPlatformOp):
         actual_seq_lengths_q_prev, actual_seq_lengths_q_next = actual_seq_lengths_q
         actual_seq_lengths_kv_prev, actual_seq_lengths_kv_next = actual_seq_lengths_kv
 
-        topk_indices_prev = torch.ops.custom.npu_lightning_indexer(
+        topk_indices_prev = torch_npu.npu_lightning_indexer(
             query=q_prev,
             key=past_key_states,
             weights=weights_prev,
@@ -1323,7 +1323,7 @@ class Indexer(MultiPlatformOp):
             sparse_count=self.index_topk,
             sparse_mode=3,
         )
-        topk_indices_next = torch.ops.custom.npu_lightning_indexer(
+        topk_indices_next = torch_npu.npu_lightning_indexer(
             query=q_next,
             key=past_key_states,
             weights=weights_next,
@@ -1339,4 +1339,4 @@ class Indexer(MultiPlatformOp):
             sparse_count=self.index_topk,
             sparse_mode=3,
         )
-        return topk_indices_prev, topk_indices_next
+        return topk_indices_prev[0], topk_indices_next[0]
