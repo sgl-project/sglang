@@ -602,11 +602,20 @@ def traverse_tree(
         if accepted:
             if curr != 0:
                 # Accept the current token
+                # Skip if grammar is already terminated
+                if grammar.is_terminated():
+                    return
                 grammar.accept_token(draft_tokens[curr])
             if not grammar.is_terminated():
                 # Generate the bitmask for the current token
-                grammar.fill_vocab_mask(allocate_token_bitmask, curr)
-                if retrieve_next_token[curr] != -1:
+                # Wrap in try-except to handle case where grammar terminates
+                # between check and call (e.g., in recursive DFS calls)
+                try:
+                    if not grammar.is_terminated():
+                        grammar.fill_vocab_mask(allocate_token_bitmask, curr)
+                except RuntimeError:
+                    pass
+                if retrieve_next_token[curr] != -1 and not grammar.is_terminated():
                     # Visit the child node
                     dfs(
                         retrieve_next_token[curr],
@@ -619,7 +628,8 @@ def traverse_tree(
                 # Rollback the current token
                 grammar.rollback(1)
 
-        if retrieve_next_sibling[curr] != -1:
+        # Only visit sibling nodes if grammar is not terminated
+        if retrieve_next_sibling[curr] != -1 and not grammar.is_terminated():
             # Visit the sibling node
             dfs(
                 retrieve_next_sibling[curr],
