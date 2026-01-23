@@ -1481,7 +1481,7 @@ class Scheduler(
                 if recv_req.bootstrap_room is None:
                     error_msg = (
                         f"Invalid request: Disaggregated request received without "
-                        f"boostrap room id. {req.rid=}"
+                        f"bootstrap room id. {req.rid=}"
                     )
                     logger.error(error_msg)
                     prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
