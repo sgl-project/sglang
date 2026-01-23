@@ -1,5 +1,7 @@
 //! Harmony Preparation Stage: Harmony encoding for chat and generate requests
 
+use std::{collections::HashMap, sync::Arc};
+
 use async_trait::async_trait;
 use axum::response::Response;
 use serde_json::json;
@@ -7,8 +9,12 @@ use tracing::error;
 
 use super::super::HarmonyBuilder;
 use crate::{
+    multimodal::{
+        types::{ChatContentPart, ImageDetail, Modality, TrackedMedia},
+        AsyncMultiModalTracker, TrackerConfig,
+    },
     protocols::{
-        chat::ChatCompletionRequest,
+        chat::{ChatCompletionRequest, ChatMessage, MessageContent},
         common::{Tool, ToolChoice, ToolChoiceValue},
         responses::ResponsesRequest,
     },
@@ -85,35 +91,147 @@ impl HarmonyPreparationStage {
         ctx: &mut RequestContext,
         request: &ChatCompletionRequest,
     ) -> Result<Option<Response>, Response> {
-        // Validate - reject logprobs
+        // Step 0: Resolve tokenizer and validate
+        let tokenizer = utils::resolve_tokenizer(ctx, "HarmonyPreparationStage::prepare_chat")
+            .map_err(|e| *e)?;
+
         if request.logprobs {
-            error!(
-                function = "prepare_chat",
-                "logprobs requested but not supported for Harmony models"
-            );
             return Err(error::bad_request(
                 "harmony_logprobs_not_supported",
                 "logprobs are not supported for Harmony models".to_string(),
             ));
         }
 
-        // Step 1: Filter tools if needed
+        // Step 1: Handle Multimodal Tracking for zero-copy extraction
+        let mut multimodal_data = None;
+        if request.is_multimodal() {
+            let mut tracker = AsyncMultiModalTracker::new(
+                ctx.components.media_connector.clone(),
+                TrackerConfig::default(),
+            );
+
+            for message in &request.messages {
+                match message {
+                    ChatMessage::User { content, .. }
+                    | ChatMessage::System { content, .. }
+                    | ChatMessage::Tool { content, .. }
+                    | ChatMessage::Developer { content, .. } => {
+                        if let MessageContent::Parts(parts) = content {
+                            for part in parts {
+                                let chat_part = match part {
+                                    crate::protocols::common::ContentPart::Text { text } => {
+                                        ChatContentPart::Text { text: text.clone() }
+                                    }
+                                    crate::protocols::common::ContentPart::ImageUrl {
+                                        image_url,
+                                    } => ChatContentPart::ImageUrl {
+                                        url: image_url.url.clone(),
+                                        detail: image_url.detail.as_ref().map(|d| {
+                                            match d.as_str() {
+                                                "low" => ImageDetail::Low,
+                                                "high" => ImageDetail::High,
+                                                _ => ImageDetail::Auto,
+                                            }
+                                        }),
+                                        uuid: None,
+                                    },
+                                    crate::protocols::common::ContentPart::VideoUrl { .. } => {
+                                        return Err(error::bad_request(
+                                            "unsupported_media_type",
+                                            "Video inputs are not yet supported in gRPC Harmony chat",
+                                        ));
+                                    }
+                                };
+                                tracker.push_part(chat_part).map_err(|e| {
+                                    error!(error = %e, "Failed to push multimodal part to tracker (Harmony)");
+                                    error::bad_request("multimodal_tracking_failed", e.to_string())
+                                })?;
+                            }
+                        }
+                    }
+                    ChatMessage::Assistant { content, .. } => {
+                        if let Some(MessageContent::Parts(parts)) = content {
+                            for part in parts {
+                                if let crate::protocols::common::ContentPart::ImageUrl {
+                                    image_url,
+                                } = part
+                                {
+                                    tracker
+                                        .push_part(ChatContentPart::ImageUrl {
+                                            url: image_url.url.clone(),
+                                            detail: image_url.detail.as_ref().map(|d| {
+                                                match d.as_str() {
+                                                    "low" => ImageDetail::Low,
+                                                    "high" => ImageDetail::High,
+                                                    _ => ImageDetail::Auto,
+                                                }
+                                            }),
+                                            uuid: None,
+                                        })
+                                        .map_err(|e| {
+                                            error::bad_request(
+                                                "multimodal_tracking_failed",
+                                                e.to_string(),
+                                            )
+                                        })?;
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            let output = tracker.finalize().await.map_err(|e| {
+                error!("Multimodal tracking failed in Harmony: {}", e);
+                error::internal_error("multimodal_tracking_failed", e.to_string())
+            })?;
+
+            if let Some(media_vec) = output.data.get(&Modality::Image) {
+                let frames = media_vec
+                    .iter()
+                    .filter_map(|m| {
+                        if let TrackedMedia::Image(frame) = m {
+                            Some(frame.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>();
+
+                if !frames.is_empty() {
+                    let mut map = HashMap::new();
+                    map.insert(Modality::Image, frames);
+                    multimodal_data = Some(map);
+                }
+            }
+        }
+
+        // Step 2: Filter tools and process messages for multimodal payload
         let body_ref = utils::filter_chat_request_by_tool_choice(request);
 
-        // Step 2: Build tool constraints
+        // Zero-Copy: populate ProcessedMessages to carry multimodal_inputs to gRPC builder
+        let processed_messages = match utils::process_chat_messages(
+            &body_ref,
+            &*tokenizer,
+            multimodal_data,
+        ) {
+            Ok(msgs) => Some(msgs),
+            Err(e) => {
+                error!(function = "HarmonyPreparationStage::prepare_chat", error = %e, "Failed to process chat messages");
+                return Err(error::bad_request("process_messages_failed", e));
+            }
+        };
+
+        // Step 3: Build tool constraints and Harmony encoding
         let tool_constraints = if let Some(tools) = body_ref.tools.as_ref() {
             Self::generate_tool_call_constraint(tools, &body_ref.tool_choice).map_err(|e| *e)?
         } else {
             None
         };
 
-        // Step 3: Build via Harmony
         let build_output = self.builder.build_from_chat(&body_ref).map_err(|e| {
-            error!(
-                function = "prepare_chat",
-                error = %e,
-                "Harmony build failed for chat request"
-            );
+            error!(function = "prepare_chat", error = %e, "Harmony build failed");
             error::bad_request(
                 "harmony_build_failed",
                 format!("Harmony build failed: {}", e),
@@ -124,7 +242,7 @@ impl HarmonyPreparationStage {
         ctx.state.preparation = Some(PreparationOutput {
             original_text: None,
             token_ids: build_output.input_ids,
-            processed_messages: None,
+            processed_messages,
             tool_constraints,
             filtered_request: if matches!(body_ref, std::borrow::Cow::Owned(_)) {
                 Some(body_ref.into_owned())
