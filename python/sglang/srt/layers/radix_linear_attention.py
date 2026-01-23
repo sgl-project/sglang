@@ -19,6 +19,10 @@ from typing import TYPE_CHECKING, Optional
 import torch
 from torch import nn
 
+from sglang.srt.compilation.compilation_config import register_split_op
+from sglang.srt.compilation.piecewise_context_manager import get_forward_context
+from sglang.srt.utils.custom_op import register_custom_op
+
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
@@ -74,10 +78,72 @@ class RadixLinearAttention(nn.Module):
         a: torch.Tensor,
         b: torch.Tensor,
     ) -> torch.Tensor:
-        return forward_batch.attn_backend.forward(
-            layer=self,
-            forward_batch=forward_batch,
-            mixed_qkv=mixed_qkv,
-            a=a,
-            b=b,
-        )
+        if forward_batch.forward_mode.is_extend() and get_forward_context() is not None:
+            # Output shape from linear attention: (1, seq_len, num_v_heads, head_v_dim)
+            seq_len = mixed_qkv.shape[0]
+            output = torch.empty(
+                (1, seq_len, self.num_v_heads, self.head_v_dim),
+                dtype=mixed_qkv.dtype,
+                device=mixed_qkv.device,
+            )
+            unified_linear_attention_with_output(
+                mixed_qkv,
+                a,
+                b,
+                output,
+                self.layer_id,
+            )
+            return output
+        else:
+            return forward_batch.attn_backend.forward(
+                layer=self,
+                forward_batch=forward_batch,
+                mixed_qkv=mixed_qkv,
+                a=a,
+                b=b,
+            )
+
+
+@register_custom_op(mutates_args=["output"])
+@register_split_op()
+def unified_linear_attention_with_output(
+    mixed_qkv: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    output: torch.Tensor,
+    layer_id: int,
+) -> None:
+    """
+    Custom op wrapper for linear attention computation only.
+    """
+    context = get_forward_context()
+    forward_batch = context.forward_batch
+    attention_layers = context.attention_layers
+    parent_layer = attention_layers[layer_id]
+
+    # For models like Qwen3Next, the RadixLinearAttention is stored
+    # as a sub-component (parent_layer.linear_attn.linear_attn)
+    # Navigate to get the actual RadixLinearAttention
+    if hasattr(parent_layer, 'linear_attn'):
+        gdn_layer = parent_layer.linear_attn
+        if hasattr(gdn_layer, 'linear_attn'):
+            attention_layer = gdn_layer.linear_attn
+        else:
+            attention_layer = gdn_layer
+    else:
+        attention_layer = parent_layer
+
+    ret = forward_batch.attn_backend.forward(
+        layer=attention_layer,
+        forward_batch=forward_batch,
+        mixed_qkv=mixed_qkv,
+        a=a,
+        b=b,
+    )
+
+    assert (
+        output.numel() == ret.numel()
+    ), f"Output tensor element mismatch: {output.numel()} != {ret.numel()}"
+
+    output.view(ret.shape).copy_(ret)
+    return
