@@ -817,7 +817,10 @@ mod tests {
 
     async fn create_test_app_context() -> Arc<AppContext> {
         use crate::{
-            config::RouterConfig, core::WorkerService, middleware::TokenBucket,
+            config::RouterConfig,
+            core::WorkerService,
+            middleware::TokenBucket,
+            multimodal::{MediaConnector, MediaConnectorConfig},
             observability::inflight_tracker::InFlightRequestTracker,
         };
 
@@ -827,6 +830,10 @@ mod tests {
 
         let worker_registry = Arc::new(crate::core::WorkerRegistry::new());
         let worker_job_queue = Arc::new(std::sync::OnceLock::new());
+        let media_connector = Arc::new(
+            MediaConnector::new(client.clone(), MediaConnectorConfig::default())
+                .expect("Failed to create test media connector"),
+        );
 
         // Note: Using uninitialized queue for tests to avoid spawning background workers
         // Jobs submitted during tests will queue but not be processed
@@ -860,6 +867,7 @@ mod tests {
                 router_config,
             )),
             inflight_tracker: InFlightRequestTracker::new(),
+            media_connector,
         })
     }
 
