@@ -218,6 +218,20 @@ def compute_topk_attention_chunked(
             torch.zeros((batch_size,), dtype=torch.float32, device=device),
         )
 
+    # CRITICAL: Device assertions to prevent segfault with CPU-offloaded KV cache
+    # Triton kernels CANNOT access CPU memory - they will cause illegal memory access
+    if k_buffer.device.type != "cuda":
+        raise RuntimeError(
+            f"compute_topk_attention_chunked requires k_buffer on CUDA, "
+            f"got {k_buffer.device}. KV cache may have been offloaded to CPU RAM. "
+            f"This will cause a segfault in Triton kernels."
+        )
+    if q.device != k_buffer.device:
+        raise RuntimeError(
+            f"Device mismatch: q on {q.device}, k_buffer on {k_buffer.device}. "
+            f"Both must be on the same CUDA device for Triton kernel."
+        )
+
     num_kv_heads = k_buffer.shape[1]
     kv_group_num = num_heads // num_kv_heads
 

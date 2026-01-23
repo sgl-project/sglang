@@ -149,6 +149,19 @@ def compute_topk_attention_tokens(
             torch.zeros((batch_size, top_k), dtype=torch.int64, device=device),
         )
 
+    # CRITICAL: Device assertions to prevent segfault with CPU-offloaded KV cache
+    # Triton kernels CANNOT access CPU memory - will cause illegal memory access
+    if k_buffer.device.type != "cuda":
+        raise RuntimeError(
+            f"compute_topk_attention_tokens requires k_buffer on CUDA, "
+            f"got {k_buffer.device}. KV cache may have been offloaded to CPU RAM."
+        )
+    if q.device != k_buffer.device:
+        raise RuntimeError(
+            f"Device mismatch: q on {q.device}, k_buffer on {k_buffer.device}. "
+            f"Both must be on the same CUDA device."
+        )
+
     # For small sequences, use direct PyTorch computation
     # For large sequences, use chunked Triton kernel
     use_triton = max_seq_len > 1024

@@ -1400,6 +1400,64 @@ class TritonAttnBackend(AttentionBackend):
                     )
                     return
 
+            # Handle CPU-offloaded KV cache: transfer to GPU for attention capture
+            # When using large contexts (1M+ tokens) with CPU offloading, k_buffer may
+            # reside in CPU RAM. Triton kernels cannot access CPU memory directly.
+            target_device = q.device
+            if k_buffer.device.type != "cuda" or k_buffer.device != target_device:
+                import logging
+
+                _logger = logging.getLogger(__name__)
+
+                # For very large KV caches, only transfer the needed portion
+                # This uses kv_indices to gather only referenced entries
+                if max_kv_idx > 0 and max_kv_idx < k_buffer.shape[0]:
+                    # Gather only the KV entries we actually need
+                    relevant_indices = kv_indices[:max_kv_idx].to(target_device)
+                    unique_locs, inverse_indices = relevant_indices.unique(
+                        return_inverse=True
+                    )
+
+                    # Transfer only unique KV entries (much smaller than full buffer)
+                    transfer_size_mb = (
+                        unique_locs.shape[0]
+                        * k_buffer.shape[1]
+                        * k_buffer.shape[2]
+                        * k_buffer.element_size()
+                        / (1024 * 1024)
+                    )
+                    _logger.warning(
+                        f"Attention capture: transferring {unique_locs.shape[0]} KV entries "
+                        f"({transfer_size_mb:.1f} MB) from {k_buffer.device} to {target_device}. "
+                        f"This adds PCIe latency. Consider disabling attention capture for "
+                        f"CPU-offloaded contexts or using fingerprint-only mode."
+                    )
+
+                    # Transfer subset and create remapped buffer
+                    k_buffer_subset = k_buffer[unique_locs.cpu()].to(
+                        target_device, non_blocking=False
+                    )
+
+                    # Create new sequential kv_indices that map to the subset
+                    kv_indices = inverse_indices  # Now indices into k_buffer_subset
+                    k_buffer = k_buffer_subset
+                    kv_indptr = kv_indptr.to(target_device)
+
+                    # Sync to ensure transfer completes before kernel launch
+                    torch.cuda.synchronize(target_device)
+                else:
+                    # Full transfer (fallback for edge cases)
+                    full_size_mb = k_buffer.numel() * k_buffer.element_size() / (1024 * 1024)
+                    _logger.warning(
+                        f"Attention capture: transferring full KV buffer "
+                        f"({full_size_mb:.1f} MB) from {k_buffer.device} to {target_device}. "
+                        f"This may cause significant PCIe latency."
+                    )
+                    k_buffer = k_buffer.to(target_device, non_blocking=False)
+                    kv_indptr = kv_indptr.to(target_device)
+                    kv_indices = kv_indices.to(target_device)
+                    torch.cuda.synchronize(target_device)
+
             topk_scores, topk_indices, topk_logits, logsumexp_candidates = (
                 compute_topk_attention_chunked(
                     q,
