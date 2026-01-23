@@ -148,14 +148,16 @@ def handle_tag_run_ci(gh_repo, pr, comment, user_perms, react_on_success=True):
 def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=True):
     """
     Handles the /rerun-failed-ci command.
-    Reruns workflows with 'failure' or 'skipped' conclusions.
+    Reruns workflows with 'failure', 'skipped', or 'cancelled' conclusions.
     Returns True if action was taken, False otherwise.
     """
     if not user_perms.get("can_rerun_failed_ci", False):
         print("Permission denied: can_rerun_failed_ci is false.")
         return False
 
-    print("Permission granted. Triggering rerun of failed or skipped workflows.")
+    print(
+        "Permission granted. Triggering rerun of failed, skipped, or cancelled workflows."
+    )
 
     # Get the SHA of the latest commit in the PR
     head_sha = pr.head.sha
@@ -188,13 +190,22 @@ def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=Tr
             except Exception as e:
                 print(f"Failed to rerun workflow {run.id}: {e}")
 
+        elif run.conclusion == "cancelled":
+            # Cancelled workflows may have failed jobs inside (e.g., due to concurrency cancellation)
+            print(f"Rerunning cancelled workflow: {run.name} (ID: {run.id})")
+            try:
+                run.rerun_failed_jobs()
+                rerun_count += 1
+            except Exception as e:
+                print(f"Failed to rerun workflow {run.id}: {e}")
+
     if rerun_count > 0:
         print(f"Triggered rerun for {rerun_count} workflows.")
         if react_on_success:
             comment.create_reaction("+1")
         return True
     else:
-        print("No failed or skipped workflows found to rerun.")
+        print("No failed, skipped, or cancelled workflows found to rerun.")
         return False
 
 
