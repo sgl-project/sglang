@@ -13,10 +13,8 @@ classifiers = [
   "Programming Language :: Python :: 3",
   "License :: OSI Approved :: Apache Software License",
 ]
-dependencies = ["aiohttp", "requests", "tqdm", "numpy", "IPython", "setproctitle"]
 
-[project.optional-dependencies]
-runtime_common = [
+dependencies = [
   "IPython",
   "aiohttp",
   "anthropic>=0.20.0",
@@ -69,6 +67,7 @@ runtime_common = [
   "bidict",
 ]
 
+[project.optional-dependencies]
 checkpoint-engine = ["checkpoint-engine==0.1.2"]
 diffusion = [
     "PyYAML==6.0.1",
@@ -103,8 +102,8 @@ test = [
 ]
 
 # https://docs.sglang.io/platforms/ascend_npu.html
-srt_npu = ["sglang[runtime_common]"]
-all_npu = ["sglang[srt_npu, diffusion]"]
+srt_npu = []
+all_npu = ["sglang[diffusion]"]
 dev_npu = ["sglang[all_npu]", "sglang[test]"]
 
 [project.urls]
