@@ -19,7 +19,10 @@ from pathlib import Path
 
 # Add the ci_register module path directly to avoid heavy sglang imports
 sys.path.insert(
-    0, str(Path(__file__).parent.parent.parent / "python" / "sglang" / "test" / "ci")
+    0,
+    str(
+        Path(__file__).parent.parent.parent.parent / "python" / "sglang" / "test" / "ci"
+    ),
 )
 
 from ci_register import CIRegistry, HWBackend, ut_parse_one_file
@@ -450,7 +453,7 @@ def main():
     args = parser.parse_args()
 
     # Change to repo root if needed
-    script_dir = Path(__file__).parent
+    script_dir = Path(__file__).parent.parent
     repo_root = script_dir.parent.parent
     os.chdir(repo_root)
 
