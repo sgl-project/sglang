@@ -496,10 +496,11 @@ def run_dp_sharded_mrope_vision_model(
 
     """
     from sglang.srt.layers.dp_attention import (
-        get_attention_tp_size,
         get_attention_tp_group,
-        get_attention_tp_rank
+        get_attention_tp_rank,
+        get_attention_tp_size,
     )
+
     tp_size = get_attention_tp_size()
     if tp_size == 1:
         return vision_model(pixel_values, grid_thw=torch.tensor(grid_thw_list))
@@ -618,7 +619,9 @@ def run_dp_sharded_mrope_vision_model(
         image_embeds_local_padded = image_embeds_local
 
     # Do all_gather to collect embeddings from all ranks
-    gathered_embeds = get_attention_tp_group().all_gather(image_embeds_local_padded, dim=0)
+    gathered_embeds = get_attention_tp_group().all_gather(
+        image_embeds_local_padded, dim=0
+    )
 
     # Remove padding and reconstruct per-rank embeddings
     rank_embeddings = list[torch.Tensor]()

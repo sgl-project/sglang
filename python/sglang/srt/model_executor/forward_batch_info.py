@@ -861,8 +861,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         if self.mrope_positions is not None:
             self.mrope_positions = torch.cat(
-                [self.mrope_positions, 
-                self.mrope_positions.new_zeros(3, num_tokens - self.mrope_positions.shape[1])],
+                [
+                    self.mrope_positions,
+                    self.mrope_positions.new_zeros(
+                        3, num_tokens - self.mrope_positions.shape[1]
+                    ),
+                ],
                 dim=1,
             )
 
