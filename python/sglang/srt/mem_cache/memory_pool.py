@@ -304,8 +304,9 @@ class MambaPool:
                     f"conv_state size: {get_tensor_size_bytes(conv_state) / GB:.2f}GB, "
                     f"ssm_state size: {get_tensor_size_bytes(temporal_state) / GB:.2f}GB "
                 )
+            # The padded slot 0 is used for writing dummy outputs from padded tokens.
             self.free_slots = torch.arange(
-                self.size, dtype=torch.int64, device=self.device
+                1, self.size + 1, dtype=torch.int64, device=self.device
             )
             self.mem_usage = self.mamba_cache.mem_usage_bytes() / GB
             self.num_mamba_layers = num_mamba_layers
@@ -339,7 +340,9 @@ class MambaPool:
         self.free_slots = torch.cat((self.free_slots, free_index))
 
     def clear(self):
-        self.free_slots = torch.arange(self.size, dtype=torch.int64, device=self.device)
+        self.free_slots = torch.arange(
+            1, self.size + 1, dtype=torch.int64, device=self.device
+        )
 
     def copy_from(self, src_index: torch.Tensor, dst_index: torch.Tensor):
         for i in range(len(self.mamba_cache.conv)):

@@ -2412,14 +2412,12 @@ class ServerArgs:
                 self.enable_dynamic_batch_tokenizer = False
 
     def _handle_environment_variables(self):
-        os.environ["SGLANG_ENABLE_TORCH_COMPILE"] = (
-            "1" if self.enable_torch_compile else "0"
-        )
-        os.environ["SGLANG_MAMBA_SSM_DTYPE"] = self.mamba_ssm_dtype
-        os.environ["SGLANG_DISABLE_OUTLINES_DISK_CACHE"] = (
+        envs.SGLANG_ENABLE_TORCH_COMPILE.set("1" if self.enable_torch_compile else "0")
+        envs.SGLANG_MAMBA_SSM_DTYPE.set(self.mamba_ssm_dtype)
+        envs.SGLANG_DISABLE_OUTLINES_DISK_CACHE.set(
             "1" if self.disable_outlines_disk_cache else "0"
         )
-        os.environ["SGLANG_ENABLE_DETERMINISTIC_INFERENCE"] = (
+        envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.set(
             "1" if self.enable_deterministic_inference else "0"
         )
         # Set the highest strict level for Kimi K2 tool calls
@@ -4022,7 +4020,7 @@ class ServerArgs:
             "--hicache-storage-backend-extra-config",
             type=str,
             default=ServerArgs.hicache_storage_backend_extra_config,
-            help="A dictionary in JSON string format containing extra configuration for the storage backend.",
+            help="A dictionary in JSON string format, or a string starting with a leading '@' and a config file in JSON/YAML/TOML format, containing extra configuration for the storage backend.",
         )
 
         # Hierarchical sparse attention
