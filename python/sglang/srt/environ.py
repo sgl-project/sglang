@@ -174,6 +174,7 @@ class Envs:
     # Constrained Decoding (Grammar)
     SGLANG_GRAMMAR_POLL_INTERVAL = EnvFloat(0.005)
     SGLANG_GRAMMAR_MAX_POLL_ITERATIONS = EnvInt(10000)
+    SGLANG_DISABLE_OUTLINES_DISK_CACHE = EnvBool(False)
 
     # CuTe DSL GDN Decode
     SGLANG_USE_CUTEDSL_GDN_DECODE = EnvBool(False)
@@ -408,6 +409,10 @@ class Envs:
     # MM splitting behavior control
     SGLANG_ENABLE_MM_SPLITTING = EnvBool(False)
 
+    # Mamba
+    SGLANG_MAMBA_CONV_DTYPE = EnvStr("bfloat16")
+    SGLANG_MAMBA_SSM_DTYPE = EnvStr("float32")
+
     # Release & Resume Memory
     SGLANG_MEMORY_SAVER_CUDA_GRAPH = EnvBool(False)
 
@@ -448,6 +453,8 @@ class Envs:
     # TokenizerManager
     SGLANG_REQUEST_STATE_WAIT_TIMEOUT = EnvInt(4)
 
+    # Aiter
+    SGLANG_USE_AITER_FP8_PER_TOKEN = EnvBool(False)
     # fmt: on
 
 
