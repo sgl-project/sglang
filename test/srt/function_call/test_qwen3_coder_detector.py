@@ -58,13 +58,15 @@ class TestQwen3CoderDetector(unittest.TestCase):
         result = self.detector.parse_streaming_increment(
             "<parameter=city>Shanghai</parameter>", self.tools
         )
-        self.assertEqual(len(result.calls), 1)
-        self.assertEqual(result.calls[0].parameters, '{"city": "Shanghai"')
+        self.assertGreaterEqual(len(result.calls), 1)
+        self.assertEqual(
+            "".join([c.parameters for c in result.calls]), '{"city": "Shanghai"'
+        )
 
         # End
         result = self.detector.parse_streaming_increment("</tool_call>", self.tools)
-        self.assertEqual(len(result.calls), 1)
-        self.assertEqual(result.calls[0].parameters, "}")
+        self.assertGreaterEqual(len(result.calls), 1)
+        self.assertEqual("".join([c.parameters for c in result.calls]), "}")
 
 
 if __name__ == "__main__":

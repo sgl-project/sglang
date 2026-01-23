@@ -1,6 +1,4 @@
-import json
 import logging
-import re
 from typing import List
 
 from sglang.srt.entrypoints.openai.protocol import Tool
@@ -8,8 +6,11 @@ from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
     StructureInfo,
+    ToolCallItem,
     _GetInfoFunc,
 )
+from sglang.srt.function_call.state_machine import JsonConfig
+from sglang.srt.function_call.universal_state_machine import UniversalJsonStateMachine
 
 logger = logging.getLogger(__name__)
 
@@ -35,14 +36,22 @@ class Qwen25Detector(BaseFormatDetector):
         Initializes the detector with necessary state variables.
         """
         super().__init__()
-        self.bot_token = "<tool_call>\n"
-        self.eot_token = "\n</tool_call>"
-        self.tool_call_separator = "\n"
-        self._normal_text_buffer = ""  # Buffer for handling partial end tokens
+        self.sm = UniversalJsonStateMachine(
+            JsonConfig(prefix="<tool_call>\n", suffix="\n</tool_call>")
+        )
+        self._tool_indices = {}
+        self._reset_streaming_state()
+
+    def _reset_streaming_state(self):
+        self._buffer = ""
+        self.current_tool_id = -1
+        self.prev_tool_call_arr = []
+        self.streamed_args_for_tool = []
+        self.sm.reset()
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a Qwen 2.5 format tool call."""
-        return self.bot_token in text
+        return "<tool_call>" in text
 
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
         """
@@ -52,65 +61,96 @@ class Qwen25Detector(BaseFormatDetector):
         :param tools: List of available tools.
         :return: ParseResult indicating success or failure, consumed text, leftover text, and parsed calls.
         """
-        idx = text.find(self.bot_token)
-        normal_text = text[:idx].strip() if idx != -1 else text
-        if self.bot_token not in text:
-            return StreamingParseResult(normal_text=normal_text, calls=[])
-
-        # Find all <tool_call>\n...\n</tool_call> blocks
-        pattern = rf"{re.escape(self.bot_token)}(.*?){re.escape(self.eot_token)}"
-        match_result_list = re.findall(pattern, text, re.DOTALL)
+        self.sm.reset()
+        result = self.sm.parse(text)
         calls = []
-        for match_result in match_result_list:
-            try:
-                parsed_call = json.loads(match_result.strip())
-                calls.extend(self.parse_base_json(parsed_call, tools))
-            except json.JSONDecodeError as e:
-                logger.warning(
-                    f"Failed to parse JSON part: {match_result}, JSON parse error: {str(e)}"
-                )
-                continue
-        return StreamingParseResult(normal_text=normal_text, calls=calls)
+        for tool in result.completed_tools:
+            if isinstance(tool, dict):
+                parsed_calls = self.parse_base_json(tool, tools)
+                calls.extend(parsed_calls)
+                self.current_tool_id += len(parsed_calls)
+        return StreamingParseResult(normal_text=result.normal_text, calls=calls)
 
     def parse_streaming_increment(
         self, new_text: str, tools: List[Tool]
     ) -> StreamingParseResult:
-        """
-        Streaming incremental parsing for Qwen 2.5 tool calls.
-        Uses base class implementation with buffering to handle partial end tokens.
-        """
-        result = super().parse_streaming_increment(new_text, tools)
+        if not self._tool_indices:
+            self._tool_indices = self._get_tool_indices(tools)
 
-        # Handle partial end tokens that are streamed character by character
-        if result.normal_text:
-            self._normal_text_buffer += result.normal_text
+        result = self.sm.parse(new_text)
+        calls: List[ToolCallItem] = []
 
-            # Check if buffer contains complete end token (without leading newline)
-            end_token_without_newline = self.eot_token[1:]  # "</tool_call>"
-            if end_token_without_newline in self._normal_text_buffer:
-                cleaned_text = self._normal_text_buffer.replace(
-                    end_token_without_newline, ""
-                )
-                self._normal_text_buffer = ""
-                result.normal_text = cleaned_text
-            else:
-                # Check if buffer might contain partial end token at the end
-                partial_match_len = self._ends_with_partial_token(
-                    self._normal_text_buffer, end_token_without_newline
-                )
+        for event in result.events:
+            if event.event_type == "tool_start":
+                while len(self.prev_tool_call_arr) <= self.current_tool_id + 1:
+                    self.prev_tool_call_arr.append({})
+                while len(self.streamed_args_for_tool) <= self.current_tool_id + 1:
+                    self.streamed_args_for_tool.append("")
 
-                if partial_match_len:
-                    # Keep potential partial match in buffer, return the rest
-                    result.normal_text = self._normal_text_buffer[:-partial_match_len]
-                    self._normal_text_buffer = self._normal_text_buffer[
-                        -partial_match_len:
-                    ]
+                if self.current_tool_id == -1 or self.prev_tool_call_arr[
+                    self.current_tool_id
+                ].get("name"):
+                    self.current_tool_id += 1
+                    while len(self.prev_tool_call_arr) <= self.current_tool_id:
+                        self.prev_tool_call_arr.append({})
+                    while len(self.streamed_args_for_tool) <= self.current_tool_id:
+                        self.streamed_args_for_tool.append("")
+
+                    calls.append(
+                        ToolCallItem(
+                            tool_index=self.current_tool_id, name=None, parameters=""
+                        )
+                    )
                 else:
-                    # No partial match, return all buffered text
-                    result.normal_text = self._normal_text_buffer
-                    self._normal_text_buffer = ""
+                    # Nameless tool call already started, nothing to update until JSON starts
+                    pass
 
-        return result
+            elif event.event_type == "text_delta" and self.current_tool_id != -1:
+                delta = event.text_delta or ""
+                self.streamed_args_for_tool[self.current_tool_id] += delta
+
+                if not self.prev_tool_call_arr[self.current_tool_id].get("name"):
+                    try:
+                        from partial_json_parser.core.options import Allow
+
+                        from sglang.srt.function_call.utils import _partial_json_loads
+
+                        parsed, _ = _partial_json_loads(
+                            self.streamed_args_for_tool[self.current_tool_id], Allow.ALL
+                        )
+                        if isinstance(parsed, dict) and "name" in parsed:
+                            name = parsed["name"]
+                            self.prev_tool_call_arr[self.current_tool_id]["name"] = name
+                            for call in calls:
+                                if (
+                                    call.tool_index == self.current_tool_id
+                                    and call.name is None
+                                ):
+                                    call.name = name
+                    except:
+                        pass
+
+                calls.append(
+                    ToolCallItem(tool_index=self.current_tool_id, parameters=delta)
+                )
+
+            elif event.event_type == "tool_end" and self.current_tool_id != -1:
+                if result.completed_tools:
+                    tool = result.completed_tools[-1]
+                    name = tool.get("name")
+                    self.prev_tool_call_arr[self.current_tool_id]["name"] = name
+                    self.prev_tool_call_arr[self.current_tool_id]["arguments"] = (
+                        tool.get("arguments", {})
+                    )
+
+                    for call in calls:
+                        if (
+                            call.tool_index == self.current_tool_id
+                            and call.name is None
+                        ):
+                            call.name = name
+
+        return StreamingParseResult(normal_text=result.normal_text, calls=calls)
 
     def structure_info(self) -> _GetInfoFunc:
         return lambda name: StructureInfo(

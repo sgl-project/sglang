@@ -4,8 +4,6 @@ from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel
 
-from sglang.srt.function_call.core_types import ToolCallItem
-
 
 class UniversalToolParserState(Enum):
     IDLE = auto()
@@ -20,11 +18,18 @@ class UniversalToolParserState(Enum):
     ERROR = auto()
 
 
+class ParserEvent(BaseModel):
+    event_type: str
+    name: Optional[str] = None
+    value: Optional[str] = None
+    text_delta: Optional[str] = None
+
+
 class ParseResult(BaseModel):
     state: UniversalToolParserState
     completed_tools: List[Dict[str, Any]]
     remaining: str
-    streaming_calls: List[ToolCallItem] = []
+    events: List[ParserEvent] = []
     normal_text: str = ""
     error: Optional[str] = None
 
@@ -51,6 +56,8 @@ class JsonConfig(BaseModel):
     suffix: Optional[str] = None
     is_array: bool = True
     is_markdown: bool = False
+    name_prefix: Optional[str] = None
+    name_suffix: Optional[str] = None
 
 
 class ToolParserStateMachine(ABC):
@@ -61,3 +68,18 @@ class ToolParserStateMachine(ABC):
         Returns a ParseResult containing the new state and any completed tools.
         """
         pass
+
+    @abstractmethod
+    def reset(self):
+        """Reset the state machine to its initial state."""
+        pass
+
+    def _ends_with_partial(self, buffer: str, tokens: List[Optional[str]]) -> int:
+        max_partial = 0
+        for token in tokens:
+            if not token:
+                continue
+            for i in range(1, min(len(buffer), len(token)) + 1):
+                if token.startswith(buffer[-i:]):
+                    max_partial = max(max_partial, i)
+        return max_partial

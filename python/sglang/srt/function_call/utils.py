@@ -1,5 +1,6 @@
 from json import JSONDecodeError, JSONDecoder
 from json.decoder import WHITESPACE
+from types import SimpleNamespace
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 import orjson
@@ -78,9 +79,7 @@ def _get_tool_schema_defs(tools: List[Tool]) -> dict:
         for def_name, def_schema in defs.items():
             if def_name in all_defs and all_defs[def_name] != def_schema:
                 raise ValueError(
-                    f"Tool definition '{def_name}' has "
-                    "multiple schemas, which is not "
-                    "supported."
+                    f"Tool definition '{def_name}' has multiple schemas, which is not supported."
                 )
             else:
                 all_defs[def_name] = def_schema
@@ -243,4 +242,81 @@ def get_json_schema_constraint(
             json_schema["$defs"] = json_schema_defs
         return json_schema
 
+    return None
+
+
+def get_argument_type(
+    func_name: str, arg_key: str, defined_tools: Any
+) -> Optional[str]:
+    # Handle both list of tools and single tool or dict
+    if not isinstance(defined_tools, list):
+        if defined_tools:
+            defined_tools = [defined_tools]
+        else:
+            return None
+
+    for tool in defined_tools:
+        t_name = ""
+        # Handle Tool object (pydantic), SimpleNamespace, or dict
+        if hasattr(tool, "function"):
+            func = tool.function
+            if hasattr(func, "name"):
+                t_name = func.name
+            elif isinstance(func, dict):
+                t_name = func.get("name", "")
+        elif isinstance(tool, dict):
+            if "function" in tool:
+                func = tool["function"]
+                if isinstance(func, dict):
+                    t_name = func.get("name", "")
+                elif hasattr(func, "name"):
+                    t_name = func.name
+                elif isinstance(func, SimpleNamespace):
+                    t_name = getattr(func, "name", "")
+            else:
+                t_name = tool.get("name", "")
+        elif hasattr(tool, "name"):
+            t_name = tool.name
+        elif isinstance(tool, SimpleNamespace):
+            t_name = getattr(tool, "name", "")
+
+        if t_name == func_name:
+            params = None
+            if hasattr(tool, "function"):
+                func = tool.function
+                if hasattr(func, "parameters"):
+                    params = func.parameters
+                elif isinstance(func, dict):
+                    params = func.get("parameters")
+            elif isinstance(tool, dict):
+                params = tool.get("function", {}).get("parameters") or tool.get(
+                    "parameters"
+                )
+            elif hasattr(tool, "parameters"):
+                params = tool.parameters
+            elif isinstance(tool, SimpleNamespace):
+                params = getattr(tool, "parameters", None)
+
+            # Handle parameters as dict or SimpleNamespace
+            if isinstance(params, SimpleNamespace):
+                params = vars(params)
+
+            if isinstance(params, dict):
+                properties = params.get("properties")
+                if not isinstance(properties, dict):
+                    # Some models put properties at top level or in a different way
+                    if "type" in params and params["type"] == "object":
+                        properties = params.get("properties", {})
+                    else:
+                        properties = params
+
+                if isinstance(properties, SimpleNamespace):
+                    properties = vars(properties)
+
+                if isinstance(properties, dict):
+                    schema = properties.get(arg_key)
+                    if schema:
+                        if isinstance(schema, SimpleNamespace):
+                            schema = vars(schema)
+                        return infer_type_from_json_schema(schema)
     return None
