@@ -59,9 +59,6 @@ from sglang.srt.speculative.spec_utils import (
     load_token_map,
     select_top_k_tokens,
 )
-from sglang.srt.speculative.auto_eagle import (
-    AutoTunerEagle,
-)
 from sglang.srt.utils import (
     MultiprocessingSerializer,
     empty_context,
@@ -107,7 +104,6 @@ class EAGLEWorker(TpModelWorker):
         )
         self.auto_spec = server_args.auto_spec
         if self.auto_spec:
-            # self.spec_auto_tuner = AutoTunerEagle(server_args, gpu_id)  # todo init eagle AutoTuner
             self.spec_auto_tuner = server_args.spec_auto_tuner
         # Override the context length of the draft model to be the same as the target model.
         server_args.context_length = target_worker.model_runner.model_config.context_len
@@ -244,7 +240,7 @@ class EAGLEWorker(TpModelWorker):
         self.draft_model_runner.draft_attn_backend_for_steps = {}
         # Create multi-step attn backends and cuda graph runners
         for num_steps in self.spec_auto_tuner.step_range:
-            logger.info(f"[MY LOG] EAGLEWorker.init_attention_backend_for_steps, num_steps={num_steps}")
+            logger.info(f"[AUTOSPEC] EAGLEWorker.init_attention_backend_for_steps, num_steps={num_steps}")
             draft_backend_factory = DraftBackendFactory(
                 self.server_args,
                 self.draft_model_runner,
@@ -263,7 +259,7 @@ class EAGLEWorker(TpModelWorker):
             self.draft_model_runner.draft_attn_backend_for_steps[num_steps] = self.draft_attn_backend_for_steps[num_steps]
         # set current backend
         for num_steps, attn_backend in self.draft_model_runner.draft_attn_backend_for_steps.items():
-            logger.info(f"[MY LOG] EAGLEWorker.init_attention_backend_for_steps, step={num_steps}, id attn_backend={id(attn_backend)}")
+            logger.debug(f"[AUTOSPEC] EAGLEWorker.init_attention_backend_for_steps, step={num_steps}, id attn_backend={id(attn_backend)}")
         assert len(self.spec_auto_tuner.step_range) > 0  # make sure the step_range has values to avoid index out of range
         initial_step = self.spec_auto_tuner.step_range[-1]
         self.draft_attn_backend = self.draft_attn_backend_for_steps[initial_step]
@@ -328,7 +324,7 @@ class EAGLEWorker(TpModelWorker):
         }
         # Capture draft
         for num_steps in self.spec_auto_tuner.step_range:
-            logger.info(f"[MY LOG] EAGLEWorker.init_cuda_graphs_for_steps, num_steps={num_steps}")
+            logger.info(f"[AUTOSPEC] EAGLEWorker.init_cuda_graphs_for_steps, num_steps={num_steps}")
             # eagle_worker parameters
             self.speculative_num_steps = num_steps
             self.topk = 1
@@ -372,7 +368,7 @@ class EAGLEWorker(TpModelWorker):
                 logger.info(
                     f"Capture draft extend cuda graph end, num_step: {num_steps}. Time elapsed: {time.perf_counter() - tic:.2f} s. mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB."
                 )
-            logger.info(f"[MY LOG] EAGLEWorker.init_cuda_graphs_for_steps, num_steps={num_steps} capture ends")
+            logger.debug(f"[AUTOSPEC] EAGLEWorker.init_cuda_graphs_for_steps, num_steps={num_steps} capture ends")
 
         assert len(
             self.spec_auto_tuner.step_range) > 0  # make sure the step_range has values to avoid index out of range
@@ -442,12 +438,8 @@ class EAGLEWorker(TpModelWorker):
             if self.auto_spec:
                 best_params = self.spec_auto_tuner.get_best_parameters(batch.batch_size())
                 if self.speculative_num_steps != best_params.num_steps:  # if same as last step, no need to update
-                    logger.info(f"[MY LOG] bs {batch.batch_size()}, speculative_num_steps before change: {self.speculative_num_steps}")
                     self.update_member_spec_parameter(best_params)
-                    logger.info(f"[MY LOG] bs {batch.batch_size()}, speculative_num_steps after change: {self.speculative_num_steps}")
                     self.set_current_graph_and_backend_by_spec_parameter()
-                else:
-                    logger.info(f"[MY LOG] bs {batch.batch_size()}, speculative_num_steps fixed to {self.speculative_num_steps}")
             with self.draft_tp_context(
                 self.draft_model_runner.tp_group
             ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
@@ -1151,7 +1143,7 @@ class EAGLEWorker(TpModelWorker):
 
     def update_member_spec_parameter(self, best_params):
         """
-        get current best parameter and update all parameters relative to spec_num_steps
+        Get current best parameter and update all parameters relative to spec_num_steps
         """
         # set eagle_worker params
         self.speculative_num_steps, self.topk, self.speculative_num_draft_tokens = best_params.num_steps, best_params.topk, best_params.num_draft

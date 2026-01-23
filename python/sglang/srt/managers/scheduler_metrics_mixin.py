@@ -480,7 +480,6 @@ class SchedulerMetricsMixin:
             )
 
     def get_metrics(self, bs: int, num_accepted_tokens: int, speculative_num_draft_tokens: int):
-        # logger.info(f"[MY LOG] SchedulerMetricsMixin get_metrics_v2, bs={bs}, num_accepted_tokens={num_accepted_tokens}, speculative_num_draft_tokens={speculative_num_draft_tokens}")
         avg_spec_accept_length = (num_accepted_tokens + bs) / bs
         avg_spec_accept_rate = avg_spec_accept_length / speculative_num_draft_tokens
         return avg_spec_accept_length, avg_spec_accept_rate, 0

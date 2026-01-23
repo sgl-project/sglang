@@ -516,8 +516,8 @@ class EAGLEDraftExtendCudaGraphRunnerAuto(EAGLEDraftExtendCudaGraphRunner):
         self.require_attn_tp_gather = require_attn_tp_gather(model_runner.server_args)
         self.tp_size = self.model_runner.tp_size
         self.dp_size = self.model_runner.dp_size
-        self.speculative_num_steps = speculative_num_steps  # todo use current num_step for the parameter
-        self.topk = 1  # todo use current topk for the parameter
+        self.speculative_num_steps = speculative_num_steps
+        self.topk = 1
         self.enable_profile_cuda_graph = (
             model_runner.server_args.enable_profile_cuda_graph
         )

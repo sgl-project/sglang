@@ -316,7 +316,7 @@ class Scheduler(
         if self.auto_spec:
             self.spec_auto_tuner = AutoTunerEagle(server_args)
             server_args.spec_auto_tuner = self.spec_auto_tuner
-        # add idle flag to, auto_spec tune results will be saved to file when idle
+        # add idle flag, auto_spec tune results will be saved to file when idle
         self.last_loop_is_idle = True
 
         # Distributed rank info
@@ -1096,6 +1096,7 @@ class Scheduler(
             else:
                 if not self.last_loop_is_idle and self.server_args.save_tune_results:
                     with open(self.model_worker.spec_auto_tuner.spec_tune_file, "w") as f:
+                        logger.info(f"[AUTOSPEC] auto tune results saved to file: {self.model_worker.spec_auto_tuner.spec_tune_file}")
                         json.dump(self.model_worker.spec_auto_tuner.results, f)
                 # When the server is idle, do self-check and re-init some states
                 self.self_check_during_idle()
@@ -2444,11 +2445,8 @@ class Scheduler(
             self.process_batch_result_idle(batch, result)
 
         if self.auto_spec and batch.forward_mode.is_decode() and self.model_worker.spec_auto_tuner.enable_watch_for_batch(batch.batch_size()):
-            logger.info(f"[MY LOG] auto_spec enabled, batchsize: {batch.batch_size()}")
             accept_length, accept_rate, throughput = self.get_metrics(batch.batch_size(), result.num_accepted_tokens, self.model_worker.speculative_num_draft_tokens)
             self.model_worker.spec_auto_tuner.compute_and_update_best_parameters(batch.batch_size(), accept_length, accept_rate, throughput)
-        elif self.auto_spec and batch.forward_mode.is_decode():
-            logger.info(f"[MY LOG] batchsize {batch.batch_size()}, fix parameter, skip computing.")
 
         self.log_batch_result_stats(batch, result)
         self._maybe_clear_mm_inputs(batch)

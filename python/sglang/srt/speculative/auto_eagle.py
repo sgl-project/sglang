@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 class TuningParams:
     def __init__(self, num_steps: int=5, topk: int=1, num_draft: int=6):
-        """todo add tunable param set for spec infer"""
+        """Add tunable param set for spec infer"""
         self.num_steps: int = num_steps
         self.topk: int = topk  # fixed for auto_spec
         self.num_draft: int = num_draft  # num_steps+1 for auto_spec
@@ -31,6 +31,8 @@ class AutoTunerEagle:
         self.device_id = server_args.device
         self.model_name = server_args.served_model_name or server_args.model_path
         self.speculative_config_file = server_args.speculative_config_file
+
+        # empirical settings for tuning params and tuning thresholds
         self.exp_setting = {
             1: TuningParams(5, 1, 6),
             2: TuningParams(5, 1, 6),
@@ -43,14 +45,19 @@ class AutoTunerEagle:
         }
         self.exp_pos_threshold = {1: 0.55, 2: 0.55, 4: 0.6, 8: 0.8, 16: 0.95, 32: 0.91, 64: 0.95, 128: 0.95}
         self.exp_neg_threshold = {1: 0.5, 2: 0.5, 4: 0.5, 8: 0.5, 16: 0.6, 32: 0.66, 64: 0.65, 128: 0.65}
+
         # for memory control
         self.step_thres = 6  # control maximum graph number, graph whose num_steps > threshold will be deleted first
         self.reserve_mem = 4
         self.mem_each_graph = 2
+
+        # save auto tune results
         self.save_tune_results = server_args.save_tune_results
         if self.save_tune_results is not None:
             os.makedirs(self.save_tune_results, exist_ok=True)
             self.spec_tune_file = os.path.join(self.save_tune_results, "spec_tune_results.json")
+
+        # auto tune threshold based on server args
         self.neg_threshold = None
         self.pos_threshold = None
         if server_args.neg_threshold is not None:
@@ -63,15 +70,16 @@ class AutoTunerEagle:
         # 1. get remaining memory size, determines how many cuda graphs to capture
         available_memory = get_available_gpu_memory(self.device_id, gpu_id, empty_cache=False)
         self.max_num_graphs = int((available_memory - self.reserve_mem) // self.mem_each_graph)
-        logger.info(f"AutoTunerEagle, max num_graphs to capture for different steps: {self.max_num_graphs}")
+        logger.info(f"[AUTOSPEC] AutoTunerEagle, max num_graphs to capture for different steps: {self.max_num_graphs}")
 
-        # load speculative config file
+        # 2. Load speculative config file
         self._init_speculative_config()
 
-        # init original_bs: bs lookup for all bs, since parameters are only recorded for bs in --cuda-graph-bs
+        # 3. Init original_bs: bs lookup for all bs, since parameters are only recorded for bs in bs_list, other batchsizes
+        # follows their closest recorded bs
         self._generate_closest_bs_mapping()
 
-        # 2. set accept rate to increase or decrease num_steps for different batchsizes
+        # 4. Set accept rate thresholds to increase or decrease num_steps for different batchsizes
         self.thres_positive_accept_rate = {bs: self.exp_pos_threshold[bs] for bs in self.bs_steps_mapping.keys()}
         self.thres_negative_accept_rate = {bs: self.exp_neg_threshold[bs] for bs in self.bs_steps_mapping.keys()}
         if self.pos_threshold is not None:
@@ -82,20 +90,21 @@ class AutoTunerEagle:
             assert len(self.neg_threshold) == len(self.thres_negative_accept_rate)
             for i, bs in enumerate(self.thres_negative_accept_rate.keys()):
                 self.thres_negative_accept_rate[bs] = self.neg_threshold[i]
-        logger.info(f"[MY LOG] AutoTunerEagle, pos_thresholds: {self.thres_positive_accept_rate}; neg_thresholds: {self.thres_negative_accept_rate}")
+        logger.info(f"[AUTOSPEC] AutoTunerEagle, pos_thresholds: {self.thres_positive_accept_rate}; neg_thresholds: {self.thres_negative_accept_rate}")
 
-        # 3. initialise recorded speculative parameters
+        # 5. Initialise recorded speculative parameters
         self.best_speculative_parameters: Dict[int, TuningParams] = {bs: self.exp_setting[bs] for bs in self.bs_list}
         for bs, params in self.best_speculative_parameters.items():
             if params.num_steps not in self.bs_steps_mapping[bs]:
                 self.best_speculative_parameters[bs] = TuningParams(self.bs_steps_mapping[bs][-1], 1, self.bs_steps_mapping[bs][-1] + 1)  # if intuitive params not in setting, reset
-        logger.info(f"[MY LOG] AutoTunerEagle, best_speculative_parameters init: {self._print_params()}")
+        logger.info(f"[AUTOSPEC] AutoTunerEagle, best_speculative_parameters init: {self._print_params()}")
+
+        # 6. Save tune results
         if self.save_tune_results:
             self.results = {bs: {num_steps: 0 for num_steps in self.bs_steps_mapping[bs]} for bs in self.bs_list}
 
     def _init_speculative_config(self):
         """Initialize speculative configuration from config file or use defaults."""
-
         # Default configuration
         default_bs_steps_mapping = {
             1: [3, 4, 5, 6],
@@ -108,7 +117,7 @@ class AutoTunerEagle:
             128: [1, 2, 3, 4]
         }
 
-        # Check if config file is provided
+        # 1. Get bs: [num_steps] mapping from config_file
         if self.speculative_config_file and os.path.exists(self.speculative_config_file):
             try:
                 with open(self.speculative_config_file, 'r') as f:
@@ -125,52 +134,50 @@ class AutoTunerEagle:
                             steps.sort()
                             self.bs_steps_mapping[bs] = steps
                         except ValueError:
-                            logger.warning(f"[MY LOG] AutoTunerEagle, config init. Invalid batch size in config: {bs_str}")
+                            logger.warning(f"[AUTOSPEC] AutoTunerEagle, config init. Invalid batch size in config: {bs_str}")
 
                     if self.bs_steps_mapping:
-                        logger.info(f"[MY LOG] AutoTunerEagle, config init. Loaded speculative config for model '{self.model_name}' from {self.speculative_config_file}, parameters: {self.bs_steps_mapping}")
+                        logger.info(f"[AUTOSPEC] AutoTunerEagle, config init. Loaded speculative config for model '{self.model_name}' from {self.speculative_config_file}, parameters: {self.bs_steps_mapping}")
                     else:
-                        logger.warning(f"[MY LOG] AutoTunerEagle, config init. No valid batch size configuration found for model '{self.model_name}', using defaults: {default_bs_steps_mapping}")
+                        logger.warning(f"[AUTOSPEC] AutoTunerEagle, config init. No valid batch size configuration found for model '{self.model_name}', using defaults: {default_bs_steps_mapping}")
                         self.bs_steps_mapping = default_bs_steps_mapping
                 else:
-                    logger.info(f"[MY LOG] AutoTunerEagle, config init. Model '{self.model_name}' not found in config file, using defaults: {default_bs_steps_mapping}")
+                    logger.info(f"[AUTOSPEC] AutoTunerEagle, config init. Model '{self.model_name}' not found in config file, using defaults: {default_bs_steps_mapping}")
                     self.bs_steps_mapping = default_bs_steps_mapping
 
             except (json.JSONDecodeError, IOError) as e:
-                logger.warning(f"[MY LOG] AutoTunerEagle, config init. Failed to load speculative config from {self.speculative_config_file}: {e}, using defaults: {default_bs_steps_mapping}")
+                logger.warning(f"[AUTOSPEC] AutoTunerEagle, config init. Failed to load speculative config from {self.speculative_config_file}: {e}, using defaults: {default_bs_steps_mapping}")
                 self.bs_steps_mapping = default_bs_steps_mapping
         else:
             # Use default configuration
             self.bs_steps_mapping = default_bs_steps_mapping
-            logger.info(f"[MY LOG] AutoTunerEagle, config init. Speculative config file has not been passed, using defaults: {self.bs_steps_mapping}")
+            logger.info(f"[AUTOSPEC] AutoTunerEagle, config init. Speculative config file has not been passed, using defaults: {self.bs_steps_mapping}")
 
+        # 2. Get step_range, eg: [1, 2, 3, 4, 5, 6], this determines what num_steps' graphs to capture
         self.step_range = list(set(step for steps in self.bs_steps_mapping.values() for step in steps))
         self.step_range.sort()
 
+        # 3. Get batch sizes, eg: [1, 2, 4, 8, 16, 32] and bs_range_dict, this records graphs of bs that will be captured,
+        # and decides the batchsize interval, i.e., batchsize 7 will follow the tuning paradigm of batchsize 8
         self.bs_list = list(self.bs_steps_mapping.keys())
         self.bs_list.sort()
         if self.cuda_graph_bs != self.bs_list:
-            logger.warning(f"AutoTunerEagle, cuda_graph_bs parameter different from speculative config dict, will capture graph according to speculative config.")
+            logger.warning(f"[AUTOSPEC] AutoTunerEagle, cuda_graph_bs parameter different from speculative config dict, will capture graph according to speculative config.")
 
-        self.bs_range_dict = {}
-        for i in range(len(self.bs_list) - 1):
-            self.bs_range_dict[self.bs_list[i]] = int((self.bs_list[i] + self.bs_list[i + 1]) // 2)
-
-        # Build reverse mapping: steps -> batch sizes
+        # 4. Build reverse mapping: steps -> batch sizes
         self.steps_bs_mapping = {}
         for bs, steps in self.bs_steps_mapping.items():
             for step in steps:
                 if step not in self.steps_bs_mapping:
                     self.steps_bs_mapping[step] = []
                 self.steps_bs_mapping[step].append(bs)
-
         # Sort batch sizes for each step
         for step in self.steps_bs_mapping:
             self.steps_bs_mapping[step].sort()
 
-        # deal with scenes when memory available is not enough for the given number of num_steps
+        # 5. Deal with scenes when memory available is not enough for the given number of num_steps
         if self.max_num_graphs < len(self.step_range):
-            logger.info(f"[MY LOG] AutoTunerEagle init, number of speculative steps to capture: {self.step_range} might exceed available memory.")
+            logger.info(f"[AUTOSPEC] AutoTunerEagle init, number of speculative steps to capture: {self.step_range} might exceed available memory.")
             step_range_thres = [step for step in self.step_range if step <= self.step_thres]
             if len(step_range_thres) <= self.max_num_graphs:  # eg: thres=6, max_num_graph=7, remove 8, 9
                 self.step_range = self.step_range[:self.max_num_graphs]
@@ -185,7 +192,7 @@ class AutoTunerEagle:
                     temp_step_range.append(self.step_range[2 * i + 1])
                 self.step_range = temp_step_range
                 self.step_range.sort()
-            logger.info(f"[MY LOG] AutoTunerEagle init, only capture for steps: {self.step_range}")
+            logger.info(f"[AUTOSPEC] AutoTunerEagle init, only capture for steps: {self.step_range}")
 
             # update self.bs_steps_mapping
             temp_bs_steps_mapping = {}
@@ -194,7 +201,7 @@ class AutoTunerEagle:
                 if len(temp_bs_steps_mapping[bs]) == 0:  # if all the steps of given bs is removed, set the bs as the steps_range
                     temp_bs_steps_mapping[bs] = self.step_range
             self.bs_steps_mapping = temp_bs_steps_mapping
-            logger.info(f"[MY LOG] AutoTunerEagle init, updated bs_steps_mapping: {self.bs_steps_mapping}")
+            logger.info(f"[AUTOSPEC] AutoTunerEagle init, updated bs_steps_mapping: {self.bs_steps_mapping}")
 
             # update steps_bs_mapping
             self.steps_bs_mapping = {}
@@ -203,7 +210,7 @@ class AutoTunerEagle:
                     if step not in self.steps_bs_mapping:
                         self.steps_bs_mapping[step] = []
                     self.steps_bs_mapping[step].append(bs)
-            logger.info(f"[MY LOG] AutoTunerEagle init, updated steps_bs_mapping: {self.steps_bs_mapping}")
+            logger.info(f"[AUTOSPEC] AutoTunerEagle init, updated steps_bs_mapping: {self.steps_bs_mapping}")
 
     def _find_closest_bs(self, target: Union[int, float]) -> Union[int, float, None]:
         """
@@ -242,17 +249,18 @@ class AutoTunerEagle:
         generate bs: cuda_graph_bs mapping during initialisation to avoid searching in each forward step
         eg: {1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 8, 8: 8, ..., 48: 32, 49: 64, ...}
         """
-
         start = self.bs_list[0]
         end = self.bs_list[-1]
 
+        # 1. Create bs to recorded bs mapping
         self.raw_bs_to_bs = {}
-
         for i in range(start, end + 1):
             closest = self._find_closest_bs(i)
             if closest is not None:
                 self.raw_bs_to_bs[i] = closest
 
+        # 2. Record if bs has only 1 possible spec params from config, if True, spec params will be fixed for certain
+        # batchsizes to avoid redundant computing
         self.bs_param_fix = {bs: False for bs in self.raw_bs_to_bs.keys()}
         bs_single_param = []
         for bs, num_steps in self.bs_steps_mapping.items():
@@ -272,9 +280,6 @@ class AutoTunerEagle:
         return msg
 
     def _update_speculative_params(self, bs: int, increase: bool = True):
-        # logger.info(f"[MY LOGS] AutoTunerEagle._update_speculative_params, bs={bs}, "
-        #             f"best_speculative_parameters={self.best_speculative_parameters}"
-        #             f"bs_steps_mapping={self.bs_steps_mapping}")
         if increase:
             self.best_speculative_parameters[bs].num_steps += 1
             self.best_speculative_parameters[bs].num_draft += 1
@@ -289,55 +294,46 @@ class AutoTunerEagle:
                 self.best_speculative_parameters[bs].num_draft -= 1
 
     def enable_watch_for_batch(self, bs: int):
+        """
+        Returns if bs only has one possible parameter
+        """
         if bs not in self.bs_param_fix.keys():
             bs = self.bs_list[-1]
-        logger.info(f"[MY LOG] batchsize {bs} enable_watch: {not self.bs_param_fix[bs]}")
         return not self.bs_param_fix[bs]
 
     def compute_and_update_best_parameters(self, bs, accept_length, accept_rate, throughput):
         """
-        calculate best parameters for current batch_size based on negative feedback method and update the
+        Calculate best parameters for current batch_size based on negative feedback method and update the
         settings for self.best_speculative_parameters
         """
-        # logger.info(f"[MY LOG]AutoTunerEagle compute_and_update_parameters, bs: {bs}, accept_length: {accept_length}, "
-        #             f"accept_rate: {accept_rate}, throughput: {throughput}")
         if bs not in self.raw_bs_to_bs.keys():
             bs = self.bs_list[-1]  # exceed max bs, set to max bs
         else:
             bs = self.raw_bs_to_bs[bs]
-        # logger.info(f"[MY LOG] AutoTunerEagle bs: {raw_bs}, compute_and_update_parameters round to nearest bs: {bs} ")
-        # logger.info(f"[MY LOG]AutoTunerEagle best_speculative_parameters before update: {self._print_params()}")
         accept_rate_pos_flag = accept_rate >= self.thres_positive_accept_rate[bs]
         accept_rate_neg_flag = accept_rate < self.thres_negative_accept_rate[bs]
-        # logger.info(f"[MY LOG] AutoTunerEagle compute_and_update_parameters, bs: {bs}, accept_rate: {accept_rate} vs threshold_neg: {self.thres_negative_accept_rate} vs threshold_pos: {self.thres_positive_accept_rate}")
         if accept_rate_pos_flag:  # increase parameter
-            # logger.info(f"[MY LOG] AutoTunerEagle compute_and_update_parameters, should increase")
-            if self.best_speculative_parameters[bs].num_steps < self.bs_steps_mapping[bs][-1]:
+            if self.best_speculative_parameters[bs].num_steps < self.bs_steps_mapping[bs][-1]:  # cannot exceed step range
                 self._update_speculative_params(bs, True)
                 if self.save_tune_results:
                     self.results[bs][self.best_speculative_parameters[bs].num_steps] += 1
                 return
-            # else:
-            #     logger.info(f"[MY LOG] AutoTunerEagle compute_and_update_parameters, increase abandoned because step out of range")
-        elif accept_rate_neg_flag:  # decrease parameter, do not update last parameter
-            # logger.info(f"[MY LOG] AutoTunerEagle compute_and_update_parameters, should decrease")
-            if self.best_speculative_parameters[bs].num_steps > self.bs_steps_mapping[bs][0]:
+        elif accept_rate_neg_flag:  # decrease parameter
+            if self.best_speculative_parameters[bs].num_steps > self.bs_steps_mapping[bs][0]:  # cannot exceed step range
                 self._update_speculative_params(bs, False)
                 if self.save_tune_results:
                     self.results[bs][self.best_speculative_parameters[bs].num_steps] += 1
                 return
-            # else:
-            #     logger.info(f"[MY LOG] AutoTunerEagle compute_and_update_parameters, decrease abandoned because step out of range")
         # otherwise, parameters do not change
         if self.save_tune_results:
             self.results[bs][self.best_speculative_parameters[bs].num_steps] += 1
-        # logger.info(f"[MY LOG] AutoTunerEagle compute_and_update_parameters, should remain")
-        # logger.info(f"[MY LOG]AutoTunerEagle best_speculative_parameters after update: {self._print_params()}")
 
     def get_best_parameters(self, bs):
+        """
+        Get spec parameters for given batchsize
+        """
         if bs not in self.raw_bs_to_bs.keys():
             bs = self.bs_list[-1]  # exceed max bs, set to max bs
         else:
             bs = self.raw_bs_to_bs[bs]
-        # logger.info(f"[MY LOG]AutoTunerEagle get_best_parameters for bs {bs}, {self._print_params()}")
         return self.best_speculative_parameters[bs]

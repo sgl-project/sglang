@@ -577,7 +577,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self.init_device_graphs()
             else:
                 if not self.is_draft_worker:
-                    server_args.spec_auto_tuner.initialize(self.gpu_id)  # todo: at this time, calculate how many graph gpu is able to capture for diff num_steps
+                    server_args.spec_auto_tuner.initialize(self.gpu_id)
                 self.step_range = server_args.spec_auto_tuner.step_range
                 self.init_attention_backend_for_steps()
                 self.kernel_warmup()
@@ -1616,9 +1616,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.attn_backend = self._get_attention_backend()
 
     def init_attention_backend_for_steps(self):
-        """todo: auto_spec. Init attention kernel backend for different num_steps."""
+        """Init attention kernel backend for different num_steps."""
         self.attn_backend_for_steps = {}
-        for num_steps in self.step_range:  # todo 暂时不支持另外两个分支
+        for num_steps in self.step_range:
             if self.server_args.enable_pdmux:
                 self.attn_backend = self._get_attention_backend(init_new_workspace=True)
                 self.decode_attn_backend_group = []
@@ -1631,7 +1631,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self.server_args.speculative_num_steps = num_steps
                 self.server_args.speculative_num_draft_tokens = 1
                 self.server_args.speculative_num_draft_tokens = num_steps + 1
-                logger.info(f"[MY LOG] init_attention_backend_for_steps: num_steps={num_steps}")
+                logger.info(f"[AUTOSPEC] init_attention_backend_for_steps: num_steps={num_steps}")
                 self.attn_backend_for_steps[num_steps] = self._get_attention_backend()
         initial_steps = self.step_range[-1]
         self.server_args.speculative_num_steps = initial_steps
@@ -2049,7 +2049,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
 
     def init_device_graphs_for_steps(self):
-        """todo: auto_spec. Capture device graphs for different num_steps."""
+        """Capture device graphs for different num_steps."""
         self.graph_runner_for_steps = {}
         self.graph_runner = None
         self.graph_mem_usage = 0
@@ -2080,7 +2080,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             },
         )
         for num_steps in self.step_range:
-            logger.info(f"[MY LOG] ModelRunner init graph for num_steps={num_steps}")
+            logger.info(f"[AUTOSPEC] ModelRunner init graph for num_steps={num_steps}")
             before_mem_n = get_available_gpu_memory(self.device, self.gpu_id)
             self.server_args.speculative_num_steps = num_steps
             self.server_args.speculative_num_draft_tokens = 1
@@ -2089,8 +2089,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.graph_runner_for_steps[num_steps] = graph_runners[self.device](self)
             after_mem_n = get_available_gpu_memory(self.device, self.gpu_id)
             graph_mem_usage = before_mem_n - after_mem_n
-            logger.info(
-                f"[MY LOG] Capture num_step: {num_steps}, {'cpu graph' if self.device == 'cpu' else 'cuda graph'} end. Time elapsed: {time.perf_counter() - tic:.2f} s. "
+            logger.debug(
+                f"[AUTOSPEC] Capture num_step: {num_steps}, {'cpu graph' if self.device == 'cpu' else 'cuda graph'} end. Time elapsed: {time.perf_counter() - tic:.2f} s. "
                 f"mem usage={graph_mem_usage:.2f} GB. avail mem={after_mem_n:.2f} GB."
             )
         initial_steps = self.step_range[-1]

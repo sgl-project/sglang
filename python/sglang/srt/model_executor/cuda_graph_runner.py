@@ -219,12 +219,10 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner, num_tokens_per_bs=1):
 
 
 def get_batch_sizes_to_capture_for_steps(model_runner: ModelRunner, batchsizes: List[int] = None):
-    # todo autospec: get batchsizes for the given step to capture instead of all cuda graph batchsize
-    # todo this function can be merged with the original function
-    # information can be get from AutoTunerEagle
+    # get batchsizes for the given step to capture instead of all cuda graph batchsize
     server_args = model_runner.server_args
     if batchsizes:
-        capture_bs = batchsizes  # todo if batchsizes given for current step, do not get from server args
+        capture_bs = batchsizes
     else:
         capture_bs = server_args.cuda_graph_bs
 
