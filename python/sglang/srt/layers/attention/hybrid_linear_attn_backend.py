@@ -844,11 +844,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
         conv_weights = layer.conv_weights
         bias = layer.bias
         activation = layer.activation
-        key_dim = layer.key_dim
-        value_dim = layer.value_dim
-        attn_tp_size = layer.attention_tp_size
-        head_k_dim = layer.head_k_dim
+        head_qk_dim = layer.head_qk_dim
         head_v_dim = layer.head_v_dim
+        # Precomputed for torch.compile compatibility
+        qk_dim = layer.qk_dim
+        value_dim = layer.value_dim
 
         layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
         conv_states = layer_cache.conv[0]
@@ -867,18 +867,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
         query, key, value = torch.split(
             mixed_qkv,
-            [
-                key_dim // attn_tp_size,
-                key_dim // attn_tp_size,
-                value_dim // attn_tp_size,
-            ],
+            [qk_dim, qk_dim, value_dim],
             dim=-1,
         )
         # Reshape from [l, h*d] to [1, l, h, d]
         seq_len = query.shape[0]
-        num_heads = query.shape[1] // head_k_dim
-        query = query.view(1, seq_len, num_heads, head_k_dim)
-        key = key.view(1, seq_len, num_heads, head_k_dim)
+        num_heads = query.shape[1] // head_qk_dim
+        query = query.view(1, seq_len, num_heads, head_qk_dim)
+        key = key.view(1, seq_len, num_heads, head_qk_dim)
         value = value.view(1, seq_len, value.shape[1] // head_v_dim, head_v_dim)
 
         core_attn_out = self._kernel_func(
@@ -917,11 +913,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
         conv_weights = layer.conv_weights
         bias = layer.bias
         activation = layer.activation
-        key_dim = layer.key_dim
-        value_dim = layer.value_dim
-        attn_tp_size = layer.attention_tp_size
-        head_k_dim = layer.head_k_dim
+        head_qk_dim = layer.head_qk_dim
         head_v_dim = layer.head_v_dim
+        # Precomputed for torch.compile compatibility
+        qk_dim = layer.qk_dim
+        value_dim = layer.value_dim
 
         is_target_verify = forward_batch.forward_mode.is_target_verify()
         forward_metadata = self.forward_metadata
@@ -1000,21 +996,18 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
             ).transpose(0, 1)[:seq_len]
 
-        key_split_dim = key_dim // attn_tp_size
-        value_split_dim = value_dim // attn_tp_size
-
         query, key, value = torch.split(
             mixed_qkv,
-            [key_split_dim, key_split_dim, value_split_dim],
+            [qk_dim, qk_dim, value_dim],
             dim=-1,
         )
 
         actual_seq_len = query.shape[0]
-        num_heads = query.shape[1] // head_k_dim
+        num_heads = query.shape[1] // head_qk_dim
         num_value_heads = value.shape[1] // head_v_dim
 
-        query = query.view(1, actual_seq_len, num_heads, head_k_dim)
-        key = key.view(1, actual_seq_len, num_heads, head_k_dim)
+        query = query.view(1, actual_seq_len, num_heads, head_qk_dim)
+        key = key.view(1, actual_seq_len, num_heads, head_qk_dim)
         value = value.view(1, actual_seq_len, num_value_heads, head_v_dim)
 
         g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)

@@ -310,7 +310,6 @@ class Qwen3GatedDeltaNet(nn.Module):
             num_v_heads=self.num_v_heads // self.attn_tp_size,
             head_qk_dim=self.head_k_dim,
             head_v_dim=self.head_v_dim,
-            attention_tp_size=self.attn_tp_size,
             conv_weights=self.conv1d.weight.squeeze(1),
             bias=self.conv1d.bias,
             activation=self.activation,

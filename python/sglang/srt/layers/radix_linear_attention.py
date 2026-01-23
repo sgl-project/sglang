@@ -35,7 +35,6 @@ class RadixLinearAttention(nn.Module):
         num_v_heads: int,
         head_qk_dim: int,
         head_v_dim: int,
-        attention_tp_size: int = 1,
         conv_weights: Optional[torch.Tensor] = None,
         bias: Optional[torch.Tensor] = None,
         activation: str = "silu",
@@ -44,22 +43,13 @@ class RadixLinearAttention(nn.Module):
     ):
         super().__init__()
         self.layer_id = layer_id
-        # Q and K share the same head count and dimension (per-TP values)
         self.num_qk_heads = num_qk_heads
         self.num_v_heads = num_v_heads
         self.head_qk_dim = head_qk_dim
         self.head_v_dim = head_v_dim
-        self.attention_tp_size = attention_tp_size
-
-        self.qk_dim_per_tp = num_qk_heads * head_qk_dim
-        self.value_dim_per_tp = num_v_heads * head_v_dim
-
-        self.key_dim = self.qk_dim_per_tp * attention_tp_size
-        self.value_dim = self.value_dim_per_tp * attention_tp_size
-
-        self.num_k_heads = num_qk_heads
-        self.num_q_heads = num_qk_heads
-        self.head_k_dim = head_qk_dim
+        # Precomputed for torch.compile
+        self.qk_dim = num_qk_heads * head_qk_dim
+        self.value_dim = num_v_heads * head_v_dim
 
         self.conv_weights = conv_weights
         self.bias = bias
