@@ -181,10 +181,6 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
         loaded_params: Set[str] = set()
         params_dict = dict(self.named_parameters(remove_duplicate=False))
-        
-        # Debug: print all parameter names to understand the model structure
-        # for name, param in params_dict.items():
-        #     print(name, param.shape)
 
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
@@ -197,7 +193,6 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 name = name.replace(".self_attn", "")
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
-                # print(name, param_name, weight_name, shard_id)
                 if "experts.gate_up_proj" in name or "experts.down_proj" in name:
                     is_fused_expert = True
                     expert_params_mapping = fused_expert_params_mapping
@@ -220,9 +215,6 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 # Skip loading extra parameters for GPTQ/modelopt models.
                 if name.endswith(ignore_suffixes) and name not in params_dict:
                     continue
-                # [TODO] Skip layers that are on other devices (check if sglang has a similar function)
-                # if is_pp_missing_parameter(name, self):
-                #     continue
 
                 if name not in params_dict:
                     continue
@@ -245,17 +237,12 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     # attempted to load as other weights later
                     is_expert_weight = True
                     name_mapped = name.replace(weight_name, param_name)
-                    # print(name_mapped, 'is fused experts', is_fused_expert, loaded_weight.shape)
                     if is_fused_expert:
-                        ### [TODO] no chunk?
-                        # loaded_weight = loaded_weight.transpose(-1, -2)  # no bias
                         if "experts.gate_up_proj" in name:
-                            # print(name, loaded_weight.shape)
                             loaded_weight = loaded_weight.chunk(2, dim=-2)
                             load_fused_expert_weights(
                                 name_mapped,
                                 params_dict,
-                                # loaded_weight,
                                 loaded_weight[0],
                                 "w1",
                                 num_experts,
@@ -263,7 +250,6 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                             load_fused_expert_weights(
                                 name_mapped,
                                 params_dict,
-                                # loaded_weight,
                                 loaded_weight[1],
                                 "w3",
                                 num_experts,
@@ -318,61 +304,9 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                         )
                         weight_loader(param, loaded_weight)
                     else:
-                        print(f"Parameter {name} not found in params_dict")
                         logger.warning(f"Parameter {name} not found in params_dict")
             loaded_params.add(name)
-        
-        # # Dump all loaded weights for verification
-        # import os
-        # dump_dir = "/cpfs01/user/yuche.lz/open3_5/weight_dump"
-        # os.makedirs(dump_dir, exist_ok=True)
-        
-        # print(f"\n{'='*60}")
-        # print(f"Dumping model weights to {dump_dir}")
-        # print(f"{'='*60}")
-        
-        # # Save each parameter with its name, shape, and stats
-        # weight_info = {}
-        # for name, param in params_dict.items():
-        #     if hasattr(param, 'data'):
-        #         data = param.data
-        #         weight_info[name] = {
-        #             'shape': list(data.shape),
-        #             'dtype': str(data.dtype),
-        #             'mean': float(data.float().mean().item()) if data.numel() > 0 else 0,
-        #             'std': float(data.float().std().item()) if data.numel() > 1 else 0,
-        #             'min': float(data.float().min().item()) if data.numel() > 0 else 0,
-        #             'max': float(data.float().max().item()) if data.numel() > 0 else 0,
-        #             'loaded': name in loaded_params,
-        #         }
-        #         print(f"{name}: shape={data.shape}, dtype={data.dtype}, mean={weight_info[name]['mean']:.6f}, std={weight_info[name]['std']:.6f}, loaded={weight_info[name]['loaded']}")
-        
-        # # Save weight statistics as JSON
-        # import json
-        # with open(os.path.join(dump_dir, "weight_stats.json"), "w") as f:
-        #     json.dump(weight_info, f, indent=2)
-        
-        # # Save actual weights as safetensors
-        # try:
-        #     from safetensors.torch import save_file
-        #     weights_to_save = {}
-        #     for name, param in params_dict.items():
-        #         if hasattr(param, 'data'):
-        #             weights_to_save[name] = param.data.contiguous().cpu()
-        #     save_file(weights_to_save, os.path.join(dump_dir, "model_weights.safetensors"))
-        #     print(f"\nWeights saved to {os.path.join(dump_dir, 'model_weights.safetensors')}")
-        # except Exception as e:
-        #     print(f"Failed to save safetensors: {e}")
-        #     # Fallback to torch.save
-        #     torch.save({name: param.data.cpu() for name, param in params_dict.items() if hasattr(param, 'data')}, 
-        #                os.path.join(dump_dir, "model_weights.pt"))
-        #     print(f"Weights saved to {os.path.join(dump_dir, 'model_weights.pt')}")
-        
-        # print(f"\nTotal parameters in model: {len(params_dict)}")
-        # print(f"Loaded parameters: {len(loaded_params)}")
-        # print(f"Missing parameters: {set(params_dict.keys()) - loaded_params}")
-        # print(f"{'='*60}\n")
-        
+                
         return loaded_params
 
 EntryClass = Qwen3_5MoeForConditionalGeneration
