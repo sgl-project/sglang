@@ -6,6 +6,7 @@ from typing import List
 
 from sglang.srt.tracing.clock import now_mono_s
 
+
 class ReqTimePoint(IntEnum):
     received = 0
     request_sent_to_scheduler = 1
@@ -14,6 +15,7 @@ class ReqTimePoint(IntEnum):
     response_sent = 4
     finished = 5
 
+
 @dataclass
 class ReqTimeStatsBase:
     """
@@ -21,6 +23,7 @@ class ReqTimeStatsBase:
     Each entry corresponds to a milestone in ReqTimePoint.
     Durations are computed as ts[end] minus ts[start].
     """
+
     ts_mono_s: List[float]
 
     @classmethod
@@ -34,14 +37,12 @@ class ReqTimeStatsBase:
             return
         self.ts_mono_s[i] = now_mono_s()
 
-
     def mark_at(self, point: ReqTimePoint, ts_mono_s: float) -> None:
         i = int(point)
         cur = self.ts_mono_s[i]
         if cur == cur:
             return
         self.ts_mono_s[i] = ts_mono_s
-
 
     def duration_s(self, start: ReqTimePoint, end: ReqTimePoint) -> float:
         return self.ts_mono_s[int(end)] - self.ts_mono_s[int(start)]

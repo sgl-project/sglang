@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import logging
-import time
 import uuid
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
@@ -15,8 +14,8 @@ from sglang.srt.entrypoints.openai.encoding_dsv32 import DS32EncodingError
 from sglang.srt.entrypoints.openai.protocol import ErrorResponse, OpenAIServingRequest
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 from sglang.srt.server_args import ServerArgs
-
 from sglang.srt.tracing.clock import now_mono_s, now_wall_s
+
 if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
 

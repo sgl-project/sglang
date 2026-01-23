@@ -23,7 +23,6 @@ import signal
 import socket
 import sys
 import threading
-import time
 from collections import deque
 from contextlib import nullcontext
 from datetime import datetime
@@ -89,8 +88,8 @@ from sglang.srt.server_args import (
     set_global_server_args_for_tokenizer,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.tracing.req_time_stats import ReqTimeStatsBase, ReqTimePoint
 from sglang.srt.tracing.clock import now_mono_s, now_wall_s
+from sglang.srt.tracing.req_time_stats import ReqTimePoint, ReqTimeStatsBase
 from sglang.srt.tracing.trace import (
     extract_trace_headers,
     trace_get_proc_propagate_context,
@@ -134,12 +133,12 @@ class ReqState:
     event: asyncio.Event
     obj: Union[GenerateReqInput, EmbeddingReqInput]
 
+    created_time: float
     req_time_stats: ReqTimeStatsBase = dataclasses.field(
         default_factory=ReqTimeStatsBase.create
     )
 
     # For metrics
-    created_time: float
     finished_time: float = 0.0
     first_token_time: float = 0.0
     last_time: float = 0.0
@@ -520,7 +519,12 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             # Tokenize the request and send it to the scheduler
             if obj.is_single:
                 tokenized_obj = await self._tokenize_one_request(obj)
-                state = self._send_one_request(obj, tokenized_obj, created_time, created_time_mono_s=created_time_mono_s)
+                state = self._send_one_request(
+                    obj,
+                    tokenized_obj,
+                    created_time,
+                    created_time_mono_s=created_time_mono_s,
+                )
                 async for response in self._wait_one_response(obj, state, request):
                     yield response
             else:
@@ -1062,7 +1066,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
         created_time: Optional[float] = None,
-        created_time_mono_s: Optional[float]=None,
+        created_time_mono_s: Optional[float] = None,
     ):
         trace_slice_start(RequestStage.TOKENIZER_DISPATCH, obj.rid)
         tokenized_obj.trace_context = trace_get_proc_propagate_context(obj.rid)
@@ -1093,31 +1097,42 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]
         ],
         created_time: Optional[float] = None,
-        created_time_mono_s: Optional[float]=None,
+        created_time_mono_s: Optional[float] = None,
     ):
+        """Send a batch of tokenized requests as a single batched request to the scheduler."""
+        # Capture send time once for the whole batch (consistent across items)
         sent_wall = now_wall_s()
         sent_mono = now_mono_s()
-        self.send_to_scheduler.send_pyobj(batch_req)
 
-        """Send a batch of tokenized requests as a single batched request to the scheduler."""
+        # Build the batched request
         if isinstance(tokenized_objs[0], TokenizedGenerateReqInput):
             batch_req = BatchTokenizedGenerateReqInput(batch=tokenized_objs)
         else:
             batch_req = BatchTokenizedEmbeddingReqInput(batch=tokenized_objs)
 
+        # Send once
         self.send_to_scheduler.send_pyobj(batch_req)
-        # Create states for each individual request in the batch
+
+        # Create per-request states
         for i, tokenized_obj in enumerate(tokenized_objs):
             tmp_obj = obj[i]
             state = self.req_state_class(
                 [], False, asyncio.Event(), tmp_obj, created_time=created_time
             )
+
+            # Seed "received" monotonic timestamp from captured mono (if provided),
+            # otherwise record at first opportunity.
             if created_time_mono_s is not None:
                 state.req_time_stats.mark_at(ReqTimePoint.received, created_time_mono_s)
             else:
                 state.req_time_stats.mark(ReqTimePoint.received)
 
-            state.req_time_stats.mark_at(ReqTimePoint.request_sent_to_scheduler, sent_mono)
+            # Mark send-to-scheduler milestone using shared batch send time
+            state.req_time_stats.mark_at(
+                ReqTimePoint.request_sent_to_scheduler, sent_mono
+            )
+
+            # Keep existing wall-clock fields used elsewhere
             state.request_sent_to_scheduler_ts = sent_wall
 
             self.rid_to_state[tmp_obj.rid] = state
@@ -1248,7 +1263,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         request: Optional[fastapi.Request] = None,
         created_time: Optional[float] = None,
-        created_time_mono_s: Optional[float]=None,
+        created_time_mono_s: Optional[float] = None,
     ):
         batch_size = obj.batch_size
 
@@ -1279,7 +1294,10 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                         tmp_obj = obj[i]
                         tokenized_obj = await self._tokenize_one_request(tmp_obj)
                         state = self._send_one_request(
-                            tmp_obj, tokenized_obj, created_time
+                            tmp_obj,
+                            tokenized_obj,
+                            created_time,
+                            created_time_mono_s=created_time_mono_s,
                         )
                         generators.append(
                             self._wait_one_response(tmp_obj, state, request)
@@ -1317,7 +1335,12 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     tmp_obj = copy.copy(objs[i])
                     tokenized_obj = copy.copy(tokenized_objs[i])
                     tokenized_obj.rid = tmp_obj.regenerate_rid()
-                    state = self._send_one_request(tmp_obj, tokenized_obj, created_time)
+                    state = self._send_one_request(
+                        tmp_obj,
+                        tokenized_obj,
+                        created_time,
+                        created_time_mono_s=created_time_mono_s,
+                    )
                     generators.append(self._wait_one_response(tmp_obj, state, request))
                     rids.append(tmp_obj.rid)
 
@@ -1527,8 +1550,8 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 logger.error(
                     f"Received output for {rid=} but the state was deleted in TokenizerManager."
                 )
-                state.req_time_stats.mark(ReqTimePoint.scheduled)
                 continue
+            state.req_time_stats.mark(ReqTimePoint.scheduled)
 
             # Build meta_info and return value
             meta_info = {
@@ -1624,7 +1647,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             if state.finished:
                 state.finished_time = now_wall_s()
                 state.finished_time_perf = now_mono_s()
-                state.req_time_stats.mark_at(ReqTimePoint.finished, state.finished_time_perf)
+                state.req_time_stats.mark_at(
+                    ReqTimePoint.finished, state.finished_time_perf
+                )
                 meta_info["e2e_latency"] = state.finished_time - state.created_time
 
                 if self.server_args.speculative_algorithm:
