@@ -225,6 +225,14 @@ def compute_node_hash_values(node: "TreeNode", page_size: int) -> List[str]:
         # Use SHA256-based chaining via get_hash_str
         hash_val = get_hash_str(page_tokens, prior_hash=parent_hash)
         hash_values.append(hash_val)
+        # Debug: log first page hash computation
+        if start == 0:
+            import logging
+
+            logging.getLogger(__name__).info(
+                f"[DEBUG] compute_node_hash_values first page: tokens[:10]={page_tokens[:10]}, "
+                f"page_size={page_size}, parent_hash={parent_hash}, hash={hash_val[:16]}..."
+            )
         parent_hash = hash_val
 
     return hash_values

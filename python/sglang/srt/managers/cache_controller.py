@@ -305,6 +305,11 @@ class HiCacheController:
             self.prefetch_capacity_limit = int(
                 0.8 * (self.mem_pool_host.size - self.mem_pool_device.size)
             )
+            logger.info(
+                f"[DEBUG] HiCache init: host_pool_size={self.mem_pool_host.size}, "
+                f"device_pool_size={self.mem_pool_device.size}, "
+                f"prefetch_capacity_limit={self.prefetch_capacity_limit}"
+            )
             # granularity of batch storage IO operations, in number of pages
             self.storage_batch_size = 128
             # tracking the number of tokens locked in prefetching, updated by the main scheduler thread
@@ -699,10 +704,15 @@ class HiCacheController:
             batch_tokens = tokens_to_fetch[start:end]
             batch_hashes = []
             for i in range(0, len(batch_tokens), self.page_size):
-                last_hash = self.get_hash_str(
-                    batch_tokens[i : i + self.page_size], last_hash
-                )
+                page_tokens = batch_tokens[i : i + self.page_size]
+                last_hash = self.get_hash_str(page_tokens, last_hash)
                 batch_hashes.append(last_hash)
+                # Debug: log first page hash computation
+                if start == 0 and i == 0:
+                    logger.info(
+                        f"[DEBUG] _storage_hit_query first page: tokens[:10]={page_tokens[:10]}, "
+                        f"page_size={self.page_size}, hash={last_hash[:16]}..."
+                    )
             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
             hit_page_num = self.storage_backend.batch_exists(batch_hashes, extra_info)
             hash_value.extend(batch_hashes[:hit_page_num])
