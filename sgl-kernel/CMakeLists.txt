@@ -47,7 +47,7 @@ clear_cuda_arches(CMAKE_FLAG)
 FetchContent_Declare(
     repo-cutlass
     GIT_REPOSITORY https://github.com/NVIDIA/cutlass
-    GIT_TAG        8debf77437753beca676eb3c6bf97b56a5f9fd68
+    GIT_TAG        2fafefb7b9c7e233c1cfb258f38139a6406d1511
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-cutlass)
