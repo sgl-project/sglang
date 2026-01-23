@@ -15,6 +15,8 @@ os.environ.setdefault("HF_HUB_CACHE", "/data2/models/huggingface/hub")
 import unittest
 from types import SimpleNamespace
 
+from transformers import AutoConfig
+
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
@@ -41,6 +43,11 @@ DEEPSEEK_V32_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2"
 GSM8K_ACCURACY_THRESHOLD = 0.935
 
 
+def _prefetch_model_config(model_path: str) -> None:
+    """Prefetch HF config to avoid DP workers racing on config download/parse."""
+    AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+
+
 class TestDeepseekV32DP(CustomTestCase):
     """Test DeepSeek V3.2 with DP=8 + TP=8 + dp-attention.
 
@@ -51,6 +58,7 @@ class TestDeepseekV32DP(CustomTestCase):
     def setUpClass(cls):
         cls.model = DEEPSEEK_V32_MODEL_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
+        _prefetch_model_config(cls.model)
         other_args = [
             "--trust-remote-code",
             "--tp",
