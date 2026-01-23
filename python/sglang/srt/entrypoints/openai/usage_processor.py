@@ -46,69 +46,49 @@ class UsageProcessor:
 
             if has_details:
                 # Aggregate detailed breakdown across requests
-                device_total = sum(
-                    responses[i]["meta_info"]
-                    .get("cached_tokens_details", {})
-                    .get("device", 0)
+                details_list = [
+                    responses[i]["meta_info"].get("cached_tokens_details")
                     for i in range(0, len(responses), n_choices)
-                    if responses[i]["meta_info"].get("cached_tokens_details")
-                )
-                host_total = sum(
-                    responses[i]["meta_info"]
-                    .get("cached_tokens_details", {})
-                    .get("host", 0)
-                    for i in range(0, len(responses), n_choices)
-                    if responses[i]["meta_info"].get("cached_tokens_details")
-                )
+                ]
+                details_list = [d for d in details_list if d]
 
-                # Check if L3 storage fields are present (only when storage backend is enabled)
-                has_storage_fields = any(
-                    "storage"
-                    in responses[i]["meta_info"].get("cached_tokens_details", {})
-                    for i in range(0, len(responses), n_choices)
-                    if responses[i]["meta_info"].get("cached_tokens_details")
-                )
+                if details_list:
+                    device_total = sum(d.get("device", 0) for d in details_list)
+                    host_total = sum(d.get("host", 0) for d in details_list)
 
-                if has_storage_fields:
-                    storage_total = sum(
-                        responses[i]["meta_info"]
-                        .get("cached_tokens_details", {})
-                        .get("storage", 0)
-                        for i in range(0, len(responses), n_choices)
-                        if responses[i]["meta_info"].get("cached_tokens_details")
-                    )
-                    # Get storage backend from first request with details
-                    storage_backend = next(
-                        (
-                            responses[i]["meta_info"]
-                            .get("cached_tokens_details", {})
-                            .get("storage_backend")
-                            for i in range(0, len(responses), n_choices)
-                            if responses[i]["meta_info"].get("cached_tokens_details")
-                            and responses[i]["meta_info"]
-                            .get("cached_tokens_details", {})
-                            .get("storage_backend")
-                        ),
-                        None,
-                    )
-                    cached_details = PromptTokensDetails(
-                        cached_tokens=cached_total,
-                        cached_tokens_details=CachedTokensDetails(
+                    # Check if L3 storage fields are present (only when storage backend is enabled)
+                    has_storage_fields = any("storage" in d for d in details_list)
+
+                    if has_storage_fields:
+                        storage_total = sum(d.get("storage", 0) for d in details_list)
+                        # Get storage backend from first request with details
+                        storage_backend = next(
+                            (
+                                d.get("storage_backend")
+                                for d in details_list
+                                if d.get("storage_backend")
+                            ),
+                            None,
+                        )
+                        cached_tokens_details_obj = CachedTokensDetails(
                             device=device_total,
                             host=host_total,
                             storage=storage_total,
                             storage_backend=storage_backend,
-                        ),
-                    )
-                else:
-                    # L3 storage not enabled - only device and host
-                    cached_details = PromptTokensDetails(
-                        cached_tokens=cached_total,
-                        cached_tokens_details=CachedTokensDetails(
+                        )
+                    else:
+                        # L3 storage not enabled - only device and host
+                        cached_tokens_details_obj = CachedTokensDetails(
                             device=device_total,
                             host=host_total,
-                        ),
+                        )
+
+                    cached_details = PromptTokensDetails(
+                        cached_tokens=cached_total,
+                        cached_tokens_details=cached_tokens_details_obj,
                     )
+                else:
+                    cached_details = UsageProcessor._details_if_cached(cached_total)
             else:
                 cached_details = UsageProcessor._details_if_cached(cached_total)
 
