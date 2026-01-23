@@ -680,9 +680,8 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
   # MI35x 8-GPU DeepSeek-V3.2 TP+MTP Accuracy Test
-  # TEMP DISABLED
   nightly-accuracy-8-gpu-mi35x-deepseek-v32-mtp:
-    if: false  # (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-accuracy-8-gpu-mi35x-deepseek-v32-mtp')
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-accuracy-8-gpu-mi35x-deepseek-v32-mtp')
     runs-on: linux-mi35x-gpu-8
     steps:
       - name: Checkout code
