@@ -67,8 +67,8 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
-from sglang.srt.managers.embedding_cache_controller import EmbeddingCacheController
 from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
+from sglang.srt.managers.embedding_cache_controller import EmbeddingCacheController
 from sglang.srt.managers.io_struct import (
     AbortReq,
     ActiveRanksOutput,

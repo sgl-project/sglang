@@ -848,22 +848,24 @@ async def handle_encode_request(request: dict):
         for socket in send_sockets:
             socket.send_pyobj(request)
         if encoder.mm_global_cache is not None:
-            nbytes, embedding_len, embedding_dim = await encoder.encode_with_global_cache(
-                mm_items=request["mm_items"],
-                req_id=request["req_id"],
-                num_parts=request["num_parts"],
-                part_idx=request["part_idx"],
-                hashes=request.get("hashes", None),
+            nbytes, embedding_len, embedding_dim = (
+                await encoder.encode_with_global_cache(
+                    mm_items=request["mm_items"],
+                    req_id=request["req_id"],
+                    num_parts=request["num_parts"],
+                    part_idx=request["part_idx"],
+                    hashes=request.get("hashes", None),
+                )
             )
         else:
             nbytes, embedding_len, embedding_dim, error_msg, error_code = (
-            await encoder.encode(
+                await encoder.encode(
                     mm_items=request["mm_items"],
                     req_id=request["req_id"],
                     num_parts=request["num_parts"],
                     part_idx=request["part_idx"],
                 )
-        )
+            )
 
         if error_msg:
             if encoder.server_args.encoder_transfer_backend == "zmq_to_scheduler":
