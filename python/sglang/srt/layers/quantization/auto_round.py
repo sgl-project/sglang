@@ -214,7 +214,7 @@ class AutoRoundConfig(QuantizationConfig):
     def check_quantized(self, weight_bits: int) -> bool:
         return weight_bits < 16
 
-    def apply_awq_quant_layer(self, layer, prefix: str, backend: str = "auto"):
+    def apply_awq_quant_layer(self, layer, prefix: str, backend: str):
         from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
         from sglang.srt.layers.quantization.marlin_utils import (
@@ -298,7 +298,7 @@ class AutoRoundConfig(QuantizationConfig):
                 return AWQLinearMethod(quant_args)
         return None
 
-    def apply_gptq_quant_layer(self, layer, prefix: str, backend: str = "auto"):
+    def apply_gptq_quant_layer(self, layer, prefix: str, backend: str):
         from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
         from sglang.srt.layers.quantization.marlin_utils import (
@@ -366,19 +366,20 @@ class AutoRoundConfig(QuantizationConfig):
 
         if isinstance(layer, FusedMoE):
             if use_marlin:
-                from sglang.srt.layers.quantization.moe_wna16 import MoeWNA16Config
+                return GPTQMarlinMoEMethod(quant_args_marlin)
+            from sglang.srt.layers.quantization.moe_wna16 import MoeWNA16Config
 
-                config = {
-                    "quant_method": "gptq",
-                    "bits": weight_bits,
-                    "group_size": group_size,
-                    "sym": sym,
-                    "lm_head": False,
-                }
-                return MoeWNA16Config.from_config(config).get_quant_method(
-                    layer, prefix
-                )
-            return GPTQMarlinMoEMethod(quant_args_marlin)
+            config = {
+                "quant_method": "gptq",
+                "bits": weight_bits,
+                "group_size": group_size,
+                "sym": sym,
+                "lm_head": False,
+            }
+            return MoeWNA16Config.from_config(config).get_quant_method(
+                layer, prefix
+            )
+            
 
         if isinstance(layer, (LinearBase, ParallelLMHead)):
             if use_marlin:
@@ -391,6 +392,6 @@ class AutoRoundConfig(QuantizationConfig):
     def get_quant_method(self, layer: torch.nn.Module, prefix: str):
         # TODO enable CPU quant method later
         if "gptq" in self.packing_format or "gptq" in self.backend:
-            return self.apply_gptq_quant_layer(layer, prefix)
+            return self.apply_gptq_quant_layer(layer, prefix, self.backend)
         if "awq" in self.packing_format or "awq" in self.backend:
-            return self.apply_awq_quant_layer(layer, prefix)
+            return self.apply_awq_quant_layer(layer, prefix, self.backend)
