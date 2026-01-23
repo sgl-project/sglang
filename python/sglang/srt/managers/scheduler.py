@@ -14,6 +14,7 @@
 """A scheduler that manages a tensor parallel GPU worker."""
 
 import faulthandler
+import json
 import logging
 import os
 import signal
@@ -315,7 +316,8 @@ class Scheduler(
         if self.auto_spec:
             self.spec_auto_tuner = AutoTunerEagle(server_args)
             server_args.spec_auto_tuner = self.spec_auto_tuner
-        # todo: add idle flag to identify when to start auto tuning
+        # add idle flag to, auto_spec tune results will be saved to file when idle
+        self.last_loop_is_idle = True
 
         # Distributed rank info
         self.attn_tp_rank, self.attn_tp_size, self.attn_dp_rank = (
@@ -1090,9 +1092,14 @@ class Scheduler(
             if batch:
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
+                self.last_loop_is_idle = False
             else:
+                if not self.last_loop_is_idle and self.server_args.save_tune_results:
+                    with open(self.model_worker.spec_auto_tuner.spec_tune_file, "w") as f:
+                        json.dump(self.model_worker.spec_auto_tuner.results, f)
                 # When the server is idle, do self-check and re-init some states
                 self.self_check_during_idle()
+                self.last_loop_is_idle = True
 
             # Update last_batch
             self.last_batch = batch

@@ -48,6 +48,9 @@ class AutoTunerEagle:
         self.reserve_mem = 4
         self.mem_each_graph = 2
         self.save_tune_results = server_args.save_tune_results
+        if self.save_tune_results is not None:
+            os.makedirs(self.save_tune_results, exist_ok=True)
+            self.spec_tune_file = os.path.join(self.save_tune_results, "spec_tune_results.json")
         self.neg_threshold = None
         self.pos_threshold = None
         if server_args.neg_threshold is not None:
