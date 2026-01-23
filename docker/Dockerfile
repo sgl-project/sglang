@@ -310,7 +310,7 @@ RUN --mount=type=cache,target=/root/.cache/pip if [ "${CUDA_VERSION%%.*}" = "12"
 elif [ "${CUDA_VERSION%%.*}" = "13" ]; then \
     python3 -m pip install nvidia-nccl-cu13==2.28.3 --force-reinstall --no-deps ; \
     python3 -m pip install nvidia-cublas==13.1.0.3 --force-reinstall --no-deps ; \
-    python3 -m pip install nixl-cu13 ; \
+    python3 -m pip install nixl-cu13 --no-deps ; \
     python3 -m pip install cuda-python==13.1.1 ; \
 fi
 
@@ -424,6 +424,8 @@ RUN if [ "${CUDA_VERSION%%.*}" = "13" ] && [ -d /usr/local/lib/python3.12/dist-p
         ln -s /usr/local/cuda/bin/ptxas /usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin/ptxas; \
     fi
 
+RUN python3 -m pip install --upgrade "urllib3>=2.6.3"
+
 # Set workspace directory
 WORKDIR /sgl-workspace/sglang
 
@@ -505,6 +507,8 @@ RUN --mount=type=cache,target=/var/cache/apt,id=runtime-apt \
     # NCCL packages needed for pynccl_allocator JIT compilation (-lnccl)
     libnccl2 \
     libnccl-dev \
+    # GPG key verification
+    gnupg2 \
     && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 2 \
     && update-alternatives --set python3 /usr/bin/python3.12 \
     && ln -sf /usr/bin/python3.12 /usr/bin/python \
