@@ -2152,16 +2152,9 @@ class MLATokenToKVPoolMixedPrecision(MLATokenToKVPool):
         self.kv_lora_rank = kv_lora_rank
         self.qk_rope_head_dim = qk_rope_head_dim
         self.use_nsa = use_nsa
-        self.nsa_kv_cache_store_fp8 = use_nsa and dtype == torch.float8_e4m3fn
-        if self.nsa_kv_cache_store_fp8 and override_kv_cache_dim is None:
-            raise ValueError(
-                "override_kv_cache_dim must be provided when using NSA with FP8 kv cache storage"
-            )
-        self.kv_cache_dim = (
-            override_kv_cache_dim
-            if self.use_nsa and self.nsa_kv_cache_store_fp8
-            else (kv_lora_rank + qk_rope_head_dim)
-        )
+        if use_nsa:
+            raise ValueError("Heterogeneous KV cache currently does not support NSA.")
+        self.kv_cache_dim = kv_lora_rank + qk_rope_head_dim
 
         # Store per-layer dtypes
         self.per_layer_dtypes = per_layer_dtypes
