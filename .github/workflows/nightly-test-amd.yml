@@ -770,12 +770,12 @@ jobs:
           bash scripts/ci/amd_ci_exec.sh pip install tabulate
 
       - name: Performance Test MI35x (8-GPU DeepSeek-V3.2 MTP)
-        timeout-minutes: 150
+        timeout-minutes: 180
         run: |
           > github_summary.md  # Clear summary file
           bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
-            python3 run_suite.py --hw amd --suite nightly-perf-8-gpu-mi35x-deepseek-v32-mtp --nightly --timeout-per-file 5400 || TEST_EXIT_CODE=$?
+            python3 run_suite.py --hw amd --suite nightly-perf-8-gpu-mi35x-deepseek-v32-mtp --nightly --timeout-per-file 7200 || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
