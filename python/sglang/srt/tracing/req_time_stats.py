@@ -34,8 +34,17 @@ class ReqTimeStatsBase:
             return
         self.ts_mono_s[i] = now_mono_s()
 
+
+    def mark_at(self, point: ReqTimePoint, ts_mono_s: float) -> None:
+        i = int(point)
+        cur = self.ts_mono_s[i]
+        if cur == cur:
+            return
+        self.ts_mono_s[i] = ts_mono_s
+
+
     def duration_s(self, start: ReqTimePoint, end: ReqTimePoint) -> float:
         return self.ts_mono_s[int(end)] - self.ts_mono_s[int(start)]
 
     def to_log_record(self) -> dict:
-        return {"req_time_ts_mono_s": self.ts_mono_s}
+        return {"req_time_ts_mono_s": list(self.ts_mono_s)}
