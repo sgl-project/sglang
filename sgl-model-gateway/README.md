@@ -639,6 +639,7 @@ Supported tool parsers: `json`, `python`, `xml`.
 - `--history-backend none` disables persistence while keeping APIs.
 - `--history-backend oracle` uses Oracle Autonomous Database; provide credentials via flags or environment variables.
 - `--history-backend postgres` uses PostgreSQL Database.
+- `--history-backend redis` uses Redis.
 - Conversation item storage mirrors the history backend (Oracle or memory). The same storage powers OpenAI `/responses` and conversation APIs.
 
 ### History Backend (OpenAI Router Mode)
@@ -651,6 +652,7 @@ Store conversation and response data for tracking, debugging, or analytics.
 - **None**: No storage, minimal overhead.
 - **Oracle**: Persistent storage backed by Oracle Autonomous Database.
 - **Postgres**: Persistent storage backed by PostgreSQL Database.
+- **Redis**: Persistent storage backed by Redis.
 
 ```bash
 # Memory backend (default)
@@ -676,6 +678,12 @@ python3 -m sglang_router.launch_router \
   --backend openai \
   --worker-urls https://api.openai.com \
   --history-backend postgres
+
+# Redis backend
+python3 -m sglang_router.launch_router \
+  --backend openai \
+  --worker-urls https://api.openai.com \
+  --history-backend redis
 ```
 
 #### Oracle configuration
@@ -704,11 +712,24 @@ Router flags map to these values:
 
 Only one of `--oracle-dsn` or `--oracle-tns-alias` should be supplied.
 
+#### Redis configuration
+Provide Redis connection URL and optional pool sizing:
+```bash
+export REDIS_URL="redis://localhost:6379"
+export REDIS_POOL_MAX=16
+export REDIS_RETENTION_DAYS=30
+```
+
+Router flags map to these values:
+- `--redis-url` (env: `REDIS_URL`)
+- `--redis-pool-max` (env: `REDIS_POOL_MAX`)
+- `--redis-retention-days` (env: `REDIS_RETENTION_DAYS`). Set to `-1` for persistent storage (default: 30 days).
+
 ## Reliability & Flow Control
 - **Retries**: Default max retries = 5 with exponential backoff (`--retry-max-retries`, `--retry-initial-backoff-ms`, `--retry-max-backoff-ms`, `--retry-backoff-multiplier`, `--retry-jitter-factor`). Retries trigger on 408/429/500/502/503/504.
 - **Circuit Breakers**: Per worker thresholds (`--cb-failure-threshold`, `--cb-success-threshold`, `--cb-timeout-duration-secs`, `--cb-window-duration-secs`). Disable via `--disable-circuit-breaker`.
 - **Rate Limiting**: Token bucket driven by `--max-concurrent-requests`. Set `--rate-limit-tokens-per-second` to override refill rate. Configure request queue via `--queue-size` and `--queue-timeout-secs`; queued requests observe FIFO order and respect cancellation.
-- **Health Checks**: Runtime probes via `--health-check-interval-secs`, `--health-check-timeout-secs`, failure/success thresholds, and `--health-check-endpoint`.
+- **Health Checks**: Runtime probes via `--health-check-interval-secs`, `--health-check-timeout-secs`, failure/success thresholds, and `--health-check-endpoint`. Use `--disable-health-check` to skip health checks entirely.
 - **Cache Management**: `/flush_cache` ensures LRU eviction when redeploying PD workers.
 
 ## Load Balancing Policies

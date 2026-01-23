@@ -115,9 +115,10 @@ class RotaryEmbedding(MultiPlatformOp):
             cache = cache.to(dtype)
 
         if (
-            (not (_is_cuda or _is_npu) or self.head_size not in [64, 128, 256, 512])
-            and not (_is_cpu and _is_cpu_amx_available)
+            (not (_is_cuda) or self.head_size not in [64, 128, 256, 512])
+            and not (_is_cpu)
             and not (_is_xpu)
+            and not (_is_npu)
         ):
             if _is_cuda or _is_hip:
                 from sgl_kernel import rotary_embedding

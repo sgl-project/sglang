@@ -5,7 +5,7 @@ set -euxo pipefail
 # Set up environment variables
 IS_BLACKWELL=${IS_BLACKWELL:-0}
 CU_VERSION="cu129"
-FLASHINFER_VERSION=0.5.3
+FLASHINFER_VERSION=0.6.1
 OPTIONAL_DEPS="${1:-}"
 
 # Detect system architecture
@@ -126,7 +126,7 @@ SGL_KERNEL_VERSION_FROM_KERNEL=$(grep -Po '(?<=^version = ")[^"]*' sgl-kernel/py
 SGL_KERNEL_VERSION_FROM_SRT=$(grep -Po -m1 '(?<=sgl-kernel==)[0-9A-Za-z\.\-]+' python/pyproject.toml)
 echo "SGL_KERNEL_VERSION_FROM_KERNEL=${SGL_KERNEL_VERSION_FROM_KERNEL} SGL_KERNEL_VERSION_FROM_SRT=${SGL_KERNEL_VERSION_FROM_SRT}"
 
-if [ "${CUSTOM_BUILD_SGL_KERNEL:-}" = "true" ]; then
+if [ "${CUSTOM_BUILD_SGL_KERNEL:-}" = "true" ] && [ -d "sgl-kernel/dist" ]; then
     ls -alh sgl-kernel/dist
     # Determine wheel architecture
     if [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then
@@ -135,8 +135,24 @@ if [ "${CUSTOM_BUILD_SGL_KERNEL:-}" = "true" ]; then
         WHEEL_ARCH="x86_64"
     fi
     $PIP_CMD install sgl-kernel/dist/sgl_kernel-${SGL_KERNEL_VERSION_FROM_KERNEL}-cp310-abi3-manylinux2014_${WHEEL_ARCH}.whl --force-reinstall $PIP_INSTALL_SUFFIX
-else
+elif [ "${CUSTOM_BUILD_SGL_KERNEL:-}" = "true" ] && [ ! -d "sgl-kernel/dist" ]; then
+    # CUSTOM_BUILD_SGL_KERNEL was set but artifacts not available (e.g., stage rerun without wheel build)
+    # Fall back to installing from PyPI
+    echo "WARNING: CUSTOM_BUILD_SGL_KERNEL=true but sgl-kernel/dist not found, falling back to PyPI"
     $PIP_CMD install sgl-kernel==${SGL_KERNEL_VERSION_FROM_SRT} --force-reinstall $PIP_INSTALL_SUFFIX
+else
+    # On Blackwell machines, skip reinstall if correct version already installed to avoid race conditions
+    if [ "$IS_BLACKWELL" = "1" ]; then
+        INSTALLED_SGL_KERNEL=$(pip show sgl-kernel 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
+        if [ "$INSTALLED_SGL_KERNEL" = "$SGL_KERNEL_VERSION_FROM_SRT" ]; then
+            echo "sgl-kernel==${SGL_KERNEL_VERSION_FROM_SRT} already installed, skipping reinstall"
+        else
+            echo "Installing sgl-kernel==${SGL_KERNEL_VERSION_FROM_SRT} (current: ${INSTALLED_SGL_KERNEL:-none})"
+            $PIP_CMD install sgl-kernel==${SGL_KERNEL_VERSION_FROM_SRT} $PIP_INSTALL_SUFFIX
+        fi
+    else
+        $PIP_CMD install sgl-kernel==${SGL_KERNEL_VERSION_FROM_SRT} --force-reinstall $PIP_INSTALL_SUFFIX
+    fi
 fi
 
 # Show current packages
@@ -152,10 +168,30 @@ if [ "$IS_BLACKWELL" != "1" ]; then
 fi
 
 # DeepEP depends on nvshmem 3.4.5
-$PIP_CMD install nvidia-nvshmem-cu12==3.4.5 --force-reinstall $PIP_INSTALL_SUFFIX
+# On Blackwell machines, skip reinstall if correct version already installed to avoid race conditions
+if [ "$IS_BLACKWELL" = "1" ]; then
+    INSTALLED_NVSHMEM=$(pip show nvidia-nvshmem-cu12 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
+    if [ "$INSTALLED_NVSHMEM" = "3.4.5" ]; then
+        echo "nvidia-nvshmem-cu12==3.4.5 already installed, skipping reinstall"
+    else
+        $PIP_CMD install nvidia-nvshmem-cu12==3.4.5 $PIP_INSTALL_SUFFIX
+    fi
+else
+    $PIP_CMD install nvidia-nvshmem-cu12==3.4.5 --force-reinstall $PIP_INSTALL_SUFFIX
+fi
 
 # Cudnn with version less than 9.16.0.29 will cause performance regression on Conv3D kernel
-$PIP_CMD install nvidia-cudnn-cu12==9.16.0.29 --force-reinstall $PIP_INSTALL_SUFFIX
+# On Blackwell machines, skip reinstall if correct version already installed to avoid race conditions
+if [ "$IS_BLACKWELL" = "1" ]; then
+    INSTALLED_CUDNN=$(pip show nvidia-cudnn-cu12 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
+    if [ "$INSTALLED_CUDNN" = "9.16.0.29" ]; then
+        echo "nvidia-cudnn-cu12==9.16.0.29 already installed, skipping reinstall"
+    else
+        $PIP_CMD install nvidia-cudnn-cu12==9.16.0.29 $PIP_INSTALL_SUFFIX
+    fi
+else
+    $PIP_CMD install nvidia-cudnn-cu12==9.16.0.29 --force-reinstall $PIP_INSTALL_SUFFIX
+fi
 $PIP_CMD uninstall xformers || true
 
 # Install flashinfer-jit-cache with caching and retry logic (flashinfer.ai can have transient DNS issues)
