@@ -1036,6 +1036,17 @@ class ServerArgs:
             if model_config.is_multimodal:
                 self.adjust_mem_fraction_for_vlm(model_config)
 
+            # If symm mem is enabled and prealloc size is not set, set it to 4GB
+            if (
+                self.enable_symm_mem
+                and not envs.SGLANG_SYMM_MEM_PREALLOC_GB_SIZE.is_set()
+            ):
+                envs.SGLANG_SYMM_MEM_PREALLOC_GB_SIZE.set(4)
+                logger.warning(
+                    "Symmetric memory is enabled, setting symmetric memory prealloc size to 4GB as default."
+                    "Use environment variable SGLANG_SYMM_MEM_PREALLOC_GB_SIZE to change the prealloc size."
+                )
+
     def _generate_cuda_graph_batch_sizes(self):
         """
         Generate the list of batch sizes for CUDA graph capture based on cuda_graph_max_bs.
@@ -2412,14 +2423,12 @@ class ServerArgs:
                 self.enable_dynamic_batch_tokenizer = False
 
     def _handle_environment_variables(self):
-        os.environ["SGLANG_ENABLE_TORCH_COMPILE"] = (
-            "1" if self.enable_torch_compile else "0"
-        )
-        os.environ["SGLANG_MAMBA_SSM_DTYPE"] = self.mamba_ssm_dtype
-        os.environ["SGLANG_DISABLE_OUTLINES_DISK_CACHE"] = (
+        envs.SGLANG_ENABLE_TORCH_COMPILE.set("1" if self.enable_torch_compile else "0")
+        envs.SGLANG_MAMBA_SSM_DTYPE.set(self.mamba_ssm_dtype)
+        envs.SGLANG_DISABLE_OUTLINES_DISK_CACHE.set(
             "1" if self.disable_outlines_disk_cache else "0"
         )
-        os.environ["SGLANG_ENABLE_DETERMINISTIC_INFERENCE"] = (
+        envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.set(
             "1" if self.enable_deterministic_inference else "0"
         )
         # Set the highest strict level for Kimi K2 tool calls
