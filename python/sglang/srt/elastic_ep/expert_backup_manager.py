@@ -1,19 +1,22 @@
 import logging
 import multiprocessing as mp
+import re
+
 import torch
 import zmq
-import re
-from sglang.srt.configs.model_config import ModelConfig
+
 from sglang.srt.configs.load_config import LoadConfig
+from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.managers.io_struct import BackupDramReq
 from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
 from sglang.srt.model_loader.utils import set_default_torch_dtype
-from sglang.srt.managers.io_struct import BackupDramReq
 from sglang.srt.server_args import (
     PortArgs,
     ServerArgs,
     set_global_server_args_for_scheduler,
 )
-from sglang.srt.utils import get_zmq_socket, get_local_ip_auto
+
+from sglang.srt.utils import get_local_ip_auto, get_zmq_socket
 
 
 logger = logging.getLogger(__name__)
@@ -124,7 +127,10 @@ class ExpertBackupManager:
 
         self.transfer_engine = TransferEngine()
         self.transfer_engine.initialize(
-            get_local_ip_auto(), "P2PHANDSHAKE", "rdma", self.server_args.mooncake_ib_device
+            get_local_ip_auto(),
+            "P2PHANDSHAKE",
+            "rdma",
+            self.server_args.mooncake_ib_device,
         )
         self.session_id = f"{get_local_ip_auto()}:{self.transfer_engine.get_rpc_port()}"
         server_ptr = self.continuous_buffer.data_ptr()

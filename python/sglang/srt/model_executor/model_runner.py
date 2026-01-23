@@ -450,7 +450,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             else None
         )
         self.expert_location_updater = ExpertLocationUpdater()
-        self.expert_backup_client = ExpertBackupClient(self.server_args, self)
+        self.expert_backup_client = (
+            ExpertBackupClient(self.server_args, self)
+            if self.server_args.enable_elastic_expert_backup
+            else None
+        )
 
         (
             ElasticEPStateManager.init(self.server_args)
@@ -1004,7 +1008,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 new_expert_location_metadata,
                 update_layer_ids=update_layer_ids,
             )
-            if self.expert_backup_client.use_backup:
+            if (
+                self.expert_backup_client is not None
+                and self.expert_backup_client.use_backup
+            ):
                 self.expert_backup_client.update_weights()
                 return
 

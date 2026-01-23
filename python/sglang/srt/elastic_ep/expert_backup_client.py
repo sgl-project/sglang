@@ -1,17 +1,18 @@
 import logging
 import re
-import torch
-import zmq
 import threading
 import time
-from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+
+import torch
+import zmq
+
 from sglang.srt.distributed.parallel_state import (
     get_world_group,
     get_world_rank,
     get_world_size,
 )
-
 from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
+from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.managers.io_struct import UpdateExpertBackupReq
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_local_ip_auto, get_zmq_socket
@@ -92,7 +93,10 @@ class ExpertBackupClient:
 
         self.transfer_engine = TransferEngine()
         self.transfer_engine.initialize(
-            get_local_ip_auto(), "P2PHANDSHAKE", "rdma", self.server_args.mooncake_ib_device
+            get_local_ip_auto(),
+            "P2PHANDSHAKE",
+            "rdma",
+            self.server_args.mooncake_ib_device,
         )
 
         self.params_dict = dict(self.model_runner.model.named_parameters())
