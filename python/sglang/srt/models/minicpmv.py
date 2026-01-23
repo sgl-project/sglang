@@ -932,6 +932,19 @@ class MiniCPMV4_0(MiniCPMBaseModel):
 
         return pattern.pad_input_tokens(input_ids, image_inputs)
 
+    def get_embed_and_head(self):
+        """Get embedding and lm_head weights for EAGLE3 support."""
+        if hasattr(self.llm, "get_embed_and_head"):
+            return self.llm.get_embed_and_head()
+        # Fallback
+        return self.llm.model.embed_tokens.weight, self.llm.lm_head.weight
+
+    def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
+        """Set layers to capture for EAGLE3 speculative decoding."""
+        self.capture_aux_hidden_states = True
+        if hasattr(self.llm, "set_eagle3_layers_to_capture"):
+            self.llm.set_eagle3_layers_to_capture(layer_ids)
+
 
 _SUPPORT_VERSION = {
     (2, 6): MiniCPMV2_6,
