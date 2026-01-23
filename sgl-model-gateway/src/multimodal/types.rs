@@ -160,6 +160,9 @@ impl ImageFrame {
     pub fn size(&self) -> ImageSize {
         ImageSize::new(self.image.width(), self.image.height())
     }
+    pub fn raw_bytes_handle(&self) -> &Bytes {
+        &self.raw_bytes
+    }
 }
 
 /// Container for all supported multimodal media objects.

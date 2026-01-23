@@ -399,6 +399,9 @@ pub(crate) fn filter_chat_request_by_tool_choice(
 pub(crate) fn process_chat_messages(
     request: &ChatCompletionRequest,
     tokenizer: &dyn Tokenizer,
+    multimodal_data: Option<
+        HashMap<crate::multimodal::Modality, Vec<Arc<crate::multimodal::types::ImageFrame>>>,
+    >,
 ) -> Result<ProcessedMessages, String> {
     // Use the tokenizer's chat template - we require HuggingFace tokenizer for gRPC
     // First try direct downcast, then try via CachedTokenizer wrapper
@@ -508,9 +511,19 @@ pub(crate) fn process_chat_messages(
 
     // Placeholder for multimodal inputs
     let multimodal_inputs = None;
+    let multimodal_inputs = multimodal_data.map(|data| {
+        let mut proto_mm = MultimodalInputs::default();
+        if let Some(images) = data.get(&crate::multimodal::Modality::Image) {
+            proto_mm.image_data = images
+                .iter()
+                .map(|f| f.raw_bytes_handle().clone())
+                .collect();
+        }
+        proto_mm
+    });
 
     Ok(ProcessedMessages {
-        text: formatted_text,
+        text: rendered,
         multimodal_inputs,
         stop_sequences: request.stop.clone(),
     })

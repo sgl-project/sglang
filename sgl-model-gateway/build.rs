@@ -22,7 +22,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build_server(true)
         .build_client(true)
         .type_attribute("GetModelInfoResponse", "#[derive(serde::Serialize)]")
-        .bytes(["sglang.grpc.scheduler"])
+        .bytes(".sglang.grpc.scheduler")
         .protoc_arg("--experimental_allow_proto3_optional")
         .compile_protos(
             &[
