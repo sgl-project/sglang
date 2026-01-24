@@ -242,19 +242,36 @@ class OpenAIServingCompletion(OpenAIServingBase):
                         input_top_logprobs = None
 
                     n_prev_token = n_prev_tokens.get(index, 0)
+                    total_output_logprobs = len(
+                        content["meta_info"]["output_token_logprobs"]
+                    )
+                    output_logprobs_slice = content["meta_info"][
+                        "output_token_logprobs"
+                    ][n_prev_token:]
+
+                    # Debug logging for flaky streaming logprobs issue
+                    # See: https://github.com/sgl-project/sglang/actions/runs/21319310492/job/61366797740
+                    delta_for_log = text[len(stream_buffer) :]
+                    finish_reason_for_log = content["meta_info"]["finish_reason"]
+                    if len(output_logprobs_slice) == 0 and len(delta_for_log) > 0:
+                        logger.warning(
+                            f"[STREAMING_LOGPROBS_DEBUG] Empty logprobs with non-empty text! "
+                            f"index={index}, n_prev_token={n_prev_token}, "
+                            f"total_output_logprobs={total_output_logprobs}, "
+                            f"delta_text='{delta_for_log}', "
+                            f"finish_reason={finish_reason_for_log}, "
+                            f"stream_buffer_len={len(stream_buffer)}, text_len={len(text)}"
+                        )
+
                     logprobs = to_openai_style_logprobs(
                         input_token_logprobs=input_token_logprobs,
                         input_top_logprobs=input_top_logprobs,
-                        output_token_logprobs=content["meta_info"][
-                            "output_token_logprobs"
-                        ][n_prev_token:],
+                        output_token_logprobs=output_logprobs_slice,
                         output_top_logprobs=content["meta_info"].get(
                             "output_top_logprobs", []
                         )[n_prev_token:],
                     )
-                    n_prev_tokens[index] = len(
-                        content["meta_info"]["output_token_logprobs"]
-                    )
+                    n_prev_tokens[index] = total_output_logprobs
 
                 # Generate delta
                 delta = text[len(stream_buffer) :]
