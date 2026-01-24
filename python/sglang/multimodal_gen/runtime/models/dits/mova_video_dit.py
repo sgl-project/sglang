@@ -6,7 +6,7 @@
 # but could be refactored to a common module in the future.
 
 import math
-from typing import Any, Optional, Tuple
+from typing import Any, Tuple
 
 import torch
 import torch.nn as nn
@@ -16,10 +16,19 @@ from einops import rearrange
 from torch.distributed.tensor import DTensor
 
 from sglang.multimodal_gen.configs.models.dits.mova_video import MovaVideoConfig
+from sglang.multimodal_gen.runtime.distributed import get_tp_world_size
 from sglang.multimodal_gen.runtime.layers.attention import LocalAttention, USPAttention
 
 # Reuse SGLang's optimized RMSNorm instead of torch.nn.RMSNorm or custom SlowRMSNorm
-from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
+from sglang.multimodal_gen.runtime.layers.layernorm import (
+    RMSNorm,
+    tensor_parallel_rms_norm,
+)
+from sglang.multimodal_gen.runtime.layers.linear import (
+    ColumnParallelLinear,
+    ReplicatedLinear,
+    RowParallelLinear,
+)
 from sglang.multimodal_gen.runtime.layers.mlp import MLP
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
@@ -101,15 +110,24 @@ class SelfAttention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
 
-        self.q = nn.Linear(dim, dim)
-        self.k = nn.Linear(dim, dim)
-        self.v = nn.Linear(dim, dim)
-        self.o = nn.Linear(dim, dim)
+        self.tp_size = get_tp_world_size()
+        if self.num_heads % self.tp_size != 0:
+            raise ValueError(
+                f"num_heads ({self.num_heads}) must be divisible by tp_size ({self.tp_size})."
+            )
+        self.num_heads_per_rank = self.num_heads // self.tp_size
+
+        # TP strategy: shard Q/K/V over heads (column-parallel), then row-parallel output.
+        self.q = ColumnParallelLinear(dim, dim, bias=True, gather_output=False)
+        self.k = ColumnParallelLinear(dim, dim, bias=True, gather_output=False)
+        self.v = ColumnParallelLinear(dim, dim, bias=True, gather_output=False)
+        self.o = RowParallelLinear(dim, dim, bias=True, input_is_parallel=True)
         self.norm_q = RMSNorm(dim, eps=eps)
         self.norm_k = RMSNorm(dim, eps=eps)
 
         self.attn = USPAttention(
-            num_heads=num_heads,
+            # Local heads per TP rank.
+            num_heads=self.num_heads_per_rank,
             head_size=self.head_dim,
             causal=False,
             softmax_scale=None,
@@ -130,24 +148,33 @@ class SelfAttention(nn.Module):
             freqs = freqs.to_local()
 
         # Compute Q, K, V on local sequence
-        q = self.norm_q(self.q(x))
-        k = self.norm_k(self.k(x))
-        v = self.v(x)
+        q, _ = self.q(x)
+        k, _ = self.k(x)
+        v, _ = self.v(x)
+
+        # RMSNorm over sharded hidden dimension.
+        if self.tp_size > 1:
+            q = tensor_parallel_rms_norm(q, self.norm_q)
+            k = tensor_parallel_rms_norm(k, self.norm_k)
+        else:
+            q = self.norm_q(q)
+            k = self.norm_k(k)
 
         # Apply RoPE
         q = rope_apply_head_dim(q, freqs, self.head_dim)
         k = rope_apply_head_dim(k, freqs, self.head_dim)
 
         # USPAttention expects [B, S_local, H, D] format
-        q = rearrange(q, "b s (n d) -> b s n d", n=self.num_heads)
-        k = rearrange(k, "b s (n d) -> b s n d", n=self.num_heads)
-        v = rearrange(v, "b s (n d) -> b s n d", n=self.num_heads)
+        q = rearrange(q, "b s (n d) -> b s n d", n=self.num_heads_per_rank)
+        k = rearrange(k, "b s (n d) -> b s n d", n=self.num_heads_per_rank)
+        v = rearrange(v, "b s (n d) -> b s n d", n=self.num_heads_per_rank)
 
         # USPAttention handles SP communication internally
         out = self.attn(q, k, v)
         out = rearrange(out, "b s n d -> b s (n d)")
 
-        return self.o(out)
+        out, _ = self.o(out)
+        return out
 
 
 class CrossAttention(nn.Module):
@@ -169,21 +196,28 @@ class CrossAttention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
 
-        self.q = nn.Linear(dim, dim)
-        self.k = nn.Linear(dim, dim)
-        self.v = nn.Linear(dim, dim)
-        self.o = nn.Linear(dim, dim)
+        self.tp_size = get_tp_world_size()
+        if self.num_heads % self.tp_size != 0:
+            raise ValueError(
+                f"num_heads ({self.num_heads}) must be divisible by tp_size ({self.tp_size})."
+            )
+        self.num_heads_per_rank = self.num_heads // self.tp_size
+
+        self.q = ColumnParallelLinear(dim, dim, bias=True, gather_output=False)
+        self.k = ColumnParallelLinear(dim, dim, bias=True, gather_output=False)
+        self.v = ColumnParallelLinear(dim, dim, bias=True, gather_output=False)
+        self.o = RowParallelLinear(dim, dim, bias=True, input_is_parallel=True)
         self.norm_q = RMSNorm(dim, eps=eps)
         self.norm_k = RMSNorm(dim, eps=eps)
         self.has_image_input = has_image_input
         if has_image_input:
-            self.k_img = nn.Linear(dim, dim)
-            self.v_img = nn.Linear(dim, dim)
+            self.k_img = ColumnParallelLinear(dim, dim, bias=True, gather_output=False)
+            self.v_img = ColumnParallelLinear(dim, dim, bias=True, gather_output=False)
             self.norm_k_img = RMSNorm(dim, eps=eps)
 
         # Use LocalAttention for cross-attention (no SP communication needed)
         self.attn = LocalAttention(
-            num_heads=self.num_heads,
+            num_heads=self.num_heads_per_rank,
             head_size=self.head_dim,
             causal=False,
             softmax_scale=None,
@@ -200,28 +234,46 @@ class CrossAttention(nn.Module):
         Returns:
             Output tensor [B, S_local, D]
         """
+        img: torch.Tensor | None = None
         if self.has_image_input:
             img = y[:, :257]
             ctx = y[:, 257:]
         else:
             ctx = y
-        q = self.norm_q(self.q(x))
-        k = self.norm_k(self.k(ctx))
-        v = self.v(ctx)
-        q = rearrange(q, "b s (n d) -> b s n d", n=self.num_heads)
-        k = rearrange(k, "b s (n d) -> b s n d", n=self.num_heads)
-        v = rearrange(v, "b s (n d) -> b s n d", n=self.num_heads)
+
+        q, _ = self.q(x)
+        k, _ = self.k(ctx)
+        v, _ = self.v(ctx)
+
+        if self.tp_size > 1:
+            q = tensor_parallel_rms_norm(q, self.norm_q)
+            k = tensor_parallel_rms_norm(k, self.norm_k)
+        else:
+            q = self.norm_q(q)
+            k = self.norm_k(k)
+
+        q = rearrange(q, "b s (n d) -> b s n d", n=self.num_heads_per_rank)
+        k = rearrange(k, "b s (n d) -> b s n d", n=self.num_heads_per_rank)
+        v = rearrange(v, "b s (n d) -> b s n d", n=self.num_heads_per_rank)
         x = self.attn(q, k, v)
         x = rearrange(x, "b s n d -> b s (n d)")
         if self.has_image_input:
-            k_img = self.norm_k_img(self.k_img(img))
-            v_img = self.v_img(img)
-            k_img = rearrange(k_img, "b s (n d) -> b s n d", n=self.num_heads)
-            v_img = rearrange(v_img, "b s (n d) -> b s n d", n=self.num_heads)
+            assert img is not None
+            k_img, _ = self.k_img(img)
+            v_img, _ = self.v_img(img)
+
+            if self.tp_size > 1:
+                k_img = tensor_parallel_rms_norm(k_img, self.norm_k_img)
+            else:
+                k_img = self.norm_k_img(k_img)
+
+            k_img = rearrange(k_img, "b s (n d) -> b s n d", n=self.num_heads_per_rank)
+            v_img = rearrange(v_img, "b s (n d) -> b s n d", n=self.num_heads_per_rank)
             y = self.attn(q, k_img, v_img)
             y = rearrange(y, "b s n d -> b s (n d)")
             x = x + y
-        return self.o(x)
+        x, _ = self.o(x)
+        return x
 
 
 class GateModule(nn.Module):
@@ -291,7 +343,8 @@ class Head(nn.Module):
         self.dim = dim
         self.patch_size = patch_size
         self.norm = nn.LayerNorm(dim, eps=eps, elementwise_affine=False)
-        self.head = nn.Linear(dim, out_dim * math.prod(patch_size))
+        # Output dim is small for MoVA; replicate to avoid TP shape coupling.
+        self.head = ReplicatedLinear(dim, out_dim * math.prod(patch_size))
         self.modulation = nn.Parameter(torch.randn(1, 2, dim) / dim**0.5)
 
     def forward(self, x, t_mod):
@@ -300,12 +353,12 @@ class Head(nn.Module):
                 self.modulation.unsqueeze(0).to(dtype=t_mod.dtype, device=t_mod.device)
                 + t_mod.unsqueeze(2)
             ).chunk(2, dim=2)
-            x = self.head(self.norm(x) * (1 + scale.squeeze(2)) + shift.squeeze(2))
+            x, _ = self.head(self.norm(x) * (1 + scale.squeeze(2)) + shift.squeeze(2))
         else:
             shift, scale = (
                 self.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod
             ).chunk(2, dim=1)
-            x = self.head(self.norm(x) * (1 + scale) + shift)
+            x, _ = self.head(self.norm(x) * (1 + scale) + shift)
         return x
 
 
@@ -320,15 +373,19 @@ class Conv3dLocalIsland(nn.Conv3d):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-    def forward(self, x):
-        if isinstance(x, DTensor):
-            x_local = x.to_local()
-            w_local = self.weight.to_local()
-            b_local = self.bias.to_local()
+    def forward(self, input):
+        if isinstance(input, DTensor):
+            # NOTE: DTensor typing stubs are incomplete; at runtime DTensor has
+            # to_local() and parameters may also be DTensor.
+            x_local = input.to_local()  # type: ignore[attr-defined]
+            w_local = self.weight.to_local()  # type: ignore[attr-defined]
+            b_local = (
+                self.bias.to_local() if self.bias is not None else None  # type: ignore[attr-defined]
+            )
 
             return self._conv_forward(x_local, w_local, b_local)
         else:
-            return super().forward(x)
+            return super().forward(input)
 
 
 class WanModel(CachableDiT, OffloadableDiTMixin, ModelMixin, ConfigMixin):
@@ -380,7 +437,8 @@ class WanModel(CachableDiT, OffloadableDiTMixin, ModelMixin, ConfigMixin):
             text_dim, dim, output_dim=dim, act_type="gelu_pytorch_tanh"
         )
         self.time_embedding = MLP(freq_dim, dim, output_dim=dim, act_type="silu")
-        self.time_projection = nn.Sequential(nn.SiLU(), nn.Linear(dim, dim * 6))
+        # Preserve state_dict keys (time_projection.1.weight/bias).
+        self.time_projection = nn.Sequential(nn.SiLU(), ReplicatedLinear(dim, dim * 6))
         self.blocks = nn.ModuleList(
             [
                 DiTBlock(has_image_input, dim, num_heads, ffn_dim, eps)
@@ -443,7 +501,7 @@ class WanModel(CachableDiT, OffloadableDiTMixin, ModelMixin, ConfigMixin):
         self.freqs = precompute_freqs_cis_3d(head_dim)
 
     def patchify(
-        self, x: torch.Tensor, control_camera_latents_input: torch.Tensor = None
+        self, x: torch.Tensor, control_camera_latents_input: torch.Tensor | None = None
     ):
         # NOTE(dhyu): avoid slow_conv
         x = x.contiguous(memory_format=torch.channels_last_3d)
@@ -453,13 +511,20 @@ class WanModel(CachableDiT, OffloadableDiTMixin, ModelMixin, ConfigMixin):
             and control_camera_latents_input is not None
         ):
             y_camera = self.control_adapter(control_camera_latents_input)
-            x = [u + v for u, v in zip(x, y_camera)]
-            x = x[0].unsqueeze(0)
+            if isinstance(x, list):
+                x = [u + v for u, v in zip(x, y_camera)]
+                x = x[0].unsqueeze(0)
+            else:
+                # Some adapters may return a list even when x is a Tensor.
+                if isinstance(y_camera, list):
+                    x = x + y_camera[0]
+                else:
+                    x = x + y_camera
         grid_size = x.shape[2:]
         x = rearrange(x, "b c f h w -> b (f h w) c").contiguous()
         return x, grid_size  # x, grid_size: (f, h, w)
 
-    def unpatchify(self, x: torch.Tensor, grid_size: torch.Tensor):
+    def unpatchify(self, x: torch.Tensor, grid_size: tuple[int, int, int]):
         return rearrange(
             x,
             "b (f h w) (x y z c) -> b c (f x) (h y) (w z)",
@@ -473,25 +538,48 @@ class WanModel(CachableDiT, OffloadableDiTMixin, ModelMixin, ConfigMixin):
 
     def forward(
         self,
-        x: torch.Tensor,
-        timestep: torch.Tensor,
-        context: torch.Tensor,
-        clip_feature: Optional[torch.Tensor] = None,
-        y: Optional[torch.Tensor] = None,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor | list[torch.Tensor],
+        timestep: torch.LongTensor,
+        encoder_hidden_states_image: torch.Tensor | list[torch.Tensor] | None = None,
+        guidance=None,
         use_gradient_checkpointing: bool = False,
         use_gradient_checkpointing_offload: bool = False,
         **kwargs,
-    ):
+    ) -> torch.Tensor:
+        # MoVA code historically uses x/context/y/clip_feature naming.
+        x = hidden_states
+        context = (
+            encoder_hidden_states[0]
+            if isinstance(encoder_hidden_states, list)
+            else encoder_hidden_states
+        )
+        clip_feature = (
+            encoder_hidden_states_image[0]
+            if isinstance(encoder_hidden_states_image, list)
+            and len(encoder_hidden_states_image) > 0
+            else encoder_hidden_states_image
+        )
+        y = kwargs.get("y", None)
         t = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, timestep))
-        t_mod = self.time_projection(t).unflatten(1, (6, self.dim))
+        t_proj, _ = self.time_projection(t)
+        t_mod = t_proj.unflatten(1, (6, self.dim))
         context = self.text_embedding(context)
 
         if self.has_image_input:
+            if y is None:
+                raise ValueError(
+                    "MoVA video DiT requires reference image latents 'y' when has_image_input=True"
+                )
+            if clip_feature is None:
+                raise ValueError(
+                    "MoVA video DiT requires encoder_hidden_states_image (clip features) when has_image_input=True"
+                )
             x = torch.cat([x, y], dim=1)  # (b, c_x + c_y, f, h, w)
             clip_feature_input = clip_feature
             if self.img_pos_emb is not None:
                 clip_feature_input = clip_feature_input + self.img_pos_emb.to(
-                    dtype=clip_feature.dtype, device=clip_feature.device
+                    dtype=clip_feature_input.dtype, device=clip_feature_input.device
                 )
             clip_embedding = self.img_emb(clip_feature_input)
             context = torch.cat([clip_embedding, context], dim=1)

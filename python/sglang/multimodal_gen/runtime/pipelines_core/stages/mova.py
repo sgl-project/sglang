@@ -423,16 +423,14 @@ class MovaDenoisingStage(PipelineStage):
             visual_t = visual_dit.time_embedding(
                 video_sinusoidal_embedding_1d(visual_dit.freq_dim, timestep)
             )
-            visual_t_mod = visual_dit.time_projection(visual_t).unflatten(
-                1, (6, visual_dit.dim)
-            )
+            visual_t_mod, _ = visual_dit.time_projection(visual_t)
+            visual_t_mod = visual_t_mod.unflatten(1, (6, visual_dit.dim))
 
             audio_t = self.audio_dit.time_embedding(
                 audio_sinusoidal_embedding_1d(self.audio_dit.freq_dim, audio_timestep)
             )
-            audio_t_mod = self.audio_dit.time_projection(audio_t).unflatten(
-                1, (6, self.audio_dit.dim)
-            )
+            audio_t_mod, _ = self.audio_dit.time_projection(audio_t)
+            audio_t_mod = audio_t_mod.unflatten(1, (6, self.audio_dit.dim))
 
         visual_t = visual_t.to(model_dtype)
         visual_t_mod = visual_t_mod.to(model_dtype)

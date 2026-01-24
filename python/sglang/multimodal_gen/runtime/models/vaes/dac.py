@@ -15,6 +15,7 @@ from sglang.multimodal_gen.runtime.models.vaes.common import (
     DiagonalGaussianDistribution,
 )
 
+
 # Scripting this brings model speed up 1.4x
 @torch.jit.script
 def snake(x, alpha):

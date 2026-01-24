@@ -15,6 +15,7 @@ from einops import rearrange
 from torch.distributed.tensor import DTensor
 
 from sglang.multimodal_gen.configs.models.dits.mova_audio import MovaAudioConfig
+from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
 from sglang.multimodal_gen.runtime.layers.mlp import MLP
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
@@ -53,7 +54,7 @@ class Head(nn.Module):
         self.dim = dim
         self.patch_size = patch_size
         self.norm = nn.LayerNorm(dim, eps=eps, elementwise_affine=False)
-        self.head = nn.Linear(dim, out_dim * math.prod(patch_size))
+        self.head = ReplicatedLinear(dim, out_dim * math.prod(patch_size))
         self.modulation = nn.Parameter(torch.randn(1, 2, dim) / dim**0.5)
 
     def forward(self, x, t_mod):
@@ -63,14 +64,14 @@ class Head(nn.Module):
                 self.modulation.unsqueeze(0).to(dtype=t_mod.dtype, device=t_mod.device)
                 + t_mod.unsqueeze(2)
             ).chunk(2, dim=2)
-            x = self.head(self.norm(x) * (1 + scale.squeeze(2)) + shift.squeeze(2))
+            x, _ = self.head(self.norm(x) * (1 + scale.squeeze(2)) + shift.squeeze(2))
         else:
             # NOTE: 这里 t_mod 原本是 [B, C], 当 B = 1 时可以通过广播机制正确处理，但 B > 1 后就会和 [1, 2, C] 匹配不上
             shift, scale = (
                 self.modulation.to(dtype=t_mod.dtype, device=t_mod.device)
                 + t_mod.unsqueeze(1)
             ).chunk(2, dim=1)
-            x = self.head(self.norm(x) * (1 + scale) + shift)
+            x, _ = self.head(self.norm(x) * (1 + scale) + shift)
         return x
 
 
@@ -85,15 +86,17 @@ class Conv1dLocalIsland(nn.Conv1d):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-    def forward(self, x):
-        if isinstance(x, DTensor):
-            x_local = x.to_local()
-            w_local = self.weight.to_local()
-            b_local = self.bias.to_local()
+    def forward(self, input):
+        if isinstance(input, DTensor):
+            x_local = input.to_local()  # type: ignore[attr-defined]
+            w_local = self.weight.to_local()  # type: ignore[attr-defined]
+            b_local = (
+                self.bias.to_local() if self.bias is not None else None  # type: ignore[attr-defined]
+            )
 
             return self._conv_forward(x_local, w_local, b_local)
         else:
-            return super().forward(x)
+            return super().forward(input)
 
 
 class WanAudioModel(CachableDiT, OffloadableDiTMixin, ModelMixin, ConfigMixin):
@@ -148,7 +151,8 @@ class WanAudioModel(CachableDiT, OffloadableDiTMixin, ModelMixin, ConfigMixin):
             text_dim, dim, output_dim=dim, act_type="gelu_pytorch_tanh"
         )
         self.time_embedding = MLP(freq_dim, dim, output_dim=dim, act_type="silu")
-        self.time_projection = nn.Sequential(nn.SiLU(), nn.Linear(dim, dim * 6))
+        # Preserve state_dict keys (time_projection.1.weight/bias).
+        self.time_projection = nn.Sequential(nn.SiLU(), ReplicatedLinear(dim, dim * 6))
         self.blocks = nn.ModuleList(
             [
                 DiTBlock(has_image_input, dim, num_heads, ffn_dim, eps)
@@ -229,30 +233,52 @@ class WanAudioModel(CachableDiT, OffloadableDiTMixin, ModelMixin, ConfigMixin):
             and control_camera_latents_input is not None
         ):
             y_camera = self.control_adapter(control_camera_latents_input)
-            x = [u + v for u, v in zip(x, y_camera)]
-            x = x[0].unsqueeze(0)
+            if isinstance(x, list):
+                x = [u + v for u, v in zip(x, y_camera)]
+                x = x[0].unsqueeze(0)
+            else:
+                if isinstance(y_camera, list):
+                    x = x + y_camera[0]
+                else:
+                    x = x + y_camera
         grid_size = x.shape[2:]
         x = rearrange(x, "b c f -> b f c").contiguous()
         return x, grid_size  # x, grid_size: (f)
 
-    def unpatchify(self, x: torch.Tensor, grid_size: torch.Tensor):
+    def unpatchify(self, x: torch.Tensor, grid_size: tuple[int]):
         return rearrange(
             x, "b f (p c) -> b c (f p)", f=grid_size[0], p=self.patch_size[0]
         )
 
     def forward(
         self,
-        x: torch.Tensor,
-        timestep: torch.Tensor,
-        context: torch.Tensor,
-        clip_feature: Optional[torch.Tensor] = None,
-        y: Optional[torch.Tensor] = None,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor | list[torch.Tensor],
+        timestep: torch.LongTensor,
+        encoder_hidden_states_image: torch.Tensor | list[torch.Tensor] | None = None,
+        guidance=None,
         use_gradient_checkpointing: bool = False,
         use_gradient_checkpointing_offload: bool = False,
         **kwargs,
-    ):
+    ) -> torch.Tensor:
+        # MoVA audio uses x/context naming historically.
+        x = hidden_states
+        context = (
+            encoder_hidden_states[0]
+            if isinstance(encoder_hidden_states, list)
+            else encoder_hidden_states
+        )
+        clip_feature = (
+            encoder_hidden_states_image[0]
+            if isinstance(encoder_hidden_states_image, list)
+            and len(encoder_hidden_states_image) > 0
+            else encoder_hidden_states_image
+        )
+        y = kwargs.get("y", None)
+
         t = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, timestep))
-        t_mod = self.time_projection(t).unflatten(1, (6, self.dim))
+        t_proj, _ = self.time_projection(t)
+        t_mod = t_proj.unflatten(1, (6, self.dim))
         context = self.text_embedding(context)
 
         if self.has_image_input:
@@ -260,7 +286,7 @@ class WanAudioModel(CachableDiT, OffloadableDiTMixin, ModelMixin, ConfigMixin):
             clip_feature_input = clip_feature
             if self.img_pos_emb is not None:
                 clip_feature_input = clip_feature_input + self.img_pos_emb.to(
-                    dtype=clip_feature.dtype, device=clip_feature.device
+                    dtype=clip_feature_input.dtype, device=clip_feature_input.device
                 )
             clip_embedding = self.img_emb(clip_feature_input)
             context = torch.cat([clip_embedding, context], dim=1)

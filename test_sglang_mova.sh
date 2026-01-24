@@ -7,8 +7,7 @@ cd "${WORKDIR}"
 
 # Assert branch clean
 if [[ -n $(git status --porcelain) ]]; then
-    echo "Error: Git branch is not clean. Please commit or stash your changes."
-    # exit 1
+    echo "Warning: Git branch is not clean. Please commit or stash your changes."
 fi
 
 export PYTHONPATH=${WORKDIR}/python
@@ -42,10 +41,9 @@ EOF
 # 5) 运行（SGLang native）
 python -m sglang.multimodal_gen.runtime.entrypoints.cli.main generate \
     --backend sglang \
-    --pipeline-class-name MoVA \
     --model-path "${MODEL_PATH}" \
-    --adjust-frames false \
     --num-gpus 4 \
+    --tp-size 4 \
     --prompt "${PROMPT}" \
     --image-path "${REF_IMAGE}" \
     --output-path "${OUT_DIR}" \
