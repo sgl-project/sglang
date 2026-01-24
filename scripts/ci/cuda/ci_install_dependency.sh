@@ -126,7 +126,7 @@ SGL_KERNEL_VERSION_FROM_KERNEL=$(grep -Po '(?<=^version = ")[^"]*' sgl-kernel/py
 SGL_KERNEL_VERSION_FROM_SRT=$(grep -Po -m1 '(?<=sgl-kernel==)[0-9A-Za-z\.\-]+' python/pyproject.toml)
 echo "SGL_KERNEL_VERSION_FROM_KERNEL=${SGL_KERNEL_VERSION_FROM_KERNEL} SGL_KERNEL_VERSION_FROM_SRT=${SGL_KERNEL_VERSION_FROM_SRT}"
 
-if [ "${CUSTOM_BUILD_SGL_KERNEL:-}" = "true" ]; then
+if [ "${CUSTOM_BUILD_SGL_KERNEL:-}" = "true" ] && [ -d "sgl-kernel/dist" ]; then
     ls -alh sgl-kernel/dist
     # Determine wheel architecture
     if [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then
@@ -135,6 +135,11 @@ if [ "${CUSTOM_BUILD_SGL_KERNEL:-}" = "true" ]; then
         WHEEL_ARCH="x86_64"
     fi
     $PIP_CMD install sgl-kernel/dist/sgl_kernel-${SGL_KERNEL_VERSION_FROM_KERNEL}-cp310-abi3-manylinux2014_${WHEEL_ARCH}.whl --force-reinstall $PIP_INSTALL_SUFFIX
+elif [ "${CUSTOM_BUILD_SGL_KERNEL:-}" = "true" ] && [ ! -d "sgl-kernel/dist" ]; then
+    # CUSTOM_BUILD_SGL_KERNEL was set but artifacts not available (e.g., stage rerun without wheel build)
+    # Fall back to installing from PyPI
+    echo "WARNING: CUSTOM_BUILD_SGL_KERNEL=true but sgl-kernel/dist not found, falling back to PyPI"
+    $PIP_CMD install sgl-kernel==${SGL_KERNEL_VERSION_FROM_SRT} --force-reinstall $PIP_INSTALL_SUFFIX
 else
     # On Blackwell machines, skip reinstall if correct version already installed to avoid race conditions
     if [ "$IS_BLACKWELL" = "1" ]; then
