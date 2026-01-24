@@ -376,10 +376,7 @@ class AutoRoundConfig(QuantizationConfig):
                 "sym": sym,
                 "lm_head": False,
             }
-            return MoeWNA16Config.from_config(config).get_quant_method(
-                layer, prefix
-            )
-            
+            return MoeWNA16Config.from_config(config).get_quant_method(layer, prefix)
 
         if isinstance(layer, (LinearBase, ParallelLMHead)):
             if use_marlin:
