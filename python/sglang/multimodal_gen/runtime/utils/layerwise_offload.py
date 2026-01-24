@@ -39,7 +39,9 @@ class LayerwiseOffloadManager:
         self.layers_attr_str = layers_attr_str
         self.num_layers = num_layers
         self.pin_cpu_memory = pin_cpu_memory
-        self.prefetch_size = min(self.num_layers // 2, max(1, prefetch_size)) % self.num_layers
+        self.prefetch_size = (
+            min(self.num_layers // 2, max(1, prefetch_size)) % self.num_layers
+        )
         print(f"{self.prefetch_size=}")
         print(f"{self.num_layers=}")
         self.enabled = bool(enabled and torch.cuda.is_available())
@@ -115,7 +117,7 @@ class LayerwiseOffloadManager:
                 current_offset = 0
                 for name, weight in weights:
                     numel = weight.numel()
-                    cpu_buffer[current_offset: current_offset + numel].copy_(
+                    cpu_buffer[current_offset : current_offset + numel].copy_(
                         weight.flatten()
                     )
                     self._weight_metadata[layer_idx][name] = {
@@ -187,7 +189,7 @@ class LayerwiseOffloadManager:
             # map the parameter's data to the correct slice of the GPU buffer
             target = self.get_target_with_name(name)
             target.data = gpu_buffer[
-                meta["offset"]: meta["offset"] + meta["numel"]
+                meta["offset"] : meta["offset"] + meta["numel"]
             ].view(meta["shape"])
 
         logger.debug(f"fetched layer: {layer_idx=}")
@@ -255,7 +257,7 @@ class LayerwiseOffloadManager:
             cpu_buffer = self._consolidated_cpu_weights[layer_idx][dtype]
             offset = meta["offset"]
             numel = meta["numel"]
-            cpu_buffer[offset: offset + numel].copy_(gpu_weight)
+            cpu_buffer[offset : offset + numel].copy_(gpu_weight)
 
     @torch.compiler.disable
     def sync_all_layers_to_cpu(self) -> None:
@@ -294,12 +296,23 @@ class LayerwiseOffloadManager:
                     # else:
                     # fetch for next denoise iteration
                     if start_layer >= self.num_layers:
-                        ranges = [(start_layer % self.num_layers, (end_layer - 1) % self.num_layers + 1)]
+                        ranges = [
+                            (
+                                start_layer % self.num_layers,
+                                (end_layer - 1) % self.num_layers + 1,
+                            )
+                        ]
                     elif end_layer > self.num_layers:
-                        ranges = [(start_layer, self.num_layers), (0, end_layer % self.num_layers)]
+                        ranges = [
+                            (start_layer, self.num_layers),
+                            (0, end_layer % self.num_layers),
+                        ]
                     else:
                         ranges = [(start_layer, end_layer)]
-                    logger.info(f"pre hook layer: {i} prefetching {ranges=}", main_process_only=True)
+                    logger.debug(
+                        f"pre hook layer: {i} prefetching {ranges=}",
+                        main_process_only=True,
+                    )
                     for s, e in ranges:
                         for l in range(s, e):
                             self.prefetch_layer(l, non_blocking=True)
