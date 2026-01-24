@@ -59,7 +59,6 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
         self.fc = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
 
         config.full_attention_interval = 1
-        # self.model = Qwen3_5Model(config, quant_config, prefix=add_prefix("model", prefix))
         self.layers = torch.nn.ModuleList(
             [Qwen3_5AttentionDecoderLayer(config, idx, quant_config, prefix=add_prefix(f"layers.{idx}", prefix))
              for idx in range(self.num_mtp_layers)]
@@ -90,7 +89,7 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
         input_embeds = forward_batch.target_extend_input_embeds
         if forward_batch.forward_mode.is_extend() and forward_batch.contains_mm_inputs() and not forward_batch.forward_mode.is_draft_extend():
             assert input_embeds is not None
-            input_embeds = torch.cat([input_embeds[:-1], self.model.embed_tokens(input_ids[-1].unsqueeze(0))])
+            input_embeds = torch.cat([input_embeds[:-1], self.embed_tokens(input_ids[-1].unsqueeze(0))])
 
         if input_embeds is None:
             input_embeds = self.embed_tokens(input_ids)

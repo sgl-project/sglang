@@ -65,7 +65,7 @@ from sglang.srt.model_loader.weight_utils import (
 )
 
 # Models
-from sglang.srt.models.qwen3_next import Qwen3NextModel, gdn_with_output
+from sglang.srt.models.qwen3_next import gdn_with_output
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from sglang.srt.models.qwen2_moe import Qwen2MoeSparseMoeBlock, Qwen2MoeMLP
 
@@ -640,7 +640,7 @@ ALL_DECODER_LAYER_TYPES = {
 }
 
 
-class Qwen3_5Model(nn.Module):
+class Qwen3_5LLMModel(nn.Module):
     """Qwen3.5 Model with support for dense variant."""
     def __init__(
         self,
@@ -753,76 +753,6 @@ class Qwen3_5Model(nn.Module):
             else:
                 hidden_states, _ = self.norm(hidden_states, residual)
         
-        return hidden_states
-
-
-class Qwen3_5LLMModel(Qwen3_5Model):
-    def __init__(
-        self,
-        *,
-        config: Qwen3NextVLConfig,
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
-    ):
-        super().__init__(config=config, quant_config=quant_config, prefix=prefix)
-        self.hidden_size = config.hidden_size
-        self.pp_group = get_pp_group()
-
-    def get_input_embeddings(self) -> nn.Embedding:
-        return self.embed_tokens
-
-    @torch.no_grad()
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        forward_batch: ForwardBatch,
-        input_embeds: torch.Tensor = None,
-        pp_proxy_tensors: Optional[PPProxyTensors] = None,
-        input_deepstack_embeds: Optional[torch.Tensor] = None,
-    ) -> Union[torch.Tensor, PPProxyTensors]:
-        if self.pp_group.is_first_rank:
-            if input_embeds is None:
-                hidden_states = self.embed_tokens(input_ids)
-            else:
-                hidden_states = input_embeds
-            residual = None
-        else:
-            assert pp_proxy_tensors is not None
-            hidden_states = pp_proxy_tensors["hidden_states"]
-            residual = pp_proxy_tensors["residual"]
-
-        for layer_idx in range(len(self.layers)):
-            layer = self.layers[layer_idx]
-            with get_global_expert_distribution_recorder().with_current_layer(layer_idx):
-                hidden_states, residual = layer(
-                    layer_id=layer_idx,
-                    positions=positions,
-                    hidden_states=hidden_states,
-                    residual=residual,
-                    forward_batch=forward_batch,
-                )
-
-            # process deepstack
-            if input_deepstack_embeds is not None and input_deepstack_embeds.numel() > 0 and layer_idx < 3:
-                sep = self.hidden_size * layer_idx
-                hidden_states.add_(
-                    input_deepstack_embeds[:, sep : sep + self.hidden_size]
-                )
-
-        if not self.pp_group.is_last_rank:
-            return PPProxyTensors(
-                {
-                    "hidden_states": hidden_states,
-                    "residual": residual,
-                }
-            )
-        else:
-            if hidden_states.shape[0] != 0:
-                if residual is None:
-                    hidden_states = self.norm(hidden_states)
-                else:
-                    hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
 
