@@ -41,6 +41,10 @@ from sglang.srt.disaggregation.kv_events import (
 )
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
+    EvictParams,
+    EvictResult,
+    InsertParams,
+    InsertResult,
     MatchPrefixParams,
     MatchResult,
 )
@@ -413,16 +417,21 @@ class RadixCache(BasePrefixCache):
             last_host_node=last_node,
         )
 
-    def insert(self, key: RadixKey, value=None, chunked=False, priority: int = 0):
+    def insert(self, params: InsertParams) -> InsertResult:
         if self.disable:
-            return 0
+            return InsertResult(prefix_len=0)
+
+        key = params.key
+        value = params.value
+        priority = params.priority
 
         if value is None:
             value = torch.tensor(key.token_ids, dtype=torch.int64)
 
         key, value = self.maybe_bigram_convert(key, value)
 
-        return self._insert_helper(self.root_node, key, value, priority)
+        prefix_len = self._insert_helper(self.root_node, key, value, priority)
+        return InsertResult(prefix_len=prefix_len)
 
     def _page_align_keys(self, key: list) -> list:
         if self.page_size == 1:
@@ -459,7 +468,10 @@ class RadixCache(BasePrefixCache):
         # Radix Cache takes one ref in memory pool
         if is_insert:
             priority = getattr(req, "priority", 0) or 0
-            new_prefix_len = self.insert(radix_key, values, priority=priority)
+            result = self.insert(
+                InsertParams(key=radix_key, value=values, priority=priority)
+            )
+            new_prefix_len = result.prefix_len
             # Free the duplicates that were already in the tree
             self.token_to_kv_pool_allocator.free(
                 kv_indices[req.cache_protected_len : new_prefix_len]
@@ -493,12 +505,15 @@ class RadixCache(BasePrefixCache):
         radix_key = RadixKey(keys, req.extra_key, is_bigram=self.is_eagle)
 
         # Radix Cache takes one ref in memory pool
-        new_prefix_len = self.insert(
-            radix_key,
-            values,
-            chunked=chunked,
-            priority=getattr(req, "priority", 0) or 0,
+        result = self.insert(
+            InsertParams(
+                key=radix_key,
+                value=values,
+                chunked=chunked,
+                priority=getattr(req, "priority", 0) or 0,
+            )
         )
+        new_prefix_len = result.prefix_len
 
         self.token_to_kv_pool_allocator.free(
             kv_indices[req.cache_protected_len : new_prefix_len]
@@ -545,11 +560,12 @@ class RadixCache(BasePrefixCache):
     def total_size(self):
         return self._total_size_helper()
 
-    def evict(self, num_tokens: int):
+    def evict(self, params: EvictParams) -> EvictResult:
         if self.disable:
-            return
+            return EvictResult()
 
         start_time = time.perf_counter()
+        num_tokens = params.num_tokens
         leaves = self._collect_leaves()
         eviction_heap = [
             (self.eviction_strategy.get_priority(node), node) for node in leaves
@@ -571,6 +587,7 @@ class RadixCache(BasePrefixCache):
             self._record_remove_event(x)
 
         self.update_eviction_metrics(num_evicted, start_time)
+        return EvictResult(num_tokens_evicted=num_evicted)
 
     def inc_lock_ref(self, node: TreeNode):
         if self.disable:
@@ -842,11 +859,15 @@ if __name__ == "__main__":
     tree = RadixCache.create_simulated()
 
     # Example token id sequences (as lists of ints)
-    tree.insert(RadixKey(token_ids=[1, 2, 3], extra_key=None))
-    tree.insert(RadixKey(token_ids=[1, 2, 3], extra_key=None))
-    tree.insert(RadixKey(token_ids=[1, 2, 4, 5], extra_key=None))
-    tree.insert(RadixKey(token_ids=[1, 2, 4, 5, 6, 7], extra_key=None))
-    tree.insert(RadixKey(token_ids=[8, 9, 10, 11, 12], extra_key=None))
+    tree.insert(InsertParams(key=RadixKey(token_ids=[1, 2, 3], extra_key=None)))
+    tree.insert(InsertParams(key=RadixKey(token_ids=[1, 2, 3], extra_key=None)))
+    tree.insert(InsertParams(key=RadixKey(token_ids=[1, 2, 4, 5], extra_key=None)))
+    tree.insert(
+        InsertParams(key=RadixKey(token_ids=[1, 2, 4, 5, 6, 7], extra_key=None))
+    )
+    tree.insert(
+        InsertParams(key=RadixKey(token_ids=[8, 9, 10, 11, 12], extra_key=None))
+    )
     tree.pretty_print()
 
     print(

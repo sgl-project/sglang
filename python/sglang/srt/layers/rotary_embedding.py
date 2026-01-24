@@ -115,9 +115,10 @@ class RotaryEmbedding(MultiPlatformOp):
             cache = cache.to(dtype)
 
         if (
-            (not (_is_cuda or _is_npu) or self.head_size not in [64, 128, 256, 512])
+            (not (_is_cuda) or self.head_size not in [64, 128, 256, 512])
             and not (_is_cpu)
             and not (_is_xpu)
+            and not (_is_npu)
         ):
             if _is_cuda or _is_hip:
                 from sgl_kernel import rotary_embedding
@@ -755,8 +756,8 @@ class Phi3LongRoPEScaledRotaryEmbedding(nn.Module):
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        query = query.view(*query.shape[:-1], -1, self.head_size)
-        key = key.view(*key.shape[:-1], -1, self.head_size)
+        query = query.unflatten(1, (-1, self.head_size))
+        key = key.unflatten(1, (-1, self.head_size))
 
         k = self.original_max_position_embeddings
         long_prompt_offset = (
