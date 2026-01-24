@@ -107,12 +107,14 @@ class ComfyUILatentPreparationStage(LatentPreparationStage):
 
         if original_latents_shape is not None:
             current_shape = result.latents.shape if result.latents is not None else None
-            if (
+            # Spatial format conversion (4D->3D) should also preserve original
+            if len(original_latents_shape) == 3 or (
                 current_shape is not None
                 and len(current_shape) == 3
                 and len(original_latents_shape) == 4
             ):
-                # Keep original shape for raw_latent_shape
+                result.raw_latent_shape = original_latents_shape
+            elif current_shape is not None and current_shape != original_latents_shape:
                 result.raw_latent_shape = original_latents_shape
             elif current_shape is not None and current_shape == original_latents_shape:
                 result.raw_latent_shape = current_shape

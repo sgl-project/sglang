@@ -92,6 +92,7 @@ class Req:
     # vae-encoded condition image
     image_latent: torch.Tensor | list[torch.Tensor] | None = None
     condition_image_latent_ids: torch.Tensor | list[torch.Tensor] | None = None
+    vae_image_sizes: list[tuple[int, int]] | None = None
 
     # Latent dimensions
     height_latents: list[int] | int | None = None
@@ -287,7 +288,8 @@ class Req:
                  save_output: {self.save_output}
             output_file_path: {self.output_file_path()}
         """  # type: ignore[attr-defined]
-        logger.info(debug_str)
+        if not server_args.comfyui_mode:
+            logger.info(debug_str)
 
 
 @dataclass
