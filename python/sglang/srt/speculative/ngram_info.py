@@ -26,6 +26,7 @@ from sglang.srt.mem_cache.common import (
     get_last_loc,
 )
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.speculative.eagle_info_v2 import EagleDraftInputV2Mixin
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import (
     TREE_SPEC_KERNEL_AVAILABLE,
@@ -447,3 +448,34 @@ class NgramVerifyInput(SpecInput):
 
     def merge_batch(self, spec_info: NgramVerifyInput):
         pass
+
+
+class NgramVerifyInputV2(NgramVerifyInput, EagleDraftInputV2Mixin):
+    def __init__(
+        self,
+        draft_token: torch.Tensor,
+        tree_mask: torch.Tensor,
+        positions: torch.Tensor,
+        retrive_index: torch.Tensor,
+        retrive_next_token: torch.Tensor,
+        retrive_next_sibling: torch.Tensor,
+        draft_token_num: int,
+    ):
+        super().__init__(
+            draft_token,
+            tree_mask,
+            positions,
+            retrive_index,
+            retrive_next_token,
+            retrive_next_sibling,
+            draft_token_num,
+        )
+        self.draft_token = draft_token
+        self.custom_mask = tree_mask
+        self.positions = positions
+        self.retrive_index = retrive_index
+        self.retrive_next_token = retrive_next_token
+        self.retrive_next_sibling = retrive_next_sibling
+        self.draft_token_num = draft_token_num
+        self.device = self.custom_mask.device
+        self.verify_done: Optional[torch.cuda.Event] = None

@@ -9,43 +9,10 @@ from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.eagle_info import EagleDraftInput
-from sglang.srt.speculative.eagle_info_v2 import EagleDraftInputV2Mixin
-from sglang.srt.speculative.ngram_info import NgramVerifyInput
 from sglang.srt.speculative.ngram_worker import NGRAMWorker
 from sglang.srt.speculative.spec_utils import detect_nan, generate_token_bitmask
 
 logger = logging.getLogger(__name__)
-
-
-class NgramVerifyInputV2(NgramVerifyInput, EagleDraftInputV2Mixin):
-    def __init__(
-        self,
-        draft_token: torch.Tensor,
-        tree_mask: torch.Tensor,
-        positions: torch.Tensor,
-        retrive_index: torch.Tensor,
-        retrive_next_token: torch.Tensor,
-        retrive_next_sibling: torch.Tensor,
-        draft_token_num: int,
-    ):
-        super().__init__(
-            draft_token,
-            tree_mask,
-            positions,
-            retrive_index,
-            retrive_next_token,
-            retrive_next_sibling,
-            draft_token_num,
-        )
-        self.draft_token = draft_token
-        self.custom_mask = tree_mask
-        self.positions = positions
-        self.retrive_index = retrive_index
-        self.retrive_next_token = retrive_next_token
-        self.retrive_next_sibling = retrive_next_sibling
-        self.draft_token_num = draft_token_num
-        self.device = self.custom_mask.device
-        self.verify_done: Optional[torch.cuda.Event] = None
 
 
 class NGRAMWorkerV2(NGRAMWorker):
