@@ -599,8 +599,13 @@ class TokenizerLoader(ComponentLoader):
         )
 
 
-class VAELoader(ComponentLoader):
-    """Loader for VAE."""
+class _BaseVAELoader(ComponentLoader):
+    """Shared loader for (video/audio) VAE modules."""
+
+    pipeline_vae_config_attr: str = "vae_config"
+    allowed_module_keys: tuple[str, ...] = ("vae",)
+    call_post_init: bool = False
+    log_state_dict_mismatches: bool = False
 
     def should_offload(
         self, server_args: ServerArgs, model_config: ModelConfig | None = None
@@ -620,17 +625,18 @@ class VAELoader(ComponentLoader):
             class_name is not None
         ), "Model config does not contain a _class_name attribute. Only diffusers format is supported."
 
-        module_key = "vae"
-        if module_name in ("video_vae", "vae"):
+        if module_name in self.allowed_module_keys:
             module_key = module_name
+        else:
+            raise ValueError(f"Invalid module name: {module_name}")
         server_args.model_paths[module_key] = component_model_path
 
         logger.debug("HF model config: %s", config)
-        vae_config = server_args.pipeline_config.vae_config
+        vae_config = getattr(server_args.pipeline_config, self.pipeline_vae_config_attr)
         vae_config.update_model_arch(config)
-
-        # NOTE: some post init logics are only available after updated with config
-        vae_config.post_init()
+        if self.call_post_init and hasattr(vae_config, "post_init"):
+            # NOTE: some post init logics are only available after updated with config
+            vae_config.post_init()
 
         should_offload = self.should_offload(server_args)
         target_device = self.target_device(should_offload)
@@ -671,88 +677,34 @@ class VAELoader(ComponentLoader):
         ), f"Found {len(safetensors_list)} safetensors files in {component_model_path}"
         loaded = safetensors_load_file(safetensors_list[0])
         vae.load_state_dict(loaded, strict=False)
+
+        if self.log_state_dict_mismatches:
+            state_keys = set(vae.state_dict().keys())
+            loaded_keys = set(loaded.keys())
+            missing_keys = sorted(state_keys - loaded_keys)
+            unexpected_keys = sorted(loaded_keys - state_keys)
+            if missing_keys:
+                logger.warning("VAE missing keys: %s", missing_keys)
+            if unexpected_keys:
+                logger.warning("VAE unexpected keys: %s", unexpected_keys)
+
         return vae.eval()
 
 
-class AudioVAELoader(ComponentLoader):
-    """Loader for MoVA audio VAE (DAC/oobleck)."""
+class VAELoader(_BaseVAELoader):
+    """Loader for VAE (image/video)."""
 
-    def should_offload(
-        self, server_args: ServerArgs, model_config: ModelConfig | None = None
-    ):
-        return server_args.vae_cpu_offload
+    pipeline_vae_config_attr = "vae_config"
+    allowed_module_keys = ("video_vae", "vae")
+    call_post_init = True
 
-    def load_customized(
-        self,
-        component_model_path: str,
-        server_args: ServerArgs,
-        module_name: str | None = None,
-    ):
 
-        config = get_diffusers_component_config(model_path=component_model_path)
-        class_name = config.pop("_class_name", None)
-        assert (
-            class_name is not None
-        ), "Model config does not contain a _class_name attribute. Only diffusers format is supported."
+class AudioVAELoader(_BaseVAELoader):
+    """Loader for audio VAE (e.g. DAC/oobleck)."""
 
-        module_key = "audio_vae"
-        if module_name in ("audio_vae",):
-            module_key = module_name
-        server_args.model_paths[module_key] = component_model_path
-        logger.info("HF model config: %s", config)
-
-        audio_vae_config = server_args.pipeline_config.audio_vae_config
-        audio_vae_config.update_model_arch(config)
-
-        should_offload = self.should_offload(server_args)
-        target_device = self.target_device(should_offload)
-
-        # Check for auto_map first (custom VAE classes)
-        auto_map = config.get("auto_map", {})
-        auto_model_map = auto_map.get("AutoModel")
-        if auto_model_map:
-            module_path, cls_name = auto_model_map.rsplit(".", 1)
-            custom_module_file = os.path.join(component_model_path, f"{module_path}.py")
-            spec = importlib.util.spec_from_file_location("_custom", custom_module_file)
-            custom_module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(custom_module)
-            vae_cls = getattr(custom_module, cls_name)
-            vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
-            with set_default_torch_dtype(vae_dtype):
-                vae = vae_cls.from_pretrained(
-                    component_model_path,
-                    revision=server_args.revision,
-                    trust_remote_code=server_args.trust_remote_code,
-                )
-            vae = vae.to(device=target_device, dtype=vae_dtype)
-            return vae.eval()
-
-        # Load from ModelRegistry (standard VAE classes)
-        with (
-            set_default_torch_dtype(
-                PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
-            ),
-            skip_init_modules(),
-        ):
-            audio_vae_cls, _ = ModelRegistry.resolve_model_cls(class_name)
-            audio_vae = audio_vae_cls(audio_vae_config).to(target_device)
-
-        safetensors_list = _list_safetensors_files(component_model_path)
-        assert (
-            len(safetensors_list) == 1
-        ), f"Found {len(safetensors_list)} safetensors files in {component_model_path}"
-        loaded = safetensors_load_file(safetensors_list[0])
-        audio_vae.load_state_dict(loaded, strict=False)
-
-        state_keys = set(audio_vae.state_dict().keys())
-        loaded_keys = set(loaded.keys())
-        missing_keys = sorted(state_keys - loaded_keys)
-        unexpected_keys = sorted(loaded_keys - state_keys)
-        if missing_keys:
-            logger.warning("Audio VAE missing keys: %s", missing_keys)
-        if unexpected_keys:
-            logger.warning("Audio VAE unexpected keys: %s", unexpected_keys)
-        return audio_vae.eval()
+    pipeline_vae_config_attr = "audio_vae_config"
+    allowed_module_keys = ("audio_vae",)
+    log_state_dict_mismatches = True
 
 
 class BridgeLoader(ComponentLoader):
