@@ -52,6 +52,7 @@ from .model_specs import (  # Default model paths; Model groups
     DEFAULT_SMALL_MODEL_PATH,
     EMBEDDING_MODELS,
     FUNCTION_CALLING_MODELS,
+    IMAGE_BACKENDS,
     MODEL_SPECS,
     REASONING_MODELS,
     THIRD_PARTY_MODELS,
@@ -139,6 +140,7 @@ __all__ = [
     "FUNCTION_CALLING_MODELS",
     # Third-party models
     "THIRD_PARTY_MODELS",
+    "IMAGE_BACKENDS",
     # Evaluation
     "run_eval",
 ]
