@@ -6,6 +6,7 @@ import json
 import logging
 import threading
 import time
+from queue import Empty
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
@@ -407,41 +408,64 @@ class HiRadixCache(RadixCache):
         This is intended for shutdown/detach paths where we want to make best-effort
         cleanup even if queue sizes temporarily differ across ranks.
         """
+        self._drain_storage_control_queues_impl(
+            n_revoke=None,
+            n_backup=None,
+            n_release=None,
+            log_metrics=False,
+        )
+
+    def _drain_storage_control_queues_impl(
+        self,
+        n_revoke: Optional[int],
+        n_backup: Optional[int],
+        n_release: Optional[int],
+        log_metrics: bool,
+    ):
         cc = self.cache_controller
 
-        # process prefetch revokes
-        try:
-            while not cc.prefetch_revoke_queue.empty():
-                req_id = cc.prefetch_revoke_queue.get_nowait()
+        def _drain_queue(q, limit: Optional[int]):
+            drained = 0
+            while limit is None or drained < limit:
+                try:
+                    item = q.get_nowait()
+                except Empty:
+                    break
+                drained += 1
+                yield item
+
+        def _drain_revoke():
+            for req_id in _drain_queue(cc.prefetch_revoke_queue, n_revoke):
                 info = self.ongoing_prefetch.pop(req_id, None)
                 if info is not None:
                     last_host_node, token_ids, _, _ = info
                     last_host_node.release_host()
                     cc.prefetch_tokens_occupied -= len(token_ids)
-        except Exception:
-            pass
+                    if cc.prefetch_tokens_occupied < 0:
+                        cc.prefetch_tokens_occupied = 0
 
-        # process backup acks
-        try:
-            while not cc.ack_backup_queue.empty():
-                operation = cc.ack_backup_queue.get_nowait()
+        def _drain_backup():
+            for operation in _drain_queue(cc.ack_backup_queue, n_backup):
                 ack_id = operation.id
                 entry = self.ongoing_backup.pop(ack_id, None)
                 if entry is not None:
                     entry.release_host()
-        except Exception:
-            pass
+                if log_metrics and self.enable_storage_metrics:
+                    self.storage_metrics_collector.log_backuped_tokens(
+                        operation.completed_tokens
+                    )
 
-        # release host memory
-        try:
+        def _drain_release():
             host_indices_list = []
-            while not cc.host_mem_release_queue.empty():
-                host_indices_list.append(cc.host_mem_release_queue.get_nowait())
+            for host_indices in _drain_queue(cc.host_mem_release_queue, n_release):
+                host_indices_list.append(host_indices)
             if host_indices_list:
                 host_indices = torch.cat(host_indices_list, dim=0)
                 cc.mem_pool_host.free(host_indices)
-        except Exception:
-            pass
+
+        _drain_revoke()
+        _drain_backup()
+        _drain_release()
 
     def _parse_storage_backend_extra_config(
         self, storage_backend_extra_config: Optional[str]
@@ -850,36 +874,12 @@ class HiRadixCache(RadixCache):
             )
 
         n_revoke, n_backup, n_release = map(int, qsizes.tolist())
-
-        # process prefetch revokes
-        for _ in range(n_revoke):
-            req_id = cc.prefetch_revoke_queue.get()
-            info = self.ongoing_prefetch.pop(req_id, None)
-            if info is not None:
-                last_host_node, token_ids, _, _ = info
-                last_host_node.release_host()
-                cc.prefetch_tokens_occupied -= len(token_ids)
-            # else: the revoked operation already got terminated, nothing to do
-
-        # process backup acks
-        for _ in range(n_backup):
-            operation = cc.ack_backup_queue.get()
-            ack_id = operation.id
-            entry = self.ongoing_backup.pop(ack_id, None)
-            if entry is not None:
-                entry.release_host()
-            if self.enable_storage_metrics:
-                self.storage_metrics_collector.log_backuped_tokens(
-                    operation.completed_tokens
-                )
-
-        # release host memory
-        host_indices_list = []
-        for _ in range(n_release):
-            host_indices_list.append(cc.host_mem_release_queue.get())
-        if host_indices_list:
-            host_indices = torch.cat(host_indices_list, dim=0)
-            cc.mem_pool_host.free(host_indices)
+        self._drain_storage_control_queues_impl(
+            n_revoke=n_revoke,
+            n_backup=n_backup,
+            n_release=n_release,
+            log_metrics=True,
+        )
 
     # Timeout is linearly increasing with the number of pages
     def _prefetch_timeout_check_linear_func(self, operation: PrefetchOperation):
