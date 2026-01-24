@@ -28,11 +28,13 @@ on:
           - 'nightly-perf-2-gpu-text'
           - 'nightly-perf-2-gpu-vlm'
           - 'nightly-accuracy-8-gpu'
-          - 'nightly-accuracy-8-gpu-deepseek-r1'
+          - 'nightly-accuracy-8-gpu-deepseek-v32-dp-tc'
           # MI30x Accuracy + Performance Tests (combined)
           - 'nightly-8-gpu-grok1-int4'
           - 'nightly-8-gpu-grok2'
           - 'nightly-8-gpu-deepseek-v31'
+          - 'nightly-8-gpu-deepseek-v32'
+          - 'nightly-8-gpu-deepseek-v32-mtp'
           # MI35x jobs
           - 'nightly-test-1-gpu-mi35x'
           - 'nightly-accuracy-8-gpu-mi35x'
@@ -253,9 +255,9 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
-  # 8-GPU DeepSeek-R1 Accuracy Test (separate job due to long loading time)
-  nightly-accuracy-8-gpu-deepseek-r1:
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-accuracy-8-gpu-deepseek-r1')
+  # 8-GPU DeepSeek-R1 (Accuracy + Performance combined)
+  nightly-8-gpu-deepseek-r1:
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-8-gpu-deepseek-r1')
     runs-on: linux-mi325-gpu-8
     steps:
       - name: Checkout code
@@ -276,9 +278,23 @@ jobs:
       - name: Accuracy Test (8-GPU DeepSeek-R1)
         timeout-minutes: 240
         run: |
+          > github_summary.md  # Clear summary file
           bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e SGLANG_USE_AITER=1 \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
             python3 run_suite.py --hw amd --suite nightly-amd-accuracy-8-gpu-deepseek-r1 --nightly --timeout-per-file 7200 || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+      - name: Performance Test (8-GPU DeepSeek-R1)
+        timeout-minutes: 300
+        continue-on-error: true  # Perf test failure doesn't fail the job if accuracy passed
+        run: |
+          > github_summary.md  # Clear summary file
+          bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e SGLANG_USE_AITER=1 \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-perf-8-gpu-deepseek-r1 --nightly --timeout-per-file 18000 || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
@@ -409,6 +425,128 @@ jobs:
             -e SGLANG_USE_ROCM700A=1 \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
             python3 run_suite.py --hw amd --suite nightly-perf-8-gpu-deepseek-v31 --nightly --timeout-per-file 18000 || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+  # 8-GPU DeepSeek-V3.2 (Basic Accuracy + Perf)
+  nightly-8-gpu-deepseek-v32:
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-8-gpu-deepseek-v32')
+    runs-on: linux-mi325-gpu-8
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Setup docker
+        run: |
+          touch github_summary.md
+          bash scripts/ci/amd_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: bash scripts/ci/amd_ci_install_dependency.sh
+
+      - name: Accuracy Test (8-GPU DeepSeek-V3.2 Basic)
+        timeout-minutes: 120
+        run: |
+          > github_summary.md  # Clear summary file
+          bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-amd-accuracy-8-gpu-deepseek-v32 --nightly --timeout-per-file 3600 || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+      - name: Performance Test (8-GPU DeepSeek-V3.2 Basic)
+        timeout-minutes: 150
+        continue-on-error: true  # Perf test failure doesn't fail the job if accuracy passed
+        run: |
+          > github_summary.md  # Clear summary file
+          bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-perf-8-gpu-deepseek-v32-basic --nightly --timeout-per-file 5400 || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+  # 8-GPU DeepSeek-V3.2 MTP (MTP Accuracy + Perf)
+  nightly-8-gpu-deepseek-v32-mtp:
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-8-gpu-deepseek-v32-mtp')
+    runs-on: linux-mi325-gpu-8
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Setup docker
+        run: |
+          touch github_summary.md
+          bash scripts/ci/amd_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: bash scripts/ci/amd_ci_install_dependency.sh
+
+      - name: Accuracy Test (8-GPU DeepSeek-V3.2 MTP)
+        timeout-minutes: 120
+        run: |
+          > github_summary.md  # Clear summary file
+          bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-amd-accuracy-8-gpu-deepseek-v32-mtp --nightly --timeout-per-file 3600 || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+      - name: Performance Test (8-GPU DeepSeek-V3.2 MTP)
+        timeout-minutes: 180
+        continue-on-error: true  # Perf test failure doesn't fail the job if accuracy passed
+        run: |
+          > github_summary.md  # Clear summary file
+          bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-perf-8-gpu-deepseek-v32-mtp --nightly --timeout-per-file 7200 || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+  # 8-GPU DeepSeek-V3.2 DP+TC (Accuracy only)
+  nightly-accuracy-8-gpu-deepseek-v32-dp-tc:
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-accuracy-8-gpu-deepseek-v32-dp-tc')
+    runs-on: linux-mi325-gpu-8
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Setup docker
+        run: |
+          touch github_summary.md
+          bash scripts/ci/amd_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: bash scripts/ci/amd_ci_install_dependency.sh
+
+      - name: Accuracy Test (8-GPU DeepSeek-V3.2 DP)
+        timeout-minutes: 150
+        run: |
+          > github_summary.md  # Clear summary file
+          bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-amd-accuracy-8-gpu-deepseek-v32-dp --nightly --timeout-per-file 5400 || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+      - name: Accuracy Test (8-GPU DeepSeek-V3.2 TC)
+        timeout-minutes: 150
+        run: |
+          > github_summary.md  # Clear summary file
+          bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-amd-accuracy-8-gpu-deepseek-v32-tc --nightly --timeout-per-file 5400 || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
@@ -670,12 +808,12 @@ jobs:
           bash scripts/ci/amd_ci_exec.sh pip install tabulate
 
       - name: Accuracy Test MI35x (8-GPU DeepSeek-V3.2 DP)
-        timeout-minutes: 120
+        timeout-minutes: 150
         run: |
           > github_summary.md  # Clear summary file
           bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
-            python3 run_suite.py --hw amd --suite nightly-amd-accuracy-8-gpu-mi35x-deepseek-v32-dp --nightly --timeout-per-file 3600 || TEST_EXIT_CODE=$?
+            python3 run_suite.py --hw amd --suite nightly-amd-accuracy-8-gpu-mi35x-deepseek-v32-dp --nightly --timeout-per-file 5400 || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
@@ -790,11 +928,14 @@ jobs:
       - nightly-perf-2-gpu-text
       - nightly-perf-2-gpu-vlm
       - nightly-accuracy-8-gpu
-      - nightly-accuracy-8-gpu-deepseek-r1
+      - nightly-8-gpu-deepseek-r1
       # MI30x Combined Accuracy + Performance Tests
       - nightly-8-gpu-grok1-int4
       - nightly-8-gpu-grok2
       - nightly-8-gpu-deepseek-v31
+      - nightly-8-gpu-deepseek-v32
+      - nightly-8-gpu-deepseek-v32-mtp
+      - nightly-accuracy-8-gpu-deepseek-v32-dp-tc
       # MI35x jobs
       - nightly-test-1-gpu-mi35x
       - nightly-accuracy-8-gpu-mi35x
