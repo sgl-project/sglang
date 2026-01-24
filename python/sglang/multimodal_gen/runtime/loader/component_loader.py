@@ -764,6 +764,15 @@ class AudioVAELoader(ComponentLoader):
         ), f"Found {len(safetensors_list)} safetensors files in {component_model_path}"
         loaded = safetensors_load_file(safetensors_list[0])
         audio_vae.load_state_dict(loaded, strict=False)
+
+        state_keys = set(audio_vae.state_dict().keys())
+        loaded_keys = set(loaded.keys())
+        missing_keys = sorted(state_keys - loaded_keys)
+        unexpected_keys = sorted(loaded_keys - state_keys)
+        if missing_keys:
+            logger.warning("Audio VAE missing keys: %s", missing_keys)
+        if unexpected_keys:
+            logger.warning("Audio VAE unexpected keys: %s", unexpected_keys)
         return audio_vae.eval()
 
 

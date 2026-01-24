@@ -119,10 +119,7 @@ class InputValidationStage(PipelineStage):
                 batch.width = width
                 batch.height = height
 
-        elif (
-            server_args.pipeline_config.task_type == ModelTaskType.TI2V
-            and not isinstance(server_args.pipeline_config, MovaPipelineConfig)
-        ):
+        elif server_args.pipeline_config.task_type == ModelTaskType.TI2V:
             # duplicate with vae_image_processor
             # further processing for ti2v task
             if isinstance(
@@ -178,6 +175,31 @@ class InputValidationStage(PipelineStage):
             batch.condition_image = batch.condition_image.resize((width, height))
             batch.height = height
             batch.width = width
+
+        elif issubclass(type(server_args.pipeline_config), MovaPipelineConfig):
+            # resize image only, MoVA
+            image = batch.condition_image
+            if isinstance(image, list):
+                image = image[0]  # not support multi image input yet.
+
+            max_area = server_args.pipeline_config.max_area
+            aspect_ratio = condition_image_height / condition_image_width
+            mod_value = (
+                server_args.pipeline_config.vae_config.arch_config.scale_factor_spatial
+                * server_args.pipeline_config.dit_config.arch_config.patch_size[1]
+            )
+            height = round(np.sqrt(max_area * aspect_ratio)) // mod_value * mod_value
+            width = round(np.sqrt(max_area / aspect_ratio)) // mod_value * mod_value
+
+            config = server_args.pipeline_config
+            image, (final_w, final_h) = (
+                server_args.pipeline_config.preprocess_condition_image(
+                    image, width, height, self.vae_image_processor
+                )
+            )
+            batch.condition_image = image
+            batch.width = final_w
+            batch.height = final_h
 
     def forward(
         self,
@@ -251,29 +273,6 @@ class InputValidationStage(PipelineStage):
             self.preprocess_condition_image(
                 batch, server_args, condition_image_width, condition_image_height
             )
-
-        if isinstance(server_args.pipeline_config, MovaPipelineConfig):
-            if batch.condition_image is None:
-                raise ValueError("MoVA requires an input reference image")
-
-            image = batch.condition_image
-            if isinstance(image, list):
-                image = image[0]
-            if not isinstance(image, Image.Image):
-                raise TypeError(f"Expected PIL.Image for MoVA, got {type(image)}")
-
-            if batch.height is None or batch.width is None:
-                batch.height = image.height
-                batch.width = image.width
-
-            image, (final_w, final_h) = (
-                server_args.pipeline_config.preprocess_condition_image(
-                    image, batch.width, batch.height, self.vae_image_processor
-                )
-            )
-            batch.condition_image = image
-            batch.width = final_w
-            batch.height = final_h
 
         # if height or width is not specified at this point, set default to 720p
         default_height = 720

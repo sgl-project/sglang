@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from PIL import Image
 
 from sglang.multimodal_gen.configs.models.dits import MovaAudioConfig, MovaVideoConfig
@@ -26,11 +27,10 @@ logger = init_logger(__name__)
 class MovaPipelineConfig(PipelineConfig):
     """Configuration for MoVA (text+image -> video+audio) pipelines."""
 
-    task_type: ModelTaskType = ModelTaskType.TI2V
+    task_type: ModelTaskType = ModelTaskType.T2V
 
     # Model configs
-    video_dit_config: MovaVideoConfig = field(default_factory=MovaVideoConfig)
-    video_dit2_config: MovaVideoConfig = field(default_factory=MovaVideoConfig)
+    dit_config: MovaVideoConfig = field(default_factory=MovaVideoConfig)
     audio_dit_config: MovaAudioConfig = field(default_factory=MovaAudioConfig)
 
     # Video VAE (Wan) + Audio VAE (DAC)
@@ -52,23 +52,54 @@ class MovaPipelineConfig(PipelineConfig):
     time_division_remainder: int = 1
 
     def _center_crop_and_resize(
-        self, image: Image.Image, target_height: int, target_width: int
-    ) -> Image.Image:
-        image_np = np.array(image)
-        image_height, image_width, _ = image_np.shape
-        if image_height / image_width < target_height / target_width:
-            cropped_width = int(image_height / target_height * target_width)
-            left = (image_width - cropped_width) // 2
-            image_np = image_np[:, left : left + cropped_width]
-            return Image.fromarray(image_np).resize(
-                (target_width, target_height), Image.Resampling.LANCZOS
-            )
-        cropped_height = int(image_width / target_width * target_height)
-        top = (image_height - cropped_height) // 2
-        image_np = image_np[top : top + cropped_height, :]
-        return Image.fromarray(image_np).resize(
-            (target_width, target_height), Image.Resampling.LANCZOS
+        self, image: torch.Tensor | Image.Image, target_height: int, target_width: int
+    ) -> torch.Tensor | Image.Image:
+        if isinstance(image, Image.Image):
+            if image.size == (target_width, target_height):
+                return image
+            image = torch.from_numpy(np.array(image))
+        elif isinstance(image, torch.Tensor):
+            raise TypeError(f"Unsupported image type: {type(image)}")
+
+        if image.ndim == 2:
+            image = image[..., None]
+
+        if not image.dtype.is_floating_point:
+            image = image.to(torch.float32).div(255.0)
+
+        if image.ndim == 3:
+            if image.shape[0] in (1, 3, 4) and image.shape[-1] not in (1, 3, 4):
+                image = image.unsqueeze(0)
+            else:
+                image = image.permute(2, 0, 1).unsqueeze(0)
+        elif image.ndim == 4:
+            if image.shape[1] not in (1, 3, 4) and image.shape[-1] in (1, 3, 4):
+                image = image.permute(0, 3, 1, 2)
+
+        image_height, image_width = image.shape[-2], image.shape[-1]
+        if image_height == target_height and image_width == target_width:
+            return image
+
+        logger.info(
+            "Center cropping and resizing image to %dx%d", target_width, target_height
         )
+
+        if image_height * target_width < image_width * target_height:
+            cropped_width = (image_height * target_width) // target_height
+            left = (image_width - cropped_width) // 2
+            image = image[..., :, left : left + cropped_width]
+        else:
+            cropped_height = (image_width * target_height) // target_width
+            top = (image_height - cropped_height) // 2
+            image = image[..., top : top + cropped_height, :]
+
+        image = F.interpolate(
+            image,
+            size=(target_height, target_width),
+            mode="bilinear",
+            align_corners=False,
+        )
+        return image
 
     def adjust_num_frames(self, num_frames: int) -> int:
         if num_frames is None:
@@ -100,7 +131,7 @@ class MovaPipelineConfig(PipelineConfig):
         length = (num_frames - 1) // self.time_division_factor + 1
         shape = (
             batch_size,
-            self.video_dit_config.arch_config.out_dim,
+            self.dit_config.arch_config.out_dim,
             length,
             batch.height // spatial,
             batch.width // spatial,
@@ -141,3 +172,17 @@ class MovaPipelineConfig(PipelineConfig):
             latents_std, device=latents.device, dtype=latents.dtype
         ).view(1, video_vae.config.z_dim, 1, 1, 1)
         return latents * std + mean
+
+
+@dataclass
+class Mova360PConfig(MovaPipelineConfig):
+    """Configuration for MoVA 360P (text+image -> video+audio) pipelines."""
+
+    max_area: int = 352 * 640
+
+
+@dataclass
+class Mova720PConfig(MovaPipelineConfig):
+    """Configuration for MoVA 720P (text+image -> video+audio) pipelines."""
+
+    max_area: int = 720 * 1280
