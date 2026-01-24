@@ -50,7 +50,8 @@ jobs:
           cp ../README.md ../LICENSE .
 
           # Parse git describe output to detect exact tag builds (distance=0)
-          DESC=$(git describe --tags --long --match 'v*' 2>/dev/null || echo 'v0.0.0-0-g0000000')
+          # Use same command as pyproject.toml to ensure version consistency
+          DESC=$(git tag --list --sort=-version:refname 'v*.*.*' | head -1 | xargs git describe --tags --long 2>/dev/null || echo 'v0.0.0-0-g0000000')
           DIST=$(echo "$DESC" | cut -d- -f2)
 
           # If building at exact tag (distance=0), force dev0 version for unique wheel names
