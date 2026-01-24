@@ -956,6 +956,29 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
     def _quantize_mxfp8_moe_weights(self, layer: Module) -> None:
 
+        def _swizzle_mxfp8_sf(scale, num_warps):
+            """weight swizzle for mxfp4 moe, used for OAI mxfp4 kernel"""
+            import triton_kernels.matmul_ogs_details.opt_flags as opt_flags
+            from triton_kernels.numerics import InFlexData
+            from triton_kernels.tensor import FP4, convert_layout, wrap_torch_tensor
+            from triton_kernels.tensor_details import layout
+            from triton_kernels.tensor_details.layout_details.blackwell_scale import BlackwellMXScaleLayout
+            
+
+            scale_layout, scale_layout_opts = layout.make_default_matmul_mxfp4_w_scale_layout(
+                mx_axis=1, num_warps=num_warps
+            )
+            print(f"@@@ scale_layout: {scale_layout}")
+            print(f"@@@ scale_layout_opts: {scale_layout_opts}")
+            # scale_layout, scale_layout_opts = BlackwellMXScaleLayout(None)
+            # transpose the tensor so that the quantization axis is on dim1
+            scale = scale.transpose(-2, -1)
+            
+            print(f"@@@ scale.shape before convert_layout: {scale.shape}")
+            scale = convert_layout(wrap_torch_tensor(scale), scale_layout, **scale_layout_opts)
+            print(f"@@@ scale.shape after convert_layout: {scale.shape}")
+            return InFlexData(), scale
+
         if get_moe_runner_backend().is_cutlass():
             if not (_is_cuda and is_sm100_supported()):
                 raise RuntimeError("MXFP8 MoE quantization requires SM100.")
@@ -965,6 +988,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             def _quantize_with_es_kernel(weight: torch.Tensor):
                 weight = weight.contiguous()
                 num_experts, m, k = weight.shape
+                # print(f"@@@ _quantize_with_es_kernel weight.shape: {weight.shape}")
                 assert k % 32 == 0, f"{k=} must be divisible by 32 for MXFP8"
 
                 weight_flat = weight.view(-1, k).contiguous()
@@ -1003,7 +1027,74 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 scale = scale.view(num_experts, aligned_m, k // 32)
                 if aligned_m != m:
                     scale = scale[:, :m, :]
-                return qweight, scale
+                # q_weight_2 = torch.empty_like(weight, dtype=torch.float8_e4m3fn)
+                # scale_2 = torch.empty_like(scale, dtype=torch.uint8)
+                # # weight = layer.weight.data
+                # for e_idx in range(num_experts):
+                #     # print(f"@@@ e: {e}")
+                #     weight_e = weight[e_idx, :, :]
+                #     weight_e_flat = weight_e.view(-1, k).contiguous()
+                #     q_weight_2[e_idx, :, :], scale_2[e_idx, :, :] = mxfp8_group_quantize(weight_e_flat)
+                #     torch.testing.assert_close(qweight[e_idx, :, :], q_weight_2[e_idx, :, :])
+                #     sum_sf = scale[e_idx, :, :].float().sum()
+                #     sum_sf_2 = scale_2[e_idx, :, :].float().sum()
+                #     sum_sf_diff = sum_sf - sum_sf_2
+                #     print(f"@@@ sum_sf_diff: {sum_sf_diff}")
+                #     try:
+                #         torch.testing.assert_close(scale[e_idx, :, :], scale_2[e_idx, :, :])
+                #     except Exception as e:
+                #         print(f"@@@ e_idx: {e_idx}")
+                # raise Exception("Stop here")
+                #     qweight_e = qweight_e.view_as(weight_e)
+                #     scale_2 = scale_2.view(1, aligned_m, k // 32)
+                #     if aligned_m != m:
+                #         scale_2 = scale_2[:, :m, :]
+                #     torch.testing.assert_close(qweight_e, qweight[e, :, :])
+                #     q_weight_list.append(qweight_e)
+                #     scale_list.append(scale_e)
+                # qweight = torch.stack(q_weight_list, dim=0)
+                # scale = torch.stack(scale_list, dim=0)
+                print(f"@@@ weight.shape: {weight.shape}")
+                print(f"@@@ num_experts: {num_experts}")
+                print(f"@@@ aligned_m: {aligned_m}")
+                print(f"@@@ k // 32: {k // 32}")
+                print(f"@@@ qweight.shape: {qweight.shape}")
+                print(f"@@@ scale.shape: {scale.shape}")
+                qweight_2, scale_2 = mxfp8_group_quantize(weight_flat)
+                qweight_2 = qweight_2.view_as(weight)
+                scale_2 = scale_2.view(num_experts, aligned_m, k // 32)
+                print(f"@@@ scale_2.shape before swizzle: {scale_2.shape}")
+                num_warps = 8
+                _, scale_2 = _swizzle_mxfp8_sf(scale_2, num_warps)
+                scale_2 = scale_2.data
+                print(f"@@@ scale_2.shape after swizzle: {scale_2.shape}", flush=True)
+                # print(f"@@@ scale_2: {scale_2}")
+                scale_2 = scale_2.view(num_experts, aligned_m, k // 32)
+                scale_all_zero = torch.zeros_like(scale, dtype=scale.dtype, device=scale.device)
+                torch.testing.assert_close(qweight, qweight_2)
+                print(f"@@@ scale.float().sum(): {scale.float().sum()}")
+                print(f"@@@ scale_2.float().sum(): {scale_2.float().sum()}")
+                sf_sorted, _ = scale.flatten().float().sort()
+                sf_2_sorted, _ = scale_2.flatten().float().sort()
+                print(sf_sorted)
+                print(sf_2_sorted)
+                torch.testing.assert_close(sf_sorted, sf_2_sorted)
+                print(f"@@@ sorted assertion passed")
+                
+                # print(scale[39, 1])
+                # print(scale_2[39, 1])
+                # print(qweight[39, 1])
+                # print(qweight_2[39, 1])
+                torch.testing.assert_close(scale, scale_2)
+                # torch.testing.assert_close(scale, scale_all_zero)
+                # torch.testing.assert_close(scale_2, scale_all_zero)
+                # print(f"@@@ scale: {scale.shape}, {scale.dtype}, {scale.device}")
+                # print(f"@@@ scale_2: {scale_2.shape}, {scale_2.dtype}, {scale_2.device}")
+                # layer.weight = Parameter(qweight, requires_grad=False)
+                # layer.weight_scale_inv = Parameter(weight_scale, requires_grad=False)
+                # layer.weight_scale_inv.format_ue8m0 = True
+                # layer.input_scale = None
+                return qweight_2, scale_2
 
             w13_q, w13_s = _quantize_with_es_kernel(layer.w13_weight.data)
             w2_q, w2_s = _quantize_with_es_kernel(layer.w2_weight.data)
