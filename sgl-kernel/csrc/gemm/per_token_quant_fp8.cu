@@ -222,7 +222,7 @@ void sgl_per_token_quant_fp8(torch::Tensor input, torch::Tensor output_q, torch:
 
   // Calculate dynamic shared memory size needed for caching one token's data
   // Each CTA has 8 tokens, each token needs hidden_dim * sizeof(T) bytes
-  // Add padding to avoid bank conflicts (32-byte alignment per warp)
+  // Add padding to do memory alignment(32-byte alignment per warp)
   const int sizeof_T = input.scalar_type() == torch::kFloat16 ? 2 : (input.scalar_type() == torch::kBFloat16 ? 2 : 4);
   const int smem_padding = 32;  // Pad to bank boundary to avoid conflicts
   const int warp_smem_stride = (hidden_dim * sizeof_T + smem_padding - 1) / smem_padding * smem_padding;
@@ -242,7 +242,7 @@ void sgl_per_token_quant_fp8(torch::Tensor input, torch::Tensor output_q, torch:
 
   // Additional safety check: disable shared memory if it exceeds GPU limits (48KB default)
   // This prevents kernel launch failures on GPUs with limited shared memory
-  if (dynamicSmemSz >= 48 * 1024) {
+  if (dynamicSmemSz >= DEFAULT_SHARED_MEM_THRESHOLD_KB) {
     use_smem = false;  // Disable shared memory if >= 48KB to avoid allocation failures
   }
 
