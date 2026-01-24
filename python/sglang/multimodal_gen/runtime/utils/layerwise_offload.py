@@ -39,9 +39,8 @@ class LayerwiseOffloadManager:
         self.layers_attr_str = layers_attr_str
         self.num_layers = num_layers
         self.pin_cpu_memory = pin_cpu_memory
-        self.prefetch_size = max(1, prefetch_size) % self.num_layers
+        self.prefetch_size = min(max(1, prefetch_size), self.num_layers)
         print(f"{self.prefetch_size=}")
-        print(f"{self.num_layers=}")
         self.enabled = bool(enabled and torch.cuda.is_available())
         if not self.enabled:
             return
@@ -115,7 +114,7 @@ class LayerwiseOffloadManager:
                 current_offset = 0
                 for name, weight in weights:
                     numel = weight.numel()
-                    cpu_buffer[current_offset: current_offset + numel].copy_(
+                    cpu_buffer[current_offset : current_offset + numel].copy_(
                         weight.flatten()
                     )
                     self._weight_metadata[layer_idx][name] = {
@@ -187,7 +186,7 @@ class LayerwiseOffloadManager:
             # map the parameter's data to the correct slice of the GPU buffer
             target = self.get_target_with_name(name)
             target.data = gpu_buffer[
-                meta["offset"]: meta["offset"] + meta["numel"]
+                meta["offset"] : meta["offset"] + meta["numel"]
             ].view(meta["shape"])
 
         logger.debug(f"fetched layer: {layer_idx=}")
@@ -255,7 +254,7 @@ class LayerwiseOffloadManager:
             cpu_buffer = self._consolidated_cpu_weights[layer_idx][dtype]
             offset = meta["offset"]
             numel = meta["numel"]
-            cpu_buffer[offset: offset + numel].copy_(gpu_weight)
+            cpu_buffer[offset : offset + numel].copy_(gpu_weight)
 
     @torch.compiler.disable
     def sync_all_layers_to_cpu(self) -> None:
@@ -338,13 +337,16 @@ class OffloadableDiTMixin:
                 continue
 
             num_layers = len(module_list)
+            prefetch_size = 1 + int(
+                round(server_args.dit_offload_conservativeness * (num_layers - 1))
+            )
             manager = LayerwiseOffloadManager(
                 model=self,
                 layers_attr_str=layer_name,
                 num_layers=num_layers,
                 enabled=True,
                 pin_cpu_memory=server_args.pin_cpu_memory,
-                prefetch_size=server_args.dit_offload_prefetch_size,
+                prefetch_size=prefetch_size,
             )
             self.layerwise_offload_managers.append(manager)
 
