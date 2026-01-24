@@ -76,6 +76,7 @@ class ZImagePipelineConfig(ImagePipelineConfig):
         return super().shard_latents_for_sp(batch, latents)
 
     def gather_latents_for_sp(self, latents):
+        latents = latents.contiguous()
         if latents.dim() == 5:
             return PipelineConfig.gather_latents_for_sp(self, latents)
         return super().gather_latents_for_sp(latents)
