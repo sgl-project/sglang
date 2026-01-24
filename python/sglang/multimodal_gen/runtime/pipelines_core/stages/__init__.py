@@ -34,12 +34,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.input_validation import
 from sglang.multimodal_gen.runtime.pipelines_core.stages.latent_preparation import (
     LatentPreparationStage,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.mova import (
-    MovaDecodingStage,
-    MovaDenoisingStage,
-    MovaLatentPreparationStage,
-    MovaTimestepPreparationStage,
-)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.text_encoding import (
     TextEncodingStage,
 )
@@ -52,10 +46,6 @@ __all__ = [
     "InputValidationStage",
     "TimestepPreparationStage",
     "LatentPreparationStage",
-    "MovaLatentPreparationStage",
-    "MovaTimestepPreparationStage",
-    "MovaDenoisingStage",
-    "MovaDecodingStage",
     "ComfyUILatentPreparationStage",
     "ConditioningStage",
     "DenoisingStage",
