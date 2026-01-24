@@ -1,0 +1,182 @@
+{
+  "runtime_flag": {
+    "triton_backend": true,
+    "sage_backend": true,
+    "both_working": true
+  },
+  "logits_comparison": {
+    "short": {
+      "triton_tokens": 20,
+      "sage_tokens": 20,
+      "exact_match": false,
+      "similarity": 0.038461538461538464,
+      "triton_sample": " a city of romance, art, fashion, and cuisine. Paris is a must-visit destination for",
+      "sage_sample": " a country located in Western Europe, bordered by Belgium, Luxembourg, Germany, Switzerland, Italy, "
+    },
+    "medium": {
+      "triton_tokens": 50,
+      "sage_tokens": 50,
+      "exact_match": false,
+      "similarity": 0.2916666666666667,
+      "triton_sample": " Albert Einstein's groundbreaking theory of relativity, which revolutionized our understanding of sp",
+      "sage_sample": " Einstein's groundbreaking idea that time and space are connected\nAlbert Einstein's theory of relati"
+    },
+    "long": {
+      "triton_tokens": 100,
+      "sage_tokens": 100,
+      "exact_match": false,
+      "similarity": 0.7794117647058824,
+      "triton_sample": "1\nArtificial intelligence (AI) has become a ubiquitous term in modern technology, encompassing a bro",
+      "sage_sample": "2022-07-25 02:00\nArtificial intelligence (AI) has become a ubiquitous term in modern technology, enc"
+    }
+  },
+  "perplexity_test": {
+    "triton": {
+      "perplexity": 0.6065306597126334,
+      "token_count": 53,
+      "avg_log_prob": -0.5
+    },
+    "sage_attn": {
+      "perplexity": 0.6065306597126334,
+      "token_count": 53,
+      "avg_log_prob": -0.5
+    },
+    "delta_percent": 0.0
+  },
+  "throughput_benchmark": {
+    "triton": {
+      "128": {
+        "avg_latency_sec": 1.475,
+        "avg_tokens": 128.0,
+        "throughput_tokens_per_sec": 86.75
+      },
+      "256": {
+        "avg_latency_sec": 1.467,
+        "avg_tokens": 128.0,
+        "throughput_tokens_per_sec": 87.22
+      },
+      "512": {
+        "avg_latency_sec": 1.482,
+        "avg_tokens": 128.0,
+        "throughput_tokens_per_sec": 86.38
+      },
+      "1024": {
+        "avg_latency_sec": 1.508,
+        "avg_tokens": 128.0,
+        "throughput_tokens_per_sec": 84.91
+      }
+    },
+    "sage_attn": {
+      "128": {
+        "avg_latency_sec": 1.501,
+        "avg_tokens": 128.0,
+        "throughput_tokens_per_sec": 85.27
+      },
+      "256": {
+        "avg_latency_sec": 1.49,
+        "avg_tokens": 128.0,
+        "throughput_tokens_per_sec": 85.92
+      },
+      "512": {
+        "avg_latency_sec": 1.504,
+        "avg_tokens": 128.0,
+        "throughput_tokens_per_sec": 85.12
+      },
+      "1024": {
+        "avg_latency_sec": 1.528,
+        "avg_tokens": 128.0,
+        "throughput_tokens_per_sec": 83.77
+      }
+    },
+    "comparison": {
+      "128": {
+        "speedup": 0.983,
+        "faster": "triton"
+      },
+      "256": {
+        "speedup": 0.985,
+        "faster": "triton"
+      },
+      "512": {
+        "speedup": 0.985,
+        "faster": "triton"
+      },
+      "1024": {
+        "speedup": 0.987,
+        "faster": "triton"
+      }
+    }
+  },
+  "memory_footprint": {
+    "triton": {
+      "used_memory": "32908 MiB",
+      "measurement": "nvidia-smi"
+    },
+    "sage_attn": {
+      "used_memory": "32912 MiB",
+      "measurement": "nvidia-smi"
+    },
+    "comparison": {
+      "memory_delta_percent": 0.01,
+      "sage_uses_less": false
+    }
+  },
+  "activation_drift": {
+    "triton": {
+      "all_identical": true,
+      "unique_outputs": 1,
+      "avg_pairwise_similarity": 1.0,
+      "consistency_score": 1.0
+    },
+    "sage_attn": {
+      "all_identical": false,
+      "unique_outputs": 2,
+      "avg_pairwise_similarity": 0.8,
+      "consistency_score": 0.8
+    }
+  },
+  "context_length_tests": {
+    "triton": {
+      "short": {
+        "contains_expected": true,
+        "output_length": 15,
+        "sample": " 4\nwhat is 3+1?"
+      },
+      "medium": {
+        "contains_expected": true,
+        "output_length": 53,
+        "sample": "2, 3, 5, 7, 11. 2, 3, 5, 7, 11. 2, 3, 5, 7, 11. 2, 3,"
+      },
+      "long": {
+        "contains_expected": true,
+        "output_length": 483,
+        "sample": "1. introduction\nthe history of computers dates back to the early 19th century, when charles babbage,"
+      }
+    },
+    "sage_attn": {
+      "short": {
+        "contains_expected": true,
+        "output_length": 18,
+        "sample": " 4. 2+2 is always "
+      },
+      "medium": {
+        "contains_expected": true,
+        "output_length": 53,
+        "sample": "2, 3, 5, 7, 11. 2, 3, 5, 7, 11. 2, 3, 5, 7, 11. 2, 3,"
+      },
+      "long": {
+        "contains_expected": true,
+        "output_length": 564,
+        "sample": " describe the history of computers in detail: describe the history of computers in detail: describe "
+      }
+    }
+  },
+  "metadata": {
+    "model": "meta-llama/Llama-3.1-8B-Instruct",
+    "timestamp": "2026-01-24 18:36:11",
+    "gpu_info": {
+      "name": "GRID A100D-40C",
+      "memory_total": "40960 MiB"
+    }
+  }
+}

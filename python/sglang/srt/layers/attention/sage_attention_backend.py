@@ -358,20 +358,20 @@ class SageAttnBackend(AttentionBackend):
 
         # Allocate output tensors
         k_full = torch.empty(
-            (total_kv_tokens, layer.tp_kv_head_num, layer.qk_head_dim),
+            (total_kv_tokens, layer.tp_k_head_num, layer.qk_head_dim),
             dtype=k_current.dtype,
             device=self.device,
         )
         v_full = torch.empty(
-            (total_kv_tokens, layer.tp_kv_head_num, layer.v_head_dim),
+            (total_kv_tokens, layer.tp_v_head_num, layer.v_head_dim),
             dtype=v_current.dtype,
             device=self.device,
         )
 
         # Gather K, V for each sequence
         # This includes prefix tokens (from cache) and current tokens
-        k_current_reshaped = k_current.view(-1, layer.tp_kv_head_num, layer.qk_head_dim)
-        v_current_reshaped = v_current.view(-1, layer.tp_kv_head_num, layer.v_head_dim)
+        k_current_reshaped = k_current.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
+        v_current_reshaped = v_current.view(-1, layer.tp_v_head_num, layer.v_head_dim)
 
         k_idx = 0
         current_idx = 0
@@ -386,10 +386,10 @@ class SageAttnBackend(AttentionBackend):
                 cache_indices = self.req_to_token[req_pool_idx, :prefix_len]
 
                 k_full[k_idx : k_idx + prefix_len] = k_buffer[cache_indices].view(
-                    prefix_len, layer.tp_kv_head_num, layer.qk_head_dim
+                    prefix_len, layer.tp_k_head_num, layer.qk_head_dim
                 )
                 v_full[k_idx : k_idx + prefix_len] = v_buffer[cache_indices].view(
-                    prefix_len, layer.tp_kv_head_num, layer.v_head_dim
+                    prefix_len, layer.tp_v_head_num, layer.v_head_dim
                 )
                 k_idx += prefix_len
 
