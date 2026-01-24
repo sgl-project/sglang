@@ -57,8 +57,7 @@ Enable memory saver support when launching the server:
 
 ## Open-To-Use Refit Functionality
 
-After training completes each step, rollout engines must be refit with new weights. SGLang supports three refit strategies so you can match your infrastructure style (co-located vs disaggregated) and scaling needs. Each strategy maps to a concrete API with clear request schemas. Here's the detail of how to integrate SGLang weight update in verl's co-located strategy: [RL System Deep Thinking: Weight Update Mechanisms
-](https://github.com/zhaochenyang20/Awesome-ML-SYS-Tutorial/blob/main/rlhf/sys-design/readme-1-EN.md)
+After training completes each step, rollout engines must be refit with new weights. SGLang supports three refit strategies so you can match your infrastructure style (co-located vs disaggregated) and scaling needs. Each strategy maps to a concrete API with clear request schemas. Here's the detail of how to integrate SGLang weight update in verl's co-located strategy: [RL System Deep Thinking: Weight Update Mechanisms](https://github.com/zhaochenyang20/Awesome-ML-SYS-Tutorial/blob/main/rlhf/sys-design/readme-1-EN.md)
 
 **How to choose:**
 
