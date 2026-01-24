@@ -643,7 +643,11 @@ class Scheduler(
             server_args.chunked_prefill_size is not None
             and server_args.disable_radix_cache
         ):
-            if not self.is_hybrid_swa:
+            if server_args.enable_nsa_decode_hybrid_pool:
+                from sglang.srt.mem_cache.chunk_cache import NSAChunkCache
+
+                self.tree_cache = NSAChunkCache(params)
+            elif not self.is_hybrid_swa:
                 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 
                 self.tree_cache = ChunkCache(params)

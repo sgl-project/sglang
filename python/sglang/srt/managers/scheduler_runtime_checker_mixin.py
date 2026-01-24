@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.mem_cache.common import enable_nsa_hybrid_indexer_pool
 from sglang.srt.utils.common import ceil_align, raise_error_or_warn
 from sglang.srt.utils.request_logger import disable_request_logging
 from sglang.srt.utils.watchdog import WatchdogRaw
@@ -147,6 +148,29 @@ class SchedulerRuntimeCheckerMixin:
             )
         return memory_leak, token_msg
 
+    def _check_nsa_memory(self: Scheduler):
+        _, _, available_size, evictable_size = self._get_token_info()
+        protected_size = self.tree_cache.protected_size()
+
+        # Check KV cache
+        kv_memory_leak = (available_size + evictable_size) != (
+            self.max_total_num_tokens - protected_size
+        )
+
+        # Check index_k
+        index_k_available = self.token_to_kv_pool_allocator.index_k_available_size()
+        index_k_expected = self.token_to_kv_pool_allocator.index_k_expected_size()
+        index_k_memory_leak = index_k_available != index_k_expected
+
+        memory_leak = kv_memory_leak or index_k_memory_leak
+
+        token_msg = (
+            f"[KV Cache] {self.max_total_num_tokens=}, {available_size=}, {evictable_size=}, {protected_size=}\n"
+            f"[Index K] {index_k_expected=}, {index_k_available=}\n"
+        )
+
+        return memory_leak, token_msg
+
     def _check_radix_cache_memory(self: Scheduler):
         _, _, available_size, evictable_size = self._get_token_info()
         protected_size = self.tree_cache.protected_size()
@@ -236,6 +260,8 @@ class SchedulerRuntimeCheckerMixin:
             memory_leak, token_msg = self._check_hybrid_memory()
         elif self.is_hybrid_ssm and self.tree_cache.supports_mamba():
             memory_leak, token_msg = self._check_mamba_memory()
+        elif enable_nsa_hybrid_indexer_pool(allocator=self.token_to_kv_pool_allocator):
+            memory_leak, token_msg = self._check_nsa_memory()
         else:
             memory_leak, token_msg = self._check_radix_cache_memory()
 

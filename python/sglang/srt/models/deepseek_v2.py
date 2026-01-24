@@ -116,6 +116,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from sglang.srt.mem_cache.sparsity import get_sparse_coordinator
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.models.deepseek_common.attention_backend_handler import (
     AttentionBackendRegistry,
@@ -1602,6 +1603,7 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
                     q_lora = q
 
             # overlap q_b_proj and indexer during decode
+            sparse_coordinator = get_sparse_coordinator()
             if (
                 self.alt_stream is not None
                 and get_is_capture_mode()
@@ -1615,18 +1617,24 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
                     q = self.q_b_proj(q)[0].view(
                         -1, self.num_local_heads, self.qk_head_dim
                     )
-                topk_indices = self.indexer(
-                    x=hidden_states,
-                    q_lora=q_lora,
-                    positions=positions,
-                    forward_batch=forward_batch,
-                    layer_id=self.layer_id,
-                )
-                current_stream.wait_stream(self.alt_stream)
-            else:
-                k_nope = k_nope.unsqueeze(1)
-                q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
-                if q_lora is not None:
+
+                if (
+                    forward_batch.forward_mode.is_decode()
+                    and sparse_coordinator is not None
+                ):
+                    topk_indices = sparse_coordinator.attention_begin(
+                        query=None,
+                        key=None,
+                        value=None,
+                        layer=self,
+                        forward_batch=forward_batch,
+                        attn_metadata=None,
+                        indexer=self.indexer,
+                        x=hidden_states,
+                        q_lora=q_lora,
+                        positions=positions,
+                    )
+                else:
                     topk_indices = self.indexer(
                         x=hidden_states,
                         q_lora=q_lora,
@@ -1634,6 +1642,35 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
                         forward_batch=forward_batch,
                         layer_id=self.layer_id,
                     )
+                current_stream.wait_stream(self.alt_stream)
+            else:
+                k_nope = k_nope.unsqueeze(1)
+                q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+                if q_lora is not None:
+                    if (
+                        forward_batch.forward_mode.is_decode()
+                        and sparse_coordinator is not None
+                    ):
+                        topk_indices = sparse_coordinator.attention_begin(
+                            query=None,
+                            key=None,
+                            value=None,
+                            layer=self,
+                            forward_batch=forward_batch,
+                            attn_metadata=None,
+                            indexer=self.indexer,
+                            x=hidden_states,
+                            q_lora=q_lora,
+                            positions=positions,
+                        )
+                    else:
+                        topk_indices = self.indexer(
+                            x=hidden_states,
+                            q_lora=q_lora,
+                            positions=positions,
+                            forward_batch=forward_batch,
+                            layer_id=self.layer_id,
+                        )
         else:
             q = self.q_proj(hidden_states)[0].view(
                 -1, self.num_local_heads, self.qk_head_dim
