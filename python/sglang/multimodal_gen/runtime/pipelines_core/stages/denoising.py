@@ -1017,9 +1017,6 @@ class DenoisingStage(PipelineStage):
 
                         # Predict noise residual
                         attn_metadata = self._build_attn_metadata(i, batch, server_args)
-                        # print(f"latent_model_input shape: {latent_model_input.shape}")
-                        # # [B, C, T, H/sp_size, W] for zimage-turbo
-                        # [B, H*C / sp_size,C] for FLUX.1-dev
                         noise_pred = self._predict_noise_with_cfg(
                             current_model=current_model,
                             latent_model_input=latent_model_input,
