@@ -57,8 +57,8 @@ except ImportError:
     sageattn = None
     sageattn_varlen = None
     logger.warning(
-        "SageAttention not found. Please install it with: "
-        "pip install sageattention or build from source. "
+        "SageAttention not found. Try reinstalling sglang or "
+        "install manually with: pip install sageattention. "
         "Falling back to Triton backend for all operations."
     )
 

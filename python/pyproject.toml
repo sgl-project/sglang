@@ -30,6 +30,7 @@ dependencies = [
   "fastapi",
   "flashinfer_python==0.6.1", # keep it aligned with jit-cache version in Dockerfile
   "flashinfer_cubin==0.6.1",
+  "sageattention>=2.2.0",
   "gguf",
   "hf_transfer",
   "huggingface_hub",
