@@ -62,8 +62,8 @@ from sglang.srt.configs import (
     NemotronHConfig,
     Olmo3Config,
     Qwen3NextConfig,
-    Qwen3NextVLConfig,
-    Qwen3NextVLMoEConfig,
+    Qwen3_5Config,
+    Qwen3_5MoeConfig,
     Step3VLConfig,
 )
 from sglang.srt.configs.deepseek_ocr import DeepseekVLV2Config
@@ -93,8 +93,8 @@ _CONFIG_REGISTRY: List[Type[PretrainedConfig]] = [
     NemotronH_Nano_VL_V2_Config,
     NemotronHConfig,
     DeepseekVLV2Config,
-    Qwen3NextVLConfig,
-    Qwen3NextVLMoEConfig,
+    Qwen3_5Config,
+    Qwen3_5MoeConfig,
     JetNemotronConfig,
     JetVLMConfig,
 ]

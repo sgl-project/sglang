@@ -1,32 +1,31 @@
 from transformers import PretrainedConfig
-from transformers.modeling_rope_utils import rope_config_validation
 from sglang.srt.configs.qwen3_next import Qwen3NextConfig
 from sglang.srt.configs.qwen3_vl import Qwen3VLVisionConfig
 
-class Qwen3NextVLVisionConfig(Qwen3VLVisionConfig):
+class Qwen3_5VisionConfig(Qwen3VLVisionConfig):
     model_type = "qwen3_5"
     base_config_key = "vision_config"
 
-class Qwen3NextVLTextConfig(Qwen3NextConfig):
+class Qwen3_5TextConfig(Qwen3NextConfig):
     model_type = "qwen3_5_text"
     base_config_key = "text_config"
 
 
-class Qwen3NextVLConfig(PretrainedConfig):
+class Qwen3_5Config(PretrainedConfig):
     r"""
-    This is the configuration class to store the configuration of a [`Qwen3VLMoeModel`]. It is used to instantiate a
-    Qwen3-VL-MOE model according to the specified arguments, defining the model architecture. Instantiating a configuration
+    This is the configuration class to store the configuration of a [`Qwen3_5Model`]. It is used to instantiate a
+    Qwen3.5 model according to the specified arguments, defining the model architecture. Instantiating a configuration
     with the defaults will yield a similar configuration to that of
-    Qwen3-VL-30B-A3B-Instruct [Qwen/Qwen3-VL-30B-A3B-Instruct](https://huggingface.co/Qwen/Qwen3-VL-30B-A3B-Instruct).
+    Qwen3.5.
 
     Configuration objects inherit from [`PretrainedConfig`] and can be used to control the model outputs. Read the
     documentation from [`PretrainedConfig`] for more information.
 
 
     Args:
-        text_config (`Union[PreTrainedConfig, dict]`, *optional*, defaults to `Qwen3VLMoeTextConfig`):
+        text_config (`Union[PreTrainedConfig, dict]`, *optional*, defaults to `Qwen3_5TextConfig`):
             The config object or dictionary of the text backbone.
-        vision_config (`Union[PreTrainedConfig, dict]`,  *optional*, defaults to `Qwen3VLMoeVisionConfig`):
+        vision_config (`Union[PreTrainedConfig, dict]`,  *optional*, defaults to `Qwen3_5VisionConfig`):
             The config object or dictionary of the vision backbone.
         image_token_id (`int`, *optional*, defaults to 151655):
             The image token index to encode the image prompt.
@@ -40,13 +39,13 @@ class Qwen3NextVLConfig(PretrainedConfig):
             Whether to tie the word embeddings.
 
     ```python
-    >>> from transformers import Qwen3VLMoeForConditionalGeneration, Qwen3VLMoeConfig
+    >>> from transformers import Qwen3_5ForConditionalGeneration, Qwen3_5Config
 
-    >>> # Initializing a Qwen3-VL-MOE style configuration
-    >>> configuration = Qwen3VLMoeConfig()
+    >>> # Initializing a Qwen3.5 style configuration
+    >>> configuration = Qwen3_5Config()
 
-    >>> # Initializing a model from the Qwen3-VL-30B-A3B style configuration
-    >>> model = Qwen3VLMoeForConditionalGeneration(configuration)
+    >>> # Initializing a model from the Qwen3.5 style configuration
+    >>> model = Qwen3_5ForConditionalGeneration(configuration)
 
     >>> # Accessing the model configuration
     >>> configuration = model.config
@@ -54,8 +53,8 @@ class Qwen3NextVLConfig(PretrainedConfig):
 
     model_type = "qwen3_5"
     sub_configs = {
-        "vision_config": Qwen3NextVLVisionConfig,
-        "text_config": Qwen3NextVLTextConfig,
+        "vision_config": Qwen3_5VisionConfig,
+        "text_config": Qwen3_5TextConfig,
     }
     keys_to_ignore_at_inference = ["past_key_values"]
 
@@ -88,15 +87,15 @@ class Qwen3NextVLConfig(PretrainedConfig):
 
 
 
-class Qwen3NextVLMoEVisionConfig(Qwen3NextVLVisionConfig):
+class Qwen3_5MoeVisionConfig(Qwen3_5VisionConfig):
     model_type = "qwen3_5_moe"
 
-class Qwen3NextVLMoETextConfig(Qwen3NextVLTextConfig):
+class Qwen3_5MoeTextConfig(Qwen3_5TextConfig):
     model_type = "qwen3_5_moe_text"
 
-class Qwen3NextVLMoEConfig(Qwen3NextVLConfig):
+class Qwen3_5MoeConfig(Qwen3_5Config):
     model_type = "qwen3_5_moe"
     sub_configs = {
-        "vision_config": Qwen3NextVLMoEVisionConfig,
-        "text_config": Qwen3NextVLMoETextConfig,
+        "vision_config": Qwen3_5MoeVisionConfig,
+        "text_config": Qwen3_5MoeTextConfig,
     }
