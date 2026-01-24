@@ -10,8 +10,6 @@ from typing import Any, Tuple
 
 import torch
 import torch.nn as nn
-from diffusers.configuration_utils import ConfigMixin
-from diffusers.models.modeling_utils import ModelMixin
 from einops import rearrange
 from torch.distributed.tensor import DTensor
 
@@ -388,8 +386,7 @@ class Conv3dLocalIsland(nn.Conv3d):
             return super().forward(input)
 
 
-class WanModel(CachableDiT, OffloadableDiTMixin, ModelMixin, ConfigMixin):
-    _repeated_blocks = ("DiTBlock",)
+class WanModel(CachableDiT, OffloadableDiTMixin):
     _fsdp_shard_conditions = MovaVideoConfig()._fsdp_shard_conditions
     _compile_conditions = MovaVideoConfig()._compile_conditions
     _supported_attention_backends = MovaVideoConfig()._supported_attention_backends
@@ -398,7 +395,7 @@ class WanModel(CachableDiT, OffloadableDiTMixin, ModelMixin, ConfigMixin):
     lora_param_names_mapping = MovaVideoConfig().lora_param_names_mapping
 
     def __init__(self, config: MovaVideoConfig, hf_config: dict[str, Any]) -> None:
-        super().__init__()
+        super().__init__(config=config, hf_config=hf_config)
 
         # Extract parameters from config
         dim = config.dim

@@ -399,7 +399,6 @@ class DualTowerConditionalBridge(
     3. Cross-attention interaction between the hidden states of the two DiTs.
     """
 
-    _repeated_blocks = ("ConditionalCrossAttentionBlock",)
     _fsdp_shard_conditions = MovaDualTowerConfig()._fsdp_shard_conditions
     _compile_conditions = MovaDualTowerConfig()._compile_conditions
     _supported_attention_backends = MovaDualTowerConfig()._supported_attention_backends
@@ -424,7 +423,7 @@ class DualTowerConditionalBridge(
         trainable_condition_scale: bool = False,
         pooled_adaln: bool = False,
     ):
-        super().__init__()
+        super().__init__(config=config, hf_config=hf_config)
 
         # Use config if provided, otherwise use individual parameters
         if config is not None:

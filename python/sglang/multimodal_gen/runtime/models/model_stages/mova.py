@@ -11,10 +11,16 @@ Sequence Parallelism (SP) Support:
 
 from __future__ import annotations
 
+from typing import Iterable
+
 import torch
 from diffusers.utils.torch_utils import randn_tensor
+from tqdm.auto import tqdm
 
-from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.distributed import (
+    get_local_torch_device,
+    get_world_group,
+)
 from sglang.multimodal_gen.runtime.distributed.communication_op import (
     cfg_model_parallel_all_reduce,
     sequence_model_parallel_all_gather,
@@ -176,6 +182,16 @@ class MovaDenoisingStage(PipelineStage):
             partial = (1 - guidance_scale) * neg
         return cfg_model_parallel_all_reduce(partial)
 
+    def progress_bar(
+        self, iterable: Iterable | None = None, total: int | None = None
+    ) -> tqdm:
+        """
+        Create a progress bar for the denoising process.
+        """
+        local_rank = get_world_group().local_rank
+        disable = local_rank != 0
+        return tqdm(iterable=iterable, total=total, disable=disable)
+
     @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         paired_timesteps = batch.paired_timesteps
@@ -193,43 +209,32 @@ class MovaDenoisingStage(PipelineStage):
         cfg_rank = get_classifier_free_guidance_rank()
         enable_cfg_parallel = server_args.enable_cfg_parallel
 
-        for idx_step in range(total_steps):
-            pair_t = paired_timesteps[idx_step]
-            if pair_t.shape == (2,):
-                timestep, audio_timestep = pair_t
-            else:
-                timestep = pair_t
-                audio_timestep = pair_t
+        with self.progress_bar(total=total_steps) as progress_bar:
+            for idx_step in range(total_steps):
+                pair_t = paired_timesteps[idx_step]
+                if pair_t.shape == (2,):
+                    timestep, audio_timestep = pair_t
+                else:
+                    timestep = pair_t
+                    audio_timestep = pair_t
 
-            if (
-                not switched
-                and boundary_ratio is not None
-                and self.video_dit2 is not None
-                and timestep.item()
-                < boundary_ratio * self.scheduler.num_train_timesteps
-            ):
-                cur_visual_dit = self.video_dit2
-                switched = True
+                if (
+                    not switched
+                    and boundary_ratio is not None
+                    and self.video_dit2 is not None
+                    and timestep.item()
+                    < boundary_ratio * self.scheduler.num_train_timesteps
+                ):
+                    cur_visual_dit = self.video_dit2
+                    switched = True
 
-            timestep = timestep.unsqueeze(0).to(device=get_local_torch_device())
-            audio_timestep = audio_timestep.unsqueeze(0).to(
-                device=get_local_torch_device()
-            )
-
-            if not batch.do_classifier_free_guidance:
-                visual_noise_pred, audio_noise_pred = self._predict(
-                    cur_visual_dit,
-                    batch.latents,
-                    batch.audio_latents,
-                    y,
-                    batch.prompt_embeds[0],
-                    timestep,
-                    audio_timestep,
-                    batch.fps,
+                timestep = timestep.unsqueeze(0).to(device=get_local_torch_device())
+                audio_timestep = audio_timestep.unsqueeze(0).to(
+                    device=get_local_torch_device()
                 )
-            else:
-                if enable_cfg_parallel and cfg_rank == 0:
-                    pos = self._predict(
+
+                if not batch.do_classifier_free_guidance:
+                    visual_noise_pred, audio_noise_pred = self._predict(
                         cur_visual_dit,
                         batch.latents,
                         batch.audio_latents,
@@ -239,91 +244,103 @@ class MovaDenoisingStage(PipelineStage):
                         audio_timestep,
                         batch.fps,
                     )
-                    neg = (None, None)
-                elif enable_cfg_parallel and cfg_rank != 0:
-                    pos = (None, None)
-                    neg = self._predict(
-                        cur_visual_dit,
-                        batch.latents,
-                        batch.audio_latents,
-                        y,
-                        batch.negative_prompt_embeds[0],
-                        timestep,
-                        audio_timestep,
-                        batch.fps,
-                    )
                 else:
-                    pos = self._predict(
-                        cur_visual_dit,
-                        batch.latents,
-                        batch.audio_latents,
-                        y,
-                        batch.prompt_embeds[0],
-                        timestep,
-                        audio_timestep,
-                        batch.fps,
-                    )
-                    neg = self._predict(
-                        cur_visual_dit,
-                        batch.latents,
-                        batch.audio_latents,
-                        y,
-                        batch.negative_prompt_embeds[0],
-                        timestep,
-                        audio_timestep,
-                        batch.fps,
-                    )
+                    if enable_cfg_parallel and cfg_rank == 0:
+                        pos = self._predict(
+                            cur_visual_dit,
+                            batch.latents,
+                            batch.audio_latents,
+                            y,
+                            batch.prompt_embeds[0],
+                            timestep,
+                            audio_timestep,
+                            batch.fps,
+                        )
+                        neg = (None, None)
+                    elif enable_cfg_parallel and cfg_rank != 0:
+                        pos = (None, None)
+                        neg = self._predict(
+                            cur_visual_dit,
+                            batch.latents,
+                            batch.audio_latents,
+                            y,
+                            batch.negative_prompt_embeds[0],
+                            timestep,
+                            audio_timestep,
+                            batch.fps,
+                        )
+                    else:
+                        pos = self._predict(
+                            cur_visual_dit,
+                            batch.latents,
+                            batch.audio_latents,
+                            y,
+                            batch.prompt_embeds[0],
+                            timestep,
+                            audio_timestep,
+                            batch.fps,
+                        )
+                        neg = self._predict(
+                            cur_visual_dit,
+                            batch.latents,
+                            batch.audio_latents,
+                            y,
+                            batch.negative_prompt_embeds[0],
+                            timestep,
+                            audio_timestep,
+                            batch.fps,
+                        )
 
-                if enable_cfg_parallel:
-                    visual_noise_pred = self._cfg_combine(
-                        pos[0] if pos[0] is not None else neg[0],
-                        neg[0] if neg[0] is not None else pos[0],
-                        batch.guidance_scale,
-                        cfg_rank,
-                        enable_cfg_parallel,
-                    )
-                    audio_noise_pred = self._cfg_combine(
-                        pos[1] if pos[1] is not None else neg[1],
-                        neg[1] if neg[1] is not None else pos[1],
-                        batch.guidance_scale,
-                        cfg_rank,
-                        enable_cfg_parallel,
-                    )
-                else:
-                    visual_noise_pred = self._cfg_combine(
-                        pos[0],
-                        neg[0],
-                        batch.guidance_scale,
-                        cfg_rank,
-                        enable_cfg_parallel,
-                    )
-                    audio_noise_pred = self._cfg_combine(
-                        pos[1],
-                        neg[1],
-                        batch.guidance_scale,
-                        cfg_rank,
-                        enable_cfg_parallel,
-                    )
+                    if enable_cfg_parallel:
+                        visual_noise_pred = self._cfg_combine(
+                            pos[0] if pos[0] is not None else neg[0],
+                            neg[0] if neg[0] is not None else pos[0],
+                            batch.guidance_scale,
+                            cfg_rank,
+                            enable_cfg_parallel,
+                        )
+                        audio_noise_pred = self._cfg_combine(
+                            pos[1] if pos[1] is not None else neg[1],
+                            neg[1] if neg[1] is not None else pos[1],
+                            batch.guidance_scale,
+                            cfg_rank,
+                            enable_cfg_parallel,
+                        )
+                    else:
+                        visual_noise_pred = self._cfg_combine(
+                            pos[0],
+                            neg[0],
+                            batch.guidance_scale,
+                            cfg_rank,
+                            enable_cfg_parallel,
+                        )
+                        audio_noise_pred = self._cfg_combine(
+                            pos[1],
+                            neg[1],
+                            batch.guidance_scale,
+                            cfg_rank,
+                            enable_cfg_parallel,
+                        )
 
-            next_timestep = (
-                paired_timesteps[idx_step + 1, 0]
-                if idx_step + 1 < total_steps
-                else None
-            )
-            next_audio_timestep = (
-                paired_timesteps[idx_step + 1, 1]
-                if idx_step + 1 < total_steps
-                else None
-            )
-            batch.latents = self.scheduler.step_from_to(
-                visual_noise_pred, timestep, next_timestep, batch.latents
-            )
-            batch.audio_latents = self.scheduler.step_from_to(
-                audio_noise_pred,
-                audio_timestep,
-                next_audio_timestep,
-                batch.audio_latents,
-            )
+                next_timestep = (
+                    paired_timesteps[idx_step + 1, 0]
+                    if idx_step + 1 < total_steps
+                    else None
+                )
+                next_audio_timestep = (
+                    paired_timesteps[idx_step + 1, 1]
+                    if idx_step + 1 < total_steps
+                    else None
+                )
+                batch.latents = self.scheduler.step_from_to(
+                    visual_noise_pred, timestep, next_timestep, batch.latents
+                )
+                batch.audio_latents = self.scheduler.step_from_to(
+                    audio_noise_pred,
+                    audio_timestep,
+                    next_audio_timestep,
+                    batch.audio_latents,
+                )
 
         for dit in filter(None, [self.video_dit, self.video_dit2, self.audio_dit]):
             if isinstance(dit, OffloadableDiTMixin):
