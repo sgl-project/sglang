@@ -6,6 +6,7 @@ completion benchmark on MI325/MI300X.
 Registry: nightly-amd-accuracy-8-gpu-deepseek-v32-dp suite
 """
 
+import os
 import unittest
 from types import SimpleNamespace
 
@@ -63,12 +64,15 @@ class TestDeepseekV32DP(CustomTestCase):
             "--watchdog-timeout",
             "1200",
         ]
+        env = os.environ.copy()
+        env["SGLANG_USE_AITER"] = "1"
+        env["SGLANG_USE_ROCM700A"] = "1"
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=other_args,
-            env={"SGLANG_USE_AITER": "1", "SGLANG_USE_ROCM700A": "1"},
+            env=env,
         )
 
     @classmethod
