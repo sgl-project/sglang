@@ -620,45 +620,13 @@ class VisionAttention(nn.Module):
         self.dummy_dim = (num_dummy_heads + num_heads) * self.head_size
 
         if self.qk_normalization:
-            norm_kwargs = (
-                dict(
-                    weight_dtype=torch.float32,
-                    cast_x_before_out_mul=True,
-                )
-                if get_global_server_args().rl_on_policy_target is not None
-                else {}
-            )
-            self.q_norm = RMSNorm(
-                self.dummy_dim,
-                eps=layer_norm_eps,
-                var_hidden_size=embed_dim,
-                **norm_kwargs,
-            )
-            self.k_norm = RMSNorm(
-                self.dummy_dim,
-                eps=layer_norm_eps,
-                var_hidden_size=embed_dim,
-                **norm_kwargs,
+            self.q_norm, self.k_norm = self._init_qk_norm(
+                self.dummy_dim, layer_norm_eps, embed_dim
             )
 
         elif self.qk_normalization_by_head_size:
-            norm_kwargs = (
-                dict(
-                    weight_dtype=torch.float32,
-                    cast_x_before_out_mul=True,
-                )
-                if get_global_server_args().rl_on_policy_target is not None
-                else {}
-            )
-            self.q_norm = RMSNorm(
-                self.head_size,
-                eps=layer_norm_eps,
-                **norm_kwargs,
-            )
-            self.k_norm = RMSNorm(
-                self.head_size,
-                eps=layer_norm_eps,
-                **norm_kwargs,
+            self.q_norm, self.k_norm = self._init_qk_norm(
+                self.head_size, layer_norm_eps
             )
 
         # Select attention backend via a unified method
@@ -718,6 +686,31 @@ class VisionAttention(nn.Module):
         )
         self.aux_stream = aux_stream
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()] if aux_stream else []
+
+    def _init_qk_norm(
+        self, norm_dim: int, eps: float, var_hidden_size: Optional[int] = None
+    ):
+        norm_kwargs = (
+            dict(
+                weight_dtype=torch.float32,
+                cast_x_before_out_mul=True,
+            )
+            if get_global_server_args().rl_on_policy_target is not None
+            else {}
+        )
+        q_norm = RMSNorm(
+            norm_dim,
+            eps=eps,
+            var_hidden_size=var_hidden_size,
+            **norm_kwargs,
+        )
+        k_norm = RMSNorm(
+            norm_dim,
+            eps=eps,
+            var_hidden_size=var_hidden_size,
+            **norm_kwargs,
+        )
+        return q_norm, k_norm
 
     def _determine_attention_backend(self, passed_backend: Optional[str]) -> str:
         """Decide the multimodal attention backend string.
@@ -866,7 +859,7 @@ class VisionAttention(nn.Module):
                 rearrange(x, "s b ... -> b s ...").contiguous() for x in (q, k, v)
             ]
 
-            if self.qk_norm_by_head_size:
+            if self.qk_normalization_by_head_size:
                 q, k = self._apply_qk_norm_head_size(q, k)
 
         cos = None
