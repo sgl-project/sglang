@@ -324,6 +324,10 @@ pub struct ChatCompletionRequest {
     #[serde(default)]
     pub ignore_eos: bool,
 
+    /// Add generation prompt to the chat template
+    #[serde(default = "default_true")]
+    pub add_generation_prompt: bool,
+
     /// Continue generating from final assistant message
     #[serde(default)]
     pub continue_final_message: bool,
