@@ -10,7 +10,7 @@ SGLang is a flexible tool, not a rigid framework. Here are five reasons to use S
 * **Fine-Grained Engine Sleep and Wake Up**: facilitate maximum-powered rollout and training
 * **Open-To-Use Refit Functionality**: diverse methods for co-location or disaggregation
 * **Easy To Postpone Generation**: enable partial rollout and dedicated rollout control
-* **Deterministic Inference**: achieve deterministic inference through kernel-level optimization 
+* **Deterministic Inference**: achieve deterministic inference through kernel-level optimization
 * **Load Balancing Router**: cache-aware load-balancing for high-throughput rollout
 
 The following sections cover these aspects in detail.
