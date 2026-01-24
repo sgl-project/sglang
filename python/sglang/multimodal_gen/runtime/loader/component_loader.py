@@ -708,12 +708,15 @@ class AudioVAELoader(BaseVAELoader):
 
 
 class BridgeLoader(ComponentLoader):
-    """Loader for MoVA dual tower bridge."""
+    """Loader for MoVA dual tower bridge with FSDP support."""
+
+    pipeline_bridge_config_attr: str = "bridge_config"
 
     def load_customized(
         self, component_model_path: str, server_args: ServerArgs, module_name: str
     ):
         config = get_diffusers_component_config(model_path=component_model_path)
+        hf_config = deepcopy(config)
         class_name = config.pop("_class_name", None)
         if class_name is None:
             raise ValueError(
@@ -721,10 +724,71 @@ class BridgeLoader(ComponentLoader):
                 "Only diffusers format is supported."
             )
         server_args.model_paths[module_name] = component_model_path
+
+        # Try to get bridge config from pipeline config, fallback to creating one
+        bridge_config = getattr(
+            server_args.pipeline_config, self.pipeline_bridge_config_attr, None
+        )
+        if bridge_config is not None:
+            bridge_config.update_model_arch(config)
+        else:
+            # Create a minimal config from hf_config
+            from sglang.multimodal_gen.configs.models.bridges.mova_dual_tower import (
+                MovaDualTowerConfig,
+            )
+
+            bridge_config = MovaDualTowerConfig()
+            bridge_config.update_model_arch(config)
+
         model_cls, _ = ModelRegistry.resolve_model_cls(class_name)
-        torch_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.dit_precision]
-        model = model_cls.from_pretrained(component_model_path, torch_dtype=torch_dtype)
-        model = model.to(device=get_local_torch_device(), dtype=torch_dtype)
+
+        # Find all safetensors files
+        safetensors_list = _list_safetensors_files(component_model_path)
+        if not safetensors_list:
+            raise ValueError(f"No safetensors files found in {component_model_path}")
+
+        default_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.dit_precision]
+
+        logger.info(
+            "Loading %s from %s safetensors files, default_dtype: %s",
+            class_name,
+            len(safetensors_list),
+            default_dtype,
+        )
+
+        # Check if FSDP loading is available
+        if (
+            server_args.hsdp_shard_dim is not None
+            and hasattr(model_cls, "_fsdp_shard_conditions")
+            and model_cls._fsdp_shard_conditions
+        ):
+            # Load with FSDP support
+            model = maybe_load_fsdp_model(
+                model_cls=model_cls,
+                init_params={"config": bridge_config, "hf_config": hf_config},
+                weight_dir_list=safetensors_list,
+                device=get_local_torch_device(),
+                hsdp_replicate_dim=server_args.hsdp_replicate_dim,
+                hsdp_shard_dim=server_args.hsdp_shard_dim,
+                cpu_offload=server_args.dit_cpu_offload,
+                pin_cpu_memory=server_args.pin_cpu_memory,
+                fsdp_inference=server_args.use_fsdp_inference,
+                default_dtype=default_dtype,
+                param_dtype=torch.bfloat16,
+                reduce_dtype=torch.float32,
+                output_dtype=None,
+                strict=False,
+            )
+        else:
+            # Fallback to simple loading (for non-FSDP or legacy models)
+            model = model_cls.from_pretrained(
+                component_model_path, torch_dtype=default_dtype
+            )
+            model = model.to(device=get_local_torch_device(), dtype=default_dtype)
+
+        total_params = sum(p.numel() for p in model.parameters())
+        logger.info("Loaded bridge model with %.2fM parameters", total_params / 1e6)
+
         return model.eval()
 
 
