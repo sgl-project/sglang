@@ -275,8 +275,8 @@ class MooncakeStore(HiCacheStorage):
                 self.extra_backend_tag = extra_config["extra_backend_tag"]
                 logger.info(f"Using extra_backend_tag: {self.extra_backend_tag}")
 
-            # Check server status
-            if self.config.check_server:
+            # Check server status (only in Real Client mode, not Dummy Client)
+            if self.config.check_server and not self.config.standalone_storage:
                 self.check_server()
 
             # Handle JSON device_name configuration
@@ -493,7 +493,7 @@ class MooncakeStore(HiCacheStorage):
         host_indices: torch.Tensor,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
-        logger.info(
+        logger.debug(
             f"[MooncakeStore] batch_set_v1 START: keys_count={len(keys)}, "
             f"first_keys={keys[:2] if keys else []}"
         )
@@ -524,27 +524,28 @@ class MooncakeStore(HiCacheStorage):
 
         # Only set non-existing keys to storage
         if len(set_keys) > 0:
-            logger.info(
+            logger.debug(
                 f"[MooncakeStore] batch_set_v1: WRITING {len(set_keys)} new keys to L3 storage"
             )
             put_results = self._put_batch_zero_copy_impl(
                 set_keys, set_buffer_ptrs, set_buffer_sizes
             )
-            logger.info(
+            logger.debug(
                 f"[MooncakeStore] batch_set_v1: put_results={put_results[:10] if len(put_results) > 10 else put_results}"
             )
             for i in range(len(set_indices)):
                 set_results[set_indices[i]] = put_results[i]
         else:
-            logger.info(
+            logger.debug(
                 f"[MooncakeStore] batch_set_v1: all {len(keys)} keys already exist, skipping write"
             )
 
         final_results = self._batch_postprocess(set_results, is_set_operate=True)
         success_count = sum(final_results)
-        logger.info(
-            f"[MooncakeStore] batch_set_v1 DONE: success={success_count}/{len(final_results)}"
-        )
+        if success_count != len(final_results):
+            logger.info(
+                f"[MooncakeStore] batch_set_v1 DONE: success={success_count}/{len(final_results)}"
+            )
         return final_results
 
     def set(

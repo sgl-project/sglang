@@ -314,10 +314,6 @@ class SchedulerPPMixin:
 
                 self.running_batch.batch_is_full = False
 
-            if not ENABLE_RELEASE:
-                if len(self.disagg_prefill_inflight_queue) > 0:
-                    self.process_disagg_prefill_inflight_queue()
-
             # Check hierarchical cache events to process pending L3 writes
             if self.enable_hierarchical_cache:
                 self.tree_cache.check_hicache_events()
