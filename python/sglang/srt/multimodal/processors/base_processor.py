@@ -17,7 +17,17 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
     MultimodalInputFormat,
 )
-from sglang.srt.utils import envs, is_npu, load_audio, load_image, load_video, logger
+from sglang.srt.server_args import get_global_server_args
+from sglang.srt.utils import (
+    envs,
+    is_cpu,
+    is_npu,
+    is_xpu,
+    load_audio,
+    load_image,
+    load_video,
+    logger,
+)
 from sglang.srt.utils.cuda_ipc_transport_utils import (
     MM_FEATURE_CACHE_SIZE,
     MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
@@ -25,7 +35,9 @@ from sglang.srt.utils.cuda_ipc_transport_utils import (
     MmItemMemoryPool,
 )
 
+_is_cpu = is_cpu()
 _is_npu = is_npu()
+_is_xpu = is_xpu()
 
 SGL_USE_CUDA_IPC = envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get()
 
@@ -222,7 +234,9 @@ class BaseMultimodalProcessor(ABC):
             "input_features",
         ]
 
-        if SGL_USE_CUDA_IPC:
+        skip_mm_pool = kwargs.get("skip_mm_pool", False)
+
+        if SGL_USE_CUDA_IPC and not skip_mm_pool:
             self.cudaipc_mmfeature_pool = MmItemMemoryPool(
                 MM_FEATURE_CACHE_SIZE,
                 MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
@@ -316,7 +330,11 @@ class BaseMultimodalProcessor(ABC):
             and isinstance(processor.image_processor, BaseImageProcessorFast)
             and not self.server_args.disable_fast_image_processor
         ):
-            if not _is_npu:
+            if _is_cpu or get_global_server_args().rl_on_policy_target is not None:
+                kwargs["device"] = "cpu"
+            elif _is_xpu:
+                kwargs["device"] = "xpu"
+            elif not _is_npu:
                 kwargs["device"] = "cuda"
             elif processor.__class__.__name__ not in {
                 "Qwen2_5_VLProcessor",
@@ -324,6 +342,7 @@ class BaseMultimodalProcessor(ABC):
             }:
                 # Note: for qwen-vl, processor has some reshape issue because of dims restriction on Ascend.
                 kwargs["device"] = "npu"
+
         result = processor.__call__(
             text=[input_text],
             padding=True,
@@ -424,7 +443,6 @@ class BaseMultimodalProcessor(ABC):
     ) -> List[Tuple[Modality, int, concurrent.futures.Future]]:
         """
         Simple version: For one modal data submit IO load task.
-
         Return:
             List[(modality, index_in_that_modality, future)]
         """
@@ -457,7 +475,6 @@ class BaseMultimodalProcessor(ABC):
 
         return futures
 
-    # TODO(yuan-luo): To be obsoleted.
     def submit_data_loading_tasks(
         self,
         text_parts: List[str],
@@ -613,8 +630,37 @@ class BaseMultimodalProcessor(ABC):
         audio_sample_rate: Optional[int] = None,
     ) -> BaseMultiModalProcessorOutput:
 
-        # For MiniCPMO and MiniCPMV
-        if getattr(self, "support_dynamic_frame_expansion", False):
+        BaseMultimodalProcessor.validate_mm_data(image_data, video_data, audio_data)
+
+        multimodal_tokens_pattern = multimodal_tokens.get_combined_regex()
+        if isinstance(prompt, list) and return_text:
+            assert len(prompt) and isinstance(prompt[0], int)
+            prompt = self._processor.tokenizer.decode(prompt)
+        else:
+            prompt = prompt
+
+        assert isinstance(prompt, str)
+        # split text into list of normal text and special tokens
+        text_parts = re.split(multimodal_tokens_pattern, prompt)
+
+        cnt = {Modality.IMAGE: 0, Modality.VIDEO: 0, Modality.AUDIO: 0}
+        for text_part in text_parts:
+            modality = multimodal_tokens.get_modality_of_token(text_part)
+            if modality is not None:
+                cnt[modality] += 1
+
+        n_image = len(image_data) if image_data else 0
+        n_video = len(video_data) if video_data else 0
+        n_audio = len(audio_data) if audio_data else 0
+
+        # For MiniCPMO and MiniCPMV or multimodal_tokens not totally align, legacy show path
+        if (
+            self.server_args.skip_tokenizer_init
+            or cnt[Modality.IMAGE] != n_image
+            or cnt[Modality.VIDEO] != n_video
+            or cnt[Modality.AUDIO] != n_audio
+            or getattr(self, "support_dynamic_frame_expansion", False)
+        ):
             return self.legacy_load_mm_data(
                 prompt=prompt,
                 multimodal_tokens=multimodal_tokens,
@@ -625,18 +671,18 @@ class BaseMultimodalProcessor(ABC):
                 discard_alpha_channel=discard_alpha_channel,
                 audio_sample_rate=audio_sample_rate,
             )
-        # For models other than MiniCPMO and MiniCPMV
-        else:
-            return self.fast_load_mm_data(
-                prompt=prompt,
-                multimodal_tokens=multimodal_tokens,
-                image_data=image_data,
-                video_data=video_data,
-                audio_data=audio_data,
-                return_text=return_text,
-                discard_alpha_channel=discard_alpha_channel,
-                audio_sample_rate=audio_sample_rate,
-            )
+        # For models other than MiniCPMO and MiniCPMV,
+        # totally align multimodal_tokens, fast path
+        return self.fast_load_mm_data(
+            prompt=prompt,
+            multimodal_tokens=multimodal_tokens,
+            image_data=image_data,
+            video_data=video_data,
+            audio_data=audio_data,
+            return_text=return_text,
+            discard_alpha_channel=discard_alpha_channel,
+            audio_sample_rate=audio_sample_rate,
+        )
 
     def fast_load_mm_data(
         self,
@@ -742,8 +788,6 @@ class BaseMultimodalProcessor(ABC):
             discard_alpha_channel: if True, discards the alpha channel in the returned images
 
         """
-
-        BaseMultimodalProcessor.validate_mm_data(image_data, video_data, audio_data)
 
         multimodal_tokens_pattern = multimodal_tokens.get_combined_regex()
         if isinstance(prompt, list) and return_text:
@@ -1041,6 +1085,8 @@ class BaseMultimodalProcessor(ABC):
                             info_data=item.feature,
                             sync_buffer_meta=sync_flag,
                         )
+                    elif not self.server_args.keep_mm_feature_on_device:
+                        item.feature = item.feature.cpu()
                 elif (
                     isinstance(item.precomputed_embeddings, torch.Tensor)
                     and item.precomputed_embeddings.is_cuda
@@ -1061,5 +1107,7 @@ class BaseMultimodalProcessor(ABC):
                             info_data=item.precomputed_embeddings,
                             sync_buffer_meta=sync_flag,
                         )
+                    elif not self.server_args.keep_mm_feature_on_device:
+                        item.precomputed_embeddings = item.precomputed_embeddings.cpu()
 
         return all_collected_items, input_ids, ret

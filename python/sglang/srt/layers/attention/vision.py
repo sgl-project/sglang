@@ -11,12 +11,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
+from sglang.jit_kernel.norm import can_use_fused_inplace_qknorm as can_use_jit_qk_norm
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
+from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.utils import (
     get_bool_env_var,
     get_device_capability,
-    is_blackwell,
+    is_blackwell_supported,
     is_cuda,
     is_hip,
     is_npu,
@@ -398,6 +400,58 @@ class VisionFlash3Attention(nn.Module):
         return output
 
 
+class VisionFlash4Attention(nn.Module):
+    def __init__(
+        self,
+        **kwargs,
+    ):
+        if not _is_cuda:
+            raise Exception("VisionFlash4Attention is only available for cuda")
+        super().__init__()
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        cu_seqlens: torch.Tensor | SingletonCache | None,
+        bsz: int,
+        seq_len: int,
+        **kwargs,
+    ) -> torch.Tensor:
+        r"""
+        Args:
+            cu_seqlens: [b]
+        Returns:
+             [b * s, h, head_size]
+        """
+        if cu_seqlens is None:
+            cu_seqlens = _get_cu_seqlens_for_shape(bsz, seq_len, device=q.device)
+        elif isinstance(cu_seqlens, SingletonCache):
+            if cu_seqlens.empty():
+                cu_seqlens.set_data(
+                    _get_cu_seqlens_for_shape(bsz, seq_len, device=q.device)
+                )
+            cu_seqlens = cu_seqlens.get_data()
+
+        cu_seqlens = cu_seqlens.to(dtype=torch.int32).to(q.device)
+        seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+        max_seqlen = seq_lens.max().item()
+
+        output = flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_k=max_seqlen,
+            ver=4,
+        )
+
+        return output
+
+
 class VisionAiterAttention(nn.Module):
     def __init__(
         self,
@@ -468,7 +522,7 @@ class VisionAscendAttention(nn.Module):
         Returns:
              [b * s, h, head_size]
         """
-        cu_seqlens = resolve_seqlens(cu_seqlens, bsz, seq_len, device=q.device)
+        cu_seqlens = resolve_seqlens(cu_seqlens, bsz, seq_len, device="cpu")
 
         seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
         if seq_lens.is_npu:
@@ -497,6 +551,7 @@ QKV_BACKEND_IMPL = {
     "triton_attn": VisionTritonAttention,
     "sdpa": VisionSdpaAttention,
     "fa3": VisionFlash3Attention,
+    "fa4": VisionFlash4Attention,
     "ascend_attn": VisionAscendAttention,
     "aiter_attn": VisionAiterAttention,
 }
@@ -563,11 +618,25 @@ class VisionAttention(nn.Module):
         self.dummy_dim = (num_dummy_heads + num_heads) * self.head_size
 
         if self.qk_normalization:
+            norm_kwargs = (
+                dict(
+                    weight_dtype=torch.float32,
+                    cast_x_before_out_mul=True,
+                )
+                if get_global_server_args().rl_on_policy_target is not None
+                else {}
+            )
             self.q_norm = RMSNorm(
-                self.dummy_dim, eps=layer_norm_eps, var_hidden_size=embed_dim
+                self.dummy_dim,
+                eps=layer_norm_eps,
+                var_hidden_size=embed_dim,
+                **norm_kwargs,
             )
             self.k_norm = RMSNorm(
-                self.dummy_dim, eps=layer_norm_eps, var_hidden_size=embed_dim
+                self.dummy_dim,
+                eps=layer_norm_eps,
+                var_hidden_size=embed_dim,
+                **norm_kwargs,
             )
 
         # Select attention backend via a unified method
@@ -626,7 +695,7 @@ class VisionAttention(nn.Module):
             prefix=add_prefix("proj", prefix),
         )
         self.aux_stream = aux_stream
-        self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
+        self.ln_events = [torch.cuda.Event(), torch.cuda.Event()] if aux_stream else []
 
     def _determine_attention_backend(self, passed_backend: Optional[str]) -> str:
         """Decide the multimodal attention backend string.
@@ -655,7 +724,7 @@ class VisionAttention(nn.Module):
                 backend = "triton_attn"
         else:
             backend = "sdpa"
-        if backend == "fa3" and is_blackwell():
+        if backend == "fa3" and is_blackwell_supported():
             raise ValueError("The 'fa3' backend is not supported on Blackwell GPUs")
 
         return backend
@@ -693,8 +762,7 @@ class VisionAttention(nn.Module):
             q, k = maybe_execute_in_parallel(
                 q_l2norm,
                 k_l2norm,
-                self.ln_events[0],
-                self.ln_events[1],
+                self.ln_events,
                 self.aux_stream,
             )
         return q, k
@@ -719,6 +787,15 @@ class VisionAttention(nn.Module):
         if x.dim() == 2:
             x = x.unsqueeze(0)
         assert x.dim() == 3, x.shape
+        if (
+            get_global_server_args().rl_on_policy_target is not None
+            and position_embeddings is not None
+        ):
+            assert isinstance(position_embeddings, tuple), (
+                "expected position_embeddings to be a tuple of two tensors,\n"
+                f"but got {type(position_embeddings)}, change if needed"
+            )
+            position_embeddings = tuple(p.to(x.dtype) for p in position_embeddings)
         x_shape = x.shape
         bsz, s, _ = x_shape
         head = self.num_attention_heads_per_partition
@@ -800,7 +877,23 @@ class VisionAttention(nn.Module):
 
         # internvl
         if self.qk_normalization:
-            q, k = self._apply_qk_norm(q, k)
+            # jit kernel
+            if can_use_jit_qk_norm(self.head_size, q.dtype):
+
+                # q: [tokens, head, head_size]  ->  [tokens, embed_dim]
+                head_dim_for_norm = head * self.head_size
+
+                q, k = apply_qk_norm(
+                    q=q,
+                    k=k,
+                    q_norm=self.q_norm,
+                    k_norm=self.k_norm,
+                    head_dim=head_dim_for_norm,
+                    alt_stream=self.aux_stream,
+                )
+
+            else:
+                q, k = self._apply_qk_norm(q, k)
 
         output = self.qkv_backend.forward(
             q=q,

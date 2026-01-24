@@ -13,6 +13,8 @@ from torch.nn.attention.flex_attention import (
     flex_attention,
 )
 
+from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
+
 # wan 1.3B model has a weird channel / head configurations and require max-autotune to work with flexattention
 # see https://github.com/pytorch/pytorch/issues/133254
 # change to default for other models
@@ -421,7 +423,7 @@ class CausalWanTransformerBlock(nn.Module):
         return hidden_states
 
 
-class CausalWanTransformer3DModel(BaseDiT):
+class CausalWanTransformer3DModel(BaseDiT, OffloadableDiTMixin):
     _fsdp_shard_conditions = WanVideoConfig()._fsdp_shard_conditions
     _compile_conditions = WanVideoConfig()._compile_conditions
     _supported_attention_backends = WanVideoConfig()._supported_attention_backends
@@ -504,6 +506,10 @@ class CausalWanTransformer3DModel(BaseDiT):
         self.independent_first_frame = False
 
         self.__post_init__()
+
+        self.layer_names = [
+            "blocks",
+        ]
 
     @staticmethod
     def _prepare_blockwise_causal_attn_mask(
@@ -627,7 +633,11 @@ class CausalWanTransformer3DModel(BaseDiT):
             self.hidden_size,
             self.num_attention_heads,
             rope_dim_list,
-            dtype=torch.float32 if current_platform.is_mps() else torch.float64,
+            dtype=(
+                torch.float32
+                if current_platform.is_mps() or current_platform.is_musa()
+                else torch.float64
+            ),
             rope_theta=10000,
             start_frame=start_frame,  # Assume that start_frame is 0 when kv_cache is None
         )
@@ -755,7 +765,11 @@ class CausalWanTransformer3DModel(BaseDiT):
             self.hidden_size,
             self.num_attention_heads,
             rope_dim_list,
-            dtype=torch.float32 if current_platform.is_mps() else torch.float64,
+            dtype=(
+                torch.float32
+                if current_platform.is_mps() or current_platform.is_musa()
+                else torch.float64
+            ),
             rope_theta=10000,
             start_frame=start_frame,
         )

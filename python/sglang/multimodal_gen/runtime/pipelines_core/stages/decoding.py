@@ -57,6 +57,7 @@ class DecodingStage(PipelineStage):
     """
 
     def __init__(self, vae, pipeline=None) -> None:
+        super().__init__()
         self.vae: ParallelTiledVAE = vae
         self.pipeline = weakref.ref(pipeline) if pipeline else None
 
@@ -153,6 +154,32 @@ class DecodingStage(PipelineStage):
         image = (image / 2 + 0.5).clamp(0, 1)
         return image
 
+    def load_model(self):
+        # load vae if not already loaded (used for memory constrained devices)
+        pipeline = self.pipeline() if self.pipeline else None
+        if not self.server_args.model_loaded["vae"]:
+            loader = VAELoader()
+            self.vae = loader.load(
+                self.server_args.model_paths["vae"], self.server_args
+            )
+            if pipeline:
+                pipeline.add_module("vae", self.vae)
+            self.server_args.model_loaded["vae"] = True
+
+    def offload_model(self):
+        # Offload models if needed
+        self.maybe_free_model_hooks()
+
+        if self.server_args.vae_cpu_offload:
+            self.vae.to("cpu", non_blocking=True)
+
+        if torch.backends.mps.is_available():
+            del self.vae
+            pipeline = self.pipeline() if self.pipeline else None
+            if pipeline is not None and "vae" in pipeline.modules:
+                del pipeline.modules["vae"]
+            self.server_args.model_loaded["vae"] = False
+
     @torch.no_grad()
     def forward(
         self,
@@ -166,36 +193,11 @@ class DecodingStage(PipelineStage):
         representations to pixel-space video/images. It also optionally decodes
         trajectory latents for visualization purposes.
 
-        Args:
-            batch: The current batch containing:
-                - latents: Tensor to decode (batch, channels, frames, height_latents, width_latents)
-                - return_trajectory_decoded (optional): Flag to decode trajectory latents
-                - trajectory_latents (optional): Latents at different timesteps
-                - trajectory_timesteps (optional): Corresponding timesteps
-            server_args: Configuration containing:
-                - output_type: "latent" to skip decoding, otherwise decode to pixels
-                - vae_cpu_offload: Whether to offload VAE to CPU after decoding
-                - model_loaded: Track VAE loading state
-                - model_paths: Path to VAE model if loading needed
-
-        Returns:
-            Modified batch with:
-                - output: Decoded frames (batch, channels, frames, height, width) as CPU float32
-                - trajectory_decoded (if requested): List of decoded frames per timestep
         """
         # load vae if not already loaded (used for memory constrained devices)
-        pipeline = self.pipeline() if self.pipeline else None
-        if not server_args.model_loaded["vae"]:
-            loader = VAELoader()
-            self.vae = loader.load(server_args.model_paths["vae"], server_args)
-            if pipeline:
-                pipeline.add_module("vae", self.vae)
-            server_args.model_loaded["vae"] = True
+        self.load_model()
 
-        if server_args.output_type == "latent":
-            frames = batch.latents
-        else:
-            frames = self.decode(batch.latents, server_args)
+        frames = self.decode(batch.latents, server_args)
 
         # decode trajectory latents if needed
         if batch.return_trajectory_decoded:
@@ -222,6 +224,8 @@ class DecodingStage(PipelineStage):
         else:
             trajectory_decoded = None
 
+        frames = server_args.pipeline_config.post_decoding(frames, server_args)
+
         # Update batch with decoded image
         output_batch = OutputBatch(
             output=frames,
@@ -231,16 +235,6 @@ class DecodingStage(PipelineStage):
             timings=batch.timings,
         )
 
-        # Offload models if needed
-        self.maybe_free_model_hooks()
-
-        if server_args.vae_cpu_offload:
-            self.vae.to("cpu")
-
-        if torch.backends.mps.is_available():
-            del self.vae
-            if pipeline is not None and "vae" in pipeline.modules:
-                del pipeline.modules["vae"]
-            server_args.model_loaded["vae"] = False
+        self.offload_model()
 
         return output_batch
