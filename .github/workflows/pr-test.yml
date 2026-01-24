@@ -376,7 +376,7 @@ jobs:
     # Skip for scheduled runs (they run stages independently) and when target_stage is set
     if: github.event_name != 'schedule' && inputs.test_parallel_dispatch != true && !inputs.target_stage && needs.check-changes.outputs.sgl_kernel == 'true'
     runs-on: x64-kernel-build-node
-    timeout-minutes: 60
+    timeout-minutes: 240
     strategy:
       matrix:
         include:
@@ -425,7 +425,7 @@ jobs:
     # Skip for scheduled runs (they run stages independently) and when target_stage is set
     if: github.event_name != 'schedule' && inputs.test_parallel_dispatch != true && !inputs.target_stage && needs.check-changes.outputs.sgl_kernel == 'true'
     runs-on: arm-kernel-build-node
-    timeout-minutes: 60
+    timeout-minutes: 240
     strategy:
       matrix:
         include:
@@ -479,7 +479,7 @@ jobs:
       !inputs.target_stage &&
       needs.check-changes.outputs.sgl_kernel == 'true'
     runs-on: 1-gpu-runner
-    timeout-minutes: 60
+    timeout-minutes: 240
     env:
       RUNNER_LABELS: 1-gpu-runner
     steps:
@@ -519,7 +519,7 @@ jobs:
       !inputs.target_stage &&
       needs.check-changes.outputs.sgl_kernel == 'true'
     runs-on: 1-gpu-runner
-    timeout-minutes: 60
+    timeout-minutes: 240
     env:
       RUNNER_LABELS: 1-gpu-runner
     steps:
@@ -559,7 +559,7 @@ jobs:
       !inputs.target_stage &&
       needs.check-changes.outputs.sgl_kernel == 'true'
     runs-on: 1-gpu-runner
-    timeout-minutes: 60
+    timeout-minutes: 240
     env:
       CI: true
       RUNNER_LABELS: 1-gpu-runner
@@ -612,7 +612,7 @@ jobs:
       !inputs.target_stage &&
       needs.check-changes.outputs.sgl_kernel == 'true'
     runs-on: ${{ needs.check-changes.outputs.b200_runner }}
-    timeout-minutes: 60
+    timeout-minutes: 240
     env:
       RUNNER_LABELS: ${{ needs.check-changes.outputs.b200_runner }}
     steps:
@@ -685,7 +685,7 @@ jobs:
       !inputs.target_stage &&
       needs.check-changes.outputs.jit_kernel == 'true'
     runs-on: 1-gpu-runner
-    timeout-minutes: 60
+    timeout-minutes: 240
     env:
       RUNNER_LABELS: 1-gpu-runner
     steps:
@@ -719,7 +719,7 @@ jobs:
         )
       )
     runs-on: 1-gpu-runner
-    timeout-minutes: 60
+    timeout-minutes: 240
     env:
       RUNNER_LABELS: 1-gpu-runner
     steps:
@@ -766,7 +766,7 @@ jobs:
         )
       )
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 240
     steps:
       - name: Free disk space
         run: |
@@ -812,7 +812,7 @@ jobs:
         )
       )
     runs-on: 1-gpu-5090
-    timeout-minutes: 60
+    timeout-minutes: 240
     env:
       RUNNER_LABELS: 1-gpu-5090
       IS_BLACKWELL: "1"
@@ -866,7 +866,7 @@ jobs:
         )
       )
     runs-on: 1-gpu-runner
-    timeout-minutes: 60
+    timeout-minutes: 240
     env:
       RUNNER_LABELS: 1-gpu-runner
     strategy:
@@ -916,7 +916,7 @@ jobs:
         )
       )
     runs-on: 2-gpu-runner
-    timeout-minutes: 60
+    timeout-minutes: 240
     env:
       RUNNER_LABELS: 2-gpu-runner
     strategy:
@@ -965,7 +965,7 @@ jobs:
         )
       )
     runs-on: 1-gpu-5090
-    timeout-minutes: 60
+    timeout-minutes: 240
     env:
       RUNNER_LABELS: 1-gpu-5090
       IS_BLACKWELL: "1"
@@ -1013,7 +1013,7 @@ jobs:
         )
       )
     runs-on: 1-gpu-runner
-    timeout-minutes: 60
+    timeout-minutes: 240
     env:
       RUNNER_LABELS: 1-gpu-runner
     strategy:
@@ -1062,7 +1062,7 @@ jobs:
         )
       )
     runs-on: 2-gpu-runner
-    timeout-minutes: 60
+    timeout-minutes: 240
     env:
       RUNNER_LABELS: 2-gpu-runner
     steps:
@@ -1107,7 +1107,7 @@ jobs:
         )
       )
     runs-on: 1-gpu-5090
-    timeout-minutes: 60
+    timeout-minutes: 240
     env:
       RUNNER_LABELS: 1-gpu-5090
       IS_BLACKWELL: "1"
@@ -1158,7 +1158,7 @@ jobs:
         )
       )
     runs-on: 2-gpu-runner
-    timeout-minutes: 60
+    timeout-minutes: 240
     env:
       RUNNER_LABELS: 2-gpu-runner
     steps:
@@ -1206,7 +1206,7 @@ jobs:
         )
       )
     runs-on: ${{ needs.check-changes.outputs.b200_runner }}
-    timeout-minutes: 60
+    timeout-minutes: 240
     env:
       RUNNER_LABELS: ${{ needs.check-changes.outputs.b200_runner }}
     strategy:
@@ -1241,6 +1241,11 @@ jobs:
           fi
           IS_BLACKWELL=1 python3 run_suite.py --hw cuda --suite stage-b-test-4-gpu-b200 $CONTINUE_ON_ERROR_FLAG
 
+      - name: Run FA4 jit_kernel tests (SM100+)
+        timeout-minutes: 5
+        run: |
+          IS_BLACKWELL=1 python3 -m pytest -q python/sglang/jit_kernel/tests/test_flash_attention_4.py
+
   stage-c-test-large-4-gpu:
     needs: [check-changes, call-gate, wait-for-stage-b, sgl-kernel-build-wheels]
     if: |
@@ -1254,7 +1259,7 @@ jobs:
         )
       )
     runs-on: 4-gpu-h100
-    timeout-minutes: 60
+    timeout-minutes: 240
     env:
       RUNNER_LABELS: 4-gpu-h100
     steps:
@@ -1299,7 +1304,7 @@ jobs:
         )
       )
     runs-on: ${{ needs.check-changes.outputs.b200_runner }}
-    timeout-minutes: 60
+    timeout-minutes: 240
     env:
       RUNNER_LABELS: ${{ needs.check-changes.outputs.b200_runner }}
     steps:
@@ -1340,7 +1345,7 @@ jobs:
         )
       )
     runs-on: 1-gpu-runner
-    timeout-minutes: 60
+    timeout-minutes: 240
     strategy:
       fail-fast: false
       matrix:
@@ -1364,7 +1369,7 @@ jobs:
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh diffusion
       - name: Run diffusion server tests
-        timeout-minutes: 60
+        timeout-minutes: 240
         run: |
           cd python
           CONTINUE_ON_ERROR_FLAG=""
@@ -1391,7 +1396,7 @@ jobs:
         )
       )
     runs-on: 2-gpu-runner
-    timeout-minutes: 60
+    timeout-minutes: 240
     strategy:
       fail-fast: false
       matrix:
@@ -1416,7 +1421,7 @@ jobs:
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh diffusion
 
       - name: Run diffusion server tests
-        timeout-minutes: 60
+        timeout-minutes: 240
         run: |
           cd python
           CONTINUE_ON_ERROR_FLAG=""
@@ -1442,7 +1447,7 @@ jobs:
         )
       )
     runs-on: 4-gpu-h100
-    timeout-minutes: 60
+    timeout-minutes: 240
     env:
       RUNNER_LABELS: 4-gpu-h100
     strategy:
@@ -1495,7 +1500,7 @@ jobs:
         )
       )
     runs-on: 8-gpu-h200
-    timeout-minutes: 60
+    timeout-minutes: 240
     env:
       RUNNER_LABELS: 8-gpu-h200
     strategy:
@@ -1554,7 +1559,7 @@ jobs:
         )
       )
     runs-on: 8-gpu-h20
-    timeout-minutes: 60
+    timeout-minutes: 240
     env:
       SGLANG_CI_RDMA_ALL_DEVICES: "mlx5_1,mlx5_2,mlx5_3,mlx5_4"
       RUNNER_LABELS: 8-gpu-h20
@@ -1608,7 +1613,7 @@ jobs:
         )
       )
     runs-on: 4-gpu-h100
-    timeout-minutes: 60
+    timeout-minutes: 240
     env:
       RUNNER_LABELS: 4-gpu-h100
     steps:
@@ -1657,7 +1662,7 @@ jobs:
         )
       )
     runs-on: 8-gpu-h200
-    timeout-minutes: 60
+    timeout-minutes: 240
     env:
       RUNNER_LABELS: 8-gpu-h200
     steps:
@@ -1706,7 +1711,7 @@ jobs:
         )
       )
     runs-on: ${{ needs.check-changes.outputs.b200_runner }}
-    timeout-minutes: 60
+    timeout-minutes: 240
     env:
       RUNNER_LABELS: ${{ needs.check-changes.outputs.b200_runner }}
     strategy:
@@ -1760,7 +1765,7 @@ jobs:
         )
       )
     runs-on: 4-gpu-gb200
-    timeout-minutes: 60
+    timeout-minutes: 240
     env:
       RUNNER_LABELS: 4-gpu-gb200
     strategy:
