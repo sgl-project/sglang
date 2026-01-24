@@ -17,7 +17,7 @@ class SGLDiffusionExecutor(torch.nn.Module):
         self.config = config
         self.loras = []
 
-    def set_lora(self, lora_nickname=[], lora_path=[], strength=[], target=[]):
+    def set_lora(self, lora_nickname=None, lora_path=None, strength=None, target=None):
         """Set LoRA adapter using SGLang Diffusion API."""
         if len(lora_nickname) > 0:
             self.generator.set_lora(
