@@ -38,6 +38,7 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 
 # Layers - Linear
 from sglang.srt.layers.linear import (
