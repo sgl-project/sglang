@@ -35,7 +35,7 @@ class TestDeepseekV32FP4(CustomTestCase):
             "modelopt_fp4",
             "--kv-cache-dtype",
             "fp8_e4m3",
-            "--tool-call-parse",
+            "--tool-call-parser",
             "deepseekv32",
             "--reasoning-parser",
             "deepseek-v3",
