@@ -1424,13 +1424,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             max_loras_per_batch=self.server_args.max_loras_per_batch,
             load_config=self.load_config,
             dtype=self.dtype,
+            server_args=self.server_args,
             lora_backend=self.server_args.lora_backend,
             tp_size=self.tp_size,
             tp_rank=self.tp_rank,
             max_lora_rank=self.server_args.max_lora_rank,
             target_modules=self.server_args.lora_target_modules,
             lora_paths=self.server_args.lora_paths,
-            server_args=self.server_args,
         )
 
     def load_lora_adapter(self, lora_ref: LoRARef):
