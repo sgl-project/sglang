@@ -17,6 +17,16 @@ class SGLDiffusionExecutor(torch.nn.Module):
         self.config = config
         self.loras = []
 
+    def set_lora(self, lora_nickname=[], lora_path=[], strength=[], target=[]):
+        """Set LoRA adapter using SGLang Diffusion API."""
+        if len(lora_nickname) > 0:
+            self.generator.set_lora(
+                lora_nickname=lora_nickname,
+                lora_path=lora_path,
+                strength=strength,
+                target=target,
+            )
+
     def _unpack_latents(self, latents, height, width, channels):
         """Unpack latents from packed format to standard format."""
         batch_size = latents.shape[0]
