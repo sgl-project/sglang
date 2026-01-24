@@ -599,7 +599,7 @@ class TokenizerLoader(ComponentLoader):
         )
 
 
-class _BaseVAELoader(ComponentLoader):
+class BaseVAELoader(ComponentLoader):
     """Shared loader for (video/audio) VAE modules."""
 
     pipeline_vae_config_attr: str = "vae_config"
@@ -691,7 +691,7 @@ class _BaseVAELoader(ComponentLoader):
         return vae.eval()
 
 
-class VAELoader(_BaseVAELoader):
+class VAELoader(BaseVAELoader):
     """Loader for VAE (image/video)."""
 
     pipeline_vae_config_attr = "vae_config"
@@ -699,7 +699,7 @@ class VAELoader(_BaseVAELoader):
     call_post_init = True
 
 
-class AudioVAELoader(_BaseVAELoader):
+class AudioVAELoader(BaseVAELoader):
     """Loader for audio VAE (e.g. DAC/oobleck)."""
 
     pipeline_vae_config_attr = "audio_vae_config"
@@ -728,7 +728,7 @@ class BridgeLoader(ComponentLoader):
         return model.eval()
 
 
-class _BaseTransformerLoader(ComponentLoader):
+class BaseTransformerLoader(ComponentLoader):
     """Shared loader for (video/audio) DiT transformers."""
 
     # Attribute name on `server_args.pipeline_config` for the DiT config object.
@@ -822,13 +822,13 @@ class _BaseTransformerLoader(ComponentLoader):
         return model
 
 
-class AudioTransformerLoader(_BaseTransformerLoader):
+class AudioTransformerLoader(BaseTransformerLoader):
     """Loader for audio DiT transformer."""
 
     pipeline_dit_config_attr = "audio_dit_config"
 
 
-class TransformerLoader(_BaseTransformerLoader):
+class TransformerLoader(BaseTransformerLoader):
     """Loader for video/image DiT transformer."""
 
     pipeline_dit_config_attr = "dit_config"
