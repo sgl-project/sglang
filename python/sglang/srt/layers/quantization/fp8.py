@@ -919,9 +919,14 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 _is_cpu_amx_available
             ), "Fp8MoEMethod on CPU requires that CPU has AMX support"
             _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
-        elif self.use_mxfp8 and not self.quant_config.is_checkpoint_fp8_serialized:
-            self._quantize_mxfp8_moe_weights(layer)
-            return
+        elif self.use_mxfp8:
+            self._process_mxfp8_moe_weights(
+                layer, quantize=not self.quant_config.is_checkpoint_fp8_serialized
+            )
+            # if not self.quant_config.is_checkpoint_fp8_serialized:
+            #     self._quantize_mxfp8_moe_weights(layer)
+            # else:
+            #     pass
         else:
             # For fp8 moe run with deepgemm, the expert weights and scales need be requantized to ue8m0
             from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE
@@ -954,12 +959,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 layer.w13_weight_scale_inv.format_ue8m0 = True
                 layer.w2_weight_scale_inv.format_ue8m0 = True
 
-    def _quantize_mxfp8_moe_weights(self, layer: Module) -> None:
+    def _process_mxfp8_moe_weights(self, layer: Module, quantize: bool = True) -> None:
 
         if not (_is_cuda and is_sm100_supported()):
             raise RuntimeError("MXFP8 MoE quantization requires SM100.")
 
-        def _quantize_with_cutlass_es_kernel(weight: torch.Tensor):
+        def _quantize_and_swizzle_with_cutlass_es_kernel(weight: torch.Tensor):
             from sgl_kernel import es_sm100_mxfp8_blockscaled_grouped_quant
 
             weight = weight.contiguous()
@@ -1004,46 +1009,73 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 scale = scale[:, :m, :]
             return qweight, scale
 
-        def _quantize_with_triton_kernel(weight: torch.Tensor):
-            def _swizzle_mxfp8_sf(scale, num_warps):
-                from triton_kernels.tensor import convert_layout, wrap_torch_tensor
-                from triton_kernels.tensor_details import layout
+        def _swizzle_mxfp8_sf(scale, num_warps):
+            from triton_kernels.tensor import convert_layout, wrap_torch_tensor
+            from triton_kernels.tensor_details import layout
 
-                scale_layout, scale_layout_opts = (
-                    layout.make_default_matmul_mxfp4_w_scale_layout(
-                        mx_axis=1, num_warps=num_warps
-                    )
+            scale_layout, scale_layout_opts = (
+                layout.make_default_matmul_mxfp4_w_scale_layout(
+                    mx_axis=1, num_warps=num_warps
                 )
-                scale = scale.transpose(-2, -1)
-                scale = convert_layout(
-                    wrap_torch_tensor(scale), scale_layout, **scale_layout_opts
-                )
-                return scale
+            )
+            scale = scale.transpose(-2, -1)
+            scale = convert_layout(
+                wrap_torch_tensor(scale), scale_layout, **scale_layout_opts
+            )
+            return scale
 
-            weight = weight.contiguous()
-            num_experts, m, k = weight.shape
-            assert k % 32 == 0, f"{k=} must be divisible by 32 for MXFP8"
-
-            weight_flat = weight.view(-1, k).contiguous()
+        def _swizzle_with_triton_kernel(
+            weight_shape: tuple[int, int, int], scale: torch.Tensor
+        ):
+            num_experts, m, k = weight_shape
             aligned_m = ((m + 127) // 128) * 128
-            qweight, scale = mxfp8_group_quantize(weight_flat)
-            qweight = qweight.view_as(weight)
             scale = scale.view(num_experts, aligned_m, k // 32)
             num_warps = 8
             scale = _swizzle_mxfp8_sf(scale, num_warps)
             scale = scale.data.view(num_experts, aligned_m, k // 32)
+            return scale
+
+        def _quantize_and_swizzle_with_triton_kernel(weight: torch.Tensor):
+
+            weight = weight.contiguous()
+            _, _, k = weight.shape
+            assert k % 32 == 0, f"{k=} must be divisible by 32 for MXFP8"
+
+            weight_flat = weight.view(-1, k).contiguous()
+            # aligned_m = ((m + 127) // 128) * 128
+            qweight, scale = mxfp8_group_quantize(weight_flat)
+            qweight = qweight.view_as(weight)
+            # scale = scale.view(num_experts, aligned_m, k // 32)
+            # num_warps = 8
+            # scale = _swizzle_mxfp8_sf(scale, num_warps)
+            # scale = scale.data.view(num_experts, aligned_m, k // 32)
+            scale = _swizzle_with_triton_kernel(weight.shape, scale)
             return qweight, scale
 
-        if (
-            get_moe_runner_backend().is_cutlass()
-            and not self.quant_config.is_checkpoint_fp8_serialized
-        ):
-
-            w13_q, w13_s = _quantize_with_cutlass_es_kernel(layer.w13_weight.data)
-            w2_q, w2_s = _quantize_with_cutlass_es_kernel(layer.w2_weight.data)
+        if quantize:
+            if get_moe_runner_backend().is_cutlass():
+                w13_q, w13_s = _quantize_and_swizzle_with_cutlass_es_kernel(
+                    layer.w13_weight.data
+                )
+                w2_q, w2_s = _quantize_and_swizzle_with_cutlass_es_kernel(
+                    layer.w2_weight.data
+                )
+            else:
+                w13_q, w13_s = _quantize_and_swizzle_with_triton_kernel(
+                    layer.w13_weight.data
+                )
+                w2_q, w2_s = _quantize_and_swizzle_with_triton_kernel(
+                    layer.w2_weight.data
+                )
         else:
-            w13_q, w13_s = _quantize_with_triton_kernel(layer.w13_weight.data)
-            w2_q, w2_s = _quantize_with_triton_kernel(layer.w2_weight.data)
+            w13_q = layer.w13_weight.data
+            w2_q = layer.w2_weight.data
+            w13_s = _swizzle_with_triton_kernel(
+                layer.w13_weight.data.shape, layer.w13_weight_scale_inv.data
+            )
+            w2_s = _swizzle_with_triton_kernel(
+                layer.w2_weight.data.shape, layer.w2_weight_scale_inv.data
+            )
 
         layer.w13_weight = torch.nn.Parameter(w13_q, requires_grad=False)
         layer.w2_weight = torch.nn.Parameter(w2_q, requires_grad=False)
