@@ -14,7 +14,18 @@ def _is_blocks(n: str, m) -> bool:
 class MovaAudioArchConfig(DiTArchConfig):
     _fsdp_shard_conditions: list = field(default_factory=lambda: [_is_blocks])
 
-    param_names_mapping: dict = field(default_factory=dict)
+    param_names_mapping: dict = field(
+        default_factory=lambda: {
+            r"^blocks\.(\d+)\.ffn\.0\.(.*)$": r"blocks.\1.ffn.fc_in.\2",
+            r"^blocks\.(\d+)\.ffn\.2\.(.*)$": r"blocks.\1.ffn.fc_out.\2",
+            r"^text_embedding\.0\.(.*)$": r"text_embedding.fc_in.\1",
+            r"^text_embedding\.2\.(.*)$": r"text_embedding.fc_out.\1",
+            r"^time_embedding\.0\.(.*)$": r"time_embedding.fc_in.\1",
+            r"^time_embedding\.2\.(.*)$": r"time_embedding.fc_out.\1",
+            r"^img_emb\.proj\.1\.(.*)$": r"img_emb.fc_in.\1",
+            r"^img_emb\.proj\.3\.(.*)$": r"img_emb.fc_out.\1",
+        }
+    )
     reverse_param_names_mapping: dict = field(default_factory=dict)
     lora_param_names_mapping: dict = field(default_factory=dict)
 

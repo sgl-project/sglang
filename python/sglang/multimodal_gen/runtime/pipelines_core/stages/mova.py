@@ -411,7 +411,7 @@ class MovaDenoisingStage(PipelineStage):
         - USPAttention handles distributed attention communication
         - Before unpatchify, sequences are gathered back
         """
-        model_dtype = visual_dit.time_embedding[0].weight.dtype
+        model_dtype = visual_dit.time_embedding.fc_in.weight.dtype
         device = visual_latents.device
         sp_size = get_sp_world_size()
 

@@ -18,6 +18,7 @@ from sglang.multimodal_gen.runtime.layers.attention import LocalAttention, USPAt
 
 # Reuse SGLang's optimized RMSNorm instead of torch.nn.RMSNorm or custom SlowRMSNorm
 from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
+from sglang.multimodal_gen.runtime.layers.mlp import MLP
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -252,10 +253,8 @@ class DiTBlock(nn.Module):
         self.norm1 = nn.LayerNorm(dim, eps=eps, elementwise_affine=False)
         self.norm2 = nn.LayerNorm(dim, eps=eps, elementwise_affine=False)
         self.norm3 = nn.LayerNorm(dim, eps=eps)
-        self.ffn = nn.Sequential(
-            nn.Linear(dim, ffn_dim),
-            nn.GELU(approximate="tanh"),
-            nn.Linear(ffn_dim, dim),
+        self.ffn = MLP(
+            dim, ffn_dim, output_dim=dim, act_type="gelu_pytorch_tanh"
         )
         self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
         self.gate = GateModule()
@@ -282,26 +281,6 @@ class DiTBlock(nn.Module):
         input_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
         x = self.gate(x, gate_mlp, self.ffn(input_x))
         return x
-
-
-class MLP(torch.nn.Module):
-    def __init__(self, in_dim, out_dim, has_pos_emb=False):
-        super().__init__()
-        self.proj = torch.nn.Sequential(
-            nn.LayerNorm(in_dim),
-            nn.Linear(in_dim, in_dim),
-            nn.GELU(),
-            nn.Linear(in_dim, out_dim),
-            nn.LayerNorm(out_dim),
-        )
-        self.has_pos_emb = has_pos_emb
-        if has_pos_emb:
-            self.emb_pos = torch.nn.Parameter(torch.zeros((1, 514, 1280)))
-
-    def forward(self, x):
-        if self.has_pos_emb:
-            x = x + self.emb_pos.to(dtype=x.dtype, device=x.device)
-        return self.proj(x)
 
 
 class Head(nn.Module):
@@ -401,11 +380,11 @@ class WanModel(CachableDiT, OffloadableDiTMixin, ModelMixin, ConfigMixin):
         self.patch_embedding = Conv3dLocalIsland(
             in_dim, dim, kernel_size=patch_size, stride=patch_size
         )
-        self.text_embedding = nn.Sequential(
-            nn.Linear(text_dim, dim), nn.GELU(approximate="tanh"), nn.Linear(dim, dim)
+        self.text_embedding = MLP(
+            text_dim, dim, output_dim=dim, act_type="gelu_pytorch_tanh"
         )
-        self.time_embedding = nn.Sequential(
-            nn.Linear(freq_dim, dim), nn.SiLU(), nn.Linear(dim, dim)
+        self.time_embedding = MLP(
+            freq_dim, dim, output_dim=dim, act_type="silu"
         )
         self.time_projection = nn.Sequential(nn.SiLU(), nn.Linear(dim, dim * 6))
         self.blocks = nn.ModuleList(
@@ -420,8 +399,15 @@ class WanModel(CachableDiT, OffloadableDiTMixin, ModelMixin, ConfigMixin):
 
         if has_image_input:
             self.img_emb = MLP(
-                1280, dim, has_pos_emb=has_image_pos_emb
+                1280, dim, output_dim=dim, act_type="gelu_pytorch_tanh"
             )  # clip_feature_dim = 1280
+            self.img_pos_emb = (
+                nn.Parameter(torch.zeros((1, 514, 1280)))
+                if has_image_pos_emb
+                else None
+            )
+        else:
+            self.img_pos_emb = None
         if has_ref_conv:
             self.ref_conv = nn.Conv2d(16, dim, kernel_size=(2, 2), stride=(2, 2))
         self.has_image_pos_emb = has_image_pos_emb
@@ -504,8 +490,13 @@ class WanModel(CachableDiT, OffloadableDiTMixin, ModelMixin, ConfigMixin):
 
         if self.has_image_input:
             x = torch.cat([x, y], dim=1)  # (b, c_x + c_y, f, h, w)
-            clip_embdding = self.img_emb(clip_feature)
-            context = torch.cat([clip_embdding, context], dim=1)
+            clip_feature_input = clip_feature
+            if self.img_pos_emb is not None:
+                clip_feature_input = clip_feature_input + self.img_pos_emb.to(
+                    dtype=clip_feature.dtype, device=clip_feature.device
+                )
+            clip_embedding = self.img_emb(clip_feature_input)
+            context = torch.cat([clip_embedding, context], dim=1)
 
         x, (f, h, w) = self.patchify(x)
 

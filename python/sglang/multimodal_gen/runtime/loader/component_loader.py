@@ -793,7 +793,19 @@ class MovaDiTLoader(ComponentLoader):
         server_args.model_paths[module_name] = component_model_path
         model_cls, _ = ModelRegistry.resolve_model_cls(class_name)
         torch_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.dit_precision]
-        model = model_cls.from_pretrained(component_model_path, torch_dtype=torch_dtype)
+        config = model_cls.load_config(component_model_path)
+        model = model_cls.from_config(config, torch_dtype=torch_dtype)
+        safetensors_list = _list_safetensors_files(component_model_path)
+        state_dict = dict(safetensors_weights_iterator(safetensors_list))
+        from sglang.multimodal_gen.runtime.loader.utils import (
+            get_param_names_mapping,
+        )
+        param_names_mapping_fn = get_param_names_mapping(model.param_names_mapping)
+        custom_state_dict = {}
+        for name, tensor in state_dict.items():
+            new_name, _, _ = param_names_mapping_fn(name)
+            custom_state_dict[new_name] = tensor
+        model.load_state_dict(custom_state_dict, strict=True, assign=True)
         model = model.to(device=get_local_torch_device(), dtype=torch_dtype)
         return model.eval()
 

@@ -13,6 +13,7 @@ from einops import rearrange
 from torch.distributed.tensor import DTensor
 
 from sglang.multimodal_gen.configs.models.dits.mova_audio import MovaAudioConfig
+from sglang.multimodal_gen.runtime.layers.mlp import MLP
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 
@@ -40,26 +41,6 @@ def legacy_precompute_freqs_cis_1d(
 def precompute_freqs_cis_1d(dim: int, end: int = 16384, theta: float = 10000.0):
     f_freqs_cis = precompute_freqs_cis(dim, end, theta)
     return f_freqs_cis.chunk(3, dim=-1)
-
-
-class MLP(torch.nn.Module):
-    def __init__(self, in_dim, out_dim, has_pos_emb=False):
-        super().__init__()
-        self.proj = torch.nn.Sequential(
-            nn.LayerNorm(in_dim),
-            nn.Linear(in_dim, in_dim),
-            nn.GELU(),
-            nn.Linear(in_dim, out_dim),
-            nn.LayerNorm(out_dim),
-        )
-        self.has_pos_emb = has_pos_emb
-        if has_pos_emb:
-            self.emb_pos = torch.nn.Parameter(torch.zeros((1, 514, 1280)))
-
-    def forward(self, x):
-        if self.has_pos_emb:
-            x = x + self.emb_pos.to(dtype=x.dtype, device=x.device)
-        return self.proj(x)
 
 
 class Head(nn.Module):
@@ -165,11 +146,11 @@ class WanAudioModel(CachableDiT, OffloadableDiTMixin, ModelMixin, ConfigMixin):
         self.patch_embedding = Conv1dLocalIsland(
             in_dim, dim, kernel_size=patch_size, stride=patch_size
         )
-        self.text_embedding = nn.Sequential(
-            nn.Linear(text_dim, dim), nn.GELU(approximate="tanh"), nn.Linear(dim, dim)
+        self.text_embedding = MLP(
+            text_dim, dim, output_dim=dim, act_type="gelu_pytorch_tanh"
         )
-        self.time_embedding = nn.Sequential(
-            nn.Linear(freq_dim, dim), nn.SiLU(), nn.Linear(dim, dim)
+        self.time_embedding = MLP(
+            freq_dim, dim, output_dim=dim, act_type="silu"
         )
         self.time_projection = nn.Sequential(nn.SiLU(), nn.Linear(dim, dim * 6))
         self.blocks = nn.ModuleList(
@@ -192,8 +173,15 @@ class WanAudioModel(CachableDiT, OffloadableDiTMixin, ModelMixin, ConfigMixin):
 
         if has_image_input:
             self.img_emb = MLP(
-                1280, dim, has_pos_emb=has_image_pos_emb
+                1280, dim, output_dim=dim, act_type="gelu_pytorch_tanh"
             )  # clip_feature_dim = 1280
+            self.img_pos_emb = (
+                nn.Parameter(torch.zeros((1, 514, 1280)))
+                if has_image_pos_emb
+                else None
+            )
+        else:
+            self.img_pos_emb = None
         if has_ref_conv:
             self.ref_conv = nn.Conv2d(16, dim, kernel_size=(2, 2), stride=(2, 2))
         self.has_image_pos_emb = has_image_pos_emb
@@ -269,8 +257,13 @@ class WanAudioModel(CachableDiT, OffloadableDiTMixin, ModelMixin, ConfigMixin):
 
         if self.has_image_input:
             x = torch.cat([x, y], dim=1)  # (b, c_x + c_y, f, h, w)
-            clip_embdding = self.img_emb(clip_feature)
-            context = torch.cat([clip_embdding, context], dim=1)
+            clip_feature_input = clip_feature
+            if self.img_pos_emb is not None:
+                clip_feature_input = clip_feature_input + self.img_pos_emb.to(
+                    dtype=clip_feature.dtype, device=clip_feature.device
+                )
+            clip_embedding = self.img_emb(clip_feature_input)
+            context = torch.cat([clip_embedding, context], dim=1)
 
         x, (f,) = self.patchify(x)
 
