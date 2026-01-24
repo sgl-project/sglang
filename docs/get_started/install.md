@@ -1,7 +1,6 @@
 # Install SGLang
 
 You can install SGLang using one of the methods below.
-
 This page primarily applies to common NVIDIA GPU platforms.
 For other or newer platforms, please refer to the dedicated pages for [AMD GPUs](../platforms/amd_gpu.md), [Intel Xeon CPUs](../platforms/cpu_server.md), [TPU](../platforms/tpu.md), [NVIDIA DGX Spark](https://lmsys.org/blog/2025-11-03-gpt-oss-on-nvidia-dgx-spark/), [NVIDIA Jetson](../platforms/nvidia_jetson.md), [Ascend NPUs](../platforms/ascend_npu.md), and [Intel XPU](../platforms/xpu.md).
 
@@ -18,7 +17,7 @@ uv pip install "sglang"
 **Quick fixes to common problems**
 - In some cases (e.g., GB200), the above command might install a wrong torch version (e.g., the CPU version) due to dependency resolution. To fix this, you can first run the above command and then force-reinstall the correct [PyTorch](https://pytorch.org/get-started/locally/) with the following:
   ```
-  uv pip install "torch" --extra-index-url https://download.pytorch.org/whl/cu129 --force-reinstall
+  uv pip install "torch==2.9.1" "torchvision" --extra-index-url https://download.pytorch.org/whl/cu129 --force-reinstall
   ```
 - For CUDA 13, Docker is recommended (see the Method 3 note on B300/GB300/CUDA 13). If you do not have Docker access, installing the matching `sgl_kernel` wheel from [the sgl-project whl releases](https://github.com/sgl-project/whl/releases) after installing SGLang also works. Replace `X.Y.Z` with the `sgl_kernel` version required by your SGLang (you can find this by running `uv pip show sgl_kernel`). Examples:
   ```bash
