@@ -14,8 +14,12 @@ import time
 from typing import Any, List, Union
 
 import numpy as np
+import torch
 
-from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.configs.sample.sampling_params import (
+    DataType,
+    SamplingParams,
+)
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     ListLorasReq,
     MergeLoraWeightsReq,
@@ -231,8 +235,27 @@ class DiffGenerator:
                             request_idx + 1,
                         )
                         continue
+                    audio_sample_rate = output_batch.audio_sample_rate
                     for output_idx, sample in enumerate(output_batch.output):
                         num_outputs = len(output_batch.output)
+                        audio = output_batch.audio
+                        if req.data_type == DataType.VIDEO:
+                            if isinstance(audio, torch.Tensor) and audio.ndim >= 2:
+                                audio = (
+                                    audio[output_idx]
+                                    if audio.shape[0] > output_idx
+                                    else None
+                                )
+                            elif isinstance(audio, np.ndarray) and audio.ndim >= 2:
+                                audio = (
+                                    audio[output_idx]
+                                    if audio.shape[0] > output_idx
+                                    else None
+                                )
+                            if audio is not None and not (
+                                isinstance(sample, (tuple, list)) and len(sample) == 2
+                            ):
+                                sample = (sample, audio)
                         frames = post_process_sample(
                             sample,
                             fps=req.fps,
@@ -242,11 +265,13 @@ class DiffGenerator:
                                 num_outputs, output_idx
                             ),
                             data_type=req.data_type,
+                            audio_sample_rate=audio_sample_rate,
                         )
 
                         result_item: dict[str, Any] = {
                             "samples": sample,
                             "frames": frames,
+                            "audio": audio,
                             "prompts": req.prompt,
                             "size": (req.height, req.width, req.num_frames),
                             "generation_time": timer.duration,
