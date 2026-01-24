@@ -183,7 +183,12 @@ class InputValidationStage(PipelineStage):
                 image = image[0]  # not support multi image input yet.
 
             max_area = server_args.pipeline_config.max_area
-            aspect_ratio = condition_image_height / condition_image_width
+            if hasattr(batch, "height") and hasattr(batch, "width"):
+                aspect_ratio = batch.height / batch.width
+            else:
+                aspect_ratio = (
+                    batch.sampling_params.height / batch.sampling_params.width
+                )
             mod_value = (
                 server_args.pipeline_config.vae_config.arch_config.scale_factor_spatial
                 * server_args.pipeline_config.dit_config.arch_config.patch_size[1]
