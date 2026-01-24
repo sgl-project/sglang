@@ -6,10 +6,12 @@
 # but could be refactored to a common module in the future.
 
 import math
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 import torch
 import torch.nn as nn
+from diffusers.configuration_utils import ConfigMixin
+from diffusers.models.modeling_utils import ModelMixin
 from einops import rearrange
 from torch.distributed.tensor import DTensor
 
@@ -253,9 +255,7 @@ class DiTBlock(nn.Module):
         self.norm1 = nn.LayerNorm(dim, eps=eps, elementwise_affine=False)
         self.norm2 = nn.LayerNorm(dim, eps=eps, elementwise_affine=False)
         self.norm3 = nn.LayerNorm(dim, eps=eps)
-        self.ffn = MLP(
-            dim, ffn_dim, output_dim=dim, act_type="gelu_pytorch_tanh"
-        )
+        self.ffn = MLP(dim, ffn_dim, output_dim=dim, act_type="gelu_pytorch_tanh")
         self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
         self.gate = GateModule()
 
@@ -331,10 +331,6 @@ class Conv3dLocalIsland(nn.Conv3d):
             return super().forward(x)
 
 
-from diffusers.configuration_utils import ConfigMixin, register_to_config
-from diffusers.models.modeling_utils import ModelMixin
-
-
 class WanModel(CachableDiT, OffloadableDiTMixin, ModelMixin, ConfigMixin):
     _repeated_blocks = ("DiTBlock",)
     _fsdp_shard_conditions = MovaVideoConfig()._fsdp_shard_conditions
@@ -344,30 +340,30 @@ class WanModel(CachableDiT, OffloadableDiTMixin, ModelMixin, ConfigMixin):
     reverse_param_names_mapping = MovaVideoConfig().reverse_param_names_mapping
     lora_param_names_mapping = MovaVideoConfig().lora_param_names_mapping
 
-    @register_to_config
-    def __init__(
-        self,
-        dim: int,
-        in_dim: int,
-        ffn_dim: int,
-        out_dim: int,
-        text_dim: int,
-        freq_dim: int,
-        eps: float,
-        patch_size: Tuple[int, int, int],
-        num_heads: int,
-        num_layers: int,
-        has_image_input: bool,
-        has_image_pos_emb: bool = False,
-        has_ref_conv: bool = False,
-        add_control_adapter: bool = False,
-        in_dim_control_adapter: int = 24,
-        seperated_timestep: bool = False,
-        require_vae_embedding: bool = True,
-        require_clip_embedding: bool = True,
-        fuse_vae_embedding_in_latents: bool = False,
-    ):
+    def __init__(self, config: MovaVideoConfig, hf_config: dict[str, Any]) -> None:
         super().__init__()
+
+        # Extract parameters from config
+        dim = config.dim
+        in_dim = config.in_dim
+        ffn_dim = config.ffn_dim
+        out_dim = config.out_dim
+        text_dim = config.text_dim
+        freq_dim = config.freq_dim
+        eps = config.eps
+        patch_size = config.patch_size
+        num_heads = config.num_heads
+        num_layers = config.num_layers
+        has_image_input = config.has_image_input
+        has_image_pos_emb = config.has_image_pos_emb
+        has_ref_conv = config.has_ref_conv
+        add_control_adapter = config.add_control_adapter
+        in_dim_control_adapter = config.in_dim_control_adapter
+        seperated_timestep = config.seperated_timestep
+        require_vae_embedding = config.require_vae_embedding
+        require_clip_embedding = config.require_clip_embedding
+        fuse_vae_embedding_in_latents = config.fuse_vae_embedding_in_latents
+
         self.dim = dim
         self.freq_dim = freq_dim
         self.has_image_input = has_image_input
@@ -383,9 +379,7 @@ class WanModel(CachableDiT, OffloadableDiTMixin, ModelMixin, ConfigMixin):
         self.text_embedding = MLP(
             text_dim, dim, output_dim=dim, act_type="gelu_pytorch_tanh"
         )
-        self.time_embedding = MLP(
-            freq_dim, dim, output_dim=dim, act_type="silu"
-        )
+        self.time_embedding = MLP(freq_dim, dim, output_dim=dim, act_type="silu")
         self.time_projection = nn.Sequential(nn.SiLU(), nn.Linear(dim, dim * 6))
         self.blocks = nn.ModuleList(
             [
@@ -394,17 +388,15 @@ class WanModel(CachableDiT, OffloadableDiTMixin, ModelMixin, ConfigMixin):
             ]
         )
         self.head = Head(dim, out_dim, patch_size, eps)
-        head_dim = dim // num_heads
-        self.freqs = precompute_freqs_cis_3d(head_dim)
+        self.num_heads = num_heads
+        self.freqs = None
 
         if has_image_input:
             self.img_emb = MLP(
                 1280, dim, output_dim=dim, act_type="gelu_pytorch_tanh"
             )  # clip_feature_dim = 1280
             self.img_pos_emb = (
-                nn.Parameter(torch.zeros((1, 514, 1280)))
-                if has_image_pos_emb
-                else None
+                nn.Parameter(torch.zeros((1, 514, 1280))) if has_image_pos_emb else None
             )
         else:
             self.img_pos_emb = None
@@ -443,6 +435,12 @@ class WanModel(CachableDiT, OffloadableDiTMixin, ModelMixin, ConfigMixin):
             )
         else:
             self.control_adapter = None
+
+    def _init_freqs(self):
+        if self.freqs is not None:
+            return
+        head_dim = self.dim // self.num_heads
+        self.freqs = precompute_freqs_cis_3d(head_dim)
 
     def patchify(
         self, x: torch.Tensor, control_camera_latents_input: torch.Tensor = None

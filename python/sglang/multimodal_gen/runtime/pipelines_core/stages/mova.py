@@ -454,6 +454,7 @@ class MovaDenoisingStage(PipelineStage):
         full_visual_seq_len = t * h * w
 
         # Build visual freqs for full sequence
+        visual_dit._init_freqs()
         visual_freqs = tuple(freq.to(visual_x.device) for freq in visual_dit.freqs)
         visual_freqs = (
             torch.cat(
@@ -473,6 +474,7 @@ class MovaDenoisingStage(PipelineStage):
         full_audio_seq_len = f
 
         # Build audio freqs for full sequence
+        self.audio_dit._init_freqs()
         audio_freqs = (
             torch.cat(
                 [

@@ -15,7 +15,7 @@ export PYTHONPATH=${WORKDIR}/python
 export PYTORCH_ALLOC_CONF=expandable_segments:True
 
 # 2) 模型路径（按需替换）
-MODEL_PATH="/inspire/ssd/project/embodied-multimodality/public/openveo3/checkpoints/A14B-360p-wsd-105000"
+MODEL_PATH="/inspire/ssd/project/embodied-multimodality/public/openveo3/checkpoints/A14B-360p-wsd-105000-no-weight-norm"
 
 # 3) 输入/输出
 REF_IMAGE="../mossVG/assets/trump.jpeg"

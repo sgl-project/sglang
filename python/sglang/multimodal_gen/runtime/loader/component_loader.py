@@ -265,8 +265,8 @@ class ComponentLoader(ABC):
             "vae": (VAELoader, "diffusers"),
             "video_vae": (VAELoader, "diffusers"),
             "audio_vae": (AudioVAELoader, "diffusers"),
-            "video_dit": (MovaDiTLoader, "diffusers"),
-            "audio_dit": (MovaDiTLoader, "diffusers"),
+            "video_dit": (TransformerLoader, "diffusers"),
+            "audio_dit": (AudioTransformerLoader, "diffusers"),
             "dual_tower_bridge": (BridgeLoader, "diffusers"),
             "text_encoder": (TextEncoderLoader, "transformers"),
             "tokenizer": (TokenizerLoader, "transformers"),
@@ -275,31 +275,10 @@ class ComponentLoader(ABC):
             "processor": (AutoProcessorLoader, "transformers"),
             "vision_language_encoder": (VisionLanguageEncoderLoader, "transformers"),
         }
-        custom_library_allowed = {
-            "scheduler",
-            "audio_vae",
-            "video_dit",
-            "audio_dit",
-            "dual_tower_bridge",
-        }
 
         if module_type in module_loaders:
             loader_cls, expected_library = module_loaders[module_type]
             # Assert that the library matches what's expected for this module type
-            if transformers_or_diffusers != expected_library:
-                if (
-                    module_type in custom_library_allowed
-                    and expected_library == "diffusers"
-                ):
-                    logger.info(
-                        "Allowing custom library %s for module type %s",
-                        transformers_or_diffusers,
-                        module_type,
-                    )
-                else:
-                    raise AssertionError(
-                        f"{module_type} must be loaded from {expected_library}, got {transformers_or_diffusers}"
-                    )
             return loader_cls()
 
         # For unknown module types, use a generic loader
@@ -776,40 +755,6 @@ class AudioVAELoader(ComponentLoader):
         return audio_vae.eval()
 
 
-class MovaDiTLoader(ComponentLoader):
-    """Loader for MoVA video/audio DiT modules (diffusers-style)."""
-
-    def load_customized(
-        self, component_model_path: str, server_args: ServerArgs, module_name: str
-    ):
-        config = get_diffusers_component_config(model_path=component_model_path)
-        class_name = config.pop("_class_name", None)
-        if class_name is None:
-            raise ValueError(
-                "Model config does not contain a _class_name attribute. "
-                "Only diffusers format is supported."
-            )
-
-        server_args.model_paths[module_name] = component_model_path
-        model_cls, _ = ModelRegistry.resolve_model_cls(class_name)
-        torch_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.dit_precision]
-        config = model_cls.load_config(component_model_path)
-        model = model_cls.from_config(config, torch_dtype=torch_dtype)
-        safetensors_list = _list_safetensors_files(component_model_path)
-        state_dict = dict(safetensors_weights_iterator(safetensors_list))
-        from sglang.multimodal_gen.runtime.loader.utils import (
-            get_param_names_mapping,
-        )
-        param_names_mapping_fn = get_param_names_mapping(model.param_names_mapping)
-        custom_state_dict = {}
-        for name, tensor in state_dict.items():
-            new_name, _, _ = param_names_mapping_fn(name)
-            custom_state_dict[new_name] = tensor
-        model.load_state_dict(custom_state_dict, strict=True, assign=True)
-        model = model.to(device=get_local_torch_device(), dtype=torch_dtype)
-        return model.eval()
-
-
 class BridgeLoader(ComponentLoader):
     """Loader for MoVA dual tower bridge."""
 
@@ -831,8 +776,11 @@ class BridgeLoader(ComponentLoader):
         return model.eval()
 
 
-class TransformerLoader(ComponentLoader):
-    """Loader for transformer."""
+class _BaseTransformerLoader(ComponentLoader):
+    """Shared loader for (video/audio) DiT transformers."""
+
+    # Attribute name on `server_args.pipeline_config` for the DiT config object.
+    pipeline_dit_config_attr: str = "dit_config"
 
     def load_customized(
         self, component_model_path: str, server_args: ServerArgs, *args
@@ -850,7 +798,7 @@ class TransformerLoader(ComponentLoader):
         server_args.model_paths["transformer"] = component_model_path
 
         # Config from Diffusers supersedes sgl_diffusion's model config
-        dit_config = server_args.pipeline_config.dit_config
+        dit_config = getattr(server_args.pipeline_config, self.pipeline_dit_config_attr)
         dit_config.update_model_arch(config)
 
         model_cls, _ = ModelRegistry.resolve_model_cls(cls_name)
@@ -920,6 +868,18 @@ class TransformerLoader(ComponentLoader):
         model = model.eval()
 
         return model
+
+
+class AudioTransformerLoader(_BaseTransformerLoader):
+    """Loader for audio DiT transformer."""
+
+    pipeline_dit_config_attr = "audio_dit_config"
+
+
+class TransformerLoader(_BaseTransformerLoader):
+    """Loader for video/image DiT transformer."""
+
+    pipeline_dit_config_attr = "dit_config"
 
 
 class SchedulerLoader(ComponentLoader):
