@@ -39,9 +39,7 @@ class LayerwiseOffloadManager:
         self.layers_attr_str = layers_attr_str
         self.num_layers = num_layers
         self.pin_cpu_memory = pin_cpu_memory
-        self.prefetch_size = (
-            min(self.num_layers // 2, max(1, prefetch_size)) % self.num_layers
-        )
+        self.prefetch_size = max(1, prefetch_size) % self.num_layers
         print(f"{self.prefetch_size=}")
         print(f"{self.num_layers=}")
         self.enabled = bool(enabled and torch.cuda.is_available())
@@ -117,7 +115,7 @@ class LayerwiseOffloadManager:
                 current_offset = 0
                 for name, weight in weights:
                     numel = weight.numel()
-                    cpu_buffer[current_offset : current_offset + numel].copy_(
+                    cpu_buffer[current_offset: current_offset + numel].copy_(
                         weight.flatten()
                     )
                     self._weight_metadata[layer_idx][name] = {
@@ -189,7 +187,7 @@ class LayerwiseOffloadManager:
             # map the parameter's data to the correct slice of the GPU buffer
             target = self.get_target_with_name(name)
             target.data = gpu_buffer[
-                meta["offset"] : meta["offset"] + meta["numel"]
+                meta["offset"]: meta["offset"] + meta["numel"]
             ].view(meta["shape"])
 
         logger.debug(f"fetched layer: {layer_idx=}")
@@ -257,7 +255,7 @@ class LayerwiseOffloadManager:
             cpu_buffer = self._consolidated_cpu_weights[layer_idx][dtype]
             offset = meta["offset"]
             numel = meta["numel"]
-            cpu_buffer[offset : offset + numel].copy_(gpu_weight)
+            cpu_buffer[offset: offset + numel].copy_(gpu_weight)
 
     @torch.compiler.disable
     def sync_all_layers_to_cpu(self) -> None:
@@ -282,40 +280,21 @@ class LayerwiseOffloadManager:
                 if i in self._prefetch_events:
                     torch.cuda.current_stream().wait_event(self._prefetch_events[i])
                 logger.debug(f"pre hook layer: {i}")
-                # 2. Trigger batch prefetch (i + prefetch_size ~ i + 2 * prefetch_size)  if needed
+                # 2. Trigger batch prefetch (i + prefetch_size ~ i + 2 * prefetch_size) if needed
                 if i % self.prefetch_size == 0:
-                    start_layer = i + self.prefetch_size
-                    end_layer = start_layer + self.prefetch_size
-                    # if i == self.num_layers - 1:
-                    #     if start_layer >= self.num_layers:
-                    #         ranges = []
-                    #     elif end_layer >= self.num_layers:
-                    #         ranges = [(start_layer, self.num_layers - 1)]
-                    #     else:
-                    #         ranges = [(start_layer, end_layer)]
-                    # else:
-                    # fetch for next denoise iteration
-                    if start_layer >= self.num_layers:
-                        ranges = [
-                            (
-                                start_layer % self.num_layers,
-                                (end_layer - 1) % self.num_layers + 1,
-                            )
-                        ]
-                    elif end_layer > self.num_layers:
-                        ranges = [
-                            (start_layer, self.num_layers),
-                            (0, end_layer % self.num_layers),
-                        ]
-                    else:
-                        ranges = [(start_layer, end_layer)]
+                    # Current forwarding range: [i, i + prefetch_size)
+                    # Next prefetching range: [i + prefetch_size, i + 2 * prefetch_size)
+                    # We use % self.num_layers to wrap around across denoising iterations
+                    for j in range(i + self.prefetch_size, i + 2 * self.prefetch_size):
+                        layer_to_prefetch = j % self.num_layers
+                        self.prefetch_layer(layer_to_prefetch, non_blocking=True)
+
                     logger.debug(
-                        f"pre hook layer: {i} prefetching {ranges=}",
+                        f"pre hook layer: {i} prefetching range: "
+                        f"[{(i + self.prefetch_size) % self.num_layers}, "
+                        f"{(i + 2 * self.prefetch_size - 1) % self.num_layers + 1})",
                         main_process_only=True,
                     )
-                    for s, e in ranges:
-                        for l in range(s, e):
-                            self.prefetch_layer(l, non_blocking=True)
 
             return hook
 
