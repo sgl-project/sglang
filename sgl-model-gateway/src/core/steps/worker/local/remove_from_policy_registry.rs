@@ -1,13 +1,10 @@
 //! Step to remove workers from policy registry.
 
-use std::sync::Arc;
-
 use async_trait::async_trait;
 use tracing::debug;
 
 use crate::{
-    app_context::AppContext,
-    core::Worker,
+    core::steps::workflow_data::WorkerRemovalWorkflowData,
     workflow::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult},
 };
 
@@ -18,11 +15,21 @@ use crate::{
 pub struct RemoveFromPolicyRegistryStep;
 
 #[async_trait]
-impl StepExecutor for RemoveFromPolicyRegistryStep {
-    async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
-        let app_context: Arc<AppContext> = context.get_or_err("app_context")?;
-        let workers_to_remove: Arc<Vec<Arc<dyn Worker>>> =
-            context.get_or_err("workers_to_remove")?;
+impl StepExecutor<WorkerRemovalWorkflowData> for RemoveFromPolicyRegistryStep {
+    async fn execute(
+        &self,
+        context: &mut WorkflowContext<WorkerRemovalWorkflowData>,
+    ) -> WorkflowResult<StepResult> {
+        let app_context = context
+            .data
+            .app_context
+            .as_ref()
+            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
+        let workers_to_remove = context
+            .data
+            .actual_workers_to_remove
+            .as_ref()
+            .ok_or_else(|| WorkflowError::ContextValueNotFound("workers_to_remove".to_string()))?;
 
         debug!(
             "Removing {} worker(s) from policy registry",

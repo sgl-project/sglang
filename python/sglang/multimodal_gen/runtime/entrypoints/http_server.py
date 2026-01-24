@@ -12,13 +12,15 @@ from fastapi.responses import ORJSONResponse
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.entrypoints.openai import image_api, video_api
+from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
+    VertexGenerateReqInput,
+)
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
     post_process_sample,
     prepare_request,
 )
 from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 from sglang.multimodal_gen.runtime.server_args import ServerArgs, get_global_server_args
-from sglang.srt.managers.io_struct import VertexGenerateReqInput
 
 DEFAULT_SEED = 1024
 VERTEX_ROUTE = os.environ.get("AIP_PREDICT_ROUTE", "/vertex_generate")
@@ -116,12 +118,28 @@ async def forward_to_scheduler(req_obj, sp):
             raise RuntimeError("Model generation returned no output.")
 
         output_file_path = sp.output_file_path()
+        sample = response.output[0]
+        try:
+            audio = response.audio
+        except AttributeError:
+            audio = None
+        if isinstance(audio, torch.Tensor) and audio.ndim >= 2:
+            audio = audio[0]
+        if audio is not None and not (
+            isinstance(sample, (tuple, list)) and len(sample) == 2
+        ):
+            sample = (sample, audio)
         post_process_sample(
-            sample=response.output[0],
+            sample=sample,
             data_type=sp.data_type,
             fps=sp.fps or 24,
             save_output=True,
             save_file_path=output_file_path,
+            audio_sample_rate=(
+                response.audio_sample_rate
+                if hasattr(response, "audio_sample_rate")
+                else None
+            ),
         )
 
         if hasattr(response, "model_dump"):
