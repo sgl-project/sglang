@@ -176,7 +176,9 @@ class Engine(EngineBase):
         self.port_args = port_args
         # Ray mode attributes (None for mp mode)
         self.scheduler_actors = scheduler_actors  # List of Ray actors for Ray mode
-        self.event_loop_refs = event_loop_refs  # List of Ray ObjectRefs for health monitoring
+        self.event_loop_refs = (
+            event_loop_refs  # List of Ray ObjectRefs for health monitoring
+        )
         self.remote_instance_transfer_engine_info = (
             parse_remote_instance_transfer_engine_info_from_scheduler_infos(
                 scheduler_infos
@@ -893,6 +895,28 @@ def _launch_scheduler_processes(
         )
 
 
+def _calculate_rank_ranges(server_args: ServerArgs):
+    """Calculate pp_rank_range and tp_rank_range for the current node.
+
+    This helper is shared by both mp and Ray scheduler launching functions.
+    """
+    pp_size_per_node = max(server_args.pp_size // server_args.nnodes, 1)
+    nnodes_per_pp_rank = max(server_args.nnodes // server_args.pp_size, 1)
+    pp_rank_range = range(
+        pp_size_per_node * (server_args.node_rank // nnodes_per_pp_rank),
+        pp_size_per_node * (server_args.node_rank // nnodes_per_pp_rank + 1),
+    )
+
+    nnodes_per_tp_group = nnodes_per_pp_rank
+    tp_size_per_node = server_args.tp_size // nnodes_per_tp_group
+    tp_rank_range = range(
+        tp_size_per_node * (server_args.node_rank % nnodes_per_tp_group),
+        tp_size_per_node * (server_args.node_rank % nnodes_per_tp_group + 1),
+    )
+
+    return pp_rank_range, tp_rank_range, pp_size_per_node, tp_size_per_node
+
+
 def _launch_scheduler_processes_mp(
     server_args: ServerArgs,
     port_args: PortArgs,
@@ -908,18 +932,8 @@ def _launch_scheduler_processes_mp(
         )
         scheduler_pipe_readers = []
 
-        pp_size_per_node = max(server_args.pp_size // server_args.nnodes, 1)
-        nnodes_per_pp_rank = max(server_args.nnodes // server_args.pp_size, 1)
-        pp_rank_range = range(
-            pp_size_per_node * (server_args.node_rank // nnodes_per_pp_rank),
-            pp_size_per_node * (server_args.node_rank // nnodes_per_pp_rank + 1),
-        )
-
-        nnodes_per_tp_group = nnodes_per_pp_rank
-        tp_size_per_node = server_args.tp_size // nnodes_per_tp_group
-        tp_rank_range = range(
-            tp_size_per_node * (server_args.node_rank % nnodes_per_tp_group),
-            tp_size_per_node * (server_args.node_rank % nnodes_per_tp_group + 1),
+        pp_rank_range, tp_rank_range, pp_size_per_node, tp_size_per_node = (
+            _calculate_rank_ranges(server_args)
         )
 
         for pp_rank in pp_rank_range:
@@ -1007,19 +1021,9 @@ def _launch_scheduler_processes_ray(
 
     scheduler_actors = []
 
-    # Calculate rank ranges (same logic as mp version)
-    pp_size_per_node = max(server_args.pp_size // server_args.nnodes, 1)
-    nnodes_per_pp_rank = max(server_args.nnodes // server_args.pp_size, 1)
-    pp_rank_range = range(
-        pp_size_per_node * (server_args.node_rank // nnodes_per_pp_rank),
-        pp_size_per_node * (server_args.node_rank // nnodes_per_pp_rank + 1),
-    )
-
-    nnodes_per_tp_group = nnodes_per_pp_rank
-    tp_size_per_node = server_args.tp_size // nnodes_per_tp_group
-    tp_rank_range = range(
-        tp_size_per_node * (server_args.node_rank % nnodes_per_tp_group),
-        tp_size_per_node * (server_args.node_rank % nnodes_per_tp_group + 1),
+    # Calculate rank ranges (shared logic with mp version)
+    pp_rank_range, tp_rank_range, pp_size_per_node, tp_size_per_node = (
+        _calculate_rank_ranges(server_args)
     )
 
     for pp_rank in pp_rank_range:
@@ -1069,7 +1073,14 @@ def _launch_subprocesses(
     run_scheduler_process_func: Callable,
     run_detokenizer_process_func: Callable,
     port_args: Optional[PortArgs] = None,
-) -> Tuple[TokenizerManager, TemplateManager, Tuple[Dict], PortArgs, Optional[List], Optional[List]]:
+) -> Tuple[
+    TokenizerManager,
+    TemplateManager,
+    Tuple[Dict],
+    PortArgs,
+    Optional[List],
+    Optional[List],
+]:
     """
     Launch the TokenizerManager in the main process, the Scheduler in a subprocess, and the DetokenizerManager in another subprocess.
 
@@ -1118,7 +1129,14 @@ def _launch_subprocesses(
 
         if os.getenv("SGLANG_BLOCK_NONZERO_RANK_CHILDREN") == "0":
             # When using `Engine` as a Python API, we don't want to block here.
-            return None, None, scheduler_infos, port_args, scheduler_actors, event_loop_refs
+            return (
+                None,
+                None,
+                scheduler_infos,
+                port_args,
+                scheduler_actors,
+                event_loop_refs,
+            )
 
         launch_dummy_health_check_server(
             server_args.host, server_args.port, server_args.enable_metrics
@@ -1170,4 +1188,11 @@ def _launch_subprocesses(
     # Get back some info from scheduler to tokenizer_manager
     tokenizer_manager.max_req_input_len = scheduler_infos[0]["max_req_input_len"]
 
-    return tokenizer_manager, template_manager, scheduler_infos, port_args, scheduler_actors, event_loop_refs
+    return (
+        tokenizer_manager,
+        template_manager,
+        scheduler_infos,
+        port_args,
+        scheduler_actors,
+        event_loop_refs,
+    )

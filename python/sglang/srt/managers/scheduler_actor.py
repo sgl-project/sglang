@@ -146,6 +146,8 @@ def create_scheduler_actor_class():
             This method blocks until shutdown. The appropriate event loop
             variant is chosen based on server_args configuration.
             """
+            from sglang.srt.disaggregation.utils import DisaggregationMode
+
             try:
                 server_args = self._server_args
                 disaggregation_mode = self._disaggregation_mode
