@@ -956,6 +956,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
     def _quantize_mxfp8_moe_weights(self, layer: Module) -> None:
 
+        if not (_is_cuda and is_sm100_supported()):
+            raise RuntimeError("MXFP8 MoE quantization requires SM100.")
+
         def _quantize_with_cutlass_es_kernel(weight: torch.Tensor):
             from sgl_kernel import es_sm100_mxfp8_blockscaled_grouped_quant
 
@@ -1031,16 +1034,16 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             scale = scale.data.view(num_experts, aligned_m, k // 32)
             return qweight, scale
 
-        if get_moe_runner_backend().is_cutlass():
-            if not (_is_cuda and is_sm100_supported()):
-                raise RuntimeError("MXFP8 MoE quantization requires SM100.")
+        if (
+            get_moe_runner_backend().is_cutlass()
+            and not self.quant_config.is_checkpoint_fp8_serialized
+        ):
 
+            w13_q, w13_s = _quantize_with_cutlass_es_kernel(layer.w13_weight.data)
+            w2_q, w2_s = _quantize_with_cutlass_es_kernel(layer.w2_weight.data)
+        else:
             w13_q, w13_s = _quantize_with_triton_kernel(layer.w13_weight.data)
             w2_q, w2_s = _quantize_with_triton_kernel(layer.w2_weight.data)
-        else:
-            raise RuntimeError(
-                "MXFP8 MoE quantization is only supported with CUTLASS backend."
-            )
 
         layer.w13_weight = torch.nn.Parameter(w13_q, requires_grad=False)
         layer.w2_weight = torch.nn.Parameter(w2_q, requires_grad=False)
