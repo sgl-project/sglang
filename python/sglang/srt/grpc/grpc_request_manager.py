@@ -23,6 +23,8 @@ from sglang.srt.managers.io_struct import (
     AbortReq,
     BatchEmbeddingOutput,
     BatchTokenIDOutput,
+    GetLoadsReqInput,
+    GetLoadsReqOutput,
     HealthCheckOutput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
@@ -32,6 +34,68 @@ from sglang.srt.utils import get_or_create_event_loop, get_zmq_socket, kill_proc
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
+
+
+class _GrpcCommunicator:
+    """
+    Communicator for request/response patterns with scheduler.
+
+    Thread-safe and handles the async request/response cycle with proper
+    timeout handling to prevent hangs if the scheduler becomes unresponsive.
+    """
+
+    DEFAULT_TIMEOUT = 30.0  # seconds
+
+    def __init__(self, sender: zmq.Socket, fan_out: int = 1):
+        self._sender = sender
+        self._fan_out = fan_out
+        self._result_event: Optional[asyncio.Event] = None
+        self._result_values: Optional[List[Any]] = None
+        self._lock = asyncio.Lock()
+
+    async def __call__(self, obj, timeout: float = DEFAULT_TIMEOUT) -> List[Any]:
+        """
+        Send request and wait for response(s).
+
+        Args:
+            obj: Request object to send to scheduler
+            timeout: Maximum time to wait for response (seconds)
+
+        Returns:
+            List of response objects from scheduler(s)
+
+        Raises:
+            asyncio.TimeoutError: If no response within timeout
+        """
+        async with self._lock:
+            # Initialize state BEFORE sending to avoid race condition
+            self._result_event = asyncio.Event()
+            self._result_values = []
+
+            # Send request to scheduler
+            if obj:
+                self._sender.send_pyobj(obj)
+
+            try:
+                # Wait for response(s) with timeout
+                await asyncio.wait_for(self._result_event.wait(), timeout=timeout)
+                return self._result_values
+            finally:
+                # Always clean up state
+                self._result_event = None
+                self._result_values = None
+
+    def handle_recv(self, recv_obj: Any):
+        """
+        Handle received response from scheduler.
+
+        Called by handle_loop when a matching response type is received.
+        Safe to call even if no request is pending (will be ignored).
+        """
+        if self._result_values is not None and self._result_event is not None:
+            self._result_values.append(recv_obj)
+            if len(self._result_values) >= self._fan_out:
+                self._result_event.set()
 
 
 class GrpcSignalHandler:
@@ -153,6 +217,12 @@ class GrpcRequestManager:
 
         # Bootstrap server (passed from serve_grpc, not started here)
         self.bootstrap_server = bootstrap_server
+
+        # Communicators for request/response patterns with scheduler
+        # Note: These must be initialized after send_to_scheduler socket is created
+        self.get_loads_communicator = _GrpcCommunicator(
+            self.send_to_scheduler, fan_out=server_args.dp_size
+        )
 
         logger.info(
             f"GrpcRequestManager initialized with ZMQ IPC: "
@@ -462,6 +532,9 @@ class GrpcRequestManager:
                     await self._handle_health_check_output(recv_obj)
                 elif isinstance(recv_obj, AbortReq):
                     await self._handle_abort_req(recv_obj)
+                elif isinstance(recv_obj, GetLoadsReqOutput):
+                    # Route to communicator for request/response pattern
+                    self.get_loads_communicator.handle_recv(recv_obj)
                 else:
                     logger.warning(f"Unknown output type: {type(recv_obj)}")
 
@@ -871,6 +944,31 @@ class GrpcRequestManager:
             "paused": self.is_pause,
             "last_receive_time": self.last_receive_tstamp,
         }
+
+    async def get_loads(
+        self, include: List[str], dp_rank: Optional[int] = None
+    ) -> List[GetLoadsReqOutput]:
+        """
+        Get comprehensive load metrics from the scheduler.
+
+        This method uses the communicator pattern to send GetLoadsReqInput to the
+        scheduler and wait for GetLoadsReqOutput responses.
+
+        Args:
+            include: List of metric sections to include (core, memory, spec, lora, disagg, queues, all)
+            dp_rank: Optional DP rank filter (None for all ranks)
+
+        Returns:
+            List of GetLoadsReqOutput objects, one per scheduler/DP rank
+        """
+        req = GetLoadsReqInput(include=include, dp_rank=dp_rank)
+        results = await self.get_loads_communicator(req)
+
+        # Filter by dp_rank if specified
+        if dp_rank is not None:
+            results = [r for r in results if r.dp_rank == dp_rank]
+
+        return results
 
     def auto_create_handle_loop(self):
         """Automatically create and start the handle_loop task, matching TokenizerManager pattern."""

@@ -7,15 +7,13 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
-from sglang.srt.mem_cache.chunk_cache import ChunkCache, SWAChunkCache
-from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
+from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
+from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.sparsity.factory import (
     get_sparse_coordinator,
     is_hierarchical_sparse_attention_enabled,
 )
-from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import support_triton
 from sglang.srt.utils.common import ceil_align
@@ -449,13 +447,7 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     if is_hierarchical_sparse_attention_enabled():
         return alloc_for_hierarchical_sparse_decode(batch, token_per_req)
 
-    if isinstance(batch.tree_cache, SWAChunkCache):
-        for req in batch.reqs:
-            # We set evict_swa condition here with two reasons:
-            # 1. In overlap scheduler, we cannot evict swa when req.decode_batch_idx == 0 since the prev extend batch is still running.
-            # 2. Evict swa every window_size tokens to reduce the overhead.
-            if req.decode_batch_idx % batch.tree_cache.window_size == 1:
-                batch.tree_cache.evict_swa(req, req.seqlen - 1)
+    batch.maybe_evict_swa()
 
     bs = batch.seq_lens.shape[0]
 
@@ -495,11 +487,6 @@ def alloc_for_hierarchical_sparse_decode(
     """
     Allocate KV cache for hierarchical sparse decode batch and write to req_to_token_pool.
     """
-    if isinstance(batch.tree_cache, SWAChunkCache):
-        raise RuntimeError(
-            "SWAChunkCache is not supported for hierarchical sparse decode"
-        )
-
     bs = batch.seq_lens.shape[0]
     seq_lens_next = batch.seq_lens + token_per_req
     page_size = batch.tree_cache.page_size
@@ -568,8 +555,8 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
 
     # MambaRadixCache may alloc mamba state before alloc KV cache
     if req.req_pool_idx is None:
-        assert isinstance(
-            tree_cache, MambaRadixCache
+        assert (
+            tree_cache.supports_mamba()
         ), "Only MambaRadixCache can handle abort with prefix cache hit before alloc"
         return
 

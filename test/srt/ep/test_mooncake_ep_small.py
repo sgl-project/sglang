@@ -1,3 +1,4 @@
+import os
 import unittest
 from types import SimpleNamespace
 
@@ -9,6 +10,7 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    is_in_ci,
     popen_launch_server,
 )
 
@@ -38,6 +40,14 @@ class TestTP(CustomTestCase):
                 "mooncake",
                 "--deepep-mode",
                 "low_latency",
+                "--moe-dense-tp-size",
+                "1",
+                "--enable-dp-lm-head",
+                "--enable-two-batch-overlap",
+                "--disable-custom-all-reduce",
+                "--enable-eplb",
+                "--ep-num-redundant-experts",
+                "72",
                 "--chunked-prefill-size",
                 "512",
                 "--cuda-graph-max-bs",
@@ -70,76 +80,42 @@ class TestTP(CustomTestCase):
         self.assertGreater(metrics["accuracy"], 0.60)
 
 
-@unittest.skip("covered in TestMooncakeWithEPLB")
 class TestPureDP(TestTP):
     extra_args = [
-        "--tp",
-        "4",
         "--enable-dp-attention",
         "--dp",
         "4",
     ]
 
+    pkill_process_1 = "sglang::scheduler_DP1_TP1_EP1"
+    pkill_process_2 = "sglang::scheduler_DP3_TP3_EP3"
 
-class TestHybridDPTP(TestTP):
+    def test_gsm8k_fault_1(self):
+        """
+        Kill one rank and the system should remain operational.
+        """
+        os.system(f"pkill -f {self.pkill_process_1}")
+        super().test_gsm8k()
+
+    @unittest.skipIf(is_in_ci(), "To reduce the CI execution time.")
+    def test_gsm8k_fault_2(self):
+        """
+        Kill another rank and the system should remain operational.
+        """
+        os.system(f"pkill -f {self.pkill_process_2}")
+        super().test_gsm8k()
+
+
+@unittest.skipIf(is_in_ci(), "To reduce the CI execution time.")
+class TestHybridDPTP(TestPureDP):
     extra_args = [
-        "--tp",
-        "4",
         "--enable-dp-attention",
         "--dp",
         "2",
     ]
 
-
-@unittest.skip("covered in TestMooncakeWithEPLB")
-class TestNoGatherdBuffer(TestTP):
-    extra_args = [
-        "--tp",
-        "4",
-        "--enable-dp-attention",
-        "--dp",
-        "4",
-        "--moe-dense-tp-size",
-        "1",
-    ]
-
-
-@unittest.skip("covered in TestMooncakeWithEPLB")
-class TestTBO(TestTP):
-    extra_args = [
-        "--tp",
-        "4",
-        "--enable-dp-attention",
-        "--dp",
-        "4",
-        "--moe-dense-tp-size",
-        "1",
-        "--enable-two-batch-overlap",
-    ]
-
-
-class TestMooncakeWithEPLB(TestTP):
-    extra_args = [
-        "--tp",
-        "4",
-        "--enable-dp-attention",
-        "--dp",
-        "4",
-        "--moe-dense-tp-size",
-        "1",
-        "--enable-two-batch-overlap",
-        "--enable-eplb",
-        "--ep-num-redundant-experts",
-        "4",
-        "--eplb-rebalance-num-iterations",
-        "50",
-        "--expert-distribution-recorder-buffer-size",
-        "50",
-        "--expert-distribution-recorder-mode",
-        "stat",
-        "--ep-dispatch-algorithm",
-        "static",
-    ]
+    pkill_process_1 = "sglang::scheduler_DP1_TP2_EP2"
+    pkill_process_2 = "sglang::scheduler_DP1_TP3_EP3"
 
 
 if __name__ == "__main__":
