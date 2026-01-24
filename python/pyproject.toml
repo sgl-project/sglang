@@ -36,7 +36,6 @@ dependencies = [
   "huggingface_hub",
   "interegular",
   "llguidance>=0.7.11,<0.8.0",
-  "jinja2>=3.1.0",
   "modelscope",
   "msgspec",
   "ninja",
