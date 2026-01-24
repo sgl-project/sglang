@@ -329,6 +329,10 @@ class SchedulerRuntimeCheckerMixin:
             if queue_size:
                 return
 
+        # Check hierarchical cache events during idle to ensure L3 writes complete
+        if self.enable_hierarchical_cache:
+            self.tree_cache.check_hicache_events()
+
         self.check_memory()
         self.check_tree_cache()
         self.new_token_ratio = self.init_new_token_ratio

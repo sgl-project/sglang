@@ -493,6 +493,10 @@ class MooncakeStore(HiCacheStorage):
         host_indices: torch.Tensor,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
+        logger.info(
+            f"[MooncakeStore] batch_set_v1 START: keys_count={len(keys)}, "
+            f"first_keys={keys[:2] if keys else []}"
+        )
         # Apply extra_backend_tag prefix if available
         if self.extra_backend_tag is not None:
             prefix = self.extra_backend_tag
@@ -500,6 +504,9 @@ class MooncakeStore(HiCacheStorage):
 
         key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(keys, host_indices)
         exist_result = self._batch_exist(key_strs)
+        logger.debug(
+            f"[MooncakeStore] batch_set_v1: exist_result={exist_result[:10] if len(exist_result) > 10 else exist_result}"
+        )
 
         set_keys = []
         set_buffer_ptrs = []
@@ -517,13 +524,28 @@ class MooncakeStore(HiCacheStorage):
 
         # Only set non-existing keys to storage
         if len(set_keys) > 0:
+            logger.info(
+                f"[MooncakeStore] batch_set_v1: WRITING {len(set_keys)} new keys to L3 storage"
+            )
             put_results = self._put_batch_zero_copy_impl(
                 set_keys, set_buffer_ptrs, set_buffer_sizes
             )
+            logger.info(
+                f"[MooncakeStore] batch_set_v1: put_results={put_results[:10] if len(put_results) > 10 else put_results}"
+            )
             for i in range(len(set_indices)):
                 set_results[set_indices[i]] = put_results[i]
+        else:
+            logger.info(
+                f"[MooncakeStore] batch_set_v1: all {len(keys)} keys already exist, skipping write"
+            )
 
-        return self._batch_postprocess(set_results, is_set_operate=True)
+        final_results = self._batch_postprocess(set_results, is_set_operate=True)
+        success_count = sum(final_results)
+        logger.info(
+            f"[MooncakeStore] batch_set_v1 DONE: success={success_count}/{len(final_results)}"
+        )
+        return final_results
 
     def set(
         self,

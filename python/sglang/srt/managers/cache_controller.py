@@ -664,7 +664,22 @@ class HiCacheController:
         while not self.stop_event.is_set():
             try:
                 operation = self.prefetch_buffer.get(block=True, timeout=1)
+                
+                # Add timing for L3 transfer
+                import time
+                transfer_start = time.perf_counter()
+                is_l3_first = (operation.last_hash is None)
+                
                 self._page_transfer(operation)
+                
+                transfer_duration = (time.perf_counter() - transfer_start) * 1000  # ms
+                if is_l3_first:
+                    logger.debug(
+                        f"[L3-First] Transfer completed for {operation.request_id}: "
+                        f"pages={len(operation.hash_value)}, tokens={operation.completed_tokens}, "
+                        f"transfer_duration={transfer_duration:.2f}ms"
+                    )
+                
                 # operation terminated by controller, release pre-allocated memory
                 self.append_host_mem_release(
                     operation.host_indices[operation.completed_tokens :]
@@ -686,6 +701,9 @@ class HiCacheController:
         last_hash = operation.last_hash
         tokens_to_fetch = operation.token_ids
         prefix_keys = operation.prefix_keys.copy() if operation.prefix_keys else None
+        
+        # Check if this is an L3-first query (no prior hash)
+        is_l3_first = (last_hash is None)
 
         storage_query_count = 0
         hash_value = []
@@ -707,6 +725,7 @@ class HiCacheController:
             hit_page_num = self.storage_backend.batch_exists(batch_hashes, extra_info)
             hash_value.extend(batch_hashes[:hit_page_num])
             storage_query_count += hit_page_num * self.page_size
+            
             if hit_page_num < len(batch_hashes):
                 break
             if prefix_keys and len(prefix_keys) > 0:
@@ -738,13 +757,17 @@ class HiCacheController:
                     )
                     storage_hit_count = storage_hit_count_tensor.item()
 
-                if storage_hit_count < self.prefetch_threshold:
+                # Check if this is an L3-first query
+                is_l3_first = (operation.last_hash is None)
+                
+                # For L3-first queries, use a lower threshold since any L3 hit saves computation
+                # The minimum is 1 page (page_size tokens)
+                effective_threshold = self.page_size if is_l3_first else self.prefetch_threshold
+                
+                if storage_hit_count < effective_threshold:
                     # not to prefetch if not enough benefits
                     self.prefetch_revoke_queue.put(operation.request_id)
                     self.append_host_mem_release(operation.host_indices)
-                    logger.debug(
-                        f"Revoking prefetch for request {operation.request_id} due to insufficient hits ({storage_hit_count})."
-                    )
                 else:
                     operation.hash_value = hash_value[
                         : (storage_hit_count // self.page_size)
@@ -754,9 +777,6 @@ class HiCacheController:
                         operation.host_indices[storage_hit_count:]
                     )
                     operation.host_indices = operation.host_indices[:storage_hit_count]
-                    logger.debug(
-                        f"Prefetching {len(operation.hash_value)} pages for request {operation.request_id}."
-                    )
                     self.prefetch_buffer.put(operation)
 
             except Empty:
