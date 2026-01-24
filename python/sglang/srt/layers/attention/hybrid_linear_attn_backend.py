@@ -834,6 +834,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
         activation = layer.activation
         head_qk_dim = layer.head_qk_dim
         head_v_dim = layer.head_v_dim
+        num_qk_heads = layer.num_qk_heads
+        num_v_heads = layer.num_v_heads
         qk_dim = layer.qk_dim
         value_dim = layer.value_dim
 
@@ -860,10 +862,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
         )
         # Reshape from [l, h*d] to [1, l, h, d]
         seq_len = query.shape[0]
-        num_heads = query.shape[1] // head_qk_dim
-        query = query.view(1, seq_len, num_heads, head_qk_dim)
-        key = key.view(1, seq_len, num_heads, head_qk_dim)
-        value = value.view(1, seq_len, value.shape[1] // head_v_dim, head_v_dim)
+        query = query.view(1, seq_len, num_qk_heads, head_qk_dim)
+        key = key.view(1, seq_len, num_qk_heads, head_qk_dim)
+        value = value.view(1, seq_len, num_v_heads, head_v_dim)
 
         core_attn_out = self._kernel_func(
             A_log=layer.A_log,
@@ -904,6 +905,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
         activation = layer.activation
         head_qk_dim = layer.head_qk_dim
         head_v_dim = layer.head_v_dim
+        num_qk_heads = layer.num_qk_heads
+        num_v_heads = layer.num_v_heads
         qk_dim = layer.qk_dim
         value_dim = layer.value_dim
 
@@ -991,12 +994,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
         )
 
         actual_seq_len = query.shape[0]
-        num_heads = query.shape[1] // head_qk_dim
-        num_value_heads = value.shape[1] // head_v_dim
-
-        query = query.view(1, actual_seq_len, num_heads, head_qk_dim)
-        key = key.view(1, actual_seq_len, num_heads, head_qk_dim)
-        value = value.view(1, actual_seq_len, num_value_heads, head_v_dim)
+        query = query.view(1, actual_seq_len, num_qk_heads, head_qk_dim)
+        key = key.view(1, actual_seq_len, num_qk_heads, head_qk_dim)
+        value = value.view(1, actual_seq_len, num_v_heads, head_v_dim)
 
         g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
 

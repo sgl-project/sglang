@@ -319,7 +319,6 @@ class KimiDeltaAttention(nn.Module):
             num_v_heads=self.num_v_heads // self.attn_tp_size,
             head_qk_dim=self.head_k_dim,
             head_v_dim=self.head_v_dim,
-            attention_tp_size=self.attn_tp_size,
             conv_weights=conv_weights,
             bias=bias,
             A_log=self.A_log,
