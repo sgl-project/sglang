@@ -1042,13 +1042,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             assert k % 32 == 0, f"{k=} must be divisible by 32 for MXFP8"
 
             weight_flat = weight.view(-1, k).contiguous()
-            # aligned_m = ((m + 127) // 128) * 128
             qweight, scale = mxfp8_group_quantize(weight_flat)
             qweight = qweight.view_as(weight)
-            # scale = scale.view(num_experts, aligned_m, k // 32)
-            # num_warps = 8
-            # scale = _swizzle_mxfp8_sf(scale, num_warps)
-            # scale = scale.data.view(num_experts, aligned_m, k // 32)
             scale = _swizzle_with_triton_kernel(weight.shape, scale)
             return qweight, scale
 
