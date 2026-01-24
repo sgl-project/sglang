@@ -51,7 +51,7 @@ from sglang.srt.managers.schedule_batch import FINISH_ABORT, RequestStage, Sched
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
-from sglang.srt.mem_cache.common import release_kv_cache
+from sglang.srt.mem_cache.common import enable_nsa_hybrid_indexer_pool, release_kv_cache
 from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
     HybridReqToTokenPool,
@@ -134,6 +134,45 @@ class DecodeReqToTokenPool:
     def clear(self):
         self.free_slots = list(range(self.size + self.pre_alloc_size))
 
+
+class NSADecodeReqToTokenPool(DecodeReqToTokenPool):
+    """DecodeReqToTokenPool with separate mapping for KV cache and index_k."""
+
+    def __init__(
+        self,
+        size: int,
+        max_context_len: int,
+        device: str,
+        enable_memory_saver: bool,
+        pre_alloc_size: int,
+    ):
+        super().__init__(
+            size, max_context_len, device, enable_memory_saver, pre_alloc_size
+        )
+
+        memory_saver_adapter = TorchMemorySaverAdapter.create(
+            enable=enable_memory_saver
+        )
+        with memory_saver_adapter.region(tag=GPU_MEMORY_TYPE_KV_CACHE):
+            self.req_to_nsa_index_k = torch.zeros(
+                (size + pre_alloc_size, max_context_len),
+                dtype=torch.int32,
+                device=device,
+            )
+
+    def write_index_token(self, indices, values):
+        """Write index_k mapping."""
+        self.req_to_nsa_index_k[indices] = values
+
+    def get_all_indices_range(self, req_pool_idx, start, end):
+        """Get both KV and index_k indices for a range."""
+        kv_indices = self.req_to_token[req_pool_idx, start:end]
+        index_k_indices = self.req_to_nsa_index_k[req_pool_idx, start:end]
+        return (kv_indices, index_k_indices)
+
+    def clear(self):
+        super().clear()
+        self.req_to_nsa_index_k.zero_()
 
 class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
 
@@ -558,9 +597,14 @@ class DecodePreallocQueue:
                 state_indices = kv_to_page_indices(state_indices, page_size)
             elif isinstance(self.token_to_kv_pool, NSATokenToKVPool):
                 seq_len = len(decode_req.req.origin_input_ids)
-                kv_indices_full = self.req_to_token_pool.req_to_token[
-                    decode_req.req.req_pool_idx, :seq_len
-                ]
+                pool = (
+                    self.req_to_token_pool.req_to_nsa_index_k
+                    if enable_nsa_hybrid_indexer_pool(
+                        req_to_token_pool=self.req_to_token_pool
+                    )
+                    else self.req_to_token_pool.req_to_token
+                )
+                kv_indices_full = pool[decode_req.req.req_pool_idx, :seq_len]
                 state_indices = kv_indices_full.cpu().numpy()
                 state_indices = kv_to_page_indices(state_indices, page_size)
             else:
@@ -687,6 +731,13 @@ class DecodePreallocQueue:
         assert (
             kv_loc is not None
         ), "KV cache is full! There is a bug in memory estimation."
+
+        if enable_nsa_hybrid_indexer_pool(allocator=self.token_to_kv_pool_allocator):
+            kv_loc, index_k_loc = kv_loc
+            self.req_to_token_pool.write_index_token(
+                (req.req_pool_idx, slice(0, len(index_k_loc))),
+                index_k_loc.to(torch.int32),
+            )
 
         self.req_to_token_pool.write((req.req_pool_idx, slice(0, len(kv_loc))), kv_loc)
 
@@ -1030,5 +1081,8 @@ class SchedulerDisaggregationDecodeMixin:
                 for req in alloc_reqs:
                     sparse_coordinator.on_request_begin(req)
                     sparse_coordinator.trigger_async_offload_prompt_cache(req)
+
+                # TODO: Support async offload later
+                sparse_coordinator.block_check_prompt_offload_completion(self.tree_cache)
 
             self.waiting_queue.extend(alloc_reqs)

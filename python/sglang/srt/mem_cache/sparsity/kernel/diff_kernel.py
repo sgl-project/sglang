@@ -161,146 +161,528 @@ def page_wise_diff_triton_kernel(
     tl.store(load_tokens_host_base + offset_top_k, token_slot_host, mask=load_page_mask)
 
 
+# @triton.jit
+# def nsa_sparse_diff_triton_kernel(
+#     prev_topk_ptr,
+#     curr_topk_ptr,
+#     prev_dev_idx_ptr,
+#     curr_dev_idx_ptr,
+#     diff_map_ptr,
+#     host_idx_ptr,
+#     load_dev_idx_ptr,
+#     load_host_idx_ptr,
+#     out_cache_loc_ptr,
+#     seq_len_ptr,
+#     req_idx_ptr,
+#     sparse_mask_ptr,
+#     page_table_ptr,
+#     prev_topk_s0: tl.constexpr,
+#     prev_topk_s1: tl.constexpr,
+#     curr_topk_s: tl.constexpr,
+#     prev_dev_s0: tl.constexpr,
+#     prev_dev_s1: tl.constexpr,
+#     curr_dev_s: tl.constexpr,
+#     diff_map_s: tl.constexpr,
+#     host_idx_s: tl.constexpr,
+#     load_dev_s: tl.constexpr,
+#     load_host_s: tl.constexpr,
+#     page_table_s: tl.constexpr,
+#     layer_id,
+#     TOPK: tl.constexpr,
+#     LRU_LEN: tl.constexpr,
+# ):
+#     """Optimized version with vectorized operations instead of serial loops."""
+#     bid = tl.program_id(0)
+#     offset = tl.arange(0, TOPK)
+#     offset_lru = tl.arange(0, LRU_LEN)
+#     req_idx = tl.load(req_idx_ptr + bid)
+#     seq_len = tl.load(seq_len_ptr + bid) - 1
+#     out_cache_loc = tl.load(out_cache_loc_ptr + bid)
+
+#     # ---- Pointer Setup ----
+#     prev_topk_base = prev_topk_ptr + req_idx * prev_topk_s0 + layer_id * prev_topk_s1
+#     prev_dev_base = prev_dev_idx_ptr + req_idx * prev_dev_s0 + layer_id * prev_dev_s1
+#     curr_topk_base = curr_topk_ptr + bid * curr_topk_s
+#     curr_dev_base = curr_dev_idx_ptr + curr_dev_s * bid
+#     load_dev_base = load_dev_idx_ptr + load_dev_s * bid
+#     load_host_base = load_host_idx_ptr + load_host_s * bid
+
+#     # ----  Refill -1 ----
+#     tl.store(curr_dev_base + offset_lru, -1)
+#     tl.store(load_dev_base + offset_lru, -1)
+#     tl.store(load_host_base + offset_lru, -1)
+
+#     # Handling reqs where seq_len < min_sparse_len
+#     sparse_mask_val = tl.load(sparse_mask_ptr + bid)
+#     if (sparse_mask_val == 0) | (seq_len <= 0):
+#         loaded_topk_indices = tl.load(curr_topk_base + offset)
+#         mask = loaded_topk_indices >= 0
+#         loaded_kv_indices = tl.load(
+#             page_table_ptr + page_table_s * req_idx + loaded_topk_indices, mask=mask
+#         )
+#         tl.store(curr_dev_base + offset, loaded_kv_indices, mask=mask)
+#         return
+
+#     # ----- Calculate intersection of prev_topk and curr_topk -----
+#     prev_topk = tl.load(prev_topk_base + offset_lru)
+#     curr_topk_origin = tl.load(curr_topk_base + offset)
+#     tl.store(diff_map_ptr + diff_map_s * bid + prev_topk, offset_lru)
+#     tl.debug_barrier()
+
+#     # 1. remove previous step's out_cache_loc
+#     prev_cache_idx = tl.load(diff_map_ptr + diff_map_s * bid + seq_len - 1)
+#     if prev_cache_idx != -1:
+#         tl.store(diff_map_ptr + diff_map_s * bid + seq_len - 1, -1)
+#         tl.store(prev_dev_base + prev_cache_idx, -1)
+
+#     # 2. get intersection and store
+#     exist_topk_idx = tl.load(diff_map_ptr + diff_map_s * bid + curr_topk_origin)
+#     mask = exist_topk_idx >= 0
+#     existing_dev_idx = tl.load(prev_dev_base + exist_topk_idx, mask=mask)
+#     tl.store(curr_dev_base + offset, existing_dev_idx, mask=mask)
+
+#     # 3. clear existence slots
+#     tl.store(prev_dev_base + exist_topk_idx, -1, mask=mask)
+#     tl.store(curr_topk_base + offset, -1, mask=mask)
+#     tl.store(diff_map_ptr + diff_map_s * bid + prev_topk, -1)  # reset diff map
+
+#     # 4. get should load host slots
+#     no_exist_topk = tl.load(curr_topk_base + offset)
+#     mask1 = no_exist_topk < seq_len
+#     host_mask = ~mask & mask1
+#     no_exist_host_indices = tl.load(
+#         host_idx_ptr + req_idx * host_idx_s + no_exist_topk,
+#         mask=host_mask,
+#     )
+#     tl.store(load_host_base + offset, no_exist_host_indices, mask=host_mask)
+
+#     # 5. set out_cache_loc
+#     out_cache_loc_mask = curr_topk_origin == seq_len
+#     tl.store(curr_dev_base + offset, out_cache_loc, mask=out_cache_loc_mask)
+
+#     # 6. get empty slots in curr_dev
+#     curr_dev = tl.load(curr_dev_base + offset_lru)
+#     curr_topk = tl.load(curr_topk_base + offset_lru)
+#     empty_slots = curr_dev == -1
+#     empty_slots_int = empty_slots.to(tl.int32)
+#     fill_cumsum = tl.cumsum(empty_slots_int, axis=0)
+#     fill_pos = fill_cumsum - empty_slots_int
+
+#     empty_slots_topk = tl.where(offset_lru < TOPK, empty_slots_int, 0)
+#     fill_count = tl.sum(empty_slots_topk)
+
+#     # 7. get non-empty slots in prev_dev
+#     dev_vals = tl.load(prev_dev_base + offset_lru)
+#     dev_topk = tl.load(prev_topk_base + offset_lru)
+#     dev_valid = dev_vals != -1
+#     dev_valid_int = dev_valid.to(tl.int32)
+#     dev_valid_count = tl.sum(dev_valid_int)
+#     dev_cumsum = tl.cumsum(dev_valid_int, axis=0)
+#     dev_pos = dev_cumsum - dev_valid_int
+#     move_count = dev_valid_count - fill_count
+#     fill_slots = dev_pos >= move_count
+#     dev_pos = tl.where(fill_slots, dev_pos - move_count, dev_pos + fill_count)
+
+#     # 8. Store the slots that need to be loaded and left-aligned.
+#     tl.store(load_dev_base + dev_pos, dev_vals, mask=dev_valid)
+#     tl.store(prev_topk_base + dev_pos, dev_topk, mask=dev_valid)
+
+#     # 9. merge slots
+#     fill_vals = tl.load(load_dev_base + fill_pos, mask=empty_slots, other=-1)
+#     fill_topk = tl.load(prev_topk_base + fill_pos, mask=empty_slots, other=-1)
+#     final_dev = tl.where(empty_slots, fill_vals, curr_dev)
+#     final_topk = tl.where(empty_slots, fill_topk, curr_topk)
+#     tl.store(curr_dev_base + offset_lru, final_dev)
+#     tl.store(prev_dev_base + offset_lru, final_dev)
+#     tl.store(prev_topk_base + offset_lru, final_topk)
+#     tl.store(prev_topk_base + offset, curr_topk_origin)
+
+#     tl.store(load_dev_base + offset_lru, -1, mask=offset_lru >= fill_count)
+#     host_vals_all = tl.load(load_host_base + offset_lru)
+#     tl.store(load_host_base + fill_pos, host_vals_all, mask=empty_slots)
+#     tl.store(load_host_base + offset_lru, -1, mask=offset_lru >= fill_count)
+
+# def invoke_nsa_sparse_diff_kernel(
+#     prev_top_k_result_pool: torch.Tensor,
+#     curr_top_k_result: torch.Tensor,
+#     prev_device_indices_pool: torch.Tensor,
+#     curr_device_indices: torch.Tensor,
+#     bitmap: torch.Tensor,
+#     full_host_indices: torch.Tensor,
+#     should_load_device_indices: torch.Tensor,
+#     should_load_host_indices: torch.Tensor,
+#     out_cache_loc: torch.Tensor,
+#     seq_lens: torch.Tensor,
+#     req_pool_indices: torch.Tensor,
+#     sparse_mask: torch.Tensor,
+#     page_table: torch.Tensor,
+#     layer_id: int,
+#     page_size: int,
+#     lru_len: int,
+# ):
+#     bs = curr_top_k_result.shape[0]
+#     top_k = curr_top_k_result.shape[1]
+#     grid = (bs,)
+#     assert page_size == 1
+#     nsa_sparse_diff_triton_kernel[grid](
+#         prev_top_k_result_pool,
+#         curr_top_k_result,
+#         prev_device_indices_pool,
+#         curr_device_indices,
+#         bitmap,
+#         full_host_indices,
+#         should_load_device_indices,
+#         should_load_host_indices,
+#         out_cache_loc,
+#         seq_lens,
+#         req_pool_indices,
+#         sparse_mask,
+#         page_table,
+#         prev_top_k_result_pool.stride(0),
+#         prev_top_k_result_pool.stride(1),
+#         curr_top_k_result.stride(0),
+#         prev_device_indices_pool.stride(0),
+#         prev_device_indices_pool.stride(1),
+#         curr_device_indices.stride(0),
+#         bitmap.stride(0),
+#         full_host_indices.stride(0),
+#         should_load_device_indices.stride(0),
+#         should_load_host_indices.stride(0),
+#         page_table.stride(0),
+#         layer_id,
+#         top_k,
+#         lru_len,
+#     )
+
+
 @triton.jit
-def token_wise_diff_triton_kernel(
-    prev_topk_ptr,
-    curr_topk_ptr,
-    prev_dev_idx_ptr,
-    curr_dev_idx_ptr,
-    diff_map_ptr,
-    host_idx_ptr,
-    load_dev_idx_ptr,
-    load_host_idx_ptr,
+def nsa_sparse_diff_triton_kernel(
+    prev_top_k_result_ptr,
+    curr_top_k_result_ptr,
+    prev_device_indices_ptr,
+    curr_device_indices_ptr,
+    bitmap_ptr,
+    full_host_indices_ptr,
+    should_load_device_indices_ptr,
+    should_load_host_indices_ptr,
     out_cache_loc_ptr,
-    seq_len_ptr,
-    req_idx_ptr,
+    seq_lens_ptr,
+    req_pool_indices_ptr,
     sparse_mask_ptr,
     page_table_ptr,
-    prev_topk_s0: tl.constexpr,
-    prev_topk_s1: tl.constexpr,
-    curr_topk_s: tl.constexpr,
-    prev_dev_s0: tl.constexpr,
-    prev_dev_s1: tl.constexpr,
-    curr_dev_s: tl.constexpr,
-    diff_map_s: tl.constexpr,
-    host_idx_s: tl.constexpr,
-    load_dev_s: tl.constexpr,
-    load_host_s: tl.constexpr,
-    page_table_s: tl.constexpr,
+    prev_top_k_result_stride_0: tl.constexpr,
+    prev_top_k_result_stride_1: tl.constexpr,
+    curr_top_k_result_stride: tl.constexpr,
+    prev_device_indices_stride_0: tl.constexpr,
+    prev_device_indices_stride_1: tl.constexpr,
+    curr_device_indices_stride: tl.constexpr,
+    bitmap_stride: tl.constexpr,
+    full_host_indices_stride: tl.constexpr,
+    should_load_device_indices_stride: tl.constexpr,
+    should_load_host_indices_stride: tl.constexpr,
+    page_table_stride: tl.constexpr,
     layer_id,
     TOPK: tl.constexpr,
-    LRU_LEN: tl.constexpr,
 ):
     """Optimized version with vectorized operations instead of serial loops."""
     bid = tl.program_id(0)
     offset = tl.arange(0, TOPK)
-    offset_lru = tl.arange(0, LRU_LEN)
-    req_idx = tl.load(req_idx_ptr + bid)
-    seq_len = tl.load(seq_len_ptr + bid) - 1
-    out_cache_loc = tl.load(out_cache_loc_ptr + bid)
+    req_pool_index = tl.load(req_pool_indices_ptr + bid)
+    seq_len = tl.load(seq_lens_ptr + bid) - 1
+    prev_top_k_result_start_ptr = (
+        prev_top_k_result_ptr
+        + req_pool_index * prev_top_k_result_stride_0
+        + layer_id * prev_top_k_result_stride_1
+    )
+    prev_device_indices_start_ptr = (
+        prev_device_indices_ptr
+        + req_pool_index * prev_device_indices_stride_0
+        + layer_id * prev_device_indices_stride_1
+    )
 
-    # ---- Pointer Setup ----
-    prev_topk_base = prev_topk_ptr + req_idx * prev_topk_s0 + layer_id * prev_topk_s1
-    prev_dev_base = prev_dev_idx_ptr + req_idx * prev_dev_s0 + layer_id * prev_dev_s1
-    curr_topk_base = curr_topk_ptr + bid * curr_topk_s
-    curr_dev_base = curr_dev_idx_ptr + curr_dev_s * bid
-    load_dev_base = load_dev_idx_ptr + load_dev_s * bid
-    load_host_base = load_host_idx_ptr + load_host_s * bid
+    # Refill -1
+    tl.store(curr_device_indices_ptr + curr_device_indices_stride * bid + offset, -1)
+    tl.store(curr_device_indices_ptr + curr_device_indices_stride * bid + TOPK, -1)
+    tl.store(
+        should_load_device_indices_ptr
+        + should_load_device_indices_stride * bid
+        + offset,
+        -1,
+    )
+    tl.store(
+        should_load_host_indices_ptr + should_load_host_indices_stride * bid + offset,
+        -1,
+    )
 
-    # ----  Refill -1 ----
-    tl.store(curr_dev_base + offset_lru, -1)
-    tl.store(load_dev_base + offset_lru, -1)
-    tl.store(load_host_base + offset_lru, -1)
-
-    # Handling reqs where seq_len < min_sparse_len
     sparse_mask_val = tl.load(sparse_mask_ptr + bid)
     if (sparse_mask_val == 0) | (seq_len <= 0):
-        loaded_topk_indices = tl.load(curr_topk_base + offset)
+        page_table_ptr = page_table_ptr + page_table_stride * req_pool_index
+        topk_indices_ptr = curr_top_k_result_ptr + curr_top_k_result_stride * bid
+        result_ptr = curr_device_indices_ptr + curr_device_indices_stride * bid
+
+        loaded_topk_indices = tl.load(topk_indices_ptr + offset)
         mask = loaded_topk_indices >= 0
-        loaded_kv_indices = tl.load(
-            page_table_ptr + page_table_s * req_idx + loaded_topk_indices, mask=mask
-        )
-        tl.store(curr_dev_base + offset, loaded_kv_indices, mask=mask)
+        loaded_kv_indices = tl.load(page_table_ptr + loaded_topk_indices, mask=mask)
+        tl.store(result_ptr + offset, loaded_kv_indices, mask=mask)
         return
 
-    # ----- Calculate intersection of prev_topk and curr_topk -----
-    prev_topk = tl.load(prev_topk_base + offset_lru)
-    curr_topk_origin = tl.load(curr_topk_base + offset)
-    tl.store(diff_map_ptr + diff_map_s * bid + prev_topk, offset_lru)
-    tl.debug_barrier()
-
-    # 1. remove previous step's out_cache_loc
-    prev_cache_idx = tl.load(diff_map_ptr + diff_map_s * bid + seq_len - 1)
-    if prev_cache_idx != -1:
-        tl.store(diff_map_ptr + diff_map_s * bid + seq_len - 1, -1)
-        tl.store(prev_dev_base + prev_cache_idx, -1)
-
-    # 2. get intersection and store
-    exist_topk_idx = tl.load(diff_map_ptr + diff_map_s * bid + curr_topk_origin)
-    mask = exist_topk_idx >= 0
-    existing_dev_idx = tl.load(prev_dev_base + exist_topk_idx, mask=mask)
-    tl.store(curr_dev_base + offset, existing_dev_idx, mask=mask)
-
-    # 3. clear existence slots
-    tl.store(prev_dev_base + exist_topk_idx, -1, mask=mask)
-    tl.store(curr_topk_base + offset, -1, mask=mask)
-    tl.store(diff_map_ptr + diff_map_s * bid + prev_topk, -1)  # reset diff map
-
-    # 4. get should load host slots
-    no_exist_topk = tl.load(curr_topk_base + offset)
-    mask1 = no_exist_topk < seq_len
-    host_mask = ~mask & mask1
-    no_exist_host_indices = tl.load(
-        host_idx_ptr + req_idx * host_idx_s + no_exist_topk,
-        mask=host_mask,
+    # Load current top-k (save for later update)
+    tmp_curr_top_k_result = tl.load(
+        curr_top_k_result_ptr + curr_top_k_result_stride * bid + offset
     )
-    tl.store(load_host_base + offset, no_exist_host_indices, mask=host_mask)
 
-    # 5. set out_cache_loc
-    out_cache_loc_mask = curr_topk_origin == seq_len
-    tl.store(curr_dev_base + offset, out_cache_loc, mask=out_cache_loc_mask)
+    prev_top_k_result = tl.load(prev_top_k_result_start_ptr + offset)
+    max_val = tl.max(prev_top_k_result)
 
-    # 6. get empty slots in curr_dev
-    curr_dev = tl.load(curr_dev_base + offset_lru)
-    curr_topk = tl.load(curr_topk_base + offset_lru)
-    empty_slots = curr_dev == -1
-    empty_slots_int = empty_slots.to(tl.int32)
-    fill_cumsum = tl.cumsum(empty_slots_int, axis=0)
-    fill_pos = fill_cumsum - empty_slots_int
+    if max_val == -1:
+        no_exist_top_k_result = tl.load(
+            curr_top_k_result_ptr + curr_top_k_result_stride * bid + offset
+        )
+        mask = no_exist_top_k_result < seq_len
+        no_exist_host_indices = tl.load(
+            full_host_indices_ptr
+            + req_pool_index * full_host_indices_stride
+            + no_exist_top_k_result,
+            mask=mask,
+        )
+        tl.store(
+            should_load_host_indices_ptr
+            + should_load_host_indices_stride * bid
+            + offset,
+            no_exist_host_indices,
+            mask=mask,
+        )
+    else:
+        tl.store(bitmap_ptr + bitmap_stride * bid + prev_top_k_result, offset)
 
-    empty_slots_topk = tl.where(offset_lru < TOPK, empty_slots_int, 0)
-    fill_count = tl.sum(empty_slots_topk)
+        tl.debug_barrier()
+        prev_out_cache_loc_index = tl.load(
+            bitmap_ptr + bitmap_stride * bid + seq_len - 1
+        )
+        if prev_out_cache_loc_index != -1:
+            tl.store(bitmap_ptr + bitmap_stride * bid + seq_len - 1, -1)
+            tl.store(prev_device_indices_start_ptr + prev_out_cache_loc_index, -1)
 
-    # 7. get non-empty slots in prev_dev
-    dev_vals = tl.load(prev_dev_base + offset_lru)
-    dev_topk = tl.load(prev_topk_base + offset_lru)
-    dev_valid = dev_vals != -1
-    dev_valid_int = dev_valid.to(tl.int32)
-    dev_valid_count = tl.sum(dev_valid_int)
-    dev_cumsum = tl.cumsum(dev_valid_int, axis=0)
-    dev_pos = dev_cumsum - dev_valid_int
-    move_count = dev_valid_count - fill_count
-    fill_slots = dev_pos >= move_count
-    dev_pos = tl.where(fill_slots, dev_pos - move_count, dev_pos + fill_count)
+        curr_top_k_result = tl.load(
+            curr_top_k_result_ptr + curr_top_k_result_stride * bid + offset
+        )
+        exist_indices = tl.load(bitmap_ptr + bitmap_stride * bid + curr_top_k_result)
 
-    # 8. Store the slots that need to be loaded and left-aligned.
-    tl.store(load_dev_base + dev_pos, dev_vals, mask=dev_valid)
-    tl.store(prev_topk_base + dev_pos, dev_topk, mask=dev_valid)
+        mask = exist_indices >= 0
+        exist_prev_device_indices = tl.load(
+            prev_device_indices_start_ptr + exist_indices,
+            mask=mask,
+        )
+        tl.store(
+            curr_device_indices_ptr + curr_device_indices_stride * bid + offset,
+            exist_prev_device_indices,
+            mask=mask,
+        )
 
-    # 9. merge slots
-    fill_vals = tl.load(load_dev_base + fill_pos, mask=empty_slots, other=-1)
-    fill_topk = tl.load(prev_topk_base + fill_pos, mask=empty_slots, other=-1)
-    final_dev = tl.where(empty_slots, fill_vals, curr_dev)
-    final_topk = tl.where(empty_slots, fill_topk, curr_topk)
-    tl.store(curr_dev_base + offset_lru, final_dev)
-    tl.store(prev_dev_base + offset_lru, final_dev)
-    tl.store(prev_topk_base + offset_lru, final_topk)
-    tl.store(prev_topk_base + offset, curr_topk_origin)
+        tl.store(
+            prev_device_indices_start_ptr + exist_indices,
+            -1,
+            mask=mask,
+        )
+        tl.store(
+            curr_top_k_result_ptr + curr_top_k_result_stride * bid + offset,
+            -1,
+            mask=mask,
+        )
+        tl.store(bitmap_ptr + bitmap_stride * bid + prev_top_k_result, -1)
 
-    tl.store(load_dev_base + offset_lru, -1, mask=offset_lru >= fill_count)
-    host_vals_all = tl.load(load_host_base + offset_lru)
-    tl.store(load_host_base + fill_pos, host_vals_all, mask=empty_slots)
-    tl.store(load_host_base + offset_lru, -1, mask=offset_lru >= fill_count)
+        no_exist_top_k_result = tl.load(
+            curr_top_k_result_ptr + curr_top_k_result_stride * bid + offset
+        )
+
+        mask1 = no_exist_top_k_result < seq_len
+        host_mask = ~mask & mask1
+        no_exist_host_indices = tl.load(
+            full_host_indices_ptr
+            + req_pool_index * full_host_indices_stride
+            + no_exist_top_k_result,
+            mask=host_mask,
+        )
+        tl.store(
+            should_load_host_indices_ptr
+            + should_load_host_indices_stride * bid
+            + offset,
+            no_exist_host_indices,
+            mask=host_mask,
+        )
+
+    out_cache_loc = tl.load(out_cache_loc_ptr + bid)
+    curr_top_k_result = tl.load(
+        curr_top_k_result_ptr + curr_top_k_result_stride * bid + offset
+    )
+    out_cache_loc_mask = curr_top_k_result == seq_len
+    tl.store(
+        curr_device_indices_ptr + curr_device_indices_stride * bid + offset,
+        out_cache_loc,
+        mask=out_cache_loc_mask,
+    )
+
+    # Vectorized compaction (replaces serial loop 1)
+    device_vals_topk = tl.load(prev_device_indices_start_ptr + offset)
+    device_valid_topk = device_vals_topk != -1
+    device_valid_topk_int = device_valid_topk.to(tl.int32)
+    device_cumsum_topk = tl.cumsum(device_valid_topk_int, axis=0)
+    device_write_pos_topk = device_cumsum_topk - device_valid_topk_int
+
+    device_val_last = tl.load(prev_device_indices_start_ptr + TOPK)
+    device_count_topk = tl.sum(device_valid_topk_int)
+
+    tl.store(
+        should_load_device_indices_ptr
+        + should_load_device_indices_stride * bid
+        + device_write_pos_topk,
+        device_vals_topk,
+        mask=device_valid_topk,
+    )
+
+    device_count = device_count_topk
+    if device_val_last != -1:
+        tl.store(
+            should_load_device_indices_ptr
+            + should_load_device_indices_stride * bid
+            + device_count_topk,
+            device_val_last,
+        )
+        device_count = device_count_topk + 1
+
+    host_vals_all = tl.load(
+        should_load_host_indices_ptr + should_load_host_indices_stride * bid + offset
+    )
+    host_valid = host_vals_all != -1
+    host_valid_int = host_valid.to(tl.int32)
+    host_cumsum = tl.cumsum(host_valid_int, axis=0)
+    host_write_pos = host_cumsum - host_valid_int
+
+    tl.store(
+        should_load_host_indices_ptr
+        + should_load_host_indices_stride * bid
+        + host_write_pos,
+        host_vals_all,
+        mask=host_valid,
+    )
+    host_count = tl.sum(host_valid_int)
+
+    # Vectorized fill (replaces serial loop 2)
+    curr_vals_topk = tl.load(
+        curr_device_indices_ptr + curr_device_indices_stride * bid + offset
+    )
+    empty_mask_topk = curr_vals_topk == -1
+    empty_mask_topk_int = empty_mask_topk.to(tl.int32)
+    empty_cumsum_topk = tl.cumsum(empty_mask_topk_int, axis=0)
+    fill_positions_topk = empty_cumsum_topk - empty_mask_topk_int
+
+    fill_vals_topk = tl.load(
+        should_load_device_indices_ptr
+        + should_load_device_indices_stride * bid
+        + fill_positions_topk,
+        mask=empty_mask_topk,
+        other=-1,
+    )
+    result_topk = tl.where(empty_mask_topk, fill_vals_topk, curr_vals_topk)
+    tl.store(
+        curr_device_indices_ptr + curr_device_indices_stride * bid + offset, result_topk
+    )
+
+    curr_val_last = tl.load(
+        curr_device_indices_ptr + curr_device_indices_stride * bid + TOPK
+    )
+    if curr_val_last == -1:
+        empty_count_topk = tl.sum(empty_mask_topk_int)
+        fill_val_last = tl.load(
+            should_load_device_indices_ptr
+            + should_load_device_indices_stride * bid
+            + empty_count_topk
+        )
+        tl.store(
+            curr_device_indices_ptr + curr_device_indices_stride * bid + TOPK,
+            fill_val_last,
+        )
+
+    # Clear invalid entries
+    clear_mask = offset >= host_count
+    tl.store(
+        should_load_device_indices_ptr
+        + should_load_device_indices_stride * bid
+        + offset,
+        -1,
+        mask=clear_mask,
+    )
+    tl.store(
+        should_load_host_indices_ptr + should_load_host_indices_stride * bid + offset,
+        -1,
+        mask=clear_mask,
+    )
+
+    # Update state
+    tl.store(prev_top_k_result_start_ptr + offset, tmp_curr_top_k_result)
+    tl.store(
+        curr_top_k_result_ptr + curr_top_k_result_stride * bid + offset,
+        tmp_curr_top_k_result,
+    )
+    curr_device_indices = tl.load(
+        curr_device_indices_ptr + curr_device_indices_stride * bid + offset
+    )
+    tl.store(prev_device_indices_start_ptr + offset, curr_device_indices)
+    last_index = tl.load(
+        curr_device_indices_ptr + curr_device_indices_stride * bid + TOPK
+    )
+    tl.store(prev_device_indices_start_ptr + TOPK, last_index)
+
+
+def invoke_nsa_sparse_diff_kernel(
+    prev_top_k_result_pool: torch.Tensor,
+    curr_top_k_result: torch.Tensor,
+    prev_device_indices_pool: torch.Tensor,
+    curr_device_indices: torch.Tensor,
+    bitmap: torch.Tensor,
+    full_host_indices: torch.Tensor,
+    should_load_device_indices: torch.Tensor,
+    should_load_host_indices: torch.Tensor,
+    out_cache_loc: torch.Tensor,
+    seq_lens: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    sparse_mask: torch.Tensor,
+    page_table: torch.Tensor,
+    layer_id: int,
+    page_size: int,
+):
+    bs = curr_top_k_result.shape[0]
+    top_k = curr_top_k_result.shape[1]
+    grid = (bs,)
+    assert page_size == 1
+    nsa_sparse_diff_triton_kernel[grid](
+        prev_top_k_result_pool,
+        curr_top_k_result,
+        prev_device_indices_pool,
+        curr_device_indices,
+        bitmap,
+        full_host_indices,
+        should_load_device_indices,
+        should_load_host_indices,
+        out_cache_loc,
+        seq_lens,
+        req_pool_indices,
+        sparse_mask,
+        page_table,
+        prev_top_k_result_pool.stride(0),
+        prev_top_k_result_pool.stride(1),
+        curr_top_k_result.stride(0),
+        prev_device_indices_pool.stride(0),
+        prev_device_indices_pool.stride(1),
+        curr_device_indices.stride(0),
+        bitmap.stride(0),
+        full_host_indices.stride(0),
+        should_load_device_indices.stride(0),
+        should_load_host_indices.stride(0),
+        page_table.stride(0),
+        layer_id,
+        top_k,
+    )
 
 
 def invoke_sparse_diff_kernel(

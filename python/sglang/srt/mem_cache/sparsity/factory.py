@@ -54,7 +54,7 @@ def _create_backend_adaptor(
 ):
     """Create backend adaptor."""
     if isinstance(sparse_algorithm, DeepSeekNSAAlgorithm):
-        return NSABackendAdaptor(device, req_to_token_pool)
+        return NSABackendAdaptor(device, req_to_token_pool, sparse_kv_cache_manager)
 
     if backend in ["fa3", "flashattention"]:
         return FlashAttentionAdaptor(device, req_to_token_pool, sparse_kv_cache_manager)

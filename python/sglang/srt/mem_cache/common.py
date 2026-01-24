@@ -9,6 +9,9 @@ import triton.language as tl
 
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
+from sglang.srt.mem_cache.allocator import (
+    NSAHybridTokenToKVPoolAllocator,
+)
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.sparsity.factory import (
     get_sparse_coordinator,
@@ -234,7 +237,7 @@ def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
     if tree_cache is None:
         return
 
-    if isinstance(tree_cache, (SWAChunkCache, ChunkCache)):
+    if tree_cache.is_chunk_cache():
         return
 
     allocator = tree_cache.token_to_kv_pool_allocator
@@ -248,11 +251,13 @@ def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
         if full_available_size < num_tokens or swa_available_size < num_tokens:
             full_num_tokens = max(0, num_tokens - full_available_size)
             swa_num_tokens = max(0, num_tokens - swa_available_size)
-            tree_cache.evict(full_num_tokens, swa_num_tokens)
+            tree_cache.evict(
+                EvictParams(num_tokens=full_num_tokens, swa_num_tokens=swa_num_tokens)
+            )
     else:
         # Standard allocator
         if allocator.available_size() < num_tokens:
-            tree_cache.evict(num_tokens)
+            tree_cache.evict(EvictParams(num_tokens=num_tokens))
 
 
 def alloc_paged_token_slots_extend(
@@ -308,14 +313,14 @@ def alloc_req_slots(
         mamba_available_size = req_to_token_pool.mamba_pool.available_size()
         factor = (
             MAMBA_STATE_PER_REQ_PREFIX_CACHE
-            if isinstance(tree_cache, MambaRadixCache)
+            if tree_cache.supports_mamba()
             else MAMBA_STATE_PER_REQ_NO_CACHE
         )
         mamba_state_needed = num_reqs * factor
         if mamba_available_size < mamba_state_needed:
-            if tree_cache is not None and isinstance(tree_cache, MambaRadixCache):
+            if tree_cache is not None and tree_cache.supports_mamba():
                 mamba_num = max(0, mamba_state_needed - mamba_available_size)
-                tree_cache.evict_mamba(mamba_num)
+                tree_cache.evict(EvictParams(num_tokens=0, mamba_num=mamba_num))
         req_pool_indices = req_to_token_pool.alloc(num_reqs, reqs)
     else:
         req_pool_indices = req_to_token_pool.alloc(num_reqs)
@@ -342,18 +347,7 @@ def alloc_for_extend(
         req_pool_indices: request pool indices as list
     """
     # free out-of-window swa tokens
-    if isinstance(batch.tree_cache, SWAChunkCache):
-        for req, pre_len in zip(batch.reqs, batch.prefix_lens):
-            if batch.enable_overlap:
-                # In chunked prefill case, when the second extend batch is scheduling, the first extend batch is still running, so we cannot evict swa tokens
-                if req.extend_batch_idx < 2:
-                    continue
-                else:
-                    batch.tree_cache.evict_swa(
-                        req, pre_len - batch.tree_cache.chunked_prefill_size
-                    )
-            else:
-                batch.tree_cache.evict_swa(req, pre_len)
+    batch.maybe_evict_swa()
 
     bs = len(batch.reqs)
     prefix_tensors = [r.prefix_indices for r in batch.reqs]
@@ -509,10 +503,12 @@ def alloc_for_hierarchical_sparse_decode(
     if hierarchical_sparse_masks.any():
         truncated_indices = hierarchical_sparse_masks.nonzero(as_tuple=True)[0]
         # Map logical decode positions onto the reserved rolling page in a round-robin way
-        decode_offsets = locs[truncated_indices]
-        rolling_positions = (kv_truncated_len - page_size) + (
-            decode_offsets % page_size
-        )
+        # decode_offsets = locs[truncated_indices]
+        # rolling_positions = (kv_truncated_len - page_size) + (
+        #     decode_offsets % page_size
+        # )
+        # TODO：先暂时用固定的 loc 位置; 后面兼容 rolling buffer 的形式
+        rolling_positions = kv_truncated_len
         out_cache_loc[truncated_indices] = batch.req_to_token_pool.req_to_token[
             batch.req_pool_indices[truncated_indices],
             rolling_positions,
@@ -547,8 +543,39 @@ def alloc_for_hierarchical_sparse_decode(
             ),
             out_cache_loc[non_truncated_indices],
         )
+
+    # Allocate index_k tokens if using NSA hybrid pool
+    if enable_nsa_hybrid_indexer_pool(req_to_token_pool=batch.req_to_token_pool):
+        _alloc_for_nsa_index_k(batch, token_per_req, seq_lens_next, locs)
+
+
     return out_cache_loc
 
+def _alloc_for_nsa_index_k(
+    batch: ScheduleBatch, token_per_req: int, seq_lens_next, locs
+):
+    """Allocate index_k tokens for NSA decode."""
+    allocator = batch.tree_cache.token_to_kv_pool_allocator
+    index_k_last_loc = batch.req_to_token_pool.req_to_nsa_index_k[
+        batch.req_pool_indices, batch.seq_lens - 1
+    ]
+
+    out_index_cache_loc = allocator.alloc_decode_for_index_k(
+        seq_lens_next, batch.seq_lens_cpu + token_per_req, index_k_last_loc
+    )
+
+    if out_index_cache_loc is None:
+        error_msg = (
+            f"Decode out of memory for index_k. Try to lower your batch size.\n"
+            f"Try to allocate {len(seq_lens_next) * token_per_req} tokens.\n"
+            f"{available_and_evictable_str(batch.tree_cache)}"
+        )
+        logger.error(error_msg)
+        raise RuntimeError(error_msg)
+
+    batch.req_to_token_pool.write_index_token(
+        (batch.req_pool_indices, locs), out_index_cache_loc.to(torch.int32)
+    )
 
 def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
     tree_cache.cache_finished_req(req, is_insert=is_insert)
@@ -577,10 +604,16 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     if start_p >= end_p:
         return
 
-    indices_to_free = tree_cache.req_to_token_pool.req_to_token[req.req_pool_idx][
-        start_p:end_p
-    ]
-    tree_cache.token_to_kv_pool_allocator.free(indices_to_free)
+    if enable_nsa_hybrid_indexer_pool(req_to_token_pool=tree_cache.req_to_token_pool):
+        indices = tree_cache.req_to_token_pool.get_all_indices_range(
+            req.req_pool_idx, start_p, end_p
+        )
+    else:
+        indices = tree_cache.req_to_token_pool.req_to_token[
+            req.req_pool_idx, start_p:end_p
+        ]
+
+    tree_cache.token_to_kv_pool_allocator.free(indices)
 
 
 def available_and_evictable_str(tree_cache) -> str:
@@ -596,7 +629,28 @@ def available_and_evictable_str(tree_cache) -> str:
             f"Full LRU list evictable size: {tree_cache.full_lru_list_evictable_size()}\n"
             f"SWA LRU list evictable size: {tree_cache.swa_lru_list_evictable_size()}\n"
         )
+    elif enable_nsa_hybrid_indexer_pool(allocator=token_to_kv_pool_allocator):
+        kv_available_size = token_to_kv_pool_allocator.available_size()
+        index_k_available_size = token_to_kv_pool_allocator.index_k_available_size()
+        evictable_size = tree_cache.evictable_size()
+        return (
+            f"Available KV tokens: {kv_available_size + evictable_size} ({kv_available_size=} + {evictable_size=})\n"
+            f"Available index_k tokens: {index_k_available_size}\n"
+        )
     else:
         available_size = token_to_kv_pool_allocator.available_size()
         evictable_size = tree_cache.evictable_size()
         return f"Available tokens: {available_size + evictable_size} ({available_size=} + {evictable_size=})\n"
+
+def enable_nsa_hybrid_indexer_pool(allocator=None, req_to_token_pool=None):
+    """Check if NSA decode hybrid pool is enabled."""
+    if allocator is not None and isinstance(allocator, NSAHybridTokenToKVPoolAllocator):
+        return True
+
+    if req_to_token_pool is not None:
+        from sglang.srt.disaggregation.decode import NSADecodeReqToTokenPool
+
+        if isinstance(req_to_token_pool, NSADecodeReqToTokenPool):
+            return True
+
+    return False

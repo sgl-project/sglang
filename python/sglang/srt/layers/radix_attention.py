@@ -122,7 +122,9 @@ class RadixAttention(nn.Module):
             )
             return output
         else:
-            attention_begin_hook(q, k, v, self, forward_batch)
+
+            # TODO: 这里需要改一下，dsa 不需要在这里 hook；而是在 deepseek_v2.py 里面 hook indexer；需要看看怎么兼容后面
+            #attention_begin_hook(q, k, v, self, forward_batch)
 
             # Call backend attention
             output = forward_batch.attn_backend.forward(
@@ -135,7 +137,7 @@ class RadixAttention(nn.Module):
                 **kwargs,
             )
 
-            attention_end_hook(output, self, forward_batch)
+            #attention_end_hook(output, self, forward_batch)
             return output
 
 

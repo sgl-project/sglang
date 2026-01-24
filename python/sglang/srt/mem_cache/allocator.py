@@ -457,3 +457,167 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def load_cpu_copy(self, kv_cache_cpu, indices):
         return self._kvcache.load_cpu_copy(kv_cache_cpu, indices)
+
+
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+class NSAHybridTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
+    """Hybrid allocator with separate KV cache and index_k pools for NSA."""
+
+    def __init__(
+        self,
+        kv_size: int,
+        index_k_size: int,
+        page_size: int,
+        dtype: torch.dtype,
+        device: str,
+        kvcache,
+        need_sort: bool,
+    ):
+        super().__init__(kv_size, page_size, dtype, device, kvcache, need_sort)
+
+        self._size_kv = kv_size
+        self._size_index_k = index_k_size
+
+        self.kv_allocator = PagedTokenToKVPoolAllocator(
+            kv_size, page_size, dtype, device, kvcache, need_sort
+        )
+
+        self.index_k_max_total_size = index_k_size
+        self.index_k_allocator = PagedTokenToKVPoolAllocator(
+            index_k_size, page_size, dtype, device, kvcache, need_sort
+        )
+        logger.info(
+            f"NSAHybridTokenToKVPoolAllocator initialized with {kv_size=} and {index_k_size=}"
+        )
+
+    def alloc(self, need_size: int):
+        if self.kv_allocator.available_size() < need_size:
+            return None
+        if self.index_k_allocator.available_size() < need_size:
+            return None
+
+        kv_indices = self.kv_allocator.alloc(need_size)
+        if kv_indices is None:
+            return None
+
+        index_k_indices = self.index_k_allocator.alloc(need_size)
+        if index_k_indices is None:
+            self.kv_allocator.free(kv_indices)
+            return None
+
+        return (kv_indices, index_k_indices)
+
+    def alloc_extend(
+        self,
+        prefix_lens: torch.Tensor,
+        prefix_lens_cpu: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        last_loc: torch.Tensor,
+        extend_num_tokens: int,
+        index_k_last_loc: torch.Tensor = None,
+    ):
+        kv_indices = self.kv_allocator.alloc_extend(
+            prefix_lens,
+            prefix_lens_cpu,
+            seq_lens,
+            seq_lens_cpu,
+            last_loc,
+            extend_num_tokens,
+        )
+        if kv_indices is None:
+            return None
+
+        if index_k_last_loc is None:
+            index_k_last_loc = torch.full_like(last_loc, -1)
+
+        index_k_indices = self.index_k_allocator.alloc_extend(
+            prefix_lens,
+            prefix_lens_cpu,
+            seq_lens,
+            seq_lens_cpu,
+            index_k_last_loc,
+            extend_num_tokens,
+        )
+        if index_k_indices is None:
+            self.kv_allocator.free(kv_indices)
+            return None
+
+        return (kv_indices, index_k_indices)
+
+    def alloc_decode(
+        self,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        last_loc: torch.Tensor,
+        index_k_last_loc: torch.Tensor = None,
+    ):
+        return self.kv_allocator.alloc_decode(seq_lens, seq_lens_cpu, last_loc)
+
+    def alloc_decode_for_index_k(
+        self,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        index_k_last_loc: torch.Tensor,
+    ):
+        return self.index_k_allocator.alloc_decode(
+            seq_lens, seq_lens_cpu, index_k_last_loc
+        )
+
+    def free(self, free_index: torch.Tensor):
+        if isinstance(free_index, tuple):
+            kv_indices, index_k_indices = free_index
+        else:
+            kv_indices = free_index
+            index_k_indices = None
+
+        if kv_indices.numel() == 0:
+            return
+
+        self.kv_allocator.free(kv_indices)
+        if index_k_indices is not None and index_k_indices.numel() > 0:
+            self.index_k_allocator.free(index_k_indices)
+
+    def available_size(self):
+        return self.kv_allocator.available_size()
+
+    def index_k_available_size(self):
+        return self.index_k_allocator.available_size()
+
+    def index_k_expected_size(self):
+        return self.index_k_allocator.num_pages * self.index_k_allocator.page_size
+
+    def clear(self):
+        self.kv_allocator.clear()
+        self.index_k_allocator.clear()
+
+    def free_group_begin(self):
+        self.kv_allocator.free_group_begin()
+        self.index_k_allocator.free_group_begin()
+
+    def free_group_end(self):
+        self.kv_allocator.free_group_end()
+        self.index_k_allocator.free_group_end()
+        self.is_not_in_free_group = True
+        self.free_group = []
+
+    def backup_state(self):
+        return [
+            self.kv_allocator.backup_state(),
+            self.index_k_allocator.backup_state(),
+        ]
+
+    def restore_state(self, state):
+        assert len(state) == 2
+        self.kv_allocator.restore_state(state[0])
+        self.index_k_allocator.restore_state(state[1])
+
+    def get_cpu_copy(self, indices):
+        return self._kvcache.get_cpu_copy(indices)
+
+    def load_cpu_copy(self, kv_cache_cpu, indices):
+        return self._kvcache.load_cpu_copy(kv_cache_cpu, indices)
