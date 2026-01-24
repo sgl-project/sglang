@@ -14,11 +14,13 @@ from sglang.srt.entrypoints.openai.protocol import (
     CompletionResponseStreamChoice,
     CompletionStreamResponse,
     ErrorResponse,
+    SglExt,
 )
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
 from sglang.srt.entrypoints.openai.utils import (
     process_hidden_states_from_ret,
+    process_routed_experts_from_ret,
     to_openai_style_logprobs,
 )
 from sglang.srt.managers.io_struct import GenerateReqInput
@@ -118,6 +120,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
             bootstrap_room=request.bootstrap_room,
             data_parallel_rank=request.data_parallel_rank,
             return_hidden_states=request.return_hidden_states,
+            return_routed_experts=request.return_routed_experts,
             rid=request.rid,
             extra_key=self._compute_extra_key(request),
             priority=request.priority,
@@ -203,6 +206,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
         completion_tokens = {}
         cached_tokens = {}
         hidden_states = {}
+        routed_experts = {}
 
         try:
             async for content in self.tokenizer_manager.generate_request(
@@ -215,6 +219,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 completion_tokens[index] = content["meta_info"]["completion_tokens"]
                 cached_tokens[index] = content["meta_info"].get("cached_tokens", 0)
                 hidden_states[index] = content["meta_info"].get("hidden_states", None)
+                routed_experts[index] = content["meta_info"].get("routed_experts", None)
 
                 stream_buffer = stream_buffers.get(index, "")
                 # Handle echo for first chunk
@@ -310,6 +315,27 @@ class OpenAIServingCompletion(OpenAIServingBase):
                             model=request.model,
                         )
                         yield f"data: {hidden_states_chunk.model_dump_json()}\n\n"
+
+            if request.return_routed_experts and routed_experts:
+                for index, choice_routed_experts in routed_experts.items():
+                    if choice_routed_experts is not None:
+                        routed_experts_chunk = CompletionStreamResponse(
+                            id=content["meta_info"]["id"],
+                            created=created,
+                            object="text_completion",
+                            choices=[
+                                CompletionResponseStreamChoice(
+                                    index=index,
+                                    text="",
+                                    sgl_ext=SglExt(
+                                        routed_experts=choice_routed_experts
+                                    ),
+                                    finish_reason=None,
+                                )
+                            ],
+                            model=request.model,
+                        )
+                        yield (f"data: {routed_experts_chunk.model_dump_json()}\n\n")
 
             # Handle final usage chunk
             if request.stream_options and request.stream_options.include_usage:
@@ -409,6 +435,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
 
             # Handle hidden states
             hidden_states = process_hidden_states_from_ret(ret_item, request)
+            routed_experts = process_routed_experts_from_ret(ret_item, request)
 
             finish_reason = ret_item["meta_info"]["finish_reason"]
 
@@ -423,6 +450,9 @@ class OpenAIServingCompletion(OpenAIServingBase):
                     else None
                 ),
                 hidden_states=hidden_states,
+                sgl_ext=(
+                    SglExt(routed_experts=routed_experts) if routed_experts else None
+                ),
             )
             choices.append(choice_data)
 
