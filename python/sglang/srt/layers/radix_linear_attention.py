@@ -14,7 +14,7 @@
 """Radix linear attention."""
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Tuple, Union
 
 import torch
 from torch import nn
@@ -35,7 +35,8 @@ class RadixLinearAttention(nn.Module):
         num_v_heads: int,
         head_qk_dim: int,
         head_v_dim: int,
-        conv_weights: Optional[torch.Tensor] = None,
+        # GDN KDA Shared Weights
+        conv_weights: Optional[Union[torch.Tensor, Tuple[torch.Tensor, ...]]] = None,
         bias: Optional[torch.Tensor] = None,
         activation: str = "silu",
         A_log: Optional[torch.Tensor] = None,
@@ -53,13 +54,14 @@ class RadixLinearAttention(nn.Module):
         self.conv_weights = conv_weights
         self.bias = bias
         self.activation = activation
+
         self.A_log = A_log
         self.dt_bias = dt_bias
 
     def forward(
         self,
         forward_batch: ForwardBatch,
-        mixed_qkv: torch.Tensor,
+        mixed_qkv: Union[torch.Tensor, Tuple[torch.Tensor, ...]],
         a: torch.Tensor,
         b: torch.Tensor,
     ) -> torch.Tensor:
