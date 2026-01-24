@@ -15,12 +15,13 @@
 import multiprocessing as mp
 import os
 import unittest
-from typing import List
+from typing import List, Optional
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.lora_utils import (
     ALL_OTHER_LORA_MODELS,
     CI_LORA_MODELS,
+    CI_MULTI_LORA_MODELS,
     DEFAULT_PROMPTS,
     TORCH_DTYPES,
     LoRAModelCase,
@@ -29,11 +30,20 @@ from sglang.test.lora_utils import (
 from sglang.test.test_utils import CustomTestCase, is_in_ci
 
 register_cuda_ci(est_time=116, suite="stage-b-test-large-2-gpu")
+register_amd_ci(
+    est_time=116,
+    suite="stage-b-test-large-2-gpu-amd",
+    disabled="see https://github.com/sgl-project/sglang/issues/13107",
+)
 
 
 class TestLoRATP(CustomTestCase):
 
-    def _run_tp_on_model_cases(self, model_cases: List[LoRAModelCase]):
+    def _run_tp_on_model_cases(
+        self,
+        model_cases: List[LoRAModelCase],
+        enable_lora_overlap_loading: Optional[bool] = None,
+    ):
         tp_list = [2]  # Define TP sizes to iterate over
         for model_case in model_cases:
             # If skip_long_prompt is True, filter out prompts longer than 1000 characters
@@ -50,11 +60,17 @@ class TestLoRATP(CustomTestCase):
                         model_case,
                         torch_dtype,
                         max_new_tokens=32,
-                        test_tag=f"tp={tp_size}",
+                        enable_lora_overlap_loading=enable_lora_overlap_loading,
+                        test_tag=f"tp={tp_size}, enable_lora_overlap_loading={enable_lora_overlap_loading}",
                     )
 
     def test_ci_lora_models(self):
         self._run_tp_on_model_cases(CI_LORA_MODELS)
+
+    def test_lora_overlap_loading_ci_lora_models(self):
+        self._run_tp_on_model_cases(
+            CI_MULTI_LORA_MODELS, enable_lora_overlap_loading=True
+        )
 
     def test_all_lora_models(self):
         if is_in_ci():

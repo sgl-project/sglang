@@ -6,7 +6,7 @@ use super::traits::{
 };
 
 /// Tiktoken tokenizer wrapper for OpenAI GPT models
-pub struct TiktokenTokenizer {
+pub(crate) struct TiktokenTokenizer {
     tokenizer: CoreBPE,
     #[allow(dead_code)]
     model: TiktokenModel,

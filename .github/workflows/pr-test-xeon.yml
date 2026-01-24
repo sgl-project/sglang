@@ -20,7 +20,7 @@ on:
         default: false
 
 concurrency:
-  group: pr-test-xeon-${{ github.ref }}
+  group: pr-test-xeon-${{ inputs.ref || github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -56,7 +56,7 @@ jobs:
           filters: |
             main_package:
               - "python/sglang/!(multimodal_gen)/**"
-              - "python/*.toml"
+              - "python/pyproject_cpu.toml"
               - "scripts/ci/**"
               - "test/**"
               - "sgl-kernel/**"

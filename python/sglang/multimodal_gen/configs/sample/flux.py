@@ -20,3 +20,9 @@ class FluxSamplingParams(SamplingParams):
         # FIXME
         # self.height = default_sample_size * vae_scale_factor
         # self.width = default_sample_size * vae_scale_factor
+
+
+@dataclass
+class Flux2KleinSamplingParams(FluxSamplingParams):
+    # Klein is step-distilled, so default to 4 steps
+    num_inference_steps: int = 4

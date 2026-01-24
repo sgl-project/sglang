@@ -39,7 +39,7 @@ class SchedulerProfilerMixin:
         if envs.SGLANG_PROFILE_V2.get():
             self._profile_manager = ProfileManager(
                 tp_rank=self.tp_rank,
-                cpu_group=self.cpu_group,
+                cpu_group=self.dp_tp_cpu_group,
                 gpu_id=self.gpu_id,
             )
             return
@@ -180,7 +180,7 @@ class SchedulerProfilerMixin:
                 schema.writeSchema(connection)
                 connection.commit()
                 del connection
-            torch.distributed.barrier(self.cpu_group)
+            torch.distributed.barrier(self.dp_tp_cpu_group)
 
             self.rpd_profiler = rpdTracerControl()
             self.rpd_profiler.setPythonTrace(True)
@@ -291,14 +291,14 @@ class SchedulerProfilerMixin:
                 self.torch_profiler.export_chrome_trace(
                     os.path.join(self.torch_profiler_output_dir, filename)
                 )
-            torch.distributed.barrier(self.cpu_group)
+            torch.distributed.barrier(self.dp_tp_cpu_group)
 
         if self.rpd_profiler is not None:
             self.rpd_profiler.rangePop()
             self.rpd_profiler.stop()
             self.rpd_profiler.flush()
 
-            torch.distributed.barrier(self.cpu_group)
+            torch.distributed.barrier(self.dp_tp_cpu_group)
             if self.tp_rank == 0:
                 from sglang.srt.utils.rpd_utils import rpd_to_chrome_trace
 

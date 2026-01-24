@@ -14,10 +14,12 @@ use axum::{
     http::{header, HeaderValue, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
+    Json,
 };
 use bytes::Bytes;
 use http_body::Frame;
 use rand::Rng;
+use serde_json::json;
 use subtle::ConstantTimeEq;
 use tokio::sync::{mpsc, oneshot};
 use tower::{Layer, Service};
@@ -26,7 +28,10 @@ use tracing::{debug, error, field::Empty, info, info_span, warn, Span};
 
 pub use crate::core::token_bucket::TokenBucket;
 use crate::{
-    observability::metrics::{method_to_static_str, metrics_labels, Metrics},
+    observability::{
+        inflight_tracker::InFlightRequestTracker,
+        metrics::{method_to_static_str, metrics_labels, Metrics},
+    },
     routers::error::extract_error_code_from_response,
     server::AppState,
     wasm::{
@@ -66,23 +71,12 @@ impl TokenGuardBody {
 impl Drop for TokenGuardBody {
     fn drop(&mut self) {
         if let Some(bucket) = self.token_bucket.take() {
-            let tokens = self.tokens;
             debug!(
                 "TokenGuardBody: stream ended, returning {} tokens to bucket",
-                tokens
+                self.tokens
             );
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                handle.spawn(async move {
-                    bucket.return_tokens(tokens).await;
-                });
-            } else {
-                // Runtime not available (e.g., during shutdown)
-                // Tokens will be lost, but this is acceptable during shutdown
-                warn!(
-                    "TokenGuardBody: Cannot return {} tokens - no Tokio runtime available",
-                    tokens
-                );
-            }
+            // Use lock-free sync return - no runtime needed, guaranteed token return
+            bucket.return_tokens_sync(self.tokens);
         }
     }
 }
@@ -156,7 +150,7 @@ pub async fn auth_middleware(
 /// Alphanumeric characters for request ID generation (as bytes for O(1) indexing)
 const REQUEST_ID_CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
 
-/// Generate OpenAI-compatible request ID based on endpoint
+/// Generate OpenAI-compatible request ID based on endpoint.
 fn generate_request_id(path: &str) -> String {
     let prefix = if path.contains("/chat/completions") {
         "chatcmpl-"
@@ -280,7 +274,7 @@ impl<B> MakeSpan<B> for RequestSpan {
         // Don't try to extract request ID here - it won't be available yet
         // The RequestIdLayer runs after TraceLayer creates the span
         info_span!(
-            target: "sgl_model_gateway::otel-trace",
+            target: "smg::otel-trace",
             "http_request",
             method = %request.method(),
             uri = %request.uri(),
@@ -289,7 +283,7 @@ impl<B> MakeSpan<B> for RequestSpan {
             status_code = Empty,
             latency = Empty,
             error = Empty,
-            module = "sgl_model_gateway"
+            module = "smg"
         )
     }
 }
@@ -314,7 +308,7 @@ impl<B> OnRequest<B> for RequestLogger {
 
         // Log the request start
         info!(
-            target: "sgl_model_gateway::request",
+            target: "smg::request",
             "started processing request"
         );
     }
@@ -353,17 +347,17 @@ impl<B> OnResponse<B> for ResponseLogger {
         let _enter = span.enter();
         if status.is_server_error() {
             error!(
-                target: "sgl_model_gateway::response",
+                target: "smg::response",
                 "request failed with server error"
             );
         } else if status.is_client_error() {
             warn!(
-                target: "sgl_model_gateway::response",
+                target: "smg::response",
                 "request failed with client error"
             );
         } else {
             info!(
-                target: "sgl_model_gateway::response",
+                target: "smg::response",
                 "finished processing request"
             );
         }
@@ -501,6 +495,27 @@ pub async fn concurrency_limit_middleware(
     request: Request<Body>,
     next: Next,
 ) -> Response {
+    // Check mesh global rate limit first if mesh is enabled
+    // If mesh is not enabled, this check is skipped and local rate limiting is used
+    if let Some(sync_manager) = &app_state.mesh_sync_manager {
+        let (is_exceeded, current_count, limit) = sync_manager.check_global_rate_limit();
+        if is_exceeded {
+            debug!(
+                "Global rate limit exceeded: {}/{} req/s",
+                current_count, limit
+            );
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(json!({
+                    "error": "Rate limit exceeded",
+                    "current_count": current_count,
+                    "limit": limit
+                })),
+            )
+                .into_response();
+        }
+    }
+
     let token_bucket = match &app_state.context.rate_limiter {
         Some(bucket) => bucket.clone(),
         None => {
@@ -607,12 +622,14 @@ pub async fn concurrency_limit_middleware(
 static ACTIVE_HTTP_CONNECTIONS: AtomicU64 = AtomicU64::new(0);
 
 /// Tower Layer for HTTP metrics collection (SMG Layer 1 metrics)
-#[derive(Clone, Copy, Default)]
-pub struct HttpMetricsLayer;
+#[derive(Clone)]
+pub struct HttpMetricsLayer {
+    tracker: Arc<InFlightRequestTracker>,
+}
 
 impl HttpMetricsLayer {
-    pub fn new() -> Self {
-        Self
+    pub fn new(tracker: Arc<InFlightRequestTracker>) -> Self {
+        Self { tracker }
     }
 }
 
@@ -620,7 +637,10 @@ impl<S> Layer<S> for HttpMetricsLayer {
     type Service = HttpMetricsMiddleware<S>;
 
     fn layer(&self, inner: S) -> Self::Service {
-        HttpMetricsMiddleware { inner }
+        HttpMetricsMiddleware {
+            inner,
+            in_flight_request_tracker: self.tracker.clone(),
+        }
     }
 }
 
@@ -628,6 +648,7 @@ impl<S> Layer<S> for HttpMetricsLayer {
 #[derive(Clone)]
 pub struct HttpMetricsMiddleware<S> {
     inner: S,
+    in_flight_request_tracker: Arc<InFlightRequestTracker>,
 }
 
 impl<S> Service<Request> for HttpMetricsMiddleware<S>
@@ -651,14 +672,19 @@ where
         let start = Instant::now();
 
         let mut inner = self.inner.clone();
+        let in_flight_request_tracker = self.in_flight_request_tracker.clone();
 
         Box::pin(async move {
             // Increment inside async block - ensures no leak if future is dropped before polling
             let active = ACTIVE_HTTP_CONNECTIONS.fetch_add(1, Ordering::Relaxed) + 1;
             Metrics::set_http_connections_active(active as usize);
 
+            let guard = in_flight_request_tracker.track();
+
             // Capture result before decrementing to ensure decrement happens on error too
             let result = inner.call(req).await;
+
+            drop(guard);
 
             // Always decrement, regardless of success or failure
             let active = ACTIVE_HTTP_CONNECTIONS.fetch_sub(1, Ordering::Relaxed) - 1;
@@ -770,95 +796,91 @@ pub async fn wasm_middleware(
             }
         };
 
-    // Extract request body once before processing modules
-    let method = request.method().clone();
-    let uri = request.uri().clone();
-    let mut headers = request.headers().clone();
-    let max_body_size = wasm_manager.get_max_body_size();
-    let body_bytes = match axum::body::to_bytes(request.into_body(), max_body_size).await {
-        Ok(bytes) => bytes.to_vec(),
-        Err(e) => {
-            error!("Failed to read request body: {}", e);
-            // Create a minimal request with empty body for error recovery
-            let error_request = Request::builder()
-                .uri(uri)
-                .body(Body::empty())
-                .unwrap_or_else(|_| Request::new(Body::empty()));
-            return Ok(next.run(error_request).await);
-        }
-    };
-
-    // Process each OnRequest module
-    let mut modified_body = body_bytes;
-
-    // Pre-compute strings once before the loop to avoid repeated allocations
-    let method_str = method.to_string();
-    let path_str = uri.path().to_string();
-    let query_str = uri.query().unwrap_or("").to_string();
-
-    for module in modules_on_request {
-        // Build WebAssembly request from collected data
-        let wasm_headers = build_wasm_headers_from_axum_headers(&headers);
-        let wasm_request = WasmRequest {
-            method: method_str.clone(),
-            path: path_str.clone(),
-            query: query_str.clone(),
-            headers: wasm_headers,
-            body: modified_body.clone(),
-            request_id: request_id.clone(),
-            now_epoch_ms: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_else(|_| {
-                    // Fallback to 0 if system time is before UNIX_EPOCH
-                    // This should never happen in practice, but provides a safe fallback
-                    Duration::from_millis(0)
-                })
-                .as_millis() as u64,
+    let response = if modules_on_request.is_empty() {
+        next.run(request).await
+    } else {
+        // Extract request body once before processing modules
+        let method = request.method().clone();
+        let uri = request.uri().clone();
+        let mut headers = request.headers().clone();
+        let max_body_size = wasm_manager.get_max_body_size();
+        let body_bytes = match axum::body::to_bytes(request.into_body(), max_body_size).await {
+            Ok(bytes) => bytes.to_vec(),
+            Err(e) => {
+                error!("Failed to read request body: {}", e);
+                // Create a minimal request with empty body for error recovery
+                let error_request = Request::builder()
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap_or_else(|_| Request::new(Body::empty()));
+                return Ok(next.run(error_request).await);
+            }
         };
 
-        // Execute WASM component
-        let action = match wasm_manager
-            .execute_module_for_attach_point(
-                &module,
-                on_request_attach_point.clone(),
-                WasmComponentInput::MiddlewareRequest(wasm_request),
-            )
-            .await
-        {
-            Some(action) => action,
-            None => continue, // Continue to next module on error
-        };
+        // Process each OnRequest module
+        let mut modified_body = body_bytes;
 
-        // Process action
-        match action {
-            Action::Continue => {
-                // Continue to next module or request processing
-            }
-            Action::Reject(status) => {
-                // Immediately reject the request
-                return Err(StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST));
-            }
-            Action::Modify(modify) => {
-                // Apply modifications to headers and body
-                apply_modify_action_to_headers(&mut headers, &modify);
-                // Apply body_replace
-                if let Some(body_bytes) = modify.body_replace {
-                    modified_body = body_bytes;
+        // Pre-compute strings once before the loop to avoid repeated allocations
+        let method_str = method.to_string();
+        let path_str = uri.path().to_string();
+        let query_str = uri.query().unwrap_or("").to_string();
+
+        for module in modules_on_request {
+            // Build WebAssembly request from collected data
+            let wasm_headers = build_wasm_headers_from_axum_headers(&headers);
+            let wasm_request = WasmRequest {
+                method: method_str.clone(),
+                path: path_str.clone(),
+                query: query_str.clone(),
+                headers: wasm_headers,
+                body: modified_body.clone(),
+                request_id: request_id.clone(),
+                now_epoch_ms: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_else(|_| Duration::from_millis(0))
+                    .as_millis() as u64,
+            };
+
+            // Execute WASM component
+            let action = match wasm_manager
+                .execute_module_for_attach_point(
+                    &module,
+                    on_request_attach_point.clone(),
+                    WasmComponentInput::MiddlewareRequest(wasm_request),
+                )
+                .await
+            {
+                Some(action) => action,
+                None => continue, // Continue to next module on error
+            };
+
+            // Process action
+            match action {
+                Action::Continue => {}
+                Action::Reject(status) => {
+                    return Err(StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST));
+                }
+                Action::Modify(modify) => {
+                    // Apply modifications to headers and body
+                    apply_modify_action_to_headers(&mut headers, &modify);
+                    if let Some(body_bytes) = modify.body_replace {
+                        modified_body = body_bytes;
+                    }
                 }
             }
         }
-    }
 
-    // Reconstruct request with modifications
-    let mut final_request = Request::builder()
-        .method(method)
-        .uri(uri)
-        .body(Body::from(modified_body))
-        .unwrap_or_else(|_| Request::new(Body::empty()));
-    *final_request.headers_mut() = headers;
+        // Reconstruct request with modifications
+        let mut final_request = Request::builder()
+            .method(method)
+            .uri(uri)
+            .body(Body::from(modified_body))
+            .unwrap_or_else(|_| Request::new(Body::empty()));
+        *final_request.headers_mut() = headers;
 
-    // Continue with request processing
-    let response = next.run(final_request).await;
+        // Continue with request processing
+        next.run(final_request).await
+    };
 
     // ===== OnResponse Phase =====
     let on_response_attach_point =
@@ -872,10 +894,13 @@ pub async fn wasm_middleware(
                 return Ok(response);
             }
         };
-
+    if modules_on_response.is_empty() {
+        return Ok(response);
+    }
     // Extract response data once before processing modules
     let mut status = response.status();
     let mut headers = response.headers().clone();
+    let max_body_size = wasm_manager.get_max_body_size();
     let mut body_bytes = match axum::body::to_bytes(response.into_body(), max_body_size).await {
         Ok(bytes) => bytes.to_vec(),
         Err(e) => {

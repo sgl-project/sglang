@@ -25,6 +25,7 @@ class LoRAModelCase:
     decode_tolerance: float = 1e-1
     rouge_l_tolerance: float = 1.0
     max_loras_per_batch: int = 1
+    max_loaded_loras: Optional[int] = None
     skip_long_prompt: bool = False
 
     def __post_init__(self):
@@ -95,6 +96,7 @@ CI_MULTI_LORA_MODELS = [
             ),
         ],
         max_loras_per_batch=2,
+        max_loaded_loras=4,
     ),
 ]
 
@@ -109,6 +111,23 @@ ALL_OTHER_MULTI_LORA_MODELS = [
             LoRAAdaptor(
                 name="Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16",
                 prefill_tolerance=1e-1,
+            ),
+        ],
+        max_loras_per_batch=2,
+    ),
+]
+
+LORA_MODELS_QWEN3 = [
+    LoRAModelCase(
+        base="Qwen/Qwen3-4B",
+        adaptors=[
+            LoRAAdaptor(
+                name="nissenj/Qwen3-4B-lora-v2",
+                prefill_tolerance=3e-1,
+            ),
+            LoRAAdaptor(
+                name="y9760210/Qwen3-4B-lora_model",
+                prefill_tolerance=3e-1,
             ),
         ],
         max_loras_per_batch=2,
@@ -267,6 +286,7 @@ def run_lora_test_one_by_one(
     torch_dtype: torch.dtype,
     max_new_tokens: int,
     backend: str = "csgmv",
+    enable_lora_overlap_loading: Optional[bool] = None,
     disable_cuda_graph: bool = False,
     disable_radix_cache: bool = False,
     mem_fraction_static: float = 0.88,
@@ -313,7 +333,9 @@ def run_lora_test_one_by_one(
         lora_paths=[
             adaptor.name for adaptor in model_case.adaptors if adaptor.name is not None
         ],
+        enable_lora_overlap_loading=enable_lora_overlap_loading,
         max_loras_per_batch=model_case.max_loras_per_batch,
+        max_loaded_loras=model_case.max_loaded_loras,
         lora_backend=backend,
         disable_cuda_graph=disable_cuda_graph,
         disable_radix_cache=disable_radix_cache,
@@ -461,6 +483,7 @@ def run_lora_test_by_batch(
             adaptor.name for adaptor in model_case.adaptors if adaptor.name is not None
         ],
         max_loras_per_batch=model_case.max_loras_per_batch,
+        max_loaded_loras=model_case.max_loaded_loras,
         lora_backend=backend,
         disable_cuda_graph=disable_cuda_graph,
         disable_radix_cache=disable_radix_cache,
@@ -651,6 +674,7 @@ def run_lora_multiple_batch_on_model_cases(
                 model_type="generation",
                 lora_paths=[lora_adapter_paths[0], lora_adapter_paths[1]],
                 max_loras_per_batch=len(lora_adapter_paths) + 1,
+                max_loaded_loras=model_case.max_loaded_loras,
                 sleep_on_idle=True,  # Eliminate non-determinism by forcing all requests to be processed in one batch.
                 attention_backend=attention_backend,
                 enable_deterministic_inference=enable_deterministic_inference,
@@ -702,3 +726,112 @@ def run_lora_multiple_batch_on_model_cases(
                             )
 
                     print(f"--- Batch {i+1} Comparison Passed --- ")
+
+
+def run_lora_batch_splitting_equivalence_test(
+    model_cases: List[LoRAModelCase],
+    attention_backend: str = "torch_native",
+    disable_cuda_graph: bool = True,
+    disable_radix_cache: bool = True,
+):
+    """
+    Test that SRT correctly handles batch splitting with multiple LoRA adapters.
+
+    When the number of distinct adapters (including None for base model) exceeds
+    max_loras_per_batch, SRT internally splits requests into microbatches.
+
+    This test validates:
+    1. SRT can process batches that trigger internal splitting without errors
+    2. Different adapters don't produce all identical outputs (i.e., at least one
+       output differs, indicating adapters are being applied correctly)
+
+    Args:
+        model_cases: List of LoRAModelCase configurations to test
+        attention_backend: Attention backend to use
+        disable_cuda_graph: Whether to disable CUDA graph
+        disable_radix_cache: Whether to disable radix cache
+    """
+    max_loras_per_batch = 2
+
+    def _run_test(model_case: LoRAModelCase, torch_dtype: torch.dtype):
+        lora_adapter_paths = [a.name for a in model_case.adaptors]
+        assert (
+            len(lora_adapter_paths) >= max_loras_per_batch
+        ), f"Need at least {max_loras_per_batch} adapters for this test"
+
+        max_new_tokens = 64
+        base_path = model_case.base
+
+        print(
+            f"\n========== Testing batch splitting on base '{base_path}', "
+            f"dtype={torch_dtype} =========="
+        )
+
+        prompts = [TEST_MULTIPLE_BATCH_PROMPTS[0]] * 3
+        test_cases = [
+            (
+                prompts,
+                [None, lora_adapter_paths[0], lora_adapter_paths[1]],
+            ),
+            (
+                prompts,
+                [lora_adapter_paths[0], None, lora_adapter_paths[1]],
+            ),
+            (
+                prompts,
+                [lora_adapter_paths[0], lora_adapter_paths[1], None],
+            ),
+            (
+                prompts,
+                [None, lora_adapter_paths[1], None],
+            ),
+            (
+                prompts,
+                [lora_adapter_paths[0], lora_adapter_paths[1], lora_adapter_paths[0]],
+            ),
+            (
+                prompts,
+                [None, None, None],
+            ),
+        ]
+
+        ensure_reproducibility()
+        with SRTRunner(
+            base_path,
+            torch_dtype=torch_dtype,
+            model_type="generation",
+            lora_paths=lora_adapter_paths,
+            max_loras_per_batch=max_loras_per_batch,
+            max_loaded_loras=model_case.max_loaded_loras,
+            sleep_on_idle=True,
+            attention_backend=attention_backend,
+            disable_cuda_graph=disable_cuda_graph,
+            disable_radix_cache=disable_radix_cache,
+        ) as srt_runner:
+            for batch_idx, (batch_prompts, lora_paths) in enumerate(test_cases):
+                print(f"\n--- Batch {batch_idx + 1} ---")
+                print(f"  Adapters: {lora_paths}")
+
+                srt_outputs = srt_runner.batch_forward(
+                    batch_prompts,
+                    max_new_tokens=max_new_tokens,
+                    lora_paths=lora_paths,
+                )
+
+                # If different adapters are used in this batch, verify that not every
+                # output is identical (at least one should differ)
+                unique_adapters = set(lora_paths)
+                if len(unique_adapters) >= 2:
+                    all_outputs = [s.strip() for s in srt_outputs.output_strs]
+                    all_identical = all(out == all_outputs[0] for out in all_outputs)
+                    assert not all_identical, (
+                        f"Every output was identical despite using different adapters for "
+                        f"base '{base_path}', batch {batch_idx + 1}: "
+                        f"adapters={lora_paths}. Expected at least one output to differ."
+                    )
+
+                print(f"--- Batch {batch_idx + 1} passed ---")
+
+    for model_case in model_cases:
+        for torch_dtype in TORCH_DTYPES:
+            _run_test(model_case, torch_dtype)

@@ -1,5 +1,5 @@
 use pyo3::prelude::*;
-use sgl_model_gateway::*;
+use smg::*;
 use once_cell::sync::OnceCell;
 use std::collections::HashMap;
 
@@ -31,6 +31,7 @@ pub enum HistoryBackendType {
     None,
     Oracle,
     Postgres,
+    Redis,
 }
 
 #[pyclass(eq)]
@@ -272,6 +273,40 @@ impl PyOracleConfig {
 
 #[pyclass]
 #[derive(Debug, Clone, PartialEq)]
+pub struct PyRedisConfig {
+    #[pyo3(get, set)]
+    pub url: String,
+    #[pyo3(get, set)]
+    pub pool_max: usize,
+    #[pyo3(get, set)]
+    pub retention_days: Option<u64>,
+}
+
+#[pymethods]
+impl PyRedisConfig {
+    #[new]
+    #[pyo3(signature = (url, pool_max = 16, retention_days = Some(30)))]
+    fn new(url: String, pool_max: usize, retention_days: Option<u64>) -> PyResult<Self> {
+        Ok(PyRedisConfig {
+            url,
+            pool_max,
+            retention_days,
+        })
+    }
+}
+
+impl PyRedisConfig {
+    pub fn to_config_redis(&self) -> config::RedisConfig {
+        config::RedisConfig {
+            url: self.url.clone(),
+            pool_max: self.pool_max,
+            retention_days: self.retention_days,
+        }
+    }
+}
+
+#[pyclass]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PyPostgresConfig {
     #[pyo3(get, set)]
     pub db_url: Option<String>,
@@ -312,6 +347,8 @@ struct Router {
     balance_rel_threshold: f32,
     eviction_interval_secs: u64,
     max_tree_size: usize,
+    max_idle_secs: u64,
+    assignment_mode: String,
     max_payload_size: usize,
     dp_aware: bool,
     api_key: Option<String>,
@@ -354,6 +391,7 @@ struct Router {
     health_check_timeout_secs: u64,
     health_check_interval_secs: u64,
     health_check_endpoint: String,
+    disable_health_check: bool,
     enable_igw: bool,
     queue_size: usize,
     queue_timeout_secs: u64,
@@ -373,6 +411,7 @@ struct Router {
     history_backend: HistoryBackendType,
     oracle_config: Option<PyOracleConfig>,
     postgres_config: Option<PyPostgresConfig>,
+    redis_config: Option<PyRedisConfig>,
     client_cert_path: Option<String>,
     client_key_path: Option<String>,
     ca_cert_paths: Vec<String>,
@@ -417,7 +456,16 @@ impl Router {
                     balance_rel_threshold: self.balance_rel_threshold,
                     bucket_adjust_interval_secs: self.bucket_adjust_interval_secs,
                 },
-                PolicyType::Manual => ConfigPolicyConfig::Manual,
+                PolicyType::Manual => ConfigPolicyConfig::Manual {
+                    eviction_interval_secs: self.eviction_interval_secs,
+                    max_idle_secs: self.max_idle_secs,
+                    assignment_mode: match self.assignment_mode.as_str() {
+                        "random" => config::ManualAssignmentMode::Random,
+                        "min_load" => config::ManualAssignmentMode::MinLoad,
+                        "min_group" => config::ManualAssignmentMode::MinGroup,
+                        other => panic!("Unknown assignment mode: {}", other),
+                    },
+                },
                 PolicyType::ConsistentHashing => ConfigPolicyConfig::ConsistentHashing,
                 PolicyType::PrefixHash => ConfigPolicyConfig::PrefixHash {
                     prefix_token_count: 256,
@@ -459,6 +507,8 @@ impl Router {
                 prefill_selector: self.prefill_selector.clone(),
                 decode_selector: self.decode_selector.clone(),
                 bootstrap_port_annotation: self.bootstrap_port_annotation.clone(),
+                router_selector: HashMap::new(),
+                router_mesh_port_annotation: "sglang.ai/mesh-port".to_string(),
             })
         } else {
             None
@@ -482,6 +532,7 @@ impl Router {
             HistoryBackendType::None => config::HistoryBackend::None,
             HistoryBackendType::Oracle => config::HistoryBackend::Oracle,
             HistoryBackendType::Postgres => config::HistoryBackend::Postgres,
+            HistoryBackendType::Redis => config::HistoryBackend::Redis,
         };
 
         let oracle = if matches!(self.history_backend, HistoryBackendType::Oracle) {
@@ -496,6 +547,14 @@ impl Router {
             self.postgres_config
                 .as_ref()
                 .map(|cfg| cfg.to_config_postgres())
+        } else {
+            None
+        };
+
+        let redis_config = if matches!(self.history_backend, HistoryBackendType::Redis) {
+            self.redis_config
+                .as_ref()
+                .map(|cfg| cfg.to_config_redis())
         } else {
             None
         };
@@ -533,6 +592,7 @@ impl Router {
                 timeout_secs: self.health_check_timeout_secs,
                 check_interval_secs: self.health_check_interval_secs,
                 endpoint: self.health_check_endpoint.clone(),
+                disable_health_check: self.disable_health_check,
             })
             .tokenizer_cache(config::TokenizerCacheConfig {
                 enable_l0: self.tokenizer_cache_enable_l0,
@@ -554,6 +614,7 @@ impl Router {
             .maybe_chat_template(self.chat_template.as_ref())
             .maybe_oracle(oracle)
             .maybe_postgres(postgres_config)
+            .maybe_redis(redis_config)
             .maybe_reasoning_parser(self.reasoning_parser.as_ref())
             .maybe_tool_call_parser(self.tool_call_parser.as_ref())
             .maybe_mcp_config_path(self.mcp_config_path.as_ref())
@@ -589,6 +650,8 @@ impl Router {
         balance_rel_threshold = 1.5,
         eviction_interval_secs = 120,
         max_tree_size = 2usize.pow(26),
+        max_idle_secs = 14400,
+        assignment_mode = String::from("random"),
         max_payload_size = 512 * 1024 * 1024,
         dp_aware = false,
         api_key = None,
@@ -631,6 +694,7 @@ impl Router {
         health_check_timeout_secs = 5,
         health_check_interval_secs = 60,
         health_check_endpoint = String::from("/health"),
+        disable_health_check = false,
         enable_igw = false,
         queue_size = 100,
         queue_timeout_secs = 60,
@@ -649,6 +713,7 @@ impl Router {
         history_backend = HistoryBackendType::Memory,
         oracle_config = None,
         postgres_config = None,
+        redis_config = None,
         client_cert_path = None,
         client_key_path = None,
         ca_cert_paths = vec![],
@@ -671,6 +736,8 @@ impl Router {
         balance_rel_threshold: f32,
         eviction_interval_secs: u64,
         max_tree_size: usize,
+        max_idle_secs: u64,
+        assignment_mode: String,
         max_payload_size: usize,
         dp_aware: bool,
         api_key: Option<String>,
@@ -713,6 +780,7 @@ impl Router {
         health_check_timeout_secs: u64,
         health_check_interval_secs: u64,
         health_check_endpoint: String,
+        disable_health_check: bool,
         enable_igw: bool,
         queue_size: usize,
         queue_timeout_secs: u64,
@@ -731,6 +799,7 @@ impl Router {
         history_backend: HistoryBackendType,
         oracle_config: Option<PyOracleConfig>,
         postgres_config: Option<PyPostgresConfig>,
+        redis_config: Option<PyRedisConfig>,
         client_cert_path: Option<String>,
         client_key_path: Option<String>,
         ca_cert_paths: Vec<String>,
@@ -766,6 +835,8 @@ impl Router {
             balance_rel_threshold,
             eviction_interval_secs,
             max_tree_size,
+            max_idle_secs,
+            assignment_mode,
             max_payload_size,
             dp_aware,
             api_key,
@@ -808,6 +879,7 @@ impl Router {
             health_check_timeout_secs,
             health_check_interval_secs,
             health_check_endpoint,
+            disable_health_check,
             enable_igw,
             queue_size,
             queue_timeout_secs,
@@ -827,6 +899,7 @@ impl Router {
             history_backend,
             oracle_config,
             postgres_config,
+            redis_config,
             client_cert_path,
             client_key_path,
             ca_cert_paths,
@@ -863,6 +936,8 @@ impl Router {
                 prefill_selector: self.prefill_selector.clone(),
                 decode_selector: self.decode_selector.clone(),
                 bootstrap_port_annotation: self.bootstrap_port_annotation.clone(),
+                router_selector: HashMap::new(),
+                router_mesh_port_annotation: "sglang.ai/mesh-port".to_string(),
             })
         } else {
             None
@@ -897,6 +972,7 @@ impl Router {
                     .control_plane_auth
                     .as_ref()
                     .map(|c| c.to_auth_control_plane_config()),
+                mesh_server_config: None,
             })
             .await
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
@@ -939,6 +1015,7 @@ fn sglang_router_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyControlPlaneAuthConfig>()?;
     m.add_class::<PyOracleConfig>()?;
     m.add_class::<PyPostgresConfig>()?;
+    m.add_class::<PyRedisConfig>()?;
     m.add_class::<Router>()?;
     m.add_function(wrap_pyfunction!(get_version_string, m)?)?;
     m.add_function(wrap_pyfunction!(get_verbose_version_string, m)?)?;

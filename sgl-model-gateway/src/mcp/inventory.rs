@@ -8,21 +8,21 @@ use crate::mcp::config::{Prompt, RawResource, Tool};
 
 /// Cached tool with metadata
 #[derive(Clone)]
-pub struct CachedTool {
+pub(crate) struct CachedTool {
     pub server_name: String,
     pub tool: Tool,
 }
 
 /// Cached prompt with metadata
 #[derive(Clone)]
-pub struct CachedPrompt {
+pub(crate) struct CachedPrompt {
     pub server_name: String,
     pub prompt: Prompt,
 }
 
 /// Cached resource with metadata
 #[derive(Clone)]
-pub struct CachedResource {
+pub(crate) struct CachedResource {
     pub server_name: String,
     pub resource: RawResource,
 }

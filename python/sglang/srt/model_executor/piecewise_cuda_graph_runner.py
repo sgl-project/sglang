@@ -33,7 +33,6 @@ from sglang.srt.compilation.piecewise_context_manager import (
     set_forward_context,
     set_pcg_capture_stream,
 )
-from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
@@ -49,6 +48,7 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput
+from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -83,7 +83,7 @@ def freeze_gc(enable_cudagraph_gc: bool):
 
 def _to_torch(model: torch.nn.Module, reverse: bool, num_tokens: int):
     for sub in model._modules.values():
-        if isinstance(sub, CustomOp):
+        if isinstance(sub, MultiPlatformOp):
             if reverse:
                 sub.leave_torch_compile()
             else:
@@ -240,8 +240,11 @@ class PiecewiseCudaGraphRunner:
         set_graph_pool_id(get_global_graph_memory_pool())
 
         with enable_piecewise_cuda_graph():
+            language_model = getattr(
+                self.model_runner.model, "language_model", self.model_runner.model
+            )
             with patch_model(
-                self.model_runner.model.model, self.compile_config.compiler
+                language_model.model, self.compile_config.compiler
             ) as patched_model:
                 install_torch_compiled(
                     patched_model,
@@ -330,9 +333,9 @@ class PiecewiseCudaGraphRunner:
                 return_logprob=False,
                 extend_num_tokens=num_tokens,
                 extend_seq_lens=torch.tensor([num_tokens], device=self.device),
-                extend_prefix_lens=torch.tensor([num_tokens], device=self.device),
+                extend_prefix_lens=torch.tensor([0], device=self.device),
                 extend_start_loc=torch.tensor([0], device=self.device),
-                extend_prefix_lens_cpu=torch.tensor([num_tokens], device="cpu"),
+                extend_prefix_lens_cpu=torch.tensor([0], device="cpu"),
                 extend_seq_lens_cpu=torch.tensor([num_tokens], device="cpu"),
                 extend_logprob_start_lens_cpu=torch.tensor([num_tokens], device="cpu"),
                 positions=positions,
@@ -477,9 +480,9 @@ class PiecewiseCudaGraphRunner:
                 return_logprob=False,
                 extend_num_tokens=num_tokens,
                 extend_seq_lens=torch.tensor([num_tokens], device=self.device),
-                extend_prefix_lens=torch.tensor([num_tokens], device=self.device),
+                extend_prefix_lens=torch.tensor([0], device=self.device),
                 extend_start_loc=torch.tensor([0], device=self.device),
-                extend_prefix_lens_cpu=torch.tensor([num_tokens], device="cpu"),
+                extend_prefix_lens_cpu=torch.tensor([0], device="cpu"),
                 extend_seq_lens_cpu=torch.tensor([num_tokens], device="cpu"),
                 extend_logprob_start_lens_cpu=torch.tensor([num_tokens], device="cpu"),
                 positions=positions,

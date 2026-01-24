@@ -15,7 +15,7 @@
 
 import dataclasses
 import logging
-from typing import List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import triton
@@ -100,6 +100,9 @@ class LogitsProcessorOutput:
 
     ## Part 4: Diffusion LLM only.
     full_logits: Optional[torch.Tensor] = None
+
+    ## Part 5: Customized Info
+    customized_info: Optional[Dict[str, List[Any]]] = None
 
 
 @dataclasses.dataclass
@@ -763,14 +766,19 @@ class LogitsProcessor(nn.Module):
 
             # Compute the logprobs of the chunk
             chunk_input_logprobs = chunk_logits[chunk_indices]
+            # Only index per-token arrays when the corresponding feature is active.
+            # Otherwise these tensors can be per-sequence (or scalars), which can
+            # cause out-of-bounds indexing on GPU.
             chunk_temperature = (
                 logits_metadata.temperature[global_indices]
-                if logits_metadata.temperature is not None
+                if logits_metadata.temp_scaled_logprobs
+                and logits_metadata.temperature is not None
                 else None
             )
             chunk_top_p = (
                 logits_metadata.top_p[global_indices]
-                if logits_metadata.top_p is not None
+                if logits_metadata.top_p_normalized_logprobs
+                and logits_metadata.top_p is not None
                 else None
             )
             chunk_input_logprobs = compute_temp_top_p_normalized_logprobs(

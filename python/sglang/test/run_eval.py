@@ -22,6 +22,7 @@ def get_thinking_kwargs(args):
         if thinking_mode == "deepseek-v3":
             thinking_param = "thinking"
         else:
+            # Qwen3
             thinking_param = "enable_thinking"
         return {
             "chat_template_kwargs": {thinking_param: True},
@@ -36,6 +37,7 @@ def run_eval_once(args, base_url: str, eval_obj: Eval) -> dict:
     sampler = ChatCompletionSampler(
         model=args.model,
         max_tokens=getattr(args, "max_tokens", 2048),
+        top_p=getattr(args, "top_p", 1.0),
         base_url=base_url,
         temperature=getattr(args, "temperature", 0.0),
         reasoning_effort=getattr(args, "reasoning_effort", None),
@@ -51,6 +53,9 @@ def run_eval_once(args, base_url: str, eval_obj: Eval) -> dict:
 
 
 def run_eval(args):
+    # Lazy import to avoid circular dependency with test_utils
+    from sglang.test.test_utils import dump_metric
+
     set_ulimit()
 
     if "OPENAI_API_KEY" not in os.environ:
@@ -124,6 +129,15 @@ def run_eval(args):
         from sglang.test.simple_eval_aime25 import AIME25Eval
 
         eval_obj = AIME25Eval(args.num_examples, args.num_threads)
+    elif args.eval_name == "gsm8k":
+        from sglang.test.simple_eval_gsm8k import GSM8KEval
+
+        eval_obj = GSM8KEval(
+            num_examples=args.num_examples,
+            num_threads=args.num_threads,
+            num_shots=getattr(args, "num_shots", 5),
+            data_path=getattr(args, "gsm8k_data_path", None),
+        )
     else:
         raise ValueError(f"Invalid eval name: {args.eval_name}")
 
@@ -132,6 +146,18 @@ def run_eval(args):
         metrics = result.metrics | {"score": result.score}
         print(f"Total latency: {latency:.3f} s")
         print(f"Score: {metrics['score']:.3f}")
+
+        # Report metrics to unified collection framework
+        dump_metric(
+            f"{args.eval_name}_score",
+            metrics["score"],
+            labels={"model": sampler.model, "eval": args.eval_name},
+        )
+        dump_metric(
+            f"{args.eval_name}_latency",
+            latency,
+            labels={"model": sampler.model, "eval": args.eval_name},
+        )
     else:
         from concurrent.futures import ThreadPoolExecutor
 
@@ -157,6 +183,17 @@ def run_eval(args):
         metrics = result.metrics | {"scores": scores_repeat}
         metrics = metrics | {"mean_score": mean_score}
 
+        # Report metrics to unified collection framework
+        dump_metric(
+            f"{args.eval_name}_mean_score",
+            mean_score,
+            labels={
+                "model": sampler.model,
+                "eval": args.eval_name,
+                "repeat": args.repeat,
+            },
+        )
+
         executor.shutdown()
 
     # Dump reports
@@ -176,7 +213,7 @@ def run_eval(args):
     return metrics
 
 
-THINKING_MODE_CHOICES = ["deepseek-r1", "deepseek-v3", "qwen3"]
+THINKING_MODE_CHOICES = ["deepseek-v3", "qwen3"]
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -207,13 +244,14 @@ if __name__ == "__main__":
     parser.add_argument("--num-threads", type=int, default=512)
     parser.add_argument("--max-tokens", type=int, default=2048)
     parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument("--reasoning-effort", type=str)
     parser.add_argument(
         "--thinking-mode",
         default=None,
         type=str,
         choices=THINKING_MODE_CHOICES,
-        help="Enable thinking mode in Deepseek R1, V3.1/3.2, or Qwen3",
+        help="Enable thinking mode in Deepseek V3.1/3.2, or Qwen3.--reasoning-parser must be set when launching the server.",
     )
 
     # LongBench-v2 specific arguments
@@ -238,6 +276,18 @@ if __name__ == "__main__":
         "--min-context-length",
         type=int,
         help="Minimum context length in characters for LongBench-v2",
+    )
+    parser.add_argument(
+        "--num-shots",
+        type=int,
+        default=5,
+        help="Number of few-shot examples for GSM8K (default: 5)",
+    )
+    parser.add_argument(
+        "--gsm8k-data-path",
+        type=str,
+        default=None,
+        help="Path to GSM8K data file (e.g., test.jsonl)",
     )
 
     args = parser.parse_args()

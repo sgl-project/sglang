@@ -54,6 +54,7 @@ class _WatchdogReal(Watchdog):
         self._counter = 0
         self._active = True
         self._test_stuck_time = test_stuck_time
+        self._test_stuck_triggered = False
         self._raw = WatchdogRaw(
             debug_name=debug_name,
             get_counter=lambda: self._counter,
@@ -68,7 +69,10 @@ class _WatchdogReal(Watchdog):
             )
 
     def feed(self):
-        if self._test_stuck_time > 0:
+        # Only trigger the test stuck behavior once to avoid blocking server
+        # startup health checks while still testing watchdog timeout detection
+        if self._test_stuck_time > 0 and not self._test_stuck_triggered:
+            self._test_stuck_triggered = True
             logger.info(
                 f"Watchdog {self._raw.debug_name} start deliberately stuck for {self._test_stuck_time}s"
             )

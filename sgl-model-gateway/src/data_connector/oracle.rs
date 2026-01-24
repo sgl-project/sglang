@@ -232,7 +232,7 @@ impl Manager for OracleConnectionManager {
 // ============================================================================
 
 #[derive(Clone)]
-pub struct OracleConversationStorage {
+pub(super) struct OracleConversationStorage {
     store: OracleStore,
 }
 
@@ -420,7 +420,7 @@ impl ConversationStorage for OracleConversationStorage {
 // ============================================================================
 
 #[derive(Clone)]
-pub struct OracleConversationItemStorage {
+pub(super) struct OracleConversationItemStorage {
     store: OracleStore,
 }
 
@@ -775,7 +775,7 @@ const SELECT_BASE: &str = "SELECT id, previous_response_id, input, instructions,
     tool_calls, metadata, created_at, safety_identifier, model, conversation_id, raw_response FROM responses";
 
 #[derive(Clone)]
-pub struct OracleResponseStorage {
+pub(super) struct OracleResponseStorage {
     store: OracleStore,
 }
 

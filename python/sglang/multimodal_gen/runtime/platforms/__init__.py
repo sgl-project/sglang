@@ -101,11 +101,31 @@ def rocm_platform_plugin() -> str | None:
     )
 
 
+def musa_platform_plugin() -> str | None:
+    is_musa = False
+
+    try:
+        import pymtml
+
+        pymtml.mtmlLibraryInit()
+        try:
+            is_musa = pymtml.mtmlLibraryCountDevice() > 0
+        finally:
+            pymtml.mtmlLibraryShutDown()
+    except Exception as e:
+        logger.info("MUSA platform is unavailable: %s", e)
+
+    return (
+        "sglang.multimodal_gen.runtime.platforms.musa.MusaPlatform" if is_musa else None
+    )
+
+
 builtin_platform_plugins = {
     "cuda": cuda_platform_plugin,
     "rocm": rocm_platform_plugin,
     "mps": mps_platform_plugin,
     "cpu": cpu_platform_plugin,
+    "musa": musa_platform_plugin,
 }
 
 
@@ -125,6 +145,11 @@ def resolve_current_platform_cls_qualname() -> str:
 
     # Fall back to CUDA
     platform_cls_qualname = cuda_platform_plugin()
+    if platform_cls_qualname is not None:
+        return platform_cls_qualname
+
+    # Fall back to MUSA
+    platform_cls_qualname = musa_platform_plugin()
     if platform_cls_qualname is not None:
         return platform_cls_qualname
 

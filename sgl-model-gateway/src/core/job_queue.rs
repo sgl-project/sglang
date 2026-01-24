@@ -17,12 +17,16 @@ use crate::{
     app_context::AppContext,
     config::{RouterConfig, RoutingMode},
     core::steps::{
+        create_external_worker_workflow_data, create_local_worker_workflow_data,
+        create_mcp_workflow_data, create_tokenizer_workflow_data,
+        create_wasm_registration_workflow_data, create_wasm_removal_workflow_data,
+        create_worker_removal_workflow_data, create_worker_update_workflow_data,
         McpServerConfigRequest, TokenizerConfigRequest, TokenizerRemovalRequest,
-        WasmModuleConfigRequest, WasmModuleRemovalRequest, WorkerRemovalRequest,
+        WasmModuleConfigRequest, WasmModuleRemovalRequest,
     },
     mcp::McpConfig,
     protocols::worker_spec::{JobStatus, WorkerConfigRequest, WorkerUpdateRequest},
-    workflow::{WorkflowContext, WorkflowEngine, WorkflowId, WorkflowInstanceId, WorkflowStatus},
+    workflow::WorkflowId,
 };
 
 /// Job types for control plane operations
@@ -331,37 +335,93 @@ impl JobQueue {
     async fn execute_job(job: &Job, context: &Arc<AppContext>) -> Result<String, String> {
         match job {
             Job::AddWorker { config } => {
-                let engine = context
-                    .workflow_engine
+                let engines = context
+                    .workflow_engines
                     .get()
-                    .ok_or_else(|| "Workflow engine not initialized".to_string())?;
-
-                let instance_id = Self::start_worker_workflow(engine, config, context).await?;
-
-                debug!(
-                    "Started worker registration workflow for {} (instance: {})",
-                    config.url, instance_id
-                );
+                    .ok_or_else(|| "Workflow engines not initialized".to_string())?;
 
                 let timeout_duration =
                     Duration::from_secs(context.router_config.worker_startup_timeout_secs + 30);
 
-                Self::wait_for_workflow_completion(
-                    engine,
-                    instance_id,
-                    &config.url,
-                    timeout_duration,
-                )
-                .await
+                // Select workflow based on runtime field
+                match config.runtime.as_deref() {
+                    Some("external") => {
+                        let workflow_data = create_external_worker_workflow_data(
+                            (**config).clone(),
+                            Arc::clone(context),
+                        );
+                        let instance_id = engines
+                            .external_worker
+                            .start_workflow(
+                                WorkflowId::new("external_worker_registration"),
+                                workflow_data,
+                            )
+                            .await
+                            .map_err(|e| {
+                                format!(
+                                    "Failed to start external worker registration workflow: {:?}",
+                                    e
+                                )
+                            })?;
+
+                        debug!(
+                            "Started external worker registration workflow for {} (instance: {})",
+                            config.url, instance_id
+                        );
+
+                        engines
+                            .external_worker
+                            .wait_for_completion(instance_id, &config.url, timeout_duration)
+                            .await
+                    }
+                    _ => {
+                        let workflow_data = create_local_worker_workflow_data(
+                            (**config).clone(),
+                            Arc::clone(context),
+                        );
+                        let instance_id = engines
+                            .local_worker
+                            .start_workflow(
+                                WorkflowId::new("local_worker_registration"),
+                                workflow_data,
+                            )
+                            .await
+                            .map_err(|e| {
+                                format!(
+                                    "Failed to start local worker registration workflow: {:?}",
+                                    e
+                                )
+                            })?;
+
+                        debug!(
+                            "Started local worker registration workflow for {} (instance: {})",
+                            config.url, instance_id
+                        );
+
+                        engines
+                            .local_worker
+                            .wait_for_completion(instance_id, &config.url, timeout_duration)
+                            .await
+                    }
+                }
             }
             Job::UpdateWorker { url, update } => {
-                let engine = context
-                    .workflow_engine
+                let engines = context
+                    .workflow_engines
                     .get()
-                    .ok_or_else(|| "Workflow engine not initialized".to_string())?;
+                    .ok_or_else(|| "Workflow engines not initialized".to_string())?;
 
-                let instance_id =
-                    Self::start_worker_update_workflow(engine, url, update, context).await?;
+                let workflow_data = create_worker_update_workflow_data(
+                    url.to_string(),
+                    (**update).clone(),
+                    Arc::clone(context),
+                );
+
+                let instance_id = engines
+                    .worker_update
+                    .start_workflow(WorkflowId::new("worker_update"), workflow_data)
+                    .await
+                    .map_err(|e| format!("Failed to start worker update workflow: {:?}", e))?;
 
                 debug!(
                     "Started worker update workflow for {} (instance: {})",
@@ -370,15 +430,28 @@ impl JobQueue {
 
                 let timeout_duration = Duration::from_secs(30);
 
-                Self::wait_for_workflow_completion(engine, instance_id, url, timeout_duration).await
+                engines
+                    .worker_update
+                    .wait_for_completion(instance_id, url, timeout_duration)
+                    .await
             }
             Job::RemoveWorker { url } => {
-                let engine = context
-                    .workflow_engine
+                let engines = context
+                    .workflow_engines
                     .get()
-                    .ok_or_else(|| "Workflow engine not initialized".to_string())?;
+                    .ok_or_else(|| "Workflow engines not initialized".to_string())?;
 
-                let instance_id = Self::start_worker_removal_workflow(engine, url, context).await?;
+                let workflow_data = create_worker_removal_workflow_data(
+                    url.to_string(),
+                    context.router_config.dp_aware,
+                    Arc::clone(context),
+                );
+
+                let instance_id = engines
+                    .worker_removal
+                    .start_workflow(WorkflowId::new("worker_removal"), workflow_data)
+                    .await
+                    .map_err(|e| format!("Failed to start worker removal workflow: {:?}", e))?;
 
                 debug!(
                     "Started worker removal workflow for {} (instance: {})",
@@ -387,9 +460,10 @@ impl JobQueue {
 
                 let timeout_duration = Duration::from_secs(30);
 
-                let result =
-                    Self::wait_for_workflow_completion(engine, instance_id, url, timeout_duration)
-                        .await;
+                let result = engines
+                    .worker_removal
+                    .wait_for_completion(instance_id, url, timeout_duration)
+                    .await;
 
                 // Clean up job status when removing worker
                 if let Some(queue) = context.worker_job_queue.get() {
@@ -399,22 +473,17 @@ impl JobQueue {
                 result
             }
             Job::AddWasmModule { config } => {
-                let engine = context
-                    .workflow_engine
+                let engines = context
+                    .workflow_engines
                     .get()
-                    .ok_or_else(|| "Workflow engine not initialized".to_string())?;
+                    .ok_or_else(|| "Workflow engines not initialized".to_string())?;
 
-                let mut workflow_context = WorkflowContext::new(WorkflowInstanceId::new());
-                // Convert Box to Arc for context storage
-                let config_arc: Arc<WasmModuleConfigRequest> = Arc::new(*config.clone());
-                workflow_context.set_arc("wasm_module_config", config_arc);
-                workflow_context.set_arc("app_context", Arc::clone(context));
+                let workflow_data =
+                    create_wasm_registration_workflow_data(*config.clone(), Arc::clone(context));
 
-                let instance_id = engine
-                    .start_workflow(
-                        WorkflowId::new("wasm_module_registration"),
-                        workflow_context,
-                    )
+                let instance_id = engines
+                    .wasm_registration
+                    .start_workflow(WorkflowId::new("wasm_module_registration"), workflow_data)
                     .await
                     .map_err(|e| {
                         format!("Failed to start WASM module registration workflow: {:?}", e)
@@ -427,28 +496,23 @@ impl JobQueue {
 
                 let timeout_duration = Duration::from_secs(300); // 5 minutes
 
-                Self::wait_for_workflow_completion(
-                    engine,
-                    instance_id,
-                    &config.descriptor.name,
-                    timeout_duration,
-                )
-                .await
+                engines
+                    .wasm_registration
+                    .wait_for_completion(instance_id, &config.descriptor.name, timeout_duration)
+                    .await
             }
             Job::RemoveWasmModule { request } => {
-                let engine = context
-                    .workflow_engine
+                let engines = context
+                    .workflow_engines
                     .get()
-                    .ok_or_else(|| "Workflow engine not initialized".to_string())?;
+                    .ok_or_else(|| "Workflow engines not initialized".to_string())?;
 
-                let mut workflow_context = WorkflowContext::new(WorkflowInstanceId::new());
-                // Convert Box to Arc for context storage
-                let request_arc: Arc<WasmModuleRemovalRequest> = Arc::new(*request.clone());
-                workflow_context.set_arc("wasm_module_removal_request", request_arc);
-                workflow_context.set_arc("app_context", Arc::clone(context));
+                let workflow_data =
+                    create_wasm_removal_workflow_data(*request.clone(), Arc::clone(context));
 
-                let instance_id = engine
-                    .start_workflow(WorkflowId::new("wasm_module_removal"), workflow_context)
+                let instance_id = engines
+                    .wasm_removal
+                    .start_workflow(WorkflowId::new("wasm_module_removal"), workflow_data)
                     .await
                     .map_err(|e| {
                         format!("Failed to start WASM module removal workflow: {:?}", e)
@@ -461,13 +525,14 @@ impl JobQueue {
 
                 let timeout_duration = Duration::from_secs(60); // 1 minute
 
-                Self::wait_for_workflow_completion(
-                    engine,
-                    instance_id,
-                    &request.module_uuid.to_string(),
-                    timeout_duration,
-                )
-                .await
+                engines
+                    .wasm_removal
+                    .wait_for_completion(
+                        instance_id,
+                        &request.module_uuid.to_string(),
+                        timeout_duration,
+                    )
+                    .await
             }
             Job::InitializeWorkersFromConfig { router_config } => {
                 let api_key = router_config.api_key.clone();
@@ -513,7 +578,7 @@ impl JobQueue {
                                 tokenizer_path: None,
                                 reasoning_parser: None,
                                 tool_parser: None,
-                                chat_template: None,
+                                chat_template: router_config.chat_template.clone(),
                                 bootstrap_port: None,
                                 health_check_timeout_secs: router_config.health_check.timeout_secs,
                                 health_check_interval_secs: router_config
@@ -525,6 +590,9 @@ impl JobQueue {
                                 health_failure_threshold: router_config
                                     .health_check
                                     .failure_threshold,
+                                disable_health_check: router_config
+                                    .health_check
+                                    .disable_health_check,
                                 max_connection_attempts: router_config
                                     .health_check
                                     .success_threshold
@@ -581,12 +649,13 @@ impl JobQueue {
                         tokenizer_path: None,
                         reasoning_parser: None,
                         tool_parser: None,
-                        chat_template: None,
+                        chat_template: router_config.chat_template.clone(),
                         bootstrap_port,
                         health_check_timeout_secs: router_config.health_check.timeout_secs,
                         health_check_interval_secs: router_config.health_check.check_interval_secs,
                         health_success_threshold: router_config.health_check.success_threshold,
                         health_failure_threshold: router_config.health_check.failure_threshold,
+                        disable_health_check: router_config.health_check.disable_health_check,
                         max_connection_attempts: router_config.health_check.success_threshold * 10,
                         dp_aware: router_config.dp_aware,
                     };
@@ -645,13 +714,19 @@ impl JobQueue {
                 Ok(format!("Submitted {} RegisterMcpServer jobs", server_count))
             }
             Job::RegisterMcpServer { config } => {
-                let engine = context
-                    .workflow_engine
+                let engines = context
+                    .workflow_engines
                     .get()
-                    .ok_or_else(|| "Workflow engine not initialized".to_string())?;
+                    .ok_or_else(|| "Workflow engines not initialized".to_string())?;
 
-                let instance_id =
-                    Self::start_mcp_registration_workflow(engine, config, context).await?;
+                let workflow_data =
+                    create_mcp_workflow_data((**config).clone(), Arc::clone(context));
+
+                let instance_id = engines
+                    .mcp
+                    .start_workflow(WorkflowId::new("mcp_registration"), workflow_data)
+                    .await
+                    .map_err(|e| format!("Failed to start MCP registration workflow: {:?}", e))?;
 
                 debug!(
                     "Started MCP registration workflow for {} (instance: {})",
@@ -660,27 +735,23 @@ impl JobQueue {
 
                 let timeout_duration = Duration::from_secs(7200 + 30); // 2hr + margin
 
-                Self::wait_for_workflow_completion(
-                    engine,
-                    instance_id,
-                    &config.name,
-                    timeout_duration,
-                )
-                .await
+                engines
+                    .mcp
+                    .wait_for_completion(instance_id, &config.name, timeout_duration)
+                    .await
             }
             Job::AddTokenizer { config } => {
-                let engine = context
-                    .workflow_engine
+                let engines = context
+                    .workflow_engines
                     .get()
-                    .ok_or_else(|| "Workflow engine not initialized".to_string())?;
+                    .ok_or_else(|| "Workflow engines not initialized".to_string())?;
 
-                let mut workflow_context = WorkflowContext::new(WorkflowInstanceId::new());
-                let config_arc: Arc<TokenizerConfigRequest> = Arc::new(*config.clone());
-                workflow_context.set_arc("tokenizer_config", config_arc);
-                workflow_context.set_arc("app_context", Arc::clone(context));
+                let workflow_data =
+                    create_tokenizer_workflow_data(*config.clone(), Arc::clone(context));
 
-                let instance_id = engine
-                    .start_workflow(WorkflowId::new("tokenizer_registration"), workflow_context)
+                let instance_id = engines
+                    .tokenizer
+                    .start_workflow(WorkflowId::new("tokenizer_registration"), workflow_data)
                     .await
                     .map_err(|e| {
                         format!("Failed to start tokenizer registration workflow: {:?}", e)
@@ -694,13 +765,10 @@ impl JobQueue {
                 // Allow up to 10 minutes for HuggingFace downloads
                 let timeout_duration = Duration::from_secs(600);
 
-                Self::wait_for_workflow_completion(
-                    engine,
-                    instance_id,
-                    &config.id,
-                    timeout_duration,
-                )
-                .await
+                engines
+                    .tokenizer
+                    .wait_for_completion(instance_id, &config.id, timeout_duration)
+                    .await
             }
             Job::RemoveTokenizer { request } => {
                 // Tokenizer removal is synchronous and fast
@@ -714,147 +782,6 @@ impl JobQueue {
                     Err(format!("Tokenizer with id '{}' not found", request.id))
                 }
             }
-        }
-    }
-
-    /// Start a workflow and return its instance ID
-    async fn start_worker_workflow(
-        engine: &Arc<WorkflowEngine>,
-        config: &WorkerConfigRequest,
-        context: &Arc<AppContext>,
-    ) -> Result<WorkflowInstanceId, String> {
-        let mut workflow_context = WorkflowContext::new(WorkflowInstanceId::new());
-        workflow_context.set("worker_config", config.clone());
-        workflow_context.set_arc("app_context", Arc::clone(context));
-
-        // Select workflow based on runtime field
-        let workflow_id = match config.runtime.as_deref() {
-            Some("external") => WorkflowId::new("external_worker_registration"),
-            _ => WorkflowId::new("local_worker_registration"),
-        };
-
-        engine
-            .start_workflow(workflow_id, workflow_context)
-            .await
-            .map_err(|e| format!("Failed to start worker registration workflow: {:?}", e))
-    }
-
-    /// Start worker removal workflow
-    async fn start_worker_removal_workflow(
-        engine: &Arc<WorkflowEngine>,
-        url: &str,
-        context: &Arc<AppContext>,
-    ) -> Result<WorkflowInstanceId, String> {
-        let removal_request = WorkerRemovalRequest {
-            url: url.to_string(),
-            dp_aware: context.router_config.dp_aware,
-        };
-
-        let mut workflow_context = WorkflowContext::new(WorkflowInstanceId::new());
-        workflow_context.set("removal_request", removal_request);
-        workflow_context.set_arc("app_context", Arc::clone(context));
-
-        engine
-            .start_workflow(WorkflowId::new("worker_removal"), workflow_context)
-            .await
-            .map_err(|e| format!("Failed to start worker removal workflow: {:?}", e))
-    }
-
-    /// Start worker update workflow
-    async fn start_worker_update_workflow(
-        engine: &Arc<WorkflowEngine>,
-        url: &str,
-        update: &WorkerUpdateRequest,
-        context: &Arc<AppContext>,
-    ) -> Result<WorkflowInstanceId, String> {
-        let mut workflow_context = WorkflowContext::new(WorkflowInstanceId::new());
-        // Pass URL and dp_aware separately, workflow step handles the rest
-        workflow_context.set("worker_url", url.to_string());
-        workflow_context.set("dp_aware", context.router_config.dp_aware);
-        workflow_context.set("update_request", update.clone());
-        workflow_context.set_arc("app_context", Arc::clone(context));
-
-        engine
-            .start_workflow(WorkflowId::new("worker_update"), workflow_context)
-            .await
-            .map_err(|e| format!("Failed to start worker update workflow: {:?}", e))
-    }
-
-    /// Start MCP server registration workflow
-    async fn start_mcp_registration_workflow(
-        engine: &Arc<WorkflowEngine>,
-        config: &McpServerConfigRequest,
-        context: &Arc<AppContext>,
-    ) -> Result<WorkflowInstanceId, String> {
-        let mut workflow_context = WorkflowContext::new(WorkflowInstanceId::new());
-        workflow_context.set("mcp_server_config", config.clone());
-        workflow_context.set_arc("app_context", Arc::clone(context));
-
-        engine
-            .start_workflow(WorkflowId::new("mcp_registration"), workflow_context)
-            .await
-            .map_err(|e| format!("Failed to start MCP registration workflow: {:?}", e))
-    }
-
-    /// Wait for workflow completion with adaptive polling
-    async fn wait_for_workflow_completion(
-        engine: &Arc<WorkflowEngine>,
-        instance_id: WorkflowInstanceId,
-        worker_url: &str,
-        timeout_duration: Duration,
-    ) -> Result<String, String> {
-        let start = std::time::Instant::now();
-        let mut poll_interval = Duration::from_millis(100);
-        let max_poll_interval = Duration::from_millis(2000);
-        let poll_backoff = Duration::from_millis(200);
-
-        loop {
-            // Check timeout
-            if start.elapsed() > timeout_duration {
-                return Err(format!(
-                    "Workflow timeout after {}s for worker {}",
-                    timeout_duration.as_secs(),
-                    worker_url
-                ));
-            }
-
-            // Get workflow status
-            let state = engine
-                .get_status(instance_id)
-                .map_err(|e| format!("Failed to get workflow status: {:?}", e))?;
-
-            let result = match state.status {
-                WorkflowStatus::Completed => Ok(format!(
-                    "Worker {} registered and activated successfully via workflow",
-                    worker_url
-                )),
-                WorkflowStatus::Failed => {
-                    let current_step = state.current_step.as_ref();
-                    let step_name = current_step
-                        .map(|s| s.to_string())
-                        .unwrap_or_else(|| "unknown".to_string());
-                    let error_msg = current_step
-                        .and_then(|step_id| state.step_states.get(step_id))
-                        .and_then(|s| s.last_error.as_deref())
-                        .unwrap_or("Unknown error");
-                    Err(format!(
-                        "Workflow failed at step {}: {}",
-                        step_name, error_msg
-                    ))
-                }
-                WorkflowStatus::Cancelled => {
-                    Err(format!("Workflow cancelled for worker {}", worker_url))
-                }
-                WorkflowStatus::Pending | WorkflowStatus::Paused | WorkflowStatus::Running => {
-                    tokio::time::sleep(poll_interval).await;
-                    poll_interval = (poll_interval + poll_backoff).min(max_poll_interval);
-                    continue;
-                }
-            };
-
-            // Clean up terminal workflow states
-            engine.state_store().cleanup_if_terminal(instance_id);
-            return result;
         }
     }
 

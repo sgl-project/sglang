@@ -2,28 +2,28 @@ use std::collections::HashMap;
 
 use serde_json::Value;
 
-pub fn parse_tool_calls(raw: Option<String>) -> Result<Vec<Value>, String> {
+pub(super) fn parse_tool_calls(raw: Option<String>) -> Result<Vec<Value>, String> {
     match raw {
         Some(s) if !s.is_empty() => serde_json::from_str(&s).map_err(|e| e.to_string()),
         _ => Ok(Vec::new()),
     }
 }
 
-pub fn parse_metadata(raw: Option<String>) -> Result<HashMap<String, Value>, String> {
+pub(super) fn parse_metadata(raw: Option<String>) -> Result<HashMap<String, Value>, String> {
     match raw {
         Some(s) if !s.is_empty() => serde_json::from_str(&s).map_err(|e| e.to_string()),
         _ => Ok(HashMap::new()),
     }
 }
 
-pub fn parse_raw_response(raw: Option<String>) -> Result<Value, String> {
+pub(super) fn parse_raw_response(raw: Option<String>) -> Result<Value, String> {
     match raw {
         Some(s) if !s.is_empty() => serde_json::from_str(&s).map_err(|e| e.to_string()),
         _ => Ok(Value::Null),
     }
 }
 
-pub fn parse_json_value(raw: Option<String>) -> Result<Value, String> {
+pub(super) fn parse_json_value(raw: Option<String>) -> Result<Value, String> {
     match raw {
         Some(s) if !s.is_empty() => serde_json::from_str(&s).map_err(|e| e.to_string()),
         _ => Ok(Value::Array(vec![])),

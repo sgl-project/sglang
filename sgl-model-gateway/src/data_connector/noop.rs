@@ -18,7 +18,7 @@ use super::core::*;
 
 /// No-op implementation that synthesizes conversation responses without persistence
 #[derive(Default, Debug, Clone)]
-pub struct NoOpConversationStorage;
+pub(super) struct NoOpConversationStorage;
 
 impl NoOpConversationStorage {
     pub fn new() -> Self {
@@ -61,7 +61,7 @@ impl ConversationStorage for NoOpConversationStorage {
 
 /// No-op conversation item storage (does nothing)
 #[derive(Clone, Copy, Default)]
-pub struct NoOpConversationItemStorage;
+pub(super) struct NoOpConversationItemStorage;
 
 impl NoOpConversationItemStorage {
     pub fn new() -> Self {
@@ -136,7 +136,7 @@ impl ConversationItemStorage for NoOpConversationItemStorage {
 // ============================================================================
 
 /// No-op implementation of response storage (does nothing)
-pub struct NoOpResponseStorage;
+pub(super) struct NoOpResponseStorage;
 
 impl NoOpResponseStorage {
     pub fn new() -> Self {

@@ -1,4 +1,3 @@
-import itertools
 import os
 from typing import Optional, Tuple
 
@@ -57,7 +56,7 @@ def sglang_scaled_fp8_quant(
 
 def calculate_diff(batch_size: int, seq_len: int):
     device = torch.device("cuda")
-    x = torch.rand((batch_size, seq_len), dtype=torch.float16, device=device)
+    x = torch.rand((batch_size, seq_len), dtype=torch.bfloat16, device=device)
 
     if not VLLM_AVAILABLE:
         print("vLLM not available, skipping comparison")
@@ -66,25 +65,17 @@ def calculate_diff(batch_size: int, seq_len: int):
     vllm_out, vllm_scale = vllm_scaled_fp8_quant(x)
     sglang_out, sglang_scale = sglang_scaled_fp8_quant(x)
 
-    scale_diff = torch.abs(vllm_scale - sglang_scale).item()
-    output_diff = torch.abs(vllm_out.float() - sglang_out.float()).mean().item()
+    vllm_out = vllm_out.to(torch.float32)
+    sglang_out = sglang_out.to(torch.float32)
 
-    if torch.allclose(
-        vllm_out.to(torch.float32), sglang_out.to(torch.float32), rtol=1e-3, atol=1e-5
-    ) and torch.allclose(vllm_scale, sglang_scale, rtol=1e-3, atol=1e-5):
-        print("All implementations match")
-    else:
-        print("Implementations differ")
+    triton.testing.assert_close(vllm_out, sglang_out, rtol=1e-3, atol=1e-3)
+    triton.testing.assert_close(vllm_scale, sglang_scale, rtol=1e-3, atol=1e-3)
 
 
 if IS_CI:
-    batch_size_range = [16]
-    seq_len_range = [64]
+    element_range = [16384]
 else:
-    batch_size_range = [16, 32, 64, 128]
-    seq_len_range = [64, 128, 256, 512, 1024, 2048]
-
-configs = list(itertools.product(batch_size_range, seq_len_range))
+    element_range = [2**n for n in range(10, 20)]
 
 
 if VLLM_AVAILABLE:
@@ -99,8 +90,8 @@ else:
 
 @triton.testing.perf_report(
     triton.testing.Benchmark(
-        x_names=["batch_size", "seq_len"],
-        x_vals=configs,
+        x_names=["element_count"],
+        x_vals=element_range,
         line_arg="provider",
         line_vals=line_vals,
         line_names=line_names,
@@ -110,11 +101,11 @@ else:
         args={},
     )
 )
-def benchmark(batch_size, seq_len, provider):
+def benchmark(element_count, provider):
     dtype = torch.float16
     device = torch.device("cuda")
 
-    x = torch.randn(batch_size * seq_len, 4096, device=device, dtype=dtype)
+    x = torch.randn(element_count, 4096, device=device, dtype=dtype)
 
     quantiles = [0.5, 0.2, 0.8]
 

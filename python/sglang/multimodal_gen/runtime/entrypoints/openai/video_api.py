@@ -27,6 +27,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     VideoListResponse,
     VideoResponse,
 )
+from sglang.multimodal_gen.runtime.entrypoints.openai.storage import cloud_storage
 from sglang.multimodal_gen.runtime.entrypoints.openai.stores import VIDEO_STORE
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     _parse_size,
@@ -54,14 +55,13 @@ def _build_sampling_params_from_request(
     else:
         width, height = _parse_size(request.size)
     seconds = request.seconds if request.seconds is not None else 4
-    # Prefer user-provided fps/num_frames from request; fallback to defaults
     fps_default = 24
     fps = request.fps if request.fps is not None else fps_default
-    # If user provides num_frames, use it directly; otherwise derive from seconds * fps
     derived_num_frames = fps * seconds
     num_frames = (
         request.num_frames if request.num_frames is not None else derived_num_frames
     )
+
     server_args = get_global_server_args()
     sampling_kwargs = {
         "request_id": request_id,
@@ -86,11 +86,20 @@ def _build_sampling_params_from_request(
         sampling_kwargs["negative_prompt"] = request.negative_prompt
     if request.enable_teacache is not None:
         sampling_kwargs["enable_teacache"] = request.enable_teacache
+    if request.output_path is not None:
+        sampling_kwargs["output_path"] = request.output_path
     sampling_params = SamplingParams.from_user_sampling_params_args(
         model_path=server_args.model_path,
         server_args=server_args,
         **sampling_kwargs,
     )
+
+    if request.num_inference_steps is not None:
+        sampling_params.num_inference_steps = request.num_inference_steps
+    if request.guidance_scale is not None:
+        sampling_params.guidance_scale = request.guidance_scale
+    if request.seed is not None:
+        sampling_params.seed = request.seed
 
     return sampling_params
 
@@ -111,7 +120,7 @@ def _video_job_from_sampling(
         "size": size_str,
         "seconds": str(seconds),
         "quality": "standard",
-        "file_path": sampling.output_file_path(),
+        "file_path": os.path.abspath(sampling.output_file_path()),
     }
 
 
@@ -119,11 +128,19 @@ async def _dispatch_job_async(job_id: str, batch: Req) -> None:
     from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 
     try:
-        _, result = await process_generation_batch(async_scheduler_client, batch)
+        save_file_path_list, result = await process_generation_batch(
+            async_scheduler_client, batch
+        )
+        save_file_path = save_file_path_list[0]
+
+        cloud_url = await cloud_storage.upload_and_cleanup(save_file_path)
+
         update_fields = {
             "status": "completed",
             "progress": 100,
             "completed_at": int(time.time()),
+            "url": cloud_url,
+            "file_path": save_file_path if not cloud_url else None,
         }
         update_fields = add_common_data_to_response(
             update_fields, request_id=job_id, result=result
@@ -207,9 +224,11 @@ async def create_video(
             seed=seed,
             generator_device=generator_device,
             negative_prompt=negative_prompt,
-            guidance_scale=guidance_scale,
             num_inference_steps=num_inference_steps,
             enable_teacache=enable_teacache,
+            **(
+                {"guidance_scale": guidance_scale} if guidance_scale is not None else {}
+            ),
         )
     else:
         try:
@@ -261,6 +280,9 @@ async def create_video(
         server_args=get_global_server_args(),
         sampling_params=sampling_params,
     )
+    # Add diffusers_kwargs if provided
+    if req.diffusers_kwargs:
+        batch.extra["diffusers_kwargs"] = req.diffusers_kwargs
     # Enqueue the job asynchronously and return immediately
     asyncio.create_task(_dispatch_job_async(request_id, batch))
     return VideoResponse(**job)
@@ -320,6 +342,12 @@ async def download_video_content(
     job = await VIDEO_STORE.get(video_id)
     if not job:
         raise HTTPException(status_code=404, detail="Video not found")
+
+    if job.get("url"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Video has been uploaded to cloud storage. Please use the cloud URL: {job.get('url')}",
+        )
 
     file_path = job.get("file_path")
     if not file_path or not os.path.exists(file_path):

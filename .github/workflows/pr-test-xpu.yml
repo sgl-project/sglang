@@ -20,8 +20,8 @@ on:
         default: false
 
 concurrency:
-  group: pr-test-xpu-${{ github.ref }}
-  cancel-in-progress: true
+  group: pr-test-xpu-${{ inputs.ref || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
 
 jobs:
   # ==================== Check Changes ==================== #
@@ -55,7 +55,7 @@ jobs:
           filters: |
             main_package:
               - "python/sglang/!(multimodal_gen)/**"
-              - "python/*.toml"
+              - "python/pyproject_xpu.toml"
               - "scripts/ci/**"
               - "test/**"
               - "sgl-kernel/**"

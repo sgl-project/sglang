@@ -2,13 +2,13 @@
 
 use async_trait::async_trait;
 
-use super::types::{StepResult, WorkflowContext, WorkflowError, WorkflowResult};
+use super::types::{StepResult, WorkflowContext, WorkflowData, WorkflowError, WorkflowResult};
 
 /// Trait for executing individual workflow steps
 #[async_trait]
-pub trait StepExecutor: Send + Sync {
+pub trait StepExecutor<D: WorkflowData>: Send + Sync {
     /// Execute the step with the given context
-    async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult>;
+    async fn execute(&self, context: &mut WorkflowContext<D>) -> WorkflowResult<StepResult>;
 
     /// Check if an error is retry-able
     ///
@@ -22,7 +22,7 @@ pub trait StepExecutor: Send + Sync {
     ///
     /// This hook allows steps to perform cleanup or additional actions
     /// after successful execution.
-    async fn on_success(&self, _context: &WorkflowContext) -> WorkflowResult<()> {
+    async fn on_success(&self, _context: &WorkflowContext<D>) -> WorkflowResult<()> {
         Ok(())
     }
 
@@ -32,7 +32,7 @@ pub trait StepExecutor: Send + Sync {
     /// when the step cannot complete successfully.
     async fn on_failure(
         &self,
-        _context: &WorkflowContext,
+        _context: &WorkflowContext<D>,
         _error: &WorkflowError,
     ) -> WorkflowResult<()> {
         Ok(())
@@ -40,59 +40,82 @@ pub trait StepExecutor: Send + Sync {
 }
 
 /// Simple function-based step executor
-pub struct FunctionStep<F>
+pub struct FunctionStep<D, F>
 where
+    D: WorkflowData,
     F: Fn(
-            &mut WorkflowContext,
+            &mut WorkflowContext<D>,
         ) -> std::pin::Pin<
             Box<dyn std::future::Future<Output = WorkflowResult<StepResult>> + Send + '_>,
         > + Send
         + Sync,
 {
     func: F,
+    _phantom: std::marker::PhantomData<D>,
 }
 
-impl<F> FunctionStep<F>
+impl<D, F> FunctionStep<D, F>
 where
+    D: WorkflowData,
     F: Fn(
-            &mut WorkflowContext,
+            &mut WorkflowContext<D>,
         ) -> std::pin::Pin<
             Box<dyn std::future::Future<Output = WorkflowResult<StepResult>> + Send + '_>,
         > + Send
         + Sync,
 {
     pub fn new(func: F) -> Self {
-        Self { func }
+        Self {
+            func,
+            _phantom: std::marker::PhantomData,
+        }
     }
 }
 
 #[async_trait]
-impl<F> StepExecutor for FunctionStep<F>
+impl<D, F> StepExecutor<D> for FunctionStep<D, F>
 where
+    D: WorkflowData,
     F: Fn(
-            &mut WorkflowContext,
+            &mut WorkflowContext<D>,
         ) -> std::pin::Pin<
             Box<dyn std::future::Future<Output = WorkflowResult<StepResult>> + Send + '_>,
         > + Send
         + Sync,
 {
-    async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
+    async fn execute(&self, context: &mut WorkflowContext<D>) -> WorkflowResult<StepResult> {
         (self.func)(context).await
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use serde::{Deserialize, Serialize};
+
     use super::*;
     use crate::workflow::types::WorkflowInstanceId;
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct TestData {
+        value: i32,
+    }
+
+    impl WorkflowData for TestData {
+        fn workflow_type() -> &'static str {
+            "test"
+        }
+    }
 
     struct TestStep {
         should_succeed: bool,
     }
 
     #[async_trait]
-    impl StepExecutor for TestStep {
-        async fn execute(&self, _context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
+    impl StepExecutor<TestData> for TestStep {
+        async fn execute(
+            &self,
+            _context: &mut WorkflowContext<TestData>,
+        ) -> WorkflowResult<StepResult> {
             if self.should_succeed {
                 Ok(StepResult::Success)
             } else {
@@ -109,7 +132,7 @@ mod tests {
         let step = TestStep {
             should_succeed: true,
         };
-        let mut context = WorkflowContext::new(WorkflowInstanceId::new());
+        let mut context = WorkflowContext::new(WorkflowInstanceId::new(), TestData { value: 42 });
 
         let result = step.execute(&mut context).await;
         assert!(result.is_ok());
@@ -121,7 +144,7 @@ mod tests {
         let step = TestStep {
             should_succeed: false,
         };
-        let mut context = WorkflowContext::new(WorkflowInstanceId::new());
+        let mut context = WorkflowContext::new(WorkflowInstanceId::new(), TestData { value: 42 });
 
         let result = step.execute(&mut context).await;
         assert!(result.is_err());

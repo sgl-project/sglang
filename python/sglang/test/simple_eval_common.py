@@ -91,6 +91,7 @@ class ChatCompletionSampler(SamplerBase):
         model: Optional[str] = None,
         system_message: Optional[str] = None,
         temperature: float = 0.0,
+        top_p: float = 1.0,
         reasoning_effort: Optional[str] = None,
         max_tokens: int = 2048,
         extra_body: Optional[Dict[str, Any]] = None,
@@ -103,6 +104,7 @@ class ChatCompletionSampler(SamplerBase):
         self.model = model
         self.system_message = system_message
         self.temperature = temperature
+        self.top_p = top_p
         self.max_tokens = max_tokens
         self.reasoning_effort = reasoning_effort
         self.extra_body = extra_body
@@ -144,6 +146,7 @@ class ChatCompletionSampler(SamplerBase):
                     model=self.model,
                     messages=message_list,
                     temperature=self.temperature,
+                    top_p=self.top_p,
                     max_tokens=self.max_tokens,
                     reasoning_effort=self.reasoning_effort,
                     extra_body=self.extra_body,

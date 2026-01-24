@@ -6,7 +6,7 @@ from typing import Any, List, Optional, cast
 
 import torch
 
-from sglang.srt.layers.linear import LinearBase, UnquantizedLinearMethod
+from sglang.srt.layers.linear import LinearBase
 from sglang.srt.layers.quantization.base_config import (  # noqa: E501
     LinearMethodBase,
     QuantizationConfig,
@@ -20,6 +20,7 @@ from sglang.srt.layers.quantization.quark.schemes import (
     QuarkW8A8Fp8,
 )
 from sglang.srt.layers.quantization.quark.utils import deep_compare, should_ignore_layer
+from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.utils import get_device_capability
 

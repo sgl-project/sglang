@@ -118,7 +118,7 @@ fn is_link_local_v6(ip: &Ipv6Addr) -> bool {
 ///
 /// For testing purposes, HTTP is allowed for localhost/127.0.0.1 only.
 /// In production, only HTTPS should be used.
-pub fn validate_url(url_str: &str) -> Result<Url, JwksError> {
+pub(crate) fn validate_url(url_str: &str) -> Result<Url, JwksError> {
     let url = Url::parse(url_str)
         .map_err(|e| JwksError::InvalidUrl(format!("Failed to parse URL: {}", e)))?;
 
@@ -210,7 +210,7 @@ impl CachedJwks {
 }
 
 /// JWKS provider with caching and automatic refresh.
-pub struct JwksProvider {
+pub(crate) struct JwksProvider {
     /// HTTP client for fetching JWKS
     client: reqwest::Client,
     /// JWKS endpoint URL (validated)
@@ -304,6 +304,7 @@ impl JwksProvider {
     }
 
     /// Get the JWKS URI.
+    #[allow(dead_code)]
     pub fn jwks_uri(&self) -> &str {
         &self.jwks_uri
     }
@@ -411,6 +412,7 @@ impl JwksProvider {
     }
 
     /// Force refresh the JWKS cache.
+    #[allow(dead_code)]
     pub async fn refresh(&self) -> Result<(), JwksError> {
         let jwks = self.fetch_jwks().await?;
         let mut cache = self.cache.write();

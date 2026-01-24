@@ -12,6 +12,7 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
+_is_cuda = current_platform.is_cuda()
 
 
 class CustomOp(nn.Module):
@@ -58,7 +59,7 @@ class CustomOp(nn.Module):
         return self.forward_native(*args, **kwargs)
 
     def dispatch_forward(self) -> Callable:
-        if current_platform.is_cuda():
+        if _is_cuda:
             return self.forward_cuda
         elif current_platform.is_hip():
             return self.forward_hip

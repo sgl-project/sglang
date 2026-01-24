@@ -1,14 +1,17 @@
 use std::collections::HashMap;
 
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
-use sgl_model_gateway::{
+use rand::{distr::Alphanumeric, Rng};
+use smg::{
     auth::{ApiKeyEntry, ControlPlaneAuthConfig, JwtConfig, Role},
     config::{
         CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, HealthCheckConfig,
-        HistoryBackend, MetricsConfig, OracleConfig, PolicyConfig, PostgresConfig, RetryConfig,
-        RouterConfig, RoutingMode, TokenizerCacheConfig, TraceConfig,
+        HistoryBackend, ManualAssignmentMode, MetricsConfig, OracleConfig, PolicyConfig,
+        PostgresConfig, RedisConfig, RetryConfig, RouterConfig, RoutingMode, TokenizerCacheConfig,
+        TraceConfig,
     },
     core::ConnectionMode,
+    mesh::service::MeshServerConfig,
     observability::{
         metrics::PrometheusConfig,
         otel_trace::{is_otel_enabled, shutdown_otel},
@@ -165,6 +168,14 @@ struct CliArgs {
     /// Maximum size of the approximation tree for cache-aware routing
     #[arg(long, default_value_t = 67108864, help_heading = "Routing Policy")]
     max_tree_size: usize,
+
+    /// Maximum idle time in seconds before eviction (for manual policy)
+    #[arg(long, default_value_t = 14400, help_heading = "Routing Policy")]
+    max_idle_secs: u64,
+
+    /// Assignment mode for manual policy when encountering a new routing key
+    #[arg(long, default_value = "random", value_parser = ["random", "min_load", "min_group"], help_heading = "Routing Policy")]
+    assignment_mode: String,
 
     /// Number of prefix tokens to use for prefix_hash policy
     #[arg(long, default_value_t = 256, help_heading = "Routing Policy")]
@@ -367,6 +378,10 @@ struct CliArgs {
     #[arg(long, default_value = "/health", help_heading = "Health Checks")]
     health_check_endpoint: String,
 
+    /// Disable all worker health checks at startup
+    #[arg(long, default_value_t = false, help_heading = "Health Checks")]
+    disable_health_check: bool,
+
     // ==================== Tokenizer ====================
     /// Model path for loading tokenizer (HuggingFace ID or local path)
     #[arg(long, help_heading = "Tokenizer")]
@@ -415,7 +430,7 @@ struct CliArgs {
     backend: Backend,
 
     /// History storage backend
-    #[arg(long, default_value = "memory", value_parser = ["memory", "none", "oracle","postgres"], help_heading = "Backend")]
+    #[arg(long, default_value = "memory", value_parser = ["memory", "none", "oracle", "postgres", "redis"], help_heading = "Backend")]
     history_backend: String,
 
     /// Enable WebAssembly support
@@ -463,6 +478,19 @@ struct CliArgs {
     /// Maximum PostgreSQL connection pool size
     #[arg(long, help_heading = "PostgreSQL Database")]
     postgres_pool_max_size: Option<usize>,
+
+    // ==================== Redis Database ====================
+    /// Redis connection URL
+    #[arg(long, help_heading = "Redis Database")]
+    redis_url: Option<String>,
+
+    /// Maximum Redis connection pool size
+    #[arg(long, help_heading = "Redis Database")]
+    redis_pool_max_size: Option<usize>,
+
+    /// Redis data retention in days (-1 for persistent, default 30)
+    #[arg(long, help_heading = "Redis Database")]
+    redis_retention_days: Option<i64>,
 
     // ==================== TLS/mTLS Security ====================
     /// Path to server TLS certificate (PEM format)
@@ -542,6 +570,22 @@ struct CliArgs {
         help_heading = "Control Plane Authentication"
     )]
     disable_audit_logging: bool,
+
+    // ==================== Mesh Server ====================
+    #[arg(long, default_value_t = false)]
+    enable_mesh: bool,
+
+    #[arg(long)]
+    mesh_server_name: Option<String>,
+
+    #[arg(long, default_value = "0.0.0.0")]
+    mesh_host: String,
+
+    #[arg(long, default_value_t = 39527)]
+    mesh_port: u16,
+
+    #[arg(long, num_args = 0..)]
+    mesh_peer_urls: Vec<String>,
 }
 
 enum OracleConnectSource {
@@ -688,7 +732,16 @@ impl CliArgs {
                 prefix_token_count: self.prefix_token_count,
                 load_factor: self.prefix_hash_load_factor,
             },
-            "manual" => PolicyConfig::Manual,
+            "manual" => PolicyConfig::Manual {
+                eviction_interval_secs: self.eviction_interval,
+                max_idle_secs: self.max_idle_secs,
+                assignment_mode: match self.assignment_mode.as_str() {
+                    "random" => ManualAssignmentMode::Random,
+                    "min_load" => ManualAssignmentMode::MinLoad,
+                    "min_group" => ManualAssignmentMode::MinGroup,
+                    other => panic!("Unknown assignment mode: {}", other),
+                },
+            },
             _ => PolicyConfig::RoundRobin,
         }
     }
@@ -786,6 +839,27 @@ impl CliArgs {
         Ok(pcf)
     }
 
+    fn build_redis_config(&self) -> ConfigResult<RedisConfig> {
+        let url = self.redis_url.clone().unwrap_or_default();
+        let pool_max = self.redis_pool_max_size.unwrap_or(16);
+
+        let retention_days = match self.redis_retention_days {
+            Some(d) if d < 0 => None, // Persistent
+            Some(d) => Some(d as u64),
+            None => Some(30), // Default 30 days
+        };
+
+        let rcf = RedisConfig {
+            url,
+            pool_max,
+            retention_days,
+        };
+        rcf.validate().map_err(|e| ConfigError::ValidationFailed {
+            reason: e.to_string(),
+        })?;
+        Ok(rcf)
+    }
+
     fn to_router_config(
         &self,
         prefill_urls: Vec<(String, Option<u16>)>,
@@ -821,6 +895,8 @@ impl CliArgs {
                 prefill_selector: Self::parse_selector(&self.prefill_selector),
                 decode_selector: Self::parse_selector(&self.decode_selector),
                 bootstrap_port_annotation: "sglang.ai/bootstrap-port".to_string(),
+                router_selector: HashMap::new(), // Can be set via config file
+                router_mesh_port_annotation: "sglang.ai/ha-port".to_string(),
             })
         } else {
             None
@@ -862,6 +938,7 @@ impl CliArgs {
             "none" => HistoryBackend::None,
             "oracle" => HistoryBackend::Oracle,
             "postgres" => HistoryBackend::Postgres,
+            "redis" => HistoryBackend::Redis,
             _ => HistoryBackend::Memory,
         };
 
@@ -872,6 +949,11 @@ impl CliArgs {
         };
         let postgres = if history_backend == HistoryBackend::Postgres {
             Some(self.build_postgres_config()?)
+        } else {
+            None
+        };
+        let redis = if history_backend == HistoryBackend::Redis {
+            Some(self.build_redis_config()?)
         } else {
             None
         };
@@ -909,6 +991,7 @@ impl CliArgs {
                 timeout_secs: self.health_check_timeout_secs,
                 check_interval_secs: self.health_check_interval_secs,
                 endpoint: self.health_check_endpoint.clone(),
+                disable_health_check: self.disable_health_check,
             })
             .tokenizer_cache(TokenizerCacheConfig {
                 enable_l0: self.tokenizer_cache_enable_l0,
@@ -932,6 +1015,7 @@ impl CliArgs {
             .maybe_chat_template(self.chat_template.as_ref())
             .maybe_oracle(oracle)
             .maybe_postgres(postgres)
+            .maybe_redis(redis)
             .maybe_reasoning_parser(self.reasoning_parser.as_ref())
             .maybe_tool_call_parser(self.tool_call_parser.as_ref())
             .maybe_mcp_config_path(self.mcp_config_path.as_ref())
@@ -947,6 +1031,18 @@ impl CliArgs {
 
     fn to_server_config(&self, router_config: RouterConfig) -> ServerConfig {
         let service_discovery_config = if self.service_discovery {
+            // Get router discovery config from router_config.discovery if available
+            let (router_selector, router_mesh_port_annotation) = router_config
+                .discovery
+                .as_ref()
+                .map(|d| {
+                    (
+                        d.router_selector.clone(),
+                        d.router_mesh_port_annotation.clone(),
+                    )
+                })
+                .unwrap_or_else(|| (HashMap::new(), "sglang.ai/mesh-port".to_string()));
+
             Some(ServiceDiscoveryConfig {
                 enabled: true,
                 selector: Self::parse_selector(&self.selector),
@@ -957,6 +1053,8 @@ impl CliArgs {
                 prefill_selector: Self::parse_selector(&self.prefill_selector),
                 decode_selector: Self::parse_selector(&self.decode_selector),
                 bootstrap_port_annotation: "sglang.ai/bootstrap-port".to_string(),
+                router_selector,
+                router_mesh_port_annotation,
             })
         } else {
             None
@@ -982,6 +1080,38 @@ impl CliArgs {
             }
         };
 
+        // ==================== Mesh Server ====================
+        let mesh_server_config = if self.enable_mesh {
+            let self_name = if let Some(name) = &self.mesh_server_name {
+                name.to_string()
+            } else {
+                // If name is not set, use a random name
+                let mut rng = rand::rng();
+                let random_string: String =
+                    (0..4).map(|_| rng.sample(Alphanumeric) as char).collect();
+                format!("Mesh_{}", random_string)
+            };
+
+            let peer = self
+                .mesh_peer_urls
+                .first()
+                .and_then(|url| url.parse::<std::net::SocketAddr>().ok());
+            if let Ok(addr) =
+                format!("{}:{}", self.mesh_host, self.mesh_port).parse::<std::net::SocketAddr>()
+            {
+                Some(MeshServerConfig {
+                    self_name,
+                    self_addr: addr,
+                    init_peer: peer,
+                })
+            } else {
+                tracing::warn!("Invalid mesh server address, so mesh server will not be started");
+                None
+            }
+        } else {
+            None
+        };
+
         ServerConfig {
             host: self.host.clone(),
             port: self.port,
@@ -999,6 +1129,7 @@ impl CliArgs {
             },
             shutdown_grace_period_secs: self.shutdown_grace_period_secs,
             control_plane_auth,
+            mesh_server_config,
         }
     }
 }

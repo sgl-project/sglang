@@ -13,13 +13,12 @@ export STREAMS_PER_DEVICE=32
 export HCCL_BUFFSIZE=1536
 export HCCL_OP_EXPANSION_MODE=AIV
 
-ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python -m sglang.launch_server \
+python -m sglang.launch_server \
    --device npu \
    --attention-backend ascend \
    --trust-remote-code \
    --tp-size 4 \
    --model-path Qwen/Qwen3-32B \
-   --port 30111 \
    --mem-fraction-static 0.8
 ```
 
@@ -43,7 +42,6 @@ python -m sglang.launch_server \
    --trust-remote-code \
    --tp-size 4 \
    --model-path Qwen/Qwen3-32B \
-   --port 30111 \
    --mem-fraction-static 0.8 \
    --speculative-algorithm EAGLE3 \
    --speculative-draft-model-path Qwen/Qwen3-32B-Eagle3 \
@@ -66,13 +64,12 @@ export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=32
 export SGLANG_DEEPEP_BF16_DISPATCH=1
 export ENABLE_ASCEND_MOE_NZ=1
 
-ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python -m sglang.launch_server \
+python -m sglang.launch_server \
    --device npu \
    --attention-backend ascend \
    --trust-remote-code \
    --tp-size 4 \
    --model-path Qwen/Qwen3-30B-A3B \
-   --port 30111 \
    --mem-fraction-static 0.8
 ```
 
@@ -96,7 +93,6 @@ python -m sglang.launch_server \
    --attention-backend ascend \
    --device npu \
    --watchdog-timeout 9000 \
-   --port 30111 \
    --mem-fraction-static 0.8
 ```
 
@@ -111,14 +107,12 @@ export STREAMS_PER_DEVICE=32
 export HCCL_BUFFSIZE=1536
 export HCCL_OP_EXPANSION_MODE=AIV
 
-ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python -m sglang.launch_server \
-   --device npu \
+python -m sglang.launch_server \
    --enable-multimodal \
    --attention-backend ascend \
    --mm-attention-backend ascend_attn \
    --trust-remote-code \
    --tp-size 4 \
    --model-path Qwen/Qwen3-VL-8B-Instruct \
-   --port 30111 \
    --mem-fraction-static 0.8
 ```

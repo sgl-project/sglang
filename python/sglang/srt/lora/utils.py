@@ -92,7 +92,9 @@ def get_hidden_dim(
             # if contain extra tokens will be added; otherwise is 0.
             return config.hidden_size, config.vocab_size + lora_added_vocab_size
         else:
-            raise NotImplementedError()
+            raise NotImplementedError(
+                "get_hidden_dim not implemented for " + module_name
+            )
 
 
 def get_normalized_target_modules(

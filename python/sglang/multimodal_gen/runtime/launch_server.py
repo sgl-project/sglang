@@ -2,8 +2,11 @@
 
 import multiprocessing as mp
 import os
+import signal
 import sys
+import threading
 
+import psutil
 import uvicorn
 
 from sglang.multimodal_gen.runtime.entrypoints.http_server import create_app
@@ -14,7 +17,45 @@ from sglang.multimodal_gen.runtime.server_args import (
     set_global_server_args,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import configure_logger, logger
-from sglang.srt.utils import kill_process_tree
+
+
+def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = None):
+    """Kill the process and all its child processes."""
+    # Remove sigchld handler to avoid spammy logs.
+    if threading.current_thread() is threading.main_thread():
+        signal.signal(signal.SIGCHLD, signal.SIG_DFL)
+
+    if parent_pid is None:
+        parent_pid = os.getpid()
+        include_parent = False
+
+    try:
+        itself = psutil.Process(parent_pid)
+    except psutil.NoSuchProcess:
+        return
+
+    children = itself.children(recursive=True)
+    for child in children:
+        if child.pid == skip_pid:
+            continue
+        try:
+            child.kill()
+        except psutil.NoSuchProcess:
+            pass
+
+    if include_parent:
+        try:
+            if parent_pid == os.getpid():
+                itself.kill()
+                sys.exit(0)
+
+            itself.kill()
+
+            # Sometime processes cannot be killed with SIGKILL (e.g, PID=1 launched by kubernetes),
+            # so we send an additional signal to kill them.
+            itself.send_signal(signal.SIGQUIT)
+        except psutil.NoSuchProcess:
+            pass
 
 
 def launch_server(server_args: ServerArgs, launch_http_server: bool = True):

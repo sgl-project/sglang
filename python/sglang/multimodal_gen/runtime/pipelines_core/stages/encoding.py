@@ -60,9 +60,7 @@ class EncodingStage(PipelineStage):
         """
         Encode pixel space representations into latent space.
 
-        Args:
-            batch: The current batch information.
-            server_args: The inference arguments.
+
 
         Returns:
             The batch with encoded latents.

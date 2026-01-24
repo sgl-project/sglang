@@ -4,14 +4,22 @@ mod discover_dp;
 mod discover_metadata;
 mod find_worker_to_update;
 mod find_workers_to_remove;
-mod register_tokenizer;
 mod remove_from_policy_registry;
 mod remove_from_worker_registry;
+mod submit_tokenizer_job;
 mod update_policies_for_worker;
 mod update_remaining_policies;
 mod update_worker_properties;
 
 use std::{sync::Arc, time::Duration};
+
+/// Strip protocol prefix (http://, https://, grpc://) from URL.
+pub(crate) fn strip_protocol(url: &str) -> String {
+    url.trim_start_matches("http://")
+        .trim_start_matches("https://")
+        .trim_start_matches("grpc://")
+        .to_string()
+}
 
 pub use create_worker::CreateLocalWorkerStep;
 pub use detect_connection::DetectConnectionModeStep;
@@ -19,17 +27,24 @@ pub use discover_dp::{get_dp_info, DiscoverDPInfoStep, DpInfo};
 pub use discover_metadata::DiscoverMetadataStep;
 pub use find_worker_to_update::FindWorkerToUpdateStep;
 pub use find_workers_to_remove::{FindWorkersToRemoveStep, WorkerRemovalRequest};
-pub use register_tokenizer::RegisterTokenizerStep;
 pub use remove_from_policy_registry::RemoveFromPolicyRegistryStep;
 pub use remove_from_worker_registry::RemoveFromWorkerRegistryStep;
+pub use submit_tokenizer_job::SubmitTokenizerJobStep;
 pub use update_policies_for_worker::UpdatePoliciesForWorkerStep;
 pub use update_remaining_policies::UpdateRemainingPoliciesStep;
 pub use update_worker_properties::UpdateWorkerPropertiesStep;
 
 use super::shared::{ActivateWorkersStep, RegisterWorkersStep, UpdatePoliciesStep};
 use crate::{
+    app_context::AppContext,
     config::RouterConfig,
-    core::{Worker, WorkerRegistry},
+    core::{
+        steps::workflow_data::{
+            LocalWorkerWorkflowData, WorkerRemovalWorkflowData, WorkerUpdateWorkflowData,
+        },
+        Worker, WorkerRegistry,
+    },
+    protocols::worker_spec::{WorkerConfigRequest, WorkerUpdateRequest},
     workflow::{BackoffStrategy, FailureAction, RetryPolicy, StepDefinition, WorkflowDefinition},
 };
 
@@ -58,7 +73,9 @@ pub(crate) fn find_workers_by_url(
     }
 }
 
-pub fn create_local_worker_workflow(router_config: &RouterConfig) -> WorkflowDefinition {
+pub fn create_local_worker_workflow(
+    router_config: &RouterConfig,
+) -> WorkflowDefinition<LocalWorkerWorkflowData> {
     let detect_timeout = Duration::from_secs(router_config.worker_startup_timeout_secs);
 
     // Calculate max_attempts based on timeout
@@ -142,15 +159,11 @@ pub fn create_local_worker_workflow(router_config: &RouterConfig) -> WorkflowDef
         )
         .add_step(
             StepDefinition::new(
-                "register_tokenizer",
-                "Register Tokenizer",
-                Arc::new(RegisterTokenizerStep),
+                "submit_tokenizer_job",
+                "Submit Tokenizer Job",
+                Arc::new(SubmitTokenizerJobStep),
             )
-            .with_retry(RetryPolicy {
-                max_attempts: 3,
-                backoff: BackoffStrategy::Fixed(Duration::from_secs(1)),
-            })
-            .with_timeout(Duration::from_secs(10))
+            .with_timeout(Duration::from_secs(5))
             .with_failure_action(FailureAction::ContinueNextStep)
             .depends_on(&["register_workers"]),
         )
@@ -190,7 +203,7 @@ pub fn create_local_worker_workflow(router_config: &RouterConfig) -> WorkflowDef
 ///              │
 ///     update_remaining_policies
 /// ```
-pub fn create_worker_removal_workflow() -> WorkflowDefinition {
+pub fn create_worker_removal_workflow() -> WorkflowDefinition<WorkerRemovalWorkflowData> {
     WorkflowDefinition::new("worker_removal", "Remove worker from router")
         .add_step(
             StepDefinition::new(
@@ -255,7 +268,7 @@ pub fn create_worker_removal_workflow() -> WorkflowDefinition {
 ///              │
 ///     update_policies_for_worker
 /// ```
-pub fn create_worker_update_workflow() -> WorkflowDefinition {
+pub fn create_worker_update_workflow() -> WorkflowDefinition<WorkerUpdateWorkflowData> {
     WorkflowDefinition::new("worker_update", "Update worker properties")
         .add_step(
             StepDefinition::new(
@@ -295,4 +308,56 @@ pub fn create_worker_update_workflow() -> WorkflowDefinition {
             })
             .depends_on(&["update_worker_properties"]),
         )
+}
+
+/// Helper to create initial workflow data for local worker registration
+pub fn create_local_worker_workflow_data(
+    config: WorkerConfigRequest,
+    app_context: Arc<AppContext>,
+) -> LocalWorkerWorkflowData {
+    LocalWorkerWorkflowData {
+        config,
+        connection_mode: None,
+        discovered_labels: std::collections::HashMap::new(),
+        dp_info: None,
+        workers: None,
+        final_labels: std::collections::HashMap::new(),
+        detected_runtime_type: None,
+        app_context: Some(app_context),
+        actual_workers: None,
+    }
+}
+
+/// Helper to create initial workflow data for worker removal
+pub fn create_worker_removal_workflow_data(
+    url: String,
+    dp_aware: bool,
+    app_context: Arc<AppContext>,
+) -> WorkerRemovalWorkflowData {
+    WorkerRemovalWorkflowData {
+        config: WorkerRemovalRequest { url, dp_aware },
+        workers_to_remove: None,
+        worker_urls: Vec::new(),
+        affected_models: std::collections::HashSet::new(),
+        app_context: Some(app_context),
+        actual_workers_to_remove: None,
+    }
+}
+
+/// Helper to create initial workflow data for worker update
+pub fn create_worker_update_workflow_data(
+    worker_url: String,
+    update_config: WorkerUpdateRequest,
+    app_context: Arc<AppContext>,
+) -> WorkerUpdateWorkflowData {
+    // Determine if this is a DP-aware update based on URL pattern
+    let dp_aware = worker_url.contains('@');
+    WorkerUpdateWorkflowData {
+        config: update_config,
+        worker_url,
+        dp_aware,
+        app_context: Some(app_context),
+        workers_to_update: None,
+        updated_workers: None,
+    }
 }

@@ -174,6 +174,8 @@ class TestDeepseekV32TBO(CustomTestCase):
             "deepep",
             "--cuda-graph-max-bs",
             "256",
+            "--model-loader-extra-config",
+            '{"enable_multithread_load": true, "num_threads": 64}',
         ]
         cls.process = popen_launch_server(
             cls.model,

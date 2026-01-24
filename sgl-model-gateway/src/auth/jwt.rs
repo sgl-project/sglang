@@ -75,7 +75,7 @@ pub enum JwtValidatorError {
 
 /// Standard JWT claims we extract.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StandardClaims {
+pub(crate) struct StandardClaims {
     /// Subject (user ID)
     pub sub: Option<String>,
 
@@ -115,7 +115,7 @@ pub struct StandardClaims {
 /// Audience claim can be a single string or an array.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(untagged)]
-pub enum Audience {
+pub(crate) enum Audience {
     Single(String),
     Multiple(Vec<String>),
     #[default]
@@ -123,6 +123,7 @@ pub enum Audience {
 }
 
 impl Audience {
+    #[allow(dead_code)]
     pub fn contains(&self, aud: &str) -> bool {
         match self {
             Audience::Single(s) => s == aud,
@@ -151,7 +152,8 @@ pub struct ValidatedToken {
     pub name: Option<String>,
 
     /// Full claims for additional processing
-    pub claims: StandardClaims,
+    #[allow(dead_code)]
+    pub(crate) claims: StandardClaims,
 }
 
 /// JTI (JWT ID) cache entry with expiration tracking.
@@ -181,12 +183,13 @@ pub struct JwtValidator {
 
 impl JwtValidator {
     /// Create a new JWT validator with explicit JWKS URI.
-    pub fn new(config: JwtConfig, jwks_provider: Arc<JwksProvider>) -> Self {
+    #[allow(dead_code)]
+    pub(crate) fn new(config: JwtConfig, jwks_provider: Arc<JwksProvider>) -> Self {
         Self::new_with_options(config, jwks_provider, false)
     }
 
     /// Create a new JWT validator with optional JTI replay protection.
-    pub fn new_with_options(
+    pub(crate) fn new_with_options(
         config: JwtConfig,
         jwks_provider: Arc<JwksProvider>,
         enable_jti_check: bool,
@@ -500,7 +503,8 @@ impl JwtValidator {
     }
 
     /// Get a reference to the JWKS provider.
-    pub fn jwks_provider(&self) -> &Arc<JwksProvider> {
+    #[allow(dead_code)]
+    pub(crate) fn jwks_provider(&self) -> &Arc<JwksProvider> {
         &self.jwks_provider
     }
 

@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flash-attn-cute"
+version = "0.1.0"
+description = "Flash Attention CUTE (CUDA Template Engine) implementation"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "BSD 3-Clause License"}
+authors = [
+    {name = "Tri Dao"},
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "License :: OSI Approved :: BSD License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+
+dependencies = [
+    "nvidia-cutlass-dsl>=4.3.5,<4.4.0",
+    "torch",
+    "einops",
+    "typing_extensions",
+    "apache-tvm-ffi>=0.1.5,<0.2",
+    "torch-c-dlpack-ext",
+    "quack-kernels==0.2.4",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "ruff",
+]
+
+[project.urls]
+Homepage = "https://github.com/Dao-AILab/flash-attention"
+Repository = "https://github.com/Dao-AILab/flash-attention"
+
+[tool.setuptools]
+packages = ["flash_attn.cute"]
+package-dir = {"flash_attn.cute" = "."}
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+ignore = [
+    "E731",  # do not assign a lambda expression, use a def
+    "E741",  # Do not use variables named 'I', 'O', or 'l'
+    "F841",  # local variable is assigned to but never used
+]

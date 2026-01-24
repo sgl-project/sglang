@@ -15,13 +15,10 @@ use axum::{
     extract::Request,
     http::{header::CONTENT_TYPE, StatusCode},
 };
-use sgl_model_gateway::{
+use smg::{
     app_context::AppContext,
     config::RouterConfig,
-    core::{
-        steps::{create_wasm_module_registration_workflow, create_wasm_module_removal_workflow},
-        LoadMonitor, WorkerRegistry,
-    },
+    core::{LoadMonitor, WorkerRegistry},
     data_connector::{
         MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
     },
@@ -71,10 +68,10 @@ async fn create_test_context_with_wasm() -> Arc<AppContext> {
         config.worker_startup_check_interval_secs,
     )));
 
-    // Create empty OnceLock for worker job queue, workflow engine, and mcp manager
+    // Create empty OnceLock for worker job queue, workflow engines, and mcp manager
     use std::sync::OnceLock;
     let worker_job_queue = Arc::new(OnceLock::new());
-    let workflow_engine = Arc::new(OnceLock::new());
+    let workflow_engines = Arc::new(OnceLock::new());
     let mcp_manager_lock = Arc::new(OnceLock::new());
 
     let app_context = Arc::new(
@@ -92,7 +89,7 @@ async fn create_test_context_with_wasm() -> Arc<AppContext> {
             .conversation_item_storage(conversation_item_storage)
             .load_monitor(load_monitor)
             .worker_job_queue(worker_job_queue)
-            .workflow_engine(workflow_engine)
+            .workflow_engines(workflow_engines)
             .mcp_manager(mcp_manager_lock)
             .wasm_manager(Some(wasm_manager))
             .build()
@@ -101,40 +98,22 @@ async fn create_test_context_with_wasm() -> Arc<AppContext> {
 
     // Initialize JobQueue after AppContext is created
     let weak_context = Arc::downgrade(&app_context);
-    let job_queue = sgl_model_gateway::core::JobQueue::new(
-        sgl_model_gateway::core::JobQueueConfig::default(),
-        weak_context,
-    );
+    let job_queue = smg::core::JobQueue::new(smg::core::JobQueueConfig::default(), weak_context);
     app_context
         .worker_job_queue
         .set(job_queue)
         .expect("JobQueue should only be initialized once");
 
-    // Initialize WorkflowEngine and register workflows
-    use sgl_model_gateway::{
-        core::steps::{create_worker_registration_workflow, create_worker_removal_workflow},
-        workflow::WorkflowEngine,
-    };
-    let engine = Arc::new(WorkflowEngine::new());
-    engine
-        .register_workflow(create_worker_registration_workflow(&config))
-        .expect("worker_registration workflow should be valid");
-    engine
-        .register_workflow(create_worker_removal_workflow())
-        .expect("worker_removal workflow should be valid");
-    engine
-        .register_workflow(create_wasm_module_registration_workflow())
-        .expect("wasm_module_registration workflow should be valid");
-    engine
-        .register_workflow(create_wasm_module_removal_workflow())
-        .expect("wasm_module_removal workflow should be valid");
+    // Initialize WorkflowEngines
+    use smg::core::steps::WorkflowEngines;
+    let engines = WorkflowEngines::new(&config);
     app_context
-        .workflow_engine
-        .set(engine)
-        .expect("WorkflowEngine should only be initialized once");
+        .workflow_engines
+        .set(engines)
+        .expect("WorkflowEngines should only be initialized once");
 
     // Initialize MCP manager with empty config
-    use sgl_model_gateway::mcp::{McpConfig, McpManager};
+    use smg::mcp::{McpConfig, McpManager};
     let empty_config = McpConfig {
         servers: vec![],
         pool: Default::default(),
@@ -200,13 +179,15 @@ async fn create_test_app_with_wasm() -> (axum::Router, Arc<AppContext>, TempDir)
         context: app_context.clone(),
         concurrency_queue_tx: None,
         router_manager: None,
+        mesh_handler: None,
+        mesh_sync_manager: None,
     });
 
     let request_id_headers = vec!["x-request-id".to_string(), "x-correlation-id".to_string()];
 
     let app = build_app(
         app_state,
-        sgl_model_gateway::middleware::AuthConfig { api_key: None },
+        smg::middleware::AuthConfig { api_key: None },
         None, // No control plane auth for tests
         256 * 1024 * 1024,
         request_id_headers,
@@ -231,7 +212,7 @@ async fn test_wasm_api_add_module() {
             file_path: wasm_file_path.clone(),
             module_type: WasmModuleType::Middleware,
             attach_points: vec![WasmModuleAttachPoint::Middleware(
-                sgl_model_gateway::wasm::module::MiddlewareAttachPoint::OnRequest,
+                smg::wasm::module::MiddlewareAttachPoint::OnRequest,
             )],
             add_result: None,
         }],
@@ -257,7 +238,7 @@ async fn test_wasm_api_add_module() {
     let module_result = &response_json.modules[0].add_result;
 
     // Print error for debugging
-    if let Some(sgl_model_gateway::wasm::module::WasmModuleAddResult::Error(err)) = module_result {
+    if let Some(smg::wasm::module::WasmModuleAddResult::Error(err)) = module_result {
         eprintln!("Module registration failed: {}", err);
     }
 
@@ -278,9 +259,7 @@ async fn test_wasm_api_add_module() {
         let modules = wasm_manager.get_modules().expect("Failed to get modules");
         assert!(!modules.is_empty(), "Module should be registered");
 
-        if let Some(sgl_model_gateway::wasm::module::WasmModuleAddResult::Success(uuid)) =
-            module_result
-        {
+        if let Some(smg::wasm::module::WasmModuleAddResult::Success(uuid)) = module_result {
             let module = wasm_manager
                 .get_module(*uuid)
                 .expect("Failed to get module");
@@ -299,7 +278,7 @@ async fn test_wasm_api_add_module_invalid_file() {
             file_path: "/nonexistent/path/to/module.component.wasm".to_string(),
             module_type: WasmModuleType::Middleware,
             attach_points: vec![WasmModuleAttachPoint::Middleware(
-                sgl_model_gateway::wasm::module::MiddlewareAttachPoint::OnRequest,
+                smg::wasm::module::MiddlewareAttachPoint::OnRequest,
             )],
             add_result: None,
         }],
@@ -331,7 +310,7 @@ async fn test_wasm_api_add_module_invalid_file() {
     assert!(module_result.is_some());
 
     // Verify it's an error result
-    if let Some(sgl_model_gateway::wasm::module::WasmModuleAddResult::Error(_)) = module_result {
+    if let Some(smg::wasm::module::WasmModuleAddResult::Error(_)) = module_result {
         // Expected error
     } else {
         panic!("Expected error result for invalid file path");
@@ -354,7 +333,7 @@ async fn test_wasm_api_add_module_invalid_wasm() {
             file_path: invalid_wasm_path.to_str().unwrap().to_string(),
             module_type: WasmModuleType::Middleware,
             attach_points: vec![WasmModuleAttachPoint::Middleware(
-                sgl_model_gateway::wasm::module::MiddlewareAttachPoint::OnRequest,
+                smg::wasm::module::MiddlewareAttachPoint::OnRequest,
             )],
             add_result: None,
         }],
@@ -386,7 +365,7 @@ async fn test_wasm_api_add_module_invalid_wasm() {
     assert!(module_result.is_some());
 
     // Verify it's an error result
-    if let Some(sgl_model_gateway::wasm::module::WasmModuleAddResult::Error(_)) = module_result {
+    if let Some(smg::wasm::module::WasmModuleAddResult::Error(_)) = module_result {
         // Expected error
     } else {
         panic!("Expected error result for invalid WASM file");
@@ -405,7 +384,7 @@ async fn test_wasm_api_list_modules() {
             file_path: wasm_file_path.clone(),
             module_type: WasmModuleType::Middleware,
             attach_points: vec![WasmModuleAttachPoint::Middleware(
-                sgl_model_gateway::wasm::module::MiddlewareAttachPoint::OnRequest,
+                smg::wasm::module::MiddlewareAttachPoint::OnRequest,
             )],
             add_result: None,
         }],
@@ -473,7 +452,7 @@ async fn test_wasm_api_remove_module() {
             file_path: wasm_file_path.clone(),
             module_type: WasmModuleType::Middleware,
             attach_points: vec![WasmModuleAttachPoint::Middleware(
-                sgl_model_gateway::wasm::module::MiddlewareAttachPoint::OnRequest,
+                smg::wasm::module::MiddlewareAttachPoint::OnRequest,
             )],
             add_result: None,
         }],
@@ -503,24 +482,23 @@ async fn test_wasm_api_remove_module() {
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Get the module UUID
-    let module_uuid =
-        if let Some(sgl_model_gateway::wasm::module::WasmModuleAddResult::Success(uuid)) =
-            &response_json.modules[0].add_result
-        {
-            *uuid
+    let module_uuid = if let Some(smg::wasm::module::WasmModuleAddResult::Success(uuid)) =
+        &response_json.modules[0].add_result
+    {
+        *uuid
+    } else {
+        // If we can't get UUID from response, try to find it from manager
+        if let Some(wasm_manager) = app_context.wasm_manager.as_ref() {
+            let modules = wasm_manager.get_modules().expect("Failed to get modules");
+            modules
+                .iter()
+                .find(|m| m.module_meta.name == "test_module_remove")
+                .map(|m| m.module_uuid)
+                .expect("Module should be registered")
         } else {
-            // If we can't get UUID from response, try to find it from manager
-            if let Some(wasm_manager) = app_context.wasm_manager.as_ref() {
-                let modules = wasm_manager.get_modules().expect("Failed to get modules");
-                modules
-                    .iter()
-                    .find(|m| m.module_meta.name == "test_module_remove")
-                    .map(|m| m.module_uuid)
-                    .expect("Module should be registered")
-            } else {
-                panic!("WASM manager not available");
-            }
-        };
+            panic!("WASM manager not available");
+        }
+    };
 
     // Now remove the module
     let remove_response = app
@@ -599,7 +577,7 @@ async fn test_wasm_module_duplicate_sha256() {
             file_path: wasm_file_path.clone(),
             module_type: WasmModuleType::Middleware,
             attach_points: vec![WasmModuleAttachPoint::Middleware(
-                sgl_model_gateway::wasm::module::MiddlewareAttachPoint::OnRequest,
+                smg::wasm::module::MiddlewareAttachPoint::OnRequest,
             )],
             add_result: None,
         }],
@@ -630,7 +608,7 @@ async fn test_wasm_module_duplicate_sha256() {
             file_path: wasm_file_path.clone(), // Same file
             module_type: WasmModuleType::Middleware,
             attach_points: vec![WasmModuleAttachPoint::Middleware(
-                sgl_model_gateway::wasm::module::MiddlewareAttachPoint::OnRequest,
+                smg::wasm::module::MiddlewareAttachPoint::OnRequest,
             )],
             add_result: None,
         }],
@@ -662,9 +640,7 @@ async fn test_wasm_module_duplicate_sha256() {
     assert!(module_result.is_some());
 
     // Verify it's an error result (duplicate)
-    if let Some(sgl_model_gateway::wasm::module::WasmModuleAddResult::Error(err_msg)) =
-        module_result
-    {
+    if let Some(smg::wasm::module::WasmModuleAddResult::Error(err_msg)) = module_result {
         assert!(
             err_msg.contains("duplicate")
                 || err_msg.contains("Duplicate")
@@ -686,15 +662,15 @@ async fn test_wasm_module_execution() {
         .as_ref()
         .expect("WASM manager should be initialized");
 
-    let engine = app_context
-        .workflow_engine
+    let engines = app_context
+        .workflow_engines
         .get()
-        .expect("Workflow engine should be initialized");
+        .expect("Workflow engines should be initialized");
 
     // Create workflow context for registration
-    use sgl_model_gateway::{
-        core::steps::WasmModuleConfigRequest,
-        workflow::{WorkflowContext, WorkflowId, WorkflowInstanceId},
+    use smg::{
+        core::steps::{WasmModuleConfigRequest, WasmRegistrationWorkflowData},
+        workflow::WorkflowId,
     };
 
     let descriptor = WasmModuleDescriptor {
@@ -702,57 +678,60 @@ async fn test_wasm_module_execution() {
         file_path: wasm_file_path.clone(),
         module_type: WasmModuleType::Middleware,
         attach_points: vec![WasmModuleAttachPoint::Middleware(
-            sgl_model_gateway::wasm::module::MiddlewareAttachPoint::OnRequest,
+            smg::wasm::module::MiddlewareAttachPoint::OnRequest,
         )],
         add_result: None,
     };
 
     let config_request = WasmModuleConfigRequest { descriptor };
-    let mut workflow_context = WorkflowContext::new(WorkflowInstanceId::new());
-    workflow_context.set_arc("wasm_module_config", Arc::new(config_request));
-    workflow_context.set_arc("app_context", app_context.clone());
+    let workflow_data = WasmRegistrationWorkflowData {
+        config: config_request,
+        wasm_bytes: None,
+        sha256_hash: None,
+        file_size_bytes: None,
+        module_uuid: None,
+        app_context: Some(app_context.clone()),
+    };
 
     // Start workflow
-    let instance_id = engine
-        .start_workflow(
-            WorkflowId::new("wasm_module_registration"),
-            workflow_context,
-        )
+    let instance_id = engines
+        .wasm_registration
+        .start_workflow(WorkflowId::new("wasm_module_registration"), workflow_data)
         .await
         .expect("Failed to start workflow");
 
     // Wait for workflow to complete
     let timeout = Duration::from_secs(30);
     let start = std::time::Instant::now();
-    let mut module_uuid: Option<Uuid> = None;
 
-    loop {
+    let module_uuid = loop {
         if start.elapsed() > timeout {
             panic!("Workflow timeout");
         }
 
-        let state = engine
+        let state = engines
+            .wasm_registration
             .get_status(instance_id)
+            .await
             .expect("Failed to get workflow status");
 
         match state.status {
-            sgl_model_gateway::workflow::WorkflowStatus::Completed => {
-                // Extract module UUID from context
-                if let Some(uuid_arc) = state.context.get::<Uuid>("module_uuid") {
-                    module_uuid = Some(*uuid_arc.as_ref());
-                }
-                break;
+            smg::workflow::WorkflowStatus::Completed => {
+                // Extract module UUID from typed workflow data
+                break state
+                    .context
+                    .data
+                    .module_uuid
+                    .expect("Module UUID should be in context");
             }
-            sgl_model_gateway::workflow::WorkflowStatus::Failed => {
+            smg::workflow::WorkflowStatus::Failed => {
                 panic!("Workflow failed: {:?}", state);
             }
             _ => {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
         }
-    }
-
-    let module_uuid = module_uuid.expect("Module UUID should be in context");
+    };
 
     // Verify module is registered
     let module = wasm_manager
@@ -764,7 +743,7 @@ async fn test_wasm_module_execution() {
     let (initial_total, initial_success, initial_failed, _, _) = wasm_manager.get_metrics();
 
     // Execute the module
-    use sgl_model_gateway::wasm::{
+    use smg::wasm::{
         spec::sgl::model_gateway::middleware_types,
         types::{WasmComponentInput, WasmComponentOutput},
     };
@@ -780,9 +759,8 @@ async fn test_wasm_module_execution() {
     };
 
     let input = WasmComponentInput::MiddlewareRequest(request);
-    let attach_point = WasmModuleAttachPoint::Middleware(
-        sgl_model_gateway::wasm::module::MiddlewareAttachPoint::OnRequest,
-    );
+    let attach_point =
+        WasmModuleAttachPoint::Middleware(smg::wasm::module::MiddlewareAttachPoint::OnRequest);
 
     // Execute the module
     let result = wasm_manager

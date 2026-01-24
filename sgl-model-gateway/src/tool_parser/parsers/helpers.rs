@@ -186,7 +186,7 @@ pub fn normalize_arguments_field(mut obj: Value) -> Value {
 /// - `Ok(StreamingParseResult)` with any tool call items to stream
 /// - `Err(ParserError)` if JSON parsing or serialization fails
 #[allow(clippy::too_many_arguments)]
-pub fn handle_json_tool_streaming(
+pub(crate) fn handle_json_tool_streaming(
     current_text: &str,
     start_idx: usize,
     partial_json: &mut crate::tool_parser::partial_json::PartialJson,

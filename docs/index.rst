@@ -58,6 +58,7 @@ Its core features include:
    advanced_features/pd_multiplexing.md
    advanced_features/vlm_query.ipynb
    advanced_features/dp_for_multi_modal_encoder.md
+   advanced_features/cuda_graph_for_multi_modal_encoder.md
    advanced_features/sgl_model_gateway.md
    advanced_features/deterministic_inference.md
    advanced_features/observability.md
@@ -70,6 +71,7 @@ Its core features include:
    supported_models/generative_models.md
    supported_models/multimodal_language_models.md
    supported_models/diffusion_language_models.md
+   supported_models/diffusion_models.md
    supported_models/embedding_models.md
    supported_models/reward_models.md
    supported_models/rerank_models.md
@@ -98,6 +100,7 @@ Its core features include:
    developer_guide/development_guide_using_docker.md
    developer_guide/benchmark_and_profiling.md
    developer_guide/bench_serving.md
+   developer_guide/evaluating_new_models.md
 
 .. toctree::
    :maxdepth: 1

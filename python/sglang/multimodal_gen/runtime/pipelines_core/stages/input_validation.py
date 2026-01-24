@@ -182,13 +182,6 @@ class InputValidationStage(PipelineStage):
     ) -> Req:
         """
         Validate and prepare inputs.
-
-        Args:
-            batch: The current batch information.
-            server_args: The inference arguments.
-
-        Returns:
-            The validated batch information.
         """
 
         self._generate_seeds(batch, server_args)

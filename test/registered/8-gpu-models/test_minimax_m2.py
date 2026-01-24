@@ -7,12 +7,12 @@ from sglang.test.run_combined_tests import run_combined_tests
 from sglang.test.test_utils import ModelLaunchSettings
 
 # Runs on both H200 and B200 via nightly-8-gpu-common suite
-register_cuda_ci(est_time=12000, suite="nightly-8-gpu-common", nightly=True)
+register_cuda_ci(est_time=1800, suite="nightly-8-gpu-common", nightly=True)
 
 MINIMAX_M2_MODEL_PATH = "MiniMaxAI/MiniMax-M2"
 
 
-class TestMiniMaxM2Unified(unittest.TestCase):
+class TestMiniMaxM2(unittest.TestCase):
     """Unified test class for MiniMax-M2 performance and accuracy.
 
     Single variant with TP=8 + EP=8 configuration.
@@ -37,6 +37,7 @@ class TestMiniMaxM2Unified(unittest.TestCase):
                 MINIMAX_M2_MODEL_PATH,
                 tp_size=8,
                 extra_args=base_args,
+                variant="TP8+EP8",
             ),
         ]
 

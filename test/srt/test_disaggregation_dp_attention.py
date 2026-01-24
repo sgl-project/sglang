@@ -69,7 +69,6 @@ class TestDisaggregationDPAttention(PDDisaggregationServerBase):
             "--enable-dp-attention",
             "--base-gpu-id",
             str(cls.PREFILL_DP_SIZE),
-            "--prefill-round-robin-balance",
         ]
         decode_args += cls.transfer_backend + cls.rdma_devices
         cls.process_decode = popen_launch_pd_server(

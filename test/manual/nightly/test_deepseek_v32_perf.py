@@ -113,7 +113,7 @@ class TestNightlyDeepseekV32Performance(unittest.TestCase):
                     if not success:
                         failed_variants.append(variant_config["name"])
 
-                    self.runner.add_report(results)
+                    self.runner.add_report(results, variant=variant_config["name"])
         finally:
             self.runner.write_final_report()
 

@@ -219,6 +219,24 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
       "                 Tensor!? key, int head_size,"
       "                 Tensor cos_sin_cache, bool is_neox) -> ()");
   m.impl("rotary_embedding", torch::kCUDA, &rotary_embedding);
+  /*
+   * From csrc/sgl_diffusion/elementwise
+   */
+  m.def(
+      "timestep_embedding(Tensor input,"
+      "Tensor output,"
+      "int dim,"
+      "bool flip_sin_to_cos,"
+      "float downscale_freq_shift,"
+      "float scale,"
+      "int max_period) -> Tensor");
+  m.impl("timestep_embedding", torch::kCUDA, &timestep_embedding);
+
+  /*
+   * From csrc/memory
+   */
+  m.def("weak_ref_tensor(Tensor tensor) -> Tensor");
+  m.impl("weak_ref_tensor", torch::kCUDA, &weak_ref_tensor);
 }
 
 REGISTER_EXTENSION(common_ops)

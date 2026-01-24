@@ -87,7 +87,9 @@ Note: To view the traces through perfetto-ui, please:
         return f"| {self.batch_size} | {self.input_len} | {self.latency:.2f} | {self.input_throughput:.2f} | {self.output_throughput:.2f} | {accept_length} | {itl:.2f} | {input_cost:.2f} | {output_cost:.2f} | {profile_link} |\n"
 
 
-def generate_markdown_report(trace_dir, results: List[BenchmarkResult]) -> str:
+def generate_markdown_report(
+    trace_dir, results: List[BenchmarkResult], variant: Optional[str] = None
+) -> str:
     """Generate a markdown report from a list of BenchmarkResult object from a single run."""
     # Build model header with run_name if it's not "default"
     model_header = results[0].model_path
@@ -98,6 +100,9 @@ def generate_markdown_report(trace_dir, results: List[BenchmarkResult]) -> str:
     gpu_config = os.getenv("GPU_CONFIG", "")
     if gpu_config:
         model_header += f" [{gpu_config}]"
+
+    if variant:
+        model_header += f" ({variant})"
 
     summary = f"### {model_header}\n"
 
@@ -127,12 +132,25 @@ def save_results_as_pydantic_models(
         profile_link_decode = None
 
         if res.profile_link:
+            # Collect all trace files, preferring TP-0 to match upload behavior
+            # (only TP-0 traces are published to avoid duplicates)
+            extend_files = []
+            decode_files = []
             for file in os.listdir(res.profile_link):
                 if file.endswith(".trace.json.gz") or file.endswith(".trace.json"):
                     if "extend" in file.lower() or "prefill" in file.lower():
-                        profile_link_extend = os.path.join(res.profile_link, file)
+                        extend_files.append(file)
                     elif "decode" in file.lower():
-                        profile_link_decode = os.path.join(res.profile_link, file)
+                        decode_files.append(file)
+
+            # Sort to prefer TP-0 files (TP-0 < TP-1 < TP-2... alphabetically)
+            extend_files.sort()
+            decode_files.sort()
+
+            if extend_files:
+                profile_link_extend = os.path.join(res.profile_link, extend_files[0])
+            if decode_files:
+                profile_link_decode = os.path.join(res.profile_link, decode_files[0])
 
         benchmark_result = BenchmarkResult(
             model_path=model_path,

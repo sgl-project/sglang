@@ -282,3 +282,8 @@ class OpenAIServingBase(ABC):
                 if label in self.allowed_custom_labels
             }
         return custom_labels
+
+    def extract_routing_key(self, raw_request):
+        if raw_request is None:
+            return None
+        return raw_request.headers.get("x-smg-routing-key")

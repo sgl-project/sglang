@@ -14,8 +14,39 @@ from urllib.request import Request, urlopen
 
 
 def is_rate_limit_error(e):
-    """Check if an exception is a GitHub permission/quota error that should not be retried"""
-    return isinstance(e, HTTPError) and e.code in [403, 429]
+    """Check if an exception is a GitHub rate limit error (not permission error)"""
+    if not isinstance(e, HTTPError):
+        return False
+    if e.code == 429:
+        return True
+    if e.code == 403:
+        # 403 can be rate limit OR permission error - check the message
+        error_body = getattr(e, "error_body", "")
+        if isinstance(error_body, str):
+            # Rate limit errors contain specific phrases
+            rate_limit_phrases = [
+                "rate limit",
+                "abuse detection",
+                "secondary rate limit",
+            ]
+            return any(phrase in error_body.lower() for phrase in rate_limit_phrases)
+    return False
+
+
+def is_permission_error(e):
+    """Check if an exception is a GitHub permission error"""
+    if not isinstance(e, HTTPError) or e.code != 403:
+        return False
+    error_body = getattr(e, "error_body", "")
+    if isinstance(error_body, str):
+        permission_phrases = [
+            "resource not accessible",
+            "must have push access",
+            "permission",
+            "denied",
+        ]
+        return any(phrase in error_body.lower() for phrase in permission_phrases)
+    return False
 
 
 def make_github_request(url, token, method="GET", data=None):
@@ -266,7 +297,10 @@ def update_branch_ref(repo_owner, repo_name, branch, commit_sha, token, max_retr
 
 
 def copy_trace_files(source_dir, target_base_path):
-    """Copy trace files and return list of files to upload"""
+    """Copy trace files and return list of files to upload.
+
+    Only uploads traces from TP rank 0 to avoid duplicated data across tensor parallel ranks.
+    """
     files_to_upload = []
 
     if not os.path.exists(source_dir):
@@ -277,6 +311,11 @@ def copy_trace_files(source_dir, target_base_path):
     for root, dirs, files in os.walk(source_dir):
         for file in files:
             if file.endswith(".json.gz"):
+
+                # Only upload TP rank 0 traces to avoid duplicates across tensor parallel ranks
+                if "TP-" in file and "TP-0" not in file:
+                    continue
+
                 source_file = os.path.join(root, file)
                 # Calculate relative path from source_dir
                 rel_path = os.path.relpath(source_file, source_dir)
@@ -341,6 +380,14 @@ def publish_traces(traces_dir, run_id, run_number):
                 "GitHub API rate limit exceeded during blob creation. Skipping trace upload."
             )
             return
+        # Check for permission errors - these should fail loudly
+        if is_permission_error(e):
+            print(
+                f"ERROR: Token does not have write permission to {repo_owner}/{repo_name}. "
+                "Please update the GH_PAT_FOR_NIGHTLY_CI_DATA secret with a token that has "
+                "'contents: write' permission for the repository."
+            )
+            sys.exit(1)
         print(f"Failed to create blobs: {e}")
         raise
 
@@ -401,6 +448,15 @@ def publish_traces(traces_dir, run_id, run_number):
             if is_rate_limit_error(e):
                 warnings.warn("GitHub API rate limit exceeded. Skipping trace upload.")
                 return
+
+            # Check for permission errors - these should fail loudly
+            if is_permission_error(e):
+                print(
+                    f"ERROR: Token does not have write permission to {repo_owner}/{repo_name}. "
+                    "Please update the GH_PAT_FOR_NIGHTLY_CI_DATA secret with a token that has "
+                    "'contents: write' permission for the repository."
+                )
+                sys.exit(1)
 
             if is_retryable and attempt < max_retries - 1:
                 print(

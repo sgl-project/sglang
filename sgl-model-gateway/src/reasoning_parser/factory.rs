@@ -206,6 +206,10 @@ impl ParserFactory {
         registry.register_pattern("minimax-m2", "minimax");
         registry.register_pattern("mm-m2", "minimax");
 
+        // Nano V3 uses same format as Qwen3 (requires explicit <think> token)
+        registry.register_pattern("nemotron-nano", "qwen3");
+        registry.register_pattern("nano-v3", "qwen3");
+
         Self { registry }
     }
 

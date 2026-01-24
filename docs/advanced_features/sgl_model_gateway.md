@@ -24,6 +24,7 @@ SGLang Model Gateway is a high-performance model-routing gateway for large-scale
    - [Inference Endpoints](#inference-endpoints)
    - [Tokenization Endpoints](#tokenization-endpoints)
    - [Parser Endpoints](#parser-endpoints)
+   - [Classification API](#classification-api)
    - [Conversation and Response APIs](#conversation-and-response-apis)
    - [Worker Management APIs](#worker-management-apis)
    - [Admin and Health Endpoints](#admin-and-health-endpoints)
@@ -85,7 +86,7 @@ SGLang Model Gateway is a high-performance model-routing gateway for large-scale
 ### Data Plane
 
 - **HTTP routers** (regular & PD) implement `/generate`, `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/embeddings`, `/v1/rerank`, `/v1/classify`, `/v1/tokenize`, `/v1/detokenize`, and associated admin endpoints.
-- **gRPC router** streams tokenized requests directly to SRT gRPC workers, running fully in Rust—tokenizer, reasoning parser, and tool parser all reside in-process. Supports both single-stage and PD routing, including embeddings.
+- **gRPC router** streams tokenized requests directly to SRT gRPC workers, running fully in Rust—tokenizer, reasoning parser, and tool parser all reside in-process. Supports both single-stage and PD routing, including embeddings and classification.
 - **OpenAI router** proxies OpenAI-compatible endpoints to external vendors (OpenAI, xAI, etc.) while keeping chat history and multi-turn orchestration local.
 
 ### Storage and Privacy
@@ -419,6 +420,59 @@ The gateway provides admin endpoints for parsing reasoning content and function 
   "parser": "json"
 }
 ```
+
+### Classification API
+
+The `/v1/classify` endpoint provides text classification using sequence classification models (e.g., `Qwen2ForSequenceClassification`, `BertForSequenceClassification`).
+
+#### Request
+
+```bash
+curl http://localhost:30000/v1/classify \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "jason9693/Qwen2.5-1.5B-apeach",
+    "input": "I love this product!"
+  }'
+```
+
+#### Response
+
+```json
+{
+  "id": "classify-a1b2c3d4-5678-90ab-cdef-1234567890ab",
+  "object": "list",
+  "created": 1767034308,
+  "model": "jason9693/Qwen2.5-1.5B-apeach",
+  "data": [
+    {
+      "index": 0,
+      "label": "positive",
+      "probs": [0.12, 0.88],
+      "num_classes": 2
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 6,
+    "completion_tokens": 0,
+    "total_tokens": 6
+  }
+}
+```
+
+#### Response Fields
+
+| Field | Description |
+|-------|-------------|
+| `label` | Predicted class label (from model's `id2label` config, or `LABEL_N` fallback) |
+| `probs` | Probability distribution over all classes (softmax of logits) |
+| `num_classes` | Number of classification classes |
+
+#### Notes
+
+- Classification reuses the embedding backend—the scheduler returns logits which are converted to probabilities via softmax
+- Labels come from the model's HuggingFace config (`id2label` field); models without this mapping use generic labels (`LABEL_0`, `LABEL_1`, etc.)
+- Both HTTP and gRPC routers support classification
 
 ### Conversation and Response APIs
 
@@ -804,6 +858,7 @@ Prefill pods can expose bootstrap ports via the `sglang.ai/bootstrap-port` annot
 | `none` | No persistence | `--history-backend none` |
 | `oracle` | Oracle Autonomous Database | `--history-backend oracle` |
 | `postgres` | PostgreSQL Database | `--history-backend postgres` |
+| `redis` | Redis | `--history-backend redis` |
 
 ### Oracle Configuration
 
@@ -837,6 +892,22 @@ python -m sglang_router.launch_router \
   --worker-urls https://api.openai.com \
   --history-backend postgres
 ```
+
+### Redis Configuration
+
+```bash
+export REDIS_URL="redis://localhost:6379"
+export REDIS_POOL_MAX=16
+export REDIS_RETENTION_DAYS=30
+
+python -m sglang_router.launch_router \
+  --backend openai \
+  --worker-urls https://api.openai.com \
+  --history-backend redis \
+  --redis-retention-days 30
+```
+
+Use `--redis-retention-days -1` for persistent storage (default is 30 days).
 
 ---
 

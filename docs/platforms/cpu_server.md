@@ -93,6 +93,10 @@ name = "torchvision"
 url = "https://download.pytorch.org/whl/cpu"
 
 [[index]]
+name = "torchaudio"
+url = "https://download.pytorch.org/whl/cpu"
+
+[[index]]
 name = "triton"
 url = "https://download.pytorch.org/whl/cpu"
 
@@ -119,7 +123,7 @@ cp pyproject_cpu.toml pyproject.toml
 # Install SGLang dependent libs, and build SGLang main package
 uv pip install --upgrade pip setuptools
 uv pip install .
-uv pip install torch==2.9.0 torchvision==0.24.0 triton==3.5.0 --force-reinstall
+uv pip install torch==2.9.0 torchvision==0.24.0 torchaudio==2.9.0 torchao==0.14.1 triton==3.5.0 --force-reinstall
 
 # Build the CPU backend kernels
 cd ../sgl-kernel

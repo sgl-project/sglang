@@ -1,6 +1,7 @@
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 use dashmap::DashMap;
+use serde_json;
 use tracing::{debug, info, warn};
 
 /// Policy Registry for managing model-to-policy mappings
@@ -10,7 +11,7 @@ use tracing::{debug, info, warn};
 /// All subsequent workers of the same model use the established policy.
 /// When the last worker of a model is removed, the policy mapping is cleaned up.
 use super::{BucketPolicy, CacheAwarePolicy, LoadBalancingPolicy, PolicyFactory};
-use crate::{config::types::PolicyConfig, core::Worker};
+use crate::{config::types::PolicyConfig, core::Worker, mesh::OptionalMeshSyncManager};
 
 /// Registry for managing model-to-policy mappings
 #[derive(Clone)]
@@ -29,6 +30,11 @@ pub struct PolicyRegistry {
 
     /// Decode policy for PD mode (set once at startup, lock-free reads via OnceLock)
     decode_policy: Arc<OnceLock<Arc<dyn LoadBalancingPolicy>>>,
+
+    /// Optional mesh sync manager for state synchronization
+    /// When None, the registry works independently without mesh synchronization
+    /// Uses RwLock for thread-safe access when setting mesh_sync after initialization
+    mesh_sync: Arc<RwLock<OptionalMeshSyncManager>>,
 }
 
 impl PolicyRegistry {
@@ -42,7 +48,13 @@ impl PolicyRegistry {
             default_policy,
             prefill_policy: Arc::new(OnceLock::new()),
             decode_policy: Arc::new(OnceLock::new()),
+            mesh_sync: Arc::new(RwLock::new(None)),
         }
+    }
+
+    /// Set mesh sync manager (thread-safe, can be called after initialization)
+    pub fn set_mesh_sync(&self, mesh_sync: OptionalMeshSyncManager) {
+        *self.mesh_sync.write().unwrap() = mesh_sync;
     }
 
     /// Called when a worker is added
@@ -84,6 +96,13 @@ impl PolicyRegistry {
         self.model_policies
             .insert(model_id.to_string(), Arc::clone(&policy));
 
+        // Sync to mesh if enabled (no-op if mesh is not enabled)
+        if let Some(ref mesh_sync) = *self.mesh_sync.read().unwrap() {
+            // Serialize policy config (simplified - just store policy name for now)
+            let config = serde_json::to_vec(&policy.name()).unwrap_or_default();
+            mesh_sync.sync_policy_state(model_id.to_string(), policy.name().to_string(), config);
+        }
+
         policy
     }
 
@@ -120,6 +139,11 @@ impl PolicyRegistry {
                     policy.name(),
                     model_id
                 );
+            }
+
+            // Sync removal to mesh if enabled (no-op if mesh is not enabled)
+            if let Some(ref mesh_sync) = *self.mesh_sync.read().unwrap() {
+                mesh_sync.remove_policy_state(model_id);
             }
         }
     }
@@ -159,10 +183,17 @@ impl PolicyRegistry {
 
     /// Create a policy from a type string (delegates to PolicyFactory)
     fn create_policy_from_type(&self, policy_type: &str) -> Arc<dyn LoadBalancingPolicy> {
-        PolicyFactory::create_by_name(policy_type).unwrap_or_else(|| {
-            warn!("Unknown policy type '{}', using default", policy_type);
-            Arc::clone(&self.default_policy)
-        })
+        if policy_type == "cache_aware" {
+            let mut cache_aware = CacheAwarePolicy::new();
+            let mesh_sync = &*self.mesh_sync.read().unwrap();
+            cache_aware.set_mesh_sync(mesh_sync.clone());
+            Arc::new(cache_aware)
+        } else {
+            PolicyFactory::create_by_name(policy_type).unwrap_or_else(|| {
+                warn!("Unknown policy type '{}', using default", policy_type);
+                Arc::clone(&self.default_policy)
+            })
+        }
     }
 
     /// Create a policy from a PolicyConfig (delegates to PolicyFactory)
@@ -354,6 +385,54 @@ impl PolicyRegistry {
             }
         }
     }
+
+    /// Apply remote tree operation to cache-aware policy for a model
+    /// This is called when receiving tree state updates from mesh
+    pub fn apply_remote_tree_operation(
+        &self,
+        model_id: &str,
+        operation: &crate::mesh::tree_ops::TreeOperation,
+    ) {
+        // Try to find the policy for this model
+        if let Some(policy) = self.get_policy(model_id) {
+            if policy.name() == "cache_aware" {
+                if let Some(cache_aware) = policy.as_any().downcast_ref::<CacheAwarePolicy>() {
+                    cache_aware.apply_remote_tree_operation(model_id, operation);
+                }
+            }
+        }
+
+        // Also check default policy if it's cache-aware
+        if self.default_policy.name() == "cache_aware" {
+            if let Some(cache_aware) = self
+                .default_policy
+                .as_any()
+                .downcast_ref::<CacheAwarePolicy>()
+            {
+                cache_aware.apply_remote_tree_operation(model_id, operation);
+            }
+        }
+
+        // Check prefill and decode policies for PD mode
+        if let Some(prefill_policy) = self.prefill_policy.get() {
+            if prefill_policy.name() == "cache_aware" {
+                if let Some(cache_aware) =
+                    prefill_policy.as_any().downcast_ref::<CacheAwarePolicy>()
+                {
+                    cache_aware.apply_remote_tree_operation(model_id, operation);
+                }
+            }
+        }
+
+        if let Some(decode_policy) = self.decode_policy.get() {
+            if decode_policy.name() == "cache_aware" {
+                if let Some(cache_aware) = decode_policy.as_any().downcast_ref::<CacheAwarePolicy>()
+                {
+                    cache_aware.apply_remote_tree_operation(model_id, operation);
+                }
+            }
+        }
+    }
 }
 
 impl std::fmt::Debug for PolicyRegistry {
@@ -370,8 +449,8 @@ impl std::fmt::Debug for PolicyRegistry {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_policy_registry_basic() {
+    #[tokio::test]
+    async fn test_policy_registry_basic() {
         let registry = PolicyRegistry::new(PolicyConfig::RoundRobin);
 
         // First worker of a model sets the policy
@@ -397,8 +476,8 @@ mod tests {
         assert_eq!(*counts.get("gpt-4").unwrap(), 1);
     }
 
-    #[test]
-    fn test_policy_registry_cleanup() {
+    #[tokio::test]
+    async fn test_policy_registry_cleanup() {
         let registry = PolicyRegistry::new(PolicyConfig::RoundRobin);
 
         // Add workers
@@ -417,8 +496,8 @@ mod tests {
         assert_eq!(registry.get_worker_counts().get("llama-3"), None);
     }
 
-    #[test]
-    fn test_default_policy() {
+    #[tokio::test]
+    async fn test_default_policy() {
         let registry = PolicyRegistry::new(PolicyConfig::RoundRobin);
 
         // No hint, no template - uses default
