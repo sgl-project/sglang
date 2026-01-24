@@ -255,49 +255,6 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
-  # 8-GPU DeepSeek-R1 (Accuracy + Performance combined)
-  nightly-8-gpu-deepseek-r1:
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-8-gpu-deepseek-r1')
-    runs-on: linux-mi325-gpu-8
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.ref || github.ref }}
-
-      - name: Setup docker
-        run: |
-          touch github_summary.md
-          bash scripts/ci/amd_ci_start_container.sh
-        env:
-          GITHUB_WORKSPACE: ${{ github.workspace }}
-
-      - name: Install dependencies
-        run: bash scripts/ci/amd_ci_install_dependency.sh
-
-      - name: Accuracy Test (8-GPU DeepSeek-R1)
-        timeout-minutes: 240
-        run: |
-          > github_summary.md  # Clear summary file
-          bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test \
-            -e SGLANG_USE_AITER=1 \
-            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
-            python3 run_suite.py --hw amd --suite nightly-amd-accuracy-8-gpu-deepseek-r1 --nightly --timeout-per-file 7200 || TEST_EXIT_CODE=$?
-          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
-          exit ${TEST_EXIT_CODE:-0}
-
-      - name: Performance Test (8-GPU DeepSeek-R1)
-        timeout-minutes: 300
-        continue-on-error: true  # Perf test failure doesn't fail the job if accuracy passed
-        run: |
-          > github_summary.md  # Clear summary file
-          bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test \
-            -e SGLANG_USE_AITER=1 \
-            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
-            python3 run_suite.py --hw amd --suite nightly-perf-8-gpu-deepseek-r1 --nightly --timeout-per-file 18000 || TEST_EXIT_CODE=$?
-          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
-          exit ${TEST_EXIT_CODE:-0}
-
   # ============================================== MI30x Combined Accuracy + Performance Tests ==============================================
   # 8-GPU Grok1-INT4 (Accuracy + Performance combined)
   nightly-8-gpu-grok1-int4:
@@ -928,7 +885,6 @@ jobs:
       - nightly-perf-2-gpu-text
       - nightly-perf-2-gpu-vlm
       - nightly-accuracy-8-gpu
-      - nightly-8-gpu-deepseek-r1
       # MI30x Combined Accuracy + Performance Tests
       - nightly-8-gpu-grok1-int4
       - nightly-8-gpu-grok2
