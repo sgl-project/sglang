@@ -286,6 +286,7 @@ class ServerArgs:
     # CPU offload parameters
     dit_cpu_offload: bool | None = None
     dit_layerwise_offload: bool | None = None
+    dit_offload_prefetch_size: int = 1
     text_encoder_cpu_offload: bool | None = None
     image_encoder_cpu_offload: bool | None = None
     vae_cpu_offload: bool | None = None
@@ -617,6 +618,12 @@ class ServerArgs:
             default=ServerArgs.dit_layerwise_offload,
             help="Enable layerwise CPU offload with async H2D prefetch overlap for supported DiT models (e.g., Wan). "
             "Cannot be used together with cache-dit (SGLANG_CACHE_DIT_ENABLED), dit_cpu_offload, or use_fsdp_inference.",
+        )
+        parser.add_argument(
+            "--dit-offload-prefetch-size",
+            type=int,
+            default=ServerArgs.dit_offload_prefetch_size,
+            help="Number of layers to prefetch at once when dit-layerwise-offload is enabled.",
         )
         parser.add_argument(
             "--use-fsdp-inference",
