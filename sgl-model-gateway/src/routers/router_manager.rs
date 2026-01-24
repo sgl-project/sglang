@@ -28,6 +28,7 @@ use crate::{
         completion::CompletionRequest,
         embedding::EmbeddingRequest,
         generate::GenerateRequest,
+        images::{ImageEditRequest, ImageGenerationRequest},
         rerank::RerankRequest,
         responses::{ResponsesGetParams, ResponsesRequest},
     },
@@ -724,6 +725,46 @@ impl RouterTrait for RouterManager {
             (
                 StatusCode::NOT_FOUND,
                 "No router available for rerank request",
+            )
+                .into_response()
+        }
+    }
+
+    async fn route_images_generations(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &ImageGenerationRequest,
+        model_id: Option<&str>,
+    ) -> Response {
+        let router = self.select_router_for_request(headers, model_id);
+
+        if let Some(router) = router {
+            router
+                .route_images_generations(headers, body, model_id)
+                .await
+        } else {
+            (
+                StatusCode::NOT_FOUND,
+                format!("Model '{}' not found or no router available", body.model),
+            )
+                .into_response()
+        }
+    }
+
+    async fn route_images_edits(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &ImageEditRequest,
+        model_id: Option<&str>,
+    ) -> Response {
+        let router = self.select_router_for_request(headers, model_id);
+
+        if let Some(router) = router {
+            router.route_images_edits(headers, body, model_id).await
+        } else {
+            (
+                StatusCode::NOT_FOUND,
+                format!("Model '{}' not found or no router available", body.model),
             )
                 .into_response()
         }

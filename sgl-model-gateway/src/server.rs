@@ -51,6 +51,7 @@ use crate::{
         completion::CompletionRequest,
         embedding::EmbeddingRequest,
         generate::GenerateRequest,
+        images::{ImageEditRequest, ImageGenerationRequest},
         parser::{ParseFunctionCallRequest, SeparateReasoningRequest},
         rerank::{RerankRequest, V1RerankReqInput},
         responses::{ResponsesGetParams, ResponsesRequest},
@@ -253,6 +254,28 @@ async fn v1_classify(
     state
         .router
         .route_classify(Some(&headers), &body, Some(&body.model))
+        .await
+}
+
+async fn v1_images_generations(
+    State(state): State<Arc<AppState>>,
+    headers: http::HeaderMap,
+    Json(body): Json<ImageGenerationRequest>,
+) -> Response {
+    state
+        .router
+        .route_images_generations(Some(&headers), &body, Some(&body.model))
+        .await
+}
+
+async fn v1_images_edits(
+    State(state): State<Arc<AppState>>,
+    headers: http::HeaderMap,
+    Json(body): Json<ImageEditRequest>,
+) -> Response {
+    state
+        .router
+        .route_images_edits(Some(&headers), &body, Some(&body.model))
         .await
 }
 
@@ -557,6 +580,8 @@ pub fn build_app(
         .route("/v1/responses", post(v1_responses))
         .route("/v1/embeddings", post(v1_embeddings))
         .route("/v1/classify", post(v1_classify))
+        .route("/v1/images/generations", post(v1_images_generations))
+        .route("/v1/images/edits", post(v1_images_edits))
         .route("/v1/responses/{response_id}", get(v1_responses_get))
         .route(
             "/v1/responses/{response_id}/cancel",

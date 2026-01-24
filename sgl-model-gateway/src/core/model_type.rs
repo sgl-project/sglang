@@ -167,6 +167,7 @@ impl ModelType {
             Endpoint::Rerank => self.supports_rerank(),
             Endpoint::Generate => self.supports_generate(),
             Endpoint::Models => true, // Models endpoint is always supported
+            Endpoint::ImagesGenerations | Endpoint::ImagesEdits => self.supports_image_gen(),
         }
     }
 
@@ -271,6 +272,10 @@ pub enum Endpoint {
     Generate,
     /// Models listing endpoint (/v1/models)
     Models,
+    /// Image generation endpoint (/v1/images/generations)
+    ImagesGenerations,
+    /// Image editing endpoint (/v1/images/edits)
+    ImagesEdits,
 }
 
 impl Endpoint {
@@ -284,6 +289,8 @@ impl Endpoint {
             Endpoint::Rerank => "/v1/rerank",
             Endpoint::Generate => "/generate",
             Endpoint::Models => "/v1/models",
+            Endpoint::ImagesGenerations => "/v1/images/generations",
+            Endpoint::ImagesEdits => "/v1/images/edits",
         }
     }
 
@@ -299,6 +306,8 @@ impl Endpoint {
             "/v1/rerank" => Some(Endpoint::Rerank),
             "/generate" => Some(Endpoint::Generate),
             "/v1/models" => Some(Endpoint::Models),
+            "/v1/images/generations" => Some(Endpoint::ImagesGenerations),
+            "/v1/images/edits" => Some(Endpoint::ImagesEdits),
             _ => None,
         }
     }
@@ -313,6 +322,7 @@ impl Endpoint {
             Endpoint::Rerank => Some(ModelType::RERANK),
             Endpoint::Generate => Some(ModelType::GENERATE),
             Endpoint::Models => None, // No specific capability required
+            Endpoint::ImagesGenerations | Endpoint::ImagesEdits => Some(ModelType::IMAGE_GEN),
         }
     }
 }
@@ -327,6 +337,8 @@ impl std::fmt::Display for Endpoint {
             Endpoint::Rerank => write!(f, "rerank"),
             Endpoint::Generate => write!(f, "generate"),
             Endpoint::Models => write!(f, "models"),
+            Endpoint::ImagesGenerations => write!(f, "images_generations"),
+            Endpoint::ImagesEdits => write!(f, "images_edits"),
         }
     }
 }

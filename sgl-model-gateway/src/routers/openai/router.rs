@@ -37,6 +37,7 @@ use crate::{
     observability::metrics::{bool_to_static_str, metrics_labels, Metrics},
     protocols::{
         chat::ChatCompletionRequest,
+        images::{ImageEditRequest, ImageGenerationRequest},
         responses::{
             generate_id, ResponseContentPart, ResponseInput, ResponseInputOutputItem,
             ResponsesGetParams, ResponsesRequest,
@@ -1037,6 +1038,348 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                 error_responses::internal_error(format!("Failed to retrieve input items: {}", e))
             }
         }
+    }
+
+    async fn route_images_generations(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &ImageGenerationRequest,
+        model_id: Option<&str>,
+    ) -> Response {
+        let start = Instant::now();
+        let model = model_id.unwrap_or(body.model.as_str());
+
+        // Record request start
+        Metrics::record_router_request(
+            metrics_labels::ROUTER_OPENAI,
+            metrics_labels::BACKEND_EXTERNAL,
+            metrics_labels::CONNECTION_HTTP,
+            model,
+            metrics_labels::ENDPOINT_IMAGES_GENERATIONS,
+            bool_to_static_str(false), // images are non-streaming
+        );
+
+        let auth_header = extract_auth_header(headers, &None);
+
+        let worker = match self
+            .select_worker_for_model(&body.model, auth_header.as_ref())
+            .await
+        {
+            Ok(w) => w,
+            Err(response) => {
+                Metrics::record_router_error(
+                    metrics_labels::ROUTER_OPENAI,
+                    metrics_labels::BACKEND_EXTERNAL,
+                    metrics_labels::CONNECTION_HTTP,
+                    model,
+                    metrics_labels::ENDPOINT_IMAGES_GENERATIONS,
+                    metrics_labels::ERROR_NO_WORKERS,
+                );
+                return response;
+            }
+        };
+
+        let mut payload = match to_value(body) {
+            Ok(v) => v,
+            Err(e) => {
+                Metrics::record_router_error(
+                    metrics_labels::ROUTER_OPENAI,
+                    metrics_labels::BACKEND_EXTERNAL,
+                    metrics_labels::CONNECTION_HTTP,
+                    model,
+                    metrics_labels::ENDPOINT_IMAGES_GENERATIONS,
+                    metrics_labels::ERROR_VALIDATION,
+                );
+                return error_responses::bad_request(format!("Failed to serialize request: {}", e));
+            }
+        };
+
+        let provider = self.get_provider_arc_for_worker(worker.as_ref(), model_id);
+        if let Err(e) = provider.transform_request(&mut payload, Endpoint::ImagesGenerations) {
+            Metrics::record_router_error(
+                metrics_labels::ROUTER_OPENAI,
+                metrics_labels::BACKEND_EXTERNAL,
+                metrics_labels::CONNECTION_HTTP,
+                model,
+                metrics_labels::ENDPOINT_IMAGES_GENERATIONS,
+                metrics_labels::ERROR_VALIDATION,
+            );
+            return error_responses::bad_request(format!("Provider transform error: {}", e));
+        }
+
+        let url = format!("{}/v1/images/generations", worker.url());
+        let payload_json = Arc::new(payload);
+        let client = self.shared_components.client.clone();
+        let headers_cloned = Arc::new(headers.cloned());
+        let worker_api_key = Arc::new(worker.api_key().clone());
+
+        let response = RetryExecutor::execute_response_with_retry(
+            &self.retry_config,
+            |_attempt| {
+                let client = client.clone();
+                let url = url.clone();
+                let payload = Arc::clone(&payload_json);
+                let headers = Arc::clone(&headers_cloned);
+                let worker_api_key = Arc::clone(&worker_api_key);
+                let worker = Arc::clone(&worker);
+
+                async move {
+                    let mut req = client.post(&url).json(&*payload);
+                    let auth_header = extract_auth_header((*headers).as_ref(), &worker_api_key);
+                    req = apply_provider_headers(req, &url, auth_header.as_ref());
+
+                    let resp = match req.send().await {
+                        Ok(r) => r,
+                        Err(e) => {
+                            worker.circuit_breaker().record_failure();
+                            return (
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                format!("Failed to contact upstream: {}", e),
+                            )
+                                .into_response();
+                        }
+                    };
+
+                    let status = StatusCode::from_u16(resp.status().as_u16())
+                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+
+                    if !status.is_success() {
+                        worker.circuit_breaker().record_failure();
+                    }
+
+                    let content_type = resp.headers().get(CONTENT_TYPE).cloned();
+                    match resp.bytes().await {
+                        Ok(body) => {
+                            if status.is_success() {
+                                worker.circuit_breaker().record_success();
+                            }
+                            let mut response = Response::new(Body::from(body));
+                            *response.status_mut() = status;
+                            if let Some(ct) = content_type {
+                                response.headers_mut().insert(CONTENT_TYPE, ct);
+                            }
+                            response
+                        }
+                        Err(e) => {
+                            worker.circuit_breaker().record_failure();
+                            (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                format!("Failed to read response: {}", e),
+                            )
+                                .into_response()
+                        }
+                    }
+                }
+            },
+            |res, _attempt| is_retryable_status(res.status()),
+            |delay, attempt| {
+                Metrics::record_worker_retry(
+                    metrics_labels::BACKEND_EXTERNAL,
+                    metrics_labels::ENDPOINT_IMAGES_GENERATIONS,
+                );
+                Metrics::record_worker_retry_backoff(attempt, delay);
+            },
+            || {
+                Metrics::record_worker_retries_exhausted(
+                    metrics_labels::BACKEND_EXTERNAL,
+                    metrics_labels::ENDPOINT_IMAGES_GENERATIONS,
+                );
+            },
+        )
+        .await;
+
+        if response.status().is_success() {
+            Metrics::record_router_duration(
+                metrics_labels::ROUTER_OPENAI,
+                metrics_labels::BACKEND_EXTERNAL,
+                metrics_labels::CONNECTION_HTTP,
+                model,
+                metrics_labels::ENDPOINT_IMAGES_GENERATIONS,
+                start.elapsed(),
+            );
+        } else {
+            Metrics::record_router_error(
+                metrics_labels::ROUTER_OPENAI,
+                metrics_labels::BACKEND_EXTERNAL,
+                metrics_labels::CONNECTION_HTTP,
+                model,
+                metrics_labels::ENDPOINT_IMAGES_GENERATIONS,
+                metrics_labels::ERROR_BACKEND,
+            );
+        }
+
+        response
+    }
+
+    async fn route_images_edits(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &ImageEditRequest,
+        model_id: Option<&str>,
+    ) -> Response {
+        let start = Instant::now();
+        let model = model_id.unwrap_or(body.model.as_str());
+
+        // Record request start
+        Metrics::record_router_request(
+            metrics_labels::ROUTER_OPENAI,
+            metrics_labels::BACKEND_EXTERNAL,
+            metrics_labels::CONNECTION_HTTP,
+            model,
+            metrics_labels::ENDPOINT_IMAGES_EDITS,
+            bool_to_static_str(false), // images are non-streaming
+        );
+
+        let auth_header = extract_auth_header(headers, &None);
+
+        let worker = match self
+            .select_worker_for_model(&body.model, auth_header.as_ref())
+            .await
+        {
+            Ok(w) => w,
+            Err(response) => {
+                Metrics::record_router_error(
+                    metrics_labels::ROUTER_OPENAI,
+                    metrics_labels::BACKEND_EXTERNAL,
+                    metrics_labels::CONNECTION_HTTP,
+                    model,
+                    metrics_labels::ENDPOINT_IMAGES_EDITS,
+                    metrics_labels::ERROR_NO_WORKERS,
+                );
+                return response;
+            }
+        };
+
+        let mut payload = match to_value(body) {
+            Ok(v) => v,
+            Err(e) => {
+                Metrics::record_router_error(
+                    metrics_labels::ROUTER_OPENAI,
+                    metrics_labels::BACKEND_EXTERNAL,
+                    metrics_labels::CONNECTION_HTTP,
+                    model,
+                    metrics_labels::ENDPOINT_IMAGES_EDITS,
+                    metrics_labels::ERROR_VALIDATION,
+                );
+                return error_responses::bad_request(format!("Failed to serialize request: {}", e));
+            }
+        };
+
+        let provider = self.get_provider_arc_for_worker(worker.as_ref(), model_id);
+        if let Err(e) = provider.transform_request(&mut payload, Endpoint::ImagesEdits) {
+            Metrics::record_router_error(
+                metrics_labels::ROUTER_OPENAI,
+                metrics_labels::BACKEND_EXTERNAL,
+                metrics_labels::CONNECTION_HTTP,
+                model,
+                metrics_labels::ENDPOINT_IMAGES_EDITS,
+                metrics_labels::ERROR_VALIDATION,
+            );
+            return error_responses::bad_request(format!("Provider transform error: {}", e));
+        }
+
+        let url = format!("{}/v1/images/edits", worker.url());
+        let payload_json = Arc::new(payload);
+        let client = self.shared_components.client.clone();
+        let headers_cloned = Arc::new(headers.cloned());
+        let worker_api_key = Arc::new(worker.api_key().clone());
+
+        let response = RetryExecutor::execute_response_with_retry(
+            &self.retry_config,
+            |_attempt| {
+                let client = client.clone();
+                let url = url.clone();
+                let payload = Arc::clone(&payload_json);
+                let headers = Arc::clone(&headers_cloned);
+                let worker_api_key = Arc::clone(&worker_api_key);
+                let worker = Arc::clone(&worker);
+
+                async move {
+                    let mut req = client.post(&url).json(&*payload);
+                    let auth_header = extract_auth_header((*headers).as_ref(), &worker_api_key);
+                    req = apply_provider_headers(req, &url, auth_header.as_ref());
+
+                    let resp = match req.send().await {
+                        Ok(r) => r,
+                        Err(e) => {
+                            worker.circuit_breaker().record_failure();
+                            return (
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                format!("Failed to contact upstream: {}", e),
+                            )
+                                .into_response();
+                        }
+                    };
+
+                    let status = StatusCode::from_u16(resp.status().as_u16())
+                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+
+                    if !status.is_success() {
+                        worker.circuit_breaker().record_failure();
+                    }
+
+                    let content_type = resp.headers().get(CONTENT_TYPE).cloned();
+                    match resp.bytes().await {
+                        Ok(body) => {
+                            if status.is_success() {
+                                worker.circuit_breaker().record_success();
+                            }
+                            let mut response = Response::new(Body::from(body));
+                            *response.status_mut() = status;
+                            if let Some(ct) = content_type {
+                                response.headers_mut().insert(CONTENT_TYPE, ct);
+                            }
+                            response
+                        }
+                        Err(e) => {
+                            worker.circuit_breaker().record_failure();
+                            (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                format!("Failed to read response: {}", e),
+                            )
+                                .into_response()
+                        }
+                    }
+                }
+            },
+            |res, _attempt| is_retryable_status(res.status()),
+            |delay, attempt| {
+                Metrics::record_worker_retry(
+                    metrics_labels::BACKEND_EXTERNAL,
+                    metrics_labels::ENDPOINT_IMAGES_EDITS,
+                );
+                Metrics::record_worker_retry_backoff(attempt, delay);
+            },
+            || {
+                Metrics::record_worker_retries_exhausted(
+                    metrics_labels::BACKEND_EXTERNAL,
+                    metrics_labels::ENDPOINT_IMAGES_EDITS,
+                );
+            },
+        )
+        .await;
+
+        if response.status().is_success() {
+            Metrics::record_router_duration(
+                metrics_labels::ROUTER_OPENAI,
+                metrics_labels::BACKEND_EXTERNAL,
+                metrics_labels::CONNECTION_HTTP,
+                model,
+                metrics_labels::ENDPOINT_IMAGES_EDITS,
+                start.elapsed(),
+            );
+        } else {
+            Metrics::record_router_error(
+                metrics_labels::ROUTER_OPENAI,
+                metrics_labels::BACKEND_EXTERNAL,
+                metrics_labels::CONNECTION_HTTP,
+                model,
+                metrics_labels::ENDPOINT_IMAGES_EDITS,
+                metrics_labels::ERROR_BACKEND,
+            );
+        }
+
+        response
     }
 
     fn router_type(&self) -> &'static str {

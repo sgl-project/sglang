@@ -1026,6 +1026,8 @@ pub(crate) fn route_to_endpoint(route: &str) -> &'static str {
         "/v1/completions" => metrics_labels::ENDPOINT_COMPLETIONS,
         "/v1/rerank" => metrics_labels::ENDPOINT_RERANK,
         "/v1/responses" => metrics_labels::ENDPOINT_RESPONSES,
+        "/v1/images/generations" => metrics_labels::ENDPOINT_IMAGES_GENERATIONS,
+        "/v1/images/edits" => metrics_labels::ENDPOINT_IMAGES_EDITS,
         _ => "other",
     }
 }

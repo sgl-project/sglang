@@ -32,6 +32,7 @@ use crate::{
         completion::CompletionRequest,
         embedding::EmbeddingRequest,
         generate::GenerateRequest,
+        images::{ImageEditRequest, ImageGenerationRequest},
         rerank::{RerankRequest, RerankResponse, RerankResult},
         responses::{ResponsesGetParams, ResponsesRequest},
     },
@@ -833,6 +834,26 @@ impl RouterTrait for Router {
         } else {
             response
         }
+    }
+
+    async fn route_images_generations(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &ImageGenerationRequest,
+        model_id: Option<&str>,
+    ) -> Response {
+        self.route_typed_request(headers, body, "/v1/images/generations", model_id)
+            .await
+    }
+
+    async fn route_images_edits(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &ImageEditRequest,
+        model_id: Option<&str>,
+    ) -> Response {
+        self.route_typed_request(headers, body, "/v1/images/edits", model_id)
+            .await
     }
 
     fn router_type(&self) -> &'static str {

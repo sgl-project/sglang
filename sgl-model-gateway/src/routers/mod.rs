@@ -16,6 +16,7 @@ use crate::protocols::{
     completion::CompletionRequest,
     embedding::EmbeddingRequest,
     generate::GenerateRequest,
+    images::{ImageEditRequest, ImageGenerationRequest},
     rerank::RerankRequest,
     responses::{ResponsesGetParams, ResponsesRequest},
 };
@@ -193,6 +194,30 @@ pub trait RouterTrait: Send + Sync + Debug {
         _model_id: Option<&str>,
     ) -> Response {
         (StatusCode::NOT_IMPLEMENTED, "Rerank not implemented").into_response()
+    }
+
+    /// Route image generation requests (OpenAI-compatible /v1/images/generations)
+    async fn route_images_generations(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _body: &ImageGenerationRequest,
+        _model_id: Option<&str>,
+    ) -> Response {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "Images generations not implemented",
+        )
+            .into_response()
+    }
+
+    /// Route image edit requests (OpenAI-compatible /v1/images/edits)
+    async fn route_images_edits(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _body: &ImageEditRequest,
+        _model_id: Option<&str>,
+    ) -> Response {
+        (StatusCode::NOT_IMPLEMENTED, "Images edits not implemented").into_response()
     }
 
     /// Get router type name
