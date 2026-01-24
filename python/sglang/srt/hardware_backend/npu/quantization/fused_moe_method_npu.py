@@ -183,8 +183,10 @@ class NPUW8A8Int8DynamicMoEMethod(_NPUFusedMoEMethodBase):
                 requires_grad=False,
             )
 
-        layer.w13_weight.data = npu_format_cast(layer.w13_weight.data)
-        layer.w2_weight.data = npu_format_cast(layer.w2_weight.data)
+        for i in range(layer.w13_weight.data.shape[0]):
+            layer.w13_weight.data[i].copy_(npu_format_cast(layer.w13_weight.data[i]))
+        for i in range(layer.w2_weight.data.shape[0]):
+            layer.w2_weight.data[i].copy_(npu_format_cast(layer.w2_weight.data[i]))
 
     def apply(
         self,
@@ -326,8 +328,10 @@ class NPUW4A8Int8DynamicMoEMethod(_NPUFusedMoEMethodBase):
             layer.w2_weight.data.transpose(1, 2).contiguous(), requires_grad=False
         )
 
-        layer.w13_weight.data = npu_format_cast(layer.w13_weight.data)
-        layer.w2_weight.data = npu_format_cast(layer.w2_weight.data)
+        for i in range(layer.w13_weight.data.shape[0]):
+            layer.w13_weight.data[i].copy_(npu_format_cast(layer.w13_weight.data[i]))
+        for i in range(layer.w2_weight.data.shape[0]):
+            layer.w2_weight.data[i].copy_(npu_format_cast(layer.w2_weight.data[i]))
 
         layer.w13_weight.data = self._pack_to_int32(layer.w13_weight.data)
         layer.w2_weight.data = self._pack_to_int32(layer.w2_weight.data)
