@@ -956,82 +956,84 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
     def _quantize_mxfp8_moe_weights(self, layer: Module) -> None:
 
-        def _swizzle_mxfp8_sf(scale, num_warps):
-            from triton_kernels.tensor import convert_layout, wrap_torch_tensor
-            from triton_kernels.tensor_details import layout
-            
+        def _quantize_with_cutlass_es_kernel(weight: torch.Tensor):
+            from sgl_kernel import es_sm100_mxfp8_blockscaled_grouped_quant
 
-            scale_layout, scale_layout_opts = layout.make_default_matmul_mxfp4_w_scale_layout(
-                mx_axis=1, num_warps=num_warps
+            weight = weight.contiguous()
+            num_experts, m, k = weight.shape
+            assert k % 32 == 0, f"{k=} must be divisible by 32 for MXFP8"
+
+            weight_flat = weight.view(-1, k).contiguous()
+            problem_sizes = torch.empty(
+                (num_experts, 3), dtype=torch.int32, device=weight.device
             )
-            scale = scale.transpose(-2, -1)
-            scale = convert_layout(wrap_torch_tensor(scale), scale_layout, **scale_layout_opts)
-            return scale
+            problem_sizes[:, 0] = m
+            problem_sizes[:, 1] = 0
+            problem_sizes[:, 2] = k
+            expert_offsets = torch.arange(
+                0, num_experts * m, m, dtype=torch.int32, device=weight.device
+            )
+            aligned_m = ((m + 127) // 128) * 128
+            blockscale_offsets = torch.arange(
+                0,
+                num_experts * aligned_m,
+                aligned_m,
+                dtype=torch.int32,
+                device=weight.device,
+            )
+            qweight = torch.empty_like(weight_flat, dtype=torch.float8_e4m3fn)
+            scale = torch.empty(
+                (num_experts * aligned_m, k // 32),
+                dtype=torch.uint8,
+                device=weight.device,
+            )
+            es_sm100_mxfp8_blockscaled_grouped_quant(
+                weight_flat,
+                problem_sizes,
+                expert_offsets,
+                blockscale_offsets,
+                qweight,
+                scale,
+            )
+            qweight = qweight.view_as(weight)
+            scale = scale.view(num_experts, aligned_m, k // 32)
+            if aligned_m != m:
+                scale = scale[:, :m, :]
+            return qweight, scale
+
+        def _quantize_with_triton_kernel(weight: torch.Tensor):
+            def _swizzle_mxfp8_sf(scale, num_warps):
+                from triton_kernels.tensor import convert_layout, wrap_torch_tensor
+                from triton_kernels.tensor_details import layout
+
+                scale_layout, scale_layout_opts = (
+                    layout.make_default_matmul_mxfp4_w_scale_layout(
+                        mx_axis=1, num_warps=num_warps
+                    )
+                )
+                scale = scale.transpose(-2, -1)
+                scale = convert_layout(
+                    wrap_torch_tensor(scale), scale_layout, **scale_layout_opts
+                )
+                return scale
+
+            weight = weight.contiguous()
+            num_experts, m, k = weight.shape
+            assert k % 32 == 0, f"{k=} must be divisible by 32 for MXFP8"
+
+            weight_flat = weight.view(-1, k).contiguous()
+            aligned_m = ((m + 127) // 128) * 128
+            qweight, scale = mxfp8_group_quantize(weight_flat)
+            qweight = qweight.view_as(weight)
+            scale = scale.view(num_experts, aligned_m, k // 32)
+            num_warps = 8
+            scale = _swizzle_mxfp8_sf(scale, num_warps)
+            scale = scale.data.view(num_experts, aligned_m, k // 32)
+            return qweight, scale
 
         if get_moe_runner_backend().is_cutlass():
             if not (_is_cuda and is_sm100_supported()):
                 raise RuntimeError("MXFP8 MoE quantization requires SM100.")
-
-            from sgl_kernel import es_sm100_mxfp8_blockscaled_grouped_quant
-
-            def _quantize_with_es_kernel(weight: torch.Tensor):
-                weight = weight.contiguous()
-                num_experts, m, k = weight.shape
-                assert k % 32 == 0, f"{k=} must be divisible by 32 for MXFP8"
-
-                weight_flat = weight.view(-1, k).contiguous()
-                problem_sizes = torch.empty(
-                    (num_experts, 3), dtype=torch.int32, device=weight.device
-                )
-                problem_sizes[:, 0] = m
-                problem_sizes[:, 1] = 0
-                problem_sizes[:, 2] = k
-                expert_offsets = torch.arange(
-                    0, num_experts * m, m, dtype=torch.int32, device=weight.device
-                )
-                aligned_m = ((m + 127) // 128) * 128
-                blockscale_offsets = torch.arange(
-                    0,
-                    num_experts * aligned_m,
-                    aligned_m,
-                    dtype=torch.int32,
-                    device=weight.device,
-                )
-                qweight = torch.empty_like(weight_flat, dtype=torch.float8_e4m3fn)
-                scale = torch.empty(
-                    (num_experts * aligned_m, k // 32),
-                    dtype=torch.uint8,
-                    device=weight.device,
-                )
-                es_sm100_mxfp8_blockscaled_grouped_quant(
-                    weight_flat,
-                    problem_sizes,
-                    expert_offsets,
-                    blockscale_offsets,
-                    qweight,
-                    scale,
-                )
-                qweight = qweight.view_as(weight)
-                scale = scale.view(num_experts, aligned_m, k // 32)
-                if aligned_m != m:
-                    scale = scale[:, :m, :]
-                return qweight, scale
-            
-            def _quantize_with_triton_kernel(weight: torch.Tensor):
-                weight = weight.contiguous()
-                num_experts, m, k = weight.shape
-
-                assert k % 32 == 0, f"{k=} must be divisible by 32 for MXFP8"
-
-                weight_flat = weight.view(-1, k).contiguous()
-                aligned_m = ((m + 127) // 128) * 128
-                qweight, scale = mxfp8_group_quantize(weight_flat)
-                qweight = qweight.view_as(weight)
-                scale = scale.view(num_experts, aligned_m, k // 32)
-                num_warps = 8
-                scale = _swizzle_mxfp8_sf(scale, num_warps)
-                scale = scale.data.view(num_experts, aligned_m, k // 32)
-                return qweight, scale
 
             w13_q, w13_s = _quantize_with_triton_kernel(layer.w13_weight.data)
             w2_q, w2_s = _quantize_with_triton_kernel(layer.w2_weight.data)
