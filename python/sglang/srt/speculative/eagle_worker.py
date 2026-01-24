@@ -872,9 +872,14 @@ class EAGLEWorker(TpModelWorker):
             hidden_states: Hidden states from the target model forward
             next_token_ids: Next token ids generated from the target forward.
         """
+        # Map next_token_ids from target vocab to draft vocab for heterogeneous vocab
+        draft_token_ids = next_token_ids
+        if self.vocab_mapper is not None:
+            draft_token_ids = self.vocab_mapper.map_target_to_draft(next_token_ids)
+
         batch.spec_info = EagleDraftInput(
             hidden_states=hidden_states,
-            verified_id=next_token_ids,
+            verified_id=draft_token_ids,
             num_tokens_per_batch=1,
             num_tokens_for_logprob_per_batch=1,
         )
