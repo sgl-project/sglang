@@ -33,12 +33,15 @@ class LayerwiseOffloadManager:
         num_layers: int,
         enabled: bool,
         pin_cpu_memory: bool = True,
+        prefetch_size: int = 1,
     ) -> None:
         self.model = model
         self.layers_attr_str = layers_attr_str
         self.num_layers = num_layers
         self.pin_cpu_memory = pin_cpu_memory
-
+        self.prefetch_size = min(self.num_layers // 2, max(1, prefetch_size)) % self.num_layers
+        print(f"{self.prefetch_size=}")
+        print(f"{self.num_layers=}")
         self.enabled = bool(enabled and torch.cuda.is_available())
         if not self.enabled:
             return
@@ -57,6 +60,8 @@ class LayerwiseOffloadManager:
         self._weight_metadata: Dict[int, Dict[str, Dict[str, Any]]] = {}
         # layer indices that are already in gpu
         self._gpu_layers: Set[int] = set()
+        # layer_idx -> torch.cuda.Event for fine-grained sync
+        self._prefetch_events: Dict[int, torch.cuda.Event] = {}
 
         self._named_parameters: Dict[str, torch.nn.Parameter] = {}
         self._named_buffers: Dict[str, torch.Tensor] = {}
@@ -110,7 +115,7 @@ class LayerwiseOffloadManager:
                 current_offset = 0
                 for name, weight in weights:
                     numel = weight.numel()
-                    cpu_buffer[current_offset : current_offset + numel].copy_(
+                    cpu_buffer[current_offset: current_offset + numel].copy_(
                         weight.flatten()
                     )
                     self._weight_metadata[layer_idx][name] = {
@@ -127,13 +132,14 @@ class LayerwiseOffloadManager:
                 self._consolidated_cpu_weights[layer_idx][dtype] = cpu_buffer
 
         # prefetch the first layer for warm-up
-        self.prepare_for_next_denoise(non_blocking=False)
+        self.prepare_for_next_req(non_blocking=False)
 
         self.register_forward_hooks()
         logger.info("LayerwiseOffloadManager initialized")
 
-    def prepare_for_next_denoise(self, non_blocking=True):
-        self.prefetch_layer(0, non_blocking=non_blocking)
+    def prepare_for_next_req(self, non_blocking=True):
+        for i in range(self.prefetch_size):
+            self.prefetch_layer(i, non_blocking=non_blocking)
         if not non_blocking and self.copy_stream is not None:
             torch.cuda.current_stream().wait_stream(self.copy_stream)
 
@@ -147,6 +153,7 @@ class LayerwiseOffloadManager:
 
     @torch.compiler.disable
     def prefetch_layer(self, layer_idx: int, non_blocking: bool = True) -> None:
+        logger.debug(f"trying to prefetch layer: {layer_idx}")
         if not self.enabled or self.device is None or self.copy_stream is None:
             return
         if layer_idx < 0 or layer_idx >= self.num_layers:
@@ -167,6 +174,11 @@ class LayerwiseOffloadManager:
                 gpu_buffer.copy_(cpu_buffer, non_blocking=non_blocking)
                 gpu_buffers[dtype] = gpu_buffer
 
+        # record event for this layer's prefetch
+        event = torch.cuda.Event()
+        event.record(self.copy_stream)
+        self._prefetch_events[layer_idx] = event
+
         # restore model's weights by their metadata using gpu buffer
         for name, meta in self._weight_metadata[layer_idx].items():
             dtype = meta["dtype"]
@@ -175,15 +187,20 @@ class LayerwiseOffloadManager:
             # map the parameter's data to the correct slice of the GPU buffer
             target = self.get_target_with_name(name)
             target.data = gpu_buffer[
-                meta["offset"] : meta["offset"] + meta["numel"]
+                meta["offset"]: meta["offset"] + meta["numel"]
             ].view(meta["shape"])
 
+        logger.debug(f"fetched layer: {layer_idx=}")
         self._gpu_layers.add(layer_idx)
 
     @torch.compiler.disable
     def release_layer(self, layer_idx: int) -> None:
         if not self.enabled or self.device is None:
             return
+
+        # clear prefetch event
+        self._prefetch_events.pop(layer_idx, None)
+
         if layer_idx <= 0:
             return
 
@@ -238,7 +255,7 @@ class LayerwiseOffloadManager:
             cpu_buffer = self._consolidated_cpu_weights[layer_idx][dtype]
             offset = meta["offset"]
             numel = meta["numel"]
-            cpu_buffer[offset : offset + numel].copy_(gpu_weight)
+            cpu_buffer[offset: offset + numel].copy_(gpu_weight)
 
     @torch.compiler.disable
     def sync_all_layers_to_cpu(self) -> None:
@@ -259,14 +276,40 @@ class LayerwiseOffloadManager:
 
         def make_pre_hook(i):
             def hook(module, input):
-                self.prefetch_layer(i + 1, non_blocking=True)
+                # 1. Fine-grained sync: wait ONLY for the current layer if it's being prefetched
+                if i in self._prefetch_events:
+                    torch.cuda.current_stream().wait_event(self._prefetch_events[i])
+                logger.debug(f"pre hook layer: {i}")
+                # 2. Trigger batch prefetch (i + prefetch_size ~ i + 2 * prefetch_size)  if needed
+                if i % self.prefetch_size == 0:
+                    start_layer = i + self.prefetch_size
+                    end_layer = start_layer + self.prefetch_size
+                    # if i == self.num_layers - 1:
+                    #     if start_layer >= self.num_layers:
+                    #         ranges = []
+                    #     elif end_layer >= self.num_layers:
+                    #         ranges = [(start_layer, self.num_layers - 1)]
+                    #     else:
+                    #         ranges = [(start_layer, end_layer)]
+                    # else:
+                    # fetch for next denoise iteration
+                    if start_layer >= self.num_layers:
+                        ranges = [(start_layer % self.num_layers, (end_layer - 1) % self.num_layers + 1)]
+                    elif end_layer > self.num_layers:
+                        ranges = [(start_layer, self.num_layers), (0, end_layer % self.num_layers)]
+                    else:
+                        ranges = [(start_layer, end_layer)]
+                    logger.info(f"pre hook layer: {i} prefetching {ranges=}", main_process_only=True)
+                    for s, e in ranges:
+                        for l in range(s, e):
+                            self.prefetch_layer(l, non_blocking=True)
 
             return hook
 
         def make_post_hook(i):
             def hook(module, input, output):
-                if self.copy_stream is not None:
-                    torch.cuda.current_stream().wait_stream(self.copy_stream)
+                # previous, we wait here, until the copy stream for next layer is finished,
+                # now with any prefetch_size, only wait for the copy stream, when the copy stream is for the next layer
                 self.release_layer(i)
 
             return hook
@@ -309,6 +352,7 @@ class OffloadableDiTMixin:
                 num_layers=num_layers,
                 enabled=True,
                 pin_cpu_memory=server_args.pin_cpu_memory,
+                prefetch_size=server_args.dit_offload_prefetch_size,
             )
             self.layerwise_offload_managers.append(manager)
 
@@ -320,7 +364,7 @@ class OffloadableDiTMixin:
         if self.layerwise_offload_managers is None:
             return
         for manager in self.layerwise_offload_managers:
-            manager.prepare_for_next_denoise(non_blocking=True)
+            manager.prepare_for_next_req(non_blocking=True)
 
     def disable_offload(self) -> None:
         """Disable layerwise offload: load all layers to GPU and remove hooks."""
