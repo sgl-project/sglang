@@ -5,7 +5,6 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.speculative.spec_utils import spec_need_hidden_states
 from sglang.srt.utils import get_compiler_backend
 
@@ -58,7 +57,7 @@ class FutureMap:
         self.device = device
         self.spec_algo = spec_algo
 
-        if self.spec_algo.is_none() or self.spec_algo.is_ngram():
+        if self.spec_algo.is_none():
             # For non-speculative decoding, we only need to store the token ids.
             self.buf_initialized = True
             self.token_ids_buf = torch.empty(
@@ -120,9 +119,9 @@ class FutureMap:
         self, model_worker_batch: ModelWorkerBatch, batch: ScheduleBatch
     ):
         ngram_v2 = batch.is_spec_v2 and self.spec_algo.is_ngram()
-        if ngram_v2 and model_worker_batch.forward_mode != ForwardMode.EXTEND:
+        if ngram_v2:
             return
-        if self.spec_algo.is_none() or ngram_v2:
+        if self.spec_algo.is_none():
             _resolve_future_token_ids(model_worker_batch.input_ids, self.token_ids_buf)
         else:
             # TODO(lsyin): write future indices into spec_info.future_indices
@@ -153,9 +152,9 @@ class FutureMap:
     ):
         # ngram decode return, prefill behaves like normal overlap
         ngram_v2 = batch.is_spec_v2 and self.spec_algo.is_ngram()
-        if ngram_v2 and batch.forward_mode != ForwardMode.EXTEND:
+        if ngram_v2:
             return
-        if self.spec_algo.is_none() or ngram_v2:
+        if self.spec_algo.is_none():
             intv = future_indices.interval
             self.token_ids_buf[intv] = batch_result.next_token_ids
         else:

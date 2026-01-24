@@ -58,7 +58,6 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.common import (
@@ -537,8 +536,6 @@ class Req:
         self.kv_allocated_len = 0
         self.kv_committed_freed = False
         self.kv_overallocated_freed = False
-
-        self.req_finish_processed = False
 
         # for corss-endoder model
         self.token_type_ids = token_type_ids
@@ -1262,7 +1259,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     spec_algorithm: SpeculativeAlgorithm = None
     # spec_info: Optional[SpecInput] = None
     spec_info: Optional[SpecInput] = None
-    logits_output: Optional[LogitsProcessorOutput] = None
 
     # Whether to return hidden states
     return_hidden_states: bool = False
@@ -1857,7 +1853,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.forward_mode = ForwardMode.DECODE
         bs = len(self.reqs)
 
-        if self.is_spec_v2 and not self.spec_algorithm.is_ngram():
+        if self.is_spec_v2:
             # TODO(spec-v2): all spec v2 should go through this path
             draft_input: EagleDraftInput = self.spec_info
             draft_input.prepare_for_decode(self)

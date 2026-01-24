@@ -13,6 +13,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.cpp_ngram.ngram_cache import NgramCache
 from sglang.srt.speculative.ngram_info import NgramVerifyInput
+from sglang.srt.speculative.ngram_worker_v2 import NgramVerifyInputV2
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 logger = logging.getLogger(__name__)
@@ -139,7 +140,7 @@ class NGRAMWorker:
         ), f"{total_draft_token_num=}, {bs=}, {self.draft_token_num=}"
         return req_drafts, mask
 
-    def _prepare_for_speculative_decoding(self, batch: ScheduleBatch):
+    def _prepare_for_speculative_decoding(self, batch: ScheduleBatch, is_spec_v2=False):
         if batch.forward_mode.is_extend():
             return
 
@@ -185,20 +186,31 @@ class NGRAMWorker:
 
         batch.spec_algorithm = SpeculativeAlgorithm.NGRAM
         batch.forward_mode = ForwardMode.TARGET_VERIFY
-        batch.spec_info = NgramVerifyInput(
-            draft_tokens,
-            tree_mask,
-            positions,
-            retrive_index,
-            retrive_next_token,
-            retrive_next_sibling,
-            self.draft_token_num,
-        )
-        batch.spec_info.prepare_for_verify(batch, self.page_size)
+        if is_spec_v2:
+            batch.input_ids = draft_tokens
+            batch.spec_info = NgramVerifyInputV2(
+                draft_tokens,
+                tree_mask,
+                positions,
+                retrive_index,
+                retrive_next_token,
+                retrive_next_sibling,
+                self.draft_token_num,
+            )
+        else:
+            batch.spec_info = NgramVerifyInput(
+                draft_tokens,
+                tree_mask,
+                positions,
+                retrive_index,
+                retrive_next_token,
+                retrive_next_sibling,
+                self.draft_token_num,
+            )
+            # NOTE in spec v2, slot allocation happens in scheduler and it's over-allocation
+            batch.spec_info.prepare_for_verify(batch, self.page_size)
 
     def _update_ngram_cache(self, batch: ScheduleBatch):
-        if batch.forward_mode == ForwardMode.EXTEND:
-            return
         batch_tokens = []
         for req in batch.reqs:
             # FIXME: Whether to insert 'extend' into the cache or not, after testing,
