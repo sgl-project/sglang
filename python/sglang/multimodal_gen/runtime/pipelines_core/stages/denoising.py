@@ -132,10 +132,10 @@ class DenoisingStage(PipelineStage):
         except ImportError:
             pass
         mode = os.environ.get("SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs")
-        logger.info(f"Compiling transformer with mode: {mode}, regional: {regional}")
         fullgraph = False
         dynamic = None
         regional = self.server_args.regional_compile
+        logger.info(f"Compiling transformer with mode: {mode}, fullgraph: {fullgraph}, dynamic: {dynamic}, regional: {regional}")
         if regional:
             self.regionally_compile(module, mode=mode, fullgraph=fullgraph, dynamic=dynamic)
         else:
