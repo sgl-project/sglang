@@ -205,45 +205,49 @@ class ModelRunnerKVCacheMixin:
 
     def set_num_tokens_hybrid_swa(self: ModelRunner):
         page_size = self.server_args.page_size
-        if "MiMoV2MTP" in self.model_config.hf_config.architectures:
-            assert self.is_draft_worker
-            # MiMoV2MTP uses SWA, so set full KV cache to 0
+
+        assert self.sliding_window_size is not None and self.sliding_window_size > 0
+        full_layers_num = len(self.model_config.full_attention_layer_ids)
+        swa_layers_num = len(self.model_config.swa_attention_layer_ids)
+
+        assert swa_layers_num > 0, "Hybrid SWA model must have at least one SWA layer"
+
+        def align_page_size(x: int) -> int:
+            return (x // page_size) * page_size
+
+        if full_layers_num == 0:
+            # all layers are SWA
+            self.swa_max_total_num_tokens = align_page_size(self.max_total_num_tokens)
             self.full_max_total_num_tokens = 0
-            self.swa_max_total_num_tokens = (
-                self.max_total_num_tokens // page_size * page_size
-            )
             self.max_total_num_tokens = self.swa_max_total_num_tokens
-        else:
-            assert self.sliding_window_size is not None and self.sliding_window_size > 0
-            full_layers_num = len(self.model_config.full_attention_layer_ids)
-            swa_layers_num = len(self.model_config.swa_attention_layer_ids)
-
-            # Algorithm:
-            # Existing max_total_num_tokens is per layer and assume all layers have the same number of tokens.
-            # - Find total # of tokens available across layers.
-            # - Calculate full_max_total_num_tokens and swa_max_total_num_tokens based on the given swa_full_tokens_ratio.
-            total_tokens = (
-                self.max_total_num_tokens * self.model_config.num_hidden_layers
+            logger.info(
+                f"Use sliding window memory pool (all SWA). swa_layer_tokens={self.swa_max_total_num_tokens}"
             )
-            swa_full_tokens_ratio = self.server_args.swa_full_tokens_ratio
+            return
 
-            # Solve the equations:
-            # 1. swa_max_total_num_tokens * swa_layers_num + full_max_total_num_tokens * full_layers_num == total_tokens
-            # 2. full_max_total_num_tokens * swa_full_tokens_ratio == swa_max_total_num_tokens
-            denominator = swa_full_tokens_ratio * swa_layers_num + full_layers_num
-            self.full_max_total_num_tokens = int(total_tokens / denominator)
-            self.swa_max_total_num_tokens = int(
-                self.full_max_total_num_tokens * swa_full_tokens_ratio
-            )
+        # Algorithm:
+        # Existing max_total_num_tokens is per layer and assume all layers have the same number of tokens.
+        # - Find total # of tokens available across layers.
+        # - Calculate full_max_total_num_tokens and swa_max_total_num_tokens based on the given swa_full_tokens_ratio.
+        total_tokens = self.max_total_num_tokens * self.model_config.num_hidden_layers
+        swa_full_tokens_ratio = self.server_args.swa_full_tokens_ratio
 
-            self.full_max_total_num_tokens = (
-                self.full_max_total_num_tokens // page_size * page_size
-            )
-            self.swa_max_total_num_tokens = (
-                self.swa_max_total_num_tokens // page_size * page_size
-            )
+        # Solve the equations:
+        # 1. swa_max_total_num_tokens * swa_layers_num + full_max_total_num_tokens * full_layers_num == total_tokens
+        # 2. full_max_total_num_tokens * swa_full_tokens_ratio == swa_max_total_num_tokens
+        denominator = swa_full_tokens_ratio * swa_layers_num + full_layers_num
+        assert (
+            denominator > 0
+        ), f"Invalid denominator={denominator} for swa_full_tokens_ratio={swa_full_tokens_ratio} and swa_layers_num={swa_layers_num} and full_layers_num={full_layers_num}"
+        self.full_max_total_num_tokens = int(total_tokens / denominator)
+        self.swa_max_total_num_tokens = int(
+            self.full_max_total_num_tokens * swa_full_tokens_ratio
+        )
 
-            self.max_total_num_tokens = self.full_max_total_num_tokens
+        self.full_max_total_num_tokens = align_page_size(self.full_max_total_num_tokens)
+        self.swa_max_total_num_tokens = align_page_size(self.swa_max_total_num_tokens)
+
+        self.max_total_num_tokens = self.full_max_total_num_tokens
 
         logger.info(
             f"Use sliding window memory pool. full_layer_tokens={self.full_max_total_num_tokens}, swa_layer_tokens={self.swa_max_total_num_tokens}"
@@ -288,14 +292,6 @@ class ModelRunnerKVCacheMixin:
                     max_num_reqs, self.server_args.max_running_requests // self.dp_size
                 )
 
-        if not self.spec_algorithm.is_none():
-            if self.is_draft_worker:
-                self.max_total_num_tokens = self.server_args.draft_runner_cache_size
-                max_num_reqs = self.server_args.max_num_reqs
-            else:
-                self.server_args.draft_runner_cache_size = self.max_total_num_tokens
-                self.server_args.max_num_reqs = max_num_reqs
-
         if max_total_tokens is not None:
             if max_total_tokens > self.max_total_num_tokens:
                 logging.warning(
@@ -320,9 +316,18 @@ class ModelRunnerKVCacheMixin:
             )
             self.max_total_num_tokens = tensor.item()
 
+        if not self.spec_algorithm.is_none() and self.is_draft_worker:
+            self.max_total_num_tokens = self.server_args.draft_runner_cache_size
+            max_num_reqs = self.server_args.max_num_reqs
+
         # create token size for hybrid cache
         if self.is_hybrid_swa:
             self.set_num_tokens_hybrid_swa()
+
+        if not self.spec_algorithm.is_none() and not self.is_draft_worker:
+            # Draft worker should use SWA adjusted max_total_num_tokens for cache size, otherwise it may cause oob in kv cache store
+            self.server_args.draft_runner_cache_size = self.max_total_num_tokens
+            self.server_args.max_num_reqs = max_num_reqs
 
         if self.max_total_num_tokens <= 0:
             raise RuntimeError(
@@ -406,7 +411,9 @@ class ModelRunnerKVCacheMixin:
                     dtype=self.kv_cache_dtype,
                     kv_lora_rank=self.model_config.kv_lora_rank,
                     qk_rope_head_dim=self.model_config.qk_rope_head_dim,
-                    index_head_dim=self.model_config.index_head_dim,
+                    index_head_dim=(
+                        self.model_config.index_head_dim if is_nsa_model else None
+                    ),
                     layer_num=self.num_effective_layers,
                     device=self.device,
                     enable_memory_saver=self.server_args.enable_memory_saver,
