@@ -86,6 +86,7 @@ tiktoken-rs = { version = "0.7.0" }
 reasoning-parser = "1.0.0"
 openai-protocol = { version = "1.0.0", features = ["axum"] }
 tool-parser = "1.0.0"
+llm-tokenizer = "1.0.0"
 minijinja = { version = "2.0", features = ["unstable_machinery", "json", "builtins"] }
 minijinja-contrib = { version = "2.0", features = ["pycompat"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
@@ -171,21 +172,6 @@ path = "benches/request_processing.rs"
 [[bench]]
 name = "router_registry_bench"
 harness = false
-
-[[bench]]
-name = "tokenizer_benchmark"
-harness = false
-path = "benches/tokenizer_benchmark.rs"
-
-[[bench]]
-name = "tool_parser_benchmark"
-harness = false
-path = "benches/tool_parser_benchmark.rs"
-
-[[bench]]
-name = "tree_benchmark"
-harness = false
-path = "benches/tree_benchmark.rs"
 
 [[bench]]
 name = "manual_policy_benchmark"

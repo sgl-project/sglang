@@ -15,7 +15,7 @@ pub use reasoning_parser;
 pub mod routers;
 pub mod server;
 pub mod service_discovery;
-pub mod tokenizer;
+pub use llm_tokenizer as tokenizer;
 pub use tool_parser;
 pub mod version;
 pub mod wasm;
