@@ -200,6 +200,10 @@ class OpenAIServingCompletion(OpenAIServingBase):
         # State tracking for streaming
         stream_buffers = {}
         n_prev_tokens = {}
+        pending_output_token_logprobs = {}
+        pending_output_top_logprobs = {}
+        pending_input_token_logprobs = {}
+        pending_input_top_logprobs = {}
 
         # Usage tracking
         prompt_tokens = {}
@@ -228,6 +232,11 @@ class OpenAIServingCompletion(OpenAIServingBase):
                         echo_text = self._get_echo_text(request, index)
                         text = echo_text + text
 
+                # Generate delta
+                delta = text[len(stream_buffer) :]
+                stream_buffers[index] = stream_buffer + delta
+                finish_reason = content["meta_info"]["finish_reason"]
+
                 # Handle logprobs
                 logprobs = None
                 if request.logprobs is not None:
@@ -237,29 +246,57 @@ class OpenAIServingCompletion(OpenAIServingBase):
                             "input_token_logprobs"
                         ]
                         input_top_logprobs = content["meta_info"]["input_top_logprobs"]
-                    else:
-                        input_token_logprobs = None
-                        input_top_logprobs = None
+                        if input_token_logprobs:
+                            pending_input_token_logprobs.setdefault(
+                                index, input_token_logprobs
+                            )
+                            pending_input_top_logprobs.setdefault(
+                                index, input_top_logprobs
+                            )
 
                     n_prev_token = n_prev_tokens.get(index, 0)
-                    logprobs = to_openai_style_logprobs(
-                        input_token_logprobs=input_token_logprobs,
-                        input_top_logprobs=input_top_logprobs,
-                        output_token_logprobs=content["meta_info"][
-                            "output_token_logprobs"
-                        ][n_prev_token:],
-                        output_top_logprobs=content["meta_info"].get(
-                            "output_top_logprobs", []
-                        )[n_prev_token:],
-                    )
+                    output_token_logprobs = content["meta_info"][
+                        "output_token_logprobs"
+                    ][n_prev_token:]
+                    output_top_logprobs = content["meta_info"].get(
+                        "output_top_logprobs", []
+                    )[n_prev_token:]
+                    if output_token_logprobs:
+                        pending_output_token_logprobs.setdefault(index, []).extend(
+                            output_token_logprobs
+                        )
+                        pending_output_top_logprobs.setdefault(index, []).extend(
+                            output_top_logprobs
+                        )
                     n_prev_tokens[index] = len(
                         content["meta_info"]["output_token_logprobs"]
                     )
 
-                # Generate delta
-                delta = text[len(stream_buffer) :]
-                stream_buffers[index] = stream_buffer + delta
-                finish_reason = content["meta_info"]["finish_reason"]
+                    pending_output = pending_output_token_logprobs.get(index, [])
+                    pending_output_top = pending_output_top_logprobs.get(index, [])
+                    pending_input = pending_input_token_logprobs.get(index)
+                    pending_input_top = pending_input_top_logprobs.get(index)
+                    should_send_logprobs = bool(delta) or finish_reason is not None
+
+                    if should_send_logprobs and (pending_output or pending_input):
+                        logprobs = to_openai_style_logprobs(
+                            input_token_logprobs=pending_input,
+                            input_top_logprobs=pending_input_top,
+                            output_token_logprobs=pending_output,
+                            output_top_logprobs=pending_output_top,
+                        )
+                        if pending_output:
+                            pending_output_token_logprobs.pop(index, None)
+                            pending_output_top_logprobs.pop(index, None)
+                        if pending_input is not None:
+                            pending_input_token_logprobs.pop(index, None)
+                            pending_input_top_logprobs.pop(index, None)
+                    elif should_send_logprobs:
+                        logger.debug(
+                            "Skipping logprobs for streaming chunk %d: "
+                            "no tokens buffered yet",
+                            index,
+                        )
 
                 choice_data = CompletionResponseStreamChoice(
                     index=index,

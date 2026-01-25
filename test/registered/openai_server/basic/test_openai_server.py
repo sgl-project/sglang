@@ -155,7 +155,8 @@ class TestOpenAIServer(CustomTestCase):
             index = response.choices[0].index
             is_first = is_firsts.get(index, True)
 
-            if logprobs:
+            # Only check logprobs when chunk has text delta.
+            if logprobs and response.choices[0].text:
                 assert response.choices[0].logprobs, f"no logprobs in response"
                 print(
                     f"{response=}, {response.choices[0]=}, {response.choices[0].logprobs=}"
