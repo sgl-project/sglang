@@ -54,12 +54,10 @@ class MOVAPipelineConfig(PipelineConfig):
     def _center_crop_and_resize(
         self, image: torch.Tensor | Image.Image, target_height: int, target_width: int
     ) -> torch.Tensor | Image.Image:
-        if isinstance(image, Image.Image):
-            if image.size == (target_width, target_height):
-                return image
-            image = torch.from_numpy(np.array(image))
-        elif isinstance(image, torch.Tensor):
+        if not isinstance(image, (Image.Image, torch.Tensor)):
             raise TypeError(f"Unsupported image type: {type(image)}")
+        if isinstance(image, Image.Image):
+            image = torch.from_numpy(np.array(image))
 
         if image.ndim == 2:
             image = image[..., None]
