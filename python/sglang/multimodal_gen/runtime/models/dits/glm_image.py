@@ -401,6 +401,7 @@ class GlmImageAttention(torch.nn.Module):
                     ],
                     dim=-1,
                 )
+                # apply_flashinfer_rope_qk_inplace is inplace kernel and q_img/k_img are views of query/key, so we need not copy back
                 q_out, k_out = apply_flashinfer_rope_qk_inplace(
                     q_img, k_img, cos_sin_cache, is_neox=True
                 )
