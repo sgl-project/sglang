@@ -80,7 +80,7 @@ def compare_versions(v1: str, v2: str) -> int:
 
 
 def get_repo_root() -> Path:
-    return Path(__file__).parent.parent.parent.parent
+    return Path(__file__).parent.parent.parent
 
 
 def read_current_version(version_file: Path) -> str:
