@@ -122,6 +122,12 @@ test = [
 
 dev = ["sglang[test]"]
 
+all = [
+  "sglang[checkpoint-engine]",
+  "sglang[diffusion]",
+  "sglang[tracing]",
+]
+
 [tool.uv.extra-build-dependencies]
 st-attn = ["torch", "setuptools"]
 vsa = ["torch", "setuptools"]
