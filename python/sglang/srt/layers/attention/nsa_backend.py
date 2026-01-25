@@ -1340,6 +1340,9 @@ class NativeSparseAttnBackend(
                 page_size=1,
             )
         elif nsa_impl == "trtllm":
+            assert forward_batch.forward_mode.is_target_verify() or forward_batch.forward_mode.is_draft_extend(
+                include_v2=True
+            ), "TRT-LLM NSA only supports target_verify/draft_extend; normal extend untested."
             if q_rope is not None:
                 q_all = _concat_mla_absorb_q_general(q_nope, q_rope)
             # Use expanded seq_lens for per-token decode in target_verify/draft_extend.
@@ -1480,6 +1483,7 @@ class NativeSparseAttnBackend(
                 page_table_1=page_table_1,
                 metadata=metadata,
                 sm_scale=layer.scaling,
+                seq_lens=metadata.cache_seqlens_int32,
             )
 
         else:
@@ -1748,7 +1752,7 @@ class NativeSparseAttnBackend(
         page_table_1: torch.Tensor,
         metadata: NSAMetadata,
         sm_scale: float,
-        seq_lens: Optional[torch.Tensor] = None,
+        seq_lens: torch.Tensor,
     ) -> torch.Tensor:
         """Forward using TRT-LLM sparse MLA kernel."""
         import flashinfer.decode
@@ -1759,8 +1763,6 @@ class NativeSparseAttnBackend(
         q = q_all.view(batch_size, 1, num_heads, head_dim)
         kv = kv_cache.view(-1, 1, self.real_page_size, self.kv_cache_dim)
         block_tables = page_table_1.unsqueeze(1)
-        if seq_lens is None:
-            seq_lens = metadata.cache_seqlens_int32
 
         out = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
             query=q,
