@@ -30,6 +30,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.managers.io_struct import (
     ActiveRanksOutput,
+    BatchFinishReqACK,
     BlockReqInput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
@@ -160,6 +161,8 @@ class DataParallelController:
         self.scheduler_procs = []
         self.workers: List[zmq.Socket] = [None] * server_args.dp_size
         self.status: List[bool] = [True] * server_args.dp_size
+        # [Failover] In-Flight Requests Buffer: {rank: {rid: req}}
+        self.inflight_requests: List[dict] = [{} for _ in range(server_args.dp_size)]
 
         if server_args.enable_dp_attention:
             self.launch_dp_attention_schedulers(server_args, port_args)
@@ -192,8 +195,33 @@ class DataParallelController:
 
     def handle_load_update_req(self, obj):
         self.dp_budget.update_budget(obj)
-
+    
+    # [Failover] Handle finished request ACK
+    def handle_batch_finish_req(self, obj: BatchFinishReqACK):
+        logger.info(f"Received batch finish ack from Rank {obj.dp_rank}: {obj.rids}")
+        rank_inflight = self.inflight_requests[obj.dp_rank]
+        for rid in obj.rids:
+            if rid in rank_inflight:
+                del rank_inflight[rid]
+            
     def update_active_ranks(self, ranks: ActiveRanksOutput):
+        if self.status != ranks.status:
+            logger.info(f"Received active ranks update: {ranks.status}")
+            
+            for i, (old_s, new_s) in enumerate(zip(self.status, ranks.status)):
+                if old_s and not new_s:
+                    failed_reqs = list(self.inflight_requests[i].values())
+                    if failed_reqs:
+                        logger.warning(f"Rank {i} failed! Rescheduling req {len(failed_reqs)} inflight requests...")
+                        # Clear buffer for dead rank
+                        self.inflight_requests[i].clear()
+                        # Reschedule
+                        self.status = ranks.status
+                        for req in failed_reqs:
+                            logger.info(f"Rescheduling req {req.rid}")
+                            self.dispatching_with_trace(req)
+                        return 
+
         self.status = ranks.status
 
     def dispatching_with_trace(self, req: Req):
@@ -215,6 +243,7 @@ class DataParallelController:
                 (BlockReqInput, self.send_to_all_workers),
                 (WatchLoadUpdateReq, self.handle_load_update_req),
                 (ActiveRanksOutput, self.update_active_ranks),
+                (BatchFinishReqACK, self.handle_batch_finish_req),
             ]
         )
         self._request_dispatcher.add_fallback_fn(self.send_control_message)
@@ -478,6 +507,8 @@ class DataParallelController:
     def maybe_external_dp_rank_routing(self, req: Req):
         if req.data_parallel_rank is not None:
             logger.debug(f"Direct routing to DP rank {req.data_parallel_rank}")
+            logger.info(f"[TrafficMonitor] Request {req.rid} -> Rank {req.data_parallel_rank}")
+            self.inflight_requests[req.data_parallel_rank][req.rid] = req
             self.workers[req.data_parallel_rank].send_pyobj(req)
             return True
         return False
@@ -489,6 +520,8 @@ class DataParallelController:
         while True:
             if self.status[self.round_robin_counter]:
                 logger.debug(f"Choose worker {self.round_robin_counter}")
+                logger.info(f"[TrafficMonitor] Request {req.rid} -> Rank {self.round_robin_counter}")
+                self.inflight_requests[self.round_robin_counter][req.rid] = req
                 self.workers[self.round_robin_counter].send_pyobj(req)
                 self.round_robin_counter = (self.round_robin_counter + 1) % len(
                     self.workers
@@ -517,18 +550,24 @@ class DataParallelController:
             "prefill or decode instances; send to the router instead."
         )
         target_rank = req.bootstrap_room % len(self.workers)
+        logger.info(f"[TrafficMonitor] Request {req.rid} -> Rank {target_rank}")
+        self.inflight_requests[target_rank][req.rid] = req
         self.workers[target_rank].send_pyobj(req)
 
     def total_requests_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):
             return
         target_worker = self.dp_budget.dispatch(LoadBalanceMethod.TOTAL_REQUESTS)
+        logger.info(f"[TrafficMonitor] Request {req.rid} -> Rank {target_worker}")
+        self.inflight_requests[target_worker][req.rid] = req
         self.workers[target_worker].send_pyobj(req)
 
     def total_tokens_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):
             return
         target_worker = self.dp_budget.dispatch(LoadBalanceMethod.TOTAL_TOKENS)
+        logger.info(f"[TrafficMonitor] Request {req.rid} -> Rank {target_worker}")
+        self.inflight_requests[target_worker][req.rid] = req
         self.workers[target_worker].send_pyobj(req)
 
     def event_loop(self):

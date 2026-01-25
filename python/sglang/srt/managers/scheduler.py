@@ -73,6 +73,7 @@ from sglang.srt.managers.io_struct import (
     ActiveRanksOutput,
     BaseBatchReq,
     BaseReq,
+    BatchFinishReqACK,
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
     CheckWeightsReqInput,
@@ -2380,19 +2381,39 @@ class Scheduler(
             for req in batch.reqs:
                 req.time_stats.prefill_end_time_host = current_time
 
+        # if (
+        #     self.server_args.enable_dp_attention
+        #     and self.server_args.elastic_ep_backend == "mooncake"
+        # ):
+        #     # Get the tensors indicating rank activeness
+        #     tp_active_ranks = self.tp_group.active_ranks.detach().cpu().numpy()
+        #     tp_active_ranks_cpu = self.tp_group.active_ranks_cpu.detach().numpy()
+        #     tp_active_ranks &= tp_active_ranks_cpu
+        #     dp_active_ranks = tp_active_ranks.reshape(self.dp_size, -1).prod(axis=1)
+        #     self.send_to_tokenizer.send_output(
+        #         ActiveRanksOutput(status=dp_active_ranks.tolist())
+        #     )
         if (
-            self.server_args.enable_dp_attention
-            and self.server_args.elastic_ep_backend == "mooncake"
+            # self.server_args.enable_dp_attention and
+            self.server_args.elastic_ep_backend == "mooncake"
         ):
-            # Get the tensors indicating rank activeness
-            tp_active_ranks = self.tp_group.active_ranks.detach().cpu().numpy()
-            tp_active_ranks_cpu = self.tp_group.active_ranks_cpu.detach().numpy()
-            tp_active_ranks &= tp_active_ranks_cpu
-            dp_active_ranks = tp_active_ranks.reshape(self.dp_size, -1).prod(axis=1)
-            self.send_to_tokenizer.send_output(
-                ActiveRanksOutput(status=dp_active_ranks.tolist())
-            )
-
+            import os
+            
+            # Initialize all as healthy
+            mock_status = [1] * self.dp_size
+            
+            # Check flags for each rank
+            for r in range(self.dp_size):
+                if os.path.exists(f"/tmp/sglang_fail_rank_{r}"):
+                    mock_status[r] = 0
+            
+            try:
+                # Send the global view to the controller
+                self.send_to_tokenizer.send_output(
+                    ActiveRanksOutput(status=mock_status)
+                )
+            except Exception as e:
+                pass
         return ret
 
     def launch_batch_sample_if_needed(
@@ -2431,6 +2452,19 @@ class Scheduler(
         self.log_batch_result_stats(batch, result)
         self._maybe_clear_mm_inputs(batch)
         self.maybe_send_health_check_signal()
+        
+        # [Failover] Report finished requests to Controller for accounting
+        if self.server_args.dp_size > 1:
+            finished_rids = []
+            for req in batch.reqs:
+                if req.finished():
+                    finished_rids.append(req.rid)
+            if finished_rids:
+                try:
+                    # logger.info(f"Sending finish ack for {len(finished_rids)} reqs")
+                    self.send_to_tokenizer.send_output(BatchFinishReqACK(dp_rank=self.dp_rank, rids=finished_rids))
+                except Exception as e:
+                    logger.error(f"Failed to send finish ack: {e}")
 
     def maybe_send_health_check_signal(self):
         if self.return_health_check_ct:
