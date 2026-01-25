@@ -22,22 +22,12 @@ from datetime import datetime, timezone
 
 def find_result_files(search_dirs: list[str]) -> list[str]:
     """Find all results_*.json files in the given directories."""
-    result_files = []
+    result_files = set()
     for search_dir in search_dirs:
         if os.path.exists(search_dir):
-            pattern = os.path.join(search_dir, "results_*.json")
-            files = glob.glob(pattern)
-            result_files.extend(files)
-
-            # Also search in subdirectories (profile directories)
-            subdir_pattern = os.path.join(search_dir, "*", "results_*.json")
-            result_files.extend(glob.glob(subdir_pattern))
-
-    # Also search in current directory and test directory
-    for pattern in ["results_*.json", "test/results_*.json"]:
-        result_files.extend(glob.glob(pattern))
-
-    return list(set(result_files))  # Remove duplicates
+            pattern = os.path.join(search_dir, "**/results_*.json")
+            result_files.update(glob.glob(pattern, recursive=True))
+    return list(result_files)
 
 
 def parse_result_file(filepath: str) -> list[dict]:
@@ -63,11 +53,11 @@ def transform_benchmark_result(result: dict, gpu_config: str, partition: int) ->
         "batch_size": result.get("batch_size"),
         "input_len": result.get("input_len"),
         "output_len": result.get("output_len"),
-        "latency_ms": (latency or 0) * 1000 if latency is not None else None,
+        "latency_ms": latency * 1000 if latency is not None else None,
         "input_throughput": result.get("input_throughput"),
         "output_throughput": result.get("output_throughput"),
         "overall_throughput": result.get("overall_throughput"),
-        "ttft_ms": (last_ttft or 0) * 1000 if last_ttft is not None else None,
+        "ttft_ms": last_ttft * 1000 if last_ttft is not None else None,
         "acc_length": result.get("acc_length"),
     }
 
@@ -75,21 +65,25 @@ def transform_benchmark_result(result: dict, gpu_config: str, partition: int) ->
 def group_results_by_model(
     results: list[dict], gpu_config: str, partition: int
 ) -> list[dict]:
-    """Group benchmark results by model and variant."""
+    """Group benchmark results by model, variant, and server_args."""
     groups = {}
 
     for result in results:
         model_path = result.get("model_path", "unknown")
         run_name = result.get("run_name", "default")
         variant = run_name if run_name != "default" else None
+        server_args = result.get("server_args")
+        # Convert server_args list to tuple for use as dict key (lists are not hashable)
+        server_args_key = tuple(server_args) if server_args else None
 
-        key = (model_path, variant)
+        key = (model_path, variant, server_args_key)
         if key not in groups:
             groups[key] = {
                 "gpu_config": gpu_config,
                 "partition": partition,
                 "model": model_path,
                 "variant": variant,
+                "server_args": server_args,
                 "benchmarks": [],
             }
 
@@ -108,46 +102,31 @@ def save_metrics(
     search_dirs: list[str],
 ) -> bool:
     """Collect metrics and save to output file."""
+    timestamp = datetime.now(timezone.utc).isoformat()
+
     # Find all result files
     result_files = find_result_files(search_dirs)
     print(f"Found {len(result_files)} result file(s)")
 
+    grouped = []
     if not result_files:
         print("No benchmark result files found")
-        # Create an empty metrics file to indicate the job ran but had no results
-        metrics = {
-            "run_id": run_id,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "gpu_config": gpu_config,
-            "partition": partition,
-            "results": [],
-        }
-        try:
-            os.makedirs(os.path.dirname(output_file) or ".", exist_ok=True)
-            with open(output_file, "w", encoding="utf-8") as f:
-                json.dump(metrics, f, indent=2)
-            print(f"Created empty metrics file: {output_file}")
-            return True
-        except OSError as e:
-            print(f"Error writing empty metrics file: {e}")
-            return False
+    else:
+        # Parse all result files
+        all_results = []
+        for filepath in sorted(result_files):
+            print(f"  Reading: {filepath}")
+            results = parse_result_file(filepath)
+            all_results.extend(results)
+        print(f"Total benchmark results: {len(all_results)}")
 
-    # Parse all result files
-    all_results = []
-    for filepath in result_files:
-        print(f"  Reading: {filepath}")
-        results = parse_result_file(filepath)
-        all_results.extend(results)
-
-    print(f"Total benchmark results: {len(all_results)}")
-
-    # Group by model/variant
-    grouped = group_results_by_model(all_results, gpu_config, partition)
+        # Group by model/variant
+        grouped = group_results_by_model(all_results, gpu_config, partition)
 
     # Create metrics structure
     metrics = {
         "run_id": run_id,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": timestamp,
         "gpu_config": gpu_config,
         "partition": partition,
         "results": grouped,
@@ -158,7 +137,11 @@ def save_metrics(
         os.makedirs(os.path.dirname(output_file) or ".", exist_ok=True)
         with open(output_file, "w", encoding="utf-8") as f:
             json.dump(metrics, f, indent=2)
-        print(f"Saved metrics to: {output_file}")
+
+        if not result_files:
+            print(f"Created empty metrics file: {output_file}")
+        else:
+            print(f"Saved metrics to: {output_file}")
         return True
     except OSError as e:
         print(f"Error writing metrics file: {e}")

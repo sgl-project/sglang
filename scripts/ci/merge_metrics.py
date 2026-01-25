@@ -22,14 +22,8 @@ from datetime import datetime, timezone
 
 def find_partition_files(input_dir: str) -> list[str]:
     """Find all partition metric files in the input directory."""
-    patterns = [
-        os.path.join(input_dir, "metrics-*.json"),
-        os.path.join(input_dir, "**/metrics-*.json"),
-    ]
-    files = []
-    for pattern in patterns:
-        files.extend(glob.glob(pattern, recursive=True))
-    return list(set(files))
+    pattern = os.path.join(input_dir, "**/metrics-*.json")
+    return glob.glob(pattern, recursive=True)
 
 
 def load_partition_metrics(filepath: str) -> dict | None:
@@ -50,44 +44,28 @@ def merge_metrics(
     branch: str | None = None,
 ) -> bool:
     """Merge all partition metrics into a consolidated file."""
+    run_date = datetime.now(timezone.utc).isoformat()
+
     # Find all partition files
     partition_files = find_partition_files(input_dir)
     print(f"Found {len(partition_files)} partition file(s)")
 
+    all_results = []
     if not partition_files:
         print("No partition metrics files found")
-        # Create an empty consolidated file
-        consolidated = {
-            "run_id": run_id,
-            "run_date": datetime.now(timezone.utc).isoformat(),
-            "commit_sha": commit_sha,
-            "branch": branch,
-            "results": [],
-        }
-        try:
-            os.makedirs(os.path.dirname(output_file) or ".", exist_ok=True)
-            with open(output_file, "w", encoding="utf-8") as f:
-                json.dump(consolidated, f, indent=2)
-            print(f"Created empty consolidated file: {output_file}")
-            return True
-        except OSError as e:
-            print(f"Error writing empty consolidated file: {e}")
-            return False
-
-    # Load all partition files
-    all_results = []
-    for filepath in sorted(partition_files):
-        print(f"  Reading: {filepath}")
-        metrics = load_partition_metrics(filepath)
-        if metrics and "results" in metrics:
-            all_results.extend(metrics["results"])
-
-    print(f"Total results collected: {len(all_results)}")
+    else:
+        # Load all partition files
+        for filepath in sorted(partition_files):
+            print(f"  Reading: {filepath}")
+            metrics = load_partition_metrics(filepath)
+            if metrics and "results" in metrics:
+                all_results.extend(metrics["results"])
+        print(f"Total results collected: {len(all_results)}")
 
     # Create consolidated structure
     consolidated = {
         "run_id": run_id,
-        "run_date": datetime.now(timezone.utc).isoformat(),
+        "run_date": run_date,
         "commit_sha": commit_sha,
         "branch": branch,
         "results": all_results,
@@ -95,12 +73,14 @@ def merge_metrics(
 
     # Ensure output directory exists and write output
     try:
-        output_dir = os.path.dirname(output_file)
-        if output_dir:
-            os.makedirs(output_dir, exist_ok=True)
+        os.makedirs(os.path.dirname(output_file) or ".", exist_ok=True)
         with open(output_file, "w", encoding="utf-8") as f:
             json.dump(consolidated, f, indent=2)
-        print(f"Saved consolidated metrics to: {output_file}")
+
+        if not partition_files:
+            print(f"Created empty consolidated file: {output_file}")
+        else:
+            print(f"Saved consolidated metrics to: {output_file}")
         return True
     except OSError as e:
         print(f"Error writing consolidated file: {e}")
