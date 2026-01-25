@@ -432,6 +432,7 @@ class ModelConfig:
             self.attention_arch = AttentionArch.MLA
             self.kv_lora_rank = self.hf_text_config.kv_lora_rank
             self.qk_rope_head_dim = self.hf_text_config.qk_rope_head_dim
+            self.qk_nope_head_dim = self.hf_text_config.qk_nope_head_dim
         elif "KimiVLForConditionalGeneration" in self.hf_config.architectures:
             self.head_dim = 256
             self.attention_arch = AttentionArch.MLA
@@ -1160,6 +1161,7 @@ multimodal_model_archs = [
     "JetVLMForConditionalGeneration",
     "PaddleOCRVLForConditionalGeneration",
     "MiDashengLMModel",
+    "StepVLForConditionalGeneration",
 ]
 
 if external_mm_model_arch := envs.SGLANG_EXTERNAL_MM_MODEL_ARCH.get():
@@ -1257,7 +1259,8 @@ def get_hybrid_layer_ids(
             i for i in range(num_hidden_layers) if hybrid_layer_pattern[i] == 0
         ]
     elif "MiMoV2MTP" in model_architectures:
-        return [0], []
+        swa_attention_layer_ids = [0]
+        full_attention_layer_ids = []
     else:
         swa_attention_layer_ids = None
         full_attention_layer_ids = None

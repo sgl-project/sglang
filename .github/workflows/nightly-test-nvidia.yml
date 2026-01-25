@@ -66,7 +66,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          bash scripts/ci/ci_install_dependency.sh
+          bash scripts/ci/cuda/ci_install_dependency.sh
 
       - name: Run test
         timeout-minutes: 60
@@ -86,7 +86,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          bash scripts/ci/ci_install_dependency.sh
+          bash scripts/ci/cuda/ci_install_dependency.sh
 
       - name: Run test
         timeout-minutes: 30
@@ -112,7 +112,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          bash scripts/ci/ci_install_dependency.sh
+          bash scripts/ci/cuda/ci_install_dependency.sh
 
       - name: Run common 8-GPU model tests
         if: always()
@@ -148,7 +148,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          bash scripts/ci/ci_install_dependency.sh
+          bash scripts/ci/cuda/ci_install_dependency.sh
 
       - name: Run test
         timeout-minutes: 30
@@ -174,7 +174,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          IS_BLACKWELL=1 bash scripts/ci/ci_install_dependency.sh
+          IS_BLACKWELL=1 bash scripts/ci/cuda/ci_install_dependency.sh
 
       - name: Run common 8-GPU model tests
         if: always()
@@ -199,7 +199,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          bash scripts/ci/ci_install_dependency.sh
+          bash scripts/ci/cuda/ci_install_dependency.sh
 
       - name: Run eval test for text models
         timeout-minutes: 120
@@ -219,7 +219,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          bash scripts/ci/ci_install_dependency.sh
+          bash scripts/ci/cuda/ci_install_dependency.sh
 
       - name: Run performance test for text models
         timeout-minutes: 180
@@ -238,7 +238,7 @@ jobs:
           GITHUB_RUN_ID: ${{ github.run_id }}
           GITHUB_RUN_NUMBER: ${{ github.run_number }}
         run: |
-          python3 scripts/ci/publish_traces.py --traces-dir test/performance_profiles_text_models
+          python3 scripts/ci/utils/publish_traces.py --traces-dir test/performance_profiles_text_models
 
   # VLM accuracy tests
   nightly-test-vlm-accuracy-2-gpu-runner:
@@ -252,7 +252,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          bash scripts/ci/ci_install_dependency.sh
+          bash scripts/ci/cuda/ci_install_dependency.sh
 
       - name: Run eval test for VLM models (fixed MMMU-100)
         timeout-minutes: 240
@@ -272,7 +272,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          bash scripts/ci/ci_install_dependency.sh
+          bash scripts/ci/cuda/ci_install_dependency.sh
 
       - name: Run perf test for VLM models (MMMU)
         timeout-minutes: 240
@@ -291,7 +291,7 @@ jobs:
           GITHUB_RUN_ID: ${{ github.run_id }}
           GITHUB_RUN_NUMBER: ${{ github.run_number }}
         run: |
-          python3 scripts/ci/publish_traces.py --traces-dir test/performance_profiles_vlms
+          python3 scripts/ci/utils/publish_traces.py --traces-dir test/performance_profiles_vlms
 
   # diffusion performance tests
   nightly-test-multimodal-server-1-gpu:
@@ -310,7 +310,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          bash scripts/ci/ci_install_dependency.sh diffusion
+          bash scripts/ci/cuda/ci_install_dependency.sh diffusion
           pip install slack_sdk
 
       - name: Run diffusion server tests
@@ -343,7 +343,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          bash scripts/ci/ci_install_dependency.sh diffusion
+          bash scripts/ci/cuda/ci_install_dependency.sh diffusion
           pip install slack_sdk
 
       - name: Run diffusion server tests
@@ -371,7 +371,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          IS_BLACKWELL=1 bash scripts/ci/ci_install_dependency.sh
+          IS_BLACKWELL=1 bash scripts/ci/cuda/ci_install_dependency.sh
 
       - name: Run test
         timeout-minutes: 300
@@ -393,7 +393,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          IS_BLACKWELL=1 bash scripts/ci/ci_install_dependency.sh
+          IS_BLACKWELL=1 bash scripts/ci/cuda/ci_install_dependency.sh
 
       - name: Run test
         timeout-minutes: 120

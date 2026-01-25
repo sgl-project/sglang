@@ -77,7 +77,9 @@ class TextEncodingStage(PipelineStage):
 
         for pe in pooler_embeds_list:
             batch.pooled_embeds.append(pe)
-        if batch.prompt_attention_mask is not None:
+
+        if batch.prompt_attention_mask is None:
+            batch.prompt_attention_mask = []
             for am in prompt_masks_list:
                 batch.prompt_attention_mask.append(am)
 
@@ -98,7 +100,8 @@ class TextEncodingStage(PipelineStage):
 
             for pe in neg_pooler_embeds_list:
                 batch.neg_pooled_embeds.append(pe)
-            if batch.negative_attention_mask is not None:
+            if batch.negative_attention_mask is None:
+                batch.negative_attention_mask = []
                 for nm in neg_masks_list:
                     batch.negative_attention_mask.append(nm)
 
