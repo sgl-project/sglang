@@ -137,10 +137,7 @@ class MOVAPipelineConfig(PipelineConfig):
         return shape
 
     def prepare_audio_latent_shape(self, batch_size, num_samples, audio_vae):
-        if self.audio_vae_type == "oobleck":
-            latent_T = num_samples // audio_vae.hop_length
-        else:
-            latent_T = (num_samples + audio_vae.hop_length - 1) // audio_vae.hop_length
+        latent_T = (num_samples + audio_vae.hop_length - 1) // audio_vae.hop_length
         return (batch_size, audio_vae.latent_dim, latent_T)
 
     def normalize_video_latents(self, latents: torch.Tensor, video_vae) -> torch.Tensor:

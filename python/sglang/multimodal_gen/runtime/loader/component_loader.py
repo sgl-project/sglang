@@ -700,7 +700,7 @@ class VAELoader(BaseVAELoader):
 
 
 class AudioVAELoader(BaseVAELoader):
-    """Loader for audio VAE (e.g. DAC/oobleck)."""
+    """Loader for audio VAE (e.g. DAC)."""
 
     pipeline_vae_config_attr = "audio_vae_config"
     allowed_module_keys = ("audio_vae",)
