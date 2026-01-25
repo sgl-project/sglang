@@ -246,7 +246,7 @@ class RouterArgs:
             f"--{prefix}policy",
             type=str,
             default=RouterArgs.policy,
-            choices=["random", "round_robin", "cache_aware", "power_of_two", "manual"],
+            choices=["random", "round_robin", "cache_aware", "power_of_two", "manual", "consistent_hashing"],
             help="Load balancing policy to use. In PD mode, this is used for both prefill and decode unless overridden",
         )
         routing_group.add_argument(
@@ -260,6 +260,7 @@ class RouterArgs:
                 "power_of_two",
                 "manual",
                 "bucket",
+                "consistent_hashing",
             ],
             help="Specific policy for prefill nodes in PD mode. If not specified, uses the main policy",
         )
@@ -267,7 +268,7 @@ class RouterArgs:
             f"--{prefix}decode-policy",
             type=str,
             default=None,
-            choices=["random", "round_robin", "cache_aware", "power_of_two", "manual"],
+            choices=["random", "round_robin", "cache_aware", "power_of_two", "manual", "consistent_hashing"],
             help="Specific policy for decode nodes in PD mode. If not specified, uses the main policy",
         )
         routing_group.add_argument(
