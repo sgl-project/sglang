@@ -135,9 +135,13 @@ class DenoisingStage(PipelineStage):
         fullgraph = False
         dynamic = None
         regional = self.server_args.regional_compile
-        logger.info(f"Compiling transformer with mode: {mode}, fullgraph: {fullgraph}, dynamic: {dynamic}, regional: {regional}")
+        logger.info(
+            f"Compiling transformer with mode: {mode}, fullgraph: {fullgraph}, dynamic: {dynamic}, regional: {regional}"
+        )
         if regional:
-            self.regionally_compile(module, mode=mode, fullgraph=fullgraph, dynamic=dynamic)
+            self.regionally_compile(
+                module, mode=mode, fullgraph=fullgraph, dynamic=dynamic
+            )
         else:
             # TODO(triple-mu): support customized fullgraph and dynamic in the future
             module.compile(mode=mode, fullgraph=fullgraph, dynamic=dynamic)
@@ -159,7 +163,9 @@ class DenoisingStage(PipelineStage):
                 has_compiled_region = True
 
         if not has_compiled_region:
-            logger.warning(f"Regional compilation failed because {repeated_blocks} classes are not found in the model.")
+            logger.warning(
+                f"Regional compilation failed because {repeated_blocks} classes are not found in the model."
+            )
 
     def _maybe_enable_cache_dit(self, num_inference_steps: int, batch: Req) -> None:
         """Enable cache-dit on the transformers if configured (idempotent).

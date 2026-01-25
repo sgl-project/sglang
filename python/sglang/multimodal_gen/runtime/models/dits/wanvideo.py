@@ -683,7 +683,6 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
     reverse_param_names_mapping = WanVideoConfig().reverse_param_names_mapping
     lora_param_names_mapping = WanVideoConfig().lora_param_names_mapping
 
-
     def __init__(self, config: WanVideoConfig, hf_config: dict[str, Any]) -> None:
         super().__init__(config=config, hf_config=hf_config)
 
@@ -697,7 +696,7 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         self.text_len = config.text_len
 
         # Could have been class attribute, but the type of block is decide based on
-        # attn_backend, therfore we put it here.
+        # attn_backend, therefore we put it here.
         self._repeated_blocks = []
 
         # 1. Patch & position embedding

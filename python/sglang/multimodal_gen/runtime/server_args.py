@@ -593,7 +593,7 @@ class ServerArgs:
             "--regional-compile",
             action=StoreBoolean,
             default=ServerArgs.regional_compile,
-            help="Apply regional compile on repeated blocks to reduce compile time."
+            help="Apply regional compile on repeated blocks to reduce compile time.",
         )
 
         # warmup
