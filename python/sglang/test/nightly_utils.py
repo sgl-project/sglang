@@ -192,17 +192,14 @@ class NightlyBenchmarkRunner:
                 f"Loaded {len(benchmark_results)} benchmark results from {json_output_file}"
             )
 
-            # Clean up JSON file
-            os.remove(json_output_file)
+            # Note: JSON files are preserved for metrics collection by CI scripts
+            # They will be collected by scripts/ci/save_metrics.py
 
             return benchmark_results, True
 
         except Exception as e:
             desc = model_description or "model"
             print(f"Error loading benchmark results for {desc}: {e}")
-            # Try to clean up the file anyway
-            if os.path.exists(json_output_file):
-                os.remove(json_output_file)
             return benchmark_results, False
 
     def run_benchmark_for_model(
