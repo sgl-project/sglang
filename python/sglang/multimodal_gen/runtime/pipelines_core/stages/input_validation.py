@@ -47,6 +47,25 @@ class InputValidationStage(PipelineStage):
         super().__init__()
         self.vae_image_processor = vae_image_processor
 
+    @staticmethod
+    def _calculate_dimensions_from_area(
+        max_area: float, aspect_ratio: float, mod_value: int
+    ) -> tuple[int, int]:
+        """
+        Calculate output dimensions based on maximum area and aspect ratio.
+
+        Args:
+            max_area: Maximum area constraint for the output
+            aspect_ratio: Target aspect ratio (height/width)
+            mod_value: Value to round dimensions to (typically vae_scale * patch_size)
+
+        Returns:
+            Tuple of (width, height) rounded to multiples of mod_value
+        """
+        height = round(np.sqrt(max_area * aspect_ratio)) // mod_value * mod_value
+        width = round(np.sqrt(max_area / aspect_ratio)) // mod_value * mod_value
+        return width, height
+
     def _generate_seeds(self, batch: Req, server_args: ServerArgs):
         """Generate seeds for the inference"""
         seed = batch.seed
@@ -169,8 +188,9 @@ class InputValidationStage(PipelineStage):
                 server_args.pipeline_config.vae_config.arch_config.scale_factor_spatial
                 * server_args.pipeline_config.dit_config.arch_config.patch_size[1]
             )
-            height = round(np.sqrt(max_area * aspect_ratio)) // mod_value * mod_value
-            width = round(np.sqrt(max_area / aspect_ratio)) // mod_value * mod_value
+            width, height = self._calculate_dimensions_from_area(
+                max_area, aspect_ratio, mod_value
+            )
 
             batch.condition_image = batch.condition_image.resize((width, height))
             batch.height = height
@@ -193,8 +213,9 @@ class InputValidationStage(PipelineStage):
                 server_args.pipeline_config.vae_config.arch_config.scale_factor_spatial
                 * server_args.pipeline_config.dit_config.arch_config.patch_size[1]
             )
-            height = round(np.sqrt(max_area * aspect_ratio)) // mod_value * mod_value
-            width = round(np.sqrt(max_area / aspect_ratio)) // mod_value * mod_value
+            width, height = self._calculate_dimensions_from_area(
+                max_area, aspect_ratio, mod_value
+            )
 
             config = server_args.pipeline_config
             image, (final_w, final_h) = (
