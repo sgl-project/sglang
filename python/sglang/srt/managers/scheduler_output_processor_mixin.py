@@ -1005,30 +1005,11 @@ class SchedulerOutputProcessorMixin:
                         input_token_ids_logprobs_idx.append([])
 
                     if req.return_logprob:
-                        # Debug logging for flaky streaming logprobs issue
-                        # See: https://github.com/sgl-project/sglang/actions/runs/21319310492/job/61366797740
-                        logprob_slice = req.output_token_logprobs_val[
-                            send_output_token_logprobs_offset:
-                        ]
-                        decode_ids_slice = decode_ids[req.send_decode_id_offset :]
-                        if (
-                            len(logprob_slice) == 0
-                            and len(decode_ids_slice) > 0
-                            and req.stream
-                        ):
-                            logger.warning(
-                                f"[SCHEDULER_LOGPROBS_DEBUG] Empty logprobs slice with non-empty decode_ids! "
-                                f"rid={req.rid}, "
-                                f"send_output_token_logprobs_offset={send_output_token_logprobs_offset}, "
-                                f"total_output_token_logprobs={len(req.output_token_logprobs_val)}, "
-                                f"send_decode_id_offset={req.send_decode_id_offset}, "
-                                f"total_decode_ids={len(decode_ids)}, "
-                                f"decode_ids_slice_len={len(decode_ids_slice)}, "
-                                f"finished={req.finished()}, "
-                                f"finished_reason={req.finished_reason}"
-                            )
-
-                        output_token_logprobs_val.append(logprob_slice)
+                        output_token_logprobs_val.append(
+                            req.output_token_logprobs_val[
+                                send_output_token_logprobs_offset:
+                            ]
+                        )
                         output_token_logprobs_idx.append(
                             req.output_token_logprobs_idx[
                                 send_output_token_logprobs_offset:
