@@ -5,11 +5,10 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sageattention import sageattn, sageattn_varlen
+from sageattention import sageattn_varlen
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
-from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 
@@ -39,8 +38,8 @@ class SageAttnBackend(AttentionBackend):
     throughput. SageAttention quantizes Q and K to INT8 on-the-fly during
     computation, providing speedup while maintaining accuracy.
 
-    For decode operations with paged KV cache, we fall back to the Triton
-    backend since SageAttention works best with contiguous Q, K, V tensors.
+    Both extend (prefill) and decode operations use SageAttention. For decode,
+    we gather the KV cache into contiguous memory to use SageAttention's API.
     """
 
     def __init__(self, model_runner: ModelRunner):
@@ -49,28 +48,9 @@ class SageAttnBackend(AttentionBackend):
         self.model_runner = model_runner
         self.device = model_runner.device
 
-        # Parse model configuration
-        self.num_heads = (
-            model_runner.model_config.num_attention_heads // get_attention_tp_size()
-        )
-        self.num_kv_heads = model_runner.model_config.get_num_kv_heads(
-            get_attention_tp_size()
-        )
-        self.head_dim = model_runner.model_config.head_dim
-
-        # Get v_head_dim (may differ from head_dim for MQA/GQA)
-        if (
-            model_runner.hybrid_gdn_config is not None
-            or model_runner.kimi_linear_config is not None
-        ):
-            self.v_head_dim = model_runner.token_to_kv_pool.get_v_head_dim()
-        else:
-            self.v_head_dim = model_runner.token_to_kv_pool.get_value_buffer(0).shape[
-                -1
-            ]
-
-        # Create a Triton backend for decode operations (fallback)
-        # The Triton backend handles paged KV cache efficiently
+        # Create a Triton backend for CUDA graph support and fallback
+        # Also used when prefix caching is active (SageAttention's causal mask
+        # only works when qo_len == kv_len)
         self.triton_backend = TritonAttnBackend(model_runner)
 
         # Store reference to KV pool for gathering KV cache
@@ -81,12 +61,32 @@ class SageAttnBackend(AttentionBackend):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize metadata for a forward pass."""
-        # Always initialize triton backend metadata (for decode fallback)
+        # Always initialize triton backend metadata (for CUDA graph support)
         self.triton_backend.init_forward_metadata(forward_batch)
 
         if forward_batch.forward_mode.is_decode_or_idle():
-            # For decode, we'll use the triton backend
-            self.forward_metadata = None
+            # For decode, prepare SageAttention metadata
+            metadata = SageAttentionMetadata()
+
+            # Decode processes 1 token per sequence
+            bs = forward_batch.batch_size
+
+            # Q: 1 token per sequence
+            metadata.max_seqlen_q = 1
+            metadata.cu_seqlens_q = torch.arange(
+                0, bs + 1, dtype=torch.int32, device=self.device
+            )
+
+            # K, V: full sequence length (all cached tokens)
+            # Use seq_lens_cpu for max (scalar), seq_lens (GPU) for cumsum
+            metadata.max_seqlen_k = forward_batch.seq_lens_cpu.max().item()
+            metadata.cu_seqlens_k = torch.nn.functional.pad(
+                torch.cumsum(forward_batch.seq_lens, dim=0, dtype=torch.int32), (1, 0)
+            )
+
+            metadata.is_causal = True
+
+            self.forward_metadata = metadata
         elif forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
             # For extend (prefill), prepare SageAttention metadata
             metadata = SageAttentionMetadata()
@@ -182,16 +182,59 @@ class SageAttnBackend(AttentionBackend):
         save_kv_cache: bool = True,
     ):
         """
-        Forward pass for decode.
+        Forward pass for decode using SageAttention.
 
-        For decode operations, we use the Triton backend because:
-        1. Decode operates on paged KV cache which requires gather operations
-        2. SageAttention works best with contiguous tensors
-        3. The Triton backend is already optimized for decode with paged KV cache
+        This uses SageAttention's 8-bit quantized attention for decode operations.
+        We gather the KV cache into contiguous memory to use SageAttention's API.
+
+        Note: We use is_causal=False for decode because SageAttention's causal mask
+        only works when qo_len == kv_len. For decode, Q has 1 token and K has seq_len
+        tokens, so we must disable the causal mask. This is correct because all K tokens
+        are past tokens that should be attended to.
         """
-        return self.triton_backend.forward_decode(
-            q, k, v, layer, forward_batch, save_kv_cache
+        if self.forward_metadata is None:
+            return self.triton_backend.forward_decode(
+                q, k, v, layer, forward_batch, save_kv_cache
+            )
+
+        # Save KV cache first
+        if save_kv_cache:
+            forward_batch.token_to_kv_pool.set_kv_buffer(
+                layer, forward_batch.out_cache_loc, k, v
+            )
+
+        # Get full K, V tensors by gathering from KV cache
+        metadata = self.forward_metadata
+
+        # For decode, we need to gather the full KV cache (all tokens including current)
+        k_full, v_full = self._gather_kv_for_decode(
+            layer, forward_batch, k, v, metadata
         )
+
+        # Reshape Q for SageAttention: (batch_size, num_heads, head_dim)
+        # Decode has 1 token per sequence
+        q_reshaped = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+
+        # For decode, is_causal must be False because SageAttention's causal mask
+        # only works when qo_len == kv_len. For decode, Q=1 token, K=seq_len tokens.
+        # All K tokens are past tokens that should be fully attended to.
+        is_causal = False
+
+        # Apply SageAttention with variable-length support
+        output = sageattn_varlen(
+            q_reshaped.contiguous(),
+            k_full.contiguous(),
+            v_full.contiguous(),
+            cu_seqlens_q=metadata.cu_seqlens_q,
+            cu_seqlens_k=metadata.cu_seqlens_k,
+            max_seqlen_q=metadata.max_seqlen_q,
+            max_seqlen_k=metadata.max_seqlen_k,
+            is_causal=is_causal,
+            sm_scale=layer.scaling,
+        )
+
+        # Reshape output back to (batch_size, num_heads * v_head_dim)
+        return output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     def forward_extend(
         self,
@@ -207,8 +250,23 @@ class SageAttnBackend(AttentionBackend):
 
         This uses SageAttention's 8-bit quantized attention for the prefill
         operation where we have all Q, K, V tensors available.
+
+        Note: SageAttention's causal mask only works when qo_len == kv_len.
+        If there's a prefix (cached KV), we fall back to Triton because
+        qo_len (extend_len) != kv_len (prefix_len + extend_len).
         """
         if self.forward_metadata is None:
+            return self.triton_backend.forward_extend(
+                q, k, v, layer, forward_batch, save_kv_cache
+            )
+
+        # Check if there's a prefix - if so, fall back to Triton because
+        # SageAttention's causal mask only works when qo_len == kv_len
+        has_prefix = (
+            forward_batch.extend_prefix_lens_cpu is not None
+            and any(p > 0 for p in forward_batch.extend_prefix_lens_cpu)
+        )
+        if has_prefix:
             return self.triton_backend.forward_extend(
                 q, k, v, layer, forward_batch, save_kv_cache
             )
@@ -218,12 +276,6 @@ class SageAttnBackend(AttentionBackend):
             forward_batch.token_to_kv_pool.set_kv_buffer(
                 layer, forward_batch.out_cache_loc, k, v
             )
-
-        # Prepare output tensor
-        if layer.qk_head_dim != layer.v_head_dim:
-            o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
-        else:
-            o = torch.empty_like(q)
 
         # Get full K, V tensors by gathering from KV cache
         # This includes both prefix (cached) and current tokens
@@ -237,7 +289,7 @@ class SageAttnBackend(AttentionBackend):
         # Reshape Q for SageAttention: (total_q_tokens, num_heads, head_dim)
         q_reshaped = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
 
-        # Determine causality
+        # Determine causality - only use causal when qo_len == kv_len (no prefix)
         is_causal = True
         if layer.is_cross_attention or layer.attn_type == AttentionType.ENCODER_ONLY:
             is_causal = False
@@ -255,10 +307,8 @@ class SageAttnBackend(AttentionBackend):
             sm_scale=layer.scaling,
         )
 
-        # Reshape output back to (total_tokens, num_heads * head_dim)
-        o = output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
-
-        return o
+        # Reshape output back to (total_tokens, num_heads * v_head_dim)
+        return output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     def _gather_kv_for_extend(
         self,
@@ -326,5 +376,59 @@ class SageAttnBackend(AttentionBackend):
             ]
             k_idx += extend_len
             current_idx += extend_len
+
+        return k_full, v_full
+
+    def _gather_kv_for_decode(
+        self,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        k_current: torch.Tensor,
+        v_current: torch.Tensor,
+        metadata: SageAttentionMetadata,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Gather full K, V tensors for decode operation.
+
+        For decode, we gather all KV tokens from the cache. Note that k_current and
+        v_current have already been saved to the cache before this function is called,
+        so we gather seq_len tokens from the cache (which includes the token we just saved).
+        """
+        bs = forward_batch.batch_size
+        total_kv_tokens = metadata.cu_seqlens_k[-1].item()
+
+        # Get K, V buffers from cache
+        k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        v_buffer = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
+
+        # Allocate output tensors
+        k_full = torch.empty(
+            (total_kv_tokens, layer.tp_k_head_num, layer.qk_head_dim),
+            dtype=k_current.dtype,
+            device=self.device,
+        )
+        v_full = torch.empty(
+            (total_kv_tokens, layer.tp_v_head_num, layer.v_head_dim),
+            dtype=v_current.dtype,
+            device=self.device,
+        )
+
+        # Gather K, V for each sequence
+        # After save_kv_cache, the cache contains seq_len tokens (including the one we just saved)
+        k_idx = 0
+        for i in range(bs):
+            seq_len = forward_batch.seq_lens_cpu[i].item()
+
+            # Gather all tokens from cache (includes the token we just saved)
+            req_pool_idx = forward_batch.req_pool_indices[i].item()
+            cache_indices = self.req_to_token[req_pool_idx, :seq_len]
+
+            k_full[k_idx : k_idx + seq_len] = k_buffer[cache_indices].view(
+                seq_len, layer.tp_k_head_num, layer.qk_head_dim
+            )
+            v_full[k_idx : k_idx + seq_len] = v_buffer[cache_indices].view(
+                seq_len, layer.tp_v_head_num, layer.v_head_dim
+            )
+            k_idx += seq_len
 
         return k_full, v_full
