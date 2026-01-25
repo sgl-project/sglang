@@ -25,8 +25,8 @@ const CONFIG = {
   outputDir: path.join(__dirname, 'demo_recordings'),
   viewportWidth: 1920,
   viewportHeight: 1080,
-  prompt: 'Explain how attention mechanisms in transformers help the model understand context and relationships between words in a sentence.',
-  maxTokens: 80,
+  prompt: 'Write a Python function called fibonacci that returns the nth number. Include a docstring and type hints.',
+  maxTokens: 120,
   topK: 10,
 };
 

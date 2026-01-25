@@ -45,8 +45,12 @@ SKETCH_DIST_MAX = 20  # Max log2 distance for binning (covers 1M+ tokens)
 
 # Fingerprint configuration (matches client-side types.ts)
 FINGERPRINT_HISTOGRAM_BINS = 16
-FINGERPRINT_LOCAL_THRESHOLD = 16  # Tokens within 16 = local
-FINGERPRINT_MID_THRESHOLD = 256  # Tokens within 256 = mid-range
+# Thresholds aligned with histogram bins for consistent local/mid/long classification:
+# - Bins 0-2: distance 1-7 (local) -> 2^3 - 1 = 7
+# - Bins 3-7: distance 8-255 (mid) -> 2^8 - 1 = 255
+# - Bins 8+: distance 256+ (long)
+FINGERPRINT_LOCAL_THRESHOLD = 7   # Tokens within 7 = local (bins 0-2)
+FINGERPRINT_MID_THRESHOLD = 255   # Tokens within 255 = mid-range (bins 3-7)
 
 
 def compute_fingerprint_from_raw(
