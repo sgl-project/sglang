@@ -302,6 +302,7 @@ class ServerArgs:
 
     # Compilation
     enable_torch_compile: bool = False
+    regional_compile: bool = False
 
     # warmup
     warmup: bool = False
@@ -587,6 +588,12 @@ class ServerArgs:
             default=ServerArgs.enable_torch_compile,
             help="Use torch.compile to speed up DiT inference."
             + "However, will likely cause precision drifts. See (https://github.com/pytorch/pytorch/issues/145213)",
+        )
+        parser.add_argument(
+            "--regional-compile",
+            action=StoreBoolean,
+            default=ServerArgs.regional_compile,
+            help="Apply regional compile on repeated blocks to reduce compile time."
         )
 
         # warmup

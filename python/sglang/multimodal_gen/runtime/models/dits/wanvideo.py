@@ -675,6 +675,28 @@ class WanTransformerBlock_VSA(nn.Module):
         return hidden_states
 
 
+class WanPreTransformerLayers(nn.Module):
+    def __init__(self, config: WanVideoConfig, hf_config: dict[str, Any]) -> None:
+        super().__init__(config=config, hf_config=hf_config)
+        inner_dim = config.num_attention_heads * config.attention_head_dim
+
+        # 1. Patch & position embedding
+        self.patch_embedding = PatchEmbed(
+            in_chans=config.in_channels,
+            embed_dim=inner_dim,
+            patch_size=config.patch_size,
+            flatten=False,
+        )
+
+        # 2. Condition embeddings
+        self.condition_embedder = WanTimeTextImageEmbedding(
+            dim=inner_dim,
+            time_freq_dim=config.freq_dim,
+            text_embed_dim=config.text_dim,
+            image_embed_dim=config.image_dim,
+        )
+
+
 class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
     _fsdp_shard_conditions = WanVideoConfig()._fsdp_shard_conditions
     _compile_conditions = WanVideoConfig()._compile_conditions
@@ -682,6 +704,7 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
     param_names_mapping = WanVideoConfig().param_names_mapping
     reverse_param_names_mapping = WanVideoConfig().reverse_param_names_mapping
     lora_param_names_mapping = WanVideoConfig().lora_param_names_mapping
+
 
     def __init__(self, config: WanVideoConfig, hf_config: dict[str, Any]) -> None:
         super().__init__(config=config, hf_config=hf_config)
@@ -694,6 +717,10 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         self.num_channels_latents = config.num_channels_latents
         self.patch_size = config.patch_size
         self.text_len = config.text_len
+
+        # Could have been class attribute, but the type of block is decide based on
+        # attn_backend, therfore we put it here.
+        self._repeated_blocks = []
 
         # 1. Patch & position embedding
         self.patch_embedding = PatchEmbed(
@@ -718,6 +745,7 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
             if (attn_backend and attn_backend.lower() == "video_sparse_attn")
             else WanTransformerBlock
         )
+        self._repeated_blocks.append(transformer_block.__class__.__name__)
         self.blocks = nn.ModuleList(
             [
                 transformer_block(
