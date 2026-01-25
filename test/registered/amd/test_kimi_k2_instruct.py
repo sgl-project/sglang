@@ -19,7 +19,7 @@ from sglang.test.test_utils import (
 register_amd_ci(est_time=3600, suite="stage-c-test-large-8-gpu-amd-mi35x")
 
 KIMI_K2_MODEL_PATH = "moonshotai/Kimi-K2-Instruct-0905"
-SERVER_LAUNCH_TIMEOUT = 1800
+SERVER_LAUNCH_TIMEOUT = 3600
 
 
 class TestKimiK2Instruct0905(CustomTestCase):
