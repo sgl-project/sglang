@@ -1,24 +1,29 @@
 import argparse
 
-import torch 
+import torch
+import triton
 from flashinfer.gemm.routergemm_dsv3 import mm_M1_16_K7168_N256 
 
-from sgl_kernel import dsv3_router_gemm
+from sgl_kernel import dsv3_router_gemm as dsv3_router_gemm
+
+N = 256
+K = 7168
+
+def create_benchmark_configs(tp_size):
+    configs = []
+    for launch_with_pdl in [False, True]:
+        for m in range(1, 17):
+            configs.append((m, N, K, tp_size, launch_with_pdl))
+    return configs
+
 
 def dsv3_router_gemm_flashinfer(
     hidden_states: torch.Tensor,
     router_weights: torch.Tensor,
-    launch_with_pdl=False
+    launch_with_pdl: bool,
 ):
     """Flashinfer implementation of dsv3 router gemm"""
-    num_tokens, num_experts = hidden_states.shape[0], router_weights.shape[0]
-    # output = torch.randn(num_tokens, num_experts, device="cuda", dtype=torch.bfloat16)
-    output = torch.randn(num_tokens, num_experts, device="cuda", dtype=torch.float32).contiguous()
-
-    print(f"hidden_states.shape: {hidden_states.shape}")    
-    print(f"num_tokens: {num_tokens}, num_experts: {num_experts}")
-    print(f"router_weights.shape: {router_weights.shape}")    
-    print(f"output.shape: {output.shape}")    
+    output = torch.randn(hidden_states.shape[0],  router_weights.shape[0], device="cuda", dtype=torch.float32).contiguous()
 
     mm_M1_16_K7168_N256(
         hidden_states,
@@ -65,30 +70,114 @@ def check_accuracy(a, b, atol, rtol, percent):
         )
         return False
 
-def calculate_diff(num_tokens: int, num_experts: int, hidden_dim: int):
-    hidden_states = torch.randn((num_tokens, hidden_dim), device="cuda", dtype=torch.bfloat16).contiguous()
-    router_weights = torch.randn((num_experts, hidden_dim), device="cuda", dtype=torch.bfloat16).contiguous()
+
+def calculate_diff(m: int, n: int, k: int, launch_with_pdl: bool):
+    hidden_states = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
+    router_weights = torch.randn((n, k), device="cuda", dtype=torch.bfloat16)
 
     out_flashinfer = dsv3_router_gemm_flashinfer(
-        hidden_states,
-        router_weights,
-        False,
+        hidden_states.clone(memory_format=torch.contiguous_format),
+        router_weights.clone(memory_format=torch.contiguous_format),
+        launch_with_pdl,
     )
 
     out_sgl = dsv3_router_gemm_sgl(
-        hidden_states,
-        router_weights,
+        hidden_states.clone(memory_format=torch.contiguous_format),
+        router_weights.clone(memory_format=torch.contiguous_format),
     )
 
-    print(f"Shape m={num_tokens}, n={num_experts}, k={hidden_dim}:")
+    print(f"Shape m={m}, n={n}, k={k}:")
+    print(f"Using launch_with_pdl={launch_with_pdl} for flashinfer")
     print(f"Flashinfer output: {out_flashinfer[0, 0:5]}")
-    print(f"DeepGEMM output: {out_sgl[0, 0:5]}")
+    print(f"SGLang output: {out_sgl[0, 0:5]}")
 
-    flashinfer_deepgemm_match = check_accuracy(
+    flashinfer_sgl_match = check_accuracy(
         out_flashinfer, out_sgl, 0.1, 0.6, 0.95
     )
     print("Correctness check:")
-    print(f"  - Flashinfer vs DeepGEMM: {'✅' if flashinfer_deepgemm_match else '❌'}")
+    print(f"  - Flashinfer vs SGLang: {'✅' if flashinfer_sgl_match else '❌'}")
+
+
+def _benchmark(m, n, k, tp_size, launch_with_pdl, provider):
+    print(f"Shape (m={m}, n={n}, k={k}, tp={tp_size}), launch_with_pdl={launch_with_pdl}, Provider: {provider}")
+    hidden_states = torch.randn((m, k), device="cuda", dtype=torch.bfloat16).contiguous()
+    router_weights = torch.randn((n, k), device="cuda", dtype=torch.bfloat16).contiguous()
+
+    quantiles = [0.5, 0.2, 0.8]
+
+    if provider == "sglang":
+        ms, min_ms, max_ms = triton.testing.do_bench(
+            lambda: dsv3_router_gemm_sgl(
+                hidden_states.clone(memory_format=torch.contiguous_format),
+                router_weights.clone(memory_format=torch.contiguous_format),
+            ),
+            quantiles=quantiles,
+        )
+    elif provider == "flashinfer":
+        ms, min_ms, max_ms = triton.testing.do_bench(
+            lambda: dsv3_router_gemm_flashinfer(
+                hidden_states.clone(memory_format=torch.contiguous_format),
+                router_weights.clone(memory_format=torch.contiguous_format),
+                launch_with_pdl,
+            ),
+            quantiles=quantiles,
+        )
+
+    # Calculate TFLOPS
+    flops = 2 * m * n * k  # multiply-adds
+    tflops = flops / (ms * 1e-3) / 1e12
+
+    # Print shape-specific results with TFLOPS
+    print(f"Time: {ms*1000:.2f} us, TFLOPS: {tflops:.2f}")
+    return ms, max_ms, min_ms
+
+
+def get_benchmark_plot_friendly(tp_size):
+    all_configs = create_benchmark_configs(tp_size)
+    x_vals = list(range(len(all_configs)))
+
+    @triton.testing.perf_report(
+        triton.testing.Benchmark(
+            x_names=["cfg_id"],
+            x_vals=x_vals,
+            line_arg="provider",
+            line_vals=["sglang", "flashinfer"],
+            line_names=["SGLang", "Flashinfer"],
+            styles=[("blue", "-"), ("red", "-")],
+            ylabel="us",
+            plot_name=f"fp8-gemm-performance-comparison-tp{tp_size}",
+            args={},
+        )
+    )
+    def benchmark(cfg_id, provider):
+        m, n, k, tp_size, launch_with_pdl= all_configs[cfg_id]
+        ms, min_ms, max_ms = _benchmark(m, n, k, tp_size, launch_with_pdl, provider)
+        return ms * 1000, max_ms * 1000, min_ms * 1000  # convert to ms
+
+    return benchmark
+
+
+def get_benchmark(tp_size):
+    all_configs = create_benchmark_configs(tp_size)
+
+    @triton.testing.perf_report(
+        triton.testing.Benchmark(
+            x_names=["m", "n", "k", "tp_size", "launch_with_pdl", ],
+            x_vals=[list(config) for config in all_configs],
+            line_arg="provider",
+            line_vals=["sglang", "flashinfer"],
+            line_names=["SGLang", "Flashinfer"],
+            styles=[("blue", "-"), ("red", "-")],
+            ylabel="us",
+            plot_name=f"fp8-gemm-performance-comparison-tp{tp_size}",
+            args={},
+        )
+    )
+    def benchmark(m, n, k, tp_size, launch_with_pdl, provider):
+        ms, min_ms, max_ms = _benchmark(m, n, k, tp_size, launch_with_pdl, provider)
+        return ms * 1000, max_ms * 1000, min_ms * 1000  # convert to ms
+
+    return benchmark
 
 
 if __name__ == "__main__":
@@ -129,8 +218,16 @@ if __name__ == "__main__":
 
     # Run correctness tests on a few examples
     if args.run_correctness:
-        print("Running correctness tests...")
-        calculate_diff(1, 256, 7168)  # Small test
-        calculate_diff(8, 256, 7168)  # Medium test
-        calculate_diff(16, 256, 7168)  # Large test
+        print("Running correctness tests...") 
+        for m, n, k, _, launch_with_pdl in create_benchmark_configs(args.tp_size):
+            calculate_diff(m, n, k, launch_with_pdl) 
 
+    # Get the benchmark function with the specified tp_size
+    benchmark = (
+        get_benchmark_plot_friendly(args.tp_size)
+        if args.plot_friendly
+        else get_benchmark(args.tp_size)
+    )
+
+    print(f"Running performance benchmark for TP size = {args.tp_size}...")
+    benchmark.run(print_data=True, save_path=args.save_path)
