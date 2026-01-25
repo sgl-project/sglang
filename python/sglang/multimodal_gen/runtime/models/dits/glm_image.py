@@ -391,9 +391,9 @@ class GlmImageAttention(torch.nn.Module):
         if image_rotary_emb is not None:
             cos, sin = image_rotary_emb
 
-            q_img = query[:, text_seq_length:, :, :]
-            k_img = key[:, text_seq_length:, :, :]
             if _is_cuda and cos.dim() == 2:
+                q_img = query[:, text_seq_length:, :, :]
+                k_img = key[:, text_seq_length:, :, :]
                 cos_sin_cache = torch.cat(
                     [
                         cos.to(dtype=torch.float32).contiguous(),
@@ -405,8 +405,12 @@ class GlmImageAttention(torch.nn.Module):
                     q_img, k_img, cos_sin_cache, is_neox=True
                 )
             else:
-                q_img.copy_(_apply_rotary_emb(q_img, cos, sin, is_neox_style=True))
-                k_img.copy_(_apply_rotary_emb(k_img, cos, sin, is_neox_style=True))
+                query[:, text_seq_length:, :, :] = _apply_rotary_emb(
+                    query[:, text_seq_length:, :, :], cos, sin, is_neox_style=True
+                )
+                key[:, text_seq_length:, :, :] = _apply_rotary_emb(
+                    key[:, text_seq_length:, :, :], cos, sin, is_neox_style=True
+                )
 
         if kv_cache is not None:
             if kv_cache.mode == "write":
