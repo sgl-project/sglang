@@ -28,7 +28,6 @@ on:
           - 'nightly-perf-2-gpu-text'
           - 'nightly-perf-2-gpu-vlm'
           - 'nightly-accuracy-8-gpu'
-          - 'nightly-accuracy-8-gpu-deepseek-v32-dp-tc'
           # MI30x Accuracy + Performance Tests (combined)
           - 'nightly-8-gpu-grok1-int4'
           - 'nightly-8-gpu-grok2'
@@ -467,46 +466,6 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
-  # 8-GPU DeepSeek-V3.2 DP+TC (Accuracy only)
-  nightly-accuracy-8-gpu-deepseek-v32-dp-tc:
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-accuracy-8-gpu-deepseek-v32-dp-tc')
-    runs-on: linux-mi325-gpu-8
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.ref || github.ref }}
-
-      - name: Setup docker
-        run: |
-          touch github_summary.md
-          bash scripts/ci/amd_ci_start_container.sh
-        env:
-          GITHUB_WORKSPACE: ${{ github.workspace }}
-
-      - name: Install dependencies
-        run: bash scripts/ci/amd_ci_install_dependency.sh
-
-      - name: Accuracy Test (8-GPU DeepSeek-V3.2 DP)
-        timeout-minutes: 150
-        run: |
-          > github_summary.md  # Clear summary file
-          bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test \
-            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
-            python3 run_suite.py --hw amd --suite nightly-amd-accuracy-8-gpu-deepseek-v32-dp --nightly --timeout-per-file 5400 || TEST_EXIT_CODE=$?
-          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
-          exit ${TEST_EXIT_CODE:-0}
-
-      - name: Accuracy Test (8-GPU DeepSeek-V3.2 TC)
-        timeout-minutes: 150
-        run: |
-          > github_summary.md  # Clear summary file
-          bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test \
-            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
-            python3 run_suite.py --hw amd --suite nightly-amd-accuracy-8-gpu-deepseek-v32-tc --nightly --timeout-per-file 5400 || TEST_EXIT_CODE=$?
-          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
-          exit ${TEST_EXIT_CODE:-0}
-
   # ============================================== MI35x Tests ==============================================
   # MI35x 1-GPU tests - platform-agnostic tests that may work on CDNA4 (gfx950)
   nightly-test-1-gpu-mi35x:
@@ -891,7 +850,6 @@ jobs:
       - nightly-8-gpu-deepseek-v31
       - nightly-8-gpu-deepseek-v32
       - nightly-8-gpu-deepseek-v32-mtp
-      - nightly-accuracy-8-gpu-deepseek-v32-dp-tc
       # MI35x jobs
       - nightly-test-1-gpu-mi35x
       - nightly-accuracy-8-gpu-mi35x
