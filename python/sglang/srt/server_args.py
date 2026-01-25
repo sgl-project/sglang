@@ -2411,8 +2411,6 @@ class ServerArgs:
         if device_str is None:
             return None
 
-        import subprocess
-
         # Strip whitespace from device names
         devices = [d.strip() for d in device_str.split(",") if d.strip()]
         assert len(devices) > 0, "No valid IB devices specified"
@@ -2422,46 +2420,24 @@ class ServerArgs:
             set(devices)
         ), f"Duplicate IB devices specified: {device_str}"
 
-        try:
-            # Run `ibstat` to get available devices
-            result = subprocess.run(
-                ["ibstat", "-l"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-                check=False,
-            )
-            assert (
-                result.returncode == 0
-            ), f"Failed to run `ibstat -l`, return code: {result.returncode}, stderr: {result.stderr}"
+        # Get available IB devices from sysfs
+        ib_sysfs_path = "/sys/class/infiniband"
+        assert os.path.isdir(ib_sysfs_path), (
+            f"InfiniBand sysfs path not found: {ib_sysfs_path}. "
+            "Please ensure InfiniBand drivers are installed."
+        )
 
-            # Parse available devices from `ibstat -l` output
-            # Output format is one device per line:
-            #     mlx5_0
-            #     mlx5_1
-            available_devices = {
-                line.strip() for line in result.stdout.splitlines() if line.strip()
-            }
-            assert (
-                len(available_devices) > 0
-            ), f"No IB devices found by `ibstat`, output: {result.stdout}"
+        available_devices = set(os.listdir(ib_sysfs_path))
+        assert len(available_devices) > 0, f"No IB devices found in {ib_sysfs_path}"
 
-            # Check for invalid devices
-            invalid_devices = [d for d in devices if d not in available_devices]
-            assert (
-                len(invalid_devices) == 0
-            ), f"Invalid IB devices specified: {invalid_devices}. Available devices: {sorted(available_devices)}"
+        # Check for invalid devices
+        invalid_devices = [d for d in devices if d not in available_devices]
+        assert len(invalid_devices) == 0, (
+            f"Invalid IB devices specified: {invalid_devices}. "
+            f"Available devices: {sorted(available_devices)}"
+        )
 
-            return ",".join(devices)
-
-        except subprocess.TimeoutExpired as e:
-            raise RuntimeError(
-                "Timeout while validating IB devices using `ibstat -l`."
-            ) from e
-        except AssertionError:
-            raise
-        except Exception as e:
-            raise RuntimeError(f"Error validating IB devices: {e}") from e
+        return ",".join(devices)
 
     def _handle_tokenizer_batching(self):
         if self.enable_tokenizer_batch_encode and self.enable_dynamic_batch_tokenizer:
