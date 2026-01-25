@@ -397,18 +397,18 @@ jobs:
       - name: Setup docker
         run: |
           touch github_summary.md
-          bash scripts/ci/amd_ci_start_container.sh
+          bash scripts/ci/amd/amd_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Install dependencies
-        run: bash scripts/ci/amd_ci_install_dependency.sh
+        run: bash scripts/ci/amd/amd_ci_install_dependency.sh
 
       - name: Accuracy Test (8-GPU DeepSeek-V3.2 Basic)
         timeout-minutes: 120
         run: |
           > github_summary.md  # Clear summary file
-          bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test \
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
             python3 run_suite.py --hw amd --suite nightly-amd-accuracy-8-gpu-deepseek-v32 --nightly --timeout-per-file 3600 || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
@@ -419,7 +419,7 @@ jobs:
         continue-on-error: true  # Perf test failure doesn't fail the job if accuracy passed
         run: |
           > github_summary.md  # Clear summary file
-          bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test \
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
             python3 run_suite.py --hw amd --suite nightly-perf-8-gpu-deepseek-v32-basic --nightly --timeout-per-file 5400 || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
@@ -438,18 +438,18 @@ jobs:
       - name: Setup docker
         run: |
           touch github_summary.md
-          bash scripts/ci/amd_ci_start_container.sh
+          bash scripts/ci/amd/amd_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Install dependencies
-        run: bash scripts/ci/amd_ci_install_dependency.sh
+        run: bash scripts/ci/amd/amd_ci_install_dependency.sh
 
       - name: Accuracy Test (8-GPU DeepSeek-V3.2 MTP)
         timeout-minutes: 120
         run: |
           > github_summary.md  # Clear summary file
-          bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test \
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
             python3 run_suite.py --hw amd --suite nightly-amd-accuracy-8-gpu-deepseek-v32-mtp --nightly --timeout-per-file 3600 || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
@@ -460,7 +460,7 @@ jobs:
         continue-on-error: true  # Perf test failure doesn't fail the job if accuracy passed
         run: |
           > github_summary.md  # Clear summary file
-          bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test \
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
             python3 run_suite.py --hw amd --suite nightly-perf-8-gpu-deepseek-v32-mtp --nightly --timeout-per-file 7200 || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
@@ -713,21 +713,21 @@ jobs:
       - name: Setup docker
         run: |
           touch github_summary.md
-          bash scripts/ci/amd_ci_start_container.sh
+          bash scripts/ci/amd/amd_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Install dependencies
         run: |
-          bash scripts/ci/amd_ci_install_dependency.sh
+          bash scripts/ci/amd/amd_ci_install_dependency.sh
           # Install tabulate for run_suite.py (missing in MI35x container)
-          bash scripts/ci/amd_ci_exec.sh pip install tabulate
+          bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
 
       - name: Accuracy Test MI35x (8-GPU DeepSeek-V3.2 DP)
         timeout-minutes: 150
         run: |
           > github_summary.md  # Clear summary file
-          bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test \
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
             python3 run_suite.py --hw amd --suite nightly-amd-accuracy-8-gpu-mi35x-deepseek-v32-dp --nightly --timeout-per-file 5400 || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
@@ -746,21 +746,21 @@ jobs:
       - name: Setup docker
         run: |
           touch github_summary.md
-          bash scripts/ci/amd_ci_start_container.sh
+          bash scripts/ci/amd/amd_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Install dependencies
         run: |
-          bash scripts/ci/amd_ci_install_dependency.sh
+          bash scripts/ci/amd/amd_ci_install_dependency.sh
           # Install tabulate for run_suite.py (missing in MI35x container)
-          bash scripts/ci/amd_ci_exec.sh pip install tabulate
+          bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
 
       - name: Accuracy Test MI35x (8-GPU DeepSeek-V3.2 TP+MTP)
         timeout-minutes: 120
         run: |
           > github_summary.md  # Clear summary file
-          bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test \
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
             python3 run_suite.py --hw amd --suite nightly-amd-accuracy-8-gpu-mi35x-deepseek-v32-mtp --nightly --timeout-per-file 3600 || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
