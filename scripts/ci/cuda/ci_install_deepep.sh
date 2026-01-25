@@ -2,7 +2,7 @@
 # Install the dependency in CI.
 set -euxo pipefail
 
-bash scripts/ci/ci_install_dependency.sh
+bash scripts/ci/cuda/ci_install_dependency.sh
 
 export GDRCOPY_HOME=/usr/src/gdrdrv-2.5.1/
 export CUDA_HOME=/usr/local/cuda
