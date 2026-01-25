@@ -1826,7 +1826,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         num_tokens = max(len_per_topk * spec_topk, spec_tokens) * len(requests)
 
         # v2 eagle has over-allocation
-        return num_tokens * (1 + self.is_eagle_v2)
+        return num_tokens * (1 + self.is_spec_v2)
 
     def check_decode_mem(self, selected_indices: Optional[List[int]] = None):
         num_tokens = self.new_tokens_required_next_decode(selected_indices)
