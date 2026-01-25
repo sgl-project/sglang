@@ -253,15 +253,13 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             )
 
         bs = self.retrive_index.shape[0]
+        # Note: draft_token is already mapped to target vocab in EAGLEWorker.verify()
+        # before prepare_for_verify() is called, so no mapping needed here
         candidates = self.draft_token.reshape(bs, self.draft_token_num)
 
-        # DEBUG: Print mapping info for heterogeneous vocab
+        # DEBUG: Print candidates (should already be in target vocab)
         if vocab_mapper is not None:
-            draft_tokens_before = candidates.flatten()[:5].tolist()
-            candidates = vocab_mapper.map_draft_to_target(candidates)
-            target_tokens_after = candidates.flatten()[:5].tolist()
-            logger.info(f"[HeteroVocab DEBUG] draft_tokens (before): {draft_tokens_before}")
-            logger.info(f"[HeteroVocab DEBUG] candidates (after map): {target_tokens_after}")
+            logger.info(f"[HeteroVocab DEBUG] candidates (target vocab): {candidates.flatten()[:5].tolist()}")
 
         sampling_info = batch.sampling_info
 

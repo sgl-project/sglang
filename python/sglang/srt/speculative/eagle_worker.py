@@ -689,6 +689,12 @@ class EAGLEWorker(TpModelWorker):
 
     def verify(self, batch: ScheduleBatch, spec_info: EagleVerifyInput):
         seq_lens_pre_verify = batch.seq_lens.clone()
+
+        # Map draft tokens to target vocab BEFORE prepare_for_verify
+        # This ensures target model forward receives correct token IDs
+        if self.vocab_mapper is not None:
+            spec_info.draft_token = self.vocab_mapper.map_draft_to_target(spec_info.draft_token)
+
         spec_info.prepare_for_verify(batch, self.page_size)
         spec_info.num_tokens_per_batch = self.speculative_num_steps + 1
         batch.return_hidden_states = False
