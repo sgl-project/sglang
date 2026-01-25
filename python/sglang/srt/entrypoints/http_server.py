@@ -46,7 +46,7 @@ import orjson
 import requests
 import uvicorn
 import uvloop
-from fastapi import Depends, FastAPI, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
@@ -283,7 +283,7 @@ async def lifespan(fast_api_app: FastAPI):
         _global_state.tokenizer_manager
     )
     fast_api_app.state.openai_serving_rerank = OpenAIServingRerank(
-        _global_state.tokenizer_manager
+        _global_state.tokenizer_manager, _global_state.template_manager
     )
     fast_api_app.state.openai_serving_tokenize = OpenAIServingTokenize(
         _global_state.tokenizer_manager
@@ -358,6 +358,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Include routers
+from sglang.srt.entrypoints.v1_loads import router as v1_loads_router
+
+app.include_router(v1_loads_router)
 
 
 @app.exception_handler(HTTPException)
@@ -547,26 +552,20 @@ async def model_info():
         "has_audio_understanding": model_config.is_audio_understandable_model,
         "model_type": getattr(model_config.hf_config, "model_type", None),
         "architectures": getattr(model_config.hf_config, "architectures", None),
+        "weight_version": _global_state.tokenizer_manager.server_args.weight_version,
+        # "hf_config": model_config.hf_config.to_dict(),
     }
     return result
 
 
 @app.get("/get_weight_version")
-async def get_weight_version():
-    """Get the current weight version (deprecated - use /weight_version instead)."""
-    logger.warning(
-        "Endpoint '/get_weight_version' is deprecated and will be removed in a future version. "
-        "Please use '/weight_version' instead."
-    )
-    return await weight_version()
-
-
 @app.get("/weight_version")
 async def weight_version():
     """Get the current weight version."""
-    return {
-        "weight_version": _global_state.tokenizer_manager.server_args.weight_version
-    }
+    raise HTTPException(
+        status_code=404,
+        detail="Endpoint '/get_weight_version' or '/weight_version' is deprecated. Please use '/model_info' instead.",
+    )
 
 
 @app.get("/get_server_info")
@@ -601,6 +600,11 @@ async def server_info():
 
 @app.get("/get_load")
 async def get_load():
+    """Get load metrics (deprecated - use /v1/loads instead)."""
+    logger.warning(
+        "Endpoint '/get_load' is deprecated and will be removed in a future version. "
+        "Please use '/v1/loads' instead."
+    )
     return await _global_state.tokenizer_manager.get_load()
 
 
@@ -649,30 +653,6 @@ async def generate_request(obj: GenerateReqInput, request: Request):
         except ValueError as e:
             logger.error(f"[http_server] Error: {e}")
             return _create_error_response(e)
-
-
-@app.api_route("/generate_from_file", methods=["POST"])
-async def generate_from_file_request(file: UploadFile, request: Request):
-    """Handle a generate request, this is purely to work with input_embeds."""
-    content = await file.read()
-    input_embeds = orjson.loads(content.decode("utf-8"))
-
-    obj = GenerateReqInput(
-        input_embeds=input_embeds,
-        sampling_params={
-            "temperature": 0.0,
-            "max_new_tokens": 512,
-        },
-    )
-
-    try:
-        ret = await _global_state.tokenizer_manager.generate_request(
-            obj, request
-        ).__anext__()
-        return ret
-    except ValueError as e:
-        logger.error(f"Error: {e}")
-        return _create_error_response(e)
 
 
 @app.api_route("/encode", methods=["POST", "PUT"])
@@ -1807,7 +1787,7 @@ def launch_server(
 
     try:
         # Update logging configs
-        set_uvicorn_logging_configs()
+        set_uvicorn_logging_configs(server_args)
 
         # Listen for HTTP requests
         if server_args.tokenizer_worker_num == 1:
