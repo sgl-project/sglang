@@ -139,6 +139,7 @@ sha2 = "0.10"
 wasmtime = { version = "38.0", features = ["component-model", "async"] }
 wasmtime-wasi = "38.0"
 async-channel = "2.5"
+aho-corasick = "1.1.4"
 
 [build-dependencies]
 tonic-prost-build = "0.14.2"
@@ -160,6 +161,10 @@ tonic-v12 = { version = "0.12.3", package = "tonic" }
 serial_test = "3.0"
 rsa = { version = "0.9", features = ["sha2"] }
 
+[[bench]]
+name = "special_token_search"
+harness = false
+path = "benches/special_token_search.rs"
 [[bench]]
 name = "wasm_middleware_latency"
 harness = false
