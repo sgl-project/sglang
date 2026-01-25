@@ -122,9 +122,7 @@ class RadixAttention(nn.Module):
             )
             return output
         else:
-
-            # TODO: 这里需要改一下，dsa 不需要在这里 hook；而是在 deepseek_v2.py 里面 hook indexer；需要看看怎么兼容后面
-            #attention_begin_hook(q, k, v, self, forward_batch)
+            attention_begin_hook(q, k, v, self, forward_batch)
 
             # Call backend attention
             output = forward_batch.attn_backend.forward(
@@ -137,13 +135,13 @@ class RadixAttention(nn.Module):
                 **kwargs,
             )
 
-            #attention_end_hook(output, self, forward_batch)
+            attention_end_hook(output, self, forward_batch)
             return output
 
 
 def attention_begin_hook(q, k, v, layer, forward_batch):
     sparse_coordinator = get_sparse_coordinator()
-    if sparse_coordinator is not None:
+    if sparse_coordinator is not None and sparse_coordinator.should_hook_attention():
         sparse_coordinator.attention_begin(
             query=q,
             key=k,
@@ -156,7 +154,7 @@ def attention_begin_hook(q, k, v, layer, forward_batch):
 
 def attention_end_hook(output, layer, forward_batch):
     sparse_coordinator = get_sparse_coordinator()
-    if sparse_coordinator is not None:
+    if sparse_coordinator is not None and sparse_coordinator.should_hook_attention():
         sparse_coordinator.attention_end(
             output=output,
             layer=layer,
