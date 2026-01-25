@@ -26,6 +26,7 @@ import random
 import tempfile
 from typing import Any, Callable, Dict, List, Literal, Optional, Union
 
+from sglang.srt.compilation.compilation_config import CompilationConfig
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import ToolStrictLevel, envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
@@ -584,6 +585,7 @@ class ServerArgs:
     tbo_token_distribution_threshold: float = 0.48
     enable_torch_compile: bool = False
     enable_piecewise_cuda_graph: bool = False
+    enable_npu_torchair_compile: bool = False
     enable_torch_compile_debug_mode: bool = False
     torch_compile_max_bs: int = 32
     piecewise_cuda_graph_max_tokens: Optional[int] = None
@@ -648,6 +650,7 @@ class ServerArgs:
     # FIXME: hack to reduce ITL when decode bs is small
     disaggregation_decode_polling_interval: int = 1
 
+    compilation_config: Optional[CompilationConfig] = None
     # Encode prefill disaggregation
     encoder_only: bool = False
     language_only: bool = False
@@ -858,6 +861,11 @@ class ServerArgs:
             self.speculative_draft_model_quantization = self.quantization
         elif self.speculative_draft_model_quantization == "unquant":
             self.speculative_draft_model_quantization = None
+
+        if self.compilation_config:
+            if isinstance(self.compilation_config, str):
+                args_dict = json.loads(self.compilation_config)
+                self.compilation_config = CompilationConfig(**args_dict)
 
     def _handle_hpu_backends(self):
         if self.device == "hpu":
@@ -2644,6 +2652,18 @@ class ServerArgs:
             self.disable_cuda_graph = True
             self.skip_server_warmup = True
 
+        if not is_npu() and (
+            self.enable_npu_torchair_compile
+            or (
+                self.compilation_config is not None
+                and self.compilation_config.compiler == "npugraph_ex"
+            )
+        ):
+            self.enable_npu_torchair_compile = False
+            logger.warning(
+                "The option --enable-npu-torchair-compile is ignored, this option is available for Ascend NPU only"
+            )
+
         # Validate limit_mm_per_prompt modalities
         if self.limit_mm_data_per_request:
             if isinstance(self.limit_mm_data_per_request, str):
@@ -3684,6 +3704,13 @@ class ServerArgs:
             help="Disable FlashInfer autotuning.",
         )
 
+        parser.add_argument(
+            "--compilation-config",
+            type=str,
+            default=None,
+            help="Represents JSON serialized instance of 'CompilationConfig' class to provide compilation details.",
+        )
+
         # Speculative decoding
         parser.add_argument(
             "--speculative-algorithm",
@@ -4356,6 +4383,11 @@ class ServerArgs:
             "--enable-torch-compile-debug-mode",
             action="store_true",
             help="Enable debug mode for torch compile",
+        )
+        parser.add_argument(
+            "--enable-npu-torchair-compile",
+            action="store_true",
+            help="Optimize the model with Torch Ascend Intermediate Representation compilation. This is only available for Ascend NPU. Experimental feature.",
         )
         parser.add_argument(
             "--enable-piecewise-cuda-graph",

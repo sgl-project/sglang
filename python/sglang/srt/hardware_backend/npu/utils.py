@@ -82,6 +82,43 @@ def set_default_server_args(args: "ServerArgs"):
         else:
             args.hicache_mem_layout = "page_first_direct"
 
+    if args.disable_cuda_graph and (
+        args.enable_torch_compile or args.enable_npu_torchair_compile
+    ):
+        raise ValueError(
+            f"--enable-torch-compile or --enable-npu-torchair-compile is not appropriate for --disable-cuda-graph"
+        )
+
+    if args.compilation_config:
+        if not args.enable_torch_compile and not args.enable_npu_torchair_compile:
+            raise ValueError(
+                f"--compilation-config must be used only with --enable-torch-compile or --enable-npu-torchair-compile"
+            )
+
+        if args.compilation_config.compiler == "npugraph":
+            args.enable_torch_compile = True
+
+            if args.disable_cuda_graph:
+                raise ValueError(
+                    f"compilation_config.compiler '{args.compilation_config.compiler}' is not appropriate for --disable-cuda-graph"
+                )
+
+            if args.enable_npu_torchair_compile:
+                raise ValueError(
+                    f"compilation_config.compiler '{args.compilation_config.compiler}' is not appropriate for --enable-npu-torchair-compile"
+                )
+
+        if args.compilation_config.compiler == "npugraph_ex":
+            args.enable_npu_torchair_compile = True
+
+            if args.disable_cuda_graph:
+                raise ValueError(
+                    f"compilation_config.compiler '{args.compilation_config.compiler}' is not appropriate for --disable-cuda-graph"
+                )
+
+    if args.enable_npu_torchair_compile:
+        args.enable_torch_compile = True
+
 
 @_call_once
 def init_npu_backend():

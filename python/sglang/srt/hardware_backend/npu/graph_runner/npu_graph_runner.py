@@ -26,9 +26,11 @@ import numpy as np
 import torch
 
 import sglang
+import sglang.srt.model_executor.cuda_graph_runner
 from sglang.srt.configs.model_config import AttentionArch, is_deepseek_nsa
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     empty_context,
     get_bool_env_var,
@@ -47,6 +49,20 @@ logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
+from torch._dynamo.eval_frame import DisableContext
+
+from sglang.srt.hardware_backend.npu.custom_ops import (
+    _set_dp_buffer_len,
+    _set_is_extend_in_batch,
+)
+from sglang.srt.hardware_backend.npu.graph_runner.compilation.npu_graph_compiler import (
+    NpuGraphCompiler,
+)
+from sglang.srt.hardware_backend.npu.graph_runner.compilation.patch_dynamo import (
+    patch_dynamo_context,
+    patch_dynamo_context_call,
+    restore_dynamo_context_call,
+)
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 
@@ -58,8 +74,13 @@ def patch_model_npu(
     num_tokens: int,
     tp_group: GroupCoordinator,
 ):
-    if enable_compile:
-        backend = get_compiler_backend("npugraph_ex")
+    compilation_config = get_global_server_args().compilation_config
+    if (
+        enable_compile
+        and (compilation_config is not None)
+        and (compilation_config.compiler == "npugraph_ex")
+    ):
+        backend = get_compiler_backend(compilation_config=compilation_config)
         yield torch.compile(
             torch.no_grad()(model.forward),
             fullgraph=True,
@@ -74,7 +95,17 @@ class NPUGraphRunner(CudaGraphRunner):
     """A NPUGraphRunner runs the forward pass of a model with npu graph and torch.compile."""
 
     def __init__(self, model_runner: ModelRunner):
+        if model_runner.server_args.enable_torch_compile:
+            patch_dynamo_context()
+
         sglang.srt.model_executor.cuda_graph_runner.patch_model = patch_model_npu
+        model_runner.attn_backend.enable_torch_compile = (
+            model_runner.server_args.enable_torch_compile
+        )
+        self.enable_npu_torchair_compile = (
+            model_runner.server_args.enable_npu_torchair_compile
+        )
+
         super().__init__(model_runner)
         self.update_attr_name = None
         self.update_attr_type = None
@@ -95,19 +126,77 @@ class NPUGraphRunner(CudaGraphRunner):
     def _create_device_graph(self):
         return torch.npu.NPUGraph()
 
-    def _capture_graph(self, graph, pool, stream, run_once_fn):
-        if self.enable_torch_compile:
-            skip_guard_context = torch.compiler.set_stance(skip_guard_eval_unsafe=True)
+    def _init_dp_gathered_buffer(
+        self, global_dp_buffer_len: int, local_dp_buffer_len: int, dp_max_padding: bool
+    ):
+        if get_global_server_args().enable_torch_compile:
+            _set_dp_buffer_len(
+                global_dp_buffer_len, local_dp_buffer_len, dp_max_padding
+            )
+            _set_is_extend_in_batch(False)
         else:
-            skip_guard_context = empty_context()
+            super()._init_dp_gathered_buffer(
+                global_dp_buffer_len, local_dp_buffer_len, dp_max_padding
+            )
 
-        with skip_guard_context, torch.npu.graph(
-            graph,
-            pool=pool,
-            stream=stream,
-            auto_dispatch_capture=True,
+    def _capture_graph(self, graph, pool, stream, run_once_fn, bs: int):
+        compilation_config = get_global_server_args().compilation_config
+        if (
+            self.enable_torch_compile
+            and (not self.enable_npu_torchair_compile)
+            and (not self.compile_bs or bs in self.compile_bs)
+            and (bs >= get_attention_tp_size())
         ):
-            out = run_once_fn()
+            compiler = NpuGraphCompiler(
+                model_runner=self.model_runner,
+                model=run_once_fn,
+                compilation_config=compilation_config,
+                batch_size=bs,
+            )
+
+            patch_dynamo_context_call()
+            DisableContext.batch_size = bs
+            try:
+                # compilation
+                out = compiler.compiled_callable()
+
+                # capture function and args
+                out = compiler.compiled_callable()
+            finally:
+                DisableContext.batch_size = None
+                restore_dynamo_context_call()
+
+            assert bs in DisableContext.compiled_function
+            assert DisableContext.compiled_function[bs]
+            assert bs in DisableContext.compiled_function_args
+            assert DisableContext.compiled_function_args[bs]
+
+            compiled_function = DisableContext.compiled_function[bs]
+            args = DisableContext.compiled_function_args[bs]
+
+            with torch.npu.graph(
+                graph,
+                pool=pool,
+                stream=stream,
+                auto_dispatch_capture=True,
+            ):
+                compiled_function(*args)
+
+        else:
+            if self.enable_npu_torchair_compile:
+                skip_guard_context = torch.compiler.set_stance(
+                    skip_guard_eval_unsafe=True
+                )
+            else:
+                skip_guard_context = empty_context()
+
+            with skip_guard_context, torch.npu.graph(
+                graph,
+                pool=pool,
+                stream=stream,
+                auto_dispatch_capture=True,
+            ):
+                out = run_once_fn()
         return out
 
     def _get_update_attr_name(self):

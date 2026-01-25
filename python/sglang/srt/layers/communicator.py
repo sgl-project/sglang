@@ -77,8 +77,11 @@ if _use_aiter and _is_gfx95_supported:
     from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
 
     from sglang.srt.layers.quantization.rocm_mxfp4_utils import fused_rms_mxfp4_quant
-elif _is_npu:
-    from sglang.srt.hardware_backend.npu.cmo import prepare_weight_cache
+
+if _is_npu:
+    from sglang.srt.hardware_backend.npu.cmo_custom_ops import (  # noqa
+        prepare_weight_cache,
+    )
 
 
 # TODO: According to the discussion in https://github.com/flashinfer-ai/flashinfer/issues/1223#issuecomment-3047256465
