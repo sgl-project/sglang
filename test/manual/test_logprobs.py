@@ -334,7 +334,8 @@ class TestLogprobsDense(unittest.TestCase):
                 print(f"Testing with config: {config}")
 
                 # Sample records for this config
-                test_records = random.sample(records, k=min(NUM_SAMPLES, len(records)))
+                num_samples = config.get("num_samples", NUM_SAMPLES)
+                test_records = random.sample(records, k=min(num_samples, len(records)))
                 random.shuffle(test_records)
 
                 # Calculate how many samples should return logprobs

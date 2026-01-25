@@ -20,7 +20,7 @@ import time
 from pathlib import Path
 
 # Add python directory to path to import sglang modules
-REPO_ROOT = Path(__file__).parent.parent.parent
+REPO_ROOT = Path(__file__).parent.parent.parent.parent
 sys.path.insert(0, str(REPO_ROOT / "python"))
 
 from sglang.srt.model_loader.ci_weight_validation import (  # noqa: E402
