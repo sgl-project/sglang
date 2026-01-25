@@ -257,10 +257,6 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         # before prepare_for_verify() is called, so no mapping needed here
         candidates = self.draft_token.reshape(bs, self.draft_token_num)
 
-        # DEBUG: Print candidates (should already be in target vocab)
-        if vocab_mapper is not None:
-            logger.info(f"[HeteroVocab DEBUG] candidates (target vocab): {candidates.flatten()[:5].tolist()}")
-
         sampling_info = batch.sampling_info
 
         predict_shape = list(logits_output.next_token_logits.shape)[:-1]
@@ -318,11 +314,6 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         if is_all_greedy or not TREE_SPEC_KERNEL_AVAILABLE:
             target_predict = torch.argmax(logits_output.next_token_logits, dim=-1)
             target_predict = target_predict.reshape(bs, self.draft_token_num)
-
-            # DEBUG: Print target_predict before verification
-            if vocab_mapper is not None:
-                logger.info(f"[HeteroVocab DEBUG] target_predict: {target_predict.flatten()[:5].tolist()}")
-
             predict, accept_index, accept_length = verify_tree_greedy_func(
                 predicts=predict,  # mutable
                 accept_index=accept_index,  # mutable
@@ -334,11 +325,6 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 target_predict=target_predict,
                 topk=self.topk,
             )
-
-            # DEBUG: Print predict after verification
-            if vocab_mapper is not None:
-                logger.info(f"[HeteroVocab DEBUG] predict (after verify): {predict[:5].tolist()}")
-                logger.info(f"[HeteroVocab DEBUG] accept_length: {accept_length.tolist()}")
 
         else:
             # apply temperature and get target probs
@@ -416,9 +402,6 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 if idx == -1:
                     break
                 id = predict_cpu[idx]
-                # DEBUG: Print the token being added to output
-                if vocab_mapper is not None and j < 3:
-                    logger.info(f"[HeteroVocab DEBUG] Adding token to output: idx={idx}, token_id={id}")
                 req.output_ids.append(id)
                 req.check_finished()
                 if req.finished():
