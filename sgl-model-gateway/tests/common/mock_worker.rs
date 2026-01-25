@@ -96,6 +96,8 @@ impl MockWorker {
             )
             .route("/flush_cache", post(flush_cache_handler))
             .route("/v1/models", get(v1_models_handler))
+            .route("/v1/images/generations", post(images_generations_handler))
+            .route("/v1/images/edits", post(images_edits_handler))
             .with_state(config);
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
@@ -1263,6 +1265,84 @@ async fn rerank_handler(
     });
 
     (StatusCode::OK, Json(mock_results)).into_response()
+}
+
+async fn images_generations_handler(
+    State(config): State<Arc<RwLock<MockWorkerConfig>>>,
+    Json(payload): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let config = config.read().await;
+
+    // Simulate response delay
+    if config.response_delay_ms > 0 {
+        tokio::time::sleep(tokio::time::Duration::from_millis(config.response_delay_ms)).await;
+    }
+
+    // Simulate failure rate
+    if rand::random::<f32>() < config.fail_rate {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "Simulated failure").into_response();
+    }
+
+    let n = payload.get("n").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
+    let prompt = payload
+        .get("prompt")
+        .and_then(|v| v.as_str())
+        .unwrap_or("test prompt");
+
+    // Create mock image data
+    let mut images = Vec::new();
+    for i in 0..n {
+        images.push(json!({
+            "url": format!("https://mock-images.example.com/generated_{}.png", i),
+            "revised_prompt": format!("A mock generated image for: {}", prompt)
+        }));
+    }
+
+    let response = json!({
+        "created": SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+        "data": images
+    });
+
+    (StatusCode::OK, Json(response)).into_response()
+}
+
+async fn images_edits_handler(
+    State(config): State<Arc<RwLock<MockWorkerConfig>>>,
+    Json(payload): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let config = config.read().await;
+
+    // Simulate response delay
+    if config.response_delay_ms > 0 {
+        tokio::time::sleep(tokio::time::Duration::from_millis(config.response_delay_ms)).await;
+    }
+
+    // Simulate failure rate
+    if rand::random::<f32>() < config.fail_rate {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "Simulated failure").into_response();
+    }
+
+    let n = payload.get("n").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
+    let prompt = payload
+        .get("prompt")
+        .and_then(|v| v.as_str())
+        .unwrap_or("test edit prompt");
+
+    // Create mock edited image data
+    let mut images = Vec::new();
+    for i in 0..n {
+        images.push(json!({
+            "url": format!("https://mock-images.example.com/edited_{}.png", i),
+            "revised_prompt": format!("A mock edited image for: {}", prompt)
+        }));
+    }
+
+    let response = json!({
+        "created": SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+        "data": images
+    });
+
+    (StatusCode::OK, Json(response)).into_response()
 }
 
 impl Default for MockWorkerConfig {

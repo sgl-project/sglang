@@ -119,6 +119,19 @@ REASONING_MODELS = get_models_with_feature("reasoning")
 FUNCTION_CALLING_MODELS = get_models_with_feature("function_calling")
 
 
+def get_third_party_with_feature(feature: str) -> list[str]:
+    """Get list of third-party backend IDs that support a specific feature."""
+    return [
+        backend_id
+        for backend_id, spec in THIRD_PARTY_MODELS.items()
+        if feature in spec.get("features", [])
+    ]
+
+
+# Third-party backends with image support
+IMAGE_BACKENDS = get_third_party_with_feature("images")
+
+
 # =============================================================================
 # Default model path constants (for backward compatibility with existing tests)
 # =============================================================================
@@ -142,10 +155,13 @@ THIRD_PARTY_MODELS: dict[str, dict] = {
         "description": "OpenAI API",
         "model": "gpt-5-nano",
         "api_key_env": "OPENAI_API_KEY",
+        "features": ["chat", "embeddings", "images"],
+        "image_model": "dall-e-3",
     },
     "xai": {
         "description": "xAI API",
         "model": "grok-4-fast",
         "api_key_env": "XAI_API_KEY",
+        "features": ["chat"],
     },
 }

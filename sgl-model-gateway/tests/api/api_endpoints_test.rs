@@ -1884,3 +1884,276 @@ mod rerank_tests {
         ctx.shutdown().await;
     }
 }
+
+#[cfg(test)]
+mod images_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_images_generations_success() {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 19001,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+
+        let app = ctx.create_app().await;
+
+        let payload = json!({
+            "model": "dall-e-3",
+            "prompt": "A beautiful sunset over the ocean",
+            "n": 1,
+            "size": "1024x1024"
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/images/generations")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // Verify response structure
+        assert!(body_json.get("created").is_some());
+        assert!(body_json.get("data").is_some());
+
+        let data = body_json["data"].as_array().unwrap();
+        assert_eq!(data.len(), 1);
+        assert!(data[0].get("url").is_some());
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_images_generations_multiple() {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 19002,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+
+        let app = ctx.create_app().await;
+
+        let payload = json!({
+            "model": "dall-e-3",
+            "prompt": "A cat wearing a hat",
+            "n": 3,
+            "size": "512x512"
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/images/generations")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        let data = body_json["data"].as_array().unwrap();
+        assert_eq!(data.len(), 3);
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_images_generations_worker_failure() {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 19003,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 1.0, // Always fail
+        }])
+        .await;
+
+        let app = ctx.create_app().await;
+
+        let payload = json!({
+            "model": "dall-e-3",
+            "prompt": "This should fail",
+            "n": 1
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/images/generations")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_images_edits_success() {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 19004,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+
+        let app = ctx.create_app().await;
+
+        let payload = json!({
+            "model": "dall-e-2",
+            "image": "base64encodedimagedata",
+            "prompt": "Add a rainbow in the sky",
+            "n": 1,
+            "size": "1024x1024"
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/images/edits")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // Verify response structure
+        assert!(body_json.get("created").is_some());
+        assert!(body_json.get("data").is_some());
+
+        let data = body_json["data"].as_array().unwrap();
+        assert_eq!(data.len(), 1);
+        assert!(data[0].get("url").is_some());
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_images_edits_with_mask() {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 19005,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+
+        let app = ctx.create_app().await;
+
+        let payload = json!({
+            "model": "dall-e-2",
+            "image": "base64encodedimagedata",
+            "mask": "base64encodedmaskdata",
+            "prompt": "Replace the masked area with flowers",
+            "n": 2,
+            "size": "512x512"
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/images/edits")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        let data = body_json["data"].as_array().unwrap();
+        assert_eq!(data.len(), 2);
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_images_edits_worker_failure() {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 19006,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 1.0, // Always fail
+        }])
+        .await;
+
+        let app = ctx.create_app().await;
+
+        let payload = json!({
+            "model": "dall-e-2",
+            "image": "base64encodedimagedata",
+            "prompt": "This should fail",
+            "n": 1
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/images/edits")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_images_generations_invalid_json() {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 19007,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+
+        let app = ctx.create_app().await;
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/images/generations")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from("{invalid json}"))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        ctx.shutdown().await;
+    }
+}
