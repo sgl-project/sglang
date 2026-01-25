@@ -193,7 +193,6 @@ class LayerwiseOffloadManager:
                 meta["offset"] : meta["offset"] + meta["numel"]
             ].view(meta["shape"])
 
-        logger.debug(f"fetched layer: {layer_idx=}")
         self._gpu_layers.add(layer_idx)
 
     @torch.compiler.disable
@@ -283,25 +282,14 @@ class LayerwiseOffloadManager:
 
         def make_pre_hook(i):
             def hook(module, input):
-                # 1. Fine-grained sync: wait ONLY for the current layer if it's being prefetched
+                # wait only for the current layer if it's being prefetched
                 if i in self._prefetch_events:
                     torch.cuda.current_stream().wait_event(self._prefetch_events[i])
-                logger.debug(f"pre hook layer: {i}")
-                # 2. Trigger batch prefetch (i + prefetch_size ~ i + 2 * prefetch_size) if needed
+                # trigger batch prefetch (i + prefetch_size ~ i + 2 * prefetch_size) if needed
                 if i % self.prefetch_size == 0:
-                    # Current forwarding range: [i, i + prefetch_size)
-                    # Next prefetching range: [i + prefetch_size, i + 2 * prefetch_size)
-                    # We use % self.num_layers to wrap around across denoising iterations
                     for j in range(i + self.prefetch_size, i + 2 * self.prefetch_size):
                         layer_to_prefetch = j % self.num_layers
                         self.prefetch_layer(layer_to_prefetch, non_blocking=True)
-
-                    logger.debug(
-                        f"pre hook layer: {i} prefetching range: "
-                        f"[{(i + self.prefetch_size) % self.num_layers}, "
-                        f"{(i + 2 * self.prefetch_size - 1) % self.num_layers + 1})",
-                        main_process_only=True,
-                    )
 
             return hook
 
