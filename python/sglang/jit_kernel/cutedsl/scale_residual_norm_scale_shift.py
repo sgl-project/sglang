@@ -4,58 +4,101 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import torch
-from cutlass.cute.runtime import from_dlpack
 
 from sglang.jit_kernel.cutedsl.common.norm_fusion import (
     apply_norm_cta,
     broadcast_tensor_for_bsfd,
     tensor_slice_for_bsfd,
 )
+from sglang.jit_kernel.cutedsl.utils import TORCH_TO_CUTE_DTYPE
 
 _COMPILE_CACHE = {}
 
 
-def _tensor_sig(tensor):
-    if not isinstance(tensor, torch.Tensor):
-        return type(tensor)
-    return (tensor.dtype, tensor.shape, tensor.stride())
-
-
-def _make_hash_key(
-    norm_type: str,
-    *tensors,
+def to_cute_arg(
+    t,
+    *,
+    assume_aligned: Optional[int] = 32,
+    use_32bit_stride: bool = False,
+    enable_tvm_ffi: bool = True,
 ):
-    # TODO: After upgrading the CuTe DSL version, use `make_fake_tensor` to compile
-    #       the kernel with only hidden_dim (D) as a compile-time constant,
-    #       avoiding specialization on B, S, or F.
-    return (norm_type, *(_tensor_sig(t) for t in tensors))
+    """
+    Convert a Python value into a CuTeDSL value.
+    """
+    if isinstance(t, torch.Tensor):
+        return cute.runtime.from_dlpack(
+            t,
+            assumed_align=assume_aligned,
+            use_32bit_stride=use_32bit_stride,
+            enable_tvm_ffi=enable_tvm_ffi,
+        )
+    if isinstance(t, int):
+        return cutlass.Int32(t)
+    if isinstance(t, float):
+        return cutlass.Float32(t)
+    return t
+
+
+def to_fake_cute_args(t: torch.Tensor):
+    if isinstance(t, torch.Tensor):
+        # Only keep the last dim as compile-time value to maximum compiled kernel reuse
+        # e.g. (1,2,1536):(3027,1536,1) -> (?,?,1536):(?,?,1)
+        D = t.shape[-1]
+        dtype = TORCH_TO_CUTE_DTYPE[t.dtype]
+        shape = (*(cute.sym_int() for _ in range(t.ndim - 1)), D)
+        stride = (*(cute.sym_int(divisibility=D) for _ in range(t.ndim - 1)), 1)
+        fake_t = cute.runtime.make_fake_tensor(
+            dtype, shape, stride, memspace=cute.AddressSpace.gmem, assumed_align=32
+        )
+        return fake_t
+    return to_cute_arg(t)
 
 
 class ScaleResidualNormScaleShift:
-    def __init__(self, D: int):
+    @classmethod
+    def make_hash_key(cls, *inputs):
+        """
+        Compile-time values:
+          - D: hidden dimension (size of the last dimension)
+          - norm_type: layer norm or RMS norm
+          - tensor dtype
+          - tensor rank (i.e., tensor.ndim)
+
+        Runtime values:
+          - all other inputs
+
+        This hash key defines the compile-time specialization boundary for
+        ScaleResidualNormScaleShift kernels.
+        """
+
+        def _sig(val):
+            if isinstance(val, torch.Tensor):
+                return (val.dtype, val.ndim, val.shape[-1])
+            return val
+
+        return tuple(_sig(val) for val in inputs)
+
+    def __init__(self, D: int, norm_type: str):
         self.D = D
+        self.norm_type = norm_type  # layernorm or rmsnorm
 
     @cute.jit
     def __call__(
         self,
         mY: cute.Tensor,
-        mResOut: Optional[cute.Tensor],
-        mRes: Optional[cute.Tensor],
+        mResOut,
+        mRes,
         mX: cute.Tensor,
-        mGate: Union[Optional[cute.Tensor], cutlass.Int32, int],
-        mWeight: Optional[cute.Tensor],
-        mBias: Optional[cute.Tensor],
+        mGate,
+        mWeight,
+        mBias,
         mScale: Optional[cute.Tensor],
         mShift: Optional[cute.Tensor],
-        norm_type: cutlass.Constexpr = "rms",
-        eps: cutlass.Float32 = cutlass.Float32(1e-6),
+        eps: cutlass.Float32 = cutlass.Float32(1e-5),
         stream: cuda.CUstream = cuda.CUstream(cuda.CUstream_flags.CU_STREAM_DEFAULT),
     ):
         # Tensor shapes
         B, S, _ = mX.shape  # (batch, seq_len, hidden_dim)
-        F = self.infer_frame(mGate, mScale, mShift)  # num of frame
-        self.len_f = cutlass.Int32(S // F)  # len of frame
-        self.norm_type = norm_type  # layernorm or rmsnorm
         # Vectorized copy configuration
         num_vectorized = 8  # maximum num of elem per copy
         atom_copy = cute.make_copy_atom(
@@ -79,7 +122,6 @@ class ScaleResidualNormScaleShift:
             mBias,
             mScale,
             mShift,
-            S,
             tiled_copy,
             eps,
         ).launch(
@@ -92,20 +134,20 @@ class ScaleResidualNormScaleShift:
     def kernel(
         self,
         mY: cute.Tensor,
-        mResOut: Optional[cute.Tensor],
-        mRes: Optional[cute.Tensor],
+        mResOut,
+        mRes,
         mX: cute.Tensor,
-        mGate: Union[Optional[cute.Tensor], cutlass.Int32],
-        mWeight: Optional[cute.Tensor],
-        mBias: Optional[cute.Tensor],
+        mGate,
+        mWeight,
+        mBias,
         mScale: Optional[cute.Tensor],
         mShift: Optional[cute.Tensor],
-        S: cutlass.Int32,
         tiled_copy: cute.TiledCopy,
         eps: cutlass.Float32,
     ):
-        tidx = cutlass.Int32(cute.arch.thread_idx()[0])  # thread index
-        bid = cutlass.Int32(cute.arch.block_idx()[0])  # cta index
+        _, S, _ = mX.shape
+        tidx, _, _ = cute.arch.thread_idx()  # thread index
+        bid, _, _ = cute.arch.block_idx()  # cta index
         bidx = cutlass.Int32(bid // S)  # batch index
         bidy = cutlass.Int32(bid % S)  # seq_len index
         thr_copy = tiled_copy.get_slice(tidx)
@@ -113,9 +155,7 @@ class ScaleResidualNormScaleShift:
         @cute.jit
         def slice_if(mV):
             if cutlass.const_expr(isinstance(mV, cute.Tensor)):
-                return tensor_slice_for_bsfd(
-                    mV, thr_copy, bidx, bidy, self.D, self.len_f
-                )
+                return tensor_slice_for_bsfd(mV, thr_copy, bidx, bidy, S, self.D)
             return mV, mV
 
         @cute.jit
@@ -185,38 +225,30 @@ class ScaleResidualNormScaleShift:
         tYrY.store(value.to(tYrY.element_type))
         copy_if(tYrY, tYgY)  # rmem -> gmem
 
-    @cute.jit
-    def infer_frame(self, *tensors) -> cutlass.Int32:
-        num_of_frame = 1
-        for t in tensors:
-            if cutlass.const_expr(isinstance(t, cute.Tensor) and len(t.shape) == 4):
-                num_of_frame = t.shape[1]
-        return num_of_frame
-
 
 def validate_x(t: torch.Tensor, B: int, S: int, D: int):
     if t.dtype not in (torch.float16, torch.bfloat16, torch.float32):
-        raise ValueError(f"validate failed: unsupported dtype: {t.dtype}")
+        raise ValueError(f"Validate failed: unsupported dtype: {t.dtype}")
     if t.shape != (B, S, D):
-        raise ValueError(f"validate failed: unsupported tensor shape: {t.shape}.")
+        raise ValueError(f"Validate failed: unsupported tensor shape: {t.shape}.")
     if t.stride()[-1] != 1:
-        raise ValueError(f"validate failed: not contiguous on dim D.")
+        raise ValueError(f"Validate failed: not contiguous on dim D.")
 
 
 def validate_weight_bias(t: Optional[torch.Tensor], B: int, S: int, D: int):
     if t is None:
         return
     if t.dtype not in (torch.float16, torch.bfloat16, torch.float32):
-        raise ValueError(f"validate failed: unsupported dtype: {t.dtype}")
+        raise ValueError(f"Validate failed: unsupported dtype: {t.dtype}")
     if t.shape != (D,):
-        raise ValueError(f"validate failed: unsupported tensor shape: {t.shape}.")
+        raise ValueError(f"Validate failed: unsupported tensor shape: {t.shape}.")
     if t.stride()[-1] != 1:
-        raise ValueError(f"validate failed: not contiguous on dim D.")
+        raise ValueError(f"Validate failed: not contiguous on dim D.")
 
 
 def validate_scale_shift(t: torch.Tensor, B: int, S: int, D: int):
     if t.dtype not in (torch.float16, torch.bfloat16, torch.float32):
-        raise ValueError(f"validate failed: unsupported dtype: {t.dtype}")
+        raise ValueError(f"Validate failed: unsupported dtype: {t.dtype}")
     failed = False
     if t.ndim == 1 and (t.shape[0] not in (1, D)):
         failed = True
@@ -227,11 +259,14 @@ def validate_scale_shift(t: torch.Tensor, B: int, S: int, D: int):
     ):
         failed = True
     elif t.ndim == 4 and (t.shape[0] != B or t.shape[2] != 1 or t.shape[3] != D):
+        F = t.shape[1]
+        if S % F != 0:
+            raise ValueError(f"Validate failed: S({S}) must be divisible by F({F}).")
         failed = True
     if failed:
-        raise ValueError(f"validate failed: unsupported tensor shape: {t.shape}.")
+        raise ValueError(f"Validate failed: unsupported tensor shape: {t.shape}.")
     if t.stride()[-1] != 1:
-        raise ValueError(f"validate failed: not contiguous on dim D.")
+        raise ValueError(f"Validate failed: not contiguous on dim D.")
 
 
 def validate_gate(t: Union[torch.Tensor, int], B: int, S: int, D: int):
@@ -248,6 +283,7 @@ def fused_norm_scale_shift(
     shift: torch.Tensor,
     norm_type: str,
     eps: float = 1e-5,
+    stream: cuda.CUstream = cuda.CUstream(cuda.CUstream_flags.CU_STREAM_DEFAULT),
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Fuse: norm(x) * (1 + scale) + shift
@@ -260,7 +296,8 @@ def fused_norm_scale_shift(
       - norm_type: str, "layer" or "rms"
       - eps: Optional[float], default: 1e-5
 
-    Supported D values (must be 256's multiple and <= 8192, etc.)
+    D must be a multiple of 256 and <= 8192 to enable LDG.128 vectorized loads per
+    thread and avoid predicated loads (e.g., bounds checks such as `index < D`).
     """
     # Tensor Validation
     BSD = x.shape
@@ -276,33 +313,30 @@ def fused_norm_scale_shift(
             raise ValueError(
                 f"D={D} not supported, must be multiple of 256 and <= 8192"
             )
-        y = torch.empty_like(x)
-        scale = broadcast_tensor_for_bsfd(scale, *x.shape)
-        shift = broadcast_tensor_for_bsfd(shift, *x.shape)
-        # Use None as placeholders for ResOut, Residual, and Gate
-        torch_tensors = [y, None, None, x, None, weight, bias, scale, shift]
-        cute_tensors = [
-            # TODO: Enable tvm ffi to reduce host-side overhead of `from_dlpack`
-            #       once the CuTe DSL version is updated.
-            from_dlpack(t, assumed_align=32) if isinstance(t, torch.Tensor) else t
-            for t in torch_tensors
-        ]
+        y = torch.empty_like(x)  # create output tensor
+        scale = broadcast_tensor_for_bsfd(scale, *x.shape)  # handle various shapes
+        shift = broadcast_tensor_for_bsfd(shift, *x.shape)  # handle various shapes
+        # Use scalar placeholders for None tensors as a workaround, since the CuTe DSL
+        # TVM-FFI backend does not support None parameters. Unless explicitly handled
+        # (e.g., for gate), scalar values do not result in code generation and have no
+        # impact on runtime performance.
+        weight = 1 if weight is None else weight
+        bias = 0 if bias is None else bias
+        ResOut, Residual, Gate = 0, 0, 1
+        torch_tensors = [y, ResOut, Residual, x, Gate, weight, bias, scale, shift]
+        cute_tensor_args = [to_cute_arg(t) for t in torch_tensors]
         # Compile cache
-        hash_key = _make_hash_key(
-            norm_type,
-            x,
-            weight,
-            bias,
-            scale,
-            shift,
-        )
+        hash_key = ScaleResidualNormScaleShift.make_hash_key(norm_type, *torch_tensors)
         compiled_fn = _COMPILE_CACHE.get(hash_key)
         if compiled_fn is None:
-            kernel = ScaleResidualNormScaleShift(D)
-            compiled_fn = cute.compile(kernel, *cute_tensors, norm_type)
+            kernel = ScaleResidualNormScaleShift(D, norm_type)
+            fake_sig_args = [to_fake_cute_args(t) for t in torch_tensors]
+            compiled_fn = cute.compile(
+                kernel, *fake_sig_args, options="--enable-tvm-ffi"
+            )
             _COMPILE_CACHE[hash_key] = compiled_fn
         # Execute
-        compiled_fn(*cute_tensors, eps=eps)
+        compiled_fn(*cute_tensor_args, eps, stream)
         return y
     else:
         raise ValueError(f'norm_type must be one of "layer" and "rms"')
@@ -318,6 +352,7 @@ def fused_scale_residual_norm_scale_shift(
     shift: torch.Tensor,
     norm_type: str,
     eps: float = 1e-5,
+    stream: cuda.CUstream = cuda.CUstream(cuda.CUstream_flags.CU_STREAM_DEFAULT),
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Fuse: norm(residual + gate * x) * (1 + scale) + shift
@@ -331,7 +366,8 @@ def fused_scale_residual_norm_scale_shift(
       - norm_type: str, "layer" or "rms"
       - eps: Optional[float], default: 1e-5
 
-    Supported D values (must be 256's multiple and <= 8192, etc).
+    D must be a multiple of 256 and <= 8192 to enable LDG.128 vectorized loads per
+    thread and avoid predicated loads (e.g., bounds checks such as `index < D`).
     """
     # Tensor Validation
     BSD = x.shape
@@ -349,36 +385,31 @@ def fused_scale_residual_norm_scale_shift(
             raise ValueError(
                 f"D={D} not supported, must be multiple of 256 and <= 8192"
             )
-        y = torch.empty_like(x)
-        resi_out = torch.empty_like(x)
-        gate = broadcast_tensor_for_bsfd(gate, *x.shape)
-        scale = broadcast_tensor_for_bsfd(scale, *x.shape)
-        shift = broadcast_tensor_for_bsfd(shift, *x.shape)
+        y = torch.empty_like(x)  # create output tensor
+        resi_out = torch.empty_like(x)  # create output tensor
+        gate = broadcast_tensor_for_bsfd(gate, *x.shape)  # handle various shapes
+        scale = broadcast_tensor_for_bsfd(scale, *x.shape)  # handle various shapes
+        shift = broadcast_tensor_for_bsfd(shift, *x.shape)  # handle various shapes
+        # Use scalar placeholders for None tensors as a workaround, since the CuTe DSL
+        # TVM-FFI backend does not support None parameters. Unless explicitly handled
+        # (e.g., for gate), scalar values do not result in code generation and have no
+        # impact on runtime performance.
+        weight = 1 if weight is None else weight
+        bias = 0 if bias is None else bias
         torch_tensors = [y, resi_out, residual, x, gate, weight, bias, scale, shift]
-        cute_tensors = [
-            # TODO: Enable tvm ffi to reduce host-side overhead of `from_dlpack`
-            #       once the CuTe DSL version is updated.
-            from_dlpack(t, assumed_align=32) if isinstance(t, torch.Tensor) else t
-            for t in torch_tensors
-        ]
+        cute_tensor_args = [to_cute_arg(t) for t in torch_tensors]
         # Compile cache
-        hash_key = _make_hash_key(
-            norm_type,
-            x,
-            residual,
-            gate,
-            weight,
-            bias,
-            scale,
-            shift,
-        )
+        hash_key = ScaleResidualNormScaleShift.make_hash_key(norm_type, *torch_tensors)
         compiled_fn = _COMPILE_CACHE.get(hash_key)
         if compiled_fn is None:
-            kernel = ScaleResidualNormScaleShift(D)
-            compiled_fn = cute.compile(kernel, *cute_tensors, norm_type)
+            kernel = ScaleResidualNormScaleShift(D, norm_type)
+            fake_sig_args = [to_fake_cute_args(t) for t in torch_tensors]
+            compiled_fn = cute.compile(
+                kernel, *fake_sig_args, options="--enable-tvm-ffi"
+            )
             _COMPILE_CACHE[hash_key] = compiled_fn
         # Execute
-        compiled_fn(*cute_tensors, eps=eps)
+        compiled_fn(*cute_tensor_args, eps, stream)
         return y, resi_out
     else:
         raise ValueError(f'norm_type must be one of "layer" and "rms"')

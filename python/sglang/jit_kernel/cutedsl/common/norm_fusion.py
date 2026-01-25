@@ -156,34 +156,36 @@ def tensor_slice_for_bsfd(
     thr_copy: cute.ThrCopy,
     batch_id: cutlass.Int32,
     seq_id: cutlass.Int32,
+    S: Union[cutlass.Int32, cutlass.Constexpr],
     D: Union[cutlass.Int32, cutlass.Constexpr],
-    len_of_frame: Union[cutlass.Int32, cutlass.Constexpr],
 ) -> Tuple[cute.Tensor, cute.Tensor]:
     """
     Slice a BSFD-compatible tensor into a per-thread gmem tile and rmem fragment.
 
     Given a logical (batch_id, seq_id), this helper selects the corresponding
     D-length slice from `mV` and prepares it for vectorized copy.
-
-    - Scalar ([1]) fast path: build a ((1,1),(1,)) layout so it could
-      broadcast-align with the regular rmem fragment shape ((4,1),(k,)).
-    - Use `local_tile` instead of direct indexing to preserve gmem base pointer
-      alignment required for vectorized loads.
     """
     gV: cute.Tensor
     if cutlass.const_expr(cute.is_static(mV.layout) and cute.size(mV.layout) == 1):
+        # build a ((1,1),(1,)) layout so it could broadcast-align with the
+        # regular rmem fragment shape ((4,1),(k,)).
         layout = cute.make_layout(shape=((1, 1), (1,)))
         tVgV = cute.make_tensor(mV.iterator, layout)
         tVrV = cute.make_rmem_tensor(layout, mV.element_type)
         return tVgV, tVrV
 
+    # Use `local_tile` instead of direct indexing to preserve gmem base pointer
+    # alignment required for vectorized loads.
     if cutlass.const_expr(len(mV.shape) == 1):
         gV = mV
     elif cutlass.const_expr(len(mV.shape) == 3):
         gV = cute.local_tile(mV, tiler=(1, 1, D), coord=(batch_id, seq_id, 0))
         gV = gV[0, 0, None]
     elif cutlass.const_expr(len(mV.shape) == 4):
-        frame_id = seq_id // len_of_frame
+        # Compute frame length at runtime (instead of compile time) to avoid
+        # specializing kernels on the frame dimension.
+        frame_len = S // mV.shape[1]
+        frame_id = seq_id // frame_len
         gV = cute.local_tile(mV, tiler=(1, 1, 1, D), coord=(batch_id, frame_id, 0, 0))
         gV = gV[0, 0, 0, None]
     else:
