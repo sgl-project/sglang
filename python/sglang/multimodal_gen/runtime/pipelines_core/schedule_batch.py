@@ -303,7 +303,7 @@ class Req:
                  save_output: {self.save_output}
             output_file_path: {self.output_file_path()}
         """  # type: ignore[attr-defined]
-        if not server_args.comfyui_mode:
+        if not self.suppress_logs:
             logger.info(debug_str)
 
 

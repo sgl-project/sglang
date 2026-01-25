@@ -149,7 +149,7 @@ class GPUWorker:
                 can_stay_resident = self.get_can_stay_resident_components(
                     remaining_gpu_mem_gb
                 )
-                if not self.server_args.comfyui_mode:
+                if not req.suppress_logs:
                     logger.info(
                         f"Peak GPU memory: {peak_memory_gb:.2f} GB, "
                         f"Remaining GPU memory at peak: {remaining_gpu_mem_gb:.2f} GB. "

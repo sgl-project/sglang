@@ -81,6 +81,7 @@ class QwenImageExecutor(SGLDiffusionExecutor):
             num_frames=1,
             num_inference_steps=1,
             save_output=False,
+            suppress_logs=self.should_suppress_logs(timestep),
         )
 
         # Prepare request (converts SamplingParams to Req)
@@ -147,6 +148,7 @@ class QwenImageEditExecutor(QwenImageExecutor):
             num_frames=1,
             num_inference_steps=1,
             save_output=False,
+            suppress_logs=self.should_suppress_logs(timestep),
         )
 
         # Prepare request (converts SamplingParams to Req)
