@@ -25,6 +25,7 @@ from http import HTTPStatus
 from typing import Any, Deque, Dict, List, Optional, Tuple, Union
 
 import psutil
+from sglang.srt.layers.attention.mamba.ops import initialize_mamba_selective_state_update_backend
 import setproctitle
 import torch
 import torch.distributed
@@ -345,6 +346,9 @@ class Scheduler(
 
         # Init moe config and GEMM config (FP8 GEMM, etc.)
         self.init_moe_gemm_config()
+        
+        # Init mamba backend
+        self.init_mamba_backend()
 
         # Launch a model worker and draft model worker if using speculative decoding
         self.init_model_worker()
@@ -483,6 +487,9 @@ class Scheduler(
             self.tokenizer.think_end_id = self.tokenizer.encode(
                 reasoning_parser.detector.think_end_token, add_special_tokens=False
             )[0]
+
+    def init_mamba_backend(self) -> None:
+        initialize_mamba_selective_state_update_backend(self.server_args)
 
     def init_moe_gemm_config(self):
         if hasattr(self.model_config.hf_config, "num_experts_per_tok"):
