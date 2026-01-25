@@ -2056,7 +2056,9 @@ class ServerArgs:
                 ), "Elastic EP requires eplb_algorithm to be set to 'auto' or 'elasticity_aware'."
 
             if self.elastic_ep_backend == "mooncake":
-                self._validate_ib_devices(self.mooncake_ib_device)
+                self.mooncake_ib_device = self._validate_ib_devices(
+                    self.mooncake_ib_device
+                )
 
     def _handle_expert_distribution_metrics(self):
         if self.enable_expert_distribution_metrics and (
@@ -2387,14 +2389,24 @@ class ServerArgs:
                 "requires at least one encoder urls to be set via --encoder-urls"
             )
 
-        self._validate_ib_devices(self.disaggregation_ib_device)
+        # Validate IB devices when mooncake backend is used
+        if (
+            self.disaggregation_transfer_backend == "mooncake"
+            and self.disaggregation_mode in ("prefill", "decode")
+        ) or self.encoder_transfer_backend == "mooncake":
+            self.disaggregation_ib_device = self._validate_ib_devices(
+                self.disaggregation_ib_device
+            )
 
-    def _validate_ib_devices(self, device_str: str):
+    def _validate_ib_devices(self, device_str: str) -> str:
         """
         Validate IB devices before passing to mooncake.
 
         Args:
-            device_str: List of IB device names (e.g., "mlx5_0,mlx5_1")
+            device_str: Comma-separated IB device names (e.g., "mlx5_0,mlx5_1")
+
+        Returns:
+            Normalized comma-separated string of validated device names, or None if input is None.
         """
         if device_str is None:
             return None
@@ -2402,9 +2414,13 @@ class ServerArgs:
         import subprocess
 
         # Strip whitespace from device names
-        devices = device_str.split(",")
-        devices = [device.strip() for device in devices if device.strip()]
+        devices = [d.strip() for d in device_str.split(",") if d.strip()]
         assert len(devices) > 0, "No valid IB devices specified"
+
+        # Check for duplicates
+        assert len(devices) == len(
+            set(devices)
+        ), f"Duplicate IB devices specified: {device_str}"
 
         try:
             # Run `ibstat` to get available devices
@@ -2423,38 +2439,27 @@ class ServerArgs:
             # Output format is one device per line:
             #     mlx5_0
             #     mlx5_1
-            available_devices = set()
-            for line in result.stdout.splitlines():
-                line = line.strip()
-                if line:
-                    available_devices.add(line)
+            available_devices = {
+                line.strip() for line in result.stdout.splitlines() if line.strip()
+            }
             assert (
                 len(available_devices) > 0
             ), f"No IB devices found by `ibstat`, output: {result.stdout}"
 
+            # Check for invalid devices
             invalid_devices = [d for d in devices if d not in available_devices]
             assert (
                 len(invalid_devices) == 0
-            ), f"Invalid IB devices specified: {invalid_devices}."
+            ), f"Invalid IB devices specified: {invalid_devices}. Available devices: {sorted(available_devices)}"
 
-            valid_devices = [d for d in devices if d in available_devices]
-            assert (
-                len(valid_devices) > 0
-            ), f"None of the specified IB devices are valid, available devices: {sorted(available_devices)}."
-            assert len(valid_devices) == len(
-                devices
-            ), f"Some of the specified IB devices are not valid, available devices: {sorted(available_devices)}."
-            unique_valid_devices = set(valid_devices)
-            assert len(valid_devices) <= len(
-                unique_valid_devices
-            ), f"Some of the specified IB devices are duplicates."
-
-            return valid_devices
+            return ",".join(devices)
 
         except subprocess.TimeoutExpired as e:
             raise RuntimeError(
                 "Timeout while validating IB devices using `ibstat -l`."
             ) from e
+        except AssertionError:
+            raise
         except Exception as e:
             raise RuntimeError(f"Error validating IB devices: {e}") from e
 
