@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """
-MoVA-specific pipeline stages.
+MOVA-specific pipeline stages.
 
 Sequence Parallelism (SP) Support:
 - Video latents are sharded along the sequence dimension (T*H*W) after patchify
@@ -70,8 +70,8 @@ from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 logger = init_logger(__name__)
 
 
-class MovaLatentPreparationStage(PipelineStage):
-    """Prepare video/audio noise latents for MoVA."""
+class MOVALatentPreparationStage(PipelineStage):
+    """Prepare video/audio noise latents for MOVA."""
 
     def __init__(self, audio_vae, require_vae_embedding: bool = True) -> None:
         super().__init__()
@@ -82,7 +82,7 @@ class MovaLatentPreparationStage(PipelineStage):
         batch_size = batch.batch_size
         num_frames = batch.num_frames
         if num_frames is None:
-            raise ValueError("num_frames is required for MoVA")
+            raise ValueError("num_frames is required for MOVA")
 
         audio_num_samples = int(self.audio_vae.sample_rate * num_frames / batch.fps)
         batch.audio_num_samples = audio_num_samples
@@ -113,12 +113,12 @@ class MovaLatentPreparationStage(PipelineStage):
         if batch.image_latent is not None:
             batch.y = batch.image_latent.to(device=device, dtype=dit_dtype)
         elif self.require_vae_embedding:
-            raise ValueError("MoVA requires reference image latents for denoising")
+            raise ValueError("MOVA requires reference image latents for denoising")
         return batch
 
 
-class MovaTimestepPreparationStage(PipelineStage):
-    """Prepare paired timesteps for MoVA."""
+class MOVATimestepPreparationStage(PipelineStage):
+    """Prepare paired timesteps for MOVA."""
 
     def __init__(self, scheduler) -> None:
         super().__init__()
@@ -141,8 +141,8 @@ class MovaTimestepPreparationStage(PipelineStage):
         return batch
 
 
-class MovaDenoisingStage(PipelineStage):
-    """Run MoVA dual-tower denoising loop."""
+class MOVADenoisingStage(PipelineStage):
+    """Run MOVA dual-tower denoising loop."""
 
     def __init__(self, video_dit, video_dit2, audio_dit, dual_tower_bridge, scheduler):
         super().__init__()
@@ -380,11 +380,11 @@ class MovaDenoisingStage(PipelineStage):
 
         paired_timesteps = batch.paired_timesteps
         if paired_timesteps is None:
-            raise ValueError("paired_timesteps must be set for MoVA")
+            raise ValueError("paired_timesteps must be set for MOVA")
 
         y = batch.y if batch.y is not None else batch.image_latent
         if getattr(self.video_dit, "require_vae_embedding", False) and y is None:
-            raise ValueError("MoVA requires reference image latents for denoising")
+            raise ValueError("MOVA requires reference image latents for denoising")
 
         boundary_ratio = server_args.pipeline_config.boundary_ratio
         total_steps = paired_timesteps.shape[0]
@@ -397,7 +397,7 @@ class MovaDenoisingStage(PipelineStage):
             getattr(batch, "extra_step_kwargs", None) or {},
         )
         # Optional NVTX / CUDART profiling for Nsight Systems.
-        # Enable with env vars (kept local to MoVA so other pipelines are unaffected):
+        # Enable with env vars (kept local to MOVA so other pipelines are unaffected):
         # - SGLANG_MOVA_ENABLE_NVTX=1
         # - SGLANG_MOVA_NVTX_RECORD_SHAPES=1
         # - SGLANG_MOVA_NVTX_START_STEP=3
@@ -738,7 +738,7 @@ class MovaDenoisingStage(PipelineStage):
         video_fps: float,
     ):
         """
-        Single inference step for MoVA dual-tower denoising.
+        Single inference step for MOVA dual-tower denoising.
 
         Supports Sequence Parallelism (SP):
         - After patchify, sequences are sharded across SP ranks
@@ -986,8 +986,8 @@ class MovaDenoisingStage(PipelineStage):
         return visual_x, audio_x
 
 
-class MovaDecodingStage(PipelineStage):
-    """Decode video and audio outputs for MoVA."""
+class MOVADecodingStage(PipelineStage):
+    """Decode video and audio outputs for MOVA."""
 
     def __init__(self, video_vae, audio_vae) -> None:
         super().__init__()

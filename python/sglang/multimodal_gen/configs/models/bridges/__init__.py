@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from sglang.multimodal_gen.configs.models.bridges.mova_dual_tower import (
-    MovaDualTowerConfig,
+    MOVADualTowerConfig,
 )
 
-__all__ = ["MovaDualTowerConfig"]
+__all__ = ["MOVADualTowerConfig"]

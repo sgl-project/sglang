@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """
-MoVA pipeline configuration.
+MOVA pipeline configuration.
 """
 
 from dataclasses import dataclass, field
@@ -10,7 +10,7 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 
-from sglang.multimodal_gen.configs.models.dits import MovaAudioConfig, MovaVideoConfig
+from sglang.multimodal_gen.configs.models.dits import MOVAAudioConfig, MOVAVideoConfig
 from sglang.multimodal_gen.configs.models.encoders import T5Config
 from sglang.multimodal_gen.configs.models.vaes import DacVAEConfig, WanVAEConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
@@ -24,14 +24,14 @@ logger = init_logger(__name__)
 
 
 @dataclass
-class MovaPipelineConfig(PipelineConfig):
-    """Configuration for MoVA (text+image -> video+audio) pipelines."""
+class MOVAPipelineConfig(PipelineConfig):
+    """Configuration for MOVA (text+image -> video+audio) pipelines."""
 
     task_type: ModelTaskType = ModelTaskType.T2V
 
     # Model configs
-    dit_config: MovaVideoConfig = field(default_factory=MovaVideoConfig)
-    audio_dit_config: MovaAudioConfig = field(default_factory=MovaAudioConfig)
+    dit_config: MOVAVideoConfig = field(default_factory=MOVAVideoConfig)
+    audio_dit_config: MOVAAudioConfig = field(default_factory=MOVAAudioConfig)
 
     # Video VAE (Wan) + Audio VAE (DAC)
     vae_config: WanVAEConfig = field(default_factory=WanVAEConfig)
@@ -43,11 +43,11 @@ class MovaPipelineConfig(PipelineConfig):
         default_factory=lambda: (t5_postprocess_text,)
     )
 
-    # MoVA specific
+    # MOVA specific
     audio_vae_type: str = "dac"
     boundary_ratio: float | None = 0.9
 
-    # temporal alignment: MoVA expects (num_frames - 1) % 4 == 0
+    # temporal alignment: MOVA expects (num_frames - 1) % 4 == 0
     time_division_factor: int = 4
     time_division_remainder: int = 1
 
@@ -112,7 +112,7 @@ class MovaPipelineConfig(PipelineConfig):
                 + self.time_division_remainder
             )
             logger.warning(
-                "`num_frames` (%s) is not compatible with MoVA temporal constraints. "
+                "`num_frames` (%s) is not compatible with MOVA temporal constraints. "
                 "Rounding to %s.",
                 num_frames,
                 adjusted,
@@ -175,14 +175,14 @@ class MovaPipelineConfig(PipelineConfig):
 
 
 @dataclass
-class Mova360PConfig(MovaPipelineConfig):
-    """Configuration for MoVA 360P (text+image -> video+audio) pipelines."""
+class MOVA360PConfig(MOVAPipelineConfig):
+    """Configuration for MOVA 360P (text+image -> video+audio) pipelines."""
 
     max_area: int = 352 * 640
 
 
 @dataclass
-class Mova720PConfig(MovaPipelineConfig):
-    """Configuration for MoVA 720P (text+image -> video+audio) pipelines."""
+class MOVA720PConfig(MOVAPipelineConfig):
+    """Configuration for MOVA 720P (text+image -> video+audio) pipelines."""
 
     max_area: int = 720 * 1280

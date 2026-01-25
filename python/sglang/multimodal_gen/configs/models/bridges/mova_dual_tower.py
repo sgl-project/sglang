@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Configuration for MoVA dual tower bridge model."""
+"""Configuration for MOVA dual tower bridge model."""
 
 from dataclasses import dataclass, field
 
@@ -12,7 +12,7 @@ def _is_conditioner_block(name: str, module) -> bool:
 
 
 @dataclass
-class MovaDualTowerArchConfig(DiTArchConfig):
+class MOVADualTowerArchConfig(DiTArchConfig):
     _fsdp_shard_conditions: list = field(
         default_factory=lambda: [_is_conditioner_block]
     )
@@ -46,5 +46,5 @@ class MovaDualTowerArchConfig(DiTArchConfig):
 
 
 @dataclass
-class MovaDualTowerConfig(DiTConfig):
-    arch_config: DiTArchConfig = field(default_factory=MovaDualTowerArchConfig)
+class MOVADualTowerConfig(DiTConfig):
+    arch_config: DiTArchConfig = field(default_factory=MOVADualTowerArchConfig)

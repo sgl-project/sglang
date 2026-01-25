@@ -708,7 +708,7 @@ class AudioVAELoader(BaseVAELoader):
 
 
 class BridgeLoader(ComponentLoader):
-    """Loader for MoVA dual tower bridge with FSDP support."""
+    """Loader for MOVA dual tower bridge with FSDP support."""
 
     pipeline_bridge_config_attr: str = "bridge_config"
 
@@ -734,10 +734,10 @@ class BridgeLoader(ComponentLoader):
         else:
             # Create a minimal config from hf_config
             from sglang.multimodal_gen.configs.models.bridges.mova_dual_tower import (
-                MovaDualTowerConfig,
+                MOVADualTowerConfig,
             )
 
-            bridge_config = MovaDualTowerConfig()
+            bridge_config = MOVADualTowerConfig()
             bridge_config.update_model_arch(config)
 
         model_cls, _ = ModelRegistry.resolve_model_cls(class_name)

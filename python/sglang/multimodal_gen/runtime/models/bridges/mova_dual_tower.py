@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from einops import rearrange
 
 from sglang.multimodal_gen.configs.models.bridges.mova_dual_tower import (
-    MovaDualTowerConfig,
+    MOVADualTowerConfig,
 )
 from sglang.multimodal_gen.runtime.distributed import get_tp_world_size
 from sglang.multimodal_gen.runtime.layers.attention import LocalAttention
@@ -399,16 +399,16 @@ class DualTowerConditionalBridge(
     3. Cross-attention interaction between the hidden states of the two DiTs.
     """
 
-    _fsdp_shard_conditions = MovaDualTowerConfig()._fsdp_shard_conditions
-    _compile_conditions = MovaDualTowerConfig()._compile_conditions
-    _supported_attention_backends = MovaDualTowerConfig()._supported_attention_backends
-    param_names_mapping = MovaDualTowerConfig().param_names_mapping
-    reverse_param_names_mapping = MovaDualTowerConfig().reverse_param_names_mapping
-    lora_param_names_mapping = MovaDualTowerConfig().lora_param_names_mapping
+    _fsdp_shard_conditions = MOVADualTowerConfig()._fsdp_shard_conditions
+    _compile_conditions = MOVADualTowerConfig()._compile_conditions
+    _supported_attention_backends = MOVADualTowerConfig()._supported_attention_backends
+    param_names_mapping = MOVADualTowerConfig().param_names_mapping
+    reverse_param_names_mapping = MOVADualTowerConfig().reverse_param_names_mapping
+    lora_param_names_mapping = MOVADualTowerConfig().lora_param_names_mapping
 
     def __init__(
         self,
-        config: MovaDualTowerConfig | None = None,
+        config: MOVADualTowerConfig | None = None,
         hf_config: dict[str, Any] | None = None,
         # Fallback parameters for from_pretrained compatibility
         visual_layers: int = 40,

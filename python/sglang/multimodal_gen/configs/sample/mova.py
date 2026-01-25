@@ -5,8 +5,8 @@ from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 
 
 @dataclass
-class MovaSamplingParams(SamplingParams):
-    # Video parameters (MoVA defaults)
+class MOVASamplingParams(SamplingParams):
+    # Video parameters (MOVA defaults)
     height: int = 352
     width: int = 640
     num_frames: int = 193
@@ -28,12 +28,12 @@ class MovaSamplingParams(SamplingParams):
 
 
 @dataclass
-class Mova_360P_SamplingParams(MovaSamplingParams):
-    # Video parameters (MoVA 360P)
+class MOVA_360P_SamplingParams(MOVASamplingParams):
+    # Video parameters (MOVA 360P)
     height: int = 352
     width: int = 640
 
-    # Mova 360P supported resolutions
+    # MOVA 360P supported resolutions
     supported_resolutions: list[tuple[int, int]] = field(
         default_factory=lambda: [
             (352, 640),
@@ -43,12 +43,12 @@ class Mova_360P_SamplingParams(MovaSamplingParams):
 
 
 @dataclass
-class Mova_720P_SamplingParams(MovaSamplingParams):
-    # Video parameters (MoVA 720P)
+class MOVA_720P_SamplingParams(MOVASamplingParams):
+    # Video parameters (MOVA 720P)
     height: int = 720
     width: int = 1280
 
-    # Mova 720P supported resolutions
+    # MOVA 720P supported resolutions
     supported_resolutions: list[tuple[int, int]] = field(
         default_factory=lambda: [
             (720, 1280),

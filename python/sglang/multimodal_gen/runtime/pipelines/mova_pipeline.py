@@ -1,17 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 """
-MoVA pipeline integration (native SGLang pipeline).
+MOVA pipeline integration (native SGLang pipeline).
 """
 
 from __future__ import annotations
 
-from sglang.multimodal_gen.configs.pipeline_configs.mova import MovaPipelineConfig
-from sglang.multimodal_gen.configs.sample.mova import MovaSamplingParams
+from sglang.multimodal_gen.configs.pipeline_configs.mova import MOVAPipelineConfig
+from sglang.multimodal_gen.configs.sample.mova import MOVASamplingParams
 from sglang.multimodal_gen.runtime.models.model_stages.mova import (
-    MovaDecodingStage,
-    MovaDenoisingStage,
-    MovaLatentPreparationStage,
-    MovaTimestepPreparationStage,
+    MOVADecodingStage,
+    MOVADenoisingStage,
+    MOVALatentPreparationStage,
+    MOVATimestepPreparationStage,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
@@ -28,10 +28,10 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 
-class MovaPipeline(ComposedPipelineBase):
-    """MoVA pipeline with SGLang stage orchestration."""
+class MOVAPipeline(ComposedPipelineBase):
+    """MOVA pipeline with SGLang stage orchestration."""
 
-    pipeline_name = "MoVA"
+    pipeline_name = "MOVA"
     is_video_pipeline = True
     _required_config_modules = [
         "video_vae",
@@ -44,19 +44,19 @@ class MovaPipeline(ComposedPipelineBase):
         "audio_dit",
         "dual_tower_bridge",
     ]
-    pipeline_config_cls = MovaPipelineConfig
-    sampling_params_cls = MovaSamplingParams
+    pipeline_config_cls = MOVAPipelineConfig
+    sampling_params_cls = MOVASamplingParams
 
     def initialize_pipeline(self, server_args: ServerArgs) -> None:
         """
         Initialize the pipeline.
 
-        MoVA supports Context Parallel (sequence parallel) through USPAttention,
+        MOVA supports Context Parallel (sequence parallel) through USPAttention,
         which uses Ulysses-style all-to-all communication for distributed attention.
         """
         if server_args.sp_degree > 1:
             logger.info(
-                "MoVA Context Parallel enabled with sp_degree=%d. "
+                "MOVA Context Parallel enabled with sp_degree=%d. "
                 "Using USPAttention for distributed self-attention.",
                 server_args.sp_degree,
             )
@@ -80,7 +80,7 @@ class MovaPipeline(ComposedPipelineBase):
             )
         self.add_stage(
             stage_name="mova_latent_preparation_stage",
-            stage=MovaLatentPreparationStage(
+            stage=MOVALatentPreparationStage(
                 audio_vae=self.get_module("audio_vae"),
                 require_vae_embedding=getattr(
                     self.get_module("video_dit"), "require_vae_embedding", True
@@ -89,13 +89,13 @@ class MovaPipeline(ComposedPipelineBase):
         )
         self.add_stage(
             stage_name="mova_timestep_preparation_stage",
-            stage=MovaTimestepPreparationStage(
+            stage=MOVATimestepPreparationStage(
                 scheduler=self.get_module("scheduler"),
             ),
         )
         self.add_stage(
             stage_name="mova_denoising_stage",
-            stage=MovaDenoisingStage(
+            stage=MOVADenoisingStage(
                 video_dit=self.get_module("video_dit"),
                 video_dit2=self.get_module("video_dit2"),
                 audio_dit=self.get_module("audio_dit"),
@@ -105,15 +105,15 @@ class MovaPipeline(ComposedPipelineBase):
         )
         self.add_stage(
             stage_name="mova_decoding_stage",
-            stage=MovaDecodingStage(
+            stage=MOVADecodingStage(
                 video_vae=self.get_module("video_vae"),
                 audio_vae=self.get_module("audio_vae"),
             ),
         )
 
 
-class MoVAPipelineAlias(MovaPipeline):
-    pipeline_name = "MoVAPipeline"
+class MOVAPipelineAlias(MOVAPipeline):
+    pipeline_name = "MOVAPipeline"
 
 
-EntryClass = [MovaPipeline, MoVAPipelineAlias]
+EntryClass = [MOVAPipeline, MOVAPipelineAlias]

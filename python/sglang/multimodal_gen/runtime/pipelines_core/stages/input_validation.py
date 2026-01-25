@@ -11,7 +11,7 @@ from PIL import Image
 
 from sglang.multimodal_gen.configs.pipeline_configs import WanI2V480PConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
-from sglang.multimodal_gen.configs.pipeline_configs.mova import MovaPipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.mova import MOVAPipelineConfig
 from sglang.multimodal_gen.runtime.models.vision_utils import load_image, load_video
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
@@ -176,8 +176,8 @@ class InputValidationStage(PipelineStage):
             batch.height = height
             batch.width = width
 
-        elif issubclass(type(server_args.pipeline_config), MovaPipelineConfig):
-            # resize image only, MoVA
+        elif issubclass(type(server_args.pipeline_config), MOVAPipelineConfig):
+            # resize image only, MOVA
             image = batch.condition_image
             if isinstance(image, list):
                 image = image[0]  # not support multi image input yet.

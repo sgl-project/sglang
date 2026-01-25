@@ -12,7 +12,7 @@ import torch.nn as nn
 from einops import rearrange
 from torch.distributed.tensor import DTensor
 
-from sglang.multimodal_gen.configs.models.dits.mova_audio import MovaAudioConfig
+from sglang.multimodal_gen.configs.models.dits.mova_audio import MOVAAudioConfig
 from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
 from sglang.multimodal_gen.runtime.layers.mlp import MLP
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
@@ -98,14 +98,14 @@ class Conv1dLocalIsland(nn.Conv1d):
 
 
 class WanAudioModel(CachableDiT, OffloadableDiTMixin):
-    _fsdp_shard_conditions = MovaAudioConfig()._fsdp_shard_conditions
-    _compile_conditions = MovaAudioConfig()._compile_conditions
-    _supported_attention_backends = MovaAudioConfig()._supported_attention_backends
-    param_names_mapping = MovaAudioConfig().param_names_mapping
-    reverse_param_names_mapping = MovaAudioConfig().reverse_param_names_mapping
-    lora_param_names_mapping = MovaAudioConfig().lora_param_names_mapping
+    _fsdp_shard_conditions = MOVAAudioConfig()._fsdp_shard_conditions
+    _compile_conditions = MOVAAudioConfig()._compile_conditions
+    _supported_attention_backends = MOVAAudioConfig()._supported_attention_backends
+    param_names_mapping = MOVAAudioConfig().param_names_mapping
+    reverse_param_names_mapping = MOVAAudioConfig().reverse_param_names_mapping
+    lora_param_names_mapping = MOVAAudioConfig().lora_param_names_mapping
 
-    def __init__(self, config: MovaAudioConfig, hf_config: dict[str, Any]) -> None:
+    def __init__(self, config: MOVAAudioConfig, hf_config: dict[str, Any]) -> None:
         super().__init__(config=config, hf_config=hf_config)
 
         # Extract parameters from config
@@ -258,7 +258,7 @@ class WanAudioModel(CachableDiT, OffloadableDiTMixin):
         use_gradient_checkpointing_offload: bool = False,
         **kwargs,
     ) -> torch.Tensor:
-        # MoVA audio uses x/context naming historically.
+        # MOVA audio uses x/context naming historically.
         x = hidden_states
         context = (
             encoder_hidden_states[0]

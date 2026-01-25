@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # NOTE: This module shares common functions (sinusoidal_embedding_1d, precompute_freqs_cis, etc.)
-# with wanvideo.py. These functions are kept here for MoVA-specific model architecture,
+# with wanvideo.py. These functions are kept here for MOVA-specific model architecture,
 # but could be refactored to a common module in the future.
 
 import math
@@ -13,7 +13,7 @@ import torch.nn as nn
 from einops import rearrange
 from torch.distributed.tensor import DTensor
 
-from sglang.multimodal_gen.configs.models.dits.mova_video import MovaVideoConfig
+from sglang.multimodal_gen.configs.models.dits.mova_video import MOVAVideoConfig
 from sglang.multimodal_gen.runtime.distributed import get_tp_world_size
 from sglang.multimodal_gen.runtime.layers.attention import LocalAttention, USPAttention
 
@@ -95,7 +95,7 @@ def rope_apply_head_dim(x, freqs, head_dim):
 
 class SelfAttention(nn.Module):
     """
-    Self-Attention module for MoVA DiT with Sequence Parallelism support.
+    Self-Attention module for MOVA DiT with Sequence Parallelism support.
 
     SP is handled at the pipeline level (latents are pre-sharded before DiT forward).
     USPAttention internally handles the all-to-all communication for distributed attention.
@@ -177,7 +177,7 @@ class SelfAttention(nn.Module):
 
 class CrossAttention(nn.Module):
     """
-    Cross-Attention module for MoVA DiT.
+    Cross-Attention module for MOVA DiT.
 
     Cross-attention does NOT require SP communication because:
     - Query comes from the main sequence (already sharded by SP)
@@ -341,7 +341,7 @@ class Head(nn.Module):
         self.dim = dim
         self.patch_size = patch_size
         self.norm = nn.LayerNorm(dim, eps=eps, elementwise_affine=False)
-        # Output dim is small for MoVA; replicate to avoid TP shape coupling.
+        # Output dim is small for MOVA; replicate to avoid TP shape coupling.
         self.head = ReplicatedLinear(dim, out_dim * math.prod(patch_size))
         self.modulation = nn.Parameter(torch.randn(1, 2, dim) / dim**0.5)
 
@@ -387,14 +387,14 @@ class Conv3dLocalIsland(nn.Conv3d):
 
 
 class WanModel(CachableDiT, OffloadableDiTMixin):
-    _fsdp_shard_conditions = MovaVideoConfig()._fsdp_shard_conditions
-    _compile_conditions = MovaVideoConfig()._compile_conditions
-    _supported_attention_backends = MovaVideoConfig()._supported_attention_backends
-    param_names_mapping = MovaVideoConfig().param_names_mapping
-    reverse_param_names_mapping = MovaVideoConfig().reverse_param_names_mapping
-    lora_param_names_mapping = MovaVideoConfig().lora_param_names_mapping
+    _fsdp_shard_conditions = MOVAVideoConfig()._fsdp_shard_conditions
+    _compile_conditions = MOVAVideoConfig()._compile_conditions
+    _supported_attention_backends = MOVAVideoConfig()._supported_attention_backends
+    param_names_mapping = MOVAVideoConfig().param_names_mapping
+    reverse_param_names_mapping = MOVAVideoConfig().reverse_param_names_mapping
+    lora_param_names_mapping = MOVAVideoConfig().lora_param_names_mapping
 
-    def __init__(self, config: MovaVideoConfig, hf_config: dict[str, Any]) -> None:
+    def __init__(self, config: MOVAVideoConfig, hf_config: dict[str, Any]) -> None:
         super().__init__(config=config, hf_config=hf_config)
 
         # Extract parameters from config
@@ -544,7 +544,7 @@ class WanModel(CachableDiT, OffloadableDiTMixin):
         use_gradient_checkpointing_offload: bool = False,
         **kwargs,
     ) -> torch.Tensor:
-        # MoVA code historically uses x/context/y/clip_feature naming.
+        # MOVA code historically uses x/context/y/clip_feature naming.
         x = hidden_states
         context = (
             encoder_hidden_states[0]
@@ -566,11 +566,11 @@ class WanModel(CachableDiT, OffloadableDiTMixin):
         if self.has_image_input:
             if y is None:
                 raise ValueError(
-                    "MoVA video DiT requires reference image latents 'y' when has_image_input=True"
+                    "MOVA video DiT requires reference image latents 'y' when has_image_input=True"
                 )
             if clip_feature is None:
                 raise ValueError(
-                    "MoVA video DiT requires encoder_hidden_states_image (clip features) when has_image_input=True"
+                    "MOVA video DiT requires encoder_hidden_states_image (clip features) when has_image_input=True"
                 )
             x = torch.cat([x, y], dim=1)  # (b, c_x + c_y, f, h, w)
             clip_feature_input = clip_feature

@@ -11,7 +11,7 @@ def _is_blocks(n: str, m) -> bool:
 
 
 @dataclass
-class MovaVideoArchConfig(DiTArchConfig):
+class MOVAVideoArchConfig(DiTArchConfig):
     _fsdp_shard_conditions: list = field(default_factory=lambda: [_is_blocks])
 
     param_names_mapping: dict = field(
@@ -57,6 +57,6 @@ class MovaVideoArchConfig(DiTArchConfig):
 
 
 @dataclass
-class MovaVideoConfig(DiTConfig):
-    arch_config: DiTArchConfig = field(default_factory=MovaVideoArchConfig)
+class MOVAVideoConfig(DiTConfig):
+    arch_config: DiTArchConfig = field(default_factory=MOVAVideoArchConfig)
     prefix: str = "mova_video"
