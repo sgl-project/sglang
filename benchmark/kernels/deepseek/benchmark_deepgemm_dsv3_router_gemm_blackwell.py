@@ -3,12 +3,12 @@ from typing import List
 
 import torch
 import triton
-from flashinfer.gemm.routergemm_dsv3 import mm_M1_16_K7168_N256 
-
+from flashinfer.gemm.routergemm_dsv3 import mm_M1_16_K7168_N256
 from sgl_kernel import dsv3_router_gemm as dsv3_router_gemm
 
 N = 256
 K = 7168
+
 
 def create_benchmark_configs(tp_sizes: List[int]):
     configs = []
@@ -25,13 +25,15 @@ def dsv3_router_gemm_flashinfer(
     launch_with_pdl: bool,
 ):
     """Flashinfer implementation of dsv3 router gemm"""
-    output = torch.randn(hidden_states.shape[0],  router_weights.shape[0], device="cuda", dtype=torch.float32).contiguous()
+    output = torch.randn(
+        hidden_states.shape[0],
+        router_weights.shape[0],
+        device="cuda",
+        dtype=torch.float32,
+    ).contiguous()
 
     mm_M1_16_K7168_N256(
-        hidden_states,
-        router_weights.t(),
-        output,
-        launch_with_pdl=launch_with_pdl
+        hidden_states, router_weights.t(), output, launch_with_pdl=launch_with_pdl
     )
     return output
 
@@ -93,17 +95,21 @@ def calculate_diff(m: int, n: int, k: int, launch_with_pdl: bool):
     print(f"Flashinfer output: {out_flashinfer[0, 0:5]}")
     print(f"SGLang output: {out_sgl[0, 0:5]}")
 
-    flashinfer_sgl_match = check_accuracy(
-        out_flashinfer, out_sgl, 0.1, 0.6, 0.95
-    )
+    flashinfer_sgl_match = check_accuracy(out_flashinfer, out_sgl, 0.1, 0.6, 0.95)
     print("Correctness check:")
     print(f"  - Flashinfer vs SGLang: {'✅' if flashinfer_sgl_match else '❌'}")
 
 
 def _benchmark(m, n, k, tp_size, launch_with_pdl, provider):
-    print(f"Shape (m={m}, n={n}, k={k}, tp={tp_size}), launch_with_pdl={launch_with_pdl}, Provider: {provider}")
-    hidden_states = torch.randn((m, k), device="cuda", dtype=torch.bfloat16).contiguous()
-    router_weights = torch.randn((n, k), device="cuda", dtype=torch.bfloat16).contiguous()
+    print(
+        f"Shape (m={m}, n={n}, k={k}, tp={tp_size}), launch_with_pdl={launch_with_pdl}, Provider: {provider}"
+    )
+    hidden_states = torch.randn(
+        (m, k), device="cuda", dtype=torch.bfloat16
+    ).contiguous()
+    router_weights = torch.randn(
+        (n, k), device="cuda", dtype=torch.bfloat16
+    ).contiguous()
 
     quantiles = [0.5, 0.2, 0.8]
 
@@ -152,7 +158,7 @@ def get_benchmark_plot_friendly(tp_sizes):
         )
     )
     def benchmark(cfg_id, provider):
-        m, n, k, tp_size, launch_with_pdl= all_configs[cfg_id]
+        m, n, k, tp_size, launch_with_pdl = all_configs[cfg_id]
         ms, min_ms, max_ms = _benchmark(m, n, k, tp_size, launch_with_pdl, provider)
         return ms * 1000, max_ms * 1000, min_ms * 1000  # convert to ms
 
@@ -164,7 +170,13 @@ def get_benchmark(tp_sizes):
 
     @triton.testing.perf_report(
         triton.testing.Benchmark(
-            x_names=["m", "n", "k", "tp_size", "launch_with_pdl", ],
+            x_names=[
+                "m",
+                "n",
+                "k",
+                "tp_size",
+                "launch_with_pdl",
+            ],
             x_vals=[list(config) for config in all_configs],
             line_arg="provider",
             line_vals=["sglang", "flashinfer"],
@@ -203,7 +215,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--tp-sizes",
         type=int,
-        nargs='+',
+        nargs="+",
         default=[1],
         help="List of tensor parallelism sizes to benchmark",
     )
@@ -221,9 +233,9 @@ if __name__ == "__main__":
 
     # Run correctness tests on a few examples
     if args.run_correctness:
-        print("Running correctness tests...") 
+        print("Running correctness tests...")
         for m, n, k, _, launch_with_pdl in create_benchmark_configs(args.tp_sizes):
-            calculate_diff(m, n, k, launch_with_pdl) 
+            calculate_diff(m, n, k, launch_with_pdl)
 
     # Get the benchmark function with the specified tp_size
     benchmark = (
