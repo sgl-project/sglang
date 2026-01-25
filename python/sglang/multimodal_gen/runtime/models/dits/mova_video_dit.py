@@ -362,10 +362,14 @@ class Head(nn.Module):
 
 class Conv3dLocalIsland(nn.Conv3d):
     """
-    继承 Conv3d，只改 forward：
-    - 参数继续保留为 DTensor（优化器一致性不变）
-    - 前向把 x/weight/bias 统一聚合为 Replicate，再 to_local 本地卷积
-    - 输出再 distribute 成 DTensor（默认 Replicate，可自定义 placements）
+    Inherits from Conv3d and overrides the forward method.
+
+    Key behaviors:
+    - Parameters are kept as DTensor to maintain optimizer consistency.
+    - The forward pass aggregates input, weight, and bias into a Replicate state,
+      then performs the convolution locally using to_local().
+    - The output is then redistributed as a DTensor (defaults to Replicate,
+      but placements can be customized).
     """
 
     def __init__(self, *args, **kwargs):
