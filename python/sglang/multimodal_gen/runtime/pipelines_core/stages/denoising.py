@@ -116,7 +116,7 @@ class DenoisingStage(PipelineStage):
         self._cached_num_steps = None
         self._is_warmed_up = False
 
-    def _maybe_enable_torch_compile(self, module: object, regional: bool = False) -> None:
+    def _maybe_enable_torch_compile(self, module: object) -> None:
         """
         Compile a module with torch.compile, and enable inductor overlap tweak if available.
         No-op if torch compile is disabled or the object is not a nn.Module.
@@ -135,6 +135,7 @@ class DenoisingStage(PipelineStage):
         logger.info(f"Compiling transformer with mode: {mode}, regional: {regional}")
         fullgraph = False
         dynamic = None
+        regional = self.server_args.regional_compile
         if regional:
             self.regionally_compile(module, mode=mode, fullgraph=fullgraph, dynamic=dynamic)
         else:
