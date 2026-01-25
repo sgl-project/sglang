@@ -396,175 +396,55 @@ class MOVADenoisingStage(PipelineStage):
             self.scheduler.step_from_to,
             getattr(batch, "extra_step_kwargs", None) or {},
         )
-        # Optional NVTX / CUDART profiling for Nsight Systems.
-        # Enable with env vars (kept local to MOVA so other pipelines are unaffected):
-        # - SGLANG_MOVA_ENABLE_NVTX=1
-        # - SGLANG_MOVA_NVTX_RECORD_SHAPES=1
-        # - SGLANG_MOVA_NVTX_START_STEP=3
-        # - SGLANG_MOVA_NVTX_STOP_STEP=4
-        # - SGLANG_MOVA_ENABLE_CUDART_PROFILER=1
-        # - SGLANG_MOVA_CUDART_START_STEP=3
-        # - SGLANG_MOVA_CUDART_STOP_STEP=4
-        enable_nvtx = os.environ.get("SGLANG_MOVA_ENABLE_NVTX", "0") == "1"
-        nvtx_record_shapes = (
-            os.environ.get("SGLANG_MOVA_NVTX_RECORD_SHAPES", "1") == "1"
-        )
-        nvtx_start_step = int(os.environ.get("SGLANG_MOVA_NVTX_START_STEP", "3"))
-        nvtx_stop_step = int(os.environ.get("SGLANG_MOVA_NVTX_STOP_STEP", "4"))
-        enable_cudart_profiler = (
-            os.environ.get("SGLANG_MOVA_ENABLE_CUDART_PROFILER", "0") == "1"
-        )
-        cudart_start_step = int(
-            os.environ.get("SGLANG_MOVA_CUDART_START_STEP", str(nvtx_start_step))
-        )
-        cudart_stop_step = int(
-            os.environ.get("SGLANG_MOVA_CUDART_STOP_STEP", str(nvtx_stop_step))
-        )
 
         timings = getattr(batch, "timings", None)
         perf_dump_path_provided = getattr(batch, "perf_dump_path", None) is not None
 
-        nsys_nvtx_context = None
-        nvtx_emitters = []
-        cudart_started = False
+        with self.progress_bar(total=total_steps) as progress_bar:
+            for idx_step in range(total_steps):
+                with StageProfiler(
+                    f"denoising_step_{idx_step}",
+                    logger=logger,
+                    timings=timings,
+                    perf_dump_path_provided=perf_dump_path_provided,
+                ):
+                    pair_t = paired_timesteps[idx_step]
+                    if getattr(pair_t, "shape", None) == (2,):
+                        timestep, audio_timestep = pair_t
+                    else:
+                        timestep = pair_t
+                        audio_timestep = pair_t
 
-        def _maybe_start_nsys_profiling():
-            nonlocal nsys_nvtx_context, nvtx_emitters, cudart_started
-            if not torch.cuda.is_available():
-                return
-
-            if enable_nvtx and nsys_nvtx_context is None:
-                from sglang.multimodal_gen.runtime.pipelines_core.stages.utils.emit_nvtx import (
-                    NVTXEmitter,
-                )
-
-                nsys_nvtx_context = torch.autograd.profiler.emit_nvtx(
-                    record_shapes=nvtx_record_shapes
-                )
-                nsys_nvtx_context.__enter__()
-                # Instrument all possible DiTs so model switching still emits ranges.
-                nvtx_emitters = [
-                    NVTXEmitter(m, enabled=True)
-                    for m in filter(
-                        None, [self.video_dit, self.video_dit2, self.audio_dit]
+                    cur_visual_dit = self._select_visual_dit(
+                        timestep.item(), boundary_ratio, server_args
                     )
-                ]
 
-            if enable_cudart_profiler and not cudart_started:
-                try:
-                    if hasattr(torch.cuda, "cudart"):
-                        err = torch.cuda.cudart().cudaProfilerStart()
-                        if hasattr(torch.cuda, "check_error"):
-                            torch.cuda.check_error(err)
-                except Exception as e:  # best-effort: do not fail inference
-                    logger.warning("Failed to start CUDART profiler: %s", e)
-                cudart_started = True
+                    timestep = timestep.unsqueeze(0).to(device=get_local_torch_device())
+                    audio_timestep = audio_timestep.unsqueeze(0).to(
+                        device=get_local_torch_device()
+                    )
 
-        def _maybe_stop_nsys_profiling():
-            nonlocal nsys_nvtx_context, nvtx_emitters, cudart_started
-            if cudart_started and enable_cudart_profiler:
-                try:
-                    if hasattr(torch.cuda, "cudart"):
-                        err = torch.cuda.cudart().cudaProfilerStop()
-                        if hasattr(torch.cuda, "check_error"):
-                            torch.cuda.check_error(err)
-                except Exception as e:  # best-effort: do not fail inference
-                    logger.warning("Failed to stop CUDART profiler: %s", e)
-                cudart_started = False
+                    attn_metadata = self._build_attn_metadata(
+                        idx_step, batch, server_args
+                    )
 
-            if nsys_nvtx_context is not None:
-                for emitter in nvtx_emitters:
-                    try:
-                        emitter.close()
-                    except Exception:
-                        pass
-                nvtx_emitters = []
-
-                try:
-                    nsys_nvtx_context.__exit__(None, None, None)
-                finally:
-                    nsys_nvtx_context = None
-
-        try:
-            with self.progress_bar(total=total_steps) as progress_bar:
-                for idx_step in range(total_steps):
-                    with StageProfiler(
-                        f"denoising_step_{idx_step}",
-                        logger=logger,
-                        timings=timings,
-                        perf_dump_path_provided=perf_dump_path_provided,
-                    ):
-                        pair_t = paired_timesteps[idx_step]
-                        if getattr(pair_t, "shape", None) == (2,):
-                            timestep, audio_timestep = pair_t
-                        else:
-                            timestep = pair_t
-                            audio_timestep = pair_t
-
-                        cur_visual_dit = self._select_visual_dit(
-                            timestep.item(), boundary_ratio, server_args
+                    if not batch.do_classifier_free_guidance:
+                        visual_noise_pred, audio_noise_pred = self._predict(
+                            cur_visual_dit,
+                            batch.latents,
+                            batch.audio_latents,
+                            y,
+                            batch.prompt_embeds[0],
+                            timestep,
+                            audio_timestep,
+                            batch.fps,
+                            idx_step,
+                            attn_metadata,
+                            batch,
                         )
-                        if idx_step == nvtx_start_step or idx_step == cudart_start_step:
-                            _maybe_start_nsys_profiling()
-
-                        timestep = timestep.unsqueeze(0).to(
-                            device=get_local_torch_device()
-                        )
-                        audio_timestep = audio_timestep.unsqueeze(0).to(
-                            device=get_local_torch_device()
-                        )
-
-                        attn_metadata = self._build_attn_metadata(
-                            idx_step, batch, server_args
-                        )
-
-                        if not batch.do_classifier_free_guidance:
-                            visual_noise_pred, audio_noise_pred = self._predict(
-                                cur_visual_dit,
-                                batch.latents,
-                                batch.audio_latents,
-                                y,
-                                batch.prompt_embeds[0],
-                                timestep,
-                                audio_timestep,
-                                batch.fps,
-                                idx_step,
-                                attn_metadata,
-                                batch,
-                            )
-                        else:
-                            if enable_cfg_parallel:
-                                if cfg_rank == 0:
-                                    pos = self._predict(
-                                        cur_visual_dit,
-                                        batch.latents,
-                                        batch.audio_latents,
-                                        y,
-                                        batch.prompt_embeds[0],
-                                        timestep,
-                                        audio_timestep,
-                                        batch.fps,
-                                        idx_step,
-                                        attn_metadata,
-                                        batch,
-                                    )
-                                    neg = (None, None)
-                                else:
-                                    pos = (None, None)
-                                    neg = self._predict(
-                                        cur_visual_dit,
-                                        batch.latents,
-                                        batch.audio_latents,
-                                        y,
-                                        batch.negative_prompt_embeds[0],
-                                        timestep,
-                                        audio_timestep,
-                                        batch.fps,
-                                        idx_step,
-                                        attn_metadata,
-                                        batch,
-                                    )
-                            else:
+                    else:
+                        if enable_cfg_parallel:
+                            if cfg_rank == 0:
                                 pos = self._predict(
                                     cur_visual_dit,
                                     batch.latents,
@@ -578,6 +458,9 @@ class MOVADenoisingStage(PipelineStage):
                                     attn_metadata,
                                     batch,
                                 )
+                                neg = (None, None)
+                            else:
+                                pos = (None, None)
                                 neg = self._predict(
                                     cur_visual_dit,
                                     batch.latents,
@@ -591,6 +474,33 @@ class MOVADenoisingStage(PipelineStage):
                                     attn_metadata,
                                     batch,
                                 )
+                        else:
+                            pos = self._predict(
+                                cur_visual_dit,
+                                batch.latents,
+                                batch.audio_latents,
+                                y,
+                                batch.prompt_embeds[0],
+                                timestep,
+                                audio_timestep,
+                                batch.fps,
+                                idx_step,
+                                attn_metadata,
+                                batch,
+                            )
+                            neg = self._predict(
+                                cur_visual_dit,
+                                batch.latents,
+                                batch.audio_latents,
+                                y,
+                                batch.negative_prompt_embeds[0],
+                                timestep,
+                                audio_timestep,
+                                batch.fps,
+                                idx_step,
+                                attn_metadata,
+                                batch,
+                            )
 
                             visual_noise_pred = self._cfg_combine(
                                 pos[0] if pos[0] is not None else neg[0],
@@ -649,15 +559,10 @@ class MOVADenoisingStage(PipelineStage):
                             **extra_step_kwargs,
                         )
 
-                        if idx_step == nvtx_stop_step or idx_step == cudart_stop_step:
-                            _maybe_stop_nsys_profiling()
-
                     if progress_bar is not None:
                         progress_bar.update()
                     if not is_warmup and hasattr(self, "step_profile"):
                         self.step_profile()
-        finally:
-            _maybe_stop_nsys_profiling()
 
         for dit in filter(None, [self.video_dit, self.video_dit2, self.audio_dit]):
             if isinstance(dit, OffloadableDiTMixin):
