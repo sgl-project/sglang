@@ -401,15 +401,12 @@ class GlmImageAttention(torch.nn.Module):
                     ],
                     dim=-1,
                 )
-                q_img, k_img = apply_flashinfer_rope_qk_inplace(
+                q_out, k_out = apply_flashinfer_rope_qk_inplace(
                     q_img, k_img, cos_sin_cache, is_neox=True
                 )
             else:
-                q_img = _apply_rotary_emb(q_img, cos, sin, is_neox_style=True)
-                k_img = _apply_rotary_emb(k_img, cos, sin, is_neox_style=True)
-
-            query[:, text_seq_length:, :, :] = q_img
-            key[:, text_seq_length:, :, :] = k_img
+                q_img.copy_(_apply_rotary_emb(q_img, cos, sin, is_neox_style=True))
+                k_img.copy_(_apply_rotary_emb(k_img, cos, sin, is_neox_style=True))
 
         if kv_cache is not None:
             if kv_cache.mode == "write":
