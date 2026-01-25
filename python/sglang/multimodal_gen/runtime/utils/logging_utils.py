@@ -159,6 +159,7 @@ def _log_process_aware(
         and not local_main_process_only
         or (main_process_only and is_main_process)
         or (local_main_process_only and is_local_main_process)
+        or level >= logging.DEBUG
     )
 
     if should_log:
@@ -281,7 +282,7 @@ def init_logger(name: str) -> _SGLDiffusionLogger:
     setattr(
         logger,
         "error",
-        MethodType(_create_patched_method(logging.ERROR, False, True), logger),
+        MethodType(_create_patched_method(logging.ERROR, False, False), logger),
     )
 
     return cast(_SGLDiffusionLogger, logger)
