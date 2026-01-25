@@ -228,6 +228,12 @@ class MOVADenoisingStage(PipelineStage):
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         """Verify denoising stage inputs."""
         result = VerificationResult()
+        result.add_check("y", batch.y, V.is_tensor)
+        result.add_check(
+            "encoder_hidden_states_image",
+            batch.encoder_hidden_states_image,
+            lambda x: V.is_tensor(x) or V.list_not_empty(x),
+        )
         result.add_check("paired_timesteps", batch.paired_timesteps, V.is_tensor)
         result.add_check("latents", batch.latents, V.is_tensor)
         result.add_check("audio_latents", batch.audio_latents, V.is_tensor)

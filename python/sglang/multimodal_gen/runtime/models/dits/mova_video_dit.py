@@ -450,15 +450,18 @@ class WanModel(CachableDiT, OffloadableDiTMixin):
         self.num_heads = num_heads
         self.freqs = None
 
-        if has_image_input:
-            self.img_emb = MLP(
-                1280, dim, output_dim=dim, act_type="gelu_pytorch_tanh"
-            )  # clip_feature_dim = 1280
-            self.img_pos_emb = (
-                nn.Parameter(torch.zeros((1, 514, 1280))) if has_image_pos_emb else None
+        # image embedding. if has_image_input is False, this will raise an error.
+        if not has_image_input:
+            raise ValueError(
+                "has_image_input must be True; MOVA video DiT requires reference image input."
             )
-        else:
-            self.img_pos_emb = None
+        self.img_emb = MLP(
+            1280, dim, output_dim=dim, act_type="gelu_pytorch_tanh"
+        )  # clip_feature_dim = 1280
+        self.img_pos_emb = (
+            nn.Parameter(torch.zeros((1, 514, 1280))) if has_image_pos_emb else None
+        )
+
         if has_ref_conv:
             self.ref_conv = nn.Conv2d(16, dim, kernel_size=(2, 2), stride=(2, 2))
         self.has_image_pos_emb = has_image_pos_emb
@@ -542,7 +545,8 @@ class WanModel(CachableDiT, OffloadableDiTMixin):
         hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor | list[torch.Tensor],
         timestep: torch.LongTensor,
-        encoder_hidden_states_image: torch.Tensor | list[torch.Tensor] | None = None,
+        encoder_hidden_states_image: torch.Tensor | list[torch.Tensor],
+        y: torch.Tensor,
         guidance=None,
         use_gradient_checkpointing: bool = False,
         use_gradient_checkpointing_offload: bool = False,
@@ -561,29 +565,17 @@ class WanModel(CachableDiT, OffloadableDiTMixin):
             and len(encoder_hidden_states_image) > 0
             else encoder_hidden_states_image
         )
-        y = kwargs.get("y", None)
         t = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, timestep))
         t_proj, _ = self.time_projection(t)
         t_mod = t_proj.unflatten(1, (6, self.dim))
         context = self.text_embedding(context)
 
-        if self.has_image_input:
-            if y is None:
-                raise ValueError(
-                    "MOVA video DiT requires reference image latents 'y' when has_image_input=True"
-                )
-            if clip_feature is None:
-                raise ValueError(
-                    "MOVA video DiT requires encoder_hidden_states_image (clip features) when has_image_input=True"
-                )
-            x = torch.cat([x, y], dim=1)  # (b, c_x + c_y, f, h, w)
-            clip_feature_input = clip_feature
-            if self.img_pos_emb is not None:
-                clip_feature_input = clip_feature_input + self.img_pos_emb.to(
-                    dtype=clip_feature_input.dtype, device=clip_feature_input.device
-                )
-            clip_embedding = self.img_emb(clip_feature_input)
-            context = torch.cat([clip_embedding, context], dim=1)
+        x = torch.cat([x, y], dim=1)  # (b, c_x + c_y, f, h, w)
+        clip_feature_input = clip_feature + self.img_pos_emb.to(
+            dtype=clip_feature.dtype, device=clip_feature.device
+        )
+        clip_embedding = self.img_emb(clip_feature_input)
+        context = torch.cat([clip_embedding, context], dim=1)
 
         x, (f, h, w) = self.patchify(x)
 
