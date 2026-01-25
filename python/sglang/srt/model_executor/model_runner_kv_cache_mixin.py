@@ -406,7 +406,9 @@ class ModelRunnerKVCacheMixin:
                     dtype=self.kv_cache_dtype,
                     kv_lora_rank=self.model_config.kv_lora_rank,
                     qk_rope_head_dim=self.model_config.qk_rope_head_dim,
-                    index_head_dim=self.model_config.index_head_dim,
+                    index_head_dim=(
+                        self.model_config.index_head_dim if is_nsa_model else None
+                    ),
                     layer_num=self.num_effective_layers,
                     device=self.device,
                     enable_memory_saver=self.server_args.enable_memory_saver,
