@@ -1,5 +1,5 @@
 pub mod app_context;
-pub mod auth;
+pub use smg_auth as auth;
 pub mod config;
 pub mod core;
 pub mod data_connector;
