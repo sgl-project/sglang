@@ -1,4 +1,5 @@
 import argparse
+from typing import List
 
 import torch
 import triton
@@ -9,11 +10,12 @@ from sgl_kernel import dsv3_router_gemm as dsv3_router_gemm
 N = 256
 K = 7168
 
-def create_benchmark_configs(tp_size):
+def create_benchmark_configs(tp_sizes: List[int]):
     configs = []
     for launch_with_pdl in [False, True]:
-        for m in range(1, 17):
-            configs.append((m, N, K, tp_size, launch_with_pdl))
+        for tp_size in tp_sizes:
+            for m in range(1, 17):
+                configs.append((m, N, K, tp_size, launch_with_pdl))
     return configs
 
 
@@ -132,8 +134,8 @@ def _benchmark(m, n, k, tp_size, launch_with_pdl, provider):
     return ms, max_ms, min_ms
 
 
-def get_benchmark_plot_friendly(tp_size):
-    all_configs = create_benchmark_configs(tp_size)
+def get_benchmark_plot_friendly(tp_sizes):
+    all_configs = create_benchmark_configs(tp_sizes)
     x_vals = list(range(len(all_configs)))
 
     @triton.testing.perf_report(
@@ -145,7 +147,7 @@ def get_benchmark_plot_friendly(tp_size):
             line_names=["SGLang", "Flashinfer"],
             styles=[("blue", "-"), ("red", "-")],
             ylabel="us",
-            plot_name=f"fp8-gemm-performance-comparison-tp{tp_size}",
+            plot_name=f"fp8-gemm-performance-comparison-tp-{"-".join(str(tp) for tp in tp_sizes)}",
             args={},
         )
     )
@@ -157,8 +159,8 @@ def get_benchmark_plot_friendly(tp_size):
     return benchmark
 
 
-def get_benchmark(tp_size):
-    all_configs = create_benchmark_configs(tp_size)
+def get_benchmark(tp_sizes):
+    all_configs = create_benchmark_configs(tp_sizes)
 
     @triton.testing.perf_report(
         triton.testing.Benchmark(
@@ -169,7 +171,7 @@ def get_benchmark(tp_size):
             line_names=["SGLang", "Flashinfer"],
             styles=[("blue", "-"), ("red", "-")],
             ylabel="us",
-            plot_name=f"fp8-gemm-performance-comparison-tp{tp_size}",
+            plot_name=f"fp8-gemm-performance-comparison-tp-{"-".join(str(tp) for tp in tp_sizes)}",
             args={},
         )
     )
@@ -199,10 +201,11 @@ if __name__ == "__main__":
         help="Whether to run correctness test",
     )
     parser.add_argument(
-        "--tp-size",
+        "--tp-sizes",
         type=int,
-        default=1,
-        help="Tensor parallelism size to benchmark (default: 1)",
+        nargs='+',
+        default=[1],
+        help="List of tensor parallelism sizes to benchmark",
     )
     parser.add_argument(
         "--plot-friendly",
@@ -219,15 +222,15 @@ if __name__ == "__main__":
     # Run correctness tests on a few examples
     if args.run_correctness:
         print("Running correctness tests...") 
-        for m, n, k, _, launch_with_pdl in create_benchmark_configs(args.tp_size):
+        for m, n, k, _, launch_with_pdl in create_benchmark_configs(args.tp_sizes):
             calculate_diff(m, n, k, launch_with_pdl) 
 
     # Get the benchmark function with the specified tp_size
     benchmark = (
-        get_benchmark_plot_friendly(args.tp_size)
+        get_benchmark_plot_friendly(args.tp_sizes)
         if args.plot_friendly
-        else get_benchmark(args.tp_size)
+        else get_benchmark(args.tp_sizes)
     )
 
-    print(f"Running performance benchmark for TP size = {args.tp_size}...")
+    print(f"Running performance benchmark for TP sizes = {args.tp_sizes}...")
     benchmark.run(print_data=True, save_path=args.save_path)
