@@ -1831,7 +1831,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def check_decode_mem(self, selected_indices: Optional[List[int]] = None):
         num_tokens = self.new_tokens_required_next_decode(selected_indices)
         evict_from_tree_cache(self.tree_cache, num_tokens)
-        return self._is_available_size_sufficient(num_tokens)
+        return self.token_to_kv_pool_allocator.available_size() >= num_tokens
 
     def retract_all(self, server_args: ServerArgs):
         retracted_reqs = self.reqs
@@ -2313,9 +2313,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             ]
             self.token_to_kv_pool_allocator.free_swa(free_slots)
             req.swa_evicted_seqlen = new_swa_evicted_seqlen
-
-    def _is_available_size_sufficient(self, num_tokens: int) -> bool:
-        return self.token_to_kv_pool_allocator.available_size() >= num_tokens
 
     def __str__(self):
         return (
