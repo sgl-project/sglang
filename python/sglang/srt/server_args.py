@@ -2398,7 +2398,7 @@ class ServerArgs:
                 self.disaggregation_ib_device
             )
 
-    def _validate_ib_devices(self, device_str: str) -> str:
+    def _validate_ib_devices(self, device_str: str) -> Optional[str]:
         """
         Validate IB devices before passing to mooncake.
 
@@ -2409,33 +2409,39 @@ class ServerArgs:
             Normalized comma-separated string of validated device names, or None if input is None.
         """
         if device_str is None:
+            logger.warning(
+                "No IB devices specified for Mooncake backend, falling back to auto discovery."
+            )
             return None
 
         # Strip whitespace from device names
         devices = [d.strip() for d in device_str.split(",") if d.strip()]
-        assert len(devices) > 0, "No valid IB devices specified"
+        if len(devices) == 0:
+            raise ValueError("No valid IB devices specified")
 
         # Check for duplicates
-        assert len(devices) == len(
-            set(devices)
-        ), f"Duplicate IB devices specified: {device_str}"
+        if len(devices) != len(set(devices)):
+            raise ValueError(f"Duplicate IB devices specified: {device_str}")
 
         # Get available IB devices from sysfs
         ib_sysfs_path = "/sys/class/infiniband"
-        assert os.path.isdir(ib_sysfs_path), (
-            f"InfiniBand sysfs path not found: {ib_sysfs_path}. "
-            "Please ensure InfiniBand drivers are installed."
-        )
+        if not os.path.isdir(ib_sysfs_path):
+            raise RuntimeError(
+                f"InfiniBand sysfs path not found: {ib_sysfs_path}. "
+                "Please ensure InfiniBand drivers are installed."
+            )
 
         available_devices = set(os.listdir(ib_sysfs_path))
-        assert len(available_devices) > 0, f"No IB devices found in {ib_sysfs_path}"
+        if len(available_devices) == 0:
+            raise RuntimeError(f"No IB devices found in {ib_sysfs_path}")
 
         # Check for invalid devices
         invalid_devices = [d for d in devices if d not in available_devices]
-        assert len(invalid_devices) == 0, (
-            f"Invalid IB devices specified: {invalid_devices}. "
-            f"Available devices: {sorted(available_devices)}"
-        )
+        if len(invalid_devices) != 0:
+            raise ValueError(
+                f"Invalid IB devices specified: {invalid_devices}. "
+                f"Available devices: {sorted(available_devices)}"
+            )
 
         return ",".join(devices)
 
