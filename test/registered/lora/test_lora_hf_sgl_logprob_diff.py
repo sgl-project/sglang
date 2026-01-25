@@ -47,7 +47,7 @@ register_amd_ci(
     suite="stage-b-test-small-1-gpu-amd",
 )
 # Test configuration constants
-LORA_BACKEND = "triton"
+LORA_BACKEND = "csgmv"
 DISABLE_CUDA_GRAPH = False
 LORA_TARGET_MODULES = None
 LOGPROB_THRESHOLD = 1e-01

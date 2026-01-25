@@ -7,13 +7,18 @@ import torch
 
 from sglang.srt.lora.backend.chunked_backend import ChunkedSgmvLoRABackend
 from sglang.srt.lora.triton_ops import (
+    chunked_embedding_lora_a_forward,
     chunked_sgmv_lora_expand_forward,
     chunked_sgmv_lora_shrink_forward,
 )
 from sglang.srt.lora.triton_ops.chunked_sgmv_expand import _chunked_lora_expand_kernel
 from sglang.srt.lora.triton_ops.chunked_sgmv_shrink import _chunked_lora_shrink_kernel
 from sglang.srt.lora.utils import LoRABatchInfo
-from sglang.test.lora_utils import reference_sgmv_expand, reference_sgmv_shrink
+from sglang.test.lora_utils import (
+    reference_embedding_lora_a_shrink,
+    reference_sgmv_expand,
+    reference_sgmv_shrink,
+)
 
 CHUNK_SIZE = 16
 
@@ -100,6 +105,7 @@ class TestChunkedSGMV(unittest.TestCase):
         self.dtype = torch.float16
         self.input_dim = 2560  # Hidden dimension
         self.max_seq_len = 1024
+        self.vocab_size = 32000  # Vocabulary size for embedding tests
 
         # LoRA configurations: name -> (rank, output_q, output_k, output_v)
         self.lora_configs = {
@@ -285,6 +291,42 @@ class TestChunkedSGMV(unittest.TestCase):
 
         return stacked
 
+    def create_embedding_lora_a_weights(self, lora_ranks: torch.Tensor) -> torch.Tensor:
+        """Create LoRA A weights for embedding lookup.
+
+        Args:
+            lora_ranks: Tensor of ranks for each LoRA adapter
+
+        Returns:
+            Tensor of shape (num_loras, max_rank, vocab_size)
+        """
+        lora_ranks_cpu = lora_ranks.cpu().numpy()
+        num_loras = len(lora_ranks_cpu)
+        max_rank = int(lora_ranks_cpu.max()) if num_loras > 0 else 0
+
+        if max_rank == 0:
+            return torch.empty(
+                num_loras, 0, self.vocab_size, dtype=self.dtype, device=self.device
+            )
+
+        weights = torch.zeros(
+            num_loras, max_rank, self.vocab_size, dtype=self.dtype, device=self.device
+        )
+
+        for i, rank in enumerate(lora_ranks_cpu):
+            if rank > 0:
+                weights[i, :rank, :] = torch.randn(
+                    rank, self.vocab_size, dtype=self.dtype, device=self.device
+                )
+
+        return weights
+
+    def create_test_input_ids(self, total_tokens: int) -> torch.Tensor:
+        """Create random token IDs for embedding test."""
+        return torch.randint(
+            0, self.vocab_size, (total_tokens,), dtype=torch.int64, device=self.device
+        )
+
     def create_test_batch(
         self,
         batch_composition: BatchComposition,
@@ -459,6 +501,36 @@ class TestChunkedSGMV(unittest.TestCase):
 
                 torch.testing.assert_close(
                     chunked_shrink, reference_shrink, rtol=self.RTOL, atol=self.ATOL
+                )
+
+                # Test chunked embedding LoRA A forward
+                # Create embedding-specific LoRA A weights with shape (num_loras, rank, vocab_size)
+                embedding_lora_a = self.create_embedding_lora_a_weights(
+                    batch_info.lora_ranks
+                )
+
+                # Create input_ids (token indices) instead of hidden states
+                total_tokens = x.shape[0]
+                input_ids = self.create_test_input_ids(total_tokens)
+
+                chunked_shrink_embeddings = chunked_embedding_lora_a_forward(
+                    input_ids, embedding_lora_a, batch_info, self.vocab_size
+                )
+
+                reference_shrink_embeddings = reference_embedding_lora_a_shrink(
+                    input_ids,
+                    embedding_lora_a,
+                    lora_assignments_tensor,
+                    seq_lengths_tensor,
+                    lora_ranks_tensor,
+                    self.vocab_size,
+                )
+                torch.testing.assert_close(
+                    chunked_shrink_embeddings,
+                    reference_shrink_embeddings,
+                    rtol=self.RTOL,
+                    atol=self.ATOL,
+                    msg=f"Shrink test embedding loRA A operation failed for batch_size={batch_size}",
                 )
 
     def test_expand_basic(self):
