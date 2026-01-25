@@ -2315,13 +2315,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req.swa_evicted_seqlen = new_swa_evicted_seqlen
 
     def _is_available_size_sufficient(self, num_tokens: int) -> bool:
-        if self.is_hybrid_swa:
-            return (
-                self.token_to_kv_pool_allocator.full_available_size() >= num_tokens
-                and self.token_to_kv_pool_allocator.swa_available_size() >= num_tokens
-            )
-        else:
-            return self.token_to_kv_pool_allocator.available_size() >= num_tokens
+        return self.token_to_kv_pool_allocator.available_size() >= num_tokens
 
     def __str__(self):
         return (
