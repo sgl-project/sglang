@@ -33,7 +33,7 @@ def legacy_precompute_freqs_cis_1d(
     s = float(base_tps) / float(target_tps)
     # 1d rope precompute
     f_freqs_cis = precompute_freqs_cis(dim - 2 * (dim // 3), end, theta, s)
-    # 剩下的维度不施加位置编码
+    # No positional encoding is applied to the remaining dimensions
     no_freqs_cis = precompute_freqs_cis(dim // 3, end, theta, s)
     no_freqs_cis = torch.ones_like(no_freqs_cis)
     return f_freqs_cis, no_freqs_cis, no_freqs_cis
@@ -56,7 +56,6 @@ class Head(nn.Module):
         self.modulation = nn.Parameter(torch.randn(1, 2, dim) / dim**0.5)
 
     def forward(self, x, t_mod):
-        # print(f"{t_mod.shape = }")
         if len(t_mod.shape) == 3:
             shift, scale = (
                 self.modulation.unsqueeze(0).to(dtype=t_mod.dtype, device=t_mod.device)
@@ -64,7 +63,7 @@ class Head(nn.Module):
             ).chunk(2, dim=2)
             x, _ = self.head(self.norm(x) * (1 + scale.squeeze(2)) + shift.squeeze(2))
         else:
-            # NOTE: 这里 t_mod 原本是 [B, C], 当 B = 1 时可以通过广播机制正确处理，但 B > 1 后就会和 [1, 2, C] 匹配不上
+            # NOTE: t_mod was originally [B, C]. This works correctly with broadcasting when B=1, but it won't match [1, 2, C] when B > 1.
             shift, scale = (
                 self.modulation.to(dtype=t_mod.dtype, device=t_mod.device)
                 + t_mod.unsqueeze(1)
@@ -74,11 +73,13 @@ class Head(nn.Module):
 
 
 class Conv1dLocalIsland(nn.Conv1d):
-    """
-    继承 Conv1d，只改 forward：
-    - 参数继续保留为 DTensor（优化器一致性不变）
-    - 前向把 x/weight/bias 统一聚合为 Replicate，再 to_local 本地卷积
-    - 输出再 distribute 成 DTensor（默认 Replicate，可自定义 placements）
+    """Inherits from Conv1d and overrides forward.
+
+    - Parameters remain as DTensors (optimizer consistency is maintained).
+    - In the forward pass, x, weight, and bias are aggregated as Replicate,
+      and then local convolution is performed via to_local.
+    - The output is then redistributed as a DTensor (default is Replicate,
+      placements can be customized).
     """
 
     def __init__(self, *args, **kwargs):
@@ -209,12 +210,7 @@ class WanAudioModel(CachableDiT, OffloadableDiTMixin):
         if self.freqs is not None:
             return
         head_dim = self.dim // self.num_heads
-        if self.vae_type == "oobleck":
-            # NOTE(dhyu): 这个位置编码算法没什么道理，4.0 也是错的，因为 Wan2.2 是 6.0
-            self.freqs = legacy_precompute_freqs_cis_1d(
-                head_dim, base_tps=4.0, target_tps=44100 / 2048
-            )
-        elif self.vae_type == "dac":
+        if self.vae_type == "dac":
             self.freqs = precompute_freqs_cis_1d(head_dim)
         else:
             raise ValueError(f"Invalid VAE type: {self.vae_type}")
