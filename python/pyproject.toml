@@ -123,7 +123,6 @@ test = [
 dev = ["sglang[test]"]
 
 all = [
-  "sglang[checkpoint-engine]",
   "sglang[diffusion]",
   "sglang[tracing]",
 ]
