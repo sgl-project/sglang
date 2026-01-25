@@ -345,9 +345,13 @@ class OffloadableDiTMixin:
                 continue
 
             num_layers = len(module_list)
-            prefetch_size = 1 + int(
-                round(server_args.dit_offload_conservativeness * (num_layers - 1))
-            )
+            if server_args.dit_offload_prefetch_size <= 1.0:
+                prefetch_size = 1 + int(
+                    round(server_args.dit_offload_prefetch_size * (num_layers - 1))
+                )
+            else:
+                prefetch_size = int(server_args.dit_offload_prefetch_size)
+
             manager = LayerwiseOffloadManager(
                 model=self,
                 layers_attr_str=layer_name,

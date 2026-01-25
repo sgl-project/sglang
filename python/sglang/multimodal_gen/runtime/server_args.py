@@ -286,7 +286,7 @@ class ServerArgs:
     # CPU offload parameters
     dit_cpu_offload: bool | None = None
     dit_layerwise_offload: bool | None = None
-    dit_offload_conservativeness: float = 0.0
+    dit_offload_prefetch_size: float = 0.0
     text_encoder_cpu_offload: bool | None = None
     image_encoder_cpu_offload: bool | None = None
     vae_cpu_offload: bool | None = None
@@ -620,10 +620,10 @@ class ServerArgs:
             "Cannot be used together with cache-dit (SGLANG_CACHE_DIT_ENABLED), dit_cpu_offload, or use_fsdp_inference.",
         )
         parser.add_argument(
-            "--dit-offload-conservativeness",
+            "--dit-offload-prefetch-size",
             type=float,
-            default=ServerArgs.dit_offload_conservativeness,
-            help="Conservativeness of dit-layerwise-offload. 0.0 means prefetch 1 layer (lowest memory, potentially slower); 1.0 means prefetch all layers (highest memory, same as no offload). 0.5 or above might have peak memory close to no offload but worse performance. If you want better performance, consider disabling offload entirely.",
+            default=ServerArgs.dit_offload_prefetch_size,
+            help="The size of prefetch for dit-layerwise-offload. If the value is between 0.0 and 1.0, it is treated as a ratio of the total number of layers. If the value is greater than 1.0, it is treated as the absolute number of layers. 0.0 means prefetch 1 layer (lowest memory); 1.0 means prefetch all layers (highest memory). Values above 0.5 might have peak memory close to no offload but worse performance.",
         )
         parser.add_argument(
             "--use-fsdp-inference",
@@ -971,8 +971,8 @@ class ServerArgs:
 
         if self.dit_layerwise_offload:
             assert (
-                0.0 <= self.dit_offload_conservativeness <= 1.0
-            ), "dit_offload_conservativeness must be between 0.0 and 1.0"
+                self.dit_offload_prefetch_size >= 0.0
+            ), "dit_offload_prefetch_size must be non-negative"
             if self.use_fsdp_inference:
                 logger.warning(
                     "dit_layerwise_offload is enabled, automatically disabling use_fsdp_inference."
