@@ -163,7 +163,7 @@ class ScaleResidualNormScaleShift:
             if cutlass.const_expr(
                 isinstance(src, cute.Tensor) and isinstance(src, cute.Tensor)
             ):
-                cute.autovec_copy(src, dst) # LDG.128
+                cute.autovec_copy(src, dst)  # LDG.128
 
         @cute.jit
         def norm(x, weight, bias):
