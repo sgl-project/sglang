@@ -254,8 +254,14 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
 
         bs = self.retrive_index.shape[0]
         candidates = self.draft_token.reshape(bs, self.draft_token_num)
+
+        # DEBUG: Print mapping info for heterogeneous vocab
         if vocab_mapper is not None:
+            draft_tokens_before = candidates.flatten()[:5].tolist()
             candidates = vocab_mapper.map_draft_to_target(candidates)
+            target_tokens_after = candidates.flatten()[:5].tolist()
+            logger.info(f"[HeteroVocab DEBUG] draft_tokens (before): {draft_tokens_before}")
+            logger.info(f"[HeteroVocab DEBUG] candidates (after map): {target_tokens_after}")
 
         sampling_info = batch.sampling_info
 
@@ -314,6 +320,11 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         if is_all_greedy or not TREE_SPEC_KERNEL_AVAILABLE:
             target_predict = torch.argmax(logits_output.next_token_logits, dim=-1)
             target_predict = target_predict.reshape(bs, self.draft_token_num)
+
+            # DEBUG: Print target_predict before verification
+            if vocab_mapper is not None:
+                logger.info(f"[HeteroVocab DEBUG] target_predict: {target_predict.flatten()[:5].tolist()}")
+
             predict, accept_index, accept_length = verify_tree_greedy_func(
                 predicts=predict,  # mutable
                 accept_index=accept_index,  # mutable
@@ -325,6 +336,11 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 target_predict=target_predict,
                 topk=self.topk,
             )
+
+            # DEBUG: Print predict after verification
+            if vocab_mapper is not None:
+                logger.info(f"[HeteroVocab DEBUG] predict (after verify): {predict[:5].tolist()}")
+                logger.info(f"[HeteroVocab DEBUG] accept_length: {accept_length.tolist()}")
 
         else:
             # apply temperature and get target probs
@@ -402,6 +418,9 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 if idx == -1:
                     break
                 id = predict_cpu[idx]
+                # DEBUG: Print the token being added to output
+                if vocab_mapper is not None and j < 3:
+                    logger.info(f"[HeteroVocab DEBUG] Adding token to output: idx={idx}, token_id={id}")
                 req.output_ids.append(id)
                 req.check_finished()
                 if req.finished():
