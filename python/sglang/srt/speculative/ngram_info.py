@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import copy
 import logging
-from typing import Optional, Tuple
+from typing import ClassVar, Optional, Tuple
 
 import torch
 import triton
@@ -19,6 +19,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import apply_custom_logit_processor
+from sglang.srt.managers.overlap_utils import FutureIndices
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
@@ -48,26 +49,26 @@ elif is_hip():
 
 
 @dataclass
-class NgramVerifyInput(SpecInput):
-    def __init__(
-        self,
-        draft_token: torch.Tensor,
-        tree_mask: torch.Tensor,
-        positions: torch.Tensor,
-        retrive_index: torch.Tensor,
-        retrive_next_token: torch.Tensor,
-        retrive_next_sibling: torch.Tensor,
-        draft_token_num: int,
-    ):
+class NgramVerifyInput(SpecInput, EagleDraftInputV2Mixin):
+    # Constant: alloc length per decode step
+    ALLOC_LEN_PER_DECODE: ClassVar[int] = None
+
+    draft_token: torch.Tensor = (None,)
+    custom_mask: torch.Tensor = (None,)
+    positions: torch.Tensor = (None,)
+    retrive_index: torch.Tensor = (None,)
+    retrive_next_token: torch.Tensor = (None,)
+    retrive_next_sibling: torch.Tensor = (None,)
+    draft_token_num: int = (0,)
+
+    # Inputs for V2 overlap worker
+    future_indices: Optional[FutureIndices] = None
+    new_seq_lens: Optional[torch.Tensor] = None
+    verify_done: Optional[torch.cuda.Event] = None
+
+    def __post_init__(self):
         super().__init__(SpecInputType.NGRAM_VERIFY)
-        self.draft_token = draft_token
-        self.custom_mask = tree_mask
-        self.positions = positions
-        self.retrive_index = retrive_index
-        self.retrive_next_token = retrive_next_token
-        self.retrive_next_sibling = retrive_next_sibling
-        self.draft_token_num = draft_token_num
-        self.device = self.custom_mask.device
+        self.device = NgramVerifyInput.custom_mask.device
 
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
         return self.draft_token_num, self.draft_token_num
@@ -108,10 +109,10 @@ class NgramVerifyInput(SpecInput):
 
         bs = batch.batch_size()
         assign_req_to_token_pool[(bs,)](
-            batch.req_pool_indices,  # where is the block table
-            batch.req_to_token_pool.req_to_token,  # block table
-            batch.seq_lens,  # start offset
-            end_offset,  # seqlens + draft_token_num
+            batch.req_pool_indices,
+            batch.req_to_token_pool.req_to_token,
+            batch.seq_lens,
+            end_offset,
             batch.out_cache_loc,
             batch.req_to_token_pool.req_to_token.shape[1],
             triton.next_power_of_2(bs),
@@ -448,34 +449,3 @@ class NgramVerifyInput(SpecInput):
 
     def merge_batch(self, spec_info: NgramVerifyInput):
         pass
-
-
-class NgramVerifyInputV2(NgramVerifyInput, EagleDraftInputV2Mixin):
-    def __init__(
-        self,
-        draft_token: torch.Tensor,
-        tree_mask: torch.Tensor,
-        positions: torch.Tensor,
-        retrive_index: torch.Tensor,
-        retrive_next_token: torch.Tensor,
-        retrive_next_sibling: torch.Tensor,
-        draft_token_num: int,
-    ):
-        super().__init__(
-            draft_token,
-            tree_mask,
-            positions,
-            retrive_index,
-            retrive_next_token,
-            retrive_next_sibling,
-            draft_token_num,
-        )
-        self.draft_token = draft_token
-        self.custom_mask = tree_mask
-        self.positions = positions
-        self.retrive_index = retrive_index
-        self.retrive_next_token = retrive_next_token
-        self.retrive_next_sibling = retrive_next_sibling
-        self.draft_token_num = draft_token_num
-        self.device = self.custom_mask.device
-        self.verify_done: Optional[torch.cuda.Event] = None

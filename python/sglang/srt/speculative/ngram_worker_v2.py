@@ -8,7 +8,7 @@ from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative.eagle_info import EagleDraftInput
+from sglang.srt.speculative.ngram_info import NgramVerifyInput
 from sglang.srt.speculative.ngram_worker import NGRAMWorker
 from sglang.srt.speculative.spec_utils import detect_nan, generate_token_bitmask
 
@@ -38,6 +38,12 @@ class NGRAMWorkerV2(NGRAMWorker):
         self.server_args = server_args
         self.enable_nan_detection = server_args.enable_nan_detection
         self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
+        self.topk = server_args.speculative_eagle_topk
+        self.speculative_num_steps = server_args.speculative_num_steps
+        # Set constant
+        NgramVerifyInput.ALLOC_LEN_PER_DECODE = max(
+            self.speculative_num_steps * self.topk, self.speculative_num_draft_tokens
+        )
 
     def forward_batch_generation(
         self, model_worker_batch: ModelWorkerBatch
@@ -46,9 +52,9 @@ class NGRAMWorkerV2(NGRAMWorker):
             torch.get_device_module(self.device).current_stream()
         )
         self._prepare_for_speculative_decoding(model_worker_batch, is_spec_v2=True)
-        verify_input: NgramVerifyInputV2 = model_worker_batch.spec_info
+        verify_input: NgramVerifyInput = model_worker_batch.spec_info
         accept_length = None
-        next_draft_input = None
+        new_seq_lens, verify_done = None, None
 
         if model_worker_batch.forward_mode.is_target_verify():
             # Prepare grammar data on CPU if needed
@@ -109,12 +115,6 @@ class NGRAMWorkerV2(NGRAMWorker):
 
             self._update_ngram_cache(model_worker_batch)
             model_worker_batch.forward_mode = ForwardMode.DECODE
-            # Construct the next draft input
-            next_draft_input = EagleDraftInput(
-                verified_id=None,
-                new_seq_lens=new_seq_lens,
-                verify_done=verify_done,
-            )
 
         else:
             batch_result = self.target_worker.forward_batch_generation(
@@ -125,7 +125,13 @@ class NGRAMWorkerV2(NGRAMWorker):
                 batch_result.next_token_ids,
                 batch_result.can_run_cuda_graph,
             )
+            new_seq_lens = model_worker_batch.seq_lens + 1
 
+        # Construct the next draft input
+        next_draft_input = NgramVerifyInput(
+            new_seq_lens=new_seq_lens,
+            verify_done=verify_done,
+        )
         return GenerationBatchResult(
             logits_output=logits_output,
             next_token_ids=predict,

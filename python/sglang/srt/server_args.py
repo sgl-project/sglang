@@ -2048,7 +2048,7 @@ class ServerArgs:
                 )
 
             if (
-                self.speculative_algorithm in ["NGRAM", "EAGLE", "EAGLE3", "STANDALONE"]
+                self.speculative_algorithm in ["EAGLE", "EAGLE3", "STANDALONE"]
                 and envs.SGLANG_ENABLE_SPEC_V2.get()
             ):
                 self.disable_overlap_schedule = False
@@ -2157,6 +2157,10 @@ class ServerArgs:
             if self.speculative_num_draft_tokens is None:
                 self.speculative_num_draft_tokens = (
                     self.speculative_ngram_max_match_window_size
+                )
+            if self.speculative_num_steps is None:
+                self.speculative_num_steps = (
+                    self.speculative_num_draft_tokens // self.speculative_eagle_topk
                 )
             logger.warning(
                 "The overlap scheduler and mixed chunked prefill are disabled because of "
