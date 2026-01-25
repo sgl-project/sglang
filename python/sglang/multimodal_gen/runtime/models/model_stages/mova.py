@@ -11,7 +11,10 @@ Sequence Parallelism (SP) Support:
 
 from __future__ import annotations
 
-from typing import Iterable
+import functools
+import inspect
+import os
+from collections.abc import Iterable
 
 import torch
 from diffusers.utils.torch_utils import randn_tensor
@@ -26,6 +29,7 @@ from sglang.multimodal_gen.runtime.distributed.communication_op import (
     sequence_model_parallel_all_gather,
 )
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_cfg_group,
     get_classifier_free_guidance_rank,
     get_sp_parallel_rank,
     get_sp_world_size,
@@ -49,10 +53,18 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import (
     _ensure_tensor_decode_output,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
+    StageValidators as V,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
+    VerificationResult,
+)
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs, get_global_server_args
 from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
+from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
 logger = init_logger(__name__)
@@ -139,6 +151,9 @@ class MovaDenoisingStage(PipelineStage):
         self.audio_dit = audio_dit
         self.dual_tower_bridge = dual_tower_bridge
         self.scheduler = scheduler
+        self._cache_dit_enabled = False
+        self._cached_num_steps = None
+        self._torch_compiled = False
 
     @property
     def parallelism_type(self) -> StageParallelismType:
@@ -156,11 +171,15 @@ class MovaDenoisingStage(PipelineStage):
         timestep,
         audio_timestep,
         video_fps,
+        timestep_index: int,
+        attn_metadata,
+        forward_batch: Req | None = None,
     ):
         # Set forward context for distributed attention (USPAttention)
         with set_forward_context(
-            current_timestep=0,  # Not used by MoVA but required by context
-            attn_metadata=None,  # MoVA doesn't use special attention metadata
+            current_timestep=timestep_index,
+            attn_metadata=attn_metadata,
+            forward_batch=forward_batch,
         ):
             return self.inference_single_step(
                 visual_dit=visual_dit,
@@ -182,6 +201,63 @@ class MovaDenoisingStage(PipelineStage):
             partial = (1 - guidance_scale) * neg
         return cfg_model_parallel_all_reduce(partial)
 
+    def compile_module_with_torch_compile(self, module, server_args: ServerArgs):
+        if not server_args.enable_torch_compile or module is None:
+            return module
+        if not hasattr(module, "forward"):
+            return module
+        try:
+            import torch._inductor.config as _inductor_cfg
+
+            _inductor_cfg.reorder_for_compute_comm_overlap = True
+        except ImportError:
+            pass
+        mode = os.environ.get("SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs")
+        logger.info("Compiling %s with mode: %s", module.__class__.__name__, mode)
+        compiled_forward = torch.compile(getattr(module, "forward"), mode=mode)
+        setattr(module, "forward", compiled_forward)
+        return module
+
+    def _maybe_compile_dits(self, server_args: ServerArgs):
+        if self._torch_compiled or not server_args.enable_torch_compile:
+            return
+        for module in filter(None, [self.video_dit, self.video_dit2, self.audio_dit]):
+            self.compile_module_with_torch_compile(module, server_args)
+        self._torch_compiled = True
+
+    def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
+        """Verify denoising stage inputs."""
+        result = VerificationResult()
+        result.add_check("paired_timesteps", batch.paired_timesteps, V.is_tensor)
+        result.add_check("latents", batch.latents, V.is_tensor)
+        result.add_check("audio_latents", batch.audio_latents, V.is_tensor)
+        result.add_check("prompt_embeds", batch.prompt_embeds, V.list_not_empty)
+        result.add_check(
+            "negative_prompt_embeds",
+            batch.negative_prompt_embeds,
+            lambda x: not batch.do_classifier_free_guidance or V.list_not_empty(x),
+        )
+        result.add_check(
+            "num_inference_steps", batch.num_inference_steps, V.positive_int
+        )
+        result.add_check("guidance_scale", batch.guidance_scale, V.non_negative_float)
+        result.add_check(
+            "guidance_rescale", batch.guidance_rescale, V.non_negative_float
+        )
+        result.add_check(
+            "do_classifier_free_guidance",
+            batch.do_classifier_free_guidance,
+            V.bool_value,
+        )
+        return result
+
+    def verify_output(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
+        """Verify denoising stage outputs."""
+        result = VerificationResult()
+        result.add_check("latents", batch.latents, V.is_tensor)
+        result.add_check("audio_latents", batch.audio_latents, V.is_tensor)
+        return result
+
     def progress_bar(
         self, iterable: Iterable | None = None, total: int | None = None
     ) -> tqdm:
@@ -192,8 +268,116 @@ class MovaDenoisingStage(PipelineStage):
         disable = local_rank != 0
         return tqdm(iterable=iterable, total=total, disable=disable)
 
+    def step_profile(self):
+        profiler = SGLDiffusionProfiler.get_instance()
+        if profiler:
+            profiler.step_denoising_step()
+
+    def rescale_noise_cfg(
+        self, noise_cfg, noise_pred_text, guidance_rescale=0.0
+    ) -> torch.Tensor:
+        """
+        Rescale noise prediction according to guidance_rescale.
+
+        Based on findings of "Common Diffusion Noise Schedules and Sample Steps are Flawed"
+        (https://arxiv.org/pdf/2305.08891.pdf), Section 3.4.
+        """
+        std_text = noise_pred_text.std(
+            dim=list(range(1, noise_pred_text.ndim)), keepdim=True
+        )
+        std_cfg = noise_cfg.std(dim=list(range(1, noise_cfg.ndim)), keepdim=True)
+        noise_pred_rescaled = noise_cfg * (std_text / std_cfg)
+        noise_cfg = (
+            guidance_rescale * noise_pred_rescaled + (1 - guidance_rescale) * noise_cfg
+        )
+        return noise_cfg
+
+    def prepare_extra_func_kwargs(self, func, kwargs) -> dict[str, object]:
+        if not kwargs:
+            return {}
+
+        if isinstance(func, functools.partial) and func.args:
+            func = getattr(func.args[0], "_original_forward", func)
+
+        target_func = inspect.unwrap(func)
+        params = inspect.signature(target_func).parameters
+        return {k: v for k, v in kwargs.items() if k in params}
+
+    def _build_attn_metadata(
+        self, i: int, batch: Req, server_args: ServerArgs
+    ) -> object | None:
+        return None
+
+    def _manage_device_placement(
+        self,
+        model_to_use: torch.nn.Module | None,
+        model_to_offload: torch.nn.Module | None,
+        server_args: ServerArgs,
+    ):
+        if not server_args.dit_cpu_offload:
+            return
+
+        if (
+            model_to_offload is not None
+            and next(model_to_offload.parameters()).device.type == "cuda"
+        ):
+            model_to_offload.to("cpu")
+
+        if (
+            model_to_use is not None
+            and next(model_to_use.parameters()).device.type == "cpu"
+        ):
+            model_to_use.to(get_local_torch_device())
+
+    def _select_visual_dit(
+        self, timestep: float, boundary_ratio: float | None, server_args: ServerArgs
+    ):
+        if boundary_ratio is None or self.video_dit2 is None:
+            self._manage_device_placement(self.video_dit, None, server_args)
+            return self.video_dit
+
+        boundary_timestep = boundary_ratio * self.scheduler.num_train_timesteps
+        if timestep >= boundary_timestep:
+            current_model = self.video_dit
+            model_to_offload = self.video_dit2
+        else:
+            current_model = self.video_dit2
+            model_to_offload = self.video_dit
+
+        self._manage_device_placement(current_model, model_to_offload, server_args)
+        return current_model
+
+    def _apply_guidance_rescale(
+        self,
+        noise_pred,
+        noise_pred_text,
+        guidance_rescale,
+        cfg_rank,
+        enable_cfg_parallel,
+    ):
+        if guidance_rescale <= 0.0:
+            return noise_pred
+        if enable_cfg_parallel:
+            std_cfg = noise_pred.std(dim=list(range(1, noise_pred.ndim)), keepdim=True)
+            if cfg_rank == 0:
+                assert noise_pred_text is not None
+                std_text = noise_pred_text.std(
+                    dim=list(range(1, noise_pred_text.ndim)), keepdim=True
+                )
+            else:
+                std_text = torch.empty_like(std_cfg)
+            std_text = get_cfg_group().broadcast(std_text, src=0)
+            noise_pred_rescaled = noise_pred * (std_text / std_cfg)
+            return guidance_rescale * noise_pred_rescaled + (1 - guidance_rescale) * (
+                noise_pred
+            )
+        return self.rescale_noise_cfg(noise_pred, noise_pred_text, guidance_rescale)
+
     @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+        self._maybe_compile_dits(server_args)
+        self._manage_device_placement(self.audio_dit, None, server_args)
+
         paired_timesteps = batch.paired_timesteps
         if paired_timesteps is None:
             raise ValueError("paired_timesteps must be set for MoVA")
@@ -202,145 +386,278 @@ class MovaDenoisingStage(PipelineStage):
         if getattr(self.video_dit, "require_vae_embedding", False) and y is None:
             raise ValueError("MoVA requires reference image latents for denoising")
 
-        cur_visual_dit = self.video_dit
-        switched = False
         boundary_ratio = server_args.pipeline_config.boundary_ratio
         total_steps = paired_timesteps.shape[0]
         cfg_rank = get_classifier_free_guidance_rank()
         enable_cfg_parallel = server_args.enable_cfg_parallel
 
-        with self.progress_bar(total=total_steps) as progress_bar:
-            for idx_step in range(total_steps):
-                pair_t = paired_timesteps[idx_step]
-                if pair_t.shape == (2,):
-                    timestep, audio_timestep = pair_t
-                else:
-                    timestep = pair_t
-                    audio_timestep = pair_t
+        is_warmup = batch.is_warmup
+        extra_step_kwargs = self.prepare_extra_func_kwargs(
+            self.scheduler.step_from_to,
+            getattr(batch, "extra_step_kwargs", None) or {},
+        )
+        # Optional NVTX / CUDART profiling for Nsight Systems.
+        # Enable with env vars (kept local to MoVA so other pipelines are unaffected):
+        # - SGLANG_MOVA_ENABLE_NVTX=1
+        # - SGLANG_MOVA_NVTX_RECORD_SHAPES=1
+        # - SGLANG_MOVA_NVTX_START_STEP=3
+        # - SGLANG_MOVA_NVTX_STOP_STEP=4
+        # - SGLANG_MOVA_ENABLE_CUDART_PROFILER=1
+        # - SGLANG_MOVA_CUDART_START_STEP=3
+        # - SGLANG_MOVA_CUDART_STOP_STEP=4
+        enable_nvtx = os.environ.get("SGLANG_MOVA_ENABLE_NVTX", "0") == "1"
+        nvtx_record_shapes = (
+            os.environ.get("SGLANG_MOVA_NVTX_RECORD_SHAPES", "1") == "1"
+        )
+        nvtx_start_step = int(os.environ.get("SGLANG_MOVA_NVTX_START_STEP", "3"))
+        nvtx_stop_step = int(os.environ.get("SGLANG_MOVA_NVTX_STOP_STEP", "4"))
+        enable_cudart_profiler = (
+            os.environ.get("SGLANG_MOVA_ENABLE_CUDART_PROFILER", "0") == "1"
+        )
+        cudart_start_step = int(
+            os.environ.get("SGLANG_MOVA_CUDART_START_STEP", str(nvtx_start_step))
+        )
+        cudart_stop_step = int(
+            os.environ.get("SGLANG_MOVA_CUDART_STOP_STEP", str(nvtx_stop_step))
+        )
 
-                if (
-                    not switched
-                    and boundary_ratio is not None
-                    and self.video_dit2 is not None
-                    and timestep.item()
-                    < boundary_ratio * self.scheduler.num_train_timesteps
-                ):
-                    cur_visual_dit = self.video_dit2
-                    switched = True
+        timings = getattr(batch, "timings", None)
+        perf_dump_path_provided = getattr(batch, "perf_dump_path", None) is not None
 
-                timestep = timestep.unsqueeze(0).to(device=get_local_torch_device())
-                audio_timestep = audio_timestep.unsqueeze(0).to(
-                    device=get_local_torch_device()
+        nsys_nvtx_context = None
+        nvtx_emitters = []
+        cudart_started = False
+
+        def _maybe_start_nsys_profiling():
+            nonlocal nsys_nvtx_context, nvtx_emitters, cudart_started
+            if not torch.cuda.is_available():
+                return
+
+            if enable_nvtx and nsys_nvtx_context is None:
+                from sglang.multimodal_gen.runtime.pipelines_core.stages.utils.emit_nvtx import (
+                    NVTXEmitter,
                 )
 
-                if not batch.do_classifier_free_guidance:
-                    visual_noise_pred, audio_noise_pred = self._predict(
-                        cur_visual_dit,
-                        batch.latents,
-                        batch.audio_latents,
-                        y,
-                        batch.prompt_embeds[0],
-                        timestep,
-                        audio_timestep,
-                        batch.fps,
+                nsys_nvtx_context = torch.autograd.profiler.emit_nvtx(
+                    record_shapes=nvtx_record_shapes
+                )
+                nsys_nvtx_context.__enter__()
+                # Instrument all possible DiTs so model switching still emits ranges.
+                nvtx_emitters = [
+                    NVTXEmitter(m, enabled=True)
+                    for m in filter(
+                        None, [self.video_dit, self.video_dit2, self.audio_dit]
                     )
-                else:
-                    if enable_cfg_parallel and cfg_rank == 0:
-                        pos = self._predict(
-                            cur_visual_dit,
-                            batch.latents,
-                            batch.audio_latents,
-                            y,
-                            batch.prompt_embeds[0],
-                            timestep,
-                            audio_timestep,
-                            batch.fps,
+                ]
+
+            if enable_cudart_profiler and not cudart_started:
+                try:
+                    if hasattr(torch.cuda, "cudart"):
+                        err = torch.cuda.cudart().cudaProfilerStart()
+                        if hasattr(torch.cuda, "check_error"):
+                            torch.cuda.check_error(err)
+                except Exception as e:  # best-effort: do not fail inference
+                    logger.warning("Failed to start CUDART profiler: %s", e)
+                cudart_started = True
+
+        def _maybe_stop_nsys_profiling():
+            nonlocal nsys_nvtx_context, nvtx_emitters, cudart_started
+            if cudart_started and enable_cudart_profiler:
+                try:
+                    if hasattr(torch.cuda, "cudart"):
+                        err = torch.cuda.cudart().cudaProfilerStop()
+                        if hasattr(torch.cuda, "check_error"):
+                            torch.cuda.check_error(err)
+                except Exception as e:  # best-effort: do not fail inference
+                    logger.warning("Failed to stop CUDART profiler: %s", e)
+                cudart_started = False
+
+            if nsys_nvtx_context is not None:
+                for emitter in nvtx_emitters:
+                    try:
+                        emitter.close()
+                    except Exception:
+                        pass
+                nvtx_emitters = []
+
+                try:
+                    nsys_nvtx_context.__exit__(None, None, None)
+                finally:
+                    nsys_nvtx_context = None
+
+        try:
+            with self.progress_bar(total=total_steps) as progress_bar:
+                for idx_step in range(total_steps):
+                    with StageProfiler(
+                        f"denoising_step_{idx_step}",
+                        logger=logger,
+                        timings=timings,
+                        perf_dump_path_provided=perf_dump_path_provided,
+                    ):
+                        pair_t = paired_timesteps[idx_step]
+                        if getattr(pair_t, "shape", None) == (2,):
+                            timestep, audio_timestep = pair_t
+                        else:
+                            timestep = pair_t
+                            audio_timestep = pair_t
+
+                        cur_visual_dit = self._select_visual_dit(
+                            timestep.item(), boundary_ratio, server_args
                         )
-                        neg = (None, None)
-                    elif enable_cfg_parallel and cfg_rank != 0:
-                        pos = (None, None)
-                        neg = self._predict(
-                            cur_visual_dit,
-                            batch.latents,
-                            batch.audio_latents,
-                            y,
-                            batch.negative_prompt_embeds[0],
-                            timestep,
-                            audio_timestep,
-                            batch.fps,
+                        if idx_step == nvtx_start_step or idx_step == cudart_start_step:
+                            _maybe_start_nsys_profiling()
+
+                        timestep = timestep.unsqueeze(0).to(
+                            device=get_local_torch_device()
                         )
-                    else:
-                        pos = self._predict(
-                            cur_visual_dit,
-                            batch.latents,
-                            batch.audio_latents,
-                            y,
-                            batch.prompt_embeds[0],
-                            timestep,
-                            audio_timestep,
-                            batch.fps,
-                        )
-                        neg = self._predict(
-                            cur_visual_dit,
-                            batch.latents,
-                            batch.audio_latents,
-                            y,
-                            batch.negative_prompt_embeds[0],
-                            timestep,
-                            audio_timestep,
-                            batch.fps,
+                        audio_timestep = audio_timestep.unsqueeze(0).to(
+                            device=get_local_torch_device()
                         )
 
-                    if enable_cfg_parallel:
-                        visual_noise_pred = self._cfg_combine(
-                            pos[0] if pos[0] is not None else neg[0],
-                            neg[0] if neg[0] is not None else pos[0],
-                            batch.guidance_scale,
-                            cfg_rank,
-                            enable_cfg_parallel,
-                        )
-                        audio_noise_pred = self._cfg_combine(
-                            pos[1] if pos[1] is not None else neg[1],
-                            neg[1] if neg[1] is not None else pos[1],
-                            batch.guidance_scale,
-                            cfg_rank,
-                            enable_cfg_parallel,
-                        )
-                    else:
-                        visual_noise_pred = self._cfg_combine(
-                            pos[0],
-                            neg[0],
-                            batch.guidance_scale,
-                            cfg_rank,
-                            enable_cfg_parallel,
-                        )
-                        audio_noise_pred = self._cfg_combine(
-                            pos[1],
-                            neg[1],
-                            batch.guidance_scale,
-                            cfg_rank,
-                            enable_cfg_parallel,
+                        attn_metadata = self._build_attn_metadata(
+                            idx_step, batch, server_args
                         )
 
-                next_timestep = (
-                    paired_timesteps[idx_step + 1, 0]
-                    if idx_step + 1 < total_steps
-                    else None
-                )
-                next_audio_timestep = (
-                    paired_timesteps[idx_step + 1, 1]
-                    if idx_step + 1 < total_steps
-                    else None
-                )
-                batch.latents = self.scheduler.step_from_to(
-                    visual_noise_pred, timestep, next_timestep, batch.latents
-                )
-                batch.audio_latents = self.scheduler.step_from_to(
-                    audio_noise_pred,
-                    audio_timestep,
-                    next_audio_timestep,
-                    batch.audio_latents,
-                )
+                        if not batch.do_classifier_free_guidance:
+                            visual_noise_pred, audio_noise_pred = self._predict(
+                                cur_visual_dit,
+                                batch.latents,
+                                batch.audio_latents,
+                                y,
+                                batch.prompt_embeds[0],
+                                timestep,
+                                audio_timestep,
+                                batch.fps,
+                                idx_step,
+                                attn_metadata,
+                                batch,
+                            )
+                        else:
+                            if enable_cfg_parallel:
+                                if cfg_rank == 0:
+                                    pos = self._predict(
+                                        cur_visual_dit,
+                                        batch.latents,
+                                        batch.audio_latents,
+                                        y,
+                                        batch.prompt_embeds[0],
+                                        timestep,
+                                        audio_timestep,
+                                        batch.fps,
+                                        idx_step,
+                                        attn_metadata,
+                                        batch,
+                                    )
+                                    neg = (None, None)
+                                else:
+                                    pos = (None, None)
+                                    neg = self._predict(
+                                        cur_visual_dit,
+                                        batch.latents,
+                                        batch.audio_latents,
+                                        y,
+                                        batch.negative_prompt_embeds[0],
+                                        timestep,
+                                        audio_timestep,
+                                        batch.fps,
+                                        idx_step,
+                                        attn_metadata,
+                                        batch,
+                                    )
+                            else:
+                                pos = self._predict(
+                                    cur_visual_dit,
+                                    batch.latents,
+                                    batch.audio_latents,
+                                    y,
+                                    batch.prompt_embeds[0],
+                                    timestep,
+                                    audio_timestep,
+                                    batch.fps,
+                                    idx_step,
+                                    attn_metadata,
+                                    batch,
+                                )
+                                neg = self._predict(
+                                    cur_visual_dit,
+                                    batch.latents,
+                                    batch.audio_latents,
+                                    y,
+                                    batch.negative_prompt_embeds[0],
+                                    timestep,
+                                    audio_timestep,
+                                    batch.fps,
+                                    idx_step,
+                                    attn_metadata,
+                                    batch,
+                                )
+
+                            visual_noise_pred = self._cfg_combine(
+                                pos[0] if pos[0] is not None else neg[0],
+                                neg[0] if neg[0] is not None else pos[0],
+                                batch.guidance_scale,
+                                cfg_rank,
+                                enable_cfg_parallel,
+                            )
+                            audio_noise_pred = self._cfg_combine(
+                                pos[1] if pos[1] is not None else neg[1],
+                                neg[1] if neg[1] is not None else pos[1],
+                                batch.guidance_scale,
+                                cfg_rank,
+                                enable_cfg_parallel,
+                            )
+
+                            if batch.guidance_rescale > 0.0:
+                                visual_noise_pred = self._apply_guidance_rescale(
+                                    visual_noise_pred,
+                                    pos[0] if pos[0] is not None else None,
+                                    batch.guidance_rescale,
+                                    cfg_rank,
+                                    enable_cfg_parallel,
+                                )
+                                audio_noise_pred = self._apply_guidance_rescale(
+                                    audio_noise_pred,
+                                    pos[1] if pos[1] is not None else None,
+                                    batch.guidance_rescale,
+                                    cfg_rank,
+                                    enable_cfg_parallel,
+                                )
+
+                        if idx_step + 1 < total_steps:
+                            next_pair_t = paired_timesteps[idx_step + 1]
+                            if getattr(next_pair_t, "shape", None) == (2,):
+                                next_timestep, next_audio_timestep = next_pair_t
+                            else:
+                                next_timestep = next_pair_t
+                                next_audio_timestep = next_pair_t
+                        else:
+                            next_timestep = None
+                            next_audio_timestep = None
+
+                        batch.latents = self.scheduler.step_from_to(
+                            visual_noise_pred,
+                            timestep,
+                            next_timestep,
+                            batch.latents,
+                            **extra_step_kwargs,
+                        )
+                        batch.audio_latents = self.scheduler.step_from_to(
+                            audio_noise_pred,
+                            audio_timestep,
+                            next_audio_timestep,
+                            batch.audio_latents,
+                            **extra_step_kwargs,
+                        )
+
+                        if idx_step == nvtx_stop_step or idx_step == cudart_stop_step:
+                            _maybe_stop_nsys_profiling()
+
+                    if progress_bar is not None:
+                        progress_bar.update()
+                    if not is_warmup and hasattr(self, "step_profile"):
+                        self.step_profile()
+        finally:
+            _maybe_stop_nsys_profiling()
 
         for dit in filter(None, [self.video_dit, self.video_dit2, self.audio_dit]):
             if isinstance(dit, OffloadableDiTMixin):
@@ -430,7 +747,6 @@ class MovaDenoisingStage(PipelineStage):
         """
         model_dtype = visual_dit.time_embedding.fc_in.weight.dtype
         device = visual_latents.device
-        sp_size = get_sp_world_size()
 
         visual_context = context.to(device=device, dtype=model_dtype)
         audio_context = context.to(device=device, dtype=model_dtype)
