@@ -742,7 +742,10 @@ class DenoisingStage(PipelineStage):
         # reset offload managers with prefetching first layer for next forward
         for dit in filter(None, [self.transformer, self.transformer_2]):
             if isinstance(dit, OffloadableDiTMixin):
-                dit.prepare_for_next_denoise()
+                for manager in dit.layerwise_offload_managers:
+                    manager.release_all()
+                # dit.configure_layerwise_offload()
+                # dit.prepare_for_next_req()
 
     def _preprocess_sp_latents(self, batch: Req, server_args: ServerArgs):
         """Shard latents for Sequence Parallelism if applicable."""

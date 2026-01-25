@@ -134,7 +134,9 @@ class LayerwiseOffloadManager:
         self.prepare_for_next_req(non_blocking=False)
 
         self.register_forward_hooks()
-        logger.info("LayerwiseOffloadManager initialized")
+        logger.info(
+            f"LayerwiseOffloadManager initialized with prefetched layer num: {self.prefetch_size}"
+        )
 
     def prepare_for_next_req(self, non_blocking=True):
         for i in range(self.prefetch_size):
@@ -152,7 +154,9 @@ class LayerwiseOffloadManager:
 
     @torch.compiler.disable
     def prefetch_layer(self, layer_idx: int, non_blocking: bool = True) -> None:
-        logger.debug(f"trying to prefetch layer: {layer_idx}")
+        """
+        idempotent
+        """
         if not self.enabled or self.device is None or self.copy_stream is None:
             return
         if layer_idx < 0 or layer_idx >= self.num_layers:
@@ -194,6 +198,10 @@ class LayerwiseOffloadManager:
 
     @torch.compiler.disable
     def release_layer(self, layer_idx: int) -> None:
+        """
+        lightweight release layer weights
+        Basically set the reference count to the gpu weight tensor to zero
+        """
         if not self.enabled or self.device is None:
             return
 
@@ -326,7 +334,7 @@ class OffloadableDiTMixin:
 
     # the list of names of a DiT's layers/blocks
     layer_names: List[str]
-    layerwise_offload_managers: list[LayerwiseOffloadManager] | None = None
+    layerwise_offload_managers: list[LayerwiseOffloadManager] = []
 
     def configure_layerwise_offload(self, server_args: ServerArgs):
         self.layerwise_offload_managers = []
@@ -354,7 +362,7 @@ class OffloadableDiTMixin:
             f"Enabled layerwise offload for {self.__class__.__name__} on modules: {self.layer_names}"
         )
 
-    def prepare_for_next_denoise(self):
+    def prepare_for_next_req(self):
         if self.layerwise_offload_managers is None:
             return
         for manager in self.layerwise_offload_managers:
@@ -376,7 +384,5 @@ class OffloadableDiTMixin:
         for manager in self.layerwise_offload_managers:
             if manager.enabled:
                 manager.sync_all_layers_to_cpu()
-                for layer_idx in list(manager._gpu_layers):
-                    if layer_idx > 0:
-                        manager.release_layer(layer_idx)
+                manager.release_all()
                 manager.register_forward_hooks()
