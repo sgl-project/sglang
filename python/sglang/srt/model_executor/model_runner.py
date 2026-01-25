@@ -1741,6 +1741,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             return False
 
         backend_str = self.server_args.moe_runner_backend
+        
+        # TODO smor- support other cases for flashinfer autotune, such as, mamba backend
         if backend_str not in [
             "flashinfer_trtllm",
             "flashinfer_mxfp4",
