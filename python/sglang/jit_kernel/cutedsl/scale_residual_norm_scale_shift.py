@@ -85,15 +85,15 @@ class ScaleResidualNormScaleShift:
     @cute.jit
     def __call__(
         self,
-        mY: cute.Tensor,
+        mY,
         mResOut,
         mRes,
-        mX: cute.Tensor,
+        mX,
         mGate,
         mWeight,
         mBias,
-        mScale: Optional[cute.Tensor],
-        mShift: Optional[cute.Tensor],
+        mScale,
+        mShift,
         eps: cutlass.Float32 = cutlass.Float32(1e-5),
         stream: cuda.CUstream = cuda.CUstream(cuda.CUstream_flags.CU_STREAM_DEFAULT),
     ):
@@ -133,15 +133,15 @@ class ScaleResidualNormScaleShift:
     @cute.kernel
     def kernel(
         self,
-        mY: cute.Tensor,
+        mY,
         mResOut,
         mRes,
-        mX: cute.Tensor,
+        mX,
         mGate,
         mWeight,
         mBias,
-        mScale: Optional[cute.Tensor],
-        mShift: Optional[cute.Tensor],
+        mScale,
+        mShift,
         tiled_copy: cute.TiledCopy,
         eps: cutlass.Float32,
     ):
@@ -163,7 +163,7 @@ class ScaleResidualNormScaleShift:
             if cutlass.const_expr(
                 isinstance(src, cute.Tensor) and isinstance(src, cute.Tensor)
             ):
-                cute.autovec_copy(src, dst)
+                cute.autovec_copy(src, dst) # LDG.128
 
         @cute.jit
         def norm(x, weight, bias):
