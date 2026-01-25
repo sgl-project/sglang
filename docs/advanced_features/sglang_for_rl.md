@@ -5,21 +5,25 @@ This document is a practical guide for infrastructure teams integrating SGLang i
 
 ## Why SGLang for RL Lifecycle?
 
-SGLang is a flexible tool, not a rigid framework. Here are five reasons to use SGLang for your RL lifecycle:
+Let's embrace a guiding principle from early DeepMind's RL engineering:
+
+**Be a library, not a framework.**
+
+This philosophy empowers innovation by providing SGLang as flexible tools, not rigid structures. Here are five reasons to use SGLang for your RL lifecycle:
 
 * **Fine-Grained Engine Sleep and Wake Up**: facilitate maximum-powered rollout and training
 * **Open-To-Use Refit Functionality**: diverse methods for co-location or disaggregation
 * **Easy To Postpone Generation**: enable partial rollout and dedicated rollout control
-* **Deterministic Inference**: achieve deterministic inference through kernel-level optimization
+* **Deterministic Inference**: achieve deterministic inference to enable zero training-inference mismatch
 * **Load Balancing Router**: cache-aware load-balancing for high-throughput rollout
 
 The following sections cover these aspects in detail.
 
 ## Fine-Grained Engine Sleep and Wake Up
 
-Rollout and training are both memory-intensive, and co-locating them on the same GPUs often leads to memory pressure and slow handoffs. SGLang provides a memory-aware sleep/wake mechanism that releases KV cache, weights while keeping the server process alive, then resumes them for rollout without a full restart. This avoids repeated disk I/O and CUDA graph recapture during each RL step.
+Rollout and training are both memory-intensive, and co-locating them on the same GPUs often leads to memory pressure and slow handoffs. SGLang provides a memory-aware sleep/wake mechanism that releases KV cache and weights while keeping the server process alive, then resumes them for rollout without a full restart. This avoids repeated disk I/O and CUDA graph recapture during each RL step.
 
-Under the hood, the RL team uses CUDA-graph-aware weight offload via [torch_memory_saver](https://github.com/fzyzcjy/torch_memory_saver) to preserve virtual memory addresses for graph replay. For details, see: [Efficient RL Training - Optimizing Memory Usage in verl](https://hebiao064.github.io/rl-memory-management)
+Under the hood, the RL team uses CUDA-graph-aware weight offload via [torch_memory_saver](https://github.com/fzyzcjy/torch_memory_saver) to preserve virtual memory addresses for graph replay. For details, see: [Efficient RL Training - Optimizing Memory Usage in verl](https://hebiao064.github.io/rl-memory-management).
 
 ### Server flag
 
@@ -38,7 +42,7 @@ Enable memory saver support when launching the server:
 | Field | Description | Defaults | Options |
 | --- | --- | --- | --- |
 | `tags` | Which memory regions to release. If omitted, all are released. | `None` | Type: list[str], values: `kv_cache`, `weights` |
-<!-- python/sglang/srt/managers/io_struct.py#L1381 currently only support `kv_cache`, `weights` -->
+<!-- python/sglang/srt/managers/io_struct.py#L1381 currently only supports `kv_cache`, `weights` -->
 **Behavior notes:**
 
 - This call asserts there are no ongoing requests. Ensure the engine is idle before calling it.
@@ -53,16 +57,16 @@ Enable memory saver support when launching the server:
 | Field | Description | Defaults | Options |
 | --- | --- | --- | --- |
 | `tags` | Which memory regions to resume. If omitted, all are resumed. | `None` | Type: list[str], values: `kv_cache`, `weights` |
-<!-- python/sglang/srt/managers/io_struct.py#L1393  currently only support `kv_cache`, `weights` -->
+<!-- python/sglang/srt/managers/io_struct.py#L1393 currently only supports `kv_cache`, `weights` -->
 
 ## Open-To-Use Refit Functionality
 
-After training completes each step, rollout engines must be refit with new weights. SGLang supports three refit strategies so you can match your infrastructure style (co-located vs disaggregated) and scaling needs. Each strategy maps to a concrete API with clear request schemas. Here's the detail of how to integrate SGLang weight update in verl's co-located strategy: [RL System Deep Thinking: Weight Update Mechanisms](https://github.com/zhaochenyang20/Awesome-ML-SYS-Tutorial/blob/main/rlhf/sys-design/readme-1-EN.md)
+After training completes each step, rollout engines must be refit with new weights. SGLang supports three refit strategies so you can match your infrastructure style (co-located vs disaggregated) and scaling needs. Each strategy maps to a concrete API with clear request schemas. Here are the details of various ways of SGLang's weight update utility: [RL System Deep Thinking: Weight Update Mechanisms](https://github.com/zhaochenyang20/Awesome-ML-SYS-Tutorial/blob/main/rlhf/sys-design/readme-1-EN.md)
 
 **How to choose:**
 
 - **From disk** is simplest and best for elastic rollout scaling and checkpointing.
-- **From tensor** is fastest for co-located training/rollout when you can pass in-memory tensors.
+- **From tensor** is best for co-located training/rollout when you can pass in-memory tensors.
 - **From distributed** is best for disaggregated training/rollout with dedicated communication groups (NCCL/IB).
 
 ### Update Weights from Disk
@@ -112,7 +116,7 @@ This path trades some I/O overhead for simplicity and flexibility. It integrates
 
 **Important constraints:**
 
-This strategy is fastest, but requires the training process and rollout engine to share access to the tensors. Co-located setups must keep the model on GPU; moving tensors to CPU will break the update path. For high-performance MoE or specialized attention kernels, co-location may limit some optimizations compared to disaggregated rollouts.
+This strategy requires the training process and rollout engine to share access to the tensors. Co-located setups must keep the model on GPU; moving tensors to CPU will break the update path. For high-performance MoE or specialized attention kernels, co-location may limit some optimizations compared to disaggregated rollouts.
 
 **Endpoint:** `POST /update_weights_from_tensor`
 
@@ -141,7 +145,7 @@ This strategy is fastest, but requires the training process and rollout engine t
 
 Training workers gather weights (typically on TP rank 0), broadcast them to the rollout group, and each rollout TP shard loads the parameters it needs. This avoids disk I/O and keeps training and rollout decoupled, at the cost of managing a dedicated communication group.
 
-#### Initialize weight update group
+**Initialize weight update group**
 
 **Endpoint:** `POST /init_weights_update_group`
 
@@ -156,7 +160,7 @@ Training workers gather weights (typically on TP rank 0), broadcast them to the 
 | `group_name` | Group name. | `weight_update_group` | Type: str |
 | `backend` | Communication backend. | `nccl` | Type: str |
 
-#### Update weight
+**Update weight**
 
 **Endpoint:** `POST /update_weights_from_distributed`
 
@@ -173,7 +177,7 @@ Training workers gather weights (typically on TP rank 0), broadcast them to the 
 | `weight_version` | Optional version label. | `None` | Type: str |
 | `load_format` | Optional format selector. | `None` | `None` or `flattened_bucket` |
 
-#### Destroy weights update group
+**Destroy weights update group**
 
 **Endpoint:** `POST /destroy_weights_update_group`
 
@@ -193,7 +197,7 @@ Training workers gather weights (typically on TP rank 0), broadcast them to the 
 
 Multi-turn RL rollouts often suffer from long-tail requests that block the entire batch. A small number of slow interactions can stall all GPUs, and the long-tail behavior makes profiling and monitoring difficult.
 
-SGLang exposes explicit pause/resume APIs so you can pause slow requests, and continue them later. This pattern matches systems like [APRIL](https://arxiv.org/abs/2509.18521), which over-provision rollouts, terminate once enough responses are collected, and recycle incomplete responses in the next step. The result is higher GPU utilization without discarding partial work.
+SGLang exposes explicit pause/resume APIs so you can pause slow requests and continue them later. This pattern matches systems like [APRIL](https://arxiv.org/abs/2509.18521), which over-provision rollouts, terminate once enough responses are collected, and recycle incomplete responses in the next step. The result is higher GPU utilization without discarding partial work.
 
 ### Pause Generation
 
@@ -207,9 +211,9 @@ SGLang exposes explicit pause/resume APIs so you can pause slow requests, and co
 
 **Modes:**
 
-- `abort`: Abort and return all running requests.
+- `abort`: Hard stop; repeatedly aborts all requests until no in-flight work remains. Scheduler is cleared.
 - `retract`: Pause inference; move running requests back to waiting queue. KV cache can be flushed and recomputed later.
-- `in_place`: Pause inference; keep requests in event loop with existing KV cache. KV flush will fail if a running batch exists.
+- `in_place`: Pause inference; keep requests in event loop with existing KV cache. Note: In `in_place` mode, `flush_cache` will fail if there are any requests in the running batch.
 
 ### Continue Generation
 
@@ -219,7 +223,7 @@ SGLang exposes explicit pause/resume APIs so you can pause slow requests, and co
 
 In many RL stacks, rollout and training are implemented with different kernels or batching behavior. Even when weights are identical, token probabilities can drift, silently breaking the on-policy assumption. This is the train-inference mismatch problem.
 
-SGLang supports a deterministic inference mode that reduces nondeterminism across batch shapes, which helps narrow rollout/training mismatch. This mitigates variance introduced by runtime batching and kernel selection.
+SGLang supports a deterministic inference mode that reduces nondeterminism across batch shapes. This mitigates variance introduced by runtime batching and kernel selection. To achieve true on-policy training, you need to modify the training engine to use the same deterministic kernels. For more implementation details, refer to these examples in miles: [True On-Policy](https://github.com/radixark/miles/tree/main/examples/true_on_policy) and [True On-Policy for VLM](https://github.com/radixark/miles/tree/main/examples/true_on_policy_vlm).
 
 **Server flag:**
 
@@ -227,17 +231,17 @@ SGLang supports a deterministic inference mode that reduces nondeterminism acros
 --enable-deterministic-inference
 ```
 
-You may find more detail on this topic: [Deterministic Inference](deterministic_inference.md)
+You may find more details on this topic: [Deterministic Inference](deterministic_inference.md)
 
 ## Load Balancing Router
 
-SGLang Model Gateway is the recommended control plane for large‑scale RL rollouts. It provides async, non‑blocking request handling, cache‑aware load balancing, and fault‑tolerant routing across rollout and reward servers. This lets you keep GPUs saturated while avoiding long‑tail stalls and brittle, engine‑local concurrency logic.
+SGLang Model Gateway is the recommended control plane for large‑scale RL rollouts. It provides async, non‑blocking request handling, cache‑aware load balancing, and fault‑tolerant routing across rollout and reward servers. This lets you keep GPUs saturated while avoiding long‑tail stalls and brittle, engine‑local concurrency logic. It has been deployed in the training of GLM 4.5+ models and proven to be highly efficient in production-level large-scale RL workloads.
 
 Key benefits for RL infrastructure:
 
-- **Async Non-blocking Efficiency**:  SGLang’s native async server/router architecture (HTTPS/gRPC) manages concurrency automatically. This guarantees maximum GPU saturation and effective continuous batching without requiring complex, manual implementation by engineers.
-- **Elasticity and fault tolerance**: By encapsulating the Reward Model and Rollout as independent servers, SGLang decoupling them logically and physically. This architecture provides robust disaster recovery for large-scale distributed training; if a server fails, the router automatically redirects traffic to healthy nodes, ensuring the training process continues without interruption.
+- **Async non-blocking efficiency**: SGLang’s native async server/router architecture (HTTPS/gRPC) manages concurrency automatically. This guarantees maximum GPU saturation and effective continuous batching without requiring complex, manual implementation by engineers.
+- **Elasticity and fault tolerance**: By encapsulating the reward model and rollout as independent servers, SGLang decouples them logically and physically. This architecture provides robust disaster recovery for large-scale distributed training; if a server fails, the router automatically redirects traffic to healthy nodes, ensuring the training process continues without interruption.
 - **Training–Inference alignment**: Using the SGLang Model Gateway for both training and inference ensures "What You See Is What You Get." This eliminates score discrepancies and the painful backend alignment issues often caused by using different engines for training versus deployment.
-- **Dynamic Load Balancing and Long-tail Mitigation**: Unlike static partitioning, the SGLang Model Gateway enables request-level dynamic dispatching for multi-turn RL. It can distribute different turns of a conversation across different servers to balance workloads and eliminate long-tail latency caused by varying sequence lengths.
+- **Dynamic load balancing and long-tail mitigation**: Unlike static partitioning, the SGLang Model Gateway enables request-level dynamic dispatching for multi-turn RL. It can distribute different turns of a conversation across different servers to balance workloads and eliminate long-tail latency caused by varying sequence lengths.
 
 For deployment and configuration, see: [SGLang Model Gateway](sgl_model_gateway.md)
