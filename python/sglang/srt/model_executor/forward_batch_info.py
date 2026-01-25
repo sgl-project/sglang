@@ -375,6 +375,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For hidden states before normal
     return_hidden_states_before_norm: bool = False
 
+    # For hidden states before normal
+    real_num_tokens: Optional[int] = None
+
     @classmethod
     def init_new(
         cls,

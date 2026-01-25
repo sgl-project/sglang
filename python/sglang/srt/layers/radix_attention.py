@@ -150,21 +150,22 @@ def unified_attention_with_output(
     forward_batch = context.forward_batch
     attention_layers = context.attention_layers
     attention_layer = attention_layers[layer_id]
+    real_num_tokens = forward_batch.real_num_tokens
+    query = query[:real_num_tokens, :]
+    key = key[:real_num_tokens, :]
+    value = value[:real_num_tokens, :]
 
     kwargs = {}
     if q_rope is not None:
-        kwargs["q_rope"] = q_rope
+        kwargs["q_rope"] = q_rope[:real_num_tokens, :]
     if k_rope is not None:
-        kwargs["k_rope"] = k_rope
+        kwargs["k_rope"] = k_rope[:real_num_tokens, :]
     if sinks is not None:
-        kwargs["sinks"] = sinks
+        kwargs["sinks"] = sinks[:real_num_tokens, :]
 
     ret = forward_batch.attn_backend.forward(
         query, key, value, attention_layer, forward_batch, save_kv_cache, **kwargs
     )
-    assert (
-        output.numel() == ret.numel()
-    ), f"Output tensor element mismatch: {output.numel()} != {ret.numel()}"
 
-    output.view(ret.shape).copy_(ret)
+    output[:real_num_tokens, :].copy_(ret)
     return

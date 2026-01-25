@@ -1059,12 +1059,10 @@ def gdn_with_output(
     forward_batch = context.forward_batch
     attention_layers = context.attention_layers
     attention_layer = attention_layers[layer_id]
+    real_num_tokens = forward_batch.real_num_tokens
+    hidden_states = hidden_states[:real_num_tokens, :]
 
     ret = attention_layer._forward(hidden_states, forward_batch)
 
-    assert (
-        output.numel() == ret.numel()
-    ), f"Output tensor element mismatch: {output.numel()} != {ret.numel()}"
-
-    output.view(ret.shape).copy_(ret)
+    output[:real_num_tokens, :].copy_(ret)
     return
