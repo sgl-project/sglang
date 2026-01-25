@@ -187,7 +187,7 @@ class CrossAttention(nn.Module):
     """
 
     def __init__(
-        self, dim: int, num_heads: int, eps: float = 1e-6, has_image_input: bool = False
+        self, dim: int, num_heads: int, eps: float = 1e-6
     ):
         super().__init__()
         self.dim = dim
@@ -207,11 +207,6 @@ class CrossAttention(nn.Module):
         self.o = RowParallelLinear(dim, dim, bias=True, input_is_parallel=True)
         self.norm_q = RMSNorm(dim, eps=eps)
         self.norm_k = RMSNorm(dim, eps=eps)
-        self.has_image_input = has_image_input
-        if has_image_input:
-            self.k_img = ColumnParallelLinear(dim, dim, bias=True, gather_output=False)
-            self.v_img = ColumnParallelLinear(dim, dim, bias=True, gather_output=False)
-            self.norm_k_img = RMSNorm(dim, eps=eps)
 
         # Use LocalAttention for cross-attention (no SP communication needed)
         self.attn = LocalAttention(
@@ -232,12 +227,7 @@ class CrossAttention(nn.Module):
         Returns:
             Output tensor [B, S_local, D]
         """
-        img: torch.Tensor | None = None
-        if self.has_image_input:
-            img = y[:, :257]
-            ctx = y[:, 257:]
-        else:
-            ctx = y
+        ctx = y
 
         q, _ = self.q(x)
         k, _ = self.k(ctx)
@@ -255,21 +245,6 @@ class CrossAttention(nn.Module):
         v = rearrange(v, "b s (n d) -> b s n d", n=self.num_heads_per_rank)
         x = self.attn(q, k, v)
         x = rearrange(x, "b s n d -> b s (n d)")
-        if self.has_image_input:
-            assert img is not None
-            k_img, _ = self.k_img(img)
-            v_img, _ = self.v_img(img)
-
-            if self.tp_size > 1:
-                k_img = tensor_parallel_rms_norm(k_img, self.norm_k_img)
-            else:
-                k_img = self.norm_k_img(k_img)
-
-            k_img = rearrange(k_img, "b s (n d) -> b s n d", n=self.num_heads_per_rank)
-            v_img = rearrange(v_img, "b s (n d) -> b s n d", n=self.num_heads_per_rank)
-            y = self.attn(q, k_img, v_img)
-            y = rearrange(y, "b s n d -> b s (n d)")
-            x = x + y
         x, _ = self.o(x)
         return x
 
@@ -287,7 +262,6 @@ class GateModule(nn.Module):
 class DiTBlock(nn.Module):
     def __init__(
         self,
-        has_image_input: bool,
         dim: int,
         num_heads: int,
         ffn_dim: int,
@@ -299,9 +273,7 @@ class DiTBlock(nn.Module):
         self.ffn_dim = ffn_dim
 
         self.self_attn = SelfAttention(dim, num_heads, eps)
-        self.cross_attn = CrossAttention(
-            dim, num_heads, eps, has_image_input=has_image_input
-        )
+        self.cross_attn = CrossAttention(dim, num_heads, eps)
         self.norm1 = nn.LayerNorm(dim, eps=eps, elementwise_affine=False)
         self.norm2 = nn.LayerNorm(dim, eps=eps, elementwise_affine=False)
         self.norm3 = nn.LayerNorm(dim, eps=eps)
@@ -412,7 +384,6 @@ class WanModel(CachableDiT, OffloadableDiTMixin):
         patch_size = config.patch_size
         num_heads = config.num_heads
         num_layers = config.num_layers
-        has_image_input = config.has_image_input
         has_image_pos_emb = config.has_image_pos_emb
         has_ref_conv = config.has_ref_conv
         add_control_adapter = config.add_control_adapter
@@ -424,7 +395,6 @@ class WanModel(CachableDiT, OffloadableDiTMixin):
 
         self.dim = dim
         self.freq_dim = freq_dim
-        self.has_image_input = has_image_input
         self.patch_size = patch_size
         self.seperated_timestep = seperated_timestep
         self.require_vae_embedding = require_vae_embedding
@@ -442,25 +412,13 @@ class WanModel(CachableDiT, OffloadableDiTMixin):
         self.time_projection = nn.Sequential(nn.SiLU(), ReplicatedLinear(dim, dim * 6))
         self.blocks = nn.ModuleList(
             [
-                DiTBlock(has_image_input, dim, num_heads, ffn_dim, eps)
+                DiTBlock(dim, num_heads, ffn_dim, eps)
                 for _ in range(num_layers)
             ]
         )
         self.head = Head(dim, out_dim, patch_size, eps)
         self.num_heads = num_heads
         self.freqs = None
-
-        # image embedding. if has_image_input is False, this will raise an error.
-        if not has_image_input:
-            raise ValueError(
-                "has_image_input must be True; MOVA video DiT requires reference image input."
-            )
-        self.img_emb = MLP(
-            1280, dim, output_dim=dim, act_type="gelu_pytorch_tanh"
-        )  # clip_feature_dim = 1280
-        self.img_pos_emb = (
-            nn.Parameter(torch.zeros((1, 514, 1280))) if has_image_pos_emb else None
-        )
 
         if has_ref_conv:
             self.ref_conv = nn.Conv2d(16, dim, kernel_size=(2, 2), stride=(2, 2))
@@ -559,23 +517,10 @@ class WanModel(CachableDiT, OffloadableDiTMixin):
             if isinstance(encoder_hidden_states, list)
             else encoder_hidden_states
         )
-        clip_feature = (
-            encoder_hidden_states_image[0]
-            if isinstance(encoder_hidden_states_image, list)
-            and len(encoder_hidden_states_image) > 0
-            else encoder_hidden_states_image
-        )
         t = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, timestep))
         t_proj, _ = self.time_projection(t)
         t_mod = t_proj.unflatten(1, (6, self.dim))
         context = self.text_embedding(context)
-
-        x = torch.cat([x, y], dim=1)  # (b, c_x + c_y, f, h, w)
-        clip_feature_input = clip_feature + self.img_pos_emb.to(
-            dtype=clip_feature.dtype, device=clip_feature.device
-        )
-        clip_embedding = self.img_emb(clip_feature_input)
-        context = torch.cat([clip_embedding, context], dim=1)
 
         x, (f, h, w) = self.patchify(x)
 

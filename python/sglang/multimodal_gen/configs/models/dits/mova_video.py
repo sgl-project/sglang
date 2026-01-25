@@ -39,7 +39,7 @@ class MOVAVideoArchConfig(DiTArchConfig):
     patch_size: tuple[int, int, int] = (1, 2, 2)
     num_heads: int = 40
     num_layers: int = 40
-    has_image_input: bool = True
+    has_image_input: bool = False
     has_image_pos_emb: bool = False
     has_ref_conv: bool = False
     add_control_adapter: bool = False
@@ -54,6 +54,7 @@ class MOVAVideoArchConfig(DiTArchConfig):
         self.hidden_size = self.dim
         self.num_attention_heads = self.num_heads
         self.num_channels_latents = self.out_dim
+        assert not self.has_image_input, "has_image_input must be False; it's a config from Diffsynth Studio, which means the model uses CLIP for image encoding (we don't)."
 
 
 @dataclass

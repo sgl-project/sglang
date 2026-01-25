@@ -120,7 +120,6 @@ class WanAudioModel(CachableDiT, OffloadableDiTMixin):
         patch_size = config.patch_size
         num_heads = config.num_heads
         num_layers = config.num_layers
-        has_image_input = config.has_image_input
         has_image_pos_emb = config.has_image_pos_emb
         has_ref_conv = config.has_ref_conv
         add_control_adapter = config.add_control_adapter
@@ -133,7 +132,6 @@ class WanAudioModel(CachableDiT, OffloadableDiTMixin):
 
         self.dim = dim
         self.freq_dim = freq_dim
-        self.has_image_input = has_image_input
         self.patch_size = patch_size
         self.seperated_timestep = seperated_timestep
         self.require_vae_embedding = require_vae_embedding
@@ -153,23 +151,14 @@ class WanAudioModel(CachableDiT, OffloadableDiTMixin):
         self.time_projection = nn.Sequential(nn.SiLU(), ReplicatedLinear(dim, dim * 6))
         self.blocks = nn.ModuleList(
             [
-                DiTBlock(has_image_input, dim, num_heads, ffn_dim, eps)
+                DiTBlock(dim, num_heads, ffn_dim, eps)
                 for _ in range(num_layers)
             ]
         )
         self.head = Head(dim, out_dim, patch_size, eps)
         self.num_heads = num_heads
         self.freqs = None
-
-        if has_image_input:
-            self.img_emb = MLP(
-                1280, dim, output_dim=dim, act_type="gelu_pytorch_tanh"
-            )  # clip_feature_dim = 1280
-            self.img_pos_emb = (
-                nn.Parameter(torch.zeros((1, 514, 1280))) if has_image_pos_emb else None
-            )
-        else:
-            self.img_pos_emb = None
+        self.img_pos_emb = None
         if has_ref_conv:
             self.ref_conv = nn.Conv2d(16, dim, kernel_size=(2, 2), stride=(2, 2))
         self.has_image_pos_emb = has_image_pos_emb
@@ -261,28 +250,11 @@ class WanAudioModel(CachableDiT, OffloadableDiTMixin):
             if isinstance(encoder_hidden_states, list)
             else encoder_hidden_states
         )
-        clip_feature = (
-            encoder_hidden_states_image[0]
-            if isinstance(encoder_hidden_states_image, list)
-            and len(encoder_hidden_states_image) > 0
-            else encoder_hidden_states_image
-        )
-        y = kwargs.get("y", None)
 
         t = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, timestep))
         t_proj, _ = self.time_projection(t)
         t_mod = t_proj.unflatten(1, (6, self.dim))
         context = self.text_embedding(context)
-
-        if self.has_image_input:
-            x = torch.cat([x, y], dim=1)  # (b, c_x + c_y, f, h, w)
-            clip_feature_input = clip_feature
-            if self.img_pos_emb is not None:
-                clip_feature_input = clip_feature_input + self.img_pos_emb.to(
-                    dtype=clip_feature_input.dtype, device=clip_feature_input.device
-                )
-            clip_embedding = self.img_emb(clip_feature_input)
-            context = torch.cat([clip_embedding, context], dim=1)
 
         x, (f,) = self.patchify(x)
 
