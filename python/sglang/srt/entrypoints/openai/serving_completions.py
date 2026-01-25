@@ -257,6 +257,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                     if (
                         len(output_logprobs_slice) == 0
                         and finish_reason_for_logprobs is not None
+                        and input_token_logprobs is None
                     ):
                         logprobs = None
                     else:
