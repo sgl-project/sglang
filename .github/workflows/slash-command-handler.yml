@@ -13,12 +13,13 @@ permissions:
 jobs:
   slash_command:
     # Only run if it is a PR and the comment starts with a recognized command
+    # Use trim() to handle leading/trailing whitespace and newlines in comment body
     if: >
       github.event.issue.pull_request &&
-      (startsWith(github.event.comment.body, '/tag-run-ci-label') ||
-       startsWith(github.event.comment.body, '/rerun-failed-ci') ||
-       startsWith(github.event.comment.body, '/tag-and-rerun-ci') ||
-       startsWith(github.event.comment.body, '/rerun-stage'))
+      (startsWith(trim(github.event.comment.body), '/tag-run-ci-label') ||
+       startsWith(trim(github.event.comment.body), '/rerun-failed-ci') ||
+       startsWith(trim(github.event.comment.body), '/tag-and-rerun-ci') ||
+       startsWith(trim(github.event.comment.body), '/rerun-stage'))
     runs-on: ubuntu-latest
 
     steps:
