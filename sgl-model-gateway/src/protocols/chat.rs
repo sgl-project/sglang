@@ -561,6 +561,27 @@ fn validate_chat_cross_parameters(
 
     Ok(())
 }
+impl ChatCompletionRequest {
+    /// Returns true if any message in the request contains multimodal content parts.
+    pub fn is_multimodal(&self) -> bool {
+        self.messages.iter().any(|m| match m {
+            ChatMessage::User { content, .. }
+            | ChatMessage::System { content, .. }
+            | ChatMessage::Tool { content, .. }
+            | ChatMessage::Developer { content, .. } => match content {
+                MessageContent::Parts(parts) => {
+                    parts.iter().any(|p| !matches!(p, ContentPart::Text { .. }))
+                }
+                _ => false,
+            },
+            ChatMessage::Assistant {
+                content: Some(MessageContent::Parts(parts)),
+                ..
+            } => parts.iter().any(|p| !matches!(p, ContentPart::Text { .. })),
+            _ => false,
+        })
+    }
+}
 
 // ============================================================================
 // Normalizable Implementation

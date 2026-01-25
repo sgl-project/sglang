@@ -817,21 +817,29 @@ mod tests {
 
     async fn create_test_app_context() -> Arc<AppContext> {
         use crate::{
-            config::RouterConfig, core::WorkerService, middleware::TokenBucket,
+            config::RouterConfig,
+            core::WorkerService,
+            middleware::TokenBucket,
+            multimodal::{MediaConnector, MediaConnectorConfig},
             observability::inflight_tracker::InFlightRequestTracker,
         };
 
         let router_config = RouterConfig::builder()
             .worker_startup_timeout_secs(1)
             .build_unchecked();
+        let client = reqwest::Client::new();
 
         let worker_registry = Arc::new(crate::core::WorkerRegistry::new());
         let worker_job_queue = Arc::new(std::sync::OnceLock::new());
+        let media_connector = Arc::new(
+            MediaConnector::new(client.clone(), MediaConnectorConfig::default())
+                .expect("Failed to create test media connector"),
+        );
 
         // Note: Using uninitialized queue for tests to avoid spawning background workers
         // Jobs submitted during tests will queue but not be processed
         Arc::new(AppContext {
-            client: reqwest::Client::new(),
+            client,
             router_config: router_config.clone(),
             rate_limiter: Some(Arc::new(TokenBucket::new(1000, 1000))),
             worker_registry: worker_registry.clone(),
@@ -860,6 +868,7 @@ mod tests {
                 router_config,
             )),
             inflight_tracker: InFlightRequestTracker::new(),
+            media_connector,
         })
     }
 

@@ -46,7 +46,7 @@ impl Default for ImageFetchConfig {
 pub enum MediaSource {
     Url(String),
     DataUrl(String),
-    InlineBytes(Vec<u8>),
+    InlineBytes(Bytes),
     File(PathBuf),
 }
 
@@ -196,10 +196,10 @@ impl MediaConnector {
         detail: ImageDetail,
         source: ImageSource,
     ) -> Result<Arc<ImageFrame>, MediaConnectorError> {
-        let raw: Arc<Vec<u8>> = Arc::new(bytes.to_vec());
-        let raw_clone = raw.clone();
-        let image: DynamicImage =
-            task::spawn_blocking(move || image::load_from_memory(&raw_clone)).await??;
+        let raw = bytes.clone();
+        let bytes_for_loader = bytes.clone();
+        let image: image::DynamicImage =
+            task::spawn_blocking(move || image::load_from_memory(&bytes_for_loader)).await??;
 
         Ok(Arc::new(ImageFrame::new(image, raw, detail, source)))
     }

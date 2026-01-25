@@ -13,6 +13,7 @@ use smg::{
     },
     mcp::{McpConfig, McpManager},
     middleware::{AuthConfig, TokenBucket},
+    multimodal::{MediaConnector, MediaConnectorConfig},
     policies::PolicyRegistry,
     routers::RouterTrait,
     server::{build_app, AppState},
@@ -61,7 +62,10 @@ pub fn create_test_app(
     // Create empty OnceLock for worker job queue and workflow engines
     let worker_job_queue = Arc::new(OnceLock::new());
     let workflow_engines = Arc::new(OnceLock::new());
-
+    let media_connector = Arc::new(
+        MediaConnector::new(client.clone(), MediaConnectorConfig::default())
+            .expect("Failed to create test media connector"),
+    );
     // Create AppContext using builder pattern
     let app_context = Arc::new(
         AppContext::builder()
@@ -79,6 +83,7 @@ pub fn create_test_app(
             .load_monitor(load_monitor)
             .worker_job_queue(worker_job_queue)
             .workflow_engines(workflow_engines)
+            .media_connector(Some(media_connector))
             .build()
             .unwrap(),
     );
@@ -196,7 +201,10 @@ pub async fn create_test_app_context() -> Arc<AppContext> {
     let response_storage = Arc::new(MemoryResponseStorage::new());
     let conversation_storage = Arc::new(MemoryConversationStorage::new());
     let conversation_item_storage = Arc::new(MemoryConversationItemStorage::new());
-
+    let media_connector = Arc::new(
+        MediaConnector::new(client.clone(), MediaConnectorConfig::default())
+            .expect("Failed to create test media connector"),
+    );
     Arc::new(
         AppContext::builder()
             .router_config(router_config)
@@ -214,6 +222,7 @@ pub async fn create_test_app_context() -> Arc<AppContext> {
             .worker_job_queue(worker_job_queue)
             .workflow_engines(workflow_engines)
             .mcp_manager(mcp_manager_lock)
+            .media_connector(Some(media_connector))
             .build()
             .unwrap(),
     )

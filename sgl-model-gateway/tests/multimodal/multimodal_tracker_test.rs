@@ -1,6 +1,7 @@
 use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
 
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine};
+use bytes::Bytes;
 use reqwest::Client;
 use smg::multimodal::{
     AsyncMultiModalTracker, ChatContentPart, ConversationSegment, ImageFetchConfig, ImageSource,
@@ -11,10 +12,11 @@ use tempfile::tempdir;
 const TINY_PNG_BASE64: &str =
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNgYAAAAAMAASsJTYQAAAAASUVORK5CYII=";
 
-fn tiny_png_bytes() -> Vec<u8> {
+fn tiny_png_bytes() -> Bytes {
     BASE64_STANDARD
         .decode(TINY_PNG_BASE64)
         .expect("decode tiny png fixture")
+        .into()
 }
 
 fn test_connector(allowed_path: Option<PathBuf>) -> MediaConnector {
@@ -47,7 +49,7 @@ async fn fetch_image_from_inline_bytes() {
         .expect("inline image");
     assert_eq!(frame.data().width(), 1);
     assert_eq!(frame.data().height(), 1);
-    assert_eq!(frame.raw_bytes(), bytes.as_slice());
+    assert_eq!(frame.raw_bytes(), bytes.as_ref());
 }
 
 #[tokio::test]
@@ -64,7 +66,7 @@ async fn fetch_image_from_data_url() {
         .await
         .expect("data url");
     assert_eq!(frame.data().width(), 1);
-    assert_eq!(frame.raw_bytes(), bytes.as_slice());
+    assert_eq!(frame.raw_bytes(), bytes.as_ref());
 }
 
 #[tokio::test]
