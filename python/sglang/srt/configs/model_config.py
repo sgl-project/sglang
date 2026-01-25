@@ -1262,7 +1262,8 @@ def get_hybrid_layer_ids(
             i for i in range(num_hidden_layers) if hybrid_layer_pattern[i] == 0
         ]
     elif "MiMoV2MTP" in model_architectures:
-        return [0], []
+        swa_attention_layer_ids = [0]
+        full_attention_layer_ids = []
     else:
         swa_attention_layer_ids = None
         full_attention_layer_ids = None

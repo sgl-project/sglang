@@ -252,4 +252,4 @@ docker exec ci_sglang ls -la /sgl-workspace/aiter/aiter/jit/ 2>/dev/null || echo
 
 # Pre-build AITER kernels to avoid timeout during tests
 echo "Warming up AITER JIT kernels..."
-docker exec -e SGLANG_USE_AITER=1 ci_sglang python3 /sglang-checkout/scripts/ci/amd_ci_warmup_aiter.py || echo "AITER warmup completed (some kernels may not be available)"
+docker exec -e SGLANG_USE_AITER=1 ci_sglang python3 /sglang-checkout/scripts/ci/amd/amd_ci_warmup_aiter.py || echo "AITER warmup completed (some kernels may not be available)"
