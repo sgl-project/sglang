@@ -106,7 +106,7 @@ class ComfyUILatentPreparationStage(LatentPreparationStage):
         result = super().forward(batch, server_args)
 
         if original_latents_shape is not None:
-            # Preserve the original shape before any potential packing/conversion 
+            # Preserve the original shape before any potential packing/conversion
             # (e.g., 4D spatial -> 3D sequence) to ensure proper unpadding later.
             result.raw_latent_shape = original_latents_shape
 

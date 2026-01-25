@@ -74,17 +74,12 @@ class ComfyUIQwenImagePipelineBase(LoRAPipeline, ComposedPipelineBase):
         )
 
         # Ensure VAE config is properly initialized even though we don't load the VAE model
-        # This is necessary because _prepare_cond_kwargs uses vae_scale_factor
-        if hasattr(server_args.pipeline_config, "vae_config"):
-            vae_config = server_args.pipeline_config.vae_config
-            if hasattr(vae_config, "post_init") and not hasattr(
-                vae_config, "_post_init_called"
-            ):
-                vae_config.post_init()
-                logger.info(
-                    "Called vae_config.post_init() to set vae_scale_factor. "
-                    f"vae_scale_factor={vae_config.arch_config.vae_scale_factor}"
-                )
+        vae_config = server_args.pipeline_config.vae_config
+        vae_config.post_init()
+        logger.info(
+            "Called vae_config.post_init() to set vae_scale_factor. "
+            f"vae_scale_factor={vae_config.arch_config.vae_scale_factor}"
+        )
 
     def load_modules(
         self,
