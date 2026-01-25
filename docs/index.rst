@@ -75,10 +75,6 @@ Its core features include:
    supported_models/embedding_models.md
    supported_models/reward_models.md
    supported_models/rerank_models.md
-   supported_models/classify_models.md
-   supported_models/support_new_models.md
-   supported_models/transformers_fallback.md
-   supported_models/modelscope.md
    supported_models/mindspore_models.md
 
 .. toctree::
@@ -121,3 +117,12 @@ Its core features include:
    :caption: Security Acknowledgement
 
    security/acknowledgements.md
+
+.. toctree::
+   :maxdepth: 1
+   :caption: Miscellaneous
+
+   miscellaneous/classify_models.md
+   miscellaneous/modelscope.md
+   miscellaneous/support_new_models.md
+   miscellaneous/transformers_fallback.md
