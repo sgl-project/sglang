@@ -1,36 +1,11 @@
-# Copyright 2023-2024 SGLang Team
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-# ==============================================================================
-"""
-SageAttention Backend for SGLang LLM Inference.
-
-This backend integrates SageAttention's 8-bit quantized attention kernels
-for improved inference throughput while maintaining accuracy.
-
-SageAttention quantizes Q and K to INT8 on-the-fly during the attention
-computation, providing ~2x speedup with minimal accuracy loss.
-
-Usage:
-    python -m sglang.launch_server --model <model> --attention-backend sage_attn
-"""
-
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
 import torch
+
+from sageattention import sageattn, sageattn_varlen
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
@@ -44,29 +19,8 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpecInput
 
 
-logger = logging.getLogger(__name__)
-
-
-# Try to import SageAttention
-try:
-    from sageattention import sageattn, sageattn_varlen
-
-    SAGE_ATTENTION_AVAILABLE = True
-except ImportError:
-    SAGE_ATTENTION_AVAILABLE = False
-    sageattn = None
-    sageattn_varlen = None
-    logger.warning(
-        "SageAttention not found. Try reinstalling sglang or "
-        "install manually with: pip install sageattention. "
-        "Falling back to Triton backend for all operations."
-    )
-
-
 @dataclass
 class SageAttentionMetadata:
-    """Metadata for SageAttention forward pass."""
-
     # For extend (prefill) operations
     cu_seqlens_q: Optional[torch.Tensor] = None
     cu_seqlens_k: Optional[torch.Tensor] = None
@@ -125,28 +79,10 @@ class SageAttnBackend(AttentionBackend):
         # Forward metadata
         self.forward_metadata: Optional[SageAttentionMetadata] = None
 
-        # Log initialization
-        if SAGE_ATTENTION_AVAILABLE:
-            logger.info(
-                f"SageAttention backend initialized. "
-                f"num_heads={self.num_heads}, num_kv_heads={self.num_kv_heads}, "
-                f"head_dim={self.head_dim}, v_head_dim={self.v_head_dim}"
-            )
-        else:
-            logger.warning(
-                "SageAttention not available, using Triton backend as fallback"
-            )
-
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize metadata for a forward pass."""
         # Always initialize triton backend metadata (for decode fallback)
         self.triton_backend.init_forward_metadata(forward_batch)
-
-        if not SAGE_ATTENTION_AVAILABLE:
-            return
-
-        bs = forward_batch.batch_size
-        device = self.device
 
         if forward_batch.forward_mode.is_decode_or_idle():
             # For decode, we'll use the triton backend
@@ -272,8 +208,7 @@ class SageAttnBackend(AttentionBackend):
         This uses SageAttention's 8-bit quantized attention for the prefill
         operation where we have all Q, K, V tensors available.
         """
-        # Fall back to triton if SageAttention not available
-        if not SAGE_ATTENTION_AVAILABLE or self.forward_metadata is None:
+        if self.forward_metadata is None:
             return self.triton_backend.forward_extend(
                 q, k, v, layer, forward_batch, save_kv_cache
             )
@@ -292,7 +227,6 @@ class SageAttnBackend(AttentionBackend):
 
         # Get full K, V tensors by gathering from KV cache
         # This includes both prefix (cached) and current tokens
-        bs = forward_batch.batch_size
         metadata = self.forward_metadata
 
         # For extend, we need to gather the full K, V including cached prefix
@@ -309,30 +243,20 @@ class SageAttnBackend(AttentionBackend):
             is_causal = False
 
         # Apply SageAttention with variable-length support
-        try:
-            output = sageattn_varlen(
-                q_reshaped.contiguous(),
-                k_full.contiguous(),
-                v_full.contiguous(),
-                cu_seqlens_q=metadata.cu_seqlens_q,
-                cu_seqlens_k=metadata.cu_seqlens_k,
-                max_seqlen_q=metadata.max_seqlen_q,
-                max_seqlen_k=metadata.max_seqlen_k,
-                is_causal=is_causal,
-                sm_scale=layer.scaling,
-            )
+        output = sageattn_varlen(
+            q_reshaped.contiguous(),
+            k_full.contiguous(),
+            v_full.contiguous(),
+            cu_seqlens_q=metadata.cu_seqlens_q,
+            cu_seqlens_k=metadata.cu_seqlens_k,
+            max_seqlen_q=metadata.max_seqlen_q,
+            max_seqlen_k=metadata.max_seqlen_k,
+            is_causal=is_causal,
+            sm_scale=layer.scaling,
+        )
 
-            # Reshape output back to (total_tokens, num_heads * head_dim)
-            o = output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
-
-        except Exception as e:
-            # Fall back to triton backend on any error
-            logger.warning(
-                f"SageAttention failed, falling back to Triton: {e}"
-            )
-            return self.triton_backend.forward_extend(
-                q, k, v, layer, forward_batch, save_kv_cache=False
-            )
+        # Reshape output back to (total_tokens, num_heads * head_dim)
+        o = output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
         return o
 
@@ -404,9 +328,3 @@ class SageAttnBackend(AttentionBackend):
             current_idx += extend_len
 
         return k_full, v_full
-
-
-def is_sage_attention_available() -> bool:
-    """Check if SageAttention is available."""
-    return SAGE_ATTENTION_AVAILABLE
-
