@@ -42,7 +42,9 @@ def apply_rmsnorm_cta(
     """
     val = cute.Float32(0.0)
     for idx in range(cute.size(tXrX)):
-        val += tXrX[idx] * tXrX[idx]
+        # Accumulate in FP32 to improve numerical precision.
+        x_fp32 = tXrX[idx].to(cutlass.Float32)
+        val += x_fp32 * x_fp32
     val = warp_reduce_sum(val)
     acc_sq = cta_reduce_sum(val, num_threads // WARP_SIZE, tidx)
     factor = cute.rsqrt(acc_sq / D + eps)
@@ -73,14 +75,17 @@ def apply_layernorm_cta(
     # Reduce mean
     val = cute.Float32(0.0)
     for idx in range(cute.size(tXrX)):
-        val += tXrX[idx]
+        # Accumulate in FP32 to improve numerical precision.
+        val += tXrX[idx].to(cutlass.Float32)
     val = warp_reduce_sum(val)
     val = cta_reduce_sum(val, num_threads // WARP_SIZE, tidx)
     mean = val / D
     # Reduce variance
     val = cute.Float32(0.0)
     for idx in range(cute.size(tXrX)):
-        val += (tXrX[idx] - mean) * (tXrX[idx] - mean)
+        # Accumulate in FP32 to improve numerical precision.
+        x_fp32 = tXrX[idx].to(cutlass.Float32)
+        val += (x_fp32 - mean) * (x_fp32 - mean)
     val = warp_reduce_sum(val)
     val = cta_reduce_sum(val, num_threads // WARP_SIZE, tidx)
     factor = cute.rsqrt(val / D + eps)
