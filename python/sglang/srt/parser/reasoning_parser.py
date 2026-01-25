@@ -252,6 +252,7 @@ class GptOssDetector(BaseReasoningFormatDetector):
 class MiniMaxAppendThinkDetector(BaseReasoningFormatDetector):
     """
     Append `<think>` token to the beginning of the text.
+    And separate reasoning from normal text if a tool call start marker is detected.
     """
 
     def __init__(self, stream_reasoning: bool = True, force_reasoning: bool = False):
@@ -259,18 +260,44 @@ class MiniMaxAppendThinkDetector(BaseReasoningFormatDetector):
         super().__init__(
             "<think>",
             "</think>",
-            force_reasoning=force_reasoning,
+            force_reasoning=True,
             stream_reasoning=stream_reasoning,
         )
         self.is_first_chunk = False
+        self.tool_call_start = "<minimax:tool_call>"
 
     def parse_streaming_increment(self, new_text: str) -> StreamingParseResult:
         if not self.is_first_chunk:
             self.is_first_chunk = True
-            new_text = self.think_start_token + new_text
-        return StreamingParseResult(normal_text=new_text)
+            # Prepend the think start token only to the very first chunk of reasoning
+            self._buffer = self.think_start_token + new_text
+        else:
+            self._buffer += new_text
+
+        if self.tool_call_start in self._buffer:
+            pos = self._buffer.find(self.tool_call_start)
+            reasoning = self._buffer[:pos]
+            self._buffer = self._buffer[pos:]
+            self._in_reasoning = False
+            return StreamingParseResult(
+                reasoning_text=reasoning, normal_text=self._buffer
+            )
+
+        if self._in_reasoning:
+            res = StreamingParseResult(reasoning_text=self._buffer)
+            self._buffer = ""
+            return res
+
+        res = StreamingParseResult(normal_text=self._buffer)
+        self._buffer = ""
+        return res
 
     def detect_and_parse(self, text: str) -> StreamingParseResult:
+        if self.tool_call_start in text:
+            pos = text.find(self.tool_call_start)
+            reasoning = self.think_start_token + text[:pos]
+            normal = text[pos:]
+            return StreamingParseResult(reasoning_text=reasoning, normal_text=normal)
         return StreamingParseResult(normal_text=self.think_start_token + text)
 
 
