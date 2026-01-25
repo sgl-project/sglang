@@ -41,7 +41,6 @@ __global__ void kimi_k2_moe_fused_gate_kernel_small_token(
   __shared__ float shared_original_scores[NUM_EXPERTS];
   // For storing selected top-k indices and values
   __shared__ int selected_experts[8];  // Up to topk=6, I use 8 for alignment
-  __shared__ float selected_vals[8];
   // For warp-level reduction
   __shared__ float warp_maxs[WARPS_PER_TOKEN_SMALL];
   __shared__ int warp_experts[WARPS_PER_TOKEN_SMALL];
@@ -103,7 +102,6 @@ __global__ void kimi_k2_moe_fused_gate_kernel_small_token(
 
       if (lane_id == 0) {
         selected_experts[k] = final_expert;
-        selected_vals[k] = final_max;
       }
     }
 

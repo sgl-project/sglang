@@ -426,8 +426,14 @@ def fused_experts_impl(
             else 0
         )
         total_tokens = tokens_in_chunk * topk + padded_tokens
-        intermediate_cache1 = cache[: total_tokens * N].view(
-            (total_tokens, N),
+        intermediate_cache1 = (
+            cache[: total_tokens * N].view(
+                (total_tokens, N),
+            )
+            if down_moe_use_tma
+            else cache[: total_tokens * N].view(
+                (M, topk, N),
+            )
         )
         intermediate_cache2 = torch.empty(
             (total_tokens, N // 2),

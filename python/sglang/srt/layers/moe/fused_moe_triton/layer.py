@@ -888,6 +888,8 @@ class FusedMoE(torch.nn.Module):
             if (
                 self.quant_method.__class__.__name__
                 == "CompressedTensorsWNA16MoEMethod"
+                or self.quant_method.__class__.__name__
+                == "CompressedTensorsWNA16MarlinMoEMethod"
             )
             else loaded_weight
         )
