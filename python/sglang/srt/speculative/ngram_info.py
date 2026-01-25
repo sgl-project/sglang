@@ -27,7 +27,11 @@ from sglang.srt.mem_cache.common import (
     get_last_loc,
 )
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-from sglang.srt.speculative.eagle_info_v2 import EagleDraftInputV2Mixin
+from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.eagle_info_v2 import (
+    EagleDraftInputV2Mixin,
+    EagleVerifyInputV2Mixin,
+)
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import (
     TREE_SPEC_KERNEL_AVAILABLE,
@@ -49,26 +53,45 @@ elif is_hip():
 
 
 @dataclass
-class NgramVerifyInput(SpecInput, EagleDraftInputV2Mixin):
+class NgramVerifyInput(SpecInput, EagleDraftInputV2Mixin, EagleVerifyInputV2Mixin):
     # Constant: alloc length per decode step
     ALLOC_LEN_PER_DECODE: ClassVar[int] = None
 
-    draft_token: torch.Tensor = (None,)
-    custom_mask: torch.Tensor = (None,)
-    positions: torch.Tensor = (None,)
-    retrive_index: torch.Tensor = (None,)
-    retrive_next_token: torch.Tensor = (None,)
-    retrive_next_sibling: torch.Tensor = (None,)
-    draft_token_num: int = (0,)
-
-    # Inputs for V2 overlap worker
-    future_indices: Optional[FutureIndices] = None
-    new_seq_lens: Optional[torch.Tensor] = None
-    verify_done: Optional[torch.cuda.Event] = None
-
-    def __post_init__(self):
+    def __init__(
+        self,
+        server_args: ServerArgs = None,
+        draft_token: torch.Tensor = None,
+        custom_mask: torch.Tensor = None,
+        positions: torch.Tensor = None,
+        retrive_index: torch.Tensor = None,
+        retrive_next_token: torch.Tensor = None,
+        retrive_next_sibling: torch.Tensor = None,
+        draft_token_num: int = 0,
+        future_indices: Optional[FutureIndices] = None,
+        new_seq_lens: Optional[torch.Tensor] = None,
+        verify_done: Optional[torch.cuda.Event] = None,
+    ):
         super().__init__(SpecInputType.NGRAM_VERIFY)
-        self.device = NgramVerifyInput.custom_mask.device
+        if custom_mask is not None:
+            self.draft_token = draft_token
+            self.custom_mask = custom_mask
+            self.positions = positions
+            self.retrive_index = retrive_index
+            self.retrive_next_token = retrive_next_token
+            self.retrive_next_sibling = retrive_next_sibling
+            self.draft_token_num = draft_token_num
+
+        # Inputs for V2 overlap worker
+        self.future_indices = future_indices
+        self.new_seq_lens = new_seq_lens
+        self.verify_done = verify_done
+
+        self.device = (
+            custom_mask.device if custom_mask is not None else new_seq_lens.device
+        )
+        if server_args is not None:
+            self.topk = server_args.speculative_eagle_topk
+            self.spec_steps = server_args.speculative_num_steps
 
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
         return self.draft_token_num, self.draft_token_num

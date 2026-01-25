@@ -33,6 +33,7 @@ class NGRAMWorker:
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
+        self.server_args = server_args
         self.target_worker = target_worker
         self.model_runner = target_worker.model_runner
         self.tp_rank = tp_rank
@@ -122,7 +123,7 @@ class NGRAMWorker:
     def _prepare_draft_tokens(
         self, batch: ScheduleBatch
     ) -> tuple[np.ndarray, np.ndarray]:
-        bs = batch.batch_size()
+        bs = len(batch.reqs)
 
         self.ngram_cache.synchronize()
         batch_tokens = []
@@ -196,6 +197,7 @@ class NGRAMWorker:
                 device=self.device,
             )
             batch.spec_info = NgramVerifyInput(
+                server_args=self.server_args,
                 draft_token=draft_tokens,
                 custom_mask=tree_mask,
                 positions=positions,
