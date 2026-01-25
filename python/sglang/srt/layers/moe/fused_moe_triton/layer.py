@@ -34,6 +34,7 @@ from sglang.srt.layers.quantization.modelopt_quant import ModelOptNvFp4FusedMoEM
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_loader.weight_utils import narrow_padded_param_and_loaded_weight
+from sglang.srt.layers.utils import pad_or_narrow_weight
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -429,9 +430,17 @@ class FusedMoE(torch.nn.Module):
             if not is_bias and not self.use_presharded_weights:
                 if self.use_triton_kernels:
                     loaded_weight = loaded_weight.transpose(-2, -1)
-                loaded_weight = loaded_weight.narrow(
-                    shard_dim, shard_size * tp_rank, shard_size
-                )
+                # Padding for special case where weight dimension is not properly aligned
+                start_idx = shard_size * tp_rank
+                end_idx = start_idx + shard_size
+                if end_idx > loaded_weight.shape[shard_dim]:
+                    loaded_weight = pad_or_narrow_weight(
+                        loaded_weight, shard_dim, start_idx, shard_size
+                    )
+                else:
+                    loaded_weight = loaded_weight.narrow(
+                        shard_dim, start_idx, shard_size
+                    )
 
         # w2, down_proj: Load into only logical weight of w2.
         expert_data.copy_(loaded_weight)

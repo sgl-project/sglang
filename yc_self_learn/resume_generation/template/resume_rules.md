@@ -402,25 +402,36 @@ LangChain and vector database integration for RAG system
 
 ## 11. 文件命名规则
 
-**文件命名格式**：`resume_XX_template_公司名字.tex`
+**文件命名格式**：`resume_XX_template_公司名字[_岗位名字].tex`
 
 ### 11.1 命名规则
 
 - **XX**：数字序号（递增，如 01, 02, 03, 04, 05...）
 - **template**：模板类型（`software` 或 `hardware`）
 - **公司名字**：从 JD 中提取的公司名称（简化形式，去除特殊字符）
+- **岗位名字**（可选）：如果同一公司有多个不同岗位，需要在文件名中包含岗位名称（简化形式，去除特殊字符和空格，用下划线连接）
 
 ### 11.2 示例
 
+**单一公司单一岗位**：
 - JD 公司：`FriendliAI` → 文件名：`resume_05_software_FriendliAI.tex`
 - JD 公司：`ShelterZoom` → 文件名：`resume_02_software_ShelterZoom.tex`
 - JD 公司：`Interface` → 文件名：`resume_03_software_Interface.tex`
 - JD 公司：`Exelon Corporation` → 文件名：`resume_01_hardware_Exelon.tex`
 
+**同一公司多个岗位**（必须包含岗位名）：
+- JD 公司：`Thinking Machines Lab`，岗位：`Software Engineer, Data Infrastructure` → 文件名：`resume_40_software_ThinkingMachines_DataInfrastructure.tex`
+- JD 公司：`Thinking Machines Lab`，岗位：`Infrastructure Research Engineer` → 文件名：`resume_41_software_ThinkingMachines_InfrastructureResearchEngineer.tex`
+- JD 公司：`xAI`，岗位：`Member of Technical Staff - RL Infrastructure` → 文件名：`resume_38_software_xAI_RLInfrastructure.tex`
+- JD 公司：`xAI`，岗位：`RLHF Evaluation Engineer` → 文件名：`resume_39_software_xAI_RLHFEvaluation.tex`
+
 ### 11.3 执行
 
 - 从 JD 中识别公司名称（通常在 "Company:"、"About [Company]" 等字段）
-- 简化公司名称（去除 "Corporation"、"Inc."、"LLC" 等后缀，去除特殊字符）
+- 从 JD 中识别岗位名称（通常在标题、第一行或 "About the Role" 部分）
+- 简化公司名称（去除 "Corporation"、"Inc."、"LLC"、"Lab" 等后缀，去除特殊字符）
+- 简化岗位名称（去除标点符号、空格用下划线连接，如 "Software Engineer, Data Infrastructure" → "DataInfrastructure"）
+- **如果同一公司有多个不同岗位，必须在文件名中包含岗位名称**
 - 生成文件时使用此命名格式
 
 ---
@@ -496,3 +507,91 @@ LangChain and vector database integration for RAG system
 - **不劝申不申**：除非触发硬拒绝条件
 - **真实性边界**：不编造未做过的事情
 - **格式严格**：只输出 LaTeX，不输出其他文字
+
+---
+
+## 13. Cover Letter 生成规则（LaTeX格式）
+
+### 13.1 文件命名规则
+
+**文件命名格式**：`cover_letter_公司名字.tex`
+
+- **公司名字**：从 JD 中提取的公司名称（简化形式，去除特殊字符）
+- 如果同一公司有多个不同岗位，文件名中也需要包含岗位名称：`cover_letter_公司名字_岗位名字.tex`
+
+### 13.2 LaTeX 格式要求
+
+**使用标准 LaTeX letter 文档类**：
+
+```latex
+\documentclass[11pt,a4paper]{letter}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{geometry}
+\usepackage{url}
+\usepackage{hyperref}
+
+\geometry{margin=1in}
+
+% Sender information
+\signature{Yanda Cheng}
+\address{Yanda Cheng \\ yc2675@cornell.edu \\ 8593383379}
+```
+
+### 13.3 Cover Letter 结构
+
+**必须包含以下部分**：
+
+1. **Opening**：称呼和开头段落
+   - 表达对职位的兴趣
+   - 简要介绍背景
+
+2. **Preferred Research Areas of Interest**（如果是研究/实习岗位）
+   - 列出 3-4 个研究兴趣方向
+   - 每个方向说明为什么感兴趣，以及相关经验
+
+3. **Relevant Experience and Contributions**
+   - 列出与职位相关的经验
+   - 使用项目符号列表
+   - 突出量化成果（如 "reducing hallucination rates from 30% to 15%"）
+
+4. **Why [Company Name]**
+   - 说明为什么选择这家公司
+   - 强调价值观和目标的契合
+
+5. **Relevant Links**
+   - GitHub 链接
+   - Publications 链接
+   - Projects 链接
+   - Blog 链接（如果有）
+
+6. **Closing**：结尾段落和签名
+   - 说明可用时间（如果是实习）
+   - 感谢考虑
+
+### 13.4 写作风格要求
+
+- **专业但热情**：保持专业语调，但表达对职位和公司的热情
+- **具体量化**：尽可能使用具体数字和成果（如 "8+ publications", "30% to 15%"）
+- **匹配关键词**：自然融入 JD 中的关键词和术语
+- **真实经验**：只写真实经历，不编造
+- **长度适中**：通常 1-2 页（A4）
+
+### 13.5 执行流程
+
+1. **输入**：Cover letter description（包含职位信息、要求、公司背景）
+2. **提取**：
+   - 提取公司名称（用于文件命名）
+   - 提取职位类型（研究/工程/实习等）
+   - 提取关键要求（研究兴趣、技能要求等）
+3. **生成**：
+   - 创建 LaTeX 格式的 cover letter
+   - 使用标准 letter 文档类
+   - 包含所有必需部分
+   - 文件名格式：`cover_letter_公司名字.tex`
+
+### 13.6 示例
+
+**文件命名示例**：
+- JD 公司：`Together AI` → 文件名：`cover_letter_TogetherAI.tex`
+- JD 公司：`Thinking Machines Lab`，岗位：`Data Infrastructure` → 文件名：`cover_letter_ThinkingMachines_DataInfrastructure.tex`

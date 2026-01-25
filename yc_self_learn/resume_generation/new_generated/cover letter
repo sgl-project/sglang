@@ -1,0 +1,53 @@
+Dear Together AI Hiring Team,
+
+I am writing to express my strong interest in the Frontier Agents Intern (Summer 2026) position at Together AI. As a Ph.D. candidate in Biomedical Engineering at the University at Buffalo with extensive experience in AI infrastructure, LLM serving systems, and agentic applications, I am excited about the opportunity to contribute to Together AI's mission of advancing frontier agentic AI systems.
+
+**Preferred Research Areas of Interest**
+
+My research interests align closely with the Agents team's focus areas:
+
+1. **Evaluation Frameworks for Open-Ended Agentic Tasks**: I am particularly interested in developing robust evaluation methodologies for non-deterministic, open-ended tasks where traditional metrics fall short. My experience building cross-modal quality control systems (Rad-Linter) and evaluation harnesses for RAG systems has given me insights into the challenges of measuring agent performance in complex, real-world scenarios.
+
+2. **ML Infrastructure for Agent Operations at Scale**: Having contributed to SGLang, a high-performance LLM serving framework, I am passionate about building scalable infrastructure that enables reliable agent operations. I am interested in exploring how we can extend inference systems to support long-horizon reasoning, multi-step workflows, and distributed agent coordination.
+
+3. **Post-Training Methods for Agentic Behavior**: I am eager to investigate training recipes for self-learning and agentic capabilities, particularly in scientific and domain-specific applications. My background in medical AI and document understanding has shown me the potential for agents to tackle complex, multi-step workflows in specialized domains.
+
+4. **Failure Mode Analysis and Safety Paradigms**: Through my work on production LLM systems, I have encountered various failure modes in agentic behavior. I am interested in systematically studying these failures and developing safety frameworks that ensure reliable agent operation in critical applications.
+
+**Relevant Experience and Contributions**
+
+My research and engineering experience directly relates to the challenges in frontier agentic AI:
+
+- **LLM Infrastructure & Serving Systems**: I am an active contributor to SGLang, focusing on router performance, scalability improvements, and distributed inference optimization. This work has given me deep understanding of how to build high-performance systems that can power agent operations at scale.
+
+- **Agentic Applications in Production**: I built a KYC Document Intelligence Pipeline using SGLang and Llama 3.2 11B Vision, implementing structured outputs, confidence-based routing, and comprehensive error handling—demonstrating how agents can reliably handle complex, multi-step document understanding tasks.
+
+- **Evaluation Frameworks**: At Seno Medical, I designed end-to-end evaluation harnesses for RAG systems, reducing hallucination rates from 30% to 15% and increasing Recall@5 to 90%. This experience taught me how to design metrics and evaluation protocols for systems where ground truth is ambiguous or non-deterministic.
+
+- **Cross-Modal Agent Systems**: My Rad-Linter project demonstrates experience building cross-modal quality control systems that use LLM agents to verify consistency between imaging and text reports—a form of agentic behavior in scientific/medical domains.
+
+- **Research Publications**: I have 8+ publications in top-tier journals (IEEE Transactions on Medical Imaging, Biomedical Optics Express, Photoacoustics) on medical imaging, AI-assisted diagnostics, and cross-modal analysis, demonstrating my ability to conduct rigorous research and communicate findings effectively.
+
+**Why Together AI**
+
+Together AI's commitment to open and transparent AI systems resonates deeply with my values. Your team's contributions to FlashAttention, Mamba, and open-source research align with my own experience contributing to SGLang and building open-source tools. I am particularly excited about the opportunity to work at the intersection of algorithmic innovation, dataset design, and systems engineering—exactly where I believe the most impactful advances in agentic AI will emerge.
+
+**Relevant Links**
+
+- **GitHub**: [Your GitHub profile URL]
+- **Publications**: 
+  - "Unsupervised Denoising of Photoacoustic Images Based on the Noise2Noise Network," Biomedical Optics Express, 2024
+  - "Enhanced Clinical Photoacoustic Vascular Imaging Through a Skin Localization Network," Photoacoustics, 2025
+  - Additional publications available on [Google Scholar/ResearchGate profile]
+- **Projects**:
+  - SGLang Contributions: [GitHub link to SGLang contributions]
+  - KYC Document Intelligence Pipeline: [GitHub repository link]
+  - Rad-Linter: [Project/blog post link]
+- **Blog**: [Your blog URL with posts on Rad-Linter, SGLang, and LLM agent systems]
+
+I am available for the full 12-week internship period (May 18th to August 7th or June 15th to September 4th) and am excited about the possibility of contributing to Together AI's research while learning from your world-class team. Thank you for considering my application.
+
+Best regards,
+Yanda Cheng
+yc2675@cornell.edu
+8593383379

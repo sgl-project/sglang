@@ -1,0 +1,105 @@
+Frontier Agents Intern (Summer 2026)
+San Francisco
+
+57%
+Resume Match
+4 of 7 keywords
+Simplify
+Simplify
+V1
+V2
+About Together AI
+Together AI is a research-driven artificial intelligence company. We believe open and transparent AI systems will drive innovation and create the best outcomes for society, and together we are on a mission to significantly lower the cost of modern AI systems by co-designing software, algorithms, and models. We have contributed to leading open-source research, models, and datasets to advance the frontier of AI, and our team has been behind technological advancements such as FlashAttention, Mamba, FlexGen, Petals, Mixture of Agents, and RedPajama.
+
+Role Overview 
+The Agents team investigates how to build, align, and scale frontier AI systems that can tackle complex, multi-step tasks and workflows, with a particular focus on agentic and scientific domains. Our work sits at the intersection of agent capabilities, human-computer interaction, and infrastructure—from designing post-training methods for agentic behavior to developing evaluation frameworks for open-ended tasks where traditional metrics fall short. As a research intern, you will work on problems at the frontier of agentic AI, where challenges in alignment, reliability, and scalability are deeply intertwined. Projects may involve developing new training recipes for self-learning and long-horizon reasoning, curating datasets for non-deterministic scientific and agentic tasks, studying failure modes in agentic behavior, or building infrastructure that enables agent operations at scale. You'll operate in a space where algorithmic innovation, dataset and interaction design, and systems work come together to push the boundaries of what AI agents can reliably accomplish.
+
+Requirements
+Currently pursuing a Ph.D. degree in Computer Science, Electrical Engineering, Information Science, Statistics or a related field
+Publications at leading ML conferences or journals (such as NeurIPS, ICML, ICLR, *ACL, EMNLP)
+Strong knowledge of Machine Learning and Deep Learning fundamentals
+Experience with deep learning frameworks (PyTorch, JAX, etc.)
+Understanding of how LLMs work
+Strong programming skills in Python
+Familiarity with Transformer architectures and recent developments in foundation models
+Responsibilities
+Research and implement novel techniques in one or more of our focus areas
+Design and conduct rigorous experiments to validate hypotheses
+Document findings in scientific publications and blog posts
+Communicate the plans, progress, and results of projects to the broader team
+Example Research Directions
+Training, developing, and evaluating frontier models, especially in the domain of agentic tasks and workflows
+Designing and curating datasets for frontier agents alignment and post-training
+Examples could include: expanding on open-ended, non-deterministic tasks and environments
+Studying failure modes and developing safety paradigms for agentic behaviorFrontier Agents Intern (Summer 2026)
+San Francisco
+
+57%
+Resume Match
+4 of 7 keywords
+Simplify
+Simplify
+V1
+V2
+About Together AI
+Together AI is a research-driven artificial intelligence company. We believe open and transparent AI systems will drive innovation and create the best outcomes for society, and together we are on a mission to significantly lower the cost of modern AI systems by co-designing software, algorithms, and models. We have contributed to leading open-source research, models, and datasets to advance the frontier of AI, and our team has been behind technological advancements such as FlashAttention, Mamba, FlexGen, Petals, Mixture of Agents, and RedPajama.
+
+Role Overview 
+The Agents team investigates how to build, align, and scale frontier AI systems that can tackle complex, multi-step tasks and workflows, with a particular focus on agentic and scientific domains. Our work sits at the intersection of agent capabilities, human-computer interaction, and infrastructure—from designing post-training methods for agentic behavior to developing evaluation frameworks for open-ended tasks where traditional metrics fall short. As a research intern, you will work on problems at the frontier of agentic AI, where challenges in alignment, reliability, and scalability are deeply intertwined. Projects may involve developing new training recipes for self-learning and long-horizon reasoning, curating datasets for non-deterministic scientific and agentic tasks, studying failure modes in agentic behavior, or building infrastructure that enables agent operations at scale. You'll operate in a space where algorithmic innovation, dataset and interaction design, and systems work come together to push the boundaries of what AI agents can reliably accomplish.
+
+Requirements
+Currently pursuing a Ph.D. degree in Computer Science, Electrical Engineering, Information Science, Statistics or a related field
+Publications at leading ML conferences or journals (such as NeurIPS, ICML, ICLR, *ACL, EMNLP)
+Strong knowledge of Machine Learning and Deep Learning fundamentals
+Experience with deep learning frameworks (PyTorch, JAX, etc.)
+Understanding of how LLMs work
+Strong programming skills in Python
+Familiarity with Transformer architectures and recent developments in foundation models
+Responsibilities
+Research and implement novel techniques in one or more of our focus areas
+Design and conduct rigorous experiments to validate hypotheses
+Document findings in scientific publications and blog posts
+Communicate the plans, progress, and results of projects to the broader team
+Example Research Directions
+Training, developing, and evaluating frontier models, especially in the domain of agentic tasks and workflows
+Designing and curating datasets for frontier agents alignment and post-training
+Examples could include: expanding on open-ended, non-deterministic tasks and environments
+Studying failure modes and developing safety paradigms for agentic behavior
+Research new recipes (for RL or test time scaling) for self-learning and long-context tasks completion
+Developing ML infrastructure that can power agent operations at scale
+Internship Details
+Duration: ~12 weeks (Summer 2026)
+Location: San Francisco (in person)
+Application Process
+
+Please submit your application with:
+
+Resume/CV
+A cover letter that includes your preferred research areas of interest, academic transcript (unofficial is acceptable), and links to relevant projects and your GitHub profile or publications
+Internship Program Details
+Our summer internship program spans over 12 weeks where you’ll have the opportunity to work with industry-leading engineers building a cloud from the ground up and possibly contribute to influential open source projects. Our internship dates are May 18th to August 7th or June 15th to September 4th. 
+
+Compensation
+We offer competitive compensation, housing stipends, and other competitive benefits. The estimated US hourly rate for this role is $58-63/hr. Our hourly rates are determined by location, level and role. Individual compensation will be determined by experience, skills, and job-related knowledge.
+
+Equal Opportunity
+Together AI is an Equal Opportunity Employer and is proud to offer equal employment opportunity to everyone regardless of race, color, ancestry, religion, sex, national origin, sexual orientation, age, citizenship, marital status, disability, gender identity, veteran status, and more.
+Research new recipes (for RL or test time scaling) for self-learning and long-context tasks completion
+Developing ML infrastructure that can power agent operations at scale
+Internship Details
+Duration: ~12 weeks (Summer 2026)
+Location: San Francisco (in person)
+Application Process
+
+Please submit your application with:
+
+Resume/CV
+A cover letter that includes your preferred research areas of interest, academic transcript (unofficial is acceptable), and links to relevant projects and your GitHub profile or publications
+Internship Program Details
+Our summer internship program spans over 12 weeks where you’ll have the opportunity to work with industry-leading engineers building a cloud from the ground up and possibly contribute to influential open source projects. Our internship dates are May 18th to August 7th or June 15th to September 4th. 
+
+Compensation
+We offer competitive compensation, housing stipends, and other competitive benefits. The estimated US hourly rate for this role is $58-63/hr. Our hourly rates are determined by location, level and role. Individual compensation will be determined by experience, skills, and job-related knowledge.
+
+Equal Opportunity
+Together AI is an Equal Opportunity Employer and is proud to offer equal employment opportunity to everyone regardless of race, color, ancestry, religion, sex, national origin, sexual orientation, age, citizenship, marital status, disability, gender identity, veteran status, and more.

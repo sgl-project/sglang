@@ -7,6 +7,11 @@
 - 近一个月内有公开招聘活动
 - 在AI/GenAI/Agentic AI领域有明确产品方向
 
+## 投递状态记录
+- **已投递**: 公司1-15（xAI, Thinking Machines Lab, WitnessAI, Mercor, Together AI, Fal.ai, Deepgram, Glean, EliseAI, Runway ML, Stability AI, Cohere, Perplexity AI, Inflection AI, Jasper AI）
+- **待投递**: Mythic（下一个目标）
+- **未投递**: 公司17-50
+
 ---
 
 ## 公司列表
@@ -101,11 +106,12 @@
 - **最新动态**: 在生成式内容工具中用户基数大，持续招聘
 - **招聘重点**: NLP工程师、内容生成工程师、产品工程师
 
-### 16. Mythic
+### 16. Mythic ⭐ 下一个目标
 - **地点**: Austin, TX
 - **方向**: AI硬件 / 边缘推理
 - **最新动态**: 2025年末完成大笔融资，专注低功耗推理硬件
 - **招聘重点**: 硬件工程师、ML工程师、系统工程师
+- **投递状态**: 待投递
 
 ### 17. ElevenLabs
 - **地点**: New York, NY

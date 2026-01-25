@@ -1,0 +1,42 @@
+About Glean:
+Glean is the Work AI platform that helps everyone work smarter with AI. What began as the industry’s most advanced enterprise search has evolved into a full-scale Work AI ecosystem, powering intelligent Search, an AI Assistant, and scalable AI agents on one secure, open platform. With over 100 enterprise SaaS connectors, flexible LLM choice, and robust APIs, Glean gives organizations the infrastructure to govern, scale, and customize AI across their entire business - without vendor lock-in or costly implementation cycles.
+
+At its core, Glean is redefining how enterprises find, use, and act on knowledge. Its Enterprise Graph and Personal Knowledge Graph map the relationships between people, content, and activity, delivering deeply personalized, context-aware responses for every employee. This foundation powers Glean’s agentic capabilities - AI agents that automate real work across teams by accessing the industry’s broadest range of data: enterprise and world, structured and unstructured, historical and real-time. The result: measurable business impact through faster onboarding, hours of productivity gained each week, and smarter, safer decisions at every level.
+Recognized by Fast Company as one of the World’s Most Innovative Companies (Top 10, 2025), by CNBC’s Disruptor 50, Bloomberg’s AI Startups to Watch (2026), Forbes AI 50, and Gartner’s Tech Innovators in Agentic AI, Glean continues to accelerate its global impact. With customers across 50+ industries and 1,000+ employees in more than 25 countries, we’re helping the world’s largest organizations make every employee AI-fluent, and turning the superintelligent enterprise from concept into reality.
+
+If you’re excited to shape how the world works, you’ll help build systems used daily across Microsoft Teams, Zoom, ServiceNow, Zendesk, GitHub, and many more - deeply embedded where people get things done. You’ll ship agentic capabilities on an open, extensible stack, with the craft and care required for enterprise trust, as we bring Work AI to every employee, in every company.
+About the Role:
+
+Glean is building a world-class Data Organization composed of product data science, applied science, data engineering and business intelligence groups. This is an applied science role based in our Palo Alto or San Francisco office. It covers a subset of:
+
+A/B Experimentation:
+
+Collaborate with product data science and engineering teams to identify techniques, tooling and process improvements in online A/B experimentation to assist rigorous decision making across all relevant product domains. 
+Develop and maintain our A/B experimentation platform based on stakeholder feedback
+Write code or identify vendors to deploy these techniques to production in a scalable manner that’s easy to use by engineering, product data science, product management and design teams
+Generative AI evaluation:
+
+End to end evaluation of various hero use cases like document/URL uploads, including evaluation set generation, coming up with evaluation criteria and methods to interpret the results.
+Breaking down end to end evaluations into more granular evaluation of various tasks & skills including but not limited to content summarization/analysis/generation, multi-step reasoning & strategizing, tool selection & use, coding & system design.
+Design, development and ownership of best practices, tools and processes across various evaluation problems, e.g. query intent classification, standardizing the use of best statistical principles to handle LLM stochasticity, industry benchmarking.
+About you:
+
+You have 5+ years of experience as a Masters degree holder, 3+ as a PhD degree holders (Masters/PhD degree in Statistics, Mathematics or Computer Science, or another quantitative field)
+You’re strong in statistics and/or machine learning. You have experience in applying these skills into tangible improvements in products, internal tools, and processes in a pragmatic way that puts business urgencies first.
+You are very proficient in Python, e.g. proficient enough to maintain an internal source-controlled library used by dozens of others.
+You are concise and precise in written and verbal communication. Technical documentation is your strong suit.
+You are proficient in SQL and the modern data stack (e.g. source-controlled dbt pipelines for ETL/ELT).
+You are strong at defining good product KPIs/guardrail metrics, dashboarding and analysis of raw data to derive strategic insights.
+You have experience in B2B SaaS.
+You have experience working on ranking, developing, and maintaining A/B experimentation platforms and/or ML measurement problems.
+You are passionate about using AI to improve the productivity of data teams as well as non-data professionals trying to derive more value of their company’s data.
+Location: 
+
+This role is hybrid (3-4 days a week in one of our SF Bay Area offices)
+Compensation & Benefits:
+
+The standard base salary range for this position is $175,000 - $230,000 annually. Compensation offered will be determined by factors such as location, level, job-related knowledge, skills, and experience. Certain roles may be eligible for variable compensation, equity, and benefits.
+
+We offer a comprehensive benefits package including competitive compensation, Medical, Vision, and Dental coverage, generous time-off policy, and the opportunity to contribute to your 401k plan to support your long-term goals. When you join, you'll receive a home office improvement stipend, as well as an annual education and wellness stipends to support your growth and wellbeing. We foster a vibrant company culture through regular events, and provide healthy lunches daily to keep you fueled and focused.
+
+We are a diverse bunch of people and we want to continue to attract and retain a diverse range of people into our organization. We're committed to an inclusive and diverse company. We do not discriminate based on gender, ethnicity, sexual orientation, religion, civil or family status, age, disability, or race.
