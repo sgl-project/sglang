@@ -1,0 +1,18 @@
+{
+  "identifier" : "com.example.CivicsPrep.monetization",
+  "nonConsumables" : [
+    {
+      "displayName" : "Remove Ads",
+      "identifier" : "com.example.civicsprep.removeads",
+      "price" : "9.99",
+      "type" : "non-consumable"
+    },
+    {
+      "displayName" : "Mock Exam",
+      "identifier" : "com.example.civicsprep.mockexam",
+      "price" : "9.99",
+      "type" : "non-consumable"
+    }
+  ],
+  "version" : "1.0"
+}

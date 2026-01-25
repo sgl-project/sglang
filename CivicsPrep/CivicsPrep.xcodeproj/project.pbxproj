@@ -1,0 +1,395 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {};
+	objectVersion = 56;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		A00000000000000000000100 /* CivicsPrepApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000020 /* CivicsPrepApp.swift */; };
+		A00000000000000000000101 /* AppLanguage.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000021 /* AppLanguage.swift */; };
+		A00000000000000000000102 /* LocalizedText.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000022 /* LocalizedText.swift */; };
+		A00000000000000000000103 /* Question.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000023 /* Question.swift */; };
+		A00000000000000000000104 /* ExamResult.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000024 /* ExamResult.swift */; };
+		A00000000000000000000105 /* LocalizationManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000025 /* LocalizationManager.swift */; };
+		A00000000000000000000106 /* QuestionRepository.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000026 /* QuestionRepository.swift */; };
+		A00000000000000000000107 /* UserDataStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000027 /* UserDataStore.swift */; };
+		A00000000000000000000108 /* ExamHistoryStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000028 /* ExamHistoryStore.swift */; };
+		A00000000000000000000109 /* PurchaseManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000029 /* PurchaseManager.swift */; };
+		A0000000000000000000010A /* AdsManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = A0000000000000000000002A /* AdsManager.swift */; };
+		A0000000000000000000010B /* AppContainer.swift in Sources */ = {isa = PBXBuildFile; fileRef = A0000000000000000000002B /* AppContainer.swift */; };
+		A0000000000000000000010C /* StudyViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = A0000000000000000000002C /* StudyViewModel.swift */; };
+		A0000000000000000000010D /* MockExamViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = A0000000000000000000002D /* MockExamViewModel.swift */; };
+		A0000000000000000000010E /* SettingsViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = A0000000000000000000002E /* SettingsViewModel.swift */; };
+		A0000000000000000000010F /* OnboardingViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = A0000000000000000000002F /* OnboardingViewModel.swift */; };
+		A00000000000000000000110 /* RootView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000030 /* RootView.swift */; };
+		A00000000000000000000111 /* OnboardingView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000031 /* OnboardingView.swift */; };
+		A00000000000000000000112 /* MainTabView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000032 /* MainTabView.swift */; };
+		A00000000000000000000113 /* StudyView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000033 /* StudyView.swift */; };
+		A00000000000000000000114 /* QuestionListView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000034 /* QuestionListView.swift */; };
+		A00000000000000000000115 /* QuestionDetailView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000035 /* QuestionDetailView.swift */; };
+		A00000000000000000000116 /* MockExamView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000036 /* MockExamView.swift */; };
+		A00000000000000000000117 /* ExamViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000037 /* ExamViews.swift */; };
+		A00000000000000000000118 /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000038 /* SettingsView.swift */; };
+		A00000000000000000000119 /* AdBannerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000039 /* AdBannerView.swift */; };
+		A0000000000000000000011A /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = A0000000000000000000003A /* Assets.xcassets */; };
+		A0000000000000000000011B /* questions.json in Resources */ = {isa = PBXBuildFile; fileRef = A0000000000000000000003B /* questions.json */; };
+		A0000000000000000000011C /* MVP.storekit in Resources */ = {isa = PBXBuildFile; fileRef = A0000000000000000000003C /* MVP.storekit */; };
+		A0000000000000000000011D /* Localizable.strings in Resources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000050 /* Localizable.strings */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		A00000000000000000000020 /* CivicsPrepApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CivicsPrepApp.swift; sourceTree = "<group>"; };
+		A00000000000000000000021 /* AppLanguage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppLanguage.swift; sourceTree = "<group>"; };
+		A00000000000000000000022 /* LocalizedText.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalizedText.swift; sourceTree = "<group>"; };
+		A00000000000000000000023 /* Question.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Question.swift; sourceTree = "<group>"; };
+		A00000000000000000000024 /* ExamResult.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ExamResult.swift; sourceTree = "<group>"; };
+		A00000000000000000000025 /* LocalizationManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalizationManager.swift; sourceTree = "<group>"; };
+		A00000000000000000000026 /* QuestionRepository.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QuestionRepository.swift; sourceTree = "<group>"; };
+		A00000000000000000000027 /* UserDataStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UserDataStore.swift; sourceTree = "<group>"; };
+		A00000000000000000000028 /* ExamHistoryStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ExamHistoryStore.swift; sourceTree = "<group>"; };
+		A00000000000000000000029 /* PurchaseManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PurchaseManager.swift; sourceTree = "<group>"; };
+		A0000000000000000000002A /* AdsManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AdsManager.swift; sourceTree = "<group>"; };
+		A0000000000000000000002B /* AppContainer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppContainer.swift; sourceTree = "<group>"; };
+		A0000000000000000000002C /* StudyViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StudyViewModel.swift; sourceTree = "<group>"; };
+		A0000000000000000000002D /* MockExamViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MockExamViewModel.swift; sourceTree = "<group>"; };
+		A0000000000000000000002E /* SettingsViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsViewModel.swift; sourceTree = "<group>"; };
+		A0000000000000000000002F /* OnboardingViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OnboardingViewModel.swift; sourceTree = "<group>"; };
+		A00000000000000000000030 /* RootView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RootView.swift; sourceTree = "<group>"; };
+		A00000000000000000000031 /* OnboardingView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OnboardingView.swift; sourceTree = "<group>"; };
+		A00000000000000000000032 /* MainTabView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MainTabView.swift; sourceTree = "<group>"; };
+		A00000000000000000000033 /* StudyView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StudyView.swift; sourceTree = "<group>"; };
+		A00000000000000000000034 /* QuestionListView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QuestionListView.swift; sourceTree = "<group>"; };
+		A00000000000000000000035 /* QuestionDetailView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QuestionDetailView.swift; sourceTree = "<group>"; };
+		A00000000000000000000036 /* MockExamView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MockExamView.swift; sourceTree = "<group>"; };
+		A00000000000000000000037 /* ExamViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ExamViews.swift; sourceTree = "<group>"; };
+		A00000000000000000000038 /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
+		A00000000000000000000039 /* AdBannerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AdBannerView.swift; sourceTree = "<group>"; };
+		A0000000000000000000003A /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		A0000000000000000000003B /* questions.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = questions.json; sourceTree = "<group>"; };
+		A0000000000000000000003C /* MVP.storekit */ = {isa = PBXFileReference; lastKnownFileType = file.storekit; path = MVP.storekit; sourceTree = "<group>"; };
+		A0000000000000000000003D /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		A00000000000000000000040 /* CivicsPrep.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; path = CivicsPrep.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		A00000000000000000000051 /* Localizable.strings (en) */ = {isa = PBXFileReference; lastKnownFileType = text.plist.strings; path = en.lproj/Localizable.strings; sourceTree = "<group>"; };
+		A00000000000000000000052 /* Localizable.strings (es) */ = {isa = PBXFileReference; lastKnownFileType = text.plist.strings; path = es.lproj/Localizable.strings; sourceTree = "<group>"; };
+		A00000000000000000000053 /* Localizable.strings (zh-Hans) */ = {isa = PBXFileReference; lastKnownFileType = text.plist.strings; path = "zh-Hans.lproj/Localizable.strings"; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		A00000000000000000000004 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		A00000000000000000000005 = {
+			isa = PBXGroup;
+			children = (
+				A00000000000000000000006,
+				A0000000000000000000000C,
+			);
+			sourceTree = "<group>";
+		};
+		A00000000000000000000006 /* CivicsPrep */ = {
+			isa = PBXGroup;
+			children = (
+				A00000000000000000000020,
+				A00000000000000000000007,
+				A00000000000000000000008,
+				A00000000000000000000009,
+				A0000000000000000000000A,
+				A0000000000000000000000B,
+				A0000000000000000000003D,
+			);
+			path = CivicsPrep;
+			sourceTree = "<group>";
+		};
+		A00000000000000000000007 /* Models */ = {
+			isa = PBXGroup;
+			children = (
+				A00000000000000000000021,
+				A00000000000000000000022,
+				A00000000000000000000023,
+				A00000000000000000000024,
+			);
+			path = Models;
+			sourceTree = "<group>";
+		};
+		A00000000000000000000008 /* Services */ = {
+			isa = PBXGroup;
+			children = (
+				A00000000000000000000025,
+				A00000000000000000000026,
+				A00000000000000000000027,
+				A00000000000000000000028,
+				A00000000000000000000029,
+				A0000000000000000000002A,
+				A0000000000000000000002B,
+			);
+			path = Services;
+			sourceTree = "<group>";
+		};
+		A00000000000000000000009 /* ViewModels */ = {
+			isa = PBXGroup;
+			children = (
+				A0000000000000000000002C,
+				A0000000000000000000002D,
+				A0000000000000000000002E,
+				A0000000000000000000002F,
+			);
+			path = ViewModels;
+			sourceTree = "<group>";
+		};
+		A0000000000000000000000A /* Views */ = {
+			isa = PBXGroup;
+			children = (
+				A00000000000000000000030,
+				A00000000000000000000031,
+				A00000000000000000000032,
+				A00000000000000000000033,
+				A00000000000000000000034,
+				A00000000000000000000035,
+				A00000000000000000000036,
+				A00000000000000000000037,
+				A00000000000000000000038,
+				A00000000000000000000039,
+			);
+			path = Views;
+			sourceTree = "<group>";
+		};
+		A0000000000000000000000B /* Resources */ = {
+			isa = PBXGroup;
+			children = (
+				A0000000000000000000003A,
+				A0000000000000000000003B,
+				A0000000000000000000003C,
+				A00000000000000000000050,
+			);
+			path = Resources;
+			sourceTree = "<group>";
+		};
+		A0000000000000000000000C /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				A00000000000000000000040,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		A00000000000000000000001 /* CivicsPrep */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = A0000000000000000000000F /* Build configuration list for PBXNativeTarget "CivicsPrep" */;
+			buildPhases = (
+				A00000000000000000000002 /* Sources */,
+				A00000000000000000000003 /* Resources */,
+				A00000000000000000000004 /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = CivicsPrep;
+			productName = CivicsPrep;
+			productReference = A00000000000000000000040 /* CivicsPrep.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		A00000000000000000000000 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastSwiftUpdateCheck = 1500;
+				LastUpgradeCheck = 1500;
+				TargetAttributes = {
+					A00000000000000000000001 = {
+						CreatedOnToolsVersion = 15.0;
+					};
+				};
+			};
+			buildConfigurationList = A00000000000000000000010 /* Build configuration list for PBXProject "CivicsPrep" */;
+			compatibilityVersion = "Xcode 15.0";
+			developmentRegion = en;
+			knownRegions = (
+				en,
+				zh-Hans,
+				es,
+			);
+			mainGroup = A00000000000000000000005;
+			productRefGroup = A0000000000000000000000C /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				A00000000000000000000001 /* CivicsPrep */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		A00000000000000000000003 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A0000000000000000000011A /* Assets.xcassets in Resources */,
+				A0000000000000000000011B /* questions.json in Resources */,
+				A0000000000000000000011C /* MVP.storekit in Resources */,
+				A0000000000000000000011D /* Localizable.strings in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		A00000000000000000000002 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A00000000000000000000100 /* CivicsPrepApp.swift in Sources */,
+				A00000000000000000000101 /* AppLanguage.swift in Sources */,
+				A00000000000000000000102 /* LocalizedText.swift in Sources */,
+				A00000000000000000000103 /* Question.swift in Sources */,
+				A00000000000000000000104 /* ExamResult.swift in Sources */,
+				A00000000000000000000105 /* LocalizationManager.swift in Sources */,
+				A00000000000000000000106 /* QuestionRepository.swift in Sources */,
+				A00000000000000000000107 /* UserDataStore.swift in Sources */,
+				A00000000000000000000108 /* ExamHistoryStore.swift in Sources */,
+				A00000000000000000000109 /* PurchaseManager.swift in Sources */,
+				A0000000000000000000010A /* AdsManager.swift in Sources */,
+				A0000000000000000000010B /* AppContainer.swift in Sources */,
+				A0000000000000000000010C /* StudyViewModel.swift in Sources */,
+				A0000000000000000000010D /* MockExamViewModel.swift in Sources */,
+				A0000000000000000000010E /* SettingsViewModel.swift in Sources */,
+				A0000000000000000000010F /* OnboardingViewModel.swift in Sources */,
+				A00000000000000000000110 /* RootView.swift in Sources */,
+				A00000000000000000000111 /* OnboardingView.swift in Sources */,
+				A00000000000000000000112 /* MainTabView.swift in Sources */,
+				A00000000000000000000113 /* StudyView.swift in Sources */,
+				A00000000000000000000114 /* QuestionListView.swift in Sources */,
+				A00000000000000000000115 /* QuestionDetailView.swift in Sources */,
+				A00000000000000000000116 /* MockExamView.swift in Sources */,
+				A00000000000000000000117 /* ExamViews.swift in Sources */,
+				A00000000000000000000118 /* SettingsView.swift in Sources */,
+				A00000000000000000000119 /* AdBannerView.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXVariantGroup section */
+		A00000000000000000000050 /* Localizable.strings */ = {
+			isa = PBXVariantGroup;
+			children = (
+				A00000000000000000000051 /* Localizable.strings (en) */,
+				A00000000000000000000052 /* Localizable.strings (es) */,
+				A00000000000000000000053 /* Localizable.strings (zh-Hans) */,
+			);
+			name = Localizable.strings;
+			sourceTree = "<group>";
+		};
+/* End PBXVariantGroup section */
+
+/* Begin XCBuildConfiguration section */
+		A0000000000000000000000D /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CLANG_ENABLE_MODULES = YES;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = "";
+				ENABLE_PREVIEWS = YES;
+				INFOPLIST_FILE = CivicsPrep/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.example.CivicsPrep;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_VERSION = 5.9;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		A0000000000000000000000E /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CLANG_ENABLE_MODULES = YES;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = "";
+				INFOPLIST_FILE = CivicsPrep/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.example.CivicsPrep;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_VERSION = 5.9;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+		A00000000000000000000011 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ENABLE_MODULES = YES;
+				CODE_SIGN_STYLE = Automatic;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_TESTABILITY = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				SWIFT_VERSION = 5.9;
+			};
+			name = Debug;
+		};
+		A00000000000000000000012 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ENABLE_MODULES = YES;
+				CODE_SIGN_STYLE = Automatic;
+				COPY_PHASE_STRIP = YES;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				SWIFT_VERSION = 5.9;
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		A0000000000000000000000F /* Build configuration list for PBXNativeTarget "CivicsPrep" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A0000000000000000000000D /* Debug */,
+				A0000000000000000000000E /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		A00000000000000000000010 /* Build configuration list for PBXProject "CivicsPrep" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A00000000000000000000011 /* Debug */,
+				A00000000000000000000012 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+
+	};
+	rootObject = A00000000000000000000000 /* Project object */;
+}

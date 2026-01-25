@@ -1,0 +1,242 @@
+[
+  {
+    "id": "q001",
+    "category": "American Government",
+    "difficulty": 1,
+    "question": {"zh": "美国最高法律是什么？", "es": "¿Cuál es la ley suprema de los Estados Unidos?"},
+    "answers": [{"zh": "宪法", "es": "La Constitución"}],
+    "explanation": {"zh": "宪法是美国的最高法律。", "es": "La Constitución es la ley suprema."}
+  },
+  {
+    "id": "q002",
+    "category": "American Government",
+    "difficulty": 1,
+    "question": {"zh": "宪法做什么？", "es": "¿Qué hace la Constitución?"},
+    "answers": [{"zh": "建立政府", "es": "Establece el gobierno"}, {"zh": "定义政府权力", "es": "Define los poderes del gobierno"}, {"zh": "保护基本权利", "es": "Protege los derechos básicos"}],
+    "explanation": {"zh": "宪法建立政府并保护权利。", "es": "Define el gobierno y protege derechos."}
+  },
+  {
+    "id": "q003",
+    "category": "American Government",
+    "difficulty": 1,
+    "question": {"zh": "美国有几个修正案？", "es": "¿Cuántas enmiendas tiene la Constitución?"},
+    "answers": [{"zh": "27", "es": "27"}],
+    "explanation": {"zh": "宪法有27条修正案。", "es": "La Constitución tiene 27 enmiendas."}
+  },
+  {
+    "id": "q004",
+    "category": "American Government",
+    "difficulty": 1,
+    "question": {"zh": "第一修正案保护什么？", "es": "¿Qué protege la Primera Enmienda?"},
+    "answers": [{"zh": "言论自由", "es": "Libertad de expresión"}, {"zh": "宗教自由", "es": "Libertad de religión"}, {"zh": "新闻自由", "es": "Libertad de prensa"}, {"zh": "集会自由", "es": "Libertad de reunión"}, {"zh": "请愿政府", "es": "Pedir al gobierno"}],
+    "explanation": {"zh": "第一修正案保护多项自由。", "es": "La Primera Enmienda protege varias libertades."}
+  },
+  {
+    "id": "q005",
+    "category": "American Government",
+    "difficulty": 1,
+    "question": {"zh": "国会有两个部分是什么？", "es": "¿Cuáles son las dos partes del Congreso?"},
+    "answers": [{"zh": "参议院和众议院", "es": "El Senado y la Cámara de Representantes"}],
+    "explanation": {"zh": "国会由参议院和众议院组成。", "es": "El Congreso tiene Senado y Cámara."}
+  },
+  {
+    "id": "q006",
+    "category": "American Government",
+    "difficulty": 1,
+    "question": {"zh": "参议员任期多少年？", "es": "¿De cuántos años es el mandato de un senador?"},
+    "answers": [{"zh": "6年", "es": "6 años"}],
+    "explanation": {"zh": "参议员任期六年。", "es": "Los senadores sirven 6 años."}
+  },
+  {
+    "id": "q007",
+    "category": "American Government",
+    "difficulty": 1,
+    "question": {"zh": "我们选出多少名参议员？", "es": "¿Cuántos senadores elegimos?"},
+    "answers": [{"zh": "100", "es": "100"}],
+    "explanation": {"zh": "每州2名，共100名。", "es": "Dos por estado, total 100."}
+  },
+  {
+    "id": "q008",
+    "category": "American Government",
+    "difficulty": 1,
+    "question": {"zh": "众议员任期多少年？", "es": "¿De cuántos años es el mandato de un representante?"},
+    "answers": [{"zh": "2年", "es": "2 años"}],
+    "explanation": {"zh": "众议员任期两年。", "es": "Los representantes sirven 2 años."}
+  },
+  {
+    "id": "q009",
+    "category": "American Government",
+    "difficulty": 1,
+    "question": {"zh": "美国总统任期多少年？", "es": "¿De cuántos años es el mandato presidencial?"},
+    "answers": [{"zh": "4年", "es": "4 años"}],
+    "explanation": {"zh": "总统任期四年。", "es": "El presidente sirve 4 años."}
+  },
+  {
+    "id": "q010",
+    "category": "American Government",
+    "difficulty": 1,
+    "question": {"zh": "总统是谁？", "es": "¿Quién es el presidente?"},
+    "answers": [{"zh": "答案会变化", "es": "La respuesta cambia"}],
+    "explanation": {"zh": "请根据当前总统更新。", "es": "Varía según el presidente actual."}
+  },
+  {
+    "id": "q011",
+    "category": "American Government",
+    "difficulty": 1,
+    "question": {"zh": "副总统是谁？", "es": "¿Quién es el vicepresidente?"},
+    "answers": [{"zh": "答案会变化", "es": "La respuesta cambia"}],
+    "explanation": {"zh": "请根据当前副总统更新。", "es": "Varía según el vicepresidente actual."}
+  },
+  {
+    "id": "q012",
+    "category": "American Government",
+    "difficulty": 1,
+    "question": {"zh": "最高法院有多少名大法官？", "es": "¿Cuántos jueces hay en la Corte Suprema?"},
+    "answers": [{"zh": "9", "es": "9"}],
+    "explanation": {"zh": "目前是9名。", "es": "Actualmente hay 9."}
+  },
+  {
+    "id": "q013",
+    "category": "American Government",
+    "difficulty": 1,
+    "question": {"zh": "美国有多少个州？", "es": "¿Cuántos estados hay?"},
+    "answers": [{"zh": "50", "es": "50"}],
+    "explanation": {"zh": "美国有50个州。", "es": "Hay 50 estados."}
+  },
+  {
+    "id": "q014",
+    "category": "American History",
+    "difficulty": 1,
+    "question": {"zh": "美国独立日是哪一天？", "es": "¿Cuál es el Día de la Independencia?"},
+    "answers": [{"zh": "7月4日", "es": "4 de julio"}],
+    "explanation": {"zh": "独立日是7月4日。", "es": "El 4 de julio."}
+  },
+  {
+    "id": "q015",
+    "category": "American History",
+    "difficulty": 1,
+    "question": {"zh": "美国首任总统是谁？", "es": "¿Quién fue el primer presidente?"},
+    "answers": [{"zh": "乔治·华盛顿", "es": "George Washington"}],
+    "explanation": {"zh": "乔治·华盛顿是首任总统。", "es": "Fue el primer presidente."}
+  },
+  {
+    "id": "q016",
+    "category": "American History",
+    "difficulty": 1,
+    "question": {"zh": "独立战争打的对象是谁？", "es": "¿Contra quién luchó Estados Unidos en la Revolución?"},
+    "answers": [{"zh": "英国", "es": "Gran Bretaña"}],
+    "explanation": {"zh": "美国与英国作战。", "es": "Fue contra Gran Bretaña."}
+  },
+  {
+    "id": "q017",
+    "category": "American History",
+    "difficulty": 1,
+    "question": {"zh": "内战的主要原因之一是什么？", "es": "¿Cuál fue una causa principal de la Guerra Civil?"},
+    "answers": [{"zh": "奴隶制度", "es": "La esclavitud"}],
+    "explanation": {"zh": "奴隶制度是主要原因之一。", "es": "La esclavitud fue una causa principal."}
+  },
+  {
+    "id": "q018",
+    "category": "American History",
+    "difficulty": 1,
+    "question": {"zh": "谁解放了奴隶？", "es": "¿Quién liberó a los esclavos?"},
+    "answers": [{"zh": "亚伯拉罕·林肯", "es": "Abraham Lincoln"}],
+    "explanation": {"zh": "林肯发布了解放宣言。", "es": "Lincoln emitió la Proclamación."}
+  },
+  {
+    "id": "q019",
+    "category": "American History",
+    "difficulty": 1,
+    "question": {"zh": "南北战争在哪里发生？", "es": "¿Dónde se libró la Guerra Civil?"},
+    "answers": [{"zh": "美国国内", "es": "En Estados Unidos"}],
+    "explanation": {"zh": "战争发生在美国国内。", "es": "Fue en EE. UU."}
+  },
+  {
+    "id": "q020",
+    "category": "American History",
+    "difficulty": 1,
+    "question": {"zh": "美国在何时加入二战？", "es": "¿Cuándo entró EE. UU. en la Segunda Guerra Mundial?"},
+    "answers": [{"zh": "1941年", "es": "En 1941"}],
+    "explanation": {"zh": "珍珠港后加入。", "es": "Tras Pearl Harbor."}
+  },
+  {
+    "id": "q021",
+    "category": "Integrated Civics",
+    "difficulty": 1,
+    "question": {"zh": "美国国旗有多少颗星？", "es": "¿Cuántas estrellas tiene la bandera?"},
+    "answers": [{"zh": "50", "es": "50"}],
+    "explanation": {"zh": "每州一颗星。", "es": "Una por cada estado."}
+  },
+  {
+    "id": "q022",
+    "category": "Integrated Civics",
+    "difficulty": 1,
+    "question": {"zh": "美国国旗有多少条纹？", "es": "¿Cuántas franjas tiene la bandera?"},
+    "answers": [{"zh": "13", "es": "13"}],
+    "explanation": {"zh": "代表13个殖民地。", "es": "Representan las 13 colonias."}
+  },
+  {
+    "id": "q023",
+    "category": "Integrated Civics",
+    "difficulty": 1,
+    "question": {"zh": "美国的首都是哪里？", "es": "¿Cuál es la capital de EE. UU.?"},
+    "answers": [{"zh": "华盛顿特区", "es": "Washington, D.C."}],
+    "explanation": {"zh": "首都是华盛顿特区。", "es": "La capital es Washington, D.C."}
+  },
+  {
+    "id": "q024",
+    "category": "Integrated Civics",
+    "difficulty": 1,
+    "question": {"zh": "美国有两个主要政党是什么？", "es": "¿Cuáles son los dos partidos principales?"},
+    "answers": [{"zh": "民主党和共和党", "es": "Demócrata y Republicano"}],
+    "explanation": {"zh": "两大党是民主党和共和党。", "es": "Los principales son Demócrata y Republicano."}
+  },
+  {
+    "id": "q025",
+    "category": "Integrated Civics",
+    "difficulty": 1,
+    "question": {"zh": "公民必须遵守一项重要义务是什么？", "es": "¿Cuál es una responsabilidad importante de los ciudadanos?"},
+    "answers": [{"zh": "遵守法律", "es": "Obedecer las leyes"}, {"zh": "纳税", "es": "Pagar impuestos"}],
+    "explanation": {"zh": "公民有义务遵守法律并纳税。", "es": "Deben obedecer leyes y pagar impuestos."}
+  },
+  {
+    "id": "q026",
+    "category": "Integrated Civics",
+    "difficulty": 1,
+    "question": {"zh": "18岁及以上的公民可以做什么？", "es": "¿Qué pueden hacer los ciudadanos de 18 años o más?"},
+    "answers": [{"zh": "投票", "es": "Votar"}],
+    "explanation": {"zh": "18岁及以上可以投票。", "es": "Pueden votar."}
+  },
+  {
+    "id": "q027",
+    "category": "American Government",
+    "difficulty": 2,
+    "question": {"zh": "政府的三个分支是什么？", "es": "¿Cuáles son las tres ramas del gobierno?"},
+    "answers": [{"zh": "立法、行政、司法", "es": "Legislativa, ejecutiva y judicial"}],
+    "explanation": {"zh": "三权分立。", "es": "Separación de poderes."}
+  },
+  {
+    "id": "q028",
+    "category": "American History",
+    "difficulty": 2,
+    "question": {"zh": "《权利法案》是什么？", "es": "¿Qué es la Carta de Derechos?"},
+    "answers": [{"zh": "宪法的前十条修正案", "es": "Las primeras diez enmiendas"}],
+    "explanation": {"zh": "前十条修正案被称为权利法案。", "es": "Son las primeras diez enmiendas."}
+  },
+  {
+    "id": "q029",
+    "category": "American History",
+    "difficulty": 2,
+    "question": {"zh": "谁写了《独立宣言》？", "es": "¿Quién escribió la Declaración de Independencia?"},
+    "answers": [{"zh": "托马斯·杰斐逊", "es": "Thomas Jefferson"}],
+    "explanation": {"zh": "主要作者是托马斯·杰斐逊。", "es": "El principal autor fue Jefferson."}
+  },
+  {
+    "id": "q030",
+    "category": "Integrated Civics",
+    "difficulty": 2,
+    "question": {"zh": "美国的国家假日之一是什么？", "es": "¿Cuál es un feriado nacional?"},
+    "answers": [{"zh": "感恩节", "es": "Día de Acción de Gracias"}, {"zh": "独立日", "es": "Día de la Independencia"}],
+    "explanation": {"zh": "感恩节和独立日都是国家假日。", "es": "Acción de Gracias e Independencia."}
+  }
+]
