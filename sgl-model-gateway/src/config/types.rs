@@ -118,6 +118,18 @@ fn default_l1_max_memory() -> usize {
     50 * 1024 * 1024 // 50MB
 }
 
+impl TokenizerCacheConfig {
+    /// Returns Some(self) if any caching is enabled, None otherwise.
+    /// Use this when passing cache config to tokenizer registration workflow.
+    pub fn to_option(&self) -> Option<Self> {
+        if self.enable_l0 || self.enable_l1 {
+            Some(self.clone())
+        } else {
+            None
+        }
+    }
+}
+
 impl Default for TokenizerCacheConfig {
     fn default() -> Self {
         Self {

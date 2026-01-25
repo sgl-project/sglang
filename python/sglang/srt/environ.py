@@ -172,8 +172,12 @@ class Envs:
     SGLANG_TEST_MAX_RETRY = EnvInt(None)
 
     # Constrained Decoding (Grammar)
-    SGLANG_GRAMMAR_SIMULATE_TIMEOUT = EnvFloat(-1)
-    SGLANG_GRAMMAR_POLL_INTERVAL = EnvFloat(0.03)
+    SGLANG_GRAMMAR_POLL_INTERVAL = EnvFloat(0.005)
+    SGLANG_GRAMMAR_MAX_POLL_ITERATIONS = EnvInt(10000)
+    SGLANG_DISABLE_OUTLINES_DISK_CACHE = EnvBool(False)
+
+    # CuTe DSL GDN Decode
+    SGLANG_USE_CUTEDSL_GDN_DECODE = EnvBool(False)
 
     # Test & Debug
     SGLANG_DETECT_SLOW_RANK = EnvBool(False)
@@ -242,6 +246,8 @@ class Envs:
     SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES = EnvInt(30)
     SGLANG_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK = EnvFloat(None)
     SGLANG_DATA_PARALLEL_BUDGET_INTERVAL = EnvInt(1)
+    SGLANG_QUEUED_TIMEOUT_MS = EnvInt(-1)
+    SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH = EnvBool(False)
 
     # Test: pd-disaggregation
     SGLANG_TEST_PD_DISAGG_BACKEND = EnvStr("mooncake")
@@ -250,10 +256,6 @@ class Envs:
     # Model Parallel
     SGLANG_USE_MESSAGE_QUEUE_BROADCASTER = EnvBool(True)
     SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS = EnvBool(False)
-
-    # Constrained Decoding
-    SGLANG_DISABLE_OUTLINES_DISK_CACHE = EnvBool(True)
-    SGLANG_GRAMMAR_TIMEOUT = EnvFloat(300)
 
     # Tool Calling
     SGLANG_FORWARD_UNKNOWN_TOOLS = EnvBool(False)
@@ -265,6 +267,7 @@ class Envs:
     SGLANG_MOONCAKE_CUSTOM_MEM_POOL = EnvStr(None)
     ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE = EnvBool(False)
     ASCEND_NPU_PHY_ID = EnvInt(-1)
+    SGLANG_MOONCAKE_SEND_AUX_TCP = EnvBool(False)
 
     # Mooncake Store
     SGLANG_HICACHE_MOONCAKE_CONFIG_PATH = EnvStr(None)
@@ -339,6 +342,7 @@ class Envs:
     SGLANG_DEEPEP_BF16_DISPATCH = EnvBool(False)
     SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS = EnvInt(32)
+    SGLANG_BLACKWELL_OVERLAP_SHARED_EXPERTS_OUTSIDE_SBO = EnvBool(False)
 
     # NSA Backend
     SGLANG_NSA_FUSE_TOPK = EnvBool(True)
@@ -405,6 +409,10 @@ class Envs:
     # MM splitting behavior control
     SGLANG_ENABLE_MM_SPLITTING = EnvBool(False)
 
+    # Mamba
+    SGLANG_MAMBA_CONV_DTYPE = EnvStr("bfloat16")
+    SGLANG_MAMBA_SSM_DTYPE = EnvStr("float32")
+
     # Release & Resume Memory
     SGLANG_MEMORY_SAVER_CUDA_GRAPH = EnvBool(False)
 
@@ -445,6 +453,11 @@ class Envs:
     # TokenizerManager
     SGLANG_REQUEST_STATE_WAIT_TIMEOUT = EnvInt(4)
 
+    # Symmetric Memory
+    SGLANG_SYMM_MEM_PREALLOC_GB_SIZE = EnvInt(-1)
+
+    # Aiter
+    SGLANG_USE_AITER_FP8_PER_TOKEN = EnvBool(False)
     # fmt: on
 
 
@@ -504,6 +517,10 @@ _warn_deprecated_env_to_cli_flag(
 _warn_deprecated_env_to_cli_flag(
     "SGLANG_SUPPORT_CUTLASS_BLOCK_FP8",
     "It will be completely removed in 0.5.7. Please use '--fp8-gemm-backend=cutlass' instead.",
+)
+_warn_deprecated_env_to_cli_flag(
+    "SGLANG_FLASHINFER_FP4_GEMM_BACKEND",
+    "It will be completely removed in 0.5.9. Please use '--fp4-gemm-backend' instead.",
 )
 _warn_deprecated_env_to_cli_flag(
     "SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE",
