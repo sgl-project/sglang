@@ -24,9 +24,11 @@ class BaseReasoningFormatDetector:
         think_end_token: str,
         force_reasoning: bool = False,
         stream_reasoning: bool = True,
+        tool_start_token: Optional[str] = None,
     ):
         self.think_start_token = think_start_token
         self.think_end_token = think_end_token
+        self.tool_start_token = tool_start_token
         self._in_reasoning = force_reasoning
         self.stream_reasoning = stream_reasoning
 
@@ -47,7 +49,15 @@ class BaseReasoningFormatDetector:
         processed_text = text.replace(self.think_start_token, "").strip()
 
         if self.think_end_token not in processed_text:
-            # Assume reasoning was truncated before `</think>` token
+            # Check for tool_start_token interruption
+            if self._in_reasoning and self.tool_start_token is not None and self.tool_start_token in processed_text:
+                # Find the last occurrence of tool_start_token and split there
+                tool_idx = processed_text.find(self.tool_start_token)
+                reasoning_text = processed_text[:tool_idx].strip()
+                # Preserve tool_start_token in normal text
+                normal_text = processed_text[tool_idx:]
+                return StreamingParseResult(normal_text=normal_text, reasoning_text=reasoning_text)
+            # Assume reasoning was truncated before end token
             return StreamingParseResult(reasoning_text=processed_text)
 
         # Extract reasoning content
@@ -55,9 +65,7 @@ class BaseReasoningFormatDetector:
         reasoning_text = splits[0]
         normal_text = splits[1].strip()
 
-        return StreamingParseResult(
-            normal_text=normal_text, reasoning_text=reasoning_text
-        )
+        return StreamingParseResult(normal_text=normal_text, reasoning_text=reasoning_text)
 
     def parse_streaming_increment(self, new_text: str) -> StreamingParseResult:
         """
@@ -73,10 +81,10 @@ class BaseReasoningFormatDetector:
         current_text = self._buffer
 
         # If the current text is a prefix of the think token, keep buffering
-        if any(
-            token.startswith(current_text) and token != current_text
-            for token in [self.think_start_token, self.think_end_token]
-        ):
+        tokens_to_check = [self.think_start_token, self.think_end_token]
+        if self.tool_start_token:
+            tokens_to_check.append(self.tool_start_token)
+        if any(token.startswith(current_text) and token != current_text for token in tokens_to_check):
             return StreamingParseResult()
 
         # Strip `<think>` token if present
@@ -95,12 +103,19 @@ class BaseReasoningFormatDetector:
             self._in_reasoning = False
             normal_text = current_text[end_idx + len(self.think_end_token) :]
 
-            return StreamingParseResult(
-                normal_text=normal_text, reasoning_text=reasoning_text.rstrip()
-            )
+            return StreamingParseResult(normal_text=normal_text, reasoning_text=reasoning_text.rstrip())
 
         # Continue with reasoning content
         if self._in_reasoning:
+            # Check for tool_start_token interruption
+            if self.tool_start_token and self.tool_start_token in current_text:
+                tool_idx = current_text.find(self.tool_start_token)
+                reasoning_text = current_text[:tool_idx]
+                # Preserve tool_start_token in normal text
+                normal_text = current_text[tool_idx:]
+                self._buffer = ""
+                self._in_reasoning = False
+                return StreamingParseResult(normal_text=normal_text, reasoning_text=reasoning_text)
             if self.stream_reasoning:
                 # Stream the content immediately
                 self._buffer = ""
@@ -191,6 +206,29 @@ class KimiDetector(BaseReasoningFormatDetector):
         )
 
 
+class Glm45Detector(BaseReasoningFormatDetector):
+    """
+    Detector for GLM-4.5 models.
+    Assumes reasoning format:
+      (<think>)*(.*)</think>
+
+    GLM-4.5 uses `<tool_call>` as the tool start token to switch from reasoning mode to normal mode.
+
+    Args:
+        stream_reasoning (bool): If False, accumulates reasoning content until the end tag.
+            If True, streams reasoning content as it arrives.
+    """
+
+    def __init__(self, stream_reasoning: bool = True, force_reasoning: bool = False):
+        super().__init__(
+            "<think>",
+            "</think>",
+            force_reasoning=force_reasoning,
+            stream_reasoning=stream_reasoning,
+            tool_start_token="<tool_call>",
+        )
+
+
 class GptOssDetector(BaseReasoningFormatDetector):
     """
     Detector for T4-style reasoning format (GPT-OSS), using the HarmonyParser.
@@ -210,9 +248,7 @@ class GptOssDetector(BaseReasoningFormatDetector):
         # Flush the buffer for one-shot parsing
         events += self.parser.parse("")
 
-        reasoning_text = "".join(
-            [e.content for e in events if e.event_type == "reasoning"]
-        )
+        reasoning_text = "".join([e.content for e in events if e.event_type == "reasoning"])
         normal_parts = []
         for e in events:
             if e.event_type == "normal":
@@ -231,9 +267,7 @@ class GptOssDetector(BaseReasoningFormatDetector):
     def parse_streaming_increment(self, new_text: str) -> StreamingParseResult:
         events = self.parser.parse(new_text)
 
-        reasoning_text = "".join(
-            [e.content for e in events if e.event_type == "reasoning"]
-        )
+        reasoning_text = "".join([e.content for e in events if e.event_type == "reasoning"])
         normal_parts = []
         for e in events:
             if e.event_type == "normal":
@@ -304,7 +338,7 @@ class ReasoningParser:
     DetectorMap: Dict[str, Type[BaseReasoningFormatDetector]] = {
         "deepseek-r1": DeepSeekR1Detector,
         "deepseek-v3": Qwen3Detector,
-        "glm45": Qwen3Detector,
+        "glm45": Glm45Detector,
         "gpt-oss": GptOssDetector,
         "kimi": KimiDetector,
         "kimi_k2": DeepSeekR1Detector,
@@ -346,9 +380,7 @@ class ReasoningParser:
         ret = self.detector.detect_and_parse(full_text)
         return ret.reasoning_text, ret.normal_text
 
-    def parse_stream_chunk(
-        self, chunk_text: str
-    ) -> Tuple[Optional[str], Optional[str]]:
+    def parse_stream_chunk(self, chunk_text: str) -> Tuple[Optional[str], Optional[str]]:
         """Streaming call: incremental parsing"""
         ret = self.detector.parse_streaming_increment(chunk_text)
         return ret.reasoning_text, ret.normal_text
