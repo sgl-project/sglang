@@ -15,6 +15,34 @@ logger = logging.getLogger(__name__)
 temp_dir = tempfile.gettempdir()
 
 
+def _is_local_path(path: str) -> bool:
+    """
+    Check if a path looks like a local filesystem path rather than a HuggingFace Hub ID.
+
+    HuggingFace Hub IDs are in the form 'repo_name' or 'namespace/repo_name'.
+    Local paths typically start with '/', './', '../', '~', or are absolute paths.
+
+    Args:
+        path: The path string to check
+
+    Returns:
+        True if the path appears to be a local filesystem path, False otherwise
+    """
+    # Absolute paths (Unix or Windows)
+    if os.path.isabs(path):
+        return True
+
+    # Paths starting with common local path prefixes
+    if path.startswith(("./", "../", "~")):
+        return True
+
+    # Windows-style paths with drive letters (e.g., C:\, D:\)
+    if len(path) >= 2 and path[1] == ":" and path[0].isalpha():
+        return True
+
+    return False
+
+
 def _get_lock(model_name_or_path: str, cache_dir: Optional[str] = None):
     lock_dir = cache_dir or temp_dir
     os.makedirs(os.path.dirname(lock_dir), exist_ok=True)
@@ -43,9 +71,20 @@ def _maybe_download_model(
         Local directory path that contains the downloaded config file, or the original local directory.
     """
 
-    if os.path.exists(model_name_or_path):
+    # Expand ~ to home directory for proper path resolution
+    expanded_path = os.path.expanduser(model_name_or_path)
+
+    if os.path.exists(expanded_path):
         logger.info("Model already exists locally")
-        return model_name_or_path
+        return expanded_path
+
+    # Check if this looks like a local path that doesn't exist
+    # This provides a clearer error message than the HuggingFace validation error
+    if _is_local_path(model_name_or_path):
+        raise ValueError(
+            f"Local model path '{model_name_or_path}' does not exist. "
+            "Please verify the path is correct."
+        )
 
     if not download:
         return model_name_or_path
