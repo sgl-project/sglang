@@ -161,6 +161,11 @@ class PrefillBootstrapQueue:
                 kv_args.state_type = "swa"
             elif isinstance(self.token_to_kv_pool, HybridLinearKVPool):
                 kv_args.state_type = "mamba"
+                # Get state dimension info for cross-TP slice transfer
+                if hasattr(self.token_to_kv_pool, "get_state_dim_per_tensor"):
+                    kv_args.state_dim_per_tensor = (
+                        self.token_to_kv_pool.get_state_dim_per_tensor()
+                    )
             elif isinstance(self.token_to_kv_pool, NSATokenToKVPool):
                 kv_args.state_type = "nsa"
             else:
