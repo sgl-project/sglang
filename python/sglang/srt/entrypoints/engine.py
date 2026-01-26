@@ -47,6 +47,7 @@ from sglang.srt.managers.io_struct import (
     GenerateReqInput,
     GetWeightsByNameReqInput,
     InitWeightsUpdateGroupReqInput,
+    LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterReqInput,
     MultimodalDataInputFormat,
     ReleaseMemoryOccupationReqInput,
@@ -600,6 +601,22 @@ class Engine(EngineBase):
             self.tokenizer_manager.get_weights_by_name(obj, None)
         )
 
+    def load_lora_adapter_from_tensors(
+        self, lora_name: str, tensors: List[Tuple[str, torch.Tensor]], config_dict: Dict
+    ):
+        # Load LoRA adapter again
+        serialized_tensors = MultiprocessingSerializer.serialize(
+            tensors, output_str=True
+        )
+        lora_req = LoadLoRAAdapterFromTensorsReqInput(
+            lora_name=lora_name,
+            config_dict=config_dict,
+            serialized_tensors=serialized_tensors,
+        )
+        return self.loop.run_until_complete(
+            self.tokenizer_manager.load_lora_adapter_from_tensors(lora_req, None)
+        )
+
     def load_lora_adapter(self, lora_name: str, lora_path: str, pinned: bool = False):
         """Load a new LoRA adapter without re-launching the engine."""
 
@@ -783,7 +800,7 @@ def _set_envs_and_config(server_args: ServerArgs):
         if server_args.attention_backend == "flashinfer":
             assert_pkg_version(
                 "flashinfer_python",
-                "0.5.3",
+                "0.6.2",
                 "Please uninstall the old version and "
                 "reinstall the latest version by following the instructions "
                 "at https://docs.flashinfer.ai/installation.html.",
@@ -791,7 +808,7 @@ def _set_envs_and_config(server_args: ServerArgs):
         if _is_cuda:
             assert_pkg_version(
                 "sgl-kernel",
-                "0.3.20",
+                "0.3.21",
                 "Please reinstall the latest version with `pip install sgl-kernel --force-reinstall`",
             )
 

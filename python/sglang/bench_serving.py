@@ -12,6 +12,7 @@ python3 -m sglang.bench_serving --backend sglang --dataset-name random --num-pro
 
 import argparse
 import asyncio
+import copy
 import importlib.util
 import io
 import json
@@ -27,12 +28,12 @@ import uuid
 import warnings
 from argparse import ArgumentParser
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from functools import lru_cache
 from json import JSONDecodeError
 from pathlib import Path
-from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple, Union
+from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, Tuple, Union
 
 import aiohttp
 import numpy as np
@@ -80,7 +81,7 @@ def _create_bench_client_session():
 
 @dataclass
 class RequestFuncInput:
-    prompt: str
+    prompt: Union[str, List[str], List[Dict[str, str]]]
     api_url: str
     prompt_len: int
     output_len: int
@@ -129,6 +130,17 @@ def get_auth_headers() -> Dict[str, str]:
         if api_key:
             return {"Authorization": f"{api_key}"}
         return {}
+
+
+def parse_custom_headers(header_list: List[str]) -> Dict[str, str]:
+    return {k: v for h in header_list for k, _, v in [h.partition("=")] if k and v}
+
+
+def get_request_headers() -> Dict[str, str]:
+    headers = get_auth_headers()
+    if h := getattr(args, "header", None):
+        headers.update(parse_custom_headers(h))
+    return headers
 
 
 # trt llm does not support ignore_eos
@@ -216,16 +228,25 @@ async def async_request_openai_completions(
     prompt = request_func_input.prompt
 
     async with _create_bench_client_session() as session:
+        # Build payload with defaults that can be overridden by extra_request_body
         payload = {
             "model": request_func_input.model,
             "prompt": prompt,
-            "temperature": 0.0,
             "best_of": 1,
             "max_tokens": request_func_input.output_len,
             "stream": not args.disable_stream,
-            "ignore_eos": not args.disable_ignore_eos,
-            **request_func_input.extra_request_body,
         }
+
+        # Add temperature default only if not specified in extra_request_body
+        if "temperature" not in request_func_input.extra_request_body:
+            payload["temperature"] = 0.0
+
+        # Add ignore_eos default only if not specified in extra_request_body
+        if "ignore_eos" not in request_func_input.extra_request_body:
+            payload["ignore_eos"] = not args.disable_ignore_eos
+
+        # Merge in extra parameters - these will override defaults if present
+        payload.update(request_func_input.extra_request_body)
 
         # hack to accommodate different LoRA conventions between SGLang and vLLM.
         if request_func_input.lora_name:
@@ -235,7 +256,7 @@ async def async_request_openai_completions(
         if request_func_input.image_data:
             payload.update({"image_data": request_func_input.image_data})
 
-        headers = get_auth_headers()
+        headers = get_request_headers()
         if request_func_input.routing_key:
             headers[_ROUTING_KEY_HEADER] = request_func_input.routing_key
 
@@ -339,7 +360,9 @@ async def async_request_openai_chat_completions(
             f'rid={rid} time={request_start_time} message="request start" request_func_input="{str(input_partial)}"'
         )
 
-    if request_func_input.image_data:
+    if isinstance(request_func_input.prompt, list):
+        messages = request_func_input.prompt
+    elif request_func_input.image_data:
         # Build multi-image content: a list of image_url entries followed by the text
         content_items = [
             {
@@ -359,22 +382,33 @@ async def async_request_openai_chat_completions(
         messages = [{"role": "user", "content": request_func_input.prompt}]
 
     async with _create_bench_client_session() as session:
+        # Build payload with defaults that can be overridden by extra_request_body
         payload = {
             "model": request_func_input.model,
             "messages": messages,
-            "temperature": 0.0,
             "max_completion_tokens": request_func_input.output_len,
             "stream": not args.disable_stream,
-            "ignore_eos": not args.disable_ignore_eos,
-            **request_func_input.extra_request_body,
         }
+
+        # Add temperature default only if not specified in extra_request_body
+        if "temperature" not in request_func_input.extra_request_body:
+            payload["temperature"] = 0.0
+
+        # Add ignore_eos default only if not specified in extra_request_body
+        # Default to False for more realistic behavior (respect EOS tokens)
+        if "ignore_eos" not in request_func_input.extra_request_body:
+            payload["ignore_eos"] = not args.disable_ignore_eos
+
+        # Merge in extra parameters (tools, temperature, top_p, etc.)
+        # These will override defaults if present
+        payload.update(request_func_input.extra_request_body)
 
         # hack to accommodate different LoRA conventions between SGLang and vLLM.
         if request_func_input.lora_name:
             payload["model"] = request_func_input.lora_name
             payload["lora_path"] = request_func_input.lora_name
 
-        headers = get_auth_headers()
+        headers = get_request_headers()
         if request_func_input.routing_key:
             headers[_ROUTING_KEY_HEADER] = request_func_input.routing_key
 
@@ -492,7 +526,7 @@ async def async_request_truss(
             "ignore_eos": not args.disable_ignore_eos,
             **request_func_input.extra_request_body,
         }
-        headers = get_auth_headers()
+        headers = get_request_headers()
 
         output = RequestFuncOutput.init_new(request_func_input)
 
@@ -580,7 +614,7 @@ async def async_request_sglang_generate(
         if request_func_input.image_data:
             payload["image_data"] = request_func_input.image_data
 
-        headers = get_auth_headers()
+        headers = get_request_headers()
         if request_func_input.routing_key:
             headers[_ROUTING_KEY_HEADER] = request_func_input.routing_key
 
@@ -881,6 +915,13 @@ def get_dataset(args, tokenizer, model_id=None):
             prompt_suffix=args.prompt_suffix,
             apply_chat_template=args.apply_chat_template,
         )
+    elif args.dataset_name == "openai":
+        input_requests = sample_openai_requests(
+            dataset_path=args.dataset_path,
+            num_requests=args.num_prompts,
+            tokenizer=tokenizer,
+            fixed_output_len=args.sharegpt_output_len,
+        )
     else:
         raise ValueError(f"Unknown dataset: {args.dataset_name}")
     return input_requests
@@ -1020,12 +1061,15 @@ class DatasetRow:
     image_data: Optional[List[str]] = None
     timestamp: Optional[float] = None
     routing_key: Optional[str] = None
+    extra_request_body: Optional[Dict[str, Any]] = None  # Per-request API parameters
 
     def __post_init__(self):
         if self.text_prompt_len is None:
             self.text_prompt_len = self.prompt_len
         if self.vision_prompt_len is None:
             self.vision_prompt_len = 0
+        if self.extra_request_body is None:
+            self.extra_request_body = {}
 
 
 async def get_mooncake_request_over_time(
@@ -1281,6 +1325,85 @@ def sample_sharegpt_requests(
             )
         )
 
+    print(f"#Input tokens: {np.sum([x.prompt_len for x in filtered_dataset])}")
+    print(f"#Output tokens: {np.sum([x.output_len for x in filtered_dataset])}")
+    return filtered_dataset
+
+
+def sample_openai_requests(
+    dataset_path: str,
+    num_requests: int,
+    tokenizer: PreTrainedTokenizerBase,
+    fixed_output_len: Optional[int] = None,
+) -> List[DatasetRow]:
+    """
+    Load OpenAI-compatible chat completion requests from a JSONL file.
+
+    Each line should be a JSON object with:
+    - "messages": list of {"role": str, "content": str}
+    - "max_tokens": int (used as output_len if fixed_output_len not set)
+    - "tools": optional list of tool definitions
+    - "temperature": optional temperature value
+    - "top_p": optional top_p value
+    - Other OpenAI API parameters are also extracted and passed through
+    """
+    dataset = []
+    with open(dataset_path, "r") as f:
+        for line in f:
+            if num_requests > 0 and len(dataset) >= num_requests:
+                break
+            if line.strip():
+                try:
+                    dataset.append(json.loads(line))
+                except json.JSONDecodeError:
+                    # Skip invalid JSON lines
+                    continue
+
+    # Fields that should NOT be passed through extra_request_body
+    # These are either handled separately or are metadata
+    # max_tokens is excluded because it's handled via output_len -> max_completion_tokens
+    # max_completion_tokens is also excluded to avoid conflicts
+    EXCLUDED_FIELDS = {"messages", "max_tokens", "max_completion_tokens", "model"}
+
+    filtered_dataset: List[DatasetRow] = []
+    for data in dataset:
+        messages = data.get("messages", [])
+        if not messages:
+            continue
+
+        # Use max_tokens from the request, or fall back to fixed_output_len
+        output_len = fixed_output_len or data.get("max_tokens", 256)
+
+        # Extract extra request body parameters (tools, temperature, top_p, etc.)
+        extra_body = {k: v for k, v in data.items() if k not in EXCLUDED_FIELDS}
+
+        # Calculate prompt length by applying chat template
+        # This includes the messages but not the tools
+        prompt_len = len(
+            tokenizer.apply_chat_template(
+                messages, tokenize=True, add_generation_prompt=True
+            )
+        )
+
+        # If tools are present, we need to add their token count
+        # Tools are sent as part of the request and count toward input tokens
+        if "tools" in extra_body:
+            # Encode tools as JSON string to estimate token count
+            tools_str = json.dumps(extra_body["tools"])
+            tools_tokens = len(tokenizer.encode(tools_str))
+            prompt_len += tools_tokens
+
+        # Pass messages list directly - bench_serving handles List[Dict] prompts
+        filtered_dataset.append(
+            DatasetRow(
+                prompt=messages,
+                prompt_len=prompt_len,
+                output_len=output_len,
+                extra_request_body=extra_body,  # Store per-request parameters
+            )
+        )
+
+    print(f"Loaded {len(filtered_dataset)} OpenAI-format requests")
     print(f"#Input tokens: {np.sum([x.prompt_len for x in filtered_dataset])}")
     print(f"#Output tokens: {np.sum([x.output_len for x in filtered_dataset])}")
     return filtered_dataset
@@ -1768,9 +1891,10 @@ def sample_generated_shared_prefix_requests(
 ) -> List[DatasetRow]:
     """Generate benchmark requests with shared system prompts using random tokens and caching."""
     send_routing_key = getattr(args, "gsp_send_routing_key", False)
+    num_turns = getattr(args, "gsp_num_turns", 1)
 
     cache_path = get_gen_prefix_cache_path(args, tokenizer)
-    should_cache = (range_ratio == 1) and not send_routing_key
+    should_cache = (range_ratio == 1) and not send_routing_key and num_turns == 1
 
     # Try to load from cache first
     if cache_path.exists() and should_cache:
@@ -1780,7 +1904,7 @@ def sample_generated_shared_prefix_requests(
 
     print(
         f"\nGenerating new input data... "
-        f"({num_groups=}, {prompts_per_group}, {system_prompt_len=}, {question_len=}, {output_len=}, {range_ratio=})"
+        f"({num_groups=}, {prompts_per_group}, {system_prompt_len=}, {question_len=}, {output_len=}, {range_ratio=}, {num_turns=})"
     )
 
     run_random_str = uuid.uuid4().hex[:8]
@@ -1794,26 +1918,31 @@ def sample_generated_shared_prefix_requests(
     question_lens = compute_random_lens(
         full_len=question_len,
         range_ratio=range_ratio,
-        num=num_groups * prompts_per_group,
-    )
+        num=num_groups * prompts_per_group * num_turns,
+    ).reshape(num_groups, prompts_per_group, num_turns)
     output_lens = compute_random_lens(
         full_len=output_len,
         range_ratio=range_ratio,
         num=num_groups * prompts_per_group,
-    )
+    ).reshape(num_groups, prompts_per_group)
     del system_prompt_len, question_len, output_len
 
     # Generate system prompts for each group
-    system_prompts = []
-    for i in range(num_groups):
-        system_prompt = gen_prompt(tokenizer, system_prompt_lens[i].item())
-        system_prompts.append(system_prompt)
+    system_prompts = [
+        gen_prompt(tokenizer, system_prompt_lens[i].item()) for i in range(num_groups)
+    ]
 
-    # Generate questions
-    questions = []
-    for i in range(num_groups * prompts_per_group):
-        question = gen_prompt(tokenizer, question_lens[i].item())
-        questions.append(question)
+    # Generate questions: shape (num_groups, prompts_per_group, num_turns)
+    questions = [
+        [
+            [
+                gen_prompt(tokenizer, question_lens[g, p, t].item())
+                for t in range(num_turns)
+            ]
+            for p in range(prompts_per_group)
+        ]
+        for g in range(num_groups)
+    ]
 
     # Combine system prompts with questions
     input_requests = []
@@ -1830,33 +1959,37 @@ def sample_generated_shared_prefix_requests(
         for prompt_idx in tqdm(
             range(prompts_per_group), desc="Generating questions", leave=False
         ):
-            flat_index = group_idx * prompts_per_group + prompt_idx
-            question = questions[flat_index]
-            full_prompt = f"{system_prompt}\n\n{question}"
+            turn_questions = questions[group_idx][prompt_idx]
+            turn_prompts = [f"{system_prompt}\n\n{turn_questions[0]}"] + turn_questions[
+                1:
+            ]
+            full_prompt = turn_prompts[0] if num_turns == 1 else turn_prompts
             prompt_len = (
                 1
                 if getattr(args, "gsp_fast_prepare", False)
-                else len(tokenizer.encode(full_prompt))
+                else len(tokenizer.encode(turn_prompts[0]))
             )
+            output_len_val = output_lens[group_idx, prompt_idx].item()
 
             input_requests.append(
                 DatasetRow(
                     prompt=full_prompt,
                     prompt_len=prompt_len,
-                    output_len=output_lens[flat_index].item(),
+                    output_len=output_len_val,
                     routing_key=routing_key,
                 )
             )
             total_input_tokens += prompt_len
-            total_output_tokens += output_lens[flat_index].item()
+            total_output_tokens += output_len_val
 
-    # Shuffle questions
-    random.shuffle(input_requests)
+    if not getattr(args, "gsp_ordered", False):
+        random.shuffle(input_requests)
 
     # Print statistics
     print(f"\nGenerated shared prefix dataset statistics:")
     print(f"Number of groups: {num_groups}")
     print(f"Prompts per group: {prompts_per_group}")
+    print(f"Number of turns: {num_turns}")
     print(f"Total prompts: {len(input_requests)}")
     if not getattr(args, "gsp_fast_prepare", False):
         print(f"Total input tokens: {total_input_tokens}")
@@ -1864,8 +1997,9 @@ def sample_generated_shared_prefix_requests(
         print(
             f"Average system prompt length: {sum(len(tokenizer.encode(sp)) for sp in system_prompts) / len(system_prompts):.1f} tokens"
         )
+        all_questions = [q for group in questions for conv in group for q in conv]
         print(
-            f"Average question length: {sum(len(tokenizer.encode(q)) for q in questions) / len(questions):.1f} tokens\n"
+            f"Average question length: {sum(len(tokenizer.encode(q)) for q in all_questions) / len(all_questions):.1f} tokens\n"
         )
 
     # Save to cache
@@ -1919,7 +2053,7 @@ async def get_request(
 
 
 def calculate_metrics(
-    input_requests: List[DatasetRow],
+    input_requests: Optional[List[DatasetRow]],
     outputs: List[RequestFuncOutput],
     dur_s: float,
     tokenizer: PreTrainedTokenizerBase,
@@ -1953,9 +2087,10 @@ def calculate_metrics(
                 tokenizer.encode(outputs[i].generated_text, add_special_tokens=False)
             )
             retokenized_output_lens.append(retokenized_output_len)
-            total_input += input_requests[i].prompt_len
-            total_input_text += input_requests[i].text_prompt_len
-            total_input_vision += input_requests[i].vision_prompt_len
+            if input_requests is not None:
+                total_input += input_requests[i].prompt_len
+                total_input_text += input_requests[i].text_prompt_len
+                total_input_vision += input_requests[i].vision_prompt_len
             if output_len > 1:
                 tpots.append((outputs[i].latency - outputs[i].ttft) / (output_len - 1))
             if use_retokenized_itl:
@@ -2092,6 +2227,42 @@ def calculate_metrics(
     return metrics, output_lens
 
 
+MULTI_TURN_BACKENDS = {"sglang-oai-chat", "vllm-chat", "lmdeploy-chat"}
+
+
+def wrap_multi_turn_request_func(request_func: Callable, backend: str) -> Callable:
+    assert (
+        backend in MULTI_TURN_BACKENDS
+    ), f"Multi-turn only supports chat backends: {MULTI_TURN_BACKENDS}, got {backend}"
+
+    async def f(
+        request_func_input: RequestFuncInput,
+        pbar: Optional[tqdm] = None,
+    ) -> List[RequestFuncOutput]:
+        prompts: List[str] = request_func_input.prompt
+        prev_messages: List[Dict[str, str]] = []
+        outputs = []
+
+        for round_index in range(len(prompts)):
+            prev_messages.append({"role": "user", "content": prompts[round_index]})
+
+            inner_input = replace(
+                copy.deepcopy(request_func_input), prompt=copy.deepcopy(prev_messages)
+            )
+            output = await request_func(
+                inner_input, pbar=pbar if round_index == len(prompts) - 1 else None
+            )
+            outputs.append(output)
+
+            prev_messages.append(
+                {"role": "assistant", "content": output.generated_text}
+            )
+
+        return outputs
+
+    return f
+
+
 async def benchmark(
     backend: str,
     api_url: str,
@@ -2120,6 +2291,18 @@ async def benchmark(
         request_func = ASYNC_REQUEST_FUNCS[backend]
     else:
         raise ValueError(f"Unknown backend: {backend}")
+
+    # Check for multi-turn: prompt is a list of strings (not OpenAI messages dicts)
+    # Multi-turn format: ["turn1", "turn2", ...] - list of strings
+    # OpenAI format: [{"role": "user", "content": "..."}, ...] - list of dicts
+    first_prompt = input_requests[0].prompt
+    is_multi_turn = (
+        isinstance(first_prompt, list)
+        and len(first_prompt) > 0
+        and isinstance(first_prompt[0], str)
+    )
+    if is_multi_turn:
+        request_func = wrap_multi_turn_request_func(request_func, backend=backend)
 
     # Limit concurrency
     # From https://github.com/vllm-project/vllm/pull/9390
@@ -2186,6 +2369,8 @@ async def benchmark(
         )
 
     warmup_outputs = await asyncio.gather(*warmup_tasks)
+    if is_multi_turn:
+        warmup_outputs = [x for output in warmup_outputs for x in output]
 
     # Check if at least one warmup request succeeded
     if warmup_requests > 0 and not any(output.success for output in warmup_outputs):
@@ -2272,6 +2457,10 @@ async def benchmark(
         else:
             lora_name = None
 
+        # Merge global extra_request_body with per-request extras
+        # Per-request parameters take precedence over global ones
+        merged_extra_body = {**extra_request_body, **request.extra_request_body}
+
         request_func_input = RequestFuncInput(
             model=model_id,
             prompt=request.prompt,
@@ -2280,7 +2469,7 @@ async def benchmark(
             output_len=request.output_len,
             lora_name=lora_name,
             image_data=request.image_data,
-            extra_request_body=extra_request_body,
+            extra_request_body=merged_extra_body,
             timestamp=request.timestamp,
             routing_key=request.routing_key,
         )
@@ -2291,6 +2480,8 @@ async def benchmark(
             )
         )
     outputs: List[RequestFuncOutput] = await asyncio.gather(*tasks)
+    if is_multi_turn:
+        outputs = [x for output in outputs for x in output]
 
     # Stop profiler
     if profile:
@@ -2334,7 +2525,7 @@ async def benchmark(
     # Compute metrics and print results
     benchmark_duration = time.perf_counter() - benchmark_start_time
     metrics, output_lens = calculate_metrics(
-        input_requests=input_requests,
+        input_requests=None if is_multi_turn else input_requests,
         outputs=outputs,
         dur_s=benchmark_duration,
         tokenizer=tokenizer,
@@ -2360,9 +2551,12 @@ async def benchmark(
     print("{:<40} {:<10.2f}".format("Benchmark duration (s):", benchmark_duration))
     print("{:<40} {:<10}".format("Total input tokens:", metrics.total_input))
     print("{:<40} {:<10}".format("Total input text tokens:", metrics.total_input_text))
-    print(
-        "{:<40} {:<10}".format("Total input vision tokens:", metrics.total_input_vision)
-    )
+    if args.dataset_name in ["image", "mmmu"]:
+        print(
+            "{:<40} {:<10}".format(
+                "Total input vision tokens:", metrics.total_input_vision
+            )
+        )
     print("{:<40} {:<10}".format("Total generated tokens:", metrics.total_output))
     print(
         "{:<40} {:<10}".format(
@@ -2804,6 +2998,7 @@ if __name__ == "__main__":
         choices=[
             "sharegpt",
             "custom",
+            "openai",
             "random",
             "random-ids",
             "generated-shared-prefix",
@@ -3124,6 +3319,17 @@ if __name__ == "__main__":
         action="store_true",
         help="Send routing key in requests via X-SMG-Routing-Key header. Requests with the same prefix share the same routing key.",
     )
+    group.add_argument(
+        "--gsp-num-turns",
+        type=int,
+        default=1,
+        help="Number of turns for multi-turn conversations. If > 1, each prompt becomes a list of questions sharing the same system prefix.",
+    )
+    group.add_argument(
+        "--gsp-ordered",
+        action="store_true",
+        help="Keep requests in order without shuffling. By default, requests are shuffled randomly.",
+    )
     mooncake_group = parser.add_argument_group("mooncake dataset arguments")
     mooncake_group.add_argument(
         "--mooncake-slowdown-factor",
@@ -3154,6 +3360,13 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--tag", type=str, default=None, help="The tag to be dumped to output."
+    )
+    parser.add_argument(
+        "--header",
+        type=str,
+        nargs="+",
+        default=None,
+        help="Custom HTTP headers in Key=Value format. Example: --header MyHeader=MY_VALUE MyAnotherHeader=myanothervalue",
     )
     args = parser.parse_args()
     run_benchmark(args)

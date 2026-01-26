@@ -447,10 +447,6 @@ class CLIPTextTransformer(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         output_hidden_states: bool | None = None,
     ) -> BaseEncoderOutput:
-        r"""
-        Returns:
-
-        """
         output_hidden_states = (
             output_hidden_states
             if output_hidden_states is not None

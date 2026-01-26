@@ -16,7 +16,7 @@ use crate::{
 };
 
 /// Dispatch metadata stage: Prepare metadata for dispatch
-pub struct DispatchMetadataStage;
+pub(crate) struct DispatchMetadataStage;
 
 #[async_trait]
 impl PipelineStage for DispatchMetadataStage {
@@ -66,7 +66,6 @@ impl PipelineStage for DispatchMetadataStage {
             model,
             created,
             weight_version: Some(weight_version),
-            is_streaming: ctx.is_streaming(),
         });
 
         Ok(None)
