@@ -25,6 +25,8 @@ if TYPE_CHECKING:
         DeepEPLLDispatchOutput,
         DeepEPNormalCombineInput,
         DeepEPNormalDispatchOutput,
+        FlashinferCombineInput,
+        FlashinferDispatchOutput,
         StandardCombineInput,
         StandardDispatchOutput,
     )
@@ -155,12 +157,19 @@ class DispatchOutputChecker:
     ) -> TypeGuard[Union[DeepEPNormalDispatchOutput, DeepEPLLDispatchOutput]]:
         return dispatch_output.format.is_deepep()
 
+    @staticmethod
+    def format_is_flashinfer(
+        dispatch_output: DispatchOutput,
+    ) -> TypeGuard[FlashinferDispatchOutput]:
+        return dispatch_output.format.is_flashinfer()
+
 
 class DispatchOutputFormat(Enum):
 
     STANDARD = "standard"
     DEEPEP_NORMAL = "deepep_normal"
     DEEPEP_LL = "deepep_ll"
+    FLASHINFER = "flashinfer"
 
     def is_standard(self) -> bool:
         return self == DispatchOutputFormat.STANDARD
@@ -176,6 +185,9 @@ class DispatchOutputFormat(Enum):
             DispatchOutputFormat.DEEPEP_NORMAL,
             DispatchOutputFormat.DEEPEP_LL,
         ]
+
+    def is_flashinfer(self) -> bool:
+        return self == DispatchOutputFormat.FLASHINFER
 
 
 @runtime_checkable
@@ -219,11 +231,18 @@ class CombineInputChecker:
             CombineInputFormat.DEEPEP_LL,
         ]
 
+    @staticmethod
+    def format_is_flashinfer(
+        combine_input: CombineInput,
+    ) -> TypeGuard[FlashinferCombineInput]:
+        return combine_input.format == CombineInputFormat.FLASHINFER
+
 
 class CombineInputFormat(Enum):
     STANDARD = "standard"
     DEEPEP_NORMAL = "deepep_normal"
     DEEPEP_LL = "deepep_ll"
+    FLASHINFER = "flashinfer"
 
 
 @runtime_checkable
