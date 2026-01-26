@@ -40,7 +40,6 @@ class LayerwiseOffloadManager:
         self.num_layers = num_layers
         self.pin_cpu_memory = pin_cpu_memory
         self.prefetch_size = min(max(1, prefetch_size), self.num_layers)
-        print(f"{self.prefetch_size=}")
         self.enabled = bool(enabled and torch.cuda.is_available())
         if not self.enabled:
             return
