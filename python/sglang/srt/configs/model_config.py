@@ -386,19 +386,6 @@ class ModelConfig:
 
         # FIXME: temporary special judge for MLA architecture
         if (
-<<<<<<< HEAD
-            "DeepseekV2ForCausalLM" in self.hf_config.architectures
-            or "DeepseekV32ForCausalLM" in self.hf_config.architectures
-            or "DeepseekV3ForCausalLM" in self.hf_text_config.architectures
-            or "DeepseekV3ForCausalLMNextN" in self.hf_config.architectures
-            or "Glm4MoeLiteForCausalLM" in self.hf_config.architectures
-            or "LongcatFlashForCausalLM" in self.hf_config.architectures
-            or "LongcatFlashForCausalLMNextN" in self.hf_config.architectures
-            or "DotsVLMForCausalLM" in self.hf_config.architectures
-            or "MistralLarge3ForCausalLM" in self.hf_config.architectures
-            or "PixtralForConditionalGeneration" in self.hf_config.architectures
-            or "MistralLarge3ForCausalLMEagle" in self.hf_config.architectures
-=======
             "DeepseekV2ForCausalLM" in hf_architectures
             or "DeepseekV32ForCausalLM" in hf_architectures
             or "DeepseekV3ForCausalLM" in hf_architectures
@@ -409,7 +396,6 @@ class ModelConfig:
             or "MistralLarge3ForCausalLM" in hf_architectures
             or "PixtralForConditionalGeneration" in hf_architectures
             or "MistralLarge3ForCausalLMEagle" in hf_architectures
->>>>>>> 8ab264e66 (fixed launch errors in other models.)
         ):
             self.head_dim = 256
             self.attention_arch = AttentionArch.MLA
