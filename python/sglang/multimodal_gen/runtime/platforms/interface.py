@@ -34,6 +34,7 @@ class AttentionBackendEnum(enum.Enum):
     VMOBA_ATTN = enum.auto()
     AITER = enum.auto()
     SLA_ATTN = enum.auto()
+    SAGE_SLA_ATTN = enum.auto()
     NO_ATTENTION = enum.auto()
 
     def __str__(self):
@@ -341,6 +342,11 @@ class Platform:
     def get_cpu_architecture(cls) -> CpuArchEnum:
         """Get the CPU architecture of the current platform."""
         return CpuArchEnum.UNSPECIFIED
+
+    @classmethod
+    def enable_dit_layerwise_offload_for_wan_by_default(cls) -> bool:
+        """Whether to enable DIT layerwise offload by default on the current platform."""
+        return True
 
     def get_attn_backend(self, *args, **kwargs) -> AttentionImpl:
         attention_cls_str = self.get_attn_backend_cls_str(*args, **kwargs)

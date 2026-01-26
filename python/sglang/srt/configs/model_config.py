@@ -101,6 +101,7 @@ class ModelConfig:
         is_multi_layer_eagle: bool = False,
         encoder_only: bool = False,
         language_only: bool = False,
+        disable_hybrid_swa_memory: bool = False,
     ) -> None:
         # Parse args
         self.model_path = model_path
@@ -111,6 +112,7 @@ class ModelConfig:
         self.sampling_defaults = sampling_defaults
         self.quantize_and_serve = quantize_and_serve
         self.is_multi_layer_eagle = is_multi_layer_eagle
+        self.disable_hybrid_swa_memory = disable_hybrid_swa_memory
 
         # Validate quantize_and_serve configuration
         self._validate_quantize_and_serve_config()
@@ -257,6 +259,7 @@ class ModelConfig:
             language_only=server_args.language_only,
             encoder_only=server_args.encoder_only,
             is_draft_model=is_draft_model,
+            disable_hybrid_swa_memory=server_args.disable_hybrid_swa_memory,
             **kwargs,
         )
 
@@ -269,7 +272,10 @@ class ModelConfig:
         ):
             self.hf_config.architectures[0] = "DeepseekV3ForCausalLMNextN"
 
-        if is_draft_model and self.hf_config.architectures[0] == "Glm4MoeForCausalLM":
+        if is_draft_model and self.hf_config.architectures[0] in [
+            "Glm4MoeForCausalLM",
+            "Glm4MoeLiteForCausalLM",
+        ]:
             self.hf_config.architectures[0] = "Glm4MoeForCausalLMNextN"
 
         if (
@@ -307,7 +313,10 @@ class ModelConfig:
 
     def _derive_hybrid_model(self):
         # Use self.context_len after it has been initialized to prevent using context_len which may be None.
-        self.is_hybrid_swa = is_hybrid_swa_model(self.hf_config.architectures)
+        self.is_hybrid_swa = (
+            is_hybrid_swa_model(self.hf_config.architectures)
+            and not self.disable_hybrid_swa_memory
+        )
 
         if self.is_hybrid_swa:
             self.swa_attention_layer_ids, self.full_attention_layer_ids = (
@@ -375,6 +384,7 @@ class ModelConfig:
             or "DeepseekV32ForCausalLM" in self.hf_config.architectures
             or "DeepseekV3ForCausalLM" in self.hf_config.architectures
             or "DeepseekV3ForCausalLMNextN" in self.hf_config.architectures
+            or "Glm4MoeLiteForCausalLM" in self.hf_config.architectures
             or "LongcatFlashForCausalLM" in self.hf_config.architectures
             or "LongcatFlashForCausalLMNextN" in self.hf_config.architectures
             or "DotsVLMForCausalLM" in self.hf_config.architectures
@@ -394,15 +404,21 @@ class ModelConfig:
                 else None
             )
 
-            # Handle rope scaling with yarn
-            self.scaling = 1 / math.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim)
-            if self.hf_config.rope_scaling:
-                mscale_all_dim = self.hf_config.rope_scaling.get(
-                    "mscale_all_dim", False
+            if "Glm4MoeLiteForCausalLM" in self.hf_config.architectures:
+                self.scaling = 1
+                self.hf_config.rope_scaling = None
+            else:
+                # Handle rope scaling with yarn
+                self.scaling = 1 / math.sqrt(
+                    self.qk_nope_head_dim + self.qk_rope_head_dim
                 )
-                scaling_factor = self.hf_config.rope_scaling["factor"]
-                mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
-                self.scaling = self.scaling * mscale * mscale
+                if self.hf_config.rope_scaling:
+                    mscale_all_dim = self.hf_config.rope_scaling.get(
+                        "mscale_all_dim", False
+                    )
+                    scaling_factor = self.hf_config.rope_scaling["factor"]
+                    mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
+                    self.scaling = self.scaling * mscale * mscale
 
         elif "MiniCPM3ForCausalLM" in self.hf_config.architectures:
             self.head_dim = 128
@@ -416,6 +432,7 @@ class ModelConfig:
             self.attention_arch = AttentionArch.MLA
             self.kv_lora_rank = self.hf_text_config.kv_lora_rank
             self.qk_rope_head_dim = self.hf_text_config.qk_rope_head_dim
+            self.qk_nope_head_dim = self.hf_text_config.qk_nope_head_dim
         elif "KimiVLForConditionalGeneration" in self.hf_config.architectures:
             self.head_dim = 256
             self.attention_arch = AttentionArch.MLA
@@ -818,20 +835,29 @@ class ModelConfig:
             if self.quantization is None:
                 self.quantization = quant_method
             elif self.quantization != quant_method:
-                # Allow auto-detection of quantization from checkpoint for draft model
-                # even if it differs from main model's quantization
-                if self.is_draft_model:
+                # Check if the CLI-specified quantization is compatible with HF config's quant_method
+                is_compatible = (
+                    self.quantization in compatible_quantization_methods
+                    and quant_method
+                    in compatible_quantization_methods[self.quantization]
+                )
+                if is_compatible:
+                    # Keep the CLI-specified quantization (e.g., modelopt_fp4) even if
+                    # HF config says "modelopt" - they are compatible
+                    logger.info(
+                        f"Using CLI-specified quantization ({self.quantization}) which is "
+                        f"compatible with HF config quant_method ({quant_method})."
+                    )
+                elif self.is_draft_model:
+                    # Allow auto-detection of quantization from checkpoint for draft model
+                    # only if the CLI quantization is not compatible
                     logger.info(
                         f"Draft model quantization ({quant_method}) differs from "
                         f"main model quantization ({self.quantization}). "
                         f"Using draft model's detected quantization: {quant_method}"
                     )
                     self.quantization = quant_method
-                elif (
-                    self.quantization not in compatible_quantization_methods
-                    or quant_method
-                    not in compatible_quantization_methods[self.quantization]
-                ):
+                else:
                     raise ValueError(
                         "Quantization method specified in the model config "
                         f"({quant_method}) does not match the quantization "
@@ -1135,6 +1161,7 @@ multimodal_model_archs = [
     "JetVLMForConditionalGeneration",
     "PaddleOCRVLForConditionalGeneration",
     "MiDashengLMModel",
+    "StepVLForConditionalGeneration",
 ]
 
 if external_mm_model_arch := envs.SGLANG_EXTERNAL_MM_MODEL_ARCH.get():
@@ -1232,7 +1259,8 @@ def get_hybrid_layer_ids(
             i for i in range(num_hidden_layers) if hybrid_layer_pattern[i] == 0
         ]
     elif "MiMoV2MTP" in model_architectures:
-        return [0], []
+        swa_attention_layer_ids = [0]
+        full_attention_layer_ids = []
     else:
         swa_attention_layer_ids = None
         full_attention_layer_ids = None
