@@ -8,15 +8,15 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    use_symmetric_memory,
+)
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather_into_tensor,
     get_attention_tp_group,
     get_attention_tp_rank,
     get_attention_tp_size,
     is_allocation_symmetric,
-)
-from sglang.srt.distributed.device_communicators.pynccl_allocator import (
-    use_symmetric_memory,
 )
 from sglang.srt.server_args import get_global_server_args
 
