@@ -1174,7 +1174,6 @@ multimodal_model_archs = [
     "PaddleOCRVLForConditionalGeneration",
     "MiDashengLMModel",
     "StepVLForConditionalGeneration",
-    "K2VLForConditionalGeneration",
     "KimiK25ForConditionalGeneration",
 ]
 
