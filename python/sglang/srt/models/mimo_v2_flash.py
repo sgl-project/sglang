@@ -856,17 +856,19 @@ class MiMoV2Model(nn.Module):
 
         aux_hidden_states = []
         if forward_batch.can_run_tbo:
-            normal_end_layer = self.start_layer
-            # first layer is dense, skip tbo
+            tbo_start_layer = self.start_layer
+            tbo_end_layer = self.end_layer
+
+            # skip first layer for TBO when starting from layer 0
             if self.start_layer == 0:
                 layer = self.layers[0]
                 hidden_states, residual = layer(
                     positions, hidden_states, forward_batch, residual
                 )
-                normal_end_layer = normal_end_layer + 1
+                tbo_start_layer = tbo_start_layer + 1
 
             hidden_states, residual = model_forward_maybe_tbo(
-                layers=self.layers[normal_end_layer : self.end_layer],
+                layers=self.layers[tbo_start_layer:tbo_end_layer],
                 enable_tbo=True,
                 input_data_scatter_mode=ScatterMode.model_input_output(),
                 positions=positions,
