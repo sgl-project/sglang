@@ -145,18 +145,10 @@ impl PodInfo {
         let pod_status = status.phase.unwrap_or_else(|| "Unknown".to_string());
 
         let pod_type = if let Some(config) = config {
-            if config.epd_mode {
+            if config.pd_mode {
                 if Self::matches_selector(pod, &config.encode_selector) {
                     Some(PodType::Encode)
                 } else if Self::matches_selector(pod, &config.prefill_selector) {
-                    Some(PodType::Prefill)
-                } else if Self::matches_selector(pod, &config.decode_selector) {
-                    Some(PodType::Decode)
-                } else {
-                    Some(PodType::Regular)
-                }
-            } else if config.pd_mode {
-                if Self::matches_selector(pod, &config.prefill_selector) {
                     Some(PodType::Prefill)
                 } else if Self::matches_selector(pod, &config.decode_selector) {
                     Some(PodType::Decode)
@@ -386,7 +378,7 @@ pub async fn start_service_discovery(
                                     tracked_pods_inner,
                                     app_context_inner,
                                     port,
-                                    config_inner.pd_mode || config_inner.epd_mode,
+                                    config_inner.pd_mode,
                                 )
                                 .await;
                             }
@@ -427,7 +419,7 @@ async fn handle_pod_event(
     tracked_pods: Arc<Mutex<HashSet<PodInfo>>>,
     app_context: Arc<AppContext>,
     port: u16,
-    disagg_mode: bool,
+    pd_mode: bool,
 ) {
     let worker_url = pod_info.worker_url(port);
 
@@ -456,7 +448,7 @@ async fn handle_pod_event(
                 pod_info.name, pod_info.pod_type, worker_url
             );
 
-            let worker_type = if disagg_mode {
+            let worker_type = if pd_mode {
                 match &pod_info.pod_type {
                     Some(PodType::Prefill) => Some("prefill".to_string()),
                     Some(PodType::Decode) => Some("decode".to_string()),
@@ -467,7 +459,7 @@ async fn handle_pod_event(
                 None
             };
 
-            let bootstrap_port = if disagg_mode {
+            let bootstrap_port = if pd_mode {
                 match &pod_info.pod_type {
                     Some(PodType::Prefill) | Some(PodType::Encode) => pod_info.bootstrap_port,
                     _ => None,
