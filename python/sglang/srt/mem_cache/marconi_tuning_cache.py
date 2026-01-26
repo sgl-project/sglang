@@ -17,12 +17,12 @@ from sglang.srt.mem_cache.marconi_utils import (
 
 
 @dataclass
-class ShadowNode:
+class TuningNode:
     key: Tuple[int, ...]
     value: List[int]
     extra_key: Optional[str] = None
-    parent: Optional["ShadowNode"] = None
-    children: Optional[dict[object, "ShadowNode"]] = None
+    parent: Optional["TuningNode"] = None
+    children: Optional[dict[object, "TuningNode"]] = None
     last_access_time: int = 0
     prefix_len: int = 0
 
@@ -31,7 +31,7 @@ class ShadowNode:
             self.children = {}
 
 
-class MarconiShadowCache:
+class MarconiTuningCache:
     def __init__(
         self,
         model_stats: MarconiModelStats,
@@ -43,11 +43,11 @@ class MarconiShadowCache:
         self.capacity_bytes = capacity_bytes
         self.eff_weight = eff_weight
         self.tuning_interval = tuning_interval
-        self.root_node = ShadowNode(key=tuple(), value=[])
+        self.root_node = TuningNode(key=tuple(), value=[])
         self.logical_ts = 0
         self.request_history: List[Tuple[bool, int, int]] = []
 
-    def clone(self) -> "MarconiShadowCache":
+    def clone(self) -> "MarconiTuningCache":
         return copy.deepcopy(self)
 
     def _tick(self) -> int:
@@ -202,14 +202,14 @@ class MarconiShadowCache:
                 )
                 self._evict_intermediate_node(node_to_evict)
 
-    def _select_node(self, nodes: List[ShadowNode]) -> Optional[ShadowNode]:
+    def _select_node(self, nodes: List[TuningNode]) -> Optional[TuningNode]:
         utilities = self._compute_utilities(nodes)
         if not utilities:
             return None
         min_idx = utilities.index(min(utilities))
         return nodes[min_idx]
 
-    def _compute_utilities(self, nodes: List[ShadowNode]) -> List[float]:
+    def _compute_utilities(self, nodes: List[TuningNode]) -> List[float]:
         current_ts = self._tick()
         timestamps = [node.last_access_time for node in nodes]
         recency_scores = []
@@ -262,10 +262,10 @@ class MarconiShadowCache:
 
     def _match_prefix_helper(
         self,
-        node: ShadowNode,
+        node: TuningNode,
         key: Tuple[int, ...],
         value: List[List[int]],
-        nodes_accessed: List[ShadowNode],
+        nodes_accessed: List[TuningNode],
         extra_key: Optional[str],
     ) -> int:
         if len(key) == 0:
@@ -287,7 +287,7 @@ class MarconiShadowCache:
 
     def _insert_helper(
         self,
-        node: ShadowNode,
+        node: TuningNode,
         key: Tuple[int, ...],
         value: List[int],
         extra_key: Optional[str],
@@ -312,7 +312,7 @@ class MarconiShadowCache:
             )
 
         if len(key):
-            new_node = ShadowNode(
+            new_node = TuningNode(
                 key=key, value=value, parent=node, extra_key=extra_key
             )
             new_node.prefix_len = node.prefix_len + len(value)
@@ -322,11 +322,11 @@ class MarconiShadowCache:
     def _split_node(
         self,
         key: Tuple[int, ...],
-        child: ShadowNode,
+        child: TuningNode,
         split_len: int,
         extra_key: Optional[str],
-    ) -> ShadowNode:
-        new_node = ShadowNode(
+    ) -> TuningNode:
+        new_node = TuningNode(
             key=child.key[:split_len],
             value=child.value[:split_len],
             parent=child.parent,
@@ -341,16 +341,16 @@ class MarconiShadowCache:
         new_node.parent.children[self._child_key(extra_key, new_node.key)] = new_node
         return new_node
 
-    def _delete_leaf(self, node: ShadowNode) -> None:
+    def _delete_leaf(self, node: TuningNode) -> None:
         if node.parent is None:
             return
         node.parent.children.pop(self._child_key(node.extra_key, node.key), None)
 
-    def _evict_intermediate_node(self, node: ShadowNode) -> None:
+    def _evict_intermediate_node(self, node: TuningNode) -> None:
         if len(node.children) != 1 or node.parent is None:
             return
         child = next(iter(node.children.values()))
-        new_node = ShadowNode(
+        new_node = TuningNode(
             key=tuple(node.value + child.value),
             value=node.value + child.value,
             parent=node.parent,
@@ -365,8 +365,8 @@ class MarconiShadowCache:
         )
 
     def _collect_leaf_and_single_child_nodes(
-        self, node: ShadowNode
-    ) -> List[ShadowNode]:
+        self, node: TuningNode
+    ) -> List[TuningNode]:
         ret_list = []
         stack = [node]
         while stack:
@@ -376,7 +376,7 @@ class MarconiShadowCache:
             stack.extend(cur_node.children.values())
         return ret_list
 
-    def _count_cached_tokens(self, node: ShadowNode) -> Tuple[int, int]:
+    def _count_cached_tokens(self, node: TuningNode) -> Tuple[int, int]:
         if node.value:
             total_mamba_states = 1
             total_kv_tokens = len(node.value)
@@ -391,7 +391,7 @@ class MarconiShadowCache:
 
 class MarconiConfigTuner:
     def __init__(self, weights: Optional[List[float]] = None):
-        self.tree_snapshot: Optional[MarconiShadowCache] = None
+        self.tree_snapshot: Optional[MarconiTuningCache] = None
         self.num_tunings = 0
         self.executor: Optional[ProcessPoolExecutor] = None
         self.weights = weights or [
@@ -442,7 +442,7 @@ class MarconiConfigTuner:
 
     def submit(
         self,
-        tree_snapshot: Optional[MarconiShadowCache],
+        tree_snapshot: Optional[MarconiTuningCache],
         request_history_windowed: List[Tuple[Optional[str], List[int], List[int]]],
         tuning_interval: int,
         generation: int,
@@ -459,7 +459,7 @@ class MarconiConfigTuner:
 
     @staticmethod
     def _tune_with_snapshot(
-        tree_snapshot: Optional[MarconiShadowCache],
+        tree_snapshot: Optional[MarconiTuningCache],
         weights: List[float],
         request_history_windowed: List[Tuple[Optional[str], List[int], List[int]]],
         tuning_interval: int,
@@ -469,14 +469,14 @@ class MarconiConfigTuner:
             return generation, None
         results = {}
         for weight in weights:
-            shadow_cache = tree_snapshot.clone()
-            shadow_cache.eff_weight = weight
+            tuning_cache = tree_snapshot.clone()
+            tuning_cache.eff_weight = weight
             for extra_key, input_ids, output_ids in request_history_windowed:
-                shadow_cache.match_prefix(
+                tuning_cache.match_prefix(
                     input_ids, extra_key=extra_key, record_request=True
                 )
-                shadow_cache.insert(input_ids + output_ids, extra_key=extra_key)
-            _, _, total_flops_saved = shadow_cache.get_cache_stats(
+                tuning_cache.insert(input_ids + output_ids, extra_key=extra_key)
+            _, _, total_flops_saved = tuning_cache.get_cache_stats(
                 last_n=tuning_interval
             )
             results[weight] = total_flops_saved

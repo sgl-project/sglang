@@ -35,10 +35,10 @@ from sglang.srt.mem_cache.allocator import (
 )
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
 from sglang.srt.mem_cache.marconi_admission_cache import MarconiAdmissionTree
-from sglang.srt.mem_cache.marconi_shadow_cache import (
+from sglang.srt.mem_cache.marconi_tuning_cache import (
     MarconiConfigTuner,
-    MarconiShadowCache,
-    ShadowNode,
+    MarconiTuningCache,
+    TuningNode,
 )
 from sglang.srt.mem_cache.marconi_utils import (
     get_attn_flops,
@@ -820,7 +820,7 @@ class MambaRadixCache(BasePrefixCache):
         )
         self._marconi_maybe_tune()
 
-    def _marconi_shadow_capacity_bytes(self) -> Optional[int]:
+    def _marconi_tuning_capacity_bytes(self) -> Optional[int]:
         stats = self.marconi_model_stats
         if stats is None:
             return None
@@ -844,11 +844,11 @@ class MambaRadixCache(BasePrefixCache):
         )
         return kv_capacity_bytes + mamba_capacity_bytes
 
-    def _marconi_copy_tree(self, src_node: TreeNode, dst_node: "ShadowNode") -> int:
+    def _marconi_copy_tree(self, src_node: TreeNode, dst_node: "TuningNode") -> int:
         max_ts = int(src_node.last_access_time)
         for child in src_node.children.values():
             key_tokens = tuple(child.key.token_ids)
-            new_node = ShadowNode(
+            new_node = TuningNode(
                 key=key_tokens,
                 value=list(key_tokens),
                 extra_key=child.key.extra_key,
@@ -860,22 +860,22 @@ class MambaRadixCache(BasePrefixCache):
             max_ts = max(max_ts, self._marconi_copy_tree(child, new_node))
         return max_ts
 
-    def _marconi_build_shadow_cache(self) -> Optional[MarconiShadowCache]:
+    def _marconi_build_tuning_cache(self) -> Optional[MarconiTuningCache]:
         stats = self.marconi_model_stats
         if stats is None:
             return None
-        capacity_bytes = self._marconi_shadow_capacity_bytes()
+        capacity_bytes = self._marconi_tuning_capacity_bytes()
         if capacity_bytes is None:
             return None
-        shadow_cache = MarconiShadowCache(
+        tuning_cache = MarconiTuningCache(
             model_stats=stats,
             capacity_bytes=capacity_bytes,
             eff_weight=self.marconi_eff_weight,
             tuning_interval=self.marconi_tuning_interval,
         )
-        max_ts = self._marconi_copy_tree(self.root_node, shadow_cache.root_node)
-        shadow_cache.logical_ts = max_ts
-        return shadow_cache
+        max_ts = self._marconi_copy_tree(self.root_node, tuning_cache.root_node)
+        tuning_cache.logical_ts = max_ts
+        return tuning_cache
 
     def _marconi_maybe_snapshot(self) -> None:
         if self.marconi_tuner is None:
@@ -885,7 +885,7 @@ class MambaRadixCache(BasePrefixCache):
         if self.marconi_request_count < self.marconi_bootstrap_window_size:
             return
         if self.marconi_tuner.tree_snapshot is None:
-            self.marconi_tuner.tree_snapshot = self._marconi_build_shadow_cache()
+            self.marconi_tuner.tree_snapshot = self._marconi_build_tuning_cache()
             if self.marconi_tuner.tree_snapshot is not None:
                 self.marconi_request_history_windowed = []
 
@@ -910,7 +910,7 @@ class MambaRadixCache(BasePrefixCache):
                 and best_eff_weight is not None
             ):
                 self.marconi_eff_weight = best_eff_weight
-            self.marconi_tuner.tree_snapshot = self._marconi_build_shadow_cache()
+            self.marconi_tuner.tree_snapshot = self._marconi_build_tuning_cache()
         if len(self.marconi_request_history_windowed) < self.marconi_tuning_interval:
             return
         if self.marconi_tuner.tree_snapshot is None:
