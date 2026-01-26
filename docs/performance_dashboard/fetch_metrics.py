@@ -78,7 +78,7 @@ def fetch_workflow_runs(
     if event:
         params["event"] = event
 
-    response = requests.get(url, headers=get_headers(token), params=params)
+    response = requests.get(url, headers=get_headers(token), params=params, timeout=30)
     response.raise_for_status()
 
     runs = response.json().get("workflow_runs", [])
@@ -98,7 +98,7 @@ def fetch_run_artifacts(token: Optional[str], run_id: int) -> list:
     """Fetch artifacts for a specific workflow run."""
     url = f"https://api.github.com/repos/{GITHUB_REPO}/actions/runs/{run_id}/artifacts"
 
-    response = requests.get(url, headers=get_headers(token))
+    response = requests.get(url, headers=get_headers(token), timeout=30)
     response.raise_for_status()
 
     return response.json().get("artifacts", [])
@@ -113,7 +113,7 @@ def download_artifact(token: Optional[str], artifact_id: int) -> Optional[bytes]
     url = f"https://api.github.com/repos/{GITHUB_REPO}/actions/artifacts/{artifact_id}/zip"
 
     headers = get_headers(token)
-    response = requests.get(url, headers=headers, allow_redirects=True)
+    response = requests.get(url, headers=headers, allow_redirects=True, timeout=60)
 
     if response.status_code == 200:
         return response.content
@@ -185,7 +185,7 @@ def fetch_single_run(token: Optional[str], run_id: int) -> Optional[dict]:
     """Fetch metrics for a single run by ID."""
     url = f"https://api.github.com/repos/{GITHUB_REPO}/actions/runs/{run_id}"
 
-    response = requests.get(url, headers=get_headers(token))
+    response = requests.get(url, headers=get_headers(token), timeout=30)
     response.raise_for_status()
 
     run = response.json()

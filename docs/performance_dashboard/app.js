@@ -203,13 +203,32 @@ function selectModelTab(model, tabElement) {
     updateCharts();
 }
 
+// Handle model filter dropdown change to sync with tabs
+function handleModelFilterChange(model) {
+    // Find the corresponding tab and activate it to keep UI in sync
+    const tab = Array.from(document.querySelectorAll('.tab')).find(
+        t => t.title === model || (model === 'all' && t.textContent === 'All Models')
+    );
+    if (tab) {
+        selectModelTab(model, tab);
+    } else {
+        // Fallback: still update charts even if tab sync fails
+        currentModel = model;
+        updateCharts();
+    }
+}
+
 // Update summary stats
 function updateStats() {
     const statsRow = document.getElementById('stats-row');
     const latestRun = allMetricsData[0];
 
     if (!latestRun) {
-        statsRow.innerHTML = '<div class="no-data">No data available</div>';
+        statsRow.innerHTML = '';
+        const noDataDiv = document.createElement('div');
+        noDataDiv.className = 'no-data';
+        noDataDiv.textContent = 'No data available';
+        statsRow.appendChild(noDataDiv);
         return;
     }
 
@@ -228,25 +247,32 @@ function updateStats() {
         });
     });
 
-    statsRow.innerHTML = `
-        <div class="stat-card">
-            <div class="label">Total Runs</div>
-            <div class="value">${allMetricsData.length}</div>
-        </div>
-        <div class="stat-card">
-            <div class="label">Models Tested</div>
-            <div class="value">${totalModels}</div>
-        </div>
-        <div class="stat-card">
-            <div class="label">Benchmarks</div>
-            <div class="value">${totalBenchmarks}</div>
-        </div>
-        <div class="stat-card">
-            <div class="label">Peak Throughput</div>
-            <div class="value">${formatNumber(maxThroughput)}</div>
-            <div class="change">${maxThroughputModel}</div>
-        </div>
-    `;
+    statsRow.innerHTML = ''; // Clear previous stats
+
+    const addStat = (label, value, change) => {
+        const card = document.createElement('div');
+        card.className = 'stat-card';
+        const labelEl = document.createElement('div');
+        labelEl.className = 'label';
+        labelEl.textContent = label;
+        const valueEl = document.createElement('div');
+        valueEl.className = 'value';
+        valueEl.textContent = value;
+        card.appendChild(labelEl);
+        card.appendChild(valueEl);
+        if (change) {
+            const changeEl = document.createElement('div');
+            changeEl.className = 'change';
+            changeEl.textContent = change;
+            card.appendChild(changeEl);
+        }
+        statsRow.appendChild(card);
+    };
+
+    addStat('Total Runs', allMetricsData.length);
+    addStat('Models Tested', totalModels);
+    addStat('Benchmarks', totalBenchmarks);
+    addStat('Peak Throughput', formatNumber(maxThroughput), maxThroughputModel);
 }
 
 // Update all charts based on current filters
@@ -481,7 +507,7 @@ function updateRunsTable() {
 
         const runIdCell = document.createElement('td');
         const runLink = document.createElement('a');
-        runLink.href = `https://github.com/${GITHUB_REPO}/actions/runs/${escapeHtml(run.run_id)}`;
+        runLink.href = `https://github.com/${GITHUB_REPO}/actions/runs/${encodeURIComponent(run.run_id)}`;
         runLink.target = '_blank';
         runLink.className = 'run-link';
         runLink.textContent = run.run_id;
