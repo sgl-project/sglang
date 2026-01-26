@@ -22,7 +22,7 @@ import logging
 import os
 from contextlib import contextmanager
 from functools import partial
-from typing import TYPE_CHECKING, Callable, Optional, Union, List
+from typing import TYPE_CHECKING, Callable, List, Optional, Union
 
 import torch
 import tqdm
@@ -218,7 +218,9 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner, num_tokens_per_bs=1):
     return capture_bs, compile_bs
 
 
-def get_batch_sizes_to_capture_for_steps(model_runner: ModelRunner, batchsizes: List[int] = None):
+def get_batch_sizes_to_capture_for_steps(
+    model_runner: ModelRunner, batchsizes: List[int] = None
+):
     # get batchsizes for the given step to capture instead of all cuda graph batchsize
     server_args = model_runner.server_args
     if batchsizes:

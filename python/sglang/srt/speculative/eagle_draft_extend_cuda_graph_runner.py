@@ -524,7 +524,9 @@ class EAGLEDraftExtendCudaGraphRunnerAuto(EAGLEDraftExtendCudaGraphRunner):
         self.enable_pdmux = False
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
 
-        self.capture_bs, self.compile_bs = get_batch_sizes_to_capture_for_steps(model_runner)  # use batchsizes to be captured for current step
+        self.capture_bs, self.compile_bs = get_batch_sizes_to_capture_for_steps(
+            model_runner
+        )  # use batchsizes to be captured for current step
         self.padded_static_len = -1
 
         # Attention backend

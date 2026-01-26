@@ -3752,13 +3752,13 @@ class ServerArgs:
             "--neg-threshold",
             type=float,
             nargs="+",
-            help="Threshold of negative threshold for auto-spec"
+            help="Threshold of negative threshold for auto-spec",
         )
         parser.add_argument(
             "--pos-threshold",
             type=float,
             nargs="+",
-            help="Threshold of positive threshold for auto-spec"
+            help="Threshold of positive threshold for auto-spec",
         )
         parser.add_argument(
             "--speculative-config-file",

@@ -172,8 +172,8 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTen
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import PortArgs, ServerArgs, get_global_server_args
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.auto_eagle import AutoTunerEagle
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.tracing.trace import (
     process_tracing_init,
     trace_event_batch,
@@ -1095,8 +1095,12 @@ class Scheduler(
                 self.last_loop_is_idle = False
             else:
                 if not self.last_loop_is_idle and self.server_args.save_tune_results:
-                    with open(self.model_worker.spec_auto_tuner.spec_tune_file, "w") as f:
-                        logger.info(f"[AUTOSPEC] auto tune results saved to file: {self.model_worker.spec_auto_tuner.spec_tune_file}")
+                    with open(
+                        self.model_worker.spec_auto_tuner.spec_tune_file, "w"
+                    ) as f:
+                        logger.info(
+                            f"[AUTOSPEC] auto tune results saved to file: {self.model_worker.spec_auto_tuner.spec_tune_file}"
+                        )
                         json.dump(self.model_worker.spec_auto_tuner.results, f)
                 # When the server is idle, do self-check and re-init some states
                 self.self_check_during_idle()
@@ -2444,9 +2448,21 @@ class Scheduler(
         elif batch.forward_mode.is_idle():
             self.process_batch_result_idle(batch, result)
 
-        if self.auto_spec and batch.forward_mode.is_decode() and self.model_worker.spec_auto_tuner.enable_watch_for_batch(batch.batch_size()):
-            accept_length, accept_rate, throughput = self.get_metrics(batch.batch_size(), result.num_accepted_tokens, self.model_worker.speculative_num_draft_tokens)
-            self.model_worker.spec_auto_tuner.compute_and_update_best_parameters(batch.batch_size(), accept_length, accept_rate, throughput)
+        if (
+            self.auto_spec
+            and batch.forward_mode.is_decode()
+            and self.model_worker.spec_auto_tuner.enable_watch_for_batch(
+                batch.batch_size()
+            )
+        ):
+            accept_length, accept_rate, throughput = self.get_metrics(
+                batch.batch_size(),
+                result.num_accepted_tokens,
+                self.model_worker.speculative_num_draft_tokens,
+            )
+            self.model_worker.spec_auto_tuner.compute_and_update_best_parameters(
+                batch.batch_size(), accept_length, accept_rate, throughput
+            )
 
         self.log_batch_result_stats(batch, result)
         self._maybe_clear_mm_inputs(batch)

@@ -35,6 +35,7 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_worker import EAGLEWorker
 
 import logging
+
 logger = logging.getLogger(__name__)
 
 
@@ -427,23 +428,33 @@ class EAGLEDraftCudaGraphRunnerAuto(EAGLEDraftCudaGraphRunner):
         )
         self.enable_pdmux = False
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
-        logger.info(f"[AUTOSPEC] EAGLEDraftCudaGraphRunnerAuto __init__, speculative_num_steps={self.speculative_num_steps}, topk: {self.topk}")
+        logger.info(
+            f"[AUTOSPEC] EAGLEDraftCudaGraphRunnerAuto __init__, speculative_num_steps={self.speculative_num_steps}, topk: {self.topk}"
+        )
 
         # Batch sizes to capture
-        bs_for_current_step = eagle_worker.spec_auto_tuner.steps_bs_mapping[self.speculative_num_steps]
-        self.capture_bs, self.compile_bs = get_batch_sizes_to_capture_for_steps(model_runner, bs_for_current_step)
-        logger.info(f"[AUTOSPEC] EAGLEDraftCudaGraphRunnerAuto __init__, capture_bs: {self.capture_bs}, compile_bs: {self.compile_bs}")
+        bs_for_current_step = eagle_worker.spec_auto_tuner.steps_bs_mapping[
+            self.speculative_num_steps
+        ]
+        self.capture_bs, self.compile_bs = get_batch_sizes_to_capture_for_steps(
+            model_runner, bs_for_current_step
+        )
+        logger.info(
+            f"[AUTOSPEC] EAGLEDraftCudaGraphRunnerAuto __init__, capture_bs: {self.capture_bs}, compile_bs: {self.compile_bs}"
+        )
         # Attention backend
         self.num_tokens_per_bs = self.topk
         self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.num_tokens_per_bs
 
-        self.model_runner.draft_attn_backend_for_steps[self.speculative_num_steps].init_cuda_graph_state(
-            self.max_bs, self.max_num_token
+        self.model_runner.draft_attn_backend_for_steps[
+            self.speculative_num_steps
+        ].init_cuda_graph_state(self.max_bs, self.max_num_token)
+        self.seq_len_fill_value = (
+            self.model_runner.draft_attn_backend_for_steps[self.speculative_num_steps]
+            .attn_backends[0]
+            .get_cuda_graph_seq_len_fill_value()
         )
-        self.seq_len_fill_value = self.model_runner.draft_attn_backend_for_steps[self.speculative_num_steps].attn_backends[
-            0
-        ].get_cuda_graph_seq_len_fill_value()
         self.seq_lens_cpu = torch.full(
             (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
         )
@@ -500,4 +511,6 @@ class EAGLEDraftCudaGraphRunnerAuto(EAGLEDraftCudaGraphRunner):
             raise Exception(
                 f"Capture cuda graph failed: {e}\n{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
             )
-        logger.info(f"[AUTOSPEC] EAGLEDraftCudaGraphRunnerAuto __init__, num_steps: {self.speculative_num_steps} done")
+        logger.info(
+            f"[AUTOSPEC] EAGLEDraftCudaGraphRunnerAuto __init__, num_steps: {self.speculative_num_steps} done"
+        )

@@ -1631,7 +1631,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self.server_args.speculative_num_steps = num_steps
                 self.server_args.speculative_num_draft_tokens = 1
                 self.server_args.speculative_num_draft_tokens = num_steps + 1
-                logger.info(f"[AUTOSPEC] init_attention_backend_for_steps: num_steps={num_steps}")
+                logger.info(
+                    f"[AUTOSPEC] init_attention_backend_for_steps: num_steps={num_steps}"
+                )
                 self.attn_backend_for_steps[num_steps] = self._get_attention_backend()
         initial_steps = self.step_range[-1]
         self.server_args.speculative_num_steps = initial_steps
