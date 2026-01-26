@@ -20,40 +20,34 @@ struct VecTypeTrait;
 
 template <>
 struct VecTypeTrait<bf16_t, 16> {
-  using vec_t = device::AlignedVector<packed_t<bf16_t>, 4>;
+  using packed_t = packed_t<bf16_t>;
+  using vec_t = device::AlignedVector<packed_t, 4>;
 };
 
 template <>
 struct VecTypeTrait<fp16_t, 16> {
-  using vec_t = device::AlignedVector<packed_t<fp16_t>, 4>;
+  using packed_t = packed_t<fp16_t>;
+  using vec_t = device::AlignedVector<packed_t, 4>;
 };
 
 template <>
 struct VecTypeTrait<bf16_t, 32> {
-  using vec_t = device::AlignedVector<packed_t<bf16_t>, 8>;
+  using packed_t = packed_t<bf16_t>;
+  using vec_t = device::AlignedVector<packed_t, 8>;
 };
 
 template <>
 struct VecTypeTrait<fp16_t, 32> {
-  using vec_t = device::AlignedVector<packed_t<fp16_t>, 8>;
+  using packed_t = packed_t<fp16_t>;
+  using vec_t = device::AlignedVector<packed_t, 8>;
 };
 
-template <typename T>
-SGL_DEVICE T rms(T& val, T& weight, float rsqrt_square_sum);
-
-template <>
-SGL_DEVICE bf16x2_t rms<bf16x2_t>(bf16x2_t& val, bf16x2_t& weight, float rsqrt_square_sum) {
-  float2 valf = __bfloat1622float2(val);
-  float2 weightf = __bfloat1622float2(weight);
-  return __float22bfloat162_rn(
+template <typename packed_t>
+SGL_DEVICE packed_t rms(packed_t& val, packed_t& weight, float rsqrt_square_sum) {
+  float2 valf = device::cast<fp32x2_t, packed_t>(val);
+  float2 weightf = device::cast<fp32x2_t, packed_t>(weight);
+  return device::cast<packed_t, fp32x2_t>(
       make_float2(valf.x * weightf.x * rsqrt_square_sum, valf.y * weightf.y * rsqrt_square_sum));
-}
-
-template <>
-SGL_DEVICE fp16x2_t rms<fp16x2_t>(fp16x2_t& val, fp16x2_t& weight, float rsqrt_square_sum) {
-  float2 valf = __half22float2(val);
-  float2 weightf = __half22float2(weight);
-  return __float22half2_rn(make_float2(valf.x * weightf.x * rsqrt_square_sum, valf.y * weightf.y * rsqrt_square_sum));
 }
 
 template <typename T, int VEC_SIZE_IN_BYTE>
@@ -69,6 +63,7 @@ __global__ void fused_add_rmsnorm_reg_kernel(
   __shared__ float shared_memory[32];  // Used for CTA reduce
 
   using vec_t = typename VecTypeTrait<T, VEC_SIZE_IN_BYTE>::vec_t;
+  using packed_t = typename VecTypeTrait<T, VEC_SIZE_IN_BYTE>::packed_t;
   vec_t v;         // Save input
   vec_t v_res;     // Save residual
   vec_t v_weight;  // Save weight
@@ -88,24 +83,13 @@ __global__ void fused_add_rmsnorm_reg_kernel(
     v_res = p_res[threadIdx.x];
     v_weight = p_weight[threadIdx.x];
 
-    if constexpr (std::is_same_v<T, bf16_t>) {
-      for (int i = 0; i < inner_loop; i++) {
-        float2 val = __bfloat1622float2(v[i]);
-        float2 res = __bfloat1622float2(v_res[i]);
-        float2 inp_res = make_float2(val.x + res.x, val.y + res.y);
-        acc_square.x += inp_res.x * inp_res.x;
-        acc_square.y += inp_res.y * inp_res.y;
-        v[i] = __float22bfloat162_rn(inp_res);
-      }
-    } else if constexpr (std::is_same_v<T, fp16_t>) {
-      for (int i = 0; i < inner_loop; i++) {
-        float2 val = __half22float2(v[i]);
-        float2 res = __half22float2(v_res[i]);
-        float2 inp_res = make_float2(val.x + res.x, val.y + res.y);
-        acc_square.x += inp_res.x * inp_res.x;
-        acc_square.y += inp_res.y * inp_res.y;
-        v[i] = __float22half2_rn(inp_res);
-      }
+    for (int i = 0; i < inner_loop; i++) {
+      float2 val = device::cast<fp32x2_t, packed_t>(v[i]);
+      float2 res = device::cast<fp32x2_t, packed_t>(v_res[i]);
+      float2 inp_res = make_float2(val.x + res.x, val.y + res.y);
+      acc_square.x += inp_res.x * inp_res.x;
+      acc_square.y += inp_res.y * inp_res.y;
+      v[i] = device::cast<packed_t, fp32x2_t>(inp_res);
     }
 
     // Store inp+res to residual
