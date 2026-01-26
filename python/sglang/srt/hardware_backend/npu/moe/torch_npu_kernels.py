@@ -79,9 +79,9 @@ def output_unquant(hidden_states, quant_info, topk_weights, topk_ids):
     output = npu_fused_experts_unquant(
             hidden_states=hidden_states,
             w13=quant_info.w13_weight,
-            w13_scale_bias=quant_info.w13_scale_bias,
+            w13_weight_bias=quant_info.w13_weight_bias,
             w2=quant_info.w2_weight,
-            w2_scale_bias=quant_info.w2_scale_bias,
+            w2_weight_bias=quant_info.w2_weight_bias,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
             top_k=topk_ids.shape[1],
@@ -152,6 +152,8 @@ class TorchNpuKernelsRunnerCore(MoeRunnerCore):
             self.selected_run = output_wna16
         elif config.quantization == "AWQMoEAscendMethod":
             self.selected_run = output_wna16
+        elif config.quantization == "UnquantizedFusedMoEMethod":
+            self.selected_run = output_unquant
 
     def run(
         self,
