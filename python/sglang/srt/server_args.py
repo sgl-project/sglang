@@ -1254,7 +1254,7 @@ class ServerArgs:
                     ):
                         self.attention_backend = "trtllm_mla"
                         logger.info(
-                            "Use trtllm_mla as attention backend on sm100 for DeepseekV3ForCausalLM or KimiK25ForConditionalGeneration"
+                            "Use trtllm_mla as attention backend on sm100 for DeepseekV3ForCausalLM"
                         )
 
             # Set moe backend for DeepSeek
@@ -1264,10 +1264,7 @@ class ServerArgs:
                     # Default DeepSeek V3/R1 native FP8 when not explicitly set,
                     # Because we need this condition for an assertion in
                     # flashinfer_trtllm MoE runner backend.
-                    if quant_method is None and model_arch in [
-                        "DeepseekV3ForCausalLM",
-                        "KimiK25ForConditionalGeneration",
-                    ]:
+                    if quant_method is None and model_arch in ["DeepseekV3ForCausalLM"]:
                         self.quantization = "fp8"
                         logger.info(
                             "Quantization not specified, default to fp8 for DeepSeek on sm100"
