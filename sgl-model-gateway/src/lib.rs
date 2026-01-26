@@ -7,7 +7,6 @@ pub mod grpc_client;
 pub use smg_mcp as mcp;
 pub mod mesh;
 pub mod middleware;
-pub mod multimodal;
 pub mod observability;
 pub mod policies;
 pub use openai_protocol as protocols;
