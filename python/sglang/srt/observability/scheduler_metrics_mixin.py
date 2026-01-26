@@ -23,7 +23,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.scheduler import ScheduleBatch
 from sglang.srt.managers.utils import GenerationBatchResult
-from sglang.srt.metrics.collector import (
+from sglang.srt.observability.metrics_collector import (
     DPCooperationInfo,
     SchedulerMetricsCollector,
     SchedulerStats,
