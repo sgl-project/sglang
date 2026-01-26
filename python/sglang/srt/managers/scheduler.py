@@ -667,6 +667,8 @@ class Scheduler(
                 self.tp_worker.register_hicache_layer_transfer_counter(
                     self.tree_cache.cache_controller.layer_done_counter
                 )
+                if not self.spec_algorithm.is_none():
+                    self._register_draft_kv_pool_for_hicache(server_args)
             elif self.is_hybrid_swa:
                 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 
@@ -734,6 +736,58 @@ class Scheduler(
         self.sessions: Dict[str, Session] = {}
         self.forward_sleep_time = None
         self._engine_paused = False
+
+    def _register_draft_kv_pool_for_hicache(self, server_args: ServerArgs):
+        """Register draft model KV pool with HiCache for speculative decoding."""
+        if self.draft_worker is None:
+            return
+
+        from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
+        from sglang.srt.mem_cache.memory_pool_host import (
+            MHATokenToKVPoolHost,
+            MLATokenToKVPoolHost,
+        )
+
+        draft_runner = None
+        if hasattr(self.draft_worker, "draft_worker"):
+            draft_runner = getattr(self.draft_worker, "draft_worker").model_runner
+        elif hasattr(self.draft_worker, "draft_model_runner"):
+            draft_runner = getattr(self.draft_worker, "draft_model_runner")
+        elif hasattr(self.draft_worker, "model_runner"):
+            draft_runner = getattr(self.draft_worker, "model_runner")
+
+        if draft_runner is None:
+            return
+
+        draft_kv_pool = draft_runner.token_to_kv_pool
+        if isinstance(draft_kv_pool, MHATokenToKVPool):
+            draft_host_kv_pool = MHATokenToKVPoolHost(
+                draft_kv_pool,
+                server_args.hicache_ratio,
+                server_args.hicache_size,
+                self.page_size,
+                server_args.hicache_mem_layout,
+                allocator_type=server_args.hicache_storage_backend,
+            )
+        elif isinstance(draft_kv_pool, MLATokenToKVPool):
+            draft_host_kv_pool = MLATokenToKVPoolHost(
+                draft_kv_pool,
+                server_args.hicache_ratio,
+                server_args.hicache_size,
+                self.page_size,
+                server_args.hicache_mem_layout,
+                allocator_type=server_args.hicache_storage_backend,
+            )
+        else:
+            logger.warning(
+                f"Draft KV pool type {type(draft_kv_pool).__name__} not supported for HiCache"
+            )
+            return
+
+        if hasattr(self.tree_cache, "cache_controller"):
+            self.tree_cache.cache_controller.set_draft_kv_pool(
+                draft_kv_pool, draft_host_kv_pool
+            )
 
     def init_chunked_prefill(self):
         # Init chunked prefill

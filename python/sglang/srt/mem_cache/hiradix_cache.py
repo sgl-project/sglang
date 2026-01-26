@@ -138,7 +138,9 @@ class HiRadixCache(RadixCache):
         self.ongoing_load_back = {}
         # record the ongoing prefetch requests
         self.ongoing_prefetch = {}
+        self.ongoing_prefetch_draft = {}
         self.ongoing_backup = {}
+        self.ongoing_backup_draft = {}
         # todo: dynamically adjust the threshold
         self.write_through_threshold = (
             1 if server_args.hicache_write_policy == "write_through" else 2
@@ -289,6 +291,16 @@ class HiRadixCache(RadixCache):
         )
         self.ongoing_backup[operation_id] = node
         node.protect_host()
+        if self.cache_controller.has_draft_kv_pool:
+            draft_operation_id = self.cache_controller.write_storage(
+                node.host_value,
+                node.key,
+                node.hash_value,
+                prefix_keys,
+                is_draft=True,
+            )
+            self.ongoing_backup_draft[draft_operation_id] = node
+            node.protect_host()
 
     def _inc_hit_count(self, node: TreeNode, chunked=False):
         # skip the hit count update for chunked requests
@@ -575,8 +587,11 @@ class HiRadixCache(RadixCache):
 
         # process prefetch revokes
         for _ in range(n_revoke):
-            req_id = cc.prefetch_revoke_queue.get()
-            info = self.ongoing_prefetch.pop(req_id, None)
+            req_id, is_draft = cc.prefetch_revoke_queue.get()
+            pending_map = (
+                self.ongoing_prefetch_draft if is_draft else self.ongoing_prefetch
+            )
+            info = pending_map.pop(req_id, None)
             if info is not None:
                 last_host_node, token_ids, _, _ = info
                 last_host_node.release_host()
@@ -587,7 +602,11 @@ class HiRadixCache(RadixCache):
         for _ in range(n_backup):
             operation = cc.ack_backup_queue.get()
             ack_id = operation.id
-            entry = self.ongoing_backup.pop(ack_id, None)
+            entry = (
+                self.ongoing_backup_draft.pop(ack_id, None)
+                if operation.is_draft
+                else self.ongoing_backup.pop(ack_id, None)
+            )
             if entry is not None:
                 entry.release_host()
             if self.enable_storage_metrics:
@@ -597,11 +616,19 @@ class HiRadixCache(RadixCache):
 
         # release host memory
         host_indices_list = []
+        draft_host_indices_list = []
         for _ in range(n_release):
-            host_indices_list.append(cc.host_mem_release_queue.get())
+            host_indices, is_draft = cc.host_mem_release_queue.get()
+            if is_draft:
+                draft_host_indices_list.append(host_indices)
+            else:
+                host_indices_list.append(host_indices)
         if host_indices_list:
             host_indices = torch.cat(host_indices_list, dim=0)
             cc.mem_pool_host.free(host_indices)
+        if draft_host_indices_list and cc.has_draft_kv_pool:
+            draft_host_indices = torch.cat(draft_host_indices_list, dim=0)
+            cc.mem_pool_host_draft.free(draft_host_indices)
 
     # Timeout is linearly increasing with the number of pages
     def _prefetch_timeout_check_linear_func(self, operation: PrefetchOperation):
@@ -652,74 +679,134 @@ class HiRadixCache(RadixCache):
         return can_terminate
 
     def check_prefetch_progress(self, req_id: str) -> bool:
-        if req_id not in self.ongoing_prefetch:
+        if (
+            req_id not in self.ongoing_prefetch
+            and req_id not in self.ongoing_prefetch_draft
+        ):
             # there is no ongoing prefetch for this request or it has been revoked
             return True
 
-        # todo: more policies for prefetch progress such as timeout
-        # the current policy is to prefetch with best effort and terminate when queuing is over
-        last_host_node, token_ids, host_indices, operation = self.ongoing_prefetch[
-            req_id
-        ]
+        if req_id in self.ongoing_prefetch_draft:
+            _, _, _, draft_operation = self.ongoing_prefetch_draft[req_id]
+            if (
+                draft_operation.host_indices is not None
+                and not self.can_terminate_prefetch(draft_operation)
+            ):
+                return False
 
-        if operation.host_indices is None:
-            # prefetch has not been issued due to insufficient host memory
-            return True
+        if req_id in self.ongoing_prefetch:
+            # todo: more policies for prefetch progress such as timeout
+            # the current policy is to prefetch with best effort and terminate when queuing is over
+            last_host_node, token_ids, host_indices, operation = self.ongoing_prefetch[
+                req_id
+            ]
 
-        if not self.can_terminate_prefetch(operation):
-            return False
+            if operation.host_indices is None:
+                # prefetch has not been issued due to insufficient host memory
+                return True
 
-        completed_tokens, hash_value = self.cache_controller.terminate_prefetch(
-            operation
-        )
-        logger.debug(f"Prefetch {req_id} completed with {completed_tokens} tokens")
+            if not self.can_terminate_prefetch(operation):
+                return False
 
-        min_completed_tokens = completed_tokens
-        if self.tp_world_size > 1:
-            # synchrnoize TP workers to make the same update to hiradix cache
-            completed_tokens_tensor = torch.tensor(
-                min_completed_tokens, dtype=torch.int
+            completed_tokens, hash_value = self.cache_controller.terminate_prefetch(
+                operation
             )
-            torch.distributed.all_reduce(
-                completed_tokens_tensor,
-                op=torch.distributed.ReduceOp.MIN,
-                group=self.tp_group,
-            )
-            min_completed_tokens = completed_tokens_tensor.item()
-        fetched_token_ids = token_ids[:min_completed_tokens]
-        written_indices = host_indices[:min_completed_tokens]
-        matched_length = self._insert_helper_host(
-            last_host_node,
-            RadixKey(
-                token_ids=fetched_token_ids, extra_key=last_host_node.key.extra_key
-            ),
-            written_indices,
-            hash_value[: min_completed_tokens // self.page_size],
-        )
+            logger.debug(f"Prefetch {req_id} completed with {completed_tokens} tokens")
 
-        self.cache_controller.mem_pool_host.free(host_indices[:matched_length])
-        self.cache_controller.append_host_mem_release(
-            host_indices[min_completed_tokens:completed_tokens]
-        )
-        last_host_node.release_host()
-        del self.ongoing_prefetch[req_id]
-        self.cache_controller.prefetch_tokens_occupied -= len(token_ids)
-
-        if self.enable_storage_metrics:
-            self.storage_metrics_collector.log_prefetched_tokens(
-                min_completed_tokens - matched_length
+            min_completed_tokens = completed_tokens
+            if self.tp_world_size > 1:
+                # synchrnoize TP workers to make the same update to hiradix cache
+                completed_tokens_tensor = torch.tensor(
+                    min_completed_tokens, dtype=torch.int
+                )
+                torch.distributed.all_reduce(
+                    completed_tokens_tensor,
+                    op=torch.distributed.ReduceOp.MIN,
+                    group=self.tp_group,
+                )
+                min_completed_tokens = completed_tokens_tensor.item()
+            fetched_token_ids = token_ids[:min_completed_tokens]
+            written_indices = host_indices[:min_completed_tokens]
+            matched_length = self._insert_helper_host(
+                last_host_node,
+                RadixKey(
+                    token_ids=fetched_token_ids,
+                    extra_key=last_host_node.key.extra_key,
+                ),
+                written_indices,
+                hash_value[: min_completed_tokens // self.page_size],
             )
+
+            self.cache_controller.mem_pool_host.free(host_indices[:matched_length])
+            self.cache_controller.append_host_mem_release(
+                host_indices[min_completed_tokens:completed_tokens]
+            )
+            last_host_node.release_host()
+            del self.ongoing_prefetch[req_id]
+            self.cache_controller.prefetch_tokens_occupied -= len(token_ids)
+
+            if self.enable_storage_metrics:
+                self.storage_metrics_collector.log_prefetched_tokens(
+                    min_completed_tokens - matched_length
+                )
+
+        if req_id in self.ongoing_prefetch_draft:
+            (
+                draft_last_host_node,
+                draft_token_ids,
+                draft_host_indices,
+                draft_operation,
+            ) = self.ongoing_prefetch_draft[req_id]
+            if draft_operation.host_indices is not None:
+                draft_completed_tokens, draft_hash_value = (
+                    self.cache_controller.terminate_prefetch(draft_operation)
+                )
+                draft_min_completed_tokens = draft_completed_tokens
+                if self.tp_world_size > 1:
+                    draft_completed_tokens_tensor = torch.tensor(
+                        draft_min_completed_tokens, dtype=torch.int
+                    )
+                    torch.distributed.all_reduce(
+                        draft_completed_tokens_tensor,
+                        op=torch.distributed.ReduceOp.MIN,
+                        group=self.tp_group,
+                    )
+                    draft_min_completed_tokens = draft_completed_tokens_tensor.item()
+                draft_fetched_token_ids = draft_token_ids[:draft_min_completed_tokens]
+                draft_written_indices = draft_host_indices[:draft_min_completed_tokens]
+                draft_matched_length = self._insert_helper_host(
+                    draft_last_host_node,
+                    RadixKey(
+                        token_ids=draft_fetched_token_ids,
+                        extra_key=draft_last_host_node.key.extra_key,
+                    ),
+                    draft_written_indices,
+                    draft_hash_value[: draft_min_completed_tokens // self.page_size],
+                )
+                self.cache_controller.mem_pool_host_draft.free(
+                    draft_host_indices[:draft_matched_length]
+                )
+                self.cache_controller.append_host_mem_release(
+                    draft_host_indices[
+                        draft_min_completed_tokens:draft_completed_tokens
+                    ],
+                    is_draft=True,
+                )
+                draft_last_host_node.release_host()
+            del self.ongoing_prefetch_draft[req_id]
+            self.cache_controller.prefetch_tokens_occupied -= len(draft_token_ids)
 
         return True
 
     def terminate_prefetch(self, req_id: str):
-        if req_id not in self.ongoing_prefetch:
-            return
-
-        _, _, _, operation = self.ongoing_prefetch[req_id]
-        if operation.host_indices is None:
-            return
-        operation.mark_terminate()
+        if req_id in self.ongoing_prefetch:
+            _, _, _, operation = self.ongoing_prefetch[req_id]
+            if operation.host_indices is not None:
+                operation.mark_terminate()
+        if req_id in self.ongoing_prefetch_draft:
+            _, _, _, operation = self.ongoing_prefetch_draft[req_id]
+            if operation.host_indices is not None:
+                operation.mark_terminate()
 
     def match_prefix(self, params: MatchPrefixParams):
         key = params.key
@@ -797,6 +884,35 @@ class HiRadixCache(RadixCache):
             operation,
         )
         self.cache_controller.prefetch_tokens_occupied += len(new_input_tokens)
+
+        if self.cache_controller.has_draft_kv_pool:
+            draft_host_indices = self.cache_controller.mem_pool_host_draft.alloc(
+                prefetch_length
+            )
+            if draft_host_indices is None or not torch.equal(
+                draft_host_indices, host_indices
+            ):
+                if draft_host_indices is not None:
+                    self.cache_controller.mem_pool_host_draft.free(draft_host_indices)
+                logger.warning(
+                    "Draft HiCache prefetch indices desynced. Skip draft prefetch."
+                )
+                return
+            draft_operation = self.cache_controller.prefetch(
+                req_id,
+                draft_host_indices,
+                new_input_tokens,
+                last_hash,
+                prefix_keys,
+                is_draft=True,
+            )
+            self.ongoing_prefetch_draft[req_id] = (
+                last_host_node,
+                new_input_tokens,
+                draft_host_indices,
+                draft_operation,
+            )
+            self.cache_controller.prefetch_tokens_occupied += len(new_input_tokens)
 
     def _insert_helper_host(
         self, node: TreeNode, key: RadixKey, host_value, hash_value
