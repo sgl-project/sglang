@@ -160,9 +160,24 @@ class TestOpenAIServer(CustomTestCase):
                 # only contains buffered text being flushed (no new tokens generated).
                 # The detokenizer holds back text at word boundaries during streaming.
                 if response.choices[0].logprobs is not None:
+                    # Debug logging for flaky streaming logprobs test
+                    # See: https://github.com/sgl-project/sglang/pull/17687
+                    choice_logprobs = response.choices[0].logprobs
+                    if len(choice_logprobs.tokens) == 0:
+                        print(
+                            f"[DEBUG TEST] Empty tokens list in logprobs! "
+                            f"response.id={response.id}, "
+                            f"choice.index={response.choices[0].index}, "
+                            f"choice.text={repr(response.choices[0].text)}, "
+                            f"choice.finish_reason={response.choices[0].finish_reason}, "
+                            f"logprobs.tokens={choice_logprobs.tokens}, "
+                            f"logprobs.token_logprobs={choice_logprobs.token_logprobs}, "
+                            f"logprobs.top_logprobs={choice_logprobs.top_logprobs}, "
+                            f"echo={echo}, is_first={is_first}"
+                        )
                     assert isinstance(
                         response.choices[0].logprobs.tokens[0], str
-                    ), f"{response.choices[0].logprobs.tokens[0]} is not a string"
+                    ), f"{response.choices[0].logprobs.tokens[0]} is not a string, logprobs={response.choices[0].logprobs}, text={repr(response.choices[0].text)}, finish_reason={response.choices[0].finish_reason}"
                     if not (is_first and echo):
                         assert isinstance(
                             response.choices[0].logprobs.top_logprobs[0], dict
