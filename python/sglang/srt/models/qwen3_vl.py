@@ -480,7 +480,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         Returns:
             Interpolated position embeddings tensor.
         """
-        grid_thw_cpu = grid_thw.cpu().numpy() if grid_thw.is_cuda else grid_thw.numpy()
+        grid_thw_cpu = grid_thw.cpu().numpy()
 
         # transfer data to CPU before loop
         temporal_dims = grid_thw_cpu[:, 0].tolist()
