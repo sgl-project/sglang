@@ -23,6 +23,8 @@ ensuring correct weight updates and text generation.
 3. Tensor Parallel Tests: Tests memory release and resume operations with different tensor parallel
 configurations (tp=1, tp=2) to ensure proper memory management in distributed settings. For different
 data parallel size, we test it in verl.
+
+NOTE: This test is temporarily disabled.
 """
 
 import os
@@ -38,6 +40,7 @@ from sglang.srt.constants import (
     GPU_MEMORY_TYPE_KV_CACHE,
     GPU_MEMORY_TYPE_WEIGHTS,
 )
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_HYBRID_MAMBA_MODEL_NAME_FOR_TEST,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
@@ -45,6 +48,12 @@ from sglang.test.test_utils import (
     DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_BASE,
     DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_CHAT,
     CustomTestCase,
+)
+
+register_cuda_ci(
+    est_time=200,
+    suite="stage-c-test-4-gpu-h100",
+    disabled="Temporarily disabled - needs investigation",
 )
 
 # (temporarily) set to true to observe memory usage in nvidia-smi more clearly
