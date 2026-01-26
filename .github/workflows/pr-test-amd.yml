@@ -92,7 +92,8 @@ jobs:
               - "python/sglang/!(multimodal_gen)/**"
               - "python/pyproject_rocm.toml"
               - "python/pyproject_other.toml"
-              - "scripts/ci/**"
+              - "scripts/ci/amd/*"
+              - "scripts/ci/utils/*"
               - "test/**"
               - ".github/workflows/pr-test-amd.yml"
             sgl_kernel:
@@ -131,13 +132,13 @@ jobs:
         run: bash scripts/ensure_vram_clear.sh rocm
 
       - name: Start CI container
-        run: bash scripts/ci/amd_ci_start_container.sh
+        run: bash scripts/ci/amd/amd_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Install dependencies
         run: |
-          bash scripts/ci/amd_ci_install_dependency.sh
+          bash scripts/ci/amd/amd_ci_install_dependency.sh
 
       - name: Run test
         timeout-minutes: 14
@@ -179,13 +180,13 @@ jobs:
         run: bash scripts/ensure_vram_clear.sh rocm
 
       - name: Start CI container
-        run: bash scripts/ci/amd_ci_start_container.sh
+        run: bash scripts/ci/amd/amd_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Install dependencies
         run: |
-          bash scripts/ci/amd_ci_install_dependency.sh
+          bash scripts/ci/amd/amd_ci_install_dependency.sh
 
       - name: Run test
         timeout-minutes: 20
@@ -222,18 +223,18 @@ jobs:
         run: bash scripts/ensure_vram_clear.sh rocm
 
       - name: Start CI container
-        run: bash scripts/ci/amd_ci_start_container.sh
+        run: bash scripts/ci/amd/amd_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Install dependencies
         run: |
-          bash scripts/ci/amd_ci_install_dependency.sh
+          bash scripts/ci/amd/amd_ci_install_dependency.sh
 
       - name: Run test
         timeout-minutes: 10
         run: |
-          bash scripts/ci/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-a-test-1-amd
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-a-test-1-amd
 
   stage-b-test-small-1-gpu-amd:
     needs: [check-changes, stage-a-test-1-amd]
@@ -263,17 +264,17 @@ jobs:
         run: bash scripts/ensure_vram_clear.sh rocm
 
       - name: Start CI container
-        run: bash scripts/ci/amd_ci_start_container.sh
+        run: bash scripts/ci/amd/amd_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Install dependencies
-        run: bash scripts/ci/amd_ci_install_dependency.sh
+        run: bash scripts/ci/amd/amd_ci_install_dependency.sh
 
       - name: Run test
         timeout-minutes: 30
         run: |
-          bash scripts/ci/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-small-1-gpu-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 13 --timeout-per-file 1800
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-small-1-gpu-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 13 --timeout-per-file 1800
 
   stage-b-test-small-1-gpu-amd-mi35x:
     needs: [check-changes, stage-a-test-1-amd]
@@ -302,17 +303,17 @@ jobs:
         run: bash scripts/ensure_vram_clear.sh rocm
 
       - name: Start CI container
-        run: bash scripts/ci/amd_ci_start_container.sh
+        run: bash scripts/ci/amd/amd_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Install dependencies
-        run: bash scripts/ci/amd_ci_install_dependency.sh
+        run: bash scripts/ci/amd/amd_ci_install_dependency.sh
 
       - name: Run test
         timeout-minutes: 30
         run: |
-          bash scripts/ci/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-small-1-gpu-amd-mi35x
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-small-1-gpu-amd-mi35x
 
   stage-b-test-large-2-gpu-amd:
     needs: [check-changes, stage-a-test-1-amd]
@@ -341,17 +342,17 @@ jobs:
         run: bash scripts/ensure_vram_clear.sh rocm
 
       - name: Start CI container
-        run: bash scripts/ci/amd_ci_start_container.sh
+        run: bash scripts/ci/amd/amd_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Install dependencies
-        run: bash scripts/ci/amd_ci_install_dependency.sh
+        run: bash scripts/ci/amd/amd_ci_install_dependency.sh
 
       - name: Run test
         timeout-minutes: 30
         run: |
-          bash scripts/ci/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-large-2-gpu-amd
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-large-2-gpu-amd
 
   multimodal-gen-test-1-gpu-amd:
     needs: [check-changes]
@@ -381,13 +382,13 @@ jobs:
           pattern: wheel-python3.10-cuda12.9
 
       - name: Start CI container
-        run: bash scripts/ci/amd_ci_start_container.sh
+        run: bash scripts/ci/amd/amd_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Install dependencies
         run: |
-          bash scripts/ci/amd_ci_install_dependency.sh diffusion
+          bash scripts/ci/amd/amd_ci_install_dependency.sh diffusion
 
       - name: Setup kernel caches
         run: |
@@ -501,13 +502,13 @@ jobs:
           pattern: wheel-python3.10-cuda12.9
 
       - name: Start CI container
-        run: bash scripts/ci/amd_ci_start_container.sh
+        run: bash scripts/ci/amd/amd_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Install dependencies
         run: |
-          bash scripts/ci/amd_ci_install_dependency.sh diffusion
+          bash scripts/ci/amd/amd_ci_install_dependency.sh diffusion
 
       - name: Setup kernel caches
         run: |
@@ -622,23 +623,23 @@ jobs:
         run: bash scripts/ensure_vram_clear.sh rocm
 
       - name: Start CI container
-        run: bash scripts/ci/amd_ci_start_container.sh
+        run: bash scripts/ci/amd/amd_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Install dependencies
-        run: bash scripts/ci/amd_ci_install_dependency.sh
+        run: bash scripts/ci/amd/amd_ci_install_dependency.sh
 
       - name: Test RCCL multi-GPU communication
         timeout-minutes: 5
         run: |
           echo "Testing RCCL multi-GPU communication with debug info..."
-          docker exec ci_sglang bash -c "cd /sglang-checkout && NCCL_DEBUG=INFO RCCL_DEBUG=INFO torchrun --nproc_per_node=8 scripts/ci/test_rccl_multi_gpu.py"
+          docker exec ci_sglang bash -c "cd /sglang-checkout && NCCL_DEBUG=INFO RCCL_DEBUG=INFO torchrun --nproc_per_node=8 scripts/ci/amd/test_rccl_multi_gpu.py"
 
       - name: Run test
         timeout-minutes: 60
         run: |
-          bash scripts/ci/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-c-test-large-8-gpu-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --timeout-per-file 3600
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-c-test-large-8-gpu-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --timeout-per-file 3600
 
   stage-c-test-large-8-gpu-amd-mi35x:
     needs: [check-changes, call-gate, stage-b-test-small-1-gpu-amd, stage-b-test-large-2-gpu-amd]
@@ -667,17 +668,17 @@ jobs:
         run: bash scripts/ensure_vram_clear.sh rocm
 
       - name: Start CI container
-        run: bash scripts/ci/amd_ci_start_container.sh
+        run: bash scripts/ci/amd/amd_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Install dependencies
-        run: bash scripts/ci/amd_ci_install_dependency.sh
+        run: bash scripts/ci/amd/amd_ci_install_dependency.sh
 
       - name: Run test
         timeout-minutes: 60
         run: |
-          bash scripts/ci/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-c-test-large-8-gpu-amd-mi35x --timeout-per-file 3600
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-c-test-large-8-gpu-amd-mi35x --timeout-per-file 3600
 
   stage-b-test-small-1-gpu-performance-amd:
     needs: [check-changes, call-gate, stage-a-test-1-amd]
@@ -706,17 +707,17 @@ jobs:
         run: bash scripts/ensure_vram_clear.sh rocm
 
       - name: Start CI container
-        run: bash scripts/ci/amd_ci_start_container.sh
+        run: bash scripts/ci/amd/amd_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Install dependencies
-        run: bash scripts/ci/amd_ci_install_dependency.sh
+        run: bash scripts/ci/amd/amd_ci_install_dependency.sh
 
       - name: Run test
         timeout-minutes: 30
         run: |
-          bash scripts/ci/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-small-1-gpu-performance-amd --timeout-per-file 1200
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-small-1-gpu-performance-amd --timeout-per-file 1200
 
   stage-b-test-large-1-gpu-performance-amd:
     needs: [check-changes, call-gate, stage-a-test-1-amd]
@@ -746,17 +747,17 @@ jobs:
         run: bash scripts/ensure_vram_clear.sh rocm
 
       - name: Start CI container
-        run: bash scripts/ci/amd_ci_start_container.sh
+        run: bash scripts/ci/amd/amd_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Install dependencies
-        run: bash scripts/ci/amd_ci_install_dependency.sh
+        run: bash scripts/ci/amd/amd_ci_install_dependency.sh
 
       - name: Run test
         timeout-minutes: 30
         run: |
-          bash scripts/ci/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-large-1-gpu-performance-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --timeout-per-file 1200
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-large-1-gpu-performance-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --timeout-per-file 1200
 
   stage-b-test-large-2-gpu-performance-amd:
     needs: [check-changes, call-gate, stage-a-test-1-amd]
@@ -785,17 +786,17 @@ jobs:
         run: bash scripts/ensure_vram_clear.sh rocm
 
       - name: Start CI container
-        run: bash scripts/ci/amd_ci_start_container.sh
+        run: bash scripts/ci/amd/amd_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Install dependencies
-        run: bash scripts/ci/amd_ci_install_dependency.sh
+        run: bash scripts/ci/amd/amd_ci_install_dependency.sh
 
       - name: Run test
         timeout-minutes: 30
         run: |
-          bash scripts/ci/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-large-2-gpu-performance-amd --timeout-per-file 1200
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-large-2-gpu-performance-amd --timeout-per-file 1200
 
   stage-b-test-small-1-gpu-accuracy-amd:
     needs: [check-changes, stage-a-test-1-amd]
@@ -824,17 +825,17 @@ jobs:
         run: bash scripts/ensure_vram_clear.sh rocm
 
       - name: Start CI container
-        run: bash scripts/ci/amd_ci_start_container.sh
+        run: bash scripts/ci/amd/amd_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Install dependencies
-        run: bash scripts/ci/amd_ci_install_dependency.sh
+        run: bash scripts/ci/amd/amd_ci_install_dependency.sh
 
       - name: Run test
         timeout-minutes: 30
         run: |
-          bash scripts/ci/amd_ci_exec.sh -w "/sglang-checkout/test" -e SGLANG_USE_AITER=0 python3 run_suite.py --hw amd --suite stage-b-test-small-1-gpu-accuracy-amd --timeout-per-file 1800
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" -e SGLANG_USE_AITER=0 python3 run_suite.py --hw amd --suite stage-b-test-small-1-gpu-accuracy-amd --timeout-per-file 1800
 
   stage-b-test-large-2-gpu-accuracy-amd:
     needs: [check-changes, stage-a-test-1-amd]
@@ -863,17 +864,17 @@ jobs:
         run: bash scripts/ensure_vram_clear.sh rocm
 
       - name: Start CI container
-        run: bash scripts/ci/amd_ci_start_container.sh
+        run: bash scripts/ci/amd/amd_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Install dependencies
-        run: bash scripts/ci/amd_ci_install_dependency.sh
+        run: bash scripts/ci/amd/amd_ci_install_dependency.sh
 
       - name: Run test
         timeout-minutes: 30
         run: |
-          bash scripts/ci/amd_ci_exec.sh -w "/sglang-checkout/test" -e SGLANG_USE_AITER_AR=0 -e SGLANG_USE_AITER=0 -e HF_HUB_ENABLE_HF_TRANSFER=0 python3 run_suite.py --hw amd --suite stage-b-test-large-2-gpu-accuracy-amd --timeout-per-file 1800
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" -e SGLANG_USE_AITER_AR=0 -e SGLANG_USE_AITER=0 -e HF_HUB_ENABLE_HF_TRANSFER=0 python3 run_suite.py --hw amd --suite stage-b-test-large-2-gpu-accuracy-amd --timeout-per-file 1800
 
   pr-test-amd-finish:
     needs:

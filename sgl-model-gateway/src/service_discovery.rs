@@ -841,10 +841,10 @@ mod tests {
             reasoning_parser_factory: None,
             tool_parser_factory: None,
             router_manager: None,
-            response_storage: Arc::new(crate::data_connector::MemoryResponseStorage::new()),
-            conversation_storage: Arc::new(crate::data_connector::MemoryConversationStorage::new()),
+            response_storage: Arc::new(data_connector::MemoryResponseStorage::new()),
+            conversation_storage: Arc::new(data_connector::MemoryConversationStorage::new()),
             conversation_item_storage: Arc::new(
-                crate::data_connector::MemoryConversationItemStorage::new(),
+                data_connector::MemoryConversationItemStorage::new(),
             ),
             load_monitor: None,
             configured_reasoning_parser: None,
