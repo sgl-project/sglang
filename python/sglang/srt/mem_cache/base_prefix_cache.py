@@ -17,7 +17,7 @@ import torch
 
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.srt.metrics.collector import RadixCacheMetricsCollector
+from sglang.srt.observability.metrics_collector import RadixCacheMetricsCollector
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req

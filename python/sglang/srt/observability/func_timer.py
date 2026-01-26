@@ -20,7 +20,7 @@ import time
 from functools import wraps
 from typing import Any, Callable, Optional
 
-from sglang.srt.metrics.utils import exponential_buckets
+from sglang.srt.observability.utils import exponential_buckets
 
 enable_metrics = False
 
