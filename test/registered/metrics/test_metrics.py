@@ -6,7 +6,7 @@ from prometheus_client.parser import text_string_to_metric_families
 from prometheus_client.samples import Sample
 
 from sglang.srt.environ import envs
-from sglang.srt.metrics.collector import (
+from sglang.srt.observability.metrics_collector import (
     ROUTING_KEY_REQ_COUNT_BUCKET_BOUNDS,
     compute_routing_key_stats,
 )

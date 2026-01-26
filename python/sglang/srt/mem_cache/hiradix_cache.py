@@ -38,7 +38,7 @@ from sglang.srt.mem_cache.radix_cache import (
     compute_node_hash_values,
     split_node_hash_value,
 )
-from sglang.srt.metrics.collector import StorageMetricsCollector
+from sglang.srt.observability.metrics_collector import StorageMetricsCollector
 from sglang.srt.utils import bind_to_closest_numa_node_cuda
 
 if TYPE_CHECKING:
