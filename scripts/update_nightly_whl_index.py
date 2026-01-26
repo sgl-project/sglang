@@ -14,7 +14,6 @@ import argparse
 import hashlib
 import pathlib
 import re
-import tomllib
 
 
 def compute_sha256(file_path: pathlib.Path) -> str:
@@ -33,15 +32,13 @@ def detect_cuda_version() -> str:
         CUDA version string like "cu129" or "cu130"
     """
     pyproject_path = pathlib.Path("python/pyproject.toml")
-    with open(pyproject_path, "rb") as f:
-        config = tomllib.load(f)
+    content = pyproject_path.read_text()
 
-    for dep in config["project"]["dependencies"]:
-        # Match cuda-python==12.9 or cuda-python==13.0, etc.
-        match = re.match(r"cuda-python==(\d+)\.(\d+)", dep)
-        if match:
-            major, minor = match.groups()
-            return f"cu{major}{minor}"  # "cu129" or "cu130"
+    # Match cuda-python==12.9 or cuda-python==13.0, etc.
+    match = re.search(r'"cuda-python==(\d+)\.(\d+)"', content)
+    if match:
+        major, minor = match.groups()
+        return f"cu{major}{minor}"  # "cu129" or "cu130"
 
     raise ValueError("cuda-python dependency not found in pyproject.toml")
 
