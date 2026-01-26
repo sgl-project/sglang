@@ -40,7 +40,7 @@ class TestGLM46(unittest.TestCase):
 
         run_combined_tests(
             models=variants,
-            test_name="GLM-4.6 Unified",
+            test_name="GLM-4.6",
             accuracy_params=AccuracyTestParams(dataset="gsm8k", baseline_accuracy=0.80),
             performance_params=PerformanceTestParams(
                 profile_dir="performance_profiles_glm_4_6",
