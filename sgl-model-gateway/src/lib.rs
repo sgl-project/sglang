@@ -4,7 +4,7 @@ pub mod config;
 pub mod core;
 pub use data_connector;
 pub mod grpc_client;
-pub mod mcp;
+pub use smg_mcp as mcp;
 pub mod mesh;
 pub mod middleware;
 pub mod multimodal;
