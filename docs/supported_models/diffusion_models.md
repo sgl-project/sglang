@@ -4,7 +4,7 @@ SGLang Diffusion is an inference framework for accelerated image and video gener
 
 ## Key Features
 
-- **Broad Model Support**: Wan series, FastWan series, Hunyuan, Qwen-Image, Qwen-Image-Edit, Flux, and more
+- **Broad Model Support**: Wan series, FastWan series, Hunyuan, Qwen-Image, Qwen-Image-Edit, Flux, Z-Image, GLM-Image, and more
 - **Fast Inference**: Optimized kernels from sgl-kernel, efficient scheduler loop, and Cache-DiT acceleration
 - **Ease of Use**: OpenAI-compatible API, CLI, and Python SDK
 - **Multi-Platform**: NVIDIA GPUs (H100, H200, A100, B200, 4090) and AMD GPUs (MI300X, MI325X)
@@ -110,12 +110,16 @@ default parameters when initializing and generating videos.
 
 ### Image Generation Models
 
-| Model Name      | HuggingFace Model ID           | Resolutions    |
-|:----------------|:-------------------------------|:---------------|
-| FLUX.1-dev      | `black-forest-labs/FLUX.1-dev` | Any resolution |
-| FLUX.2-dev      | `black-forest-labs/FLUX.2-dev` | Any resolution |
-| Qwen Image      | `Qwen/Qwen-Image`              | Any resolution |
-| Qwen Image Edit | `Qwen/Qwen-Image-Edit`         | Any resolution |
+| Model Name       | HuggingFace Model ID                    | Resolutions    |
+|:-----------------|:----------------------------------------|:---------------|
+| FLUX.1-dev       | `black-forest-labs/FLUX.1-dev`          | Any resolution |
+| FLUX.2-dev       | `black-forest-labs/FLUX.2-dev`          | Any resolution |
+| FLUX.2-Klein     | `black-forest-labs/FLUX.2-klein-4B`     | Any resolution |
+| Z-Image-Turbo    | `Tongyi-MAI/Z-Image-Turbo`              | Any resolution |
+| GLM-Image        | `zai-org/GLM-Image`                     | Any resolution |
+| Qwen Image       | `Qwen/Qwen-Image`                       | Any resolution |
+| Qwen Image 2512  | `Qwen/Qwen-Image-2512`                  | Any resolution |
+| Qwen Image Edit  | `Qwen/Qwen-Image-Edit`                  | Any resolution |
 
 ## Verified LoRA Examples
 
@@ -1004,13 +1008,14 @@ All Cache-DiT parameters can be set via the following environment variables:
 
 SGLang Diffusion x Cache-DiT supports almost all models originally supported in SGLang Diffusion:
 
-| Model Family | Example Models              |
-|--------------|-----------------------------|
-| Wan          | Wan2.1, Wan2.2              |
-| Flux         | FLUX.1-dev, FLUX.2-dev      |
-| Z-Image      | Z-Image-Turbo               |
-| Qwen         | Qwen-Image, Qwen-Image-Edit |
-| Hunyuan      | HunyuanVideo                |
+| Model Family | Example Models                            |
+|--------------|-------------------------------------------|
+| Wan          | Wan2.1, Wan2.2                            |
+| Flux         | FLUX.1-dev, FLUX.2-dev, FLUX.2-Klein      |
+| Z-Image      | Z-Image-Turbo                             |
+| Qwen         | Qwen-Image, Qwen-Image-Edit               |
+| GLM          | GLM-Image                                 |
+| Hunyuan      | HunyuanVideo                              |
 
 ## Performance Tips
 
