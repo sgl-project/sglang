@@ -76,25 +76,12 @@ class RequestTrackers:
             dtype=torch.int64,
             device=device,
         )
-        self.should_load_device_indices = torch.full(
-            (max_pool_size, self.device_buffer_cnt),
-            -1,
-            dtype=torch.int64,
-            device=device,
-        )
-        self.should_load_host_indices = torch.full(
-            (max_pool_size, self.device_buffer_cnt),
-            -1,
-            dtype=torch.int64,
-            device=device,
-        )
+
 
     def _reset_state(self, idx: int) -> None:
         """Reset all tensor states for a request slot."""
         self.req_to_tokens_host[idx].fill_(-1)
         self.curr_device_indices[idx].fill_(-1)
-        self.should_load_device_indices[idx].fill_(-1)
-        self.should_load_host_indices[idx].fill_(-1)
         self.last_top_k_result[idx].fill_(-1)
         self.last_device_indices[idx].fill_(-1)
         self.repr_constructed[idx] = False
