@@ -464,6 +464,9 @@ class ModelConfig:
                     ):
                         setattr(self.hf_text_config, "head_dim", self.head_dim)
 
+            elif "BaichuanForCausalLM" in self.hf_config.architectures:
+                self.use_alibi = self.hf_config.hidden_size != 4096
+
             self.attention_arch = AttentionArch.MHA
 
         self.num_attention_heads = self.hf_text_config.num_attention_heads
@@ -1123,6 +1126,7 @@ def is_generation_model(model_architectures: List[str], is_embedding: bool = Fal
 multimodal_model_archs = [
     "CLIPModel",
     "DeepseekVL2ForCausalLM",
+    "Ernie4_5_VLMoeForConditionalGeneration",
     "Gemma3ForConditionalGeneration",
     "Gemma3nForConditionalGeneration",
     "Glm4vForConditionalGeneration",

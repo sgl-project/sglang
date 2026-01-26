@@ -1,3 +1,4 @@
+import re
 from typing import TYPE_CHECKING
 
 import torch
@@ -281,61 +282,25 @@ def forward_dsa_prepare_npu(
     forward_batch: "ForwardBatch",
     zero_allocator: "BumpAllocator",
 ):
+    dynamic_scale = None
     if is_mla_preprocess_enabled() and forward_batch.forward_mode.is_decode():
-        if not hasattr(m, "mla_preprocess"):
-            m.mla_preprocess = NPUFusedMLAPreprocess(
-                m.fused_qkv_a_proj_with_mqa,
-                m.q_a_layernorm,
-                m.kv_a_layernorm,
-                m.q_b_proj,
-                m.w_kc,
-                m.rotary_emb,
-                m.layer_id,
-                m.num_local_heads,
-                m.qk_nope_head_dim,
-                m.qk_rope_head_dim,
-                m.quant_config,
-            )
-        if m.alt_stream is not None:
-            mla_event = torch.npu.Event()
-            mla_event.record()
-            with torch.npu.stream(m.alt_stream):
-                # alt stream waits for the completion of the event on the main stream to ensure data dependency is complete
-                torch.npu.current_stream().wait_event(mla_event)
-                (
-                    q_pe,
-                    k_pe,
-                    q_nope_out,
-                    k_nope,
-                    forward_batch,
-                    zero_allocator,
-                    positions,
-                ) = m.mla_preprocess.forward(
-                    positions, hidden_states, forward_batch, zero_allocator
-                )
-            fused_qkv_a_proj_out = m.fused_qkv_a_proj_with_mqa(hidden_states)[0]
-            q, _ = fused_qkv_a_proj_out.split(
-                [m.q_lora_rank, m.kv_lora_rank + m.qk_rope_head_dim], dim=-1
-            )
-            q_lora = m.q_a_layernorm(q)
-            torch.npu.current_stream().wait_stream(m.alt_stream)
-        else:
-            (
-                q_pe,
-                k_pe,
-                q_nope_out,
-                k_nope,
-                forward_batch,
-                zero_allocator,
-                positions,
-            ) = m.mla_preprocess.forward(
-                positions, hidden_states, forward_batch, zero_allocator
-            )
-            fused_qkv_a_proj_out = m.fused_qkv_a_proj_with_mqa(hidden_states)[0]
-            q, _ = fused_qkv_a_proj_out.split(
-                [m.q_lora_rank, m.kv_lora_rank + m.qk_rope_head_dim], dim=-1
-            )
-            q_lora = m.q_a_layernorm(q)
+        (
+            q_pe,
+            k_pe,
+            q_nope_out,
+            k_nope,
+            q_lora,
+            forward_batch,
+            zero_allocator,
+            positions,
+            dynamic_scale,
+        ) = npu_mla_preprocess(
+            m,
+            hidden_states,
+            positions,
+            forward_batch,
+            zero_allocator,
+        )
     else:
         fused_qkv_a_proj_out = m.fused_qkv_a_proj_with_mqa(hidden_states)[0]
         q, latent_cache = fused_qkv_a_proj_out.split(
@@ -384,7 +349,7 @@ def forward_dsa_prepare_npu(
             )
 
     topk_indices = m.indexer(
-        hidden_states, q_lora, positions, forward_batch, m.layer_id
+        hidden_states, q_lora, positions, forward_batch, m.layer_id, dynamic_scale
     )
 
     return (
@@ -449,6 +414,102 @@ def forward_dsa_core_npu(
 
     output, _ = m.o_proj(attn_bmm_output)
     return output
+
+
+def npu_mla_preprocess(
+    m: "DeepseekV2AttentionMLA",
+    hidden_states: torch.Tensor,
+    positions: torch.Tensor,
+    forward_batch: "ForwardBatch",
+    zero_allocator: "BumpAllocator",
+):
+    dynamic_scale = None
+    if not hasattr(m, "mla_preprocess"):
+        m.mla_preprocess = NPUFusedMLAPreprocess(
+            m.fused_qkv_a_proj_with_mqa,
+            m.q_a_layernorm,
+            m.kv_a_layernorm,
+            m.q_b_proj,
+            m.w_kc,
+            m.rotary_emb,
+            m.layer_id,
+            m.num_local_heads,
+            m.qk_nope_head_dim,
+            m.qk_rope_head_dim,
+            m.v_head_dim,
+            m.quant_config,
+        )
+    # mlaprolog does not require additional calculation of q_lora
+    _is_mlaprolog = hasattr(m.quant_config, "ignore") and any(
+        re.fullmatch(r".*kv_b_proj", l) for l in m.quant_config.ignore
+    )
+    if _is_mlaprolog:
+        (
+            q_pe,
+            k_pe,
+            q_nope_out,
+            k_nope,
+            q_lora,
+            forward_batch,
+            positions,
+            dynamic_scale,
+        ) = m.mla_preprocess.forward(
+            positions, hidden_states, forward_batch, zero_allocator
+        )
+    else:
+        if m.alt_stream is not None:
+            mla_event = torch.npu.Event()
+            mla_event.record()
+            with torch.npu.stream(m.alt_stream):
+                # alt stream waits for the completion of the event on the main stream to ensure data dependency is complete
+                torch.npu.current_stream().wait_event(mla_event)
+                (
+                    q_pe,
+                    k_pe,
+                    q_nope_out,
+                    k_nope,
+                    forward_batch,
+                    zero_allocator,
+                    positions,
+                ) = m.mla_preprocess.forward(
+                    positions, hidden_states, forward_batch, zero_allocator
+                )
+
+            fused_qkv_a_proj_out = m.fused_qkv_a_proj_with_mqa(hidden_states)[0]
+            q, _ = fused_qkv_a_proj_out.split(
+                [m.q_lora_rank, m.kv_lora_rank + m.qk_rope_head_dim], dim=-1
+            )
+            q_lora = m.q_a_layernorm(q)
+            torch.npu.current_stream().wait_event(m.alt_stream)
+        else:
+            (
+                q_pe,
+                k_pe,
+                q_nope_out,
+                k_nope,
+                forward_batch,
+                zero_allocator,
+                positions,
+            ) = m.mla_preprocess.forward(
+                positions, hidden_states, forward_batch, zero_allocator
+            )
+            fused_qkv_a_proj_out = m.fused_qkv_a_proj_with_mqa(hidden_states)[0]
+            q, _ = fused_qkv_a_proj_out.split(
+                [m.q_lora_rank, m.kv_lora_rank + m.qk_rope_head_dim], dim=-1
+            )
+            q_lora = m.q_a_layernorm(q)
+
+    return (
+        q_pe,
+        k_pe,
+        q_nope_out,
+        k_nope,
+        q_lora,
+        forward_batch,
+        zero_allocator,
+        positions,
+        dynamic_scale,
+    )
 
 
 # endregion
