@@ -69,11 +69,8 @@ k8s-openapi = { version = "0.25.0", features = ["v1_33"] }
 metrics = "0.24.2"
 metrics-exporter-prometheus = "0.17.0"
 uuid = { version = "1.10", features = ["v4", "serde"] }
-ulid = "1.2.1"
 parking_lot = "0.12.4"
 thiserror = "2.0.12"
-
-
 regex = "1.10"
 memchr = "2.7"  # SIMD-optimized byte pattern searching
 url = "2.5.4"
@@ -134,9 +131,6 @@ deadpool-redis = "0.18.0"
 # wasm dependencies
 sha2 = "0.10"
 wasmtime = { version = "38.0", features = ["component-model", "async"] }
-wasmtime-wasi = "38.0"
-async-channel = "2.5"
-aho-corasick = "1.1.4"
 
 [build-dependencies]
 tonic-prost-build = "0.14.2"
