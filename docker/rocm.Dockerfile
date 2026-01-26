@@ -1,8 +1,7 @@
 # Usage (to build SGLang ROCm docker image):
-#   docker build --build-arg SGL_BRANCH=v0.5.6.post2 --build-arg GPU_ARCH=gfx942 -t v0.5.6.post2-rocm630-mi30x -f rocm.Dockerfile .
-#   docker build --build-arg SGL_BRANCH=v0.5.6.post2 --build-arg GPU_ARCH=gfx942-rocm700 -t v0.5.6.post2-rocm700-mi30x -f rocm.Dockerfile .
-#   docker build --build-arg SGL_BRANCH=v0.5.6.post2 --build-arg GPU_ARCH=gfx950 -t v0.5.6.post2-rocm700-mi35x -f rocm.Dockerfile .
-
+#   docker build --build-arg SGL_BRANCH=v0.5.8 --build-arg GPU_ARCH=gfx942 -t v0.5.8-rocm630-mi30x -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.8 --build-arg GPU_ARCH=gfx942-rocm700 -t v0.5.8-rocm700-mi30x -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.8 --build-arg GPU_ARCH=gfx950 -t v0.5.8-rocm700-mi35x -f rocm.Dockerfile .
 
 # Default base images
 ARG BASE_IMAGE_942="rocm/sgl-dev:vllm20250114"
@@ -65,9 +64,8 @@ ARG LLVM_COMMIT="6520ace8227ffe2728148d5f3b9872a870b0a560"
 ARG MOONCAKE_REPO="https://github.com/kvcache-ai/Mooncake.git"
 ARG MOONCAKE_COMMIT="b6a841dc78c707ec655a563453277d969fb8f38d"
 
-ARG TILELANG_REPO="https://github.com/HaiShaw/tilelang.git"
-ARG TILELANG_BRANCH="dsv32"
-ARG TILELANG_COMMIT="9274967ba3cf1f482d3910c55d73fbc7e9417bb1"
+ARG TILELANG_REPO="https://github.com/tile-ai/tilelang.git"
+ARG TILELANG_COMMIT="ebf4a7cb8881432165ae8760e99d209d905c704a"
 
 ARG FHT_REPO="https://github.com/jeffdaily/fast-hadamard-transform.git"
 ARG FHT_BRANCH="rocm"
@@ -271,7 +269,7 @@ RUN /bin/bash -lc 'set -euo pipefail; \
   "$VENV_PIP" install --no-cache-dir "cython>=0.29.36,<3.0" "apache-tvm-ffi>=0.1.6" "z3-solver>=4.13.0"; \
   \
   # Clone + pin TileLang (bundled TVM), then build
-  git clone --recursive --branch "${TILELANG_BRANCH}" "${TILELANG_REPO}" /opt/tilelang && \
+  git clone --recursive "${TILELANG_REPO}" /opt/tilelang && \
   cd /opt/tilelang && \
   git fetch --depth=1 origin "${TILELANG_COMMIT}" || true && \
   git checkout -f "${TILELANG_COMMIT}" && \
