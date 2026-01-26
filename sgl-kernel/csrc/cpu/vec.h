@@ -375,4 +375,21 @@ inline __attribute__((always_inline)) __m512 _mm512_fexp_u20_ps(const __m512 val
 }
 #endif
 
+// gelu implementation approximated with tanh
+constexpr float kGeluBeta = M_SQRT2 * M_2_SQRTPI * 0.5;
+constexpr float kGeluKappa = 0.044715;
+
+// TODO: optimize when inputs are 16bits.
+// `.tanh()` from ATen will use Sleef_tanhf8_u10 which is a waste
+inline Vectorized<float> gelu_with_tanh(Vectorized<float> x) {
+  using Vec = Vectorized<float>;
+  const Vec kPointFiveVec(0.5);
+  const Vec kOneVec(1.0);
+  const Vec kGeluBetaVec(kGeluBeta);
+  const Vec kGeluKappaVec(kGeluKappa);
+  Vec x_cube = x * x * x;
+  Vec inner_vec = kGeluBetaVec * (x + kGeluKappaVec * x_cube);
+  return kPointFiveVec * x * (kOneVec + inner_vec.tanh());
+}
+
 }  // anonymous namespace

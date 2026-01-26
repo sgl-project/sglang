@@ -158,6 +158,34 @@ inline void scalar_sigmoid_and_mul(
   }
 }
 
+template <typename scalar_t>
+inline void add_bias_and_gelu_tanh(
+    scalar_t* __restrict__ out,
+    const float* __restrict__ input,
+    const float* __restrict__ bias,
+    int M,
+    int N,
+    int ld_src,
+    int ld_dst) {
+  constexpr int BLOCK_N = block_size_n();
+  assert(N == BLOCK_N);
+
+  using bVec = at::vec::Vectorized<scalar_t>;
+  using fVec = at::vec::Vectorized<float>;
+
+  const fVec bias0 = fVec::loadu(bias);
+  const fVec bias1 = fVec::loadu(bias + fVec::size());
+
+  for (int m = 0; m < M; ++m) {
+    fVec x0 = fVec::loadu(input + m * ld_src);
+    fVec x1 = fVec::loadu(input + m * ld_src + fVec::size());
+    fVec y0 = gelu_with_tanh(x0 + bias0);
+    fVec y1 = gelu_with_tanh(x1 + bias1);
+    bVec y = convert_from_float_ext<scalar_t>(y0, y1);
+    y.store(out + m * ld_dst);
+  }
+}
+
 template <typename scalar_t, bool has_bias, int BLOCK_M, int BLOCK_N>
 struct tinygemm_kernel_nn {
   static inline void apply(
@@ -544,6 +572,66 @@ void weight_packed_linear_kernel_impl(
   });
 }
 
+template <typename T>
+void print_array(const T* data, int M, int N, int lda) {
+  for (int m = 0; m < M; ++m) {
+    for (int n = 0; n < N; ++n) {
+      std::cout << " " << float(data[m * lda + n]);
+    }
+    std::cout << std::endl;
+  }
+}
+
+// fused linear + post_op
+template <typename scalar_t, typename post_op_t>
+void weight_packed_linear_kernel_impl(
+    scalar_t* __restrict__ out,
+    const scalar_t* __restrict__ mat1,
+    const scalar_t* __restrict__ mat2,
+    const float* __restrict__ bias,
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    const post_op_t& post_op) {
+  constexpr int64_t BLOCK_M = block_size_m();
+  constexpr int64_t BLOCK_N = block_size_n();
+  const int64_t MB = div_up(M, BLOCK_M);
+  const int64_t NB = div_up(N, BLOCK_N);
+
+  // parallel on [MB, NB]
+  parallel_2d(MB, NB, [&](int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1) {
+    // for brgemm, use float32 for accumulate
+    alignas(64) float Ctmp[BLOCK_M * BLOCK_N];
+
+    loop_2d<scalar_t>(mb0, mb1, nb0, nb1, BLOCK_N * K, [&](int64_t mb, int64_t nb, int64_t nb_offset) {
+      int64_t mb_start = mb * BLOCK_M;
+      int64_t mb_size = std::min(M - mb_start, BLOCK_M);
+      int64_t nb_start = nb * BLOCK_N;
+      int64_t nb_size = std::min(N - nb_start, BLOCK_N);
+
+      at::native::cpublas::brgemm(
+          /* M     */ mb_size,
+          /* N     */ nb_size,
+          /* K     */ K,
+          /* lda   */ K,
+          /* ldb   */ nb_size,
+          /* ldc   */ BLOCK_N,
+          /* add_C */ false,
+          /* A     */ mat1 + mb_start * K,
+          /* B     */ mat2 + nb_start * K,
+          /* C     */ Ctmp);
+
+      // print_array(Ctmp, mb_size, nb_size, BLOCK_N);
+
+#if 1
+      add_bias_and_gelu_tanh(out + mb_start * N + nb_start, Ctmp, bias + nb_start, mb_size, nb_size, BLOCK_N, N);
+#endif
+    });
+
+    at::native::cpublas::brgemm_release();
+  });
+}
+
 }  // anonymous namespace
 
 // tinygemm interface
@@ -771,6 +859,66 @@ at::Tensor fused_linear_sigmoid_mul(
         mat1_strideM,
         out_strideM);
   });
+
+  return out;
+}
+
+// fused linear + gelu + linear
+//
+//   input   : [batches, in_features]
+//   weight1 : [hidden_features, in_features]
+//   weight2 : [out_features, hidden_features]
+//   bias1   : [hidden_features]
+//   bias2   : [out_features]
+//   output  : [batches, out_features]
+//
+at::Tensor fused_linear_gelu_linear(
+    at::Tensor& input,
+    at::Tensor& weight1,
+    at::Tensor& weight2,
+    const std::optional<at::Tensor>& bias1,
+    const std::optional<at::Tensor>& bias2,
+    bool approximate_tanh,
+    bool is_vnni) {
+  RECORD_FUNCTION(
+      "sgl_kernel::fused_linear_gelu_linear", std::vector<c10::IValue>({input, weight1, weight2, bias1, bias2}));
+
+  auto packed_w1 = is_vnni ? weight1 : convert_weight_packed(weight1);
+  auto packed_w2 = is_vnni ? weight2 : convert_weight_packed(weight2);
+
+  int64_t batches = input.size(0);
+  int64_t in_features = input.size(1);
+  int64_t hidden_features = weight1.size(0);
+  int64_t out_features = weight2.size(0);
+
+  CHECK_INPUT(input);
+  CHECK_INPUT(weight1);
+  CHECK_INPUT(weight2);
+  CHECK_EQ(weight1.size(1), in_features);
+  CHECK_EQ(weight2.size(1), hidden_features);
+  CHECK_INPUT_SHAPE_DTYPE(bias1, {hidden_features}, at::kFloat);
+  CHECK_INPUT_SHAPE_DTYPE(bias2, {out_features}, at::kFloat);
+
+  TORCH_CHECK(approximate_tanh, "fused_linear_gelu_linear: only support approximate is tanh.");
+
+  auto hidden = at::empty({batches, hidden_features}, input.options());
+  // auto out = at::empty({batches, out_features}, input.options())
+
+  AT_DISPATCH_REDUCED_FLOATING_TYPES(input.scalar_type(), "fused_linear_gelu_linear", [&] {
+    weight_packed_linear_kernel_impl(
+        hidden.data_ptr<scalar_t>(),
+        input.data_ptr<scalar_t>(),
+        packed_w1.data_ptr<scalar_t>(),
+        conditional_data_ptr<float>(bias1),
+        batches,
+        hidden_features,
+        in_features,
+        [&]() {});
+  });
+
+  // at::Tensor hidden = weight_packed_linear(input, packed_w1, bias1, true);
+  // hidden = at::gelu(hidden);
+  at::Tensor out = weight_packed_linear(hidden, packed_w2, bias2, true);
 
   return out;
 }

@@ -152,6 +152,15 @@ at::Tensor fused_linear_sigmoid_mul(
     bool is_vnni,
     const at::Tensor& post_mul_mat);
 
+at::Tensor fused_linear_gelu_linear(
+    at::Tensor& input,
+    at::Tensor& weight1,
+    at::Tensor& weight2,
+    const std::optional<at::Tensor>& bias1,
+    const std::optional<at::Tensor>& bias2,
+    bool approximate_tanh,
+    bool is_vnni);
+
 // igemm
 at::Tensor int8_scaled_mm_cpu(
     at::Tensor& mat1,
@@ -422,6 +431,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def(
       "fused_linear_sigmoid_mul(Tensor mat1, Tensor mat2, Tensor? bias, bool is_vnni, Tensor post_mul_mat) -> Tensor");
   m.impl("fused_linear_sigmoid_mul", torch::kCPU, &fused_linear_sigmoid_mul);
+
+  m.def(
+      "fused_linear_gelu_linear(Tensor input, Tensor weight1, Tensor weight2, Tensor? bias1, Tensor? bias2, bool "
+      "approximate_tanh, bool is_vnni) -> Tensor");
+  m.impl("fused_linear_gelu_linear", torch::kCPU, &fused_linear_gelu_linear);
 
   // igemm
   m.def(
