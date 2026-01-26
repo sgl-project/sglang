@@ -1804,6 +1804,7 @@ def ci_download_with_validation_and_retry(
     # race conditions. Only rank 0 downloads; other ranks wait at barrier.
     is_rank_0 = _is_distributed_rank_0()
     hf_folder = None
+    download_error = None
 
     if is_rank_0:
         # Rank 0: perform the actual download with retry logic
@@ -1834,7 +1835,8 @@ def ci_download_with_validation_and_retry(
                     f"(attempt {attempt + 2}/{max_retries})...",
                 )
             else:
-                raise RuntimeError(
+                # Defer exception until after barrier to prevent deadlock
+                download_error = RuntimeError(
                     f"Downloaded model files are still corrupted for "
                     f"{model_name_or_path} after {max_retries} attempts. "
                     "This may indicate a persistent issue with the model files "
@@ -1843,6 +1845,10 @@ def ci_download_with_validation_and_retry(
 
     # Synchronize all ranks - rank 0 finished downloading, others can proceed
     _distributed_barrier()
+
+    # After barrier, raise any deferred error from rank 0
+    if download_error is not None:
+        raise download_error
 
     # Non-rank-0: use the cached model that rank 0 just downloaded
     if hf_folder is None:
