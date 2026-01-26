@@ -12,12 +12,13 @@ This test compares:
 2. Deterministic kernel (different batch size)
 
 Usage:
-    python test_amd_deterministic_custom_allreduce.py
+    pytest test_amd_deterministic_custom_allreduce.py
 """
 
 import multiprocessing as mp
 import socket
 
+import pytest
 import torch
 import torch.distributed as dist
 
@@ -264,6 +265,15 @@ def main():
 
     for p in procs:
         p.join()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.device_count() < 2,
+    reason="Requires at least 2 CUDA GPUs",
+)
+def test_deterministic_custom_allreduce():
+    """Test that deterministic custom all-reduce produces consistent results."""
+    main()
 
 
 if __name__ == "__main__":

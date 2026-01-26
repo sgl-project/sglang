@@ -326,20 +326,20 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
 
         return output_strs
 
-    def _extract_routed_experts(self, recv_obj: BatchTokenIDOutput) -> List[List[int]]:
-        output_routed_experts = None
-        if recv_obj.output_routed_experts is not None:
-            output_routed_experts = [
+    def _extract_routed_experts(
+        self, recv_obj: BatchTokenIDOutput
+    ) -> list[str | None] | None:
+        routed_experts = None
+        if recv_obj.routed_experts is not None:
+            routed_experts = [
                 (
-                    pybase64.b64encode(output_routed_experts.numpy().tobytes()).decode(
-                        "utf-8"
-                    )
-                    if output_routed_experts is not None
-                    else []
+                    pybase64.b64encode(routed_experts.numpy().tobytes()).decode("utf-8")
+                    if routed_experts is not None
+                    else None
                 )
-                for output_routed_experts in recv_obj.output_routed_experts
+                for routed_experts in recv_obj.routed_experts
             ]
-        return output_routed_experts
+        return routed_experts
 
     def handle_batch_token_id_out(self, recv_obj: BatchTokenIDOutput):
         # If handling idle batch, set output_strs to [].
@@ -348,7 +348,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             if len(recv_obj.rids) > 0
             else []
         )
-        output_routed_experts = self._extract_routed_experts(recv_obj)
+        routed_experts = self._extract_routed_experts(recv_obj)
 
         return BatchStrOutput(
             rids=recv_obj.rids,
@@ -375,7 +375,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             output_token_ids_logprobs_idx=recv_obj.output_token_ids_logprobs_idx,
             output_token_entropy_val=recv_obj.output_token_entropy_val,
             output_hidden_states=recv_obj.output_hidden_states,
-            output_routed_experts=output_routed_experts,
+            routed_experts=routed_experts,
             customized_info=recv_obj.customized_info,
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,

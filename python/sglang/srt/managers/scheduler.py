@@ -551,6 +551,7 @@ class Scheduler(
             self.max_req_input_len,
             self.random_seed,
             self.device,
+            self.forward_stream,
             _,
             _,
             _,
@@ -776,7 +777,7 @@ class Scheduler(
             self.prefill_delayer = PrefillDelayer(
                 dp_size=self.dp_size,
                 attn_tp_size=self.attn_tp_size,
-                cpu_group=self.tp_worker.get_tp_group().cpu_group,
+                cpu_group=self.tp_cpu_group,
                 server_args=self.server_args,
                 metrics_collector=(
                     self.metrics_collector if self.enable_metrics else None
@@ -959,9 +960,10 @@ class Scheduler(
             self.mm_receiver = MMReceiver(
                 self.server_args,
                 hf_config=self.model_config.hf_config,
-                tp_rank=self.tp_rank,
                 pp_rank=self.pp_rank,
+                tp_rank=self.tp_rank,
                 tp_group=self.tp_group,
+                scheduler=self,
             )
 
     def init_overlap(self):
@@ -970,7 +972,6 @@ class Scheduler(
         if self.device == "cpu":
             self.default_stream.synchronize = lambda: None  # No-op for CPU
 
-        self.forward_stream: CudaStream = self.device_module.Stream()
         self.forward_stream_ctx: CudaStreamContext = self.device_module.stream(
             self.forward_stream
         )
@@ -1260,7 +1261,16 @@ class Scheduler(
             and self.server_args.language_only
             and self.server_args.encoder_transfer_backend == "zmq_to_scheduler"
         ):
-            recv_reqs = self.mm_receiver.process_waiting_requests(recv_reqs)
+            recv_reqs, abort_reqs = self.mm_receiver.process_waiting_requests(recv_reqs)
+            for req, error_msg, error_code in abort_reqs:
+
+                status_code = (
+                    HTTPStatus.BAD_REQUEST
+                    if error_code == 400
+                    else HTTPStatus.INTERNAL_SERVER_ERROR
+                )
+                prepare_abort(req, error_msg, status_code=status_code)
+                self.stream_output([req], req.return_logprob)
 
         if self.enable_trace:
             for req in recv_reqs:
@@ -1471,7 +1481,7 @@ class Scheduler(
                 if recv_req.bootstrap_room is None:
                     error_msg = (
                         f"Invalid request: Disaggregated request received without "
-                        f"boostrap room id. {req.rid=}"
+                        f"bootstrap room id. {req.rid=}"
                     )
                     logger.error(error_msg)
                     prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
