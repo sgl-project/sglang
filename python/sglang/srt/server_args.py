@@ -183,7 +183,14 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "cutlass",
 ]
 
-MOE_A2A_BACKEND_CHOICES = ["none", "deepep", "mooncake", "mori", "ascend_fuseep", "flashinfer"]
+MOE_A2A_BACKEND_CHOICES = [
+    "none",
+    "deepep",
+    "mooncake",
+    "mori",
+    "ascend_fuseep",
+    "flashinfer",
+]
 
 FP8_GEMM_RUNNER_BACKEND_CHOICES = [
     "auto",
