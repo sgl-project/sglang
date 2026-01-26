@@ -250,6 +250,7 @@ void sgl_per_token_group_quant_8bit_v2(
     const std::optional<torch::Tensor>& masked_m);
 void sgl_per_tensor_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor output_s, bool is_static);
 void sgl_per_token_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor output_s);
+std::tuple<at::Tensor, at::Tensor> fp8_quantize_1x128(at::Tensor const& self, bool use_ue8m0);
 void bmm_fp8(
     at::Tensor A,
     at::Tensor B,

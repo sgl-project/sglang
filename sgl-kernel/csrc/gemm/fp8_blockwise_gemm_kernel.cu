@@ -30,7 +30,9 @@
 #include <cutlass/gemm/kernel/gemm_universal.hpp>
 #include <cutlass/util/packed_stride.hpp>
 
+#include "cutlass_extensions/gemm/ada_blockwise_gemm/sm89_utils.cuh"
 #include "cutlass_extensions/gemm/cutlass_gemm_caller.cuh"
+#include "cutlass_extensions/gemm/fp8_blockwise_gemm_sm89_dispatch.cuh"
 #include "cutlass_extensions/gemm/fp8_blockwise_gemm_sm90_dispatch.cuh"
 #include "utils.h"
 
@@ -373,19 +375,6 @@ torch::Tensor fp8_blockwise_scaled_mm(
     const torch::Dtype& out_dtype) {
   TORCH_CHECK(mat_a.is_cuda(), "mat_a must be a CUDA tensor");
   TORCH_CHECK(mat_b.is_cuda(), "mat_b must be a CUDA tensor");
-  TORCH_CHECK(mat_a.dim() == 2, "mat_a must be a 2D tensor");
-  TORCH_CHECK(mat_b.dim() == 2, "mat_b must be a 2D tensor");
-  TORCH_CHECK(mat_a.stride(1) == 1, "mat_a must be a row major tensor");
-  TORCH_CHECK(mat_b.stride(0) == 1, "mat_b must be a column major tensor");
-  TORCH_CHECK(mat_a.size(1) == mat_b.size(0), "mat_a and mat_b shapes cannot be multiplied");
-
-  TORCH_CHECK(
-      (mat_a.size(1) * mat_a.element_size()) % 16 == 0, "mat_a must be multiple of 16 bytes for memory alignment");
-  TORCH_CHECK(
-      (mat_b.size(0) * mat_b.element_size()) % 16 == 0, "mat_b must be multiple of 16 bytes for memory alignment");
-  TORCH_CHECK(mat_a.scalar_type() == torch::kFloat8_e4m3fn, "mat_a must be Float8_e4m3fn");
-  TORCH_CHECK(mat_b.scalar_type() == torch::kFloat8_e4m3fn, "mat_b must be Float8_e4m3fn");
-  TORCH_CHECK(out_dtype == torch::kHalf || out_dtype == torch::kBFloat16, "out_dtype must be Half or BFloat16");
 
   auto is_contiguous_vector = [](const torch::Tensor& t) {
     auto t_sizes = t.sizes();
@@ -393,24 +382,29 @@ torch::Tensor fp8_blockwise_scaled_mm(
            (t.dim() == 1 || (t.dim() == 2 && *std::min_element(t_sizes.begin(), t_sizes.end()) == 1));
   };
 
-  TORCH_CHECK(mat_a.size(0) == scales_a.size(0), "size of scales_a is not matched");
-  TORCH_CHECK(mat_a.size(1) / 128 == scales_a.size(1), "size of scales_a is not matched");
-  TORCH_CHECK(scales_a.stride(0) == 1 || is_contiguous_vector(scales_a), "scales_a must be M major");
-  TORCH_CHECK(mat_b.size(0) / 128 == scales_b.size(0), "size of scales_b is not matched");
-  TORCH_CHECK(mat_b.size(1) / 128 == scales_b.size(1), "size of scales_b is not matched");
-  TORCH_CHECK(scales_b.stride(0) == 1 || is_contiguous_vector(scales_b), "scales_b must be K major");
-  TORCH_CHECK(scales_a.scalar_type() == torch::kFloat32, "scales_a must be Float32");
-  TORCH_CHECK(scales_b.scalar_type() == torch::kFloat32, "scales_b must be Float32");
-
   torch::Tensor out = torch::empty({mat_a.size(0), mat_b.size(1)}, mat_a.options().dtype(out_dtype));
-  TORCH_CHECK((out.size(1) * out.element_size()) % 16 == 0, "out must be multiple of 16 bytes for memory alignment");
 
   auto sm_version = getSMVersion();
 
   int64_t original_rows = mat_a.size(0);
-  torch::Tensor mat_a_padded = pad_tensor(mat_a, /*alignment=*/4);
-  torch::Tensor scales_a_padded = pad_tensor(scales_a, /*alignment=*/4, /*col_major=*/true);
-  torch::Tensor out_padded = torch::empty({mat_a_padded.size(0), mat_b.size(1)}, out.options());
+  torch::Tensor mat_a_padded;
+  torch::Tensor scales_a_padded;
+  torch::Tensor out_padded;
+  if (sm_version != 89) {
+    mat_a_padded = pad_tensor(mat_a, /*alignment=*/4);
+    scales_a_padded = pad_tensor(scales_a, /*alignment=*/4, /*col_major=*/true);
+    out_padded = torch::empty({mat_a_padded.size(0), mat_b.size(1)}, out.options());
+  }
+
+#if defined(CUTLASS_ARCH_MMA_SM89_SUPPORTED)
+#if defined CUDA_VERSION && CUDA_VERSION >= 11080
+  if (sm_version == 89) {
+    if (out_dtype == torch::kBFloat16) {
+      return cutlass_gemm_blockwise_sm89_fp8_dispatch(mat_a, mat_b, scales_a, scales_b);
+    }
+  }
+#endif
+#endif
 
 #if defined(CUTLASS_ARCH_MMA_SM90_SUPPORTED)
 #if defined CUDA_VERSION && CUDA_VERSION >= 12000

@@ -157,6 +157,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("sgl_per_token_quant_fp8(Tensor input, Tensor! output_q, Tensor! output_s) -> ()");
   m.impl("sgl_per_token_quant_fp8", torch::kCUDA, &sgl_per_token_quant_fp8);
 
+  m.def("fp8_quantize_1x128(Tensor input, bool use_ue8m0=False) -> (Tensor, Tensor)");
+  m.impl("fp8_quantize_1x128", torch::kCUDA, &fp8_quantize_1x128);
+
   m.def(
       "cutlass_scaled_fp4_mm(Tensor! out, Tensor a, Tensor b,"
       "                      Tensor block_scale_a, Tensor block_scale_b,"

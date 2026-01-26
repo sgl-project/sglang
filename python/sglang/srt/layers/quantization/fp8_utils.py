@@ -38,7 +38,9 @@ from sglang.srt.utils import (
     is_flashinfer_available,
     is_hip,
     is_sm90_supported,
+    is_sm89_supported,
     offloader,
+    get_device_sm,
 )
 
 logger = logging.getLogger(__name__)
@@ -166,7 +168,7 @@ FP8_GEMM_RUNNER_BACKEND: Fp8GemmRunnerBackend | None = None
 
 def _check_cutlass_block_fp8_hardware_support() -> bool:
     """Return True if CUTLASS block FP8 is supported (Hopper or newer with CUDA 12.0+)."""
-    return is_sm90_supported() or is_blackwell_supported()
+    return is_sm89_supported or is_sm90_supported() or is_blackwell_supported()
 
 
 if is_blackwell_supported() and is_flashinfer_available():
@@ -357,12 +359,17 @@ def cutlass_w8a8_block_fp8_linear_with_fallback(
     input_2d = input.view(-1, input.shape[-1])
     output_shape = [*input.shape[:-1], weight.shape[0]]
 
-    q_input, x_scale = per_token_group_quant_fp8(
-        input_2d, block_size[1], column_major_scales=True
-    )
-    output = fp8_blockwise_scaled_mm(
-        q_input, weight.T, x_scale, weight_scale.T, out_dtype=input_2d.dtype
-    )
+    if get_device_sm() == 89:
+        act_input_fp8, act_input_sf = torch.ops.sgl_kernel.fp8_quantize_1x128(input_2d)
+        output = fp8_blockwise_scaled_mm(act_input_fp8, weight, act_input_sf, weight_scale, out_dtype=input_2d.dtype)
+    else:
+        q_input, x_scale = per_token_group_quant_fp8(
+            input_2d, block_size[1], column_major_scales=True
+        )
+        output = fp8_blockwise_scaled_mm(
+            q_input, weight.T, x_scale, weight_scale.T, out_dtype=input_2d.dtype
+        )
+
     if bias is not None:
         output += bias
     return output.to(dtype=input_2d.dtype).view(*output_shape)
