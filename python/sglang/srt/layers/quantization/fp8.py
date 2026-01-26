@@ -411,9 +411,9 @@ class Fp8LinearMethod(LinearMethodBase):
                 self._quantize_mxfp8_weights(layer)
                 return
             # MXFP8 scales are stored as UE8M0 uint8; no requantization here.
-            layer.weight_scale_inv = torch.nn.Parameter(
-                layer.weight_scale_inv.data, requires_grad=False
-            )
+            # Keep parameter object to preserve weight_loader attrs for hot reload.
+            layer.weight_scale_inv.requires_grad_(False)
+            layer.weight_scale_inv.format_ue8m0 = True
             return
         else:
             # For fp8 linear weights run with deepgemm, the weights and scales need be requantized to ue8m0
@@ -450,8 +450,11 @@ class Fp8LinearMethod(LinearMethodBase):
     def _quantize_mxfp8_weights(self, layer: Module) -> None:
         weight = layer.weight.data
         qweight, weight_scale = mxfp8_group_quantize(weight)
-        layer.weight = Parameter(qweight, requires_grad=False)
-        layer.weight_scale_inv = Parameter(weight_scale, requires_grad=False)
+        # Keep parameter objects to preserve weight_loader attrs for hot reload.
+        layer.weight.data = qweight
+        layer.weight_scale_inv.data = weight_scale
+        layer.weight.requires_grad_(False)
+        layer.weight_scale_inv.requires_grad_(False)
         layer.weight_scale_inv.format_ue8m0 = True
         layer.input_scale = None
 
@@ -1068,10 +1071,15 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 layer.w2_weight.data.shape, layer.w2_weight_scale_inv.data
             )
 
-        layer.w13_weight = torch.nn.Parameter(w13_q, requires_grad=False)
-        layer.w2_weight = torch.nn.Parameter(w2_q, requires_grad=False)
-        layer.w13_weight_scale_inv = torch.nn.Parameter(w13_s, requires_grad=False)
-        layer.w2_weight_scale_inv = torch.nn.Parameter(w2_s, requires_grad=False)
+        # Keep parameter objects to preserve weight_loader attrs for hot reload.
+        layer.w13_weight.data = w13_q
+        layer.w2_weight.data = w2_q
+        layer.w13_weight_scale_inv.data = w13_s
+        layer.w2_weight_scale_inv.data = w2_s
+        layer.w13_weight.requires_grad_(False)
+        layer.w2_weight.requires_grad_(False)
+        layer.w13_weight_scale_inv.requires_grad_(False)
+        layer.w2_weight_scale_inv.requires_grad_(False)
         layer.w13_weight_scale_inv.format_ue8m0 = True
         layer.w2_weight_scale_inv.format_ue8m0 = True
         layer.w13_input_scale = None
