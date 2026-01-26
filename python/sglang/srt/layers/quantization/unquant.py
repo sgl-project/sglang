@@ -457,7 +457,24 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             )
             return StandardCombineInput(hidden_states=output)
 
-    def forward_npu(
+    def forward_tpu(self, *args, **kwargs) -> CombineInput:
+        raise NotImplementedError("The TPU backend currently does not support MoE.")
+
+    forward_native = forward_cpu
+
+
+class UnquantizedFusedMoEAscendMethod(UnquantizedFusedMoEMethod):
+    """MoE method without quantization on Ascend."""
+    def __init__(self, quant_config: AWQConfig):
+        self.kernel = NPUFusedMoEMethod()
+
+    def create_moe_runner(
+        self, layer: torch.nn.Module, moe_runner_config: "MoeRunnerConfig"
+    ):
+        moe_runner_config.quantization = "UnquantizedFusedMoEAscendMethod"
+        self.kernel.create_moe_runner(layer, moe_runner_config)
+
+    def apply(
         self,
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
@@ -471,8 +488,3 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 activation=self.moe_runner_config.activation,
             )
         return self.runner.run(dispatch_output, quant_info)
-
-    def forward_tpu(self, *args, **kwargs) -> CombineInput:
-        raise NotImplementedError("The TPU backend currently does not support MoE.")
-
-    forward_native = forward_cpu
