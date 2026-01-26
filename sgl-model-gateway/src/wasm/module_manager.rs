@@ -143,7 +143,7 @@ impl WasmModuleManager {
         let start_time = std::time::Instant::now();
 
         // First, get the WASM bytes with a read lock (faster)
-        let wasm_bytes = {
+        let (wasm_bytes, wasm_hash) = {
             let modules = self
                 .modules
                 .read()
@@ -153,7 +153,10 @@ impl WasmModuleManager {
                 .ok_or_else(|| WasmError::from(WasmManagerError::ModuleNotFound(module_uuid)))?;
 
             // Clone the pre-loaded WASM bytes (already in memory, no file I/O)
-            module.module_meta.wasm_bytes.clone()
+            (
+                module.module_meta.wasm_bytes.clone(),
+                module.module_meta.sha256_hash,
+            )
         };
 
         {
@@ -179,7 +182,7 @@ impl WasmModuleManager {
 
         let result = self
             .runtime
-            .execute_component_async(wasm_bytes, attach_point, input)
+            .execute_component_async(wasm_bytes, wasm_hash, attach_point, input)
             .await;
 
         // Record metrics

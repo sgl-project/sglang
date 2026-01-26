@@ -59,6 +59,7 @@ pub struct WasmThreadPool {
 pub enum WasmTask {
     ExecuteComponent {
         wasm_bytes: Vec<u8>,
+        wasm_hash: [u8; 32],
         attach_point: WasmModuleAttachPoint,
         input: WasmComponentInput,
         response: oneshot::Sender<Result<WasmComponentOutput>>,
@@ -108,6 +109,7 @@ impl WasmRuntime {
     pub async fn execute_component_async(
         &self,
         wasm_bytes: Vec<u8>,
+        wasm_hash: [u8; 32],
         attach_point: WasmModuleAttachPoint,
         input: WasmComponentInput,
     ) -> Result<WasmComponentOutput> {
@@ -116,6 +118,7 @@ impl WasmRuntime {
 
         let task = WasmTask::ExecuteComponent {
             wasm_bytes,
+            wasm_hash,
             attach_point,
             input,
             response: response_tx,
@@ -281,7 +284,7 @@ impl WasmThreadPool {
 
         let cache_capacity =
             NonZeroUsize::new(config.module_cache_size).unwrap_or(NonZeroUsize::new(10).unwrap());
-        let mut component_cache: LruCache<Vec<u8>, Component> = LruCache::new(cache_capacity);
+        let mut component_cache: LruCache<[u8; 32], Component> = LruCache::new(cache_capacity);
 
         // Start epoch incrementer for timeout enforcement.
         // The engine's epoch counter is incremented periodically, and each Store
@@ -320,6 +323,7 @@ impl WasmThreadPool {
             match task {
                 WasmTask::ExecuteComponent {
                     wasm_bytes,
+                    wasm_hash,
                     attach_point,
                     input,
                     response,
@@ -328,6 +332,7 @@ impl WasmThreadPool {
                         &engine,
                         &mut component_cache, // Pass the cache
                         wasm_bytes,
+                        wasm_hash,
                         attach_point,
                         input,
                         &config,
@@ -342,28 +347,29 @@ impl WasmThreadPool {
 
     async fn execute_component_in_worker(
         engine: &Engine,
-        cache: &mut LruCache<Vec<u8>, Component>, //  cache argument
+        cache: &mut LruCache<[u8; 32], Component>, //  cache argument
         wasm_bytes: Vec<u8>,
+        wasm_hash: [u8; 32],
         attach_point: WasmModuleAttachPoint,
         input: WasmComponentInput,
         config: &WasmRuntimeConfig,
     ) -> Result<WasmComponentOutput> {
         // Compile component from bytes OR retrieve from cache
         // Note: The WASM file must be in component format (not plain WASM module)
-        let component = if let Some(comp) = cache.get(&wasm_bytes) {
+        let component = if let Some(comp) = cache.get(&wasm_hash) {
             comp.clone() // Component is just a handle (cheap clone)
         } else {
             // Compile new component
             let comp = Component::new(engine, &wasm_bytes).map_err(|e| {
-                WasmRuntimeError::CompileFailed(format!(
+                WasmError::Runtime(WasmRuntimeError::CompileFailed(format!(
                     "failed to parse WebAssembly component: {}. \
                      Hint: The WASM file must be in component format. \
                      If you're using wit-bindgen, use 'wasm-tools component new' to wrap the WASM module into a component.",
                     e
-                ))
+                )))
             })?;
 
-            cache.push(wasm_bytes, comp.clone());
+            cache.push(wasm_hash, comp.clone());
             comp
         };
 
