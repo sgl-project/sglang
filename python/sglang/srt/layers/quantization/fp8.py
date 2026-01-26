@@ -1079,35 +1079,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         # Keep parameter objects to preserve weight_loader attrs for hot reload.
         # Prefer in-place copy to avoid changing storage pointers (cuda graph safety).
-        if (
-            layer.w13_weight.data.shape == w13_q.shape
-            and layer.w13_weight.data.dtype == w13_q.dtype
-        ):
-            layer.w13_weight.data.copy_(w13_q)
-        else:
-            layer.w13_weight.data = w13_q
-        if (
-            layer.w2_weight.data.shape == w2_q.shape
-            and layer.w2_weight.data.dtype == w2_q.dtype
-        ):
-            layer.w2_weight.data.copy_(w2_q)
-        else:
-            layer.w2_weight.data = w2_q
-
-        if (
-            layer.w13_weight_scale_inv.data.shape == w13_s.shape
-            and layer.w13_weight_scale_inv.data.dtype == w13_s.dtype
-        ):
-            layer.w13_weight_scale_inv.data.copy_(w13_s)
-        else:
-            layer.w13_weight_scale_inv.data = w13_s
-        if (
-            layer.w2_weight_scale_inv.data.shape == w2_s.shape
-            and layer.w2_weight_scale_inv.data.dtype == w2_s.dtype
-        ):
-            layer.w2_weight_scale_inv.data.copy_(w2_s)
-        else:
-            layer.w2_weight_scale_inv.data = w2_s
+        layer.w13_weight.data.copy_(w13_q)
+        layer.w2_weight.data.copy_(w2_q)
+        layer.w13_weight_scale_inv.data.copy_(w13_s)
+        layer.w2_weight_scale_inv.data.copy_(w2_s)
         layer.w13_weight.requires_grad_(False)
         layer.w2_weight.requires_grad_(False)
         layer.w13_weight_scale_inv.requires_grad_(False)
