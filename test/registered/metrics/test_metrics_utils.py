@@ -1,6 +1,9 @@
 import unittest
 
-from sglang.srt.metrics.utils import generate_buckets, two_sides_exponential_buckets
+from sglang.srt.observability.utils import (
+    generate_buckets,
+    two_sides_exponential_buckets,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="stage-a-cpu-only")
