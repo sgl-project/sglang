@@ -24,7 +24,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=2, suite="nightly-1-gpu", nightly=True)
+register_cuda_ci(est_time=2, suite="stage-b-test-small-1-gpu")
 
 # Global configuration for all indexer tests
 DEFAULT_CONFIG = {
@@ -41,6 +41,7 @@ DEFAULT_CONFIG = {
     "q_lora_rank": 1536,
     "kv_lora_rank": 512,
     "qk_rope_head_dim": 64,
+    "qk_nope_head_dim": 128,
     "max_position_embeddings": 163840,
     "rope_theta": 10000.0,
     "layer_id": 0,
@@ -190,6 +191,7 @@ class MockModelRunner:
                 "num_attention_heads": 128,
                 "kv_lora_rank": self.config["kv_lora_rank"],
                 "qk_rope_head_dim": self.config["qk_rope_head_dim"],
+                "qk_nope_head_dim": self.config["qk_nope_head_dim"],
                 "hf_config": hf_config,
             },
         )()
