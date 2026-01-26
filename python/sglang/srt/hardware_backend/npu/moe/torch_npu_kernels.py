@@ -67,6 +67,7 @@ class TorchNpuKernelsQuantInfo(MoeQuantInfo):
     w2_offset: Optional[torch.Tensor] = None
     w13_scale_bias: Optional[torch.Tensor] = None
     w2_scale_bias: Optional[torch.Tensor] = None
+    activation: Optional[str] = None
 
 # ---------------------------------------------------------------------------
 # Runner core
@@ -76,14 +77,13 @@ def output_unquant(hidden_states, quant_info, topk_weights, topk_ids):
     output = npu_fused_experts_unquant(
             hidden_states=hidden_states,
             w13=quant_info.w13_weight,
-            w13_scale=quant_info.w13_scale,
             w13_scale_bias=quant_info.w13_scale_bias,
             w2=quant_info.w2_weight,
-            w2_scale=quant_info.w2_scale,
             w2_scale_bias=quant_info.w2_scale_bias,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
             top_k=topk_ids.shape[1],
+            activation=quant_info.activation,
         )
     return output
 
