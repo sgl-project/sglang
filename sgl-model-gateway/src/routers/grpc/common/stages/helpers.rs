@@ -16,8 +16,8 @@ use crate::{
 /// Used by both chat and generate request building stages when in PD mode.
 /// Only SGLang supports PD (prefill/decode) disaggregated mode.
 ///
-/// Note: For EPD mode, encode workers use gRPC while the prefill↔decode KV cache
-/// transfer still relies on bootstrap metadata.
+/// Note: For EPD mode, encode runs as a separate gRPC stage; bootstrap metadata
+/// only applies to prefill↔decode KV cache transfer.
 pub(crate) fn inject_bootstrap_metadata(
     request: &mut ProtoGenerateRequest,
     prefill_worker: &Arc<dyn Worker>,
