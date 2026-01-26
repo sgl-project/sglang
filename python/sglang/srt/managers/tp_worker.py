@@ -195,10 +195,6 @@ class BaseTpWorker(ABC):
         )
         return result
 
-    def can_run_lora_batch(self, lora_ids: list[str]) -> bool:
-        lora_ids_set = set(lora_ids) if isinstance(lora_ids, list) else lora_ids
-        return self.model_runner.lora_manager.validate_lora_batch(lora_ids_set)
-
     def forward_batch_embedding(self, model_worker_batch: ModelWorkerBatch):
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
         logits_output = self.model_runner.forward(forward_batch).logits_output
@@ -400,6 +396,7 @@ class TpModelWorker(BaseTpWorker):
             self.max_req_input_len,
             self.random_seed,
             self.device,
+            self.model_runner.forward_stream,
             self.model_runner.req_to_token_pool.size,
             self.model_runner.req_to_token_pool.max_context_len,
             self.model_runner.token_to_kv_pool.size,

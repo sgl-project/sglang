@@ -1,5 +1,4 @@
 import itertools
-import os
 
 import torch
 import triton
@@ -7,12 +6,10 @@ import triton.testing
 from flashinfer import rmsnorm as fi_rmsnorm
 from sgl_kernel import rmsnorm
 
+from sglang.jit_kernel.benchmark.utils import is_in_ci
 from sglang.jit_kernel.norm import rmsnorm as jit_rmsnorm
 
-IS_CI = (
-    os.getenv("CI", "false").lower() == "true"
-    or os.getenv("GITHUB_ACTIONS", "false").lower() == "true"
-)
+IS_CI = is_in_ci()
 
 
 def sglang_aot_rmsnorm(
