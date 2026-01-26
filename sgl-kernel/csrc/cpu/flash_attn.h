@@ -3,17 +3,6 @@
 #include "vec.h"
 #include "vec_pack.h"
 
-// debug
-template <typename T>
-void print_array(const T* data, int M, int N, int lda) {
-  for (int m = 0; m < M; ++m) {
-    for (int n = 0; n < N; ++n) {
-      std::cout << " " << float(data[m * lda + n]);
-    }
-    std::cout << std::endl;
-  }
-}
-
 template <typename scalar_t>
 inline void fill_stub(scalar_t* __restrict__ out, float val, int size) {
   using Vec = at::vec::Vectorized<scalar_t>;
