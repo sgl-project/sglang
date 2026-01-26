@@ -18,11 +18,23 @@ Validates that EmbeddingReqInput correctly handles LoRA fields through
 normalization, batching, and request splitting.
 """
 
+import multiprocessing as mp
 import unittest
+
+import numpy as np
+import torch
 
 from sglang.srt.managers.io_struct import EmbeddingReqInput, TokenizedEmbeddingReqInput
 from sglang.srt.entrypoints.openai.protocol import EmbeddingRequest
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.test.runners import SRTRunner
+from sglang.test.test_utils import DEFAULT_PORT_FOR_SRT_TEST_RUNNER, CustomTestCase
+
+# Test configuration (same model/LoRA as test_lora_hf_sgl_logprob_diff.py)
+MODEL_PATH = "meta-llama/Llama-2-7b-hf"
+LORA_PATH = "yushengsu/sglang_lora_logprob_diff_without_tuning"
+LORA_BACKEND = "triton"
+SIMILARITY_THRESHOLD = 0.99
 
 
 class TestEmbeddingLoraSupport(unittest.TestCase):
@@ -108,69 +120,28 @@ class TestEmbeddingLoraSupport(unittest.TestCase):
         self.assertEqual(request.lora_path, "my-adapter")
 
 
-class TestEmbeddingLoraHFComparison(unittest.TestCase):
-    """
-    Compare HuggingFace+LoRA vs SGLang+LoRA embedding outputs.
-
-    This test requires:
-    - A base embedding model
-    - A LoRA adapter for that model
-    - GPU access
-
-    Skip if dependencies not available.
-    """
+class TestEmbeddingLoraHFComparison(CustomTestCase):
+    """Compare HF+LoRA vs SGLang+LoRA embedding outputs."""
 
     @classmethod
-    def setUpClass(cls):
-        """Check if required dependencies are available."""
-        cls.skip_reason = None
-
-        try:
-            import torch
-            if not torch.cuda.is_available():
-                cls.skip_reason = "CUDA not available"
-                return
-        except ImportError:
-            cls.skip_reason = "torch not installed"
-            return
-
-        try:
-            from peft import PeftModel
-        except ImportError:
-            cls.skip_reason = "peft not installed"
-            return
-
-        try:
-            from transformers import AutoModel, AutoTokenizer
-        except ImportError:
-            cls.skip_reason = "transformers not installed"
-            return
-
-    def setUp(self):
-        if self.skip_reason:
-            self.skipTest(self.skip_reason)
-
-    def _get_hf_embedding_with_lora(self, model_path, lora_path, texts, torch_dtype):
+    def get_hf_embedding_with_lora(cls, model_path, lora_path, texts, torch_dtype):
         """Get embeddings from HuggingFace model with LoRA adapter."""
-        import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer
         from peft import PeftModel
 
         # Load base model as CausalLM to match adapter's expected structure
-        # (CausalLM has model.model.layers, AutoModel has model.layers)
         base_model = AutoModelForCausalLM.from_pretrained(
             model_path,
             torch_dtype=torch_dtype,
             trust_remote_code=True,
         ).cuda()
 
-        # Load LoRA adapter - keys will match with CausalLM structure
+        # Load LoRA adapter
         model = PeftModel.from_pretrained(base_model, lora_path)
         model.eval()
 
         tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
 
-        # Get embeddings
         with torch.no_grad():
             inputs = tokenizer(
                 texts,
@@ -179,123 +150,98 @@ class TestEmbeddingLoraHFComparison(unittest.TestCase):
                 return_tensors="pt"
             ).to("cuda")
 
-            # Access the inner model for embeddings (CausalLM wraps the base model)
+            # Access the inner model (CausalLM wraps the base model)
             outputs = model.model(**inputs, output_hidden_states=True)
-            hidden_states = outputs.hidden_states[-1]  # Last layer hidden states
+            hidden_states = outputs.hidden_states[-1]
 
-            # Use last token pooling (same as SGLang) with L2 normalization
-            # Get the last non-padding token for each sequence
+            # Last token pooling with L2 normalization (matching SGLang)
             attention_mask = inputs["attention_mask"]
             last_token_indices = attention_mask.sum(dim=1) - 1
             batch_size = hidden_states.shape[0]
             embeddings = hidden_states[
                 torch.arange(batch_size, device="cuda"), last_token_indices
             ]
-            # L2 normalize
             embeddings = embeddings / embeddings.norm(dim=1, keepdim=True)
 
-        return embeddings.cpu().numpy().tolist()
+        # Cleanup
+        del model, base_model
+        torch.cuda.empty_cache()
 
-    def _get_sglang_embedding_with_lora(self, base_url, model_name, lora_name, texts):
-        """Get embeddings from SGLang server with LoRA adapter."""
-        import requests
+        return embeddings.cpu().numpy()
 
-        embeddings = []
-        for text in texts:
-            response = requests.post(
-                f"{base_url}/v1/embeddings",
-                json={
-                    "model": model_name,
-                    "input": text,
-                    "lora_path": lora_name,
-                },
-                proxies={"http": None, "https": None},  # Disable proxy for localhost
-            )
-            response.raise_for_status()
-            embeddings.append(response.json()["data"][0]["embedding"])
+    @classmethod
+    def get_sglang_embedding_with_lora(cls, model_path, lora_path, texts, torch_dtype):
+        """Get embeddings from SGLang with LoRA adapter."""
+        with SRTRunner(
+            model_path,
+            torch_dtype=torch_dtype,
+            model_type="embedding",
+            lora_paths=[lora_path],
+            lora_backend=LORA_BACKEND,
+            port=DEFAULT_PORT_FOR_SRT_TEST_RUNNER,
+            trust_remote_code=True,
+        ) as runner:
+            # Call engine.encode directly with lora_path
+            response = runner.engine.encode(prompt=texts, lora_path=lora_path)
+            if isinstance(response, list):
+                embeddings = [r["embedding"] for r in response]
+            else:
+                embeddings = [response["embedding"]]
 
-        return embeddings
+        return np.array(embeddings)
 
-    def _cosine_similarity(self, a, b):
-        """Compute cosine similarity between two vectors."""
-        import numpy as np
-        a = np.array(a)
-        b = np.array(b)
+    @staticmethod
+    def cosine_similarity(a, b):
+        """Compute cosine similarity between vectors."""
         return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
 
-    def test_hf_sglang_lora_embedding_similarity(self):
-        """
-        Test that HF+LoRA and SGLang+LoRA produce similar embeddings.
-
-        This is a manual test that requires:
-        1. Setting environment variables for model/adapter paths
-        2. Running an SGLang server with LoRA enabled
-
-        Example:
-            export EMBEDDING_MODEL_PATH=/path/to/embedding/model
-            export LORA_ADAPTER_PATH=/path/to/lora/adapter
-            export SGLANG_BASE_URL=http://localhost:30000
-            python -m pytest test/srt/test_embedding_lora_support.py -k test_hf_sglang -v
-        """
-        import os
-
-        model_path = os.environ.get("EMBEDDING_MODEL_PATH")
-        lora_path = os.environ.get("LORA_ADAPTER_PATH")
-        base_url = os.environ.get("SGLANG_BASE_URL")
-        # Optional: specify the LoRA name as registered on SGLang server
-        # (defaults to basename of LORA_ADAPTER_PATH)
-        sglang_lora_name = os.environ.get("SGLANG_LORA_NAME")
-
-        if not all([model_path, lora_path, base_url]):
-            self.skipTest(
-                "Set EMBEDDING_MODEL_PATH, LORA_ADAPTER_PATH, and SGLANG_BASE_URL "
-                "environment variables to run this test"
-            )
-
-        import torch
-
+    def test_embedding_lora_hf_sglang_similarity(self):
+        """Test that HF+LoRA and SGLang+LoRA produce similar embeddings."""
         test_texts = [
             "Hello world",
             "This is a test sentence for embedding comparison",
         ]
 
+        print(f"\nModel: {MODEL_PATH}")
+        print(f"LoRA: {LORA_PATH}")
+
         # Get HF embeddings
-        hf_embeddings = self._get_hf_embedding_with_lora(
-            model_path, lora_path, test_texts, torch.float16
+        print("\nGetting HF embeddings...")
+        hf_embeddings = self.get_hf_embedding_with_lora(
+            MODEL_PATH, LORA_PATH, test_texts, torch.float16
         )
 
+        # Clear GPU memory
+        torch.cuda.empty_cache()
+
         # Get SGLang embeddings
-        model_name = os.path.basename(model_path)
-        lora_name = sglang_lora_name or os.path.basename(lora_path)
-        sglang_embeddings = self._get_sglang_embedding_with_lora(
-            base_url, model_name, lora_name, test_texts
+        print("Getting SGLang embeddings...")
+        sglang_embeddings = self.get_sglang_embedding_with_lora(
+            MODEL_PATH, LORA_PATH, test_texts, torch.float16
         )
 
         # Compare embeddings
-        # With correct pooling (last token + L2 norm) and weight loading,
-        # HF and SGLang should produce nearly identical embeddings.
-        #
-        # Threshold is configurable via SIMILARITY_THRESHOLD env var (default 0.99)
-        threshold = float(os.environ.get("SIMILARITY_THRESHOLD", "0.99"))
-
         print("\nHF vs SGLang LoRA Embedding Comparison:")
-        all_similarities = []
+        similarities = []
         for i, (hf_emb, sgl_emb) in enumerate(zip(hf_embeddings, sglang_embeddings)):
-            similarity = self._cosine_similarity(hf_emb, sgl_emb)
-            all_similarities.append(similarity)
-            print(f"  Text {i}: cosine similarity = {similarity:.6f}")
+            sim = self.cosine_similarity(hf_emb, sgl_emb)
+            similarities.append(sim)
+            print(f"  Text {i}: cosine similarity = {sim:.6f}")
 
-        avg_similarity = sum(all_similarities) / len(all_similarities)
+        avg_similarity = np.mean(similarities)
         print(f"  Average similarity: {avg_similarity:.6f}")
-        print(f"  Threshold: {threshold}")
+        print(f"  Threshold: {SIMILARITY_THRESHOLD}")
 
-        # Check average similarity meets threshold
         self.assertGreater(
-            avg_similarity, threshold,
-            f"Average similarity {avg_similarity:.4f} below threshold {threshold}. "
-            "This may indicate pooling method differences or incomplete LoRA loading."
+            avg_similarity,
+            SIMILARITY_THRESHOLD,
+            f"Average similarity {avg_similarity:.4f} below threshold {SIMILARITY_THRESHOLD}",
         )
 
 
 if __name__ == "__main__":
+    try:
+        mp.set_start_method("spawn")
+    except RuntimeError:
+        pass
     unittest.main()
