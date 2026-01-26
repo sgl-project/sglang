@@ -113,7 +113,7 @@ class LayerwiseOffloadManager:
                 current_offset = 0
                 for name, weight in weights:
                     numel = weight.numel()
-                    cpu_buffer[current_offset : current_offset + numel].copy_(
+                    cpu_buffer[current_offset: current_offset + numel].copy_(
                         weight.flatten()
                     )
                     self._weight_metadata[layer_idx][name] = {
@@ -134,7 +134,7 @@ class LayerwiseOffloadManager:
 
         self.register_forward_hooks()
         logger.info(
-            f"LayerwiseOffloadManager initialized with prefetched layer num: {self.prefetch_size}"
+            f"LayerwiseOffloadManager initialized with num prefetched layer: {self.prefetch_size}, total num layers: {self.num_layers}"
         )
 
     def prepare_for_next_req(self, non_blocking=True):
@@ -189,7 +189,7 @@ class LayerwiseOffloadManager:
             # map the parameter's data to the correct slice of the GPU buffer
             target = self.get_target_with_name(name)
             target.data = gpu_buffer[
-                meta["offset"] : meta["offset"] + meta["numel"]
+                meta["offset"]: meta["offset"] + meta["numel"]
             ].view(meta["shape"])
 
         self._gpu_layers.add(layer_idx)
@@ -198,7 +198,7 @@ class LayerwiseOffloadManager:
     def release_layer(self, layer_idx: int) -> None:
         """
         lightweight release layer weights
-        Basically set the reference count to the gpu weight tensor to zero
+        Basically set the reference count to the gpu weight tensor to zero. The weights on cpu is untouched
         """
         if not self.enabled or self.device is None:
             return
@@ -260,7 +260,7 @@ class LayerwiseOffloadManager:
             cpu_buffer = self._consolidated_cpu_weights[layer_idx][dtype]
             offset = meta["offset"]
             numel = meta["numel"]
-            cpu_buffer[offset : offset + numel].copy_(gpu_weight)
+            cpu_buffer[offset: offset + numel].copy_(gpu_weight)
 
     @torch.compiler.disable
     def sync_all_layers_to_cpu(self) -> None:
@@ -282,8 +282,11 @@ class LayerwiseOffloadManager:
         def make_pre_hook(i):
             def hook(module, input):
                 # wait only for the current layer if it's being prefetched
+                if i == 0:
+                    self.prepare_for_next_req(non_blocking=False)
                 if i in self._prefetch_events:
                     torch.cuda.current_stream().wait_event(self._prefetch_events[i])
+
                 # trigger batch prefetch (i + prefetch_size ~ i + 2 * prefetch_size) if needed
                 if i % self.prefetch_size == 0:
                     for j in range(i + self.prefetch_size, i + 2 * self.prefetch_size):
