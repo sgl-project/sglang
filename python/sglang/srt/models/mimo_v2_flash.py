@@ -870,7 +870,13 @@ class MiMoV2Model(nn.Module):
             hidden_states, residual = model_forward_maybe_tbo(
                 layers=self.layers[tbo_start_layer:tbo_end_layer],
                 enable_tbo=True,
-                input_data_scatter_mode=ScatterMode.model_input_output(),
+                input_data_scatter_mode=(
+                    ScatterMode.model_input_output()
+                    if tbo_start_layer == self.start_layer
+                    else self.layers[
+                        tbo_start_layer - 1
+                    ].layer_scatter_modes.layer_output_mode
+                ),
                 positions=positions,
                 forward_batch=forward_batch,
                 hidden_states=hidden_states,
