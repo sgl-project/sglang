@@ -84,7 +84,7 @@ __global__ void load_cache_to_device_buffer_kernel(
     int32_t* __restrict__ top_k_device_locs,
     const int32_t* __restrict__ page_table,
     int16_t* __restrict__ diff_map,
-    const int32_t* __restrict__ req_pool_indices,
+    const int64_t* __restrict__ req_pool_indices,
     const bool* __restrict__ sparse_mask,
     const int64_t* __restrict__ seq_lens,
     int64_t buffer_stride_0,
@@ -359,7 +359,7 @@ void load_cache_to_device_buffer(
   int32_t* top_k_device_locs_ptr = static_cast<int32_t*>(top_k_device_locs.data_ptr());
   const int32_t* page_table_ptr = static_cast<const int32_t*>(page_table.data_ptr());
   int16_t* diff_map_ptr = static_cast<int16_t*>(diff_map.data_ptr());
-  const int32_t* req_pool_indices_ptr = static_cast<const int32_t*>(req_pool_indices.data_ptr());
+  const int64_t* req_pool_indices_ptr = static_cast<const int64_t*>(req_pool_indices.data_ptr());
   const bool* sparse_mask_ptr = static_cast<const bool*>(sparse_mask.data_ptr());
   const int64_t* seq_lens_ptr = static_cast<const int64_t*>(seq_lens.data_ptr());
 
