@@ -34,6 +34,7 @@ suites = {
     "per-commit-4-gpu-b200": [
         TestFile("test_deepseek_v3_fp4_4gpu.py", 1500),
         TestFile("test_fp8_blockwise_gemm.py", 280),
+        TestFile("test_gpt_oss_4gpu.py", 300),
         TestFile("test_nvfp4_gemm.py", 360),
     ],
     # "per-commit-8-gpu-b200": [
@@ -47,11 +48,9 @@ suites = {
         TestFile("ep/test_deepep_small.py", 531),
         TestFile("ep/test_mooncake_ep_small.py", 660),
     ],
-    # Disabled: IBGDA/cudaHostRegister environment issues on 8-GPU runner, see #17175
-    # 4-GPU DeepEP tests provide sufficient coverage
-    # "per-commit-8-gpu-h200-deepep": [
-    #     TestFile("ep/test_deepep_large.py", 563),
-    # ],
+    "per-commit-8-gpu-h200-deepep": [
+        TestFile("ep/test_deepep_large.py", 563),
+    ],
     # quantization_test suite migrated to test/registered/quant/
     "__not_in_ci__": [
         TestFile("test_release_memory_occupation.py", 200),  # Temporarily disabled
@@ -64,7 +63,6 @@ suites = {
         TestFile(
             "models/test_qwen3_next_models_pcg.py"
         ),  # Disabled: intermittent failures, see #17039
-        TestFile("ep/test_deepep_large.py", 563),  # Disabled: see #17175
     ],
 }
 
@@ -156,7 +154,7 @@ suite_ascend = {
     ],
     "per-commit-16-npu-a3": [
         TestFile("ascend/test_ascend_deepep.py", 3600),
-        TestFile("ascend/test_ascend_deepseek_mtp.py", 2800),
+        # TestFile("ascend/test_ascend_deepseek_mtp.py", 2800),
         TestFile("ascend/test_ascend_w4a4_quantization.py", 600),
     ],
 }

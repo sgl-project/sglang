@@ -66,7 +66,6 @@ runtime_common = [
   "grpcio==1.75.1", # keep it align with compile_proto.py
   "grpcio-tools==1.75.1", # keep it align with compile_proto.py
   "grpcio-reflection==1.75.1", # required by srt/entrypoints/grpc_server.py
-  "bidict",
 ]
 
 tracing = [
@@ -99,9 +98,6 @@ diffusion_hip = [
   "vsa==0.0.4",
   "runai_model_streamer",
 ]
-
-# https://docs.sglang.io/platforms/ascend_npu.html
-srt_npu = ["sglang[runtime_common]"]
 
 # For Intel Gaudi(device : hpu) follow the installation guide
 # https://docs.vllm.ai/en/latest/getting_started/gaudi-installation.html
@@ -146,12 +142,10 @@ test = [
 ]
 
 all_hip = ["sglang[srt_hip]"]
-all_npu = ["sglang[srt_npu]"]
 all_hpu = ["sglang[srt_hpu]"]
 all_musa = ["sglang[srt_musa]", "sglang[diffusion_musa]"]
 
 dev_hip = ["sglang[all_hip]", "sglang[test]"]
-dev_npu = ["sglang[all_npu]", "sglang[test]"]
 dev_hpu = ["sglang[all_hpu]", "sglang[test]"]
 dev_musa = ["sglang[all_musa]", "sglang[test]"]
 
