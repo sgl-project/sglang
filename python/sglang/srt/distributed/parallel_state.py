@@ -54,6 +54,7 @@ from sglang.srt.utils import (
     is_xpu,
 )
 from sglang.srt.utils.custom_op import register_custom_op
+from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 
 _is_npu = is_npu()
 _is_cpu = is_cpu()
@@ -576,22 +577,22 @@ class GroupCoordinator:
             and not self.qr_comm.disabled
             and self.qr_comm.should_quick_allreduce(input_)
         ):  
-            print(f"we use qr allreduce")
             outplace_all_reduce_method = "qr"
         elif (
             self.pymscclpp_comm is not None
             and not self.pymscclpp_comm.disabled
             and self.pymscclpp_comm.should_mscclpp_allreduce(input_)
         ):
-            print(f"we use pymscclpp allreduce")
             outplace_all_reduce_method = "pymscclpp"
         elif (
             self.torch_symm_mem_comm is not None
             and not self.torch_symm_mem_comm.disabled
             and self.torch_symm_mem_comm.should_torch_symm_mem_allreduce(input_)
         ):
-            print(f"we use torch_symm_mem allreduce")
             outplace_all_reduce_method = "torch_symm_mem"
+        elif is_in_piecewise_cuda_graph():
+            # For piecewise cuda graph, we use pynccl outplace allreduce
+            outplace_all_reduce_method = "pynccl"
         if outplace_all_reduce_method is not None:
             return outplace_all_reduce(
                 input_,
@@ -609,7 +610,8 @@ class GroupCoordinator:
         qr_comm = self.qr_comm
         pymscclpp_comm = self.pymscclpp_comm
         torch_symm_mem_comm = self.torch_symm_mem_comm
-        assert any([qr_comm, ca_comm, pymscclpp_comm, torch_symm_mem_comm])
+        pynccl_comm = self.pynccl_comm
+        assert any([qr_comm, ca_comm, pymscclpp_comm, torch_symm_mem_comm, pynccl_comm])
         if outplace_all_reduce_method == "ca":
             assert not ca_comm.disabled
             out = ca_comm.custom_all_reduce(input_)
@@ -619,9 +621,14 @@ class GroupCoordinator:
         elif outplace_all_reduce_method == "torch_symm_mem":
             assert not torch_symm_mem_comm.disabled
             out = torch_symm_mem_comm.all_reduce(input_)
-        else:
+        elif outplace_all_reduce_method == "pymscclpp":
             assert not pymscclpp_comm.disabled
             out = pymscclpp_comm.all_reduce(input_)
+        elif outplace_all_reduce_method == "pynccl":
+            with pynccl_comm.change_state(
+                enable=True, stream=get_current_device_stream_fast()
+            ):
+                out = pynccl_comm.outplace_all_reduce(input_)
         assert out is not None
         return out
 

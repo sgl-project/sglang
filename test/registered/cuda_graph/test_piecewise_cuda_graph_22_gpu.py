@@ -23,7 +23,7 @@ class TestPiecewiseCudaGraphTP(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_MLA_MODEL_NAME_FOR_TEST
+        cls.model = "Qwen/Qwen3-Coder-30B-A3B-Instruct"
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -35,8 +35,6 @@ class TestPiecewiseCudaGraphTP(CustomTestCase):
                 "eager",
                 "--tp",
                 "2",
-                # "--piecewise-cuda-graph-max-tokens",
-                # "2048",
             ],
         )
 
@@ -59,7 +57,7 @@ class TestPiecewiseCudaGraphTP(CustomTestCase):
         metrics = run_eval(args)
         print(f"GSM8K Accuracy: {metrics['score']:.3f}")
 
-        self.assertGreaterEqual(metrics["score"], 0.80)
+        self.assertGreaterEqual(metrics["score"], 0.90)
 
 
 if __name__ == "__main__":

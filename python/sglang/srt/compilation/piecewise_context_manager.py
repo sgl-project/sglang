@@ -1,10 +1,11 @@
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, List, Optional
+from typing import Any, List, Optional, TYPE_CHECKING
 
 import torch
 
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+if TYPE_CHECKING:
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 _in_piecewise_cuda_graph = False
 _in_pcg_torch_compile = False
@@ -57,7 +58,7 @@ class ForwardContext:
         self.quant_config = None
         self.moe_layers = None
 
-    def set_forward_batch(self, forward_batch: ForwardBatch):
+    def set_forward_batch(self, forward_batch: "ForwardBatch"):
         self.forward_batch = forward_batch
 
     def set_attention_layers(self, layers: List[Any]):
@@ -81,7 +82,7 @@ def get_forward_context() -> Optional[ForwardContext]:
 
 @contextmanager
 def set_forward_context(
-    forward_batch: ForwardBatch,
+    forward_batch: "ForwardBatch",
     attention_layers: List[Any],
     quant_config: Any,
     moe_layers: List[Any],
