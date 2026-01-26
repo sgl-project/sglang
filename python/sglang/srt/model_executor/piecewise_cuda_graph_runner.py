@@ -549,6 +549,13 @@ class PiecewiseCudaGraphRunner:
             self.out_cache_loc.zero_()
             if self.out_cache_loc_swa is not None:
                 self.out_cache_loc_swa.zero_()
+            self.input_ids[num_tokens:static_num_tokens].zero_()
+            self.positions[num_tokens:static_num_tokens].zero_()
+            if self.is_multimodal:
+                self.input_embeds[:, num_tokens:static_num_tokens].zero_()
+            if forward_batch.mrope_positions is not None:
+                self.mrope_positions[:, num_tokens:static_num_tokens].zero_()
+
         bs = forward_batch.batch_size
 
         self.input_ids[:num_tokens].copy_(forward_batch.input_ids)
@@ -673,8 +680,9 @@ class PiecewiseCudaGraphRunner:
         **kwargs,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]:
         with enable_piecewise_cuda_graph():
-            self.model_runner.attn_backend.init_forward_metadata(forward_batch)
+            # self.model_runner.attn_backend.init_forward_metadata(forward_batch)
             static_forward_batch = self.replay_prepare(forward_batch, **kwargs)
+            self.model_runner.attn_backend.init_forward_metadata(static_forward_batch)
             # Replay
             with set_forward_context(
                 static_forward_batch,
