@@ -232,7 +232,8 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                     surr_offset=0,
                     read_offset=recv_obj.read_offsets[i],
                 )
-                self.decode_status[rid] = s
+                if not (rid and rid.startswith("HEALTH_CHECK")):
+                    self.decode_status[rid] = s
             else:
                 s = self.decode_status[rid]
                 s.decode_ids.extend(recv_obj.decode_ids[i])
@@ -290,17 +291,26 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         # Incremental decoding
         output_strs = []
         for i in range(bs):
+            rid = recv_obj.rids[i]
             try:
-                s = self.decode_status[recv_obj.rids[i]]
+                s = self.decode_status[rid]
             except KeyError:
-                raise RuntimeError(
-                    f"Decode status not found for request {recv_obj.rids[i]}. "
-                    "It may be due to the request being evicted from the decode status due to memory pressure. "
-                    "Please increase the maximum number of requests by setting "
-                    "the SGLANG_DETOKENIZER_MAX_STATES environment variable to a bigger value than the default value. "
-                    f"The current value is {DETOKENIZER_MAX_STATES}. "
-                    "For more details, see: https://github.com/sgl-project/sglang/issues/2812"
-                )
+                if rid and rid.startswith("HEALTH_CHECK"):
+                    s = DecodeStatus(
+                        decoded_text=recv_obj.decoded_texts[i],
+                        decode_ids=recv_obj.decode_ids[i],
+                        surr_offset=0,
+                        read_offset=recv_obj.read_offsets[i],
+                    )
+                else:
+                    raise RuntimeError(
+                        f"Decode status not found for request {rid}. "
+                        "It may be due to the request being evicted from the decode status due to memory pressure. "
+                        "Please increase the maximum number of requests by setting "
+                        "the SGLANG_DETOKENIZER_MAX_STATES environment variable to a bigger value than the default value. "
+                        f"The current value is {DETOKENIZER_MAX_STATES}. "
+                        "For more details, see: https://github.com/sgl-project/sglang/issues/2812"
+                    )
             new_text = read_texts[i][len(surr_texts[i]) :]
             if recv_obj.finished_reasons[i] is None:
                 # Streaming chunk: update the decode status
@@ -312,7 +322,8 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                 else:
                     new_text = find_printable_text(new_text)
             else:
-                del self.decode_status[recv_obj.rids[i]]
+                if rid in self.decode_status:
+                    del self.decode_status[rid]
 
             output_str = self.trim_matched_stop(
                 s.decoded_text + new_text,
