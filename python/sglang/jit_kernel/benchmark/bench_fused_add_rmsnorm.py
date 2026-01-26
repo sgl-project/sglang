@@ -52,7 +52,7 @@ configs = list(itertools.product(HIDDEN_SIZE_LIST, BS_LIST))
         line_names=LINE_NAMES,
         styles=STYLES,
         ylabel="us",
-        plot_name="rmsnorm-performance",
+        plot_name="fused-add-rmsnorm-performance",
         args={},
     )
 )
