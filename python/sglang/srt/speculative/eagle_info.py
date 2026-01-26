@@ -102,7 +102,6 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         )
 
     def prepare_for_verify(self, batch: ScheduleBatch, page_size: int):
-
         if batch.forward_mode.is_idle():
             return
 
@@ -414,9 +413,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                         try:
                             req.grammar.accept_token(id)
                         except ValueError as e:
-                            logger.info(
-                                f"{i=}, {req=}\n" f"{accept_index=}\n" f"{predict=}\n"
-                            )
+                            logger.info(f"{i=}, {req=}\n{accept_index=}\n{predict=}\n")
                             raise e
             if not req.finished():
                 unfinished_index.append(i)
@@ -675,7 +672,6 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         return self.num_tokens_per_batch, self.num_tokens_for_logprob_per_batch
 
     def prepare_for_extend(self, batch: ScheduleBatch):
-
         if batch.forward_mode.is_idle():
             return
 
@@ -715,7 +711,6 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         batch: ScheduleBatch,
         speculative_num_steps: int,
     ):
-
         if batch.forward_mode.is_idle():
             return
 

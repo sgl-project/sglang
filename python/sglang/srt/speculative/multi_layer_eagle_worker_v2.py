@@ -444,7 +444,7 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
             self.reset_cuda_graph_buffers(forward_batch, batch_result)
         else:
             logger.warning_once(
-                f"can't use cuda graph for draft extend! may have correctness issue!"
+                "can't use cuda graph for draft extend! may have correctness issue!"
             )
             select_index = (
                 torch.arange(len(batch.seq_lens), device=self.device)

@@ -97,7 +97,10 @@ class VocabIntersectionMapper:
         if not hasattr(self, "_target_to_draft_tensor"):
             # Use fallback_id for tokens not in intersection instead of -1
             self._target_to_draft_tensor = torch.full(
-                (self.target_vocab_size,), fallback_id, dtype=torch.long, device=self.device
+                (self.target_vocab_size,),
+                fallback_id,
+                dtype=torch.long,
+                device=self.device,
             )
             for target_id, draft_id in self.target_to_draft_map.items():
                 self._target_to_draft_tensor[target_id] = draft_id
