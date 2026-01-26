@@ -128,15 +128,19 @@ from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
     DeepseekV2WeightLoaderMixin,
 )
 from sglang.srt.models.deepseek_common.utils import (
+    FORWARD_ABSORB_CORE_ATTENTION_BACKENDS,
     _device_sm,
+    _get_llama_4_scaling,
     _is_cpu,
     _is_cpu_amx_available,
+    _is_cublas_ge_129,
     _is_cuda,
     _is_gfx95_supported,
     _is_hip,
     _is_npu,
     _use_aiter,
     _use_aiter_gfx95,
+    yarn_get_mscale,
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -146,7 +150,6 @@ from sglang.srt.utils import (
     add_prefix,
     get_bool_env_var,
     is_non_idle_and_non_empty,
-    is_nvidia_cublas_cu12_version_ge_12_9,
     log_info_on_rank0,
     make_layers,
     use_intel_amx_backend,
@@ -192,8 +195,6 @@ elif _is_npu:
     )
 else:
     pass
-
-_is_cublas_ge_129 = is_nvidia_cublas_cu12_version_ge_12_9()
 
 logger = logging.getLogger(__name__)
 
@@ -467,6 +468,7 @@ class DeepseekV2MoE(nn.Module):
                     if get_moe_a2a_backend().is_deepep()
                     or get_moe_a2a_backend().is_mooncake()
                     or get_moe_a2a_backend().is_ascend_fuseep()
+                    or get_moe_a2a_backend().is_flashinfer()
                     or should_use_flashinfer_cutlass_moe_fp4_allgather()
                     else {}
                 ),
@@ -529,6 +531,7 @@ class DeepseekV2MoE(nn.Module):
             get_moe_a2a_backend().is_deepep()
             or get_moe_a2a_backend().is_mooncake()
             or get_moe_a2a_backend().is_ascend_fuseep()
+            or get_moe_a2a_backend().is_flashinfer()
         )
         self._fuse_shared_experts_inside_sbo = SboFlags.fuse_shared_experts_inside_sbo()
 
@@ -882,6 +885,52 @@ class DeepseekV2MoE(nn.Module):
             post_combine_hook_handle = (
                 self.experts.dispatcher.register_post_combine_hook(_post_combine_hook)
             )
+        elif envs.SGLANG_BLACKWELL_OVERLAP_SHARED_EXPERTS_OUTSIDE_SBO.get():
+            # On GB200: Shared experts overlapped on alt_stream, down gemm overlapped with DeepEP Combine
+
+            def _post_dispatch_hook(
+                dispatcher: BaseDispatcher, dispatch_output: DispatchOutput
+            ):
+
+                combine_overlap_args, down_gemm_overlap_args, meta_overlap_args = (
+                    compute_overlap_args(dispatch_output, self.alt_stream)
+                )
+                dispatcher.set_overlap_args(
+                    combine_overlap_args=combine_overlap_args,
+                    meta_overlap_args=meta_overlap_args,
+                )
+                self.experts.set_overlap_args(
+                    down_gemm_overlap_args=down_gemm_overlap_args,
+                    meta_overlap_args=meta_overlap_args,
+                )
+
+                post_dispatch_hook_handle.remove()
+
+            def _pre_combine_hook(
+                dispatcher: BaseDispatcher, combine_input: CombineInput
+            ):
+                if (
+                    e := dispatcher.meta_overlap_args.get("record_event_after_down")
+                ) is not None:
+                    e.record()
+                pre_combine_hook_handle.remove()
+
+            def _post_combine_hook(
+                dispatcher: BaseDispatcher, hidden_states: torch.Tensor
+            ):
+                dispatcher.clear_overlap_args()
+                self.experts.clear_overlap_args()
+                post_combine_hook_handle.remove()
+
+            post_dispatch_hook_handle = (
+                self.experts.dispatcher.register_post_dispatch_hook(_post_dispatch_hook)
+            )
+            pre_combine_hook_handle = self.experts.dispatcher.register_pre_combine_hook(
+                _pre_combine_hook
+            )
+            post_combine_hook_handle = (
+                self.experts.dispatcher.register_post_combine_hook(_post_combine_hook)
+            )
 
         final_hidden_states = self.experts(
             hidden_states=hidden_states,
@@ -1001,24 +1050,6 @@ class DeepseekV2MoE(nn.Module):
             final_hidden_states *= self.routed_scaling_factor
 
         state.hidden_states_mlp_output = final_hidden_states
-
-
-def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
-    import math
-
-    if scale <= 1:
-        return 1.0
-    return 0.1 * mscale * math.log(scale) + 1.0
-
-
-def _get_llama_4_scaling(
-    original_max_position_embeddings: int, scaling_beta: float, positions: torch.Tensor
-) -> torch.Tensor:
-    scaling = 1 + scaling_beta * torch.log(
-        1 + torch.floor(positions / original_max_position_embeddings)
-    )
-    # Broadcast over num_heads and head_dim
-    return scaling[..., None, None]
 
 
 class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
@@ -1174,6 +1205,7 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
                 self.rotary_emb.forward = self.rotary_emb.forward_native
         else:
             self.rotary_emb = None
+        self.use_deepseek_yarn_rope = rope_scaling is not None
 
         self.attn_mqa = RadixAttention(
             self.num_local_heads,
@@ -2474,7 +2506,7 @@ class DeepseekV2Model(nn.Module):
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
-                enable_tp=not is_dp_attention_enabled(),
+                use_attn_tp_group=is_dp_attention_enabled(),
             )
         else:
             self.embed_tokens = PPMissingLayer()

@@ -41,7 +41,7 @@ class TestKimiK2(unittest.TestCase):
 
         run_combined_tests(
             models=variants,
-            test_name="Kimi-K2-Thinking Unified",
+            test_name="Kimi-K2-Thinking",
             accuracy_params=AccuracyTestParams(dataset="gsm8k", baseline_accuracy=0.94),
             performance_params=PerformanceTestParams(
                 profile_dir="performance_profiles_kimi_k2_thinking",
