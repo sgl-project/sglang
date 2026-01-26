@@ -32,10 +32,6 @@
             0.8,
             1.0
         ],
-        "warmup_requests": {
-            "text": 1,
-            "image_edit": 0
-        }
     },
     "scenarios": {
         "qwen_image_t2i": {
