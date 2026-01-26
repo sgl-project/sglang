@@ -623,7 +623,7 @@ class ServerArgs:
             "--dit-offload-prefetch-size",
             type=float,
             default=ServerArgs.dit_offload_prefetch_size,
-            help="The size of prefetch for dit-layerwise-offload. If the value is between 0.0 and 1.0, it is treated as a ratio of the total number of layers. If the value is greater than 1.0, it is treated as the absolute number of layers. 0.0 means prefetch 1 layer (lowest memory); 1.0 means prefetch all layers (highest memory). Values above 0.5 might have peak memory close to no offload but worse performance.",
+            help="The size of prefetch for dit-layerwise-offload. If the value is between 0.0 and 1.0, it is treated as a ratio of the total number of layers. If the value is >= 1, it is treated as the absolute number of layers. 0.0 means prefetch 1 layer (lowest memory); 1.0 means prefetch all layers (highest memory). Values above 0.5 might have peak memory close to no offload but worse performance.",
         )
         parser.add_argument(
             "--use-fsdp-inference",
