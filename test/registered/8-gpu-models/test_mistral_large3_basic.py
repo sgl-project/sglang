@@ -15,6 +15,7 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
+register_cuda_ci(est_time=275, suite="stage-c-test-8-gpu-b200")
 register_cuda_ci(est_time=600, suite="nightly-8-gpu-b200", nightly=True)
 MISTRAL_LARGE3_MODEL_PATH = "mistralai/Mistral-Large-3-675B-Instruct-2512"
 

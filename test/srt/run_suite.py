@@ -60,13 +60,11 @@ suites = {
         TestFile("models/test_dummy_grok_models.py"),
         TestFile("test_profile_v2.py"),
         TestFile("models/test_ministral3_models.py"),
-        TestFile("test_mistral_large3_basic.py"),
         TestFile("test_prefill_delayer.py"),
         TestFile("test_fla_layernorm_guard.py"),
         TestFile(
             "models/test_qwen3_next_models_pcg.py"
         ),  # Disabled: intermittent failures, see #17039
-        TestFile("ep/test_deepep_large.py", 563),  # Disabled: see #17175
     ],
 }
 
