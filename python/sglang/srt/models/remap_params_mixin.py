@@ -25,8 +25,8 @@ StackedEntry = Tuple[
 ExpertEntry = Tuple[
     str, str, int, Union[int, str]
 ]  # (sglang_weight, ckpt_weight, expert_id, shard_id)
-# (sglang_weight, shard_id, num_shards, expert_id)
-MappingResult = Tuple[str, Optional[Union[int, str]], int, Optional[int]]
+# (sglang_weight, shard_id, num_shards, expert_id, num_experts)
+MappingResult = Tuple[str, Optional[Union[int, str]], int, Optional[int], int]
 
 # Standard scale remapping: (suffix, pattern, replacement)
 _SCALE_REMAP = [
@@ -93,11 +93,24 @@ class RemapParamsMixin:
         )
         return count if count > 0 else 1
 
+    @lru_cache(maxsize=128)
+    def _get_num_experts(self, sglang_param: str) -> int:
+        """Count unique expert_ids for a given fused expert parameter."""
+        expert_ids = set(
+            expert_id
+            for p, _, expert_id, _ in self.get_expert_params_mapping()
+            if p == sglang_param
+        )
+        return len(expert_ids) if expert_ids else 0
+
     def get_num_shards_for_param(self, sglang_param: str) -> int:
         return self._get_num_shards(sglang_param)
 
+    def get_num_experts_for_param(self, sglang_param: str) -> int:
+        return self._get_num_experts(sglang_param)
+
     def map_weight_name(self, ckpt_weight_name: str) -> MappingResult:
-        """Map ckpt name -> (sglang_name, shard_id, num_shards, expert_id)."""
+        """Map ckpt name -> (sglang_name, shard_id, num_shards, expert_id, num_experts)."""
         name = self.mutate_weight_preload(ckpt_weight_name)
 
         if "scale" in name:
@@ -107,11 +120,18 @@ class RemapParamsMixin:
         for sglang_param, ckpt, expert_id, shard_id in self.get_expert_params_mapping():
             if ckpt in name:
                 mapped = name.replace(ckpt, sglang_param)
-                return mapped, shard_id, self._get_num_shards(sglang_param), expert_id
+                num_experts = self._get_num_experts(sglang_param)
+                return (
+                    mapped,
+                    shard_id,
+                    self._get_num_shards(sglang_param),
+                    expert_id,
+                    num_experts,
+                )
 
         for sglang_param, ckpt, shard_id in self.get_stacked_params_mapping():
             if ckpt in name:
                 mapped = name.replace(ckpt, sglang_param)
-                return mapped, shard_id, self._get_num_shards(sglang_param), None
+                return mapped, shard_id, self._get_num_shards(sglang_param), None, 0
 
-        return name, None, 1, None
+        return name, None, 1, None, 0

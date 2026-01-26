@@ -3342,6 +3342,15 @@ class DeepseekV2ForCausalLM(nn.Module, RemapParamsMixin):
             ckpt_up_proj_name="up_proj",
             num_experts=self.config.n_routed_experts + self.num_fused_shared_experts,
         )
+        # Params for special naming rules in mixed-precision models, for example:
+        # model.layers.xx.mlp.experts.xx.w1.input_scale. For details,
+        # see https://huggingface.co/Barrrrry/DeepSeek-R1-W4AFP8/blob/main.
+        if self.quant_config and self.quant_config.get_name() == "w4afp8":
+            self.expert_params_mapping += (
+                FusedMoE.make_expert_input_scale_params_mapping(
+                    num_experts=self.config.n_routed_experts
+                )
+            )
 
         self._routed_experts_weights_of_layer = LazyValue(
             lambda: {
@@ -3697,13 +3706,6 @@ class DeepseekV2ForCausalLM(nn.Module, RemapParamsMixin):
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
         expert_params_mapping = list(self.expert_params_mapping)
-        # Params for special naming rules in mixed-precision models, for example:
-        # model.layers.xx.mlp.experts.xx.w1.input_scale. For details,
-        # see https://huggingface.co/Barrrrry/DeepSeek-R1-W4AFP8/blob/main.
-        if self.quant_config and self.quant_config.get_name() == "w4afp8":
-            expert_params_mapping += FusedMoE.make_expert_input_scale_params_mapping(
-                num_experts=self.config.n_routed_experts
-            )
 
         # Fuse q_a_proj and kv_a_proj_with_mqa along output dimension when q_lora_rank is not None
         fuse_qkv_a_proj = hasattr(self.config, "q_lora_rank") and (
