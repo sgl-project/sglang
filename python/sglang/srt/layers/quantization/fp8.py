@@ -452,9 +452,15 @@ class Fp8LinearMethod(LinearMethodBase):
         qweight, weight_scale = mxfp8_group_quantize(weight)
         # Keep parameter objects to preserve weight_loader attrs for hot reload.
         layer.weight.data = qweight
-        layer.weight_scale_inv.data = weight_scale
         layer.weight.requires_grad_(False)
-        layer.weight_scale_inv.requires_grad_(False)
+        if hasattr(layer, "weight_scale_inv") and layer.weight_scale_inv is not None:
+            layer.weight_scale_inv.data = weight_scale
+            layer.weight_scale_inv.requires_grad_(False)
+        else:
+            # First-time online MXFP8 quantization (no serialized scales).
+            layer.register_parameter(
+                "weight_scale_inv", Parameter(weight_scale, requires_grad=False)
+            )
         layer.weight_scale_inv.format_ue8m0 = True
         layer.input_scale = None
 
