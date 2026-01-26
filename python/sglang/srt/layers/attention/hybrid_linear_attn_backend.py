@@ -267,9 +267,9 @@ class MambaAttnBackendBase(AttentionBackend):
         After processing a prefill chunk, we need to save the last `conv_state_len` tokens
         of the processed region for prefix caching.
 
-        The key insight is that FLA (Flash Linear Attention) processes sequences in chunks
-        of FLA_CHUNK_SIZE. We only track the conv state up to the last complete chunk boundary
-        (aligned_len).
+        The key insight is that FLA (Flash Linear Attention) and Mamba2 processes sequences in chunks
+        of the chunk size (FLA_CHUNK_SIZE=64 for FLA, mamba_chunk_size for Mamba2).
+        We only track the conv state up to the last complete chunk boundary (aligned_len).
 
         start_indices is the starting token index of the conv state to track in this extend batch.
         indices include all pos to track in this extend batch, conv_state_len for each req that
@@ -306,28 +306,33 @@ class MambaAttnBackendBase(AttentionBackend):
         Compute source and destination indices for tracking SSM states for prefix caching.
 
         After processing a prefill, we need to save the SSM recurrent state for prefix caching.
-        The FLA kernel outputs intermediate hidden states `h` at each chunk boundary,
+        The kernel outputs intermediate hidden states `h` at each chunk boundary,
         plus a `last_recurrent_state` at the end of the chunked prefill size.
 
+        The chunk size varies by model type:
+        - FLA models: FLA_CHUNK_SIZE (64)
+        - Mamba2 models: mamba_chunk_size (256)
+
         The challenge is that sequences may or may not end on a chunk boundary:
-          - Aligned case (len % FLA_CHUNK_SIZE == 0): In this case, FLA will store the to-cache
-            state in the last_recurrent_state.
-          - Unaligned case (len % FLA_CHUNK_SIZE != 0): The last_recurrent_state includes the
+          - Aligned case (len % chunk_size == 0): The to-cache state is stored in
+            the last_recurrent_state.
+          - Unaligned case (len % chunk_size != 0): The last_recurrent_state includes the
             unaligned position, but we only want state up to the last chunk boundary.
             We must extract from the intermediate `h` tensor at the appropriate chunk index.
 
         We compute the src and dst indices for all requests that need to be cached
         (i.e. mamba_track_mask is True) based on the rule above.
 
-        For example:
-        1. If chunked prefill length is < 64, then only final state has value. In this case we
-           cache `final` state.
-        2. if chunked prefill length == 64, then only final state has value. In this case we
-           cache pos 64, from `final` state
-        3. if chunked prefill length >64 and < 128, then both h and final state have value.
-           We cache pos 64 from `h` state
-        4. if chunked prefill length ==128, then both h and final state have value. We cache
-           pos 128 from `final` state. Note `h` doesn't include the pos 128.
+        For example (assuming chunk_size=64):
+        1. If chunked prefill length is < chunk_size, then only final state has value.
+           In this case we cache `final` state.
+        2. If chunked prefill length == chunk_size, then only final state has value.
+           In this case we cache pos chunk_size, from `final` state.
+        3. If chunked prefill length > chunk_size and < 2 * chunk_size, then both h and
+           final state have value. We cache pos chunk_size from `h` state.
+        4. If chunked prefill length == 2 * chunk_size, then both h and final state have
+           value. We cache pos 2 * chunk_size from `final` state. Note `h` doesn't include
+           the final position.
 
         Returns:
             track_ssm_h_src: Source indices into the packed `h` tensor (for unaligned seqs)
@@ -335,6 +340,9 @@ class MambaAttnBackendBase(AttentionBackend):
             track_ssm_final_src: Source indices into last_recurrent_state buffer (for aligned seqs)
             track_ssm_final_dst: Destination cache slot indices (for aligned seqs)
         """
+        chunk_size = getattr(
+            self, "mamba_chunk_size", get_global_server_args().mamba_cache_chunk_size
+        )
         # Move to CPU to avoid kernel launches for masking operations
         mamba_track_mask = forward_batch.mamba_track_mask.cpu()
         extend_seq_lens = forward_batch.extend_seq_lens.cpu()
@@ -344,7 +352,11 @@ class MambaAttnBackendBase(AttentionBackend):
         prefix_lens = forward_batch.extend_prefix_lens.cpu()
 
         # Calculate the number of hidden states per request
-        num_h_states = (extend_seq_lens - 1) // FLA_CHUNK_SIZE + 1
+        is_mamba2 = hasattr(self, "mamba_chunk_size")
+        if is_mamba2:
+            num_h_states = extend_seq_lens // chunk_size
+        else:
+            num_h_states = (extend_seq_lens - 1) // chunk_size + 1
 
         # Calculate the starting offset for each sequence in the packed batch
         track_ssm_src_offset = torch.zeros_like(num_h_states)
@@ -357,17 +369,17 @@ class MambaAttnBackendBase(AttentionBackend):
         dst_masked = mamba_track_indices[mamba_track_mask]
 
         # Determine if the sequence ends at a chunk boundary
-        is_aligned = (lens_masked % FLA_CHUNK_SIZE) == 0
+        is_aligned = (lens_masked % chunk_size) == 0
 
         # Case 1: Aligned. Use last_recurrent_state from ssm_states.
         track_ssm_final_src = mamba_cache_indices[mamba_track_mask][is_aligned]
         track_ssm_final_dst = dst_masked[is_aligned]
 
         # Case 2: Unaligned. Use intermediate state from h.
-        # TODO: if support FLA_CHUNK_SIZE % page size != 0, then need to modify this
+        # TODO: if support chunk_size % page size != 0, then need to modify this
         not_aligned = ~is_aligned
         track_ssm_h_src = offset_masked[not_aligned] + (
-            lens_masked[not_aligned] // FLA_CHUNK_SIZE
+            lens_masked[not_aligned] // chunk_size
         )
         track_ssm_h_dst = dst_masked[not_aligned]
 
@@ -594,10 +606,10 @@ class MambaAttnBackendBase(AttentionBackend):
         """
         Track and copy SSM states during extend for prefix caching.
 
-        After the FLA chunked prefill kernel runs, we need to save the SSM recurrent
+        After the chunked prefill kernel runs, we need to save the SSM recurrent
         state at the last chunk boundary so it can be reused for prefix caching.
         The source of the state depends on whether the sequence length is aligned
-        to FLA_CHUNK_SIZE. See `_init_track_ssm_indices` for more details on how
+        to the chunk size. See `_init_track_ssm_indices` for more details on how
         the source and destination indices are computed.
 
         Note: Conv state tracking for extend is handled separately via gather operations
@@ -1066,6 +1078,17 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
         config = model_runner.mamba2_config
         assert config is not None
         self.mamba_chunk_size = config.mamba_chunk_size
+        self.conv_states_shape = (
+            model_runner.req_to_token_pool.mamba_pool.mamba_cache.conv[0].shape
+        )
+        assert (
+            self.conv_states_shape[-1] < self.mamba_chunk_size
+        ), f"{self.conv_states_shape[-1]=} should be less than {self.mamba_chunk_size}"
+
+        if model_runner.server_args.enable_mamba_extra_buffer():
+            assert (
+                model_runner.server_args.mamba_track_interval >= self.mamba_chunk_size
+            ), f"mamba_track_interval ({model_runner.server_args.mamba_track_interval}) must be >= mamba_chunk_size ({self.mamba_chunk_size})"
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         metadata = self._forward_metadata(forward_batch)
@@ -1122,19 +1145,45 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
         hidden_states: torch.Tensor,
         output: torch.Tensor,
         layer_id: int,
+        forward_batch: ForwardBatch,
         mup_vector: Optional[torch.Tensor] = None,
         use_triton_causal_conv: bool = False,
     ):
         assert isinstance(self.forward_metadata, Mamba2Metadata)
         layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer_id)
-        return mixer.forward(
+        intermediate_states = mixer.forward(
             hidden_states=hidden_states,
             output=output,
             layer_cache=layer_cache,
             metadata=self.forward_metadata,
+            forward_batch=forward_batch,
             mup_vector=mup_vector,
             use_triton_causal_conv=use_triton_causal_conv,
         )
+
+        if forward_batch.mamba_track_mask is not None:
+            if (
+                intermediate_states is not None
+                and forward_batch.mamba_track_mask is not None
+                and forward_batch.mamba_track_mask.any()
+            ):
+                self._track_mamba_state_extend(
+                    forward_batch,
+                    intermediate_states,
+                    layer_cache.temporal,
+                    self.forward_metadata,
+                )
+
+            if self.forward_metadata.num_decodes > 0:
+                num_decodes = self.forward_metadata.num_decodes
+                track_mamba_states_if_needed(
+                    layer_cache.conv[0],
+                    layer_cache.temporal,
+                    self.forward_metadata.mamba_cache_indices[-num_decodes:],
+                    forward_batch.mamba_track_mask[-num_decodes:],
+                    forward_batch.mamba_track_indices[-num_decodes:],
+                    num_decodes,
+                )
 
     def forward_decode(self, *args, **kwargs):
         raise NotImplementedError(
