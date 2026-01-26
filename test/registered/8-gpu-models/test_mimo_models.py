@@ -46,5 +46,34 @@ class TestMiMoV2Flash(GSM8KMixin, SpecDecodingMixin, DefaultServerBase):
     accept_length_thres = 3.2
 
 
+class TestMiMoV2FlashTBO(GSM8KMixin, DefaultServerBase):
+    gsm8k_accuracy_thres = 0.75
+    gsm8k_num_questions = 1319
+    gsm8k_parallel = 1319
+    model = "XiaomiMiMo/MiMo-V2-Flash"
+
+    other_args = [
+        "--trust-remote-code",
+        "--tp",
+        "4",
+        "--dp",
+        "2",
+        "--enable-dp-attention",
+        "--attention-backend",
+        "fa3",
+        "--max-running-requests",
+        "128",
+        "--cuda-graph-max-bs",
+        "64",
+        "--mem-fraction-static",
+        "0.75",
+        "--enable-two-batch-overlap",
+        "--moe-a2a-backend",
+        "deepep",
+        "--model-loader-extra-config",
+        '{"enable_multithread_load": true,"num_threads": 64}',
+    ]
+
+
 if __name__ == "__main__":
     unittest.main()
