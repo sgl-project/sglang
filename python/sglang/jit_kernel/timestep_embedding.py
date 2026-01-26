@@ -5,18 +5,20 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.jit_kernel.utils import load_jit
+from sglang.jit_kernel.utils import load_jit, make_cpp_args
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
 
 @functools.cache
-def _jit_timestep_embedding_module() -> Module:
+def _jit_timestep_embedding_module(dtype: torch.dtype) -> Module:
+    args = make_cpp_args(dtype)
     return load_jit(
         "timestep_embedding",
+        *args,
         cuda_files=["diffusion/timestep_embedding.cuh"],
-        cuda_wrappers=[("timestep_embedding", "timestep_embedding")],
+        cuda_wrappers=[("timestep_embedding", f"timestep_embedding<{args}>")],
     )
 
 
@@ -29,9 +31,10 @@ def timestep_embedding(
     max_period: int = 10000,
     dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
-    dtype = torch.float32
-    output = torch.empty((t.shape[0], dim), dtype=dtype, device=t.device)
-    module = _jit_timestep_embedding_module()
+    if t.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        t = t.to(dtype)
+    output = torch.empty((t.shape[0], dim), dtype=torch.float32, device=t.device)
+    module = _jit_timestep_embedding_module(t.dtype)
     module.timestep_embedding(
         t,
         output,

@@ -558,26 +558,20 @@ async def model_info():
         "has_audio_understanding": model_config.is_audio_understandable_model,
         "model_type": getattr(model_config.hf_config, "model_type", None),
         "architectures": getattr(model_config.hf_config, "architectures", None),
+        "weight_version": _global_state.tokenizer_manager.server_args.weight_version,
+        # "hf_config": model_config.hf_config.to_dict(),
     }
     return result
 
 
 @app.get("/get_weight_version")
-async def get_weight_version():
-    """Get the current weight version (deprecated - use /weight_version instead)."""
-    logger.warning(
-        "Endpoint '/get_weight_version' is deprecated and will be removed in a future version. "
-        "Please use '/weight_version' instead."
-    )
-    return await weight_version()
-
-
 @app.get("/weight_version")
 async def weight_version():
     """Get the current weight version."""
-    return {
-        "weight_version": _global_state.tokenizer_manager.server_args.weight_version
-    }
+    raise HTTPException(
+        status_code=404,
+        detail="Endpoint '/get_weight_version' or '/weight_version' is deprecated. Please use '/model_info' instead.",
+    )
 
 
 @app.get("/get_server_info")
@@ -665,30 +659,6 @@ async def generate_request(obj: GenerateReqInput, request: Request):
         except ValueError as e:
             logger.error(f"[http_server] Error: {e}")
             return _create_error_response(e)
-
-
-@app.api_route("/generate_from_file", methods=["POST"])
-async def generate_from_file_request(file: UploadFile, request: Request):
-    """Handle a generate request, this is purely to work with input_embeds."""
-    content = await file.read()
-    input_embeds = orjson.loads(content.decode("utf-8"))
-
-    obj = GenerateReqInput(
-        input_embeds=input_embeds,
-        sampling_params={
-            "temperature": 0.0,
-            "max_new_tokens": 512,
-        },
-    )
-
-    try:
-        ret = await _global_state.tokenizer_manager.generate_request(
-            obj, request
-        ).__anext__()
-        return ret
-    except ValueError as e:
-        logger.error(f"Error: {e}")
-        return _create_error_response(e)
 
 
 @app.api_route("/encode", methods=["POST", "PUT"])
