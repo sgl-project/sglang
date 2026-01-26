@@ -18,7 +18,7 @@ import logging
 import os
 import signal
 from collections import OrderedDict, defaultdict
-from typing import Dict, List, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import psutil
 import pybase64
@@ -93,6 +93,10 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
 
         # Init dispatcher
         self.init_request_dispatcher()
+
+    @staticmethod
+    def is_health_check_request(rid: Optional[str]) -> bool:
+        return isinstance(rid, str) and rid.startswith("HEALTH_CHECK")
 
     def init_ipc_channels(self, port_args: PortArgs):
         context = zmq.Context(2)
@@ -232,7 +236,8 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                     surr_offset=0,
                     read_offset=recv_obj.read_offsets[i],
                 )
-                if not (rid and rid.startswith("HEALTH_CHECK")):
+                if not self.is_health_check_request(rid):
+                    # for health check requests, we do not store the decode status
                     self.decode_status[rid] = s
             else:
                 s = self.decode_status[rid]
@@ -292,17 +297,17 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         output_strs = []
         for i in range(bs):
             rid = recv_obj.rids[i]
-            try:
-                s = self.decode_status[rid]
-            except KeyError:
-                if rid and rid.startswith("HEALTH_CHECK"):
-                    s = DecodeStatus(
-                        decoded_text=recv_obj.decoded_texts[i],
-                        decode_ids=recv_obj.decode_ids[i],
-                        surr_offset=0,
-                        read_offset=recv_obj.read_offsets[i],
-                    )
-                else:
+            if self.is_health_check_request(rid):
+                s = DecodeStatus(
+                    decoded_text=recv_obj.decoded_texts[i],
+                    decode_ids=recv_obj.decode_ids[i],
+                    surr_offset=0,
+                    read_offset=recv_obj.read_offsets[i],
+                )
+            else:
+                try:
+                    s = self.decode_status[rid]
+                except KeyError:
                     raise RuntimeError(
                         f"Decode status not found for request {rid}. "
                         "It may be due to the request being evicted from the decode status due to memory pressure. "
