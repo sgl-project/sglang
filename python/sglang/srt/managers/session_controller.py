@@ -144,6 +144,8 @@ class Session:
             sampling_params=req.sampling_params,
             lora_id=req.lora_id,
             session_id=self.session_id,
+            stored_kv_cache=session_params.stored_kv_cache,
+            fresh_kv_cache=session_params.fresh_kv_cache,
             custom_logit_processor=req.custom_logit_processor,
             stream=req.stream,
             return_logprob=req.return_logprob,

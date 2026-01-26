@@ -44,7 +44,7 @@ import time
 from enum import Enum, auto
 from http import HTTPStatus
 from itertools import chain
-from typing import TYPE_CHECKING, Any, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import torch
@@ -68,6 +68,7 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.session_cache import SessionCache
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.metrics.collector import (
     DPCooperationInfo,
@@ -506,6 +507,8 @@ class Req:
         input_embeds: Optional[List[List[float]]] = None,
         token_type_ids: List[int] = None,
         session_id: Optional[str] = None,
+        stored_kv_cache: Optional[List[Dict]] = None,
+        fresh_kv_cache: Optional[List[Dict]] = None,
         custom_logit_processor: Optional[str] = None,
         require_reasoning: bool = False,
         return_hidden_states: bool = False,
@@ -538,6 +541,9 @@ class Req:
         # fill_ids = origin_input_ids + output_ids. Updated if chunked.
         self.fill_ids = []
         self.session_id = session_id
+        self.stored_kv_cache = SessionCache(stored_kv_cache)
+        self.fresh_kv_cache = SessionCache(fresh_kv_cache)
+
         self.input_embeds = input_embeds
 
         # For req-level memory management

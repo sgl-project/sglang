@@ -1558,6 +1558,8 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     "meta_info": meta_info,
                 }
 
+                if recv_obj.session_params[i] is not None:
+                    out_dict["session_params"] = recv_obj.session_params[i]
             elif isinstance(recv_obj, BatchTokenIDOutput):
                 is_stream = getattr(state.obj, "stream", False)
                 if self.server_args.stream_output and is_stream:
@@ -1572,6 +1574,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     "output_ids": output_token_ids,
                     "meta_info": meta_info,
                 }
+
+                if recv_obj.session_params[i] is not None:
+                    out_dict["session_params"] = recv_obj.session_params[i]
             elif isinstance(recv_obj, BatchMultimodalOutput):
                 raise NotImplementedError("BatchMultimodalOut not implemented")
             else:
