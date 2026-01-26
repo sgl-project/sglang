@@ -74,9 +74,9 @@ def fetch_metrics_from_github(days=30):
     if token:
         headers["Authorization"] = f"Bearer {token}"
 
-    # Get workflow runs
+    # Get workflow runs - only scheduled (nightly) runs, not workflow_dispatch
     url = f"https://api.github.com/repos/{GITHUB_REPO}/actions/workflows/{WORKFLOW_NAME}/runs"
-    params = {"status": "completed", "per_page": 50}
+    params = {"status": "completed", "per_page": 50, "event": "schedule"}
 
     try:
         response = requests.get(

@@ -4,15 +4,21 @@ const GITHUB_REPO = 'sgl-project/sglang';
 const WORKFLOW_NAME = 'nightly-test-nvidia.yml';
 const ARTIFACT_PREFIX = 'consolidated-metrics-';
 
-// Chart instances
-let throughputChart = null;
-let latencyChart = null;
-let ttftChart = null;
-let inputThroughputChart = null;
+// Chart instances (array for batch-separated charts)
+let activeCharts = [];
 
 // Data storage
 let allMetricsData = [];
-let currentModel = 'all';
+let currentModel = null;
+let currentMetricType = 'throughput'; // throughput, latency, ttft, inputThroughput
+
+// Metric type definitions
+const metricTypes = {
+    throughput: { label: 'Overall Throughput', unit: 'tokens/sec', field: 'throughput' },
+    latency: { label: 'Latency', unit: 'ms', field: 'latency' },
+    ttft: { label: 'Time to First Token', unit: 'ms', field: 'ttft' },
+    inputThroughput: { label: 'Input Throughput', unit: 'tokens/sec', field: 'inputThroughput' }
+};
 
 // Chart.js default configuration for dark theme
 Chart.defaults.color = '#8b949e';
@@ -138,27 +144,76 @@ async function fetchMetricsForRun(run) {
 function populateFilters() {
     const gpuConfigs = new Set();
     const models = new Set();
-    const variants = new Set();
     const batchSizes = new Set();
 
     allMetricsData.forEach(run => {
         run.results.forEach(result => {
             gpuConfigs.add(result.gpu_config);
             models.add(result.model);
-            variants.add(result.variant);
             result.benchmarks.forEach(bench => {
                 batchSizes.add(bench.batch_size);
             });
         });
     });
 
-    populateSelect('gpu-filter', Array.from(gpuConfigs).sort());
-    populateSelect('model-filter', Array.from(models).sort());
-    populateSelect('variant-filter', Array.from(variants).sort());
+    // No "all" option for GPU and Model - populate with first value selected
+    const gpuArray = Array.from(gpuConfigs).sort();
+    const modelArray = Array.from(models).sort();
+
+    populateSelectNoAll('gpu-filter', gpuArray);
+    populateSelectNoAll('model-filter', modelArray);
     populateSelect('batch-filter', Array.from(batchSizes).sort((a, b) => a - b));
 
-    // Create model tabs
-    createModelTabs(Array.from(models).sort());
+    // Set initial values (first option)
+    if (gpuArray.length > 0) {
+        document.getElementById('gpu-filter').value = gpuArray[0];
+    }
+    if (modelArray.length > 0) {
+        document.getElementById('model-filter').value = modelArray[0];
+        currentModel = modelArray[0];
+    }
+
+    // Update variants based on selected model
+    updateVariantFilter();
+
+    // Create metric type tabs
+    createMetricTabs();
+}
+
+// Update variant filter based on selected GPU and model
+function updateVariantFilter() {
+    const gpuFilter = document.getElementById('gpu-filter').value;
+    const modelFilter = document.getElementById('model-filter').value;
+
+    const variants = new Set();
+
+    allMetricsData.forEach(run => {
+        run.results.forEach(result => {
+            if (result.gpu_config === gpuFilter && result.model === modelFilter) {
+                variants.add(result.variant);
+            }
+        });
+    });
+
+    const variantArray = Array.from(variants).sort();
+    const variantSelect = document.getElementById('variant-filter');
+    const currentVariant = variantSelect.value;
+
+    // Clear and repopulate
+    variantSelect.innerHTML = '<option value="all">All Variants</option>';
+    variantArray.forEach(variant => {
+        const opt = document.createElement('option');
+        opt.value = variant;
+        opt.textContent = variant;
+        variantSelect.appendChild(opt);
+    });
+
+    // Try to restore previous selection if still valid
+    if (variantArray.includes(currentVariant)) {
+        variantSelect.value = currentVariant;
+    } else {
+        variantSelect.value = 'all';
+    }
 }
 
 function populateSelect(selectId, options) {
@@ -171,51 +226,59 @@ function populateSelect(selectId, options) {
     });
 }
 
-function createModelTabs(models) {
-    const tabsContainer = document.getElementById('model-tabs');
+function populateSelectNoAll(selectId, options) {
+    const select = document.getElementById(selectId);
+    // Remove the "all" option if present
+    while (select.options.length > 0) {
+        select.remove(0);
+    }
+    options.forEach(option => {
+        const opt = document.createElement('option');
+        opt.value = option;
+        opt.textContent = option;
+        select.appendChild(opt);
+    });
+}
+
+function createMetricTabs() {
+    const tabsContainer = document.getElementById('metric-tabs');
     tabsContainer.innerHTML = '';
 
-    const allTab = document.createElement('div');
-    allTab.className = 'tab active';
-    allTab.textContent = 'All Models';
-    allTab.onclick = () => selectModelTab('all', allTab);
-    tabsContainer.appendChild(allTab);
-
-    models.forEach(model => {
+    Object.entries(metricTypes).forEach(([key, metric], index) => {
         const tab = document.createElement('div');
-        tab.className = 'tab';
-        tab.textContent = model.split('/').pop(); // Show short name
-        tab.title = model;
-        tab.onclick = () => selectModelTab(model, tab);
+        tab.className = index === 0 ? 'tab active' : 'tab';
+        tab.textContent = metric.label;
+        tab.dataset.metric = key;
+        tab.onclick = () => selectMetricTab(key, tab);
         tabsContainer.appendChild(tab);
     });
 }
 
-function selectModelTab(model, tabElement) {
+function selectMetricTab(metricKey, tabElement) {
     document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
     tabElement.classList.add('active');
-    currentModel = model;
+    currentMetricType = metricKey;
 
-    // Update model filter to match
-    const modelFilter = document.getElementById('model-filter');
-    modelFilter.value = model;
+    // Update chart title
+    const metric = metricTypes[metricKey];
+    document.getElementById('metric-title').textContent = `${metric.label} (${metric.unit})`;
 
     updateCharts();
 }
 
-// Handle model filter dropdown change to sync with tabs
+// Handle model filter dropdown change
 function handleModelFilterChange(model) {
-    // Find the corresponding tab and activate it to keep UI in sync
-    const tab = Array.from(document.querySelectorAll('.tab')).find(
-        t => t.title === model || (model === 'all' && t.textContent === 'All Models')
-    );
-    if (tab) {
-        selectModelTab(model, tab);
-    } else {
-        // Fallback: still update charts even if tab sync fails
-        currentModel = model;
-        updateCharts();
-    }
+    currentModel = model;
+    // Update variant filter based on new model selection
+    updateVariantFilter();
+    updateCharts();
+}
+
+// Handle GPU filter change
+function handleGpuFilterChange() {
+    // Update variant filter based on new GPU selection
+    updateVariantFilter();
+    updateCharts();
 }
 
 // Update summary stats
@@ -275,21 +338,18 @@ function updateStats() {
     addStat('Peak Throughput', formatNumber(maxThroughput), maxThroughputModel);
 }
 
-// Update all charts based on current filters
+// Update charts based on current filters and selected metric type
 function updateCharts() {
     const gpuFilter = document.getElementById('gpu-filter').value;
-    const modelFilter = currentModel !== 'all' ? currentModel : document.getElementById('model-filter').value;
+    const modelFilter = currentModel;
     const variantFilter = document.getElementById('variant-filter').value;
     const batchFilter = document.getElementById('batch-filter').value;
 
-    // Prepare data for charts
-    const chartData = prepareChartData(gpuFilter, modelFilter, variantFilter, batchFilter);
+    // Prepare data for charts - grouped by batch size
+    const chartDataByBatch = prepareChartDataByBatch(gpuFilter, modelFilter, variantFilter, batchFilter);
 
-    // Update each chart
-    updateThroughputChart(chartData);
-    updateLatencyChart(chartData);
-    updateTTFTChart(chartData);
-    updateInputThroughputChart(chartData);
+    // Update chart for the selected metric type
+    updateMetricChart(chartDataByBatch, currentMetricType);
 }
 
 function prepareChartData(gpuFilter, modelFilter, variantFilter, batchFilter) {
@@ -300,8 +360,8 @@ function prepareChartData(gpuFilter, modelFilter, variantFilter, batchFilter) {
 
         run.results.forEach(result => {
             // Apply filters
-            if (gpuFilter !== 'all' && result.gpu_config !== gpuFilter) return;
-            if (modelFilter !== 'all' && result.model !== modelFilter) return;
+            if (result.gpu_config !== gpuFilter) return;
+            if (result.model !== modelFilter) return;
             if (variantFilter !== 'all' && result.variant !== variantFilter) return;
 
             result.benchmarks.forEach(bench => {
@@ -339,95 +399,115 @@ function prepareChartData(gpuFilter, modelFilter, variantFilter, batchFilter) {
     return Array.from(seriesMap.values());
 }
 
-function updateThroughputChart(chartData) {
-    const ctx = document.getElementById('throughput-chart').getContext('2d');
+// Prepare chart data grouped by batch size - each batch size is a separate series
+function prepareChartDataByBatch(gpuFilter, modelFilter, variantFilter, batchFilter) {
+    const batchDataMap = new Map(); // batch_size -> Map of variant -> data
 
-    if (throughputChart) {
-        throughputChart.destroy();
-    }
+    allMetricsData.forEach(run => {
+        const runDate = new Date(run.run_date);
 
-    const datasets = chartData.map((series, index) => ({
-        label: series.label,
-        data: series.data.map(d => ({ x: d.x, y: d.throughput })),
-        borderColor: chartColors[index % chartColors.length],
-        backgroundColor: chartColors[index % chartColors.length] + '20',
-        tension: 0.1,
-        fill: false
-    }));
+        run.results.forEach(result => {
+            // Apply filters - GPU and Model are required (no "all" option)
+            if (result.gpu_config !== gpuFilter) return;
+            if (result.model !== modelFilter) return;
+            if (variantFilter !== 'all' && result.variant !== variantFilter) return;
 
-    throughputChart = new Chart(ctx, {
-        type: 'line',
-        data: { datasets },
-        options: getChartOptions('tokens/sec')
+            result.benchmarks.forEach(bench => {
+                if (batchFilter !== 'all' && bench.batch_size !== parseInt(batchFilter)) return;
+
+                const batchSize = bench.batch_size;
+                const seriesKey = result.variant;
+
+                if (!batchDataMap.has(batchSize)) {
+                    batchDataMap.set(batchSize, new Map());
+                }
+
+                const variantMap = batchDataMap.get(batchSize);
+                if (!variantMap.has(seriesKey)) {
+                    variantMap.set(seriesKey, {
+                        label: seriesKey,
+                        data: [],
+                        model: result.model,
+                        variant: result.variant,
+                        batchSize: batchSize
+                    });
+                }
+
+                variantMap.get(seriesKey).data.push({
+                    x: runDate,
+                    throughput: bench.overall_throughput,
+                    latency: bench.latency_ms,
+                    ttft: bench.ttft_ms,
+                    inputThroughput: bench.input_throughput,
+                    runId: run.run_id
+                });
+            });
+        });
     });
+
+    // Sort data points by date and convert to array format
+    const result = {};
+    batchDataMap.forEach((variantMap, batchSize) => {
+        variantMap.forEach(series => {
+            series.data.sort((a, b) => a.x - b.x);
+        });
+        result[batchSize] = Array.from(variantMap.values());
+    });
+
+    return result;
 }
 
-function updateLatencyChart(chartData) {
-    const ctx = document.getElementById('latency-chart').getContext('2d');
+// Unified chart update function for any metric type
+function updateMetricChart(chartDataByBatch, metricType) {
+    const container = document.getElementById('charts-container');
+    container.innerHTML = '';
 
-    if (latencyChart) {
-        latencyChart.destroy();
+    // Destroy existing charts
+    activeCharts.forEach(chart => chart.destroy());
+    activeCharts = [];
+
+    const metric = metricTypes[metricType];
+    const batchSizes = Object.keys(chartDataByBatch).sort((a, b) => parseInt(a) - parseInt(b));
+
+    if (batchSizes.length === 0) {
+        container.innerHTML = '<div class="no-data">No data available for the selected filters</div>';
+        return;
     }
 
-    const datasets = chartData.map((series, index) => ({
-        label: series.label,
-        data: series.data.map(d => ({ x: d.x, y: d.latency })),
-        borderColor: chartColors[index % chartColors.length],
-        backgroundColor: chartColors[index % chartColors.length] + '20',
-        tension: 0.1,
-        fill: false
-    }));
+    batchSizes.forEach(batchSize => {
+        const chartData = chartDataByBatch[batchSize];
 
-    latencyChart = new Chart(ctx, {
-        type: 'line',
-        data: { datasets },
-        options: getChartOptions('ms')
-    });
-}
+        const chartWrapper = document.createElement('div');
+        chartWrapper.className = 'batch-chart-wrapper';
 
-function updateTTFTChart(chartData) {
-    const ctx = document.getElementById('ttft-chart').getContext('2d');
+        const title = document.createElement('div');
+        title.className = 'batch-chart-title';
+        title.textContent = `Batch Size: ${batchSize}`;
+        chartWrapper.appendChild(title);
 
-    if (ttftChart) {
-        ttftChart.destroy();
-    }
+        const chartContainer = document.createElement('div');
+        chartContainer.className = 'chart-container';
+        const canvas = document.createElement('canvas');
+        chartContainer.appendChild(canvas);
+        chartWrapper.appendChild(chartContainer);
+        container.appendChild(chartWrapper);
 
-    const datasets = chartData.map((series, index) => ({
-        label: series.label,
-        data: series.data.map(d => ({ x: d.x, y: d.ttft })),
-        borderColor: chartColors[index % chartColors.length],
-        backgroundColor: chartColors[index % chartColors.length] + '20',
-        tension: 0.1,
-        fill: false
-    }));
+        const ctx = canvas.getContext('2d');
+        const datasets = chartData.map((series, index) => ({
+            label: series.label,
+            data: series.data.map(d => ({ x: d.x, y: d[metric.field] })),
+            borderColor: chartColors[index % chartColors.length],
+            backgroundColor: chartColors[index % chartColors.length] + '20',
+            tension: 0.1,
+            fill: false
+        }));
 
-    ttftChart = new Chart(ctx, {
-        type: 'line',
-        data: { datasets },
-        options: getChartOptions('ms')
-    });
-}
-
-function updateInputThroughputChart(chartData) {
-    const ctx = document.getElementById('input-throughput-chart').getContext('2d');
-
-    if (inputThroughputChart) {
-        inputThroughputChart.destroy();
-    }
-
-    const datasets = chartData.map((series, index) => ({
-        label: series.label,
-        data: series.data.map(d => ({ x: d.x, y: d.inputThroughput })),
-        borderColor: chartColors[index % chartColors.length],
-        backgroundColor: chartColors[index % chartColors.length] + '20',
-        tension: 0.1,
-        fill: false
-    }));
-
-    inputThroughputChart = new Chart(ctx, {
-        type: 'line',
-        data: { datasets },
-        options: getChartOptions('tokens/sec')
+        const chart = new Chart(ctx, {
+            type: 'line',
+            data: { datasets },
+            options: getChartOptions(metric.unit)
+        });
+        activeCharts.push(chart);
     });
 }
 

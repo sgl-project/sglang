@@ -313,6 +313,30 @@
             border: 1px solid var(--border-color);
         }
 
+        .metric-section {
+            margin-bottom: 24px;
+        }
+
+        .batch-charts-container {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(400px, 1fr));
+            gap: 16px;
+        }
+
+        .batch-chart-wrapper {
+            background: var(--bg-tertiary);
+            border-radius: 6px;
+            padding: 12px;
+        }
+
+        .batch-chart-title {
+            font-size: 14px;
+            font-weight: 600;
+            color: var(--text-secondary);
+            margin-bottom: 8px;
+            text-align: center;
+        }
+
         footer {
             margin-top: 48px;
             padding: 24px 0;
@@ -345,7 +369,7 @@
             </h1>
             <div class="header-actions">
                 <button class="btn" onclick="refreshData()">Refresh</button>
-                <a href="https://github.com/sgl-project/sglang/actions/workflows/nightly-test-nvidia.yml" target="_blank" class="btn">
+                <a href="https://github.com/sgl-project/sglang/actions/workflows/nightly-test-nvidia.yml?query=event%3Aschedule" target="_blank" class="btn">
                     View Workflow
                 </a>
             </div>
@@ -361,14 +385,12 @@
             <div class="filters">
                 <div class="filter-group">
                     <label>GPU Configuration</label>
-                    <select id="gpu-filter" onchange="updateCharts()">
-                        <option value="all">All Configurations</option>
+                    <select id="gpu-filter" onchange="handleGpuFilterChange()">
                     </select>
                 </div>
                 <div class="filter-group">
                     <label>Model</label>
                     <select id="model-filter" onchange="handleModelFilterChange(this.value)">
-                        <option value="all">All Models</option>
                     </select>
                 </div>
                 <div class="filter-group">
@@ -385,31 +407,12 @@
                 </div>
             </div>
 
-            <div class="tabs" id="model-tabs"></div>
+            <div class="tabs" id="metric-tabs"></div>
 
-            <div class="charts-grid">
+            <div class="metric-section">
                 <div class="chart-card">
-                    <h3>Throughput (tokens/sec)</h3>
-                    <div class="chart-container">
-                        <canvas id="throughput-chart"></canvas>
-                    </div>
-                </div>
-                <div class="chart-card">
-                    <h3>Latency (ms)</h3>
-                    <div class="chart-container">
-                        <canvas id="latency-chart"></canvas>
-                    </div>
-                </div>
-                <div class="chart-card">
-                    <h3>Time to First Token (ms)</h3>
-                    <div class="chart-container">
-                        <canvas id="ttft-chart"></canvas>
-                    </div>
-                </div>
-                <div class="chart-card">
-                    <h3>Input Throughput (tokens/sec)</h3>
-                    <div class="chart-container">
-                        <canvas id="input-throughput-chart"></canvas>
+                    <h3 id="metric-title">Overall Throughput (tokens/sec)</h3>
+                    <div class="batch-charts-container" id="charts-container">
                     </div>
                 </div>
             </div>
