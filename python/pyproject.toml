@@ -31,7 +31,6 @@ dependencies = [
   "flashinfer_python==0.6.2", # keep it aligned with jit-cache version in Dockerfile
   "flashinfer_cubin==0.6.2",
   "gguf",
-  "huggingface_hub>=1.0.0",
   "interegular",
   "llguidance>=0.7.11,<0.8.0",
   "modelscope",
