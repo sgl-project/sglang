@@ -101,9 +101,8 @@ suite_amd = {
         # TestFile("test_wave_attention_backend.py", 150), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/11127
         # The time estimation for `test_int4fp8_moe.py` assumes `mistralai/Mixtral-8x7B-Instruct-v0.1` is already cached (running on 1xMI300X).
     ],
-    "per-commit-4-gpu-amd": [
-        TestFile("test_pp_single_node.py", 150),
-    ],
+    # "per-commit-4-gpu-amd" has been migrated to test/registered/stage-c/
+    # and is now managed by test/run_suite.py using the registry system.
     # NOTE: AMD nightly suites (nightly-amd, nightly-amd-vlm, nightly-amd-8-gpu)
     # have been migrated to test/registered/amd/nightly/ and are now managed
     # by test/run_suite.py using the registry system.
