@@ -90,14 +90,13 @@ class Req:
 
     # Latent tensors
     latents: torch.Tensor | None = None
-    audio_latents: torch.Tensor | None = None
-    audio_noise: torch.Tensor | None = None
     y: torch.Tensor | None = None
     # Flux-2
     latent_ids: torch.Tensor | None = None
 
-    # Audio Latents (LTX-2)
+    # Audio Latents
     audio_latents: torch.Tensor | None = None
+    audio_noise: torch.Tensor | None = None
     raw_audio_latent_shape: tuple[int, ...] | None = None
 
     # Audio Parameters
@@ -125,8 +124,6 @@ class Req:
     sigmas: list[float] | None = None
 
     n_tokens: int | None = None
-
-    audio_num_samples: int | None = None
 
     # Other parameters that may be needed by specific schedulers
     extra_step_kwargs: dict[str, Any] = field(default_factory=dict)

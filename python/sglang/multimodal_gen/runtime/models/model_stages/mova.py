@@ -85,7 +85,6 @@ class MOVALatentPreparationStage(PipelineStage):
             raise ValueError("num_frames is required for MOVA")
 
         audio_num_samples = int(self.audio_vae.sample_rate * num_frames / batch.fps)
-        batch.audio_num_samples = audio_num_samples
 
         video_shape = server_args.pipeline_config.prepare_latent_shape(
             batch, batch_size, num_frames
