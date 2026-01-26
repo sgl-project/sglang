@@ -413,6 +413,7 @@ class ReasoningParser:
 
         if (
             request is not None
+            and isinstance(request, ChatCompletionRequest)
             and request.continue_final_message
             and request.messages[-1].role == "assistant"
         ):
