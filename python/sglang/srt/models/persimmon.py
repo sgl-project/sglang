@@ -65,7 +65,7 @@ class PersimmonAttention(nn.Module):
         self.num_heads = self.total_num_heads // tensor_parallel_world_size
         self.head_dim = self.hidden_size // self.total_num_heads
         self.max_position_embeddings = config.max_position_embeddings
-        self.rope_theta = config.rope_theta
+        self.rope_theta = config.rope_parameters.get("rope_theta", 10000)
         self.partial_rotary_factor = config.partial_rotary_factor
         self.is_causal = True
 

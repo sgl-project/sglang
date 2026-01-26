@@ -336,7 +336,7 @@ class PhiMoEDecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
-        rope_theta = getattr(config, "rope_theta", 10000)
+        rope_theta = config.rope_parameters.get("rope_theta", 10000)
         self.self_attn = PhiMoEAttention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
@@ -349,7 +349,7 @@ class PhiMoEDecoderLayer(nn.Module):
             layer_id=layer_id,
             attention_bias=config.attention_bias,
             quant_config=quant_config,
-            rope_scaling=config.rope_scaling,
+            rope_scaling=config.rope_parameters.get("rope_scaling"),
             prefix=add_prefix("self_attn", prefix),
         )
         self.block_sparse_moe = PhiMoE(

@@ -549,7 +549,7 @@ class MiniMaxM2Attention(nn.Module):
         self.scaling = self.head_dim**-0.5
 
         # RoPE settings - support partial RoPE
-        self.rope_theta = getattr(config, "rope_theta", 10000)
+        self.rope_theta = config.rope_parameters.get("rope_theta", 10000)
         self.max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         self.rotary_dim = getattr(
             config, "rotary_dim", self.head_dim
@@ -579,7 +579,7 @@ class MiniMaxM2Attention(nn.Module):
         )
 
         # Setup RoPE with partial rotary dimension
-        rope_scaling = getattr(config, "rope_scaling", None)
+        rope_scaling = config.rope_parameters.get("rope_scaling")
         self.rotary_emb = get_rope(
             self.head_dim,
             rotary_dim=self.rotary_dim,  # Use partial rotary dimension

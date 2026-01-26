@@ -63,7 +63,7 @@ class PhiAttention(nn.Module):
         )
         assert rotary_dim % 2 == 0
 
-        rope_theta = getattr(config, "rope_theta", 10000.0)
+        rope_theta = config.rope_parameters.get("rope_theta", 10000.0)
         max_position_embeddings = getattr(config, "max_position_embeddings", 2048)
         self.rotary_emb = get_rope(
             self.head_size,

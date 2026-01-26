@@ -30,7 +30,6 @@ PACKAGE_LIST = [
     "numpy",
     "aiohttp",
     "fastapi",
-    "hf_transfer",
     "huggingface_hub",
     "interegular",
     "modelscope",

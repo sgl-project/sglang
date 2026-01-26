@@ -11,7 +11,6 @@ from collections.abc import Generator
 from pathlib import Path
 
 import filelock
-import huggingface_hub.constants
 import torch
 from safetensors.torch import safe_open
 from tqdm.auto import tqdm
@@ -38,21 +37,6 @@ logger = init_logger(__name__)
 # lock files in the temp directory will be automatically deleted when the
 # system reboots, so users will not complain about annoying lock files
 temp_dir = tempfile.gettempdir()
-
-
-def enable_hf_transfer() -> None:
-    """automatically activates hf_transfer"""
-    if "HF_HUB_ENABLE_HF_TRANSFER" not in os.environ:
-        try:
-            # enable hf hub transfer if available
-            import hf_transfer  # type: ignore # noqa
-
-            huggingface_hub.constants.HF_HUB_ENABLE_HF_TRANSFER = True
-        except ImportError:
-            pass
-
-
-enable_hf_transfer()
 
 
 class DisabledTqdm(tqdm):

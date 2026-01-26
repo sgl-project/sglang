@@ -144,14 +144,14 @@ class StablelmAttention(nn.Module):
                 self.head_dim,
                 rotary_dim=self.rotary_ndims,
                 max_position=self.config.max_position_embeddings,
-                base=self.config.rope_theta,
+                base=self.config.rope_parameters.get("rope_theta", 10000),
             )
         else:
             self.rotary_emb = get_rope(
                 self.head_dim,
                 rotary_dim=self.rotary_ndims,
                 max_position=self.config.max_position_embeddings,
-                base=self.config.rope_theta,
+                base=self.config.rope_parameters.get("rope_theta", 10000),
                 dtype=torch.float32,
             )
         self.attn = RadixAttention(

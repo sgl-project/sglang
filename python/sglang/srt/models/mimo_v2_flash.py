@@ -458,8 +458,8 @@ class MiMoV2DecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
         self.layer_id = layer_id
 
-        rope_theta = getattr(config, "rope_theta", 1000000)
-        rope_scaling = getattr(config, "rope_scaling", None)
+        rope_theta = config.rope_parameters.get("rope_theta", 1000000)
+        rope_scaling = config.rope_parameters.get("rope_scaling")
         max_position_embeddings = getattr(config, "max_position_embeddings", 32768)
 
         if self.is_swa_layer():
@@ -476,7 +476,7 @@ class MiMoV2DecoderLayer(nn.Module):
                     config, "add_swa_attention_sink_bias", False
                 ),
                 layer_id=layer_id,
-                rope_theta=getattr(config, "swa_rope_theta", rope_theta),
+                rope_theta=config.rope_parameters.get("swa_rope_theta", rope_theta),
                 rope_scaling=rope_scaling,
                 max_position_embeddings=max_position_embeddings,
                 quant_config=quant_config,

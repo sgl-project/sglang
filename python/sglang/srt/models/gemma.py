@@ -172,7 +172,7 @@ class GemmaDecoderLayer(nn.Module):
             head_dim=config.head_dim,
             layer_id=layer_id,
             max_position_embeddings=config.max_position_embeddings,
-            rope_theta=config.rope_theta,
+            rope_theta=config.rope_parameters.get("rope_theta", 10000),
             quant_config=quant_config,
             prefix=add_prefix("self_attn", prefix),
         )

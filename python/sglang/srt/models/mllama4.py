@@ -305,7 +305,7 @@ class Llama4VisionRotaryEmbedding(nn.Module):
         frequencies_y = img_idx // idx  # get the coordinates of the 2d matrix along y
         freq_dim = config.hidden_size // config.num_attention_heads // 2
         rope_freq = 1.0 / (
-            config.rope_theta
+            config.rope_parameters.get("rope_theta", 10000)
             ** (torch.arange(0, freq_dim, 2)[: (freq_dim // 2)].float() / freq_dim)
         )
         freqs_x = (
