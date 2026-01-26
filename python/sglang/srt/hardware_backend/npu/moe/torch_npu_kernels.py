@@ -65,6 +65,8 @@ class TorchNpuKernelsQuantInfo(MoeQuantInfo):
     w2_scale: Optional[torch.Tensor] = None
     w13_offset: Optional[torch.Tensor] = None
     w2_offset: Optional[torch.Tensor] = None
+    w13_weight_bias: Optional[torch.Tensor] = None
+    w2_weight_bias: Optional[torch.Tensor] = None
     w13_scale_bias: Optional[torch.Tensor] = None
     w2_scale_bias: Optional[torch.Tensor] = None
     activation: Optional[str] = None
