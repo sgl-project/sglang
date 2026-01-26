@@ -86,6 +86,7 @@ tool-parser = "1.0.0"
 llm-tokenizer = "1.0.0"
 smg-auth = "1.0.0"
 wfaas = "1.0.0"
+data-connector = "1.0.0"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rustls-pemfile = "2.2"
 openssl = "0.10.73"
