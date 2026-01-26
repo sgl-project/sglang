@@ -31,11 +31,15 @@ from sglang.multimodal_gen.runtime.layers.triton_ops import (
     fuse_scale_shift_kernel,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
-from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
 from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)  # pylint: disable=invalid-name
+_is_cuda = current_platform.is_cuda()
 
 
 def _get_qkv_projections(
@@ -116,7 +120,7 @@ class QwenEmbedRope(nn.Module):
         #     rope_theta=theta,
         #     use_real=False,
         #     repeat_interleave_real=False,
-        #     dtype=torch.float32 if current_platform.is_mps() else torch.float64,
+        #     dtype=torch.float32 if current_platform.is_mps() or current_platform.is_musa() else torch.float64,
         # )
 
         # DO NOT USING REGISTER BUFFER HERE, IT WILL CAUSE COMPLEX NUMBERS LOSE ITS IMAGINARY PART
@@ -684,7 +688,7 @@ class QwenImageTransformerBlock(nn.Module):
             )
             gate0, gate1 = gate[:actual_batch], gate[actual_batch : 2 * actual_batch]
 
-            if x.is_cuda:
+            if _is_cuda:
                 if not x.is_contiguous():
                     x = x.contiguous()
                 if not index.is_contiguous():

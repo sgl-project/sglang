@@ -232,6 +232,7 @@ class CompletionRequest(BaseModel):
     top_p: float = 1.0
     user: Optional[str] = None
     return_hidden_states: bool = False
+    return_routed_experts: bool = False
 
     # Extra parameters for SRT backend only and will be ignored by OpenAI models.
     top_k: int = -1
@@ -280,6 +281,22 @@ class CompletionRequest(BaseModel):
         return v
 
 
+class SglExt(BaseModel):
+    """SGLang extension fields for OpenAI-compatible responses.
+
+    Future SGLang-specific extensions to OpenAI-compatible response objects
+    should be added as fields here rather than directly on the choice object.
+    """
+
+    routed_experts: Optional[str] = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        # Remove None fields to keep response clean
+        return {k: v for k, v in data.items() if v is not None}
+
+
 class CompletionResponseChoice(BaseModel):
     index: int
     text: str
@@ -287,12 +304,15 @@ class CompletionResponseChoice(BaseModel):
     finish_reason: Optional[Literal["stop", "length", "content_filter", "abort"]] = None
     matched_stop: Union[None, int, str] = None
     hidden_states: Optional[object] = None
+    sgl_ext: Optional[SglExt] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
         if self.hidden_states is None:
             data.pop("hidden_states", None)
+        if self.sgl_ext is None:
+            data.pop("sgl_ext", None)
         return data
 
 
@@ -313,12 +333,15 @@ class CompletionResponseStreamChoice(BaseModel):
     finish_reason: Optional[Literal["stop", "length", "content_filter", "abort"]] = None
     matched_stop: Union[None, int, str] = None
     hidden_states: Optional[object] = None
+    sgl_ext: Optional[SglExt] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
         if self.hidden_states is None:
             data.pop("hidden_states", None)
+        if self.sgl_ext is None:
+            data.pop("sgl_ext", None)
         return data
 
 
@@ -375,6 +398,15 @@ ChatCompletionMessageContentPart = Union[
     ChatCompletionMessageContentVideoPart,
     ChatCompletionMessageContentAudioPart,
 ]
+
+# Rerank content types for multimodal reranking (e.g., Qwen3-VL-Reranker)
+# Can be a simple string (text-only) or a list of multimodal content parts
+RerankContentPart = Union[
+    ChatCompletionMessageContentTextPart,
+    ChatCompletionMessageContentImagePart,
+    ChatCompletionMessageContentVideoPart,
+]
+RerankContent = Union[str, List[RerankContentPart]]
 
 
 class FunctionResponse(BaseModel):
@@ -493,6 +525,7 @@ class ChatCompletionRequest(BaseModel):
         default="auto", examples=["none"]
     )  # noqa
     return_hidden_states: bool = False
+    return_routed_experts: bool = False
     reasoning_effort: Optional[Literal["low", "medium", "high"]] = Field(
         default="medium",
         description="Constrains effort on reasoning for reasoning models. "
@@ -645,7 +678,7 @@ class ChatCompletionRequest(BaseModel):
 
         sampling_params = {
             "temperature": get_param("temperature"),
-            "max_new_tokens": self.max_tokens or self.max_completion_tokens,
+            "max_new_tokens": self.max_completion_tokens or self.max_tokens,
             "min_new_tokens": self.min_tokens,
             "stop": stop,
             "stop_token_ids": self.stop_token_ids,
@@ -722,12 +755,15 @@ class ChatCompletionResponseChoice(BaseModel):
     ] = None
     matched_stop: Union[None, int, str] = None
     hidden_states: Optional[object] = None
+    sgl_ext: Optional[SglExt] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
         if self.hidden_states is None:
             data.pop("hidden_states", None)
+        if self.sgl_ext is None:
+            data.pop("sgl_ext", None)
         return data
 
 
@@ -747,12 +783,15 @@ class DeltaMessage(BaseModel):
     reasoning_content: Optional[str] = None
     tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
     hidden_states: Optional[object] = None
+    sgl_ext: Optional[SglExt] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
         if self.hidden_states is None:
             data.pop("hidden_states", None)
+        if self.sgl_ext is None:
+            data.pop("sgl_ext", None)
         return data
 
 
@@ -872,15 +911,60 @@ class ScoringResponse(BaseModel):
 
 
 class V1RerankReqInput(BaseModel):
-    query: str
-    documents: List[str]
+    query: RerankContent = Field(
+        ...,
+        description="The query to match against documents. Can be a string (text-only) "
+        "or a list of content parts for multimodal queries (text, image_url, video_url).",
+    )
+    documents: List[RerankContent] = Field(
+        ...,
+        description="List of documents to rank. Each document can be a string (text-only) "
+        "or a list of content parts for multimodal documents (text, image_url, video_url).",
+    )
+    instruct: Optional[str] = Field(
+        default=None,
+        description="The instruct to the reranker model.",
+    )
+    top_n: Optional[int] = Field(
+        default=None,
+        description="Maximum number of documents to return. Defaults to returning all documents. "
+        "If specified value is greater than the total number of documents, all documents will be returned.",
+    )
+    return_documents: bool = Field(
+        default=True,
+        description="Whether to return documents in the response. Only included when set to true.",
+    )
+
+    @field_validator("top_n")
+    @classmethod
+    def validate_top_n(cls, v):
+        if v is not None and v < 1:
+            raise ValueError("Value error, parameter top_n should be larger than 0.")
+        return v
+
+    def is_multimodal(self) -> bool:
+        """Check if the request contains any multimodal content."""
+        if isinstance(self.query, list):
+            return True
+        for doc in self.documents:
+            if isinstance(doc, list):
+                return True
+        return False
 
 
 class RerankResponse(BaseModel):
     score: float
-    document: str
+    document: Optional[str] = None
     index: int
     meta_info: Optional[dict] = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        # Exclude document field if it's None
+        if self.document is None:
+            data.pop("document", None)
+        return data
 
 
 class TokenizeRequest(BaseModel):
