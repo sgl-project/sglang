@@ -298,21 +298,9 @@ function updateStats() {
     const totalModels = new Set(latestRun.results.map(r => r.model)).size;
     const totalBenchmarks = latestRun.results.reduce((sum, r) => sum + r.benchmarks.length, 0);
 
-    // Calculate best throughput
-    let maxThroughput = 0;
-    let maxThroughputModel = '';
-    latestRun.results.forEach(result => {
-        result.benchmarks.forEach(bench => {
-            if (bench.overall_throughput > maxThroughput) {
-                maxThroughput = bench.overall_throughput;
-                maxThroughputModel = result.model.split('/').pop();
-            }
-        });
-    });
-
     statsRow.innerHTML = ''; // Clear previous stats
 
-    const addStat = (label, value, change) => {
+    const addStat = (label, value) => {
         const card = document.createElement('div');
         card.className = 'stat-card';
         const labelEl = document.createElement('div');
@@ -323,19 +311,12 @@ function updateStats() {
         valueEl.textContent = value;
         card.appendChild(labelEl);
         card.appendChild(valueEl);
-        if (change) {
-            const changeEl = document.createElement('div');
-            changeEl.className = 'change';
-            changeEl.textContent = change;
-            card.appendChild(changeEl);
-        }
         statsRow.appendChild(card);
     };
 
     addStat('Total Runs', allMetricsData.length);
     addStat('Models Tested', totalModels);
     addStat('Benchmarks', totalBenchmarks);
-    addStat('Peak Throughput', formatNumber(maxThroughput), maxThroughputModel);
 }
 
 // Update charts based on current filters and selected metric type
