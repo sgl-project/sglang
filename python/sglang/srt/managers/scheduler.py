@@ -551,6 +551,7 @@ class Scheduler(
             self.max_req_input_len,
             self.random_seed,
             self.device,
+            self.forward_stream,
             _,
             _,
             _,
@@ -776,7 +777,7 @@ class Scheduler(
             self.prefill_delayer = PrefillDelayer(
                 dp_size=self.dp_size,
                 attn_tp_size=self.attn_tp_size,
-                cpu_group=self.tp_worker.get_tp_group().cpu_group,
+                cpu_group=self.tp_cpu_group,
                 server_args=self.server_args,
                 metrics_collector=(
                     self.metrics_collector if self.enable_metrics else None
@@ -971,7 +972,6 @@ class Scheduler(
         if self.device == "cpu":
             self.default_stream.synchronize = lambda: None  # No-op for CPU
 
-        self.forward_stream: CudaStream = self.device_module.Stream()
         self.forward_stream_ctx: CudaStreamContext = self.device_module.stream(
             self.forward_stream
         )
@@ -1481,7 +1481,7 @@ class Scheduler(
                 if recv_req.bootstrap_room is None:
                     error_msg = (
                         f"Invalid request: Disaggregated request received without "
-                        f"boostrap room id. {req.rid=}"
+                        f"bootstrap room id. {req.rid=}"
                     )
                     logger.error(error_msg)
                     prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)

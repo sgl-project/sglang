@@ -58,6 +58,9 @@ from sglang.srt.distributed import (
     set_mscclpp_all_reduce,
     set_torch_symm_mem_all_reduce,
 )
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    use_symmetric_memory,
+)
 from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
 from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
 from sglang.srt.environ import envs
@@ -365,6 +368,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Get memory before model loading
         min_per_gpu_memory = self.init_torch_distributed()
 
+        # Init forward stream for overlap schedule
+        self.forward_stream = torch.get_device_module(self.device).Stream()
+
         # CPU offload
         set_offloader(create_offloader_from_server_args(server_args, dp_rank=dp_rank))
 
@@ -592,6 +598,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # Initialize piecewise CUDA graph
         self.init_piecewise_cuda_graphs()
+
+        self.prealloc_symmetric_memory_pool()
 
     def init_routed_experts_capturer(self):
         if not self.server_args.disable_shared_experts_fusion and hasattr(
@@ -1416,13 +1424,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             max_loras_per_batch=self.server_args.max_loras_per_batch,
             load_config=self.load_config,
             dtype=self.dtype,
+            server_args=self.server_args,
             lora_backend=self.server_args.lora_backend,
             tp_size=self.tp_size,
             tp_rank=self.tp_rank,
             max_lora_rank=self.server_args.max_lora_rank,
             target_modules=self.server_args.lora_target_modules,
             lora_paths=self.server_args.lora_paths,
-            server_args=self.server_args,
         )
 
     def load_lora_adapter(self, lora_ref: LoRARef):
@@ -1997,8 +2005,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         tic = time.perf_counter()
         before_mem = get_available_gpu_memory(self.device, self.gpu_id)
+        graph_backend = defaultdict(
+            lambda: "cuda graph",
+            {
+                "cpu": "cpu graph",
+                "npu": "npu graph",
+            },
+        )
         logger.info(
-            f"Capture {'cpu graph' if self.device == 'cpu' else 'cuda graph'} begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
+            f"Capture {graph_backend[self.device]} begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
         )
         graph_runners = defaultdict(
             lambda: CudaGraphRunner,
@@ -2012,7 +2027,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         after_mem = get_available_gpu_memory(self.device, self.gpu_id)
         self.graph_mem_usage = before_mem - after_mem
         logger.info(
-            f"Capture {'cpu graph' if self.device == 'cpu' else 'cuda graph'} end. Time elapsed: {time.perf_counter() - tic:.2f} s. "
+            f"Capture {graph_backend[self.device]} end. Time elapsed: {time.perf_counter() - tic:.2f} s. "
             f"mem usage={self.graph_mem_usage:.2f} GB. avail mem={after_mem:.2f} GB."
         )
 
@@ -2475,6 +2490,27 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         except Exception as e:
             logger.error(f"IPC weight update failed: {e}")
             return False, str(e)
+
+    def prealloc_symmetric_memory_pool(self):
+        # PyTorch mempools never de-fragment memory in OOM scenarios, so we need to pre-allocate a large chunk of memory to limit fragmentation.
+        if (
+            self.is_draft_worker
+            or not self.server_args.enable_symm_mem
+            or envs.SGLANG_SYMM_MEM_PREALLOC_GB_SIZE.get() <= 0
+        ):
+            return
+
+        # Memory allocation is tied to a cuda stream, use the forward stream
+        with torch.get_device_module(self.device).stream(self.forward_stream):
+            logger.info(
+                f"Pre-allocating symmetric memory pool with {envs.SGLANG_SYMM_MEM_PREALLOC_GB_SIZE.get()} GiB"
+            )
+            with use_symmetric_memory(get_tp_group()):
+                torch.empty(
+                    (envs.SGLANG_SYMM_MEM_PREALLOC_GB_SIZE.get() * 1024 * 1024 * 1024,),
+                    dtype=torch.uint8,
+                    device=self.device,
+                )
 
 
 def _model_load_weights_direct(model, named_tensors: List[Tuple[str, torch.Tensor]]):

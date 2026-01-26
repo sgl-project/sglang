@@ -471,13 +471,6 @@ def apply_qk_norm(
         )
         return q, k
 
-    # Fallback for AMD/ROCm: apply RMSNorm separately to q and k
-    import warnings
-
-    warnings.warn(
-        "Fused QK-norm not available, using RMSNorm fallback",
-        stacklevel=2,
-    )
     q_shape = q.shape
     k_shape = k.shape
     q_out = q_norm(q.view(-1, head_dim)).view(q_shape)
