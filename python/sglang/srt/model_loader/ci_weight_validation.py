@@ -1729,6 +1729,34 @@ def _validate_weights_after_download(
     return True
 
 
+def _is_distributed_rank_0() -> bool:
+    """Check if we're rank 0 in a distributed environment, or not distributed."""
+    try:
+        from sglang.srt.distributed import (
+            get_tensor_model_parallel_rank,
+            model_parallel_is_initialized,
+        )
+
+        if not model_parallel_is_initialized():
+            return True  # Not distributed, treat as rank 0
+        return get_tensor_model_parallel_rank() == 0
+    except ImportError:
+        return True  # If distributed module not available, treat as rank 0
+
+
+def _distributed_barrier() -> None:
+    """Execute a barrier if in a distributed environment."""
+    try:
+        from sglang.srt.distributed import get_tp_group, model_parallel_is_initialized
+
+        if model_parallel_is_initialized():
+            tp_group = get_tp_group()
+            if tp_group is not None:
+                tp_group.barrier()
+    except ImportError:
+        pass  # If distributed module not available, no barrier needed
+
+
 def ci_download_with_validation_and_retry(
     model_name_or_path: str,
     allow_patterns: List[str],
@@ -1742,6 +1770,11 @@ def ci_download_with_validation_and_retry(
 
     This function handles the download of model weights in CI environments,
     with automatic validation and retry logic for handling corrupted downloads.
+
+    In distributed environments (TP/PP), only rank 0 performs the download to
+    prevent HuggingFace hub race conditions where multiple ranks try to download
+    simultaneously, causing .incomplete file conflicts. Other ranks wait at a
+    barrier and then use the cached result.
 
     Args:
         model_name_or_path: The model name or path
@@ -1767,8 +1800,52 @@ def ci_download_with_validation_and_retry(
             kwargs["disable"] = True
             super().__init__(*args, **kwargs)
 
-    # Retry loop for handling corrupted downloads
-    for attempt in range(max_retries):
+    # In distributed environments, coordinate downloads to prevent HuggingFace hub
+    # race conditions. Only rank 0 downloads; other ranks wait at barrier.
+    is_rank_0 = _is_distributed_rank_0()
+    hf_folder = None
+
+    if is_rank_0:
+        # Rank 0: perform the actual download with retry logic
+        for attempt in range(max_retries):
+            hf_folder = snapshot_download(
+                model_name_or_path,
+                allow_patterns=allow_patterns,
+                ignore_patterns=ignore_patterns,
+                cache_dir=cache_dir,
+                tqdm_class=DisabledTqdm,
+                revision=revision,
+                local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
+            )
+
+            # Validate downloaded files to catch corruption early
+            is_valid = _validate_weights_after_download(
+                hf_folder, allow_patterns, model_name_or_path
+            )
+
+            if is_valid:
+                break
+
+            # Validation failed, corrupted files were cleaned up
+            if attempt < max_retries - 1:
+                log_info_on_rank0(
+                    logger,
+                    f"Retrying download for {model_name_or_path} "
+                    f"(attempt {attempt + 2}/{max_retries})...",
+                )
+            else:
+                raise RuntimeError(
+                    f"Downloaded model files are still corrupted for "
+                    f"{model_name_or_path} after {max_retries} attempts. "
+                    "This may indicate a persistent issue with the model files "
+                    "on Hugging Face Hub or network problems."
+                )
+
+    # Synchronize all ranks - rank 0 finished downloading, others can proceed
+    _distributed_barrier()
+
+    # Non-rank-0: use the cached model that rank 0 just downloaded
+    if hf_folder is None:
         hf_folder = snapshot_download(
             model_name_or_path,
             allow_patterns=allow_patterns,
@@ -1776,33 +1853,9 @@ def ci_download_with_validation_and_retry(
             cache_dir=cache_dir,
             tqdm_class=DisabledTqdm,
             revision=revision,
-            local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
+            local_files_only=True,  # Must use local cache only
         )
 
-        # Validate downloaded files to catch corruption early
-        is_valid = _validate_weights_after_download(
-            hf_folder, allow_patterns, model_name_or_path
-        )
-
-        if is_valid:
-            return hf_folder
-
-        # Validation failed, corrupted files were cleaned up
-        if attempt < max_retries - 1:
-            log_info_on_rank0(
-                logger,
-                f"Retrying download for {model_name_or_path} "
-                f"(attempt {attempt + 2}/{max_retries})...",
-            )
-        else:
-            raise RuntimeError(
-                f"Downloaded model files are still corrupted for "
-                f"{model_name_or_path} after {max_retries} attempts. "
-                "This may indicate a persistent issue with the model files "
-                "on Hugging Face Hub or network problems."
-            )
-
-    # This should never be reached, but just in case
     return hf_folder
 
 
