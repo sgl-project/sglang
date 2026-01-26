@@ -168,7 +168,7 @@ FP8_GEMM_RUNNER_BACKEND: Fp8GemmRunnerBackend | None = None
 
 def _check_cutlass_block_fp8_hardware_support() -> bool:
     """Return True if CUTLASS block FP8 is supported (Hopper or newer with CUDA 12.0+)."""
-    return is_sm89_supported or is_sm90_supported() or is_blackwell_supported()
+    return is_sm89_supported() or is_sm90_supported() or is_blackwell_supported()
 
 
 if is_blackwell_supported() and is_flashinfer_available():

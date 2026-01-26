@@ -14,8 +14,6 @@
  * limitations under the License.
  */
 
-// add by lanxj
-
 #pragma once
 
 #ifdef Layout
@@ -64,21 +62,20 @@ void check_input_dtypes(torch::Tensor const& mat, torch::Tensor const& matScale)
 
 template <typename TileShape>
 void launch_sm89_fp8_blockwise_scaled_mm(
-    void* mat_a,
-    void* mat_b,
+    const void* mat_a,
+    const void* mat_b,
     void* mat_d,
-    float* scales_a,
-    float* scales_b,
+    const float* scales_a,
+    const float* scales_b,
     uint32_t shape_m,
     uint32_t shape_n,
     uint32_t shape_k,
     cudaStream_t stream) {
   using ElementInput = cute::float_e4m3_t;
-  using ElementOutput = cute::bfloat16_t;  // lanxj: cute -> cutlass
+  using ElementOutput = cute::bfloat16_t;
   using ElementAccum = float;
   using ElementBlockScale = float;
   static constexpr int Stages = 3;
-  // using TileShape = cutlass::gemm::GemmShape<32, 128, 128>;
   using KT = ada_blockwise_gemm::AdaBlockwiseGemmTraits<
       ElementInput,
       ElementOutput,
@@ -110,11 +107,7 @@ void launch_sm89_fp8_blockwise_scaled_mm(
 }
 
 torch::Tensor cutlass_gemm_blockwise_sm89_fp8_dispatch(
-    // torch::Tensor& out  // del by lanxj
-    const torch::Tensor& a,
-    const torch::Tensor& b,
-    const torch::Tensor& scales_a,
-    const torch::Tensor& scales_b) {
+    const torch::Tensor& a, const torch::Tensor& b, const torch::Tensor& scales_a, const torch::Tensor& scales_b) {
   check_input_dtypes(a, scales_a);
   check_input_dtypes(b, scales_b);
 
@@ -140,8 +133,6 @@ torch::Tensor cutlass_gemm_blockwise_sm89_fp8_dispatch(
 
   at::Tensor out = at::detail::empty_cuda({m, n}, at::ScalarType::BFloat16, a.device(), std::nullopt);
 
-  // auto gemm_runner = get_gemm_runner(a.scalar_type(), b.scalar_type());
-
   auto stream = at::cuda::getCurrentCUDAStream(a.get_device());
 
   float const* scales_aPtr = scales_a.data_ptr<float>();
@@ -149,28 +140,28 @@ torch::Tensor cutlass_gemm_blockwise_sm89_fp8_dispatch(
 
   if (m >= 256) {
     using TileShape = cutlass::gemm::GemmShape<64, 128, 128>;
-    launch_sm89_fp8_blockwise_scaled_mm<TileShape>(  // update by lanxj
-      const_cast<__nv_fp8_e4m3*>(reinterpret_cast<const __nv_fp8_e4m3*>(a.data_ptr())),
-      const_cast<__nv_fp8_e4m3*>(reinterpret_cast<const __nv_fp8_e4m3*>(b.data_ptr())),
-      reinterpret_cast<__nv_bfloat16*>(out.data_ptr()),
-      const_cast<float*>(scales_aPtr), 
-      const_cast<float*>(scales_bPtr), 
-      m,
-      n,
-      k,
-      stream);
+    launch_sm89_fp8_blockwise_scaled_mm<TileShape>(
+        reinterpret_cast<const __nv_fp8_e4m3*>(a.data_ptr()),
+        reinterpret_cast<const __nv_fp8_e4m3*>(b.data_ptr()),
+        reinterpret_cast<__nv_bfloat16*>(out.data_ptr()),
+        scales_aPtr,
+        scales_bPtr,
+        m,
+        n,
+        k,
+        stream);
   } else {
     using TileShape = cutlass::gemm::GemmShape<32, 128, 128>;
-    launch_sm89_fp8_blockwise_scaled_mm<TileShape>(  // update by lanxj
-      const_cast<__nv_fp8_e4m3*>(reinterpret_cast<const __nv_fp8_e4m3*>(a.data_ptr())),
-      const_cast<__nv_fp8_e4m3*>(reinterpret_cast<const __nv_fp8_e4m3*>(b.data_ptr())),
-      reinterpret_cast<__nv_bfloat16*>(out.data_ptr()),
-      const_cast<float*>(scales_aPtr), 
-      const_cast<float*>(scales_bPtr), 
-      m,
-      n,
-      k,
-      stream);
+    launch_sm89_fp8_blockwise_scaled_mm<TileShape>(
+        reinterpret_cast<const __nv_fp8_e4m3*>(a.data_ptr()),
+        reinterpret_cast<const __nv_fp8_e4m3*>(b.data_ptr()),
+        reinterpret_cast<__nv_bfloat16*>(out.data_ptr()),
+        scales_aPtr,
+        scales_bPtr,
+        m,
+        n,
+        k,
+        stream);
   }
 
   return out;
