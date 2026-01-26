@@ -11,13 +11,13 @@ from sgl_kernel_npu.attention.sinks_attention import (
 )
 
 from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.hardware_backend.npu.attention.ascend_torch_native_backend import AscendTorchNativeAttnBackend
 from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_fia_nz,
     is_mla_preprocess_enabled,
 )
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
-from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.spec_info import SpecInput
@@ -215,7 +215,7 @@ class AscendAttnBackend(AttentionBackend):
             self.q_head_dim = (
                 self.qk_rope_head_dim + model_runner.model_config.qk_nope_head_dim
             )
-        self.native_attn = TorchNativeAttnBackend(model_runner)
+        self.native_attn = AscendTorchNativeAttnBackend()
         self.graph_metadata = {}
         self.max_context_len = model_runner.model_config.context_len
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
@@ -725,7 +725,7 @@ class AscendAttnBackend(AttentionBackend):
                     q_ = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
                     o_ = attn_output.view(-1, layer.tp_q_head_num, layer.v_head_dim)
 
-                    self.native_attn._run_sdpa_forward_extend(
+                    self.native_attn.run_sdpa_forward_extend(
                         q_,
                         o_,
                         k_cache.view(-1, layer.tp_k_head_num, layer.qk_head_dim),
@@ -1323,7 +1323,7 @@ class AscendAttnBackend(AttentionBackend):
                     actual_seq_lengths_kv=actual_seq_len_kv,
                     scale=layer.scaling,
                 )
-            else:
+            elif layer.logit_cap == 0 and forward_batch.encoder_lens is None:
                 query = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
                 num_tokens = query.shape[0]
                 attn_output = torch.empty(
@@ -1343,6 +1343,34 @@ class AscendAttnBackend(AttentionBackend):
                     context_lens=self.forward_metadata.seq_lens_cpu_int,
                     out=attn_output,
                 )
+            else:
+                if layer.qk_head_dim != layer.v_head_dim:
+                    attn_output = q.new_empty(
+                        (q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
+                    )
+                else:
+                    attn_output = torch.empty_like(q)
+
+                use_gqa = layer.tp_q_head_num != layer.tp_k_head_num
+
+                q_ = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+                o_ = attn_output.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+
+                self.native_attn.run_sdpa_forward_decode(
+                    q_,
+                    o_,
+                    k_cache.view(-1, layer.tp_k_head_num, layer.qk_head_dim),
+                    v_cache.view(-1, layer.tp_v_head_num, layer.v_head_dim),
+                    forward_batch.req_to_token_pool.req_to_token,
+                    forward_batch.req_pool_indices,
+                    forward_batch.seq_lens,
+                    forward_batch.encoder_lens,
+                    is_cross_attention=layer.is_cross_attention,
+                    scaling=layer.scaling,
+                    enable_gqa=use_gqa,
+                    causal=False
+                )
+
             return attn_output.view(num_tokens, layer.tp_q_head_num * layer.v_head_dim)
         else:
             if save_kv_cache:
