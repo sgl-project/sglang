@@ -15,6 +15,7 @@ def npu_fused_experts_unquant(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     top_k: int,
+    activation: str,
 ):
 
     original_dtype = x.dtype
@@ -32,24 +33,24 @@ def npu_fused_experts_unquant(
     )
 
     hidden_states, expanded_row_idx, expanded_expert_idx = (
-        torch_npu.npu_moe_init_routing(
+        torch.ops.npu.npu_moe_init_routing(
             x, row_idx=row_idx, expert_idx=topk_ids, active_num=num_tokens
         )
     )
 
-    expert_tokens = torch_npu.npu_moe_compute_expert_tokens(
+    expert_tokens = torch.ops.npu.npu_moe_compute_expert_tokens(
         expanded_expert_idx, num_experts
     )
 
     expert_tokens = expert_tokens.to(torch.int64)
-    w13_bias = [layer.w13_weight_bias] if self.with_bias else None
-    w2_bias = [layer.w2_weight_bias] if self.with_bias else None
+    w13_bias = [w13_weight_bias] if w13_weight_bias in not None else None
+    w2_bias = [w2_weight_bias] if w2_weight_bias in not None else None
     if layer.w13_weight.shape[-1] == layer.hidden_size:
         w13 = layer.w13_weight.transpose(1, 2)
         w2 = layer.w2_weight.transpose(1, 2)
 
     # gmm1: gate_up_proj
-    hidden_states = torch_npu.npu_grouped_matmul(
+    hidden_states = torch.ops.npu.npu_grouped_matmul(
         x=[hidden_states],
         weight=[w13],
         bias=w13_bias,
@@ -61,17 +62,17 @@ def npu_fused_experts_unquant(
     )[0]
 
     # act_fn:
-    if self.moe_runner_config.activation == "npu_swiglu_oai":
+    if activation == "npu_swiglu_oai":
         from sgl_kernel_npu.activation.swiglu_oai import swiglu_oai
         hidden_states = swiglu_oai(layer, hidden_states)
-    elif self.moe_runner_config.activation == "silu":
-        hidden_states = torch_npu.npu_swiglu(hidden_states)
+    elif activation == "silu":
+        hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
     else:
         from sglang.srt.layers.activation import GeluAndMul
         hidden_states = GeluAndMul()(hidden_states)
 
     # gmm2: down_proj
-    hidden_states = torch_npu.npu_grouped_matmul(
+    hidden_states = torch.ops.npu.npu_grouped_matmul(
         x=[hidden_states],
         weight=[w2],
         bias=w2_bias,
@@ -82,7 +83,7 @@ def npu_fused_experts_unquant(
         output_dtype=original_dtype,
     )[0]
 
-    final_hidden_states = torch_npu.npu_moe_finalize_routing(
+    final_hidden_states = torch.ops.npu.npu_moe_finalize_routing(
         hidden_states,
         skip1=None,
         skip2=None,
