@@ -26,6 +26,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_cpu,
     is_hip,
+    is_npu,
     next_power_of_2,
     set_weight_attrs,
     use_intel_amx_backend,
@@ -41,6 +42,7 @@ if TYPE_CHECKING:
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_hip = is_hip()
 _is_cpu = is_cpu()
+_is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _use_aiter:
@@ -297,6 +299,12 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 layer.num_local_experts, *new_shape_w2
             )
 
+        if _is_npu:
+            layer.w13_weight.data = layer.w13_weight.data.transpose(1, 2)
+            layer.w2_weight.data = layer.w2_weight.data.transpose(1, 2) 
+            layer.w13_weight.data = npu_format_cast(layer.w13_weight.data)
+            layer.w2_weight.data = npu_format_cast(layer.w2_weight.data)
+
         return
 
     def create_moe_runner(
@@ -305,6 +313,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         moe_runner_config.quantization = "UnquantizedFusedMoEMethod"
         self.moe_runner_config = moe_runner_config
         backend = get_moe_runner_backend()
+        print(backend)
         if backend.is_auto():
             backend = (
                 MoeRunnerBackend.TRITON
