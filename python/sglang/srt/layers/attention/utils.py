@@ -294,11 +294,9 @@ def canonicalize_stride(tensor: torch.Tensor) -> torch.Tensor:
     strides = tensor.stride()
     ndim = tensor.dim()
 
-    need_fix = False
-    for i in range(ndim - 1):
-        if sizes[i] == 1 and strides[i] == strides[i + 1]:
-            need_fix = True
-            break
+    need_fix = any(
+        sizes[i] == 1 and strides[i] == strides[i + 1] for i in range(ndim - 1)
+    )
 
     if not need_fix:
         return tensor
