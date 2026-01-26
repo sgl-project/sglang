@@ -1,9 +1,16 @@
 import unittest
 
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.gsm8k_accuracy_kit import GSM8KMixin
 from sglang.test.kits.mmmu_vlm_kit import MMMUMixin
 from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 from sglang.test.server_fixtures.mmmu_fixture import MMMUServerBase
+
+register_cuda_ci(
+    est_time=200,
+    suite="stage-b-test-small-1-gpu",
+    disabled="Temporarily disabled",
+)
 
 MODEL = "mistralai/Ministral-3-3B-Instruct-2512"
 

@@ -11,6 +11,13 @@ from sglang.srt.layers.attention.fla.layernorm_gated import (
     _layer_norm_fwd as layer_norm_fwd,
 )
 from sglang.srt.layers.attention.fla.layernorm_gated import layernorm_fn, rms_norm_ref
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(
+    est_time=60,
+    suite="stage-b-test-large-2-gpu",
+    disabled="Temporarily disabled",
+)
 
 # Optional dependency in sglang repo; skip collection cleanly if absent.
 custom_all_reduce_utils = pytest.importorskip(

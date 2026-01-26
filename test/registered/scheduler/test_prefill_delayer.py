@@ -16,6 +16,7 @@ import torch.multiprocessing as mp
 from sglang.bench_serving import run_benchmark
 from sglang.srt.managers.prefill_delayer import PrefillDelayer
 from sglang.srt.utils import kill_process_tree
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_MLA_MODEL_NAME_FOR_TEST,
@@ -24,6 +25,12 @@ from sglang.test.test_utils import (
     CustomTestCase,
     get_benchmark_args,
     popen_launch_server,
+)
+
+register_cuda_ci(
+    est_time=300,
+    suite="stage-c-test-8-gpu-h200",
+    disabled="Temporarily disabled",
 )
 
 WORLD_SIZE = os.environ.get("SGLANG_TEST_WORLD_SIZE", "8")
