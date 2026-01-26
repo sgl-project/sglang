@@ -113,7 +113,7 @@ class LayerwiseOffloadManager:
                 current_offset = 0
                 for name, weight in weights:
                     numel = weight.numel()
-                    cpu_buffer[current_offset: current_offset + numel].copy_(
+                    cpu_buffer[current_offset : current_offset + numel].copy_(
                         weight.flatten()
                     )
                     self._weight_metadata[layer_idx][name] = {
@@ -189,7 +189,7 @@ class LayerwiseOffloadManager:
             # map the parameter's data to the correct slice of the GPU buffer
             target = self.get_target_with_name(name)
             target.data = gpu_buffer[
-                meta["offset"]: meta["offset"] + meta["numel"]
+                meta["offset"] : meta["offset"] + meta["numel"]
             ].view(meta["shape"])
 
         self._gpu_layers.add(layer_idx)
@@ -260,7 +260,7 @@ class LayerwiseOffloadManager:
             cpu_buffer = self._consolidated_cpu_weights[layer_idx][dtype]
             offset = meta["offset"]
             numel = meta["numel"]
-            cpu_buffer[offset: offset + numel].copy_(gpu_weight)
+            cpu_buffer[offset : offset + numel].copy_(gpu_weight)
 
     @torch.compiler.disable
     def sync_all_layers_to_cpu(self) -> None:
