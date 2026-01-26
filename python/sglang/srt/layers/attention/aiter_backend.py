@@ -27,7 +27,7 @@ if TYPE_CHECKING:
 try:
     from aiter import (
         flash_attn_varlen_func,
-        flash_attn_varlen_fp8_pertensor_func,
+        mha_batch_prefill_func,
         dtypes,
         get_pa_metadata_info_v1,
         get_pa_metadata_v1,
@@ -60,6 +60,10 @@ class ForwardMetadata:
     pa_metadata_context_lens: Optional[torch.Tensor] = None
     pa_metadata_max_qlen: Optional[int] = None
     pa_metadata_tp_q_head_num: Optional[int] = None
+    # Prefill metadata for mha_batch_prefill_func (only used in prefill mode, non-MLA)
+    prefill_pages_kv_indptr: Optional[torch.Tensor] = None
+    prefill_kv_indices: Optional[torch.Tensor] = None
+    prefill_kv_last_page_lens: Optional[torch.Tensor] = None
 
 
 _AITER_PARTITION_SIZE_ROCM = 256
@@ -186,8 +190,9 @@ class AiterAttnBackend(AttentionBackend):
             )
 
         self.scale = float(1.0 / (self.head_dim**0.5))
-        self.k_scale = self.v_scale = torch.tensor([1.0], dtype=torch.float32).to(
-            self.device
+        # Pre-allocated descale tensors for FP8 attention (q, k, v all use scale=1.0)
+        self.q_scale = self.k_scale = self.v_scale = torch.tensor(
+            [1.0], dtype=torch.float32, device=self.device
         )
         self.fp8_scale = 1.0  # Store as scalar to avoid sync in kernel calls
 
@@ -432,16 +437,31 @@ class AiterAttnBackend(AttentionBackend):
                     encoder_lens=forward_batch.encoder_lens,
                     spec_info=None,
                 )
+                # Get page_table for mha_batch_prefill_func
+                page_table = forward_batch.req_to_token_pool.req_to_token[forward_batch.req_pool_indices, :]
                 self.forward_metadata = ForwardMetadata(
                     self.indices_updater_prefill.kv_indptr,
                     self.indices_updater_prefill.kv_indices,
-                    None,
+                    self.qo_indptr[: bs + 1],  # qo_indptr is set by indices_updater_prefill
                     None,
                     self.indices_updater_prefill.max_q_len,
                     self.indices_updater_prefill.max_kv_len,
-                    None,
+                    page_table,
                     forward_batch.seq_lens,
-                )  
+                )
+
+        if (forward_batch.forward_mode.is_extend() and
+            not self.use_mla and
+            self.forward_metadata.page_table is not None):
+            if self.page_size > 1:
+                seq_lens_cpu = forward_batch.seq_lens_cpu
+                if seq_lens_cpu is None:
+                    seq_lens_cpu = forward_batch.seq_lens.cpu()
+                max_seq_pages = (seq_lens_cpu.max().item() + self.page_size - 1) // self.page_size + 1
+                self.forward_metadata.page_table = (
+                    self.forward_metadata.page_table[:, self.strided_indices[:max_seq_pages]] // self.page_size
+                )
+            self._build_pa_metadata_for_prefill(forward_batch.batch_size)
 
     def _allocate_pa_metadata_buffers(
         self,
@@ -539,8 +559,6 @@ class AiterAttnBackend(AttentionBackend):
             batch_size: Batch size for the current forward pass
             tp_q_head_num: Number of Q heads per TP rank. If None, uses self.num_head.
         """
-        
-        
         max_qlen = 1
         
         # Use provided tp_q_head_num or default to self.num_head
@@ -564,8 +582,6 @@ class AiterAttnBackend(AttentionBackend):
             is_sparse=0,  # 0 for non-sparse attention
             fast_mode=True,
         )
-
-        
         # Allocate metadata buffers with reuse optimization for multi-layer forward passes
         self._allocate_pa_metadata_buffers(
             work_metadata_ptrs_size,
@@ -581,9 +597,6 @@ class AiterAttnBackend(AttentionBackend):
             reduce_partial_map_size,
             reduce_partial_map_type,
         )
-        
-        # Get qo_indptr for decode mode (each sequence has 1 token)
-        # pa_decode_qo_indptr is pre-initialized to [0, 1, 2, ..., max_bs], just take the slice
         qo_indptr = self.pa_decode_qo_indptr[: batch_size + 1]
         
         # Get context_lens (kv_lens is always set before calling _build_pa_metadata_for_decode)
@@ -613,7 +626,7 @@ class AiterAttnBackend(AttentionBackend):
         )
         # Use the full buffer - pa_persistent_fwd reads only valid elements based on pages_kv_indptr
         kv_indices = self.pa_kv_indices
-        
+
         get_pa_metadata_v1(
             seqlens_qo_indptr=qo_indptr,
             pages_kv_indptr=pages_kv_indptr,
@@ -635,7 +648,6 @@ class AiterAttnBackend(AttentionBackend):
             topk=-1,
             max_split_per_batch=-1,
         )
-        
         # Store computed values in ForwardMetadata for reuse in forward_decode
         self.forward_metadata.pa_metadata_qo_indptr = qo_indptr
         self.forward_metadata.pa_metadata_pages_kv_indptr = pages_kv_indptr
@@ -643,6 +655,41 @@ class AiterAttnBackend(AttentionBackend):
         self.forward_metadata.pa_metadata_context_lens = context_lens
         self.forward_metadata.pa_metadata_max_qlen = max_qlen
         self.forward_metadata.pa_metadata_tp_q_head_num = tp_q_head_num
+
+    def _build_pa_metadata_for_prefill(self, batch_size: int):
+        """Build metadata for mha_batch_prefill_func in prefill mode.
+
+        This method prepares page-level metadata needed for mha_batch_prefill_func.
+        The metadata is computed once per forward pass and reused across all layers.
+        """
+        block_size = self.page_size
+        context_lens = self.forward_metadata.kv_lens
+        num_blocks_per_seq = (context_lens + block_size - 1) // block_size
+
+        # Page-level kv_indptr (reuse pa_kv_indptr buffer)
+        pages_kv_indptr = self.pa_kv_indptr[: batch_size + 1]
+        pages_kv_indptr[1 : batch_size + 1] = torch.cumsum(num_blocks_per_seq, dim=0)
+        
+        # Build kv_indices from page_table using triton kernel
+        page_table = self.forward_metadata.page_table
+        create_flashinfer_kv_indices_triton[(batch_size,)](
+            page_table,
+            self.pa_batch_indices[:batch_size],
+            num_blocks_per_seq,
+            pages_kv_indptr,
+            None,  # kv_start_idx
+            self.pa_kv_indices,
+            page_table.stride(0),
+        )
+        kv_indices = self.pa_kv_indices
+
+        # Compute kv_last_page_lens for each sequence
+        kv_last_page_lens = ((context_lens - 1) % block_size + 1).int()
+
+        # Store in ForwardMetadata for reuse in forward_extend
+        self.forward_metadata.prefill_pages_kv_indptr = pages_kv_indptr
+        self.forward_metadata.prefill_kv_indices = kv_indices
+        self.forward_metadata.prefill_kv_last_page_lens = kv_last_page_lens
 
     def init_cuda_graph_state(
         self,
@@ -1157,23 +1204,57 @@ class AiterAttnBackend(AttentionBackend):
                     f"Invalid forward mode for MLA prefill: {forward_batch.forward_mode=}"
                 )
         else:
-            bs0 = forward_batch.batch_size + 1
+            # Non-MLA prefill: use mha_batch_prefill_func with paged KV cache (same layout as pa_persistent_fwd in decode)
+            batch_size = forward_batch.batch_size
+            bs0 = batch_size + 1
+
+            # Get paged KV cache from token_to_kv_pool (already saved via set_kv_buffer)
+            k_buffer, v_buffer = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+            num_slots, num_kv_heads, head_size = k_buffer.shape
+            block_size = self.page_size
+            num_blocks = num_slots // block_size
+            
+            k_buffer = k_buffer[:num_blocks * block_size].view(num_blocks, block_size, num_kv_heads, head_size)
+            v_buffer = v_buffer[:num_blocks * block_size].view(num_blocks, block_size, num_kv_heads, head_size)
+
+            # KV cache is already in 5D vectorized format (shuffled in fused rotary_emb)
+            # Just view_as to the correct shape (no permute needed)
+            # x is the vectorization factor: 16 bytes (128-bit) / dtype size
+            quant_dtype = dtypes.fp8
+            x = 16 // quant_dtype.itemsize  # 128-bit vector alignment
+            k_cache_template = torch.empty(
+                [num_blocks, num_kv_heads, head_size // x, block_size, x],
+                dtype=k_buffer.dtype,
+                device="meta",
+            )
+            v_cache_template = torch.empty(
+                [num_blocks, num_kv_heads, block_size // x, head_size, x],
+                dtype=v_buffer.dtype,
+                device="meta",
+            )
+            new_key_cache = k_buffer.view_as(k_cache_template)
+            new_value_cache = v_buffer.view_as(v_cache_template)
 
             q_fp8 = q.to(dtypes.fp8)
-            
-            o = flash_attn_varlen_fp8_pertensor_func(
+            pages_kv_indptr = self.forward_metadata.prefill_pages_kv_indptr
+            kv_indices = self.forward_metadata.prefill_kv_indices
+            kv_last_page_lens = self.forward_metadata.prefill_kv_last_page_lens
+
+            o = mha_batch_prefill_func(
                 q=q_fp8,
-                k=k,
-                v=v,
+                k=new_key_cache,
+                v=new_value_cache,
                 cu_seqlens_q=self.qo_indptr[:bs0],
-                cu_seqlens_k=self.forward_metadata.kv_indptr[:bs0],
+                kv_indptr=pages_kv_indptr,
+                kv_page_indices=kv_indices,
                 max_seqlen_q=self.forward_metadata.max_q_len,
                 max_seqlen_k=self.forward_metadata.max_kv_len,
                 softmax_scale=layer.scaling,
                 causal=True,
-                q_descale=None,
-                k_descale=None,
-                v_descale=None,
+                q_descale=self.q_scale,
+                k_descale=self.k_scale,
+                v_descale=self.v_scale,
+                kv_last_page_lens=kv_last_page_lens,
             )
 
             return o.view(-1, layer.tp_q_head_num * layer.head_dim)

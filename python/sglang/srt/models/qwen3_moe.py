@@ -439,7 +439,7 @@ class Qwen3MoeAttention(nn.Module):
                 cache_loc = forward_batch.out_cache_loc,
                 k_scale = 1.0,
                 v_scale = 1.0,
-                return_kv = True,
+                return_kv = False,
                 use_shuffle_layout = True,
                 block_size = block_size,
                 x = x,
