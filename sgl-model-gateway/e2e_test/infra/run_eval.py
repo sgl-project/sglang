@@ -1,4 +1,4 @@
-"""MMLU evaluation runner for E2E tests.
+"""MMLU/MMMU evaluation runner for E2E tests.
 
 Simplified evaluation runner that uses local eval implementations
 with cleaner logging for CI/CD environments.
@@ -67,7 +67,7 @@ def run_eval(args: Any) -> dict:
         args: Configuration object with attributes:
             - base_url: Base URL of the server (e.g., "http://127.0.0.1:30000")
             - model: Model name/path (optional, will be auto-detected)
-            - eval_name: Evaluation name ("mmlu")
+            - eval_name: Evaluation name ("mmlu", "mmmu")
             - num_examples: Number of examples to evaluate
             - num_threads: Number of parallel threads
             - temperature: Sampling temperature
@@ -80,6 +80,12 @@ def run_eval(args: Any) -> dict:
     if "OPENAI_API_KEY" not in os.environ:
         os.environ["OPENAI_API_KEY"] = "EMPTY"
 
+    eval_name = getattr(args, "eval_name", "mmlu")
+    if eval_name == "mmmu":
+        from sglang.test.run_eval import run_eval as sglang_run_eval
+
+        return sglang_run_eval(args)
+
     # Build base URL
     base_url = getattr(args, "base_url", None)
     if base_url:
@@ -90,8 +96,6 @@ def run_eval(args: Any) -> dict:
         host = getattr(args, "host", "127.0.0.1")
         port = getattr(args, "port", 30000)
         base_url = f"http://{host}:{port}/v1"
-
-    eval_name = getattr(args, "eval_name", "mmlu")
     num_examples = getattr(args, "num_examples", 64)
     num_threads = getattr(args, "num_threads", 32)
     temperature = getattr(args, "temperature", 0.0)
