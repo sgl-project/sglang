@@ -13,7 +13,7 @@ from sglang.test.test_utils import (
 
 # CI Registration - 2-GPU tests (80GB GPUs required)
 register_cuda_ci(
-    est_time=160, suite="stage-b-test-large-2-gpu", disabled="see issue #16691"
+    est_time=160, suite="stage-b-test-large-2-gpu"
 )
 
 
@@ -34,9 +34,6 @@ class TestPiecewiseCudaGraphTP(CustomTestCase):
                 "eager",
                 "--tp",
                 "2",
-                "--piecewise-cuda-graph-max-tokens",
-                "2048"
-                # "--disable-custom-all-reduce",
             ],
         )
 

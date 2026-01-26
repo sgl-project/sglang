@@ -593,7 +593,7 @@ class GroupCoordinator:
             self.qr_comm is not None
             and not self.qr_comm.disabled
             and self.qr_comm.should_quick_allreduce(input_)
-        ):  
+        ):
             outplace_all_reduce_method = "qr"
         elif (
             self.pymscclpp_comm is not None
