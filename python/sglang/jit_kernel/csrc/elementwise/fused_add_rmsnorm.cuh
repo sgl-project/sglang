@@ -52,12 +52,7 @@ SGL_DEVICE packed_t rms(packed_t& val, packed_t& weight, float rsqrt_square_sum)
 
 template <typename T, int VEC_SIZE_IN_BYTE>
 __global__ void fused_add_rmsnorm_reg_kernel(
-    T* __restrict__ input,
-    T* __restrict__ residual,
-    const T* __restrict__ weight,
-    uint tokens,
-    int vec_hidden_size,
-    float eps) {
+    T* __restrict__ input, T* __restrict__ residual, const T* __restrict__ weight, int vec_hidden_size, float eps) {
   constexpr int inner_loop = VEC_SIZE_IN_BYTE == 16 ? 4 : 8;
 
   __shared__ float shared_memory[32];  // Used for CTA reduce
@@ -180,7 +175,6 @@ struct FusedAddRMSNormKernel {
               reinterpret_cast<DType*>(input.data_ptr()),
               reinterpret_cast<DType*>(residual.data_ptr()),
               reinterpret_cast<DType*>(weight.data_ptr()),
-              static_cast<uint>(D.unwrap()),
               vec_hidden_size,
               eps);
     } else {
