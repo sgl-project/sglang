@@ -2472,13 +2472,12 @@ class IncModelLoader(DefaultModelLoader):
             self.load_weights_and_postprocess(
                 model, iter(quant_model.state_dict().items()), target_device
             )
-
         return model.eval()
 
     def _parse_quantization(self, quantization: str):
         """Map quantization to AutoRound's scheme and format."""
         AR_QUANT_CFG_CHOICES = {
-            "autoround_w4a16": ("W4A16", "auto_round"),
+            "auto-round-int8": ("W4A16", "auto_round"),
         }
         quant_cfg = AR_QUANT_CFG_CHOICES.get(quantization)
         if not quant_cfg:
@@ -2803,7 +2802,7 @@ def get_model_loader(
     if load_config.load_format == LoadFormat.DUMMY:
         return DummyModelLoader(load_config)
 
-    if model_config.quantization in ["autoround_w4a16"]:
+    if model_config.quantization in ["auto-round-int8"]:
         logger.info("Using IncModelLoader due to AutoRound quantization config.")
         return IncModelLoader(load_config)
 

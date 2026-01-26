@@ -63,7 +63,7 @@ class LoadConfig:
     modelopt_checkpoint_save_path: Optional[str] = None
     modelopt_export_path: Optional[str] = None
 
-    # AutoRound-specific loading options
+    # Inc-related loading options
     inc_save_path: Optional[str] = None
     inc_tuning_iters: Optional[int] = 0
     inc_disable_opt_rtn: Optional[bool] = False
@@ -90,7 +90,7 @@ class LoadConfig:
     # ModelOpt configuration object
     modelopt_config: Optional[ModelOptConfig] = None
 
-    # AutoRound-specific loading options
+    # Inc-related loading options
     inc_save_path: Optional[str] = None
     inc_tuning_iters: Optional[int] = 0
     inc_disable_opt_rtn: Optional[bool] = False
