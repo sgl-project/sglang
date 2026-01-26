@@ -74,6 +74,22 @@ MODELS_TO_TEST = [
 num_tokens_list = [11, 8192]
 
 
+def create_yarn_rope_scaling(original_config, scaling_factor=2.0):
+    yarn_config = {
+        "rope_type": "yarn",
+        "factor": scaling_factor,
+        "original_max_position_embeddings": original_config.max_position_embeddings,
+    }
+    if hasattr(original_config, "rope_scaling") and original_config.rope_scaling:
+        if "mrope_section" in original_config.rope_scaling:
+            yarn_config["mrope_section"] = original_config.rope_scaling["mrope_section"]
+        if "mrope_interleaved" in original_config.rope_scaling:
+            yarn_config["mrope_interleaved"] = original_config.rope_scaling[
+                "mrope_interleaved"
+            ]
+    return yarn_config
+
+
 @pytest.mark.skipif(not (_is_cuda or _is_hip), reason="Skipping CUDA/ROCm only tests.")
 @pytest.mark.parametrize(
     "model_info, model_name",
@@ -85,12 +101,16 @@ num_tokens_list = [11, 8192]
 @pytest.mark.parametrize("tp_size", [1, 2])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("num_tokens", num_tokens_list)
+@pytest.mark.parametrize(
+    "rope_scaling_type", ["default", "yarn"], ids=["mrope_default", "mrope_yarn"]
+)
 def test_mrope(
     model_name: str,
     model_info: MRoPETestInfo,
     tp_size: int,
     dtype: torch.dtype,
     num_tokens: int,
+    rope_scaling_type: str,
 ):
     set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
 
@@ -117,13 +137,18 @@ def test_mrope(
     partial_rotary_factor = getattr(config, "partial_rotary_factor", 1.0)
     rotary_dim = int(head_dim * partial_rotary_factor)
 
+    if rope_scaling_type == "yarn":
+        rope_scaling_config = create_yarn_rope_scaling(config, scaling_factor=2.0)
+    else:
+        rope_scaling_config = config.rope_scaling
+
     mrope_helper_class = get_rope(
         head_size=head_dim,
         rotary_dim=rotary_dim,
         max_position=max_position,
         base=rope_theta,
         is_neox_style=is_neox_style,
-        rope_scaling=config.rope_scaling,
+        rope_scaling=rope_scaling_config,
         dtype=dtype,
     ).to(device=device)
 
@@ -133,7 +158,7 @@ def test_mrope(
         num_tokens, num_heads, num_kv_heads, head_dim, max_position, dtype, device
     )
 
-    query_native, key_native = mrope_helper_class._forward_native(
+    query_native, key_native = mrope_helper_class.forward_native(
         positions,
         query.clone(),
         key.clone(),
