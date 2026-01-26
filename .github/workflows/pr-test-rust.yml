@@ -33,7 +33,7 @@ jobs:
 
       - name: Install rust dependencies
         run: |
-          bash scripts/ci/ci_install_gateway_dependencies.sh
+          bash scripts/ci/cuda/ci_install_gateway_dependencies.sh
 
       - name: Configure sccache
         uses: mozilla-actions/sccache-action@v0.0.9
@@ -120,7 +120,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          bash scripts/ci/ci_install_gateway_dependencies.sh
+          bash scripts/ci/cuda/ci_install_gateway_dependencies.sh
 
       - name: Configure sccache
         uses: mozilla-actions/sccache-action@v0.0.9
@@ -222,7 +222,7 @@ jobs:
 
       - name: Install SGLang dependencies
         run: |
-          sudo --preserve-env=PATH bash scripts/ci/ci_install_dependency.sh
+          sudo --preserve-env=PATH bash scripts/ci/cuda/ci_install_dependency.sh
 
       - name: Setup Oracle Instant Client
         if: matrix.setup_oracle
