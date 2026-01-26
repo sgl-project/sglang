@@ -1,7 +1,6 @@
 # SGLang for RL Systems
 
-This document is a practical guide for infrastructure teams integrating SGLang into RL and post-training systems. It focuses on the operational pain points in the loop (rollout, evaluation, training, weight sync) and maps them to concrete SGLang APIs, flags, and integration patterns. The emphasis is on minimizing iteration latency, preserving correctness, and keeping rollout and training behavior aligned in production environments.
-
+This document is a practical guide for infrastructure teams integrating SGLang into RL and post-training systems. It focuses on the operational pain points in the loop (rollout, evaluation, training, weight sync) and maps them to concrete SGLang APIs, flags, and integration patterns. The focus is on maximizing rollout efficiency, accuracy and stability while keeping rollout-serving behavior aligned in production environments.
 
 ## Why SGLang for RL Lifecycle?
 
@@ -61,7 +60,7 @@ Enable memory saver support when launching the server:
 
 ## Open-To-Use Refit Functionality
 
-After training completes each step, rollout engines must be refit with new weights. SGLang supports three refit strategies so you can match your infrastructure style (co-located vs disaggregated) and scaling needs. Each strategy maps to a concrete API with clear request schemas. Here are the details of various ways of SGLang's weight update utility: [RL System Deep Thinking: Weight Update Mechanisms](https://github.com/zhaochenyang20/Awesome-ML-SYS-Tutorial/blob/main/rlhf/sys-design/readme-1-EN.md)
+After training completes each step, rollout engines must be refit with new weights. SGLang supports three refit strategies so you can match your infrastructure style (co-located vs disaggregated) and scaling needs. Each strategy maps to a concrete API with clear request schemas. For a deeper dive into SGLang's weight update utilities, see [RL System Deep Thinking: Weight Update Mechanisms](https://github.com/zhaochenyang20/Awesome-ML-SYS-Tutorial/blob/main/rlhf/sys-design/readme-1-EN.md).
 
 **How to choose:**
 
@@ -197,12 +196,14 @@ Training workers gather weights (typically on TP rank 0), broadcast them to the 
 
 Multi-turn RL rollouts often suffer from long-tail requests that block the entire batch. A small number of slow interactions can stall all GPUs, and the long-tail behavior makes profiling and monitoring difficult.
 
-SGLang exposes explicit pause/resume APIs so you can pause slow requests and continue them later. This pattern matches systems like [APRIL](https://arxiv.org/abs/2509.18521), which over-provision rollouts, terminate once enough responses are collected, and recycle incomplete responses in the next step. The result is higher GPU utilization without discarding partial work.
+SGLang exposes explicit pause/resume APIs so you can pause slow requests and continue them later. This pattern matches systems like [APRIL](https://arxiv.org/abs/2509.18521), terminate once enough responses are collected, and recycle incomplete responses in the next step. The result is higher GPU utilization without discarding partial work.
+
+`pause_generation` ---  update weights --- `continue_generation` is the correct execution flow when updating weights from training. An update can only happen when SGLang is not actively processing inference tasks.
 
 ### Pause Generation
 
 **Endpoint:** `POST /pause_generation`
-`pause_generation` ---  `update_weight` --- `continue_generation` is the correct execution flow when updating weights from training. An update can only happen when sglang is not actively working inference tasks. 
+
 **Request body:**
 
 | Field | Description | Defaults | Options |
@@ -211,9 +212,9 @@ SGLang exposes explicit pause/resume APIs so you can pause slow requests and con
 
 **Modes:**
 
-- `abort`: default behavior, identical to `abort` endpoint with `abort_all` set. Pending requests from "waiting_queue" and "running_queue" will be returned immediately to the caller. 
+- `abort`: Default behavior, identical to `abort` endpoint with `abort_all` set. Pending requests from `waiting_queue` and `running_queue` will be returned immediately to the caller. 
 - `retract`: Put engine in "paused" state.  Move running requests back to waiting queue. KV cache can be flushed and recomputed later.
-- `in_place`: Pause inference; keep requests in event loop with existing KV cache. Note: In `in_place` mode, `flush_cache` will fail if there are any requests in the running batch.
+- `in_place`: Put engine in "paused" state without changing states of the requests. Running requests rely on availability of KV caches to continue, so any subsequent `flush_cache` call will be unsuccessful.
 
 ### Continue Generation
 
@@ -221,9 +222,9 @@ SGLang exposes explicit pause/resume APIs so you can pause slow requests and con
 
 ## Deterministic Inference
 
-In many RL stacks, rollout and training are implemented with different kernels or batching behavior. Even when weights are identical, token probabilities can drift, silently breaking the on-policy assumption. This is the train-inference mismatch problem.
+In many RL stacks, rollout and training are implemented with different kernels or batching behavior. Even when weights are identical, token probabilities can drift, silently breaking the on-policy assumption. This is the training–inference mismatch problem.
 
-SGLang supports a deterministic inference mode that reduces nondeterminism across batch shapes. This mitigates variance introduced by runtime batching and kernel selection. To achieve true on-policy training, you need to modify the training engine to use the same deterministic kernels. For more implementation details, refer to these examples in miles: [True On-Policy](https://github.com/radixark/miles/tree/main/examples/true_on_policy) and [True On-Policy for VLM](https://github.com/radixark/miles/tree/main/examples/true_on_policy_vlm).
+SGLang supports a deterministic inference mode that reduces non-determinism across batch shapes. This mitigates variance introduced by runtime batching and kernel selection. To further achieve true on-policy training, you need to modify the training engine to use the same deterministic kernels. For implementation details, see these miles examples: [True On-Policy](https://github.com/radixark/miles/tree/main/examples/true_on_policy) and [True On-Policy for VLM](https://github.com/radixark/miles/tree/main/examples/true_on_policy_vlm). For additional context, see the blog post [Let Speed Be With Stability: All-In-One Solution to Training-Inference Mismatch with Miles](https://github.com/zhaochenyang20/Awesome-ML-SYS-Tutorial/blob/main/rlhf/slime/mismatch/blog-en.md).
 
 **Server flag:**
 
@@ -231,7 +232,7 @@ SGLang supports a deterministic inference mode that reduces nondeterminism acros
 --enable-deterministic-inference
 ```
 
-You may find more details on this topic: [Deterministic Inference](deterministic_inference.md)
+For more details, see [Deterministic Inference](deterministic_inference.md)
 
 ## Load Balancing Router
 
