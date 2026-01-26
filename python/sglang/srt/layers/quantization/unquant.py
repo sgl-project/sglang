@@ -466,8 +466,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         quant_info = TorchNpuKernelsQuantInfo(
                 w13_weight=layer.w13_weight,
                 w2_weight=layer.w2_weight,
-                w13_scale=layer.w13_weight_bias if layer.w13_weight_bias else None,
-                w2_scale=layer.w2_weight_bias if layer.w2_weight_bias else None,
+                w13_weight_bias=layer.w13_weight_bias if self.with_bias else None,
+                w2_weight_bias=layer.w2_weight_bias if self.with_bias else None,
+                activation=self.moe_runner_config.activation,
             )
         return self.runner.run(dispatch_output, quant_info)
 
