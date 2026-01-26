@@ -709,6 +709,7 @@ class Scheduler(
             if self.spec_algorithm.is_none()
             else (
                 server_args.speculative_num_draft_tokens
+                or 0
                 + (
                     (server_args.speculative_eagle_topk or 1)
                     * (server_args.speculative_num_steps or 1)
@@ -839,7 +840,11 @@ class Scheduler(
             self.server_args.disaggregation_transfer_backend
         )
 
-        if self.draft_worker is None or self.spec_algorithm.is_ngram():
+        if (
+            self.draft_worker is None
+            or self.spec_algorithm.is_ngram()
+            or self.spec_algorithm.is_llguidance()
+        ):
             draft_token_to_kv_pool = None
         elif self.spec_algorithm.supports_spec_v2() and self.enable_overlap:
             if self.server_args.enable_multi_layer_eagle:
