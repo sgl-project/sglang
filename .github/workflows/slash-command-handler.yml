@@ -75,4 +75,4 @@ jobs:
           COMMENT_BODY: ${{ github.event.comment.body }}
           USER_LOGIN: ${{ github.event.comment.user.login }}
         run: |
-          python scripts/ci/slash_command_handler.py
+          python scripts/ci/utils/slash_command_handler.py
