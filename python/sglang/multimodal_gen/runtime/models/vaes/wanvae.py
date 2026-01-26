@@ -763,17 +763,7 @@ class WanDistResidualBlock(nn.Module):
 
 
 def attention_block_forward(self, x):
-    rank = 0
-    world_size = 1
-    if dist.is_initialized():
-        world_size = get_sp_world_size()
-        rank = get_sp_parallel_rank()
-
     identity = x
-
-    if world_size > 1:
-        x = get_sp_group().all_gather(x, dim=-2)
-
     batch_size, channels, time, height, width = x.size()
 
     x = x.permute(0, 2, 1, 3, 4).reshape(batch_size * time, channels, height, width)
@@ -801,9 +791,6 @@ def attention_block_forward(self, x):
     x = x.view(batch_size, time, channels, height, width)
     x = x.permute(0, 2, 1, 3, 4)
 
-    if world_size > 1:
-        x = torch.chunk(x, world_size, dim=-2)[rank]
-
     return x + identity
 
 
@@ -828,25 +815,27 @@ class WanAttentionBlock(nn.Module):
         return attention_block_forward(self, x)
 
 
-class WanDistAttentionBlock(nn.Module):
+class WanDistAttentionBlock(WanAttentionBlock):
     r"""
     Causal self-attention with a single head.
 
     Args:
         dim (int): The number of channels in the input tensor.
     """
-
-    def __init__(self, dim) -> None:
-        super().__init__()
-        self.dim = dim
-
-        # layers
-        self.norm = WanRMS_norm(dim)
-        self.to_qkv = WanDistConv2d(dim, dim * 3, 1)
-        self.proj = WanDistConv2d(dim, dim, 1)
-
     def forward(self, x):
-        return attention_block_forward(self, x)
+        rank = 0
+        world_size = 1
+        if dist.is_initialized():
+            world_size = get_sp_world_size()
+            rank = get_sp_parallel_rank()
+            x = get_sp_group().all_gather(x, dim=-2)
+
+        x = attention_block_forward(self, x)
+
+        if world_size > 1:
+            x = torch.chunk(x, world_size, dim=-2)[rank]
+
+        return x
 
 
 def mid_block_forward(self, x):
