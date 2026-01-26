@@ -229,24 +229,6 @@ void tinygemm_kernel(
     int64_t block_size_K,
     bool do_unpack = true);
 
-template <typename scalar_t>
-void tinygemm_kernel(
-    const scalar_t* __restrict__ A,
-    const at::Float8_e4m3fn* __restrict__ B,
-    float* __restrict__ C,
-    scalar_t* __restrict__ Btmp,
-    const float* __restrict__ Bbias,
-    const float* __restrict__ scale,
-    int64_t M,
-    int64_t N,
-    int64_t K,
-    int64_t lda,
-    int64_t ldb,
-    int64_t ldc,
-    bool brg,
-    int64_t block_size_K,
-    bool do_unpack = true);
-
 // mxfp4
 template <typename scalar_t>
 void tinygemm_kernel(
@@ -255,24 +237,6 @@ void tinygemm_kernel(
     scalar_t* __restrict__ C,
     scalar_t* __restrict__ Btmp,
     float* __restrict__ Ctmp,
-    const float* __restrict__ Bbias,
-    const uint8_t* __restrict__ scale,
-    int64_t M,
-    int64_t N,
-    int64_t K,
-    int64_t lda,
-    int64_t ldb,
-    int64_t ldc,
-    bool brg,
-    int64_t block_size_K,
-    bool do_unpack = true);
-
-template <typename scalar_t>
-void tinygemm_kernel(
-    const scalar_t* __restrict__ A,
-    const uint8_t* __restrict__ B,
-    float* __restrict__ C,
-    scalar_t* __restrict__ Btmp,
     const float* __restrict__ Bbias,
     const uint8_t* __restrict__ scale,
     int64_t M,
