@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use super::{
     BucketConfig, BucketPolicy, CacheAwareConfig, CacheAwarePolicy, ConsistentHashingPolicy,
-    LoadBalancingPolicy, ManualPolicy, PowerOfTwoPolicy, PrefixHashConfig, PrefixHashPolicy,
-    RandomPolicy, RoundRobinPolicy,
+    LoadBalancingPolicy, ManualConfig, ManualPolicy, PowerOfTwoPolicy, PrefixHashConfig,
+    PrefixHashPolicy, RandomPolicy, RoundRobinPolicy,
 };
 use crate::config::PolicyConfig;
 
@@ -47,7 +47,18 @@ impl PolicyFactory {
                 };
                 Arc::new(BucketPolicy::with_config(config))
             }
-            PolicyConfig::Manual => Arc::new(ManualPolicy::new()),
+            PolicyConfig::Manual {
+                eviction_interval_secs,
+                max_idle_secs,
+                assignment_mode,
+            } => {
+                let config = ManualConfig {
+                    eviction_interval_secs: *eviction_interval_secs,
+                    max_idle_secs: *max_idle_secs,
+                    assignment_mode: *assignment_mode,
+                };
+                Arc::new(ManualPolicy::with_config(config))
+            }
             PolicyConfig::ConsistentHashing => Arc::new(ConsistentHashingPolicy::new()),
             PolicyConfig::PrefixHash {
                 prefix_token_count,
@@ -113,7 +124,11 @@ mod tests {
         });
         assert_eq!(policy.name(), "bucket");
 
-        let policy = PolicyFactory::create_from_config(&PolicyConfig::Manual);
+        let policy = PolicyFactory::create_from_config(&PolicyConfig::Manual {
+            eviction_interval_secs: 60,
+            max_idle_secs: 4 * 3600,
+            assignment_mode: Default::default(),
+        });
         assert_eq!(policy.name(), "manual");
 
         let policy = PolicyFactory::create_from_config(&PolicyConfig::ConsistentHashing);

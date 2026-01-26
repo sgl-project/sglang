@@ -2,56 +2,30 @@
 //!
 //! This module defines error types used throughout the router for worker operations.
 
-use std::fmt;
-
 /// Worker-related errors
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum WorkerError {
-    /// Health check failed
+    #[error("Health check failed for worker {url}: {reason}")]
     HealthCheckFailed { url: String, reason: String },
-    /// Worker not found
+
+    #[error("Worker not found: {url}")]
     WorkerNotFound { url: String },
-    /// Invalid worker configuration
+
+    #[error("Invalid worker configuration: {message}")]
     InvalidConfiguration { message: String },
-    /// Network error
+
+    #[error("Network error for worker {url}: {error}")]
     NetworkError { url: String, error: String },
-    /// Worker is at capacity
+
+    #[error("Worker at capacity: {url}")]
     WorkerAtCapacity { url: String },
-    /// Invalid URL format
+
+    #[error("Invalid URL format: {url}")]
     InvalidUrl { url: String },
-    /// Connection failed
+
+    #[error("Connection failed for worker {url}: {reason}")]
     ConnectionFailed { url: String, reason: String },
 }
-
-impl fmt::Display for WorkerError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            WorkerError::HealthCheckFailed { url, reason } => {
-                write!(f, "Health check failed for worker {}: {}", url, reason)
-            }
-            WorkerError::WorkerNotFound { url } => {
-                write!(f, "Worker not found: {}", url)
-            }
-            WorkerError::InvalidConfiguration { message } => {
-                write!(f, "Invalid worker configuration: {}", message)
-            }
-            WorkerError::NetworkError { url, error } => {
-                write!(f, "Network error for worker {}: {}", url, error)
-            }
-            WorkerError::WorkerAtCapacity { url } => {
-                write!(f, "Worker at capacity: {}", url)
-            }
-            WorkerError::InvalidUrl { url } => {
-                write!(f, "Invalid URL format: {}", url)
-            }
-            WorkerError::ConnectionFailed { url, reason } => {
-                write!(f, "Connection failed for worker {}: {}", url, reason)
-            }
-        }
-    }
-}
-
-impl std::error::Error for WorkerError {}
 
 /// Result type for worker operations
 pub type WorkerResult<T> = Result<T, WorkerError>;
