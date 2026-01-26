@@ -84,12 +84,10 @@ def nsa_cp_round_robin_split_data(input_: Union[torch.Tensor, List]):
     return input_.view(-1, cp_size, *input_.shape[1:])[:, cp_rank].contiguous()
 
 
-def pad_nsa_cache_seqlens(forward_batch: "ForwardBatch", nsa_cache_seqlens):
-    if forward_batch.global_num_tokens_cpu is None:
-        return nsa_cache_seqlens
-
+def cal_padded_tokens(forward_batch: "ForwardBatch"):
+    # Consistent with the padding calculation logic in ForwardBatch.prepare_mlp_sync_batch,
+    # calculate the actual token length after padding when attn_tp_size > 1 or in the MAX_LEN padding mode.
     global_num_tokens = forward_batch.global_num_tokens_cpu.copy()
-    # same with ForwardBatch.prepare_mlp_sync_batch
     sync_group_size = len(global_num_tokens)
     attn_tp_size = get_attention_tp_size()
     for i in range(sync_group_size):
@@ -98,14 +96,20 @@ def pad_nsa_cache_seqlens(forward_batch: "ForwardBatch", nsa_cache_seqlens):
         forward_batch.is_extend_in_batch, global_num_tokens
     )
     if dp_padding_mode.is_max_len():
-        tokens = max(forward_batch.global_num_tokens_cpu)
+        tokens = max(global_num_tokens)
     elif len(global_num_tokens) > 1:
         tokens = global_num_tokens[get_attention_dp_rank()]
     else:
         tokens = global_num_tokens[0]
-
     if can_nsa_prefill_cp_round_robin_split(forward_batch):
         tokens = ceil_div(tokens, attn_tp_size)
+    return tokens
+
+
+def pad_nsa_cache_seqlens(forward_batch: "ForwardBatch", nsa_cache_seqlens):
+    if forward_batch.global_num_tokens_cpu is None:
+        return nsa_cache_seqlens
+    tokens = cal_padded_tokens(forward_batch)
     pad_len = tokens - nsa_cache_seqlens.shape[0]
     if pad_len > 0:
         nsa_cache_seqlens = torch.cat(
