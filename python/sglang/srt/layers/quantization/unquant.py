@@ -511,7 +511,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         # gmm1: gate_up_proj
         hidden_states = torch_npu.npu_grouped_matmul(
             x=[hidden_states],
-            weight=[w13],
+            weight=[layer.w13_weight],
             bias=w13_bias,
             split_item=2,
             group_list_type=0,
@@ -535,7 +535,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         # gmm2: down_proj
         hidden_states = torch_npu.npu_grouped_matmul(
             x=[hidden_states],
-            weight=[w2],
+            weight=[layer.w2_weight],
             bias=w2_bias,
             split_item=2,
             group_list_type=0,
