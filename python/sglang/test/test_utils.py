@@ -1495,6 +1495,10 @@ def run_bench_one_batch(model, other_args):
         command += ["--model-path", model]
     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
+    prefill_latency = None
+    decode_throughput = None
+    decode_latency = None
+
     try:
         stdout, stderr = process.communicate()
         output = stdout.decode(errors="backslashreplace")
@@ -1516,6 +1520,12 @@ def run_bench_one_batch(model, other_args):
             decode_throughput = float(match.group("throughput"))
     finally:
         kill_process_tree(process.pid)
+
+    if prefill_latency is None or decode_throughput is None or decode_latency is None:
+        raise RuntimeError(
+            f"Failed to parse benchmark output. "
+            f"prefill_latency={prefill_latency}, decode_throughput={decode_throughput}, decode_latency={decode_latency}"
+        )
 
     return prefill_latency, decode_throughput, decode_latency
 
