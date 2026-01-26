@@ -627,16 +627,22 @@ class OpenAIServingChat(OpenAIServingBase):
                 routed_experts[index] = content["meta_info"].get("routed_experts", None)
 
                 # Handle logprobs
+                finish_reason = content["meta_info"]["finish_reason"]
                 choice_logprobs = None
                 if request.logprobs:
-                    choice_logprobs = self._process_streaming_logprobs(
-                        content, n_prev_tokens.get(index, 0)
-                    )
-                    n_prev_tokens[index] = len(
+                    n_prev_token = n_prev_tokens.get(index, 0)
+                    total_output_logprobs = len(
                         content["meta_info"]["output_token_logprobs"]
                     )
-
-                finish_reason = content["meta_info"]["finish_reason"]
+                    # When finish_reason is set and all logprobs have been sent,
+                    # any remaining text is just buffered text being flushed by the
+                    # detokenizer (it holds back text at word boundaries). Return None
+                    # for logprobs since no new tokens were generated for this text.
+                    if n_prev_token < total_output_logprobs or finish_reason is None:
+                        choice_logprobs = self._process_streaming_logprobs(
+                            content, n_prev_token
+                        )
+                    n_prev_tokens[index] = total_output_logprobs
                 finish_reason_type = finish_reason["type"] if finish_reason else None
 
                 # Track finish_reason for each index
