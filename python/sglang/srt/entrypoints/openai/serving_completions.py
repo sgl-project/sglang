@@ -251,33 +251,12 @@ class OpenAIServingCompletion(OpenAIServingBase):
                     output_top_logprobs_slice = content["meta_info"].get(
                         "output_top_logprobs", []
                     )[n_prev_token:]
-                    finish_reason_for_logprobs = content["meta_info"]["finish_reason"]
-
-                    # Debug logging for flaky streaming logprobs test
-                    # See: https://github.com/sgl-project/sglang/pull/17687
-                    delta_text = text[len(stream_buffer) :]
-                    if len(output_logprobs_slice) == 0 and delta_text:
-                        logger.warning(
-                            f"[DEBUG LOGPROBS STREAM] Empty output_logprobs_slice but have delta_text. "
-                            f"index={index}, n_prev_token={n_prev_token}, "
-                            f"total_output_logprobs={total_output_logprobs}, "
-                            f"delta_text={repr(delta_text)}, "
-                            f"finish_reason={finish_reason_for_logprobs}, "
-                            f"stream_buffer_len={len(stream_buffer)}, "
-                            f"text_len={len(text)}, "
-                            f"input_token_logprobs is None={input_token_logprobs is None}, "
-                            f"echo={request.echo}"
-                        )
-
-                    # When finish_reason is set and all logprobs have been sent,
-                    # any remaining text is just buffered text being flushed by the
+                    # When output_logprobs_slice is empty and there are no input logprobs,
+                    # this chunk only contains buffered text being flushed by the
                     # detokenizer (it holds back text at word boundaries). Return None
                     # for logprobs since no new tokens were generated for this text.
-                    if (
-                        len(output_logprobs_slice) == 0
-                        and finish_reason_for_logprobs is not None
-                        and input_token_logprobs is None
-                    ):
+                    # This can happen both mid-stream and on the final chunk.
+                    if len(output_logprobs_slice) == 0 and input_token_logprobs is None:
                         logprobs = None
                     else:
                         logprobs = to_openai_style_logprobs(
@@ -285,14 +264,6 @@ class OpenAIServingCompletion(OpenAIServingBase):
                             input_top_logprobs=input_top_logprobs,
                             output_token_logprobs=output_logprobs_slice,
                             output_top_logprobs=output_top_logprobs_slice,
-                        )
-
-                    # Debug: log when we're about to return logprobs with empty tokens
-                    if logprobs and len(logprobs.tokens) == 0:
-                        logger.warning(
-                            f"[DEBUG LOGPROBS STREAM] Returning logprobs with empty tokens list. "
-                            f"index={index}, delta_text={repr(delta_text)}, "
-                            f"finish_reason={finish_reason_for_logprobs}"
                         )
 
                     n_prev_tokens[index] = total_output_logprobs

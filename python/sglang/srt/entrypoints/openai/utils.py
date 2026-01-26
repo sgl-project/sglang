@@ -44,17 +44,6 @@ def to_openai_style_logprobs(
     if output_top_logprobs is not None:
         append_top_logprobs(output_top_logprobs)
 
-    # Debug logging for flaky streaming logprobs test
-    # See: https://github.com/sgl-project/sglang/pull/17687
-    if len(ret_logprobs.tokens) == 0:
-        logger.warning(
-            f"[DEBUG LOGPROBS] to_openai_style_logprobs returning empty tokens list. "
-            f"input_token_logprobs={input_token_logprobs}, "
-            f"output_token_logprobs={output_token_logprobs}, "
-            f"input_top_logprobs is None={input_top_logprobs is None}, "
-            f"output_top_logprobs is None={output_top_logprobs is None}"
-        )
-
     return ret_logprobs
 
 

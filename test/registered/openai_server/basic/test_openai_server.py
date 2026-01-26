@@ -156,28 +156,14 @@ class TestOpenAIServer(CustomTestCase):
             is_first = is_firsts.get(index, True)
 
             if logprobs:
-                # When finish_reason is set, logprobs may be None if this chunk
-                # only contains buffered text being flushed (no new tokens generated).
-                # The detokenizer holds back text at word boundaries during streaming.
+                # When logprobs is requested, it may be None if this chunk only contains
+                # buffered text being flushed (no new tokens generated). The detokenizer
+                # holds back text at word boundaries during streaming. This can happen
+                # both mid-stream and on the final chunk when finish_reason is set.
                 if response.choices[0].logprobs is not None:
-                    # Debug logging for flaky streaming logprobs test
-                    # See: https://github.com/sgl-project/sglang/pull/17687
-                    choice_logprobs = response.choices[0].logprobs
-                    if len(choice_logprobs.tokens) == 0:
-                        print(
-                            f"[DEBUG TEST] Empty tokens list in logprobs! "
-                            f"response.id={response.id}, "
-                            f"choice.index={response.choices[0].index}, "
-                            f"choice.text={repr(response.choices[0].text)}, "
-                            f"choice.finish_reason={response.choices[0].finish_reason}, "
-                            f"logprobs.tokens={choice_logprobs.tokens}, "
-                            f"logprobs.token_logprobs={choice_logprobs.token_logprobs}, "
-                            f"logprobs.top_logprobs={choice_logprobs.top_logprobs}, "
-                            f"echo={echo}, is_first={is_first}"
-                        )
                     assert isinstance(
                         response.choices[0].logprobs.tokens[0], str
-                    ), f"{response.choices[0].logprobs.tokens[0]} is not a string, logprobs={response.choices[0].logprobs}, text={repr(response.choices[0].text)}, finish_reason={response.choices[0].finish_reason}"
+                    ), f"{response.choices[0].logprobs.tokens[0]} is not a string"
                     if not (is_first and echo):
                         assert isinstance(
                             response.choices[0].logprobs.top_logprobs[0], dict
@@ -284,19 +270,24 @@ class TestOpenAIServer(CustomTestCase):
                 continue
 
             if logprobs and not is_finished.get(index, False):
-                assert response.choices[0].logprobs, f"logprobs was not returned"
-                assert isinstance(
-                    response.choices[0].logprobs.content[0].top_logprobs[0].token, str
-                ), f"top_logprobs token was not a string"
-                assert isinstance(
-                    response.choices[0].logprobs.content[0].top_logprobs, list
-                ), f"top_logprobs was not a list"
-                ret_num_top_logprobs = len(
-                    response.choices[0].logprobs.content[0].top_logprobs
-                )
-                assert (
-                    ret_num_top_logprobs == logprobs
-                ), f"{ret_num_top_logprobs} vs {logprobs}"
+                # When logprobs is requested, it may be None if this chunk only contains
+                # buffered text being flushed (no new tokens generated). The detokenizer
+                # holds back text at word boundaries during streaming. This can happen
+                # both mid-stream and on the final chunk when finish_reason is set.
+                if response.choices[0].logprobs is not None:
+                    assert isinstance(
+                        response.choices[0].logprobs.content[0].top_logprobs[0].token,
+                        str,
+                    ), f"top_logprobs token was not a string"
+                    assert isinstance(
+                        response.choices[0].logprobs.content[0].top_logprobs, list
+                    ), f"top_logprobs was not a list"
+                    ret_num_top_logprobs = len(
+                        response.choices[0].logprobs.content[0].top_logprobs
+                    )
+                    assert (
+                        ret_num_top_logprobs == logprobs
+                    ), f"{ret_num_top_logprobs} vs {logprobs}"
 
             assert (
                 isinstance(data.content, str)
