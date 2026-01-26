@@ -176,7 +176,7 @@ class Qwen3_VisionBlock(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
             use_data_parallel=use_data_parallel,
-            use_dp_attention=is_dp_attention_enabled(),
+            use_dp_attention_reduce=is_dp_attention_enabled(),
         )
         self.mlp = Qwen3_VisionMLP(
             dim,
@@ -256,7 +256,7 @@ class Qwen3VLMoeVisionPatchMerger(nn.Module):
             prefix=add_prefix("linear_fc2", prefix),
             tp_size=self.tp_size,
             tp_rank=self.tp_rank,
-            use_dp_attention=is_dp_attention_enabled(),
+            use_dp_attention_reduce=is_dp_attention_enabled(),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
