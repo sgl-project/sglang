@@ -55,6 +55,20 @@ impl RouterFactory {
                 RoutingMode::OpenAI { .. } => {
                     Err("OpenAI mode requires HTTP connection_mode".to_string())
                 }
+                // EPD mode falls back to PD router for now (EPD router added in separate PR)
+                RoutingMode::EncodePrefillDecode {
+                    prefill_policy,
+                    decode_policy,
+                    ..
+                } => {
+                    Self::create_grpc_pd_router(
+                        prefill_policy.as_ref(),
+                        decode_policy.as_ref(),
+                        &ctx.router_config.policy,
+                        ctx,
+                    )
+                    .await
+                }
             },
             ConnectionMode::Http => match &ctx.router_config.mode {
                 RoutingMode::Regular { .. } => Self::create_regular_router(ctx).await,
@@ -78,6 +92,20 @@ impl RouterFactory {
                 ),
 
                 RoutingMode::OpenAI { .. } => Self::create_openai_router(ctx).await,
+                // EPD mode falls back to PD router for now (EPD router added in separate PR)
+                RoutingMode::EncodePrefillDecode {
+                    prefill_policy,
+                    decode_policy,
+                    ..
+                } => {
+                    Self::create_pd_router(
+                        prefill_policy.as_ref(),
+                        decode_policy.as_ref(),
+                        &ctx.router_config.policy,
+                        ctx,
+                    )
+                    .await
+                }
             },
         }
     }
