@@ -375,7 +375,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For hidden states before normal
     return_hidden_states_before_norm: bool = False
 
-    # For hidden states before normal
+    # For piecewise cuda graph
     real_num_tokens: Optional[int] = None
 
     @classmethod
