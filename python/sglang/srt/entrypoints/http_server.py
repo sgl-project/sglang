@@ -19,8 +19,10 @@ This file implements HTTP APIs for the inference engine via fastapi.
 
 import asyncio
 import dataclasses
+import errno
 import logging
 import os
+import socket
 import tempfile
 import threading
 import time
@@ -1695,6 +1697,76 @@ def _wait_weights_ready():
     )
 
 
+def _is_valid_ipv6_address(address: str) -> bool:
+    """Check if the given address is a valid IPv6 address."""
+    try:
+        socket.inet_pton(socket.AF_INET6, address)
+        return True
+    except (socket.error, OSError):
+        return False
+
+
+def _create_server_socket(host: str, port: int) -> socket.socket:
+    """
+    Create and bind a server socket to reserve the port before model loading.
+
+    This prevents port conflicts that could occur if another process (e.g., a
+    subprocess spawned during model loading) binds to the same port before the
+    HTTP server starts. By binding early, we ensure the port is available and
+    reserved for the HTTP server.
+
+    Args:
+        host: The host address to bind to.
+        port: The port number to bind to.
+
+    Returns:
+        A bound socket object.
+
+    Raises:
+        RuntimeError: If the port is already in use or permission is denied.
+    """
+    # Determine socket family based on address type
+    if host and _is_valid_ipv6_address(host):
+        family = socket.AF_INET6
+    else:
+        family = socket.AF_INET
+
+    sock = socket.socket(family=family, type=socket.SOCK_STREAM)
+
+    # Set socket options to allow port reuse
+    # SO_REUSEADDR: Allows binding to a port in TIME_WAIT state
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+    # SO_REUSEPORT: Allows multiple processes to bind to the same port
+    # This is useful for multi-worker mode
+    if hasattr(socket, "SO_REUSEPORT"):
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+
+    try:
+        sock.bind((host or "", port))
+        logger.info(f"Successfully reserved port {port} on host '{host or '0.0.0.0'}'")
+    except OSError as e:
+        sock.close()
+        if e.errno == errno.EADDRINUSE:
+            raise RuntimeError(
+                f"Port {port} is already in use on host '{host or '0.0.0.0'}'. "
+                f"Please choose a different port with --port or stop the process using this port. "
+                f"You can find the process using: lsof -i :{port} or netstat -tlnp | grep {port}"
+            ) from e
+        elif e.errno == errno.EACCES:
+            raise RuntimeError(
+                f"Permission denied when trying to bind to port {port}. "
+                f"Ports below 1024 require root/sudo privileges. "
+                f"Consider using a port >= 1024 (e.g., --port 8000) or run with sudo."
+            ) from e
+        else:
+            raise RuntimeError(
+                f"Failed to bind to {host or '0.0.0.0'}:{port}: {e}"
+            ) from e
+
+    return sock
+
+
 def launch_server(
     server_args: ServerArgs,
     init_tokenizer_manager_func: Callable = init_tokenizer_manager,
@@ -1718,15 +1790,27 @@ def launch_server(
     1. The HTTP server, Engine, and TokenizerManager all run in the main process.
     2. Inter-process communication is done through IPC (each process uses a different port) via the ZMQ library.
     """
-    # Launch subprocesses
-    tokenizer_manager, template_manager, scheduler_infos, port_args = (
-        _launch_subprocesses(
-            server_args=server_args,
-            init_tokenizer_manager_func=init_tokenizer_manager_func,
-            run_scheduler_process_func=run_scheduler_process_func,
-            run_detokenizer_process_func=run_detokenizer_process_func,
+    # Reserve the HTTP port before launching subprocesses to fail fast if port is unavailable.
+    # This prevents wasting time loading models only to discover port conflicts later.
+    reserved_socket = _create_server_socket(server_args.host, server_args.port)
+
+    try:
+        # Launch subprocesses
+        tokenizer_manager, template_manager, scheduler_infos, port_args = (
+            _launch_subprocesses(
+                server_args=server_args,
+                init_tokenizer_manager_func=init_tokenizer_manager_func,
+                run_scheduler_process_func=run_scheduler_process_func,
+                run_detokenizer_process_func=run_detokenizer_process_func,
+            )
         )
-    )
+    except Exception:
+        reserved_socket.close()
+        raise
+
+    # Release the reserved socket so uvicorn can bind to the same port.
+    # The SO_REUSEADDR option we set earlier allows uvicorn to bind immediately.
+    reserved_socket.close()
 
     # Parse info got from the schedulers
     remote_instance_transfer_engine_info = (
