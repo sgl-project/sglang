@@ -306,7 +306,15 @@ class HiCacheController:
                 0.8 * (self.mem_pool_host.size - self.mem_pool_device.size)
             )
             # granularity of batch storage IO operations, in number of pages
-            self.storage_batch_size = 128
+            extra_cfg = self.storage_config.extra_config or {}
+            self.storage_batch_size = int(
+                extra_cfg.get("storage_batch_size_pages", 128)
+            )
+            # If the last chunk is small (<= merge_tail), merge it into the previous chunk
+            merge_tail = int(extra_cfg.get("storage_batch_merge_tail_pages", 32))
+            self.storage_batch_merge_tail_pages = max(
+                0, min(merge_tail, self.storage_batch_size)
+            )
             # tracking the number of tokens locked in prefetching, updated by the main scheduler thread
             self.prefetch_tokens_occupied = 0
 
@@ -376,6 +384,28 @@ class HiCacheController:
 
             self.prefetch_thread.start()
             self.backup_thread.start()
+
+    def _iter_storage_page_batches(self, num_pages: int):
+        """
+        Yield (start_page, end_page) for storage IO batching.
+        """
+        if num_pages <= 0:
+            return
+
+        bs = max(1, self.storage_batch_size)
+        merge_tail = min(max(0, self.storage_batch_merge_tail_pages), bs)
+
+        start_page = 0
+        while start_page < num_pages:
+            end_page = min(start_page + bs, num_pages)
+
+            # If the next batch would be a small tail, merge it into the current one.
+            remaining_pages = num_pages - end_page
+            if 0 < remaining_pages <= merge_tail:
+                end_page = num_pages
+
+            yield (start_page, end_page)
+            start_page = end_page
 
     def _generate_storage_config(
         self,
@@ -637,10 +667,12 @@ class HiCacheController:
     def _page_transfer(self, operation):
         # Transfer batch by batch
         prefix_keys = operation.prefix_keys
-        for i in range(0, len(operation.hash_value), self.storage_batch_size):
-            batch_hashes = operation.hash_value[i : i + self.storage_batch_size]
+        for start_page, end_page in self._iter_storage_page_batches(
+            len(operation.hash_value)
+        ):
+            batch_hashes = operation.hash_value[start_page:end_page]
             batch_host_indices = operation.host_indices[
-                i * self.page_size : (i + len(batch_hashes)) * self.page_size
+                start_page * self.page_size : end_page * self.page_size
             ]
             prev_completed_tokens = operation.completed_tokens
             # Get one batch token, and update the completed_tokens if succeed
@@ -690,18 +722,14 @@ class HiCacheController:
         storage_query_count = 0
         hash_value = []
 
-        for start in range(
-            0, len(tokens_to_fetch), self.page_size * self.storage_batch_size
-        ):
-            end = min(
-                start + self.page_size * self.storage_batch_size, len(tokens_to_fetch)
-            )
-            batch_tokens = tokens_to_fetch[start:end]
+        # number of pages to query (ceil)
+        num_pages = (len(tokens_to_fetch) + self.page_size - 1) // self.page_size
+        for start_page, end_page in self._iter_storage_page_batches(num_pages):
             batch_hashes = []
-            for i in range(0, len(batch_tokens), self.page_size):
-                last_hash = self.get_hash_str(
-                    batch_tokens[i : i + self.page_size], last_hash
-                )
+            for p in range(start_page, end_page):
+                start = p * self.page_size
+                end = min((p + 1) * self.page_size, len(tokens_to_fetch))
+                last_hash = self.get_hash_str(tokens_to_fetch[start:end], last_hash)
                 batch_hashes.append(last_hash)
             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
             hit_page_num = self.storage_backend.batch_exists(batch_hashes, extra_info)
@@ -795,10 +823,12 @@ class HiCacheController:
     def _page_backup(self, operation):
         # Backup batch by batch
         prefix_keys = operation.prefix_keys
-        for i in range(0, len(operation.hash_value), self.storage_batch_size):
-            batch_hashes = operation.hash_value[i : i + self.storage_batch_size]
+        for start_page, end_page in self._iter_storage_page_batches(
+            len(operation.hash_value)
+        ):
+            batch_hashes = operation.hash_value[start_page:end_page]
             batch_host_indices = operation.host_indices[
-                i * self.page_size : (i + len(batch_hashes)) * self.page_size
+                start_page * self.page_size : end_page * self.page_size
             ]
             # Set one batch token, and record if success.
             # todo: allow partial success
