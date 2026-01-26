@@ -93,6 +93,7 @@ class NightlyBenchmarkRunner:
         profile_path_prefix: str,
         json_output_file: str,
         extra_args: Optional[List[str]] = None,
+        server_args: Optional[List[str]] = None,
     ) -> List[str]:
         """Build the benchmark command with all required arguments.
 
@@ -104,6 +105,7 @@ class NightlyBenchmarkRunner:
             profile_path_prefix: Prefix for profile output files
             json_output_file: Path to JSON output file
             extra_args: Optional extra arguments to append to command
+            server_args: Optional server launch arguments to record in metrics
 
         Returns:
             List of command arguments ready for subprocess.run()
@@ -134,6 +136,11 @@ class NightlyBenchmarkRunner:
 
         if extra_args:
             command.extend(extra_args)
+
+        # Record server launch arguments in metrics for tracking configurations
+        if server_args:
+            command.append("--server-args-for-metrics")
+            command.extend(server_args)
 
         return command
 
@@ -192,17 +199,14 @@ class NightlyBenchmarkRunner:
                 f"Loaded {len(benchmark_results)} benchmark results from {json_output_file}"
             )
 
-            # Clean up JSON file
-            os.remove(json_output_file)
+            # Note: JSON files are preserved for metrics collection by CI scripts
+            # They will be collected by scripts/ci/save_metrics.py
 
             return benchmark_results, True
 
         except Exception as e:
             desc = model_description or "model"
             print(f"Error loading benchmark results for {desc}: {e}")
-            # Try to clean up the file anyway
-            if os.path.exists(json_output_file):
-                os.remove(json_output_file)
             return benchmark_results, False
 
     def run_benchmark_for_model(
@@ -268,6 +272,7 @@ class NightlyBenchmarkRunner:
                 profile_path_prefix,
                 json_output_file,
                 extra_args=bench_args,
+                server_args=other_args,
             )
 
             result, cmd_success = self.run_benchmark_command(command, model_description)

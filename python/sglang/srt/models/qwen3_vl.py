@@ -307,7 +307,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
                 self.num_position_embeddings,
                 self.hidden_size,
                 quant_config=quant_config,
-                enable_tp=not is_dp_attention_enabled(),
+                use_attn_tp_group=is_dp_attention_enabled(),
                 prefix=add_prefix("pos_embed", prefix),
             )
         else:
@@ -852,10 +852,18 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         return torch.cat(all_chunk_embeds, dim=0)
 
     def get_video_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+        for item in items:
+            item.feature = item.feature.to(self.visual.device)
         # in qwen-vl, last dim is the same
         pixel_values = torch.cat([item.feature for item in items], dim=0).type(
             self.visual.dtype
         )
+        # Memory optimization for item.feature:
+        # 1. item.feature is released when request finished
+        # 2. High concurrency may cause device OOM due to delayed release
+        # 3. Fix: Offload item.feature to CPU, move to device only when needed
+        for item in items:
+            item.feature = item.feature.to("cpu")
         video_grid_thw = torch.concat([item.video_grid_thw for item in items], dim=0)
         assert pixel_values.dim() == 2, pixel_values.dim()
         assert video_grid_thw.dim() == 2, video_grid_thw.dim()

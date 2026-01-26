@@ -38,6 +38,16 @@ class ZImageArchConfig(DiTArchConfig):
         default_factory=lambda: {
             r"(.*)\.feed_forward\.w1\.weight$": (r"\1.feed_forward.w13.weight", 0, 2),
             r"(.*)\.feed_forward\.w3\.weight$": (r"\1.feed_forward.w13.weight", 1, 2),
+            r"(.*)\.feed_forward\.w1\.(lora_A|lora_B)$": (
+                r"\1.feed_forward.w13.\2",
+                0,
+                2,
+            ),
+            r"(.*)\.feed_forward\.w3\.(lora_A|lora_B)$": (
+                r"\1.feed_forward.w13.\2",
+                1,
+                2,
+            ),
         }
     )
 
