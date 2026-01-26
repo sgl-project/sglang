@@ -328,14 +328,14 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
 
     def _extract_routed_experts(
         self, recv_obj: BatchTokenIDOutput
-    ) -> List[List[int]] | None:
+    ) -> list[str | None] | None:
         routed_experts = None
         if recv_obj.routed_experts is not None:
             routed_experts = [
                 (
                     pybase64.b64encode(routed_experts.numpy().tobytes()).decode("utf-8")
                     if routed_experts is not None
-                    else []
+                    else None
                 )
                 for routed_experts in recv_obj.routed_experts
             ]

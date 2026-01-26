@@ -464,6 +464,9 @@ class ModelConfig:
                     ):
                         setattr(self.hf_text_config, "head_dim", self.head_dim)
 
+            elif "BaichuanForCausalLM" in self.hf_config.architectures:
+                self.use_alibi = self.hf_config.hidden_size != 4096
+
             self.attention_arch = AttentionArch.MHA
 
         self.num_attention_heads = self.hf_text_config.num_attention_heads
@@ -805,8 +808,11 @@ class ModelConfig:
         # Parse quantization method from the HF and ModelSlim model config, if available.
         # Only one function should return config, other should return None.
         cfg_list = []
-        cfg_list.append(self._parse_quant_hf_config())
-        cfg_list.append(self._find_quant_modelslim_config())
+        hf_config = self._parse_quant_hf_config()
+        modelslim_config = self._find_quant_modelslim_config()
+        quant_config = modelslim_config or hf_config
+        if quant_config is not None:
+            cfg_list.append(quant_config)
 
         # Filter out None values
         cfg_list = [item for item in cfg_list if item is not None]
@@ -1121,6 +1127,7 @@ def is_generation_model(model_architectures: List[str], is_embedding: bool = Fal
 multimodal_model_archs = [
     "CLIPModel",
     "DeepseekVL2ForCausalLM",
+    "Ernie4_5_VLMoeForConditionalGeneration",
     "Gemma3ForConditionalGeneration",
     "Gemma3nForConditionalGeneration",
     "Glm4vForConditionalGeneration",
@@ -1260,7 +1267,8 @@ def get_hybrid_layer_ids(
             i for i in range(num_hidden_layers) if hybrid_layer_pattern[i] == 0
         ]
     elif "MiMoV2MTP" in model_architectures:
-        return [0], []
+        swa_attention_layer_ids = [0]
+        full_attention_layer_ids = []
     else:
         swa_attention_layer_ids = None
         full_attention_layer_ids = None
