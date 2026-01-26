@@ -1262,7 +1262,7 @@ class AiterAttnBackend(AttentionBackend):
                     self.forward_metadata.kv_indptr[0:bs0],
                     self.forward_metadata.kv_indices,
                     k_cache,
-                    v_cache
+                    v_cache,
                 )
                 o = flash_attn_varlen_func(
                     q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
@@ -1270,8 +1270,8 @@ class AiterAttnBackend(AttentionBackend):
                     v,
                     self.qo_indptr[:bs0],
                     self.forward_metadata.kv_indptr[:bs0],
-                    self.forward_metadata.max_q_len, #max_len_extend,
-                    self.forward_metadata.max_kv_len, #max_len_in_batch,
+                    self.forward_metadata.max_q_len,
+                    self.forward_metadata.max_kv_len,
                     causal=True,
                     logits_soft_cap=self.logits_soft_cap,
                     alibi_slopes=None,
