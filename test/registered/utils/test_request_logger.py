@@ -21,7 +21,7 @@ register_cuda_ci(est_time=120, suite="nightly-1-gpu", nightly=True)
 register_amd_ci(est_time=120, suite="nightly-amd-1-gpu", nightly=True)
 
 TEST_ROUTING_KEY = "test-routing-key-12345"
-TEST_CUSTOM_HEADER_NAME = "x-test-header"
+TEST_CUSTOM_HEADER_NAME = "X-Test-Header"
 TEST_CUSTOM_HEADER_VALUE = "test-header-value-67890"
 
 
@@ -166,7 +166,7 @@ class TestCustomHeaderViaEnvVar(BaseTestRequestLogger, CustomTestCase):
     def _verify_logs(self, content: str, source_name: str):
         # Verify custom header is logged
         self.assertIn(
-            TEST_CUSTOM_HEADER_NAME,
+            TEST_CUSTOM_HEADER_NAME.lower(),
             content,
             f"Custom header name not found in {source_name}",
         )

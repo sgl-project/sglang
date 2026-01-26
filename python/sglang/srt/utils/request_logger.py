@@ -30,9 +30,9 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _DEFAULT_WHITELISTED_HEADERS = ["x-smg-routing-key"]
-WHITELISTED_HEADERS = _DEFAULT_WHITELISTED_HEADERS + list(
-    envs.SGLANG_LOG_REQUEST_HEADERS.get()
-)
+WHITELISTED_HEADERS = _DEFAULT_WHITELISTED_HEADERS + [
+    h.lower() for h in envs.SGLANG_LOG_REQUEST_HEADERS.get()
+]
 
 
 def _extract_whitelisted_headers(
