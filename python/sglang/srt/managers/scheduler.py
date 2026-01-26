@@ -2890,6 +2890,7 @@ def run_scheduler_process(
         signal_handler = SchedulerSignalHandler(scheduler)
         signal.signal(signal.SIGTERM, signal_handler.sigterm_handler)
         signal.signal(signal.SIGINT, signal_handler.sigterm_handler)
+        signal.signal(signal.SIGQUIT, signal_handler.sigquit_handler)
 
         # Dispatch to the appropriate event loop based on the disaggregation mode
         disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode
@@ -2922,26 +2923,39 @@ def run_scheduler_process(
         logger.info(
             "Scheduler received KeyboardInterrupt, initiating graceful shutdown..."
         )
-        try:
-            scheduler.gracefully_exit = True
-            signal_handler = SchedulerSignalHandler(scheduler)
-            signal_handler._on_graceful_exit()
-        except Exception as e:
-            logger.warning(f"Failed to execute graceful exit: {e}")
+        _execute_graceful_exit(scheduler)
 
     except Exception:
         traceback = get_exception_traceback()
-        logger.error(f"Scheduler hit an exception: {traceback}")
+        logger.error("Scheduler hit an exception: %s", traceback)
 
         # Execute graceful exit before notifying parent process
-        try:
-            scheduler.gracefully_exit = True
-            signal_handler = SchedulerSignalHandler(scheduler)
-            signal_handler._on_graceful_exit()
-        except Exception as e:
-            logger.warning(f"Failed to execute graceful exit: {e}")
+        _execute_graceful_exit(scheduler)
 
         parent_process.send_signal(signal.SIGQUIT)
+
+
+def _execute_graceful_exit(scheduler: Scheduler) -> None:
+    """Execute graceful exit cleanup for the scheduler.
+
+    This function handles cleanup operations before shutdown, including:
+    - Setting the gracefully_exit flag
+    - Unregistering PegaFlow CUDA IPC contexts if enabled
+    """
+    try:
+        scheduler.gracefully_exit = True
+        # Unregister PegaFlow server CUDA IPC if enabled
+        try:
+            from pegaflow.sglang.peagflow_radix_cache import PeagflowRadixCache
+
+            if hasattr(scheduler, "tree_cache") and isinstance(
+                scheduler.tree_cache, PeagflowRadixCache
+            ):
+                scheduler.tree_cache.unregister_context()
+        except ImportError:
+            logger.debug("PegaFlow not installed, skipping CUDA IPC cleanup")
+    except Exception as e:
+        logger.warning("Failed to execute graceful exit: %s", e)
 
 
 class SchedulerSignalHandler:
@@ -2953,39 +2967,17 @@ class SchedulerSignalHandler:
     def sigterm_handler(self, signum=None, frame=None):
         """Handle SIGTERM signal for graceful shutdown."""
         logger.warning(
-            f"SIGTERM received in scheduler. {signum=} {frame=}. Initiating graceful shutdown..."
+            "SIGTERM received in scheduler. signum=%s frame=%s. Initiating graceful shutdown...",
+            signum,
+            frame,
         )
-        self.scheduler.gracefully_exit = True
-        self._on_graceful_exit()
+        _execute_graceful_exit(self.scheduler)
 
     def sigquit_handler(self, signum=None, frame=None):
         """Handle SIGQUIT signal, typically indicating a child process failure."""
         logger.error(
-            f"SIGQUIT received in scheduler. {signum=}, {frame=}. A child process may have failed."
+            "SIGQUIT received in scheduler. signum=%s, frame=%s. A child process may have failed.",
+            signum,
+            frame,
         )
-        self._on_graceful_exit()
-
-    def _on_graceful_exit(self):
-        """
-        User-defined graceful exit callback.
-
-        Override this method or set a custom callback to perform cleanup
-        operations before the scheduler shuts down. Examples include:
-        - Saving in-flight request states
-        - Flushing metrics
-        - Releasing GPU resources
-        - Notifying external services
-
-        This method is called after setting gracefully_exit = True.
-        """
-        # unregister pegaflow server CUDA IPC
-        try:
-            from pegaflow.sglang.peagflow_radix_cache import PeagflowRadixCache
-
-            if hasattr(self.scheduler, "tree_cache") and isinstance(
-                self.scheduler.tree_cache, PeagflowRadixCache
-            ):
-                self.scheduler.tree_cache.unregister_context()
-
-        except ImportError:
-            pass
+        _execute_graceful_exit(self.scheduler)
