@@ -378,24 +378,19 @@ class ModelConfig:
             self.head_dim,
         )
 
-        hf_architectures = (
-            self.hf_config.architectures
-            if self.hf_config.architectures is not None
-            else self.hf_text_config.architectures
-        )
-
         # FIXME: temporary special judge for MLA architecture
         if (
-            "DeepseekV2ForCausalLM" in hf_architectures
-            or "DeepseekV32ForCausalLM" in hf_architectures
-            or "DeepseekV3ForCausalLM" in hf_architectures
-            or "DeepseekV3ForCausalLMNextN" in hf_architectures
-            or "LongcatFlashForCausalLM" in hf_architectures
-            or "LongcatFlashForCausalLMNextN" in hf_architectures
-            or "DotsVLMForCausalLM" in hf_architectures
-            or "MistralLarge3ForCausalLM" in hf_architectures
-            or "PixtralForConditionalGeneration" in hf_architectures
-            or "MistralLarge3ForCausalLMEagle" in hf_architectures
+            "DeepseekV2ForCausalLM" in self.hf_config.architectures
+            or "DeepseekV32ForCausalLM" in self.hf_config.architectures
+            or "DeepseekV3ForCausalLM" in self.hf_config.architectures
+            or "DeepseekV3ForCausalLMNextN" in self.hf_config.architectures
+            or "LongcatFlashForCausalLM" in self.hf_config.architectures
+            or "LongcatFlashForCausalLMNextN" in self.hf_config.architectures
+            or "DotsVLMForCausalLM" in self.hf_config.architectures
+            or "MistralLarge3ForCausalLM" in self.hf_config.architectures
+            or "PixtralForConditionalGeneration" in self.hf_config.architectures
+            or "MistralLarge3ForCausalLMEagle" in self.hf_config.architectures
+            or "KimiK25ForConditionalGeneration" in self.hf_config.architectures
         ):
             self.head_dim = 256
             self.attention_arch = AttentionArch.MLA
@@ -418,7 +413,7 @@ class ModelConfig:
                     self.qk_nope_head_dim + self.qk_rope_head_dim
                 )
                 if self.hf_text_config.rope_scaling:
-                    mscale_all_dim = self.hf_config.rope_scaling.get(
+                    mscale_all_dim = self.hf_text_config.rope_scaling.get(
                         "mscale_all_dim", False
                     )
                     scaling_factor = self.hf_text_config.rope_scaling["factor"]
