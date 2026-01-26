@@ -1265,7 +1265,7 @@ class RowParallelLinear(LinearBase):
         tp_rank: Optional[int] = None,
         tp_size: Optional[int] = None,
         use_presharded_weights: bool = False,
-        use_dp_attention: bool = False,
+        use_dp_attention_reduce: bool = False,
     ):
         quant_config = None if _disable_hip_linear_quant else quant_config
         super().__init__(
@@ -1274,7 +1274,7 @@ class RowParallelLinear(LinearBase):
 
         self.input_is_parallel = input_is_parallel
         self.reduce_results = reduce_results
-        self.use_dp_attention = use_dp_attention
+        self.use_dp_attention_reduce = use_dp_attention_reduce
 
         # Divide the weight matrix along the last dimension.
         if tp_rank is None:
@@ -1423,7 +1423,7 @@ class RowParallelLinear(LinearBase):
             output_parallel = self.quant_method.apply(self, input_parallel, bias=bias_)
 
         if self.reduce_results and self.tp_size > 1 and not skip_all_reduce:
-            if self.use_dp_attention:
+            if self.use_dp_attention_reduce:
                 output = get_attention_tp_group().all_reduce(output_parallel)
             else:
                 output = tensor_model_parallel_all_reduce(output_parallel)

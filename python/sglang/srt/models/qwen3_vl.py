@@ -105,7 +105,7 @@ class Qwen3_VisionMLP(nn.Module):
             prefix=add_prefix("linear_fc2", prefix),
             tp_size=self.tp_size,
             tp_rank=self.tp_rank,
-            use_dp_attention=is_dp_attention_enabled(),
+            use_dp_attention_reduce=is_dp_attention_enabled(),
         )
         self.act = ACT2FN[hidden_act]
 
