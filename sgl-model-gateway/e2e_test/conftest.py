@@ -34,17 +34,19 @@ This module defines several pytest markers for configuring E2E tests:
         @pytest.mark.model("llama-8b")
         @pytest.mark.model("qwen-72b")
 
-@pytest.mark.workers(count=1, prefill=None, decode=None)
+@pytest.mark.workers(count=1, prefill=None, decode=None, encode=None)
     Configure worker topology for the test.
 
     Args:
         count: Number of regular workers (default: 1)
         prefill: Number of prefill workers for PD disaggregation
         decode: Number of decode workers for PD disaggregation
+        encode: Number of encode workers for EPD disaggregation
 
     Examples:
         @pytest.mark.workers(count=3)  # 3 regular workers
         @pytest.mark.workers(prefill=2, decode=2)  # PD mode
+        @pytest.mark.workers(encode=2, prefill=2, decode=2)  # EPD mode
 
 @pytest.mark.gateway(policy="round_robin", timeout=None, extra_args=None)
     Configure the gateway/router.
