@@ -621,6 +621,7 @@ class AscendAttnBackend(AttentionBackend):
             )
 
         if not self.use_mla:
+            # In cross attention layer, when there is no vision input,the values of k and v is None
             if save_kv_cache and k is not None:
                 # support cross attention
                 cache_loc = (
@@ -1267,6 +1268,7 @@ class AscendAttnBackend(AttentionBackend):
             )
 
         if not self.use_mla:
+            # In cross attention layer, when there is no vision input,the values of k and v is None
             if save_kv_cache and k is not None:
                 # support cross attention
                 cache_loc = (
