@@ -40,6 +40,7 @@ import torch.distributed
 from torch.distributed import Backend, ProcessGroup
 
 from sglang.srt.compilation.compilation_config import register_split_op
+from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 from sglang.srt.environ import envs
 from sglang.srt.utils import (
     get_bool_env_var,
@@ -54,7 +55,6 @@ from sglang.srt.utils import (
     is_xpu,
 )
 from sglang.srt.utils.custom_op import register_custom_op
-from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 
 _is_npu = is_npu()
 _is_cpu = is_cpu()

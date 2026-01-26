@@ -1,6 +1,6 @@
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, List, Optional, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, List, Optional
 
 import torch
 
