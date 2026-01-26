@@ -1,11 +1,5 @@
-# SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """
-K2-VL Model Configuration.
-
-This configuration supports video-chunk as an internal modality type.
-A video-chunk is the smallest independently processable unit of video,
-typically 4 frames per chunk (temporal_merge_kernel_size=4).
+Kimi K25 Model Configuration.
 """
 
 from transformers import DeepseekV3Config
