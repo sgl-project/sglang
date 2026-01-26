@@ -1702,7 +1702,7 @@ def _is_valid_ipv6_address(address: str) -> bool:
     try:
         socket.inet_pton(socket.AF_INET6, address)
         return True
-    except (socket.error, OSError):
+    except OSError:
         return False
 
 
@@ -1744,12 +1744,14 @@ def _create_server_socket(host: str, port: int) -> socket.socket:
 
     try:
         sock.bind((host or "", port))
-        logger.info(f"Successfully reserved port {port} on host '{host or '0.0.0.0'}'")
+        logger.info(
+            f"Successfully reserved port {port} on host '{host or ('::' if family == socket.AF_INET6 else '0.0.0.0')}'"
+        )
     except OSError as e:
         sock.close()
         if e.errno == errno.EADDRINUSE:
             raise RuntimeError(
-                f"Port {port} is already in use on host '{host or '0.0.0.0'}'. "
+                f"Port {port} is already in use on host '{host or ('::' if family == socket.AF_INET6 else '0.0.0.0')}'. "
                 f"Please choose a different port with --port or stop the process using this port. "
                 f"You can find the process using: lsof -i :{port} or netstat -tlnp | grep {port}"
             ) from e
@@ -1761,7 +1763,7 @@ def _create_server_socket(host: str, port: int) -> socket.socket:
             ) from e
         else:
             raise RuntimeError(
-                f"Failed to bind to {host or '0.0.0.0'}:{port}: {e}"
+                f"Failed to bind to {host or ('::' if family == socket.AF_INET6 else '0.0.0.0')}:{port}: {e}"
             ) from e
 
     return sock
