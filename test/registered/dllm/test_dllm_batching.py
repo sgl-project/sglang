@@ -38,6 +38,7 @@ class TestBatching(CustomTestCase):
             "flashinfer",
             "--dllm-algorithm",
             "LowConfidence",
+            # "LowConfidenceFDFO", # try this for 2-4 times speed up
         ]
 
         cls.process = popen_launch_server(

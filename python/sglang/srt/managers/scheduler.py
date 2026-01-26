@@ -1818,7 +1818,13 @@ class Scheduler(
             if self.dllm_staging_reqs.non_empty():
                 chunked_req_to_exclude.update(self.dllm_staging_reqs)
                 for req in self.dllm_staging_reqs:
-                    self.stash_chunked_request(req)
+                    if not req.dllm_incomplete_ids: # if not finished, do not update prefix_indices
+                        self.tree_cache.cache_unfinished_req(req, chunked=True)
+                    # Chunked request keeps its rid but will get a new req_pool_idx
+                    if self.tp_worker.model_runner.mambaish_config is not None:
+                        self.req_to_token_pool.free(req.req_pool_idx, free_mamba_cache=False)
+                    else:
+                        self.req_to_token_pool.free(req.req_pool_idx)
 
         if self.chunked_req is not None:
             # Move the chunked request out of the batch so that we can merge
@@ -2420,7 +2426,10 @@ class Scheduler(
             trace_slice_batch(RequestStage.DECODE_LOOP, batch.reqs)
         elif batch.forward_mode.is_extend():
             if batch.is_dllm():
-                self.process_batch_result_dllm(batch, result)
+                if self.dllm_config.first_done_first_out_mode:
+                    self.process_batch_result_dllm_fdfo(batch, result)
+                else:
+                    self.process_batch_result_dllm(batch, result)
             else:
                 self.process_batch_result_prefill(batch, result)
         elif batch.forward_mode.is_prebuilt():

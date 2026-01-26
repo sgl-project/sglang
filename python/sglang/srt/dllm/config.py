@@ -3,7 +3,6 @@ from typing import Any
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.server_args import ServerArgs
 
-
 class DllmConfig:
     def __init__(
         self,
@@ -12,12 +11,14 @@ class DllmConfig:
         block_size: int,
         mask_id: int,
         max_running_requests: int,
+        first_done_first_out_mode: bool,
     ):
         self.algorithm = algorithm
         self.algorithm_config = algorithm_config
         self.block_size = block_size
         self.mask_id = mask_id
         self.max_running_requests = max_running_requests
+        self.first_done_first_out_mode = first_done_first_out_mode
 
     @staticmethod
     def from_server_args(
@@ -46,6 +47,7 @@ class DllmConfig:
             else server_args.max_running_requests
         )
 
+        first_done_first_out_mode = server_args.dllm_algorithm == "LowConfidenceFDFO"
         algorithm_config = {}
         if server_args.dllm_algorithm_config is not None:
             try:
@@ -67,4 +69,5 @@ class DllmConfig:
             block_size=block_size,
             mask_id=mask_id,
             max_running_requests=max_running_requests,
+            first_done_first_out_mode = first_done_first_out_mode,
         )

@@ -775,6 +775,7 @@ class Req:
 
         # For diffusion LLM
         self.dllm_ids = []
+        self.dllm_incomplete_ids = []
         self.dllm_block_offset = 0
         self.dllm_config = dllm_config
 
@@ -842,15 +843,25 @@ class Req:
         return self.dllm_config is not None
 
     def _init_fill_ids_for_dllm(self):
+        block_size = self.dllm_config.block_size
+        mask_id = self.dllm_config.mask_id
+        len_prefix = len(self.prefix_indices)
         if not self.dllm_ids:
-            self.dllm_ids = (
-                self.origin_input_ids
-                + [self.dllm_config.mask_id] * self.dllm_config.block_size
-            )
+            padding = (-len(self.origin_input_ids)) % block_size
+            self.dllm_ids = self.origin_input_ids + [mask_id] * padding
+            self.fill_ids = self.dllm_ids[:block_size]
+        elif self.dllm_incomplete_ids: # revert chrrent fill_ids and refill them by dllm_incomplete_ids
+            assert len(self.dllm_incomplete_ids) == block_size and len(self.fill_ids) == len_prefix + block_size, f"{len(self.dllm_incomplete_ids)=} {block_size=} {len(self.fill_ids)=} {len_prefix=}"
+            self.fill_ids = self.fill_ids[:len_prefix] + self.dllm_incomplete_ids
         else:
-            self.dllm_block_offset += self.dllm_config.block_size
-            self.dllm_ids += [self.dllm_config.mask_id] * self.dllm_config.block_size
-        self.fill_ids = self.dllm_ids
+            self.dllm_block_offset += block_size
+            fill_len, dllm_len = len(self.fill_ids), len(self.dllm_ids)
+            if fill_len < dllm_len:
+                # prefill
+                self.fill_ids += self.dllm_ids[fill_len:fill_len + block_size]
+            else:
+                # decode
+                self.fill_ids += [mask_id] * block_size
 
     def init_next_round_input(self, tree_cache: Optional[BasePrefixCache] = None):
         if self.is_dllm():

@@ -37,7 +37,7 @@ class LowConfidence(DllmAlgorithm):
             logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
 
             next_token_ids = []
-            return logits_output, next_token_ids, can_run_cuda_graph
+            return logits_output, next_token_ids, None, can_run_cuda_graph
 
         # Calculate start positions for each block
         for block_id in range(batch_size):
@@ -98,7 +98,7 @@ class LowConfidence(DllmAlgorithm):
             next_token_ids[i, start_list[i] :] for i in range(batch_size)
         ]
 
-        return logits_output, next_token_ids_list, can_run_cuda_graph
+        return logits_output, next_token_ids_list, None, can_run_cuda_graph
 
 
 Algorithm = LowConfidence
