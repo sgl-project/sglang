@@ -137,7 +137,6 @@ def inplace_all_reduce(tensor: torch.Tensor, group_name: str) -> None:
 
 
 @register_custom_op(out_shape="tensor")
-# @register_split_op()
 def outplace_all_reduce(
     tensor: torch.Tensor, group_name: str, outplace_all_reduce_method: str
 ) -> torch.Tensor:

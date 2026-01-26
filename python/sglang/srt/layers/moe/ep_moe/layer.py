@@ -168,7 +168,7 @@ class DeepEPMoE(FusedMoE):
                 self.layer_id,
             )
         else:
-            return super().forward(hidden_states, topk_output)
+            return self.forward_impl(hidden_states, topk_output)
 
     def forward_impl(
         self,
