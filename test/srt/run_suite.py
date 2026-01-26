@@ -11,6 +11,7 @@ suites = {
     "per-commit-4-gpu": [
         TestFile("models/test_qwen3_next_models.py", 350),
         TestFile("models/test_qwen3_next_models_mtp.py", 500),
+        TestFile("models/test_qwen3_next_models_pcg.py", 500),
         TestFile("test_gpt_oss_4gpu.py", 300),
         TestFile("test_multi_instance_release_memory_occupation.py", 64),
         TestFile("test_pp_single_node.py", 500),
@@ -59,9 +60,6 @@ suites = {
         TestFile("test_mistral_large3_basic.py"),
         TestFile("test_prefill_delayer.py"),
         TestFile("test_fla_layernorm_guard.py"),
-        TestFile(
-            "models/test_qwen3_next_models_pcg.py"
-        ),  # Disabled: intermittent failures, see #17039
     ],
 }
 
