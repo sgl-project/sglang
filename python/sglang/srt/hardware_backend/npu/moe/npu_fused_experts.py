@@ -18,12 +18,11 @@ def npu_fused_experts_unquant(
     activation: str,
 ):
 
-    original_dtype = x.dtype
-    num_tokens = x.shape[0]
-    topk_weights = topk_weights.to(x.dtype)
+    original_dtype = hidden_states.dtype
+    num_tokens = hidden_states.shape[0]
+    topk_weights = topk_weights.to(original_dtype)
     topk_ids = topk_ids.to(torch.int32)
-    num_experts = layer.num_experts
-    top_k = layer.top_k
+    num_experts = w13.shape[0]
     row_idx_len = num_tokens * top_k
     row_idx = (
         torch.arange(0, row_idx_len, dtype=torch.int32, device=topk_weights.device)
@@ -34,7 +33,7 @@ def npu_fused_experts_unquant(
 
     hidden_states, expanded_row_idx, expanded_expert_idx = (
         torch.ops.npu.npu_moe_init_routing(
-            x, row_idx=row_idx, expert_idx=topk_ids, active_num=num_tokens
+            hidden_states, row_idx=row_idx, expert_idx=topk_ids, active_num=num_tokens
         )
     )
 
@@ -45,9 +44,6 @@ def npu_fused_experts_unquant(
     expert_tokens = expert_tokens.to(torch.int64)
     w13_bias = [w13_weight_bias] if w13_weight_bias is not None else None
     w2_bias = [w2_weight_bias] if w2_weight_bias is not None else None
-    if layer.w13_weight.shape[-1] == layer.hidden_size:
-        w13 = layer.w13_weight.transpose(1, 2)
-        w2 = layer.w2_weight.transpose(1, 2)
 
     # gmm1: gate_up_proj
     hidden_states = torch.ops.npu.npu_grouped_matmul(
