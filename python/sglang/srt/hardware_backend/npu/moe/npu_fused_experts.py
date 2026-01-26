@@ -43,8 +43,8 @@ def npu_fused_experts_unquant(
     )
 
     expert_tokens = expert_tokens.to(torch.int64)
-    w13_bias = [w13_weight_bias] if w13_weight_bias in not None else None
-    w2_bias = [w2_weight_bias] if w2_weight_bias in not None else None
+    w13_bias = [w13_weight_bias] if w13_weight_bias is not None else None
+    w2_bias = [w2_weight_bias] if w2_weight_bias is not None else None
     if layer.w13_weight.shape[-1] == layer.hidden_size:
         w13 = layer.w13_weight.transpose(1, 2)
         w2 = layer.w2_weight.transpose(1, 2)
