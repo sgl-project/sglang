@@ -202,7 +202,7 @@ SGLang exposes explicit pause/resume APIs so you can pause slow requests and con
 ### Pause Generation
 
 **Endpoint:** `POST /pause_generation`
-
+`pause_generation` ---  `update_weight` --- `continue_generation` is the correct execution flow when updating weights from training. An update can only happen when sglang is not actively working inference tasks. 
 **Request body:**
 
 | Field | Description | Defaults | Options |
@@ -211,8 +211,8 @@ SGLang exposes explicit pause/resume APIs so you can pause slow requests and con
 
 **Modes:**
 
-- `abort`: Hard stop; repeatedly aborts all requests until no in-flight work remains. Scheduler is cleared.
-- `retract`: Pause inference; move running requests back to waiting queue. KV cache can be flushed and recomputed later.
+- `abort`: default behavior, identical to `abort` endpoint with `abort_all` set. Pending requests from "waiting_queue" and "running_queue" will be returned immediately to the caller. 
+- `retract`: Put engine in "paused" state.  Move running requests back to waiting queue. KV cache can be flushed and recomputed later.
 - `in_place`: Pause inference; keep requests in event loop with existing KV cache. Note: In `in_place` mode, `flush_cache` will fail if there are any requests in the running batch.
 
 ### Continue Generation
