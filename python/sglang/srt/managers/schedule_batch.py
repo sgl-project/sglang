@@ -95,8 +95,20 @@ if TYPE_CHECKING:
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 
+# Constant used as the base offset for MM (multimodal) pad values.
+# This ensures pad_values don't overlap with valid text token IDs.
+MM_PAD_SHIFT_VALUE = 1_000_000
 
 logger = logging.getLogger(__name__)
+
+
+def sanity_check_mm_pad_shift_value(vocab_size: int) -> None:
+    if vocab_size > MM_PAD_SHIFT_VALUE:
+        raise ValueError(
+            f"Model vocab_size ({vocab_size}) exceeds MM_PAD_SHIFT_VALUE ({MM_PAD_SHIFT_VALUE}). "
+            f"MM pad_values may overlap with valid token IDs. "
+            f"Please increase MM_PAD_SHIFT_VALUE in schedule_batch.py."
+        )
 
 
 class BaseFinishReason:
@@ -262,7 +274,7 @@ class MultimodalDataItem:
             import uuid
 
             self.hash = uuid.uuid4().int
-            self.pad_value = self.hash % (1 << 30)
+            self.pad_value = MM_PAD_SHIFT_VALUE + (self.hash % (1 << 30))
             return
         if self.hash is None:
             if self.feature is not None:
@@ -271,7 +283,7 @@ class MultimodalDataItem:
                 hashed_feature = self.precomputed_embeddings
             self.hash = hash_feature(hashed_feature)
         assert self.hash is not None
-        self.pad_value = self.hash % (1 << 30)
+        self.pad_value = MM_PAD_SHIFT_VALUE + (self.hash % (1 << 30))
 
     def is_modality(self, modality: Modality) -> bool:
         return self.modality == modality
