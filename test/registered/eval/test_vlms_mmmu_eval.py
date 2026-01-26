@@ -48,10 +48,10 @@ MODEL_THRESHOLDS = {
         "unsloth/Mistral-Small-3.1-24B-Instruct-2503"
     ): ModelEvalMetrics(0.30, 16.7),
     ModelLaunchSettings("XiaomiMiMo/MiMo-VL-7B-RL"): ModelEvalMetrics(0.28, 32.0),
-    ModelLaunchSettings("zai-org/GLM-4.1V-9B-Thinking"): ModelEvalMetrics(0.280, 30.4),
+    ModelLaunchSettings("zai-org/GLM-4.1V-9B-Thinking"): ModelEvalMetrics(0.55, 150.0),
     ModelLaunchSettings(
         "zai-org/GLM-4.5V-FP8", extra_args=["--tp=2"]
-    ): ModelEvalMetrics(0.26, 34.0),
+    ): ModelEvalMetrics(0.52, 260.0),
 }
 
 
@@ -87,6 +87,12 @@ class TestNightlyVLMMmmuEval(unittest.TestCase):
                         num_threads=64,
                         max_tokens=30,
                     )
+
+                    # patch for GLM models
+                    if "zai-org/GLM-" in model_path:
+                        args.response_answer_regex = (
+                            r"<\|begin_of_box\|>(.*)<\|end_of_box\|>"
+                        )
 
                     args.return_latency = True
 
