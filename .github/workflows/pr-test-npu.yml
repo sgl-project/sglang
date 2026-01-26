@@ -204,7 +204,7 @@ jobs:
   per-commit-16-npu-a3:
     needs: [check-changes, pr-gate]
     if: needs.check-changes.outputs.main_package == 'true'
-    runs-on: linux-aarch64-a3-16
+    runs-on: linux-aarch64-910a3-16
     strategy:
       fail-fast: true
       matrix:
