@@ -1078,11 +1078,20 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
 
         # Keep parameter objects to preserve weight_loader attrs for hot reload.
-        # Prefer in-place copy to avoid changing storage pointers (cuda graph safety).
-        layer.w13_weight.data.copy_(w13_q)
-        layer.w2_weight.data.copy_(w2_q)
-        layer.w13_weight_scale_inv.data.copy_(w13_s)
-        layer.w2_weight_scale_inv.data.copy_(w2_s)
+        # Prefer in-place copy; rebind only when shape/dtype changes (online quantize).
+        def _copy_or_rebind(param: Parameter, new_value: torch.Tensor) -> None:
+            if (
+                param.data.shape == new_value.shape
+                and param.data.dtype == new_value.dtype
+            ):
+                param.data.copy_(new_value)
+            else:
+                param.data = new_value
+
+        _copy_or_rebind(layer.w13_weight, w13_q)
+        _copy_or_rebind(layer.w2_weight, w2_q)
+        _copy_or_rebind(layer.w13_weight_scale_inv, w13_s)
+        _copy_or_rebind(layer.w2_weight_scale_inv, w2_s)
         layer.w13_weight.requires_grad_(False)
         layer.w2_weight.requires_grad_(False)
         layer.w13_weight_scale_inv.requires_grad_(False)
