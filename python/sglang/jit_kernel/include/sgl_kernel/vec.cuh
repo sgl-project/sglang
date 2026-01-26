@@ -45,7 +45,7 @@ template <typename T, std::size_t N>
 struct AlignedVector {
  private:
   /// NOTE: 1. must be pow of two 2. 16 * 8 = 128 byte, which is the max vector size supported by most devices
-  static_assert((N > 0 && (N & (N - 1)) == 0) && sizeof(T) * N <= 16, "CUDA only support at most 128B vector op");
+  static_assert((N > 0 && (N & (N - 1)) == 0) && sizeof(T) * N <= 32, "CUDA only support at most 256B vector op");
   using element_t = typename details::sized_int<T>;
   using storage_t = AlignedStorage<element_t, N>;
 

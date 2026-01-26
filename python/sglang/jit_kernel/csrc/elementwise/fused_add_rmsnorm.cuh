@@ -3,7 +3,9 @@
 
 #include <sgl_kernel/runtime.cuh>
 #include <sgl_kernel/tile.cuh>
+#include <sgl_kernel/type.cuh>
 #include <sgl_kernel/utils.cuh>
+#include <sgl_kernel/vec.cuh>
 
 #include <cooperative_groups/reduce.h>
 #include <tvm/ffi/container/tensor.h>
@@ -13,74 +15,34 @@
 
 namespace {
 
-union U16B_bf162 {
-  int4 load_store_unit;
-  __nv_bfloat162 compute_unit[4];
-};
-
-union U16B_f162 {
-  int4 load_store_unit;
-  __half2 compute_unit[4];
-};
-
-union U32B_bf162 {
-#if __CUDACC_VER_MAJOR__ >= 13
-  longlong4_32a load_store_unit;
-#else
-  longlong4 load_store_unit;
-#endif
-  __nv_bfloat162 compute_unit[8];
-};
-
-union U32B_f162 {
-#if __CUDACC_VER_MAJOR__ >= 13
-  longlong4_32a load_store_unit;
-#else
-  longlong4 load_store_unit;
-#endif
-  __half2 compute_unit[8];
-};
-
 template <typename T, int VEC_SIZE_IN_BYTE>
-struct UVTypeTrait;
+struct VecTypeTrait;
 
 template <>
-struct UVTypeTrait<__nv_bfloat16, 16> {
-  using U = U16B_bf162;
-  using V = int4;
+struct VecTypeTrait<bf16_t, 16> {
+  using vec_t = device::AlignedVector<packed_t<bf16_t>, 4>;
 };
 
 template <>
-struct UVTypeTrait<__half, 16> {
-  using U = U16B_f162;
-  using V = int4;
+struct VecTypeTrait<fp16_t, 16> {
+  using vec_t = device::AlignedVector<packed_t<fp16_t>, 4>;
 };
 
 template <>
-struct UVTypeTrait<__nv_bfloat16, 32> {
-  using U = U32B_bf162;
-#if __CUDACC_VER_MAJOR__ >= 13
-  using V = longlong4_32a;
-#else
-  using V = longlong4;
-#endif
+struct VecTypeTrait<bf16_t, 32> {
+  using vec_t = device::AlignedVector<packed_t<bf16_t>, 8>;
 };
 
 template <>
-struct UVTypeTrait<__half, 32> {
-  using U = U32B_f162;
-#if __CUDACC_VER_MAJOR__ >= 13
-  using V = longlong4_32a;
-#else
-  using V = longlong4;
-#endif
+struct VecTypeTrait<fp16_t, 32> {
+  using vec_t = device::AlignedVector<packed_t<fp16_t>, 8>;
 };
 
 template <typename T>
 SGL_DEVICE T rms(T& val, T& weight, float rsqrt_square_sum);
 
 template <>
-SGL_DEVICE __nv_bfloat162 rms<__nv_bfloat162>(__nv_bfloat162& val, __nv_bfloat162& weight, float rsqrt_square_sum) {
+SGL_DEVICE bf16x2_t rms<bf16x2_t>(bf16x2_t& val, bf16x2_t& weight, float rsqrt_square_sum) {
   float2 valf = __bfloat1622float2(val);
   float2 weightf = __bfloat1622float2(weight);
   return __float22bfloat162_rn(
@@ -88,7 +50,7 @@ SGL_DEVICE __nv_bfloat162 rms<__nv_bfloat162>(__nv_bfloat162& val, __nv_bfloat16
 }
 
 template <>
-SGL_DEVICE __half2 rms<__half2>(__half2& val, __half2& weight, float rsqrt_square_sum) {
+SGL_DEVICE fp16x2_t rms<fp16x2_t>(fp16x2_t& val, fp16x2_t& weight, float rsqrt_square_sum) {
   float2 valf = __half22float2(val);
   float2 weightf = __half22float2(weight);
   return __float22half2_rn(make_float2(valf.x * weightf.x * rsqrt_square_sum, valf.y * weightf.y * rsqrt_square_sum));
@@ -102,57 +64,52 @@ __global__ void fused_add_rmsnorm_reg_kernel(
     uint tokens,
     int vec_hidden_size,
     float eps) {
-  using U = typename UVTypeTrait<T, VEC_SIZE_IN_BYTE>::U;
-  using V = typename UVTypeTrait<T, VEC_SIZE_IN_BYTE>::V;
   constexpr int inner_loop = VEC_SIZE_IN_BYTE == 16 ? 4 : 8;
 
   __shared__ float shared_memory[32];  // Used for CTA reduce
 
-  U u;         // Save input
-  U u_res;     // Save residual
-  U u_weight;  // Save weight
-  U u_out;     // Save output
+  using vec_t = typename VecTypeTrait<T, VEC_SIZE_IN_BYTE>::vec_t;
+  vec_t v;         // Save input
+  vec_t v_res;     // Save residual
+  vec_t v_weight;  // Save weight
+  vec_t v_out;     // Save output
 
   auto token_id = blockIdx.x;
   float2 acc_square = make_float2(0.0f, 0.0f);  // Sum of squares for each thread
 
   if (threadIdx.x < vec_hidden_size) {
     // Compute address
-    V* p = reinterpret_cast<V*>(input) + token_id * vec_hidden_size;
-    V* p_res = reinterpret_cast<V*>(residual) + token_id * vec_hidden_size;
-    const V* p_weight = reinterpret_cast<const V*>(weight);
+    vec_t* p = reinterpret_cast<vec_t*>(input) + token_id * vec_hidden_size;
+    vec_t* p_res = reinterpret_cast<vec_t*>(residual) + token_id * vec_hidden_size;
+    const vec_t* p_weight = reinterpret_cast<const vec_t*>(weight);
 
     // Load data
-    u.load_store_unit = p[threadIdx.x];
-    u_res.load_store_unit = p_res[threadIdx.x];
-    if constexpr (std::is_same_v<V, int4>) {
-      u_weight.load_store_unit = __ldg(&p_weight[threadIdx.x]);
-    } else {
-      u_weight.load_store_unit = p_weight[threadIdx.x];  // The longlong4_32a has no overloaded __ldg
-    }
+    v = p[threadIdx.x];
+    v_res = p_res[threadIdx.x];
+    v_weight = p_weight[threadIdx.x];
 
-    if constexpr (std::is_same_v<T, __nv_bfloat16>) {
+    if constexpr (std::is_same_v<T, bf16_t>) {
       for (int i = 0; i < inner_loop; i++) {
-        float2 val = __bfloat1622float2(u.compute_unit[i]);
-        float2 res = __bfloat1622float2(u_res.compute_unit[i]);
+        float2 val = __bfloat1622float2(v[i]);
+        float2 res = __bfloat1622float2(v_res[i]);
         float2 inp_res = make_float2(val.x + res.x, val.y + res.y);
         acc_square.x += inp_res.x * inp_res.x;
         acc_square.y += inp_res.y * inp_res.y;
-        u.compute_unit[i] = __float22bfloat162_rn(inp_res);
+        v[i] = __float22bfloat162_rn(inp_res);
       }
-    } else if constexpr (std::is_same_v<T, __half>) {
+    } else if constexpr (std::is_same_v<T, fp16_t>) {
       for (int i = 0; i < inner_loop; i++) {
-        float2 val = __half22float2(u.compute_unit[i]);
-        float2 res = __half22float2(u_res.compute_unit[i]);
+        float2 val = __half22float2(v[i]);
+        float2 res = __half22float2(v_res[i]);
         float2 inp_res = make_float2(val.x + res.x, val.y + res.y);
         acc_square.x += inp_res.x * inp_res.x;
         acc_square.y += inp_res.y * inp_res.y;
-        u.compute_unit[i] = __float22half2_rn(inp_res);
+        v[i] = __float22half2_rn(inp_res);
       }
     }
 
     // Store inp+res to residual
-    p_res[threadIdx.x] = u.load_store_unit;
+    p_res[threadIdx.x] = v;
   }
 
   // CTA Reduce
@@ -179,10 +136,10 @@ __global__ void fused_add_rmsnorm_reg_kernel(
   if (threadIdx.x < vec_hidden_size) {
     float rsqrt_square_sum = buffer[threadIdx.x / 32];  // Read rsqrt from Shared Memory(Broadcast)
     for (int i = 0; i < inner_loop; i++) {
-      u_out.compute_unit[i] = rms(u.compute_unit[i], u_weight.compute_unit[i], rsqrt_square_sum);
+      v_out[i] = rms(v[i], v_weight[i], rsqrt_square_sum);
     }
-    V* p_out = reinterpret_cast<V*>(input) + token_id * vec_hidden_size;
-    p_out[threadIdx.x] = u_out.load_store_unit;
+    vec_t* p_out = reinterpret_cast<vec_t*>(input) + token_id * vec_hidden_size;
+    p_out[threadIdx.x] = v_out;
   }
 }
 
