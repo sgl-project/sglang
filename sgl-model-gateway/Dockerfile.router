@@ -1,0 +1,37 @@
+# Minimal Dockerfile for building sgl-model-gateway router
+# Usage: docker build -f Dockerfile.router -t sglang-router:custom .
+
+FROM rust:latest AS builder
+
+# Install dependencies for building with OpenSSL
+RUN apt-get update && apt-get install -y \
+    pkg-config \
+    libssl-dev \
+    protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+# Copy the entire sgl-model-gateway directory
+COPY . .
+
+# Build the router binary with ci profile (lighter optimization, less memory)
+# The release profile uses full LTO which requires too much memory
+RUN cargo build --profile ci --bin sgl-model-gateway --features vendored-openssl
+
+# Runtime image - use same base as builder for glibc compatibility
+FROM debian:trixie-slim
+
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    libssl3t64 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy the built binary (from ci profile directory)
+COPY --from=builder /build/target/ci/sgl-model-gateway /usr/local/bin/sgl-model-gateway
+
+# Also create symlinks for alternative names
+RUN ln -s /usr/local/bin/sgl-model-gateway /usr/local/bin/smg && \
+    ln -s /usr/local/bin/sgl-model-gateway /usr/local/bin/sglang-router
+
+ENTRYPOINT ["sgl-model-gateway"]

@@ -114,6 +114,10 @@ impl Router {
                                 let mut response = Response::new(Body::from(body));
                                 *response.status_mut() = status;
                                 *response.headers_mut() = response_headers;
+                                // Add worker URL to response headers for request tracking
+                                if let Ok(header_value) = worker_url.parse() {
+                                    response.headers_mut().insert("x-worker-url", header_value);
+                                }
                                 response
                             }
                             Err(e) => error::internal_error(
@@ -306,7 +310,7 @@ impl Router {
         inject_trace_context_http(&mut headers_with_trace);
         let headers = Some(&headers_with_trace);
 
-        let response = self
+        let mut response = self
             .send_typed_request(
                 headers,
                 typed_req,
@@ -329,6 +333,11 @@ impl Router {
                 metrics_labels::CONNECTION_HTTP,
                 error_type_from_status(status),
             );
+        }
+
+        // Add worker URL to response headers for request tracking
+        if let Ok(header_value) = worker.url().parse() {
+            response.headers_mut().insert("x-worker-url", header_value);
         }
 
         response
@@ -643,7 +652,7 @@ impl Router {
         req: &RerankRequest,
         response: Response,
     ) -> anyhow::Result<Response> {
-        let (_, response_body) = response.into_parts();
+        let (parts, response_body) = response.into_parts();
         let body_bytes = to_bytes(response_body, usize::MAX).await?;
         let rerank_results = serde_json::from_slice::<Vec<RerankResult>>(&body_bytes)?;
         let mut rerank_response =
@@ -655,7 +664,12 @@ impl Router {
         if !req.return_documents {
             rerank_response.drop_documents();
         }
-        Ok(Json(rerank_response).into_response())
+        let mut new_response = Json(rerank_response).into_response();
+        // Preserve x-worker-url header from original response
+        if let Some(worker_url) = parts.headers.get("x-worker-url") {
+            new_response.headers_mut().insert("x-worker-url", worker_url.clone());
+        }
+        Ok(new_response)
     }
 }
 
