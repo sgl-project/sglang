@@ -34,7 +34,6 @@ if IS_CI:
     HIDDEN_SIZE_LIST = [512, 2048]
 else:
     BS_LIST = [2**n for n in range(0, 14)]
-    BS_LIST = [4096]
     HIDDEN_SIZE_LIST = [1536, 3072, 4096, 5120, 8192]
 
 LINE_VALS = ["jit", "fi"]
