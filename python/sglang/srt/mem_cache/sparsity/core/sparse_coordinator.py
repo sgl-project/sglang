@@ -55,13 +55,13 @@ class RequestTrackers:
         self.curr_device_indices = torch.full(
             (max_pool_size, self.device_buffer_cnt // self.page_size),
             -1,
-            dtype=torch.int64,
+            dtype=torch.int32,
             device=device,
         )
         self.last_device_indices = torch.full(
             (max_pool_size, num_layers, self.device_buffer_cnt // self.page_size),
             -1,
-            dtype=torch.int64,
+            dtype=torch.int32,
             device=device,
         )
         self.last_top_k_result = torch.full(
@@ -76,25 +76,12 @@ class RequestTrackers:
             dtype=torch.int64,
             device=device,
         )
-        self.should_load_device_indices = torch.full(
-            (max_pool_size, self.device_buffer_cnt),
-            -1,
-            dtype=torch.int64,
-            device=device,
-        )
-        self.should_load_host_indices = torch.full(
-            (max_pool_size, self.device_buffer_cnt),
-            -1,
-            dtype=torch.int64,
-            device=device,
-        )
+
 
     def _reset_state(self, idx: int) -> None:
         """Reset all tensor states for a request slot."""
         self.req_to_tokens_host[idx].fill_(-1)
         self.curr_device_indices[idx].fill_(-1)
-        self.should_load_device_indices[idx].fill_(-1)
-        self.should_load_host_indices[idx].fill_(-1)
         self.last_top_k_result[idx].fill_(-1)
         self.last_device_indices[idx].fill_(-1)
         self.repr_constructed[idx] = False
@@ -419,7 +406,7 @@ class SparseCoordinator:
         )
 
         # Adapt Attention Metadata
-        return self.backend_adaptor.adapt_for_attn_metadata(
+        result = self.backend_adaptor.adapt_for_attn_metadata(
             selected_indices=selected_indices,
             valid_lengths=valid_lengths,
             sparse_mask=sparse_mask,
@@ -429,6 +416,7 @@ class SparseCoordinator:
             page_size=self.page_size,
             layer_id=layer.layer_id,
         )
+        return result
 
     def _maybe_truncate_kv_cache_after_prompt_offloaded(
         self, req: "Req", req_to_token_pool, tree_cache

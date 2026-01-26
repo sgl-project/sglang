@@ -4,7 +4,7 @@ import logging
 from typing import TYPE_CHECKING, Optional
 
 import torch
-from sgl_kernel.kvcacheio import (
+from sglang.jit_kernel.sparse import (
     load_cache_to_device_buffer,
     load_cache_to_device_buffer_mla,
 )
@@ -118,44 +118,51 @@ class SparseKVCacheManager:
         """
         bs = sparse_mask.shape[0]
 
-        # TODO：Refactor this part, inject into the kernel
-        if not sparse_mask.any():
-            return page_table[req_pool_indices, :]
-
+        block_size = 512 if top_k_result.size(1) == 2048 else 32
         if isinstance(self.mem_pool_device, MLATokenToKVPool):
             load_cache_to_device_buffer_mla(
-                top_k_result,
-                self.req_states.last_top_k_result,
-                self.req_states.req_to_tokens_host,
-                self.req_states.last_device_indices,
-                self.mem_pool_host.kv_buffer[layer_id],
-                self.mem_pool_device.kv_buffer[layer_id],
-                self.req_states.curr_device_indices,
-                req_pool_indices,
-                page_size,
-                layer_id,
-                self.mem_pool_host.token_stride_size,
+                top_k_tokens=top_k_result,
+                device_buffer_tokens=self.req_states.last_top_k_result,
+                host_cache_locs=self.req_states.req_to_tokens_host,
+                device_buffer_locs=self.req_states.last_device_indices,
+                host_cache=self.mem_pool_host.kv_buffer[layer_id],
+                device_buffer=self.mem_pool_device.kv_buffer[layer_id],
+                top_k_device_locs=self.req_states.curr_device_indices,
+                page_table=page_table,
+                diff_map=self.bitmap,
+                req_pool_indices=req_pool_indices,
+                sparse_mask=sparse_mask,
+                seq_lens=seq_lens,
+                page_size=page_size,
+                layer_id=layer_id,
+                item_size_bytes=self.mem_pool_host.token_stride_size,
+                block_size=block_size,
             )
         else:
             load_cache_to_device_buffer(
-                top_k_result,
-                self.req_states.last_top_k_result,
-                self.req_states.req_to_tokens_host,
-                self.req_states.last_device_indices,
-                self.mem_pool_host.k_buffer[layer_id],
-                self.mem_pool_host.v_buffer[layer_id],
-                self.mem_pool_device.k_buffer[layer_id],
-                self.mem_pool_device.v_buffer[layer_id],
-                self.req_states.curr_device_indices,
-                req_pool_indices,
-                page_size,
-                layer_id,
-                self.mem_pool_host.token_stride_size,
+                top_k_tokens=top_k_result,
+                device_buffer_tokens=self.req_states.last_top_k_result,
+                host_cache_locs=self.req_states.req_to_tokens_host,
+                device_buffer_locs=self.req_states.last_device_indices,
+                host_cache_k=self.mem_pool_host.k_buffer[layer_id],
+                host_cache_v=self.mem_pool_host.v_buffer[layer_id],
+                device_buffer_k=self.mem_pool_device.k_buffer[layer_id],
+                device_buffer_v=self.mem_pool_device.v_buffer[layer_id],
+                top_k_device_locs=self.req_states.curr_device_indices,
+                page_table=page_table,
+                diff_map=self.bitmap,
+                req_pool_indices=req_pool_indices,
+                sparse_mask=sparse_mask,
+                seq_lens=seq_lens,
+                page_size=page_size,
+                layer_id=layer_id,
+                item_size_bytes=self.mem_pool_host.token_stride_size,
+                block_size=block_size,
             )
 
         return self.req_states.curr_device_indices[
             :bs, : self.req_states.topk_tokens_cnt // page_size
-        ].to(torch.int32)
+        ]
 
     def offload_decode_token_kvcache(
         self, req_pool_indices, device_cache_locs, seq_lens
