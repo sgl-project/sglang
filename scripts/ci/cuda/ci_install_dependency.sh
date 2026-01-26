@@ -137,9 +137,11 @@ if [ "${CUSTOM_BUILD_SGL_KERNEL:-}" = "true" ] && [ -d "sgl-kernel/dist" ]; then
     $PIP_CMD install sgl-kernel/dist/sgl_kernel-${SGL_KERNEL_VERSION_FROM_KERNEL}-cp310-abi3-manylinux2014_${WHEEL_ARCH}.whl --force-reinstall $PIP_INSTALL_SUFFIX
 elif [ "${CUSTOM_BUILD_SGL_KERNEL:-}" = "true" ] && [ ! -d "sgl-kernel/dist" ]; then
     # CUSTOM_BUILD_SGL_KERNEL was set but artifacts not available (e.g., stage rerun without wheel build)
-    # Fall back to installing from PyPI
-    echo "WARNING: CUSTOM_BUILD_SGL_KERNEL=true but sgl-kernel/dist not found, falling back to PyPI"
-    $PIP_CMD install sgl-kernel==${SGL_KERNEL_VERSION_FROM_SRT} --force-reinstall $PIP_INSTALL_SUFFIX
+    # Fail instead of falling back to PyPI - we need to test the built kernel, not PyPI version
+    echo "ERROR: CUSTOM_BUILD_SGL_KERNEL=true but sgl-kernel/dist not found."
+    echo "This usually happens when rerunning a stage without the sgl-kernel-build-wheels job."
+    echo "Please re-run the full workflow using /tag-and-rerun-ci to rebuild the kernel."
+    exit 1
 else
     # On Blackwell machines, skip reinstall if correct version already installed to avoid race conditions
     if [ "$IS_BLACKWELL" = "1" ]; then
