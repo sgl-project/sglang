@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+// Adapted from
+// https://github.com/NVIDIA/TensorRT-LLM/tree/v1.2.0rc4/cpp/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/ada_blockwise_gemm/sm89_fp8_gemm_1d1d.cuh
 #pragma once
 
 #include "sm89_utils.cuh"

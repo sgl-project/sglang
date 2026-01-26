@@ -14,6 +14,9 @@
  * limitations under the License.
  */
 
+// Adapted from
+// https://github.com/NVIDIA/TensorRT-LLM/tree/v1.2.0rc4/cpp/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/ada_blockwise_gemm/sm89_utils.cuh
+
 #pragma once
 #if (__CUDACC_VER_MAJOR__ > 11 || (__CUDACC_VER_MAJOR__ == 11 && __CUDACC_VER_MINOR__ >= 8))
 #define CUTLASS_ARCH_MMA_SM89_SUPPORTED 1
