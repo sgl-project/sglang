@@ -499,6 +499,9 @@ class ModelPool:
 
         # Build environment
         env = os.environ.copy()
+        spec_env = spec.get("env", {})
+        if spec_env:
+            env.update(spec_env)
         if gpu_slot:
             env["CUDA_VISIBLE_DEVICES"] = gpu_slot.cuda_visible_devices()
 

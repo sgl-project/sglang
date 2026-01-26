@@ -62,6 +62,10 @@ MODEL_SPECS: dict[str, dict] = {
         "tp": 1,
         "features": ["chat", "streaming"],
         "worker_args": ["--trust-remote-code"],
+        "env": {
+            "SGLANG_IS_FLASHINFER_AVAILABLE": "0",
+            "SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK": "1",
+        },
     },
     # Reasoning model
     "deepseek-7b": {
