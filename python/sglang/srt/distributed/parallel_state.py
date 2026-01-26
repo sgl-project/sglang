@@ -1599,6 +1599,10 @@ def initialize_model_parallel(
             parallelism.
         pipeline_model_parallel_size: number of GPUs used for pipeline model
             parallelism.
+        attention_context_model_parallel_size: number of GPUs used for attention context
+            parallelism.
+        moe_context_model_parallel_size: number of GPUs used for moe context
+            parallelism.
 
     Let's say we have a total of 8 GPUs denoted by g0 ... g7 and we
     use 2 GPUs to parallelize the model tensor, and 4 GPUs to parallelize
@@ -1608,6 +1612,20 @@ def initialize_model_parallel(
             [g0, g1], [g2, g3], [g4, g5], [g6, g7]
         2 pipeline model-parallel groups:
             [g0, g2, g4, g6], [g1, g3, g5, g7]
+
+    Let's say we use 2 GPUs for attention context parallelism (attn_cp_size=2) and 4 GPUs for
+    attention tensor parallelism (attn_tp_size=4). As for MoE part, we use 2 GPUs for moe context
+    parallelism (moe_ep_size=2) and 4 GPUs for moe expert parallelism (moe_ep_size=4). The present
+    function will create the following groups:
+        2 tensor model-parallel groups:
+            [g0, g1, g2, g3], [g4, g5, g6, g7]
+        4 attention context-parallel groups:
+            [g0, g4], [g1, g5], [g2, g6], [g3, g7]
+        2 moe expert-parallel groups:
+            [g0, g1, g2, g3], [g4, g5, g6, g7]
+        4 moe context-parallel groups:
+            [g0, g4], [g1, g5], [g2, g6], [g3, g7]
+
     Note that for efficiency, the caller should make sure adjacent ranks
     are on the same DGX box. For example if we are using 2 DGX-1 boxes
     with a total of 16 GPUs, rank 0 to 7 belong to the first box and
@@ -1630,9 +1648,12 @@ def initialize_model_parallel(
     global _TP
     assert _TP is None, "tensor model parallel group is already initialized"
     group_ranks = []
-    for i in range(num_tensor_model_parallel_groups):
+    for tp_group_idx in range(num_tensor_model_parallel_groups):
         ranks = list(
-            range(i * tensor_model_parallel_size, (i + 1) * tensor_model_parallel_size)
+            range(
+                tp_group_idx * tensor_model_parallel_size,
+                (tp_group_idx + 1) * tensor_model_parallel_size,
+            )
         )
         group_ranks.append(ranks)
 
@@ -1679,18 +1700,18 @@ def initialize_model_parallel(
         _ATTN_CP = _TP
     else:
         group_ranks = []
-        for i in range(num_tensor_model_parallel_groups):
-            for j in range(attn_dp_size):
-                for k in range(attn_tp_size):
+        for tp_group_idx in range(num_tensor_model_parallel_groups):
+            for dp_idx in range(attn_dp_size):
+                for attn_tp_idx in range(attn_tp_size):
                     st = (
-                        i * tensor_model_parallel_size
-                        + j * attn_tp_size * attn_cp_size
-                        + k
+                        tp_group_idx * tensor_model_parallel_size
+                        + dp_idx * attn_tp_size * attn_cp_size
+                        + attn_tp_idx
                     )
                     en = (
-                        i * tensor_model_parallel_size
-                        + (j + 1) * attn_tp_size * attn_cp_size
-                        + k
+                        tp_group_idx * tensor_model_parallel_size
+                        + (dp_idx + 1) * attn_tp_size * attn_cp_size
+                        + attn_tp_idx
                     )
                     ranks = list(range(st, en, attn_tp_size))
                     group_ranks.append(ranks)
@@ -1711,10 +1732,16 @@ def initialize_model_parallel(
         _ATTN_TP = _TP
     else:
         group_ranks = []
-        for i in range(num_tensor_model_parallel_groups):
-            for j in range(attn_cp_size * attn_dp_size):
-                st = i * tensor_model_parallel_size + j * attn_tp_size
-                en = i * tensor_model_parallel_size + (j + 1) * attn_tp_size
+        for tp_group_idx in range(num_tensor_model_parallel_groups):
+            for cp_dp_combined_idx in range(attn_cp_size * attn_dp_size):
+                st = (
+                    tp_group_idx * tensor_model_parallel_size
+                    + cp_dp_combined_idx * attn_tp_size
+                )
+                en = (
+                    tp_group_idx * tensor_model_parallel_size
+                    + (cp_dp_combined_idx + 1) * attn_tp_size
+                )
                 ranks = list(range(st, en))
                 group_ranks.append(ranks)
         _ATTN_TP = init_model_parallel_group(
@@ -1736,10 +1763,12 @@ def initialize_model_parallel(
         _MOE_CP = _TP
     else:
         group_ranks = []
-        for i in range(num_tensor_model_parallel_groups):
-            for j in range(moe_tp_size * moe_ep_size):
-                st = i * tensor_model_parallel_size + j
-                en = (i + 1) * tensor_model_parallel_size + j
+        for tp_group_idx in range(num_tensor_model_parallel_groups):
+            for tp_ep_combined_idx in range(moe_tp_size * moe_ep_size):
+                st = tp_group_idx * tensor_model_parallel_size + tp_ep_combined_idx
+                en = (
+                    tp_group_idx + 1
+                ) * tensor_model_parallel_size + tp_ep_combined_idx
                 ranks = list(range(st, en, moe_tp_size * moe_ep_size))
                 group_ranks.append(ranks)
         _MOE_CP = init_model_parallel_group(
@@ -1756,13 +1785,13 @@ def initialize_model_parallel(
     else:
         # TODO(ch-wan): use split_group to save memory
         group_ranks = []
-        for i in range(num_tensor_model_parallel_groups):
-            for j in range(moe_cp_size):
-                for k in range(moe_tp_size):
+        for tp_group_idx in range(num_tensor_model_parallel_groups):
+            for moe_cp_idx in range(moe_cp_size):
+                for moe_tp_idx in range(moe_tp_size):
                     st = (
-                        i * tensor_model_parallel_size
-                        + j * moe_ep_size * moe_tp_size
-                        + k
+                        tp_group_idx * tensor_model_parallel_size
+                        + moe_cp_idx * moe_ep_size * moe_tp_size
+                        + moe_tp_idx
                     )
                     en = st + moe_ep_size * moe_tp_size
                     ranks = list(range(st, en, moe_tp_size))
@@ -1781,10 +1810,16 @@ def initialize_model_parallel(
     else:
         # TODO(ch-wan): use split_group to save memory
         group_ranks = []
-        for i in range(num_tensor_model_parallel_groups):
-            for j in range(moe_ep_size * moe_cp_size):
-                st = i * tensor_model_parallel_size + j * moe_tp_size
-                en = i * tensor_model_parallel_size + (j + 1) * moe_tp_size
+        for tp_group_idx in range(num_tensor_model_parallel_groups):
+            for ep_cp_combined_idx in range(moe_ep_size * moe_cp_size):
+                st = (
+                    tp_group_idx * tensor_model_parallel_size
+                    + ep_cp_combined_idx * moe_tp_size
+                )
+                en = (
+                    tp_group_idx * tensor_model_parallel_size
+                    + (ep_cp_combined_idx + 1) * moe_tp_size
+                )
                 ranks = list(range(st, en))
                 group_ranks.append(ranks)
         _MOE_TP = init_model_parallel_group(
@@ -1799,8 +1834,10 @@ def initialize_model_parallel(
     global _PP
     assert _PP is None, "pipeline model parallel group is already initialized"
     group_ranks = []
-    for i in range(num_pipeline_model_parallel_groups):
-        ranks = list(range(i, world_size, num_pipeline_model_parallel_groups))
+    for pp_group_idx in range(num_pipeline_model_parallel_groups):
+        ranks = list(
+            range(pp_group_idx, world_size, num_pipeline_model_parallel_groups)
+        )
         group_ranks.append(ranks)
     # pipeline parallel does not need custom allreduce
     _PP = init_model_parallel_group(
@@ -2033,6 +2070,16 @@ def destroy_model_parallel():
     if _MOE_TP:
         _MOE_TP.destroy()
     _MOE_TP = None
+
+    global _ATTN_CP
+    if _ATTN_CP:
+        _ATTN_CP.destroy()
+    _ATTN_CP = None
+
+    global _MOE_CP
+    if _MOE_CP:
+        _MOE_CP.destroy()
+    _MOE_CP = None
 
     global _PDMUX_PREFILL_TP_GROUP
     if _PDMUX_PREFILL_TP_GROUP:  # type: ignore[union-attr]

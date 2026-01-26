@@ -2043,20 +2043,29 @@ class ServerArgs:
 
     def _handle_context_parallelism(self):
         if self.attn_cp_size > 1:
+            # The tp_size is the world size, not the real tensor parallel size
             assert (
                 self.tp_size % self.attn_cp_size == 0
             ), "tp_size must be divisible by attn_cp_size"
             assert (
                 self.dp_size * self.attn_cp_size <= self.tp_size
             ), "dp_size * attn_cp_size must be less than or equal to tp_size"
+            assert self.pp_size == 1, "PP is not supported with context parallelism"
 
         if self.moe_cp_size > 1:
+            # The tp_size is the world size, not the real tensor parallel size
             assert (
                 self.tp_size % self.moe_cp_size == 0
             ), "tp_size must be divisible by moe_cp_size"
             assert (
                 self.ep_size * self.moe_cp_size <= self.tp_size
             ), "ep_size * moe_cp_size must be less than or equal to tp_size"
+            assert self.pp_size == 1, "PP is not supported with context parallelism"
+
+            if self.ep_size > 1:
+                assert (
+                    self.ep_size * self.moe_cp_size == self.tp_size
+                ), "ep_size * moe_cp_size must be equal to tp_size"
 
     def _handle_data_parallelism(self):
         if self.dp_size == 1:

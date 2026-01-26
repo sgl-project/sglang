@@ -750,6 +750,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             # there is no reduce-scatter in LM logprob, so we do not need to adjust the padded length for logprob
             global_num_tokens[i] = ceil_align(global_num_tokens[i], attn_tp_size)
 
+        # make sure that each rank has the same number of tokens to do collective communication.
         attn_cp_size = get_attention_cp_size()
         for i in range(sync_group_size):
             global_num_tokens[i] = ceil_align(global_num_tokens[i], attn_cp_size)

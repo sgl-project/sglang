@@ -451,6 +451,10 @@ class DataParallelController:
                 attn_dp_size = (
                     server_args.dp_size if server_args.enable_dp_attention else 1
                 )
+
+                # Parallelism hierarchy (outermost to innermost):
+                # - Attention: Global(TP) -> DP -> ATTN_CP -> ATTN_TP (innermost)
+                # - MoE: Global(TP) -> MOE_CP -> EP -> MOE_TP (innermost)
                 attn_tp_size = (
                     server_args.tp_size // attn_dp_size // server_args.attn_cp_size
                 )
