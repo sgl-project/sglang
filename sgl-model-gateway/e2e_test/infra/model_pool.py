@@ -6,9 +6,11 @@ import logging
 import os
 import signal
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import httpx
@@ -33,6 +35,48 @@ from .model_specs import MODEL_SPECS, get_model_spec
 from .process_utils import detect_ib_device
 
 logger = logging.getLogger(__name__)
+_GRPC_PROTO_READY = False
+
+
+def _ensure_grpc_proto_generated() -> None:
+    """Generate gRPC stubs on-demand for gRPC worker launches."""
+    global _GRPC_PROTO_READY
+    if _GRPC_PROTO_READY:
+        return
+
+    repo_root = Path(__file__).resolve().parents[3]
+    grpc_dir = repo_root / "python" / "sglang" / "srt" / "grpc"
+    expected = [
+        grpc_dir / "sglang_encoder_pb2.py",
+        grpc_dir / "sglang_encoder_pb2_grpc.py",
+        grpc_dir / "sglang_encoder_pb2.pyi",
+        grpc_dir / "sglang_scheduler_pb2.py",
+        grpc_dir / "sglang_scheduler_pb2_grpc.py",
+        grpc_dir / "sglang_scheduler_pb2.pyi",
+    ]
+
+    if all(path.exists() for path in expected):
+        _GRPC_PROTO_READY = True
+        return
+
+    compile_script = grpc_dir / "compile_proto.py"
+    if not compile_script.exists():
+        raise RuntimeError("compile_proto.py missing; cannot generate gRPC stubs")
+
+    for proto_file in ("sglang_scheduler.proto", "sglang_encoder.proto"):
+        result = subprocess.run(
+            [sys.executable, str(compile_script), "--proto-file", proto_file],
+            cwd=grpc_dir,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            detail = result.stderr.strip() or result.stdout.strip()
+            raise RuntimeError(
+                f"Failed to generate gRPC stubs for {proto_file}: {detail}"
+            )
+
+    _GRPC_PROTO_READY = True
 
 
 @dataclass(frozen=True)
@@ -523,6 +567,7 @@ class ModelPool:
         ]
 
         if mode == ConnectionMode.GRPC:
+            _ensure_grpc_proto_generated()
             cmd.append("--grpc-mode")
 
         # Embedding model flag
