@@ -597,6 +597,9 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         self.pp_group = get_pp_group()
         self.config = config
         self.use_data_parallel = get_global_server_args().mm_enable_dp_encoder
+        self.enable_batch_compute_mm_embeddings = (
+            get_global_server_args().enable_batch_compute_mm_embeddings
+        )
 
         if not self.config.encoder_only:
             self.model = Qwen2Model(
@@ -645,11 +648,21 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
+    def get_mm_dp_metadata(self):
+        return self.visual.spatial_merge_unit, "rope_3d"
+
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         # in qwen-vl, last dim is the same
         pixel_values = torch.cat([item.feature for item in items], dim=0).type(
             self.visual.dtype
         )
+        if pixel_values.shape[0] == 0:
+            if self.use_data_parallel:
+                return torch.empty(
+                    (0, self.visual.out_hidden_size),
+                    device=pixel_values.device,
+                    dtype=pixel_values.dtype,
+                )
         image_grid_thw = torch.concat([item.image_grid_thw for item in items], dim=0)
 
         expected_dim = getattr(self.visual, "embed_dim", -1)
@@ -672,7 +685,7 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
 
         assert pixel_values.dim() == 2, pixel_values.dim()
         assert image_grid_thw.dim() == 2, image_grid_thw.dim()
-        if self.use_data_parallel:
+        if self.use_data_parallel and (not self.enable_batch_compute_mm_embeddings):
             return run_dp_sharded_mrope_vision_model(
                 self.visual, pixel_values, image_grid_thw.tolist(), rope_type="rope_3d"
             )

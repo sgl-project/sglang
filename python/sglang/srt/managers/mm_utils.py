@@ -549,8 +549,8 @@ def get_embedding_items_per_chunk_with_extra_padding(
     return selected_items
 
 
-# TODO: To be obsoleted after MM batch scheduling enabled.
-def _get_chunked_prefill_embedding_ori(
+# TODO: To be obsoleted after MM batch scheduling enabled by default.
+def _get_chunked_prefill_embedding_per_req(
     data_embedding_func: DataEmbeddingFunc,
     embedding_items: List[MultimodalDataItem],
     items_size: List[int],
@@ -644,9 +644,9 @@ def _get_chunked_prefill_embedding(
             input_ids,
             modality,
         )
-        # return batch_compute_embedding
+        return batch_compute_embedding, batch_input_ids
 
-    ori_embedding, input_ids = _get_chunked_prefill_embedding_ori(
+    embedding, input_ids = _get_chunked_prefill_embedding_per_req(
         data_embedding_func,
         embedding_items,
         items_size,
@@ -655,11 +655,22 @@ def _get_chunked_prefill_embedding(
         items_offset_list,
         input_ids,
     )
-    if batch_compute_embedding is not None:
-        assert torch.equal(batch_compute_embedding, ori_embedding)
-        assert torch.equal(batch_input_ids, input_ids)
-        print("equal!!!")
-    return ori_embedding, input_ids
+    # if batch_compute_embedding is not None:
+    #     try:
+    #         assert torch.equal(batch_compute_embedding, embedding)
+    #         assert torch.equal(batch_input_ids, input_ids)
+    #     except AssertionError:
+    #         print(f"{batch_compute_embedding.shape=}")
+    #         print(f"{embedding.shape=}")
+    #         diff = batch_compute_embedding - embedding
+    #         if not torch.all(diff == 0):
+    #             non_zero_indices = torch.nonzero(diff)
+    #             print(f"Non-zero differences found at indices: {non_zero_indices}")
+    #             print(f"diff max {torch.max(diff)}, diff mean {torch.mean(diff)}")
+    #         raise
+    #     print("equal!!!")
+    #     print("="*100)
+    return embedding, input_ids
 
 
 def _get_chunked_prefill_embedding_batch(
@@ -717,7 +728,7 @@ def _get_chunked_prefill_embedding_batch(
         else:
             all_req_embedding_list.append((i, embedding_per_req))
 
-    if enable_batch_compute:
+    if enable_batch_compute and len(pixel_values_list) > 0 and len(grid_thw_list) > 0:
         cum_token_num_list = [0] + list(np.cumsum(new_compute_req_token_num_list))
         pixel_values = torch.cat(pixel_values_list, dim=0)
         grid_thw = torch.cat(grid_thw_list, dim=0)
@@ -815,6 +826,7 @@ def _get_chunked_prefill_embedding_batch(
         else:
             assert req_items_hash_map[i] is not None
             if enable_batch_compute:
+                embeddings_all_rank = cache_miss_items["batch"]
                 embeddings_per_req = embeddings_all_rank[
                     cum_token_num_list[new_computed_req_index] : cum_token_num_list[
                         new_computed_req_index + 1
@@ -842,6 +854,7 @@ def _get_chunked_prefill_embedding_batch(
 
         extend_prefix_len = prefix_length[i]
         extend_seq_len = extend_length[i] if i < len(extend_length) else 0
+        items_offset = items_offset_list[i]
 
         if isinstance(embeddings_per_req, EVSEmbeddingResult):
             item = embedding_items_per_req[0]
