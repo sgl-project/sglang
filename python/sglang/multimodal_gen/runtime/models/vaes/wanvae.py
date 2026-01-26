@@ -19,6 +19,7 @@
 import contextvars
 from contextlib import contextmanager
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -218,10 +219,41 @@ class WanCausalConv3d(nn.Conv3d):
         )  # casting needed for mps since amp isn't supported
         return super().forward(x)
 
+def sp_should_padding(x: torch.Tensor, world_size: int = 1, dim: int = -2):
+    len_to_padding = (int(math.ceil(x.shape[dim] / world_size)) * world_size) - x.shape[dim]
+    return len_to_padding != 0, len_to_padding
+
+def sp_pad(x: torch.Tensor, len_to_pad: int, dim: int = -2):
+    x = torch.cat([
+        x,
+        torch.zeros(
+            *x.shape[:dim],
+            len_to_pad,
+            *x.shape[dim+1:],
+            dtype=x.dtype,
+            device=x.device
+        )
+    ], dim=dim)
+
+    return x
+
+def sp_chunk(x: torch.Tensor, dim: int = -2, world_size: int = 1, rank: int = 0):
+    if x is None:
+        return None
+
+    if world_size <= 1:
+        return x
+
+    need_padding, len_to_padding = sp_should_padding(x, world_size=world_size, dim=dim)
+    if need_padding:
+        x = sp_pad(x, len_to_padding, dim=dim)
+
+    return torch.chunk(x, world_size, dim=dim)[rank]
+
 def halo_exchange(x: torch.Tensor, height_halo_size: int = 1) -> torch.Tensor:
     if height_halo_size == 0:
         return x
-    
+
     rank = get_sp_parallel_rank()
     world_size = get_sp_world_size()
 
@@ -1477,6 +1509,7 @@ class WanDecoder3d(nn.Module):
             self.mid_block = WanDistMidBlock(dims[0], dropout, non_linearity, num_layers=1)
 
             # upsample blocks
+            self.upsample_count = 0
             self.up_blocks = nn.ModuleList([])
             for i, (in_dim, out_dim) in enumerate(zip(dims[:-1], dims[1:], strict=True)):
                 # residual (+attention) blocks
@@ -1514,6 +1547,8 @@ class WanDecoder3d(nn.Module):
                         non_linearity=non_linearity,
                     )
                 self.up_blocks.append(up_block)
+                if up_flag:
+                    self.upsample_count += 1
 
             # output blocks
             self.norm_out = WanRMS_norm(out_dim, images=False)
@@ -1577,7 +1612,9 @@ class WanDecoder3d(nn.Module):
 
         if self.use_parallel_decode and world_size > 1:
             rank = get_sp_parallel_rank()
-            x = torch.chunk(x, world_size, dim=-2)[rank]
+            expected_height = x.shape[-2] * (2 ** self.upsample_count)
+            print(f"Rank{rank} {expected_height=}")
+            x = sp_chunk(x, dim=-2, world_size=world_size, rank=rank)
 
         ## conv1
         _feat_cache = feat_cache.get()
@@ -1642,6 +1679,9 @@ class WanDecoder3d(nn.Module):
             tensor_list = [torch.empty_like(x) for _ in range(world_size)]
             dist.all_gather(tensor_list, x)
             x = torch.concat(tensor_list, dim=-2)
+
+            if x.shape[-2] != expected_height:
+                x = x[..., :expected_height, :].contiguous()
 
         return x
 
