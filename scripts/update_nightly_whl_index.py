@@ -5,7 +5,7 @@ Update the wheel index for nightly SGLang releases.
 This script generates a PyPI-compatible index.html file at cu{version}/sglang/index.html
 containing all historical nightly builds, ordered by commit count (newest first).
 
-The CUDA version is automatically detected from the cuda-python dependency in pyproject.toml.
+The CUDA version is specified via the --cuda-version argument.
 
 Reference: https://github.com/flashinfer-ai/flashinfer/blob/v0.2.0/scripts/update_whl_index.py
 """
@@ -25,33 +25,17 @@ def compute_sha256(file_path: pathlib.Path) -> str:
     return sha256_hash.hexdigest()
 
 
-def detect_cuda_version() -> str:
-    """Detect CUDA version from pyproject.toml cuda-python dependency.
-
-    Returns:
-        CUDA version string like "cu129" or "cu130"
-    """
-    pyproject_path = pathlib.Path("python/pyproject.toml")
-    content = pyproject_path.read_text()
-
-    # Match cuda-python==12.9 or cuda-python==13.0, etc.
-    match = re.search(r'"cuda-python==(\d+)\.(\d+)"', content)
-    if match:
-        major, minor = match.groups()
-        return f"cu{major}{minor}"  # "cu129" or "cu130"
-
-    raise ValueError("cuda-python dependency not found in pyproject.toml")
-
-
-def update_wheel_index(commit_hash: str, nightly_version: str, build_date: str = None):
+def update_wheel_index(
+    commit_hash: str, nightly_version: str, cuda_version: str, build_date: str = None
+):
     """Update the wheel index for nightly releases.
 
     Creates an index at cu{version}/sglang/index.html containing all historical nightlies.
-    The CUDA version is automatically detected from pyproject.toml.
 
     Args:
         commit_hash: Short git commit hash (e.g., 'c5f1e86')
         nightly_version: Full nightly version string (e.g., '0.5.6.post1.dev7716+gc5f1e86')
+        cuda_version: CUDA version string (e.g., '129' or '130')
         build_date: Build date in YYYY-MM-DD format (e.g., '2025-12-13')
     """
     dist_dir = pathlib.Path("dist")
@@ -61,9 +45,10 @@ def update_wheel_index(commit_hash: str, nightly_version: str, build_date: str =
         print(f"Warning: {dist_dir} does not exist, skipping index update")
         return
 
-    # Detect CUDA version from pyproject.toml
-    cuda_version = detect_cuda_version()
-    print(f"Detected CUDA version: {cuda_version}")
+    # Format CUDA version with 'cu' prefix if not already present
+    if not cuda_version.startswith("cu"):
+        cuda_version = f"cu{cuda_version}"
+    print(f"Using CUDA version: {cuda_version}")
 
     # Base URL for wheels stored in GitHub Releases
     base_url = "https://github.com/sgl-project/whl/releases/download"
@@ -188,6 +173,12 @@ def main():
         help="Full nightly version string (e.g., '0.5.6.post1.dev7716+gc5f1e86')",
     )
     parser.add_argument(
+        "--cuda-version",
+        type=str,
+        default="129",
+        help="CUDA version (e.g., '129' or '130'). Defaults to '129'.",
+    )
+    parser.add_argument(
         "--build-date",
         type=str,
         required=False,
@@ -199,10 +190,13 @@ def main():
     print(f"Updating nightly wheel index")
     print(f"  Commit: {args.commit_hash}")
     print(f"  Version: {args.nightly_version}")
+    print(f"  CUDA version: {args.cuda_version}")
     if args.build_date:
         print(f"  Build date: {args.build_date}")
 
-    update_wheel_index(args.commit_hash, args.nightly_version, args.build_date)
+    update_wheel_index(
+        args.commit_hash, args.nightly_version, args.cuda_version, args.build_date
+    )
 
 
 if __name__ == "__main__":
