@@ -57,7 +57,6 @@ jobs:
             main_package:
               - "python/sglang/!(multimodal_gen)/**"
               - "python/pyproject_cpu.toml"
-              - "scripts/ci/**"
               - "test/**"
               - "sgl-kernel/**"
               - ".github/workflows/pr-test-xeon.yml"
