@@ -13,7 +13,7 @@ you encounter issues or have any questions, please [open an issue](https://githu
 | Deepseek-R1   | Atlas 800I A3 | 32      | PD Separation | 3.9K-1K   | W8A8         | [Optimal Configuration](#deepseek-r1-low-latency-20ms-2) |
 | Deepseek-R1   | Atlas 800I A3 | 32      | PD Separation | 3.5K-1.5K | W8A8         | [Optimal Configuration](#deepseek-r1-low-latency-20ms-3) |
 | Deepseek-R1   | Atlas 800I A3 | 32      | PD Separation | 3.5K-1K   | W8A8         | [Optimal Configuration](#deepseek-r1-low-latency-20ms-4) |
-| Deepseek-V3.2 | Atlas 800I A3 | 32      | PD Separation | 64K-1K    | W8A8         | [Optimal Configuration](#deepseek-v32-low-latency-30ms)  |
+| Deepseek-V3.2 | Atlas 800I A3 | 32      | PD Separation | 64K-3K    | W8A8         | [Optimal Configuration](#deepseek-v32-low-latency-30ms)  |
 
 ### High Throughput
 
@@ -135,7 +135,7 @@ do
         export SGLANG_ENABLE_SPEC_V2=1
         export HCCL_BUFFSIZE=650
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=78
-        export TASK_QUEUE_ENABLE=0
+        export TASK_QUEUE_ENABLE=1
         export SGLANG_SCHEDULER_SKIP_ALL_GATHER=1
         export HCCL_SOCKET_IFNAME=xxx
         export GLOO_SOCKET_IFNAME=xxx
@@ -170,7 +170,7 @@ python -m sglang_router.launch_router \
 #### Benchmark
 
 ```shell
-python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 6688 --max-concurrency 832  --random-input-len 3500 --random-output-len 1500 --num-prompts 3328 --random-range-ratio 1
+python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 6688 --max-concurrency 768  --random-input-len 3500 --random-output-len 1500 --num-prompts 3072 --random-range-ratio 1 --request-rate 16
 ```
 
 ### DeepSeek R1 Low Latency 20ms 1
@@ -247,13 +247,13 @@ do
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
         export SGLANG_ENABLE_SPEC_V2=1
         export HCCL_BUFFSIZE=650
-        export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=4
-        export TASK_QUEUE_ENABLE=0
+        export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=12
+        export TASK_QUEUE_ENABLE=1
         export SGLANG_SCHEDULER_SKIP_ALL_GATHER=1
         export HCCL_SOCKET_IFNAME=xxx
         export GLOO_SOCKET_IFNAME=xxx
         python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode --host ${D_IP[$i]} \
-        --port 8001 --trust-remote-code --dist-init-addr DIP1:5000 --nnodes 2 --node-rank $i --tp-size 32 --dp-size 8 \
+        --port 8001 --trust-remote-code --dist-init-addr DIP1:5000 --nnodes 2 --node-rank $i --tp-size 32 --dp-size 16 \
         --mem-fraction-static 0.75 --max-running-requests 32 --attention-backend ascend --device npu --quantization modelslim \
         --moe-a2a-backend deepep --enable-dp-attention --deepep-mode low_latency --enable-dp-lm-head --moe-dense-tp 1 \
         --cuda-graph-bs 2 4 6 --disaggregation-transfer-backend ascend --watchdog-timeout 9000 --context-length 8192 \
@@ -305,7 +305,7 @@ Please Turn to [DeepSeek R1 Low Latency 20ms](#deepSeek-r1-low-latency-20ms-1)
 #### Benchmark
 
 ```bash
-python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 6688 --max-concurrency 32  --random-input-len 3900 --random-output-len 1000 --num-prompts 32 --random-range-ratio 1
+python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 6688 --max-concurrency 768  --random-input-len 3900 --random-output-len 1000 --num-prompts 768 --random-range-ratio 1 --request-rate 16
 ```
 
 ### DeepSeek R1 Low Latency 20ms 3
@@ -327,7 +327,7 @@ Please Turn to [DeepSeek R1 Low Latency 20ms](#deepSeek-r1-low-latency-20ms-1)
 #### Benchmark
 
 ```bash
-python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 6688 --max-concurrency 32  --random-input-len 3500 --random-output-len 1500 --num-prompts 32 --random-range-ratio 1
+python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 6688 --max-concurrency 768  --random-input-len 3500 --random-output-len 1500 --num-prompts 768 --random-range-ratio 1 --request-rate 16
 ```
 
 ### DeepSeek R1 Low Latency 20ms 4
@@ -349,7 +349,7 @@ Please Turn to [DeepSeek R1 Low Latency 20ms](#deepSeek-r1-low-latency-20ms-1)
 #### Benchmark
 
 ```bash
-python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 6688 --max-concurrency 32  --random-input-len 3500 --random-output-len 1000 --num-prompts 32 --random-range-ratio 1
+python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 6688 --max-concurrency 768  --random-input-len 3500 --random-output-len 1000 --num-prompts 768 --random-range-ratio 1 --request-rate 16
 ```
 
 ### DeepSeek R1 High Performance 50ms 2
@@ -513,7 +513,7 @@ do
         export SGLANG_ENABLE_SPEC_V2=1
         export HCCL_BUFFSIZE=720
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=96
-        export TASK_QUEUE_ENABLE=0
+        export TASK_QUEUE_ENABLE=1
         export HCCL_SOCKET_IFNAME=xxx
         export GLOO_SOCKET_IFNAME=xxx
         python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode --host ${D_IP[$i]} \
@@ -706,7 +706,7 @@ do
         export SGLANG_ENABLE_SPEC_V2=1
         export HCCL_BUFFSIZE=720
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=96
-        export TASK_QUEUE_ENABLE=0
+        export TASK_QUEUE_ENABLE=1
         export HCCL_SOCKET_IFNAME=xxx
         export GLOO_SOCKET_IFNAME=xxx
         python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode --host ${D_IP[$i]} \
@@ -750,7 +750,7 @@ Hardware: Atlas 800I A3 32Card
 
 DeployMode: PD Separation
 
-DataSets: 64K1K
+DataSets: 64K3K
 
 TPOT: 30ms
 
@@ -947,7 +947,7 @@ python -m sglang_router.launch_router \
 #### Benchmark
 
 ```shell
-python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 6688 --max-concurrency 32  --random-input-len 64000 --random-output-len 1000 --num-prompts 64 --random-range-ratio 1 --request-rate 0.25
+python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 6688 --max-concurrency 32  --random-input-len 64000 --random-output-len 3000 --num-prompts 64 --random-range-ratio 1
 ```
 
 ### Qwen3 235B High Throughput 50ms 1
@@ -1019,7 +1019,6 @@ do
         --host ${P_IP[$i]} --port 8000 --disaggregation-bootstrap-port 8995 --trust-remote-code \
         --nnodes 1 --node-rank $i --tp-size 16 --dp-size 16 --mem-fraction-static 0.6 \
         --disable-radix-cache \
-        --ep-dispatch-algorithm static --init-expert-location /path/to/expert_distribution_recorder.pt \
         --attention-backend ascend --device npu --quantization modelslim --disaggregation-transfer-backend ascend \
         --speculative-algorithm EAGLE3 --speculative-draft-model-path xxx \
         --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
@@ -1080,7 +1079,7 @@ python -m sglang_router.launch_router \
 #### Benchmark
 
 ```shell
-python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 7239 --max-concurrency 768 --random-input-len 3500 --random-output-len 1500 --num-prompts 3072 --random-range-ratio 1
+python -m sglang.bench_serving --dataset-name random --backend sglang-oai --host 127.0.0.1 --port 7239 --max-concurrency 860 --random-input-len 3500 --random-output-len 1500 --num-prompts 3440 --random-range-ratio 1
 ```
 
 ### Qwen3 235B High Throughput 50ms 2
@@ -1132,7 +1131,7 @@ export GLOO_SOCKET_IFNAME=lo
 export HCCL_OP_EXPANSION_MODE="AIV"
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
 export SGLANG_ENABLE_SPEC_V2=1
-export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1
+export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=2
 
 python -m sglang.launch_server --model-path $MODEL_PATH \
     --host 127.0.0.1 --port 7439 --trust-remote-code --nnodes 1 --node-rank 0  \
@@ -1149,7 +1148,7 @@ python -m sglang.launch_server --model-path $MODEL_PATH \
 #### Benchmark
 
 ```shell
-python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 7439 --max-concurrency 288 --random-input-len 3500 --random-output-len 1500 --num-prompts 1088 --random-range-ratio 1
+python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 7439 --max-concurrency 272 --random-input-len 3500 --random-output-len 1500 --num-prompts 1088 --random-range-ratio 1
 ```
 
 ### Qwen3-235B Atlas 800I A3-8Card PD Mixed 2K-2K 100ms
@@ -1270,7 +1269,6 @@ export GLOO_SOCKET_IFNAME=xxx
 export HCCL_OP_EXPANSION_MODE="AIV"
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
 export SGLANG_ENABLE_SPEC_V2=1
-export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1
 
 python -m sglang.launch_server --model-path $MODEL_PATH \
     --host 127.0.0.1 --port 7439 --trust-remote-code --nnodes 1 --node-rank 0  \
@@ -1322,8 +1320,6 @@ source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env
 
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 
-export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=16
-
 MODEL_PATH=xxx
 
 export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
@@ -1348,17 +1344,16 @@ do
         echo "${MIX_IP[$i]}"
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
         export SGLANG_ENABLE_SPEC_V2=1
-        export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1
 
         python -m sglang.launch_server --model-path ${MODEL_PATH} \
         --host 127.0.0.1 --port 7439 --trust-remote-code \
         --nnodes 2 --node-rank $i --tp-size 32 --dp-size 32 --mem-fraction-static 0.8 --max-running-requests 768 \
         --attention-backend ascend --device npu --quantization modelslim --enable-dp-attention \
         --moe-a2a-backend deepep --deepep-mode auto --cuda-graph-bs 6 8 10 12 18 24 \
-        --dist-init-addr ${MIX_IP[0]}:5000 --chunked-prefill-size 32768 --max-prefill-tokens 458880 \
-        --speculative-algorithm EAGLE3 --speculative-draft-model-path xxx \
+        --dist-init-addr ${MIX_IP[0]}:5000 --chunked-prefill-size 131072 --max-prefill-tokens 458880 \
+        --speculative-algorithm EAGLE3 --speculative-draft-model-path xxx --speculative-draft-model-quantization= unquant \
         --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
-        --watchdog-timeout 9000 --context-length 8192 \
+        --context-length 8192 --disable-radix-cache \
         --enable-dp-lm-head --dtype bfloat16
         NODE_RANK=$i
         break
@@ -1493,10 +1488,10 @@ export SGLANG_ENABLE_SPEC_V2=1
 
 python -m sglang.launch_server --model-path $MODEL_PATH \
     --host 127.0.0.1 --port 7439 --trust-remote-code --nnodes 1 --node-rank 0  \
-    --attention-backend ascend --device npu  --quantization modelslim  \
+    --attention-backend ascend --device npu \
     --max-running-requests 32 \
     --disable-radix-cache \
-    --chunked-prefill-size 32768 --max-prefill-tokens 65536 --speculative-draft-model-quantization unquant \
+    --chunked-prefill-size 24576 --max-prefill-tokens 65536 \
     --speculative-algorithm EAGLE3 --speculative-draft-model-path xxx \
     --speculative-num-steps 4 --speculative-eagle-topk 1 --speculative-num-draft-tokens 5 \
     --tp-size 8 --mem-fraction-static 0.72 --cuda-graph-bs 8 16 24 32  --dtype bfloat16
@@ -1624,13 +1619,12 @@ export GLOO_SOCKET_IFNAME=lo
 export HCCL_OP_EXPANSION_MODE="AIV"
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
 export SGLANG_ENABLE_SPEC_V2=1
-export DISABLE_EAGLE3_QUANT=1
 
 python -m sglang.launch_server --model-path $MODEL_PATH \
     --host 127.0.0.1 --port 7339 --trust-remote-code --nnodes 1 --node-rank 0  \
     --attention-backend ascend --device npu   \
     --max-running-requests 1 \
-    --disable-radix-cache \
+    --disable-radix-cache --speculative-draft-model-quantization unquant \
     --speculative-algorithm EAGLE3 --speculative-draft-model-path xxx \
     --speculative-num-steps 4 --speculative-eagle-topk 1 --speculative-num-draft-tokens 5 \
     --chunked-prefill-size -1 --max-prefill-tokens 65536  \
@@ -1766,7 +1760,7 @@ python -m sglang.launch_server --model-path $MODEL_PATH \
     --disable-radix-cache --speculative-draft-model-quantization unquant \
     --speculative-algorithm EAGLE3 --speculative-draft-model-path xxx \
     --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
-    --chunked-prefill-size 65536 --max-prefill-tokens 49152 \
+    --chunked-prefill-size -1 --max-prefill-tokens 49152 \
     --tp-size 4 --mem-fraction-static 0.7 --cuda-graph-bs 54 60 66 72 78 84 90 108 114 120 --dtype bfloat16
 
 ```
@@ -2105,7 +2099,7 @@ python -m sglang.launch_server --model-path $MODEL_PATH \
 #### Benchmark
 
 ```shell
-python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 7439 --max-concurrency 80 --random-input-len 3500 --random-output-len 1500 --num-prompts 320 --random-range-ratio 1 --request-rate 8
+python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 7439 --max-concurrency 80 --random-input-len 3500 --random-output-len 1500 --num-prompts 320 --random-range-ratio 1
 ```
 
 ### Qwen3 Next High Throughput 50ms

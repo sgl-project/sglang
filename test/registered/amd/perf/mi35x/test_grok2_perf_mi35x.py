@@ -19,7 +19,10 @@ register_amd_ci(est_time=1500, suite="nightly-perf-8-gpu-mi35x-grok2", nightly=T
 
 
 def generate_simple_markdown_report(results: List[BenchmarkResult]) -> str:
-    """Generate a simplified markdown report without traces and cost columns."""
+    """Generate a simplified markdown report without traces and cost columns.
+
+    Skips the first result if it's a warmup run (duplicate batch_size).
+    """
     model_header = results[0].model_path
     if results[0].run_name and results[0].run_name != "default":
         model_header += f" ({results[0].run_name})"
@@ -32,7 +35,14 @@ def generate_simple_markdown_report(results: List[BenchmarkResult]) -> str:
     summary += "| batch size | input len | latency (s) | input throughput (tok/s) | output throughput (tok/s) | ITL (ms) |\n"
     summary += "| ---------- | --------- | ----------- | ------------------------ | ------------------------- | -------- |\n"
 
-    for result in results:
+    # Skip first result if it's a warmup (same batch_size as second result)
+    report_results = (
+        results[1:]
+        if len(results) > 1 and results[0].batch_size == results[1].batch_size
+        else results
+    )
+
+    for result in report_results:
         itl = 1 / (result.output_throughput / result.batch_size) * 1000
         summary += f"| {result.batch_size} | {result.input_len} | {result.latency:.2f} | {result.input_throughput:.2f} | {result.output_throughput:.2f} | {itl:.2f} |\n"
 
@@ -53,7 +63,7 @@ class TestGrok2PerfMI35x(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.batch_sizes = [1, 1, 8, 16, 64]
+        cls.batch_sizes = [1, 8, 16, 64]
         cls.input_lens = tuple(_parse_int_list_env("NIGHTLY_INPUT_LENS", "1024"))
         cls.output_lens = tuple(_parse_int_list_env("NIGHTLY_OUTPUT_LENS", "512"))
 

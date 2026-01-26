@@ -29,7 +29,11 @@ from sglang.test.lora_utils import (
 from sglang.test.runners import SRTRunner
 from sglang.test.test_utils import CustomTestCase, calculate_rouge_l
 
-register_cuda_ci(est_time=300, suite="stage-b-test-small-1-gpu")
+register_cuda_ci(
+    est_time=300,
+    suite="stage-b-test-small-1-gpu",
+    disabled="Flaky test - outputs differ between overlap/no-overlap loading modes. See https://github.com/sgl-project/sglang/actions/runs/21320657015/job/61370002606",
+)
 
 
 class TestLoRAPipelineLoading(CustomTestCase):

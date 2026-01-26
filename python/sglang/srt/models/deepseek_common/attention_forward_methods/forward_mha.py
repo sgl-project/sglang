@@ -17,7 +17,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _use_aiter_gfx95,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import BumpAllocator
+from sglang.srt.utils import BumpAllocator, next_power_of_2
 
 if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
@@ -472,7 +472,12 @@ class DeepseekMHAForwardMixin:
         ):
             k = k_nope.new_empty(*k_shape)
             concat_mla_k(k=k, k_nope=k_nope, k_rope=k_pe)
-        elif _is_cuda:
+        elif (
+            _is_cuda
+            and next_power_of_2(self.num_local_heads) == self.num_local_heads
+            and next_power_of_2(self.qk_nope_head_dim) == self.qk_nope_head_dim
+            and next_power_of_2(self.qk_rope_head_dim) == self.qk_rope_head_dim
+        ):
             # fa3 mha support fp8 inputs
             if (
                 self.current_attention_backend == "fa3"

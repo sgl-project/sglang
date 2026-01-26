@@ -24,7 +24,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=2, suite="nightly-1-gpu", nightly=True)
+register_cuda_ci(est_time=2, suite="stage-b-test-small-1-gpu")
 
 # Global configuration for all indexer tests
 DEFAULT_CONFIG = {
@@ -41,6 +41,7 @@ DEFAULT_CONFIG = {
     "q_lora_rank": 1536,
     "kv_lora_rank": 512,
     "qk_rope_head_dim": 64,
+    "qk_nope_head_dim": 128,
     "max_position_embeddings": 163840,
     "rope_theta": 10000.0,
     "layer_id": 0,
@@ -74,6 +75,22 @@ class MockIndexerMetadata(BaseIndexerMetadata):
         for i in range(self.batch_size):
             # Simple linear mapping: block i maps to page i
             num_blocks_needed = (self.seq_lens[i] + 63) // 64
+            page_table[i, :num_blocks_needed] = torch.arange(
+                num_blocks_needed, device=self.device
+            )
+        return page_table
+
+    def get_page_table_1(self) -> torch.Tensor:
+        """Return: (batch_size, num_blocks) int32, page table with page size 1."""
+        # Create a simple page table for testing with page size 1
+        max_seq_len = max(self.seq_lens)
+        num_blocks = max_seq_len  # Page size 1 means num_blocks == max_seq_len
+        page_table = torch.zeros(
+            (self.batch_size, num_blocks), dtype=torch.int32, device=self.device
+        )
+        for i in range(self.batch_size):
+            # Simple linear mapping: block i maps to page i
+            num_blocks_needed = self.seq_lens[i]
             page_table[i, :num_blocks_needed] = torch.arange(
                 num_blocks_needed, device=self.device
             )
@@ -174,6 +191,7 @@ class MockModelRunner:
                 "num_attention_heads": 128,
                 "kv_lora_rank": self.config["kv_lora_rank"],
                 "qk_rope_head_dim": self.config["qk_rope_head_dim"],
+                "qk_nope_head_dim": self.config["qk_nope_head_dim"],
                 "hf_config": hf_config,
             },
         )()

@@ -29,6 +29,7 @@ import zmq
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.managers.io_struct import (
+    ActiveRanksOutput,
     BlockReqInput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
@@ -158,6 +159,7 @@ class DataParallelController:
         # Launch data parallel workers
         self.scheduler_procs = []
         self.workers: List[zmq.Socket] = [None] * server_args.dp_size
+        self.status: List[bool] = [True] * server_args.dp_size
 
         if server_args.enable_dp_attention:
             self.launch_dp_attention_schedulers(server_args, port_args)
@@ -179,8 +181,9 @@ class DataParallelController:
             start_cpu_monitor_thread("data_parallel_controller")
 
     def send_to_all_workers(self, obj):
-        for worker in self.workers:
-            worker.send_pyobj(obj)
+        for i, worker in enumerate(self.workers):
+            if self.status[i]:
+                worker.send_pyobj(obj)
 
     def send_control_message(self, obj):
         # Send control messages to first worker of tp group
@@ -189,6 +192,9 @@ class DataParallelController:
 
     def handle_load_update_req(self, obj):
         self.dp_budget.update_budget(obj)
+
+    def update_active_ranks(self, ranks: ActiveRanksOutput):
+        self.status = ranks.status
 
     def dispatching_with_trace(self, req: Req):
         if self.server_args.enable_trace:
@@ -208,6 +214,7 @@ class DataParallelController:
                 (TokenizedEmbeddingReqInput, self.dispatching_with_trace),
                 (BlockReqInput, self.send_to_all_workers),
                 (WatchLoadUpdateReq, self.handle_load_update_req),
+                (ActiveRanksOutput, self.update_active_ranks),
             ]
         )
         self._request_dispatcher.add_fallback_fn(self.send_control_message)
@@ -479,8 +486,17 @@ class DataParallelController:
         if self.maybe_external_dp_rank_routing(req):
             return
 
-        self.workers[self.round_robin_counter].send_pyobj(req)
-        self.round_robin_counter = (self.round_robin_counter + 1) % len(self.workers)
+        while True:
+            if self.status[self.round_robin_counter]:
+                logger.debug(f"Choose worker {self.round_robin_counter}")
+                self.workers[self.round_robin_counter].send_pyobj(req)
+                self.round_robin_counter = (self.round_robin_counter + 1) % len(
+                    self.workers
+                )
+                break
+            self.round_robin_counter = (self.round_robin_counter + 1) % len(
+                self.workers
+            )
 
     def follow_bootstrap_room_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):

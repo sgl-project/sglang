@@ -1,7 +1,7 @@
 """MI35x DeepSeek-R1-MXFP4 GSM8K Completion Evaluation Test (8-GPU)
 
-Tests DeepSeek-R1-MXFP4 quantized model with multiple configurations
-(basic, MTP, DP, TC) using few-shot completion benchmark on MI35x.
+Tests DeepSeek-R1-MXFP4 quantized model with basic configuration
+using few-shot completion benchmark on MI35x.
 
 Registry: nightly-amd-8-gpu-mi35x-deepseek-r1-mxfp4 suite
 """
@@ -32,9 +32,9 @@ from sglang.test.test_utils import (
 )
 from sglang.utils import download_and_cache_file, read_jsonl
 
-# Register for AMD CI - MI35x DeepSeek-R1-MXFP4 accuracy tests (~120 min)
+# Register for AMD CI - MI35x DeepSeek-R1-MXFP4 accuracy test (~60 min, basic only)
 register_amd_ci(
-    est_time=7200, suite="nightly-amd-8-gpu-mi35x-deepseek-r1-mxfp4", nightly=True
+    est_time=3600, suite="nightly-amd-8-gpu-mi35x-deepseek-r1-mxfp4", nightly=True
 )
 
 INVALID = -9999999
@@ -83,7 +83,7 @@ def get_mxfp4_models() -> List[ModelConfig]:
     """Get DeepSeek-R1-MXFP4 model configurations for MI35x."""
     model_path = get_model_path()
     return [
-        # DeepSeek-R1-MXFP4 basic
+        # DeepSeek-R1-MXFP4 basic only (MTP tested in perf job)
         ModelConfig(
             model_path=model_path,
             tp_size=8,
@@ -102,31 +102,6 @@ def get_mxfp4_models() -> List[ModelConfig]:
             ],
             env_vars={"SGLANG_USE_AITER": "1"},
         ),
-        # DeepSeek-R1-MXFP4 with MTP (EAGLE)
-        ModelConfig(
-            model_path=model_path,
-            tp_size=8,
-            accuracy_threshold=0.93,
-            timeout=3600,
-            variant="MTP",
-            other_args=[
-                "--chunked-prefill-size",
-                "131072",
-                "--speculative-algorithm",
-                "EAGLE",
-                "--speculative-num-steps",
-                "3",
-                "--speculative-eagle-topk",
-                "1",
-                "--speculative-num-draft-tokens",
-                "4",
-                "--mem-fraction-static",
-                "0.7",
-                "--trust-remote-code",
-            ],
-            env_vars={"SGLANG_USE_AITER": "1"},
-        ),
-        # Note: DP and TC variants are not supported for MXFP4 on MI35x
     ]
 
 

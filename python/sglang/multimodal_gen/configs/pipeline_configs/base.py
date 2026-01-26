@@ -547,7 +547,7 @@ class PipelineConfig:
                     f"using {pipeline_config_cls.__name__} directly without model_index.json"
                 )
             else:
-                model_info = get_model_info(model_path)
+                model_info = get_model_info(model_path, backend=kwargs.get("backend"))
                 if model_info is None:
                     from sglang.multimodal_gen.registry import (
                         _PIPELINE_CONFIG_REGISTRY,
@@ -563,7 +563,7 @@ class PipelineConfig:
                     )
                 pipeline_config_cls = model_info.pipeline_config_cls
         else:
-            model_info = get_model_info(model_path)
+            model_info = get_model_info(model_path, backend=kwargs.get("backend"))
             if model_info is None:
                 raise ValueError(
                     f"Could not get model info for '{model_path}'. "

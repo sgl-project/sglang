@@ -31,7 +31,12 @@ import unittest.mock
 import torch
 
 from sglang.srt.disaggregation.kv_events import BlockRemoved, BlockStored
-from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams
+from sglang.srt.mem_cache.base_prefix_cache import (
+    EvictParams,
+    EvictResult,
+    InsertParams,
+    MatchPrefixParams,
+)
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 
 # Test constants
@@ -266,7 +271,12 @@ class TestRadixCache(unittest.TestCase):
         cache = RadixCache.create_simulated()
 
         # Insert some data
-        cache.insert(RadixKey([1, 2, 3]), torch.tensor([10, 20, 30], dtype=torch.int64))
+        cache.insert(
+            InsertParams(
+                key=RadixKey([1, 2, 3]),
+                value=torch.tensor([10, 20, 30], dtype=torch.int64),
+            )
+        )
         self.assertGreater(cache.total_size(), 0)
 
         # Reset
@@ -283,7 +293,8 @@ class TestRadixCache(unittest.TestCase):
 
                 key = RadixKey([1, 2, 3])
                 value = torch.tensor([10, 20, 30], dtype=torch.int64)
-                prefix_len = cache.insert(key, value)
+                result = cache.insert(InsertParams(key=key, value=value))
+                prefix_len = result.prefix_len
 
                 if disable_cache:
                     self.assertEqual(prefix_len, 0)
@@ -311,7 +322,8 @@ class TestRadixCache(unittest.TestCase):
         cache = RadixCache.create_simulated()
 
         key = RadixKey([1, 2, 3])
-        prefix_len = cache.insert(key, None)
+        result = cache.insert(InsertParams(key=key, value=None))
+        prefix_len = result.prefix_len
 
         # When None is passed, it should create value from token_ids
         self.assertEqual(prefix_len, 0)
@@ -323,10 +335,19 @@ class TestRadixCache(unittest.TestCase):
 
         self.assertEqual(cache.total_size(), 0)
 
-        cache.insert(RadixKey([1, 2, 3]), torch.tensor([10, 20, 30], dtype=torch.int64))
+        cache.insert(
+            InsertParams(
+                key=RadixKey([1, 2, 3]),
+                value=torch.tensor([10, 20, 30], dtype=torch.int64),
+            )
+        )
         self.assertEqual(cache.total_size(), 3)
 
-        cache.insert(RadixKey([4, 5]), torch.tensor([40, 50], dtype=torch.int64))
+        cache.insert(
+            InsertParams(
+                key=RadixKey([4, 5]), value=torch.tensor([40, 50], dtype=torch.int64)
+            )
+        )
         self.assertEqual(cache.total_size(), 5)
 
     def test_kv_cache_events(self):
@@ -344,7 +365,7 @@ class TestRadixCache(unittest.TestCase):
                 )
 
                 # Insert data
-                cache.insert(RadixKey([1, 2, 3, 4, 5]), None)
+                cache.insert(InsertParams(key=RadixKey([1, 2, 3, 4, 5]), value=None))
 
                 # Take events
                 events = cache.take_events()
@@ -371,8 +392,19 @@ class TestRadixCache(unittest.TestCase):
         )
 
         # Insert and then evict data
-        cache.insert(RadixKey([1, 2, 3]), torch.tensor([10, 20, 30], dtype=torch.int64))
-        cache.evict(3)
+        cache.insert(
+            InsertParams(
+                key=RadixKey([1, 2, 3]),
+                value=torch.tensor([10, 20, 30], dtype=torch.int64),
+            )
+        )
+        result = cache.evict(EvictParams(num_tokens=3))
+        self.assertIsInstance(result, EvictResult)
+        self.assertGreaterEqual(
+            result.num_tokens_evicted,
+            3,
+            f"evicted {result.num_tokens_evicted} tokens, expected at least 3",
+        )
 
         # Take events - should include both store and remove events
         events = cache.take_events()
@@ -393,13 +425,22 @@ class TestRadixCache(unittest.TestCase):
 
         # Insert same token sequence with different extra keys
         cache.insert(
-            RadixKey([1, 2, 3], "key1"), torch.tensor([10, 20, 30], dtype=torch.int64)
+            InsertParams(
+                key=RadixKey([1, 2, 3], "key1"),
+                value=torch.tensor([10, 20, 30], dtype=torch.int64),
+            )
         )
         cache.insert(
-            RadixKey([1, 2, 3], "key2"), torch.tensor([40, 50, 60], dtype=torch.int64)
+            InsertParams(
+                key=RadixKey([1, 2, 3], "key2"),
+                value=torch.tensor([40, 50, 60], dtype=torch.int64),
+            )
         )
         cache.insert(
-            RadixKey([1, 2, 3], None), torch.tensor([70, 80, 90], dtype=torch.int64)
+            InsertParams(
+                key=RadixKey([1, 2, 3], None),
+                value=torch.tensor([70, 80, 90], dtype=torch.int64),
+            )
         )
 
         # Keys with different extra_key should not match each other
@@ -434,7 +475,12 @@ class TestRadixCache(unittest.TestCase):
         cache = RadixCache.create_simulated()
 
         # Insert sequence
-        cache.insert(RadixKey([1, 2, 3]), torch.tensor([10, 20, 30], dtype=torch.int64))
+        cache.insert(
+            InsertParams(
+                key=RadixKey([1, 2, 3]),
+                value=torch.tensor([10, 20, 30], dtype=torch.int64),
+            )
+        )
 
         # Get node
         result = cache.match_prefix(MatchPrefixParams(key=RadixKey([1, 2, 3])))
@@ -461,13 +507,27 @@ class TestRadixCache(unittest.TestCase):
         cache = RadixCache.create_simulated(mock_allocator=mock_allocator)
 
         # Insert sequences
-        cache.insert(RadixKey([1, 2]), torch.tensor([10, 20], dtype=torch.int64))
-        cache.insert(RadixKey([3, 4]), torch.tensor([30, 40], dtype=torch.int64))
+        cache.insert(
+            InsertParams(
+                key=RadixKey([1, 2]), value=torch.tensor([10, 20], dtype=torch.int64)
+            )
+        )
+        cache.insert(
+            InsertParams(
+                key=RadixKey([3, 4]), value=torch.tensor([30, 40], dtype=torch.int64)
+            )
+        )
 
         initial_size = cache.total_size()
 
         # Evict some tokens
-        cache.evict(2)
+        result = cache.evict(EvictParams(num_tokens=2))
+        self.assertIsInstance(result, EvictResult)
+        self.assertGreaterEqual(
+            result.num_tokens_evicted,
+            2,
+            f"evicted {result.num_tokens_evicted} tokens, expected at least 2",
+        )
 
         # Should have called free and reduced size
         mock_allocator.free.assert_called()
@@ -486,7 +546,12 @@ class TestRadixCache(unittest.TestCase):
                 cache = RadixCache.create_simulated(page_size=page_size)
 
                 tokens = list(range(sequence_length))
-                cache.insert(RadixKey(tokens), torch.tensor(tokens, dtype=torch.int64))
+                cache.insert(
+                    InsertParams(
+                        key=RadixKey(tokens),
+                        value=torch.tensor(tokens, dtype=torch.int64),
+                    )
+                )
 
                 result = cache.match_prefix(MatchPrefixParams(key=RadixKey(tokens)))
                 self.assertGreater(len(result.device_indices), 0)
@@ -499,7 +564,12 @@ class TestRadixCache(unittest.TestCase):
         """Test pretty_print produces output."""
         cache = RadixCache.create_simulated()
 
-        cache.insert(RadixKey([1, 2, 3]), torch.tensor([10, 20, 30], dtype=torch.int64))
+        cache.insert(
+            InsertParams(
+                key=RadixKey([1, 2, 3]),
+                value=torch.tensor([10, 20, 30], dtype=torch.int64),
+            )
+        )
 
         # Just test that it doesn't crash
         try:
@@ -511,8 +581,16 @@ class TestRadixCache(unittest.TestCase):
         """Test all_values_flatten method."""
         cache = RadixCache.create_simulated()
 
-        cache.insert(RadixKey([1, 2]), torch.tensor([10, 20], dtype=torch.int64))
-        cache.insert(RadixKey([3, 4]), torch.tensor([30, 40], dtype=torch.int64))
+        cache.insert(
+            InsertParams(
+                key=RadixKey([1, 2]), value=torch.tensor([10, 20], dtype=torch.int64)
+            )
+        )
+        cache.insert(
+            InsertParams(
+                key=RadixKey([3, 4]), value=torch.tensor([30, 40], dtype=torch.int64)
+            )
+        )
 
         all_values = cache.all_values_flatten()
         self.assertEqual(len(all_values), 4)
@@ -529,12 +607,12 @@ class TestRadixCache(unittest.TestCase):
                 # Insert a long sequence that will be split later.
                 seq1 = [1, 2, 3, 4, 5, 6, 7, 8]
                 val1 = torch.tensor([x * 10 for x in seq1], dtype=torch.int64)
-                cache.insert(RadixKey(seq1), val1)
+                cache.insert(InsertParams(key=RadixKey(seq1), value=val1))
 
                 # Insert a diverging branch to create an internal node on the path.
                 seq2 = [1, 2, 9, 10]
                 val2 = torch.tensor([x * 10 for x in seq2], dtype=torch.int64)
-                cache.insert(RadixKey(seq2), val2)
+                cache.insert(InsertParams(key=RadixKey(seq2), value=val2))
                 print(cache.pretty_print())
 
                 baseline_total = cache.total_size()
@@ -573,7 +651,7 @@ class TestRadixCache(unittest.TestCase):
         )
 
         # Insert a sequence
-        cache.insert(RadixKey([1, 2, 3, 4, 5, 6, 7, 8]), None)
+        cache.insert(InsertParams(key=RadixKey([1, 2, 3, 4, 5, 6, 7, 8]), value=None))
 
         # Trigger event emission to compute hash_value lazily
         cache.take_events()
@@ -599,7 +677,7 @@ class TestRadixCache(unittest.TestCase):
         )
 
         # Insert a sequence with repeating token pattern: [1,2,3,4, 1,2,3,4]
-        cache.insert(RadixKey([1, 2, 3, 4, 1, 2, 3, 4]), None)
+        cache.insert(InsertParams(key=RadixKey([1, 2, 3, 4, 1, 2, 3, 4]), value=None))
 
         events = cache.take_events()
         block_stored_events = [e for e in events if isinstance(e, BlockStored)]
@@ -633,11 +711,11 @@ class TestRadixCache(unittest.TestCase):
         )
 
         # Insert a sequence that will cause a split
-        cache.insert(RadixKey([1, 2, 3, 4]), None)
+        cache.insert(InsertParams(key=RadixKey([1, 2, 3, 4]), value=None))
         cache.take_events()  # Clear events and compute hash_value for first node
 
         # Insert a diverging sequence that will cause a split at page boundary
-        cache.insert(RadixKey([1, 2, 5, 6]), None)
+        cache.insert(InsertParams(key=RadixKey([1, 2, 5, 6]), value=None))
         cache.take_events()  # Trigger event emission to compute hash_value
 
         # Find the split node
@@ -674,7 +752,7 @@ class TestRadixCache(unittest.TestCase):
         cache: RadixCache = RadixCache.create_simulated()
 
         for key, value in zip(keys, values):
-            cache.insert(RadixKey(key), value)
+            cache.insert(InsertParams(key=RadixKey(key), value=value))
 
         del values
 
