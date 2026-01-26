@@ -45,6 +45,9 @@ _is_cpu = is_cpu()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
+if _is_npu:
+    from sglang.srt.hardware_backend.npu.utils import npu_format_cast
+
 if _use_aiter:
     from aiter import ActivationType
     from aiter.fused_moe import fused_moe
@@ -313,10 +316,15 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         moe_runner_config.quantization = "UnquantizedFusedMoEMethod"
         self.moe_runner_config = moe_runner_config
         backend = get_moe_runner_backend()
-        print(backend)
         if backend.is_auto():
             backend = (
-                MoeRunnerBackend.TRITON
+                MoeRunnerBackend.TRITON_KERNELS
+                if self.use_triton_kernels
+                else MoeRunnerBackend.TRITON
+            )
+        if _is_npu:
+            backend = (
+                MoeRunnerBackend.TORCH_NPU_KERNELS
             )
         self.runner = MoeRunner(backend, moe_runner_config)
 
