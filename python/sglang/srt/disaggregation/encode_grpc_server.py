@@ -23,9 +23,8 @@ from grpc_reflection.v1alpha import reflection
 
 from sglang.srt.disaggregation.encode_server import (
     MMEncoder,
-    rid_lock,
-    rid_to_receive_count,
-    rid_to_receive_endpoint,
+    handle_scheduler_receive_url_request,
+    launch_encoder,
 )
 from sglang.srt.grpc import sglang_encoder_pb2, sglang_encoder_pb2_grpc
 from sglang.srt.server_args import PortArgs, ServerArgs
@@ -202,14 +201,13 @@ class SglangEncoderServicer(sglang_encoder_pb2_grpc.SglangEncoderServicer):
         Mirrors handle_scheduler_receive_url_request() from encode_server.py.
         """
         try:
-            rid = request.req_id
-            async with rid_lock:
-                global rid_to_receive_endpoint, rid_to_receive_count
-                if rid not in rid_to_receive_endpoint:
-                    rid_to_receive_endpoint[rid] = set()
-                    rid_to_receive_count[rid] = request.receive_count
-                assert rid_to_receive_count[rid] == request.receive_count
-                rid_to_receive_endpoint[rid].add(request.receive_url)
+            await handle_scheduler_receive_url_request(
+                {
+                    "req_id": request.req_id,
+                    "receive_count": request.receive_count,
+                    "receive_url": request.receive_url,
+                }
+            )
             return sglang_encoder_pb2.SchedulerReceiveUrlResponse()
 
         except Exception as e:
@@ -218,34 +216,6 @@ class SglangEncoderServicer(sglang_encoder_pb2_grpc.SglangEncoderServicer):
             context.set_code(grpc.StatusCode.INTERNAL)
             context.set_details(str(e))
             return sglang_encoder_pb2.SchedulerReceiveUrlResponse()
-
-
-async def run_encoder_worker(
-    server_args: ServerArgs, schedule_path: str, dist_init_method: str, rank: int
-):
-    """Run encoder worker process (same as HTTP version)."""
-    encoder = MMEncoder(server_args, schedule_path, dist_init_method, rank)
-    while True:
-        request = await encoder.schedule_socket.recv_pyobj()
-        await encoder.encode(
-            mm_items=request["mm_items"],
-            req_id=request["req_id"],
-            num_parts=request["num_parts"],
-            part_idx=request["part_idx"],
-        )
-
-
-def launch_encoder_worker(
-    server_args: ServerArgs, schedule_path: str, dist_init_method: str, rank: int
-):
-    """Launch encoder worker process (same as HTTP version)."""
-    try:
-        asyncio.run(run_encoder_worker(server_args, schedule_path, dist_init_method, rank))
-    except KeyboardInterrupt:
-        logger.info(f"Exit rank {rank}")
-    except Exception:
-        traceback.print_exc()
-
 
 async def serve_grpc_encoder(server_args: ServerArgs):
     """Start the gRPC encoder server."""
@@ -270,7 +240,7 @@ async def serve_grpc_encoder(server_args: ServerArgs):
             get_zmq_socket(zmq_ctx, zmq.PUSH, schedule_path, bind=False)
         )
         ctx.Process(
-            target=launch_encoder_worker,
+            target=launch_encoder,
             args=(server_args, schedule_path, dist_init_method, rank),
             daemon=True,
         ).start()
