@@ -1,5 +1,6 @@
-# Copied and adapted from: mossVG/mova/diffusion/models/dac_vae.py
-# SPDX-License-Identifier: Apache-2.0
+# Copied and adapted from: https://github.com/descriptinc/descript-audio-codec
+
+# SPDX-License-Identifier: MIT
 
 import math
 from bisect import bisect_right
