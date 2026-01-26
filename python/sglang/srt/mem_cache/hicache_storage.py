@@ -1,9 +1,14 @@
 import hashlib
+import json
 import logging
 import os
+import queue
+import threading
+import time
 from abc import ABC, abstractmethod
+from collections import deque
 from dataclasses import dataclass
-from typing import Any, List, Optional
+from typing import Any, Callable, Deque, List, Optional, Tuple
 
 import torch
 
@@ -71,6 +76,18 @@ class HiCacheStorage(ABC):
 
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         self.mem_pool_host = mem_pool_host
+        self._fault_reporter: Optional["HiCacheStorageFaultManager"] = None
+
+    def set_fault_reporter(self, reporter: Optional["HiCacheStorageFaultManager"]):
+        self._fault_reporter = reporter
+
+    def _report_storage_op(self, op: str, fatal: bool, detail: str = ""):
+        if self._fault_reporter is None:
+            return
+        try:
+            self._fault_reporter.report_op(op=op, fatal=fatal, detail=detail)
+        except Exception:
+            logger.exception("HiCacheStorage fault reporter failed.")
 
     def batch_get_v1(
         self,
@@ -181,6 +198,228 @@ class HiCacheStorage(ABC):
         return None
 
 
+@dataclass
+class HiCacheStorageFaultConfig:
+    enabled: bool = True
+    auto_detach: bool = True
+    auto_reconnect: bool = False
+    consecutive_fatal_threshold: int = 3
+    ratio_window_s: float = 60.0
+    ratio_threshold: float = 0.5
+    ratio_min_events: int = 10
+    reconnect_backoff_initial_s: float = 10.0
+    reconnect_backoff_max_s: float = 300.0
+
+
+class HiCacheStorageFaultManager:
+    def __init__(
+        self,
+        config: HiCacheStorageFaultConfig,
+        labels: Optional[dict] = None,
+        block_io_cb: Optional[Callable[[bool, str], Tuple[bool, str]]] = None,
+        detach_cb: Optional[Callable[[str], Tuple[bool, str]]] = None,
+        attach_cb: Optional[Callable[[], Tuple[bool, str]]] = None,
+    ):
+        self.config = config
+        self.labels = labels or {}
+        self.block_io_cb = block_io_cb
+        self.detach_cb = detach_cb
+        self.attach_cb = attach_cb
+
+        self._lock = threading.Lock()
+        self._events: Deque[Tuple[float, bool]] = deque()
+        self._consecutive_fatal = 0
+        self._state = "HEALTHY"
+        self._last_fault_reason = ""
+        self._detach_pending = False
+        self._backoff_s = config.reconnect_backoff_initial_s
+        self._next_reconnect_time = 0.0
+
+        self._queue: "queue.Queue[str]" = queue.Queue()
+        self._worker = threading.Thread(target=self._worker_loop, daemon=True)
+        self._worker.start()
+
+        self._init_metrics()
+
+    def _init_metrics(self):
+        try:
+            from prometheus_client import Counter, Gauge
+
+            self._fault_events_total = Counter(
+                name="sglang:hicache_storage_fault_events_total",
+                documentation="Total HiCache storage fault events.",
+                labelnames=self.labels.keys(),
+            )
+            self._fault_state = Gauge(
+                name="sglang:hicache_storage_fault_state",
+                documentation="HiCache storage fault state (0 healthy, 1 blocked, 2 detached, 3 reconnecting).",
+                labelnames=self.labels.keys(),
+            )
+            self._detach_total = Counter(
+                name="sglang:hicache_storage_auto_detach_total",
+                documentation="Total auto detaches triggered by fault manager.",
+                labelnames=self.labels.keys(),
+            )
+            self._reconnect_total = Counter(
+                name="sglang:hicache_storage_auto_reconnect_total",
+                documentation="Total auto reconnect attempts triggered by fault manager.",
+                labelnames=self.labels.keys(),
+            )
+        except Exception:
+            self._fault_events_total = None
+            self._fault_state = None
+            self._detach_total = None
+            self._reconnect_total = None
+
+    def report_op(self, op: str, fatal: bool, detail: str = ""):
+        if not self.config.enabled:
+            return
+        now = time.monotonic()
+        with self._lock:
+            self._events.append((now, fatal))
+            if fatal:
+                self._consecutive_fatal += 1
+                self._last_fault_reason = detail or op
+            else:
+                self._consecutive_fatal = 0
+            self._prune_events_locked(now)
+
+            if fatal and self._fault_events_total is not None:
+                self._fault_events_total.labels(**self.labels).inc(1)
+
+            if self._should_trigger_fault_locked():
+                self._trigger_fault_locked(reason=detail or op)
+
+    def _prune_events_locked(self, now: float):
+        window_s = self.config.ratio_window_s
+        while self._events and now - self._events[0][0] > window_s:
+            self._events.popleft()
+
+    def _should_trigger_fault_locked(self) -> bool:
+        if self._state in ("BLOCKED", "DETACHED_BY_FAULT", "RECONNECTING"):
+            return False
+        if self._consecutive_fatal >= self.config.consecutive_fatal_threshold:
+            return True
+        total = len(self._events)
+        if total < self.config.ratio_min_events:
+            return False
+        fatal_count = sum(1 for _, is_fatal in self._events if is_fatal)
+        ratio = fatal_count / max(total, 1)
+        return ratio >= self.config.ratio_threshold
+
+    def _trigger_fault_locked(self, reason: str):
+        self._state = "BLOCKED"
+        self._last_fault_reason = reason
+        if self._fault_state is not None:
+            self._fault_state.labels(**self.labels).set(1)
+        if self.block_io_cb is not None:
+            ok, msg = self.block_io_cb(True, reason)
+            if not ok:
+                logger.error("Failed to block HiCache storage IO: %s", msg)
+        if self.config.auto_detach and not self._detach_pending:
+            self._detach_pending = True
+            self._queue.put("detach")
+
+    def notify_manual_detach(self):
+        with self._lock:
+            self._state = "DISABLED"
+            self._detach_pending = False
+            self._consecutive_fatal = 0
+            self._events.clear()
+            if self._fault_state is not None:
+                self._fault_state.labels(**self.labels).set(0)
+
+    def notify_attach_success(self):
+        with self._lock:
+            self._state = "HEALTHY"
+            self._detach_pending = False
+            self._consecutive_fatal = 0
+            self._events.clear()
+            self._backoff_s = self.config.reconnect_backoff_initial_s
+            if self._fault_state is not None:
+                self._fault_state.labels(**self.labels).set(0)
+
+    def update_config(self, config: HiCacheStorageFaultConfig):
+        with self._lock:
+            self.config = config
+            self._backoff_s = config.reconnect_backoff_initial_s
+
+    def _worker_loop(self):
+        while True:
+            try:
+                task = self._queue.get(timeout=1)
+            except Exception:
+                task = None
+
+            if task == "detach":
+                self._handle_detach()
+            elif task == "attach":
+                self._handle_attach()
+
+            self._maybe_schedule_reconnect()
+
+    def _handle_detach(self):
+        if self.detach_cb is None:
+            return
+        ok, msg = self.detach_cb(self._last_fault_reason)
+        if ok:
+            if self._detach_total is not None:
+                self._detach_total.labels(**self.labels).inc(1)
+            with self._lock:
+                self._state = "DETACHED_BY_FAULT"
+                self._detach_pending = False
+                self._next_reconnect_time = time.monotonic() + self._backoff_s
+                if self._fault_state is not None:
+                    self._fault_state.labels(**self.labels).set(2)
+        else:
+            logger.error("Auto detach failed: %s", msg)
+            with self._lock:
+                self._detach_pending = False
+
+    def _handle_attach(self):
+        if self.attach_cb is None:
+            return
+        ok, msg = self.attach_cb()
+        if ok:
+            if self._reconnect_total is not None:
+                self._reconnect_total.labels(**self.labels).inc(1)
+            if self.block_io_cb is not None:
+                _ok, _msg = self.block_io_cb(False, "")
+                if not _ok:
+                    logger.error("Failed to unblock HiCache storage IO: %s", _msg)
+            with self._lock:
+                self._state = "HEALTHY"
+                self._consecutive_fatal = 0
+                self._events.clear()
+                self._backoff_s = self.config.reconnect_backoff_initial_s
+                if self._fault_state is not None:
+                    self._fault_state.labels(**self.labels).set(0)
+        else:
+            logger.error("Auto reconnect failed: %s", msg)
+            with self._lock:
+                self._state = "DETACHED_BY_FAULT"
+                self._backoff_s = min(
+                    self._backoff_s * 2, self.config.reconnect_backoff_max_s
+                )
+                self._next_reconnect_time = time.monotonic() + self._backoff_s
+                if self._fault_state is not None:
+                    self._fault_state.labels(**self.labels).set(2)
+
+    def _maybe_schedule_reconnect(self):
+        if not self.config.auto_reconnect:
+            return
+        with self._lock:
+            if self._state != "DETACHED_BY_FAULT":
+                return
+            now = time.monotonic()
+            if now < self._next_reconnect_time:
+                return
+            self._state = "RECONNECTING"
+            if self._fault_state is not None:
+                self._fault_state.labels(**self.labels).set(3)
+        self._queue.put("attach")
+
+
 class HiCacheFile(HiCacheStorage):
 
     def __init__(
@@ -204,6 +443,35 @@ class HiCacheFile(HiCacheStorage):
             os.makedirs(self.file_path)
             logger.info(f"Created HiCacheFile storage directory at {self.file_path}")
 
+        self._fault_inject_path = os.getenv("SGLANG_HICACHE_FAULT_INJECT_PATH")
+        self._fault_stats_path = os.getenv("SGLANG_HICACHE_FAULT_STATS_PATH")
+
+    def _read_fault_inject_config(self) -> dict:
+        if not self._fault_inject_path:
+            return {}
+        try:
+            with open(self._fault_inject_path, "r") as fin:
+                return json.load(fin)
+        except Exception:
+            return {}
+
+    def _update_fault_stats(self, op: str, result: str):
+        if not self._fault_stats_path:
+            return
+        try:
+            data = {}
+            if os.path.exists(self._fault_stats_path):
+                with open(self._fault_stats_path, "r") as fin:
+                    data = json.load(fin)
+            data.setdefault(op, {})
+            data[op][result] = data[op].get(result, 0) + 1
+            tmp_path = f"{self._fault_stats_path}.tmp"
+            with open(tmp_path, "w") as fout:
+                json.dump(data, fout)
+            os.replace(tmp_path, self._fault_stats_path)
+        except Exception:
+            logger.exception("Failed to update fault stats.")
+
     def _get_suffixed_key(self, key: str) -> str:
         return key + self.config_suffix
 
@@ -216,15 +484,26 @@ class HiCacheFile(HiCacheStorage):
         key = self._get_suffixed_key(key)
         tensor_path = os.path.join(self.file_path, f"{key}.bin")
         try:
+            cfg = self._read_fault_inject_config()
+            if cfg.get("fail_get"):
+                raise RuntimeError("HiCacheFile injected get failure")
             expected = target_location.numel() * target_location.element_size()
             with open(tensor_path, "rb", buffering=0) as f:
                 buf = memoryview(target_location.view(torch.uint8).contiguous().numpy())
                 if f.readinto(buf) != expected:
                     raise IOError(f"Short read for {key}")
+            self._report_storage_op("get", fatal=False)
+            self._update_fault_stats("get", "success")
             return target_location
         except FileNotFoundError:
             logger.warning(f"Failed to fetch {key} from HiCacheFile storage.")
+            self._report_storage_op("get", fatal=False)
+            self._update_fault_stats("get", "miss")
             return None
+        except Exception as e:
+            self._report_storage_op("get", fatal=True, detail=str(e))
+            self._update_fault_stats("get", "fatal")
+            raise
 
     def batch_get(
         self,
@@ -253,10 +532,17 @@ class HiCacheFile(HiCacheStorage):
         key = self._get_suffixed_key(key)
         tensor_path = os.path.join(self.file_path, f"{key}.bin")
         try:
+            cfg = self._read_fault_inject_config()
+            if cfg.get("fail_set"):
+                raise RuntimeError("HiCacheFile injected set failure")
             value.contiguous().view(dtype=torch.uint8).numpy().tofile(tensor_path)
+            self._report_storage_op("set", fatal=False)
+            self._update_fault_stats("set", "success")
             return True
         except Exception as e:
             logger.error(f"Failed to save tensor {key}: {e}")
+            self._report_storage_op("set", fatal=True, detail=str(e))
+            self._update_fault_stats("set", "fatal")
             return False
 
     def batch_set(

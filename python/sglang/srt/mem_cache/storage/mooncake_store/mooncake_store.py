@@ -476,16 +476,28 @@ class MooncakeStore(HiCacheStorage):
         host_indices: torch.Tensor,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
-        # Apply extra_backend_tag prefix if available
-        if self.extra_backend_tag is not None:
-            prefix = self.extra_backend_tag
-            keys = [f"{prefix}_{key}" for key in keys]
+        try:
+            # Apply extra_backend_tag prefix if available
+            if self.extra_backend_tag is not None:
+                prefix = self.extra_backend_tag
+                keys = [f"{prefix}_{key}" for key in keys]
 
-        key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(keys, host_indices)
-        get_results = self._get_batch_zero_copy_impl(
-            key_strs, buffer_ptrs, buffer_sizes
-        )
-        return self._batch_postprocess(get_results, is_set_operate=False)
+            key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(
+                keys, host_indices
+            )
+            get_results = self._get_batch_zero_copy_impl(
+                key_strs, buffer_ptrs, buffer_sizes
+            )
+            if any(res < 0 for res in get_results):
+                self._report_storage_op(
+                    "batch_get_v1", fatal=True, detail=str(get_results)
+                )
+            else:
+                self._report_storage_op("batch_get_v1", fatal=False)
+            return self._batch_postprocess(get_results, is_set_operate=False)
+        except Exception as e:
+            self._report_storage_op("batch_get_v1", fatal=True, detail=str(e))
+            raise
 
     def batch_set_v1(
         self,
@@ -493,37 +505,49 @@ class MooncakeStore(HiCacheStorage):
         host_indices: torch.Tensor,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
-        # Apply extra_backend_tag prefix if available
-        if self.extra_backend_tag is not None:
-            prefix = self.extra_backend_tag
-            keys = [f"{prefix}_{key}" for key in keys]
+        try:
+            # Apply extra_backend_tag prefix if available
+            if self.extra_backend_tag is not None:
+                prefix = self.extra_backend_tag
+                keys = [f"{prefix}_{key}" for key in keys]
 
-        key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(keys, host_indices)
-        exist_result = self._batch_exist(key_strs)
-
-        set_keys = []
-        set_buffer_ptrs = []
-        set_buffer_sizes = []
-        set_indices = []
-        set_results = [-1] * len(key_strs)
-        for i in range(len(key_strs)):
-            if exist_result[i] != 1:
-                set_keys.append(key_strs[i])
-                set_buffer_ptrs.append(buffer_ptrs[i])
-                set_buffer_sizes.append(buffer_sizes[i])
-                set_indices.append(i)
-            else:
-                set_results[i] = 0
-
-        # Only set non-existing keys to storage
-        if len(set_keys) > 0:
-            put_results = self._put_batch_zero_copy_impl(
-                set_keys, set_buffer_ptrs, set_buffer_sizes
+            key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(
+                keys, host_indices
             )
-            for i in range(len(set_indices)):
-                set_results[set_indices[i]] = put_results[i]
+            exist_result = self._batch_exist(key_strs)
 
-        return self._batch_postprocess(set_results, is_set_operate=True)
+            set_keys = []
+            set_buffer_ptrs = []
+            set_buffer_sizes = []
+            set_indices = []
+            set_results = [-1] * len(key_strs)
+            for i in range(len(key_strs)):
+                if exist_result[i] != 1:
+                    set_keys.append(key_strs[i])
+                    set_buffer_ptrs.append(buffer_ptrs[i])
+                    set_buffer_sizes.append(buffer_sizes[i])
+                    set_indices.append(i)
+                else:
+                    set_results[i] = 0
+
+            # Only set non-existing keys to storage
+            if len(set_keys) > 0:
+                put_results = self._put_batch_zero_copy_impl(
+                    set_keys, set_buffer_ptrs, set_buffer_sizes
+                )
+                for i in range(len(set_indices)):
+                    set_results[set_indices[i]] = put_results[i]
+
+            if any(res < 0 for res in set_results):
+                self._report_storage_op(
+                    "batch_set_v1", fatal=True, detail=str(set_results)
+                )
+            else:
+                self._report_storage_op("batch_set_v1", fatal=False)
+            return self._batch_postprocess(set_results, is_set_operate=True)
+        except Exception as e:
+            self._report_storage_op("batch_set_v1", fatal=True, detail=str(e))
+            raise
 
     def set(
         self,

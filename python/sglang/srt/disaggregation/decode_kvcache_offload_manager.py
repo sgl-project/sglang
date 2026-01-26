@@ -223,6 +223,8 @@ class DecodeKVCacheOffloadManager:
             incremental_tokens,
             hash_value=page_hashes,
         )
+        if ack_id is None:
+            return
         self.ongoing_backup[ack_id] = (req.rid, host_indices, start_time)
 
     def _compute_prefix_hash(self, tokens, prior_hash=""):
