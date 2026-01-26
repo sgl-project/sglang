@@ -5,7 +5,7 @@ set -euxo pipefail
 # Set up environment variables
 IS_BLACKWELL=${IS_BLACKWELL:-0}
 CU_VERSION="cu129"
-FLASHINFER_VERSION=0.6.1
+FLASHINFER_VERSION=0.6.2
 OPTIONAL_DEPS="${1:-}"
 
 # Detect system architecture
