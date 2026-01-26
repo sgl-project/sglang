@@ -223,8 +223,8 @@ def _compute_moe_qwen3_decode(layer):
 # -------------------------------- Strategy for MiMoV2DecoderLayer ---------------------------------------
 
 
-# TODO: unstable, current strategy is almost the same as DeepSeek, keep redundant code here for
-# convenience to adjust strategy
+# TODO: unstable; current strategy matches DeepSeek for the common operations (MiMoV2 has no op_shared_experts),
+# so we keep this redundant code here for convenience when adjusting the strategy
 def _compute_moe_mimov2_layer_operations_strategy_tbo(
     layer: torch.nn.Module,
     forward_mode: ForwardMode,
@@ -256,11 +256,11 @@ def _compute_moe_mimov2_prefill(layer):
             layer.mlp.op_gate,
             layer.mlp.op_select_experts,
             layer.mlp.op_dispatch_a,
-            operations.YieldOperation(),  # todo, adjust
+            operations.YieldOperation(),
             layer.mlp.op_dispatch_b,
             layer.mlp.op_experts,
             layer.mlp.op_combine_a,
-            operations.YieldOperation(),  # todo, adjust
+            operations.YieldOperation(),
             layer.mlp.op_combine_b,
             layer.mlp.op_output,
             layer.op_comm_postprocess_layer,
@@ -275,21 +275,21 @@ def _compute_moe_mimov2_decode(layer):
         operations=[
             layer.op_comm_prepare_attn,
             layer.self_attn.op_prepare,
-            operations.YieldOperation(),  # todo, adjust
+            operations.YieldOperation(),
             layer.self_attn.op_core,
             layer.op_comm_prepare_mlp,
             layer.mlp.op_gate,
             layer.mlp.op_select_experts,
-            operations.YieldOperation(),  # todo, adjust
+            operations.YieldOperation(),
             layer.mlp.op_dispatch_a,
-            operations.YieldOperation(),  # todo, adjust
+            operations.YieldOperation(),
             layer.mlp.op_dispatch_b,
             layer.mlp.op_experts,
             layer.mlp.op_combine_a,
-            operations.YieldOperation(),  # todo, adjust
+            operations.YieldOperation(),
             layer.mlp.op_combine_b,
             layer.mlp.op_output,
             layer.op_comm_postprocess_layer,
-            operations.YieldOperation(),  # todo, adjust
+            operations.YieldOperation(),
         ],
     )
