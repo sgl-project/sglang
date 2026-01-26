@@ -58,7 +58,7 @@ class LayerwiseOffloadManager:
         self._weight_metadata: Dict[int, Dict[str, Dict[str, Any]]] = {}
         # layer indices that are already in gpu
         self._gpu_layers: Set[int] = set()
-        # layer_idx -> torch.cuda.Event for fine-grained sync
+        # layer_idx -> torch.cuda.Event for fine-grained sync, to make sure the weight is resident in pre-hook
         self._prefetch_events: Dict[int, torch.cuda.Event] = {}
 
         self._named_parameters: Dict[str, torch.nn.Parameter] = {}
@@ -176,7 +176,7 @@ class LayerwiseOffloadManager:
                 gpu_buffer.copy_(cpu_buffer, non_blocking=non_blocking)
                 gpu_buffers[dtype] = gpu_buffer
 
-        # record event for this layer's prefetch
+        # record the prefetch event of this layer
         event = torch.cuda.Event()
         event.record(self.copy_stream)
         self._prefetch_events[layer_idx] = event
@@ -203,7 +203,7 @@ class LayerwiseOffloadManager:
         if not self.enabled or self.device is None:
             return
 
-        # clear prefetch event
+        # clear prefetch event, since it's useless and needs to be reset
         self._prefetch_events.pop(layer_idx, None)
 
         if layer_idx <= 0:
