@@ -66,7 +66,6 @@ runtime_common = [
   "grpcio==1.75.1", # keep it align with compile_proto.py
   "grpcio-tools==1.75.1", # keep it align with compile_proto.py
   "grpcio-reflection==1.75.1", # required by srt/entrypoints/grpc_server.py
-  "bidict",
 ]
 
 tracing = [
@@ -99,9 +98,6 @@ diffusion_hip = [
   "vsa==0.0.4",
   "runai_model_streamer",
 ]
-
-# https://docs.sglang.io/platforms/ascend_npu.html
-srt_npu = ["sglang[runtime_common]"]
 
 # For Intel Gaudi(device : hpu) follow the installation guide
 # https://docs.vllm.ai/en/latest/getting_started/gaudi-installation.html
@@ -146,12 +142,10 @@ test = [
 ]
 
 all_hip = ["sglang[srt_hip]"]
-all_npu = ["sglang[srt_npu]"]
 all_hpu = ["sglang[srt_hpu]"]
 all_musa = ["sglang[srt_musa]", "sglang[diffusion_musa]"]
 
 dev_hip = ["sglang[all_hip]", "sglang[test]"]
-dev_npu = ["sglang[all_npu]", "sglang[test]"]
 dev_hpu = ["sglang[all_hpu]", "sglang[test]"]
 dev_musa = ["sglang[all_musa]", "sglang[test]"]
 
@@ -164,16 +158,8 @@ sglang = "sglang.cli.main:main"
 
 [tool.setuptools.package-data]
 "sglang" = [
-  "srt/layers/moe/fused_moe_triton/configs/*/*.json",
-  "srt/layers/quantization/configs/*.json",
-  "srt/mem_cache/storage/hf3fs/hf3fs_utils.cpp",
-  "srt/mem_cache/cpp_radix_tree/*.cpp",
-  "srt/mem_cache/cpp_radix_tree/*.h",
-  "srt/speculative/cpp_ngram/*.cpp",
-  "srt/speculative/cpp_ngram/*.h",
-  "jit_kernel/include/sgl_kernel/*.h",
-  "jit_kernel/include/sgl_kernel/*.cuh",
-  "jit_kernel/csrc/*.cuh"
+  "srt/**/*",
+  "jit_kernel/**/*"
 ]
 
 [tool.setuptools.packages.find]
@@ -202,7 +188,3 @@ exclude = [
 root = ".."
 version_file = "sglang/_version.py"
 git_describe_command = ["git", "describe", "--tags", "--long", "--match", "v*"]
-
-[tool.codespell]
-ignore-words-list = "ans, als, hel, boostrap, childs, te, vas, hsa, ment"
-skip = "*.json,*.jsonl,*.patch,*.txt"

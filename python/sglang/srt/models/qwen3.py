@@ -181,7 +181,7 @@ class Qwen3Attention(nn.Module):
         if get_global_server_args().rl_on_policy_target is not None:
             hidden_states = hidden_states.bfloat16()
 
-        if not _is_npu:
+        if not _is_npu or forward_batch.forward_mode.is_extend():
             q, k, v = self.forward_prepare_native(
                 positions=positions,
                 hidden_states=hidden_states,
@@ -299,7 +299,7 @@ class Qwen3DecoderLayer(nn.Module):
             forward_batch,
             cache=(
                 [self.mlp.gate_up_proj.weight, self.mlp.down_proj.weight]
-                if _is_npu
+                if _is_npu and not get_global_server_args().enable_piecewise_cuda_graph
                 else None
             ),
         )

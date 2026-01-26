@@ -432,6 +432,7 @@ class ModelConfig:
             self.attention_arch = AttentionArch.MLA
             self.kv_lora_rank = self.hf_text_config.kv_lora_rank
             self.qk_rope_head_dim = self.hf_text_config.qk_rope_head_dim
+            self.qk_nope_head_dim = self.hf_text_config.qk_nope_head_dim
         elif "KimiVLForConditionalGeneration" in self.hf_config.architectures:
             self.head_dim = 256
             self.attention_arch = AttentionArch.MLA
@@ -462,6 +463,9 @@ class ModelConfig:
                         or self.hf_text_config.head_dim is None
                     ):
                         setattr(self.hf_text_config, "head_dim", self.head_dim)
+
+            elif "BaichuanForCausalLM" in self.hf_config.architectures:
+                self.use_alibi = self.hf_config.hidden_size != 4096
 
             self.attention_arch = AttentionArch.MHA
 
@@ -804,8 +808,11 @@ class ModelConfig:
         # Parse quantization method from the HF and ModelSlim model config, if available.
         # Only one function should return config, other should return None.
         cfg_list = []
-        cfg_list.append(self._parse_quant_hf_config())
-        cfg_list.append(self._find_quant_modelslim_config())
+        hf_config = self._parse_quant_hf_config()
+        modelslim_config = self._find_quant_modelslim_config()
+        quant_config = modelslim_config or hf_config
+        if quant_config is not None:
+            cfg_list.append(quant_config)
 
         # Filter out None values
         cfg_list = [item for item in cfg_list if item is not None]
@@ -834,20 +841,29 @@ class ModelConfig:
             if self.quantization is None:
                 self.quantization = quant_method
             elif self.quantization != quant_method:
-                # Allow auto-detection of quantization from checkpoint for draft model
-                # even if it differs from main model's quantization
-                if self.is_draft_model:
+                # Check if the CLI-specified quantization is compatible with HF config's quant_method
+                is_compatible = (
+                    self.quantization in compatible_quantization_methods
+                    and quant_method
+                    in compatible_quantization_methods[self.quantization]
+                )
+                if is_compatible:
+                    # Keep the CLI-specified quantization (e.g., modelopt_fp4) even if
+                    # HF config says "modelopt" - they are compatible
+                    logger.info(
+                        f"Using CLI-specified quantization ({self.quantization}) which is "
+                        f"compatible with HF config quant_method ({quant_method})."
+                    )
+                elif self.is_draft_model:
+                    # Allow auto-detection of quantization from checkpoint for draft model
+                    # only if the CLI quantization is not compatible
                     logger.info(
                         f"Draft model quantization ({quant_method}) differs from "
                         f"main model quantization ({self.quantization}). "
                         f"Using draft model's detected quantization: {quant_method}"
                     )
                     self.quantization = quant_method
-                elif (
-                    self.quantization not in compatible_quantization_methods
-                    or quant_method
-                    not in compatible_quantization_methods[self.quantization]
-                ):
+                else:
                     raise ValueError(
                         "Quantization method specified in the model config "
                         f"({quant_method}) does not match the quantization "
@@ -1110,6 +1126,7 @@ def is_generation_model(model_architectures: List[str], is_embedding: bool = Fal
 multimodal_model_archs = [
     "CLIPModel",
     "DeepseekVL2ForCausalLM",
+    "Ernie4_5_VLMoeForConditionalGeneration",
     "Gemma3ForConditionalGeneration",
     "Gemma3nForConditionalGeneration",
     "Glm4vForConditionalGeneration",
@@ -1151,6 +1168,7 @@ multimodal_model_archs = [
     "JetVLMForConditionalGeneration",
     "PaddleOCRVLForConditionalGeneration",
     "MiDashengLMModel",
+    "StepVLForConditionalGeneration",
 ]
 
 if external_mm_model_arch := envs.SGLANG_EXTERNAL_MM_MODEL_ARCH.get():
@@ -1248,7 +1266,8 @@ def get_hybrid_layer_ids(
             i for i in range(num_hidden_layers) if hybrid_layer_pattern[i] == 0
         ]
     elif "MiMoV2MTP" in model_architectures:
-        return [0], []
+        swa_attention_layer_ids = [0]
+        full_attention_layer_ids = []
     else:
         swa_attention_layer_ids = None
         full_attention_layer_ids = None

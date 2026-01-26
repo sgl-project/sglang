@@ -486,7 +486,7 @@ class Llama4Model(nn.Module):
             config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("embed_tokens", prefix),
-            enable_tp=not is_dp_attention_enabled(),
+            use_attn_tp_group=is_dp_attention_enabled(),
         )
         self.layers = make_layers(
             config.num_hidden_layers,

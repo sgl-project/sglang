@@ -50,6 +50,8 @@ def npu_wrapper_rmsnorm_forward(func):
         if not x.is_contiguous():
             x = x.contiguous()
         if residual is not None:
+            if post_residual_addition is not None:
+                residual = residual + post_residual_addition
             out, residual_out = add_rmsnorm_bias(
                 x,
                 residual,

@@ -14,6 +14,7 @@ from sglang.srt.distributed import get_tensor_model_parallel_world_size, get_tp_
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
@@ -89,7 +90,7 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_fp8_fnuz = is_fp8_fnuz()
 _use_hip_int4 = get_bool_env_var("SGLANG_INT4_WEIGHT") and _is_hip
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
 
 if _use_aiter or _use_hip_int4:
     from aiter import ActivationType, QuantType
@@ -227,6 +228,8 @@ class Fp8LinearMethod(LinearMethodBase):
         self.is_checkpoint_fp8_serialized = (
             self.quant_config.is_checkpoint_fp8_serialized
         )
+        self.use_aiter_fp8_per_token = envs.SGLANG_USE_AITER_FP8_PER_TOKEN.get()
+        self.use_per_token_if_dynamic = False
 
     def validate_block_quant_shapes(
         self,
@@ -419,13 +422,20 @@ class Fp8LinearMethod(LinearMethodBase):
 
             # If checkpoint not serialized fp8, quantize the weights.
             if not self.is_checkpoint_fp8_serialized:
-                if self.cutlass_fp8_supported or self.use_marlin:
+                if (
+                    self.cutlass_fp8_supported
+                    or self.use_marlin
+                    or (_use_aiter and self.use_aiter_fp8_per_token)
+                ):
                     # apply per-channel quantization default as
                     # cutlass sgl-kernel and marlin only support per-channel scale
                     qweight, weight_scale = per_token_group_quant_fp8(
                         layer.weight, layer.weight.shape[-1]
                     )
                     weight_scale = weight_scale.t().contiguous()
+                    if _use_aiter and self.use_aiter_fp8_per_token:
+                        self.use_per_token_if_dynamic = True
+                        qweight = shuffle_weight(qweight.contiguous(), (16, 16))
                 else:
                     # per-tensor quantization
                     qweight, weight_scale = input_to_float8(layer.weight)
@@ -452,12 +462,25 @@ class Fp8LinearMethod(LinearMethodBase):
                         layer.input_scale.data, requires_grad=False
                     )
 
-                # cutlass sgl-kernel and marlin only support per-channel scale
-                if self.cutlass_fp8_supported or self.use_marlin:
+                # cutlass sgl-kernel and marlin only support per-channel scale; aiter supports per-channel scale
+                if (
+                    self.cutlass_fp8_supported
+                    or self.use_marlin
+                    or (_use_aiter and self.use_aiter_fp8_per_token)
+                ):
                     weight = layer.weight
                     weight_scale = convert_to_channelwise(
                         layer.weight_scale, layer.logical_widths
                     )
+                    if _use_aiter and self.use_aiter_fp8_per_token:
+                        # Otherwise, by default, aiter only uses per-tensor quantization
+                        self.use_per_token_if_dynamic = True
+                        if _is_fp8_fnuz:
+                            weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
+                                weight=weight,
+                                weight_scale=weight_scale,
+                            )
+                        weight = shuffle_weight(weight.contiguous(), (16, 16))
                 else:
                     # Dequant -> Quant with max scale so we can run per tensor.
                     weight = layer.weight
@@ -558,7 +581,7 @@ class Fp8LinearMethod(LinearMethodBase):
             input_scale=layer.input_scale,
             bias=bias,
             cutlass_fp8_supported=self.cutlass_fp8_supported,
-            use_per_token_if_dynamic=False,
+            use_per_token_if_dynamic=self.use_per_token_if_dynamic,
         )
 
 

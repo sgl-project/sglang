@@ -1219,6 +1219,38 @@ def _validate_safetensors_file(file_path: str) -> bool:
         return False
 
 
+def _validate_pytorch_bin_file(file_path: str) -> bool:
+    """
+    Validate that a PyTorch .bin file is readable and not corrupted.
+
+    This catches corruption issues like truncated downloads or invalid archives
+    that would cause errors like:
+    "RuntimeError: PytorchStreamReader failed reading file data/X: invalid header
+    or archive is corrupted"
+
+    Args:
+        file_path: Path to the .bin file
+
+    Returns:
+        True if the file is valid, False if corrupted
+    """
+    try:
+        import torch
+
+        # Use weights_only=True for security and to avoid executing arbitrary code
+        # mmap=False to fully read the file and catch all corruption
+        torch.load(file_path, map_location="cpu", weights_only=True, mmap=False)
+        return True
+    except Exception as e:
+        logger.warning(
+            "Corrupted PyTorch bin file detected: %s - %s: %s",
+            file_path,
+            type(e).__name__,
+            str(e),
+        )
+        return False
+
+
 def _check_index_files_exist(snapshot_dir: str) -> Tuple[bool, Optional[str]]:
     """
     Check if all files listed in safetensors index files actually exist on disk.
@@ -1366,10 +1398,14 @@ def _validate_sharded_model(
                 [],
             )
 
-        # Validate safetensors files for corruption
+        # Validate weight files for corruption
         if group_info["suffix"] == "safetensors":
             for f in group_info["files"]:
                 if not _validate_safetensors_file(f):
+                    corrupted_files.append(f)
+        elif group_info["suffix"] == "bin":
+            for f in group_info["files"]:
+                if not _validate_pytorch_bin_file(f):
                     corrupted_files.append(f)
 
         # Check for required index file for safetensors shards
@@ -1561,7 +1597,7 @@ def ci_validate_and_cleanup_local_snapshot(
                 )
                 return False
 
-        # Also validate single (non-sharded) safetensors files
+        # Also validate single (non-sharded) weight files
         for f in local_weight_files:
             base_name = os.path.basename(f)
             # Check if this is a single model file (not sharded)
@@ -1572,6 +1608,21 @@ def ci_validate_and_cleanup_local_snapshot(
                 "adapter_model.safetensors",
             ]:
                 if not _validate_safetensors_file(f):
+                    log_info_on_rank0(
+                        logger,
+                        f"Corrupted model file {base_name} for {model_name_or_path}. "
+                        "Will selectively clean and re-download this file.",
+                    )
+                    # Selective cleanup for single file
+                    _cleanup_corrupted_files_selective(model_name_or_path, [f])
+                    return False
+            # Also validate single PyTorch .bin files
+            elif base_name in [
+                "pytorch_model.bin",
+                "model.bin",
+                "adapter_model.bin",
+            ]:
+                if not _validate_pytorch_bin_file(f):
                     log_info_on_rank0(
                         logger,
                         f"Corrupted model file {base_name} for {model_name_or_path}. "
@@ -1613,11 +1664,14 @@ def _validate_weights_after_download(
     if not weight_files:
         return True  # No weight files to validate
 
-    # Validate safetensors files
+    # Validate weight files (safetensors and .bin)
     corrupted_files = []
     for f in weight_files:
         if f.endswith(".safetensors") and os.path.exists(f):
             if not _validate_safetensors_file(f):
+                corrupted_files.append(os.path.basename(f))
+        elif f.endswith(".bin") and os.path.exists(f):
+            if not _validate_pytorch_bin_file(f):
                 corrupted_files.append(os.path.basename(f))
 
     if corrupted_files:
@@ -1777,9 +1831,20 @@ def ci_validate_and_clean_hf_cache(model_path: str) -> None:
                 if not _validate_safetensors_file(sf_file):
                     corrupted_files.append(sf_file)
 
+            # Also find and validate PyTorch .bin files
+            bin_files = glob_module.glob(os.path.join(snapshot_dir, "*.bin"))
+
+            for bin_file in bin_files:
+                # Skip broken symlinks (os.path.exists returns False for them)
+                if not os.path.exists(bin_file):
+                    continue
+
+                if not _validate_pytorch_bin_file(bin_file):
+                    corrupted_files.append(bin_file)
+
         if corrupted_files:
             logger.warning(
-                "HFRunner: Found %d corrupted safetensors file(s) for %s. "
+                "HFRunner: Found %d corrupted weight file(s) for %s. "
                 "Removing to force re-download.",
                 len(corrupted_files),
                 model_path,
