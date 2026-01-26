@@ -111,8 +111,8 @@ impl PipelineStage for GenerateRequestBuildingStage {
                         _ => None,
                     })
             {
-                // Inject PD bootstrap metadata for prefill->decode KV cache transfer
-                // Note: For EPD mode, encode worker uses HTTP REST API, not gRPC bootstrap
+                // Inject PD bootstrap metadata for prefill->decode KV cache transfer.
+                // For EPD mode, encode is a separate gRPC stage; bootstrap is prefill↔decode only.
                 helpers::inject_bootstrap_metadata(&mut proto_request, prefill_worker);
             }
         }

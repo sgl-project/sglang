@@ -904,10 +904,9 @@ impl CliArgs {
             let has_encode_workers = !encode_urls.is_empty();
             let has_encode_discovery = self.service_discovery && !self.encode_selector.is_empty();
             let has_encode_stage = has_encode_workers || has_encode_discovery;
-            let wants_disaggregation = self.pd_disaggregation || self.epd_disaggregation;
             let decode_urls = self.decode.clone();
 
-            if wants_disaggregation && has_encode_stage {
+            if self.epd_disaggregation && has_encode_stage {
                 RoutingMode::EncodePrefillDecode {
                     encode_urls,
                     prefill_urls,
@@ -916,7 +915,7 @@ impl CliArgs {
                     prefill_policy: self.prefill_policy.as_ref().map(|p| self.parse_policy(p)),
                     decode_policy: self.decode_policy.as_ref().map(|p| self.parse_policy(p)),
                 }
-            } else if wants_disaggregation {
+            } else if self.pd_disaggregation || self.epd_disaggregation {
                 RoutingMode::PrefillDecode {
                     prefill_urls,
                     decode_urls,
