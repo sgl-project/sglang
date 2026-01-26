@@ -67,16 +67,6 @@ suites = {
             "models/test_qwen3_next_models_pcg.py"
         ),  # Disabled: intermittent failures, see #17039
         TestFile("ep/test_deepep_large.py", 563),  # Disabled: see #17175
-        # Migrated to registry system (test/run_suite.py)
-        TestFile("ep/test_deepep_small.py"),
-        TestFile("ep/test_mooncake_ep_small.py"),
-        TestFile("quant/test_w4a8_deepseek_v3.py"),
-        TestFile("test_deepseek_v3_fp4_4gpu.py"),
-        TestFile("test_disaggregation_different_tp.py"),
-        TestFile("test_disaggregation_dp_attention.py"),
-        TestFile("test_disaggregation_pp.py"),
-        TestFile("test_fp8_blockwise_gemm.py"),
-        TestFile("test_nvfp4_gemm.py"),
     ],
 }
 
