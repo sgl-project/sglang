@@ -1729,32 +1729,91 @@ def _validate_weights_after_download(
     return True
 
 
-def _is_distributed_rank_0() -> bool:
-    """Check if we're rank 0 in a distributed environment, or not distributed."""
+def _get_rank_from_env() -> int:
+    """
+    Get rank from environment variables set by the launcher (torchrun, etc.).
+
+    This works BEFORE distributed infrastructure is initialized, which is critical
+    for coordinating model downloads that happen early in server startup.
+
+    Returns:
+        Rank number (0 for rank 0 or non-distributed), -1 if unable to determine
+    """
+    # Check common rank environment variables set by launchers
+    # RANK is set by torchrun and most distributed launchers
+    # LOCAL_RANK is the rank within a single node
+    rank_str = os.environ.get("RANK") or os.environ.get("LOCAL_RANK")
+
+    if rank_str is None:
+        return 0  # Not distributed, treat as rank 0
+
     try:
-        from sglang.srt.distributed import (
-            get_tensor_model_parallel_rank,
-            model_parallel_is_initialized,
-        )
-
-        if not model_parallel_is_initialized():
-            return True  # Not distributed, treat as rank 0
-        return get_tensor_model_parallel_rank() == 0
-    except ImportError:
-        return True  # If distributed module not available, treat as rank 0
+        return int(rank_str)
+    except ValueError:
+        return 0  # Invalid value, treat as rank 0
 
 
-def _distributed_barrier() -> None:
-    """Execute a barrier if in a distributed environment."""
+def _get_signal_file_path(model_name_or_path: str, cache_dir: Optional[str]) -> str:
+    """
+    Generate a unique signal file path for download coordination.
+
+    The signal file is created by rank 0 after successful download to notify
+    other ranks that they can proceed with local_files_only=True.
+
+    Args:
+        model_name_or_path: Model identifier
+        cache_dir: Cache directory (used in hash for uniqueness)
+
+    Returns:
+        Path to the signal file
+    """
+    # Create a unique hash based on model name and cache dir
+    unique_key = f"{model_name_or_path}:{cache_dir or 'default'}"
+    key_hash = hashlib.sha256(unique_key.encode()).hexdigest()[:12]
+
+    # Use /tmp for signal files (cleaned up on reboot)
+    return f"/tmp/sglang_download_complete_{key_hash}"
+
+
+def _wait_for_signal_file(signal_path: str, timeout: int = 600, poll_interval: float = 0.5) -> bool:
+    """
+    Wait for a signal file to be created by rank 0.
+
+    Args:
+        signal_path: Path to the signal file
+        timeout: Maximum time to wait in seconds
+        poll_interval: Time between polls in seconds
+
+    Returns:
+        True if signal file found, False if timeout
+    """
+    import time
+
+    start_time = time.time()
+    while time.time() - start_time < timeout:
+        if os.path.exists(signal_path):
+            return True
+        time.sleep(poll_interval)
+
+    return False
+
+
+def _create_signal_file(signal_path: str) -> None:
+    """Create a signal file to indicate download is complete."""
     try:
-        from sglang.srt.distributed import get_tp_group, model_parallel_is_initialized
+        with open(signal_path, "w") as f:
+            f.write(f"download_complete:{os.getpid()}")
+    except Exception as e:
+        logger.warning("Failed to create signal file %s: %s", signal_path, e)
 
-        if model_parallel_is_initialized():
-            tp_group = get_tp_group()
-            if tp_group is not None:
-                tp_group.barrier()
-    except ImportError:
-        pass  # If distributed module not available, no barrier needed
+
+def _cleanup_signal_file(signal_path: str) -> None:
+    """Remove the signal file (called by rank 0 at the end)."""
+    try:
+        if os.path.exists(signal_path):
+            os.remove(signal_path)
+    except Exception:
+        pass  # Best effort cleanup
 
 
 def ci_download_with_validation_and_retry(
@@ -1773,8 +1832,11 @@ def ci_download_with_validation_and_retry(
 
     In distributed environments (TP/PP), only rank 0 performs the download to
     prevent HuggingFace hub race conditions where multiple ranks try to download
-    simultaneously, causing .incomplete file conflicts. Other ranks wait at a
-    barrier and then use the cached result.
+    simultaneously, causing .incomplete file conflicts. Other ranks wait for
+    a signal file and then use the cached result.
+
+    Coordination uses environment variables (RANK/LOCAL_RANK) and file-based
+    signaling, which works BEFORE distributed infrastructure is initialized.
 
     Args:
         model_name_or_path: The model name or path
@@ -1800,58 +1862,81 @@ def ci_download_with_validation_and_retry(
             kwargs["disable"] = True
             super().__init__(*args, **kwargs)
 
-    # In distributed environments, coordinate downloads to prevent HuggingFace hub
-    # race conditions. Only rank 0 downloads; other ranks wait at barrier.
-    is_rank_0 = _is_distributed_rank_0()
+    # Determine rank from environment variables (works before distributed init)
+    rank = _get_rank_from_env()
+    is_rank_0 = (rank == 0)
+
+    # Generate signal file path for coordination
+    signal_file = _get_signal_file_path(model_name_or_path, cache_dir)
+
+    # Clean up any stale signal file from previous runs (rank 0 only)
+    if is_rank_0:
+        _cleanup_signal_file(signal_file)
+
     hf_folder = None
-    download_error = None
 
     if is_rank_0:
         # Rank 0: perform the actual download with retry logic
-        for attempt in range(max_retries):
-            hf_folder = snapshot_download(
-                model_name_or_path,
-                allow_patterns=allow_patterns,
-                ignore_patterns=ignore_patterns,
-                cache_dir=cache_dir,
-                tqdm_class=DisabledTqdm,
-                revision=revision,
-                local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
-            )
-
-            # Validate downloaded files to catch corruption early
-            is_valid = _validate_weights_after_download(
-                hf_folder, allow_patterns, model_name_or_path
-            )
-
-            if is_valid:
-                break
-
-            # Validation failed, corrupted files were cleaned up
-            if attempt < max_retries - 1:
-                log_info_on_rank0(
-                    logger,
-                    f"Retrying download for {model_name_or_path} "
-                    f"(attempt {attempt + 2}/{max_retries})...",
-                )
-            else:
-                # Defer exception until after barrier to prevent deadlock
-                download_error = RuntimeError(
-                    f"Downloaded model files are still corrupted for "
-                    f"{model_name_or_path} after {max_retries} attempts. "
-                    "This may indicate a persistent issue with the model files "
-                    "on Hugging Face Hub or network problems."
+        try:
+            for attempt in range(max_retries):
+                hf_folder = snapshot_download(
+                    model_name_or_path,
+                    allow_patterns=allow_patterns,
+                    ignore_patterns=ignore_patterns,
+                    cache_dir=cache_dir,
+                    tqdm_class=DisabledTqdm,
+                    revision=revision,
+                    local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
                 )
 
-    # Synchronize all ranks - rank 0 finished downloading, others can proceed
-    _distributed_barrier()
+                # Validate downloaded files to catch corruption early
+                is_valid = _validate_weights_after_download(
+                    hf_folder, allow_patterns, model_name_or_path
+                )
 
-    # After barrier, raise any deferred error from rank 0
-    if download_error is not None:
-        raise download_error
+                if is_valid:
+                    break
 
-    # Non-rank-0: use the cached model that rank 0 just downloaded
-    if hf_folder is None:
+                # Validation failed, corrupted files were cleaned up
+                if attempt < max_retries - 1:
+                    log_info_on_rank0(
+                        logger,
+                        f"Retrying download for {model_name_or_path} "
+                        f"(attempt {attempt + 2}/{max_retries})...",
+                    )
+                else:
+                    raise RuntimeError(
+                        f"Downloaded model files are still corrupted for "
+                        f"{model_name_or_path} after {max_retries} attempts. "
+                        "This may indicate a persistent issue with the model files "
+                        "on Hugging Face Hub or network problems."
+                    )
+
+            # Signal other ranks that download is complete
+            _create_signal_file(signal_file)
+
+        except Exception:
+            # On failure, still create signal file so other ranks don't hang forever
+            # They will get their own error when trying to load
+            _create_signal_file(signal_file)
+            raise
+
+    else:
+        # Non-rank-0: wait for rank 0 to finish downloading
+        logger.debug(
+            "Rank %d waiting for rank 0 to complete download of %s",
+            rank,
+            model_name_or_path,
+        )
+
+        if not _wait_for_signal_file(signal_file, timeout=600):
+            raise RuntimeError(
+                f"Rank {rank} timed out waiting for rank 0 to download "
+                f"{model_name_or_path}. This may indicate rank 0 crashed or "
+                "the download is taking too long."
+            )
+
+        # Use the cached model that rank 0 just downloaded
         hf_folder = snapshot_download(
             model_name_or_path,
             allow_patterns=allow_patterns,
