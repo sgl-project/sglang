@@ -1567,7 +1567,7 @@ jobs:
         stage-c-test-8-gpu-h20,
         stage-c-test-8-gpu-h200,
         stage-c-test-deepep-4-gpu,
-        # stage-c-test-deepep-8-gpu-h200,  # Disabled, see #17175
+        stage-c-test-deepep-8-gpu-h200,
         stage-c-test-4-gpu-b200,
         # unit-test-backend-4-gpu-gb200,  # Disabled: GB200 runner needs repair
       ]
