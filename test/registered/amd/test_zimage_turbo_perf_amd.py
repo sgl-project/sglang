@@ -61,7 +61,7 @@ def launch_diffusion_server(
     if other_args:
         cmd.extend(other_args)
 
-    print(f"Launching diffusion server: {' '.join(cmd)}")
+    print(f"Launching diffusion server: {' '.join(cmd)}", flush=True)
 
     process = subprocess.Popen(
         cmd,
@@ -78,11 +78,26 @@ def launch_diffusion_server(
 
             response = requests.get(f"{base_url}/health", timeout=5)
             if response.status_code == 200:
-                print(f"Server ready after {time.time() - start_time:.1f}s")
+                print(f"Server ready after {time.time() - start_time:.1f}s", flush=True)
                 return process
         except Exception:
             pass
         time.sleep(5)
+
+    # Print server output before killing
+    print("Server failed to start. Dumping server output:", flush=True)
+    try:
+        # Read available output without blocking
+        import select
+
+        if select.select([process.stdout], [], [], 0)[0]:
+            output = process.stdout.read()
+            if output:
+                print(
+                    output.decode() if isinstance(output, bytes) else output, flush=True
+                )
+    except Exception as e:
+        print(f"Could not read server output: {e}", flush=True)
 
     process.kill()
     raise RuntimeError(f"Diffusion server failed to start within {timeout}s")
@@ -124,21 +139,28 @@ def run_diffusion_benchmark(
         output_file,
     ]
 
-    print(f"Running benchmark: {' '.join(cmd)}")
+    print(f"Running benchmark: {' '.join(cmd)}", flush=True)
 
-    result = subprocess.run(
+    # Stream output in real-time instead of capturing
+    process = subprocess.Popen(
         cmd,
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
         text=True,
         env={**os.environ},
+        bufsize=1,  # Line buffered
     )
 
-    print(f"Benchmark stdout:\n{result.stdout}")
-    if result.stderr:
-        print(f"Benchmark stderr:\n{result.stderr}")
+    # Print output in real-time
+    output_lines = []
+    for line in process.stdout:
+        print(line, end="", flush=True)
+        output_lines.append(line)
 
-    if result.returncode != 0:
-        raise RuntimeError(f"Benchmark failed with return code {result.returncode}")
+    process.wait()
+
+    if process.returncode != 0:
+        raise RuntimeError(f"Benchmark failed with return code {process.returncode}")
 
     with open(output_file, "r") as f:
         metrics = json.load(f)
@@ -185,8 +207,8 @@ class TestZImageTurboPerfAMD(CustomTestCase):
         throughput_qps = metrics.get("throughput_qps", 0)
         latency_mean = metrics.get("latency_mean", float("inf"))
 
-        print(f"{throughput_qps=:.4f} req/s")
-        print(f"{latency_mean=:.4f} s")
+        print(f"{throughput_qps=:.4f} req/s", flush=True)
+        print(f"{latency_mean=:.4f} s", flush=True)
 
         if is_in_ci():
             write_github_step_summary(
