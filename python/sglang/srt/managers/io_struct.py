@@ -202,6 +202,8 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
     return_hidden_states: Union[List[bool], bool] = False
     # Whether to return captured routed experts
     return_routed_experts: bool = False
+    # The start location in the prompt for returning routed experts.
+    routed_experts_start_len: int = 0
 
     # The modalities of the image data [image, multi-images, video]
     modalities: Optional[List[str]] = None
@@ -709,6 +711,8 @@ class TokenizedGenerateReqInput(BaseReq):
 
     # Whether to return captured routed experts
     return_routed_experts: bool = False
+    # The start location in the prompt for returning routed experts.
+    routed_experts_start_len: int = 0
 
     # The input embeds
     input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None
@@ -981,8 +985,9 @@ class BatchTokenIDOutput(
     # Hidden states
     output_hidden_states: List[List[float]]
 
-    # The routed experts for each output token
-    output_routed_experts: List[torch.Tensor]
+    # The routed experts for each token, including both input and output tokens
+    # routed_experts[i] is a tensor of shape (token, layer, top_k) for request i
+    routed_experts: List[Optional[torch.Tensor]]
 
     # The information of placeholder tokens (e.g., image token)
     # idx is the index of the token in the prompt after expansion.
@@ -1068,8 +1073,9 @@ class BatchStrOutput(
     # Hidden states
     output_hidden_states: List[List[float]]
 
-    # The routed experts for each output token
-    output_routed_experts: List[List[int]]
+    # The routed experts for each token, including both input and output tokens
+    # routed_experts[i] is a tensor of shape (token, layer, top_k) for request i
+    routed_experts: List[Optional[torch.Tensor]]
 
     # The information of placeholder tokens (e.g., image token)
     # idx is the index of the token in the prompt after expansion.
@@ -1150,6 +1156,60 @@ class FlushCacheReqInput(BaseReq):
 @dataclass
 class FlushCacheReqOutput(BaseReq):
     success: bool
+
+
+@dataclass
+class AttachHiCacheStorageReqInput(BaseReq):
+    """Dynamically attach (enable) HiCache storage backend at runtime.
+
+    Note: `hicache_storage_backend_extra_config_json` is a JSON string. It may contain both:
+    - backend-specific configs (e.g., mooncake master address)
+    - prefetch-related knobs (prefetch_threshold, prefetch_timeout_*, hicache_storage_pass_prefix_keys)
+    """
+
+    hicache_storage_backend: str
+    hicache_storage_backend_extra_config_json: Optional[str] = None
+    hicache_storage_prefetch_policy: Optional[str] = None
+    hicache_write_policy: Optional[str] = None
+
+    def __post_init__(self):
+        if self.hicache_storage_prefetch_policy is None:
+            pass
+        else:
+            allowed = ["best_effort", "wait_complete", "timeout"]
+            if self.hicache_storage_prefetch_policy not in allowed:
+                raise ValueError(
+                    f"Invalid hicache_storage_prefetch_policy: {self.hicache_storage_prefetch_policy!r}. "
+                    f"Expected one of {allowed}."
+                )
+
+        if self.hicache_write_policy is None:
+            return
+        allowed = ["write_back", "write_through", "write_through_selective"]
+        if self.hicache_write_policy not in allowed:
+            raise ValueError(
+                f"Invalid hicache_write_policy: {self.hicache_write_policy!r}. "
+                f"Expected one of {allowed}."
+            )
+
+
+@dataclass
+class AttachHiCacheStorageReqOutput(BaseReq):
+    success: bool
+    message: str = ""
+
+
+@dataclass
+class DetachHiCacheStorageReqInput(BaseReq):
+    """Dynamically detach (disable) HiCache storage backend at runtime."""
+
+    pass
+
+
+@dataclass
+class DetachHiCacheStorageReqOutput(BaseReq):
+    success: bool
+    message: str = ""
 
 
 @dataclass
@@ -1432,6 +1492,11 @@ class AbortReq(BaseReq):
         # FIXME: This is a hack to keep the same with the old code
         if self.rid is None:
             self.rid = ""
+
+
+@dataclass
+class ActiveRanksOutput(BaseReq):
+    status: List[bool]
 
 
 @dataclass

@@ -38,10 +38,14 @@ from sglang.multimodal_gen.configs.pipeline_configs import (
     ZImagePipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
-from sglang.multimodal_gen.configs.pipeline_configs.flux import Flux2PipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.flux import (
+    Flux2KleinPipelineConfig,
+    Flux2PipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.glm_image import (
     GlmImagePipelineConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import LTX2PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImageEditPipelineConfig,
     QwenImageEditPlus_2511_PipelineConfig,
@@ -58,12 +62,16 @@ from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     Wan2_2_T2V_A14B_Config,
     Wan2_2_TI2V_5B_Config,
 )
-from sglang.multimodal_gen.configs.sample.flux import FluxSamplingParams
+from sglang.multimodal_gen.configs.sample.flux import (
+    Flux2KleinSamplingParams,
+    FluxSamplingParams,
+)
 from sglang.multimodal_gen.configs.sample.glmimage import GlmImageSamplingParams
 from sglang.multimodal_gen.configs.sample.hunyuan import (
     FastHunyuanSamplingParam,
     HunyuanSamplingParams,
 )
+from sglang.multimodal_gen.configs.sample.ltx_2 import LTX2SamplingParams
 from sglang.multimodal_gen.configs.sample.qwenimage import (
     QwenImage2512SamplingParams,
     QwenImageEditPlusSamplingParams,
@@ -417,6 +425,16 @@ def get_model_info(
 
 # Registration of model configs
 def _register_configs():
+    # LTX-2
+    register_configs(
+        sampling_param_cls=LTX2SamplingParams,
+        pipeline_config_cls=LTX2PipelineConfig,
+        model_detectors=[
+            lambda path: "ltx" in path.lower() and "video" in path.lower(),
+            lambda path: "ltx-2" in path.lower(),
+        ],
+    )
+
     # Hunyuan
     register_configs(
         sampling_param_cls=HunyuanSamplingParams,
@@ -535,12 +553,26 @@ def _register_configs():
         model_detectors=[lambda hf_id: "flux.1" in hf_id.lower()],
     )
     register_configs(
+        sampling_param_cls=Flux2KleinSamplingParams,
+        pipeline_config_cls=Flux2KleinPipelineConfig,
+        hf_model_paths=[
+            "black-forest-labs/FLUX.2-klein-4B",
+            "black-forest-labs/FLUX.2-klein-9B",
+        ],
+        model_detectors=[
+            lambda hf_id: "flux.2-klein" in hf_id.lower()
+            or "flux2-klein" in hf_id.lower()
+        ],
+    )
+    register_configs(
         sampling_param_cls=FluxSamplingParams,
         pipeline_config_cls=Flux2PipelineConfig,
         hf_model_paths=[
             "black-forest-labs/FLUX.2-dev",
         ],
-        model_detectors=[lambda hf_id: "flux.2" in hf_id.lower()],
+        model_detectors=[
+            lambda hf_id: "flux.2" in hf_id.lower() and "klein" not in hf_id.lower()
+        ],
     )
     register_configs(
         sampling_param_cls=ZImageSamplingParams,
