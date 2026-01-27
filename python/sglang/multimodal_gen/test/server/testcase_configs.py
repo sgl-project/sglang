@@ -319,8 +319,7 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
     DiffusionTestCase(
         "qwen_image_t2i",
         DiffusionServerArgs(
-            model_path="Qwen/Qwen-Image",
-            modality="image",
+            model_path="Qwen/Qwen-Image", modality="image", warmup=True
         ),
         T2I_sampling_params,
     ),
@@ -330,22 +329,21 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
             model_path="Qwen/Qwen-Image",
             modality="image",
             enable_cache_dit=True,
+            warmup=True,
         ),
         T2I_sampling_params,
     ),
     DiffusionTestCase(
         "flux_image_t2i",
         DiffusionServerArgs(
-            model_path="black-forest-labs/FLUX.1-dev",
-            modality="image",
+            model_path="black-forest-labs/FLUX.1-dev", modality="image", warmup=True
         ),
         T2I_sampling_params,
     ),
     DiffusionTestCase(
         "flux_2_image_t2i",
         DiffusionServerArgs(
-            model_path="black-forest-labs/FLUX.2-dev",
-            modality="image",
+            model_path="black-forest-labs/FLUX.2-dev", modality="image", warmup=True
         ),
         T2I_sampling_params,
     ),
@@ -354,6 +352,7 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
         DiffusionServerArgs(
             model_path="black-forest-labs/FLUX.2-klein-4B",
             modality="image",
+            warmup=True,
         ),
         T2I_sampling_params,
     ),
@@ -366,14 +365,14 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
             model_path="black-forest-labs/FLUX.2-dev",
             modality="image",
             dit_layerwise_offload=True,
+            warmup=True,
         ),
         T2I_sampling_params,
     ),
     DiffusionTestCase(
         "zimage_image_t2i",
         DiffusionServerArgs(
-            model_path="Tongyi-MAI/Z-Image-Turbo",
-            modality="image",
+            model_path="Tongyi-MAI/Z-Image-Turbo", modality="image", warmup=True
         ),
         T2I_sampling_params,
     ),
@@ -392,6 +391,7 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
             modality="image",
             lora_path="reverentelusarca/elusarca-anime-style-lora-z-image-turbo",
             second_lora_path="tarn59/pixel_art_style_lora_z_image_turbo",
+            warmup=True,
         ),
         T2I_sampling_params,
     ),
@@ -399,32 +399,28 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
     DiffusionTestCase(
         "qwen_image_edit_ti2i",
         DiffusionServerArgs(
-            model_path="Qwen/Qwen-Image-Edit",
-            modality="image",
+            model_path="Qwen/Qwen-Image-Edit", modality="image", warmup=True
         ),
         TI2I_sampling_params,
     ),
     DiffusionTestCase(
         "qwen_image_edit_2509_ti2i",
         DiffusionServerArgs(
-            model_path="Qwen/Qwen-Image-Edit-2509",
-            modality="image",
+            model_path="Qwen/Qwen-Image-Edit-2509", modality="image", warmup=True
         ),
         MULTI_IMAGE_TI2I_sampling_params,
     ),
     DiffusionTestCase(
         "qwen_image_edit_2511_ti2i",
         DiffusionServerArgs(
-            model_path="Qwen/Qwen-Image-Edit-2511",
-            modality="image",
+            model_path="Qwen/Qwen-Image-Edit-2511", modality="image", warmup=True
         ),
         TI2I_sampling_params,
     ),
     DiffusionTestCase(
         "qwen_image_layered_i2i",
         DiffusionServerArgs(
-            model_path="Qwen/Qwen-Image-Layered",
-            modality="image",
+            model_path="Qwen/Qwen-Image-Layered", modality="image", warmup=True
         ),
         MULTI_FRAME_I2I_sampling_params,
     ),
@@ -499,8 +495,7 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
     DiffusionTestCase(
         "flux_2_ti2i",
         DiffusionServerArgs(
-            model_path="black-forest-labs/FLUX.2-dev",
-            modality="image",
+            model_path="black-forest-labs/FLUX.2-dev", modality="image", warmup=True
         ),
         TI2I_sampling_params,
     ),
@@ -674,6 +669,7 @@ TWO_GPU_CASES_B = [
             # test ring attn
             ulysses_degree=1,
             ring_degree=2,
+            warmup=True,
         ),
         T2I_sampling_params,
     ),
@@ -684,6 +680,7 @@ TWO_GPU_CASES_B = [
             modality="image",
             num_gpus=2,
             ulysses_degree=2,
+            warmup=True,
         ),
         T2I_sampling_params,
     ),
@@ -693,6 +690,7 @@ TWO_GPU_CASES_B = [
             model_path="black-forest-labs/FLUX.1-dev",
             modality="image",
             num_gpus=2,
+            warmup=True,
         ),
         T2I_sampling_params,
     ),
@@ -703,6 +701,7 @@ TWO_GPU_CASES_B = [
             modality="image",
             num_gpus=2,
             tp_size=2,
+            warmup=True,
         ),
         T2I_sampling_params,
     ),

@@ -71,7 +71,6 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
 
     if server_args.dit_layerwise_offload:
         extra_args += f" --dit-layerwise-offload true"
-        extra_args += f" --dit-offload-prefetch-size 2"
 
     if server_args.text_encoder_cpu_offload:
         extra_args += f" --text-encoder-cpu-offload"
