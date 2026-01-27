@@ -21,6 +21,7 @@ class TestLightOnOCRServer(TestOpenAIMLLMServerBase):
     """Functional tests for LightOnOCR OpenAI-compatible API."""
 
     model = MODEL
+    trust_remote_code = False
     extra_args = [
         "--mem-fraction-static=0.85",
         "--cuda-graph-max-bs=4",

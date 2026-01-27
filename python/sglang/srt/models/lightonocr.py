@@ -141,7 +141,8 @@ class LightOnOCRForConditionalGeneration(nn.Module):
                     image_sizes_list.append((int(size[0]), int(size[1])))
             else:
                 img = item.feature
-                image_sizes_list.append((img.shape[-2], img.shape[-1]))
+                for _ in range(img.shape[0]):
+                    image_sizes_list.append((img.shape[-2], img.shape[-1]))
 
         # Stack pixel values
         if len(images) > 1:
@@ -156,12 +157,11 @@ class LightOnOCRForConditionalGeneration(nn.Module):
         # Norm before patch merge (matches HF Mistral3MultiModalProjector order)
         image_features = self.vision_projection_norm(image_features)
 
-        # Spatial merge via patch merger
+        # Spatial merge via patch merger — use actual image sizes (not padded tensor
+        # shape) because PixtralHFVisionModel crops embeddings to real dimensions.
         patch_size = self.vision_args.patch_size
         img_patch_dims = [
-            (img.shape[-2] // patch_size, img.shape[-1] // patch_size)
-            for img in images
-            for _ in range(img.shape[0])
+            (h // patch_size, w // patch_size) for (h, w) in image_sizes_list
         ]
         image_features = self.patch_merger(image_features, image_sizes=img_patch_dims)
 
