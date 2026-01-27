@@ -16,4 +16,9 @@ echo ""
 python3 "${SCRIPT_DIR}/../utils/prevalidate_cached_models.py"
 echo ""
 
+# Warmup DeepGEMM JIT kernels to avoid timeout during tests
+# This pre-compiles common kernel configurations so they're cached
+python3 "${SCRIPT_DIR}/warmup_deep_gemm.py"
+echo ""
+
 echo "CI runner preparation complete!"
