@@ -7,7 +7,7 @@ from sglang.test.run_combined_tests import run_combined_tests
 from sglang.test.test_utils import ModelLaunchSettings
 
 # Runs on both H200 and B200 via nightly-8-gpu-common suite
-register_cuda_ci(est_time=12000, suite="nightly-8-gpu-common", nightly=True)
+register_cuda_ci(est_time=1800, suite="nightly-8-gpu-common", nightly=True)
 
 LLAMA4_MODEL_PATH = "meta-llama/Llama-4-Scout-17B-16E-Instruct"
 
@@ -44,7 +44,7 @@ class TestLlama4(unittest.TestCase):
 
         run_combined_tests(
             models=variants,
-            test_name="Llama-4-Scout Unified",
+            test_name="Llama-4-Scout",
             accuracy_params=AccuracyTestParams(dataset="gsm8k", baseline_accuracy=0.9),
             performance_params=PerformanceTestParams(
                 profile_dir="performance_profiles_llama4",

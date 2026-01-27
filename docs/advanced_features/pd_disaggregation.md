@@ -23,7 +23,7 @@ When you need to profile prefill or decode workers in PD disaggregation mode, pl
 
 ## Router Integration
 
-For deploying PD disaggregation at scale with load balancing and fault tolerance, SGLang provides a router. The router can distribute requests between prefill and decode instances using various routing policies. For detailed information on setting up routing with PD disaggregation, including configuration options and deployment patterns, see the [SGLang Router documentation](router.md#mode-3-prefill-decode-disaggregation).
+For deploying PD disaggregation at scale with load balancing and fault tolerance, SGLang provides a router. The router can distribute requests between prefill and decode instances using various routing policies. For detailed information on setting up routing with PD disaggregation, including configuration options and deployment patterns, see the [SGLang Model Gateway (former Router)](../advanced_features/sgl_model_gateway.md#prefill-decode-disaggregation).
 
 
 ## Mooncake
@@ -260,6 +260,26 @@ python -m sglang.launch_server \
   --moe-a2a-backend deepep \
   --mem-fraction-static 0.8 \
   --max-running-requests 128
+```
+
+### Advanced Configuration
+
+#### NIXL Backend Selection
+
+By default, NIXL uses the **UCX** backend for KV cache transfers. You can select a different NIXL plugin backend depending on your infrastructure using the environment variable `SGLANG_DISAGGREGATION_NIXL_BACKEND`.
+
+Example: `export SGLANG_DISAGGREGATION_NIXL_BACKEND=LIBFABRIC`
+
+**Available backends:** UCX (default), LIBFABRIC, or any installed NIXL plugin.
+
+Example usage:
+```bash
+export SGLANG_DISAGGREGATION_NIXL_BACKEND=LIBFABRIC
+python -m sglang.launch_server \
+  --model-path meta-llama/Llama-3.1-8B-Instruct \
+  --disaggregation-mode prefill \
+  --disaggregation-transfer-backend nixl \
+  --port 30000
 ```
 
 ## ASCEND
