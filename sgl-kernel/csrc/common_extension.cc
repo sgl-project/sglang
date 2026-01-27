@@ -626,16 +626,10 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
    * From csrc/mem_cache/sparse
    */
   m.def(
-      "retrieval_score_and_combine_indices(int bs, Tensor seq_lens, int page_size, Tensor req_to_token, Tensor "
+      "quest_retrieval_score_and_combine_indices(int bs, Tensor seq_lens, int page_size, Tensor req_to_token, Tensor "
       "page_k_min, Tensor page_k_max, Tensor queries, Tensor req_pool_indices, int num_recent_pages, int? "
       "fixed_topk_page_cnt, float sparsity_ratio, Tensor sparse_mask, Tensor! out_indices, Tensor! out_lengths) -> ()");
-  m.impl("retrieval_score_and_combine_indices", torch::kCUDA, &retrieval_score_and_combine_indices);
-
-  m.def(
-      "invoke_sparse_diff_cuda_kernel(Tensor! page_table, Tensor! last_top_k, Tensor! last_page_ids, Tensor "
-      "curr_top_k, Tensor req_pool_indices, Tensor seq_lens, Tensor valid_lengths, Tensor sparse_mask, Tensor req_to_tokens_host, "
-      "Tensor! physical_pages, Tensor! load_tokens, Tensor! load_tokens_host, Tensor! cache_seqlens, Tensor original_cache_seqlens, int layer_id, int page_size) -> ()");
-  m.impl("invoke_sparse_diff_cuda_kernel", torch::kCUDA, &invoke_sparse_diff_cuda_kernel);
+  m.impl("quest_retrieval_score_and_combine_indices", torch::kCUDA, &quest_retrieval_score_and_combine_indices);
 
   m.def(
       "update_sparse_metadata(Tensor! page_table, Tensor physical_pages, Tensor valid_lengths, Tensor sparse_mask, "
