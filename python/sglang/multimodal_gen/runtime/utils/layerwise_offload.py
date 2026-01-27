@@ -316,6 +316,30 @@ class OffloadableDiTMixin:
             f"Enabled layerwise offload for {self.__class__.__name__} on modules: {self.layer_names}"
         )
 
+        device = torch.device("cuda", torch.cuda.current_device())
+        non_offload_modules = []
+        for name, module in self.named_modules():
+            # Skip the layerwise offloaded modules
+            is_offloaded = any(
+                name.startswith(layer_name) for layer_name in self.layer_names
+            )
+            if not is_offloaded:
+                # A module can have parameters and/or buffers. Both need to be on the correct device.
+                has_params = any(True for _ in module.parameters())
+                has_buffers = any(True for _ in module.buffers())
+                if has_params or has_buffers:
+                    non_offload_modules.append((name, module))
+
+        for name, module in non_offload_modules:
+            try:
+                module.to(device)
+            except Exception as e:
+                logger.warning(f"Failed to move module {name} to GPU: {e}")
+
+        logger.info(
+            f"Moved {len(non_offload_modules)} non-offloaded modules to GPU for {self.__class__.__name__}"
+        )
+
     def prepare_for_next_denoise(self):
         if self.layerwise_offload_managers is None:
             return
