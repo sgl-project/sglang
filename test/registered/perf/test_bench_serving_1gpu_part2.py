@@ -5,7 +5,7 @@ Works on 5090 (32GB).
 
 import unittest
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST_SCORE,
@@ -19,7 +19,8 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
-register_cuda_ci(est_time=900, suite="stage-b-test-large-1-gpu-performance")
+register_cuda_ci(est_time=900, suite="stage-b-test-large-1-gpu")
+register_amd_ci(est_time=900, suite="stage-b-test-large-1-gpu-amd")
 
 
 class TestBenchServing1GPUPart2(CustomTestCase):
