@@ -1175,6 +1175,7 @@ class ServerArgs:
 
         if model_arch in [
             "DeepseekV3ForCausalLM",
+            "KimiK25ForConditionalGeneration",
             "MistralLarge3ForCausalLM",
             "PixtralForConditionalGeneration",
         ]:
@@ -1424,6 +1425,15 @@ class ServerArgs:
                 f"Disable hybrid SWA memory for {model_arch} as it is not yet supported."
             )
             self.disable_hybrid_swa_memory = True
+        elif model_arch in ["Exaone4ForCausalLM"]:
+            if hf_config.sliding_window_pattern is not None:
+                # https://docs.sglang.ai/advanced_features/attention_backend.html
+                assert self.attention_backend in {
+                    "fa3",
+                    "triton",
+                    "trtllm_mha",
+                }, "fa3, triton, or trtllm_mla is required for Exaone4ForCausalLM-32B"
+                self.disable_hybrid_swa_memory = True
         elif model_arch in ["Olmo2ForCausalLM"]:
             # FIXME: https://github.com/sgl-project/sglang/pull/7367 is not compatible with Olmo3 model.
             logger.warning(
@@ -1593,6 +1603,7 @@ class ServerArgs:
                 "Glm4MoeForCausalLM",
                 "Glm4MoeLiteForCausalLM",
                 "Qwen3MoeForCausalLM",
+                "KimiK25ForConditionalGeneration",
             ]
             and (is_sm90_supported() or is_sm100_supported())
             and not self.enable_dp_attention
