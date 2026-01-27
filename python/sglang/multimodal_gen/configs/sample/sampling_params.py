@@ -303,7 +303,14 @@ class SamplingParams:
             # requires image input
             if self.image_path is None:
                 raise ValueError(
-                    f"Served model with task type '{pipeline_config.task_type.name}' requires an 'image_path' input, but none was provided"
+                    f"input_reference file is required for {pipeline_config.task_type.name} models."
+                )
+
+        if not pipeline_config.task_type.accepts_image_input():
+            # does not support image input
+            if self.image_path is not None:
+                raise ValueError(
+                    f"input_reference is not supported for {pipeline_config.task_type.name} models."
                 )
 
     def _adjust(

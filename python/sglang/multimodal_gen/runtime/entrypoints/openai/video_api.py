@@ -18,7 +18,6 @@ from fastapi import (
 )
 from fastapi.responses import FileResponse
 
-from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.configs.sample.sampling_params import (
     SamplingParams,
     generate_request_id,
@@ -179,9 +178,6 @@ async def create_video(
     content_type = request.headers.get("content-type", "").lower()
     request_id = generate_request_id()
 
-    server_args = get_global_server_args()
-    is_t2v = server_args.pipeline_config.task_type == ModelTaskType.T2V
-
     if "multipart/form-data" in content_type:
         if not prompt:
             raise HTTPException(status_code=400, detail="prompt is required")
@@ -269,27 +265,13 @@ async def create_video(
                     )
                 payload["input_reference"] = input_path
             req = VideoGenerationsRequest(**payload)
-            input_path = req.input_reference
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Invalid request body: {e}")
 
-    # Unified validation for input_reference
-    if is_t2v:
-        if input_path is not None:
-            raise HTTPException(
-                status_code=400,
-                detail="input_reference is not supported for Text-to-Video (T2V) models.",
-            )
-    else:
-        if input_path is None:
-            raise HTTPException(
-                status_code=400,
-                detail="input_reference file is required for I2V/TI2V models.",
-            )
-
-    logger.debug(f"Server received from create_video endpoint: req={req}")
-
-    sampling_params = _build_sampling_params_from_request(request_id, req)
+    try:
+        sampling_params = _build_sampling_params_from_request(request_id, req)
+    except (ValueError, TypeError) as e:
+        raise HTTPException(status_code=400, detail=str(e))
     job = _video_job_from_sampling(request_id, req, sampling_params)
     await VIDEO_STORE.upsert(request_id, job)
 
