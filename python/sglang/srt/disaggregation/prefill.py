@@ -360,6 +360,10 @@ class SchedulerDisaggregationPrefillMixin:
             else:
                 self.self_check_during_idle()
 
+            # Check hierarchical cache events to process pending L3 writes
+            if self.enable_hierarchical_cache:
+                self.tree_cache.check_hicache_events()
+
             self.process_disagg_prefill_inflight_queue()
 
             # Update last_batch
@@ -395,6 +399,10 @@ class SchedulerDisaggregationPrefillMixin:
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
                 self.self_check_during_idle()
+
+            # Check hierarchical cache events to process pending L3 writes
+            if self.enable_hierarchical_cache:
+                self.tree_cache.check_hicache_events()
 
             self.process_disagg_prefill_inflight_queue()
 

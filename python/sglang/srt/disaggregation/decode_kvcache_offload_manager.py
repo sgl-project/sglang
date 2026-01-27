@@ -67,6 +67,7 @@ class DecodeKVCacheOffloadManager:
         self.tp_group = tp_group
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
 
+        self.write_policy = server_args.hicache_write_policy
         self.cache_controller = HiCacheController(
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             mem_pool_host=self.decode_host_mem_pool,
@@ -74,6 +75,7 @@ class DecodeKVCacheOffloadManager:
             tp_group=tp_group,
             io_backend=server_args.hicache_io_backend,
             load_cache_event=threading.Event(),
+            write_policy=server_args.hicache_write_policy,
             storage_backend=server_args.hicache_storage_backend,
             model_name=server_args.served_model_name,
             storage_backend_extra_config=server_args.hicache_storage_backend_extra_config,
@@ -211,7 +213,25 @@ class DecodeKVCacheOffloadManager:
     def _trigger_backup(
         self, req, host_indices, incremental_tokens, start_time, prefill_offloaded_len
     ):
-        """Trigger async backup from host to storage."""
+        """Trigger async backup from host to storage.
+
+        In write_back mode: Decode node does NOT back up to L3 immediately.
+        The decode KV cache stays in host memory only. Since decode node doesn't
+        have L3 eviction-triggered write (unlike prefill node's true write-back),
+        the decode incremental KV cache won't be persisted to L3.
+
+        """
+        # Skip L3 storage backup in write_back mode - decode KV cache stays in host only
+        if self.write_policy == "write_back":
+            # In write_back mode, decode KV cache is not persisted to L3
+            # Free host memory immediately since we're not tracking it for later L3 backup
+            self.decode_host_mem_pool.free(host_indices)
+            logger.debug(
+                f"[write_back] Decode KV cache for {req.rid} kept in host only, "
+                f"len={len(host_indices)}, freed after offload"
+            )
+            return
+
         prefill_hashes = self._compute_prefix_hash(
             req.origin_input_ids[:prefill_offloaded_len]
         )

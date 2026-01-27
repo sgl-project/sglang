@@ -128,6 +128,15 @@ class TreeNode:
     def backuped(self):
         return self.host_value is not None
 
+    @property
+    def storage_backuped(self):
+        """Check if the node has been backed up to L3 storage."""
+        return getattr(self, "_storage_backuped", False)
+
+    @storage_backuped.setter
+    def storage_backuped(self, value: bool):
+        self._storage_backuped = value
+
     def protect_host(self):
         """Protect the host value from eviction."""
         self.host_ref_counter += 1
