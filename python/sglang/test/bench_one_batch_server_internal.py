@@ -109,6 +109,7 @@ class BenchArgs:
     append_to_github_summary: bool = True
     seed: int = 42
     cache_hit_rate: float = 0.0
+    server_args_for_metrics: Optional[List[str]] = None
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -191,6 +192,13 @@ class BenchArgs:
             default=BenchArgs.cache_hit_rate,
             help="Cache hit rate for benchmarking (0.0-1.0). "
             "0.0 means no cache hits (flush all), 0.4 means 40%% of input tokens are cached.",
+        )
+        parser.add_argument(
+            "--server-args-for-metrics",
+            type=str,
+            nargs="*",
+            default=None,
+            help="Server launch arguments to record in metrics output (for tracking configurations).",
         )
 
     @classmethod

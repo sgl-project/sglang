@@ -19,8 +19,8 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
-register_cuda_ci(est_time=300, suite="stage-b-test-small-1-gpu-accuracy")
-register_amd_ci(est_time=300, suite="stage-b-test-small-1-gpu-accuracy-amd")
+register_cuda_ci(est_time=300, suite="stage-b-test-small-1-gpu")
+register_amd_ci(est_time=300, suite="stage-b-test-small-1-gpu-amd")
 
 
 class TestEvalAccuracyLarge(CustomTestCase):
