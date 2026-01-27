@@ -1,7 +1,8 @@
 # Adapted from: https://github.com/vllm-project/vllm/blob/0384aa7150c4c9778efca041ffd1beb3ad2bd694/vllm/model_executor/models/kimi_linear.py
 
 from collections.abc import Iterable
-from typing import Optional
+from inspect import Parameter
+from typing import List, Optional
 
 import torch
 from einops import rearrange
@@ -11,6 +12,7 @@ from sglang.srt.configs.kimi_linear import KimiLinearConfig
 from sglang.srt.distributed import (
     divide,
     get_pp_group,
+    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
@@ -20,6 +22,7 @@ from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
+    LinearBase,
     ReplicatedLinear,
     RowParallelLinear,
 )
@@ -160,6 +163,89 @@ class KimiMoE(nn.Module):
         return final_hidden_states.view(num_tokens, hidden_size)
 
 
+class MergedColumnParallelRepeatedLinear(LinearBase):
+    def __init__(
+        self,
+        input_size: int,
+        column_output_sizes: List[int],
+        repeated_output_sizes: List[int],
+        skip_bias_add: bool = False,
+        params_dtype: Optional[torch.dtype] = None,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ):
+        output_size = sum(column_output_sizes) + sum(repeated_output_sizes)
+        super().__init__(
+            input_size=input_size,
+            output_size=output_size,
+            skip_bias_add=skip_bias_add,
+            params_dtype=params_dtype,
+            quant_config=quant_config,
+            prefix=prefix,
+        )
+        self.num_column_parallel = len(column_output_sizes)
+        self.tp_rank = get_tensor_model_parallel_rank()
+        self.tp_size = get_tensor_model_parallel_world_size()
+
+        self.output_partition_sizes = [
+            divide(x, self.tp_size) for x in column_output_sizes
+        ] + repeated_output_sizes
+        self.quant_method.create_weights(
+            layer=self,
+            input_size_per_partition=self.input_size,
+            output_partition_sizes=self.output_partition_sizes,
+            input_size=self.input_size,
+            output_size=self.output_size,
+            params_dtype=self.params_dtype,
+            skip_block_quant_check=True,
+            weight_loader=self.weight_loader,
+        )
+
+        self.prefix = prefix
+
+    def forward(self, input_: torch.Tensor) -> torch.Tensor:
+        return self.quant_method.apply(self, input_)
+
+    def weight_loader(
+        self, param: Parameter, loaded_weight: torch.Tensor, loaded_shard_id: int
+    ) -> torch.Tensor:
+        output_dim = param.output_dim
+        shard_offset = sum(self.output_partition_sizes[:loaded_shard_id])
+        shard_size = self.output_partition_sizes[loaded_shard_id]
+        param_data = param.data.narrow(output_dim, shard_offset, shard_size)
+
+        if loaded_shard_id < self.num_column_parallel:
+            start_idx = self.tp_rank * shard_size
+            loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
+
+        param_data.copy_(loaded_weight)
+
+
+class ColumnParallelBatchedLinear(nn.Module):
+    def __init__(
+        self, batch: int, input_size: int, output_size: int, dtype: torch.dtype
+    ):
+        super().__init__()
+        self.tp_rank = get_tensor_model_parallel_rank()
+        self.tp_size = get_tensor_model_parallel_world_size()
+        self.weight = nn.Parameter(
+            torch.empty(batch, output_size // self.tp_size, input_size, dtype=dtype),
+            requires_grad=False,
+        )
+        setattr(self.weight, "weight_loader", self.weight_loader)
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        return torch.bmm(input, self.weight.transpose(-1, -2))
+
+    def weight_loader(
+        self, param: Parameter, loaded_weight: torch.Tensor, loaded_shard_id: int
+    ) -> torch.Tensor:
+        shard_size = self.weight.shape[-2]
+        start_idx = self.tp_rank * shard_size
+        loaded_weight = loaded_weight.narrow(0, start_idx, shard_size)
+        param.data[loaded_shard_id].copy_(loaded_weight)
+
+
 class KimiDeltaAttention(nn.Module):
     def __init__(
         self,
@@ -190,56 +276,96 @@ class KimiDeltaAttention(nn.Module):
         projection_size = self.head_dim * self.num_heads
         self.conv_size = config.linear_attn_config["short_conv_kernel_size"]
 
-        self.q_proj = ColumnParallelLinear(
-            self.hidden_size,
-            projection_size,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.q_proj",
-        )
-        self.k_proj = ColumnParallelLinear(
-            self.hidden_size,
-            projection_size,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.k_proj",
-        )
-        self.v_proj = ColumnParallelLinear(
-            self.hidden_size,
-            projection_size,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.v_proj",
-        )
+        # TODO: support fusion with quant
+        self.do_fuse_qkvbfg = quant_config is None
+        if self.do_fuse_qkvbfg:
+            self.qkvb_sizes = [
+                projection_size,
+                projection_size,
+                projection_size,
+                self.num_heads,
+            ]
+            self.fg_sizes = [self.head_dim, self.head_dim]
+            self.fused_qkvbfg_proj = MergedColumnParallelRepeatedLinear(
+                self.hidden_size,
+                self.qkvb_sizes,
+                self.fg_sizes,
+                quant_config=quant_config,
+                prefix=f"{prefix}.fused_qkvbfg_proj",
+            )
+            self.split_sizes = [x // self.tp_size for x in self.qkvb_sizes] + [
+                2 * self.head_dim
+            ]
+            self.fused_fg_b_proj = ColumnParallelBatchedLinear(
+                2, self.head_dim, projection_size, dtype=config.dtype
+            )
+        else:
+            self.q_proj = ColumnParallelLinear(
+                self.hidden_size,
+                projection_size,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.q_proj",
+            )
+            self.k_proj = ColumnParallelLinear(
+                self.hidden_size,
+                projection_size,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.k_proj",
+            )
+            self.v_proj = ColumnParallelLinear(
+                self.hidden_size,
+                projection_size,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.v_proj",
+            )
 
-        self.f_a_proj = ReplicatedLinear(
-            self.hidden_size,
-            self.head_dim,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.f_a_proj",
-        )
+            self.f_a_proj = ReplicatedLinear(
+                self.hidden_size,
+                self.head_dim,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.f_a_proj",
+            )
 
-        self.f_b_proj = ColumnParallelLinear(
-            self.head_dim,
-            projection_size,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.f_b_proj",
-        )
+            self.f_b_proj = ColumnParallelLinear(
+                self.head_dim,
+                projection_size,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.f_b_proj",
+            )
+
+            self.b_proj = ColumnParallelLinear(
+                self.hidden_size,
+                self.num_heads,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.b_proj",
+            )
+
+            self.g_a_proj = ReplicatedLinear(
+                self.hidden_size,
+                self.head_dim,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.g_a_proj",
+            )
+            self.g_b_proj = ColumnParallelLinear(
+                self.head_dim,
+                projection_size,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.g_b_proj",
+            )
+
         self.dt_bias = nn.Parameter(
             torch.empty(divide(projection_size, self.tp_size), dtype=torch.float32)
         )
 
         set_weight_attrs(self.dt_bias, {"weight_loader": sharded_weight_loader(0)})
-
-        self.b_proj = ColumnParallelLinear(
-            self.hidden_size,
-            self.num_heads,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.b_proj",
-        )
 
         self.q_conv1d = ColumnParallelLinear(
             input_size=self.conv_size,
@@ -275,20 +401,6 @@ class KimiDeltaAttention(nn.Module):
         )
         set_weight_attrs(self.A_log, {"weight_loader": sharded_weight_loader(2)})
 
-        self.g_a_proj = ReplicatedLinear(
-            self.hidden_size,
-            self.head_dim,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.g_a_proj",
-        )
-        self.g_b_proj = ColumnParallelLinear(
-            self.head_dim,
-            projection_size,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.g_b_proj",
-        )
         self.o_norm = FusedRMSNormGated(
             self.head_dim, eps=rms_norm_eps, activation="sigmoid"
         )
@@ -326,6 +438,36 @@ class KimiDeltaAttention(nn.Module):
             dt_bias=self.dt_bias,
         )
 
+    def forward_qkvbfg(self, hidden_states: torch.Tensor):
+        q_proj_states = self.q_proj(hidden_states)[0]
+        k_proj_states = self.k_proj(hidden_states)[0]
+        v_proj_states = self.v_proj(hidden_states)[0]
+        beta = self.b_proj(hidden_states)[0]
+        forget_gate = self.f_b_proj(self.f_a_proj(hidden_states)[0])[0]
+        g_proj_states = self.g_b_proj(self.g_a_proj(hidden_states)[0])[0]
+        return (
+            (q_proj_states, k_proj_states, v_proj_states),
+            beta,
+            forget_gate,
+            g_proj_states,
+        )
+
+    def forward_qkvbfg_fused(self, hidden_states: torch.Tensor):
+        fused_states = self.fused_qkvbfg_proj(hidden_states)
+        q_proj_states, k_proj_states, v_proj_states, beta, fg_a_states = torch.split(
+            fused_states, self.split_sizes, dim=-1
+        )
+        # use batch matmul to calculate forget_gate and g_proj_states
+        forget_gate, g_proj_states = self.fused_fg_b_proj(
+            fg_a_states.view(-1, 2, self.head_dim).transpose(0, 1)
+        )
+        return (
+            (q_proj_states, k_proj_states, v_proj_states),
+            beta,
+            forget_gate,
+            g_proj_states,
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -333,15 +475,17 @@ class KimiDeltaAttention(nn.Module):
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
     ) -> None:
-        q_proj_states = self.q_proj(hidden_states)[0]
-        k_proj_states = self.k_proj(hidden_states)[0]
-        v_proj_states = self.v_proj(hidden_states)[0]
-        mixed_qkv = (q_proj_states, k_proj_states, v_proj_states)
-
-        forget_gate = self.f_b_proj(self.f_a_proj(hidden_states)[0])[0]
+        if self.do_fuse_qkvbfg:
+            mixed_qkv, beta, forget_gate, g_proj_states = self.forward_qkvbfg_fused(
+                hidden_states
+            )
+        else:
+            mixed_qkv, beta, forget_gate, g_proj_states = self.forward_qkvbfg(
+                hidden_states
+            )
 
         # fused_kda_gate is fused to KimiLinearAttentionBackend with decode
-        beta = self.b_proj(hidden_states)[0].float()
+        beta = beta.contiguous()
         if not forward_batch.forward_mode.is_decode():
             forget_gate = fused_kda_gate(
                 forget_gate, self.A_log, self.head_dim, g_bias=self.dt_bias
@@ -357,7 +501,6 @@ class KimiDeltaAttention(nn.Module):
             b=beta,
         )
 
-        g_proj_states = self.g_b_proj(self.g_a_proj(hidden_states)[0])[0]
         norm_gate = rearrange(g_proj_states, "... (h d) -> ... h d", d=self.head_dim)
         core_attn_out = self.o_norm(core_attn_out, norm_gate)
         core_attn_out = rearrange(core_attn_out, "1 n h d -> n (h d)")
@@ -622,7 +765,16 @@ class KimiLinearForCausalLM(nn.Module):
             # (param_name, shard_name, shard_id)
             (".gate_up_proj", ".gate_proj", 0),
             (".gate_up_proj", ".up_proj", 1),
+            (".fused_qkvbfg_proj", ".q_proj", 0),
+            (".fused_qkvbfg_proj", ".k_proj", 1),
+            (".fused_qkvbfg_proj", ".v_proj", 2),
+            (".fused_qkvbfg_proj", ".b_proj", 3),
+            (".fused_qkvbfg_proj", ".f_a_proj", 4),
+            (".fused_qkvbfg_proj", ".g_a_proj", 5),
+            (".fused_fg_b_proj", ".f_b_proj", 0),
+            (".fused_fg_b_proj", ".g_b_proj", 1),
         ]
+        fuse_qkvbfg_keys = {x[1] for x in stacked_params_mapping[2:]}
         if self.config.is_moe:
             # Params for weights, fp8 weight scales, fp8 activation scales
             # (param_name, weight_name, expert_id, shard_id)
@@ -657,6 +809,11 @@ class KimiLinearForCausalLM(nn.Module):
                 # for mlp.experts[0].gate_gate_up_proj, which breaks load.
                 if ("mlp.experts." in name) and name not in params_dict:
                     continue
+                if weight_name in fuse_qkvbfg_keys:
+                    layer_id = int(name.split(".")[2])
+                    layer = self.model.layers[layer_id].self_attn
+                    if not getattr(layer, "do_fuse_qkvbfg", False):
+                        continue
                 name = name.replace(weight_name, param_name)
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
