@@ -10,10 +10,13 @@ materializing full dot products.
 import logging
 
 import torch
+import triton
+from sgl_kernel import quest_retrieval_score_and_combine_indices
 
 from sglang.srt.mem_cache.sparsity.algorithms.base_algorithm import (
     BaseSparseAlgorithmImpl,
 )
+from sglang.srt.mem_cache.sparsity.algorithms.quest_kernels import quest_page_rep_kernel
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +29,8 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
         self.page_k_min = {}
         self.page_k_max = {}
         self.page_valid = {}
+        self._page_k_min_cast_cache = {}
+        self._page_k_max_cast_cache = {}
 
     def _initialize_representation_pools(
         self, start_layer: int, end_layer: int, total_num_pages: int
@@ -64,58 +69,52 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
         if isinstance(start_page, int):
             start_page = torch.full_like(end_page, start_page)
 
-        device = k_buffer.device
-        req_to_token = self.req_to_token_pool.req_to_token
         n = reqs.shape[0]
         max_pages = int((end_page - start_page).max().item())
         if max_pages <= 0:
             return
 
-        pg_off = torch.arange(max_pages, device=device).unsqueeze(0)
-        pg_id = start_page.unsqueeze(1) + pg_off
-        pg_mask = pg_id < end_page.unsqueeze(1)
+        req_to_token = self.req_to_token_pool.req_to_token
+        head_num = k_buffer.shape[1]
+        head_dim = k_buffer.shape[2]
 
-        tok_start = pg_id * self.page_size
-        tok_off = torch.arange(self.page_size, device=device).view(1, 1, -1)
-        tok_pos = tok_start.unsqueeze(2) + tok_off
-        tok_mask = (
-            tok_pos
-            < (tok_start + self.page_size).clamp(max=seq_lens.unsqueeze(1)).unsqueeze(2)
-        ) & pg_mask.unsqueeze(2)
+        BLOCK_DIM = triton.next_power_of_2(head_dim)
 
-        phys_tok = req_to_token[
-            reqs.view(n, 1, 1).expand(n, max_pages, self.page_size),
-            tok_pos.clamp(0, req_to_token.shape[1] - 1),
-        ].clamp(0, k_buffer.shape[0] - 1)
+        page_k_min = self.page_k_min[layer_id]
+        page_k_max = self.page_k_max[layer_id]
+        page_valid = self.page_valid[layer_id]
 
-        keys = k_buffer[phys_tok].to(torch.float32)
-        mask = tok_mask.unsqueeze(-1).unsqueeze(-1)
+        grid = (n, max_pages, head_num)
 
-        page_min = torch.where(mask, keys, torch.full_like(keys, float("inf"))).amin(
-            dim=2
+        quest_page_rep_kernel[grid](
+            page_k_min,
+            page_k_max,
+            page_valid,
+            reqs,
+            seq_lens,
+            start_page,
+            end_page,
+            req_to_token,
+            k_buffer,
+            # Strides
+            req_to_token.stride(0),
+            req_to_token.stride(1),
+            k_buffer.stride(0),
+            k_buffer.stride(1),
+            k_buffer.stride(2),
+            page_k_min.stride(0),
+            page_k_min.stride(1),
+            page_k_min.stride(2),
+            # Shapes
+            req_to_token.shape[1],
+            k_buffer.shape[0],
+            # Constants
+            PAGE_SIZE=self.page_size,
+            HEAD_NUM=head_num,
+            HEAD_DIM=head_dim,
+            BLOCK_DIM=BLOCK_DIM,
         )
-        page_max = torch.where(mask, keys, torch.full_like(keys, float("-inf"))).amax(
-            dim=2
-        )
 
-        phys_pg = (
-            req_to_token[
-                reqs.unsqueeze(1).expand(n, max_pages),
-                tok_start.clamp(0, req_to_token.shape[1] - 1),
-            ]
-            // self.page_size
-        )
-
-        idx = pg_mask.nonzero(as_tuple=False)
-        if idx.numel() == 0:
-            return
-
-        target_pages = phys_pg[idx[:, 0], idx[:, 1]].clamp(
-            0, self.page_k_min[layer_id].shape[0] - 1
-        )
-        self.page_k_min[layer_id][target_pages] = page_min[idx[:, 0], idx[:, 1]]
-        self.page_k_max[layer_id][target_pages] = page_max[idx[:, 0], idx[:, 1]]
-        self.page_valid[layer_id][target_pages] = True
         if layer_id == 0:
             logger.info(
                 f"Computed page representations for layer {layer_id}, start_page={start_page}, end_page={end_page}"
@@ -168,3 +167,160 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
         )
 
         return criticality
+
+    def construct_representations(
+        self,
+        layer_id,
+        req_pool_indices,
+        seq_lens,
+        k_buffer,
+        forward_batch,
+    ) -> torch.Tensor:
+        num_pages = seq_lens // self.page_size
+        prompt_lens = self.states.prompt_lens[req_pool_indices]
+        valid_mask = (
+            ~self.states.repr_constructed[req_pool_indices]
+            & (prompt_lens >= self.states.device_buffer_cnt)
+            & (num_pages > 0)
+        )
+
+        if not valid_mask.any():
+            return
+
+        # Compute page representations by subclass
+        self._compute_page_representations(
+            layer_id,
+            req_pool_indices[valid_mask],
+            seq_lens[valid_mask],
+            0,
+            num_pages[valid_mask],
+            k_buffer,
+        )
+
+        # Update tracking states
+        if layer_id == self.end_layer - 1:
+            success_indices = req_pool_indices[valid_mask]
+            self.states.repr_constructed[success_indices] = True
+            self.states.last_constructed_page[success_indices] = num_pages[valid_mask]
+
+    def update_representations(
+        self,
+        layer_id,
+        req_pool_indices,
+        seq_lens,
+        k_buffer,
+        forward_batch,
+    ) -> torch.Tensor:
+        if not forward_batch.forward_mode.is_decode_or_idle():
+            return
+
+        start_page = self.states.last_constructed_page[req_pool_indices]
+        end_page = seq_lens // self.page_size
+        valid_mask = self.states.repr_constructed[req_pool_indices] & (
+            start_page < end_page
+        )
+
+        if not valid_mask.any():
+            return
+
+        # Compute page representations by subclass
+        self._compute_page_representations(
+            layer_id,
+            req_pool_indices[valid_mask],
+            seq_lens[valid_mask],
+            start_page[valid_mask],
+            end_page[valid_mask],
+            k_buffer,
+        )
+
+        # Update tracking states
+        if layer_id == self.end_layer - 1:
+            success_indices = req_pool_indices[valid_mask]
+            self.states.last_constructed_page[success_indices] = end_page[valid_mask]
+
+    def retrieve_topk(
+        self,
+        queries: torch.Tensor,
+        layer_id: int,
+        req_pool_indices: torch.Tensor,
+        sparse_mask: torch.Tensor,
+        **kwargs,
+    ) -> tuple:
+        bs, device = queries.shape[0], queries.device
+
+        seq_lens_source = kwargs.get("forward_batch", None)
+        if seq_lens_source is None or not hasattr(seq_lens_source, "seq_lens"):
+            raise ValueError(
+                "forward_batch with seq_lens is required for TopK retrieval"
+            )
+        seq_lens = seq_lens_source.seq_lens
+
+        # Calculate max_out roughly
+        seq_lens_cpu = getattr(seq_lens_source, "seq_lens_cpu", None)
+        if seq_lens_cpu is not None:
+            max_seq_len = seq_lens_cpu.max().item()
+        else:
+            max_seq_len = int(torch.max(seq_lens).item())
+        max_pages = (max_seq_len + self.page_size - 1) // self.page_size
+
+        k_val = 0
+        if self.fixed_topk_page_cnt is not None:
+            k_val = self.fixed_topk_page_cnt
+        else:
+            k_val = int(max_pages * self.sparsity_ratio) + self.num_recent_pages
+
+        # Clamp k_val
+        if k_val > max_pages:
+            k_val = max_pages
+
+        # Add buffer for safety and recent pages overlap
+        max_out = k_val + self.num_recent_pages + 32
+
+        out_indices = torch.empty((bs, max_out), dtype=torch.int32, device=device)
+        out_lengths = torch.empty((bs,), dtype=torch.int32, device=device)
+
+        seq_lens_i32 = kwargs.get("seq_lens_i32", None)
+        if seq_lens_i32 is None:
+            seq_lens_i32 = seq_lens.to(torch.int32)
+
+        req_pool_indices_i32 = kwargs.get("req_pool_indices_i32", None)
+        if req_pool_indices_i32 is None:
+            req_pool_indices_i32 = req_pool_indices.to(torch.int32)
+
+        sparse_mask_i32 = kwargs.get("sparse_mask_i32", None)
+        if sparse_mask_i32 is None:
+            sparse_mask_i32 = sparse_mask.to(torch.int32)
+
+        page_k_min = self.page_k_min[layer_id]
+        page_k_max = self.page_k_max[layer_id]
+        if page_k_min.dtype != queries.dtype:
+            casted = self._page_k_min_cast_cache.get((layer_id, queries.dtype), None)
+            if casted is None:
+                casted = page_k_min.to(queries.dtype)
+                self._page_k_min_cast_cache[(layer_id, queries.dtype)] = casted
+            page_k_min = casted
+        if page_k_max.dtype != queries.dtype:
+            casted = self._page_k_max_cast_cache.get((layer_id, queries.dtype), None)
+            if casted is None:
+                casted = page_k_max.to(queries.dtype)
+                self._page_k_max_cast_cache[(layer_id, queries.dtype)] = casted
+            page_k_max = casted
+
+        quest_retrieval_score_and_combine_indices(
+            bs,
+            seq_lens_i32,
+            self.page_size,
+            self.req_to_token_pool.req_to_token,
+            page_k_min,
+            page_k_max,
+            queries,
+            req_pool_indices_i32,
+            self.num_recent_pages,
+            self.fixed_topk_page_cnt,
+            self.sparsity_ratio,
+            sparse_mask_i32,
+            out_indices,
+            out_lengths,
+        )
+
+        return out_indices, out_lengths

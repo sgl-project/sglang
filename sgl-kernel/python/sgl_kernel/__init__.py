@@ -85,6 +85,10 @@ from sgl_kernel.marlin import (
     awq_marlin_repack,
     gptq_marlin_repack,
 )
+from sgl_kernel.mem_cache.sparse.quest_kernels import (
+    quest_retrieval_score_and_combine_indices,
+    update_sparse_metadata,
+)
 from sgl_kernel.memory import set_kv_buffer_kernel, weak_ref_tensor
 from sgl_kernel.moe import (
     apply_shuffle_mul_sum,

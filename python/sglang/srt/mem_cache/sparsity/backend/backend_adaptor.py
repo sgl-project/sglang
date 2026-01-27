@@ -3,6 +3,7 @@ from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
+from sgl_kernel import update_sparse_metadata
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -136,6 +137,7 @@ class FlashAttentionAdaptor(BackendAdaptor):
         page_table = self.req_to_token_pool.req_to_token[
             forward_batch.req_pool_indices, :max_seqlen_k
         ]
+
         physical_pages = self.sparse_kv_cache_manager.swap_in_selected_pages(
             req_pool_indices=forward_batch.req_pool_indices,
             top_k_result=selected_indices,
@@ -146,23 +148,16 @@ class FlashAttentionAdaptor(BackendAdaptor):
             page_size=page_size,
             out_cache_loc=forward_batch.out_cache_loc,
         )
-        max_selected = physical_pages.shape[1]
-        valid_mask = torch.arange(max_selected, device=physical_pages.device).unsqueeze(
-            0
-        ) < valid_lengths.unsqueeze(1)
-        update_mask = sparse_mask.unsqueeze(1) & valid_mask
 
-        current_metadata.page_table[:, :max_selected] = torch.where(
-            update_mask, physical_pages, current_metadata.page_table[:, :max_selected]
-        )
-
-        seq_lens = forward_batch.seq_lens
-        positions_in_page = (seq_lens - 1) % page_size
-        diff = page_size - positions_in_page - 1
-        sparse_seq_lens = (valid_lengths * page_size - diff).to(torch.int32)
-
-        current_metadata.cache_seqlens_int32 = torch.where(
-            sparse_mask, sparse_seq_lens, self._original_metadata["cache_seqlens_int32"]
+        update_sparse_metadata(
+            current_metadata.page_table,
+            physical_pages,
+            valid_lengths.to(torch.int32).contiguous(),
+            sparse_mask.to(torch.int32).contiguous(),
+            current_metadata.cache_seqlens_int32,
+            forward_batch.seq_lens.to(torch.int32).contiguous(),
+            self._original_metadata["cache_seqlens_int32"],
+            page_size,
         )
 
         current_metadata.cu_seqlens_k = torch.nn.functional.pad(
@@ -171,5 +166,13 @@ class FlashAttentionAdaptor(BackendAdaptor):
             ),
             (1, 0),
         )
-        current_metadata.max_seq_len_k = int(current_metadata.cache_seqlens_int32.max())
+        if getattr(forward_batch, "_sparse_all", False):
+            current_metadata.max_seq_len_k = min(
+                int(self._original_metadata["max_seq_len_k"]),
+                int(self.sparse_kv_cache_manager.req_states.topk_tokens_cnt),
+            )
+        else:
+            current_metadata.max_seq_len_k = int(
+                self._original_metadata["max_seq_len_k"]
+            )
         return current_metadata
