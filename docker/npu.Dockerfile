@@ -1,4 +1,4 @@
-ARG CANN_VERSION=8.3.rc2
+ARG CANN_VERSION=8.5.0
 ARG DEVICE_TYPE=a3
 ARG OS=ubuntu22.04
 ARG PYTHON_VERSION=py3.11
@@ -6,14 +6,13 @@ ARG PYTHON_VERSION=py3.11
 FROM quay.io/ascend/cann:$CANN_VERSION-$DEVICE_TYPE-$OS-$PYTHON_VERSION
 
 # Update pip & apt sources
+ARG CANN_VERSION
+ARG DEVICE_TYPE
 ARG PIP_INDEX_URL="https://pypi.org/simple/"
 ARG APTMIRROR=""
 ARG PYTORCH_VERSION="2.8.0"
 ARG TORCHVISION_VERSION="0.23.0"
-ARG PTA_URL="https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/sglang/torch_npu/torch_npu-2.8.0.post2.dev20251113-cp311-cp311-manylinux_2_28_aarch64.whl"
-ARG TRITON_ASCEND_URL="https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/sglang/triton_ascend/triton_ascend-3.2.0.dev2025112116-cp311-cp311-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl"
-ARG BISHENG_NAME="Ascend-BiSheng-toolkit_aarch64_20251121.run"
-ARG BISHENG_URL="https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/sglang/triton_ascend/${BISHENG_NAME}"
+ARG PTA_URL="https://gitcode.com/Ascend/pytorch/releases/download/v7.3.0-pytorch2.8.0/torch_npu-2.8.0.post2-cp311-cp311-manylinux_2_28_aarch64.whl"
 ARG SGLANG_TAG=main
 ARG ASCEND_CANN_PATH=/usr/local/Ascend/ascend-toolkit
 ARG SGLANG_KERNEL_NPU_TAG=main
@@ -31,6 +30,7 @@ RUN if [ -n "$APTMIRROR" ];then sed -i "s|.*.ubuntu.com|$APTMIRROR|g" /etc/apt/s
 
 # Install development tools and utilities
 RUN apt-get update -y && apt upgrade -y && apt-get install -y \
+    unzip \
     build-essential \
     cmake \
     vim \
@@ -57,7 +57,7 @@ ENV LC_ALL=en_US.UTF-8
 
 
 ### Install MemFabric
-RUN ${PIP_INSTALL} memfabric-hybrid==1.0.0
+RUN ${PIP_INSTALL} memfabric-hybrid==1.0.5
 ### Install SGLang Model Gateway
 RUN ${PIP_INSTALL} sglang-router
 
@@ -69,32 +69,22 @@ RUN (${PIP_INSTALL} torch==${PYTORCH_VERSION} torchvision==${TORCHVISION_VERSION
 
 # TODO: install from pypi released triton-ascend
 RUN (${PIP_INSTALL} pybind11) \
-    && (${PIP_INSTALL} ${TRITON_ASCEND_URL})
+    && (${PIP_INSTALL} triton-ascend)
 
 # Install SGLang
 RUN git clone https://github.com/sgl-project/sglang --branch $SGLANG_TAG && \
-    (cd sglang/python && rm -rf pyproject.toml && mv pyproject_other.toml pyproject.toml && ${PIP_INSTALL} -v .[srt_npu]) && \
+    (cd sglang/python && rm -rf pyproject.toml && mv pyproject_npu.toml pyproject.toml && ${PIP_INSTALL} -v .[all_npu]) && \
     rm -rf sglang
 
 # Install Deep-ep
 # pin wheel to 0.45.1 ref: https://github.com/pypa/wheel/issues/662
-RUN ${PIP_INSTALL} wheel==0.45.1 && git clone --branch $SGLANG_KERNEL_NPU_TAG https://github.com/sgl-project/sgl-kernel-npu.git \
-    && export LD_LIBRARY_PATH=${ASCEND_CANN_PATH}/latest/runtime/lib64/stub:$LD_LIBRARY_PATH && \
-    source ${ASCEND_CANN_PATH}/set_env.sh && \
-    cd sgl-kernel-npu && \
-    bash build.sh \
+RUN ${PIP_INSTALL} wheel==0.45.1 pybind11 pyyaml decorator scipy attrs psutil \
+    && mkdir sgl-kernel-npu \
+    && cd sgl-kernel-npu \
+    && wget https://github.com/sgl-project/sgl-kernel-npu/releases/download/${SGLANG_KERNEL_NPU_TAG}/sgl-kernel-npu_${SGLANG_KERNEL_NPU_TAG}_${CANN_VERSION}_${DEVICE_TYPE}.zip \
+    && unzip sgl-kernel-npu_${SGLANG_KERNEL_NPU_TAG}_${CANN_VERSION}_${DEVICE_TYPE}.zip \
     && ${PIP_INSTALL} output/deep_ep*.whl output/sgl_kernel_npu*.whl \
     && cd .. && rm -rf sgl-kernel-npu \
-    && cd "$(python3 -m pip show deep-ep | awk '/^Location:/ {print $2}')" && ln -s deep_ep/deep_ep_cpp*.so
-
-# Install CustomOps
-RUN wget https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/ops/CANN-custom_ops-8.2.0.0-$DEVICE_TYPE-linux.aarch64.run && \
-    chmod a+x ./CANN-custom_ops-8.2.0.0-$DEVICE_TYPE-linux.aarch64.run && \
-    ./CANN-custom_ops-8.2.0.0-$DEVICE_TYPE-linux.aarch64.run --quiet --install-path=/usr/local/Ascend/ascend-toolkit/latest/opp && \
-    wget https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/ops/custom_ops-1.0.$DEVICE_TYPE-cp311-cp311-linux_aarch64.whl && \
-    ${PIP_INSTALL} ./custom_ops-1.0.$DEVICE_TYPE-cp311-cp311-linux_aarch64.whl
-
-# Install Bisheng
-RUN wget -O "${BISHENG_NAME}" "${BISHENG_URL}" && chmod a+x "${BISHENG_NAME}" && "./${BISHENG_NAME}" --install && rm "${BISHENG_NAME}"
+    && cd "$(python3 -m pip show deep-ep | awk '/^Location:/ {print $2}')" && ln -sf deep_ep/deep_ep_cpp*.so
 
 CMD ["/bin/bash"]

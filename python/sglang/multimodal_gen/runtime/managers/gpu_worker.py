@@ -149,11 +149,12 @@ class GPUWorker:
                 can_stay_resident = self.get_can_stay_resident_components(
                     remaining_gpu_mem_gb
                 )
-                logger.info(
-                    f"Peak GPU memory: {peak_memory_gb:.2f} GB, "
-                    f"Remaining GPU memory at peak: {remaining_gpu_mem_gb:.2f} GB. "
-                    f"Components that can stay resident: {can_stay_resident}"
-                )
+                if not req.suppress_logs:
+                    logger.info(
+                        f"Peak GPU memory: {peak_memory_gb:.2f} GB, "
+                        f"Remaining GPU memory at peak: {remaining_gpu_mem_gb:.2f} GB. "
+                        f"Components that can stay resident: {can_stay_resident}"
+                    )
 
             duration_ms = (time.monotonic() - start_time) * 1000
             output_batch.timings.total_duration_ms = duration_ms

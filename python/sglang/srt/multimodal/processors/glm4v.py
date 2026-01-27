@@ -3,6 +3,7 @@ from typing import List, Union
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
 from sglang.srt.models.glm4v import Glm4vForConditionalGeneration
 from sglang.srt.models.glm4v_moe import Glm4vMoeForConditionalGeneration
+from sglang.srt.models.glm_ocr import GlmOcrForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
@@ -10,7 +11,11 @@ from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTok
 
 
 class Glm4vImageProcessor(SGLangBaseProcessor):
-    models = [Glm4vForConditionalGeneration, Glm4vMoeForConditionalGeneration]
+    models = [
+        Glm4vForConditionalGeneration,
+        Glm4vMoeForConditionalGeneration,
+        GlmOcrForConditionalGeneration,
+    ]
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
