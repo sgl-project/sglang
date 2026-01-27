@@ -39,6 +39,7 @@ import torch
 import torch.distributed
 from torch.distributed import Backend, ProcessGroup
 
+from sglang.srt.distributed.utils import set_global_tcp_store
 from sglang.srt.utils import (
     direct_register_custom_op,
     get_bool_env_var,
@@ -1398,6 +1399,59 @@ def set_symm_mem_all_reduce(enable: bool):
     _ENABLE_SYMM_MEM_ALL_REDUCE = enable
 
 
+def _create_global_tcp_store(
+    rank: int, world_size: int
+) -> None:
+    """Create a global TCPStore for coordination across ranks.
+
+    This function creates a TCPStore that all ranks can use for coordination
+    (e.g., for NIXL buffer setup).
+    """
+    from torch.distributed import TCPStore
+
+    master_ip = os.environ.get("MASTER_ADDR")
+
+    if not master_ip:
+        logger.warning(
+            "Could not determine master IP for global TCPStore. "
+            "Broadcasting from rank 0 to all ranks."
+        )
+
+    base_store_port = int(os.environ.get("SGLANG_TCP_STORE_PORT", "29600"))
+
+    # Rank 0 gets its local IP and broadcasts it to all ranks
+    # Use broadcast_object_list which works with any backend (handles CPU/GPU automatically)
+    if not master_ip:
+        if rank == 0:
+            master_ip = get_local_ip_auto()
+            ip_list = [master_ip]
+        else:
+            ip_list = [None]
+
+        torch.distributed.broadcast_object_list(ip_list, src=0)
+        master_ip = ip_list[0]
+
+    logger.debug("yorayz: master_ip: %s, base_store_port: %d", master_ip, base_store_port)
+    try:
+        tcp_store = TCPStore(
+            host_name=master_ip,
+            port=base_store_port,
+            world_size=world_size,
+            is_master=(rank == 0),
+        )
+        set_global_tcp_store(tcp_store)
+        logger.info(
+            "Created global TCPStore at %s:%d (rank=%d, world_size=%d)",
+            master_ip, base_store_port, rank, world_size
+        )
+    except Exception as e:
+        logger.warning(
+            "Failed to create global TCPStore at %s:%d: %s. "
+            "Components requiring TCPStore (like NIXL) may not work.",
+            master_ip, base_store_port, e
+        )
+
+
 def init_distributed_environment(
     world_size: int = -1,
     rank: int = -1,
@@ -1443,6 +1497,9 @@ def init_distributed_environment(
             rank=rank,
             timeout=timeout,
         )
+
+        # Create a global TCPStore for coordination (used by NIXL)
+        _create_global_tcp_store(rank, world_size)
 
     # set the local rank
     # local_rank is not available in torch ProcessGroup,
