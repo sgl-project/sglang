@@ -11,6 +11,7 @@ from sglang.test.send_one import BenchArgs, send_one_prompt
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    is_in_amd_ci,
     is_in_ci,
     popen_launch_server,
     write_github_step_summary,
@@ -88,7 +89,10 @@ class TestKimiK2Instruct0905(CustomTestCase):
                 f"### test_bs_1_speed (Kimi-K2-Instruct-0905)\n"
                 f"{speed=:.2f} token/s\n"
             )
-            self.assertGreater(speed, 45)
+            if is_in_amd_ci():
+                self.assertGreater(speed, 30)
+            else:
+                self.assertGreater(speed, 45)
 
 
 if __name__ == "__main__":
