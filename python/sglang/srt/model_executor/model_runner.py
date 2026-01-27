@@ -368,6 +368,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Get memory before model loading
         min_per_gpu_memory = self.init_torch_distributed()
 
+        # Initialize MooncakeTransferEngine
+        self.init_mooncake_transfer_engine()
+
         # Init forward stream for overlap schedule
         self.forward_stream = torch.get_device_module(self.device).Stream()
 
@@ -812,6 +815,24 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             f"mem usage={(before_avail_memory - local_gpu_memory):.2f} GB"
         )
         return min_per_gpu_memory
+
+    def init_mooncake_transfer_engine(self):
+        use_mooncake_te = (
+            self.server_args.disaggregation_transfer_backend == "mooncake"
+            or self.server_args.encoder_transfer_backend == "mooncake"
+            or self.server_args.hicache_storage_backend == "mooncake"
+        )
+
+        if use_mooncake_te:
+            from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
+                init_mooncake_transfer_engine,
+            )
+
+            init_mooncake_transfer_engine(
+                hostname=get_local_ip_auto(),
+                gpu_id=self.gpu_id,
+                ib_device=self.server_args.disaggregation_ib_device,
+            )
 
     def load_model(self):
         tic_total = time.perf_counter()

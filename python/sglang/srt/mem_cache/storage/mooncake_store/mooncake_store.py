@@ -310,6 +310,17 @@ class MooncakeStore(HiCacheStorage):
                     self.config.client_server_address,
                 )
             else:
+                try:
+                    from sglang.srt.distributed.parallel_state import (
+                        get_mooncake_transfer_engine,
+                    )
+
+                    self._shared_mooncake_transfer_engine = (
+                        get_mooncake_transfer_engine().get_engine_ptr()
+                    )
+                except Exception:
+                    self._shared_mooncake_transfer_engine = None
+
                 ret_code = self.store.setup(
                     self.config.local_hostname,
                     self.config.metadata_server,
@@ -318,6 +329,7 @@ class MooncakeStore(HiCacheStorage):
                     self.config.protocol,
                     device_name,
                     self.config.master_server_address,
+                    self._shared_mooncake_transfer_engine,
                 )
             if ret_code:
                 raise RuntimeError(
