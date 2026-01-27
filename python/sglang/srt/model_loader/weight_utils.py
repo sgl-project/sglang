@@ -58,6 +58,7 @@ from sglang.srt.utils import (
     log_info_on_rank0,
     print_warning_once,
 )
+from sglang.srt.utils.common import is_cuda_alike
 from sglang.utils import is_in_ci
 
 try:
@@ -1099,7 +1100,7 @@ def composed_weight_loader(
 
 
 def runai_safetensors_weights_iterator(
-    hf_weights_files: List[str],
+    hf_weights_files: List[str], is_distributed: bool = False, device: str = "cpu"
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files."""
     from runai_model_streamer import SafetensorsStreamer
@@ -1107,17 +1108,30 @@ def runai_safetensors_weights_iterator(
     enable_tqdm = (
         not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
     )
+    device = device if is_distributed and is_cuda_alike() else "cpu"
 
     with SafetensorsStreamer() as streamer:
-        for st_file in tqdm(
+
+        streamer.stream_files(
             hf_weights_files,
+            device=device,
+            is_distributed=is_distributed,
+        )
+        total_tensors = sum(
+            len(tensors_meta)
+            for tensors_meta in streamer.files_to_tensors_metadata.values()
+        )
+
+        tensor_iter = tqdm(
+            streamer.get_tensors(),
+            total=total_tensors,
             desc="Loading safetensors using Runai Model Streamer",
-            disable=not enable_tqdm,
             bar_format=BAR_FORMAT,
-            position=tqdm._get_free_pos(),
-        ):
-            streamer.stream_file(st_file)
-            yield from streamer.get_tensors()
+            disable=not enable_tqdm,
+            mininterval=2,
+        )
+
+        yield from tensor_iter
 
 
 def set_runai_streamer_env(load_config: LoadConfig):
