@@ -669,6 +669,7 @@ class ServerArgs:
     mm_enable_dp_encoder: bool = False
     mm_process_config: Optional[Dict[str, Any]] = None
     limit_mm_data_per_request: Optional[Union[str, Dict[str, int]]] = None
+    # temporary variable, will be obsoleted after MM batch scheduling enabled by default.
     enable_batch_compute_mm_embeddings: bool = False
 
     # For checkpoint decryption

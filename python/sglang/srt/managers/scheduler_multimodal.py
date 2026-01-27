@@ -5,6 +5,7 @@ from __future__ import annotations
 import itertools
 import logging
 import math
+from abc import ABC, abstractmethod
 from enum import Enum
 from typing import Callable
 
@@ -15,15 +16,123 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
+from sglang.srt.environ import envs
+from sglang.srt.managers.mm_utils import MultimodalDataItem
 
 logger = logging.getLogger(__name__)
 
 
-class MMPackPolicy(Enum):
-    """Strategies for packing multiple images/videos in a single encoder instance."""
+class MMPackPolicy(ABC):
+    """Abstract base class for strategies for packing multiple images/videos in a single encoder instance."""
 
-    ALL_PACK = "all_pack"  # Pack all images/videos together
-    PROFILE_PACK = "profile_pack"  # Use offline profile data for optimal packing
+    @classmethod
+    @abstractmethod
+    def get_mm_pack_result(cls, pixel_values, grid_thw_list, modality):
+        """Get the packing result for multimodal data."""
+        pass
+
+
+class AllPackPolicy(MMPackPolicy):
+    """Pack all images/videos into a single group."""
+
+    @classmethod
+    def get_mm_pack_result(cls, pixel_values, grid_thw_list, modality):
+
+        return [
+            [
+                MultimodalDataItem(
+                    modality=modality,
+                    feature=pixel_values,
+                    model_specific_data={"image_grid_thw": torch.tensor(grid_thw_list)},
+                )
+            ]
+        ]
+
+
+class FixedMMNumPackPolicy(MMPackPolicy):
+    """Pack images/videos into groups of fixed size."""
+
+    @classmethod
+    def get_mm_pack_result(cls, pixel_values, grid_thw_list, modality):
+        mm_num = envs.SGLANG_MM_SCHEDULE_PACK_NUM.get()
+        all_num = len(grid_thw_list)
+
+        patches_per_image = [math.prod(grid_thw) for grid_thw in grid_thw_list]
+        cum_patches = [0] + list(itertools.accumulate(patches_per_image))
+
+        embedding_items_list = []
+
+        for i in range(0, all_num, mm_num):
+            end_idx = min(i + mm_num, all_num)
+            start_patch = cum_patches[i]
+            end_patch = cum_patches[end_idx]
+            group_pixel_values = pixel_values[start_patch:end_patch]
+            group_grid_thw = grid_thw_list[i:end_idx]
+
+            embedding_items_list.append(
+                [
+                    MultimodalDataItem(
+                        modality=modality,
+                        feature=group_pixel_values,
+                        model_specific_data={
+                            "image_grid_thw": torch.tensor(group_grid_thw)
+                        },
+                    )
+                ]
+            )
+
+        return embedding_items_list
+
+
+class ProfilePackPolicy(MMPackPolicy):
+    """Use offline profile data for optimal packing."""
+
+    @classmethod
+    def get_mm_pack_result(cls, pixel_values, grid_thw_list, modality):
+        """Pack images/videos based on offline profile data."""
+
+        logger.warning("ProfilePackPolicy is not fully implemented yet")
+        return None
+
+
+class DefaultPackPolicy(MMPackPolicy):
+    """Don't apply pack by default."""
+
+    @classmethod
+    def get_mm_pack_result(cls, pixel_values, grid_thw_list, modality):
+        patches_per_image = [math.prod(grid_thw) for grid_thw in grid_thw_list]
+        cum_patches = [0] + list(itertools.accumulate(patches_per_image))
+
+        embedding_items_list = []
+
+        for i in range(len(grid_thw_list)):
+            start_patch = cum_patches[i]
+            end_patch = cum_patches[i + 1]
+            single_pixel_values = pixel_values[start_patch:end_patch]
+            single_grid_thw = [grid_thw_list[i]]
+
+            embedding_items_list.append(
+                [
+                    MultimodalDataItem(
+                        modality=modality,
+                        feature=single_pixel_values,
+                        model_specific_data={
+                            "image_grid_thw": torch.tensor(single_grid_thw)
+                        },
+                    )
+                ]
+            )
+
+        return embedding_items_list
+
+
+# Map mm pack policy names to policy classes
+MM_PACK_POLICY_MAP = {
+    "all": AllPackPolicy,
+    "fixed_mm_num": FixedMMNumPackPolicy,
+    "profile": ProfilePackPolicy,
+    "default": DefaultPackPolicy,
+}
 
 
 class MMDPSchedulePolicy(Enum):
@@ -235,7 +344,7 @@ class MMScheduler:
         pixel_values: torch.Tensor,
         grid_thw_list: list,
         modality,
-        schedule_policy: MMPackPolicy = MMPackPolicy.ALL_PACK,
+        schedule_policy: str = "default",
     ):
         """
         Pack images/videos in a single encoder instance to multiple computing groups according to MMPackPolicy
@@ -244,7 +353,7 @@ class MMScheduler:
             pixel_values: Image/Video input tensor for local DP rank
             grid_thw_list: List of grid dimensions for each image on local DP rank
             modality: Modality of the input data
-            schedule_policy: MMPackPolicy
+            schedule_policy: Name of the packing policy to use
         Returns:
             embedding_items_list_local_rank:
                 List of MultimodalDataItem to be computed for local DP rank, each item represents a computing group
@@ -255,32 +364,20 @@ class MMScheduler:
             grid_thw_list = [[1, 10, 10], [1, 10, 20], [1, 50]]
             ```
         """
-        from sglang.srt.managers.mm_utils import MultimodalDataItem
+        # Create policy instance based on schedule_policy using class variable
+        policy_class = MM_PACK_POLICY_MAP.get(schedule_policy, None)
+        if policy_class is None:
+            logger.warning(
+                f"Unknown packing policy: {schedule_policy}, using DefaultPackPolicy(no pack)"
+            )
+            policy_class = DefaultPackPolicy
+        if policy_class == ProfilePackPolicy:
+            logger.warning(
+                "ProfilePackPolicy is not fully implemented yet, using DefaultPackPolicy(no pack)"
+            )
+            policy_class = DefaultPackPolicy
 
-        if schedule_policy == MMPackPolicy.ALL_PACK:
-            return [
-                [
-                    MultimodalDataItem(
-                        modality=modality,
-                        feature=pixel_values,
-                        model_specific_data={
-                            "image_grid_thw": torch.tensor(grid_thw_list)
-                        },
-                    )
-                ]
-            ]
-        elif schedule_policy == MMPackPolicy.PROFILE_PACK:
-            # TODO
-            logger.warning("MMDPScheduler only supports MMPackPolicy.ALL_PACK now")
-        return [
-            [
-                MultimodalDataItem(
-                    modality=modality,
-                    feature=pixel_values,
-                    model_specific_data={"image_grid_thw": torch.tensor(grid_thw_list)},
-                )
-            ]
-        ]
+        return policy_class.get_mm_pack_result(pixel_values, grid_thw_list, modality)
 
     @classmethod
     def gather_dp_result(

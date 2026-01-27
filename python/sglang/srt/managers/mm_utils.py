@@ -21,11 +21,7 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
     MultimodalInputs,
 )
-from sglang.srt.managers.scheduler_multimodal import (
-    MMDPSchedulePolicy,
-    MMPackPolicy,
-    MMScheduler,
-)
+from sglang.srt.managers.scheduler_multimodal import MMDPSchedulePolicy, MMScheduler
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.multimodal.evs import EVSEmbeddingResult
@@ -783,7 +779,10 @@ def _get_chunked_prefill_embedding_batch(
 
         # apply MMPackPolicy
         embedding_items_list_local_rank = MMScheduler.get_mm_pack_result(
-            pixel_values_local, grid_thw_list_local, modality, MMPackPolicy.ALL_PACK
+            pixel_values_local,
+            grid_thw_list_local,
+            modality,
+            envs.SGLANG_MM_PACK_POLICY.get(),
         )
         # print(f"{embedding_items_list_local_rank=}")
 
