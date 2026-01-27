@@ -172,6 +172,7 @@ class PipelineConfig:
     vae_config: VAEConfig = field(default_factory=VAEConfig)
     vae_precision: str = "fp32"
     vae_tiling: bool = True
+    vae_slicing: bool = False
     vae_sp: bool = True
 
     # Image encoder configuration
@@ -445,6 +446,13 @@ class PipelineConfig:
             dest=f"{prefix_with_dot.replace('-', '_')}vae_tiling",
             default=PipelineConfig.vae_tiling,
             help="Enable VAE tiling",
+        )
+        parser.add_argument(
+            f"--{prefix_with_dot}vae-slicing",
+            action=StoreBoolean,
+            dest=f"{prefix_with_dot.replace('-', '_')}vae_slicing",
+            default=PipelineConfig.vae_slicing,
+            help="Enable VAE slicing",
         )
         parser.add_argument(
             f"--{prefix_with_dot}vae-sp",

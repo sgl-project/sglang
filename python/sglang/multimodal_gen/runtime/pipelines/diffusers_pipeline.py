@@ -489,12 +489,18 @@ class DiffusersPipeline(ComposedPipelineBase):
             if hasattr(pipe, "enable_vae_slicing"):
                 pipe.enable_vae_slicing()
                 logger.info("Enabled VAE slicing for lower memory usage")
+            elif hasattr(pipe, "vae") and hasattr(pipe.vae, "enable_slicing"):
+                pipe.vae.enable_slicing()
+                logger.info("Enabled VAE slicing for lower memory usage")
 
         # VAE tiling: decode latents tile-by-tile for large images
         # https://huggingface.co/docs/diffusers/optimization/memory#vae-tiling
         if getattr(config, "vae_tiling", False):
             if hasattr(pipe, "enable_vae_tiling"):
                 pipe.enable_vae_tiling()
+                logger.info("Enabled VAE tiling for large image support")
+            elif hasattr(pipe, "vae") and hasattr(pipe.vae, "enable_tiling"):
+                pipe.vae.enable_tiling()
                 logger.info("Enabled VAE tiling for large image support")
 
     def _apply_attention_backend(self, pipe: Any, server_args: ServerArgs) -> None:
