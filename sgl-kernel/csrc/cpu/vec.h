@@ -392,4 +392,15 @@ inline Vectorized<float> gelu_with_tanh(Vectorized<float> x) {
   return kPointFiveVec * x * (kOneVec + inner_vec.tanh());
 }
 
+// tanh = 1 - 1 / (exp(2x) + 1)
+inline Vectorized<float> gelu_with_tanh_ext(const Vectorized<float> x) {
+  using Vec = Vectorized<float>;
+  const Vec kOneVec(1.0);
+  const Vec kGeluBetaVec(kGeluBeta);
+  const Vec kGeluKappaVec(kGeluKappa);
+  Vec x_cube = x * x * x;
+  Vec inner_vec = kGeluBetaVec * (x + kGeluKappaVec * x_cube);
+  return x * (kOneVec - kOneVec / ((inner_vec + inner_vec).exp_u20() + kOneVec));
+};
+
 }  // anonymous namespace

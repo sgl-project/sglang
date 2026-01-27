@@ -158,34 +158,6 @@ inline void scalar_sigmoid_and_mul(
   }
 }
 
-template <typename scalar_t>
-inline void add_bias_and_gelu_tanh(
-    scalar_t* __restrict__ out,
-    const float* __restrict__ input,
-    const float* __restrict__ bias,
-    int M,
-    int N,
-    int ld_src,
-    int ld_dst) {
-  constexpr int BLOCK_N = block_size_n();
-  assert(N == BLOCK_N);
-
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
-
-  const fVec bias0 = fVec::loadu(bias);
-  const fVec bias1 = fVec::loadu(bias + fVec::size());
-
-  for (int m = 0; m < M; ++m) {
-    fVec x0 = fVec::loadu(input + m * ld_src);
-    fVec x1 = fVec::loadu(input + m * ld_src + fVec::size());
-    fVec y0 = gelu_with_tanh(x0 + bias0);
-    fVec y1 = gelu_with_tanh(x1 + bias1);
-    bVec y = convert_from_float_ext<scalar_t>(y0, y1);
-    y.store(out + m * ld_dst);
-  }
-}
-
 template <typename scalar_t, bool has_bias, int BLOCK_M, int BLOCK_N>
 struct tinygemm_kernel_nn {
   static inline void apply(
@@ -621,11 +593,7 @@ void weight_packed_linear_kernel_impl(
           /* B     */ mat2 + nb_start * K,
           /* C     */ Ctmp);
 
-      // print_array(Ctmp, mb_size, nb_size, BLOCK_N);
-
-#if 1
-      add_bias_and_gelu_tanh(out + mb_start * N + nb_start, Ctmp, bias + nb_start, mb_size, nb_size, BLOCK_N, N);
-#endif
+      post_op(Ctmp, mb_start, nb_start, mb_size, nb_size);
     });
 
     at::native::cpublas::brgemm_release();
@@ -900,11 +868,19 @@ at::Tensor fused_linear_gelu_linear(
   CHECK_INPUT_SHAPE_DTYPE(bias2, {out_features}, at::kFloat);
 
   TORCH_CHECK(approximate_tanh, "fused_linear_gelu_linear: only support approximate is tanh.");
+  TORCH_CHECK(bias1.has_value() && bias2.has_value(), "fused_linear_gelu_linear: expect with bias.");
 
   auto hidden = at::empty({batches, hidden_features}, input.options());
   // auto out = at::empty({batches, out_features}, input.options())
 
+  constexpr int64_t BLOCK_N = block_size_n();
+
   AT_DISPATCH_REDUCED_FLOATING_TYPES(input.scalar_type(), "fused_linear_gelu_linear", [&] {
+    scalar_t* hidden_data = hidden.data_ptr<scalar_t>();
+    float* bias1_data = conditional_data_ptr<float>(bias1);
+
+    using bVec = at::vec::Vectorized<scalar_t>;
+    using fVec = at::vec::Vectorized<float>;
     weight_packed_linear_kernel_impl(
         hidden.data_ptr<scalar_t>(),
         input.data_ptr<scalar_t>(),
@@ -913,7 +889,22 @@ at::Tensor fused_linear_gelu_linear(
         batches,
         hidden_features,
         in_features,
-        [&]() {});
+        [&](const float* Ctmp, int mb_start, int nb_start, int mb_size, int nb_size) {
+          // local data pointers
+          scalar_t* out = hidden_data + mb_start * hidden_features + nb_start;
+          float* bias = bias1_data + nb_start;
+
+          const fVec bias0 = fVec::loadu(bias);
+          const fVec bias1 = fVec::loadu(bias + fVec::size());
+          for (int m = 0; m < mb_size; ++m) {
+            fVec x0 = fVec::loadu(Ctmp + m * BLOCK_N);
+            fVec x1 = fVec::loadu(Ctmp + m * BLOCK_N + fVec::size());
+            fVec y0 = gelu_with_tanh_ext(x0 + bias0);
+            fVec y1 = gelu_with_tanh_ext(x1 + bias1);
+            bVec y = convert_from_float_ext<scalar_t>(y0, y1);
+            y.store(out + m * hidden_features);
+          }
+        });
   });
 
   // at::Tensor hidden = weight_packed_linear(input, packed_w1, bias1, true);
