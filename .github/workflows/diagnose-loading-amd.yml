@@ -2,6 +2,9 @@ name: Diagnose Loading Slowness (AMD)
 
 on:
   workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/diagnose-loading-amd.yml'
 
 concurrency:
   group: diagnose-loading-amd-${{ github.ref }}
