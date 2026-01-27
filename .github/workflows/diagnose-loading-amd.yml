@@ -5,6 +5,7 @@ on:
   pull_request:
     paths:
       - '.github/workflows/diagnose-loading-amd.yml'
+      - 'scripts/diagnose_loading_slowness.sh'
 
 concurrency:
   group: diagnose-loading-amd-${{ github.ref }}
