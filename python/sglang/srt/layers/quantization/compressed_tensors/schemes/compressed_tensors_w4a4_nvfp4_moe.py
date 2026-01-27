@@ -1,9 +1,9 @@
-
 from __future__ import annotations
+
+import logging
 from typing import TYPE_CHECKING
 
 import torch
-import logging
 
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -16,19 +16,13 @@ from sglang.srt.layers.moe.utils import get_moe_runner_backend
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsScheme,
 )
-from sglang.srt.layers.quantization.fp8_utils import (
-    is_blackwell_supported,
-)
-from sglang.srt.utils import (
-    next_power_of_2,
-    set_weight_attrs,
-)
+from sglang.srt.layers.quantization.fp8_utils import is_blackwell_supported
 from sglang.srt.layers.quantization.utils import (
     prepare_static_weights_for_trtllm_fp4_moe,
     reorder_w1w3_to_w3w1,
     swizzle_blockscale,
 )
-
+from sglang.srt.utils import next_power_of_2, set_weight_attrs
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +33,7 @@ if TYPE_CHECKING:
         CombineInput,
         StandardDispatchOutput,
     )
+
 
 class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsScheme):
 
