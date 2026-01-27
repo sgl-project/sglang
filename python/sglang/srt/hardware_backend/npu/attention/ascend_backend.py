@@ -223,7 +223,7 @@ class AscendAttnBackend(AttentionBackend):
             self.q_head_dim = self.qk_rope_head_dim + self.qk_nope_head_dim
         else:
             self.use_alibi = getattr(model_runner.model_config, "use_alibi", False)
-        self.native_attn = self.native_attn = AscendTorchNativeAttnBackend()
+        self.native_attn = AscendTorchNativeAttnBackend()
         self.graph_metadata = {}
         self.max_context_len = model_runner.model_config.context_len
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
