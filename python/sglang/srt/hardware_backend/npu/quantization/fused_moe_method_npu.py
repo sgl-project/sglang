@@ -183,6 +183,7 @@ class NPUW8A8Int8DynamicMoEMethod(_NPUFusedMoEMethodBase):
                 requires_grad=False,
             )
 
+        # Use List<NZ> type instead of large NZ tensor to resolve the transfer error in EPLB
         for i in range(layer.w13_weight.data.shape[0]):
             layer.w13_weight.data[i].copy_(npu_format_cast(layer.w13_weight.data[i]))
         for i in range(layer.w2_weight.data.shape[0]):
@@ -328,6 +329,7 @@ class NPUW4A8Int8DynamicMoEMethod(_NPUFusedMoEMethodBase):
             layer.w2_weight.data.transpose(1, 2).contiguous(), requires_grad=False
         )
 
+        # Use List<NZ> type instead of large NZ tensor to resolve the transfer error in EPLB
         for i in range(layer.w13_weight.data.shape[0]):
             layer.w13_weight.data[i].copy_(npu_format_cast(layer.w13_weight.data[i]))
         for i in range(layer.w2_weight.data.shape[0]):
