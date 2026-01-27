@@ -11,7 +11,6 @@ import aiohttp
 import torch
 import zmq
 import zmq.asyncio
-from transformers import PretrainedConfig
 
 from sglang.srt.disaggregation.mooncake.transfer_engine import MooncakeTransferEngine
 from sglang.srt.distributed.parallel_state import GroupCoordinator
@@ -22,6 +21,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_local_ip_auto, get_zmq_socket_on_host
 from sglang.srt.utils.common import ImageData
 from sglang.srt.utils.hf_transformers_utils import get_processor
+from transformers import PretrainedConfig
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +54,9 @@ class EmbeddingData:
         self.error_code = error_code
 
     def get_grid(self):
+        """
+        Get the grid dimension of the embedding, used for image/video/audio.
+        """
         return self.grid_dim
 
     def get_embedding(self):
@@ -83,6 +86,7 @@ class MultiModalEmbeddingData(EmbeddingData):
         super().__init__(req_id, num_parts, part_idx, grid_dim, modality, embedding)
         self.img_grid_thw = [None] * num_parts
         self.video_grid_thw = [None] * num_parts
+        self.audio_feature_lens = [None] * num_parts
         self.modality_list = [
             modality if part_idx == i else None for i in range(num_parts)
         ]
@@ -94,6 +98,9 @@ class MultiModalEmbeddingData(EmbeddingData):
             self.img_grid_thw[part_idx] = self.get_grid()
         elif modality == Modality.VIDEO:
             self.video_grid_thw[part_idx] = self.get_grid()
+        elif modality == Modality.AUDIO:
+            # For audio, grid_dim represents audio_feature_lens; flatten for variable-length
+            self.audio_feature_lens[part_idx] = self.get_grid().flatten()
 
     @classmethod
     def from_embedding_data(cls, embedding_data: EmbeddingData):
@@ -118,12 +125,22 @@ class MultiModalEmbeddingData(EmbeddingData):
             grid_dims = self.img_grid_thw
         elif modality == Modality.VIDEO:
             grid_dims = self.video_grid_thw
+        elif modality == Modality.AUDIO:
+            # flatten all parts into one 1D tensor
+            flat = [g.flatten() for g in self.audio_feature_lens if g is not None]
+            if flat:
+                return torch.cat(flat, dim=0)
+            else:
+                return None
+        else:
+            grid_dims = []
 
         valid_grid_dims = []
         for grid_dim in grid_dims:
             if grid_dim is None:
                 continue
             if grid_dim.dim() == 1:
+                # TODO: check necessary
                 valid_grid_dims.append(grid_dim.unsqueeze(0))
             else:
                 valid_grid_dims.append(grid_dim)
@@ -141,6 +158,9 @@ class MultiModalEmbeddingData(EmbeddingData):
     def ready(self):
         return sum(self.ready_list) == self.num_parts
 
+    def get_audio_feature_lens(self):
+        return self._get_mm_grid(Modality.AUDIO)
+
     def get_img_grid(self):
         return self._get_mm_grid(Modality.IMAGE)
 
@@ -157,6 +177,10 @@ class MultiModalEmbeddingData(EmbeddingData):
             self.img_grid_thw[embedding_data.part_idx] = embedding_data.get_grid()
         elif embedding_data.modality == Modality.VIDEO:
             self.video_grid_thw[embedding_data.part_idx] = embedding_data.get_grid()
+        elif embedding_data.modality == Modality.AUDIO:
+            self.audio_feature_lens[embedding_data.part_idx] = (
+                embedding_data.get_grid().flatten()
+            )
         else:
             raise ValueError(f"Invalid modality: {embedding_data.modality}")
 
@@ -287,9 +311,15 @@ class WaitingImageRequest:
         recv_embedding = self.recv_embedding_data.get_embedding(is_concat=True)
         img_grid_thw = self.recv_embedding_data.get_img_grid()
         video_grid_thw = self.recv_embedding_data.get_video_grid()
+        audio_feature_lens = self.recv_embedding_data.get_audio_feature_lens()
+        kwargs = {
+            "img_grid_thw": img_grid_thw,
+            "video_grid_thw": video_grid_thw,
+            "audio_feature_lens": audio_feature_lens,
+        }
 
         mm_inputs = self.mm_processor.get_mm_data(
-            self.recv_req.input_text, recv_embedding, img_grid_thw, video_grid_thw
+            self.recv_req.input_text, recv_embedding, **kwargs
         )
         self.recv_req.mm_inputs = mm_inputs
         self.recv_req.input_ids = mm_inputs["input_ids"]
@@ -707,28 +737,26 @@ class MMReceiver:
 
     def _extract_url_data(self, request_obj) -> List[Dict]:
         mm_data = []
-
-        def _load_url(mm_items, modality):
-            for mm_item in mm_items:
-                mm_data.append(
-                    {
-                        "url": (
-                            mm_item.url if isinstance(mm_item, ImageData) else mm_item
-                        ),
-                        "modality": modality,
-                    }
-                )
-
-        if request_obj.image_data:
-            if not isinstance(request_obj.image_data, List):
-                _load_url([request_obj.image_data], Modality.IMAGE)
-            else:
-                _load_url(request_obj.image_data, Modality.IMAGE)
-        if request_obj.video_data:
-            if not isinstance(request_obj.video_data, List):
-                _load_url([request_obj.video_data], Modality.VIDEO)
-            else:
-                _load_url(request_obj.video_data, Modality.VIDEO)
+        for attr, modality in [
+            ("image_data", Modality.IMAGE),
+            ("video_data", Modality.VIDEO),
+            ("audio_data", Modality.AUDIO),
+        ]:
+            mm_items = getattr(request_obj, attr, None)
+            if mm_items:
+                if not isinstance(mm_items, list):
+                    mm_items = [mm_items]
+                for mm_item in mm_items:
+                    mm_data.append(
+                        {
+                            "url": (
+                                mm_item.url
+                                if isinstance(mm_item, ImageData)
+                                else mm_item
+                            ),
+                            "modality": modality,
+                        }
+                    )
         return mm_data
 
     # For zmq_to_tokenizer and mooncake
@@ -792,8 +820,11 @@ class MMReceiver:
 
         img_grid_thw = recv_embedding_data.get_img_grid()
         video_grid_thw = recv_embedding_data.get_video_grid()
-
-        mm_inputs = mm_processor.get_mm_data(
-            prompt, recv_embedding, img_grid_thw, video_grid_thw
-        )
+        audio_feature_lens = recv_embedding_data.get_audio_feature_lens()
+        kwargs = {
+            "img_grid_thw": img_grid_thw,
+            "video_grid_thw": video_grid_thw,
+            "audio_feature_lens": audio_feature_lens,
+        }
+        mm_inputs = mm_processor.get_mm_data(prompt, recv_embedding, **kwargs)
         return mm_inputs

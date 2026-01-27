@@ -18,7 +18,6 @@ import zmq
 import zmq.asyncio
 from fastapi import FastAPI
 from fastapi.responses import ORJSONResponse, Response
-from transformers import AutoProcessor
 
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
@@ -48,6 +47,7 @@ from sglang.srt.utils import (
     load_video,
     random_uuid,
 )
+from transformers import AutoProcessor
 
 logger = logging.getLogger(__name__)
 
@@ -117,6 +117,7 @@ def _convert(data):
 _vision_grid_attrs = {
     Modality.IMAGE: ["image_grid_thw", "image_grid_hws"],
     Modality.VIDEO: ["video_grid_thw"],
+    Modality.AUDIO: ["audio_feature_lens"],
 }
 
 
@@ -142,14 +143,7 @@ class MMEncoder:
         set_global_server_args_for_scheduler(server_args)
         self.rank = rank
         self.profiler = EncoderProfiler(rank)
-
-        processor_path = server_args.tokenizer_path or server_args.model_path
-        self.mm_processor = AutoProcessor.from_pretrained(
-            processor_path,
-            trust_remote_code=server_args.trust_remote_code,
-            revision=server_args.revision,
-            use_fast=True,
-        )
+        self._load_mm_processor(server_args)
 
         self.model_config = ModelConfig.from_server_args(
             server_args,
@@ -193,7 +187,10 @@ class MMEncoder:
 
         torch.get_device_module(self.device).set_device(self.gpu_id)
 
-        self.use_image_processor_gpu = use_image_processor_gpu
+        self.use_image_processor_gpu = (
+            use_image_processor_gpu and not server_args.disable_fast_image_processor
+        )
+        self._build_vision_config(server_args.mm_process_config)
 
         init_distributed_environment(
             world_size=server_args.tp_size,
@@ -244,6 +241,87 @@ class MMEncoder:
 
         logger.info(f"rank {rank} init finish ")
 
+    def _build_vision_config(self, mm_process_config):
+        """
+        Validate vision config, used for image/video/audio.
+        If not provided, keep default values.
+        """
+        self.vision_config = (
+            mm_process_config.get("vision_config", {})
+            if mm_process_config is not None
+            else {}
+        )
+        for modality_str in ["image", "video", "audio"]:
+            if not self.vision_config.get(modality_str, None):
+                self.vision_config[modality_str] = {}
+            if self.use_image_processor_gpu:
+                self.vision_config[modality_str]["device"] = self.device
+
+            if modality_str == "audio":
+                if "return_attention_mask" not in self.vision_config["audio"]:
+                    self.vision_config["audio"]["return_attention_mask"] = True
+                if "padding" not in self.vision_config["audio"]:
+                    if self.model_type == "qwen2_audio":
+                        # For Qwen2Audio, use padding="max_length"
+                        # (same as https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen2_audio/processing_qwen2_audio.py#L93)
+                        self.vision_config["audio"]["padding"] = "max_length"
+                    else:
+                        self.vision_config["audio"]["padding"] = True
+                if "truncation" not in self.vision_config["audio"]:
+                    # keep same logic as base_processor.py
+                    if (
+                        hasattr(self, "audio_processor")
+                        and self.audio_processor is not None
+                    ):
+                        if self.audio_processor.__class__.__name__ in {
+                            "Gemma3nProcessor",
+                            "GlmAsrProcessor",
+                            "Qwen2AudioProcessor",
+                            "Qwen3OmniMoeProcessor",
+                        }:
+                            self.vision_config["audio"]["truncation"] = False
+
+    def _load_mm_processor(self, server_args: ServerArgs):
+        """
+        Load image/video/audio processor separately,
+        avoid issues with AutoProcessor not recognizing certain models
+        """
+        from transformers import AutoImageProcessor, AutoVideoProcessor
+
+        try:
+            self.image_processor = AutoImageProcessor.from_pretrained(
+                server_args.tokenizer_path or server_args.model_path,
+                trust_remote_code=server_args.trust_remote_code,
+                revision=server_args.revision,
+                use_fast=not server_args.disable_fast_image_processor,
+            )
+        except Exception as e:
+            logger.warning(f"Failed to load image processor: {e}")
+            self.image_processor = None
+
+        try:
+            self.video_processor = AutoVideoProcessor.from_pretrained(
+                server_args.tokenizer_path or server_args.model_path,
+                trust_remote_code=server_args.trust_remote_code,
+                revision=server_args.revision,
+                use_fast=not server_args.disable_fast_image_processor,
+            )
+        except Exception as e:
+            logger.warning(f"Failed to load video processor: {e}")
+            self.video_processor = None
+
+        try:
+            # Note: AutoProcessor is used for audio processor
+            self.audio_processor = AutoProcessor.from_pretrained(
+                server_args.tokenizer_path or server_args.model_path,
+                trust_remote_code=server_args.trust_remote_code,
+                revision=server_args.revision,
+                use_fast=not server_args.disable_fast_image_processor,
+            )
+        except Exception as e:
+            logger.warning(f"Failed to load audio processor: {e}")
+            self.audio_processor = None
+
     def _load_single_item(
         self,
         data,
@@ -288,16 +366,65 @@ class MMEncoder:
                 task_info.append((modality, data))
         return futures, task_info
 
-    async def _flatten_and_load_images(self, mm_items):
+    async def _convert_frames(self, vr):
+        # TODO: support sample_frames to reduce memory usage
+        total_frames, video_fps = len(vr), vr.get_avg_fps()
+        video_meta_data = {
+            "total_num_frames": total_frames,
+            "fps": video_fps,
+            "duration": total_frames / video_fps,
+        }
+        frames = []
+        for fi in range(total_frames):
+            frame = vr[int(fi)]
+            img_np = frame.asnumpy() if hasattr(frame, "asnumpy") else np.array(frame)
+            frame_t = torch.from_numpy(img_np).permute(2, 0, 1)
+            frames.append(frame_t)
+        return frames, video_meta_data
+
+    async def _flatten_and_load_videos(self, mm_items):
+        if not isinstance(mm_items, (list, tuple)):
+            mm_items = [mm_items]
+
+        futures, _ = self.submit_data_loading_tasks(
+            mm_items, [Modality.VIDEO] * len(mm_items)
+        )
+        async_futures = [asyncio.wrap_future(f) for f in futures]
+        video_items = await asyncio.gather(*async_futures)
+
+        video_processor_kwargs = {}
+        if "qwen" in self.model_type:
+            # for qwen-series model, do sample frames before preprocess
+            video_processed = [
+                await preprocess_video(video, video_config=self.video_config)
+                for video in video_items
+            ]
+            videos, video_metadata = map(list, zip(*video_processed))
+            video_processor_kwargs["do_sample_frames"] = False
+            if video_metadata:
+                video_processor_kwargs["video_metadata"] = video_metadata
+            return videos, video_processor_kwargs
+        else:
+            # fallback to original HF video sample logic for other models
+            video_processed = [
+                await self._convert_frames(video) for video in video_items
+            ]
+            videos, video_metadata = map(list, zip(*video_processed))
+            video_processor_kwargs["do_sample_frames"] = True
+            if video_metadata:
+                video_processor_kwargs["video_metadata"] = video_metadata
+            return videos, video_processor_kwargs
+
+    async def _flatten_and_load_data_by_modality(self, mm_items, modality):
         """
-        Flatten mm_items structure, load images concurrently, and restore original structure.
+        Flatten mm_items structure, load multimodal data concurrently, and restore original structure.
 
         Returns:
-            Same structure as load_images would return
+            Same structure as load_mm_items would return, support for image/audio
         """
-        # Handle single image (not a list)
+        # Handle single mm_item (not a list)
         if not isinstance(mm_items, (list, tuple)):
-            futures, _ = self.submit_data_loading_tasks([mm_items], [Modality.IMAGE])
+            futures, _ = self.submit_data_loading_tasks([mm_items], [modality])
             return await asyncio.wrap_future(futures[0])
 
         # Handle nested list (list of lists)
@@ -305,14 +432,14 @@ class MMEncoder:
             # Flatten nested structure
             flat_data = []
             flat_indices = []  # Track which group each item belongs to
-            for group_idx, image_group in enumerate(mm_items):
-                for item in image_group:
+            for group_idx, item_group in enumerate(mm_items):
+                for item in item_group:
                     flat_data.append(item)
                     flat_indices.append(group_idx)
 
             # Submit all tasks concurrently
             futures, _ = self.submit_data_loading_tasks(
-                flat_data, [Modality.IMAGE] * len(flat_data)
+                flat_data, [modality] * len(flat_data)
             )
 
             # Wait for all tasks to complete asynchronously
@@ -329,54 +456,68 @@ class MMEncoder:
         # Handle simple list
         else:
             futures, _ = self.submit_data_loading_tasks(
-                mm_items, [Modality.IMAGE] * len(mm_items)
+                mm_items, [modality] * len(mm_items)
             )
             # Wait for all tasks to complete asynchronously
             async_futures = [asyncio.wrap_future(f) for f in futures]
             return await asyncio.gather(*async_futures)
 
+    async def _flatten_and_load_audios(self, mm_items):
+        """
+        Flatten mm_items structure, load audios concurrently, and restore original structure.
+        """
+        return await self._flatten_and_load_data_by_modality(mm_items, Modality.AUDIO)
+
+    async def _flatten_and_load_images(self, mm_items):
+        """
+        Flatten mm_items structure, load images concurrently, and restore original structure.
+        """
+        return await self._flatten_and_load_data_by_modality(mm_items, Modality.IMAGE)
+
     async def _process_mm_items(self, mm_items, modality):
-        if modality == Modality.IMAGE:
+        if modality == Modality.IMAGE and self.image_processor:
             images = await self._flatten_and_load_images(mm_items)
-            kwargs = {"device": self.device} if self.use_image_processor_gpu else {}
-            processor_input = self.mm_processor.image_processor(images=images, **kwargs)
+            image_config = self.vision_config.get("image", {})
+            processor_input = self.image_processor(images=images, **image_config)
             feature = processor_input["pixel_values"]
-            get_feature_method = self.model.get_image_feature
-        elif modality == Modality.VIDEO:
-            # mainly follows qwen_vl.py: only support qwen series models for video processing
-            if "qwen" not in self.model_type:
-                raise ValueError(
-                    f"Video modality processing is currently only supported for Qwen series models with EPD enabled, "
-                    f"but got model_type: {self.model_type}"
-                )
-            # Load videos concurrently
-            futures, _ = self.submit_data_loading_tasks(
-                mm_items, [Modality.VIDEO] * len(mm_items)
+            if hasattr(self.model, "thinker"):  # for omni models
+                get_feature_method = self.model.thinker.get_image_feature
+            else:
+                get_feature_method = self.model.get_image_feature
+        elif modality == Modality.VIDEO and self.video_processor:
+            videos, video_processor_kwargs = await self._flatten_and_load_videos(
+                mm_items
             )
-            async_futures = [asyncio.wrap_future(f) for f in futures]
-            video_items = await asyncio.gather(*async_futures)
-
-            videos_processed = [
-                await preprocess_video(video, video_config=self.video_config)
-                for video in video_items
-            ]
-            videos, video_metadata = map(list, zip(*videos_processed))
-
-            # pass preprocessed videos to processor with do_sample_frames=False
-            video_processor_kwargs = {}
-            video_processor_kwargs["do_sample_frames"] = False
-            for key in self.video_config:
-                video_processor_kwargs[key] = self.video_config[key]
-            if video_metadata:
-                video_processor_kwargs["video_metadata"] = video_metadata
-            processor_input = self.mm_processor.video_processor(
+            processor_input = self.video_processor(
                 videos=videos, **video_processor_kwargs
             )
             feature = processor_input["pixel_values_videos"]
-            get_feature_method = self.model.get_video_feature
+            if hasattr(self.model, "thinker"):  # for omni models
+                get_feature_method = self.model.thinker.get_video_feature
+            else:
+                get_feature_method = self.model.get_video_feature
+        elif modality == Modality.AUDIO and self.audio_processor:
+            audios = await self._flatten_and_load_audios(mm_items)
+            audio_config = self.vision_config.get("audio", {})
+            processor_input = self.audio_processor.feature_extractor(
+                audios, **audio_config
+            )
+            processor_input["feature_attention_mask"] = processor_input.pop(
+                "attention_mask"
+            )
+            # convert to same format as image/video
+            audio_feature_lens = torch.tensor(
+                processor_input["feature_attention_mask"].sum(-1), dtype=torch.long
+            )
+            processor_input["audio_feature_lens"] = audio_feature_lens
+            feature = processor_input["input_features"]
+            if hasattr(self.model, "thinker"):  # for omni models
+                get_feature_method = self.model.thinker.get_audio_feature
+            else:
+                get_feature_method = self.model.get_audio_feature
         else:
             raise ValueError(
-                f"Currently only support image and video modalities, but got {modality}"
+                f"Currently only support image, video and audio modalities, {modality} modality has no processor available."
             )
 
         mm_item = MultimodalDataItem.from_dict(

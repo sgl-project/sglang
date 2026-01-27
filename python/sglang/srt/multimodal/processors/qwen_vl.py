@@ -261,9 +261,24 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             audio_token_id=self.audio_token_id,
         ).build(_processor)
 
-    def get_mm_data(self, prompt, embeddings, img_grid_thw, video_grid_thw):
+    def get_mm_data(self, prompt, embeddings, **kwargs):
+        img_grid_thw = kwargs.get("img_grid_thw", None)
+        video_grid_thw = kwargs.get("video_grid_thw", None)
+        audio_feature_lens = kwargs.get("audio_feature_lens", None)
+
+        audio_seq_lens = None
+        if audio_feature_lens is not None:
+            # apply _get_feat_extract_lengths to get seq_lens
+            input_lengths_leave = audio_feature_lens % 100
+            feat_lengths = (input_lengths_leave - 1) // 2 + 1
+            audio_seq_lens = (
+                ((feat_lengths - 1) // 2 + 1 - 1) // 2
+                + 1
+                + (audio_feature_lens // 100) * 13
+            )
+
         input_ids, offsets, modality_list = self.build_input_ids(
-            prompt, img_grid_thw, video_grid_thw
+            prompt, img_grid_thw, video_grid_thw, audio_seq_lens
         )
         assert all(isinstance(modality, Modality) for modality in modality_list)
 
@@ -276,6 +291,16 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             input_ids=torch.tensor(input_ids, dtype=torch.long).unsqueeze(0),
             image_grid_thw=img_grid_thw,
             video_grid_thw=video_grid_thw,
+            second_per_grid_ts=None,
+            use_audio_in_video=False,
+            audio_seq_lens=(
+                audio_feature_lens if self.model_type == "qwen3_omni_moe" else None
+            ),
+            audio_token_id=getattr(self.hf_config, "audio_token_id", None),
+            audio_start_token_id=self.audio_start_token_id,
+            position_id_per_seconds=getattr(
+                self.hf_config, "position_id_per_seconds", None
+            ),
             tokens_per_second=getattr(
                 self.hf_config.vision_config, "tokens_per_second", None
             ),
