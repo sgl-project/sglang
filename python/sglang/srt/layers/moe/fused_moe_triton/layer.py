@@ -668,7 +668,7 @@ class FusedMoE(torch.nn.Module):
         # compressed-tensors checkpoints with packed weights are stored flipped
         # TODO (mgoin): check self.quant_method.quant_config.quant_format
         # against known CompressionFormat enum values that have this quality
-        if hasattr(self, 'scheme'):
+        if hasattr(self, "scheme"):
             method = self.scheme
         else:
             method = self.quant_method
@@ -891,16 +891,13 @@ class FusedMoE(torch.nn.Module):
         # compressed-tensors checkpoints with packed weights are stored flipped
         # TODO: check self.quant_method.quant_config.quant_format
         # against known CompressionFormat enum values that have this quality
-        if hasattr(self, 'scheme'):
+        if hasattr(self, "scheme"):
             method = self.scheme
         else:
             method = self.quant_method
         loaded_weight = (
             loaded_weight.t().contiguous()
-            if (
-                method.__class__.__name__
-                == "CompressedTensorsWNA16MoE"
-            )
+            if (method.__class__.__name__ == "CompressedTensorsWNA16MoE")
             else loaded_weight
         )
 
