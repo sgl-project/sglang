@@ -5,8 +5,8 @@ from types import SimpleNamespace
 from sglang.srt.utils import kill_process_tree
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.test_utils import (
-    DEFAULT_MODEL_NAME_FOR_TEST_MLA,
-    DEFAULT_MODEL_NAME_FOR_TEST_MLA_NEXTN,
+    DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST,
+    DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST_NEXTN,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -17,7 +17,7 @@ class TestPureDP(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_MODEL_NAME_FOR_TEST_MLA
+        cls.model = DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = [
             "--tp-size",
@@ -87,7 +87,7 @@ class TestMTP(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_MODEL_NAME_FOR_TEST_MLA
+        cls.model = DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = [
             "--tp-size",
@@ -118,7 +118,7 @@ class TestMTP(CustomTestCase):
             "--speculative-algo",
             "EAGLE",
             "--speculative-draft-model-path",
-            DEFAULT_MODEL_NAME_FOR_TEST_MLA_NEXTN,
+            DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST_NEXTN,
             "--speculative-num-steps",
             "1",
             "--speculative-eagle-topk",
