@@ -13,6 +13,7 @@ pub struct RouterConfig {
     pub mode: RoutingMode,
     #[serde(default)]
     pub connection_mode: ConnectionMode,
+    pub scheduler: SchedulerConfig,
     pub policy: PolicyConfig,
     pub host: String,
     pub port: u16,
@@ -217,6 +218,32 @@ pub enum ManualAssignmentMode {
     MinLoad,
     /// Select worker with minimum active routing keys
     MinGroup,
+}
+
+/// scheduler configuration for router select
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum SchedulerConfig {
+    #[serde(rename = "proportion")]
+    Proportion{
+        adjust_interval: usize,
+        adjust_window: usize,
+        balance_abs_threshold: usize,
+        balance_rel_threshold: f32,
+        regular_worker_weight: f32,
+    }
+}
+
+impl Default for SchedulerConfig {
+    fn default() -> Self {
+        Self::Proportion {
+            adjust_interval: 1,
+            adjust_window: 2,
+            balance_abs_threshold: 20,
+            balance_rel_threshold: 1.001,
+            regular_worker_weight: 0.4,
+        }
+    }
 }
 
 /// Policy configuration for routing
@@ -478,6 +505,7 @@ impl Default for RouterConfig {
                 worker_urls: vec![],
             },
             policy: PolicyConfig::Random,
+            scheduler: SchedulerConfig::default(),
             host: "0.0.0.0".to_string(),
             port: 3001,
             max_payload_size: 536_870_912,     // 512MB

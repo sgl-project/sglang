@@ -30,9 +30,17 @@ use crate::{
         generate::GenerateRequest,
         rerank::RerankRequest,
         responses::{ResponsesGetParams, ResponsesRequest},
+        common::StringOrArray,
     },
     routers::RouterTrait,
     server::ServerConfig,
+    schedulers::{
+        SchedulerPolicy,
+        SelectRouterInfo,
+        proportion::ProportionScheduler,
+        factory::SchedulerFactory,
+    },
+    tokenizer::registry::TokenizerRegistry, 
 };
 
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
@@ -65,16 +73,21 @@ pub struct RouterManager {
     routers_snapshot: ArcSwap<Vec<Arc<dyn RouterTrait>>>,
     default_router: Arc<std::sync::RwLock<Option<RouterId>>>,
     enable_igw: bool,
+    scheduler: Option<Arc<dyn SchedulerPolicy>>,
+    tokenizer_registry: Arc<TokenizerRegistry>,
 }
 
 impl RouterManager {
-    pub fn new(worker_registry: Arc<WorkerRegistry>) -> Self {
+    pub fn new(worker_registry: Arc<WorkerRegistry>, tokenizer_registry: Arc<TokenizerRegistry>) -> Self {
+        info!("RouterManager init");
         Self {
             worker_registry,
             routers: Arc::new(DashMap::new()),
-            routers_snapshot: ArcSwap::from_pointee(Vec::new()),
+            routers_snapshot: ArcSwap::from_pointee(Vec::new()), 
             default_router: Arc::new(std::sync::RwLock::new(None)),
             enable_igw: false, // Will be set properly in from_config
+            scheduler: None,
+            tokenizer_registry,
         }
     }
 
@@ -84,8 +97,14 @@ impl RouterManager {
     ) -> Result<Arc<Self>, String> {
         use crate::routers::RouterFactory;
 
-        let mut manager = Self::new(app_context.worker_registry.clone());
+        let scheduler_config = &config.router_config.scheduler;
+        let scheduler = SchedulerFactory::create_from_config(scheduler_config, app_context);
+        let mut manager = Self::new(
+            app_context.worker_registry.clone(),
+            app_context.tokenizer_registry.clone(),
+        );
         manager.enable_igw = config.router_config.enable_igw;
+        manager.scheduler = Some(scheduler);
         let manager = Arc::new(manager);
 
         if config.router_config.enable_igw {
@@ -165,6 +184,7 @@ impl RouterManager {
                 "RouterManager initialized with {} routers for multi-router mode",
                 manager.router_count(),
             );
+
         } else {
             info!("Initializing RouterManager in single-router mode");
 
@@ -326,10 +346,11 @@ impl RouterManager {
         }
     }
 
-    pub fn select_router_for_request(
+    pub async fn select_router_for_request(
         &self,
         headers: Option<&HeaderMap>,
         model_id: Option<&str>,
+        prompt_text: Option<&str>,
     ) -> Option<Arc<dyn RouterTrait>> {
         // In single-router mode (enable_igw=false), always use the default router
         if !self.enable_igw {
@@ -346,7 +367,7 @@ impl RouterManager {
                 return self.routers.get(default_id).map(|r| r.clone());
             }
         }
-        info!("进入路由选择阶段");
+        info!("begin to select router.");
         let prefer_pd = headers
             .and_then(|h| {
                 h.get("x-prefer-pd")
@@ -360,66 +381,98 @@ impl RouterManager {
         let mut best_score = -1.0;
 
         // Extract router validity check into a closure to reduce redundancy
-        // TODO 这里还需要加日志看一下
-        info!("prefer_pd == > {}", prefer_pd);
         let is_router_valid =
             |is_pd: bool| (is_pd && num_pd_workers > 0) || (!is_pd && num_regular_workers > 0);
+        
+
+        // 默认的选择逻辑
+        if self.scheduler.is_none() {
+            if let Some(model) = model_id {
+                // Efficient Single Lookup for Specific Model
+                if let Some(router) = self.get_router_for_model(model) {
+                    info!("router.is_pd_mode() == > {}", router.is_pd_mode());
+                    if is_router_valid(router.is_pd_mode()) {
+                        return Some(router);
+                    }
+                }
+            } else {
+                // ZERO-ALLOCATION Snapshot Iteration (Hot Path Optimization)
+                // Atomic load avoids heap allocations and DashMap shard locks per-request
+                let routers_snapshot = self.routers_snapshot.load();
+                for router in routers_snapshot.iter() {
+                    let mut score = 1.0;
     
-        if let Some(model) = model_id {
-            // Efficient Single Lookup for Specific Model
-            if let Some(router) = self.get_router_for_model(model) {
-                info!("router.is_pd_mode() == > {}", router.is_pd_mode());
-                if is_router_valid(router.is_pd_mode()) {
-                    return Some(router);
+                    let is_pd = router.is_pd_mode();
+                    if prefer_pd && is_pd {
+                        score += 2.0;
+                    } else if !prefer_pd && !is_pd {
+                        score += 1.0;
+                    }
+                    // TODO: Once routers expose worker stats, we can evaluate:
+                    // - Average worker priority vs priority_threshold
+                    // - Average worker cost vs max_cost
+                    // - Current load and health status
+    
+                    if score > best_score && is_router_valid(is_pd) {
+                        best_score = score;
+                        best_router = Some(Arc::clone(router));
+                    }
                 }
+                return best_router;
             }
-        } else {
-            // ZERO-ALLOCATION Snapshot Iteration (Hot Path Optimization)
-            // Atomic load avoids heap allocations and DashMap shard locks per-request
-            let routers_snapshot = self.routers_snapshot.load();
-            for router in routers_snapshot.iter() {
-                let mut score = 1.0;
-
-                let is_pd = router.is_pd_mode();
-                if prefer_pd && is_pd {
-                    score += 2.0;
-                } else if !prefer_pd && !is_pd {
-                    score += 1.0;
+        }
+        info!("Using scheduler to select router.");
+        let candidate_routers: Vec<RouterId> = (*self.routers).iter().map(|entry| entry.key().clone()).collect();
+        info!("candidate_routers ==> {:#?}", candidate_routers);
+        if candidate_routers.is_empty() {
+            warn!("No candidate routers available for scheduling.");
+            return None;
+        }
+        // 根据模型id获取tokens
+        info!("根据模型id:{:?},选择tokenizer",model_id);
+        let mut tokens = None;
+        if let (Some(mid), Some(text)) = (model_id, prompt_text) {
+            if let Some(tokenizer) = self.tokenizer_registry.get(mid) {
+                match tokenizer.encode(text, false) {
+                    Ok(encoding) => {
+                        tokens = Some(encoding.token_ids().to_vec());
+                    }
+                    Err(e) => warn!("Failed to encode prompt for model '{}': {}", mid, e),
                 }
-                // TODO: Once routers expose worker stats, we can evaluate:
-                // - Average worker priority vs priority_threshold
-                // - Average worker cost vs max_cost
-                // - Current load and health status
-
-                if score > best_score && is_router_valid(is_pd) {
-                    best_score = score;
-                    best_router = Some(Arc::clone(router));
-                }
+            } else {
+                warn!(
+                    "Tokenizer for model '{}' not found in registry. Scheduling will be based on 0 tokens.",
+                    mid
+                );
             }
         }
 
-        // let routers_snapshot = self.routers_snapshot.load();
-        //     for router in routers_snapshot.iter() {
-        //         let mut score = 1.0;
+        let info = SelectRouterInfo {
+            request_text: prompt_text,
+            tokens: tokens.as_deref(),
+            model_id,
+        };
+        // info!("SelectRouterInfo {:#?}", info);
 
-        //         let is_pd = router.is_pd_mode();
-        //         if prefer_pd && is_pd {
-        //             score += 2.0;
-        //         } else if !prefer_pd && !is_pd {
-        //             score += 1.0;
-        //         }
-        //         // TODO: Once routers expose worker stats, we can evaluate:
-        //         // - Average worker priority vs priority_threshold
-        //         // - Average worker cost vs max_cost
-        //         // - Current load and health status
+        let selected_router_id = self
+            .scheduler
+            .as_ref()
+            .unwrap()
+            .select_router(&candidate_routers, &info)
+            .await;
 
-        //         if score > best_score && is_router_valid(is_pd) {
-        //             best_score = score;
-        //             best_router = Some(Arc::clone(router));
-        //         }
-        //     }
-
-        best_router
+        if let Some(id) = selected_router_id {
+            info!("Scheduler selected router: {}", id.as_str());
+            return self.routers.get(&id).map(|router_entry| router_entry.value().clone());
+        } else {
+            warn!("Scheduler did not select any router. Falling back to default.");
+            let default_router = self.default_router.read().unwrap();
+            if let Some(ref default_id) = *default_router {
+                return self.routers.get(default_id).map(|r| r.clone());
+            } else {
+                return None;
+            }
+        }
     }
 }
 
@@ -534,7 +587,7 @@ impl RouterTrait for RouterManager {
         };
 
         let router =
-            self.select_router_for_request(headers, effective_model_id.as_deref().or(model_id));
+            self.select_router_for_request(headers, effective_model_id.as_deref().or(model_id), None).await;
 
         if let Some(router) = router {
             router
@@ -569,7 +622,7 @@ impl RouterTrait for RouterManager {
         };
 
         let router =
-            self.select_router_for_request(headers, effective_model_id.as_deref().or(model_id));
+            self.select_router_for_request(headers, effective_model_id.as_deref().or(model_id), None).await;
 
         if let Some(router) = router {
             router
@@ -592,7 +645,7 @@ impl RouterTrait for RouterManager {
     ) -> Response {
         // In IGW mode, resolve model_id and fail fast if not resolvable
         // In non-IGW mode, pass through to router (router handles validation)
-        info!("route_completion 方法");
+        info!("进入route_completion方法");
         let effective_model_id = if self.enable_igw {
             // Use provided model_id or fall back to body.model
             let model = model_id.or(Some(&body.model));
@@ -604,8 +657,18 @@ impl RouterTrait for RouterManager {
             None
         };
 
+        // 获取prompt字符串
+        let prompt_text_buffer;
+        let prompt_text_slice = match &body.prompt {
+            StringOrArray::String(s) => Some(s.as_str()),
+            StringOrArray::Array(arr) => {
+                prompt_text_buffer = arr.join("");
+                Some(prompt_text_buffer.as_str())
+            }
+        };
+
         let router =
-            self.select_router_for_request(headers, effective_model_id.as_deref().or(model_id));
+            self.select_router_for_request(headers, effective_model_id.as_deref().or(model_id), prompt_text_slice).await;
 
         if let Some(router) = router {
             router
@@ -627,7 +690,7 @@ impl RouterTrait for RouterManager {
         model_id: Option<&str>,
     ) -> Response {
         let selected_model = model_id.or(Some(body.model.as_str()));
-        let router = self.select_router_for_request(headers, selected_model);
+        let router = self.select_router_for_request(headers, selected_model, None).await;
 
         if let Some(router) = router {
             router.route_responses(headers, body, selected_model).await
@@ -646,7 +709,7 @@ impl RouterTrait for RouterManager {
         response_id: &str,
         params: &ResponsesGetParams,
     ) -> Response {
-        let router = self.select_router_for_request(headers, None);
+        let router = self.select_router_for_request(headers, None, None).await;
         if let Some(router) = router {
             router.get_response(headers, response_id, params).await
         } else {
@@ -659,7 +722,7 @@ impl RouterTrait for RouterManager {
     }
 
     async fn cancel_response(&self, headers: Option<&HeaderMap>, response_id: &str) -> Response {
-        let router = self.select_router_for_request(headers, None);
+        let router = self.select_router_for_request(headers, None, None).await;
         if let Some(router) = router {
             router.cancel_response(headers, response_id).await
         } else {
@@ -686,7 +749,7 @@ impl RouterTrait for RouterManager {
     ) -> Response {
         // Delegate to the default router (typically http-regular)
         // Response storage is shared across all routers via AppContext
-        let router = self.select_router_for_request(headers, None);
+        let router = self.select_router_for_request(headers, None, None).await;
         if let Some(router) = router {
             router.list_response_input_items(headers, response_id).await
         } else {
@@ -704,7 +767,7 @@ impl RouterTrait for RouterManager {
         body: &EmbeddingRequest,
         model_id: Option<&str>,
     ) -> Response {
-        let router = self.select_router_for_request(headers, model_id);
+        let router = self.select_router_for_request(headers, model_id, None).await;
 
         if let Some(router) = router {
             router.route_embeddings(headers, body, model_id).await
@@ -723,7 +786,7 @@ impl RouterTrait for RouterManager {
         body: &ClassifyRequest,
         model_id: Option<&str>,
     ) -> Response {
-        let router = self.select_router_for_request(headers, model_id);
+        let router = self.select_router_for_request(headers, model_id, None).await;
 
         if let Some(router) = router {
             router.route_classify(headers, body, model_id).await
@@ -742,7 +805,7 @@ impl RouterTrait for RouterManager {
         body: &RerankRequest,
         model_id: Option<&str>,
     ) -> Response {
-        let router = self.select_router_for_request(headers, model_id);
+        let router = self.select_router_for_request(headers, model_id, None).await;
 
         if let Some(router) = router {
             router.route_rerank(headers, body, model_id).await
