@@ -493,7 +493,7 @@ def enable_cache_on_dual_transformer(
                 blocks=[transformer_blocks, transformer_2_blocks],
                 forward_pattern=[ForwardPattern.Pattern_2, ForwardPattern.Pattern_2],
                 params_modifiers=[primary_modifier, secondary_modifier],
-                has_separate_cfg=False,
+                has_separate_cfg=True,
             ),
             parallelism_config=None,
         )
