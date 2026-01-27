@@ -71,6 +71,8 @@ from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
 from sglang.srt.managers.io_struct import (
     AbortReq,
     ActiveRanksOutput,
+    AttachHiCacheStorageReqInput,
+    AttachHiCacheStorageReqOutput,
     BaseBatchReq,
     BaseReq,
     BatchTokenizedEmbeddingReqInput,
@@ -81,6 +83,8 @@ from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
     ContinueGenerationReqInput,
     DestroyWeightsUpdateGroupReqInput,
+    DetachHiCacheStorageReqInput,
+    DetachHiCacheStorageReqOutput,
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
     ExpertDistributionReqType,
@@ -1008,6 +1012,8 @@ class Scheduler(
                 (BatchTokenizedEmbeddingReqInput, self.handle_batch_embedding_request),
                 (FlushCacheReqInput, self.flush_cache_wrapped),
                 (ClearHiCacheReqInput, self.clear_hicache_storage_wrapped),
+                (AttachHiCacheStorageReqInput, self.attach_hicache_storage_wrapped),
+                (DetachHiCacheStorageReqInput, self.detach_hicache_storage_wrapped),
                 (AbortReq, self.abort_request),
                 (OpenSessionReqInput, self.open_session),
                 (CloseSessionReqInput, self.close_session),
@@ -2427,6 +2433,118 @@ class Scheduler(
             logging.warning("Hierarchical cache is not enabled.")
             if_success = False
         return ClearHiCacheReqOutput(success=if_success)
+
+    def _is_idle_for_hicache_storage_op(self) -> bool:
+        """Stricter idle check for storage attach/detach.
+
+        We require:
+        - no running batches (including overlap/pp/disagg paths) via `_is_no_request()`
+        - no queued requests in scheduler queues (waiting/grammar/disagg queues)
+        """
+        if not self._is_no_request():
+            return False
+        if len(self.waiting_queue) != 0:
+            return False
+        if len(self.grammar_manager.grammar_queue) != 0:
+            return False
+        return True
+
+    def attach_hicache_storage_wrapped(
+        self, recv_req: AttachHiCacheStorageReqInput
+    ) -> AttachHiCacheStorageReqOutput:
+        if not self.enable_hierarchical_cache:
+            return AttachHiCacheStorageReqOutput(
+                success=False, message="Hierarchical cache is not enabled."
+            )
+
+        if not self._is_idle_for_hicache_storage_op():
+            return AttachHiCacheStorageReqOutput(
+                success=False,
+                message=(
+                    "Reject attach: scheduler is not idle. "
+                    f"#queue-req={len(self.waiting_queue)} "
+                    f"#running-req={len(self.running_batch.reqs)}"
+                ),
+            )
+
+        if not hasattr(self.tree_cache, "attach_storage_backend"):
+            return AttachHiCacheStorageReqOutput(
+                success=False,
+                message="Current tree_cache implementation does not support dynamic attach.",
+            )
+
+        try:
+            ok, msg = self.tree_cache.attach_storage_backend(
+                storage_backend=recv_req.hicache_storage_backend,
+                storage_backend_extra_config_json=recv_req.hicache_storage_backend_extra_config_json,
+                served_model_name=self.server_args.served_model_name,
+                hicache_storage_prefetch_policy=recv_req.hicache_storage_prefetch_policy,
+                hicache_write_policy=recv_req.hicache_write_policy,
+            )
+        except Exception as e:
+            logger.exception("Attach HiCache storage backend failed with exception.")
+            return AttachHiCacheStorageReqOutput(success=False, message=str(e))
+        if ok:
+            self.enable_hicache_storage = True
+            self.server_args.hicache_storage_backend = recv_req.hicache_storage_backend
+            if recv_req.hicache_storage_backend_extra_config_json is not None:
+                self.server_args.hicache_storage_backend_extra_config = (
+                    recv_req.hicache_storage_backend_extra_config_json
+                )
+            if recv_req.hicache_storage_prefetch_policy is not None:
+                self.server_args.hicache_storage_prefetch_policy = (
+                    recv_req.hicache_storage_prefetch_policy
+                )
+            if recv_req.hicache_write_policy is not None:
+                self.server_args.hicache_write_policy = recv_req.hicache_write_policy
+            logger.info(
+                f"Attached HiCache storage backend: {recv_req.hicache_storage_backend}"
+            )
+        return AttachHiCacheStorageReqOutput(success=ok, message=msg)
+
+    def detach_hicache_storage_wrapped(
+        self, recv_req: DetachHiCacheStorageReqInput
+    ) -> DetachHiCacheStorageReqOutput:
+        if not self.enable_hierarchical_cache:
+            return DetachHiCacheStorageReqOutput(
+                success=False, message="Hierarchical cache is not enabled."
+            )
+
+        if not self._is_idle_for_hicache_storage_op():
+            return DetachHiCacheStorageReqOutput(
+                success=False,
+                message=(
+                    "Reject detach: scheduler is not idle. "
+                    f"#queue-req={len(self.waiting_queue)} "
+                    f"#running-req={len(self.running_batch.reqs)}"
+                ),
+            )
+
+        if not hasattr(self.tree_cache, "detach_storage_backend"):
+            return DetachHiCacheStorageReqOutput(
+                success=False,
+                message="Current tree_cache implementation does not support dynamic detach.",
+            )
+
+        # Idempotent detach: even if scheduler thinks storage is disabled, we still
+        # attempt best-effort cleanup in tree_cache (it may have leftover state).
+        try:
+            ok, msg = self.tree_cache.detach_storage_backend()
+        except Exception as e:
+            logger.exception("Detach HiCache storage backend failed with exception.")
+            return DetachHiCacheStorageReqOutput(success=False, message=str(e))
+
+        if ok or (not self.enable_hicache_storage):
+            # Treat "already disabled / nothing to do" as success for idempotence.
+            self.enable_hicache_storage = False
+            self.server_args.hicache_storage_backend = None
+            self.server_args.hicache_storage_backend_extra_config = None
+            logger.info("Detached HiCache storage backend.")
+            return DetachHiCacheStorageReqOutput(
+                success=True, message=msg or "HiCache storage backend is detached."
+            )
+
+        return DetachHiCacheStorageReqOutput(success=False, message=msg)
 
     def _is_no_request(self):
         no_request = (
