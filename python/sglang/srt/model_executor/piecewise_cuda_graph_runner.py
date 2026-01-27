@@ -127,13 +127,6 @@ def set_torch_compile_config():
 class PiecewiseCudaGraphRunner:
     """A PiecewiseCudaGraphRunner runs the forward pass of a model with cuda graph and torch.compile."""
 
-    def is_mamba_track_enabled(self):
-        return (
-            self.model_runner.server_args.enable_mamba_extra_buffer()
-            and not self.model_runner.server_args.disable_radix_cache
-            and self.model_runner.spec_algorithm.is_none()
-        )
-
     def __init__(self, model_runner: ModelRunner):
         # Parse args
         self.model_runner = model_runner
@@ -185,7 +178,6 @@ class PiecewiseCudaGraphRunner:
         self.max_bs = model_runner.req_to_token_pool.size
 
         self.is_multimodal = model_runner.is_multimodal
-        self.mamba_track_enabled = self.is_mamba_track_enabled()
 
         # Graph inputs
         with torch.device(self.device):
