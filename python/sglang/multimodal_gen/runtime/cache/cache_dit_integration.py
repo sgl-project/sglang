@@ -522,11 +522,20 @@ def enable_cache_on_dual_transformer(
 def refresh_context_on_transformer(
     transformer: torch.nn.Module,
     num_inference_steps: int,
+    scm_preset: str | None = None,
     verbose: bool = False,
 ) -> None:
     """Refresh cache-dit context for transformer."""
     cache_dit.refresh_context(
-        transformer, num_inference_steps=num_inference_steps, verbose=verbose
+        transformer,
+        cache_config=DBCacheConfig().reset(
+            num_inference_steps=num_inference_steps,
+            steps_computation_mask=cache_dit.steps_mask(
+                mask_policy=scm_preset, total_steps=num_inference_steps
+            ),
+            steps_computation_policy=scm_preset,
+        ),
+        verbose=verbose,
     )
     logger.debug(f"cache-dit refreshed on transformer (steps={num_inference_steps})")
 
@@ -536,14 +545,31 @@ def refresh_context_on_dual_transformer(
     transformer_2: torch.nn.Module,
     num_high_noise_steps: int,
     num_low_noise_steps: int,
+    scm_preset: str | None = None,
     verbose: bool = False,
 ) -> None:
     """Refresh cache-dit context for dual transformers."""
     cache_dit.refresh_context(
-        transformer, num_inference_steps=num_high_noise_steps, verbose=verbose
+        transformer,
+        cache_config=DBCacheConfig().reset(
+            num_inference_steps=num_high_noise_steps,
+            steps_computation_mask=cache_dit.steps_mask(
+                mask_policy=scm_preset, total_steps=num_high_noise_steps
+            ),
+            steps_computation_policy=scm_preset,
+        ),
+        verbose=verbose,
     )
     cache_dit.refresh_context(
-        transformer_2, num_inference_steps=num_low_noise_steps, verbose=verbose
+        transformer_2,
+        cache_config=DBCacheConfig().reset(
+            num_inference_steps=num_low_noise_steps,
+            steps_computation_mask=cache_dit.steps_mask(
+                mask_policy=scm_preset, total_steps=num_low_noise_steps
+            ),
+            steps_computation_policy=scm_preset,
+        ),
+        verbose=verbose,
     )
     logger.debug(
         f"cache-dit refreshed on dual transformers (steps={num_high_noise_steps}, {num_low_noise_steps})"
