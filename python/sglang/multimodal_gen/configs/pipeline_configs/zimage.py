@@ -317,3 +317,15 @@ class ZImagePipelineConfig(ImagePipelineConfig):
                 batch,
             ),
         }
+
+    def prepare_neg_cond_kwargs(self, batch, device, rotary_emb, dtype):
+        return {
+            "freqs_cis": self.get_freqs_cis(
+                batch.prompt_embeds[0],
+                batch.width,
+                batch.height,
+                device,
+                rotary_emb,
+                batch,
+            ),
+        }
