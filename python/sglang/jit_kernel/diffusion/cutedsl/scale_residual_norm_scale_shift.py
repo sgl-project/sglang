@@ -5,12 +5,12 @@ import cutlass
 import cutlass.cute as cute
 import torch
 
-from sglang.jit_kernel.cutedsl.common.norm_fusion import (
+from sglang.jit_kernel.diffusion.cutedsl.common.norm_fusion import (
     apply_norm_cta,
     broadcast_tensor_for_bsfd,
     tensor_slice_for_bsfd,
 )
-from sglang.jit_kernel.cutedsl.utils import TORCH_TO_CUTE_DTYPE
+from sglang.jit_kernel.diffusion.cutedsl.utils import TORCH_TO_CUTE_DTYPE
 
 _COMPILE_CACHE = {}
 

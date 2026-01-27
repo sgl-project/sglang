@@ -5,7 +5,10 @@ import cutlass.cute as cute
 import torch
 from einops import rearrange
 
-from sglang.jit_kernel.cutedsl.common.reduce import cta_reduce_sum, warp_reduce_sum
+from sglang.jit_kernel.diffusion.cutedsl.common.reduce import (
+    cta_reduce_sum,
+    warp_reduce_sum,
+)
 
 WARP_SIZE = 32
 

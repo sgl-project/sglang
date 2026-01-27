@@ -10,7 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from sgl_kernel import fused_add_rmsnorm, rmsnorm
 
-from sglang.jit_kernel.cutedsl.scale_residual_norm_scale_shift import (
+from sglang.jit_kernel.diffusion.cutedsl.scale_residual_norm_scale_shift import (
     fused_norm_scale_shift,
     fused_scale_residual_norm_scale_shift,
 )

@@ -5,7 +5,7 @@ import torch
 from einops import rearrange
 from torch import Tensor
 
-from sglang.jit_kernel.cutedsl.scale_residual_norm_scale_shift import (
+from sglang.jit_kernel.diffusion.cutedsl.scale_residual_norm_scale_shift import (
     fused_norm_scale_shift,
     fused_scale_residual_norm_scale_shift,
 )
