@@ -347,7 +347,11 @@ class HiCacheHF3FS(HiCacheStorage):
         values: List[torch.Tensor],
     ) -> List[bool]:
         page_indices = self.metadata_client.get_page_indices(self.rank, keys)
-
+        if len(page_indices) != len(keys):
+            logger.error(
+                f"[Rank {self.rank}] HiCacheHF3FS get: page_indices length {len(page_indices)} mismatch keys length {len(keys)}."
+            )
+            return [False] * len(keys)
         batch_indices, file_offsets = [], []
         for i, page_index in enumerate(page_indices):
             if page_index is not None:
@@ -402,7 +406,16 @@ class HiCacheHF3FS(HiCacheStorage):
         indices = self.metadata_client.reserve_and_allocate_page_indices(
             self.rank, key_with_prefix
         )
-
+        if len(indices) != len(keys):
+            logger.error(
+                f"[Rank {self.rank}] HiCacheHF3FS batch_get: mismatched lengths {len(indices)} != {len(keys)}"
+            )
+            # free allocated pages
+            if indices:
+                self.metadata_client.confirm_write(
+                    self.rank, [], [index[1] for index in indices]
+                )
+            return [False] * len(keys)
         batch_indices, file_offsets, file_values = [], [], []
         pages_to_release = []
 
