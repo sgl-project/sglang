@@ -31,59 +31,85 @@ echo ""
 # Find model weights location
 echo "=== Finding Model Weights ==="
 
-# Common paths to search
-SEARCH_PATHS=(
-    "/sgl-data/hf-cache/hub"
-    "/home/runner/sgl-data/hf-cache/hub"
-    "${HF_HOME:-}/hub"
-    "${HOME}/.cache/huggingface/hub"
-    "/root/.cache/huggingface/hub"
-)
-
 MODEL_DIR=""
 SAFETENSOR_FILE=""
 
-# Look for DeepSeek-V3.2 or Kimi-K2
-for path in "${SEARCH_PATHS[@]}"; do
-    if [ -z "$path" ]; then continue; fi
-
-    # DeepSeek-V3.2
-    dsv32="$path/models--deepseek-ai--DeepSeek-V3.2"
-    if [ -d "$dsv32" ]; then
-        echo "Found DeepSeek-V3.2 at: $dsv32"
-        MODEL_DIR="$dsv32"
-        SAFETENSOR_FILE=$(find "$dsv32/snapshots" -name "*.safetensors" -type f 2>/dev/null | head -1)
-        break
-    fi
-
-    # Kimi-K2
-    kimi="$path/models--moonshotai--Kimi-K2-Instruct"
-    if [ -d "$kimi" ]; then
-        echo "Found Kimi-K2-Instruct at: $kimi"
-        MODEL_DIR="$kimi"
-        SAFETENSOR_FILE=$(find "$kimi/snapshots" -name "*.safetensors" -type f 2>/dev/null | head -1)
-        break
-    fi
-
-    # Also check variant names
-    kimi2="$path/models--moonshotai--Kimi-K2-Instruct-0905"
-    if [ -d "$kimi2" ]; then
-        echo "Found Kimi-K2-Instruct-0905 at: $kimi2"
-        MODEL_DIR="$kimi2"
-        SAFETENSOR_FILE=$(find "$kimi2/snapshots" -name "*.safetensors" -type f 2>/dev/null | head -1)
-        break
-    fi
-done
-
-# Also try find command as fallback
-if [ -z "$SAFETENSOR_FILE" ]; then
-    echo "Searching for any safetensor files..."
-    SAFETENSOR_FILE=$(find /sgl-data /home/runner -name "*deepseek*.safetensors" -o -name "*kimi*.safetensors" 2>/dev/null | head -1)
+# Search for DeepSeek-V3.2 directory
+echo "Searching for DeepSeek-V3.2..."
+DSV32_DIR=$(find / -type d -iname "*deepseek-v3.2*" 2>/dev/null | head -1)
+if [ -n "$DSV32_DIR" ]; then
+    echo "Found DeepSeek-V3.2 at: $DSV32_DIR"
+    MODEL_DIR="$DSV32_DIR"
+    SAFETENSOR_FILE=$(find "$DSV32_DIR" -name "*.safetensors" -type f 2>/dev/null | head -1)
 fi
 
+# If not found, search for Kimi-K2
 if [ -z "$SAFETENSOR_FILE" ]; then
-    echo "Searching for any large safetensor files..."
-    SAFETENSOR_FILE=$(find /sgl-data /home/runner /root -name "*.safetensors" -size +100M 2>/dev/null | head -1)
+    echo "Searching for Kimi-K2..."
+    KIMI_DIR=$(find / -type d -iname "*kimi-k2*" 2>/dev/null | head -1)
+    if [ -n "$KIMI_DIR" ]; then
+        echo "Found Kimi-K2 at: $KIMI_DIR"
+        MODEL_DIR="$KIMI_DIR"
+        SAFETENSOR_FILE=$(find "$KIMI_DIR" -name "*.safetensors" -type f 2>/dev/null | head -1)
+    fi
+fi
+
+# If still not found, search for any large safetensor file
+if [ -z "$SAFETENSOR_FILE" ]; then
+    echo "Searching for any large safetensor files (>1GB)..."
+    SAFETENSOR_FILE=$(find / -name "*.safetensors" -size +1G -type f 2>/dev/null | head -1)
+fi
+
+# Show what we found and disk info
+if [ -n "$SAFETENSOR_FILE" ]; then
+    echo "Found safetensor file: $SAFETENSOR_FILE"
+    echo ""
+
+    # Get mount point and disk info for this file
+    echo "=== Disk Info for Model File ==="
+    FILE_DIR=$(dirname "$SAFETENSOR_FILE")
+
+    # Get mount point
+    MOUNT_INFO=$(df "$SAFETENSOR_FILE" 2>/dev/null | tail -1)
+    echo "Mount info: $MOUNT_INFO"
+
+    # Extract device name
+    DEVICE=$(echo "$MOUNT_INFO" | awk '{print $1}')
+    MOUNT_POINT=$(echo "$MOUNT_INFO" | awk '{print $NF}')
+    echo "Device: $DEVICE"
+    echo "Mount point: $MOUNT_POINT"
+
+    # Get disk details using lsblk
+    if command -v lsblk &> /dev/null; then
+        # Extract base device name (e.g., nvme0n1 from /dev/nvme0n1p1)
+        BASE_DEVICE=$(echo "$DEVICE" | sed 's|/dev/||' | sed 's/p[0-9]*$//' | sed 's/[0-9]*$//')
+        echo ""
+        echo "Disk details:"
+        lsblk -o NAME,TYPE,SIZE,ROTA,MODEL,TRAN,SCHED "/dev/$BASE_DEVICE" 2>/dev/null || \
+        lsblk -o NAME,TYPE,SIZE,ROTA,MODEL "/dev/$BASE_DEVICE" 2>/dev/null || \
+        lsblk -d -o NAME,TYPE,SIZE,ROTA,MODEL 2>/dev/null | grep -E "NAME|$BASE_DEVICE"
+
+        # Show if it's SSD or HDD
+        ROTA=$(lsblk -d -n -o ROTA "/dev/$BASE_DEVICE" 2>/dev/null)
+        if [ "$ROTA" = "0" ]; then
+            echo "Disk type: SSD/NVMe (non-rotational)"
+        elif [ "$ROTA" = "1" ]; then
+            echo "Disk type: HDD (rotational)"
+        fi
+    fi
+
+    # Try to get more NVMe info if applicable
+    if [[ "$DEVICE" == *nvme* ]] && command -v nvme &> /dev/null; then
+        echo ""
+        echo "NVMe details:"
+        nvme list 2>/dev/null | head -5 || true
+    fi
+
+    # Show filesystem type
+    FS_TYPE=$(df -T "$SAFETENSOR_FILE" 2>/dev/null | tail -1 | awk '{print $2}')
+    echo "Filesystem type: $FS_TYPE"
+else
+    echo "No model files found."
 fi
 
 echo ""
