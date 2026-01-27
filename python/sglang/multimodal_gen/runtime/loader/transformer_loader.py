@@ -5,12 +5,8 @@ import torch
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.loader.component_loader import ComponentLoader
-from sglang.multimodal_gen.runtime.loader.fsdp_load import (
-    maybe_load_fsdp_model,
-)
-from sglang.multimodal_gen.runtime.loader.utils import (
-    _list_safetensors_files,
-)
+from sglang.multimodal_gen.runtime.loader.fsdp_load import maybe_load_fsdp_model
+from sglang.multimodal_gen.runtime.loader.utils import _list_safetensors_files
 from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (

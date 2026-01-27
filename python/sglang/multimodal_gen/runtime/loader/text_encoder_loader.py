@@ -17,9 +17,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
 )
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.loader.component_loader import ComponentLoader
-from sglang.multimodal_gen.runtime.loader.fsdp_load import (
-    shard_model,
-)
+from sglang.multimodal_gen.runtime.loader.fsdp_load import shard_model
 from sglang.multimodal_gen.runtime.loader.utils import (
     _clean_hf_config_inplace,
     set_default_torch_dtype,
