@@ -57,12 +57,14 @@ def create_scheduler_actor_class():
 
             import setproctitle
 
-            from sglang.srt.disaggregation.utils import DisaggregationMode
             from sglang.srt.environ import envs
             from sglang.srt.managers.scheduler import Scheduler
             from sglang.srt.utils import configure_logger, suppress_other_loggers
-            from sglang.srt.utils.common import get_bool_env_var, numa_bind_to_node
-            from sglang.srt.utils.gpu_utils import set_gpu_proc_affinity
+            from sglang.srt.utils.common import (
+                get_bool_env_var,
+                numa_bind_to_node,
+                set_gpu_proc_affinity,
+            )
 
             # Generate logger prefix (same logic as run_scheduler_process)
             if dp_rank is None and "SGLANG_DP_RANK" in os.environ:
@@ -109,35 +111,10 @@ def create_scheduler_actor_class():
 
             self._tp_rank = tp_rank
             self._pp_rank = pp_rank
-            self._gpu_id = gpu_id
-            self._dp_rank = dp_rank
-            self._server_args = server_args
-            self._disaggregation_mode = DisaggregationMode(
-                server_args.disaggregation_mode
-            )
 
         def get_info(self) -> Dict[str, Any]:
             """Return scheduler initialization info for handshake."""
-            result_dict = {
-                "status": "ready",
-                "max_total_num_tokens": self.scheduler.max_total_num_tokens,
-                "max_req_input_len": self.scheduler.max_req_input_len,
-            }
-
-            if self._server_args.remote_instance_weight_loader_use_transfer_engine():
-                (
-                    remote_instance_transfer_engine_session_id,
-                    remote_instance_transfer_engine_weights_info_dict,
-                ) = self.scheduler.get_remote_instance_transfer_engine_info()
-                result_dict.update(
-                    {
-                        "tp_rank": self._tp_rank,
-                        "remote_instance_transfer_engine_session_id": remote_instance_transfer_engine_session_id,
-                        "remote_instance_transfer_engine_weights_info_dict": remote_instance_transfer_engine_weights_info_dict,
-                    }
-                )
-
-            return result_dict
+            return self.scheduler.get_init_info()
 
         def run_event_loop(self) -> None:
             """
@@ -146,39 +123,8 @@ def create_scheduler_actor_class():
             This method blocks until shutdown. The appropriate event loop
             variant is chosen based on server_args configuration.
             """
-            from sglang.srt.disaggregation.utils import DisaggregationMode
-
             try:
-                server_args = self._server_args
-                disaggregation_mode = self._disaggregation_mode
-
-                if disaggregation_mode == DisaggregationMode.NULL:
-                    if self.scheduler.enable_pdmux:
-                        self.scheduler.event_loop_pdmux()
-                    elif server_args.pp_size > 1:
-                        self.scheduler.event_loop_pp()
-                    elif self.scheduler.enable_overlap:
-                        self.scheduler.event_loop_overlap()
-                    else:
-                        self.scheduler.event_loop_normal()
-                elif disaggregation_mode == DisaggregationMode.PREFILL:
-                    if server_args.pp_size > 1:
-                        self.scheduler.event_loop_pp_disagg_prefill()
-                    elif self.scheduler.enable_overlap:
-                        self.scheduler.event_loop_overlap_disagg_prefill()
-                    else:
-                        self.scheduler.event_loop_normal_disagg_prefill()
-                elif disaggregation_mode == DisaggregationMode.DECODE:
-                    if server_args.pp_size > 1:
-                        self.scheduler.event_loop_pp_disagg_decode()
-                    elif self.scheduler.enable_overlap:
-                        self.scheduler.event_loop_overlap_disagg_decode()
-                    else:
-                        self.scheduler.event_loop_normal_disagg_decode()
-                else:
-                    raise ValueError(
-                        f"Unknown disaggregation mode: {disaggregation_mode}"
-                    )
+                self.scheduler.run_event_loop()
             except Exception as e:
                 logger.error(
                     f"Scheduler PP{self._pp_rank} TP{self._tp_rank} crashed: {e}"

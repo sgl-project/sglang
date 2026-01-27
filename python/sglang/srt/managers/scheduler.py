@@ -1058,6 +1058,66 @@ class Scheduler(
             ]
         )
 
+    def get_init_info(self) -> Dict[str, Any]:
+        """Return scheduler initialization info for handshake.
+
+        This method provides the initialization info needed by the tokenizer manager
+        and other components to verify the scheduler is ready.
+        """
+        result_dict = {
+            "status": "ready",
+            "max_total_num_tokens": self.max_total_num_tokens,
+            "max_req_input_len": self.max_req_input_len,
+        }
+
+        if self.server_args.remote_instance_weight_loader_use_transfer_engine():
+            (
+                remote_instance_transfer_engine_session_id,
+                remote_instance_transfer_engine_weights_info_dict,
+            ) = self.get_remote_instance_transfer_engine_info()
+            result_dict.update(
+                {
+                    "tp_rank": self.tp_rank,
+                    "remote_instance_transfer_engine_session_id": remote_instance_transfer_engine_session_id,
+                    "remote_instance_transfer_engine_weights_info_dict": remote_instance_transfer_engine_weights_info_dict,
+                }
+            )
+
+        return result_dict
+
+    def run_event_loop(self) -> None:
+        """Run the scheduler's event loop.
+
+        This method dispatches to the appropriate event loop variant based on
+        the server configuration (disaggregation mode, pp_size, overlap, etc.).
+        The event loop blocks until shutdown.
+        """
+        if self.disaggregation_mode == DisaggregationMode.NULL:
+            if self.enable_pdmux:
+                self.event_loop_pdmux()
+            elif self.server_args.pp_size > 1:
+                self.event_loop_pp()
+            elif self.enable_overlap:
+                self.event_loop_overlap()
+            else:
+                self.event_loop_normal()
+        elif self.disaggregation_mode == DisaggregationMode.PREFILL:
+            if self.server_args.pp_size > 1:
+                self.event_loop_pp_disagg_prefill()
+            elif self.enable_overlap:
+                self.event_loop_overlap_disagg_prefill()
+            else:
+                self.event_loop_normal_disagg_prefill()
+        elif self.disaggregation_mode == DisaggregationMode.DECODE:
+            if self.server_args.pp_size > 1:
+                self.event_loop_pp_disagg_decode()
+            elif self.enable_overlap:
+                self.event_loop_overlap_disagg_decode()
+            else:
+                self.event_loop_normal_disagg_decode()
+        else:
+            raise ValueError(f"Unknown disaggregation mode: {self.disaggregation_mode}")
+
     @DynamicGradMode()
     def event_loop_normal(self):
         """A normal scheduler loop."""
@@ -3028,52 +3088,12 @@ def run_scheduler_process(
             pp_rank,
             dp_rank,
         )
-        result_dict = {
-            "status": "ready",
-            "max_total_num_tokens": scheduler.max_total_num_tokens,
-            "max_req_input_len": scheduler.max_req_input_len,
-        }
-        if server_args.remote_instance_weight_loader_use_transfer_engine():
-            (
-                remote_instance_transfer_engine_session_id,
-                remote_instance_transfer_engine_weights_info_dict,
-            ) = scheduler.get_remote_instance_transfer_engine_info()
-            result_dict.update(
-                {
-                    "tp_rank": tp_rank,
-                    "remote_instance_transfer_engine_session_id": remote_instance_transfer_engine_session_id,
-                    "remote_instance_transfer_engine_weights_info_dict": remote_instance_transfer_engine_weights_info_dict,
-                }
-            )
 
-        pipe_writer.send(result_dict)
+        # Send initialization info back to the parent process
+        pipe_writer.send(scheduler.get_init_info())
 
-        # Dispatch to the appropriate event loop based on the disaggregation mode
-        disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode
-        if disaggregation_mode == DisaggregationMode.NULL:
-            if scheduler.enable_pdmux:
-                scheduler.event_loop_pdmux()
-            elif server_args.pp_size > 1:
-                scheduler.event_loop_pp()
-            elif scheduler.enable_overlap:
-                scheduler.event_loop_overlap()
-            else:
-                scheduler.event_loop_normal()
-        elif disaggregation_mode == DisaggregationMode.PREFILL:
-            if server_args.pp_size > 1:
-                scheduler.event_loop_pp_disagg_prefill()
-            elif scheduler.enable_overlap:
-                scheduler.event_loop_overlap_disagg_prefill()
-            else:
-                scheduler.event_loop_normal_disagg_prefill()
-
-        elif disaggregation_mode == DisaggregationMode.DECODE:
-            if server_args.pp_size > 1:
-                scheduler.event_loop_pp_disagg_decode()
-            elif scheduler.enable_overlap:
-                scheduler.event_loop_overlap_disagg_decode()
-            else:
-                scheduler.event_loop_normal_disagg_decode()
+        # Run the event loop (blocks until shutdown)
+        scheduler.run_event_loop()
 
     except Exception:
         traceback = get_exception_traceback()
