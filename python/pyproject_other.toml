@@ -146,7 +146,6 @@ all_hpu = ["sglang[srt_hpu]"]
 all_musa = ["sglang[srt_musa]", "sglang[diffusion_musa]"]
 
 dev_hip = ["sglang[all_hip]", "sglang[test]"]
-dev_npu = ["sglang[all_npu]", "sglang[test]"]
 dev_hpu = ["sglang[all_hpu]", "sglang[test]"]
 dev_musa = ["sglang[all_musa]", "sglang[test]"]
 
