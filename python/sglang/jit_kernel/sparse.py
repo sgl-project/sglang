@@ -84,10 +84,10 @@ def load_cache_to_device_buffer_mla(
     ), f"hot_buffer_size ({hot_buffer_size}) must be >= num_top_k ({num_top_k})"
 
     module = _jit_sparse_module(block_size, num_top_k, hot_buffer_size, is_mla=True)
-    
+
     # Create empty tensors for V cache (not used in MLA)
     empty = torch.empty(0)
-    
+
     module.load_cache_to_device_buffer(
         top_k_tokens,
         device_buffer_tokens,
@@ -168,7 +168,7 @@ def load_cache_to_device_buffer(
     ), f"hot_buffer_size ({hot_buffer_size}) must be >= num_top_k ({num_top_k})"
 
     module = _jit_sparse_module(block_size, num_top_k, hot_buffer_size, is_mla=False)
-    
+
     module.load_cache_to_device_buffer(
         top_k_tokens,
         device_buffer_tokens,
@@ -188,4 +188,3 @@ def load_cache_to_device_buffer(
         layer_id,
         item_size_bytes,
     )
-

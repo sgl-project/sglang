@@ -1,5 +1,6 @@
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
+
 #include <sgl_kernel/utils.cuh>
 
 #include <dlpack/dlpack.h>
@@ -52,8 +53,7 @@ transfer_item_warp(int32_t lane_id, const void* src_addr, void* dst_addr, int64_
   }
 }
 
-__device__ __forceinline__ int
-warp_inclusive_scan(int* s_data, int lane_id, int offset, int count, int accumulator) {
+__device__ __forceinline__ int warp_inclusive_scan(int* s_data, int lane_id, int offset, int count, int accumulator) {
   int idx = lane_id + offset;
   int val = (idx < count) ? s_data[idx] : 0;
 

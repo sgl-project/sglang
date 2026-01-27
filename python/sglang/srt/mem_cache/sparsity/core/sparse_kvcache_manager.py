@@ -4,27 +4,17 @@ import logging
 from typing import TYPE_CHECKING, Optional
 
 import torch
+
 from sglang.jit_kernel.sparse import (
     load_cache_to_device_buffer,
     load_cache_to_device_buffer_mla,
-)
-
-from sglang.srt.managers.cache_controller import CacheOperation, HiCacheAck
-from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-from sglang.srt.mem_cache.memory_pool import (
-    MHATokenToKVPool,
-    MLATokenToKVPool,
-    ReqToTokenPool,
-)
-from sglang.srt.mem_cache.memory_pool_host import (
-    MHATokenToKVPoolHost,
-    MLATokenToKVPoolHost,
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_device_module
 
 if TYPE_CHECKING:
-    pass
+    from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+    from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +34,12 @@ class SparseKVCacheManager:
         tp_group: torch.distributed.ProcessGroup,
         server_args: ServerArgs,
     ) -> None:
+        from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
+        from sglang.srt.mem_cache.memory_pool_host import (
+            MHATokenToKVPoolHost,
+            MLATokenToKVPoolHost,
+        )
+
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.page_size = server_args.page_size
@@ -52,6 +48,7 @@ class SparseKVCacheManager:
 
         # Initialize host memory pool based on KV cache type
         self.mem_pool_device = self.token_to_kv_pool_allocator.get_kvcache()
+        self.is_mla_pool = False
         if isinstance(self.mem_pool_device, MHATokenToKVPool):
             self.mem_pool_host = MHATokenToKVPoolHost(
                 self.mem_pool_device,
@@ -68,6 +65,7 @@ class SparseKVCacheManager:
                 1,
                 server_args.hicache_mem_layout,
             )
+            self.is_mla_pool = True
         else:
             raise ValueError("Unsupported KV cache type for sparse attention offload")
 
@@ -119,7 +117,7 @@ class SparseKVCacheManager:
         bs = sparse_mask.shape[0]
 
         block_size = 512 if top_k_result.size(1) == 2048 else 32
-        if isinstance(self.mem_pool_device, MLATokenToKVPool):
+        if self.is_mla_pool:
             load_cache_to_device_buffer_mla(
                 top_k_tokens=top_k_result,
                 device_buffer_tokens=self.req_states.last_top_k_result,
@@ -329,6 +327,8 @@ class SparseKVCacheManager:
         """
         Back up KV caches from device memory to host memory.
         """
+        from sglang.srt.managers.cache_controller import CacheOperation
+
         host_indices = self.mem_pool_host.alloc(len(device_indices))
         if host_indices is None:
             return None
@@ -339,6 +339,8 @@ class SparseKVCacheManager:
         return host_indices
 
     def _start_writing(self, sparse_ack_type: str) -> None:
+        from sglang.srt.managers.cache_controller import CacheOperation, HiCacheAck
+
         if len(self.write_queue) == 0:
             return
 
@@ -369,7 +371,7 @@ class SparseKVCacheManager:
         elif sparse_ack_type == "decode_offload":
             self.ack_sparse_decode_write_queue.append(ack)
 
-    def move_indices(self, op: CacheOperation):
+    def move_indices(self, op):
         """Move indices to device if needed."""
         host_indices = op.host_indices.to(self.device, non_blocking=True)
         device_indices = op.device_indices.to(self.device, non_blocking=True)
