@@ -638,6 +638,56 @@ def make_layers(
     return modules, start_layer, end_layer
 
 
+def is_pp_last_layer(
+    layer_id: int, num_hidden_layers: int, pp_rank: int, pp_size: int
+) -> bool:
+    """Check if the layer is the last layer in the current PP stage.
+
+    Args:
+        layer_id: The global layer index (0-based)
+        num_hidden_layers: Total number of hidden layers in the model
+        pp_rank: Current PP rank
+        pp_size: Total PP size
+
+    Returns:
+        True if this layer is the last layer in the current PP stage
+    """
+    from sglang.srt.distributed import get_pp_indices
+
+    _, end_layer = get_pp_indices(num_hidden_layers, pp_rank, pp_size)
+    return layer_id == end_layer - 1
+
+
+def get_layer_id_within_pp_stage(
+    layer_id: int, num_hidden_layers: int, pp_rank: int, pp_size: int
+) -> Tuple[int, int]:
+    """Convert global layer_id to relative layer_id within current PP stage.
+
+    Returns (relative_layer_id, num_layers_in_stage) that treat each PP stage
+    as if it were a complete model. This ensures PP boundary layers have correct
+    layer_output_mode (TP_ATTN_FULL) for proper PP tensor transfer.
+
+    Example: For a 92-layer model with PP=2:
+        - PP0 (layers 0-45): get_layer_id_within_pp_stage(45, 92, 0, 2) -> (45, 46)
+        - PP1 (layers 46-91): get_layer_id_within_pp_stage(46, 92, 1, 2) -> (0, 46)
+
+    Args:
+        layer_id: The global layer index (0-based)
+        num_hidden_layers: Total number of hidden layers in the model
+        pp_rank: Current PP rank
+        pp_size: Total PP size
+
+    Returns:
+        Tuple of (relative_layer_id, num_layers_in_stage)
+    """
+    from sglang.srt.distributed import get_pp_indices
+
+    start_layer, end_layer = get_pp_indices(num_hidden_layers, pp_rank, pp_size)
+    num_layers_in_stage = end_layer - start_layer
+    relative_layer_id = layer_id - start_layer
+    return relative_layer_id, num_layers_in_stage
+
+
 def make_layers_non_pp(
     num_hidden_layers: int,
     layer_fn: LayerFn,
