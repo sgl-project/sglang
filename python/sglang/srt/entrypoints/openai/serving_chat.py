@@ -1194,7 +1194,7 @@ class OpenAIServingChat(OpenAIServingBase):
         """Judge whether the request needs reasoning"""
         if not self.reasoning_parser:
             return False
-        if self.reasoning_parser in ["deepseek-v3"]:
+        if self.reasoning_parser in ["deepseek-v3", "kimi_k2"]:
             return (
                 request.chat_template_kwargs is not None
                 and request.chat_template_kwargs.get("thinking") is True
