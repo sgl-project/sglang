@@ -2951,7 +2951,7 @@ def _execute_graceful_exit(scheduler: Scheduler) -> None:
             if hasattr(scheduler, "tree_cache") and isinstance(
                 scheduler.tree_cache, PeagflowRadixCache
             ):
-                scheduler.tree_cache.unregister_context()
+                scheduler.tree_cache.shutdown()
         except ImportError:
             logger.debug("PegaFlow not installed, skipping CUDA IPC cleanup")
     except Exception as e:
