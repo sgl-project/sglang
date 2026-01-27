@@ -544,23 +544,12 @@ void weight_packed_linear_kernel_impl(
   });
 }
 
-template <typename T>
-void print_array(const T* data, int M, int N, int lda) {
-  for (int m = 0; m < M; ++m) {
-    for (int n = 0; n < N; ++n) {
-      std::cout << " " << float(data[m * lda + n]);
-    }
-    std::cout << std::endl;
-  }
-}
-
 // fused linear + post_op
 template <typename scalar_t, typename post_op_t>
 void weight_packed_linear_kernel_impl(
     scalar_t* __restrict__ out,
     const scalar_t* __restrict__ mat1,
     const scalar_t* __restrict__ mat2,
-    const float* __restrict__ bias,
     int64_t M,
     int64_t N,
     int64_t K,
@@ -871,29 +860,28 @@ at::Tensor fused_linear_gelu_linear(
   TORCH_CHECK(bias1.has_value() && bias2.has_value(), "fused_linear_gelu_linear: expect with bias.");
 
   auto hidden = at::empty({batches, hidden_features}, input.options());
-  // auto out = at::empty({batches, out_features}, input.options())
+  auto out = at::empty({batches, out_features}, input.options());
 
   constexpr int64_t BLOCK_N = block_size_n();
 
   AT_DISPATCH_REDUCED_FLOATING_TYPES(input.scalar_type(), "fused_linear_gelu_linear", [&] {
     scalar_t* hidden_data = hidden.data_ptr<scalar_t>();
+    scalar_t* out_data = out.data_ptr<scalar_t>();
     float* bias1_data = conditional_data_ptr<float>(bias1);
+    float* bias2_data = conditional_data_ptr<float>(bias2);
 
     using bVec = at::vec::Vectorized<scalar_t>;
     using fVec = at::vec::Vectorized<float>;
     weight_packed_linear_kernel_impl(
-        hidden.data_ptr<scalar_t>(),
+        hidden_data,
         input.data_ptr<scalar_t>(),
         packed_w1.data_ptr<scalar_t>(),
-        conditional_data_ptr<float>(bias1),
         batches,
         hidden_features,
         in_features,
         [&](const float* Ctmp, int mb_start, int nb_start, int mb_size, int nb_size) {
-          // local data pointers
           scalar_t* out = hidden_data + mb_start * hidden_features + nb_start;
           float* bias = bias1_data + nb_start;
-
           const fVec bias0 = fVec::loadu(bias);
           const fVec bias1 = fVec::loadu(bias + fVec::size());
           for (int m = 0; m < mb_size; ++m) {
@@ -905,11 +893,26 @@ at::Tensor fused_linear_gelu_linear(
             y.store(out + m * hidden_features);
           }
         });
+
+    weight_packed_linear_kernel_impl(
+        out_data,
+        hidden_data,
+        packed_w2.data_ptr<scalar_t>(),
+        batches,
+        out_features,
+        hidden_features,
+        [&](const float* Ctmp, int mb_start, int nb_start, int mb_size, int nb_size) {
+          scalar_t* out = out_data + mb_start * out_features + nb_start;
+          float* bias = bias2_data + nb_start;
+          const fVec bias0 = fVec::loadu(bias);
+          const fVec bias1 = fVec::loadu(bias + fVec::size());
+          for (int m = 0; m < mb_size; ++m) {
+            fVec x0 = fVec::loadu(Ctmp + m * BLOCK_N);
+            fVec x1 = fVec::loadu(Ctmp + m * BLOCK_N + fVec::size());
+            bVec y = convert_from_float_ext<scalar_t>(x0 + bias0, x1 + bias1);
+            y.store(out + m * out_features);
+          }
+        });
   });
-
-  // at::Tensor hidden = weight_packed_linear(input, packed_w1, bias1, true);
-  // hidden = at::gelu(hidden);
-  at::Tensor out = weight_packed_linear(hidden, packed_w2, bias2, true);
-
   return out;
 }
