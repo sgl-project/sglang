@@ -2,7 +2,6 @@
 
 #include <cmath>
 #include <flashinfer/vec_dtypes.cuh>
-#include <type_traits>
 
 #include "utils.h"
 
@@ -32,14 +31,7 @@ __global__ void per_token_quant_fp8_kernel(
   DST_DTYPE* token_output = output_q + token_id * hidden_dim;
   float* token_scale = output_s + token_id;
 
-  // Shared memory for caching input data (only if USE_SMEM=true)
-  // Each warp has its own portion of shared memory
-  // To avoid bank conflicts, we add padding to ensure each warp's data is aligned
-  // CUDA shared memory has 32 banks (4 bytes per bank), so we pad to avoid conflicts
   extern __shared__ char smem_buffer[];
-  // Add padding to avoid bank conflicts: pad each warp's region to avoid stride conflicts
-  // Padding ensures that consecutive warps don't cause bank conflicts when accessing
-  // elements at the same offset within their respective regions
   const int smem_padding = 32;  // Pad to bank boundary (32 banks * 4 bytes = 128 bytes)
   const int warp_smem_stride = (hidden_dim * sizeof(T) + smem_padding - 1) / smem_padding * smem_padding;
   const int warp_smem_offset = warp_id * warp_smem_stride;
@@ -204,6 +196,48 @@ __global__ void per_token_quant_fp8_small_batch_kernel(
   }
 }
 
+template <bool USE_SMEM, typename scalar_t>
+static inline void launch_per_token_quant_fp8_warp_kernel(
+    const dim3& grid,
+    const dim3& block,
+    size_t dynamicSmemSz,
+    cudaStream_t stream,
+    bool use_vec16,
+    bool use_vec8,
+    torch::Tensor input,
+    torch::Tensor output_q,
+    torch::Tensor output_s,
+    const int64_t hidden_dim,
+    const int64_t num_tokens) {
+  const size_t smem_size = USE_SMEM ? dynamicSmemSz : 0;
+
+  if (use_vec16) {
+    per_token_quant_fp8_kernel<scalar_t, __nv_fp8_e4m3, TOKENS_PER_CTA, 16, USE_SMEM>
+        <<<grid, block, smem_size, stream>>>(
+            static_cast<const scalar_t*>(input.data_ptr()),
+            static_cast<__nv_fp8_e4m3*>(output_q.data_ptr()),
+            static_cast<float*>(output_s.data_ptr()),
+            hidden_dim,
+            num_tokens);
+  } else if (use_vec8) {
+    per_token_quant_fp8_kernel<scalar_t, __nv_fp8_e4m3, TOKENS_PER_CTA, 8, USE_SMEM>
+        <<<grid, block, smem_size, stream>>>(
+            static_cast<const scalar_t*>(input.data_ptr()),
+            static_cast<__nv_fp8_e4m3*>(output_q.data_ptr()),
+            static_cast<float*>(output_s.data_ptr()),
+            hidden_dim,
+            num_tokens);
+  } else {
+    per_token_quant_fp8_kernel<scalar_t, __nv_fp8_e4m3, TOKENS_PER_CTA, 4, USE_SMEM>
+        <<<grid, block, smem_size, stream>>>(
+            static_cast<const scalar_t*>(input.data_ptr()),
+            static_cast<__nv_fp8_e4m3*>(output_q.data_ptr()),
+            static_cast<float*>(output_s.data_ptr()),
+            hidden_dim,
+            num_tokens);
+  }
+}
+
 void sgl_per_token_quant_fp8(torch::Tensor input, torch::Tensor output_q, torch::Tensor output_s) {
   CHECK_INPUT(input);
   CHECK_INPUT(output_q);
@@ -220,28 +254,13 @@ void sgl_per_token_quant_fp8(torch::Tensor input, torch::Tensor output_q, torch:
   const bool use_vec16 = (hidden_dim % 16 == 0);
   const bool use_vec8 = (hidden_dim % 8 == 0);
 
-  // Calculate dynamic shared memory size needed for caching one token's data
-  // Each CTA has 8 tokens, each token needs hidden_dim * sizeof(T) bytes
-  // Add padding to do memory alignment(32-byte alignment per warp)
   const int sizeof_T = input.scalar_type() == torch::kFloat16 ? 2 : (input.scalar_type() == torch::kBFloat16 ? 2 : 4);
   const int smem_padding = 32;  // Pad to bank boundary to avoid conflicts
   const int warp_smem_stride = (hidden_dim * sizeof_T + smem_padding - 1) / smem_padding * smem_padding;
   const size_t dynamicSmemSz = warp_smem_stride * TOKENS_PER_CTA;
 
-  // Shared memory optimization strategy based on performance analysis:
-  // - hidden_dim < 2048: "Sweet spot" region where shared memory optimization is highly effective
-  //   Performance benefits: Better memory hierarchy utilization, reduced global memory traffic
-  // - hidden_dim >= 2048: Critical point where shared memory may become a bottleneck
-  //   Issues: Bank conflicts, register pressure, computation-to-memory ratio changes
-  // - hidden_dim >= 4096: Baseline and shared memory perform similarly, baseline is more stable
-  //
-  // We use hidden_dim < 2048 as the threshold to enable shared memory optimization.
-  // This ensures optimal performance in the sweet spot region while avoiding bottlenecks
-  // at larger dimensions where the overhead may outweigh the benefits.
   bool use_smem = (hidden_dim < 2048);
 
-  // Additional safety check: disable shared memory if it exceeds GPU limits (48KB default)
-  // This prevents kernel launch failures on GPUs with limited shared memory
   if (dynamicSmemSz >= DEFAULT_SHARED_MEM_THRESHOLD_KB) {
     use_smem = false;  // Disable shared memory if >= 48KB to avoid allocation failures
   }
@@ -249,46 +268,16 @@ void sgl_per_token_quant_fp8(torch::Tensor input, torch::Tensor output_q, torch:
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FLOAT_FP16(input.scalar_type(), scalar_t, [&] {
     if (use_warp_kernel) {
       // -------- warp‑local ---------------------------------------------------
-      constexpr int THREADS = TOKENS_PER_CTA * kWarpSize;  // 256
+      constexpr int THREADS = TOKENS_PER_CTA * kWarpSize;
       dim3 grid((num_tokens + TOKENS_PER_CTA - 1) / TOKENS_PER_CTA);
       dim3 block(THREADS);
 
-      // Use templated lambda to dispatch on use_smem at compile time
-      auto launcher = [&](auto use_smem_tag) {
-        constexpr bool USE_SMEM = decltype(use_smem_tag)::value;
-        const size_t smem_size = USE_SMEM ? dynamicSmemSz : 0;
-
-        if (use_vec16) {
-          per_token_quant_fp8_kernel<scalar_t, __nv_fp8_e4m3, TOKENS_PER_CTA, 16, USE_SMEM>
-              <<<grid, block, smem_size, stream>>>(
-                  static_cast<const scalar_t*>(input.data_ptr()),
-                  static_cast<__nv_fp8_e4m3*>(output_q.data_ptr()),
-                  static_cast<float*>(output_s.data_ptr()),
-                  hidden_dim,
-                  num_tokens);
-        } else if (use_vec8) {
-          per_token_quant_fp8_kernel<scalar_t, __nv_fp8_e4m3, TOKENS_PER_CTA, 8, USE_SMEM>
-              <<<grid, block, smem_size, stream>>>(
-                  static_cast<const scalar_t*>(input.data_ptr()),
-                  static_cast<__nv_fp8_e4m3*>(output_q.data_ptr()),
-                  static_cast<float*>(output_s.data_ptr()),
-                  hidden_dim,
-                  num_tokens);
-        } else {
-          per_token_quant_fp8_kernel<scalar_t, __nv_fp8_e4m3, TOKENS_PER_CTA, 4, USE_SMEM>
-              <<<grid, block, smem_size, stream>>>(
-                  static_cast<const scalar_t*>(input.data_ptr()),
-                  static_cast<__nv_fp8_e4m3*>(output_q.data_ptr()),
-                  static_cast<float*>(output_s.data_ptr()),
-                  hidden_dim,
-                  num_tokens);
-        }
-      };
-
       if (use_smem) {
-        launcher(std::true_type{});
+        launch_per_token_quant_fp8_warp_kernel</*USE_SMEM=*/true, scalar_t>(
+            grid, block, dynamicSmemSz, stream, use_vec16, use_vec8, input, output_q, output_s, hidden_dim, num_tokens);
       } else {
-        launcher(std::false_type{});
+        launch_per_token_quant_fp8_warp_kernel</*USE_SMEM=*/false, scalar_t>(
+            grid, block, dynamicSmemSz, stream, use_vec16, use_vec8, input, output_q, output_s, hidden_dim, num_tokens);
       }
     } else {
       // -------- baseline -----------------------------------------------------
