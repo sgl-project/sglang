@@ -17,14 +17,6 @@ class MOVADualTowerArchConfig(DiTArchConfig):
         default_factory=lambda: [_is_conditioner_block]
     )
 
-    # Key mapping: HF weights -> SGLang model weights
-    # The weights in safetensors use the same naming convention as our model,
-    # so minimal mapping is needed. The main changes are for MLP layers
-    # where we use fc_in/fc_out naming.
-    param_names_mapping: dict = field(default_factory=dict)
-    reverse_param_names_mapping: dict = field(default_factory=dict)
-    lora_param_names_mapping: dict = field(default_factory=dict)
-
     # Model architecture parameters
     visual_layers: int = 40
     audio_layers: int = 30
