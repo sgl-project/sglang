@@ -1554,6 +1554,45 @@ class TestLoRADynamicUpdate(CustomTestCase):
             self.assertEqual(len(adapter_models), 1)
             self.assertEqual(adapter_models[0]["id"], "adapter2")
 
+        # Test that we correctly handle loading a new adapter that adds tokens to the vocabulary
+        added_tokens_model = "Qwen/Qwen3-0.6B"
+        added_tokens_adapter = "YoussefHosni/Qwen3-0.6b-2B-Token-arabic-LoRA-finetuned"
+
+        with LoRAUpdateTestSession(
+            testcase=self,
+            mode=LoRAUpdateTestSessionMode.SERVER,
+            model_path=added_tokens_model,
+            lora_paths=[],
+            max_loras_per_batch=2,
+            max_lora_rank=32,
+            lora_target_modules=["all"],
+            enable_lora=True,
+        ) as session:
+            response = requests.get(DEFAULT_URL_FOR_TEST + "/v1/models")
+            self.assertTrue(response.ok, response.text)
+            models_data = response.json()
+            self.assertEqual(models_data["object"], "list")
+            self.assertEqual(len(models_data["data"]), 1)
+            base_model = models_data["data"][0]
+            self.assertIn("qwen", base_model["id"].lower())
+            self.assertIsNone(base_model.get("parent"))
+
+            session.load_lora_adapter(
+                lora_name="added_tokens_adapter", lora_path=added_tokens_adapter
+            )
+
+            response = requests.get(DEFAULT_URL_FOR_TEST + "/v1/models")
+            self.assertTrue(response.ok, response.text)
+            models_data = response.json()
+            self.assertEqual(len(models_data["data"]), 2)
+
+            # Verify adapter information
+            adapter_models = [m for m in models_data["data"] if m.get("parent")]
+            self.assertEqual(len(adapter_models), 1)
+            self.assertEqual(adapter_models[0]["id"], "added_tokens_adapter")
+            self.assertEqual(adapter_models[0]["root"], added_tokens_adapter)
+            self.assertIsNotNone(adapter_models[0]["parent"])
+
 
 if __name__ == "__main__":
     try:

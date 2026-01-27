@@ -133,6 +133,11 @@ class LoRAManager:
         try:
             # load configs
             new_adapter = LoRAConfig(lora_ref.lora_path)
+
+            memory_pool = getattr(self, "memory_pool", None)
+            if memory_pool:
+                memory_pool.update_added_tokens_size(new_adapter.lora_added_tokens_size)
+
             self.validate_new_adapter(new_adapter, lora_ref)
             self.configs[lora_ref.lora_id] = new_adapter
 
@@ -418,9 +423,8 @@ class LoRAManager:
                 default=0,
             )
 
-        # Auto-infer self.lora_added_vocab_size from loaded LoRA configs
+        # Auto-infer self.lora_added_tokens_size from loaded LoRA configs
         # This happens automatically without requiring user input
-        # if self.lora_added_vocab_size is None:
         if self.lora_added_tokens_size is None:
             inferred_extra_vocab_size = next(
                 (
