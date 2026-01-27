@@ -175,6 +175,7 @@ from sglang.srt.utils.patch_torch import (
 )
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.weight_checker import WeightChecker
+from sgl_kernel import update_token_table
 from sglang.srt.weight_sync.tensor_bucket import (
     FlattenedTensorBucket,
     FlattenedTensorMetadata,
@@ -560,6 +561,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # Init memory pool and attention backends
         self.init_memory_pool(min_per_gpu_memory)
+
+        self.use_ngram_embedding = self.model_config.use_ngram_embedding
+        if self.use_ngram_embedding:
+            self.token_table = torch.empty(self.req_to_token_pool.size, self.model_config.context_len,
+                                           dtype=torch.int32, device=server_args.device)
 
         # Init max running requests
         self.max_running_requests = min(
@@ -2411,6 +2417,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 else forward_batch.seq_lens - 1
             ),
         )
+        if self.use_ngram_embedding:
+            forward_batch.ne_out_column_starts[:forward_batch.batch_size] = forward_batch.seq_lens
+            forward_batch.ne_out_req_lens[:forward_batch.batch_size] = 1
+            update_token_table(
+                ne_token_table=forward_batch.ne_token_table,
+                tokens=next_token_ids.to(torch.int32),
+                row_indices=forward_batch.req_pool_indices,
+                column_starts=forward_batch.ne_out_column_starts,
+                req_lens=torch.ones_like(forward_batch.ne_out_column_starts),
+                ignore_tokens=None)
         return next_token_ids
 
     def compute_logprobs_only(

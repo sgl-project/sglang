@@ -100,6 +100,7 @@ from sgl_kernel.moe import (
     topk_sigmoid,
     topk_softmax,
 )
+from sgl_kernel.ngram_embedding import compute_n_gram_ids, update_token_table
 from sgl_kernel.quantization import (
     ggml_dequantize,
     ggml_moe_a8,

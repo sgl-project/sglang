@@ -64,6 +64,7 @@ from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import StandardTopKOutput, TopK
 from sglang.srt.layers.moe.utils import filter_moe_weight_param_global_expert
+from sglang.srt.layers.n_gram_embedding import NgramEmbedding
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.quantization.fp8_utils import (
@@ -500,11 +501,22 @@ class LongcatFlashModel(nn.Module):
         super().__init__()
         self.vocab_size = config.vocab_size
 
-        self.embed_tokens = VocabParallelEmbedding(
-            config.vocab_size,
-            config.hidden_size,
-            use_attn_tp_group=is_dp_attention_enabled(),
-        )
+        if config.use_ngram_embedding:
+            self.use_ngram_embedding = True
+            self.embed_tokens = NgramEmbedding(
+                num_embeddings = config.vocab_size,
+                embedding_dim = config.hidden_size,
+                over_embedding_m = config.ngram_embedding_m,
+                over_embedding_k = config.ngram_embedding_k,
+                over_embedding_n = config.ngram_embedding_n,
+            )
+        else:
+            self.use_ngram_embedding = False
+            self.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+                use_attn_tp_group=is_dp_attention_enabled(),
+            )
 
         self.alt_stream = torch.cuda.Stream()
         self.layers = nn.ModuleList(
@@ -540,7 +552,10 @@ class LongcatFlashModel(nn.Module):
             device=device,
         )
         if input_embeds is None:
-            hidden_states = self.embed_tokens(input_ids)
+            if self.use_ngram_embedding:
+                hidden_states = self.embed_tokens(input_ids, forward_batch)
+            else:
+                hidden_states = self.embed_tokens(input_ids)
         else:
             hidden_states = input_embeds
 
@@ -597,6 +612,7 @@ class LongcatFlashForCausalLM(nn.Module):
         self.model = LongcatFlashModel(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
+        self.use_ngram_embedding = config.use_ngram_embedding
         self.lm_head = ParallelLMHead(
             config.vocab_size,
             config.hidden_size,
@@ -874,7 +890,6 @@ class LongcatFlashForCausalLM(nn.Module):
             self.config.q_lora_rank is not None
         )
         cached_a_proj = {} if fuse_qkv_a_proj else None
-
         with concurrent.futures.ThreadPoolExecutor() as executor:
             futures = []
             params_dict = dict(self.named_parameters())
@@ -883,6 +898,12 @@ class LongcatFlashForCausalLM(nn.Module):
                 use_async_loading = should_async_load(loaded_weight)
                 if "mtp" in name:
                     continue
+                if self.use_ngram_embedding:
+                    if ".embed_tokens." in name:
+                        name = "model.embed_tokens.word_embeder.weight"
+                    if ".ngram_embeddings" in name:
+                        self.model.embed_tokens.load_weight(None, name, loaded_weight)
+                        continue
                 weight_names.append(name)
                 if "rotary_emb.inv_freq" in name:
                     continue

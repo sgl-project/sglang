@@ -266,6 +266,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Optional seq_lens on cpu
     seq_lens_cpu: Optional[torch.Tensor] = None
 
+    # For ngram embedding
+    ne_token_table: Optional[torch.Tensor] = None
+    ne_column_starts: Optional[torch.Tensor] = None
+    ne_req_lens: Optional[torch.Tensor] = None
+    ne_out_column_starts: Optional[torch.Tensor] = None
+    ne_out_req_lens: Optional[torch.Tensor] = None
+
     # For logprob
     return_logprob: bool = False
     top_logprobs_nums: Optional[List[int]] = None
@@ -398,6 +405,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             encoder_out_cache_loc=batch.encoder_out_cache_loc,
             seq_lens_sum=batch.seq_lens_sum,
             seq_lens_cpu=batch.seq_lens_cpu,
+            ne_token_table=batch.ne_token_table,
+            ne_column_starts=torch.empty(len(batch.seq_lens), dtype=torch.int32, device=model_runner.device),
+            ne_req_lens=torch.empty(len(batch.seq_lens), dtype=torch.int32, device=model_runner.device),
+            ne_out_column_starts=torch.empty(len(batch.seq_lens), dtype=torch.int32, device=model_runner.device),
+            ne_out_req_lens=torch.empty(len(batch.seq_lens), dtype=torch.int32, device=model_runner.device),
             orig_seq_lens=batch.orig_seq_lens,
             return_logprob=batch.return_logprob,
             top_logprobs_nums=batch.top_logprobs_nums,

@@ -206,6 +206,7 @@ from sglang.srt.utils.hf_transformers_utils import (
 )
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
+from sgl_kernel import update_token_table
 
 logger = logging.getLogger(__name__)
 
@@ -374,6 +375,9 @@ class Scheduler(
 
         # Init overlap schedule
         self.init_overlap()
+
+        # Init Ngram Embedding
+        self.init_ngram_embedding()
 
         # Init prefill kv split size when deterministic inference is enabled with various attention backends
         self.init_deterministic_inference_config()
@@ -981,6 +985,15 @@ class Scheduler(
         )
         self.batch_record_buf = [None] * 2
         self.batch_record_ct = 0
+
+    def init_ngram_embedding(self):
+        if self.tp_worker.model_config.use_ngram_embedding:
+            self.use_ngram_embedding = True
+            self.token_table = self.tp_worker.model_runner.token_table
+            self.ngram_embedding_n = self.tp_worker.model_config.hf_config.ngram_embedding_n
+            self.ngram_embedding_k = self.tp_worker.model_config.hf_config.ngram_embedding_k
+        else:
+            self.use_ngram_embedding = False
 
     def init_deterministic_inference_config(self):
         """Initialize deterministic inference configuration for different attention backends."""
@@ -1869,9 +1882,42 @@ class Scheduler(
             ret, need_sync=need_mlp_sync
         )
 
+        # handle ngram embedding
+        if ret is not None and self.use_ngram_embedding:
+            ret.ne_token_table = self.token_table
+            if ret.forward_mode == ForwardMode.EXTEND:
+                all_tokens = []
+                column_starts = []
+                request_lengths = []
+                for req in ret.reqs:
+                    start = len(req.prefix_indices)
+                    end = start + req.extend_input_len
+                    fill_ids = req.origin_input_ids + req.output_ids
+                    if start == 0:
+                        tokens = fill_ids[start:end]
+                        column_starts.append(0)
+                    elif start < self.ngram_embedding_n:
+                        tokens = fill_ids[0:end]
+                        column_starts.append(0)
+                    else:
+                        # 需要补prefix_len往前数n-1个token
+                        tokens = fill_ids[start - self.ngram_embedding_n + 1: end]
+                        column_starts.append(start - self.ngram_embedding_n + 1)
+                    all_tokens.extend(tokens)
+                    request_lengths.append(len(tokens))
+                dtype = ret.ne_token_table.dtype
+                device = ret.ne_token_table.device
+                update_token_table(
+                    ne_token_table=self.token_table,
+                    tokens=torch.tensor(all_tokens, dtype=dtype, device=device),
+                    row_indices=ret.req_pool_indices,
+                    column_starts=torch.tensor(column_starts, dtype=torch.int32, device=device),
+                    req_lens=torch.tensor(request_lengths, dtype=torch.int32, device=device),
+                    ignore_tokens=None
+                )
+
         if ret:
             trace_event_batch("schedule", ret.reqs)
-
         return ret
 
     def get_num_allocatable_reqs(self, running_bs):
