@@ -275,6 +275,7 @@ def validate_gate(t: Union[torch.Tensor, int], B: int, S: int, D: int):
     validate_scale_shift(t, B, S, D)
 
 
+@torch._dynamo.disable  # Disable Dynamo tracing
 def fused_norm_scale_shift(
     x: torch.Tensor,
     weight: Optional[torch.Tensor],
@@ -342,10 +343,11 @@ def fused_norm_scale_shift(
         raise ValueError(f'norm_type must be one of "layer" and "rms"')
 
 
+@torch._dynamo.disable  # Disable Dynamo tracing
 def fused_scale_residual_norm_scale_shift(
     residual: torch.Tensor,
     x: torch.Tensor,
-    gate: Union[torch.Tensor, int],
+    gate: Union[Optional[torch.Tensor], int],
     weight: Optional[torch.Tensor],
     bias: Optional[torch.Tensor],
     scale: torch.Tensor,
@@ -360,7 +362,7 @@ def fused_scale_residual_norm_scale_shift(
 
     Expects:
       - residual, x: [B, S, D]
-      - gate: 1, [1], [D], [1/B, D], [1/B, 1/S, D] or [B, F, 1, D]
+      - gate: None, 1, [1], [D], [1/B, D], [1/B, 1/S, D] or [B, F, 1, D]
       - weight/bias: None, [D]
       - scale/shift: [1], [D], [1/B, D], [1/B, 1/S, D] or [B, F, 1, D]
       - norm_type: str, "layer" or "rms"
@@ -394,6 +396,7 @@ def fused_scale_residual_norm_scale_shift(
         # TVM-FFI backend does not support None parameters. Unless explicitly handled
         # (e.g., for gate), scalar values do not result in code generation and have no
         # impact on runtime performance.
+        gate = 1 if gate is None else gate
         weight = 1 if weight is None else weight
         bias = 0 if bias is None else bias
         torch_tensors = [y, resi_out, residual, x, gate, weight, bias, scale, shift]
