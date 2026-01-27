@@ -1026,18 +1026,36 @@ def embed_mm_inputs(
         other_info["input_deepstack_embeds"] = input_deepstack_embeds
 
     # 4. scatter embeddings into input embedding
+    # Use masked_scatter_ to completely avoid D2D synchronization
     for i, modality, embedding, mask in zip(
         range(len(embeddings)), modalities, embeddings, masks
     ):
         if embedding is None or mask is None:
             continue
-        # in-place update
-        indices = torch.where(mask.squeeze(dim=-1))[0]
-        input_embeds[indices] = embedding.to(input_embeds.device, input_embeds.dtype)
+
+        mask_1d = mask.view(-1)
+
+        # Convert embedding to target device/dtype if needed
+        if (
+            embedding.device != input_embeds.device
+            or embedding.dtype != input_embeds.dtype
+        ):
+            embedding = embedding.to(input_embeds.device, input_embeds.dtype)
+
+        # masked_scatter_ is a pure GPU kernel operation - no D2D
+        # Need to expand mask to match embedding dimensions
+        input_embeds.masked_scatter_(mask_1d.unsqueeze(-1), embedding)
+
         if use_deepstack.get(modality, None):
-            input_deepstack_embeds[indices] = deepstack_embeddings[i].to(
-                input_embeds.device, input_embeds.dtype
-            )
+            deepstack_emb = deepstack_embeddings[i]
+            if (
+                deepstack_emb.device != input_embeds.device
+                or deepstack_emb.dtype != input_embeds.dtype
+            ):
+                deepstack_emb = deepstack_emb.to(
+                    input_embeds.device, input_embeds.dtype
+                )
+            input_deepstack_embeds.masked_scatter_(mask_1d.unsqueeze(-1), deepstack_emb)
 
     return input_embeds, other_info
 
