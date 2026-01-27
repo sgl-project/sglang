@@ -41,7 +41,7 @@ PER_COMMIT_SUITES = {
         "stage-c-test-8-gpu-h20",
         "stage-c-test-8-gpu-h200",
         "stage-c-test-8-gpu-b200",
-        "stage-c-test-8-gpu-h200-deepep",
+        "stage-c-test-deepep-8-gpu-h200",
     ],
     HWBackend.NPU: [],
 }
