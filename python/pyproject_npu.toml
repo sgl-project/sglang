@@ -23,6 +23,7 @@ dependencies = [
   "compressed-tensors",
   "decord2",
   "datasets",
+  "deprecated",
   "einops",
   "fastapi",
   "gguf",

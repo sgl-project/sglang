@@ -558,7 +558,9 @@ def get_available_device_memory(
             if empty_cache:
                 torch.xpu.empty_cache()
             used_memory = torch.xpu.memory_allocated()
-            total_device_memory = torch.xpu.get_device_properties(device_id).total_memory
+            total_device_memory = torch.xpu.get_device_properties(
+                device_id
+            ).total_memory
             free_device_memory = total_device_memory - used_memory
         elif device == "hpu":
             free_device_memory, total_device_memory = torch.hpu.mem_get_info()
