@@ -154,7 +154,10 @@ class Engine(EngineBase):
         logger.info(f"{server_args=}")
 
         # Shutdown the subprocesses automatically when the program exits
-        atexit.register(self.shutdown)
+        # Store the atexit function so we can unregister it later
+        self._shutdown_called = False
+        self._atexit_handler = lambda: self._atexit_shutdown()
+        atexit.register(self._atexit_handler)
 
         # Launch subprocesses
         (
@@ -164,7 +167,7 @@ class Engine(EngineBase):
             port_args,
             scheduler_actors,
             event_loop_refs,
-        ) = _launch_subprocesses(
+        ) = _launch_workers(
             server_args=server_args,
             init_tokenizer_manager_func=self.init_tokenizer_manager_func,
             run_scheduler_process_func=self.run_scheduler_process_func,
@@ -444,17 +447,39 @@ class Engine(EngineBase):
         ret = self.loop.run_until_complete(generator.__anext__())
         return ret
 
+    def _atexit_shutdown(self):
+        """Atexit handler - skips Ray actor killing to avoid C++ crashes."""
+        if self._shutdown_called:
+            return
+        self._shutdown_called = True
+        # Don't try to kill Ray actors during atexit - Ray is likely shutting down
+        # and calling ray.kill() can crash with "Cannot find actor handle" error.
+        # Just clean up other processes; Ray will handle its own actor cleanup.
+        self.scheduler_actors = None
+        kill_process_tree(os.getpid(), include_parent=False)
+
     def shutdown(self):
         """Shutdown the engine"""
+        if self._shutdown_called:
+            return
+        self._shutdown_called = True
+
+        # Unregister atexit handler since we're shutting down explicitly
+        try:
+            atexit.unregister(self._atexit_handler)
+        except Exception:
+            pass
+
         # Kill Ray actors if using Ray mode
         if self.server_args.use_ray and self.scheduler_actors:
-            import ray
+            # Clear references - actors will be cleaned up by Ray when driver exits.
+            # We intentionally don't call ray.kill() here because:
+            # 1. It can crash with "Cannot find actor handle" if actor already exited
+            # 2. Ray automatically cleans up actors when the driver process exits
+            # 3. For Anyscale jobs, actors are cleaned up when the job ends
+            self.scheduler_actors = None
+            self.event_loop_refs = None
 
-            for i, actor in enumerate(self.scheduler_actors):
-                try:
-                    ray.kill(actor)
-                except Exception as e:
-                    logger.debug(f"Failed to kill Ray scheduler actor {i}: {e}")
         # Kill all other child processes
         kill_process_tree(os.getpid(), include_parent=False)
 
@@ -881,14 +906,14 @@ def _wait_for_scheduler_ready(
     return scheduler_infos
 
 
-def _launch_scheduler_processes(
+def _launch_schedulers(
     server_args: ServerArgs,
     port_args: PortArgs,
     run_scheduler_process_func: Callable,
 ):
-    """Launch scheduler processes using Ray actors or mp.Process."""
+    """Launch schedulers using Ray actors or mp.Process."""
     if server_args.use_ray:
-        return _launch_scheduler_processes_ray(server_args, port_args)
+        return _launch_scheduler_ray_actors(server_args, port_args)
     else:
         return _launch_scheduler_processes_mp(
             server_args, port_args, run_scheduler_process_func
@@ -986,7 +1011,7 @@ def _launch_scheduler_processes_mp(
     return scheduler_procs, scheduler_pipe_readers
 
 
-def _launch_scheduler_processes_ray(
+def _launch_scheduler_ray_actors(
     server_args: ServerArgs,
     port_args: PortArgs,
 ):
@@ -1067,7 +1092,7 @@ def _launch_scheduler_processes_ray(
     return scheduler_actors, scheduler_infos, event_loop_refs
 
 
-def _launch_subprocesses(
+def _launch_workers(
     server_args: ServerArgs,
     init_tokenizer_manager_func: Callable,
     run_scheduler_process_func: Callable,
@@ -1082,7 +1107,8 @@ def _launch_subprocesses(
     Optional[List],
 ]:
     """
-    Launch the TokenizerManager in the main process, the Scheduler in a subprocess, and the DetokenizerManager in another subprocess.
+    Launch the TokenizerManager in the main process, the Scheduler workers (as subprocesses
+    or Ray actors), and the DetokenizerManager in another subprocess.
 
     Returns:
         Tuple of (tokenizer_manager, template_manager, scheduler_infos, port_args,
@@ -1101,7 +1127,7 @@ def _launch_subprocesses(
     logger.info(f"{server_args=}")
 
     # Launch scheduler processes
-    scheduler_result = _launch_scheduler_processes(
+    scheduler_result = _launch_schedulers(
         server_args=server_args,
         port_args=port_args,
         run_scheduler_process_func=run_scheduler_process_func,
