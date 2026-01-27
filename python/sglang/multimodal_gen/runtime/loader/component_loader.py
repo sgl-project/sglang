@@ -774,6 +774,12 @@ class TransformerLoader(ComponentLoader):
         # Config from Diffusers supersedes sgl_diffusion's model config
         dit_config = server_args.pipeline_config.dit_config
         dit_config.update_model_arch(config)
+        is_quant = False
+        if hasattr(dit_config, "update_quant_config"):
+            dit_config.update_quant_config()
+            quant_config = getattr(dit_config, "quant_config", None)
+            if quant_config is not None:
+                is_quant = True
 
         model_cls, _ = ModelRegistry.resolve_model_cls(cls_name)
 
@@ -830,6 +836,7 @@ class TransformerLoader(ComponentLoader):
             reduce_dtype=torch.float32,
             output_dtype=None,
             strict=False,
+            is_quant=is_quant,
         )
 
         total_params = sum(p.numel() for p in model.parameters())

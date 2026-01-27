@@ -448,6 +448,18 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
         ),
     ),
     DiffusionTestCase(
+        "wan2_1_t2v_1.3b_int8",
+        DiffusionServerArgs(
+            model_path="IPostYellow/Wan2.1-T2V-1.3B-INT8-Diffusers",
+            modality="video",
+            warmup=0,
+            custom_validator="video",
+        ),
+        DiffusionSamplingParams(
+            prompt=T2V_PROMPT,
+        ),
+    ),
+    DiffusionTestCase(
         "wan2_1_t2v_1.3b_text_encoder_cpu_offload",
         DiffusionServerArgs(
             model_path="Wan-AI/Wan2.1-T2V-1.3B-Diffusers",

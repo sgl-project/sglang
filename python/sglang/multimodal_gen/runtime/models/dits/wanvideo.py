@@ -33,6 +33,9 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     RowParallelLinear,
 )
 from sglang.multimodal_gen.runtime.layers.mlp import MLP
+from sglang.multimodal_gen.runtime.layers.quantization.base_config import (
+    QuantizationConfig,
+)
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     NDRotaryEmbedding,
     _apply_rotary_emb,
@@ -128,6 +131,7 @@ class WanSelfAttention(nn.Module):
         eps=1e-6,
         parallel_attention=False,
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
+        quant_config: QuantizationConfig = None,
     ) -> None:
         assert dim % num_heads == 0
         super().__init__()
@@ -141,10 +145,18 @@ class WanSelfAttention(nn.Module):
         self.tp_size = get_tensor_model_parallel_world_size()
 
         # layers
-        self.to_q = ColumnParallelLinear(dim, dim, gather_output=False)
-        self.to_k = ColumnParallelLinear(dim, dim, gather_output=False)
-        self.to_v = ColumnParallelLinear(dim, dim, gather_output=False)
-        self.to_out = RowParallelLinear(dim, dim, input_is_parallel=True)
+        self.to_q = ColumnParallelLinear(
+            dim, dim, gather_output=False, quant_config=quant_config
+        )
+        self.to_k = ColumnParallelLinear(
+            dim, dim, gather_output=False, quant_config=quant_config
+        )
+        self.to_v = ColumnParallelLinear(
+            dim, dim, gather_output=False, quant_config=quant_config
+        )
+        self.to_out = RowParallelLinear(
+            dim, dim, input_is_parallel=True, quant_config=quant_config
+        )
         self.norm_q = RMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = RMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.tp_rmsnorm = self.tp_size > 1 and qk_norm
@@ -218,6 +230,7 @@ class WanI2VCrossAttention(WanSelfAttention):
         qk_norm=True,
         eps=1e-6,
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
+        quant_config: QuantizationConfig = None,
     ) -> None:
         # VSA should not be in supported_attention_backends
         super().__init__(
@@ -227,10 +240,15 @@ class WanI2VCrossAttention(WanSelfAttention):
             qk_norm,
             eps,
             supported_attention_backends=supported_attention_backends,
+            quant_config=quant_config,
         )
 
-        self.add_k_proj = ColumnParallelLinear(dim, dim, gather_output=False)
-        self.add_v_proj = ColumnParallelLinear(dim, dim, gather_output=False)
+        self.add_k_proj = ColumnParallelLinear(
+            dim, dim, gather_output=False, quant_config=quant_config
+        )
+        self.add_v_proj = ColumnParallelLinear(
+            dim, dim, gather_output=False, quant_config=quant_config
+        )
         self.norm_added_k = RMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
     def forward(self, x, context, context_lens):
@@ -296,6 +314,7 @@ class WanTransformerBlock(nn.Module):
         added_kv_proj_dim: int | None = None,
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
         prefix: str = "",
+        quant_config: QuantizationConfig = None,
         attention_type: str = "original",
         sla_topk: float = 0.1,
     ):
@@ -303,11 +322,19 @@ class WanTransformerBlock(nn.Module):
 
         # 1. Self-attention
         self.norm1 = FP32LayerNorm(dim, eps, elementwise_affine=False)
-        self.to_q = ColumnParallelLinear(dim, dim, bias=True, gather_output=False)
-        self.to_k = ColumnParallelLinear(dim, dim, bias=True, gather_output=False)
-        self.to_v = ColumnParallelLinear(dim, dim, bias=True, gather_output=False)
+        self.to_q = ColumnParallelLinear(
+            dim, dim, bias=True, gather_output=False, quant_config=quant_config
+        )
+        self.to_k = ColumnParallelLinear(
+            dim, dim, bias=True, gather_output=False, quant_config=quant_config
+        )
+        self.to_v = ColumnParallelLinear(
+            dim, dim, bias=True, gather_output=False, quant_config=quant_config
+        )
 
-        self.to_out = RowParallelLinear(dim, dim, bias=True, reduce_results=True)
+        self.to_out = RowParallelLinear(
+            dim, dim, bias=True, reduce_results=True, quant_config=quant_config
+        )
         if attention_type in ("sla", "sagesla"):
             self.attn1 = MinimalA2AAttnOp(
                 num_heads=divide(num_heads, get_tensor_model_parallel_world_size()),
@@ -361,6 +388,7 @@ class WanTransformerBlock(nn.Module):
                 qk_norm=qk_norm,
                 eps=eps,
                 supported_attention_backends=supported_attention_backends,
+                quant_config=quant_config,
             )
         else:
             # T2V
@@ -370,6 +398,7 @@ class WanTransformerBlock(nn.Module):
                 qk_norm=qk_norm,
                 eps=eps,
                 supported_attention_backends=supported_attention_backends,
+                quant_config=quant_config,
             )
         self.cross_attn_residual_norm = ScaleResidualLayerNormScaleShift(
             dim,
@@ -381,7 +410,9 @@ class WanTransformerBlock(nn.Module):
         )
 
         # 3. Feed-forward
-        self.ffn = MLP(dim, ffn_dim, act_type="gelu_pytorch_tanh")
+        self.ffn = MLP(
+            dim, ffn_dim, act_type="gelu_pytorch_tanh", quant_config=quant_config
+        )
         self.mlp_residual = ScaleResidual()
 
         self.scale_shift_table = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
@@ -685,7 +716,7 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
 
     def __init__(self, config: WanVideoConfig, hf_config: dict[str, Any]) -> None:
         super().__init__(config=config, hf_config=hf_config)
-
+        self.quant_config = config.quant_config
         inner_dim = config.num_attention_heads * config.attention_head_dim
         self.hidden_size = config.hidden_size
         self.num_attention_heads = config.num_attention_heads
@@ -731,6 +762,7 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
                     self._supported_attention_backends
                     | {AttentionBackendEnum.VIDEO_SPARSE_ATTN},
                     prefix=f"{config.prefix}.blocks.{i}",
+                    quant_config=self.quant_config,
                     attention_type=config.attention_type,
                     sla_topk=config.sla_topk,
                 )
