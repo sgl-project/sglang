@@ -191,7 +191,7 @@ from sglang.srt.utils import (
     configure_gc_logger,
     configure_logger,
     freeze_gc,
-    get_available_gpu_memory,
+    get_available_device_memory,
     get_bool_env_var,
     get_int_env_var,
     get_zmq_socket,
