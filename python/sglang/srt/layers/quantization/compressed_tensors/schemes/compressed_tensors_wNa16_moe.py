@@ -9,39 +9,20 @@ import torch
 from compressed_tensors import CompressionFormat
 from compressed_tensors.quantization import QuantizationStrategy
 
-from sglang.srt.distributed import get_tensor_model_parallel_world_size, get_tp_group
-from sglang.srt.distributed.device_communicators.pynccl_allocator import (
-    use_symmetric_memory,
+from sglang.srt.layers.moe import MoeRunnerConfig
+from sglang.srt.layers.quantization.compressed_tensors.schemes import (
+    WNA16_SUPPORTED_BITS,
+    CompressedTensorsScheme,
 )
 from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
     NPUW4A8Int8DynamicMoEMethod,
     NPUW4A16Int4DynamicMoEMethod,
     NPUW8A8Int8DynamicMoEMethod,
 )
-from sglang.srt.layers.dp_attention import is_allocation_symmetric
-from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
-from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams, CutlassMoEType
-from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
-from sglang.srt.layers.moe.utils import get_moe_runner_backend
-from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
-from sglang.srt.layers.quantization.compressed_tensors.schemes import (
-    CompressedTensorsScheme,
-    WNA16_SUPPORTED_BITS,
-)
-from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz, scaled_fp8_quant
-from sglang.srt.layers.quantization.fp8_utils import (
-    is_blackwell_supported,
-    normalize_e4m3fn_to_e4m3fnuz,
-)
 from sglang.srt.layers.quantization.gptq import gptq_marlin_moe_repack
 from sglang.srt.layers.quantization.marlin_utils import marlin_moe_permute_scales
 from sglang.srt.layers.quantization.utils import (
-    all_close_1d,
-    per_tensor_dequantize,
-    prepare_static_weights_for_trtllm_fp4_moe,
-    reorder_w1w3_to_w3w1,
     replace_parameter,
-    swizzle_blockscale,
 )
 from sglang.srt.utils import (
     get_bool_env_var,
@@ -53,7 +34,6 @@ from sglang.srt.utils import (
 )
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
     from sglang.srt.layers.moe.token_dispatcher import (
         CombineInput,
         StandardDispatchOutput,
@@ -62,8 +42,10 @@ if TYPE_CHECKING:
         CompressedTensorsConfig,
     )
 
+__all__ = ["CompressedTensorsWNA16MoE",
+           "NPUCompressedTensorsW4A16Int4DynamicMoE"]
+
 _is_hip = is_hip()
-_is_npu = is_npu()
 _is_cuda = is_cuda()
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
@@ -80,16 +62,11 @@ class GPTQMarlinState(Enum):
     REPACK = enum.auto()
     READY = enum.auto()
 
-__all__ = ["CompressedTensorsWNA16MoE",
-           "NPUCompressedTensorsW4A16Int4DynamicMoE"]
-
 
 class CompressedTensorsWNA16MoE(CompressedTensorsScheme):
 
     def __init__(self, quant_config: CompressedTensorsConfig, num_gpu_experts=-1):
         self.quant_config = quant_config
-        # TODO: @dsikka: refactor this to use schemes as other kernels
-        # are supported + check if the layer is being ignored.
         config = self.quant_config.target_scheme_map["Linear"].get("weights")
         self.num_bits = config.num_bits
         self.packed_factor = 32 // config.num_bits
@@ -109,6 +86,11 @@ class CompressedTensorsWNA16MoE(CompressedTensorsScheme):
                 f"{WNA16_SUPPORTED_BITS}",
             )
         self.num_gpu_experts = num_gpu_experts
+
+    @classmethod
+    def get_min_capability(cls) -> int:
+        # ampere and up
+        return 80
 
     def create_weights(
         self,
@@ -382,7 +364,7 @@ class CompressedTensorsWNA16MoE(CompressedTensorsScheme):
     ):
         self.moe_runner_config = moe_runner_config
 
-    def apply(
+    def apply_weights(
         self,
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
