@@ -31,12 +31,12 @@ from pydantic import BaseModel
 
 from sglang.srt.layers.moe import MoeRunnerConfig
 from sglang.srt.layers.quantization.base_config import (
-    LinearMethodBase,
     FusedMoEMethodBase,
+    LinearMethodBase,
     QuantizationConfig,
     QuantizeMethodBase,
-    FusedMoEMethodBase,
 )
+
 # from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors_moe import (  # noqa: E501
 #     CompressedTensorsMoEMethod,
 # )
@@ -45,16 +45,16 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsScheme,
     CompressedTensorsW4A4Fp4,
     CompressedTensorsW4A4Nvfp4MoE,
-    NPUCompressedTensorsW4A8Int8DynamicMoE,
     CompressedTensorsW8A8Fp8,
     CompressedTensorsW8A8Fp8MoE,
     CompressedTensorsW8A8Int8,
-    NPUCompressedTensorsW8A8Int8DynamicMoE,
     CompressedTensorsW8A16Fp8,
     CompressedTensorsWNA16,
-    NPUCompressedTensorsW8A8Int8,
     CompressedTensorsWNA16MoE,
+    NPUCompressedTensorsW4A8Int8DynamicMoE,
     NPUCompressedTensorsW4A16Int4DynamicMoE,
+    NPUCompressedTensorsW8A8Int8,
+    NPUCompressedTensorsW8A8Int8DynamicMoE,
 )
 from sglang.srt.layers.quantization.compressed_tensors.utils import (
     find_matched_target,
@@ -69,11 +69,11 @@ _is_cuda = is_cuda()
 _is_npu = is_npu()
 
 if TYPE_CHECKING:
-    from sglang.srt.models.utils import WeightsMapper
     from sglang.srt.layers.moe.token_dispatcher import (
         CombineInput,
         StandardDispatchOutput,
     )
+    from sglang.srt.models.utils import WeightsMapper
 
 logger = logging.getLogger(__name__)
 
@@ -640,9 +640,7 @@ class CompressedTensorsConfig(QuantizationConfig):
                     self._is_dynamic_token_w4(weight_quant, input_quant)
                     and input_quant is None
                 ):
-                    logger.info_once(
-                        "Using NPUCompressedTensorsW4A16Int4DynamicMoE"
-                    )
+                    logger.info_once("Using NPUCompressedTensorsW4A16Int4DynamicMoE")
                     return NPUCompressedTensorsW4A16Int4DynamicMoE(self)
         elif self._is_fp4a4_nvfp4(weight_quant, input_quant):
             logger.info_once("Using CompressedTensorsW4A4Nvfp4MoE")
@@ -911,7 +909,7 @@ class CompressedTensorsFusedMoEMethod(FusedMoEMethodBase):
         the necessary parameters for the layer. See LinearMethodBase for param
         details
         """
-        #weight_loader = extra_weight_attrs.get("weight_loader")
+        # weight_loader = extra_weight_attrs.get("weight_loader")
         layer.scheme.create_weights(
             layer=layer,
             num_experts=num_experts,
@@ -942,7 +940,7 @@ class CompressedTensorsFusedMoEMethod(FusedMoEMethodBase):
         if scheme is None:
             raise ValueError("A scheme must be defined for each layer")
         return scheme.apply_weights(layer, dispatch_output)
-    
+
     def apply_weights_with_router_logits(
         self,
         layer: torch.nn.Module,
