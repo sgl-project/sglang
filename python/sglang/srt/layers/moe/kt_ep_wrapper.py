@@ -128,7 +128,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
     Example:
         # Wrap any GPU method with AMX/AVX CPU expert support
-        gpu_method = CompressedTensorsWNA16MoEMethod(quant_config, prefix)
+        gpu_method = CompressedTensorsWNA16MoE(quant_config, prefix)
         kt_config = KTConfig(layer_idx=0, num_gpu_experts=4, ...)
         method = KTEPWrapperMethod(gpu_method, kt_config)
     """
