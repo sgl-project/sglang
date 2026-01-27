@@ -25,6 +25,14 @@ from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     Wan2_2_TI2V_5B_Config,
     WanI2V480PConfig,
 )
+from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
+    CacheDitConfig,
+    enable_cache_on_dual_transformer,
+    enable_cache_on_transformer,
+    get_scm_mask,
+    refresh_context_on_dual_transformer,
+    refresh_context_on_transformer,
+)
 from sglang.multimodal_gen.runtime.distributed import (
     cfg_model_parallel_all_reduce,
     get_local_torch_device,
@@ -65,14 +73,6 @@ from sglang.multimodal_gen.runtime.platforms import (
     current_platform,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.multimodal_gen.runtime.utils.cache_dit_integration import (
-    CacheDitConfig,
-    enable_cache_on_dual_transformer,
-    enable_cache_on_transformer,
-    get_scm_mask,
-    refresh_context_on_dual_transformer,
-    refresh_context_on_transformer,
-)
 from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
@@ -164,15 +164,22 @@ class DenoisingStage(PipelineStage):
 
         # NOTE: When a new request arrives, we need to refresh the cache-dit context.
         if self._cache_dit_enabled:
+            scm_preset = envs.SGLANG_CACHE_DIT_SCM_PRESET
+            scm_preset = None if scm_preset == "none" else scm_preset
             if isinstance(num_inference_steps, tuple):
                 refresh_context_on_dual_transformer(
                     self.transformer,
                     self.transformer_2,
                     num_high_noise_steps,
                     num_low_noise_steps,
+                    scm_preset=scm_preset,
                 )
             else:
-                refresh_context_on_transformer(self.transformer, num_inference_steps)
+                refresh_context_on_transformer(
+                    self.transformer,
+                    num_inference_steps,
+                    scm_preset=scm_preset,
+                )
             return
 
         # check if cache-dit is enabled in config
@@ -510,8 +517,6 @@ class DenoisingStage(PipelineStage):
         boundary_timestep = self._handle_boundary_ratio(server_args, batch)
         # Get timesteps and calculate warmup steps
         timesteps = batch.timesteps
-        if timesteps is None:
-            raise ValueError("Timesteps must be provided")
         num_inference_steps = batch.num_inference_steps
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
 
