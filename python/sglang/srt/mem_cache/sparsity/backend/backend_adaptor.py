@@ -54,9 +54,11 @@ class NSABackendAdaptor(BackendAdaptor):
         self,
         device: torch.device,
         req_to_token_pool,
+        sparse_kv_cache_manager,
     ):
         super().__init__(device)
         self.req_to_token_pool = req_to_token_pool
+        self.sparse_kv_cache_manager = sparse_kv_cache_manager
 
     def adapt_for_attn_metadata(
         self,
@@ -70,11 +72,21 @@ class NSABackendAdaptor(BackendAdaptor):
         layer_id: int,
         **kwargs,
     ) -> Optional[torch.Tensor]:
-        """
-        Transform logical page indices to physical device indices for NSA backend.
-        """
-        # TODO: Implement NSA backend adaptor logic
-        pass
+        """Transform NSA topk indices to physical device indices."""
+        req_pool_indices = forward_batch.req_pool_indices
+        max_seqlen_k = int(forward_batch.seq_lens_cpu.max().item())
+        page_table = self.req_to_token_pool.req_to_token[:, :max_seqlen_k]
+        transformed_indices = self.sparse_kv_cache_manager.swap_in_selected_pages(
+            req_pool_indices=req_pool_indices,
+            top_k_result=selected_indices,
+            seq_lens=forward_batch.seq_lens,
+            sparse_mask=sparse_mask,
+            page_table=page_table,
+            layer_id=layer_id,
+            page_size=1,
+            out_cache_loc=forward_batch.out_cache_loc,
+        )
+        return transformed_indices
 
 
 class FlashAttentionAdaptor(BackendAdaptor):

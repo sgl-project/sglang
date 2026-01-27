@@ -142,6 +142,15 @@ class BaseSparseAlgorithm(ABC):
         """
         pass
 
+    @abstractmethod
+    def topk_mode(self) -> str:
+        """
+        Return the topk mode of the algorithm.
+        - "page": Page-based topk retrieval
+        - "token": Token-based topk retrieval
+        """
+        pass
+
 
 class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
     """
@@ -356,6 +365,9 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
             out_lengths[i] = length
 
         return out_indices, out_lengths
+
+    def topk_mode(self) -> str:
+        return "page"
 
     def _initialize_representation_pools(
         self, start_layer: int, end_layer: int, total_num_pages: int

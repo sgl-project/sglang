@@ -141,7 +141,7 @@ class RadixAttention(nn.Module):
 
 def attention_begin_hook(q, k, v, layer, forward_batch):
     sparse_coordinator = get_sparse_coordinator()
-    if sparse_coordinator is not None:
+    if sparse_coordinator is not None and sparse_coordinator.should_hook_attention():
         sparse_coordinator.attention_begin(
             query=q,
             key=k,
@@ -154,7 +154,7 @@ def attention_begin_hook(q, k, v, layer, forward_batch):
 
 def attention_end_hook(output, layer, forward_batch):
     sparse_coordinator = get_sparse_coordinator()
-    if sparse_coordinator is not None:
+    if sparse_coordinator is not None and sparse_coordinator.should_hook_attention():
         sparse_coordinator.attention_end(
             output=output,
             layer=layer,
