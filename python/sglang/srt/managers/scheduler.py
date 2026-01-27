@@ -704,18 +704,6 @@ class Scheduler(
         else:
             self.decode_offload_manager = None
 
-        self.decode_mem_cache_buf_multiplier = (
-            1
-            if self.spec_algorithm.is_none()
-            else (
-                server_args.speculative_num_draft_tokens
-                + (
-                    (server_args.speculative_eagle_topk or 1)
-                    * (server_args.speculative_num_steps or 1)
-                )
-            )
-        )
-
         embedding_cache_size = envs.SGLANG_VLM_CACHE_SIZE_MB.get()
         init_mm_embedding_cache(embedding_cache_size * 1024 * 1024)
 
@@ -2162,29 +2150,15 @@ class Scheduler(
             return batch
 
         # Check if decode out of memory
-        if (
-            kv_full_retract_flag := not batch.check_decode_mem(
-                self.decode_mem_cache_buf_multiplier
-            )
-        ) or (TEST_RETRACT and self.forward_ct % TEST_RETRACT_INTERVAL == 0):
-            if self.is_hybrid_swa:
-                old_available_tokens = min(
-                    self.token_to_kv_pool_allocator.full_available_size(),
-                    self.token_to_kv_pool_allocator.swa_available_size(),
-                )
-            else:
-                old_available_tokens = self.token_to_kv_pool_allocator.available_size()
+        if (kv_full_retract_flag := not batch.check_decode_mem()) or (
+            TEST_RETRACT and self.forward_ct % TEST_RETRACT_INTERVAL == 0
+        ):
+            old_available_tokens = self.token_to_kv_pool_allocator.available_size()
             old_ratio = self.new_token_ratio
             retracted_reqs, new_token_ratio, reqs_to_abort = batch.retract_decode(
-                self.server_args, self.decode_mem_cache_buf_multiplier
+                self.server_args
             )
-            if self.is_hybrid_swa:
-                new_available_tokens = min(
-                    self.token_to_kv_pool_allocator.full_available_size(),
-                    self.token_to_kv_pool_allocator.swa_available_size(),
-                )
-            else:
-                new_available_tokens = self.token_to_kv_pool_allocator.available_size()
+            new_available_tokens = self.token_to_kv_pool_allocator.available_size()
             new_token_gained = new_available_tokens - old_available_tokens
 
             self.num_retracted_reqs = len(retracted_reqs)
