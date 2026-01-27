@@ -11,7 +11,7 @@ logger = logging.getLogger(__name__)
 
 
 def rtn_quantize(
-    tensor: torch.Tensor, num_bits: int, group_size: int
+    tensor: torch.Tensor, num_bits: int, group_size: int, pack: bool = True
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize a tensor using per-group static scaling factor.
 
@@ -22,6 +22,7 @@ def rtn_quantize(
         group_size: Quantization granularity.
                     If equal to -1, each row in the input tensor is treated
                     as one group.
+        pack: Whether to pack the output tensor (default True).
     """
     batch_present = len(tensor.shape) == 3
     if not batch_present:
@@ -50,7 +51,7 @@ def rtn_quantize(
     inputs_q = scaled_input.reshape(tensor.shape).to(torch.uint8)
     inputs_q = inputs_q.contiguous()
 
-    if num_bits == 4:
+    if pack and num_bits == 4:
         # Pack two 4-bit values into each byte.
         inputs_q = (inputs_q[:, :, 1::2] << 4) | (inputs_q[:, :, ::2] & 0xF)
         inputs_q = inputs_q.reshape(
@@ -125,3 +126,35 @@ def fix_weights(layer: torch.nn.Module, param_name: str, reshape: bool = False):
         data = data.reshape(old_weight.shape[0], old_weight.shape[1] * 2, -1)
     new_weight = Parameter(data=data, requires_grad=False)
     layer.register_parameter(param_name, new_weight)
+
+
+def rtn_unpack(tensor: torch.Tensor, num_bits: int) -> torch.Tensor:
+    """Unpack a tensor using the same packing scheme as rtn_quantize.
+
+    Args:
+        tensor: The input tensor.
+        num_bits: The number of bits of the quantized tensor.
+    """
+    if num_bits == 8:
+        return tensor
+
+    if num_bits == 4:
+        # Unpack two 4-bit values from each byte.
+        # tensor shape: (..., input_dim, output_dim) (packed)
+        # unpacked shape: (..., input_dim, output_dim * 2)
+
+        # Low 4 bits (even indices)
+        low = tensor & 0xF
+        # High 4 bits (odd indices)
+        high = tensor >> 4
+
+        # Interleave low and high
+        # We want [low_0, high_0, low_1, high_1, ...]
+        shape = tensor.shape
+        unpacked_shape = list(shape)
+        unpacked_shape[-1] *= 2
+
+        unpacked = torch.stack((low, high), dim=-1).flatten(start_dim=-2)
+        return unpacked
+
+    raise ValueError(f"Unsupported num_bits={num_bits}")
