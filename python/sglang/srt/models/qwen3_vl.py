@@ -60,14 +60,25 @@ from sglang.srt.models.utils import (
     WeightsMapper,
     compute_cu_seqlens_from_grid_numpy,
 )
-from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
+from sglang.srt.multimodal.mm_utils import (
+    init_all_vision_forward_metadata,
+    run_dp_sharded_mrope_vision_model,
+)
 from sglang.srt.multimodal.vit_cuda_graph_runner import ViTCudaGraphRunner
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix, get_int_env_var, is_npu
+from sglang.srt.utils import (
+    add_prefix,
+    get_bool_env_var,
+    get_int_env_var,
+    is_hip,
+    is_npu,
+)
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
 logger = logging.getLogger(__name__)
 
+_is_hip = is_hip()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 # === Vision Encoder === #
 
@@ -445,12 +456,15 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         rotary_pos_emb_cos, rotary_pos_emb_sin = self.rot_pos_emb(grid_thw_list)
 
         # compute cu_seqlens
-        cu_seqlens = compute_cu_seqlens_from_grid_numpy(grid_thw)
-        # cu_seqlens must be on cpu because of npu_flash_attention_unpad operator restriction
-        if not is_npu():
-            cu_seqlens = cu_seqlens.to(self.device, non_blocking=True)
+        if not _use_aiter:
+            cu_seqlens = compute_cu_seqlens_from_grid_numpy(grid_thw)
+            # cu_seqlens must be on cpu because of npu_flash_attention_unpad operator restriction
+            if not is_npu():
+                cu_seqlens = cu_seqlens.to(self.device, non_blocking=True)
+            else:
+                cu_seqlens = cu_seqlens.to("cpu")
         else:
-            cu_seqlens = cu_seqlens.to("cpu")
+            cu_seqlens = None
         x = x.unsqueeze(1)
 
         deepstack_feature_lists = []
@@ -768,6 +782,10 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                     rope_type="rope_3d",
                 )
             else:
+                if _use_aiter:
+                    init_all_vision_forward_metadata(
+                        self.visual, image_grid_thw, pixel_values
+                    )
                 return self.visual(pixel_values, grid_thw=image_grid_thw)
 
         # compute the number of patches per image and the slice positions in pixel_values
@@ -872,6 +890,10 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 self.visual, pixel_values, video_grid_thw.tolist(), rope_type="rope_3d"
             )
         else:
+            if _use_aiter:
+                init_all_vision_forward_metadata(
+                    self.visual, video_grid_thw, pixel_values
+                )
             video_embeds = self.visual(pixel_values, grid_thw=video_grid_thw)
         return video_embeds
 
