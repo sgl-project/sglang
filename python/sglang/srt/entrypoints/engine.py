@@ -85,6 +85,7 @@ from sglang.srt.utils import (
     set_prometheus_multiproc_dir,
     set_ulimit,
 )
+from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.version import __version__
 
@@ -153,10 +154,19 @@ class Engine(EngineBase):
                 kwargs["log_level"] = "error"
             server_args = self.server_args_class(**kwargs)
         self.server_args = server_args
-        logger.info(f"{server_args=}")
 
         # Shutdown the subprocesses automatically when the program exits
         atexit.register(self.shutdown)
+
+        if is_runai_obj_uri(self.server_args.model_path):
+            ObjectStorageModel.download_and_get_path(self.server_args.model_path)
+
+        if (
+            self.server_args.tokenizer_path is not None
+            and is_runai_obj_uri(self.server_args.tokenizer_path)
+            and self.server_args.tokenizer_path != self.server_args.model_path
+        ):
+            ObjectStorageModel.download_and_get_path(self.server_args.tokenizer_path)
 
         # Launch subprocesses
         tokenizer_manager, template_manager, scheduler_infos, port_args = (

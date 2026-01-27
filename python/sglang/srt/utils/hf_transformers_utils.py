@@ -26,6 +26,7 @@ import torch
 from huggingface_hub import snapshot_download
 
 from sglang.srt.utils import get_bool_env_var
+from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
 
 # Conditional import based on SGLANG_USE_MODELSCOPE environment variable
 if get_bool_env_var("SGLANG_USE_MODELSCOPE"):
@@ -297,6 +298,9 @@ def get_config(
         kwargs["gguf_file"] = model
         model = Path(model).parent
 
+    if is_runai_obj_uri(model):
+        model = ObjectStorageModel.get_path(model)
+
     if is_remote_url(model):
         # BaseConnector implements __del__() to clean up the local dir.
         # Since config files need to exist all the time, so we DO NOT use
@@ -507,6 +511,9 @@ def get_tokenizer(
     if is_gguf:
         kwargs["gguf_file"] = tokenizer_name
         tokenizer_name = Path(tokenizer_name).parent
+
+    if is_runai_obj_uri(tokenizer_name):
+        tokenizer_name = ObjectStorageModel.get_path(tokenizer_name)
 
     if is_remote_url(tokenizer_name):
         # BaseConnector implements __del__() to clean up the local dir.
