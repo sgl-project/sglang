@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from .compressed_tensors_scheme import CompressedTensorsScheme
+from .compressed_tensors_w4a4_mxint4_moe import CompressedTensorsMxInt4MoE
 from .compressed_tensors_w4a4_nvfp4 import CompressedTensorsW4A4Fp4
 from .compressed_tensors_w4a4_nvfp4_moe import CompressedTensorsW4A4Nvfp4MoE
 from .compressed_tensors_w4a8_int8_moe import NPUCompressedTensorsW4A8Int8DynamicMoE
@@ -33,4 +34,5 @@ __all__ = [
     "CompressedTensorsW4A4Fp4",
     "CompressedTensorsW4A4Nvfp4MoE",
     "NPUCompressedTensorsW4A8Int8DynamicMoE",
+    "CompressedTensorsMxInt4MoE",
 ]
