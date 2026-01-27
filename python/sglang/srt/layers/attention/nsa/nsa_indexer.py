@@ -23,8 +23,7 @@ if _is_cuda:
     except ImportError as e:
         deep_gemm = e
 
-if _is_npu:
-    import custom_ops  # noqa: F401
+if is_npu():
     import torch_npu
     from sglang.srt.hardware_backend.npu.utils import get_indexer_weight_stream
 
@@ -1277,6 +1276,7 @@ class Indexer(MultiPlatformOp):
                 actual_seq_lengths_kv,
                 block_table,
             )
+            return topk_indices
         else:
             block_table = (
                 block_table[: actual_seq_lengths_q.size()[0]]
@@ -1284,7 +1284,7 @@ class Indexer(MultiPlatformOp):
                 else block_table
             )
 
-            topk_indices = torch.ops.custom.npu_lightning_indexer(
+            topk_indices = torch_npu.npu_lightning_indexer(
                 query=q.view(-1, self.n_heads, self.head_dim),
                 key=past_key_states,
                 weights=weights,
@@ -1298,8 +1298,7 @@ class Indexer(MultiPlatformOp):
                 sparse_count=self.index_topk,
                 sparse_mode=3,
             )
-
-        return topk_indices
+            return topk_indices[0]
 
     def do_npu_cp_balance_indexer(
         self,
@@ -1322,7 +1321,7 @@ class Indexer(MultiPlatformOp):
         actual_seq_lengths_q_prev, actual_seq_lengths_q_next = actual_seq_lengths_q
         actual_seq_lengths_kv_prev, actual_seq_lengths_kv_next = actual_seq_lengths_kv
 
-        topk_indices_prev = torch.ops.custom.npu_lightning_indexer(
+        topk_indices_prev = torch_npu.npu_lightning_indexer(
             query=q_prev,
             key=past_key_states,
             weights=weights_prev,
@@ -1338,7 +1337,7 @@ class Indexer(MultiPlatformOp):
             sparse_count=self.index_topk,
             sparse_mode=3,
         )
-        topk_indices_next = torch.ops.custom.npu_lightning_indexer(
+        topk_indices_next = torch_npu.npu_lightning_indexer(
             query=q_next,
             key=past_key_states,
             weights=weights_next,
@@ -1354,4 +1353,4 @@ class Indexer(MultiPlatformOp):
             sparse_count=self.index_topk,
             sparse_mode=3,
         )
-        return topk_indices_prev, topk_indices_next
+        return topk_indices_prev[0], topk_indices_next[0]

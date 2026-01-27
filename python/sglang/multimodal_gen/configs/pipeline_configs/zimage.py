@@ -200,6 +200,7 @@ class ZImagePipelineConfig(ImagePipelineConfig):
 
     def gather_latents_for_sp(self, latents):
         # Gather on effective-H dim=3 (matches shard_latents_for_sp); swap-back is handled in post_denoising_loop.
+        latents = latents.contiguous()
         if get_sp_world_size() <= 1 or latents.dim() != 5:
             return latents
         return sequence_model_parallel_all_gather(latents, dim=3)

@@ -16,7 +16,13 @@ Note: This document is originally written for the usage of [DeepSeek-V3.2-Exp](h
 docker pull lmsysorg/sglang:latest
 
 # MI350/MI355
-docker pull lmsysorg/sglang:dsv32-rocm
+docker pull lmsysorg/sglang:v0.5.8-rocm700-mi35x
+
+# MI300
+# v0.5.8-rocm700-mi30x does not include PR #17504. Prefer the newest MI30x ROCm
+# image tag from Docker Hub when available, or build from source (below).
+docker pull lmsysorg/sglang:v0.5.8-rocm700-mi30x
+
 
 # NPUs
 docker pull lmsysorg/sglang:dsv32-a2
@@ -45,6 +51,9 @@ python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp --tp 8 --ep
 
 # Launch with Pure TP
 python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp --tp 8
+
+# Launch with TP on MI30x/MI35x
+python3 -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp --tp 8 --nsa-prefill-backend tilelang --nsa-decode-backend tilelang
 ```
 
 ### Configuration Tips
@@ -116,6 +125,14 @@ python3 -m sglang.launch_server \
   --reasoning-parser deepseek-v3
 ```
 
+## NVFP4 Checkpoint
+
+To launch deepseek v3.2 [NVFP4 checkpoint](https://huggingface.co/nvidia/DeepSeek-V3.2-NVFP4) on Blackwell devices, the user needs to specify the quantization method as `modelopt_fp4`, and moe runner backend as one of `flashinfer_trtllm`(recommended), `flashinfer_cutlass` and `flashinfer_cutedsl`. Any other usage (parallelism, reasoning parser, ...) is the same as FP8 checkpoint.
+
+An example launching command can be:
+```bash
+python -m sglang.launch_server --model nvidia/DeepSeek-V3.2-NVFP4 --tp 4 --quantization modelopt_fp4 --moe-runner-backend flashinfer_trtllm --tool-call-parser deepseekv32  --reasoning-parser deepseek-v3
+```
 
 ## PD Disaggregation
 
