@@ -332,24 +332,26 @@ class SchedulerOutputProcessorMixin:
         if result.copy_done is not None:
             result.copy_done.synchronize()
 
-        next_token_ids = result.next_token_ids.tolist()
-        self.num_generated_tokens += len(next_token_ids)
-
         self.token_to_kv_pool_allocator.free_group_begin()
 
-        assert len(batch.reqs) == 1, "batch size is currently expected to be 1"
-        req = batch.reqs[0]
-
-        for next_token_id in next_token_ids:
-            req.output_ids.append(next_token_id)
-            req.check_finished()
-
-            if req.finished():
-                release_kv_cache(req, self.tree_cache)
-                req.time_stats.completion_time = time.perf_counter()
+        for idx in range(batch.batch_size()):
+            # If no new tokens generated, meaning the prefilling stage
+            if not result.next_token_ids:
                 break
 
-            self.tree_cache.cache_unfinished_req(req)
+            req = batch.reqs[idx]
+            next_token_ids = result.next_token_ids[idx].tolist()
+            self.num_generated_tokens += len(next_token_ids)
+
+            for _token_idx, next_token_id in enumerate(next_token_ids):
+                req.output_ids.append(next_token_id)
+                req.check_finished()
+                if req.finished():
+                    release_kv_cache(req, self.tree_cache)
+                    req.time_stats.completion_time = time.perf_counter()
+                    break
+
+                self.tree_cache.cache_unfinished_req(req)
 
         self.stream_output(batch.reqs, batch.return_logprob)
         self.token_to_kv_pool_allocator.free_group_end()
@@ -852,7 +854,7 @@ class SchedulerOutputProcessorMixin:
         retraction_counts = []
         output_hidden_states = None
         load = self.get_load()
-        output_routed_experts = None
+        routed_experts = None
         customized_info = {}
 
         queue_times = []
@@ -1049,9 +1051,9 @@ class SchedulerOutputProcessorMixin:
                         output_hidden_states = []
                     output_hidden_states.append(req.hidden_states)
                 if req.return_routed_experts:
-                    if output_routed_experts is None:
-                        output_routed_experts = []
-                    output_routed_experts.append(req.routed_experts)
+                    if routed_experts is None:
+                        routed_experts = []
+                    routed_experts.append(req.routed_experts)
 
                 if req.customized_info is not None:
                     for k, v in req.customized_info.items():
@@ -1070,7 +1072,6 @@ class SchedulerOutputProcessorMixin:
         if reqs or is_idle_batch:
             if self.model_config.is_multimodal_gen:
                 return
-
             self.send_to_detokenizer.send_output(
                 BatchTokenIDOutput(
                     rids=rids,
@@ -1107,7 +1108,7 @@ class SchedulerOutputProcessorMixin:
                     output_token_ids_logprobs_idx=output_token_ids_logprobs_idx,
                     output_token_entropy_val=None,
                     output_hidden_states=output_hidden_states,
-                    output_routed_experts=output_routed_experts,
+                    routed_experts=routed_experts,
                     customized_info=customized_info,
                     placeholder_tokens_idx=None,
                     placeholder_tokens_val=None,

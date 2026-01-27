@@ -7,7 +7,11 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
 from sglang.multimodal_gen.configs.pipeline_configs.diffusers_generic import (
     DiffusersGenericPipelineConfig,
 )
-from sglang.multimodal_gen.configs.pipeline_configs.flux import FluxPipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.flux import (
+    Flux2KleinPipelineConfig,
+    Flux2PipelineConfig,
+    FluxPipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.flux_finetuned import (
     Flux2FinetunedPipelineConfig,
 )
@@ -15,6 +19,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.hunyuan import (
     FastHunyuanConfig,
     HunyuanConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import LTX2PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     SelfForcingWanT2V480PConfig,
     WanI2V480PConfig,
@@ -29,6 +34,8 @@ __all__ = [
     "HunyuanConfig",
     "FastHunyuanConfig",
     "FluxPipelineConfig",
+    "Flux2PipelineConfig",
+    "Flux2KleinPipelineConfig",
     "Flux2FinetunedPipelineConfig",
     "PipelineConfig",
     "SlidingTileAttnConfig",
@@ -38,4 +45,5 @@ __all__ = [
     "WanI2V720PConfig",
     "SelfForcingWanT2V480PConfig",
     "ZImagePipelineConfig",
+    "LTX2PipelineConfig",
 ]

@@ -52,7 +52,7 @@ from sglang.srt.mem_cache.utils import (
     set_mla_kv_buffer_triton,
     set_mla_kv_scale_buffer_triton,
 )
-from sglang.srt.utils import is_cuda, is_npu, next_power_of_2
+from sglang.srt.utils import is_cuda, is_hip, is_npu, next_power_of_2
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
@@ -68,6 +68,7 @@ logger = logging.getLogger(__name__)
 GB = 1024 * 1024 * 1024
 _is_cuda = is_cuda()
 _is_npu = is_npu()
+_is_hip = is_hip()
 
 
 def get_tensor_size_bytes(t: Union[torch.Tensor, List[torch.Tensor]]):
@@ -287,8 +288,9 @@ class MambaPool:
                     f"conv_state size: {get_tensor_size_bytes(conv_state) / GB:.2f}GB, "
                     f"ssm_state size: {get_tensor_size_bytes(temporal_state) / GB:.2f}GB "
                 )
+            # The padded slot 0 is used for writing dummy outputs from padded tokens.
             self.free_slots = torch.arange(
-                self.size, dtype=torch.int64, device=self.device
+                1, self.size + 1, dtype=torch.int64, device=self.device
             )
             self.mem_usage = self.mamba_cache.mem_usage_bytes() / GB
             self.num_mamba_layers = num_mamba_layers
@@ -322,7 +324,9 @@ class MambaPool:
         self.free_slots = torch.cat((self.free_slots, free_index))
 
     def clear(self):
-        self.free_slots = torch.arange(self.size, dtype=torch.int64, device=self.device)
+        self.free_slots = torch.arange(
+            1, self.size + 1, dtype=torch.int64, device=self.device
+        )
 
     def copy_from(self, src_index: torch.Tensor, dst_index: torch.Tensor):
         for i in range(len(self.mamba_cache.conv)):
@@ -369,6 +373,33 @@ class MambaPool:
                 state_tensor[i][0].nbytes for i in range(self.num_mamba_layers)
             ]
         return data_ptrs, data_lens, item_lens
+
+    def get_state_dim_per_tensor(self):
+        """Get the sliceable dimension size for each state tensor.
+
+        For mamba state, the layout is:
+        - conv_state: [num_layers, size+1, conv_dim/tp, conv_kernel-1]
+        - temporal_state: [num_layers, size+1, num_heads/tp, head_dim, state_size]
+
+        The 3rd dimension (index 2) is the one that gets sliced by TP.
+        Returns the size of this dimension for each tensor (repeated for each layer).
+        """
+        state_tensors = []
+        for field in vars(self.mamba_cache):
+            value = getattr(self.mamba_cache, field)
+            if isinstance(value, list):
+                state_tensors.extend(value)
+            else:
+                state_tensors.append(value)
+
+        dim_per_tensor = []
+        for state_tensor in state_tensors:
+            # state_tensor shape: [num_layers, size+1, sliceable_dim, ...]
+            # The sliceable dimension is at index 2 (after num_layers and size)
+            sliceable_dim = state_tensor.shape[2]
+            # Repeat for each layer since we have per-layer data_ptrs
+            dim_per_tensor += [sliceable_dim] * self.num_mamba_layers
+        return dim_per_tensor
 
 
 class HybridReqToTokenPool(ReqToTokenPool):
@@ -1228,6 +1259,10 @@ class HybridLinearKVPool(KVCache):
         )
         return mamba_data_ptrs, mamba_data_lens, mamba_item_lens
 
+    def get_state_dim_per_tensor(self):
+        """Get the sliceable dimension size for each mamba state tensor."""
+        return self.mamba_pool.get_state_dim_per_tensor()
+
     def maybe_get_custom_mem_pool(self):
         return self.full_kv_pool.maybe_get_custom_mem_pool()
 
@@ -1724,7 +1759,10 @@ class NSATokenToKVPool(MLATokenToKVPool):
         # num head == 1 and head dim == 128 for index_k in NSA
         assert index_head_dim == 128
 
-        assert self.page_size == 64
+        if _is_hip:
+            assert self.page_size == 1
+        else:
+            assert self.page_size == 64
         with (
             torch.cuda.use_mem_pool(self.custom_mem_pool)
             if self.custom_mem_pool
