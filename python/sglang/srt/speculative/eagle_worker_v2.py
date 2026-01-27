@@ -107,11 +107,6 @@ class EagleDraftWorker(BaseDraftWorker):
             server_args.speculative_algorithm
         )
 
-        # Set constant
-        EagleDraftInput.ALLOC_LEN_PER_DECODE = max(
-            self.speculative_num_steps * self.topk, self.speculative_num_draft_tokens
-        )
-
         # Do not capture cuda graph in `TpModelWorker` init,
         # will capture later with init_cuda_graphs()
         backup_disable_cuda_graph = server_args.disable_cuda_graph
