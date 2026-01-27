@@ -7,29 +7,22 @@ from typing import TYPE_CHECKING
 
 import torch
 from compressed_tensors import CompressionFormat
-from compressed_tensors.quantization import QuantizationStrategy
 
+from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
+    NPUW4A16Int4DynamicMoEMethod,
+)
 from sglang.srt.layers.moe import MoeRunnerConfig
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     WNA16_SUPPORTED_BITS,
     CompressedTensorsScheme,
 )
-from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
-    NPUW4A8Int8DynamicMoEMethod,
-    NPUW4A16Int4DynamicMoEMethod,
-    NPUW8A8Int8DynamicMoEMethod,
-)
 from sglang.srt.layers.quantization.gptq import gptq_marlin_moe_repack
 from sglang.srt.layers.quantization.marlin_utils import marlin_moe_permute_scales
-from sglang.srt.layers.quantization.utils import (
-    replace_parameter,
-)
+from sglang.srt.layers.quantization.utils import replace_parameter
 from sglang.srt.utils import (
     get_bool_env_var,
     is_cuda,
     is_hip,
-    is_npu,
-    next_power_of_2,
     set_weight_attrs,
 )
 
@@ -42,8 +35,7 @@ if TYPE_CHECKING:
         CompressedTensorsConfig,
     )
 
-__all__ = ["CompressedTensorsWNA16MoE",
-           "NPUCompressedTensorsW4A16Int4DynamicMoE"]
+__all__ = ["CompressedTensorsWNA16MoE", "NPUCompressedTensorsW4A16Int4DynamicMoE"]
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
@@ -51,12 +43,11 @@ _is_cuda = is_cuda()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _use_aiter:
-    from aiter import ActivationType, QuantType
-    from aiter.fused_moe import fused_moe
-    from aiter.ops.shuffle import shuffle_weight
+    pass
 
 
 logger = logging.getLogger(__name__)
+
 
 class GPTQMarlinState(Enum):
     REPACK = enum.auto()
