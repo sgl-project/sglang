@@ -13,6 +13,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
+
 class TestPureDP(CustomTestCase):
 
     @classmethod
@@ -51,7 +52,7 @@ class TestPureDP(CustomTestCase):
         env["SGLANG_USE_AITER"] = "1"
         env["SGLANG_MORI_FP8_DISP"] = "True"
         env["SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK"] = "16384"
-        env["MORI_SHMEM_MODE"] = "ISOLATION" # avoid out of symmetric heap memory
+        env["MORI_SHMEM_MODE"] = "ISOLATION"  # avoid out of symmetric heap memory
 
         cls.process = popen_launch_server(
             cls.model,
@@ -133,7 +134,7 @@ class TestMTP(CustomTestCase):
         env["SGLANG_USE_AITER"] = "1"
         env["SGLANG_MORI_FP8_DISP"] = "True"
         env["SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK"] = "16384"
-        env["MORI_SHMEM_MODE"] = "ISOLATION" # avoid out of symmetric heap memory
+        env["MORI_SHMEM_MODE"] = "ISOLATION"  # avoid out of symmetric heap memory
 
         cls.process = popen_launch_server(
             cls.model,
