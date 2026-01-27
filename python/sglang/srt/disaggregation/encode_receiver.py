@@ -5,7 +5,7 @@ import random
 import threading
 import uuid
 from enum import IntEnum
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Union
 
 import aiohttp
 import torch
@@ -26,6 +26,54 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
+    from sglang.srt.utils.common import ImageData
+
+
+def _extract_image_url(image_item: Union[str, dict, "ImageData"]) -> str:
+    """Extract URL from various image data formats.
+
+    The native /generate API passes raw strings or dicts from JSON,
+    while the OpenAI-compatible API creates ImageData objects.
+
+    Supports:
+    - str: Direct URL or base64 data URI
+    - dict: {"url": "..."} or {"image_url": "..."} format from JSON
+    - ImageData: Object with .url attribute (from OpenAI-compatible API)
+
+    Args:
+        image_item: Image data in any supported format
+
+    Returns:
+        URL string extracted from the image data
+
+    Raises:
+        ValueError: If the image data type is not supported
+    """
+    if isinstance(image_item, str):
+        return image_item
+    elif isinstance(image_item, dict):
+        # Support both {"url": "..."} and {"image_url": "..."} formats
+        return image_item.get("url", image_item.get("image_url", ""))
+    elif hasattr(image_item, "url"):
+        return image_item.url
+    else:
+        raise ValueError(f"Unsupported image data type: {type(image_item)}")
+
+
+def _extract_image_urls(image_data: Union[str, dict, list, "ImageData", None]) -> List[str]:
+    """Extract URLs from image_data which may be a single item or list.
+
+    Args:
+        image_data: Single image item or list of image items
+
+    Returns:
+        List of URL strings
+    """
+    if image_data is None:
+        return []
+    if not isinstance(image_data, list):
+        return [_extract_image_url(image_data)]
+    return [_extract_image_url(img) for img in image_data]
 
 
 class EmbeddingData:
@@ -548,10 +596,7 @@ class MMReceiver:
 
     # For zmq_to_scheduler
     def send_encode_request(self, obj):
-        if type(obj.image_data) != list:
-            image_urls = [obj.image_data.url]
-        else:
-            image_urls = [img.url for img in obj.image_data]
+        image_urls = _extract_image_urls(obj.image_data)
         if obj.rid is None:
             obj.rid = uuid.uuid4().hex
         if image_urls and len(image_urls) > 0:
@@ -583,10 +628,7 @@ class MMReceiver:
                 return None
             req_id = uuid.uuid4().hex
             embedding_port, recv_socket = get_zmq_socket_on_host(self.context, zmq.PULL)
-            if type(img_data) != list:
-                img_data = [img_data.url]
-            else:
-                img_data = [img.url for img in img_data]
+            img_data = _extract_image_urls(img_data)
             asyncio.create_task(
                 self.encode(req_id, img_data, embedding_port, "encode", "send")
             )
