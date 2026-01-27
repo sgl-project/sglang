@@ -24,7 +24,7 @@ elif [ "$1" = "gpus" ] && [ -n "$2" ]; then
     echo "Targeting devices: $devices"
 
     # Kill all processes using specified GPU devices
-    lsof $devices 2>/dev/null | awk 'NR>1 {print $2}' | sort -u | xargs -r kill -9 2>/dev/null
+    [ -n "$devices" ] && lsof $devices 2>/dev/null | awk 'NR>1 {print $2}' | sort -u | xargs -r kill -9 2>/dev/null
 
     # Show GPU status after clean up
     nvidia-smi
