@@ -13,12 +13,16 @@ from einops import rearrange
 
 from sglang.jit_kernel.norm import can_use_fused_inplace_qknorm as can_use_jit_qk_norm
 from sglang.srt.environ import envs
-from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
+from sglang.srt.layers.dp_attention import (
+    get_attention_tp_group,
+    get_attention_tp_rank,
+    get_attention_tp_size,
+)
 from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.utils import (
     get_bool_env_var,
     get_device_capability,
-    is_blackwell,
+    is_blackwell_supported,
     is_cuda,
     is_hip,
     is_npu,
@@ -400,6 +404,58 @@ class VisionFlash3Attention(nn.Module):
         return output
 
 
+class VisionFlash4Attention(nn.Module):
+    def __init__(
+        self,
+        **kwargs,
+    ):
+        if not _is_cuda:
+            raise Exception("VisionFlash4Attention is only available for cuda")
+        super().__init__()
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        cu_seqlens: torch.Tensor | SingletonCache | None,
+        bsz: int,
+        seq_len: int,
+        **kwargs,
+    ) -> torch.Tensor:
+        r"""
+        Args:
+            cu_seqlens: [b]
+        Returns:
+             [b * s, h, head_size]
+        """
+        if cu_seqlens is None:
+            cu_seqlens = _get_cu_seqlens_for_shape(bsz, seq_len, device=q.device)
+        elif isinstance(cu_seqlens, SingletonCache):
+            if cu_seqlens.empty():
+                cu_seqlens.set_data(
+                    _get_cu_seqlens_for_shape(bsz, seq_len, device=q.device)
+                )
+            cu_seqlens = cu_seqlens.get_data()
+
+        cu_seqlens = cu_seqlens.to(dtype=torch.int32).to(q.device)
+        seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+        max_seqlen = seq_lens.max().item()
+
+        output = flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_k=max_seqlen,
+            ver=4,
+        )
+
+        return output
+
+
 class VisionAiterAttention(nn.Module):
     def __init__(
         self,
@@ -499,6 +555,7 @@ QKV_BACKEND_IMPL = {
     "triton_attn": VisionTritonAttention,
     "sdpa": VisionSdpaAttention,
     "fa3": VisionFlash3Attention,
+    "fa4": VisionFlash4Attention,
     "ascend_attn": VisionAscendAttention,
     "aiter_attn": VisionAiterAttention,
 }
@@ -639,6 +696,7 @@ class VisionAttention(nn.Module):
             quant_config=quant_config,
             tp_rank=self.tp_rank,
             tp_size=self.tp_size,
+            reduce_results=False,
             prefix=add_prefix("proj", prefix),
         )
         self.aux_stream = aux_stream
@@ -671,7 +729,7 @@ class VisionAttention(nn.Module):
                 backend = "triton_attn"
         else:
             backend = "sdpa"
-        if backend == "fa3" and is_blackwell():
+        if backend == "fa3" and is_blackwell_supported():
             raise ValueError("The 'fa3' backend is not supported on Blackwell GPUs")
 
         return backend
@@ -861,6 +919,8 @@ class VisionAttention(nn.Module):
 
             # [b, s, h * head_size] --> [b, s, h * head_size]
             output, _ = self.proj(output)
+            if self.tp_size > 1:
+                output = get_attention_tp_group().all_reduce(output)
         else:
             # [b * s, h, head_size] --> [s, b, h * head_size]
             context_layer = rearrange(
@@ -869,6 +929,8 @@ class VisionAttention(nn.Module):
 
             # [s, b, h * head_size] --> [s, b, h * head_size]
             output, _ = self.proj(context_layer)
+            if self.tp_size > 1:
+                output = get_attention_tp_group().all_reduce(output)
 
             # [s, b, h * head_size] --> [b, s, h * head_size]
             output = output.view(bsz, s, -1)

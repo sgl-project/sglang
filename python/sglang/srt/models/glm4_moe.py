@@ -63,7 +63,10 @@ from sglang.srt.layers.moe import (
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
-from sglang.srt.layers.moe.utils import filter_moe_weight_param_global_expert
+from sglang.srt.layers.moe.utils import (
+    RoutingMethodType,
+    filter_moe_weight_param_global_expert,
+)
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -376,6 +379,7 @@ class Glm4MoeSparseMoeBlock(nn.Module):
             intermediate_size=config.moe_intermediate_size,
             quant_config=quant_config,
             routed_scaling_factor=self.routed_scaling_factor,
+            routing_method_type=RoutingMethodType.DeepSeekV3,
             prefix=add_prefix("experts", prefix),
         )
 
@@ -409,6 +413,7 @@ class Glm4MoeSparseMoeBlock(nn.Module):
                     dict(tp_rank=0, tp_size=1)
                     if get_moe_a2a_backend().is_deepep()
                     or get_moe_a2a_backend().is_mooncake()
+                    or get_moe_a2a_backend().is_flashinfer()
                     or should_use_flashinfer_cutlass_moe_fp4_allgather()
                     else {}
                 ),
@@ -685,6 +690,8 @@ class Glm4MoeDecoderLayer(nn.Module):
         attention_bias = config.attention_bias
         self.layer_id = layer_id
 
+        use_qk_norm = config.use_qk_norm if hasattr(config, "use_qk_norm") else False
+
         self.self_attn = Glm4MoeAttention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
@@ -699,7 +706,7 @@ class Glm4MoeDecoderLayer(nn.Module):
             attention_bias=attention_bias,
             quant_config=quant_config,
             prefix=add_prefix("self_attn", prefix),
-            use_qk_norm=config.use_qk_norm,
+            use_qk_norm=use_qk_norm,
             alt_stream=alt_stream,
         )
 
@@ -889,7 +896,7 @@ class Glm4MoeModel(nn.Module):
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
-                enable_tp=not is_dp_attention_enabled(),
+                use_attn_tp_group=is_dp_attention_enabled(),
             )
         else:
             self.embed_tokens = PPMissingLayer()
