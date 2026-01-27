@@ -1274,7 +1274,7 @@ async def separate_reasoning_request(obj: SeparateReasoningReqInput, request: Re
     A native API endpoint to separate reasoning from a text.
     """
     # 1) Initialize the parser based on the request body
-    parser = ReasoningParser(model_type=obj.reasoning_parser)
+    parser = ReasoningParser(model_type=obj.reasoning_parser, request=request)
 
     # 2) Call the non-stream parsing method (non-stream)
     reasoning_text, normal_text = parser.parse_non_stream(obj.text)
