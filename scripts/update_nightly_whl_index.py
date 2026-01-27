@@ -2,8 +2,10 @@
 """
 Update the wheel index for nightly SGLang releases.
 
-This script generates a single PyPI-compatible index.html file at nightly/index.html
+This script generates a PyPI-compatible index.html file at cu{version}/sglang/index.html
 containing all historical nightly builds, ordered by commit count (newest first).
+
+The CUDA version is specified via the --cuda-version argument.
 
 Reference: https://github.com/flashinfer-ai/flashinfer/blob/v0.2.0/scripts/update_whl_index.py
 """
@@ -23,14 +25,17 @@ def compute_sha256(file_path: pathlib.Path) -> str:
     return sha256_hash.hexdigest()
 
 
-def update_wheel_index(commit_hash: str, nightly_version: str, build_date: str = None):
+def update_wheel_index(
+    commit_hash: str, nightly_version: str, cuda_version: str, build_date: str = None
+):
     """Update the wheel index for nightly releases.
 
-    Creates a single index at nightly/index.html containing all historical nightlies.
+    Creates an index at cu{version}/sglang/index.html containing all historical nightlies.
 
     Args:
         commit_hash: Short git commit hash (e.g., 'c5f1e86')
         nightly_version: Full nightly version string (e.g., '0.5.6.post1.dev7716+gc5f1e86')
+        cuda_version: CUDA version string (e.g., '129' or '130')
         build_date: Build date in YYYY-MM-DD format (e.g., '2025-12-13')
     """
     dist_dir = pathlib.Path("dist")
@@ -40,6 +45,11 @@ def update_wheel_index(commit_hash: str, nightly_version: str, build_date: str =
         print(f"Warning: {dist_dir} does not exist, skipping index update")
         return
 
+    # Format CUDA version with 'cu' prefix if not already present
+    if not cuda_version.startswith("cu"):
+        cuda_version = f"cu{cuda_version}"
+    print(f"Using CUDA version: {cuda_version}")
+
     # Base URL for wheels stored in GitHub Releases
     base_url = "https://github.com/sgl-project/whl/releases/download"
     # Use date-based tag if build_date is provided, otherwise fall back to commit-only
@@ -48,16 +58,16 @@ def update_wheel_index(commit_hash: str, nightly_version: str, build_date: str =
     else:
         release_tag = f"nightly-{commit_hash}"
 
-    # Create nightly directory structure following PEP 503
-    # /nightly/index.html -> links to sglang/
-    # /nightly/sglang/index.html -> contains wheel links
-    nightly_dir = whl_repo_dir / "nightly"
-    nightly_dir.mkdir(parents=True, exist_ok=True)
+    # Create directory structure following PEP 503
+    # /cu{version}/index.html -> links to sglang/ and sgl-kernel/
+    # /cu{version}/sglang/index.html -> contains wheel links
+    cuda_dir = whl_repo_dir / cuda_version
+    cuda_dir.mkdir(parents=True, exist_ok=True)
 
-    sglang_dir = nightly_dir / "sglang"
+    sglang_dir = cuda_dir / "sglang"
     sglang_dir.mkdir(parents=True, exist_ok=True)
 
-    root_index = nightly_dir / "index.html"
+    root_index = cuda_dir / "index.html"
     package_index = sglang_dir / "index.html"
 
     print(f"\nUpdating nightly wheel index")
@@ -110,17 +120,31 @@ def update_wheel_index(commit_hash: str, nightly_version: str, build_date: str =
                 seen.add(filename)
                 unique_links.append(link)
 
-    # Write root index (links to sglang package directory)
+    # Update root index to include both sgl-kernel and sglang
+    # Read existing packages from root index if it exists
+    existing_packages = set()
+    if root_index.exists():
+        with open(root_index, "r") as f:
+            content = f.read()
+            # Extract existing package links
+            for match in re.finditer(r'<a href="([^"]+)/">', content):
+                existing_packages.add(match.group(1))
+
+    # Add sglang to the package list
+    existing_packages.add("sglang")
+
+    # Write root index with all packages (sorted for consistency)
     with open(root_index, "w") as f:
         f.write("<!DOCTYPE html>\n")
-        f.write('<a href="sglang/">sglang</a>\n')
+        for pkg in sorted(existing_packages):
+            f.write(f'<a href="{pkg}/">{pkg}</a>\n')
 
-    print(f"  Written root index: {root_index}")
+    print(f"  Written root index: {root_index} (packages: {sorted(existing_packages)})")
 
     # Write package index in minimal format (matching production sgl-kernel index)
     with open(package_index, "w") as f:
         f.write("<!DOCTYPE html>\n")
-        f.write("<h1>SGLang Nightly Wheels</h1>\n")
+        f.write(f"<h1>SGLang Nightly Wheels ({cuda_version})</h1>\n")
         # Write links only
         f.write("\n".join(unique_links))
         f.write("\n")
@@ -128,7 +152,7 @@ def update_wheel_index(commit_hash: str, nightly_version: str, build_date: str =
     print(f"  Written {len(unique_links)} total wheels to {package_index}")
     print(f"\nDone! Users can install with:")
     print(
-        f"  pip install sglang --pre --extra-index-url https://sgl-project.github.io/whl/nightly/"
+        f"  pip install sglang --pre --extra-index-url https://sgl-project.github.io/whl/{cuda_version}/"
     )
 
 
@@ -149,6 +173,12 @@ def main():
         help="Full nightly version string (e.g., '0.5.6.post1.dev7716+gc5f1e86')",
     )
     parser.add_argument(
+        "--cuda-version",
+        type=str,
+        default="129",
+        help="CUDA version (e.g., '129' or '130'). Defaults to '129'.",
+    )
+    parser.add_argument(
         "--build-date",
         type=str,
         required=False,
@@ -160,10 +190,13 @@ def main():
     print(f"Updating nightly wheel index")
     print(f"  Commit: {args.commit_hash}")
     print(f"  Version: {args.nightly_version}")
+    print(f"  CUDA version: {args.cuda_version}")
     if args.build_date:
         print(f"  Build date: {args.build_date}")
 
-    update_wheel_index(args.commit_hash, args.nightly_version, args.build_date)
+    update_wheel_index(
+        args.commit_hash, args.nightly_version, args.cuda_version, args.build_date
+    )
 
 
 if __name__ == "__main__":
