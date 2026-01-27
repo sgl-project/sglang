@@ -29,7 +29,7 @@ from compressed_tensors.quantization import (
 )
 from pydantic import BaseModel
 
-from sglang.srt.layers.moe import MoeRunnerConfig
+from sglang.srt.layers.moe import MoeRunnerConfig, get_moe_runner_backend
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     LinearMethodBase,
@@ -42,6 +42,7 @@ from sglang.srt.layers.quantization.base_config import (
 # )
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     WNA16_SUPPORTED_BITS,
+    CompressedTensorsMxInt4MoE,
     CompressedTensorsScheme,
     CompressedTensorsW4A4Fp4,
     CompressedTensorsW4A4Nvfp4MoE,
@@ -633,8 +634,17 @@ class CompressedTensorsConfig(QuantizationConfig):
 
         if self._is_wNa16_group_channel(weight_quant, input_quant):
             if not _is_npu:
-                logger.info_once("Using CompressedTensorsWNA16MarlinMoE")
-                return CompressedTensorsWNA16MoE(self)
+                if (
+                    self._is_mxint4a16(weight_quant, input_quant)
+                    and get_moe_runner_backend().is_flashinfer_trtllm()
+                ):
+                    logger.info_once(
+                        "Using CompressedTensorsMxInt4MoE with flashinfer_trtllm backend"
+                    )
+                    return CompressedTensorsMxInt4MoE(self)
+                else:
+                    logger.info_once("Using CompressedTensorsWNA16MarlinMoEMethod")
+                    return CompressedTensorsWNA16MoE(self)
             else:
                 if (
                     self._is_dynamic_token_w4(weight_quant, input_quant)
