@@ -1237,16 +1237,12 @@ jobs:
       - name: Run test
         timeout-minutes: 20
         run: |
-          cd test/srt
-          RETRY_FLAG=""
-          if [[ "${{ needs.check-changes.outputs.enable_retry }}" == "true" ]]; then
-            RETRY_FLAG="--enable-retry"
-          fi
+          cd test
           CONTINUE_ON_ERROR_FLAG=""
           if [[ "${{ needs.check-changes.outputs.continue_on_error }}" == "true" ]]; then
             CONTINUE_ON_ERROR_FLAG="--continue-on-error"
           fi
-          python3 run_suite.py --suite per-commit-4-gpu --auto-partition-id ${{ matrix.part }} --auto-partition-size 3 $RETRY_FLAG $CONTINUE_ON_ERROR_FLAG
+          python3 run_suite.py --hw cuda --suite stage-c-test-4-gpu-h100 --partition-id ${{ matrix.part }} --total-partitions 3 $CONTINUE_ON_ERROR_FLAG
 
   stage-c-test-8-gpu-h200:
     needs: [check-changes, call-gate, wait-for-stage-b]
@@ -1296,16 +1292,12 @@ jobs:
       - name: Run test
         timeout-minutes: 20
         run: |
-          cd test/srt
-          RETRY_FLAG=""
-          if [[ "${{ needs.check-changes.outputs.enable_retry }}" == "true" ]]; then
-            RETRY_FLAG="--enable-retry"
-          fi
+          cd test
           CONTINUE_ON_ERROR_FLAG=""
           if [[ "${{ needs.check-changes.outputs.continue_on_error }}" == "true" ]]; then
             CONTINUE_ON_ERROR_FLAG="--continue-on-error"
           fi
-          python3 run_suite.py --suite per-commit-8-gpu-h200 --auto-partition-id ${{ matrix.part }} --auto-partition-size 4 $RETRY_FLAG $CONTINUE_ON_ERROR_FLAG
+          python3 run_suite.py --hw cuda --suite stage-c-test-8-gpu-h200 --partition-id ${{ matrix.part }} --total-partitions 4 $CONTINUE_ON_ERROR_FLAG
 
   stage-c-test-8-gpu-h20:
     needs: [check-changes, call-gate, wait-for-stage-b]
@@ -1350,16 +1342,12 @@ jobs:
       - name: Run test
         timeout-minutes: 20
         run: |
-          cd test/srt
-          RETRY_FLAG=""
-          if [[ "${{ needs.check-changes.outputs.enable_retry }}" == "true" ]]; then
-            RETRY_FLAG="--enable-retry"
-          fi
+          cd test
           CONTINUE_ON_ERROR_FLAG=""
           if [[ "${{ needs.check-changes.outputs.continue_on_error }}" == "true" ]]; then
             CONTINUE_ON_ERROR_FLAG="--continue-on-error"
           fi
-          python3 run_suite.py --suite stage-c-test-8-gpu-h20 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 $RETRY_FLAG $CONTINUE_ON_ERROR_FLAG
+          python3 run_suite.py --hw cuda --suite stage-c-test-8-gpu-h20 --partition-id ${{ matrix.part }} --total-partitions 2 $CONTINUE_ON_ERROR_FLAG
 
   stage-c-test-deepep-4-gpu:
     needs: [check-changes, call-gate, wait-for-stage-b]
@@ -1399,16 +1387,12 @@ jobs:
       - name: Run test
         timeout-minutes: 20
         run: |
-          cd test/srt
-          RETRY_FLAG=""
-          if [[ "${{ needs.check-changes.outputs.enable_retry }}" == "true" ]]; then
-            RETRY_FLAG="--enable-retry"
-          fi
+          cd test
           CONTINUE_ON_ERROR_FLAG=""
           if [[ "${{ needs.check-changes.outputs.continue_on_error }}" == "true" ]]; then
             CONTINUE_ON_ERROR_FLAG="--continue-on-error"
           fi
-          python3 run_suite.py --suite stage-c-test-deepep-4-gpu $RETRY_FLAG $CONTINUE_ON_ERROR_FLAG
+          python3 run_suite.py --hw cuda --suite stage-c-test-deepep-4-gpu $CONTINUE_ON_ERROR_FLAG
 
   unit-test-deepep-8-gpu:
     needs: [check-changes, call-gate, wait-for-stage-b]
@@ -1448,16 +1432,12 @@ jobs:
       - name: Run test
         timeout-minutes: 45
         run: |
-          cd test/srt
-          RETRY_FLAG=""
-          if [[ "${{ needs.check-changes.outputs.enable_retry }}" == "true" ]]; then
-            RETRY_FLAG="--enable-retry"
-          fi
+          cd test
           CONTINUE_ON_ERROR_FLAG=""
           if [[ "${{ needs.check-changes.outputs.continue_on_error }}" == "true" ]]; then
             CONTINUE_ON_ERROR_FLAG="--continue-on-error"
           fi
-          python3 run_suite.py --suite per-commit-8-gpu-h200-deepep $RETRY_FLAG $CONTINUE_ON_ERROR_FLAG
+          python3 run_suite.py --hw cuda --suite stage-c-test-8-gpu-h200-deepep $CONTINUE_ON_ERROR_FLAG
 
   stage-c-test-4-gpu-b200:
     needs: [check-changes, call-gate, wait-for-stage-b]
@@ -1502,16 +1482,12 @@ jobs:
       - name: Run test
         timeout-minutes: 30
         run: |
-          cd test/srt
-          RETRY_FLAG=""
-          if [[ "${{ needs.check-changes.outputs.enable_retry }}" == "true" ]]; then
-            RETRY_FLAG="--enable-retry"
-          fi
+          cd test
           CONTINUE_ON_ERROR_FLAG=""
           if [[ "${{ needs.check-changes.outputs.continue_on_error }}" == "true" ]]; then
             CONTINUE_ON_ERROR_FLAG="--continue-on-error"
           fi
-          IS_BLACKWELL=1 python3 run_suite.py --suite stage-c-test-4-gpu-b200 --auto-partition-id ${{ matrix.part }} --auto-partition-size 3 --timeout-per-file 1800 $RETRY_FLAG $CONTINUE_ON_ERROR_FLAG
+          IS_BLACKWELL=1 python3 run_suite.py --hw cuda --suite stage-c-test-4-gpu-b200 --partition-id ${{ matrix.part }} --total-partitions 3 --timeout-per-file 1800 $CONTINUE_ON_ERROR_FLAG
 
   unit-test-backend-4-gpu-gb200:
     needs: [check-changes, call-gate, wait-for-stage-b, sgl-kernel-build-wheels-arm]
@@ -1553,16 +1529,12 @@ jobs:
       - name: Run test
         timeout-minutes: 45
         run: |
-          cd test/srt
-          RETRY_FLAG=""
-          if [[ "${{ needs.check-changes.outputs.enable_retry }}" == "true" ]]; then
-            RETRY_FLAG="--enable-retry"
-          fi
+          cd test
           CONTINUE_ON_ERROR_FLAG=""
           if [[ "${{ needs.check-changes.outputs.continue_on_error }}" == "true" ]]; then
             CONTINUE_ON_ERROR_FLAG="--continue-on-error"
           fi
-          python3 run_suite.py --suite per-commit-4-gpu-gb200 --auto-partition-id 0 --auto-partition-size 1 --timeout-per-file 3600 $RETRY_FLAG $CONTINUE_ON_ERROR_FLAG
+          python3 run_suite.py --hw cuda --suite stage-c-test-4-gpu-gb200 --timeout-per-file 3600 $CONTINUE_ON_ERROR_FLAG
 
   pr-test-finish:
     needs:
