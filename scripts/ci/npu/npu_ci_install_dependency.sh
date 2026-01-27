@@ -17,7 +17,9 @@ apt update -y && apt install -y \
     clang \
     locales \
     ccache \
-    ca-certificates
+    ca-certificates \
+    libgl1 \
+    libglib2.0-0
 update-ca-certificates
 ${PIP_INSTALL} --upgrade pip
 # Pin wheel to 0.45.1, REF: https://github.com/pypa/wheel/issues/662
@@ -62,5 +64,5 @@ wget https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/ops/custom_ops-1.0.$D
 pip install ./custom_ops-1.0.$DEVICE_TYPE-cp311-cp311-linux_aarch64.whl
 
 ### Install SGLang
-rm -rf python/pyproject.toml && mv python/pyproject_other.toml python/pyproject.toml
+rm -rf python/pyproject.toml && mv python/pyproject_npu.toml python/pyproject.toml
 ${PIP_INSTALL} -v -e "python[dev_npu]"
