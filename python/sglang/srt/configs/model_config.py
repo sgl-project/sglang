@@ -1172,6 +1172,7 @@ multimodal_model_archs = [
     "NVILAForConditionalGeneration",
     "NVILALiteForConditionalGeneration",
     "DeepseekOCRForCausalLM",
+    "DeepseekOCR2ForCausalLM",
     "JetVLMForConditionalGeneration",
     "PaddleOCRVLForConditionalGeneration",
     "MiDashengLMModel",

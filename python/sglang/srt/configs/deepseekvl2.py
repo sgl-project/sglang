@@ -1,6 +1,6 @@
 import math
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from PIL import Image, ImageOps
@@ -176,16 +176,101 @@ class DeepseekVLV2Processor(ProcessorMixin):
             **kwargs,
         )
 
+    def _to_prompt_str(
+        self, prompt: Optional[str], conversations: Any, system_prompt: str
+    ) -> str:
+        if prompt is not None:
+            return prompt
+
+        if conversations is None:
+            return ""
+
+        if isinstance(conversations, str):
+            return conversations
+
+        if isinstance(conversations, dict) and "messages" in conversations:
+            return self._to_prompt_str(None, conversations["messages"], system_prompt)
+
+        if isinstance(conversations, list):
+            parts: List[str] = []
+            if system_prompt:
+                parts.append(system_prompt)
+
+            for m in conversations:
+                if isinstance(m, str):
+                    role = "user"
+                    content = m
+                elif isinstance(m, dict):
+                    role = m.get("role") or m.get("from") or "user"
+                    content = m.get("content") if "content" in m else m.get("value")
+                else:
+                    role = "user"
+                    content = str(m)
+
+                # OpenAI multimodal content list -> join text parts + convert images to <image>
+                if isinstance(content, list):
+                    text_parts = []
+                    for p in content:
+                        if not isinstance(p, dict):
+                            continue
+                        ptype = p.get("type")
+                        if ptype == "text":
+                            text_parts.append(p.get("text", ""))
+                        elif "text" in p:
+                            text_parts.append(p.get("text", ""))
+                        elif ptype in ("image_url", "image", "input_image"):
+                            # IMPORTANT: keep image placeholder in the prompt
+                            text_parts.append(self.image_token)
+                    content = "".join(text_parts)
+
+                if content is None:
+                    content = ""
+
+                if self.sft_format == "deepseek":
+                    if role == "user":
+                        parts.append("<|User|>" + content)
+                    elif role == "assistant":
+                        parts.append("<|Assistant|>" + content)
+                    elif role == "system":
+                        parts.append(content)
+                    else:
+                        parts.append(content)
+                else:
+                    parts.append(content)
+
+            # Ensure assistant tag at end for deepseek format
+            if self.sft_format == "deepseek":
+                if len(parts) == 0 or not parts[-1].startswith("<|Assistant|>"):
+                    parts.append("<|Assistant|>")
+
+            return "\n".join(parts)
+
+        return str(conversations)
+
     def format_messages_v2(self, messages, pil_images, max_req_input_len=-1):
-        """play the role of format_messages_v2 and get_images_info in the last version"""
+        messages = messages or ""
+        pil_images = pil_images or []
+
+        # If images exist but prompt has no <image>, inject placeholders before <|Assistant|> (best for DeepSeek SFT)
+        if len(pil_images) > 0 and self.image_token not in messages:
+            placeholders = "".join([self.image_token for _ in range(len(pil_images))])
+            if "<|Assistant|>" in messages:
+                messages = messages.replace(
+                    "<|Assistant|>", placeholders + "\n<|Assistant|>", 1
+                )
+            else:
+                messages = messages + placeholders
+
         tokenized_data = []
-        masked_tokenized_data = []  # labels
+        masked_tokenized_data = []
         images_list = []
         images_seq_mask = []
         images_spatial_crop = []
 
         image_index = 0
         image_token_cnt = messages.count(self.image_token)
+        image_token_cnt = min(image_token_cnt, len(pil_images))
+
         tokenized_str, images, seq_mask, spatial_crop = self.tokenize_with_images(
             messages,
             pil_images[image_index : image_index + image_token_cnt],
@@ -195,7 +280,6 @@ class DeepseekVLV2Processor(ProcessorMixin):
             max_req_input_len=max_req_input_len,
         )
 
-        image_index = image_token_cnt
         tokenized_data += tokenized_str
         if self.mask_prompt:
             masked_tokenized_data += [self.ignore_id] * len(tokenized_str)
@@ -207,7 +291,7 @@ class DeepseekVLV2Processor(ProcessorMixin):
 
         assert len(tokenized_data) == len(
             images_seq_mask
-        ), f"format_messages_v2: tokenized_str's length {len(tokenized_str)} is not equal to imags_seq_mask's length {len(images_seq_mask)}"
+        ), f"format_messages_v2: tokenized_str len {len(tokenized_str)} != images_seq_mask len {len(images_seq_mask)}"
 
         return (
             tokenized_data,
@@ -278,13 +362,28 @@ class DeepseekVLV2Processor(ProcessorMixin):
             prompt is None or conversations is None
         ), "prompt and conversations cannot be used at the same time."
 
+        # Make sure images is always a list
+        messages = self._to_prompt_str(prompt, conversations, system_prompt)
+
+        if images is None:
+            images = []
+        if images:
+            token_cnt = messages.count(self.image_token)
+            if token_cnt < len(images):
+                missing = len(images) - token_cnt
+                inject = (self.image_token + "\n") * missing
+                if self.sft_format == "deepseek" and "<|User|>" in messages:
+                    messages = messages.replace("<|User|>", "<|User|>" + inject, 1)
+                else:
+                    messages = inject + messages
+
         (
             tokenized_str,
             masked_tokenized_str,
             images_list,
             images_seq_mask,
             images_spatial_crop,
-        ) = self.format_messages_v2(conversations, images, max_req_input_len)
+        ) = self.format_messages_v2(messages, images, max_req_input_len)
 
         assert (
             len(tokenized_str) == len(images_seq_mask) == len(masked_tokenized_str)

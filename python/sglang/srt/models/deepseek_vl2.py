@@ -9,6 +9,7 @@ from sglang.srt.configs.deepseekvl2 import (
     DeepseekVL2Config,
     DeepseekVL2MlpProjectorConfig,
 )
+from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
@@ -163,7 +164,8 @@ class DeepseekVL2ForCausalLM(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
     ):
         super().__init__()
-
+        self.pp_group = get_pp_group()
+        self.config = config
         # ----------- vision encoder ------------
         vision_config = config.vision_config
         self.vision = self._init_vision_module(vision_config, quant_config)
