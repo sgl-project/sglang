@@ -151,12 +151,14 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
                 "All MoE projections need to have same "
                 "quantization scheme but found multiple"
             )
-        
+
         use_triton_kernels = get_moe_runner_backend().is_triton_kernels()
         use_flashinfer_trtllm_moe = get_moe_runner_backend().is_flashinfer_trtllm()
         if scheme_dict is None:  # ignored layer
-            return UnquantizedFusedMoEMethod(use_triton_kernels, use_flashinfer_trtllm_moe)
-        
+            return UnquantizedFusedMoEMethod(
+                use_triton_kernels, use_flashinfer_trtllm_moe
+            )
+
         weight_quant = scheme_dict.get("weights")
         input_quant = scheme_dict.get("input_activations")
 
