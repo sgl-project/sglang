@@ -33,13 +33,13 @@ ${PIP_INSTALL} memfabric-hybrid==1.0.5
 PYTORCH_VERSION="2.8.0"
 TORCHVISION_VERSION="0.23.0"
 ${PIP_INSTALL} torch==${PYTORCH_VERSION} torchvision==${TORCHVISION_VERSION} --index-url https://download.pytorch.org/whl/cpu
-PTA_URL="https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/sglang/torch_npu/torch_npu-2.8.0.post2.dev20251224-cp311-cp311-manylinux_2_28_aarch64.whl"
+PTA_URL="https://gitcode.com/Ascend/pytorch/releases/download/v7.3.0-pytorch2.8.0/torch_npu-2.8.0.post2-cp311-cp311-manylinux_2_28_aarch64.whl"
 ${PIP_INSTALL} ${PTA_URL}
 
 
 ### Install Triton-Ascend
 TRITON_ASCEND_URL="https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/sglang/triton_ascend/triton_ascend-3.2.0.dev2025112116-cp311-cp311-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl"
-${PIP_INSTALL} ${TRITON_ASCEND_URL}
+${PIP_INSTALL} triton-ascend
 
 
 ### Install sgl-kernel-npu
