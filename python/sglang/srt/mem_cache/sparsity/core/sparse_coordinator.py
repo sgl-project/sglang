@@ -451,6 +451,11 @@ class SparseCoordinator:
         )
         return result
 
+    def _compute_sparse_mask(self, req_pool_indices):
+        mask = self.states.hierarchical_sparse_enabled[req_pool_indices]
+        mask = mask & self.states.repr_constructed[req_pool_indices]
+        return mask
+
     def _maybe_truncate_kv_cache_after_prompt_offloaded(
         self, req: "Req", req_to_token_pool, tree_cache
     ):
