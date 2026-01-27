@@ -17,15 +17,18 @@ from sglang.multimodal_gen.runtime.loader.image_encoder_loader import ImageEncod
 from sglang.multimodal_gen.runtime.loader.scheduler_loader import SchedulerLoader
 from sglang.multimodal_gen.runtime.loader.text_encoder_loader import TextEncoderLoader
 from sglang.multimodal_gen.runtime.loader.transformer_loader import TransformerLoader
-from sglang.multimodal_gen.runtime.loader.utils import get_memory_usage_of_component, _normalize_module_type
+from sglang.multimodal_gen.runtime.loader.utils import (
+    _normalize_module_type,
+    get_memory_usage_of_component,
+)
 from sglang.multimodal_gen.runtime.loader.vae_loader import VAELoader
-from sglang.multimodal_gen.runtime.loader.vl_encoder_loader import VisionLanguageEncoderLoader
+from sglang.multimodal_gen.runtime.loader.vl_encoder_loader import (
+    VisionLanguageEncoderLoader,
+)
 from sglang.multimodal_gen.runtime.loader.vocoder_loader import VocoderLoader
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
-    get_hf_config,
-)
+from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import get_hf_config
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)

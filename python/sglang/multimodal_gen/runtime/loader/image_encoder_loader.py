@@ -9,6 +9,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
+
 class ImageEncoderLoader(TextEncoderLoader):
     def should_offload(self, server_args, model_config: ModelConfig | None = None):
         should_offload = server_args.image_encoder_cpu_offload

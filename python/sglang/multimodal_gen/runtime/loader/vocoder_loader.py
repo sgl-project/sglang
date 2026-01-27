@@ -1,14 +1,22 @@
+from safetensors.torch import load_file as safetensors_load_file
+
 from sglang.multimodal_gen.configs.models import ModelConfig
 from sglang.multimodal_gen.runtime.loader.component_loader import ComponentLoader
-from sglang.multimodal_gen.runtime.loader.utils import set_default_torch_dtype, skip_init_modules, \
-    _list_safetensors_files
+from sglang.multimodal_gen.runtime.loader.utils import (
+    _list_safetensors_files,
+    set_default_torch_dtype,
+    skip_init_modules,
+)
 from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import get_diffusers_component_config
+from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
+    get_diffusers_component_config,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
-from safetensors.torch import load_file as safetensors_load_file
+
 logger = init_logger(__name__)
+
 
 class VocoderLoader(ComponentLoader):
     def should_offload(
@@ -73,4 +81,3 @@ class VocoderLoader(ComponentLoader):
                 len(unexpected_keys),
             )
         return vocoder.eval()
-

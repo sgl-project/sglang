@@ -107,7 +107,6 @@ def hf_to_custom_state_dict(
     return custom_param_sd, reverse_param_names_mapping
 
 
-
 class skip_init_modules:
     def __enter__(self):
         # Save originals
@@ -132,11 +131,11 @@ def _normalize_module_type(module_type: str) -> str:
 def _clean_hf_config_inplace(model_config: dict) -> None:
     """Remove common extraneous HF fields if present."""
     for key in (
-            "_name_or_path",
-            "transformers_version",
-            "model_type",
-            "tokenizer_class",
-            "torch_dtype",
+        "_name_or_path",
+        "transformers_version",
+        "model_type",
+        "tokenizer_class",
+        "torch_dtype",
     ):
         model_config.pop(key, None)
 
@@ -164,4 +163,3 @@ def get_memory_usage_of_component(module) -> float | None:
         usage = total_size_bytes / (1024**3)
 
     return round(usage, 2)
-
