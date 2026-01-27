@@ -234,10 +234,10 @@ class BaseMultimodalProcessor(ABC):
         return self.hf_config.vision_config.spatial_merge_size
 
     def build_input_ids(
-        self, prompt, img_grid_thw=None, video_grid_thw=None, audio_feature_lens=None
+        self, prompt, img_grid_thw=None, video_grid_thw=None, audio_seq_lens=None
     ):
         """
-        Use prompt, img_grid_thw, video_grid_thw, and audio_feature_lens to build input_ids.
+        Use prompt, img_grid_thw, video_grid_thw, and audio_seq_lens to build input_ids.
         Supports image, video, and audio tokens.
         """
         if not isinstance(prompt, list):
@@ -281,8 +281,7 @@ class BaseMultimodalProcessor(ABC):
                 mm_token_id = video_token_id
                 video_idx += 1
             elif modality == Modality.AUDIO:
-                logger.info(f"audio_feature_lens: {audio_feature_lens}")
-                mm_token_num = int(audio_feature_lens[audio_idx].item())
+                mm_token_num = int(audio_seq_lens[audio_idx].item())
                 mm_token_id = audio_token_id
                 audio_idx += 1
             else:
@@ -308,9 +307,9 @@ class BaseMultimodalProcessor(ABC):
 
         input_ids, offsets, modality_list = self.build_input_ids(
             prompt,
-            img_grid_thw,
-            video_grid_thw,
-            audio_feature_lens,
+            image_grid_thw=img_grid_thw,
+            video_grid_thw=video_grid_thw,
+            audio_seq_lens=audio_feature_lens,
         )
         assert all(isinstance(modality, Modality) for modality in modality_list)
 

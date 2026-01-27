@@ -45,7 +45,7 @@ class Qwen2AudioMultimodalProcessor(BaseMultimodalProcessor):
 
         input_ids, offsets, modality_list = self.build_input_ids(
             prompt,
-            audio_feature_lens=output_lengths,
+            audio_seq_lens=output_lengths,
         )
 
         mm_items = []

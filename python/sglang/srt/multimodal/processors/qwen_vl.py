@@ -261,10 +261,105 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             audio_token_id=self.audio_token_id,
         ).build(_processor)
 
+    def build_input_ids_with_timestamps(
+        self, prompt, embeddings, img_grid_thw, video_grid_thw, video_timestamps
+    ):
+        """
+        Build input_ids with timestamps for qwen3_vl models.
+        """
+        if not isinstance(prompt, list):
+            prompt = self._processor.tokenizer.encode(prompt)
+
+        img_token_id = getattr(self, "IM_TOKEN_ID", None)
+        video_token_id = getattr(self, "VIDEO_TOKEN_ID", None)
+        audio_token_id = getattr(self, "audio_token_id", None)
+        spatial_merge_size = getattr(self, "spatial_merge_size", 1)
+        vision_start_token_id = getattr(self, "vision_start_token_id", None)
+        vision_end_token_id = getattr(self, "vision_end_token_id", None)
+
+        input_ids = []
+        offsets = []
+        modality_list = []
+        cur_idx = 0
+
+        vision_start_indices = []
+        for i in range(len(prompt) - 1):
+            if img_token_id is not None and prompt[i + 1] == img_token_id:
+                vision_start_indices.append((i, Modality.IMAGE))
+            elif video_token_id is not None and prompt[i + 1] == video_token_id:
+                vision_start_indices.append((i, Modality.VIDEO))
+
+        img_idx = 0
+        video_idx = 0
+        model_type = getattr(self, "model_type", None)
+        for mm_start_idx, modality in vision_start_indices:
+            modality_list.append(modality)
+            video_tokens = None
+            if modality == Modality.IMAGE:
+                mm_token_num = img_grid_thw[img_idx].prod() // (spatial_merge_size**2)
+                mm_token_id = img_token_id
+                img_idx += 1
+            elif modality == Modality.VIDEO:
+                curr_timestamps = video_timestamps[video_idx]
+                num_frames = video_grid_thw[video_idx][0]
+                frame_seqlen = video_grid_thw[video_idx][1:].prod().item() // (
+                    spatial_merge_size**2
+                )
+                video_tokens = []
+                _current_offset = len(input_ids) + mm_start_idx + 1 - cur_idx
+                # take single frame as one mm_item
+                for frame_idx in range(num_frames):
+                    if frame_idx > 0:
+                        modality_list.append(Modality.VIDEO)
+                    curr_time = curr_timestamps[frame_idx]
+                    timestamp_text = f"<{curr_time:.1f} seconds>"
+                    timestamp_tokens = self._processor.tokenizer.encode(
+                        timestamp_text, add_special_tokens=False
+                    )
+                    video_tokens.extend(timestamp_tokens)
+                    _current_offset += len(timestamp_tokens)
+                    if vision_start_token_id is not None:
+                        video_tokens.append(vision_start_token_id)
+                        _current_offset += 1
+                    video_tokens.extend([video_token_id] * frame_seqlen)
+                    if vision_end_token_id is not None:
+                        video_tokens.append(vision_end_token_id)
+                    offsets.append(
+                        (_current_offset, _current_offset + frame_seqlen - 1)
+                    )
+                    _current_offset += (
+                        frame_seqlen + 1
+                        if vision_end_token_id is not None
+                        else frame_seqlen
+                    )  # for vision_end_token_id
+                mm_token_num = len(video_tokens)
+                mm_token_id = None
+                video_idx += 1
+            else:
+                logger.warning(
+                    f"{modality} modality is not supported for qwen3_vl models with timestamps."
+                )
+                continue
+            assert cur_idx <= mm_start_idx
+            input_ids.extend(prompt[cur_idx : mm_start_idx + 1])
+            if modality == Modality.VIDEO:
+                input_ids.extend(video_tokens)
+            else:
+                mm_offset_start = len(input_ids)
+                input_ids.extend([mm_token_id] * mm_token_num)
+                offsets.append((mm_offset_start, len(input_ids) - 1))
+            cur_idx = mm_start_idx + 2  # jump to vision_end_id
+        else:
+            input_ids.extend(prompt[cur_idx:])
+
+        return input_ids, offsets, modality_list
+
     def get_mm_data(self, prompt, embeddings, **kwargs):
         img_grid_thw = kwargs.get("img_grid_thw", None)
         video_grid_thw = kwargs.get("video_grid_thw", None)
         audio_feature_lens = kwargs.get("audio_feature_lens", None)
+        video_timestamps = kwargs.get("video_timestamps", None)
+        second_per_grid_ts = kwargs.get("second_per_grid_ts", None)
 
         audio_seq_lens = None
         if audio_feature_lens is not None:
@@ -277,9 +372,17 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
                 + (audio_feature_lens // 100) * 13
             )
 
-        input_ids, offsets, modality_list = self.build_input_ids(
-            prompt, img_grid_thw, video_grid_thw, audio_seq_lens
-        )
+        if (
+            self.model_type in ["qwen3_vl", "qwen3_vl_moe"]
+            and video_timestamps is not None
+        ):
+            input_ids, offsets, modality_list = self.build_input_ids_with_timestamps(
+                prompt, embeddings, img_grid_thw, video_grid_thw, video_timestamps
+            )
+        else:
+            input_ids, offsets, modality_list = self.build_input_ids(
+                prompt, img_grid_thw, video_grid_thw, audio_seq_lens=audio_seq_lens
+            )
         assert all(isinstance(modality, Modality) for modality in modality_list)
 
         mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index(
@@ -291,7 +394,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             input_ids=torch.tensor(input_ids, dtype=torch.long).unsqueeze(0),
             image_grid_thw=img_grid_thw,
             video_grid_thw=video_grid_thw,
-            second_per_grid_ts=None,
+            second_per_grid_ts=second_per_grid_ts,
             use_audio_in_video=False,
             audio_seq_lens=(
                 audio_feature_lens if self.model_type == "qwen3_omni_moe" else None

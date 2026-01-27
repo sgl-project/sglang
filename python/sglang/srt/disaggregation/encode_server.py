@@ -474,6 +474,24 @@ class MMEncoder:
         """
         return await self._flatten_and_load_data_by_modality(mm_items, Modality.IMAGE)
 
+    def _calculate_timestamps(self, indices, video_fps: float, merge_size: int = 2):
+        """Calculate timestamps for video frames, used for qwen3_vl models."""
+        # refer to https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_vl/processing_qwen3_vl.py#L255
+        if not isinstance(indices, list):
+            indices = indices.tolist()
+        if len(indices) % merge_size != 0:
+            indices.extend(
+                indices[-1] for _ in range(merge_size - len(indices) % merge_size)
+            )
+        timestamps = [idx / video_fps for idx in indices]
+        # Frames are merged by merge_size, so we need to average the timestamps
+        # between the first/last frame within the temporal patch
+        timestamps = [
+            (timestamps[i] + timestamps[i + merge_size - 1]) / 2
+            for i in range(0, len(timestamps), merge_size)
+        ]
+        return timestamps
+
     async def _process_mm_items(self, mm_items, modality):
         if modality == Modality.IMAGE and self.image_processor:
             images = await self._flatten_and_load_images(mm_items)
@@ -491,6 +509,49 @@ class MMEncoder:
             processor_input = self.video_processor(
                 videos=videos, **video_processor_kwargs
             )
+            # Get additional video metadata
+            if (
+                self.model_type in ["qwen3_vl", "qwen3_vl_moe"]
+                and video_processor_kwargs.get("video_metadata", None) is not None
+            ):
+                # For qwen3-vl models, we need to store the video timestamps
+                video_metadata = video_processor_kwargs["video_metadata"]
+                try:
+                    merge_size = (
+                        self.model_config.hf_config.vision_config.spatial_merge_size
+                    )
+                except (AttributeError, KeyError):
+                    merge_size = 2  # Default merge_size
+
+                video_timestamps = []
+                for metadata in video_metadata:
+                    video_fps = metadata.get("fps", None) or 24  # original video fps
+                    frames_indices = metadata.get("frames_indices", None)
+                    timestamps = self._calculate_timestamps(
+                        frames_indices, video_fps, merge_size
+                    )
+                    video_timestamps.append(timestamps)
+                processor_input["video_timestamps"] = video_timestamps
+            elif (
+                self.model_type in ["qwen2_5_vl", "qwen2_5_omni", "qwen3_omni_moe"]
+                and processor_input.get("video_grid_thw", None) is not None
+            ):
+                # For omni/qwen2_5_vl models, calculate second_per_grid_ts for rotary embedding
+                video_grid_thw = processor_input["video_grid_thw"]
+                try:
+                    temporal_patch_size = self.video_processor.temporal_patch_size
+                except AttributeError:
+                    temporal_patch_size = 2  # Default temporal_patch_size
+                # get sampled fps, default: 2
+                fps_list = [
+                    self.vision_config.get("video", {}).get("fps", None) or 2
+                ] * len(video_grid_thw)
+                second_per_grid_ts = [(temporal_patch_size / fps) for fps in fps_list]
+                second_per_grid_ts_tensor = torch.tensor(
+                    second_per_grid_ts, dtype=torch.float32
+                )
+                processor_input["second_per_grid_ts"] = second_per_grid_ts_tensor
+
             feature = processor_input["pixel_values_videos"]
             if hasattr(self.model, "thinker"):  # for omni models
                 get_feature_method = self.model.thinker.get_video_feature
@@ -566,7 +627,12 @@ class MMEncoder:
             if self.profiler is not None:
                 self.profiler.step()
 
-            return _get_vision_grid_dim(mm_inputs, modality), mm_embedding
+            aux_data = {
+                "video_timestamps": mm_inputs.get("video_timestamps", None),
+                "second_per_grid_ts": mm_inputs.get("second_per_grid_ts", None),
+            }
+
+            return _get_vision_grid_dim(mm_inputs, modality), mm_embedding, aux_data
         except BadRequestError as e:
             raise BadRequestError(f"Bad request error: {str(e)}")
         except Exception as e:
@@ -620,11 +686,17 @@ class MMEncoder:
 
     async def encode(self, mm_items, modality: Modality, req_id, num_parts, part_idx):
         try:
-            grid_dim, mm_embedding = await self._encode(mm_items, modality)
+            grid_dim, mm_embedding, aux_data = await self._encode(mm_items, modality)
 
             if self.rank == 0:
                 mm_data = EmbeddingData(
-                    req_id, num_parts, part_idx, grid_dim, modality, mm_embedding
+                    req_id,
+                    num_parts,
+                    part_idx,
+                    grid_dim,
+                    modality,
+                    mm_embedding,
+                    **aux_data,
                 )
                 self.embedding_to_send[req_id] = mm_data
             return (
