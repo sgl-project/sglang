@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, List, Optional
@@ -58,7 +60,7 @@ class ForwardContext:
         self.quant_config = None
         self.moe_layers = None
 
-    def set_forward_batch(self, forward_batch: "ForwardBatch"):
+    def set_forward_batch(self, forward_batch: ForwardBatch):
         self.forward_batch = forward_batch
 
     def set_attention_layers(self, layers: List[Any]):
@@ -82,7 +84,7 @@ def get_forward_context() -> Optional[ForwardContext]:
 
 @contextmanager
 def set_forward_context(
-    forward_batch: "ForwardBatch",
+    forward_batch: ForwardBatch,
     attention_layers: List[Any],
     quant_config: Any,
     moe_layers: List[Any],
