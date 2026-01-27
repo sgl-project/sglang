@@ -16,7 +16,6 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
-from sglang.srt.environ import envs
 from sglang.srt.managers.mm_utils import MultimodalDataItem
 
 logger = logging.getLogger(__name__)
@@ -47,41 +46,6 @@ class AllPackPolicy(MMPackPolicy):
                 )
             ]
         ]
-
-
-class FixedMMNumPackPolicy(MMPackPolicy):
-    """Pack images/videos into groups of fixed size."""
-
-    @classmethod
-    def get_mm_pack_result(cls, pixel_values, grid_thw_list, modality):
-        mm_num = envs.SGLANG_MM_SCHEDULE_PACK_NUM.get()
-        all_num = len(grid_thw_list)
-
-        patches_per_image = [math.prod(grid_thw) for grid_thw in grid_thw_list]
-        cum_patches = [0] + list(itertools.accumulate(patches_per_image))
-
-        embedding_items_list = []
-
-        for i in range(0, all_num, mm_num):
-            end_idx = min(i + mm_num, all_num)
-            start_patch = cum_patches[i]
-            end_patch = cum_patches[end_idx]
-            group_pixel_values = pixel_values[start_patch:end_patch]
-            group_grid_thw = grid_thw_list[i:end_idx]
-
-            embedding_items_list.append(
-                [
-                    MultimodalDataItem(
-                        modality=modality,
-                        feature=group_pixel_values,
-                        model_specific_data={
-                            "image_grid_thw": torch.tensor(group_grid_thw)
-                        },
-                    )
-                ]
-            )
-
-        return embedding_items_list
 
 
 class ProfilePackPolicy(MMPackPolicy):
@@ -129,7 +93,6 @@ class DefaultPackPolicy(MMPackPolicy):
 # Map mm pack policy names to policy classes
 MM_PACK_POLICY_MAP = {
     "all": AllPackPolicy,
-    "fixed_mm_num": FixedMMNumPackPolicy,
     "profile": ProfilePackPolicy,
     "default": DefaultPackPolicy,
 }
