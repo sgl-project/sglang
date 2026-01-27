@@ -25,7 +25,7 @@ def _fused_scale_shift_4d_kernel(
     normalized_ptr,
     scale_ptr,
     shift_ptr,
-    scale_constant,
+    scale_constant: tl.constexpr,  # scale_constant is either 0 or 1.
     rows,
     inner_dim,
     seq_len,
@@ -68,7 +68,7 @@ def fuse_scale_shift_kernel_blc_opt(
     x_ptr,
     shift_ptr,
     scale_ptr,
-    scale_constant,
+    scale_constant: tl.constexpr,  # scale_constant is either 0 or 1.,
     y_ptr,
     B,
     L,
