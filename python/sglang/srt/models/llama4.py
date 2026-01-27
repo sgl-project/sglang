@@ -118,7 +118,9 @@ class Llama4MoE(nn.Module):
             hidden_size=config.hidden_size,
             intermediate_size=intermediate_size_moe,
             layer_id=layer_id,
-            top_k=self.top_k,
+            top_k=(
+                None if not _is_npu else self.top_k
+            ),  # The top_k parameter is used in NPU scenarios
             reduce_results=False,
             quant_config=quant_config,
             apply_router_weight_on_input=True,
