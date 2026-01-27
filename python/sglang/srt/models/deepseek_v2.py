@@ -149,7 +149,9 @@ from sglang.srt.utils import (
     LazyValue,
     add_prefix,
     get_bool_env_var,
+    get_layer_id_within_pp_stage,
     is_non_idle_and_non_empty,
+    is_pp_last_layer,
     log_info_on_rank0,
     make_layers,
     use_intel_amx_backend,
@@ -2256,9 +2258,19 @@ class DeepseekV2DecoderLayer(nn.Module):
         is_previous_layer_sparse = self._is_layer_sparse(layer_id - 1, is_nextn=False)
         is_next_layer_sparse = self._is_layer_sparse(layer_id + 1, is_nextn=False)
 
+        # Use PP-aware layer_id and num_layers for LayerScatterModes computation
+        # This ensures PP boundary layers have correct layer_output_mode (TP_ATTN_FULL)
+        pp_group = get_pp_group()
+        relative_layer_id, num_layers_in_stage = get_layer_id_within_pp_stage(
+            layer_id,
+            config.num_hidden_layers,
+            pp_group.rank_in_group,
+            pp_group.world_size,
+        )
+
         self.layer_scatter_modes = LayerScatterModes.init_new(
-            layer_id=layer_id,
-            num_layers=1 if is_nextn else config.num_hidden_layers,
+            layer_id=relative_layer_id,
+            num_layers=1 if is_nextn else num_layers_in_stage,
             is_layer_sparse=self.is_layer_sparse,
             is_previous_layer_sparse=is_previous_layer_sparse,
             is_next_layer_sparse=is_next_layer_sparse,
@@ -2293,15 +2305,21 @@ class DeepseekV2DecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
+        # Use PP-aware is_last_layer to ensure correct layer_output_mode at PP boundaries
+        pp_is_last_layer = is_nextn or is_pp_last_layer(
+            self.layer_id,
+            self.config.num_hidden_layers,
+            pp_group.rank_in_group,
+            pp_group.world_size,
+        )
+
         if self.nsa_enable_prefill_cp:
             self.layer_communicator = NSACPLayerCommunicator(
                 layer_scatter_modes=self.layer_scatter_modes,
                 input_layernorm=self.input_layernorm,
                 post_attention_layernorm=self.post_attention_layernorm,
                 allow_reduce_scatter=True,
-                is_last_layer=(
-                    is_nextn or (self.layer_id == self.config.num_hidden_layers - 1)
-                ),
+                is_last_layer=pp_is_last_layer,
                 qkv_latent_func=self.self_attn.prepare_qkv_latent,
             )
         else:
@@ -2310,9 +2328,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 input_layernorm=self.input_layernorm,
                 post_attention_layernorm=self.post_attention_layernorm,
                 allow_reduce_scatter=True,
-                is_last_layer=(
-                    is_nextn or (self.layer_id == self.config.num_hidden_layers - 1)
-                ),
+                is_last_layer=pp_is_last_layer,
                 qkv_latent_func=self.self_attn.prepare_qkv_latent,
             )
 
