@@ -13,7 +13,7 @@ from sglang.multimodal_gen.configs.models.bridges.mova_dual_tower import (
     MOVADualTowerConfig,
 )
 from sglang.multimodal_gen.runtime.distributed import get_tp_world_size
-from sglang.multimodal_gen.runtime.layers.attention import LocalAttention
+from sglang.multimodal_gen.runtime.layers.attention import USPAttention
 from sglang.multimodal_gen.runtime.layers.layernorm import (
     RMSNorm,
     tensor_parallel_rms_norm,
@@ -204,9 +204,7 @@ class ConditionalCrossAttention(nn.Module):
     Cross-modal attention for dual-tower bridge with Tensor Parallel support.
 
     This module handles attention between video and audio hidden states,
-    which have different sequence lengths. Uses LocalAttention because:
-    - Cross-modal attention doesn't benefit from SP (different modalities)
-    - The condition hidden states are replicated across all SP ranks
+    which have different sequence lengths.
     """
 
     def __init__(self, dim: int, kv_dim: int, num_heads: int, eps: float = 1e-6):
@@ -231,8 +229,7 @@ class ConditionalCrossAttention(nn.Module):
         self.norm_q = RMSNorm(dim, eps=eps)
         self.norm_k = RMSNorm(dim, eps=eps)
 
-        # Use LocalAttention for cross-modal attention (no SP communication needed)
-        self.attn = LocalAttention(
+        self.attn = USPAttention(
             num_heads=self.num_heads_per_rank,
             head_size=self.head_dim,
             causal=False,

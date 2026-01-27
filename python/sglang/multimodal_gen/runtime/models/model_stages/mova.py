@@ -800,19 +800,25 @@ class MOVADenoisingStage(PipelineStage):
 
         # Build RoPE frequencies for cross-attention if needed (only used when SP == 1)
         # When SP > 1, we rebuild freqs inside the loop after gathering full sequences
-        if getattr(self.dual_tower_bridge, "apply_cross_rope", False) and sp_size == 1:
-            visual_rope_cos_sin, audio_rope_cos_sin = (
-                self.dual_tower_bridge.build_aligned_freqs(
-                    video_fps=video_fps,
-                    grid_size=grid_size,
-                    audio_steps=full_audio_seq_len,
-                    device=visual_x.device,
-                    dtype=visual_x.dtype,
-                )
+        visual_rope_cos_sin, audio_rope_cos_sin = (
+            self.dual_tower_bridge.build_aligned_freqs(
+                video_fps=video_fps,
+                grid_size=grid_size,
+                audio_steps=full_audio_seq_len,
+                device=visual_x.device,
+                dtype=visual_x.dtype,
             )
-        else:
-            visual_rope_cos_sin = None
-            audio_rope_cos_sin = None
+        )
+        if visual_rope_cos_sin is not None:
+            visual_rope_cos_sin = [
+                self._shard_sequence_for_sp(rope_cos_sin, dim=1)[0]
+                for rope_cos_sin in visual_rope_cos_sin
+            ]
+        if audio_rope_cos_sin is not None:
+            audio_rope_cos_sin = [
+                self._shard_sequence_for_sp(rope_cos_sin, dim=1)[0]
+                for rope_cos_sin in audio_rope_cos_sin
+            ]
 
         for layer_idx in range(min_layers):
             visual_block = visual_dit.blocks[layer_idx]
@@ -822,58 +828,17 @@ class MOVADenoisingStage(PipelineStage):
             # Bridge operations (PerFrameAttentionPooling, RoPE) expect full sequences
             # When SP is enabled, we need to gather before bridge and shard after
             if self.dual_tower_bridge.should_interact(layer_idx, "a2v"):
-                if sp_size > 1:
-                    # Gather sequences for bridge operations
-                    visual_x_full = sequence_model_parallel_all_gather(visual_x, dim=1)
-                    audio_x_full = sequence_model_parallel_all_gather(audio_x, dim=1)
-                    # Remove padding if any (use full_*_seq_len to trim)
-                    visual_x_full = visual_x_full[:, :full_visual_seq_len, :]
-                    audio_x_full = audio_x_full[:, :full_audio_seq_len, :]
-
-                    # Call bridge on full sequences (use full freqs, not sharded)
-                    if getattr(self.dual_tower_bridge, "apply_cross_rope", False):
-                        # Rebuild full freqs for bridge
-                        visual_rope_full, audio_rope_full = (
-                            self.dual_tower_bridge.build_aligned_freqs(
-                                video_fps=video_fps,
-                                grid_size=grid_size,
-                                audio_steps=full_audio_seq_len,
-                                device=visual_x.device,
-                                dtype=visual_x.dtype,
-                            )
-                        )
-                    else:
-                        visual_rope_full = None
-                        audio_rope_full = None
-
-                    visual_x_full, audio_x_full = self.dual_tower_bridge(
-                        layer_idx,
-                        visual_x_full,
-                        audio_x_full,
-                        x_freqs=visual_rope_full,
-                        y_freqs=audio_rope_full,
-                        a2v_condition_scale=a2v_condition_scale,
-                        v2a_condition_scale=v2a_condition_scale,
-                        condition_scale=condition_scale,
-                        video_grid_size=grid_size,
-                    )
-
-                    # Shard back for DiT blocks
-                    visual_x, _ = self._shard_sequence_for_sp(visual_x_full, dim=1)
-                    audio_x, _ = self._shard_sequence_for_sp(audio_x_full, dim=1)
-                else:
-                    # No SP, call bridge directly
-                    visual_x, audio_x = self.dual_tower_bridge(
-                        layer_idx,
-                        visual_x,
-                        audio_x,
-                        x_freqs=visual_rope_cos_sin,
-                        y_freqs=audio_rope_cos_sin,
-                        a2v_condition_scale=a2v_condition_scale,
-                        v2a_condition_scale=v2a_condition_scale,
-                        condition_scale=condition_scale,
-                        video_grid_size=grid_size,
-                    )
+                visual_x, audio_x = self.dual_tower_bridge(
+                    layer_idx,
+                    visual_x,
+                    audio_x,
+                    x_freqs=visual_rope_cos_sin,
+                    y_freqs=audio_rope_cos_sin,
+                    a2v_condition_scale=a2v_condition_scale,
+                    v2a_condition_scale=v2a_condition_scale,
+                    condition_scale=condition_scale,
+                    video_grid_size=grid_size,
+                )
 
             # Self-attention and FFN in DiT blocks
             visual_x = visual_block(

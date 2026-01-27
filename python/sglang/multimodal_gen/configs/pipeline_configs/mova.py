@@ -97,6 +97,7 @@ class MOVAPipelineConfig(PipelineConfig):
             size=(target_height, target_width),
             mode="bilinear",
             align_corners=False,
+            antialias=True,
         )
         return image
 
