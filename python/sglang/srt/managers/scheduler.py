@@ -551,6 +551,7 @@ class Scheduler(
             self.max_req_input_len,
             self.random_seed,
             self.device,
+            self.forward_stream,
             _,
             _,
             _,
@@ -606,6 +607,7 @@ class Scheduler(
             or self.tp_worker.model_runner.mamba2_config is not None
         )
 
+        self.sliding_window_size = None
         if self.is_hybrid_swa:
             self.sliding_window_size = self.tp_worker.sliding_window_size
             self.full_tokens_per_layer, self.swa_tokens_per_layer = (
@@ -635,6 +637,7 @@ class Scheduler(
             pp_rank=self.pp_rank,
             pp_size=self.pp_size,
             chunked_prefill_size=server_args.chunked_prefill_size,
+            sliding_window_size=self.sliding_window_size,
         )
 
         if (
@@ -648,9 +651,7 @@ class Scheduler(
             else:
                 from sglang.srt.mem_cache.chunk_cache import SWAChunkCache
 
-                self.tree_cache = SWAChunkCache(
-                    params, sliding_window_size=self.sliding_window_size
-                )
+                self.tree_cache = SWAChunkCache(params)
         else:
 
             if envs.SGLANG_EXPERIMENTAL_CPP_RADIX_TREE.get():
@@ -669,9 +670,7 @@ class Scheduler(
             elif self.is_hybrid_swa:
                 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 
-                self.tree_cache = SWARadixCache(
-                    params=params, sliding_window_size=self.sliding_window_size
-                )
+                self.tree_cache = SWARadixCache(params=params)
             elif self.is_hybrid_ssm:
                 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 
@@ -704,18 +703,6 @@ class Scheduler(
             )
         else:
             self.decode_offload_manager = None
-
-        self.decode_mem_cache_buf_multiplier = (
-            1
-            if self.spec_algorithm.is_none()
-            else (
-                server_args.speculative_num_draft_tokens
-                + (
-                    (server_args.speculative_eagle_topk or 1)
-                    * (server_args.speculative_num_steps or 1)
-                )
-            )
-        )
 
         embedding_cache_size = envs.SGLANG_VLM_CACHE_SIZE_MB.get()
         init_mm_embedding_cache(embedding_cache_size * 1024 * 1024)
@@ -778,7 +765,7 @@ class Scheduler(
             self.prefill_delayer = PrefillDelayer(
                 dp_size=self.dp_size,
                 attn_tp_size=self.attn_tp_size,
-                cpu_group=self.tp_worker.get_tp_group().cpu_group,
+                cpu_group=self.tp_cpu_group,
                 server_args=self.server_args,
                 metrics_collector=(
                     self.metrics_collector if self.enable_metrics else None
@@ -961,9 +948,10 @@ class Scheduler(
             self.mm_receiver = MMReceiver(
                 self.server_args,
                 hf_config=self.model_config.hf_config,
-                tp_rank=self.tp_rank,
                 pp_rank=self.pp_rank,
+                tp_rank=self.tp_rank,
                 tp_group=self.tp_group,
+                scheduler=self,
             )
 
     def init_overlap(self):
@@ -972,7 +960,6 @@ class Scheduler(
         if self.device == "cpu":
             self.default_stream.synchronize = lambda: None  # No-op for CPU
 
-        self.forward_stream: CudaStream = self.device_module.Stream()
         self.forward_stream_ctx: CudaStreamContext = self.device_module.stream(
             self.forward_stream
         )
@@ -1262,7 +1249,16 @@ class Scheduler(
             and self.server_args.language_only
             and self.server_args.encoder_transfer_backend == "zmq_to_scheduler"
         ):
-            recv_reqs = self.mm_receiver.process_waiting_requests(recv_reqs)
+            recv_reqs, abort_reqs = self.mm_receiver.process_waiting_requests(recv_reqs)
+            for req, error_msg, error_code in abort_reqs:
+
+                status_code = (
+                    HTTPStatus.BAD_REQUEST
+                    if error_code == 400
+                    else HTTPStatus.INTERNAL_SERVER_ERROR
+                )
+                prepare_abort(req, error_msg, status_code=status_code)
+                self.stream_output([req], req.return_logprob)
 
         if self.enable_trace:
             for req in recv_reqs:
@@ -1473,7 +1469,7 @@ class Scheduler(
                 if recv_req.bootstrap_room is None:
                     error_msg = (
                         f"Invalid request: Disaggregated request received without "
-                        f"boostrap room id. {req.rid=}"
+                        f"bootstrap room id. {req.rid=}"
                     )
                     logger.error(error_msg)
                     prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
@@ -2154,29 +2150,15 @@ class Scheduler(
             return batch
 
         # Check if decode out of memory
-        if (
-            kv_full_retract_flag := not batch.check_decode_mem(
-                self.decode_mem_cache_buf_multiplier
-            )
-        ) or (TEST_RETRACT and self.forward_ct % TEST_RETRACT_INTERVAL == 0):
-            if self.is_hybrid_swa:
-                old_available_tokens = min(
-                    self.token_to_kv_pool_allocator.full_available_size(),
-                    self.token_to_kv_pool_allocator.swa_available_size(),
-                )
-            else:
-                old_available_tokens = self.token_to_kv_pool_allocator.available_size()
+        if (kv_full_retract_flag := not batch.check_decode_mem()) or (
+            TEST_RETRACT and self.forward_ct % TEST_RETRACT_INTERVAL == 0
+        ):
+            old_available_tokens = self.token_to_kv_pool_allocator.available_size()
             old_ratio = self.new_token_ratio
             retracted_reqs, new_token_ratio, reqs_to_abort = batch.retract_decode(
-                self.server_args, self.decode_mem_cache_buf_multiplier
+                self.server_args
             )
-            if self.is_hybrid_swa:
-                new_available_tokens = min(
-                    self.token_to_kv_pool_allocator.full_available_size(),
-                    self.token_to_kv_pool_allocator.swa_available_size(),
-                )
-            else:
-                new_available_tokens = self.token_to_kv_pool_allocator.available_size()
+            new_available_tokens = self.token_to_kv_pool_allocator.available_size()
             new_token_gained = new_available_tokens - old_available_tokens
 
             self.num_retracted_reqs = len(retracted_reqs)
