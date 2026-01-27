@@ -46,7 +46,7 @@ import orjson
 import requests
 import uvicorn
 import uvloop
-from fastapi import Depends, FastAPI, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
@@ -93,6 +93,7 @@ from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.managers.io_struct import (
     AbortReq,
+    AttachHiCacheStorageReqInput,
     CheckWeightsReqInput,
     CloseSessionReqInput,
     ConfigureLoggingReq,
@@ -552,26 +553,20 @@ async def model_info():
         "has_audio_understanding": model_config.is_audio_understandable_model,
         "model_type": getattr(model_config.hf_config, "model_type", None),
         "architectures": getattr(model_config.hf_config, "architectures", None),
+        "weight_version": _global_state.tokenizer_manager.server_args.weight_version,
+        # "hf_config": model_config.hf_config.to_dict(),
     }
     return result
 
 
 @app.get("/get_weight_version")
-async def get_weight_version():
-    """Get the current weight version (deprecated - use /weight_version instead)."""
-    logger.warning(
-        "Endpoint '/get_weight_version' is deprecated and will be removed in a future version. "
-        "Please use '/weight_version' instead."
-    )
-    return await weight_version()
-
-
 @app.get("/weight_version")
 async def weight_version():
     """Get the current weight version."""
-    return {
-        "weight_version": _global_state.tokenizer_manager.server_args.weight_version
-    }
+    raise HTTPException(
+        status_code=404,
+        detail="Endpoint '/get_weight_version' or '/weight_version' is deprecated. Please use '/model_info' instead.",
+    )
 
 
 @app.get("/get_server_info")
@@ -661,30 +656,6 @@ async def generate_request(obj: GenerateReqInput, request: Request):
             return _create_error_response(e)
 
 
-@app.api_route("/generate_from_file", methods=["POST"])
-async def generate_from_file_request(file: UploadFile, request: Request):
-    """Handle a generate request, this is purely to work with input_embeds."""
-    content = await file.read()
-    input_embeds = orjson.loads(content.decode("utf-8"))
-
-    obj = GenerateReqInput(
-        input_embeds=input_embeds,
-        sampling_params={
-            "temperature": 0.0,
-            "max_new_tokens": 512,
-        },
-    )
-
-    try:
-        ret = await _global_state.tokenizer_manager.generate_request(
-            obj, request
-        ).__anext__()
-        return ret
-    except ValueError as e:
-        logger.error(f"Error: {e}")
-        return _create_error_response(e)
-
-
 @app.api_route("/encode", methods=["POST", "PUT"])
 async def encode_request(obj: EmbeddingReqInput, request: Request):
     """Handle an embedding request."""
@@ -723,6 +694,22 @@ async def flush_cache():
 
 @app.api_route("/clear_hicache_storage_backend", methods=["GET", "POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def clear_hicache_storage_backend_deprecated():
+    """Deprecated: use POST /hicache/storage-backend/clear."""
+    ret = await _global_state.tokenizer_manager.clear_hicache_storage()
+    return Response(
+        content=(
+            "Deprecated endpoint. Use POST /hicache/storage-backend/clear.\n"
+            "Hierarchical cache storage backend cleared.\n"
+        ),
+        status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
+    )
+
+
+# example usage:
+# curl -s -X POST http://127.0.0.1:30000/clear_hicache_storage_backend
+@app.api_route("/hicache/storage-backend/clear", methods=["POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def clear_hicache_storage_backend():
     """Clear the hierarchical cache storage backend."""
     ret = await _global_state.tokenizer_manager.clear_hicache_storage()
@@ -730,6 +717,89 @@ async def clear_hicache_storage_backend():
         content="Hierarchical cache storage backend cleared.\n",
         status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
     )
+
+
+# example usage:
+# curl -s -X PUT http://127.0.0.1:30000/hicache/storage-backend \
+#  -H 'Content-Type: application/json' \
+#   -d '{
+#     "hicache_storage_backend": "file",
+#     "hicache_storage_backend_extra_config_json": "{}",
+#     "hicache_storage_prefetch_policy": "timeout",
+#     "hicache_write_policy": "write_through"
+#   }'
+@app.api_route("/hicache/storage-backend", methods=["PUT"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def attach_hicache_storage_backend(obj: AttachHiCacheStorageReqInput):
+    """Attach (enable) HiCache storage backend at runtime.
+
+    Only allowed when there are NO running / queued requests.
+    """
+    if not _global_state.tokenizer_manager.server_args.admin_api_key:
+        return _admin_api_key_missing_response()
+
+    ret = await _global_state.tokenizer_manager.attach_hicache_storage(
+        hicache_storage_backend=obj.hicache_storage_backend,
+        hicache_storage_backend_extra_config_json=obj.hicache_storage_backend_extra_config_json,
+        hicache_storage_prefetch_policy=obj.hicache_storage_prefetch_policy,
+        hicache_write_policy=obj.hicache_write_policy,
+    )
+    msg = getattr(ret, "message", "")
+    return Response(
+        content=(
+            (
+                "HiCache storage backend attached.\n"
+                if ret.success
+                else "Failed to attach HiCache storage backend.\n"
+            )
+            + (msg + "\n" if msg else "")
+        ),
+        status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
+    )
+
+
+# example usage:
+# curl -s -X DELETE http://127.0.0.1:30000/hicache/storage-backend
+@app.api_route("/hicache/storage-backend", methods=["DELETE"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def detach_hicache_storage_backend():
+    """Detach (disable) HiCache storage backend at runtime.
+
+    Only allowed when there are NO running / queued requests.
+    """
+    if not _global_state.tokenizer_manager.server_args.admin_api_key:
+        return _admin_api_key_missing_response()
+
+    ret = await _global_state.tokenizer_manager.detach_hicache_storage()
+    msg = getattr(ret, "message", "")
+    return Response(
+        content=(
+            (
+                "HiCache storage backend detached.\n"
+                if ret.success
+                else "Failed to detach HiCache storage backend.\n"
+            )
+            + (msg + "\n" if msg else "")
+        ),
+        status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
+    )
+
+
+# example usage:
+# curl -s http://127.0.0.1:30000/hicache/storage-backend
+@app.get("/hicache/storage-backend")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def hicache_storage_backend_status():
+    """Get current HiCache storage backend status (tokenizer-side view)."""
+    if not _global_state.tokenizer_manager.server_args.admin_api_key:
+        return _admin_api_key_missing_response()
+
+    return {
+        "hicache_storage_backend": _global_state.tokenizer_manager.server_args.hicache_storage_backend,
+        "hicache_storage_backend_extra_config": _global_state.tokenizer_manager.server_args.hicache_storage_backend_extra_config,
+        "hicache_storage_prefetch_policy": _global_state.tokenizer_manager.server_args.hicache_storage_prefetch_policy,
+        "hicache_write_policy": _global_state.tokenizer_manager.server_args.hicache_write_policy,
+    }
 
 
 @app.api_route("/start_profile", methods=["GET", "POST"])
@@ -1204,7 +1274,7 @@ async def separate_reasoning_request(obj: SeparateReasoningReqInput, request: Re
     A native API endpoint to separate reasoning from a text.
     """
     # 1) Initialize the parser based on the request body
-    parser = ReasoningParser(model_type=obj.reasoning_parser)
+    parser = ReasoningParser(model_type=obj.reasoning_parser, request=request)
 
     # 2) Call the non-stream parsing method (non-stream)
     reasoning_text, normal_text = parser.parse_non_stream(obj.text)
@@ -1516,6 +1586,27 @@ async def vertex_generate(vertex_req: VertexGenerateReqInput, raw_request: Reque
 def _create_error_response(e):
     return ORJSONResponse(
         {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
+    )
+
+
+# FIXME: In theory we should configure ADMIN_FORCE for some entrypoints, but doing so
+# would currently cause all endpoints to go through add_api_key_middleware
+# (even when neither api-key nor admin-api-key is configured).
+#
+# For now, we simulate ADMIN_FORCE by explicitly checking the admin API key parameter.
+# Once the auth wiring is refactored so ADMIN_FORCE only affects the intended
+# admin endpoints, we should switch this logic to use ADMIN_FORCE directly.
+def _admin_api_key_missing_response(
+    status_code: HTTPStatus = HTTPStatus.BAD_REQUEST,
+) -> ORJSONResponse:
+    return ORJSONResponse(
+        content={
+            "error": (
+                "This endpoint requires admin API key, but this server was started "
+                "without one (admin-api-key). Restart with --admin-api-key to enable."
+            )
+        },
+        status_code=status_code,
     )
 
 
