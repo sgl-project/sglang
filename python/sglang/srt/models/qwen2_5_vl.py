@@ -41,10 +41,6 @@ from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
     Qwen2_5_VisionRotaryEmbedding,
 )
 
-from sglang.srt.distributed import (
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-)
 from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.activation import SiluAndMul
@@ -95,18 +91,13 @@ class Qwen2_5_VLMLP(nn.Module):
         use_data_parallel: bool = False,
     ):
         super().__init__()
-        self.tp_size = (
-            1 if use_data_parallel else get_tensor_model_parallel_world_size()
-        )
-        self.tp_rank = 0 if use_data_parallel else get_tensor_model_parallel_rank()
         self.gate_up_proj = MergedColumnParallelLinear(
             input_size=in_features,
             output_sizes=[hidden_features] * 2,  # [gate_proj, up_proj]
             bias=bias,
             quant_config=quant_config,
             prefix=add_prefix("gate_up_proj", prefix),
-            tp_size=self.tp_size,
-            tp_rank=self.tp_rank,
+            disable_tp=use_data_parallel,
         )
         self.down_proj = RowParallelLinear(
             hidden_features,
@@ -114,8 +105,7 @@ class Qwen2_5_VLMLP(nn.Module):
             bias=bias,
             quant_config=quant_config,
             prefix=add_prefix("down_proj", prefix),
-            tp_size=self.tp_size,
-            tp_rank=self.tp_rank,
+            disable_tp=use_data_parallel,
         )
         self.hidden_act = hidden_act
         if self.hidden_act == "silu":
@@ -224,8 +214,7 @@ class Qwen2_5_VisionPatchMerger(nn.Module):
         super().__init__()
         self.hidden_size = context_dim * (spatial_merge_size**2)
         self.ln_q = RMSNorm(context_dim, eps=1e-6)
-        tp_size = 1 if use_data_parallel else get_tensor_model_parallel_world_size()
-        tp_rank = 0 if use_data_parallel else get_tensor_model_parallel_rank()
+
         self.mlp = nn.ModuleList(
             [
                 ColumnParallelLinear(
@@ -234,8 +223,7 @@ class Qwen2_5_VisionPatchMerger(nn.Module):
                     bias=True,
                     quant_config=quant_config,
                     prefix=add_prefix("mlp.0", prefix),
-                    tp_size=tp_size,
-                    tp_rank=tp_rank,
+                    disable_tp=use_data_parallel,
                 ),
                 nn.GELU(),
                 RowParallelLinear(
@@ -244,8 +232,7 @@ class Qwen2_5_VisionPatchMerger(nn.Module):
                     bias=True,
                     quant_config=quant_config,
                     prefix=add_prefix("mlp.2", prefix),
-                    tp_size=tp_size,
-                    tp_rank=tp_rank,
+                    disable_tp=use_data_parallel,
                 ),
             ]
         )
@@ -326,9 +313,6 @@ class Qwen2_5_VisionTransformer(nn.Module, RotaryPosMixin):
         )
 
         # Resource prepared for vit cuda graph
-        self.tp_size = (
-            1 if use_data_parallel else get_tensor_model_parallel_world_size()
-        )
         self.max_context_len = max_context_len
         self.enable_cg = _is_cuda and envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get()
 

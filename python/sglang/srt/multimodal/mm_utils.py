@@ -566,7 +566,7 @@ def run_dp_sharded_mrope_vision_model(
                 image_embeds_local = torch.cat(image_embeds_local, dim=0)
         else:
             out_dim = getattr(vision_model.config, "hidden_size", None)
-            image_embeds_local = torch.empty(
+            image_embeds_local = torch.zeros(
                 (0, embed_dim_reduction_factor, out_dim),
                 device=pixel_values.device,
                 dtype=pixel_values.dtype,
@@ -579,7 +579,7 @@ def run_dp_sharded_mrope_vision_model(
             )
         else:
             # Handle empty case
-            image_embeds_local = torch.empty(
+            image_embeds_local = torch.zeros(
                 (0, vision_model.out_hidden_size),
                 device=pixel_values.device,
                 dtype=pixel_values.dtype,
@@ -591,7 +591,7 @@ def run_dp_sharded_mrope_vision_model(
     if current_len < max_len_per_rank:
         padding_size = max_len_per_rank - current_len
         if rope_type == "rope_2d":
-            padding = torch.empty(
+            padding = torch.zeros(
                 (
                     padding_size,
                     image_embeds_local.shape[1],
@@ -601,7 +601,7 @@ def run_dp_sharded_mrope_vision_model(
                 device=image_embeds_local.device,
             )
         else:
-            padding = torch.empty(
+            padding = torch.zeros(
                 (padding_size, image_embeds_local.shape[1]),
                 dtype=image_embeds_local.dtype,
                 device=image_embeds_local.device,
@@ -610,6 +610,7 @@ def run_dp_sharded_mrope_vision_model(
     else:
         image_embeds_local_padded = image_embeds_local
 
+    image_embeds_local_padded = image_embeds_local_padded.contiguous()
     # Do all_gather to collect embeddings from all ranks
     gathered_embeds = tensor_model_parallel_all_gather(image_embeds_local_padded, dim=0)
 
