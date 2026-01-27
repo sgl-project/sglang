@@ -7,6 +7,7 @@ import time
 from typing import Any, List, Optional, Union
 
 import httpx
+import torch
 from fastapi import UploadFile
 
 from sglang.multimodal_gen.configs.sample.sampling_params import DataType
@@ -24,10 +25,10 @@ logger = init_logger(__name__)
 
 @dataclasses.dataclass
 class SetLoraReq:
-    lora_nickname: str
-    lora_path: Optional[str] = None
-    target: str = "all"  # "all", "transformer", "transformer_2", "critic"
-    strength: float = 1.0  # LoRA strength for merge, default 1.0
+    lora_nickname: Union[str, List[str]]
+    lora_path: Optional[Union[str, List[Optional[str]]]] = None
+    target: Union[str, List[str]] = "all"
+    strength: Union[float, List[float]] = 1.0  # LoRA strength for merge, default 1.0
 
 
 @dataclasses.dataclass
@@ -45,6 +46,31 @@ class UnmergeLoraWeightsReq:
 class ListLorasReq:
     # Empty payload; used only as a type marker for listing LoRA status
     pass
+
+
+def format_lora_message(
+    lora_nickname: Union[str, List[str]],
+    target: Union[str, List[str]],
+    strength: Union[float, List[float]],
+) -> tuple[str, str, str]:
+    """Format success message for single or multiple LoRAs"""
+    if isinstance(lora_nickname, list):
+        nickname_str = ", ".join(lora_nickname)
+        target_str = ", ".join(target) if isinstance(target, list) else target
+        strength_str = (
+            ", ".join(f"{s:.2f}" for s in strength)
+            if isinstance(strength, list)
+            else f"{strength:.2f}"
+        )
+    else:
+        nickname_str = lora_nickname
+        target_str = target if isinstance(target, str) else ", ".join(target)
+        strength_str = (
+            f"{strength:.2f}"
+            if isinstance(strength, (int, float))
+            else ", ".join(f"{s:.2f}" for s in strength)
+        )
+    return nickname_str, target_str, strength_str
 
 
 def _parse_size(size: str) -> tuple[int, int] | tuple[None, None]:
@@ -186,22 +212,32 @@ async def process_generation_batch(
         result = await scheduler_client.forward([batch])
 
         if result.output is None:
-            error_msg = getattr(result, "error", "Unknown error")
+            error_msg = result.error or "Unknown error"
             raise RuntimeError(
                 f"Model generation returned no output. Error from scheduler: {error_msg}"
             )
         save_file_path_list = []
+        audio_sample_rate = result.audio_sample_rate
         if batch.data_type == DataType.VIDEO:
             for idx, output in enumerate(result.output):
                 save_file_path = str(
                     os.path.join(batch.output_path, batch.output_file_name)
                 )
+                sample = result.output[idx]
+                audio = result.audio
+                if isinstance(audio, torch.Tensor) and audio.ndim >= 2:
+                    audio = audio[idx] if audio.shape[0] > idx else None
+                if audio is not None and not (
+                    isinstance(sample, (tuple, list)) and len(sample) == 2
+                ):
+                    sample = (sample, audio)
                 post_process_sample(
-                    result.output[idx],
+                    sample,
                     batch.data_type,
                     batch.fps,
                     batch.save_output,
                     save_file_path,
+                    audio_sample_rate=audio_sample_rate,
                 )
                 save_file_path_list.append(save_file_path)
         else:
@@ -217,6 +253,7 @@ async def process_generation_batch(
                     batch.fps,
                     batch.save_output,
                     save_file_path,
+                    audio_sample_rate=audio_sample_rate,
                 )
                 save_file_path_list.append(save_file_path)
 
@@ -262,6 +299,9 @@ def add_common_data_to_response(
 ) -> dict:
     if result.peak_memory_mb and result.peak_memory_mb > 0:
         response["peak_memory_mb"] = result.peak_memory_mb
+
+    if result.timings and result.timings.total_duration_s > 0:
+        response["inference_time_s"] = result.timings.total_duration_s
 
     response["id"] = request_id
 

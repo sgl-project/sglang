@@ -33,7 +33,7 @@ jobs:
 
       - name: Install rust dependencies
         run: |
-          bash scripts/ci/ci_install_rust.sh
+          bash scripts/ci/cuda/ci_install_gateway_dependencies.sh
 
       - name: Configure sccache
         uses: mozilla-actions/sccache-action@v0.0.9
@@ -120,7 +120,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          bash scripts/ci/ci_install_rust.sh
+          bash scripts/ci/cuda/ci_install_gateway_dependencies.sh
 
       - name: Configure sccache
         uses: mozilla-actions/sccache-action@v0.0.9
@@ -200,13 +200,6 @@ jobs:
             setup_oracle: true
             setup_brave: true
             parallel_opts: ""  # Cloud backend tests not compatible with parallel execution
-          - name: grpc
-            timeout: 32
-            test_dirs: "e2e_test/e2e_grpc"
-            extra_deps: ""
-            env_vars: "SHOW_ROUTER_LOGS=1"
-            reruns: "--reruns 3 --reruns-delay 2"
-            parallel_opts: ""  # Legacy tests, not yet migrated for parallel
           - name: e2e
             timeout: 45
             test_dirs: "e2e_test/router e2e_test/embeddings"
@@ -229,7 +222,7 @@ jobs:
 
       - name: Install SGLang dependencies
         run: |
-          sudo --preserve-env=PATH bash scripts/ci/ci_install_dependency.sh
+          sudo --preserve-env=PATH bash scripts/ci/cuda/ci_install_dependency.sh
 
       - name: Setup Oracle Instant Client
         if: matrix.setup_oracle

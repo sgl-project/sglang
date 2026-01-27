@@ -1,5 +1,8 @@
 import time
-from typing import Any, Dict, List, Optional
+import uuid
+from abc import ABC
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Union
 
 from pydantic import BaseModel, Field
 
@@ -9,6 +12,7 @@ class ImageResponseData(BaseModel):
     b64_json: Optional[str] = None
     url: Optional[str] = None
     revised_prompt: Optional[str] = None
+    file_path: Optional[str] = None
 
 
 class ImageResponse(BaseModel):
@@ -16,6 +20,7 @@ class ImageResponse(BaseModel):
     created: int = Field(default_factory=lambda: int(time.time()))
     data: List[ImageResponseData]
     peak_memory_mb: Optional[float] = None
+    inference_time_s: Optional[float] = None
 
 
 class ImageGenerationsRequest(BaseModel):
@@ -53,11 +58,14 @@ class VideoResponse(BaseModel):
     size: str = ""
     seconds: str = "4"
     quality: str = "standard"
+    url: Optional[str] = None
     remixed_from_video_id: Optional[str] = None
     completed_at: Optional[int] = None
     expires_at: Optional[int] = None
     error: Optional[Dict[str, Any]] = None
+    file_path: Optional[str] = None
     peak_memory_mb: Optional[float] = None
+    inference_time_s: Optional[float] = None
 
 
 class VideoGenerationsRequest(BaseModel):
@@ -79,6 +87,7 @@ class VideoGenerationsRequest(BaseModel):
     )
     negative_prompt: Optional[str] = None
     enable_teacache: Optional[bool] = False
+    output_path: Optional[str] = None
     diffusers_kwargs: Optional[Dict[str, Any]] = None  # kwargs for diffusers backend
 
 
@@ -89,3 +98,23 @@ class VideoListResponse(BaseModel):
 
 class VideoRemixRequest(BaseModel):
     prompt: str
+
+
+@dataclass
+class BaseReq(ABC):
+    rid: Optional[Union[str, List[str]]] = field(default=None, kw_only=True)
+    http_worker_ipc: Optional[str] = field(default=None, kw_only=True)
+
+    def regenerate_rid(self):
+        """Generate a new request ID and return it."""
+        if isinstance(self.rid, list):
+            self.rid = [uuid.uuid4().hex for _ in range(len(self.rid))]
+        else:
+            self.rid = uuid.uuid4().hex
+        return self.rid
+
+
+@dataclass
+class VertexGenerateReqInput(BaseReq):
+    instances: List[dict]
+    parameters: Optional[dict] = None

@@ -292,6 +292,11 @@ class DecodePreallocQueue:
                 kv_args.state_type = "swa"
             elif isinstance(self.token_to_kv_pool, HybridLinearKVPool):
                 kv_args.state_type = "mamba"
+                # Get state dimension info for cross-TP slice transfer
+                if hasattr(self.token_to_kv_pool, "get_state_dim_per_tensor"):
+                    kv_args.state_dim_per_tensor = (
+                        self.token_to_kv_pool.get_state_dim_per_tensor()
+                    )
             elif isinstance(self.token_to_kv_pool, NSATokenToKVPool):
                 kv_args.state_type = "nsa"
             else:
@@ -946,8 +951,10 @@ class SchedulerDisaggregationDecodeMixin:
 
     def get_new_prebuilt_batch(self: Scheduler) -> Optional[ScheduleBatch]:
         """Create a schedulebatch for fake completed prefill"""
-        if self.grammar_queue:
-            self.move_ready_grammar_requests()
+        if self.grammar_manager.has_waiting_grammars():
+            ready_grammar_requests = self.grammar_manager.get_ready_grammar_requests()
+            for req in ready_grammar_requests:
+                self._add_request_to_queue(req)
 
         if len(self.waiting_queue) == 0:
             return None
