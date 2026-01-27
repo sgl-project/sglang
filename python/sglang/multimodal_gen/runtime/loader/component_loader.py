@@ -270,7 +270,7 @@ class ComponentLoader(ABC):
         }
         # Loaders for audio/video specific components that might vary
         av_module_loaders = {
-            "audio_dit": (AudioTransformerLoader, "diffusers"),
+            "audio_dit": (TransformerLoader, "diffusers"),
             "audio_vae": (AudioVAELoader, "diffusers"),
             "connectors": (AdapterLoader, "diffusers"),
             "dual_tower_bridge": (BridgeLoader, "diffusers"),
@@ -889,14 +889,11 @@ class BridgeLoader(ComponentLoader):
         return model.eval()
 
 
-class BaseTransformerLoader(ComponentLoader):
+class TransformerLoader(ComponentLoader):
     """Shared loader for (video/audio) DiT transformers."""
 
-    # Attribute name on `server_args.pipeline_config` for the DiT config object.
-    pipeline_dit_config_attr: str = "dit_config"
-
     def load_customized(
-        self, component_model_path: str, server_args: ServerArgs, *args
+        self, component_model_path: str, server_args: ServerArgs, module_name: str
     ):
         """Load the transformer based on the model path, and inference args."""
         config = get_diffusers_component_config(model_path=component_model_path)
@@ -908,10 +905,17 @@ class BaseTransformerLoader(ComponentLoader):
                 "Only diffusers format is supported."
             )
 
-        server_args.model_paths["transformer"] = component_model_path
+        module_name = _normalize_module_type(module_name)
+        server_args.model_paths[module_name] = component_model_path
 
+        if module_name in ("transformer", "video_dit"):
+            pipeline_dit_config_attr = "dit_config"
+        elif module_name in ("audio_dit",):
+            pipeline_dit_config_attr = "audio_dit_config"
+        else:
+            raise ValueError(f"Invalid module name: {module_name}")
         # Config from Diffusers supersedes sgl_diffusion's model config
-        dit_config = getattr(server_args.pipeline_config, self.pipeline_dit_config_attr)
+        dit_config = getattr(server_args.pipeline_config, pipeline_dit_config_attr)
         dit_config.update_model_arch(config)
 
         model_cls, _ = ModelRegistry.resolve_model_cls(cls_name)
@@ -981,18 +985,6 @@ class BaseTransformerLoader(ComponentLoader):
         model = model.eval()
 
         return model
-
-
-class AudioTransformerLoader(BaseTransformerLoader):
-    """Loader for audio DiT transformer."""
-
-    pipeline_dit_config_attr = "audio_dit_config"
-
-
-class TransformerLoader(BaseTransformerLoader):
-    """Loader for video/image DiT transformer."""
-
-    pipeline_dit_config_attr = "dit_config"
 
 
 class AdapterLoader(ComponentLoader):
