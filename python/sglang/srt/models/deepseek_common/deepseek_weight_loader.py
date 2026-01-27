@@ -657,10 +657,6 @@ class DeepseekV2WeightLoaderMixin:
 
         # Early return if no quantization needed - avoid materializing all weights into memory
         if not partial_names:
-            if isinstance(
-                nextn_conf, NextNEnabledConfig
-            ) and enable_nextn_moe_bf16_cast_to_fp8(self.quant_config):
-                self._mark_nextn_moe_weights_as_ue8m0()
             return weights
 
         # Only materialize weights dict when quantization is actually needed
