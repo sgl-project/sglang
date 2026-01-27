@@ -6,20 +6,26 @@ import torch
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
-from sglang.srt.custom_op import CustomOp
 from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
-from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
+from sglang.srt.layers.moe import (
+    MoeRunner,
+    MoeRunnerBackend,
+    MoeRunnerConfig,
+    get_moe_runner_backend,
+)
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     LinearMethodBase,
     QuantizeMethodBase,
 )
+from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
     is_cpu,
     is_hip,
+    next_power_of_2,
     set_weight_attrs,
     use_intel_amx_backend,
 )
@@ -40,6 +46,11 @@ if _use_aiter:
     from aiter import ActivationType
     from aiter.fused_moe import fused_moe
     from aiter.ops.shuffle import shuffle_weight
+
+try:
+    from flashinfer.fused_moe import cutlass_fused_moe as flashinfer_cutlass_fused_moe
+except ImportError:
+    flashinfer_cutlass_fused_moe = None
 
 
 class UnquantizedEmbeddingMethod(QuantizeMethodBase):
@@ -115,13 +126,15 @@ class UnquantizedLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-
         if use_intel_amx_backend(layer):
             x_shapes = x.shape
             if len(x_shapes) == 3:
                 x = x.view(-1, x.shape[-1])
             output = torch.ops.sgl_kernel.weight_packed_linear(
-                x, layer.weight, bias, True  # is_vnni
+                x,
+                layer.weight,
+                bias,
+                True,  # is_vnni
             )
             if len(x_shapes) == 3:
                 output = output.view(x_shapes[0], x_shapes[1], -1)
@@ -130,26 +143,18 @@ class UnquantizedLinearMethod(LinearMethodBase):
         return F.linear(x, layer.weight, bias)
 
 
-class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
+class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
     """MoE method without quantization."""
 
-    def __init__(self, use_triton_kernels: bool = False):
+    def __init__(
+        self, use_triton_kernels: bool = False, use_flashinfer_trtllm_moe: bool = False
+    ):
         super().__init__()
+        self.use_flashinfer_cutlass = get_moe_runner_backend().is_flashinfer_cutlass()
         self.use_triton_kernels = use_triton_kernels
         self.with_bias = False
-
-        self.triton_kernel_moe_forward = None
-        self.triton_kernel_moe_with_bias_forward = None
-        if torch.cuda.is_available() and use_triton_kernels:
-            from sglang.srt.layers.moe.fused_moe_triton.triton_kernels_moe import (
-                triton_kernel_moe_forward as _tk_forward,
-            )
-            from sglang.srt.layers.moe.fused_moe_triton.triton_kernels_moe import (
-                triton_kernel_moe_with_bias_forward as _tk_with_bias_forward,
-            )
-
-            self.triton_kernel_moe_forward = _tk_forward
-            self.triton_kernel_moe_with_bias_forward = _tk_with_bias_forward
+        self.use_flashinfer_trtllm_moe = use_flashinfer_trtllm_moe
+        self._cache_permute_indices = dict({})
 
     def create_weights(
         self,
@@ -164,7 +169,12 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         self.with_bias = with_bias
 
         # Fused gate_up_proj (column parallel)
-        w13_weight_n, w13_weight_k = 2 * intermediate_size_per_partition, hidden_size
+        w13_up_dim = (
+            2 * intermediate_size_per_partition
+            if layer.moe_runner_config.is_gated
+            else intermediate_size_per_partition
+        )
+        w13_weight_n, w13_weight_k = (w13_up_dim, hidden_size)
         if self.use_triton_kernels:
             w13_weight_n, w13_weight_k = w13_weight_k, w13_weight_n
         w13_weight = torch.nn.Parameter(
@@ -176,11 +186,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
 
         if self.with_bias:
             w13_weight_bias = torch.nn.Parameter(
-                torch.empty(
-                    num_experts,
-                    2 * intermediate_size_per_partition,
-                    dtype=torch.float32,
-                ),
+                torch.empty(num_experts, w13_up_dim, dtype=torch.float32),
                 requires_grad=False,
             )
             layer.register_parameter("w13_weight_bias", w13_weight_bias)
@@ -225,20 +231,94 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         if _is_cpu and _is_cpu_amx_available:
             _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
 
+        # Reorder rows of W1 for fused gated activation
+        if self.use_flashinfer_trtllm_moe:
+            from flashinfer.fused_moe.core import (
+                _maybe_get_cached_w3_w1_permute_indices,
+                convert_to_block_layout,
+                get_w2_permute_indices_with_cache,
+            )
+
+            # w1 and w3 have been swapped, so we don't need do that here
+            epilogue_tile_m = 128
+            block_k = 128
+            old_shape_w13 = layer.w13_weight.data[0].shape
+            old_shape_w2 = layer.w2_weight.data[0].shape
+            new_shape_w13 = None
+            new_shape_w2 = None
+            for i in range(layer.num_local_experts):
+                permute_indices = _maybe_get_cached_w3_w1_permute_indices(
+                    self._cache_permute_indices,
+                    layer.w13_weight.data[i].view(torch.uint8),
+                    epilogue_tile_m,
+                )
+                tmp_weights1 = (
+                    layer.w13_weight.data[i]
+                    .clone()
+                    .view(torch.uint8)[permute_indices.to(layer.w13_weight.data.device)]
+                    .contiguous()
+                )
+
+                permute_indices = get_w2_permute_indices_with_cache(
+                    self._cache_permute_indices,
+                    layer.w2_weight.data[i].view(torch.uint8),
+                    epilogue_tile_m,
+                )
+                tmp_weights2 = (
+                    layer.w2_weight.data[i]
+                    .clone()
+                    .view(torch.uint8)[permute_indices.to(layer.w2_weight.data.device)]
+                    .contiguous()
+                )
+
+                tmp_weights1 = convert_to_block_layout(
+                    tmp_weights1.view(torch.uint8), block_k
+                )
+                tmp_weights2 = convert_to_block_layout(
+                    tmp_weights2.view(torch.uint8), block_k
+                )
+
+                new_shape_w13 = tmp_weights1.view(torch.bfloat16).shape
+                new_shape_w2 = tmp_weights2.view(torch.bfloat16).shape
+                layer.w13_weight.data[i] = (
+                    tmp_weights1.view(torch.bfloat16)
+                    .contiguous()
+                    .reshape(old_shape_w13)
+                )
+                layer.w2_weight.data[i] = (
+                    tmp_weights2.view(torch.bfloat16).contiguous().reshape(old_shape_w2)
+                )
+
+            layer.w13_weight.data = layer.w13_weight.data.reshape(
+                layer.num_local_experts, *new_shape_w13
+            )
+            layer.w2_weight.data = layer.w2_weight.data.reshape(
+                layer.num_local_experts, *new_shape_w2
+            )
+
         return
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
-        self.runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
+        backend = (
+            MoeRunnerBackend.TRITON_KERNELS
+            if self.use_triton_kernels
+            else MoeRunnerBackend.TRITON
+        )
+        self.runner = MoeRunner(backend, moe_runner_config)
+
+    @property
+    def load_up_proj_weight_first(self) -> bool:
+        # FlashInfer CUTLASS kernel assumes [Up, Gate] Proj as W13
+        return self.use_flashinfer_cutlass
 
     def apply(
         self,
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
-
         return self.forward(
             layer=layer,
             dispatch_output=dispatch_output,
@@ -249,7 +329,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
-
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
         x = dispatch_output.hidden_states
@@ -257,29 +336,34 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
 
         moe_runner_config = self.moe_runner_config
 
-        if self.use_triton_kernels:
-            if self.with_bias:
-                assert self.triton_kernel_moe_with_bias_forward is not None
-                output = self.triton_kernel_moe_with_bias_forward(
-                    hidden_states=x,
-                    w1=layer.w13_weight,
-                    w2=layer.w2_weight,
-                    b1=layer.w13_weight_bias,
-                    b2=layer.w2_weight_bias,
-                    topk_output=topk_output,
-                    moe_runner_config=moe_runner_config,
-                    w1_pcg=None,
-                    w2_pcg=None,
-                )
-            else:
-                assert self.triton_kernel_moe_forward is not None
-                output = self.triton_kernel_moe_forward(
-                    hidden_states=x,
-                    w1=layer.w13_weight,
-                    w2=layer.w2_weight,
-                    topk_output=topk_output,
-                    moe_runner_config=moe_runner_config,
-                )
+        backend = self.runner.runner_backend
+        if backend.is_triton_kernels():
+            from sglang.srt.layers.moe.moe_runner.triton_kernels import (
+                TritonKernelsQuantInfo,
+            )
+
+            quant_info = TritonKernelsQuantInfo(
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+                w13_bias=getattr(layer, "w13_weight_bias", None),
+                w2_bias=getattr(layer, "w2_weight_bias", None),
+            )
+            return self.runner.run(dispatch_output, quant_info)
+        elif self.use_flashinfer_cutlass:
+            output = flashinfer_cutlass_fused_moe(
+                input=x,
+                token_selected_experts=topk_output.topk_ids,
+                token_final_scales=topk_output.topk_weights,
+                fc1_expert_weights=layer.w13_weight,
+                fc2_expert_weights=layer.w2_weight,
+                output_dtype=x.dtype,
+                quant_scales=None,
+                ep_size=layer.moe_ep_size,
+                ep_rank=layer.moe_ep_rank,
+                tp_size=layer.moe_tp_size,
+                tp_rank=layer.moe_tp_rank,
+                tune_max_num_tokens=next_power_of_2(x.shape[0]),
+            )[0]
             return StandardCombineInput(hidden_states=output)
         else:
             if _use_aiter:
@@ -308,10 +392,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                         if moe_runner_config.activation == "silu"
                         else ActivationType.Gelu
                     ),
+                    expert_mask=layer.expert_mask_gpu,
                 )
                 return StandardCombineInput(hidden_states=output)
             else:
-
                 quant_info = TritonMoeQuantInfo(
                     w13_weight=layer.w13_weight,
                     w2_weight=layer.w2_weight,
@@ -325,7 +409,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
-
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
         x = dispatch_output.hidden_states
@@ -337,10 +420,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             moe_runner_config.activation == "silu"
         ), f"activation = {moe_runner_config.activation} is not supported."
 
-        if (
-            use_intel_amx_backend(layer)
-            and not moe_runner_config.apply_router_weight_on_input
-        ):
+        if use_intel_amx_backend(layer):
             from sglang.srt.layers.moe.topk import apply_topk_weights_cpu
 
             topk_weights, topk_ids, _ = topk_output
@@ -380,7 +460,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
-
         import torch_npu
 
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
@@ -413,6 +492,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         )
 
         expert_tokens = expert_tokens.to(torch.int64)
+        w13_bias = [layer.w13_weight_bias] if self.with_bias else None
+        w2_bias = [layer.w2_weight_bias] if self.with_bias else None
         if layer.w13_weight.shape[-1] == layer.hidden_size:
             w13 = layer.w13_weight.transpose(1, 2)
             w2 = layer.w2_weight.transpose(1, 2)
@@ -421,6 +502,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         hidden_states = torch_npu.npu_grouped_matmul(
             x=[hidden_states],
             weight=[w13],
+            bias=w13_bias,
             split_item=2,
             group_list_type=0,
             group_type=0,
@@ -429,7 +511,11 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         )[0]
 
         # act_fn:
-        if self.moe_runner_config.activation == "silu":
+        if self.moe_runner_config.activation == "npu_swiglu_oai":
+            from sgl_kernel_npu.activation.swiglu_oai import swiglu_oai
+
+            hidden_states = swiglu_oai(layer, hidden_states)
+        elif self.moe_runner_config.activation == "silu":
             hidden_states = torch_npu.npu_swiglu(hidden_states)
         else:
             from sglang.srt.layers.activation import GeluAndMul
@@ -440,6 +526,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         hidden_states = torch_npu.npu_grouped_matmul(
             x=[hidden_states],
             weight=[w2],
+            bias=w2_bias,
             split_item=2,
             group_list_type=0,
             group_type=0,

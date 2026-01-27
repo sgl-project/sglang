@@ -37,7 +37,11 @@ from pydantic import (
     model_validator,
 )
 from typing_extensions import Literal
-from xgrammar import StructuralTag
+
+try:
+    from xgrammar import StructuralTag
+except:
+    StructuralTag = Any
 
 from sglang.utils import convert_json_schema_to_str
 
@@ -54,6 +58,7 @@ class ModelCard(BaseModel):
     created: int = Field(default_factory=lambda: int(time.time()))
     owned_by: str = "sglang"
     root: Optional[str] = None
+    parent: Optional[str] = None
     max_model_len: Optional[int] = None
 
 
@@ -108,6 +113,7 @@ class UsageInfo(BaseModel):
 
 class StreamOptions(BaseModel):
     include_usage: Optional[bool] = False
+    continuous_usage_stats: Optional[bool] = False
 
 
 class JsonSchemaResponseFormat(BaseModel):
@@ -204,7 +210,10 @@ class BatchResponse(BaseModel):
 class CompletionRequest(BaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/completions/create
-    model: str = DEFAULT_MODEL_NAME
+    model: str = Field(
+        default=DEFAULT_MODEL_NAME,
+        description="Model name. Supports LoRA adapters via 'base-model:adapter-name' syntax.",
+    )
     prompt: Union[List[int], List[List[int]], str, List[str]]
     best_of: Optional[int] = None
     echo: bool = False
@@ -223,6 +232,7 @@ class CompletionRequest(BaseModel):
     top_p: float = 1.0
     user: Optional[str] = None
     return_hidden_states: bool = False
+    return_routed_experts: bool = False
 
     # Extra parameters for SRT backend only and will be ignored by OpenAI models.
     top_k: int = -1
@@ -240,11 +250,16 @@ class CompletionRequest(BaseModel):
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
     session_params: Optional[Dict] = None
     response_format: Optional[Union[ResponseFormat, StructuralTagResponseFormat]] = None
+    custom_params: Optional[Dict] = None
+    custom_logit_processor: Optional[str] = None
 
     # For PD disaggregation
     bootstrap_host: Optional[Union[List[str], str]] = None
     bootstrap_port: Optional[Union[List[Optional[int]], int]] = None
     bootstrap_room: Optional[Union[List[int], int]] = None
+
+    # For data parallel rank routing
+    data_parallel_rank: Optional[int] = None
 
     # For request id
     rid: Optional[Union[List[str], str]] = None
@@ -266,6 +281,22 @@ class CompletionRequest(BaseModel):
         return v
 
 
+class SglExt(BaseModel):
+    """SGLang extension fields for OpenAI-compatible responses.
+
+    Future SGLang-specific extensions to OpenAI-compatible response objects
+    should be added as fields here rather than directly on the choice object.
+    """
+
+    routed_experts: Optional[str] = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        # Remove None fields to keep response clean
+        return {k: v for k, v in data.items() if v is not None}
+
+
 class CompletionResponseChoice(BaseModel):
     index: int
     text: str
@@ -273,12 +304,15 @@ class CompletionResponseChoice(BaseModel):
     finish_reason: Optional[Literal["stop", "length", "content_filter", "abort"]] = None
     matched_stop: Union[None, int, str] = None
     hidden_states: Optional[object] = None
+    sgl_ext: Optional[SglExt] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
         if self.hidden_states is None:
             data.pop("hidden_states", None)
+        if self.sgl_ext is None:
+            data.pop("sgl_ext", None)
         return data
 
 
@@ -299,12 +333,15 @@ class CompletionResponseStreamChoice(BaseModel):
     finish_reason: Optional[Literal["stop", "length", "content_filter", "abort"]] = None
     matched_stop: Union[None, int, str] = None
     hidden_states: Optional[object] = None
+    sgl_ext: Optional[SglExt] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
         if self.hidden_states is None:
             data.pop("hidden_states", None)
+        if self.sgl_ext is None:
+            data.pop("sgl_ext", None)
         return data
 
 
@@ -325,10 +362,14 @@ class ChatCompletionMessageContentTextPart(BaseModel):
 class ChatCompletionMessageContentImageURL(BaseModel):
     url: str
     detail: Optional[Literal["auto", "low", "high"]] = "auto"
+    max_dynamic_patch: Optional[int] = None
+    min_dynamic_patch: Optional[int] = None
 
 
 class ChatCompletionMessageContentVideoURL(BaseModel):
     url: str
+    max_dynamic_patch: Optional[int] = None
+    min_dynamic_patch: Optional[int] = None
 
 
 class ChatCompletionMessageContentAudioURL(BaseModel):
@@ -358,6 +399,15 @@ ChatCompletionMessageContentPart = Union[
     ChatCompletionMessageContentAudioPart,
 ]
 
+# Rerank content types for multimodal reranking (e.g., Qwen3-VL-Reranker)
+# Can be a simple string (text-only) or a list of multimodal content parts
+RerankContentPart = Union[
+    ChatCompletionMessageContentTextPart,
+    ChatCompletionMessageContentImagePart,
+    ChatCompletionMessageContentVideoPart,
+]
+RerankContent = Union[str, List[RerankContentPart]]
+
 
 class FunctionResponse(BaseModel):
     """Function response."""
@@ -376,23 +426,24 @@ class ToolCall(BaseModel):
 
 
 class ChatCompletionMessageGenericParam(BaseModel):
-    role: Literal["system", "assistant", "tool", "function"]
-    content: Union[str, List[ChatCompletionMessageContentTextPart], None] = Field(
+    role: Literal["system", "assistant", "tool", "function", "developer"]
+    content: Union[str, List[ChatCompletionMessageContentPart], None] = Field(
         default=None
     )
     tool_call_id: Optional[str] = None
     name: Optional[str] = None
     reasoning_content: Optional[str] = None
     tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
+    tools: Optional[List[Tool]] = Field(default=None, examples=[None])
 
     @field_validator("role", mode="before")
     @classmethod
     def _normalize_role(cls, v):
         if isinstance(v, str):
             v_lower = v.lower()
-            if v_lower not in {"system", "assistant", "tool", "function"}:
+            if v_lower not in {"system", "assistant", "tool", "function", "developer"}:
                 raise ValueError(
-                    "'role' must be one of 'system', 'assistant', 'tool', or 'function' (case-insensitive)."
+                    "'role' must be one of 'system', 'developer', 'assistant', 'tool', or 'function' (case-insensitive)."
                 )
             return v_lower
         raise ValueError("'role' must be a string")
@@ -441,7 +492,10 @@ class ChatCompletionRequest(BaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/chat/create
     messages: List[ChatCompletionMessageParam]
-    model: str = DEFAULT_MODEL_NAME
+    model: str = Field(
+        default=DEFAULT_MODEL_NAME,
+        description="Model name. Supports LoRA adapters via 'base-model:adapter-name' syntax.",
+    )
     frequency_penalty: float = 0.0
     logit_bias: Optional[Dict[str, float]] = None
     logprobs: bool = False
@@ -471,6 +525,7 @@ class ChatCompletionRequest(BaseModel):
         default="auto", examples=["none"]
     )  # noqa
     return_hidden_states: bool = False
+    return_routed_experts: bool = False
     reasoning_effort: Optional[Literal["low", "medium", "high"]] = Field(
         default="medium",
         description="Constrains effort on reasoning for reasoning models. "
@@ -498,6 +553,14 @@ class ChatCompletionRequest(BaseModel):
     stream_reasoning: bool = True
     chat_template_kwargs: Optional[Dict] = None
 
+    # SGLang multimodal tiling controls (extensions)
+    max_dynamic_patch: Optional[int] = None
+    min_dynamic_patch: Optional[int] = None
+
+    # Custom logit processor for advanced sampling control
+    custom_logit_processor: Optional[Union[List[Optional[str]], str]] = None
+    custom_params: Optional[Dict] = None
+
     # For request id
     rid: Optional[Union[List[str], str]] = None
     # Extra key for classifying the request (e.g. cache_salt)
@@ -511,6 +574,9 @@ class ChatCompletionRequest(BaseModel):
     bootstrap_host: Optional[Union[List[str], str]] = None
     bootstrap_port: Optional[Union[List[Optional[int]], int]] = None
     bootstrap_room: Optional[Union[List[int], int]] = None
+
+    # For data parallel rank routing
+    data_parallel_rank: Optional[int] = None
 
     # OpenAI/SGLang default sampling parameters
     _DEFAULT_SAMPLING_PARAMS = {
@@ -612,7 +678,7 @@ class ChatCompletionRequest(BaseModel):
 
         sampling_params = {
             "temperature": get_param("temperature"),
-            "max_new_tokens": self.max_tokens or self.max_completion_tokens,
+            "max_new_tokens": self.max_completion_tokens or self.max_tokens,
             "min_new_tokens": self.min_tokens,
             "stop": stop,
             "stop_token_ids": self.stop_token_ids,
@@ -630,6 +696,8 @@ class ChatCompletionRequest(BaseModel):
             "ignore_eos": self.ignore_eos,
             "skip_special_tokens": self.skip_special_tokens,
             "logit_bias": self.logit_bias,
+            "custom_params": self.custom_params,
+            "sampling_seed": self.seed,
         }
 
         if self.response_format and self.response_format.type == "json_schema":
@@ -687,12 +755,15 @@ class ChatCompletionResponseChoice(BaseModel):
     ] = None
     matched_stop: Union[None, int, str] = None
     hidden_states: Optional[object] = None
+    sgl_ext: Optional[SglExt] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
         if self.hidden_states is None:
             data.pop("hidden_states", None)
+        if self.sgl_ext is None:
+            data.pop("sgl_ext", None)
         return data
 
 
@@ -712,12 +783,15 @@ class DeltaMessage(BaseModel):
     reasoning_content: Optional[str] = None
     tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
     hidden_states: Optional[object] = None
+    sgl_ext: Optional[SglExt] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
         if self.hidden_states is None:
             data.pop("hidden_states", None)
+        if self.sgl_ext is None:
+            data.pop("sgl_ext", None)
         return data
 
 
@@ -745,6 +819,7 @@ class ChatCompletionStreamResponse(BaseModel):
 class MultimodalEmbeddingInput(BaseModel):
     text: Optional[str] = None
     image: Optional[str] = None
+    video: Optional[str] = None
 
 
 EmbeddingInput = Union[
@@ -836,15 +911,60 @@ class ScoringResponse(BaseModel):
 
 
 class V1RerankReqInput(BaseModel):
-    query: str
-    documents: List[str]
+    query: RerankContent = Field(
+        ...,
+        description="The query to match against documents. Can be a string (text-only) "
+        "or a list of content parts for multimodal queries (text, image_url, video_url).",
+    )
+    documents: List[RerankContent] = Field(
+        ...,
+        description="List of documents to rank. Each document can be a string (text-only) "
+        "or a list of content parts for multimodal documents (text, image_url, video_url).",
+    )
+    instruct: Optional[str] = Field(
+        default=None,
+        description="The instruct to the reranker model.",
+    )
+    top_n: Optional[int] = Field(
+        default=None,
+        description="Maximum number of documents to return. Defaults to returning all documents. "
+        "If specified value is greater than the total number of documents, all documents will be returned.",
+    )
+    return_documents: bool = Field(
+        default=True,
+        description="Whether to return documents in the response. Only included when set to true.",
+    )
+
+    @field_validator("top_n")
+    @classmethod
+    def validate_top_n(cls, v):
+        if v is not None and v < 1:
+            raise ValueError("Value error, parameter top_n should be larger than 0.")
+        return v
+
+    def is_multimodal(self) -> bool:
+        """Check if the request contains any multimodal content."""
+        if isinstance(self.query, list):
+            return True
+        for doc in self.documents:
+            if isinstance(doc, list):
+                return True
+        return False
 
 
 class RerankResponse(BaseModel):
     score: float
-    document: str
+    document: Optional[str] = None
     index: int
     meta_info: Optional[dict] = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        # Exclude document field if it's None
+        if self.document is None:
+            data.pop("document", None)
+        return data
 
 
 class TokenizeRequest(BaseModel):
@@ -1099,7 +1219,7 @@ class ResponsesResponse(BaseModel):
                 Union[
                     ResponseOutputItem, ResponseReasoningItem, ResponseFunctionToolCall
                 ]
-            ]
+            ],
         ) -> bool:
             if not items:
                 return False

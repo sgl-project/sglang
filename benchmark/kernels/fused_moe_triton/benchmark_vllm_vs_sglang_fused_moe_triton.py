@@ -3,8 +3,6 @@ import argparse
 
 import torch
 import triton
-import vllm
-from transformers import AutoConfig
 from vllm.model_executor.layers.fused_moe.fused_moe import fused_moe as fused_moe_vllm
 
 from sglang.srt.distributed.parallel_state import (
@@ -17,91 +15,7 @@ from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
     fused_moe as fused_moe_sglang,
 )
 
-
-def get_model_config(model_name: str, tp_size: int):
-    """Get model configuration parameters"""
-    config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
-
-    if config.architectures[0] == "DbrxForCausalLM":
-        E = config.ffn_config.moe_num_experts
-        topk = config.ffn_config.moe_top_k
-        intermediate_size = config.ffn_config.ffn_hidden_size
-        shard_intermediate_size = 2 * intermediate_size // tp_size
-    elif config.architectures[0] == "JambaForCausalLM":
-        E = config.num_experts
-        topk = config.num_experts_per_tok
-        intermediate_size = config.intermediate_size
-        shard_intermediate_size = 2 * intermediate_size // tp_size
-    elif config.architectures[0] == "Qwen2MoeForCausalLM":
-        E = config.num_experts
-        topk = config.num_experts_per_tok
-        intermediate_size = config.moe_intermediate_size
-        shard_intermediate_size = 2 * intermediate_size // tp_size
-    elif config.architectures[0] == "Qwen3MoeForCausalLM":
-        E = config.num_experts
-        topk = config.num_experts_per_tok
-        intermediate_size = config.moe_intermediate_size
-        shard_intermediate_size = 2 * intermediate_size // tp_size
-    elif config.architectures[0] in [
-        "DeepseekV2ForCausalLM",
-        "DeepseekV3ForCausalLM",
-        "Glm4MoeForCausalLM",
-    ]:
-        E = (
-            config.n_routed_experts + 1
-            if config.architectures[0] in ["DeepseekV3ForCausalLM"]
-            else config.n_routed_experts
-        )
-        topk = config.num_experts_per_tok
-        intermediate_size = config.moe_intermediate_size
-        shard_intermediate_size = 2 * intermediate_size // tp_size
-    elif config.architectures[0] == "Llama4ForConditionalGeneration":
-        E = config.text_config.num_local_experts
-        topk = config.text_config.num_experts_per_tok
-        intermediate_size = config.text_config.intermediate_size
-        shard_intermediate_size = 2 * intermediate_size // tp_size
-    elif config.architectures[0] in [
-        "Grok1ForCausalLM",
-        "Grok1ImgGen",
-        "Grok1AForCausalLM",
-    ]:
-        E = config.num_local_experts
-        topk = config.num_experts_per_tok
-        intermediate_size = config.moe_intermediate_size
-        shard_intermediate_size = 2 * intermediate_size // tp_size
-    else:
-        # Default: Mixtral
-        E = config.num_local_experts
-        topk = config.num_experts_per_tok
-        intermediate_size = config.intermediate_size
-        shard_intermediate_size = 2 * intermediate_size // tp_size
-
-    vllm_version_num = (
-        vllm.__version_tuple__[0] * 100
-        + vllm.__version_tuple__[1] * 10
-        + vllm.__version_tuple__[2]
-    )
-    block_shape = None
-    if (
-        hasattr(config, "quantization_config")
-        and "weight_block_size" in config.quantization_config
-    ):
-        block_shape = config.quantization_config["weight_block_size"]
-        assert len(block_shape) == 2
-        assert (
-            vllm_version_num >= 66
-        ), "Block-wise quantized fp8 fused_moe is only supported for VLLM>=0.6.6.post1"
-
-    shape_configs = {
-        "num_experts": E,
-        "topk": topk,
-        "hidden_size": config.hidden_size,
-        "shard_intermediate_size": shard_intermediate_size,
-        "dtype": config.torch_dtype,
-        "block_shape": block_shape,
-    }
-    print(f"{shape_configs=}")
-    return shape_configs
+from .common_utils import get_model_config
 
 
 def fused_moe_vllm_api(
@@ -301,7 +215,8 @@ def main():
     parser.add_argument(
         "--model", type=str, default="mistralai/Mixtral-8x7B-Instruct-v0.1"
     )
-    parser.add_argument("--tp-size", type=int, default=2)
+    parser.add_argument("--tp-size", "--tp", type=int, default=2)
+    parser.add_argument("--ep-size", "--ep", type=int, default=1)
     parser.add_argument("--use-fp8-w8a8", action="store_true")
     parser.add_argument(
         "--save-path",
@@ -332,12 +247,12 @@ def main():
             pipeline_model_parallel_size=1,
         )
 
-        model_config = get_model_config(args.model, args.tp_size)
+        shape_configs = get_model_config(args.model, args.tp_size, args.ep_size)
         benchmark.run(
             show_plots=True,
             print_data=True,
             save_path=args.save_path,
-            model_config=model_config,
+            model_config=shape_configs,
             use_fp8_w8a8=args.use_fp8_w8a8,
         )
     finally:

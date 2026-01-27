@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Optional
+from typing import Any, List, Optional
 
 import torch
 from torch.nn import Module

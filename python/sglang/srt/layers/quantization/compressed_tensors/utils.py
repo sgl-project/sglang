@@ -14,6 +14,7 @@ def is_activation_quantization_format(format: str) -> bool:
         CompressionFormat.naive_quantized.value,
         CompressionFormat.int_quantized.value,
         CompressionFormat.float_quantized.value,
+        CompressionFormat.nvfp4_pack_quantized.value,
     ]
     return format in _ACTIVATION_QUANTIZATION_FORMATS
 
@@ -79,7 +80,7 @@ def check_equal_or_regex_match(layer_name: str, targets: Iterable[str]) -> bool:
     if target starts with 're:' to any target in list.
     """
     for target in targets:
-        if _is_equal_or_regex_match(layer_name, target):
+        if _is_equal_or_regex_match(layer_name, target, check_contains=True):
             return True
     return False
 

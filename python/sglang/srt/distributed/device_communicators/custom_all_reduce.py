@@ -10,7 +10,7 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
-from sglang.srt import _custom_ops as ops
+import sglang.srt.distributed.device_communicators.custom_all_reduce_ops as ops
 from sglang.srt.distributed.device_communicators.cuda_wrapper import CudaRTLibrary
 from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import (
     gpu_p2p_access_check,
@@ -18,25 +18,11 @@ from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import 
     is_weak_contiguous,
 )
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
-from sglang.srt.utils import is_cuda, is_hip, log_info_on_rank0
-
-logger = logging.getLogger(__name__)
+from sglang.srt.environ import envs
+from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, log_info_on_rank0
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
-
-
-try:
-    if ops.use_vllm_custom_allreduce and not _is_hip:
-        # Use vLLM custom allreduce
-        ops.meta_size()
-    else:
-        # Use custom allreduce from sgl kernel (ROCM and TRT-LLM)
-        import sgl_kernel  # noqa: F401
-    custom_ar = True
-except Exception:
-    # For CPUs
-    custom_ar = False
 
 logger = logging.getLogger(__name__)
 
@@ -80,9 +66,10 @@ class CustomAllreduce:
         are in the same node.
         """
         self._IS_CAPTURING = False
-        self.disabled = True
+        self.disabled = True  # This can be modified in-place by context manager in piecewise cuda graph runner
+        self.original_disabled = True  # To store the original state
 
-        if not custom_ar:
+        if not ops.IS_CUSTOM_AR_AVAILABLE:
             # disable because of missing custom allreduce library
             # e.g. in a non-cuda environment
             return
@@ -210,6 +197,8 @@ class CustomAllreduce:
             self.register_buffer(self.buffer)
 
         self.disabled = False
+        self.original_disabled = False  # Ensure original_disabled == disabled
+        self.tms_cudagraph = envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
 
     @staticmethod
     def create_shared_buffer(
@@ -336,12 +325,12 @@ class CustomAllreduce:
         # little performance improvement over NCCL.
         if not _is_hip:
             if self.world_size == 2 or self.full_nvlink:
-                return inp_size < self.max_size
+                return inp_size <= self.max_size
             return False
 
         if _is_hip:
             if self.full_nvlink:
-                return inp_size < self.max_size
+                return inp_size <= self.max_size
             return False
 
         return False
@@ -384,6 +373,23 @@ class CustomAllreduce:
             )
         return out
 
+    def deterministic_all_reduce(
+        self,
+        inp: torch.Tensor,
+        *,
+        out: torch.Tensor = None,
+        registered: bool = False,
+    ):
+        """Deterministic all-reduce using 1-stage kernel with fixed ordering (AMD only)."""
+        if out is None:
+            out = torch.empty_like(inp)
+        if registered:
+            ops.deterministic_all_reduce_reg(self._ptr, inp, out)
+        else:
+            reg_buffer = self.buffer.view(inp.dtype)[: inp.numel()]
+            ops.deterministic_all_reduce_unreg(self._ptr, inp, reg_buffer, out)
+        return out
+
     def custom_all_reduce(self, input: torch.Tensor) -> Optional[torch.Tensor]:
         """The main allreduce API that provides support for cuda graph."""
         # When custom allreduce is disabled, this will be None.
@@ -394,7 +400,7 @@ class CustomAllreduce:
                 if _is_hip:
                     return self.all_reduce_reg(input)
                 else:
-                    return self.all_reduce(input, registered=True)
+                    return self.all_reduce(input, registered=not self.tms_cudagraph)
             else:
                 # If warm up, mimic the allocation pattern since custom
                 # allreduce is out-of-place.
@@ -419,3 +425,58 @@ class CustomAllreduce:
 
     def __del__(self):
         self.close()
+
+
+def dispatch_custom_allreduce():
+    """Return the CustomAllreduce class to use (aiter on ROCm if enabled).
+
+    On AMD with 1-stage AR enabled, use sglang's CustomAllreduce (has deterministic_all_reduce method).
+    Otherwise use AiterCustomAllreduce if available.
+    """
+    if _is_cuda:
+        return CustomAllreduce
+
+    assert _is_hip
+
+    if envs.SGLANG_USE_1STAGE_ALLREDUCE.is_set():
+        if envs.SGLANG_USE_1STAGE_ALLREDUCE.get():
+            logger.debug(
+                "[AR] All-reduce: 1-stage kernel (SGLANG_USE_1STAGE_ALLREDUCE=1)"
+            )
+        else:
+            logger.debug("[AR] All-reduce: default (SGLANG_USE_1STAGE_ALLREDUCE=0)")
+    elif envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get():
+        logger.debug(
+            "[AR] All-reduce: 1-stage kernel (deterministic inference enabled)"
+        )
+    else:
+        logger.debug("[AR] All-reduce: default")
+
+    # Check if 1-stage AR should be used
+    if envs.SGLANG_USE_1STAGE_ALLREDUCE.is_set():
+        use_1stage = envs.SGLANG_USE_1STAGE_ALLREDUCE.get()
+    else:
+        use_1stage = envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
+
+    # On AMD with 1-stage AR, use sglang's CustomAllreduce
+    # (AiterCustomAllreduce doesn't have deterministic_all_reduce method)
+    if use_1stage:
+        return CustomAllreduce
+
+    if get_bool_env_var("SGLANG_USE_AITER_AR", default="true"):
+        try:
+            from aiter.dist.device_communicators.custom_all_reduce import (
+                CustomAllreduce as AiterCustomAllreduce,
+            )
+
+            logger.info("[AR] Using AiterCustomAllreduce (AMD default)")
+            return AiterCustomAllreduce
+        except ImportError as e:
+            logger.warning(
+                "[AR] Aiter custom all-reduce not available; "
+                "falling back to sglang CustomAllreduce. Details: %s",
+                e,
+            )
+            return CustomAllreduce
+
+    return CustomAllreduce

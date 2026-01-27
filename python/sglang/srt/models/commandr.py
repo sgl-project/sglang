@@ -43,7 +43,7 @@ import torch
 import torch.utils.checkpoint
 from torch import nn
 from torch.nn.parameter import Parameter
-from transformers import PretrainedConfig
+from transformers import Cohere2Config, CohereConfig, PretrainedConfig
 
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
@@ -198,12 +198,23 @@ class CohereAttention(nn.Module):
             rope_scaling=self.rope_scaling,
             is_neox_style=False,
         )
+
+        self.v1 = isinstance(config, CohereConfig)
+        self.v2 = isinstance(config, Cohere2Config)
+
+        # Model v2 has interleaved sliding windows, v1 does not
+        if self.v2 and config.layer_types[layer_id] == "sliding_attention":
+            self.sliding_window_size = config.sliding_window
+        else:
+            self.sliding_window_size = -1
+
         self.attn = RadixAttention(
             self.num_heads,
             self.head_dim,
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
+            sliding_window_size=self.sliding_window_size,
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
         )
@@ -235,7 +246,9 @@ class CohereAttention(nn.Module):
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         if self.use_qk_norm:
             q, k = self._apply_qk_norm(q, k)
-        q, k = self.rotary_emb(positions, q, k)
+        # Model v1 uses RoPE throughout, Model v2 uses RoPE only for SWA layers
+        if self.v1 or self.sliding_window_size > 0:
+            q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v, forward_batch)
         output, _ = self.o_proj(attn_output)
         return output
@@ -348,7 +361,8 @@ class CohereForCausalLM(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self.logits_processor = LogitsProcessor(config)
+        self.logit_scale = getattr(config, "logit_scale", None)
+        self.logits_processor = LogitsProcessor(config, logit_scale=self.logit_scale)
         self.model = CohereModel(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
