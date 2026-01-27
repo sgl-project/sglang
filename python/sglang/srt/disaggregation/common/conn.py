@@ -466,7 +466,7 @@ class CommonKVReceiver(BaseKVReceiver):
                     int(prefill_parallel_info["prefill_attn_tp_size"]),
                     int(prefill_parallel_info["prefill_dp_size"]),
                     int(prefill_parallel_info["prefill_pp_size"]),
-                    int(prefill_parallel_info["prefill_page_size"]),
+                    64,
                 )
             else:
                 logger.error(
