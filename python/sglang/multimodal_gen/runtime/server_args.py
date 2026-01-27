@@ -344,7 +344,6 @@ class ServerArgs:
             "video_vae": True,
             "audio_vae": True,
             "video_dit": True,
-            "video_dit2": True,
             "audio_dit": True,
             "dual_tower_bridge": True,
         }

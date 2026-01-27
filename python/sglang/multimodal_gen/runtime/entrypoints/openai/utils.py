@@ -7,7 +7,7 @@ import time
 from typing import Any, List, Optional, Union
 
 import httpx
-import numpy as np
+import torch
 from fastapi import UploadFile
 
 from sglang.multimodal_gen.configs.sample.sampling_params import DataType
@@ -212,36 +212,31 @@ async def process_generation_batch(
         result = await scheduler_client.forward([batch])
 
         if result.output is None:
-            error_msg = getattr(result, "error", "Unknown error")
+            error_msg = result.error or "Unknown error"
             raise RuntimeError(
                 f"Model generation returned no output. Error from scheduler: {error_msg}"
             )
         save_file_path_list = []
+        audio_sample_rate = result.audio_sample_rate
         if batch.data_type == DataType.VIDEO:
             for idx, output in enumerate(result.output):
                 save_file_path = str(
                     os.path.join(batch.output_path, batch.output_file_name)
                 )
-                audio = None
-                audio_sample_rate = None
-                if getattr(result, "audio", None) is not None:
-                    audio_tensor = result.audio
-                    if isinstance(audio_tensor, np.ndarray):
-                        audio = (
-                            audio_tensor[idx] if audio_tensor.ndim > 1 else audio_tensor
-                        )
-                    elif hasattr(audio_tensor, "shape"):
-                        audio = (
-                            audio_tensor[idx] if audio_tensor.ndim > 1 else audio_tensor
-                        )
-                    audio_sample_rate = getattr(result, "audio_sample_rate", None)
+                sample = result.output[idx]
+                audio = result.audio
+                if isinstance(audio, torch.Tensor) and audio.ndim >= 2:
+                    audio = audio[idx] if audio.shape[0] > idx else None
+                if audio is not None and not (
+                    isinstance(sample, (tuple, list)) and len(sample) == 2
+                ):
+                    sample = (sample, audio)
                 post_process_sample(
-                    result.output[idx],
+                    sample,
                     batch.data_type,
                     batch.fps,
                     batch.save_output,
                     save_file_path,
-                    audio=audio,
                     audio_sample_rate=audio_sample_rate,
                 )
                 save_file_path_list.append(save_file_path)
@@ -258,6 +253,7 @@ async def process_generation_batch(
                     batch.fps,
                     batch.save_output,
                     save_file_path,
+                    audio_sample_rate=audio_sample_rate,
                 )
                 save_file_path_list.append(save_file_path)
 

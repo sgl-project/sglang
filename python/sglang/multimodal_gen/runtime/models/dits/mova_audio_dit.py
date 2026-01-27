@@ -150,10 +150,7 @@ class WanAudioModel(CachableDiT, OffloadableDiTMixin):
         # Preserve state_dict keys (time_projection.1.weight/bias).
         self.time_projection = nn.Sequential(nn.SiLU(), ReplicatedLinear(dim, dim * 6))
         self.blocks = nn.ModuleList(
-            [
-                DiTBlock(dim, num_heads, ffn_dim, eps)
-                for _ in range(num_layers)
-            ]
+            [DiTBlock(dim, num_heads, ffn_dim, eps) for _ in range(num_layers)]
         )
         self.head = Head(dim, out_dim, patch_size, eps)
         self.num_heads = num_heads

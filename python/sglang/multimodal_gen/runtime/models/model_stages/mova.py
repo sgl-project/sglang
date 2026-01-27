@@ -144,10 +144,10 @@ class MOVATimestepPreparationStage(PipelineStage):
 class MOVADenoisingStage(PipelineStage):
     """Run MOVA dual-tower denoising loop."""
 
-    def __init__(self, video_dit, video_dit2, audio_dit, dual_tower_bridge, scheduler):
+    def __init__(self, video_dit, video_dit_2, audio_dit, dual_tower_bridge, scheduler):
         super().__init__()
         self.video_dit = video_dit
-        self.video_dit2 = video_dit2
+        self.video_dit_2 = video_dit_2
         self.audio_dit = audio_dit
         self.dual_tower_bridge = dual_tower_bridge
         self.scheduler = scheduler
@@ -221,7 +221,7 @@ class MOVADenoisingStage(PipelineStage):
     def _maybe_compile_dits(self, server_args: ServerArgs):
         if self._torch_compiled or not server_args.enable_torch_compile:
             return
-        for module in filter(None, [self.video_dit, self.video_dit2, self.audio_dit]):
+        for module in filter(None, [self.video_dit, self.video_dit_2, self.audio_dit]):
             self.compile_module_with_torch_compile(module, server_args)
         self._torch_compiled = True
 
@@ -333,16 +333,16 @@ class MOVADenoisingStage(PipelineStage):
     def _select_visual_dit(
         self, timestep: float, boundary_ratio: float | None, server_args: ServerArgs
     ):
-        if boundary_ratio is None or self.video_dit2 is None:
+        if boundary_ratio is None or self.video_dit_2 is None:
             self._manage_device_placement(self.video_dit, None, server_args)
             return self.video_dit
 
         boundary_timestep = boundary_ratio * self.scheduler.num_train_timesteps
         if timestep >= boundary_timestep:
             current_model = self.video_dit
-            model_to_offload = self.video_dit2
+            model_to_offload = self.video_dit_2
         else:
-            current_model = self.video_dit2
+            current_model = self.video_dit_2
             model_to_offload = self.video_dit
 
         self._manage_device_placement(current_model, model_to_offload, server_args)
@@ -565,7 +565,7 @@ class MOVADenoisingStage(PipelineStage):
                     if not is_warmup and hasattr(self, "step_profile"):
                         self.step_profile()
 
-        for dit in filter(None, [self.video_dit, self.video_dit2, self.audio_dit]):
+        for dit in filter(None, [self.video_dit, self.video_dit_2, self.audio_dit]):
             if isinstance(dit, OffloadableDiTMixin):
                 dit.prepare_for_next_denoise()
 

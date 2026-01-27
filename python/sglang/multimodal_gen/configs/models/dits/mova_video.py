@@ -54,7 +54,9 @@ class MOVAVideoArchConfig(DiTArchConfig):
         self.hidden_size = self.dim
         self.num_attention_heads = self.num_heads
         self.num_channels_latents = self.out_dim
-        assert not self.has_image_input, "has_image_input must be False; it's a config from Diffsynth Studio, which means the model uses CLIP for image encoding (we don't)."
+        assert (
+            not self.has_image_input
+        ), "has_image_input must be False; it's a config from Diffsynth Studio, which means the model uses CLIP for image encoding (we don't)."
 
 
 @dataclass

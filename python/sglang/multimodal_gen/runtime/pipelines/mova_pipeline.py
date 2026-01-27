@@ -40,7 +40,7 @@ class MOVAPipeline(ComposedPipelineBase):
         "tokenizer",
         "scheduler",
         "video_dit",
-        "video_dit2",
+        "video_dit_2",
         "audio_dit",
         "dual_tower_bridge",
     ]
@@ -97,7 +97,7 @@ class MOVAPipeline(ComposedPipelineBase):
             stage_name="mova_denoising_stage",
             stage=MOVADenoisingStage(
                 video_dit=self.get_module("video_dit"),
-                video_dit2=self.get_module("video_dit2"),
+                video_dit_2=self.get_module("video_dit_2"),
                 audio_dit=self.get_module("audio_dit"),
                 dual_tower_bridge=self.get_module("dual_tower_bridge"),
                 scheduler=self.get_module("scheduler"),
