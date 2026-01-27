@@ -30,7 +30,7 @@ import sys
 import time
 from collections import defaultdict
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 # ===================== Configuration =====================
 
@@ -133,6 +133,16 @@ def parse_imbalance_logs(log_content: str) -> Dict[str, Dict[str, List[float]]]:
     return result
 
 
+def _read_last_jsonl(path: str) -> Optional[dict]:
+    if not path or not os.path.exists(path):
+        return None
+    with open(path, "r", encoding="utf-8") as f:
+        lines = [ln for ln in f.read().splitlines() if ln.strip()]
+    if not lines:
+        return None
+    return json.loads(lines[-1])
+
+
 def compute_average_imbalance(
     stage_data: Dict[str, Dict[str, List[float]]]
 ) -> Dict[str, float]:
@@ -166,7 +176,7 @@ def run_experiment(
     enable_eplb: bool,
     init_expert_location: Optional[str],
     log_file: str,
-) -> Dict[str, float]:
+) -> Tuple[Dict[str, float], Optional[dict], Optional[str]]:
     """
     Run a single experiment configuration.
 
@@ -227,6 +237,10 @@ def run_experiment(
     env = os.environ.copy()
     env["PYTHONPATH"] = python_path + ":" + env.get("PYTHONPATH", "")
     env["PYTHONUNBUFFERED"] = "1"
+    # Some dev containers mount a source checkout of flashinfer on PYTHONPATH which can
+    # mismatch the installed flashinfer-cubin package. Allow bypass so we can run the
+    # benchmark without env surgery.
+    env.setdefault("FLASHINFER_DISABLE_VERSION_CHECK", "1")
     env["SGLANG_DEBUG_WATERFILL_EPLB"] = "1"
     env["SGLANG_DEBUG_WATERFILL_EPLB_LAYER"] = "all"  # Log all layers
     env["SGLANG_DEBUG_WATERFILL_EPLB_MAX_PRINTS"] = "1"
@@ -249,11 +263,16 @@ def run_experiment(
         print("Waiting for server to start...")
         if not wait_for_server(port, proc=server_proc):
             print(f"ERROR: Server failed to start within {SERVER_TIMEOUT}s")
-            return {}
+            return {}, None, None
 
         print("Server is ready. Running benchmark...")
 
         # Run bench_one_batch_server
+        out_dir = os.path.dirname(log_file)
+        bench_result_file = os.path.join(
+            out_dir,
+            f"bench_one_batch_{mode}_{eplb_str}_in{input_len}_bs{batch_size}_o{output_len}.jsonl",
+        )
         bench_cmd = [
             sys.executable,
             "-m",
@@ -269,6 +288,9 @@ def run_experiment(
             "--output-len",
             str(output_len),
             "--skip-warmup",
+            "--result-filename",
+            bench_result_file,
+            "--no-append-to-github-summary",
         ]
 
         bench_result = subprocess.run(
@@ -311,13 +333,20 @@ def run_experiment(
 
     stage_data = parse_imbalance_logs(log_content)
     avg_imbalance = compute_average_imbalance(stage_data)
+    bench_summary = (
+        _read_last_jsonl(bench_result_file) if "bench_result_file" in locals() else None
+    )
 
     print(f"Parsed imbalance data:")
     for stage, avg in sorted(avg_imbalance.items()):
         num_layers = len(stage_data.get(stage, {}))
         print(f"  {stage}: avg={avg:.4f}x (from {num_layers} layers)")
 
-    return avg_imbalance
+    return (
+        avg_imbalance,
+        bench_summary,
+        (bench_result_file if "bench_result_file" in locals() else None),
+    )
 
 
 def main():
@@ -389,7 +418,7 @@ def main():
             log_file = os.path.join(out_dir, log_filename)
 
             # Run experiment
-            avg_imbalance = run_experiment(
+            avg_imbalance, bench_summary, bench_result_file = run_experiment(
                 waterfill_sglang_dir=args.waterfill_sglang_dir,
                 baseline_sglang_dir=args.baseline_sglang_dir,
                 model_path=args.model_path,
@@ -410,6 +439,8 @@ def main():
                 "batch_size": args.batch_size,
                 "output_len": args.output_len,
                 "avg_imbalance": avg_imbalance,
+                "bench": bench_summary,
+                "bench_result_file": bench_result_file,
             }
             all_results.append(result)
             # Save partial progress so a long run can be resumed / inspected.
@@ -433,7 +464,7 @@ def main():
     for input_len in sorted(by_input_len.keys()):
         print(f"\n=== input_len={input_len} ===")
         print(
-            f"{'Mode':<15} {'EPLB':<8} {'pre_eplb':<12} {'post_eplb':<12} {'post_waterfill':<15}"
+            f"{'Mode':<15} {'EPLB':<8} {'latency(s)':<10} {'overall_tps':<12} {'pre_eplb':<12} {'post_eplb':<12} {'post_waterfill':<15}"
         )
         print("-" * 65)
 
@@ -441,6 +472,11 @@ def main():
             mode = r["mode"]
             eplb = "Yes" if r["enable_eplb"] else "No"
             avg = r["avg_imbalance"]
+            bench = r.get("bench") or {}
+            lat = bench.get("latency", None)
+            tps = bench.get("overall_throughput", None)
+            lat_s = f"{float(lat):.3f}" if lat is not None else "N/A"
+            tps_s = f"{float(tps):.1f}" if tps is not None else "N/A"
             pre_eplb = (
                 f"{avg.get('pre_eplb', 0):.4f}x" if avg.get("pre_eplb") else "N/A"
             )
@@ -452,7 +488,9 @@ def main():
                 if avg.get("post_waterfill")
                 else "N/A"
             )
-            print(f"{mode:<15} {eplb:<8} {pre_eplb:<12} {post_eplb:<12} {post_wf:<15}")
+            print(
+                f"{mode:<15} {eplb:<8} {lat_s:<10} {tps_s:<12} {pre_eplb:<12} {post_eplb:<12} {post_wf:<15}"
+            )
 
     # Calculate improvement metrics
     print("\n" + "=" * 80)

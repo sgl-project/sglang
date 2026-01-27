@@ -852,11 +852,25 @@ class DeepseekV2MoE(nn.Module):
                 config.n_routed_experts
                 + get_global_server_args().ep_num_redundant_experts
             )
+            # When static EPLB is enabled (init-expert-location != trivial), routed experts are
+            # typically already better balanced and/or more locality-friendly. In that setting,
+            # the probabilistic sampling step in Waterfill can over-send shared tokens remote
+            # (many candidate ranks), increasing communication and hurting E2E throughput.
+            # Disable sampling and use deterministic argmin (with tie-breaking to local).
+            server_args = get_global_server_args()
+            init_loc = getattr(server_args, "init_expert_location", "trivial")
+            static_eplb_enabled = bool(init_loc) and (init_loc != "trivial")
+            # Make Waterfill more conservative under static EPLB to avoid perturbing
+            # already-balanced routed load (and to reduce remote shared-token dispatch).
+            local_preference_factor = 1.2 if static_eplb_enabled else 1.0
+            enable_sampling = not static_eplb_enabled
             self.deepep_waterfill_balancer = DeepEPWaterfillBalancer(
                 num_routed_experts=num_physical_routed_experts,
                 world_size=self.moe_ep_size,
                 rank=get_moe_expert_parallel_rank(),  # Use EP rank, not TP rank!
                 routed_scaling_factor=self.routed_scaling_factor,
+                local_preference_factor=local_preference_factor,
+                enable_sampling=enable_sampling,
             )
 
             # Store the number of local *physical* routed experts (without the shared slot) for
@@ -1640,6 +1654,75 @@ class DeepseekV2MoE(nn.Module):
             topk_output = self.topk.empty_topk_output(device)
             return self.experts(hidden_states=hidden_states, topk_output=topk_output)
 
+        # ---------------- Debug-only: profile waterfill path timings ----------------
+        # Enable via env var:
+        #   SGLANG_PROFILE_WATERFILL_TIMING=1
+        #
+        # Optional:
+        #   SGLANG_PROFILE_WATERFILL_LAYER=<layer_id|all|-1>   (default: only layer 0)
+        #   SGLANG_PROFILE_WATERFILL_MAX_PRINTS=<N>            (default: 1)
+        #   SGLANG_PROFILE_WATERFILL_MIN_TOKENS=<N>            (default: 64)
+        #
+        # Prints one line from EP rank 0 with rough GPU timings for:
+        #   topk / all_reduce(routed_counts) / waterfill_prepare / dispatch / moe / combine
+        profile_waterfill_timing = os.environ.get(
+            "SGLANG_PROFILE_WATERFILL_TIMING", ""
+        ) not in (
+            "",
+            "0",
+            "false",
+            "False",
+        )
+        if profile_waterfill_timing and not torch.cuda.is_current_stream_capturing():
+            layer_filter = os.environ.get("SGLANG_PROFILE_WATERFILL_LAYER", "")
+            if layer_filter and layer_filter not in ("all", "-1"):
+                try:
+                    profile_waterfill_timing = int(layer_filter) == int(self.layer_id)
+                except Exception:
+                    profile_waterfill_timing = False
+            else:
+                # Default: only layer 0 to avoid log spam.
+                if not layer_filter:
+                    profile_waterfill_timing = int(self.layer_id) == 0
+        else:
+            profile_waterfill_timing = False
+
+        _wf_prof_group = None
+        _wf_prof_ep_rank = None
+        if profile_waterfill_timing:
+            _wf_prof_group = get_moe_ep_group().device_group
+            _wf_prof_ep_rank = torch.distributed.get_rank(group=_wf_prof_group)
+            # Only print once from EP rank 0.
+            profile_waterfill_timing = _wf_prof_ep_rank == 0
+
+        if profile_waterfill_timing:
+            max_prints = int(os.environ.get("SGLANG_PROFILE_WATERFILL_MAX_PRINTS", "1"))
+            printed = getattr(self, "_profile_waterfill_print_count", 0)
+            profile_waterfill_timing = printed < max_prints
+
+        if profile_waterfill_timing:
+            min_tokens_to_print = int(
+                os.environ.get("SGLANG_PROFILE_WATERFILL_MIN_TOKENS", "64")
+            )
+            profile_waterfill_timing = num_tokens >= min_tokens_to_print
+
+        if profile_waterfill_timing:
+            evt_total_s = torch.cuda.Event(enable_timing=True)
+            evt_total_e = torch.cuda.Event(enable_timing=True)
+            evt_topk_s = torch.cuda.Event(enable_timing=True)
+            evt_topk_e = torch.cuda.Event(enable_timing=True)
+            evt_allreduce_s = torch.cuda.Event(enable_timing=True)
+            evt_allreduce_e = torch.cuda.Event(enable_timing=True)
+            evt_prepare_s = torch.cuda.Event(enable_timing=True)
+            evt_prepare_e = torch.cuda.Event(enable_timing=True)
+            evt_dispatch_s = torch.cuda.Event(enable_timing=True)
+            evt_dispatch_e = torch.cuda.Event(enable_timing=True)
+            evt_moe_s = torch.cuda.Event(enable_timing=True)
+            evt_moe_e = torch.cuda.Event(enable_timing=True)
+            evt_combine_s = torch.cuda.Event(enable_timing=True)
+            evt_combine_e = torch.cuda.Event(enable_timing=True)
+            evt_total_s.record()
+
         router_logits = self.gate(hidden_states, forward_batch=forward_batch)
 
         # If this forward uses padded tokens (e.g. CUDA-graph padding), pass num_token_non_padded
@@ -1654,6 +1737,8 @@ class DeepseekV2MoE(nn.Module):
             and num_token_non_padded_cpu < num_tokens
         ):
             num_token_non_padded = forward_batch.num_token_non_padded
+        if profile_waterfill_timing:
+            evt_topk_s.record()
         topk_output = self.topk(
             hidden_states,
             router_logits,
@@ -1662,26 +1747,36 @@ class DeepseekV2MoE(nn.Module):
                 layer_id=self.layer_id,
             ),
         )
+        if profile_waterfill_timing:
+            evt_topk_e.record()
         topk_ids = topk_output.topk_ids  # [N, 8]
         topk_weights = topk_output.topk_weights  # [N, 8]
 
-        # Count local routed tokens and AllReduce for global counts
+        # Count local routed tokens and AllReduce for global counts (waterfill)
         local_routed_counts = self.deepep_waterfill_balancer.count_local_routed(
             topk_ids
         )
         global_routed_counts = local_routed_counts.clone()
+        if profile_waterfill_timing:
+            evt_allreduce_s.record()
         torch.distributed.all_reduce(
             global_routed_counts,
             op=torch.distributed.ReduceOp.SUM,
             group=get_moe_ep_group().device_group,
         )
+        if profile_waterfill_timing:
+            evt_allreduce_e.record()
 
         # Waterfill assignment and expand topk to 9 columns
-        expanded_topk_ids, expanded_topk_weights, _ = (
+        if profile_waterfill_timing:
+            evt_prepare_s.record()
+        expanded_topk_ids, expanded_topk_weights, local_shared_mask = (
             self.deepep_waterfill_balancer.prepare_dispatch(
                 topk_ids, topk_weights, global_routed_counts
             )
         )
+        if profile_waterfill_timing:
+            evt_prepare_e.record()
 
         # ---------------- Debug-only: EPLB load logs + validate Waterfill shared destination ----------------
         # Enable via env var:
@@ -1882,13 +1977,24 @@ class DeepseekV2MoE(nn.Module):
         )
 
         dispatcher = self.experts.dispatcher
+        if profile_waterfill_timing:
+            evt_dispatch_s.record()
         dispatcher.dispatch_a(
             hidden_states=hidden_states, topk_output=expanded_topk_output
         )
         dispatch_output = dispatcher.dispatch_b()
+        if profile_waterfill_timing:
+            evt_dispatch_e.record()
 
+        if profile_waterfill_timing:
+            evt_moe_s.record()
         combine_input = self.experts.run_moe_core(dispatch_output=dispatch_output)
+        if profile_waterfill_timing:
+            evt_moe_e.record()
+            evt_combine_s.record()
         combined_hidden_states = dispatcher.combine(combine_input=combine_input)
+        if profile_waterfill_timing:
+            evt_combine_e.record()
 
         # Apply routed scaling factor
         if not self.experts.should_fuse_routed_scaling_factor_in_topk:
@@ -1902,6 +2008,34 @@ class DeepseekV2MoE(nn.Module):
             combined_hidden_states = tensor_model_parallel_all_reduce(
                 combined_hidden_states
             )
+
+        if profile_waterfill_timing:
+            evt_total_e.record()
+            # Ensure all recorded events are completed before reading timings.
+            torch.cuda.synchronize()
+            init_loc = getattr(
+                get_global_server_args(), "init_expert_location", "trivial"
+            )
+            static_eplb = bool(init_loc) and (init_loc != "trivial")
+            # local_shared_mask is True when shared expert stays on source rank.
+            local_frac = float(local_shared_mask.float().mean().item())
+            remote_frac = 1.0 - local_frac
+            print(
+                (
+                    f"[wf_profile] layer={self.layer_id} ep_rank={_wf_prof_ep_rank} "
+                    f"static_eplb={int(static_eplb)} N={num_tokens} "
+                    f"remote_shared={remote_frac*100:.2f}% "
+                    f"topk_ms={evt_topk_s.elapsed_time(evt_topk_e):.3f} "
+                    f"allreduce_ms={evt_allreduce_s.elapsed_time(evt_allreduce_e):.3f} "
+                    f"prepare_ms={evt_prepare_s.elapsed_time(evt_prepare_e):.3f} "
+                    f"dispatch_ms={evt_dispatch_s.elapsed_time(evt_dispatch_e):.3f} "
+                    f"moe_ms={evt_moe_s.elapsed_time(evt_moe_e):.3f} "
+                    f"combine_ms={evt_combine_s.elapsed_time(evt_combine_e):.3f} "
+                    f"total_ms={evt_total_s.elapsed_time(evt_total_e):.3f}"
+                ),
+                flush=True,
+            )
+            self._profile_waterfill_print_count = printed + 1
 
         return combined_hidden_states
 
