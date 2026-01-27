@@ -817,10 +817,29 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         return min_per_gpu_memory
 
     def init_shared_mooncake_transfer_engine(self):
+        """
+        Need MooncakeTransferEngine when:
+        1) PD disaggregation uses mooncake for KV transfer (prefill/decode)
+        2) HiCache uses mooncake storage backend
+        3) Encoder disaggregation uses mooncake
+        """
         use_mooncake_te = (
-            self.server_args.disaggregation_transfer_backend == "mooncake"
-            or self.server_args.encoder_transfer_backend == "mooncake"
-            or self.server_args.hicache_storage_backend == "mooncake"
+            (
+                self.server_args.disaggregation_mode != "null"
+                and self.server_args.disaggregation_transfer_backend == "mooncake"
+            )
+            or (
+                self.server_args.enable_hierarchical_cache
+                and self.server_args.hicache_storage_backend == "mooncake"
+            )
+            or (
+                self.server_args.encoder_only
+                and self.server_args.encoder_transfer_backend == "mooncake"
+            )
+            or (
+                self.server_args.language_only
+                and self.server_args.encoder_transfer_backend == "mooncake"
+            )
         )
 
         if use_mooncake_te:
@@ -831,7 +850,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             init_mooncake_transfer_engine(
                 hostname=get_local_ip_auto(),
                 gpu_id=self.gpu_id,
-                ib_device=self.server_args.disaggregation_ib_device,
+                ib_device=(
+                    self.server_args.disaggregation_ib_device
+                    or self.server_args.mooncake_ib_device
+                ),
             )
 
     def load_model(self):
