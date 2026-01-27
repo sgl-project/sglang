@@ -906,17 +906,23 @@ class SchedulerOutputProcessorMixin:
                 should_output = True
             else:
                 if req.stream:
-                    stream_interval = (
-                        req.sampling_params.stream_interval or self.stream_interval
-                    )
+                    # Token-by-token streaming: emit one token per cycle
+                    if self.stream_output_token_by_token:
+                        # Check if there are tokens generated but not yet detokenized
+                        pending_tokens = len(req.output_ids) - req.cur_decode_ids_len
+                        should_output = pending_tokens > 0
+                    else:
+                        stream_interval = (
+                            req.sampling_params.stream_interval or self.stream_interval
+                        )
 
-                    # origin stream_interval logic
-                    should_output = (
-                        len(req.output_ids) % stream_interval == 1
-                        if not self.model_config.is_multimodal_gen
-                        and stream_interval > 1
-                        else len(req.output_ids) % stream_interval == 0
-                    )
+                        # origin stream_interval logic
+                        should_output = (
+                            len(req.output_ids) % stream_interval == 1
+                            if not self.model_config.is_multimodal_gen
+                            and stream_interval > 1
+                            else len(req.output_ids) % stream_interval == 0
+                        )
 
                     if should_output:
                         # check_match_stop_str_prefix if  tail_str's suffix match stop_str prefix
@@ -939,20 +945,23 @@ class SchedulerOutputProcessorMixin:
                     req.finished_reason.to_json() if req.finished_reason else None
                 )
                 decoded_texts.append(req.decoded_text)
-                decode_ids, read_offset = req.init_incremental_detokenize()
+                
+                # Token-by-token streaming: use limit=1 for detokenization
+                limit = 1 if self.stream_output_token_by_token and req.stream and not req.finished() else None
+                decode_ids, read_offset = req.init_incremental_detokenize(limit=limit)
 
-                if self.model_config.is_multimodal_gen:
-                    decode_ids_list.append(decode_ids)
-                else:
-                    decode_ids_list.append(decode_ids[req.send_decode_id_offset :])
+                # Use the tokens actually processed by init_incremental_detokenize
+                num_new_tokens = len(decode_ids) - req.send_decode_id_offset
+                decode_ids_list.append(decode_ids[req.send_decode_id_offset :])
 
                 # Exclude the tokens after stop condition
                 output_ids_ = req.output_ids_through_stop
 
                 req.send_decode_id_offset = len(decode_ids)
                 read_offsets.append(read_offset)
-                output_ids.append(output_ids_[send_token_offset:])
-                req.send_token_offset = len(output_ids_)
+                
+                output_ids.append(output_ids_[send_token_offset : send_token_offset + num_new_tokens])
+                req.send_token_offset = send_token_offset + num_new_tokens
                 skip_special_tokens.append(req.sampling_params.skip_special_tokens)
                 spaces_between_special_tokens.append(
                     req.sampling_params.spaces_between_special_tokens

@@ -300,6 +300,7 @@ class Scheduler(
         )
         self.enable_trace = server_args.enable_trace
         self.stream_interval = server_args.stream_interval
+        self.stream_output_token_by_token = server_args.stream_output_token_by_token
         self.spec_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )

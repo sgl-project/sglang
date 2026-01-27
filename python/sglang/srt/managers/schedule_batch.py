@@ -655,7 +655,7 @@ class Req:
         # Indicates if the req has ever been retracted.
         self.retracted_stain = False
 
-        # Incremental streamining
+        # Incremental streaming
         self.send_token_offset: int = 0
         self.send_decode_id_offset: int = 0
         # TODO (Byron): send_output_token_logprobs_offset and send_decode_id_offset can be different in disaggregation mode
@@ -907,7 +907,7 @@ class Req:
         self.set_extend_input_len(len(self.fill_ids) - len(self.prefix_indices))
 
     # Based on https://github.com/vllm-project/vllm/blob/7a64d24aad69e4d2548aa0bf528d9fe63428ab01/vllm/transformers_utils/detokenizer.py#L194-L313
-    def init_incremental_detokenize(self):
+    def init_incremental_detokenize(self, limit: Optional[int] = None):
         first_iter = self.surr_offset is None or self.read_offset is None
 
         output_ids = self.output_ids_through_stop
@@ -917,13 +917,22 @@ class Req:
             self.surr_offset = max(
                 self.read_offset - INIT_INCREMENTAL_DETOKENIZATION_OFFSET, 0
             )
+            
+            # Use limit if provided for the first iteration
+            initial_output_ids = output_ids[:limit] if limit is not None else output_ids
             self.surr_and_decode_ids = (
-                self.origin_input_ids_unpadded[self.surr_offset :] + output_ids
+                self.origin_input_ids_unpadded[self.surr_offset :] + initial_output_ids
             )
-            self.cur_decode_ids_len = len(output_ids)
+            self.cur_decode_ids_len = len(initial_output_ids)
         else:
-            self.surr_and_decode_ids.extend(output_ids[self.cur_decode_ids_len :])
-            self.cur_decode_ids_len = len(output_ids)
+            # Use limit if provided for extensions
+            if limit is not None:
+                new_ids = output_ids[self.cur_decode_ids_len : self.cur_decode_ids_len + limit]
+            else:
+                new_ids = output_ids[self.cur_decode_ids_len :]
+            
+            self.surr_and_decode_ids.extend(new_ids)
+            self.cur_decode_ids_len += len(new_ids)
 
         return self.surr_and_decode_ids, self.read_offset - self.surr_offset
 
