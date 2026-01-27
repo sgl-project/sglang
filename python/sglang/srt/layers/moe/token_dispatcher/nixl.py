@@ -21,6 +21,7 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
 from sglang.srt.layers.moe.utils import DeepEPMode
 from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.distributed.utils import get_global_tcp_store
 from sglang.srt.utils import get_bool_env_var, get_int_env_var, is_npu
 
 _is_npu = is_npu()
@@ -113,13 +114,22 @@ class NixlEPBuffer:
         rank = dist.get_rank(group)
         world_size = dist.get_world_size(group)
 
+        # Get the global TCPStore for coordination
+        tcp_store = get_global_tcp_store()
+        if tcp_store is None:
+            raise RuntimeError(
+                "Global TCPStore is not initialized. "
+                "Make sure init_distributed_environment was called before using NIXL EP."
+            )
+
         logger.info(
             f"Using NIXL EP (world_size={world_size}, rank={rank}, "
-            f"num_experts={cls._num_experts}, num_experts_per_rank={cls._num_local_experts})"
+            f"num_experts={cls._num_experts}, num_experts_per_rank={cls._num_local_experts}) "
         )
 
         cls._buffer = Buffer(
             rank=rank,
+            tcp_store_group=tcp_store,
         )
 
         cls._buffer.update_memory_buffers(
