@@ -1,0 +1,83 @@
+name: Diagnose Loading Slowness (AMD)
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: diagnose-loading-amd-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  diagnose-mi325:
+    runs-on: linux-mi325-gpu-8
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ensure_vram_clear.sh rocm
+
+      - name: Start CI container
+        run: bash scripts/ci/amd/amd_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+
+      - name: Run diagnosis script
+        timeout-minutes: 30
+        run: |
+          echo "=========================================="
+          echo "Diagnosing on: MI325 (linux-mi325-gpu-8)"
+          echo "=========================================="
+          docker exec ci_sglang bash -c "bash /sglang-checkout/scripts/diagnose_loading_slowness.sh"
+
+      - name: Cleanup
+        if: always()
+        run: docker rm -f ci_sglang || true
+
+  diagnose-mi35x:
+    runs-on: linux-mi35x-gpu-8
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ensure_vram_clear.sh rocm
+
+      - name: Start CI container
+        run: bash scripts/ci/amd/amd_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+
+      - name: Run diagnosis script
+        timeout-minutes: 30
+        run: |
+          echo "=========================================="
+          echo "Diagnosing on: MI35x (linux-mi35x-gpu-8)"
+          echo "=========================================="
+          docker exec ci_sglang bash -c "bash /sglang-checkout/scripts/diagnose_loading_slowness.sh"
+
+      - name: Cleanup
+        if: always()
+        run: docker rm -f ci_sglang || true
+
+  summary:
+    needs: [diagnose-mi325, diagnose-mi35x]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Summary
+        run: |
+          echo "=========================================="
+          echo "Diagnosis Complete"
+          echo "=========================================="
+          echo ""
+          echo "Check the logs of each job above for detailed results."
+          echo ""
+          echo "Compare the following between MI325 and MI35x:"
+          echo "  - Disk read/write speed"
+          echo "  - HF cache status"
+          echo "  - Network latency"
+          echo "  - GPU architecture info"
+          echo "=========================================="
