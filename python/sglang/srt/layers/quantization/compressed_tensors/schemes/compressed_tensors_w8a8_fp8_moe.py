@@ -1,46 +1,29 @@
 from __future__ import annotations
-
-import enum
-import logging
-from enum import Enum
-from typing import TYPE_CHECKING
+from typing import Callable, Optional, TYPE_CHECKING
 
 import torch
-from compressed_tensors import CompressionFormat
-from compressed_tensors.quantization import QuantizationStrategy
+import logging
+from compressed_tensors.quantization import QuantizationArgs, QuantizationStrategy
+from torch.nn import Parameter
 
-from sglang.srt.distributed import get_tensor_model_parallel_world_size, get_tp_group
-from sglang.srt.distributed.device_communicators.pynccl_allocator import (
-    use_symmetric_memory,
-)
-from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
-    NPUW4A8Int8DynamicMoEMethod,
-    NPUW4A16Int4DynamicMoEMethod,
-    NPUW8A8Int8DynamicMoEMethod,
-)
-from sglang.srt.layers.dp_attention import is_allocation_symmetric
+from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
-from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams, CutlassMoEType
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
-from sglang.srt.layers.moe.utils import get_moe_runner_backend
-from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsScheme,
 )
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz, scaled_fp8_quant
 from sglang.srt.layers.quantization.fp8_utils import (
-    is_blackwell_supported,
+    apply_fp8_linear,
+    apply_fp8_ptpc_linear,
+    dispatch_w8a8_block_fp8_linear,
     normalize_e4m3fn_to_e4m3fnuz,
+    validate_fp8_block_shape,
 )
-from sglang.srt.layers.quantization.gptq import gptq_marlin_moe_repack
-from sglang.srt.layers.quantization.marlin_utils import marlin_moe_permute_scales
 from sglang.srt.layers.quantization.utils import (
+    requantize_with_max_scale,
     all_close_1d,
     per_tensor_dequantize,
-    prepare_static_weights_for_trtllm_fp4_moe,
-    reorder_w1w3_to_w3w1,
-    replace_parameter,
-    swizzle_blockscale,
 )
 from sglang.srt.utils import (
     get_bool_env_var,
@@ -57,14 +40,10 @@ if TYPE_CHECKING:
         CombineInput,
         StandardDispatchOutput,
     )
-    from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
-        CompressedTensorsConfig,
-    )
+
+__all__ = ["CompressedTensorsW8A8Fp8MoE"]
 
 _is_hip = is_hip()
-_is_npu = is_npu()
-_is_cuda = is_cuda()
-
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _use_aiter:
@@ -74,8 +53,6 @@ if _use_aiter:
 
 
 logger = logging.getLogger(__name__)
-
-__all__ = ["CompressedTensorsW8A8Fp8MoE"]
 
 
 class CompressedTensorsW8A8Fp8MoE(CompressedTensorsScheme):
@@ -106,6 +83,11 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsScheme):
                 "For FP8 Fused MoE layer, we require either per tensor or "
                 "channelwise, dynamic per token quantization."
             )
+
+    @classmethod
+    def get_min_capability(cls) -> int:
+        # ampere and up
+        return 80
 
     def create_weights(
         self,
@@ -346,7 +328,7 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsScheme):
         self.moe_runner_config = moe_runner_config
         self.runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
 
-    def apply(
+    def apply_weights(
         self,
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
