@@ -24,7 +24,12 @@ if TYPE_CHECKING:
         StandardDispatchOutput,
     )
 
-from sglang.srt.hardware_backend.npu.moe.npu_fused_experts import npu_fused_experts_w4a8, npu_fused_experts_wna16, npu_fused_experts_w8a8, npu_fused_experts_unquant
+from sglang.srt.hardware_backend.npu.moe.npu_fused_experts import (
+    npu_fused_experts_unquant,
+    npu_fused_experts_w4a8,
+    npu_fused_experts_w8a8,
+    npu_fused_experts_wna16,
+)
 
 # ---------------------------------------------------------------------------
 # Runner IO dataclasses
@@ -71,68 +76,72 @@ class TorchNpuKernelsQuantInfo(MoeQuantInfo):
     w2_scale_bias: Optional[torch.Tensor] = None
     activation: Optional[str] = None
 
+
 # ---------------------------------------------------------------------------
 # Runner core
 # ---------------------------------------------------------------------------
 
+
 def output_unquant(hidden_states, quant_info, topk_weights, topk_ids):
     output = npu_fused_experts_unquant(
-            hidden_states=hidden_states,
-            w13=quant_info.w13_weight,
-            w13_weight_bias=quant_info.w13_weight_bias,
-            w2=quant_info.w2_weight,
-            w2_weight_bias=quant_info.w2_weight_bias,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            top_k=topk_ids.shape[1],
-            activation=quant_info.activation,
-        )
+        hidden_states=hidden_states,
+        w13=quant_info.w13_weight,
+        w13_weight_bias=quant_info.w13_weight_bias,
+        w2=quant_info.w2_weight,
+        w2_weight_bias=quant_info.w2_weight_bias,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        top_k=topk_ids.shape[1],
+        activation=quant_info.activation,
+    )
     return output
 
 
 def output_w4a8(hidden_states, quant_info, topk_weights, topk_ids):
     output = npu_fused_experts_w4a8(
-            hidden_states=hidden_states,
-            w13=quant_info.w13_weight,
-            w13_scale=quant_info.w13_scale,
-            w13_scale_bias=quant_info.w13_scale_bias,
-            w2=quant_info.w2_weight,
-            w2_scale=quant_info.w2_scale,
-            w2_scale_bias=quant_info.w2_scale_bias,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            top_k=topk_ids.shape[1],
-        )
+        hidden_states=hidden_states,
+        w13=quant_info.w13_weight,
+        w13_scale=quant_info.w13_scale,
+        w13_scale_bias=quant_info.w13_scale_bias,
+        w2=quant_info.w2_weight,
+        w2_scale=quant_info.w2_scale,
+        w2_scale_bias=quant_info.w2_scale_bias,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        top_k=topk_ids.shape[1],
+    )
     return output
+
 
 def output_wna16(hidden_states, quant_info, topk_weights, topk_ids):
     output = npu_fused_experts_wna16(
-            hidden_states=hidden_states,
-            w13=quant_info.w13_weight,
-            w13_scale=quant_info.w13_scale,
-            w13_offset=quant_info.w13_offset,
-            w2=quant_info.w2_weight,
-            w2_scale=quant_info.w2_scale,
-            w2_offset=quant_info.w2_offset,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            top_k=topk_ids.shape[1],
-        )
+        hidden_states=hidden_states,
+        w13=quant_info.w13_weight,
+        w13_scale=quant_info.w13_scale,
+        w13_offset=quant_info.w13_offset,
+        w2=quant_info.w2_weight,
+        w2_scale=quant_info.w2_scale,
+        w2_offset=quant_info.w2_offset,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        top_k=topk_ids.shape[1],
+    )
     return output
+
 
 def output_w8a8(hidden_states, quant_info, topk_weights, topk_ids):
     output = npu_fused_experts_w8a8(
-            hidden_states=hidden_states,
-            w13=quant_info.w13_weight,
-            w13_scale=quant_info.w13_scale,
-            w13_offset=quant_info.w13_offset,
-            w2=quant_info.w2_weight,
-            w2_scale=quant_info.w2_scale,
-            w2_offset=quant_info.w2_offset,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            top_k=topk_ids.shape[1],
-        )
+        hidden_states=hidden_states,
+        w13=quant_info.w13_weight,
+        w13_scale=quant_info.w13_scale,
+        w13_offset=quant_info.w13_offset,
+        w2=quant_info.w2_weight,
+        w2_scale=quant_info.w2_scale,
+        w2_offset=quant_info.w2_offset,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        top_k=topk_ids.shape[1],
+    )
     return output
 
 
@@ -141,14 +150,15 @@ class TorchNpuKernelsRunnerCore(MoeRunnerCore):
 
     def __init__(self, config: MoeRunnerConfig):
         super().__init__(config)
-        
+
         self.selected_run = {
             "ModelSlimW4A8Int8MoE": output_w4a8,
             "NPUCompressedTensorsW4A8Int4DynamicMoEMethod": output_w4a8,
             "ModelSlimW8A8Int8MoE": output_w8a8,
             "NPUCompressedTensorsW4A16Int4DynamicMoEMethod": output_wna16,
             "AWQMoEAscendMethod": output_wna16,
-            "UnquantizedFusedMoEMethod": output_unquant}.get(config.quantization, output_unquant)
+            "UnquantizedFusedMoEMethod": output_unquant,
+        }.get(config.quantization, output_unquant)
 
     def run(
         self,

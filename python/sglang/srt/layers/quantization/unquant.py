@@ -6,6 +6,9 @@ import torch
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
+from sglang.srt.hardware_backend.npu.moe.torch_npu_kernels import (
+    TorchNpuKernelsQuantInfo,
+)
 from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
 from sglang.srt.layers.moe import (
     MoeRunner,
@@ -13,7 +16,6 @@ from sglang.srt.layers.moe import (
     MoeRunnerConfig,
     get_moe_runner_backend,
 )
-from sglang.srt.hardware_backend.npu.moe.torch_npu_kernels import TorchNpuKernelsQuantInfo
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
@@ -304,7 +306,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
 
         if _is_npu:
             layer.w13_weight.data = layer.w13_weight.data.transpose(1, 2)
-            layer.w2_weight.data = layer.w2_weight.data.transpose(1, 2) 
+            layer.w2_weight.data = layer.w2_weight.data.transpose(1, 2)
             layer.w13_weight.data = npu_format_cast(layer.w13_weight.data)
             layer.w2_weight.data = npu_format_cast(layer.w2_weight.data)
 
@@ -323,9 +325,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 else MoeRunnerBackend.TRITON
             )
         if _is_npu:
-            backend = (
-                MoeRunnerBackend.TORCH_NPU_KERNELS
-            )
+            backend = MoeRunnerBackend.TORCH_NPU_KERNELS
         self.runner = MoeRunner(backend, moe_runner_config)
 
     @property
@@ -481,12 +481,12 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
     ) -> CombineInput:
         backend = self.runner.runner_backend
         quant_info = TorchNpuKernelsQuantInfo(
-                w13_weight=layer.w13_weight,
-                w2_weight=layer.w2_weight,
-                w13_weight_bias=layer.w13_weight_bias if self.with_bias else None,
-                w2_weight_bias=layer.w2_weight_bias if self.with_bias else None,
-                activation=self.moe_runner_config.activation,
-            )
+            w13_weight=layer.w13_weight,
+            w2_weight=layer.w2_weight,
+            w13_weight_bias=layer.w13_weight_bias if self.with_bias else None,
+            w2_weight_bias=layer.w2_weight_bias if self.with_bias else None,
+            activation=self.moe_runner_config.activation,
+        )
         return self.runner.run(dispatch_output, quant_info)
 
     def forward_tpu(self, *args, **kwargs) -> CombineInput:

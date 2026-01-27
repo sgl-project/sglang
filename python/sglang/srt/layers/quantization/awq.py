@@ -46,6 +46,9 @@ if TYPE_CHECKING:
         StandardDispatchOutput,
     )
 
+from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
+    NPUW4A16Int4DynamicMoEMethod,
+)
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
 
 _is_cuda = is_cuda()
@@ -857,7 +860,7 @@ class AWQMoEAscendMethod(AWQMoEMethod):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         self.kernel.process_weights_after_loading(layer)
-        
+
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: "MoeRunnerConfig"
     ):

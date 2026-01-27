@@ -13,9 +13,11 @@ if TYPE_CHECKING:
     )
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
-from sglang.srt.layers.moe.utils import get_moe_runner_backend
+from sglang.srt.hardware_backend.npu.moe.torch_npu_kernels import (
+    TorchNpuKernelsQuantInfo,
+)
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
-from sglang.srt.hardware_backend.npu.moe.torch_npu_kernels import TorchNpuKernelsQuantInfo
+from sglang.srt.layers.moe.utils import get_moe_runner_backend
 
 
 def npu_fused_moe_without_routing_weights_bf16(
@@ -102,9 +104,7 @@ class NPUW8A8Int8DynamicMoEMethod(_NPUFusedMoEMethodBase):
         self.moe_runner_config = moe_runner_config
         backend = get_moe_runner_backend()
         if backend.is_auto():
-            backend = (
-                MoeRunnerBackend.TORCH_NPU_KERNELS
-            )
+            backend = MoeRunnerBackend.TORCH_NPU_KERNELS
         self.runner = MoeRunner(backend, moe_runner_config)
 
     def apply(
@@ -114,13 +114,13 @@ class NPUW8A8Int8DynamicMoEMethod(_NPUFusedMoEMethodBase):
     ) -> "CombineInput":
         backend = self.runner.runner_backend
         quant_info = TorchNpuKernelsQuantInfo(
-                w13_weight=layer.w13_weight,
-                w2_weight=layer.w2_weight,
-                w13_scale=layer.w13_weight_scale,
-                w2_scale=layer.w2_weight_scale,
-                w13_offset=layer.w13_weight_offset,
-                w2_offset=layer.w2_weight_offset,
-            )
+            w13_weight=layer.w13_weight,
+            w2_weight=layer.w2_weight,
+            w13_scale=layer.w13_weight_scale,
+            w2_scale=layer.w2_weight_scale,
+            w13_offset=layer.w13_weight_offset,
+            w2_offset=layer.w2_weight_offset,
+        )
         return self.runner.run(dispatch_output, quant_info)
 
     def apply_without_routing_weights(
@@ -194,7 +194,7 @@ class NPUW4A8Int8DynamicMoEMethod(_NPUFusedMoEMethodBase):
         scale_fp32 = (scale * per_group_scale).to(torch.float16).to(torch.float32)
         scale_fp32_np = scale_fp32.cpu().numpy()
         scale_fp32_np.dtype = np.uint32
-        
+
         sscale_uint64 = np.zeros((group_num, quantgroup_num, n * 2), dtype=np.uint32)
         sscale_uint64[..., ::2] = scale_fp32_np
         sscale_uint64_buffer = np.frombuffer(
@@ -294,9 +294,7 @@ class NPUW4A8Int8DynamicMoEMethod(_NPUFusedMoEMethodBase):
         self.moe_runner_config = moe_runner_config
         backend = get_moe_runner_backend()
         if backend.is_auto():
-            backend = (
-                MoeRunnerBackend.TORCH_NPU_KERNELS
-            )
+            backend = MoeRunnerBackend.TORCH_NPU_KERNELS
         self.runner = MoeRunner(backend, moe_runner_config)
 
     def apply(
@@ -306,13 +304,13 @@ class NPUW4A8Int8DynamicMoEMethod(_NPUFusedMoEMethodBase):
     ) -> "CombineInput":
         backend = self.runner.runner_backend
         quant_info = TorchNpuKernelsQuantInfo(
-                w13_weight=layer.w13_weight,
-                w2_weight=layer.w2_weight,
-                w13_scale=layer.w2_weight_scale,
-                w2_scale=layer.w2_weight_scale,
-                w13_scale_bias=layer.w13_scale_bias,
-                w2_scale_bias=layer.w2_scale_bias,
-            )
+            w13_weight=layer.w13_weight,
+            w2_weight=layer.w2_weight,
+            w13_scale=layer.w2_weight_scale,
+            w2_scale=layer.w2_weight_scale,
+            w13_scale_bias=layer.w13_scale_bias,
+            w2_scale_bias=layer.w2_scale_bias,
+        )
         return self.runner.run(dispatch_output, quant_info)
 
     def apply_without_routing_weights(
@@ -494,13 +492,13 @@ class NPUW4A16Int4DynamicMoEMethod(_NPUFusedMoEMethodBase):
     ) -> "CombineInput":
         backend = self.runner.runner_backend
         quant_info = TorchNpuKernelsQuantInfo(
-                w13_weight=layer.w13_weight,
-                w2_weight=layer.w2_weight,
-                w13_scale=layer.w13_weight_scale,
-                w2_scale=layer.w2_weight_scale,
-                w13_bias=layer.w13_offset,
-                w2_offset=layer.w2_offset,
-            )
+            w13_weight=layer.w13_weight,
+            w2_weight=layer.w2_weight,
+            w13_scale=layer.w13_weight_scale,
+            w2_scale=layer.w2_weight_scale,
+            w13_bias=layer.w13_offset,
+            w2_offset=layer.w2_offset,
+        )
         return self.runner.run(dispatch_output, quant_info)
 
     def apply_without_routing_weights(
@@ -547,4 +545,3 @@ class NPUW4A16Int4DynamicMoEMethod(_NPUFusedMoEMethodBase):
             )
 
         return out_hidden
-

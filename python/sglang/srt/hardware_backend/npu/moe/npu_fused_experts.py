@@ -1,10 +1,17 @@
 import torch
+import torch.nn as nn
+from sgl_kernel_npu.activation.swiglu_oai import swiglu_oai
+
+from sglang.srt.layers.activation import GeluAndMul
+
 
 def prepare():
     pass
 
+
 def finalize():
     pass
+
 
 def npu_fused_experts_unquant(
     hidden_states: torch.Tensor,
@@ -59,12 +66,12 @@ def npu_fused_experts_unquant(
 
     # act_fn:
     if activation == "npu_swiglu_oai":
-        from sgl_kernel_npu.activation.swiglu_oai import swiglu_oai
+        layer = nn.ModuleList()
+        layer.register_parameter("w13_weight", w13)
         hidden_states = swiglu_oai(layer, hidden_states)
     elif activation == "silu":
         hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
     else:
-        from sglang.srt.layers.activation import GeluAndMul
         hidden_states = GeluAndMul()(hidden_states)
 
     # gmm2: down_proj
@@ -90,6 +97,7 @@ def npu_fused_experts_unquant(
     )
 
     return final_hidden_states
+
 
 def npu_fused_experts_wna16(
     hidden_states: torch.Tensor,
@@ -162,6 +170,7 @@ def npu_fused_experts_wna16(
         export_for_source_row=topk_ids,
     )
     return final_hidden_states
+
 
 def npu_fused_experts_w4a8(
     hidden_states: torch.Tensor,
@@ -246,6 +255,7 @@ def npu_fused_experts_w4a8(
     )
 
     return final_hidden_states
+
 
 def npu_fused_experts_w8a8(
     hidden_states: torch.Tensor,

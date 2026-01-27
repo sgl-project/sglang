@@ -1616,7 +1616,7 @@ class NPUCompressedTensorsW4A8Int8DynamicMoEMethod(CompressedTensorsMoEMethod):
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: "MoeRunnerConfig"
-    ):  
+    ):
         moe_runner_config.quantization = "NPUCompressedTensorsW4A8Int8DynamicMoEMethod"
         self.kernel.create_moe_runner(layer, moe_runner_config)
 
@@ -1767,7 +1767,7 @@ class NPUCompressedTensorsW4A16Int4DynamicMoEMethod(CompressedTensorsMoEMethod):
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: "MoeRunnerConfig"
-    ):  
+    ):
         moe_runner_config.quantization = "NPUCompressedTensorsW4A16Int4DynamicMoEMethod"
         self.kernel.create_moe_runner(layer, moe_runner_config)
 

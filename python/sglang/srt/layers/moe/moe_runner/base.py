@@ -50,7 +50,7 @@ class MoeRunnerConfig:
     gemm1_clamp_limit: Optional[float] = None
 
     # Quantization
-    quantization: Optional[str] = None 
+    quantization: Optional[str] = None
 
 
 @dataclass
