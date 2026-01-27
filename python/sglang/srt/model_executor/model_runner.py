@@ -369,7 +369,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         min_per_gpu_memory = self.init_torch_distributed()
 
         # Initialize MooncakeTransferEngine
-        self.init_mooncake_transfer_engine()
+        self.init_shared_mooncake_transfer_engine()
 
         # Init forward stream for overlap schedule
         self.forward_stream = torch.get_device_module(self.device).Stream()
@@ -816,7 +816,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
         return min_per_gpu_memory
 
-    def init_mooncake_transfer_engine(self):
+    def init_shared_mooncake_transfer_engine(self):
         use_mooncake_te = (
             self.server_args.disaggregation_transfer_backend == "mooncake"
             or self.server_args.encoder_transfer_backend == "mooncake"
