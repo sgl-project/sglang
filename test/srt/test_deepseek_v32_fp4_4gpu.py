@@ -24,6 +24,9 @@ class TestDeepseekV32FP4(CustomTestCase):
         other_args = [
             "--tp",
             "4",
+            "--dp",
+            "4",
+            "--enable-dp-attention",
             "--attention-backend",
             "nsa",
             "--moe-runner-backend",
