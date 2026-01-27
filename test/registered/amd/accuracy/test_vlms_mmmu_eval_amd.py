@@ -127,7 +127,8 @@ TRITON_ATTENTION_MODELS = {
 
 # Models known to fail on AMD - exclude from testing
 AMD_FAILING_VLM_MODELS = {
-    # Add models here as they are discovered to fail
+    # GLM-4.1V processor not registered yet (Glm4vForConditionalGeneration)
+    "zai-org/GLM-4.1V-9B-Thinking",
 }
 
 
