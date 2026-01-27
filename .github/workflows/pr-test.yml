@@ -1489,12 +1489,12 @@ jobs:
           fi
           IS_BLACKWELL=1 python3 run_suite.py --hw cuda --suite stage-c-test-4-gpu-b200 --partition-id ${{ matrix.part }} --total-partitions 3 --timeout-per-file 1800 $CONTINUE_ON_ERROR_FLAG
 
-  unit-test-backend-4-gpu-gb200:
+  stage-c-test-4-gpu-gb200:
     needs: [check-changes, call-gate, wait-for-stage-b, sgl-kernel-build-wheels-arm]
     if: |
       always() &&
       (
-        (inputs.target_stage == 'unit-test-backend-4-gpu-gb200') ||
+        (inputs.target_stage == 'stage-c-test-4-gpu-gb200') ||
         (
           !inputs.target_stage &&
           ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
@@ -1569,7 +1569,7 @@ jobs:
         stage-c-test-deepep-4-gpu,
         stage-c-test-deepep-8-gpu-h200,
         stage-c-test-4-gpu-b200,
-        # unit-test-backend-4-gpu-gb200,  # Disabled: GB200 runner needs repair
+        stage-c-test-4-gpu-gb200,
       ]
     if: always()
     runs-on: ubuntu-latest
