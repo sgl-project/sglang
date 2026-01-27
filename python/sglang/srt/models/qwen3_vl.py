@@ -62,6 +62,7 @@ from sglang.srt.models.utils import (
 )
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
 from sglang.srt.multimodal.vit_cuda_graph_runner import ViTCudaGraphRunner
+from sglang.srt.hardware_backend.npu.multimodel.vit_npu_graph_runner import ViTNpuGraphRunner
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, get_int_env_var, is_npu
 from sglang.srt.utils.hf_transformers_utils import get_processor
@@ -368,6 +369,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             1 if use_data_parallel else get_tensor_model_parallel_world_size()
         )
         self.cuda_graph_runner: Optional[ViTCudaGraphRunner] = ViTCudaGraphRunner(self)
+        self.npu_graph_runner: Optional[ViTNpuGraphRunner] = ViTNpuGraphRunner(self)
 
     @property
     def dtype(self) -> torch.dtype:
@@ -429,6 +431,8 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
     ) -> torch.Tensor:
         if envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get():
             return self.forward_with_cuda_graph(x, grid_thw)
+        elif envs.SGLANG_VIT_ENABLE_NPU_GRAPH.get():
+            return self.forward_with_npu_graph(x, grid_thw)
 
         x = x.to(device=self.device, dtype=self.dtype)
         x = self.patch_embed(x)
@@ -475,6 +479,40 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             [x] + deepstack_feature_lists, dim=1
         )  # [seq_len, hidden_size * (1 + depth_of_deepstack)]
         return hidden_states
+
+    def forward_with_npu_graph(
+        self,
+        x: torch.Tensor,
+        grid_thw: torch.Tensor,
+    ) -> torch.Tensor:
+        # patchify
+        x = x.to(device=self.device, dtype=self.dtype)
+        x = self.patch_embed(x)
+
+        if isinstance(grid_thw, list):
+            grid_thw_list = grid_thw
+            grid_thw = torch.tensor(grid_thw, dtype=torch.int32)
+        else:
+            grid_thw_list = grid_thw.tolist()
+
+        pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
+        x += pos_embeds
+
+        # rotary embedding -> (cos, sin)
+        rotary_pos_emb_cos, rotary_pos_emb_sin = self.rot_pos_emb(grid_thw_list)
+
+        # compute cu_seqlens
+        cu_seqlens = compute_cu_seqlens_from_grid_numpy(grid_thw)
+        cu_seqlens = cu_seqlens.to("cpu")
+
+        # blocks + merger + deepstack(optional) via NPU Graph Runner
+        return self.npu_graph_runner.run(
+            x=x,
+            rotary_pos_emb_cos=rotary_pos_emb_cos,
+            rotary_pos_emb_sin=rotary_pos_emb_sin,
+            cu_seqlens=cu_seqlens,
+            output_indices=None,
+        )
 
     def forward_with_cuda_graph(
         self,

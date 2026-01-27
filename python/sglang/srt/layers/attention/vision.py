@@ -526,27 +526,46 @@ class VisionAscendAttention(nn.Module):
         Returns:
              [b * s, h, head_size]
         """
-        cu_seqlens = resolve_seqlens(cu_seqlens, bsz, seq_len, device="cpu")
+        if envs.SGLANG_VIT_ENABLE_NPU_GRAPH.get():
+            if "output_ws" not in kwargs:
+                raise RuntimeError("output_ws should be prepared for cuda-graph mode")
+            
+            output = kwargs["output_ws"]
+            _, num_heads, head_size = q.shape
+            num_kv_heads = k.shape[1]
+            # operator requires pta version >= 2.5.1
+            torch_npu._npu_flash_attention_unpad(
+                query=q,
+                key=k,
+                value=v,
+                seq_len=cu_seqlens,
+                scale_value=head_size ** -0.5,
+                num_heads=num_heads,
+                num_kv_heads=num_kv_heads,
+                out=output,
+            )
+        else:
+            cu_seqlens = resolve_seqlens(cu_seqlens, bsz, seq_len, device="cpu")
 
-        seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
-        if seq_lens.is_npu:
-            # cu_seqlens must be on cpu because of operator restriction
-            seq_lens = seq_lens.to("cpu")
-        _, num_heads, head_size = q.shape
-        num_kv_heads = k.shape[1]
-        output = torch.empty_like(q)
+            seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+            if seq_lens.is_npu:
+                # cu_seqlens must be on cpu because of operator restriction
+                seq_lens = seq_lens.to("cpu")
+            _, num_heads, head_size = q.shape
+            num_kv_heads = k.shape[1]
+            output = torch.empty_like(q)
 
-        # operator requires pta version >= 2.5.1
-        torch_npu._npu_flash_attention_unpad(
-            query=q,
-            key=k,
-            value=v,
-            seq_len=seq_lens.to(torch.int32),
-            scale_value=head_size**-0.5,
-            num_heads=num_heads,
-            num_kv_heads=num_kv_heads,
-            out=output,
-        )
+            # operator requires pta version >= 2.5.1
+            torch_npu._npu_flash_attention_unpad(
+                query=q,
+                key=k,
+                value=v,
+                seq_len=seq_lens.to(torch.int32),
+                scale_value=head_size**-0.5,
+                num_heads=num_heads,
+                num_kv_heads=num_kv_heads,
+                out=output,
+            )
 
         return output
 
