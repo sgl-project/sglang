@@ -119,10 +119,10 @@ RUN if [ "$BUILD_LLVM" = "1" ]; then \
 # AITER
 RUN pip uninstall -y aiter
 RUN pip install psutil pybind11 # Required by AITER setup.py
-RUN git clone ${AITER_REPO} \
+RUN git clone ${AITER_REPO} --branch ${AITER_COMMIT} --depth 1 \
  && cd aiter \
- && git checkout ${AITER_COMMIT} \
  && git submodule update --init --recursive
+ADD aiter.patch ./aiter
 RUN cd aiter \
      && echo "[AITER] GPU_ARCH=${GPU_ARCH}" \
      && if [ "$BUILD_AITER_ALL" = "1" ] && [ "$BUILD_LLVM" = "1" ]; then \
@@ -131,7 +131,8 @@ RUN cd aiter \
           sh -c "PREBUILD_KERNELS=1 GPU_ARCHS=$GPU_ARCH_LIST python setup.py develop"; \
         else \
           sh -c "GPU_ARCHS=$GPU_ARCH_LIST python setup.py develop"; \
-        fi
+        fi \
+     && sh -c "patch -p1 < ./aiter.patch;"
 
 # -----------------------
 # Build vLLM
