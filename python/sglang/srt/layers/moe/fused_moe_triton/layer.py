@@ -54,8 +54,8 @@ from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     QuantizationConfig,
 )
-from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors_moe import (
-    CompressedTensorsMxInt4MoEMethod,
+from sglang.srt.layers.quantization.compressed_tensors.schemes import (
+    CompressedTensorsMxInt4MoE,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptNvFp4FusedMoEMethod
@@ -692,10 +692,10 @@ class FusedMoE(torch.nn.Module):
 
         # Flashinfer assumes w31 format for w13_weight. Same for the scales.
         if self.use_flashinfer_trtllm_moe and (
-            isinstance(self.quant_method, ModelOptNvFp4FusedMoEMethod)
-            or isinstance(self.quant_method, Fp8MoEMethod)
-            or isinstance(self.quant_method, UnquantizedFusedMoEMethod)
-            or isinstance(self.quant_method, CompressedTensorsMxInt4MoEMethod)
+            isinstance(method, ModelOptNvFp4FusedMoEMethod)
+            or isinstance(method, Fp8MoEMethod)
+            or isinstance(method, UnquantizedFusedMoEMethod)
+            or isinstance(method, CompressedTensorsMxInt4MoE)
         ):
             shard_id = {"w1": "w3", "w3": "w1", "w2": "w2"}[shard_id]
 
@@ -728,7 +728,7 @@ class FusedMoE(torch.nn.Module):
 
             if (
                 (
-                    "compressed" in self.quant_method.__class__.__name__.lower()
+                    "compressed" in method.__class__.__name__.lower()
                     or "w4afp8" in self.quant_config.get_name()
                 )
                 and (param.data[expert_id] != 1).any()
@@ -756,9 +756,9 @@ class FusedMoE(torch.nn.Module):
             )
             return
 
-        if "ModelOpt" in self.quant_method.__class__.__name__:
+        if "ModelOpt" in method.__class__.__name__:
             # Determine per-tensor weight scale patterns based on variant
-            is_fp4_variant = isinstance(self.quant_method, ModelOptNvFp4FusedMoEMethod)
+            is_fp4_variant = isinstance(method, ModelOptNvFp4FusedMoEMethod)
 
             # FP4 uses "weight_scale_2" for per-tensor, FP8 uses "weight_scale" for per-tensor
             per_tensor_conditions = (
