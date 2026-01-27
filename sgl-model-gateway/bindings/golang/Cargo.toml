@@ -1,6 +1,6 @@
 [package]
 name = "sgl-model-gateway-golang"
-version = "0.3.0"
+version = "0.3.2"
 edition = "2021"
 
 [lib]
@@ -17,6 +17,7 @@ uuid = { version = "1.10", features = ["v4", "serde"] }
 once_cell = "1.21.3"
 futures-util = "0.3"
 tracing = "0.1"
+libc = "0.2.179"
 
 [dependencies.sgl-model-gateway]
 path = "../.."

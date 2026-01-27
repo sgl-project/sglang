@@ -10,6 +10,7 @@ This module contains implementations of image encoding stages for diffusion pipe
 import PIL
 import torch
 from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
+from diffusers.models.modeling_outputs import AutoencoderKLOutput
 
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     qwen_image_postprocess_text,
@@ -95,13 +96,6 @@ class ImageEncodingStage(PipelineStage):
     ) -> Req:
         """
         Encode the prompt into image encoder hidden states.
-
-        Args:
-            batch: The current batch information.
-            server_args: The inference arguments.
-
-        Returns:
-            The batch with encoded prompt embeddings.
         """
 
         if batch.condition_image is None:
@@ -131,15 +125,16 @@ class ImageEncodingStage(PipelineStage):
         elif self.text_encoder:
             # if a text encoder is provided, e.g. Qwen-Image-Edit
             # 1. neg prompt embeds
-            neg_image_processor_kwargs = (
-                server_args.pipeline_config.prepare_image_processor_kwargs(
-                    batch, neg=True
+            if batch.do_classifier_free_guidance:
+                neg_image_processor_kwargs = (
+                    server_args.pipeline_config.prepare_image_processor_kwargs(
+                        batch, neg=True
+                    )
                 )
-            )
 
-            neg_image_inputs = self.image_processor(
-                images=image, return_tensors="pt", **neg_image_processor_kwargs
-            ).to(cuda_device)
+                neg_image_inputs = self.image_processor(
+                    images=image, return_tensors="pt", **neg_image_processor_kwargs
+                ).to(cuda_device)
 
             with set_forward_context(current_timestep=0, attn_metadata=None):
                 outputs = self.text_encoder(
@@ -149,20 +144,22 @@ class ImageEncodingStage(PipelineStage):
                     image_grid_thw=image_inputs.image_grid_thw,
                     output_hidden_states=True,
                 )
-                neg_outputs = self.text_encoder(
-                    input_ids=neg_image_inputs.input_ids,
-                    attention_mask=neg_image_inputs.attention_mask,
-                    pixel_values=neg_image_inputs.pixel_values,
-                    image_grid_thw=neg_image_inputs.image_grid_thw,
-                    output_hidden_states=True,
-                )
+                if batch.do_classifier_free_guidance:
+                    neg_outputs = self.text_encoder(
+                        input_ids=neg_image_inputs.input_ids,
+                        attention_mask=neg_image_inputs.attention_mask,
+                        pixel_values=neg_image_inputs.pixel_values,
+                        image_grid_thw=neg_image_inputs.image_grid_thw,
+                        output_hidden_states=True,
+                    )
             batch.prompt_embeds.append(
                 self.encoding_qwen_image_edit(outputs, image_inputs)
             )
 
-            batch.negative_prompt_embeds.append(
-                self.encoding_qwen_image_edit(neg_outputs, neg_image_inputs)
-            )
+            if batch.do_classifier_free_guidance:
+                batch.negative_prompt_embeds.append(
+                    self.encoding_qwen_image_edit(neg_outputs, neg_image_inputs)
+                )
 
         self.offload_model()
 
@@ -211,13 +208,6 @@ class ImageVAEEncodingStage(PipelineStage):
     ) -> Req:
         """
         Encode pixel representations into latent space.
-
-        Args:
-            batch: The current batch information.
-            server_args: The inference arguments.
-
-        Returns:
-            The batch with encoded outputs.
         """
 
         if batch.condition_image is None:
@@ -279,9 +269,12 @@ class ImageVAEEncodingStage(PipelineStage):
                 #     self.vae.enable_parallel()
                 if not vae_autocast_enabled:
                     video_condition = video_condition.to(vae_dtype)
-                encoder_output: DiagonalGaussianDistribution = self.vae.encode(
+                latent_dist: DiagonalGaussianDistribution = self.vae.encode(
                     video_condition
                 )
+                # for auto_encoder from diffusers
+                if isinstance(latent_dist, AutoencoderKLOutput):
+                    latent_dist = latent_dist.latent_dist
 
             generator = batch.generator
             if generator is None:
@@ -290,7 +283,7 @@ class ImageVAEEncodingStage(PipelineStage):
             sample_mode = server_args.pipeline_config.vae_config.encode_sample_mode()
 
             latent_condition = self.retrieve_latents(
-                encoder_output, generator, sample_mode=sample_mode
+                latent_dist, generator, sample_mode=sample_mode
             )
             latent_condition = server_args.pipeline_config.postprocess_vae_encode(
                 latent_condition, self.vae

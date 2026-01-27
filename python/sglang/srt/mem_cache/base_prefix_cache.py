@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import time
 from abc import ABC, abstractmethod
 from typing import (
@@ -20,6 +21,7 @@ from sglang.srt.metrics.collector import RadixCacheMetricsCollector
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.mem_cache.radix_cache import RadixKey
 
 
 @runtime_checkable
@@ -28,6 +30,62 @@ class PrefixCacheTrait(Protocol):
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
     page_size: int
     disable: bool
+
+
+@dataclasses.dataclass
+class MatchPrefixParams:
+    """Unified parameters for match_prefix across different cache types"""
+
+    key: RadixKey
+
+    # Mamba specific
+    cow_mamba: bool = False
+    req: Optional[Req] = None
+
+
+@dataclasses.dataclass
+class InsertParams:
+    """Unified parameters for insert across different cache types"""
+
+    key: RadixKey
+    value: Optional[torch.Tensor] = None
+
+    # Mamba specific
+    mamba_value: Optional[torch.Tensor] = None
+
+    # SWA specific
+    prev_prefix_len: int = 0
+    swa_evicted_seqlen: int = 0
+
+    # General
+    chunked: bool = False
+    priority: int = 0
+
+
+@dataclasses.dataclass
+class InsertResult:
+    """Result of an insert operation"""
+
+    prefix_len: int
+    mamba_exist: bool = False
+
+
+@dataclasses.dataclass
+class EvictParams:
+    """Unified parameters for evict across different cache types"""
+
+    num_tokens: int
+    swa_num_tokens: int = 0
+    mamba_num: int = 0
+
+
+@dataclasses.dataclass
+class EvictResult:
+    """Result of an evict operation"""
+
+    num_tokens_evicted: int = 0
+    swa_num_tokens_evicted: int = 0
+    mamba_num_evicted: int = 0
 
 
 class MatchResult(NamedTuple):
@@ -77,7 +135,7 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         pass
 
     @abstractmethod
-    def match_prefix(self, key: Any, **kwargs) -> MatchResult:
+    def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         pass
 
     @abstractmethod
@@ -89,7 +147,7 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         pass
 
     @abstractmethod
-    def evict(self, num_tokens: int):
+    def evict(self, params: EvictParams) -> EvictResult:
         pass
 
     @abstractmethod
@@ -148,3 +206,15 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
 
     def take_events(self):
         return []
+
+    def supports_swa(self) -> bool:
+        return False
+
+    def supports_mamba(self) -> bool:
+        return False
+
+    def is_chunk_cache(self) -> bool:
+        return False
+
+    def is_tree_cache(self) -> bool:
+        return not self.is_chunk_cache()
