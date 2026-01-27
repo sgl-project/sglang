@@ -112,7 +112,7 @@ test = [
   "matplotlib",
   "pandas",
   "parameterized",
-  "peft",
+  "peft>=0.18.0",
   "pytest",
   "sentence_transformers",
   "tabulate",
