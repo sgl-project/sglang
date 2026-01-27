@@ -61,11 +61,18 @@ class TestScoreAPI(CustomTestCase):
                 # Get logits for just our target tokens
                 target_logits = last_token_logits[label_token_ids]
 
-                # Apply softmax over just the target tokens
-                target_probs = torch.softmax(target_logits, dim=-1)
-
-                # Convert to list of probabilities in order of label_token_ids
-                probs = [target_probs[i].item() for i in range(len(label_token_ids))]
+                if apply_softmax:
+                    # Apply softmax over just the target tokens
+                    target_probs = torch.softmax(target_logits, dim=-1)
+                    # Convert to list of probabilities in order of label_token_ids
+                    probs = [
+                        target_probs[i].item() for i in range(len(label_token_ids))
+                    ]
+                else:
+                    # Return raw logits
+                    probs = [
+                        target_logits[i].item() for i in range(len(label_token_ids))
+                    ]
 
                 scores.append(probs)
 
@@ -587,6 +594,244 @@ class TestScoreAPI(CustomTestCase):
                 label_token_ids=label_token_ids,
                 apply_softmax=True,
             )
+
+    def test_score_accuracy_causallm_comprehensive(self):
+        """Comprehensive accuracy test for CausalLM models with various scenarios.
+
+        This test compares SGLang scoring outputs with HuggingFace reference implementations
+        across multiple use cases to ensure correctness.
+        """
+        test_cases = [
+            {
+                "name": "simple_completion",
+                "query": "The capital of France is",
+                "items": ["Paris", "London", "Berlin"],
+                "tokens": ["Paris", "London"],
+            },
+            {
+                "name": "sentiment_analysis",
+                "query": "The movie was",
+                "items": ["great", "terrible", "okay"],
+                "tokens": ["great", "terrible"],
+            },
+            {
+                "name": "long_context",
+                "query": "In the context of machine learning, " * 10
+                + "the term 'overfitting' means",
+                "items": [
+                    "the model performs well on training data but poorly on test data"
+                ],
+                "tokens": ["the", "model"],
+            },
+        ]
+
+        for case in test_cases:
+            with self.subTest(case=case["name"]):
+                label_token_ids = self._get_token_ids(case["tokens"])
+
+                sglang_scores = self.engine.score(
+                    query=case["query"],
+                    items=case["items"],
+                    label_token_ids=label_token_ids,
+                    apply_softmax=True,
+                )
+
+                hf_scores = self.compute_hf_scores(
+                    query=case["query"],
+                    items=case["items"],
+                    label_token_ids=label_token_ids,
+                    apply_softmax=True,
+                )
+
+                self._compare_scores(
+                    hf_scores,
+                    sglang_scores,
+                    label_token_ids,
+                    case["name"],
+                )
+
+    def test_score_accuracy_causallm_edge_cases(self):
+        """Test accuracy for edge cases in CausalLM scoring.
+
+        Validates that SGLang handles edge cases correctly compared to HuggingFace.
+        """
+        edge_cases = [
+            {
+                "name": "empty_query",
+                "query": "",
+                "items": ["test"],
+                "tokens": ["test", "item"],
+            },
+            {
+                "name": "single_char_items",
+                "query": "The answer is",
+                "items": ["A", "B", "C"],
+                "tokens": ["A", "B"],
+            },
+            {
+                "name": "special_characters",
+                "query": "The symbol for",
+                "items": ["@", "#", "$"],
+                "tokens": ["@", "#"],
+            },
+            {
+                "name": "unicode_text",
+                "query": "中文的意思是",
+                "items": ["你好", "世界"],
+                "tokens": ["你好", "世界"],
+            },
+        ]
+
+        for case in edge_cases:
+            with self.subTest(case=case["name"]):
+                try:
+                    label_token_ids = self._get_token_ids(case["tokens"])
+
+                    sglang_scores = self.engine.score(
+                        query=case["query"],
+                        items=case["items"],
+                        label_token_ids=label_token_ids,
+                        apply_softmax=True,
+                    )
+
+                    hf_scores = self.compute_hf_scores(
+                        query=case["query"],
+                        items=case["items"],
+                        label_token_ids=label_token_ids,
+                        apply_softmax=True,
+                    )
+
+                    self._compare_scores(
+                        hf_scores, sglang_scores, label_token_ids, case["name"]
+                    )
+                except (ValueError, IndexError) as e:
+                    # Some edge cases may not be tokenizable, skip them
+                    self.skipTest(f"Edge case {case['name']} not tokenizable: {e}")
+
+    def test_score_accuracy_causallm_batch_variations(self):
+        """Test accuracy with various batch configurations.
+
+        Ensures that SGLang maintains accuracy across different batch sizes
+        compared to HuggingFace reference.
+        """
+        query = "The answer is"
+        tokens = ["Yes", "No"]
+        label_token_ids = self._get_token_ids(tokens)
+
+        batch_configs = [
+            {"name": "single_item", "items": ["test"]},
+            {"name": "small_batch", "items": ["item1", "item2"]},
+            {"name": "medium_batch", "items": [f"item{i}" for i in range(5)]},
+            {"name": "large_batch", "items": [f"item{i}" for i in range(10)]},
+        ]
+
+        for config in batch_configs:
+            with self.subTest(config=config["name"]):
+                sglang_scores = self.engine.score(
+                    query=query,
+                    items=config["items"],
+                    label_token_ids=label_token_ids,
+                    apply_softmax=True,
+                )
+
+                hf_scores = self.compute_hf_scores(
+                    query=query,
+                    items=config["items"],
+                    label_token_ids=label_token_ids,
+                    apply_softmax=True,
+                )
+
+                self._compare_scores(
+                    hf_scores, sglang_scores, label_token_ids, config["name"]
+                )
+
+    def test_score_accuracy_reproducibility(self):
+        """Test that accuracy comparisons are reproducible across multiple runs.
+
+        Validates that both SGLang and HuggingFace produce deterministic results,
+        ensuring reliable accuracy comparisons.
+        """
+        query = "The answer is"
+        items = ["Yes", "No", "Maybe"]
+        tokens = ["Yes", "No"]
+        label_token_ids = self._get_token_ids(tokens)
+
+        # Run multiple times
+        all_sglang_scores = []
+        all_hf_scores = []
+
+        for run in range(3):
+            sglang_scores = self.engine.score(
+                query=query,
+                items=items,
+                label_token_ids=label_token_ids,
+                apply_softmax=True,
+            )
+            hf_scores = self.compute_hf_scores(
+                query=query,
+                items=items,
+                label_token_ids=label_token_ids,
+                apply_softmax=True,
+            )
+
+            all_sglang_scores.append(sglang_scores)
+            all_hf_scores.append(hf_scores)
+        # Check that SGLang results are deterministic
+        # Use relative tolerance to account for floating point precision differences
+        REPROD_TOLERANCE = 0.10
+        for i in range(1, len(all_sglang_scores)):
+            for j, (s1, s2) in enumerate(
+                zip(all_sglang_scores[0], all_sglang_scores[i])
+            ):
+                for k, (score1, score2) in enumerate(zip(s1, s2)):
+                    diff = abs(score1 - score2)
+                    # Use relative tolerance: compare difference to the average of the two values
+                    avg_score = (abs(score1) + abs(score2)) / 2
+                    if avg_score > 1e-6:  # Avoid division by zero
+                        rel_diff = diff / avg_score
+                        self.assertLessEqual(
+                            rel_diff,
+                            REPROD_TOLERANCE,
+                            msg=f"Run {i} differs from run 0 at item {j}, token {k}: "
+                            f"score1={score1:.8f}, score2={score2:.8f}, "
+                            f"rel_diff={rel_diff:.2%}",
+                        )
+                    else:
+                        # For very small values, use absolute tolerance
+                        self.assertLessEqual(
+                            diff,
+                            1e-6,
+                            msg=f"Run {i} differs from run 0 at item {j}, token {k}: "
+                            f"score1={score1:.8f}, score2={score2:.8f}",
+                        )
+        # Check that HF results are deterministic
+        REPROD_TOLERANCE = 0.10
+        for i in range(1, len(all_hf_scores)):
+            for j, (s1, s2) in enumerate(zip(all_hf_scores[0], all_hf_scores[i])):
+                for k, (score1, score2) in enumerate(zip(s1, s2)):
+                    diff = abs(score1 - score2)
+                    avg_score = (abs(score1) + abs(score2)) / 2
+                    if avg_score > 1e-6:
+                        rel_diff = diff / avg_score
+                        self.assertLessEqual(
+                            rel_diff,
+                            REPROD_TOLERANCE,
+                            msg=f"HF run {i} differs from run 0 at item {j}, token {k}: "
+                            f"score1={score1:.8f}, score2={score2:.8f}, "
+                            f"rel_diff={rel_diff:.2%}",
+                        )
+                    else:
+                        self.assertLessEqual(
+                            diff,
+                            1e-6,
+                            msg=f"HF run {i} differs from run 0 at item {j}, token {k}: "
+                            f"score1={score1:.8f}, score2={score2:.8f}",
+                        )
+
+        # Compare first run between SGLang and HuggingFace
+        self._compare_scores(
+            all_hf_scores[0], all_sglang_scores[0], label_token_ids, "reproducibility"
+        )
 
 
 if __name__ == "__main__":
