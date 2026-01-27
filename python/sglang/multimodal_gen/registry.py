@@ -555,12 +555,16 @@ def _register_configs():
     register_configs(
         sampling_param_cls=MOVA_360P_SamplingParams,
         pipeline_config_cls=MOVA360PConfig,
-        model_detectors=[lambda hf_id: "360p" in hf_id.lower()],
+        model_detectors=[
+            lambda hf_id: "mova" in hf_id.lower() and "360p" in hf_id.lower()
+        ],
     )
     register_configs(
         sampling_param_cls=MOVA_720P_SamplingParams,
         pipeline_config_cls=MOVA720PConfig,
-        model_detectors=[lambda hf_id: "720p" in hf_id.lower()],
+        model_detectors=[
+            lambda hf_id: "mova" in hf_id.lower() and "720p" in hf_id.lower()
+        ],
     )
     # FLUX
     register_configs(
