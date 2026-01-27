@@ -12,7 +12,7 @@ from sgl_kernel_npu.attention.sinks_attention import (
 
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.hardware_backend.npu.attention.ascend_torch_native_backend import (
-    AscendTorchNativeAttnBackend
+    AscendTorchNativeAttnBackend,
 )
 from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_fia_nz,
