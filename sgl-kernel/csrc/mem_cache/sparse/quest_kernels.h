@@ -1,10 +1,11 @@
 #pragma once
 
 #include <torch/all.h>
+
 #include <optional>
 #include <tuple>
 
-void retrieval_score_and_combine_indices(
+void quest_retrieval_score_and_combine_indices(
     int64_t bs,
     torch::Tensor seq_lens,
     int64_t page_size,
@@ -19,24 +20,6 @@ void retrieval_score_and_combine_indices(
     torch::Tensor sparse_mask,
     torch::Tensor out_indices,
     torch::Tensor out_lengths);
-
-void invoke_sparse_diff_cuda_kernel(
-    torch::Tensor page_table,
-    torch::Tensor last_top_k,
-    torch::Tensor last_page_ids,
-    torch::Tensor curr_top_k,
-    torch::Tensor req_pool_indices,
-    torch::Tensor seq_lens,
-    torch::Tensor valid_lengths,
-    torch::Tensor sparse_mask,
-    torch::Tensor req_to_tokens_host,
-    torch::Tensor physical_pages,
-    torch::Tensor load_tokens,
-    torch::Tensor load_tokens_host,
-    torch::Tensor cache_seqlens,
-    torch::Tensor original_cache_seqlens,
-    int64_t layer_id,
-    int64_t page_size);
 
 void update_sparse_metadata(
     torch::Tensor page_table,

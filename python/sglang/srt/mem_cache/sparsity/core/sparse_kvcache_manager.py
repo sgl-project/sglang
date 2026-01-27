@@ -139,20 +139,21 @@ class SparseKVCacheManager:
         swap_source_host_slots = self.req_states.should_load_host_indices[
             :batch_size, : self.req_states.topk_tokens_cnt
         ]
-        swap_target_device_slots = swap_target_device_slots[
-            swap_target_device_slots != -1
-        ]
-        swap_source_host_slots = swap_source_host_slots[swap_source_host_slots != -1]
-        assert (
-            swap_target_device_slots.numel() == swap_source_host_slots.numel()
-        ), "Swap target device slots and source host slots must have the same number of elements"
+
+        swap_target_device_slots = swap_target_device_slots.reshape(-1)
+        swap_source_host_slots = swap_source_host_slots.reshape(-1)
+
+        valid_pos = torch.nonzero(
+            swap_target_device_slots.ne(-1) & swap_source_host_slots.ne(-1),
+            as_tuple=False,
+        ).squeeze(1)
 
         # Load cache from host to device
-        if swap_target_device_slots.numel() > 0:
+        if valid_pos.numel() > 0:
             self.mem_pool_host.load_to_device_per_layer(
                 self.mem_pool_device,
-                swap_source_host_slots.flatten(),
-                swap_target_device_slots.flatten(),
+                swap_source_host_slots.index_select(0, valid_pos),
+                swap_target_device_slots.index_select(0, valid_pos),
                 layer_id,
                 "kernel",
             )

@@ -291,6 +291,15 @@ class SparseCoordinator:
         """
         if self._should_check_offload(forward_batch):
             self.sparse_kv_cache_manager.poll_decode_offload_completion()
+            req_pool_indices = forward_batch.req_pool_indices
+            if req_pool_indices.numel() > 0:
+                sparse_mask = self._compute_sparse_mask(req_pool_indices)
+                forward_batch._sparse_mask = sparse_mask
+                forward_batch._sparse_mask_i32 = sparse_mask.to(torch.int32)
+                forward_batch._sparse_any = bool(sparse_mask.any().item())
+                forward_batch._sparse_all = bool(sparse_mask.all().item())
+                forward_batch._req_pool_indices_i32 = req_pool_indices.to(torch.int32)
+                forward_batch._seq_lens_i32 = forward_batch.seq_lens.to(torch.int32)
 
     def forward_end(self, forward_batch: "ForwardBatch") -> None:
         """
@@ -336,6 +345,19 @@ class SparseCoordinator:
         """
         if attn_metadata is None:
             return
+
+        if not forward_batch.forward_mode.is_decode_or_idle():
+            return attn_metadata
+
+        sparse_any = getattr(forward_batch, "_sparse_any", None)
+        if sparse_any is None:
+            sparse_any = bool(
+                self._compute_sparse_mask(forward_batch.req_pool_indices).any().item()
+            )
+            forward_batch._sparse_any = sparse_any
+
+        if not sparse_any:
+            return attn_metadata
 
         if layer.layer_id == self.start_layer:
             self.backend_adaptor.save_original_metadata(attn_metadata)
@@ -384,13 +406,20 @@ class SparseCoordinator:
         **kwargs,
     ) -> Optional[torch.Tensor]:
         req_pool_indices = forward_batch.req_pool_indices
-        # Compute Topk
-        sparse_mask = self._compute_sparse_mask(req_pool_indices)
+        sparse_mask = getattr(forward_batch, "_sparse_mask", None)
+        if sparse_mask is None or sparse_mask.shape[0] != req_pool_indices.shape[0]:
+            sparse_mask = self._compute_sparse_mask(req_pool_indices)
+            forward_batch._sparse_mask = sparse_mask
+            forward_batch._sparse_mask_i32 = sparse_mask.to(torch.int32)
+
         selected_indices, valid_lengths = self.algorithm.retrieve_topk(
             queries=query,
             layer_id=layer.layer_id,
             req_pool_indices=req_pool_indices,
             sparse_mask=sparse_mask,
+            sparse_mask_i32=getattr(forward_batch, "_sparse_mask_i32", None),
+            req_pool_indices_i32=getattr(forward_batch, "_req_pool_indices_i32", None),
+            seq_lens_i32=getattr(forward_batch, "_seq_lens_i32", None),
             forward_batch=forward_batch,
             attn_metadata=attn_metadata,
             **kwargs,
