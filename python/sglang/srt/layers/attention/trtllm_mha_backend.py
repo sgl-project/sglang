@@ -454,46 +454,31 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
     def _get_inv_scale_tensors(
         self, layer: RadixAttention
     ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-        """Get cached inv_scale tensors for a layer (create on first use).
-
-        This ensures no tensor allocation happens during CUDA graph capture.
-        """
+        """Get cached inv_scale tensors for a layer (create on first use)."""
         layer_id = layer.layer_id
         if layer_id not in self._inv_scale_cache:
-            k_scale = layer.k_scale
-            v_scale = layer.v_scale
-
+            k_scale, v_scale = layer.k_scale, layer.v_scale
             if k_scale is not None and v_scale is not None:
-                # Convert to tensor and compute inverse (only done once per layer)
-                if isinstance(k_scale, torch.Tensor):
-                    inv_k = (1.0 / k_scale).to(device=self.device, dtype=torch.float32)
-                else:
-                    inv_k = torch.tensor(
-                        1.0 / float(k_scale), device=self.device, dtype=torch.float32
+
+                def to_inv_scale(scale):
+                    if isinstance(scale, torch.Tensor):
+                        return (1.0 / scale).to(device=self.device, dtype=torch.float32)
+                    return torch.tensor(
+                        1.0 / float(scale), device=self.device, dtype=torch.float32
                     )
 
-                if isinstance(v_scale, torch.Tensor):
-                    inv_v = (1.0 / v_scale).to(device=self.device, dtype=torch.float32)
-                else:
-                    inv_v = torch.tensor(
-                        1.0 / float(v_scale), device=self.device, dtype=torch.float32
-                    )
-
-                self._inv_scale_cache[layer_id] = (inv_k, inv_v)
+                self._inv_scale_cache[layer_id] = (
+                    to_inv_scale(k_scale),
+                    to_inv_scale(v_scale),
+                )
             else:
                 self._inv_scale_cache[layer_id] = (None, None)
-
         return self._inv_scale_cache[layer_id]
 
     def _ensure_q_fp8_buffer(self, num_tokens: int) -> None:
-        """Lazy allocate q_fp8_buffer if not already allocated.
-
-        This allows fused path to work even without CUDA graph initialization.
-        Allocation only happens once on first use.
-        """
+        """Lazy allocate q_fp8_buffer if needed."""
         if self.q_fp8_buffer is None or self.q_fp8_buffer.shape[0] < num_tokens:
-            # Allocate with some headroom to avoid frequent re-allocation
-            buffer_size = max(num_tokens, 1024)  # At least 1024 tokens
+            buffer_size = max(num_tokens, 1024)
             self.q_fp8_buffer = torch.empty(
                 buffer_size,
                 self.num_q_heads,
@@ -511,27 +496,14 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         forward_batch: ForwardBatch,
         **kwargs,
     ) -> torch.Tensor:
-        """Fused FP8 quantization for Q, K, V in a single kernel.
-
-        Returns:
-            q_fp8: FP8 quantized Q tensor
-        """
+        """Fused FP8 quantization for Q, K, V in a single kernel. Returns q_fp8."""
         cache_loc = forward_batch.out_cache_loc
         num_tokens = q.shape[0]
-
-        # Get K/V cache buffers from token_to_kv_pool
         k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
 
-        # Ensure q_fp8_buffer is allocated (lazy allocation on first use)
         self._ensure_q_fp8_buffer(num_tokens)
-
-        # Get pre-allocated q_fp8 buffer (slice to actual num_tokens)
         q_out = self.q_fp8_buffer[:num_tokens]
-
-        # Get cached inv_scale tensors (no allocation during CUDA graph capture)
         inv_k_scale, inv_v_scale = self._get_inv_scale_tensors(layer)
-
-        # Fused kernel: Q cast to FP8 + K/V quantize and cache write
         fused_fp8_set_qkv_buffer(
             q=q,
             k=k,

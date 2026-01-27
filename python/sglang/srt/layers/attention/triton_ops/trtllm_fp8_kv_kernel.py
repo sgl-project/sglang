@@ -109,7 +109,6 @@ def _process_q_tensor(
         head_offsets = head_idx + tl.arange(0, BLOCK_HEAD)
         dim_offsets = dim_idx + tl.arange(0, BLOCK_DIM)
 
-        # Use real boundaries for masking (avoid Python min() with Triton scalars)
         head_mask = head_offsets < num_q_heads
         dim_mask = dim_offsets < head_dim
         mask = head_mask[:, None] & dim_mask[None, :]
@@ -721,176 +720,56 @@ def _naive_fp8_set_kv_buffer(
 
 
 def fused_fp8_set_qkv_buffer(
-    q: torch.Tensor,  # [num_tokens, num_q_heads, head_dim] or [num_tokens, num_q_heads * head_dim]
-    k: torch.Tensor,  # [num_tokens, num_kv_heads, head_dim] or [num_tokens, num_kv_heads * head_dim]
-    v: torch.Tensor,  # [num_tokens, num_kv_heads, head_dim] or [num_tokens, num_kv_heads * head_dim]
-    k_cache: torch.Tensor,  # [total_slots, num_kv_heads, head_dim] or [num_pages, page_size, num_kv_heads, head_dim]
-    v_cache: torch.Tensor,  # same as k_cache
-    cache_loc: torch.Tensor,  # [num_tokens], dtype=int32
-    q_out: torch.Tensor,  # [num_tokens, num_q_heads, head_dim] FP8, pre-allocated output buffer
-    inv_k_scale: Optional[torch.Tensor] = None,  # Pre-computed 1/k_scale tensor
-    inv_v_scale: Optional[torch.Tensor] = None,  # Pre-computed 1/v_scale tensor
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    cache_loc: torch.Tensor,
+    q_out: torch.Tensor,
+    inv_k_scale: Optional[torch.Tensor] = None,
+    inv_v_scale: Optional[torch.Tensor] = None,
     page_size: int = 16,
 ) -> None:
-    """
-    Fused FP8 quantization for Q, K, V tensors in a single kernel launch.
-
-    This function performs:
-    1. Q: cast to FP8 and write to q_out (pre-allocated buffer, no cache write)
-    2. K, V: cast to FP8 with optional scale and write to paged KV cache
-
-    Args:
-        q: Query tensor, can be 2D or 3D
-        k: Key tensor after RoPE, can be 2D or 3D
-        v: Value tensor, can be 2D or 3D
-        k_cache: Paged K cache buffer in FP8
-        v_cache: Paged V cache buffer in FP8
-        cache_loc: Cache location for each token, shape [num_tokens]
-        q_out: Pre-allocated FP8 output buffer for Q (MUST be pre-allocated, no allocation here)
-        inv_k_scale: Pre-computed inverse K scale tensor (1/k_scale), or None
-        inv_v_scale: Pre-computed inverse V scale tensor (1/v_scale), or None
-        page_size: Number of tokens per page
-
-    Note:
-        - q_out MUST be pre-allocated by the caller to ensure CUDA graph compatibility.
-        - inv_k_scale/inv_v_scale MUST be pre-computed tensors to avoid allocation during forward.
-        - This function does NOT allocate any memory, making it safe for CUDA graph capture.
-    """
+    """Fused FP8 quantization for Q, K, V. Writes Q to q_out, K/V to cache."""
     num_tokens = k.shape[0]
-
     if num_tokens == 0:
         return
 
-    # Step 1: Infer num_kv_heads and head_dim from cache shape
-    if k_cache.ndim == 3:
-        total_slots, num_kv_heads, head_dim = k_cache.shape
-        assert (
-            total_slots % page_size == 0
-        ), f"total_slots ({total_slots}) must be divisible by page_size ({page_size})"
-    elif k_cache.ndim == 4:
-        num_pages, ps, num_kv_heads, head_dim = k_cache.shape
-        assert (
-            ps == page_size
-        ), f"page_size mismatch: cache has {ps}, expected {page_size}"
-    else:
-        raise ValueError(f"Unsupported k_cache.ndim={k_cache.ndim}, expected 3 or 4")
+    # Cache is always 3D: [total_slots, num_kv_heads, head_dim]
+    _, num_kv_heads, head_dim = k_cache.shape
+    num_q_heads = q_out.shape[1]
 
-    # Step 2: Infer num_q_heads from q shape
-    if q.ndim == 3:
-        num_q_heads = q.shape[1]
-        assert (
-            q.shape[2] == head_dim
-        ), f"head_dim mismatch: q.shape[2]={q.shape[2]} vs cache={head_dim}"
-        q_3d = q
-    elif q.ndim == 2:
-        # Infer num_q_heads from q_out
-        if q_out.ndim == 3:
-            num_q_heads = q_out.shape[1]
-        else:
-            raise ValueError("Cannot infer num_q_heads from 2D q without 3D q_out")
-        q_3d = q.view(num_tokens, num_q_heads, head_dim)
-    else:
-        raise ValueError(f"Unsupported q.ndim={q.ndim}, expected 2 or 3")
+    # Normalize to 3D if needed
+    q_3d = q if q.ndim == 3 else q.view(num_tokens, num_q_heads, head_dim)
+    k_3d = k if k.ndim == 3 else k.view(num_tokens, num_kv_heads, head_dim)
+    v_3d = v if v.ndim == 3 else v.view(num_tokens, num_kv_heads, head_dim)
 
-    # Step 3: Normalize k, v to 3D
-    if k.ndim == 3:
-        k_3d = k
-        v_3d = v
-    elif k.ndim == 2:
-        k_3d = k.view(num_tokens, num_kv_heads, head_dim)
-        v_3d = v.view(num_tokens, num_kv_heads, head_dim)
-    else:
-        raise ValueError(f"Unsupported k.ndim={k.ndim}, expected 2 or 3")
+    # Compute cache strides (3D layout)
+    k_cache_stride_page = k_cache.stride(0) * page_size
+    k_cache_stride_offset = k_cache.stride(0)
+    k_cache_stride_head = k_cache.stride(1)
+    k_cache_stride_dim = k_cache.stride(2)
 
-    # Step 4: Normalize q_out to 3D
-    if q_out.ndim == 3:
-        q_out_3d = q_out
-    elif q_out.ndim == 2:
-        q_out_3d = q_out.view(num_tokens, num_q_heads, head_dim)
-    else:
-        raise ValueError(f"Unsupported q_out.ndim={q_out.ndim}, expected 2 or 3")
+    v_cache_stride_page = v_cache.stride(0) * page_size
+    v_cache_stride_offset = v_cache.stride(0)
+    v_cache_stride_head = v_cache.stride(1)
+    v_cache_stride_dim = v_cache.stride(2)
 
-    # Step 5: Compute cache strides
-    if k_cache.ndim == 3:
-        stride_slot = k_cache.stride(0)
-        stride_head = k_cache.stride(1)
-        stride_dim = k_cache.stride(2)
-
-        k_cache_stride_page = stride_slot * page_size
-        k_cache_stride_offset = stride_slot
-        k_cache_stride_head = stride_head
-        k_cache_stride_dim = stride_dim
-
-        v_stride_slot = v_cache.stride(0)
-        v_stride_head = v_cache.stride(1)
-        v_stride_dim = v_cache.stride(2)
-
-        v_cache_stride_page = v_stride_slot * page_size
-        v_cache_stride_offset = v_stride_slot
-        v_cache_stride_head = v_stride_head
-        v_cache_stride_dim = v_stride_dim
-    else:
-        k_cache_stride_page = k_cache.stride(0)
-        k_cache_stride_offset = k_cache.stride(1)
-        k_cache_stride_head = k_cache.stride(2)
-        k_cache_stride_dim = k_cache.stride(3)
-
-        v_cache_stride_page = v_cache.stride(0)
-        v_cache_stride_offset = v_cache.stride(1)
-        v_cache_stride_head = v_cache.stride(2)
-        v_cache_stride_dim = v_cache.stride(3)
-
-    # Step 6: Compute input strides
-    q_stride_token = q_3d.stride(0)
-    q_stride_head = q_3d.stride(1)
-    q_stride_dim = q_3d.stride(2)
-
-    q_out_stride_token = q_out_3d.stride(0)
-    q_out_stride_head = q_out_3d.stride(1)
-    q_out_stride_dim = q_out_3d.stride(2)
-
-    k_stride_token = k_3d.stride(0)
-    k_stride_head = k_3d.stride(1)
-    k_stride_dim = k_3d.stride(2)
-
-    v_stride_token = v_3d.stride(0)
-    v_stride_head = v_3d.stride(1)
-    v_stride_dim = v_3d.stride(2)
-
-    # Step 7: Compute block sizes and grid
-    BLOCK_HEAD = 8  # Fixed for fewer Triton variants
+    # Block sizes and grid
+    BLOCK_HEAD = 8
     BLOCK_DIM = min(head_dim, 128)
-
     num_kv_head_blocks = (num_kv_heads + BLOCK_HEAD - 1) // BLOCK_HEAD
     num_q_head_blocks = (num_q_heads + BLOCK_HEAD - 1) // BLOCK_HEAD
+    grid = (num_tokens, 2 * num_kv_head_blocks + num_q_head_blocks)
 
-    # Grid: (num_tokens, 2 * num_kv_head_blocks + num_q_head_blocks)
-    # Block mapping:
-    #   [0, Bkv)            -> K
-    #   [Bkv, 2*Bkv)        -> V
-    #   [2*Bkv, 2*Bkv + Bq) -> Q
-    total_head_blocks = 2 * num_kv_head_blocks + num_q_head_blocks
-    grid = (num_tokens, total_head_blocks)
-
-    device = q_3d.device
-
-    # Step 8: Handle scales for K/V (Q has no scale)
-    # inv_k_scale/inv_v_scale are pre-computed tensors passed from caller
-    # This avoids any tensor allocation during forward, making it CUDA graph safe
     use_provided_scale = inv_k_scale is not None and inv_v_scale is not None
+    inv_k_scale_ptr = inv_k_scale if use_provided_scale else k_3d
+    inv_v_scale_ptr = inv_v_scale if use_provided_scale else k_3d
 
-    if use_provided_scale:
-        inv_k_scale_ptr = inv_k_scale
-        inv_v_scale_ptr = inv_v_scale
-    else:
-        # Dummy pointers, won't be accessed when use_provided_scale=False
-        inv_k_scale_ptr = k_3d
-        inv_v_scale_ptr = k_3d
-
-    # Step 9: Launch fused kernel
     _fused_fp8_set_qkv_buffer_kernel[grid](
         q_3d,
-        q_out_3d,
+        q_out,
         k_3d,
         v_3d,
         k_cache,
@@ -905,22 +784,22 @@ def fused_fp8_set_qkv_buffer(
         page_size,
         num_kv_head_blocks,
         num_q_head_blocks,
-        q_stride_token,
-        q_stride_head,
-        q_stride_dim,
-        q_out_stride_token,
-        q_out_stride_head,
-        q_out_stride_dim,
-        k_stride_token,
-        k_stride_head,
-        k_stride_dim,
+        q_3d.stride(0),
+        q_3d.stride(1),
+        q_3d.stride(2),
+        q_out.stride(0),
+        q_out.stride(1),
+        q_out.stride(2),
+        k_3d.stride(0),
+        k_3d.stride(1),
+        k_3d.stride(2),
         k_cache_stride_page,
         k_cache_stride_offset,
         k_cache_stride_head,
         k_cache_stride_dim,
-        v_stride_token,
-        v_stride_head,
-        v_stride_dim,
+        v_3d.stride(0),
+        v_3d.stride(1),
+        v_3d.stride(2),
         v_cache_stride_page,
         v_cache_stride_offset,
         v_cache_stride_head,
