@@ -271,7 +271,7 @@ class ComponentLoader(ABC):
         # Loaders for audio/video specific components that might vary
         av_module_loaders = {
             "audio_dit": (TransformerLoader, "diffusers"),
-            "audio_vae": (AudioVAELoader, "diffusers"),
+            "audio_vae": (VAELoader, "diffusers"),
             "connectors": (AdapterLoader, "diffusers"),
             "dual_tower_bridge": (BridgeLoader, "diffusers"),
             "video_dit": (TransformerLoader, "diffusers"),
@@ -289,7 +289,6 @@ class ComponentLoader(ABC):
             "audio_vae",
             "audio_dit",
             "dual_tower_bridge",
-            "scheduler",
             "video_dit",
         ]:
             transformers_or_diffusers = "diffusers"
@@ -629,14 +628,8 @@ class TokenizerLoader(ComponentLoader):
         )
 
 
-class BaseVAELoader(ComponentLoader):
+class VAELoader(ComponentLoader):
     """Shared loader for (video/audio) VAE modules."""
-
-    pipeline_vae_config_attr: str = "vae_config"
-    pipeline_vae_precision: str = "vae_precision"
-    allowed_module_keys: tuple[str, ...] = ("vae",)
-    call_post_init: bool = False
-    log_state_dict_mismatches: bool = False
 
     def should_offload(
         self, server_args: ServerArgs, model_config: ModelConfig | None = None
@@ -653,19 +646,21 @@ class BaseVAELoader(ComponentLoader):
             class_name is not None
         ), "Model config does not contain a _class_name attribute. Only diffusers format is supported."
 
-        if module_name in self.allowed_module_keys:
-            module_key = module_name
-        else:
-            raise ValueError(f"Invalid module name: {module_name}")
-        server_args.model_paths[module_key] = component_model_path
+        server_args.model_paths[module_name] = component_model_path
 
         logger.debug("HF model config: %s", config)
-        vae_config = getattr(server_args.pipeline_config, self.pipeline_vae_config_attr)
-        vae_precision = getattr(
-            server_args.pipeline_config, self.pipeline_vae_precision
-        )
+        if module_name in ("vae", "video_vae"):
+            pipeline_vae_config_attr = "vae_config"
+            pipeline_vae_precision = "vae_precision"
+        elif module_name in ("audio_vae",):
+            pipeline_vae_config_attr = "audio_vae_config"
+            pipeline_vae_precision = "audio_vae_precision"
+        else:
+            raise ValueError(f"Unsupported module name for VAE loader: {module_name}")
+        vae_config = getattr(server_args.pipeline_config, pipeline_vae_config_attr)
+        vae_precision = getattr(server_args.pipeline_config, pipeline_vae_precision)
         vae_config.update_model_arch(config)
-        if self.call_post_init and hasattr(vae_config, "post_init"):
+        if hasattr(vae_config, "post_init"):
             # NOTE: some post init logics are only available after updated with config
             vae_config.post_init()
 
@@ -707,36 +702,16 @@ class BaseVAELoader(ComponentLoader):
         loaded = safetensors_load_file(safetensors_list[0])
         vae.load_state_dict(loaded, strict=False)
 
-        if self.log_state_dict_mismatches:
-            state_keys = set(vae.state_dict().keys())
-            loaded_keys = set(loaded.keys())
-            missing_keys = sorted(state_keys - loaded_keys)
-            unexpected_keys = sorted(loaded_keys - state_keys)
-            if missing_keys:
-                logger.warning("VAE missing keys: %s", missing_keys)
-            if unexpected_keys:
-                logger.warning("VAE unexpected keys: %s", unexpected_keys)
+        state_keys = set(vae.state_dict().keys())
+        loaded_keys = set(loaded.keys())
+        missing_keys = sorted(state_keys - loaded_keys)
+        unexpected_keys = sorted(loaded_keys - state_keys)
+        if missing_keys:
+            logger.warning("VAE missing keys: %s", missing_keys)
+        if unexpected_keys:
+            logger.warning("VAE unexpected keys: %s", unexpected_keys)
 
         return vae.eval()
-
-
-class VAELoader(BaseVAELoader):
-    """Loader for VAE (image/video)."""
-
-    pipeline_vae_config_attr = "vae_config"
-    pipeline_vae_precision: str = "vae_precision"
-    allowed_module_keys = ("video_vae", "vae")
-    call_post_init = True
-
-
-class AudioVAELoader(BaseVAELoader):
-    """Loader for audio VAE (e.g. DAC)."""
-
-    pipeline_vae_config_attr = "audio_vae_config"
-    pipeline_vae_precision: str = "audio_vae_precision"
-    allowed_module_keys = ("audio_vae",)
-    call_post_init = True
-    log_state_dict_mismatches = True
 
 
 class VocoderLoader(ComponentLoader):
