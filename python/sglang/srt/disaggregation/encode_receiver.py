@@ -12,6 +12,7 @@ import aiohttp
 import torch
 import zmq
 import zmq.asyncio
+from transformers import PretrainedConfig
 
 from sglang.srt.disaggregation.mooncake.transfer_engine import MooncakeTransferEngine
 from sglang.srt.distributed.parallel_state import GroupCoordinator
@@ -22,7 +23,6 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_local_ip_auto, get_zmq_socket_on_host
 from sglang.srt.utils.common import ImageData
 from sglang.srt.utils.hf_transformers_utils import get_processor
-from transformers import PretrainedConfig
 
 logger = logging.getLogger(__name__)
 
@@ -193,11 +193,7 @@ class MultiModalEmbeddingData(EmbeddingData):
         for grid_dim in grid_dims:
             if grid_dim is None:
                 continue
-            if grid_dim.dim() == 1:
-                # TODO: check necessary
-                valid_grid_dims.append(grid_dim.unsqueeze(0))
-            else:
-                valid_grid_dims.append(grid_dim)
+            valid_grid_dims.append(grid_dim)
         if len(valid_grid_dims) == 0:
             return None
         return torch.cat(valid_grid_dims, dim=0)
