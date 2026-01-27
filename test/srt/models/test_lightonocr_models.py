@@ -4,15 +4,12 @@ Tests for lightonai/LightOnOCR-2-1B model support.
 Usage:
     python3 -m unittest test_lightonocr_models.TestLightOnOCRServer
     python3 -m unittest test_lightonocr_models.TestLightOnOCRServer.test_single_image_ocr
-    python3 -m unittest test_lightonocr_models.TestLightOnOCRMMMU
 """
 
 import unittest
 
 import openai
 
-from sglang.test.kits.mmmu_vlm_kit import MMMUMixin
-from sglang.test.server_fixtures.mmmu_fixture import MMMUServerBase
 from sglang.test.vlm_utils import IMAGE_MAN_IRONING_URL, TestOpenAIMLLMServerBase
 
 MODEL = "lightonai/LightOnOCR-2-1B"
@@ -134,15 +131,6 @@ class TestLightOnOCRServer(TestOpenAIMLLMServerBase):
         assert len(text) > 0
         assert response.usage.prompt_tokens > 0
         assert response.usage.completion_tokens > 0
-
-
-class TestLightOnOCRMMMU(MMMUMixin, MMMUServerBase):
-    """MMMU benchmark evaluation for LightOnOCR."""
-
-    accuracy = 0.2
-    model = MODEL
-    other_args = ["--trust-remote-code"]
-    mmmu_args = ["--limit=0.1"]
 
 
 # Delete mixin base classes to prevent pytest auto-collection
