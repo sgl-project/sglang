@@ -70,7 +70,7 @@ class AscendTransferEngine(MooncakeTransferEngine):
             )
         """Initialize the ascend transfer instance."""
         if self.disaggregation_decode_enable_fake_auto:
-            logger.info("Ascend Transfer Engine is decode fake mode.")
+            logger.info("Ascend Transfer Engine is not initialized in decode fake transfer mode.")
             return
         
         ret_value = self.engine.initialize(
