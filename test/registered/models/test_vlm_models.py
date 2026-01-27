@@ -1,21 +1,23 @@
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-
-# VLM (Vision Language Model) tests
-register_cuda_ci(est_time=228, suite="stage-b-test-small-1-gpu")
-register_amd_ci(est_time=420, suite="stage-b-test-small-1-gpu-amd")
-
 import argparse
 import random
 import sys
+import tempfile
 import unittest
 from types import SimpleNamespace
 
 from sglang.srt.utils import is_hip
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.mmmu_vlm_kit import (
     DEFAULT_MEM_FRACTION_STATIC,
     MMMUMultiModelTestBase,
 )
 from sglang.test.test_utils import is_in_ci
+
+# VLM (Vision Language Model) tests
+
+
+register_cuda_ci(est_time=228, suite="stage-b-test-large-1-gpu")
+register_amd_ci(est_time=420, suite="stage-b-test-small-1-gpu-amd")
 
 _is_hip = is_hip()
 # VLM models for testing
@@ -38,7 +40,11 @@ class TestVLMModels(MMMUMultiModelTestBase):
             models_to_test = [random.choice(MODELS)]
 
         for model in models_to_test:
-            self._run_vlm_mmmu_test(model, "./logs")
+            # Use a unique temporary directory for each model to avoid cached results
+            with tempfile.TemporaryDirectory(
+                prefix=f"test_vlm_mmmu_{model.model.replace('/', '_')}_"
+            ) as temp_dir:
+                self._run_vlm_mmmu_test(model, temp_dir)
 
 
 if __name__ == "__main__":

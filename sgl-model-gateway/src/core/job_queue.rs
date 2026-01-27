@@ -99,47 +99,6 @@ impl Job {
     }
 }
 
-impl JobStatus {
-    fn pending(job_type: &str, worker_url: &str) -> Self {
-        Self {
-            job_type: job_type.to_string(),
-            worker_url: worker_url.to_string(),
-            status: "pending".to_string(),
-            message: None,
-            timestamp: SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
-        }
-    }
-
-    fn processing(job_type: &str, worker_url: &str) -> Self {
-        Self {
-            job_type: job_type.to_string(),
-            worker_url: worker_url.to_string(),
-            status: "processing".to_string(),
-            message: None,
-            timestamp: SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
-        }
-    }
-
-    fn failed(job_type: &str, worker_url: &str, error: String) -> Self {
-        Self {
-            job_type: job_type.to_string(),
-            worker_url: worker_url.to_string(),
-            status: "failed".to_string(),
-            message: Some(error),
-            timestamp: SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
-        }
-    }
-}
-
 /// Job queue configuration
 #[derive(Clone, Debug)]
 pub struct JobQueueConfig {
@@ -578,7 +537,7 @@ impl JobQueue {
                                 tokenizer_path: None,
                                 reasoning_parser: None,
                                 tool_parser: None,
-                                chat_template: None,
+                                chat_template: router_config.chat_template.clone(),
                                 bootstrap_port: None,
                                 health_check_timeout_secs: router_config.health_check.timeout_secs,
                                 health_check_interval_secs: router_config
@@ -649,7 +608,7 @@ impl JobQueue {
                         tokenizer_path: None,
                         reasoning_parser: None,
                         tool_parser: None,
-                        chat_template: None,
+                        chat_template: router_config.chat_template.clone(),
                         bootstrap_port,
                         health_check_timeout_secs: router_config.health_check.timeout_secs,
                         health_check_interval_secs: router_config.health_check.check_interval_secs,

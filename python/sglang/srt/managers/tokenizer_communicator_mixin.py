@@ -23,6 +23,8 @@ import fastapi
 import zmq
 
 from sglang.srt.managers.io_struct import (
+    AttachHiCacheStorageReqInput,
+    AttachHiCacheStorageReqOutput,
     CheckWeightsReqInput,
     CheckWeightsReqOutput,
     ClearHiCacheReqInput,
@@ -30,6 +32,8 @@ from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
     DestroyWeightsUpdateGroupReqInput,
     DestroyWeightsUpdateGroupReqOutput,
+    DetachHiCacheStorageReqInput,
+    DetachHiCacheStorageReqOutput,
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
     ExpertDistributionReqType,
@@ -39,6 +43,8 @@ from sglang.srt.managers.io_struct import (
     GetInternalStateReqOutput,
     GetLoadReqInput,
     GetLoadReqOutput,
+    GetLoadsReqInput,
+    GetLoadsReqOutput,
     GetWeightsByNameReqInput,
     GetWeightsByNameReqOutput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
@@ -200,6 +206,12 @@ class TokenizerCommunicatorMixin:
         self.clear_hicache_storage_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        self.attach_hicache_storage_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
+        self.detach_hicache_storage_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
         self.profile_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
@@ -217,6 +229,9 @@ class TokenizerCommunicatorMixin:
         )
         self.get_load_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size, mode="watching"
+        )
+        self.get_loads_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
         )
 
         self._result_dispatcher += self._get_communicator_dispatcher()
@@ -277,6 +292,14 @@ class TokenizerCommunicatorMixin:
                     self.clear_hicache_storage_communicator.handle_recv,
                 ),
                 (
+                    AttachHiCacheStorageReqOutput,
+                    self.attach_hicache_storage_communicator.handle_recv,
+                ),
+                (
+                    DetachHiCacheStorageReqOutput,
+                    self.detach_hicache_storage_communicator.handle_recv,
+                ),
+                (
                     FlushCacheReqOutput,
                     self.flush_cache_communicator.handle_recv,
                 ),
@@ -304,6 +327,10 @@ class TokenizerCommunicatorMixin:
                     GetLoadReqOutput,
                     self.get_load_communicator.handle_recv,
                 ),
+                (
+                    GetLoadsReqOutput,
+                    self.get_loads_communicator.handle_recv,
+                ),
             ]
         )
 
@@ -316,6 +343,57 @@ class TokenizerCommunicatorMixin:
         return (await self.clear_hicache_storage_communicator(ClearHiCacheReqInput()))[
             0
         ]
+
+    async def attach_hicache_storage(
+        self: TokenizerManager,
+        hicache_storage_backend: str,
+        hicache_storage_backend_extra_config_json: Optional[str] = None,
+        hicache_storage_prefetch_policy: Optional[str] = None,
+        hicache_write_policy: Optional[str] = None,
+    ) -> AttachHiCacheStorageReqOutput:
+        """Attach (enable) HiCache storage backend at runtime."""
+        results = await self.attach_hicache_storage_communicator(
+            AttachHiCacheStorageReqInput(
+                hicache_storage_backend=hicache_storage_backend,
+                hicache_storage_backend_extra_config_json=hicache_storage_backend_extra_config_json,
+                hicache_storage_prefetch_policy=hicache_storage_prefetch_policy,
+                hicache_write_policy=hicache_write_policy,
+            )
+        )
+
+        all_success, all_message = _Communicator.merge_results(results)
+        out = AttachHiCacheStorageReqOutput(success=all_success, message=all_message)
+        # TODO: partial rollback if failed
+        if all_success:
+            # Keep tokenizer side server_info consistent with scheduler side.
+            self.server_args.hicache_storage_backend = hicache_storage_backend
+            if hicache_storage_backend_extra_config_json is not None:
+                self.server_args.hicache_storage_backend_extra_config = (
+                    hicache_storage_backend_extra_config_json
+                )
+            if hicache_storage_prefetch_policy is not None:
+                self.server_args.hicache_storage_prefetch_policy = (
+                    hicache_storage_prefetch_policy
+                )
+            if hicache_write_policy is not None:
+                self.server_args.hicache_write_policy = hicache_write_policy
+        return out
+
+    async def detach_hicache_storage(
+        self: TokenizerManager,
+    ) -> DetachHiCacheStorageReqOutput:
+        """Detach (disable) HiCache storage backend at runtime."""
+        results = await self.detach_hicache_storage_communicator(
+            DetachHiCacheStorageReqInput()
+        )
+
+        all_success, all_message = _Communicator.merge_results(results)
+        out = DetachHiCacheStorageReqOutput(success=all_success, message=all_message)
+        # TODO: partial rollback if failed
+        if all_success:
+            self.server_args.hicache_storage_backend = None
+            self.server_args.hicache_storage_backend_extra_config = None
+        return out
 
     async def start_profile(
         self: TokenizerManager,
@@ -786,6 +864,33 @@ class TokenizerCommunicatorMixin:
     async def get_load(self: TokenizerManager) -> List[GetLoadReqOutput]:
         req = GetLoadReqInput()
         return await self.get_load_communicator(req)
+
+    async def get_loads(
+        self: TokenizerManager,
+        include: Optional[List[str]] = None,
+        dp_rank: Optional[int] = None,
+    ) -> List[GetLoadsReqOutput]:
+        """
+        Get comprehensive load metrics for /v1/loads endpoint.
+
+        Args:
+            include: List of sections to include. Options: core, memory, spec, lora, disagg, queues, all
+            dp_rank: Optional filter for specific DP rank
+
+        Returns:
+            List of GetLoadsReqOutput, one per scheduler (filtered by dp_rank if specified)
+        """
+        req = GetLoadsReqInput(
+            include=include if include else ["all"],
+            dp_rank=dp_rank,
+        )
+        results = await self.get_loads_communicator(req)
+
+        # Filter by dp_rank if specified
+        if dp_rank is not None:
+            results = [r for r in results if r.dp_rank == dp_rank]
+
+        return results
 
     async def open_session(
         self, obj: OpenSessionReqInput, request: Optional[fastapi.Request] = None

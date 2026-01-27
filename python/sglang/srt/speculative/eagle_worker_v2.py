@@ -13,6 +13,9 @@ from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_npu_graph_runner i
     EAGLEDraftNpuGraphRunner,
 )
 from sglang.srt.layers.attention.triton_backend import TritonMultiStepDraftBackend
+from sglang.srt.layers.attention.trtllm_mla_backend import (
+    TRTLLMMLAMultiStepDraftBackend,
+)
 from sglang.srt.layers.dp_attention import get_attention_tp_group
 from sglang.srt.layers.moe.utils import (
     speculative_moe_a2a_backend_context,
@@ -102,11 +105,6 @@ class EagleDraftWorker(BaseDraftWorker):
         self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
-        )
-
-        # Set constant
-        EagleDraftInput.ALLOC_LEN_PER_DECODE = max(
-            self.speculative_num_steps * self.topk, self.speculative_num_draft_tokens
         )
 
         # Do not capture cuda graph in `TpModelWorker` init,
@@ -276,6 +274,10 @@ class EagleDraftWorker(BaseDraftWorker):
             or (
                 _is_cuda
                 and isinstance(self.draft_attn_backend, TritonMultiStepDraftBackend)
+            )
+            or (
+                _is_cuda
+                and isinstance(self.draft_attn_backend, TRTLLMMLAMultiStepDraftBackend)
             )
         ):
             tic = time.perf_counter()

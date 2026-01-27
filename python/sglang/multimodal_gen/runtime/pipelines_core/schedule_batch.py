@@ -82,16 +82,31 @@ class Req:
     # Tracking if embeddings are already processed
     is_prompt_processed: bool = False
 
+    # Audio Embeddings (LTX-2)
+    audio_prompt_embeds: list[torch.Tensor] | torch.Tensor = field(default_factory=list)
+    negative_audio_prompt_embeds: list[torch.Tensor] | torch.Tensor = field(
+        default_factory=list
+    )
+
     # Latent tensors
     latents: torch.Tensor | None = None
     # Flux-2
     latent_ids: torch.Tensor | None = None
+
+    # Audio Latents (LTX-2)
+    audio_latents: torch.Tensor | None = None
+    raw_audio_latent_shape: tuple[int, ...] | None = None
+
+    # Audio Parameters
+    fps: float = 24.0
+    generate_audio: bool = True
 
     raw_latent_shape: torch.Tensor | None = None
     noise_pred: torch.Tensor | None = None
     # vae-encoded condition image
     image_latent: torch.Tensor | list[torch.Tensor] | None = None
     condition_image_latent_ids: torch.Tensor | list[torch.Tensor] | None = None
+    vae_image_sizes: list[tuple[int, int]] | None = None
 
     # Latent dimensions
     height_latents: list[int] | int | None = None
@@ -115,6 +130,7 @@ class Req:
 
     trajectory_timesteps: list[torch.Tensor] | None = None
     trajectory_latents: torch.Tensor | None = None
+    trajectory_audio_latents: torch.Tensor | None = None
 
     # Extra parameters that might be needed by specific pipeline implementations
     extra: dict[str, Any] = field(default_factory=dict)
@@ -152,8 +168,7 @@ class Req:
         for name, value in kwargs.items():
             setattr(self, name, value)
 
-        if hasattr(self, "__post_init__"):
-            self.__post_init__()
+        self.validate()
 
     def __getattr__(self, name: str) -> Any:
         """
@@ -231,7 +246,12 @@ class Req:
             else None
         )
 
-    def __post_init__(self):
+    def set_as_warmup(self):
+        self.is_warmup = True
+        self.extra["cache_dit_num_inference_steps"] = self.num_inference_steps
+        self.num_inference_steps = 1
+
+    def validate(self):
         """Initialize dependent fields after dataclass initialization."""
         # Set do_classifier_free_guidance based on guidance scale and negative prompt
         if self.guidance_scale > 1.0 and self.negative_prompt is not None:
@@ -244,7 +264,7 @@ class Req:
         self.timings = RequestTimings(request_id=self.request_id)
 
         if self.is_warmup:
-            self.num_inference_steps = 1
+            self.set_as_warmup()
 
     def adjust_size(self, server_args: ServerArgs):
         pass
@@ -283,7 +303,8 @@ class Req:
                  save_output: {self.save_output}
             output_file_path: {self.output_file_path()}
         """  # type: ignore[attr-defined]
-        logger.info(debug_str)
+        if not self.suppress_logs:
+            logger.info(debug_str)
 
 
 @dataclass
@@ -293,6 +314,8 @@ class OutputBatch:
     """
 
     output: torch.Tensor | None = None
+    audio: torch.Tensor | None = None
+    audio_sample_rate: int | None = None
     trajectory_timesteps: list[torch.Tensor] | None = None
     trajectory_latents: torch.Tensor | None = None
     trajectory_decoded: list[torch.Tensor] | None = None
