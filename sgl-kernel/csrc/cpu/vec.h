@@ -400,7 +400,7 @@ inline Vectorized<float> gelu_with_tanh_ext(const Vectorized<float> x) {
   const Vec kGeluKappaVec(kGeluKappa);
   Vec x_cube = x * x * x;
   Vec inner_vec = kGeluBetaVec * (x + kGeluKappaVec * x_cube);
-  return x * (kOneVec - kOneVec / ((inner_vec + inner_vec).exp_u20() + kOneVec));
+  return x * (kOneVec - kOneVec / ((inner_vec + inner_vec).fexp_u20() + kOneVec));
 };
 
 }  // anonymous namespace
