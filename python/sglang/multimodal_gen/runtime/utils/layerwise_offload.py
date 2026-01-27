@@ -138,6 +138,9 @@ class LayerwiseOffloadManager:
         )
 
     def prepare_for_next_req(self, non_blocking=True):
+        """
+        Prepare for the next round of denoising loop with prefetching the necessary layers
+        """
         for i in range(self.prefetch_size):
             self.prefetch_layer(i, non_blocking=non_blocking)
         if not non_blocking and self.copy_stream is not None:

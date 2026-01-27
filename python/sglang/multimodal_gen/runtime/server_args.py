@@ -8,6 +8,7 @@ import argparse
 import dataclasses
 import inspect
 import json
+import math
 import os
 import random
 import sys
@@ -623,7 +624,7 @@ class ServerArgs:
             "--dit-offload-prefetch-size",
             type=float,
             default=ServerArgs.dit_offload_prefetch_size,
-            help="The size of prefetch for dit-layerwise-offload. If the value is between 0.0 and 1.0, it is treated as a ratio of the total number of layers. If the value is >= 1, it is treated as the absolute number of layers. 0.0 means prefetch 1 layer (lowest memory); 1.0 means prefetch all layers (highest memory). Values above 0.5 might have peak memory close to no offload but worse performance.",
+            help="The size of prefetch for dit-layerwise-offload. If the value is between 0.0 and 1.0, it is treated as a ratio of the total number of layers. If the value is >= 1, it is treated as the absolute number of layers. 0.0 means prefetch 1 layer (lowest memory). Values above 0.5 might have peak memory close to no offload but worse performance.",
         )
         parser.add_argument(
             "--use-fsdp-inference",
@@ -956,6 +957,21 @@ class ServerArgs:
         if current_platform.is_mps():
             self.use_fsdp_inference = False
             self.dit_layerwise_offload = False
+
+        if self.dit_offload_prefetch_size > 1 and (
+            isinstance(self.dit_offload_prefetch_size, float)
+            and not self.dit_offload_prefetch_size.is_integer()
+        ):
+            self.dit_offload_prefetch_size = int(
+                math.floor(self.dit_offload_prefetch_size)
+            )
+            logger.info(
+                f"Invalid --dit-offload-prefetch-size value passed, truncated to: {self.dit_offload_prefetch_size}"
+            )
+        if 0.5 <= self.dit_offload_prefetch_size < 1.0:
+            logger.info(
+                f"We do not recommend --dit-offload-prefetch-size to be between 0.5 and 1.0"
+            )
 
         if not envs.SGLANG_CACHE_DIT_ENABLED:
             # TODO: need a better way to tell this
