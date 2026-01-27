@@ -705,10 +705,12 @@ class ServerArgs:
         # Set missing default values.
         self._handle_missing_default_values()
 
-        # Handle device-specific backends.
-        self._handle_hpu_backends()
-        self._handle_cpu_backends()
-        self._handle_npu_backends()
+        # Apply platform-specific server argument post-processing.
+        # This replaces the previous device-specific _handle_*_backends() methods
+        # and centralizes platform-specific configuration in the Platform class.
+        from sglang.srt.platforms import current_platform
+
+        current_platform.postprocess_server_args(self)
 
         # Get GPU memory capacity, which is a common dependency for several configuration steps.
         gpu_mem = get_device_memory_capacity(self.device)
@@ -858,30 +860,6 @@ class ServerArgs:
             self.speculative_draft_model_quantization = self.quantization
         elif self.speculative_draft_model_quantization == "unquant":
             self.speculative_draft_model_quantization = None
-
-    def _handle_hpu_backends(self):
-        if self.device == "hpu":
-            self.attention_backend = "torch_native"
-            self.sampling_backend = "pytorch"
-
-    def _handle_cpu_backends(self):
-        if self.device == "cpu":
-            if self.attention_backend is None:
-                self.attention_backend = "intel_amx"
-            self.sampling_backend = "pytorch"
-
-    def _handle_npu_backends(self):
-        if self.device == "npu":
-            from sglang.srt.hardware_backend.npu.utils import set_default_server_args
-
-            set_default_server_args(self)
-
-            if self.piecewise_cuda_graph_compiler != "eager":
-                logger.warning(
-                    "At this moment Ascend platform only support prefill graph compilation with "
-                    "piecewise_cuda_graph_compiler='eager', change piecewise_cuda_graph_compiler to 'eager'."
-                )
-                self.piecewise_cuda_graph_compiler = "eager"
 
     def _handle_gpu_memory_settings(self, gpu_mem):
         """
