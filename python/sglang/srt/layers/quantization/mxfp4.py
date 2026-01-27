@@ -299,19 +299,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     intermediate_size_per_partition, 64
                 )
         elif _use_aiter:
-            pad_align = 256
 
             intermediate_size_per_partition_after_pad = round_up(
                 intermediate_size_per_partition, 256
             )
-            # intermediate_size_per_partition_after_pad = (
-            #    (intermediate_size_per_partition + pad_align - 1)
-            #    // pad_align
-            #    * pad_align
-            # )
 
             hidden_size = round_up(hidden_size, 256)
-            # hidden_size = (hidden_size + pad_align - 1) // pad_align * pad_align
             self.hidden_pad = hidden_size - layer.hidden_size
             self.intermediate_pad = (
                 intermediate_size_per_partition_after_pad
@@ -577,18 +570,21 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 .contiguous()
                 .view(e, n, -1)
             )
+
             layer.w13_weight.data = shuffle_weight_a16w4(layer.w13_weight, 16, True)
             shuffled_w13_scale = shuffle_scale_a16w4(
                 layer.w13_weight_scale.view(-1, layer.w13_weight_scale.shape[-1]),
                 self.num_experts,
                 True,
             )
+
             layer.w2_weight.data = shuffle_weight_a16w4(layer.w2_weight, 16, False)
             shuffled_w2_scale = shuffle_scale_a16w4(
                 layer.w2_weight_scale.view(-1, layer.w2_weight_scale.shape[-1]),
                 self.num_experts,
                 False,
             )
+
             layer.w13_weight_bias.data = (
                 layer.w13_weight_bias.data.view(-1, n // 2, 2)
                 .permute(0, 2, 1)
@@ -766,17 +762,15 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
             origi_hidden_size = self.hidden_size - self.hidden_pad
 
-            x_quant = x
-
-            x_quant = torch.nn.functional.pad(
-                x_quant,
+            x = torch.nn.functional.pad(
+                x,
                 (0, self.hidden_pad),
                 mode="constant",
                 value=0.0,
             )
 
             output = fused_moe(
-                x_quant,
+                x,
                 w13_weight,
                 w2_weight,
                 topk_weights,
