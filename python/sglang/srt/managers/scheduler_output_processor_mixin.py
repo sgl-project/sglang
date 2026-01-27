@@ -287,6 +287,15 @@ class SchedulerOutputProcessorMixin:
 
         self.stream_output(batch.reqs, batch.return_logprob, skip_stream_req)
 
+        if self.current_scheduler_metrics_enabled:
+            self.log_prefill_stats(
+                adder=self.adder,
+                can_run_list=self.can_run_list,
+                running_bs=self.running_bs,
+                running_bs_offline_batch=0,
+                can_run_cuda_graph=result.can_run_cuda_graph,
+            )
+
     def _resolve_spec_overlap_token_ids(
         self: Scheduler, result: GenerationBatchResult, batch: ScheduleBatch
     ) -> List[List[int]]:
@@ -355,6 +364,15 @@ class SchedulerOutputProcessorMixin:
 
         self.stream_output(batch.reqs, batch.return_logprob)
         self.token_to_kv_pool_allocator.free_group_end()
+
+        if self.current_scheduler_metrics_enabled:
+            self.log_prefill_stats(
+                adder=self.adder,
+                can_run_list=self.can_run_list,
+                running_bs=self.running_bs,
+                running_bs_offline_batch=0,
+                can_run_cuda_graph=result.can_run_cuda_graph,
+            )
 
     def process_batch_result_decode(
         self: Scheduler,
