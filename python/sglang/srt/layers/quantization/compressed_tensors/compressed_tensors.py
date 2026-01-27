@@ -35,6 +35,7 @@ from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     QuantizationConfig,
     QuantizeMethodBase,
+    FusedMoEMethodBase,
 )
 # from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors_moe import (  # noqa: E501
 #     CompressedTensorsMoEMethod,
@@ -43,17 +44,17 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     WNA16_SUPPORTED_BITS,
     CompressedTensorsScheme,
     CompressedTensorsW4A4Fp4,
+    CompressedTensorsW4A4Nvfp4MoE,
+    NPUCompressedTensorsW4A8Int8DynamicMoE,
     CompressedTensorsW8A8Fp8,
+    CompressedTensorsW8A8Fp8MoE,
     CompressedTensorsW8A8Int8,
+    NPUCompressedTensorsW8A8Int8DynamicMoE,
     CompressedTensorsW8A16Fp8,
     CompressedTensorsWNA16,
     NPUCompressedTensorsW8A8Int8,
-    CompressedTensorsW8A8Fp8MoE,
-    CompressedTensorsW4A4Nvfp4MoE,
     CompressedTensorsWNA16MoE,
     NPUCompressedTensorsW4A16Int4DynamicMoE,
-    NPUCompressedTensorsW4A8Int8DynamicMoE,
-    NPUCompressedTensorsW8A8Int8DynamicMoE
 )
 from sglang.srt.layers.quantization.compressed_tensors.utils import (
     find_matched_target,
@@ -69,6 +70,10 @@ _is_npu = is_npu()
 
 if TYPE_CHECKING:
     from sglang.srt.models.utils import WeightsMapper
+    from sglang.srt.layers.moe.token_dispatcher import (
+        CombineInput,
+        StandardDispatchOutput,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -180,7 +185,6 @@ class CompressedTensorsConfig(QuantizationConfig):
             scheme = self.get_moe_scheme(layer=layer, layer_name=prefix)
             layer.scheme = scheme
             return CompressedTensorsFusedMoEMethod(self)
-            #return CompressedTensorsMoEMethod.get_moe_method(self, layer, prefix)
         return None
 
     @property
@@ -611,14 +615,25 @@ class CompressedTensorsConfig(QuantizationConfig):
     def get_moe_scheme(
         self, layer: torch.nn.Module, layer_name: Optional[str] = None
     ) -> Optional[CompressedTensorsScheme]:
-        # TODO: @dsikka: check if the layer is being ignored.
+        """
+        compressed-tensors supports non uniform in the following way:
+
+        targets of config_groups: There can be N config_groups which each
+            have a quantization scheme. Each config_group has a list of targets
+            which can be a full layer_name, a regex for a layer_name, or
+            an nn.Module name.
+
+        Detect whether a layer_name is found in any target and
+        use the quantization scheme corresponding to the matched target
+        to select the CompressedTensorsScheme used for infernece.
+        """
 
         weight_quant = self.target_scheme_map["Linear"].get("weights")
         input_quant = self.target_scheme_map["Linear"].get("input_activations")
 
         if self._is_wNa16_group_channel(weight_quant, input_quant):
             if not _is_npu:
-                logger.info_once("Using CompressedTensorsWNA16MoE")
+                logger.info_once("Using CompressedTensorsWNA16MarlinMoE")
                 return CompressedTensorsWNA16MoE(self)
             else:
                 if (
@@ -631,7 +646,7 @@ class CompressedTensorsConfig(QuantizationConfig):
                     return NPUCompressedTensorsW4A16Int4DynamicMoE(self)
         elif self._is_fp4a4_nvfp4(weight_quant, input_quant):
             logger.info_once("Using CompressedTensorsW4A4Nvfp4MoE")
-            return CompressedTensorsW4A4Nvfp4MoE(self)
+            return CompressedTensorsW4A4Nvfp4MoE()
         elif self._is_fp8_w8a8(weight_quant, input_quant):
             logger.info_once("Using CompressedTensorsW8A8Fp8MoE")
             return CompressedTensorsW8A8Fp8MoE(weight_quant, input_quant)
@@ -655,7 +670,6 @@ class CompressedTensorsConfig(QuantizationConfig):
             raise RuntimeError(
                 f"Unsupported FusedMoe scheme: {weight_quant}, {input_quant}"
             )
-
 
     def get_scheme(
         self, layer: torch.nn.Module, layer_name: Optional[str] = None
@@ -886,10 +900,9 @@ class CompressedTensorsFusedMoEMethod(FusedMoEMethodBase):
     def create_weights(
         self,
         layer: torch.nn.Module,
-        input_size_per_partition: int,
-        output_partition_sizes: List[int],
-        input_size: int,
-        output_size: int,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
@@ -901,10 +914,9 @@ class CompressedTensorsFusedMoEMethod(FusedMoEMethodBase):
         #weight_loader = extra_weight_attrs.get("weight_loader")
         layer.scheme.create_weights(
             layer=layer,
-            input_size=input_size,
-            input_size_per_partition=input_size_per_partition,
-            output_partition_sizes=output_partition_sizes,
-            output_size=output_size,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size_per_partition=intermediate_size_per_partition,
             params_dtype=params_dtype,
             **extra_weight_attrs,
         )
@@ -917,9 +929,8 @@ class CompressedTensorsFusedMoEMethod(FusedMoEMethodBase):
     def apply(
         self,
         layer: torch.nn.Module,
-        x: torch.Tensor,
-        bias: Optional[torch.Tensor] = None,
-    ):
+        dispatch_output: StandardDispatchOutput,
+    ) -> CombineInput:
         """
         Use the output of create_weights and the CompressedTensorsScheme
         associated with the layer to apply the forward pass with the
@@ -930,4 +941,14 @@ class CompressedTensorsFusedMoEMethod(FusedMoEMethodBase):
         scheme = layer.scheme
         if scheme is None:
             raise ValueError("A scheme must be defined for each layer")
-        return scheme.apply_weights(layer, x, bias=bias)
+        return scheme.apply_weights(layer, dispatch_output)
+    
+    def apply_weights_with_router_logits(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output: StandardDispatchOutput,
+    ) -> torch.Tensor:
+        scheme = layer.scheme
+        if scheme is None:
+            raise ValueError("A scheme must be defined for each layer")
+        return scheme.apply_weights_with_router_logits(layer, dispatch_output)
