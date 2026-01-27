@@ -72,8 +72,8 @@ RUN (${PIP_INSTALL} pybind11) \
     && (${PIP_INSTALL} ${TRITON_ASCEND_URL})
 
 # Install SGLang
-RUN git clone https://github.com/sgl-project/sglang.git --branch $SGLANG_TAG && \
-    (cd sglang/python && rm -f pyproject.toml && mv pyproject_npu.toml pyproject.toml && ${PIP_INSTALL} -v ".[all_npu]") && \
+RUN git clone https://github.com/sgl-project/sglang --branch $SGLANG_TAG && \
+    (cd sglang/python && rm -rf pyproject.toml && mv pyproject_npu.toml pyproject.toml && ${PIP_INSTALL} -v .[all_npu]) && \
     rm -rf sglang
 
 # Install Deep-ep

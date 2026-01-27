@@ -20,8 +20,8 @@ python scripts/release/bump_sglang_version.py 0.5.3rc0
 - `docs/platforms/amd_gpu.md`
 - `docs/platforms/ascend_npu.md`
 - `python/pyproject.toml`
-- `python/pyproject_npu.toml`
 - `python/pyproject_other.toml`
+- `python/pyproject_npu.toml`
 - `python/sglang/version.py`
 
 ### `bump_kernel_version.py`
@@ -55,7 +55,6 @@ python scripts/release/bump_kernel_version.py 0.3.12
 3. **Check specific files contain the new version:**
    ```bash
    grep -r "0.5.4rc0" python/sglang/version.py
-   grep -r "0.5.4rc0" python/pyproject_npu.toml
    grep -r "0.5.4rc0" python/pyproject.toml
    grep -r "0.5.4rc0" docs/get_started/install.md
    ```

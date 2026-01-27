@@ -71,6 +71,8 @@ from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
 from sglang.srt.managers.io_struct import (
     AbortReq,
     ActiveRanksOutput,
+    AttachHiCacheStorageReqInput,
+    AttachHiCacheStorageReqOutput,
     BaseBatchReq,
     BaseReq,
     BatchTokenizedEmbeddingReqInput,
@@ -81,6 +83,8 @@ from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
     ContinueGenerationReqInput,
     DestroyWeightsUpdateGroupReqInput,
+    DetachHiCacheStorageReqInput,
+    DetachHiCacheStorageReqOutput,
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
     ExpertDistributionReqType,
@@ -551,6 +555,7 @@ class Scheduler(
             self.max_req_input_len,
             self.random_seed,
             self.device,
+            self.forward_stream,
             _,
             _,
             _,
@@ -703,18 +708,6 @@ class Scheduler(
         else:
             self.decode_offload_manager = None
 
-        self.decode_mem_cache_buf_multiplier = (
-            1
-            if self.spec_algorithm.is_none()
-            else (
-                server_args.speculative_num_draft_tokens
-                + (
-                    (server_args.speculative_eagle_topk or 1)
-                    * (server_args.speculative_num_steps or 1)
-                )
-            )
-        )
-
         embedding_cache_size = envs.SGLANG_VLM_CACHE_SIZE_MB.get()
         init_mm_embedding_cache(embedding_cache_size * 1024 * 1024)
 
@@ -776,7 +769,7 @@ class Scheduler(
             self.prefill_delayer = PrefillDelayer(
                 dp_size=self.dp_size,
                 attn_tp_size=self.attn_tp_size,
-                cpu_group=self.tp_worker.get_tp_group().cpu_group,
+                cpu_group=self.tp_cpu_group,
                 server_args=self.server_args,
                 metrics_collector=(
                     self.metrics_collector if self.enable_metrics else None
@@ -971,7 +964,6 @@ class Scheduler(
         if self.device == "cpu":
             self.default_stream.synchronize = lambda: None  # No-op for CPU
 
-        self.forward_stream: CudaStream = self.device_module.Stream()
         self.forward_stream_ctx: CudaStreamContext = self.device_module.stream(
             self.forward_stream
         )
@@ -1020,6 +1012,8 @@ class Scheduler(
                 (BatchTokenizedEmbeddingReqInput, self.handle_batch_embedding_request),
                 (FlushCacheReqInput, self.flush_cache_wrapped),
                 (ClearHiCacheReqInput, self.clear_hicache_storage_wrapped),
+                (AttachHiCacheStorageReqInput, self.attach_hicache_storage_wrapped),
+                (DetachHiCacheStorageReqInput, self.detach_hicache_storage_wrapped),
                 (AbortReq, self.abort_request),
                 (OpenSessionReqInput, self.open_session),
                 (CloseSessionReqInput, self.close_session),
@@ -1481,7 +1475,7 @@ class Scheduler(
                 if recv_req.bootstrap_room is None:
                     error_msg = (
                         f"Invalid request: Disaggregated request received without "
-                        f"boostrap room id. {req.rid=}"
+                        f"bootstrap room id. {req.rid=}"
                     )
                     logger.error(error_msg)
                     prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
@@ -2162,29 +2156,15 @@ class Scheduler(
             return batch
 
         # Check if decode out of memory
-        if (
-            kv_full_retract_flag := not batch.check_decode_mem(
-                self.decode_mem_cache_buf_multiplier
-            )
-        ) or (TEST_RETRACT and self.forward_ct % TEST_RETRACT_INTERVAL == 0):
-            if self.is_hybrid_swa:
-                old_available_tokens = min(
-                    self.token_to_kv_pool_allocator.full_available_size(),
-                    self.token_to_kv_pool_allocator.swa_available_size(),
-                )
-            else:
-                old_available_tokens = self.token_to_kv_pool_allocator.available_size()
+        if (kv_full_retract_flag := not batch.check_decode_mem()) or (
+            TEST_RETRACT and self.forward_ct % TEST_RETRACT_INTERVAL == 0
+        ):
+            old_available_tokens = self.token_to_kv_pool_allocator.available_size()
             old_ratio = self.new_token_ratio
             retracted_reqs, new_token_ratio, reqs_to_abort = batch.retract_decode(
-                self.server_args, self.decode_mem_cache_buf_multiplier
+                self.server_args
             )
-            if self.is_hybrid_swa:
-                new_available_tokens = min(
-                    self.token_to_kv_pool_allocator.full_available_size(),
-                    self.token_to_kv_pool_allocator.swa_available_size(),
-                )
-            else:
-                new_available_tokens = self.token_to_kv_pool_allocator.available_size()
+            new_available_tokens = self.token_to_kv_pool_allocator.available_size()
             new_token_gained = new_available_tokens - old_available_tokens
 
             self.num_retracted_reqs = len(retracted_reqs)
@@ -2453,6 +2433,118 @@ class Scheduler(
             logging.warning("Hierarchical cache is not enabled.")
             if_success = False
         return ClearHiCacheReqOutput(success=if_success)
+
+    def _is_idle_for_hicache_storage_op(self) -> bool:
+        """Stricter idle check for storage attach/detach.
+
+        We require:
+        - no running batches (including overlap/pp/disagg paths) via `_is_no_request()`
+        - no queued requests in scheduler queues (waiting/grammar/disagg queues)
+        """
+        if not self._is_no_request():
+            return False
+        if len(self.waiting_queue) != 0:
+            return False
+        if len(self.grammar_manager.grammar_queue) != 0:
+            return False
+        return True
+
+    def attach_hicache_storage_wrapped(
+        self, recv_req: AttachHiCacheStorageReqInput
+    ) -> AttachHiCacheStorageReqOutput:
+        if not self.enable_hierarchical_cache:
+            return AttachHiCacheStorageReqOutput(
+                success=False, message="Hierarchical cache is not enabled."
+            )
+
+        if not self._is_idle_for_hicache_storage_op():
+            return AttachHiCacheStorageReqOutput(
+                success=False,
+                message=(
+                    "Reject attach: scheduler is not idle. "
+                    f"#queue-req={len(self.waiting_queue)} "
+                    f"#running-req={len(self.running_batch.reqs)}"
+                ),
+            )
+
+        if not hasattr(self.tree_cache, "attach_storage_backend"):
+            return AttachHiCacheStorageReqOutput(
+                success=False,
+                message="Current tree_cache implementation does not support dynamic attach.",
+            )
+
+        try:
+            ok, msg = self.tree_cache.attach_storage_backend(
+                storage_backend=recv_req.hicache_storage_backend,
+                storage_backend_extra_config_json=recv_req.hicache_storage_backend_extra_config_json,
+                served_model_name=self.server_args.served_model_name,
+                hicache_storage_prefetch_policy=recv_req.hicache_storage_prefetch_policy,
+                hicache_write_policy=recv_req.hicache_write_policy,
+            )
+        except Exception as e:
+            logger.exception("Attach HiCache storage backend failed with exception.")
+            return AttachHiCacheStorageReqOutput(success=False, message=str(e))
+        if ok:
+            self.enable_hicache_storage = True
+            self.server_args.hicache_storage_backend = recv_req.hicache_storage_backend
+            if recv_req.hicache_storage_backend_extra_config_json is not None:
+                self.server_args.hicache_storage_backend_extra_config = (
+                    recv_req.hicache_storage_backend_extra_config_json
+                )
+            if recv_req.hicache_storage_prefetch_policy is not None:
+                self.server_args.hicache_storage_prefetch_policy = (
+                    recv_req.hicache_storage_prefetch_policy
+                )
+            if recv_req.hicache_write_policy is not None:
+                self.server_args.hicache_write_policy = recv_req.hicache_write_policy
+            logger.info(
+                f"Attached HiCache storage backend: {recv_req.hicache_storage_backend}"
+            )
+        return AttachHiCacheStorageReqOutput(success=ok, message=msg)
+
+    def detach_hicache_storage_wrapped(
+        self, recv_req: DetachHiCacheStorageReqInput
+    ) -> DetachHiCacheStorageReqOutput:
+        if not self.enable_hierarchical_cache:
+            return DetachHiCacheStorageReqOutput(
+                success=False, message="Hierarchical cache is not enabled."
+            )
+
+        if not self._is_idle_for_hicache_storage_op():
+            return DetachHiCacheStorageReqOutput(
+                success=False,
+                message=(
+                    "Reject detach: scheduler is not idle. "
+                    f"#queue-req={len(self.waiting_queue)} "
+                    f"#running-req={len(self.running_batch.reqs)}"
+                ),
+            )
+
+        if not hasattr(self.tree_cache, "detach_storage_backend"):
+            return DetachHiCacheStorageReqOutput(
+                success=False,
+                message="Current tree_cache implementation does not support dynamic detach.",
+            )
+
+        # Idempotent detach: even if scheduler thinks storage is disabled, we still
+        # attempt best-effort cleanup in tree_cache (it may have leftover state).
+        try:
+            ok, msg = self.tree_cache.detach_storage_backend()
+        except Exception as e:
+            logger.exception("Detach HiCache storage backend failed with exception.")
+            return DetachHiCacheStorageReqOutput(success=False, message=str(e))
+
+        if ok or (not self.enable_hicache_storage):
+            # Treat "already disabled / nothing to do" as success for idempotence.
+            self.enable_hicache_storage = False
+            self.server_args.hicache_storage_backend = None
+            self.server_args.hicache_storage_backend_extra_config = None
+            logger.info("Detached HiCache storage backend.")
+            return DetachHiCacheStorageReqOutput(
+                success=True, message=msg or "HiCache storage backend is detached."
+            )
+
+        return DetachHiCacheStorageReqOutput(success=False, message=msg)
 
     def _is_no_request(self):
         no_request = (

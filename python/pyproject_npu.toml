@@ -13,10 +13,8 @@ classifiers = [
   "Programming Language :: Python :: 3",
   "License :: OSI Approved :: Apache Software License",
 ]
-dependencies = ["aiohttp", "requests", "tqdm", "numpy", "IPython", "setproctitle"]
 
-[project.optional-dependencies]
-runtime_common = [
+dependencies = [
   "IPython",
   "aiohttp",
   "anthropic>=0.20.0",
@@ -68,6 +66,7 @@ runtime_common = [
   "grpcio-reflection==1.75.1", # required by srt/entrypoints/grpc_server.py
 ]
 
+[project.optional-dependencies]
 checkpoint-engine = ["checkpoint-engine==0.1.2"]
 diffusion = [
     "PyYAML==6.0.1",
@@ -102,8 +101,8 @@ test = [
 ]
 
 # https://docs.sglang.io/platforms/ascend_npu.html
-srt_npu = ["sglang[runtime_common]"]
-all_npu = ["sglang[srt_npu, diffusion]"]
+srt_npu = []
+all_npu = ["sglang[diffusion]"]
 dev_npu = ["sglang[all_npu]", "sglang[test]"]
 
 [project.urls]
@@ -115,16 +114,8 @@ sglang = "sglang.cli.main:main"
 
 [tool.setuptools.package-data]
 "sglang" = [
-  "srt/layers/moe/fused_moe_triton/configs/*/*.json",
-  "srt/layers/quantization/configs/*.json",
-  "srt/mem_cache/storage/hf3fs/hf3fs_utils.cpp",
-  "srt/mem_cache/cpp_radix_tree/*.cpp",
-  "srt/mem_cache/cpp_radix_tree/*.h",
-  "srt/speculative/cpp_ngram/*.cpp",
-  "srt/speculative/cpp_ngram/*.h",
-  "jit_kernel/include/sgl_kernel/*.h",
-  "jit_kernel/include/sgl_kernel/*.cuh",
-  "jit_kernel/csrc/*.cuh"
+  "srt/**/*",
+  "jit_kernel/**/*"
 ]
 
 [tool.setuptools.packages.find]
@@ -149,6 +140,7 @@ exclude = [
   "tests*",
 ]
 
-[tool.codespell]
-ignore-words-list = "ans, als, hel, boostrap, childs, te, vas, hsa, ment"
-skip = "*.json,*.jsonl,*.patch,*.txt"
+[tool.setuptools_scm]
+root = ".."
+version_file = "sglang/_version.py"
+git_describe_command = ["git", "describe", "--tags", "--long", "--match", "v*"]

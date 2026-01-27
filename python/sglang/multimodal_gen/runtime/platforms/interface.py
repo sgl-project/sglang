@@ -356,6 +356,11 @@ class Platform:
         """Get the CPU architecture of the current platform."""
         return CpuArchEnum.UNSPECIFIED
 
+    @classmethod
+    def enable_dit_layerwise_offload_for_wan_by_default(cls) -> bool:
+        """Whether to enable DIT layerwise offload by default on the current platform."""
+        return True
+
     def get_attn_backend(self, *args, **kwargs) -> AttentionImpl:
         attention_cls_str = self.get_attn_backend_cls_str(*args, **kwargs)
         return resolve_obj_by_qualname(attention_cls_str)
