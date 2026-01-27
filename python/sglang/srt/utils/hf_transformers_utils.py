@@ -44,6 +44,7 @@ from transformers import (
 from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
 
 from sglang.srt.configs import (
+    AfmoeConfig,
     ChatGLMConfig,
     DbrxConfig,
     DeepseekVL2Config,
@@ -53,6 +54,7 @@ from sglang.srt.configs import (
     FalconH1Config,
     JetNemotronConfig,
     JetVLMConfig,
+    KimiK25Config,
     KimiLinearConfig,
     KimiVLConfig,
     LongcatFlashConfig,
@@ -68,8 +70,10 @@ from sglang.srt.configs.internvl import InternVLChatConfig
 from sglang.srt.connector import create_remote_connector
 from sglang.srt.multimodal.customized_mm_processor_utils import _CUSTOMIZED_MM_PROCESSOR
 from sglang.srt.utils import is_remote_url, logger, lru_cache_frozenset, mistral_utils
+from sglang.srt.utils.patch_tokenizer import patch_tokenizer
 
 _CONFIG_REGISTRY: List[Type[PretrainedConfig]] = [
+    AfmoeConfig,
     ChatGLMConfig,
     DbrxConfig,
     ExaoneConfig,
@@ -90,6 +94,7 @@ _CONFIG_REGISTRY: List[Type[PretrainedConfig]] = [
     DeepseekVLV2Config,
     JetNemotronConfig,
     JetVLMConfig,
+    KimiK25Config,
 ]
 
 _CONFIG_REGISTRY = {
@@ -125,7 +130,7 @@ def get_hf_text_config(config: PretrainedConfig):
             # read the wrong values from the unused default text_config.
             # NOTE(HandH1998): We set `torch_dtype` of config to `torch.float16` for the weights, as
             # `torch.float16` is default used for image features in `python/sglang/srt/models/llava.py`.
-            setattr(config, "torch_dtype", torch.float16)
+            setattr(config, "dtype", torch.float16)
             return config
 
     if hasattr(config, "text_config"):
@@ -501,6 +506,7 @@ def get_tokenizer(
         )
 
     attach_additional_stop_token_ids(tokenizer)
+    tokenizer = patch_tokenizer(tokenizer)
     return tokenizer
 
 

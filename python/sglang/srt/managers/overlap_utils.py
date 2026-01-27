@@ -116,7 +116,9 @@ class FutureMap:
         return FutureIndices(indices=indices, interval=slice(start, end))
 
     def resolve_future(self, model_worker_batch: ModelWorkerBatch):
-        if self.spec_algo.is_eagle():
+        if self.spec_algo.is_none():
+            _resolve_future_token_ids(model_worker_batch.input_ids, self.token_ids_buf)
+        else:
             # TODO(lsyin): write future indices into spec_info.future_indices
             draft_input: EagleDraftInput = model_worker_batch.spec_info
             if draft_input is None:
@@ -129,8 +131,6 @@ class FutureMap:
             draft_input.new_seq_lens = self.new_seq_lens_buf[indices]
             if spec_need_hidden_states():
                 draft_input.hidden_states = self.hidden_states_buf[indices]
-        else:
-            _resolve_future_token_ids(model_worker_batch.input_ids, self.token_ids_buf)
 
     def is_empty_slice(self, s: slice) -> bool:
         start, stop, step = s.indices(self.future_buffer_len)
@@ -142,12 +142,12 @@ class FutureMap:
     def store_to_map(
         self, future_indices: FutureIndices, batch_result: GenerationBatchResult
     ):
-        if self.spec_algo.is_eagle():
-            draft_input: EagleDraftInput = batch_result.next_draft_input
-            self.store_to_map_for_new_batch(future_indices, draft_input)
-        else:
+        if self.spec_algo.is_none():
             intv = future_indices.interval
             self.token_ids_buf[intv] = batch_result.next_token_ids
+        else:
+            draft_input: EagleDraftInput = batch_result.next_draft_input
+            self.store_to_map_for_new_batch(future_indices, draft_input)
 
     def store_to_map_for_new_batch(
         self, future_indices: FutureIndices, draft_input: EagleDraftInput

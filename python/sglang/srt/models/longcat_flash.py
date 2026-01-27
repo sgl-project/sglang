@@ -63,6 +63,7 @@ from sglang.srt.layers.moe.ep_moe.kernels import zero_experts_compute_triton
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import StandardTopKOutput, TopK
+from sglang.srt.layers.moe.utils import filter_moe_weight_param_global_expert
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.quantization.fp8_utils import (
@@ -295,6 +296,9 @@ class LongcatFlashMoE(nn.Module):
             x.data
             for name, x in self.experts.named_parameters()
             if name not in ["correction_bias"]
+            and filter_moe_weight_param_global_expert(
+                name, x, self.experts.num_local_experts
+            )
         ]
 
 
@@ -499,7 +503,7 @@ class LongcatFlashModel(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
-            enable_tp=not is_dp_attention_enabled(),
+            use_attn_tp_group=is_dp_attention_enabled(),
         )
 
         self.alt_stream = torch.cuda.Stream()
@@ -756,18 +760,6 @@ class LongcatFlashForCausalLM(nn.Module):
                         )
                         if _is_hip:
                             self_attn.w_scale *= 2.0
-                    # TODO: remove this after adding FP8 support in bmm cpu kernel
-                    if (
-                        _is_cpu
-                        and _is_cpu_amx_available
-                        and w.dtype == torch.float8_e4m3fn
-                    ):
-                        self_attn.w_kc = (
-                            self_attn.w_kc.to(torch.bfloat16) * self_attn.w_scale
-                        )
-                        self_attn.w_vc = (
-                            self_attn.w_vc.to(torch.bfloat16) * self_attn.w_scale
-                        )
                 else:
                     num_tiles_k = self_attn.qk_nope_head_dim // weight_block_size[1]
                     num_tiles_n = self_attn.v_head_dim // weight_block_size[0]

@@ -8,23 +8,20 @@ use tracing::debug;
 
 use crate::{
     config::RouterConfig,
-    core::{ConnectionMode, JobQueue, LoadMonitor, WorkerRegistry, WorkerService},
+    core::{steps::WorkflowEngines, JobQueue, LoadMonitor, WorkerRegistry, WorkerService},
     data_connector::{
         create_storage, ConversationItemStorage, ConversationStorage, ResponseStorage,
+        StorageFactoryConfig,
     },
     mcp::McpManager,
     middleware::TokenBucket,
+    observability::inflight_tracker::InFlightRequestTracker,
     policies::PolicyRegistry,
     reasoning_parser::ParserFactory as ReasoningParserFactory,
     routers::router_manager::RouterManager,
-    tokenizer::{
-        cache::{CacheConfig, CachedTokenizer},
-        factory as tokenizer_factory,
-        traits::Tokenizer,
-    },
+    tokenizer::registry::TokenizerRegistry,
     tool_parser::ParserFactory as ToolParserFactory,
     wasm::{config::WasmRuntimeConfig, module_manager::WasmModuleManager},
-    workflow::WorkflowEngine,
 };
 
 /// Error type for AppContext builder
@@ -44,7 +41,7 @@ pub struct AppContext {
     pub client: Client,
     pub router_config: RouterConfig,
     pub rate_limiter: Option<Arc<TokenBucket>>,
-    pub tokenizer: Option<Arc<dyn Tokenizer>>,
+    pub tokenizer_registry: Arc<TokenizerRegistry>,
     pub reasoning_parser_factory: Option<ReasoningParserFactory>,
     pub tool_parser_factory: Option<ToolParserFactory>,
     pub worker_registry: Arc<WorkerRegistry>,
@@ -57,17 +54,26 @@ pub struct AppContext {
     pub configured_reasoning_parser: Option<String>,
     pub configured_tool_parser: Option<String>,
     pub worker_job_queue: Arc<OnceLock<Arc<JobQueue>>>,
-    pub workflow_engine: Arc<OnceLock<Arc<WorkflowEngine>>>,
+    pub workflow_engines: Arc<OnceLock<WorkflowEngines>>,
     pub mcp_manager: Arc<OnceLock<Arc<McpManager>>>,
     pub wasm_manager: Option<Arc<WasmModuleManager>>,
     pub worker_service: Arc<WorkerService>,
+    pub inflight_tracker: Arc<InFlightRequestTracker>,
+}
+
+impl std::fmt::Debug for AppContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AppContext")
+            .field("router_config", &self.router_config)
+            .finish_non_exhaustive()
+    }
 }
 
 pub struct AppContextBuilder {
     client: Option<Client>,
     router_config: Option<RouterConfig>,
     rate_limiter: Option<Arc<TokenBucket>>,
-    tokenizer: Option<Arc<dyn Tokenizer>>,
+    tokenizer_registry: Option<Arc<TokenizerRegistry>>,
     reasoning_parser_factory: Option<ReasoningParserFactory>,
     tool_parser_factory: Option<ToolParserFactory>,
     worker_registry: Option<Arc<WorkerRegistry>>,
@@ -78,7 +84,7 @@ pub struct AppContextBuilder {
     conversation_item_storage: Option<Arc<dyn ConversationItemStorage>>,
     load_monitor: Option<Arc<LoadMonitor>>,
     worker_job_queue: Option<Arc<OnceLock<Arc<JobQueue>>>>,
-    workflow_engine: Option<Arc<OnceLock<Arc<WorkflowEngine>>>>,
+    workflow_engines: Option<Arc<OnceLock<WorkflowEngines>>>,
     mcp_manager: Option<Arc<OnceLock<Arc<McpManager>>>>,
     wasm_manager: Option<Arc<WasmModuleManager>>,
 }
@@ -107,7 +113,7 @@ impl AppContextBuilder {
             client: None,
             router_config: None,
             rate_limiter: None,
-            tokenizer: None,
+            tokenizer_registry: None,
             reasoning_parser_factory: None,
             tool_parser_factory: None,
             worker_registry: None,
@@ -118,7 +124,7 @@ impl AppContextBuilder {
             conversation_item_storage: None,
             load_monitor: None,
             worker_job_queue: None,
-            workflow_engine: None,
+            workflow_engines: None,
             mcp_manager: None,
             wasm_manager: None,
         }
@@ -139,8 +145,8 @@ impl AppContextBuilder {
         self
     }
 
-    pub fn tokenizer(mut self, tokenizer: Option<Arc<dyn Tokenizer>>) -> Self {
-        self.tokenizer = tokenizer;
+    pub fn tokenizer_registry(mut self, tokenizer_registry: Arc<TokenizerRegistry>) -> Self {
+        self.tokenizer_registry = Some(tokenizer_registry);
         self
     }
 
@@ -203,8 +209,8 @@ impl AppContextBuilder {
         self
     }
 
-    pub fn workflow_engine(mut self, workflow_engine: Arc<OnceLock<Arc<WorkflowEngine>>>) -> Self {
-        self.workflow_engine = Some(workflow_engine);
+    pub fn workflow_engines(mut self, workflow_engines: Arc<OnceLock<WorkflowEngines>>) -> Self {
+        self.workflow_engines = Some(workflow_engines);
         self
     }
 
@@ -243,7 +249,9 @@ impl AppContextBuilder {
             client: self.client.ok_or(AppContextBuildError("client"))?,
             router_config,
             rate_limiter: self.rate_limiter,
-            tokenizer: self.tokenizer,
+            tokenizer_registry: self
+                .tokenizer_registry
+                .ok_or(AppContextBuildError("tokenizer_registry"))?,
             reasoning_parser_factory: self.reasoning_parser_factory,
             tool_parser_factory: self.tool_parser_factory,
             worker_registry,
@@ -264,14 +272,15 @@ impl AppContextBuilder {
             configured_reasoning_parser,
             configured_tool_parser,
             worker_job_queue,
-            workflow_engine: self
-                .workflow_engine
-                .ok_or(AppContextBuildError("workflow_engine"))?,
+            workflow_engines: self
+                .workflow_engines
+                .ok_or(AppContextBuildError("workflow_engines"))?,
             mcp_manager: self
                 .mcp_manager
                 .ok_or(AppContextBuildError("mcp_manager"))?,
             wasm_manager: self.wasm_manager,
             worker_service,
+            inflight_tracker: InFlightRequestTracker::new(),
         })
     }
 
@@ -284,15 +293,15 @@ impl AppContextBuilder {
         Ok(Self::new()
             .with_client(&router_config, request_timeout_secs)?
             .maybe_rate_limiter(&router_config)
-            .maybe_tokenizer(&router_config)?
-            .maybe_reasoning_parser_factory(&router_config)
-            .maybe_tool_parser_factory(&router_config)
+            .with_tokenizer_registry(&router_config)?
+            .with_reasoning_parser_factory()
+            .with_tool_parser_factory()
             .with_worker_registry()
             .with_policy_registry(&router_config)
             .with_storage(&router_config)?
             .with_load_monitor(&router_config)
             .with_worker_job_queue()
-            .with_workflow_engine()
+            .with_workflow_engines()
             .with_mcp_manager(&router_config)
             .await?
             .with_wasm_manager(&router_config)?
@@ -380,65 +389,31 @@ impl AppContextBuilder {
         self
     }
 
-    /// Create tokenizer for gRPC mode
-    fn maybe_tokenizer(mut self, config: &RouterConfig) -> Result<Self, String> {
-        if matches!(config.connection_mode, ConnectionMode::Grpc { .. }) {
-            let tokenizer_path = config
-                .tokenizer_path
-                .clone()
-                .or_else(|| config.model_path.clone())
-                .ok_or_else(|| {
-                    "gRPC mode requires either --tokenizer-path or --model-path to be specified"
-                        .to_string()
-                })?;
+    /// Create reasoning parser factory for gRPC mode or IGW mode
+    fn with_reasoning_parser_factory(mut self) -> Self {
+        // Initialize reasoning parser factory
+        self.reasoning_parser_factory = Some(ReasoningParserFactory::new());
+        self
+    }
 
-            let base_tokenizer = tokenizer_factory::create_tokenizer_with_chat_template_blocking(
-                &tokenizer_path,
-                config.chat_template.as_deref(),
-            )
-            .map_err(|e| {
-                format!(
-                    "Failed to create tokenizer from '{}': {}. \
-                    Ensure the path is valid and points to a tokenizer file (tokenizer.json) \
-                    or a HuggingFace model ID. For directories, ensure they contain tokenizer files.",
-                    tokenizer_path, e
-                )
-            })?;
+    /// Create tool parser factory for gRPC mode or IGW mode
+    fn with_tool_parser_factory(mut self) -> Self {
+        // Initialize tool parser factory
+        self.tool_parser_factory = Some(ToolParserFactory::new());
+        self
+    }
 
-            // Conditionally wrap with caching layer if at least one cache is enabled
-            self.tokenizer = if config.tokenizer_cache.enable_l0 || config.tokenizer_cache.enable_l1
-            {
-                let cache_config = CacheConfig {
-                    enable_l0: config.tokenizer_cache.enable_l0,
-                    l0_max_entries: config.tokenizer_cache.l0_max_entries,
-                    enable_l1: config.tokenizer_cache.enable_l1,
-                    l1_max_memory: config.tokenizer_cache.l1_max_memory,
-                };
-                Some(Arc::new(CachedTokenizer::new(base_tokenizer, cache_config))
-                    as Arc<dyn Tokenizer>)
-            } else {
-                // Use base tokenizer directly without caching
-                Some(base_tokenizer)
-            };
-        }
-
+    /// Create empty tokenizer registry
+    ///
+    /// Tokenizers are loaded via the tokenizer_registration workflow, which is triggered:
+    /// - At startup (if --tokenizer-path or --model-path is provided)
+    /// - When workers connect (registers under model_id)
+    /// - Via POST /v1/tokenizers API (registers under user-specified name)
+    ///
+    /// This unified approach ensures consistent behavior (caching, validation) across all paths.
+    fn with_tokenizer_registry(mut self, _config: &RouterConfig) -> Result<Self, String> {
+        self.tokenizer_registry = Some(Arc::new(TokenizerRegistry::new()));
         Ok(self)
-    }
-
-    /// Create reasoning parser factory for gRPC mode
-    fn maybe_reasoning_parser_factory(mut self, config: &RouterConfig) -> Self {
-        if matches!(config.connection_mode, ConnectionMode::Grpc { .. }) {
-            self.reasoning_parser_factory = Some(ReasoningParserFactory::new());
-        }
-        self
-    }
-
-    /// Create tool parser factory for gRPC mode
-    fn maybe_tool_parser_factory(mut self, config: &RouterConfig) -> Self {
-        if matches!(config.connection_mode, ConnectionMode::Grpc { .. }) {
-            self.tool_parser_factory = Some(ToolParserFactory::new());
-        }
-        self
     }
 
     /// Create worker registry
@@ -455,8 +430,14 @@ impl AppContextBuilder {
 
     /// Create all storage backends using the factory function
     fn with_storage(mut self, config: &RouterConfig) -> Result<Self, String> {
+        let storage_config = StorageFactoryConfig {
+            backend: &config.history_backend,
+            oracle: config.oracle.as_ref(),
+            postgres: config.postgres.as_ref(),
+            redis: config.redis.as_ref(),
+        };
         let (response_storage, conversation_storage, conversation_item_storage) =
-            create_storage(config)?;
+            create_storage(storage_config)?;
 
         self.response_storage = Some(response_storage);
         self.conversation_storage = Some(conversation_storage);
@@ -492,9 +473,9 @@ impl AppContextBuilder {
         self
     }
 
-    /// Create workflow engine OnceLock container
-    fn with_workflow_engine(mut self) -> Self {
-        self.workflow_engine = Some(Arc::new(OnceLock::new()));
+    /// Create workflow engines OnceLock container
+    fn with_workflow_engines(mut self) -> Self {
+        self.workflow_engines = Some(Arc::new(OnceLock::new()));
         self
     }
 

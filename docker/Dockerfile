@@ -11,15 +11,15 @@ ARG GRACE_BLACKWELL_DEEPEP_BRANCH=gb200_blog_part_2
 ARG HOPPER_SBO_DEEPEP_COMMIT=9f2fc4b3182a51044ae7ecb6610f7c9c3258c4d6
 ARG DEEPEP_COMMIT=9af0e0d0e74f3577af1979c9b9e1ac2cad0104ee
 ARG BUILD_AND_DOWNLOAD_PARALLEL=8
-ARG SGL_KERNEL_VERSION=0.3.19
-ARG SGL_VERSION=0.5.6.post2
+ARG SGL_KERNEL_VERSION=0.3.21
+ARG SGL_VERSION
 ARG USE_LATEST_SGLANG=0
 ARG GDRCOPY_VERSION=2.5.1
 ARG PIP_DEFAULT_INDEX
 ARG UBUNTU_MIRROR
 ARG GITHUB_ARTIFACTORY=github.com
 ARG INSTALL_FLASHINFER_JIT_CACHE=0
-ARG FLASHINFER_VERSION=0.5.3
+ARG FLASHINFER_VERSION=0.6.2
 
 ENV DEBIAN_FRONTEND=noninteractive \
     CUDA_HOME=/usr/local/cuda \
@@ -183,6 +183,8 @@ RUN if [ "$BRANCH_TYPE" = "local" ]; then \
         cp -r /tmp/local_src /sgl-workspace/sglang; \
     elif [ "$USE_LATEST_SGLANG" = "1" ]; then \
         git clone --depth=1 https://github.com/sgl-project/sglang.git /sgl-workspace/sglang; \
+    elif [ -z "$SGL_VERSION" ]; then \
+        echo "ERROR: SGL_VERSION must be set when USE_LATEST_SGLANG=0 and BRANCH_TYPE!=local" && exit 1; \
     else \
         git clone --depth=1 --branch v${SGL_VERSION} https://github.com/sgl-project/sglang.git /sgl-workspace/sglang; \
     fi \
@@ -271,7 +273,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 RUN --mount=type=cache,target=/root/.cache/pip \
     python3 -m pip install \
     datamodel_code_generator \
-    mooncake-transfer-engine==0.3.7.post2 \
+    mooncake-transfer-engine==0.3.8.post1 \
     pre-commit \
     pytest \
     black \
@@ -282,7 +284,8 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     scikit-build-core \
     nixl \
     py-spy \
-    cubloaty
+    cubloaty \
+    google-cloud-storage
 
 # Build and install sgl-model-gateway (install Rust, build, then remove to save space)
 RUN --mount=type=cache,target=/root/.cache/pip \
@@ -301,16 +304,15 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 # Patching packages for CUDA 12/13 compatibility
 # TODO: Remove when torch version covers these packages
-# TODO: Move cutlass-dsl to pyproject.toml after drivers on CI runners are updated
 RUN --mount=type=cache,target=/root/.cache/pip if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
     python3 -m pip install nvidia-nccl-cu12==2.28.3 --force-reinstall --no-deps ; \
     python3 -m pip install nvidia-cudnn-cu12==9.16.0.29 --force-reinstall --no-deps ; \
-    python3 -m pip install nvidia-cutlass-dsl==4.3.0 --force-reinstall --no-deps ; \
 elif [ "${CUDA_VERSION%%.*}" = "13" ]; then \
     python3 -m pip install nvidia-nccl-cu13==2.28.3 --force-reinstall --no-deps ; \
+    python3 -m pip install nvidia-cudnn-cu13==9.16.0.29 --force-reinstall --no-deps ; \
     python3 -m pip install nvidia-cublas==13.1.0.3 --force-reinstall --no-deps ; \
-    python3 -m pip install nixl-cu13 ; \
-    python3 -m pip install nvidia-cutlass-dsl==4.3.1 --force-reinstall --no-deps ; \
+    python3 -m pip install nixl-cu13 --no-deps ; \
+    python3 -m pip install cuda-python==13.1.1 ; \
 fi
 
 # Install development tools
@@ -409,11 +411,12 @@ RUN sh -c "$(curl --retry 3 --retry-delay 2 -fsSL https://raw.githubusercontent.
     && git clone --depth 1 https://github.com/zsh-users/zsh-autosuggestions ${ZSH_CUSTOM:-~/.oh-my-zsh/custom}/plugins/zsh-autosuggestions \
     && git clone --depth 1 https://github.com/zsh-users/zsh-syntax-highlighting.git ${ZSH_CUSTOM:-~/.oh-my-zsh/custom}/plugins/zsh-syntax-highlighting
 
+# These configs are optional; users can override them by mounting their own files
+COPY docker/configs/opt/.vimrc /opt/sglang/.vimrc
+COPY docker/configs/opt/.tmux.conf /opt/sglang/.tmux.conf
+COPY docker/configs/opt/.gitconfig /opt/sglang/.gitconfig
+
 # Configure development environment
-COPY docker/configs/.vimrc /root/.vimrc
-COPY docker/configs/.tmux.conf /root/.tmux.conf
-COPY docker/configs/.gitconfig /tmp/.gitconfig
-RUN cat /tmp/.gitconfig >> /root/.gitconfig && rm /tmp/.gitconfig
 COPY docker/configs/.zshrc /root/.zshrc
 
 # Fix Triton to use system ptxas for Blackwell (sm_103a) support (CUDA 13+ only)
@@ -421,6 +424,8 @@ RUN if [ "${CUDA_VERSION%%.*}" = "13" ] && [ -d /usr/local/lib/python3.12/dist-p
         rm -f /usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin/ptxas && \
         ln -s /usr/local/cuda/bin/ptxas /usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin/ptxas; \
     fi
+
+RUN python3 -m pip install --upgrade "urllib3>=2.6.3"
 
 # Set workspace directory
 WORKDIR /sgl-workspace/sglang
@@ -503,6 +508,8 @@ RUN --mount=type=cache,target=/var/cache/apt,id=runtime-apt \
     # NCCL packages needed for pynccl_allocator JIT compilation (-lnccl)
     libnccl2 \
     libnccl-dev \
+    # GPG key verification
+    gnupg2 \
     && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 2 \
     && update-alternatives --set python3 /usr/bin/python3.12 \
     && ln -sf /usr/bin/python3.12 /usr/bin/python \
