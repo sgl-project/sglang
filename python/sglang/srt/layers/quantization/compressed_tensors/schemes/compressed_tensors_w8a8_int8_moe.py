@@ -1,29 +1,25 @@
 from __future__ import annotations
-from typing import Callable, Optional, TYPE_CHECKING
+
+import logging
+from typing import TYPE_CHECKING
 
 import torch
-import logging
-from compressed_tensors.quantization import QuantizationArgs, QuantizationStrategy
-from torch.nn import Parameter
+from compressed_tensors.quantization import QuantizationStrategy
 
-from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
-from sglang.srt.layers.quantization.compressed_tensors.schemes import (
-    CompressedTensorsScheme,
-)
 from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
     NPUW8A8Int8DynamicMoEMethod,
 )
+from sglang.srt.layers.moe import MoeRunnerConfig
+from sglang.srt.layers.quantization.compressed_tensors.schemes import (
+    CompressedTensorsScheme,
+)
 from sglang.srt.utils import (
     get_bool_env_var,
-    is_cuda,
     is_hip,
-    is_npu,
-    next_power_of_2,
     set_weight_attrs,
 )
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
     from sglang.srt.layers.moe.token_dispatcher import (
         CombineInput,
         StandardDispatchOutput,
@@ -35,9 +31,7 @@ _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _use_aiter:
-    from aiter import ActivationType, QuantType
-    from aiter.fused_moe import fused_moe
-    from aiter.ops.shuffle import shuffle_weight
+    pass
 
 
 logger = logging.getLogger(__name__)
