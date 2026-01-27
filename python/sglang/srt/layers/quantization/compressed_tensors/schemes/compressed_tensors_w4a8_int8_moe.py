@@ -1,44 +1,24 @@
 from __future__ import annotations
-from typing import Callable, Optional, TYPE_CHECKING
+
+import logging
+from typing import TYPE_CHECKING
 
 import torch
-import logging
-from compressed_tensors.quantization import QuantizationArgs, QuantizationStrategy
-from torch.nn import Parameter
 
-from sglang.srt.distributed import get_tensor_model_parallel_world_size
-from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
-from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
-from sglang.srt.layers.quantization.compressed_tensors.schemes import (
-    CompressedTensorsScheme,
-)
 from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
     NPUW4A8Int8DynamicMoEMethod,
 )
-from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz, scaled_fp8_quant
-from sglang.srt.layers.quantization.fp8_utils import (
-    apply_fp8_linear,
-    apply_fp8_ptpc_linear,
-    dispatch_w8a8_block_fp8_linear,
-    normalize_e4m3fn_to_e4m3fnuz,
-    validate_fp8_block_shape,
-)
-from sglang.srt.layers.quantization.utils import (
-    requantize_with_max_scale,
-    all_close_1d,
-    per_tensor_dequantize,
+from sglang.srt.layers.moe import MoeRunnerConfig
+from sglang.srt.layers.quantization.compressed_tensors.schemes import (
+    CompressedTensorsScheme,
 )
 from sglang.srt.utils import (
     get_bool_env_var,
-    is_cuda,
     is_hip,
-    is_npu,
-    next_power_of_2,
     set_weight_attrs,
 )
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
     from sglang.srt.layers.moe.token_dispatcher import (
         CombineInput,
         StandardDispatchOutput,
@@ -50,9 +30,7 @@ _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _use_aiter:
-    from aiter import ActivationType, QuantType
-    from aiter.fused_moe import fused_moe
-    from aiter.ops.shuffle import shuffle_weight
+    pass
 
 
 logger = logging.getLogger(__name__)
