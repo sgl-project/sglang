@@ -71,7 +71,8 @@ warp_inclusive_scan(int* s_data, int lane_id, int offset, int count, int accumul
 }
 
 // Each block processes one request
-template <int BLOCK_SIZE, int NUM_TOP_K, int HOT_BUFFER_SIZE, bool IsMLA>
+// IndexT: type for req_pool_indices and seq_lens (int32_t or int64_t)
+template <int BLOCK_SIZE, int NUM_TOP_K, int HOT_BUFFER_SIZE, bool IsMLA, typename IndexT>
 __global__ void load_cache_to_device_buffer_kernel(
     const int32_t* __restrict__ top_k_tokens,
     int32_t* __restrict__ device_buffer_tokens,
@@ -84,9 +85,9 @@ __global__ void load_cache_to_device_buffer_kernel(
     int32_t* __restrict__ top_k_device_locs,
     const int32_t* __restrict__ page_table,
     int16_t* __restrict__ diff_map,
-    const int64_t* __restrict__ req_pool_indices,
+    const IndexT* __restrict__ req_pool_indices,
     const bool* __restrict__ sparse_mask,
-    const int64_t* __restrict__ seq_lens,
+    const IndexT* __restrict__ seq_lens,
     int64_t buffer_stride_0,
     int64_t buffer_stride_1,
     int64_t host_stride,
@@ -316,8 +317,9 @@ __global__ void load_cache_to_device_buffer_kernel(
   }
 }
 
-template <int BLOCK_SIZE, int NUM_TOP_K, int HOT_BUFFER_SIZE, bool IsMLA>
-void load_cache_to_device_buffer(
+// Internal launcher with explicit IndexT type
+template <int BLOCK_SIZE, int NUM_TOP_K, int HOT_BUFFER_SIZE, bool IsMLA, typename IndexT>
+void load_cache_to_device_buffer_impl(
     tvm::ffi::TensorView top_k_tokens,
     tvm::ffi::TensorView device_buffer_tokens,
     tvm::ffi::TensorView host_cache_locs,
@@ -360,15 +362,15 @@ void load_cache_to_device_buffer(
   int32_t* top_k_device_locs_ptr = static_cast<int32_t*>(top_k_device_locs.data_ptr());
   const int32_t* page_table_ptr = static_cast<const int32_t*>(page_table.data_ptr());
   int16_t* diff_map_ptr = static_cast<int16_t*>(diff_map.data_ptr());
-  const int64_t* req_pool_indices_ptr = static_cast<const int64_t*>(req_pool_indices.data_ptr());
+  const IndexT* req_pool_indices_ptr = static_cast<const IndexT*>(req_pool_indices.data_ptr());
   const bool* sparse_mask_ptr = static_cast<const bool*>(sparse_mask.data_ptr());
-  const int64_t* seq_lens_ptr = static_cast<const int64_t*>(seq_lens.data_ptr());
+  const IndexT* seq_lens_ptr = static_cast<const IndexT*>(seq_lens.data_ptr());
 
   const auto device = LaunchKernel::resolve_device(top_k_tokens.device());
 
   // Launch kernel with batch size as grid dimension
   LaunchKernel(bs, BLOCK_SIZE, device)(
-      load_cache_to_device_buffer_kernel<BLOCK_SIZE, NUM_TOP_K, HOT_BUFFER_SIZE, IsMLA>,
+      load_cache_to_device_buffer_kernel<BLOCK_SIZE, NUM_TOP_K, HOT_BUFFER_SIZE, IsMLA, IndexT>,
       top_k_tokens_ptr,
       device_buffer_tokens_ptr,
       host_cache_locs_ptr,
@@ -391,6 +393,46 @@ void load_cache_to_device_buffer(
       page_size,
       layer_id,
       item_size_bytes);
+}
+
+// Public launcher that dispatches based on tensor dtype
+template <int BLOCK_SIZE, int NUM_TOP_K, int HOT_BUFFER_SIZE, bool IsMLA>
+void load_cache_to_device_buffer(
+    tvm::ffi::TensorView top_k_tokens,
+    tvm::ffi::TensorView device_buffer_tokens,
+    tvm::ffi::TensorView host_cache_locs,
+    tvm::ffi::TensorView device_buffer_locs,
+    tvm::ffi::TensorView host_cache_k,
+    tvm::ffi::TensorView host_cache_v,
+    tvm::ffi::TensorView device_buffer_k,
+    tvm::ffi::TensorView device_buffer_v,
+    tvm::ffi::TensorView top_k_device_locs,
+    tvm::ffi::TensorView page_table,
+    tvm::ffi::TensorView diff_map,
+    tvm::ffi::TensorView req_pool_indices,
+    tvm::ffi::TensorView sparse_mask,
+    tvm::ffi::TensorView seq_lens,
+    int64_t page_size,
+    int64_t layer_id,
+    int64_t item_size_bytes) {
+  // Dispatch based on req_pool_indices dtype
+  // kDLInt = 0, bits = 32 or 64
+  const auto& dtype = req_pool_indices.dtype();
+  const bool is_int64 = (dtype.bits == 64);
+
+  if (is_int64) {
+    load_cache_to_device_buffer_impl<BLOCK_SIZE, NUM_TOP_K, HOT_BUFFER_SIZE, IsMLA, int64_t>(
+        top_k_tokens, device_buffer_tokens, host_cache_locs, device_buffer_locs,
+        host_cache_k, host_cache_v, device_buffer_k, device_buffer_v,
+        top_k_device_locs, page_table, diff_map, req_pool_indices,
+        sparse_mask, seq_lens, page_size, layer_id, item_size_bytes);
+  } else {
+    load_cache_to_device_buffer_impl<BLOCK_SIZE, NUM_TOP_K, HOT_BUFFER_SIZE, IsMLA, int32_t>(
+        top_k_tokens, device_buffer_tokens, host_cache_locs, device_buffer_locs,
+        host_cache_k, host_cache_v, device_buffer_k, device_buffer_v,
+        top_k_device_locs, page_table, diff_map, req_pool_indices,
+        sparse_mask, seq_lens, page_size, layer_id, item_size_bytes);
+  }
 }
 
 }  // namespace
