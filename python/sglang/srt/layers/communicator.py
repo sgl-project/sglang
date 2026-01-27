@@ -917,9 +917,10 @@ class CommunicateSummableTensorPairFn:
         ):
             return CommunicateSummableTensorPairFn._scatter
 
-        raise NotImplementedError(
-            f"{hidden_states_input_mode=} {residual_input_mode=} {output_mode=}"
-        )
+        return CommunicateSummableTensorPairFn._trivial
+        # raise NotImplementedError(
+        #     f"{hidden_states_input_mode=} {residual_input_mode=} {output_mode=}"
+        # )
 
     @staticmethod
     def _trivial(

@@ -62,19 +62,19 @@ def can_cp_split(seq_len: int, cp_size: int, forward_batch):
 
 
 def cp_split_and_rebuild_data(forward_batch, input_: torch.Tensor):
-    input_list = list(torch.split(input_, forward_batch.cp_metadata.split_list, dim=0))
+    input_list = list(torch.split(input_, forward_batch.attn_cp_metadata.split_list, dim=0))
     result = torch.cat(
-        [input_list[i] for i in forward_batch.cp_metadata.zigzag_index], dim=0
+        [input_list[i] for i in forward_batch.attn_cp_metadata.zigzag_index], dim=0
     ).view(-1, input_.shape[-1])
     return result
 
 
 def cp_split_and_rebuild_position(forward_batch, positions: torch.Tensor):
     position_id_list = list(
-        torch.split(positions, forward_batch.cp_metadata.split_list, dim=-1)
+        torch.split(positions, forward_batch.attn_cp_metadata.split_list, dim=-1)
     )
     positions = torch.cat(
-        [position_id_list[i] for i in forward_batch.cp_metadata.zigzag_index],
+        [position_id_list[i] for i in forward_batch.attn_cp_metadata.zigzag_index],
         dim=-1,
     )
     return positions
@@ -97,13 +97,13 @@ def cp_all_gather_reorganazied_into_tensor(
     )
 
     outputs_list_max = list(
-        torch.split(input_tensor_full, forward_batch.cp_metadata.max_rank_len, dim=0)
+        torch.split(input_tensor_full, forward_batch.attn_cp_metadata.max_rank_len, dim=0)
     )
     outputs = torch.cat(
         [
             outputs_list_max[index][:per_rank_len]
             for index, per_rank_len in enumerate(
-                forward_batch.cp_metadata.per_rank_actual_token
+                forward_batch.attn_cp_metadata.per_rank_actual_token
             )
         ],
         dim=0,
@@ -133,16 +133,16 @@ def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
     bs_seq_len, hidden_size = input_tensor.shape
     output_tensor = cp_all_gather_reorganazied_into_tensor(
         input_tensor,
-        forward_batch.cp_metadata.total_seq_lens,
+        forward_batch.attn_cp_metadata.total_seq_lens,
         cp_size,
         forward_batch,
         stream,
     )
     outputs_list = list(
-        torch.split(output_tensor, forward_batch.cp_metadata.reverse_split_len, dim=0)
+        torch.split(output_tensor, forward_batch.attn_cp_metadata.reverse_split_len, dim=0)
     )
     output_tensor = torch.cat(
-        [outputs_list[i] for i in forward_batch.cp_metadata.cp_reverse_index], dim=0
+        [outputs_list[i] for i in forward_batch.attn_cp_metadata.cp_reverse_index], dim=0
     )
     output_tensor = output_tensor.view(-1, hidden_size)
     return output_tensor
@@ -243,16 +243,13 @@ def prepare_context_parallel_metadata(
     kv_len_next = prefix_sum_list[cp_size * 2 - cp_rank - 1]
     actual_seq_q_prev = split_list[cp_rank]
     actual_seq_q_next = split_list[cp_size * 2 - cp_rank - 1]
-    kv_len_prev_tensor = torch.tensor(kv_len_prev).to(device="cuda", dtype=torch.int32)
-    kv_len_next_tensor = torch.tensor(kv_len_next).to(device="cuda", dtype=torch.int32)
-    actual_seq_q_prev_tensor = torch.tensor(actual_seq_q_prev).to(
-        device="cuda", dtype=torch.int32
-    )
-    actual_seq_q_next_tensor = torch.tensor(actual_seq_q_next).to(
-        device="cuda", dtype=torch.int32
-    )
+    # Flash Attention expects cache_seqlens to have shape (batch_size,), not scalar
+    kv_len_prev_tensor = torch.tensor([kv_len_prev], device="cuda", dtype=torch.int32)
+    kv_len_next_tensor = torch.tensor([kv_len_next], device="cuda", dtype=torch.int32)
+    actual_seq_q_prev_tensor = torch.tensor([actual_seq_q_prev], device="cuda", dtype=torch.int32)
+    actual_seq_q_next_tensor = torch.tensor([actual_seq_q_next], device="cuda", dtype=torch.int32)
 
-    cp_metadata = ContextParallelMetadata(
+    attn_cp_metadata = ContextParallelMetadata(
         split_list=split_list,
         max_rank_len=max_rank_len,
         zigzag_index=zigzag_index,
@@ -269,4 +266,4 @@ def prepare_context_parallel_metadata(
         actual_seq_q_next_tensor=actual_seq_q_next_tensor,
         total_seq_lens=kv_len_origin,
     )
-    return cp_metadata
+    return attn_cp_metadata
