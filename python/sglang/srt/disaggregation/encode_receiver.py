@@ -889,7 +889,6 @@ class MMReceiver:
                 ).reshape(recv_obj.shape)
 
             if recv_embedding_data is None:
-                recv_obj.embedding_list[recv_obj.part_idx] = recv_obj.embedding
                 recv_embedding_data = MultiModalEmbeddingData.from_embedding_data(
                     recv_obj
                 )
