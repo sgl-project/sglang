@@ -1,15 +1,16 @@
 import itertools
-import os
 from typing import Tuple
 
 import torch
 import triton
 import triton.testing
+from sgl_kernel import rmsnorm
 
-IS_CI = (
-    os.getenv("CI", "false").lower() == "true"
-    or os.getenv("GITHUB_ACTIONS", "false").lower() == "true"
-)
+from sglang.jit_kernel.benchmark.utils import is_in_ci
+from sglang.jit_kernel.norm import fused_inplace_qknorm
+from sglang.srt.utils import get_current_device_stream_fast
+
+IS_CI = is_in_ci()
 
 alt_stream = torch.cuda.Stream()
 
@@ -20,13 +21,12 @@ def sglang_aot_qknorm(
     q_weight: torch.Tensor,
     k_weight: torch.Tensor,
 ) -> None:
-    from sgl_kernel import rmsnorm
 
     head_dim = q.shape[-1]
     q = q.view(-1, head_dim)
     k = k.view(-1, head_dim)
 
-    current_stream = torch.cuda.current_stream()
+    current_stream = get_current_device_stream_fast()
     alt_stream.wait_stream(current_stream)
     rmsnorm(q, q_weight, out=q)
     with torch.cuda.stream(alt_stream):
@@ -40,7 +40,6 @@ def sglang_jit_qknorm(
     q_weight: torch.Tensor,
     k_weight: torch.Tensor,
 ) -> None:
-    from sglang.jit_kernel.norm import fused_inplace_qknorm
 
     fused_inplace_qknorm(q, k, q_weight, k_weight)
 
@@ -51,7 +50,7 @@ def flashinfer_qknorm(
     q_weight: torch.Tensor,
     k_weight: torch.Tensor,
 ) -> None:
-    from flashinfer.norm import rmsnorm
+    from flashinfer import rmsnorm
 
     rmsnorm(q, q_weight, out=q)
     rmsnorm(k, k_weight, out=k)

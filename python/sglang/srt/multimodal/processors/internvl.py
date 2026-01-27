@@ -25,6 +25,7 @@ class InternVLProcessor(BaseMultimodalProcessor):
 
     IMAGENET_MEAN = [0.485, 0.456, 0.406]
     IMAGENET_STD = [0.229, 0.224, 0.225]
+    IMAGE_MAX_NUM = 12
 
     DEFAULT_VIDEO_NUM_FRAMES = 32
     VIDEO_MAX_NUM = 1
@@ -71,7 +72,17 @@ class InternVLProcessor(BaseMultimodalProcessor):
             tokenizer = self._processor
         self.tokenizer = tokenizer
 
-        llm_arch = hf_config.llm_config.architectures[0]
+        # Support both InternVL (llm_config) and InternS1 (text_config).
+        # Different multimodal models use different field names for the text backbone:
+        # - InternVL uses: hf_config.llm_config
+        # - InternS1 uses: hf_config.text_config
+        # - Some store architectures at top-level
+        text_cfg = (
+            getattr(hf_config, "llm_config", None)
+            or getattr(hf_config, "text_config", None)
+            or hf_config
+        )
+        llm_arch = (getattr(text_cfg, "architectures", []) or [None])[0]
         self.llm_arch = llm_arch
         video_token_map = {
             "Qwen2ForCausalLM": "<|video_pad|>",
@@ -86,6 +97,11 @@ class InternVLProcessor(BaseMultimodalProcessor):
             else None
         )
 
+        self.image_token_id = (
+            tokenizer.convert_tokens_to_ids(self.IMG_CONTEXT)
+            if self.IMG_CONTEXT
+            else None
+        )
         self.num_image_token = int(
             (image_size // patch_size) ** 2 * (hf_config.downsample_ratio**2)
         )
@@ -97,7 +113,7 @@ class InternVLProcessor(BaseMultimodalProcessor):
         # Offset token id use IMG_CONTEXT / VIDEO_CONTEXT
         self.mm_tokens = MultimodalSpecialTokens(
             image_token=self.IMAGE_PLACEHOLDER_TOKEN,
-            image_token_id=tokenizer.convert_tokens_to_ids(self.IMG_CONTEXT),
+            image_token_id=self.image_token_id,
             video_token=self.VIDEO_PLACEHOLDER_TOKEN,
             video_token_id=self.video_token_id,
         ).build(_image_processor)
@@ -115,14 +131,14 @@ class InternVLProcessor(BaseMultimodalProcessor):
             getattr(server_args, "context_length", None)
             or getattr(server_args, "max_context_len", None)
             or getattr(hf_config, "max_position_embeddings", None)
-            or getattr(
-                getattr(hf_config, "llm_config", None), "max_position_embeddings", None
-            )
+            or getattr(text_cfg, "max_position_embeddings", None)
             or self.CONTEXT_FALLBACK
         )
 
     @staticmethod
-    def dynamic_preprocess(tensor, image_size=448, max_num=12, use_thumbnail=False):
+    def dynamic_preprocess(
+        tensor, image_size=448, max_num=IMAGE_MAX_NUM, use_thumbnail=False
+    ):
         # Tensor: (C,H,W) float on GPU
         C, H, W = tensor.shape
         aspect_ratio = W / H
@@ -264,6 +280,25 @@ class InternVLProcessor(BaseMultimodalProcessor):
     async def process_qwen_mm_data_async(
         self, image_data, input_text, request_obj, **kwargs
     ):
+
+        img_max_num = (
+            getattr(request_obj, "image_max_dynamic_patch", None)
+            or getattr(request_obj, "max_dynamic_patch", None)
+            or kwargs.get("image_max_dynamic_patch")
+            or kwargs.get("max_dynamic_patch")
+            or self.IMAGE_MAX_NUM
+        )
+        img_max_num = max(1, int(img_max_num))
+
+        vid_max_num = (
+            getattr(request_obj, "video_max_dynamic_patch", None)
+            or getattr(request_obj, "max_dynamic_patch", None)
+            or kwargs.get("video_max_dynamic_patch")
+            or kwargs.get("max_dynamic_patch")
+            or self.VIDEO_MAX_NUM
+        )
+        vid_max_num = max(1, int(vid_max_num))
+
         # Qwen/Qwen3 branch: OpenAI-style placeholders <image>/<video>
         prompt = input_text or ""
         video_data = getattr(request_obj, "video_data", None) or []
@@ -314,7 +349,7 @@ class InternVLProcessor(BaseMultimodalProcessor):
 
             tensor = (tensor - mean) / std
             tiles = self.dynamic_preprocess(
-                tensor, image_size=448, max_num=12, use_thumbnail=True
+                tensor, image_size=448, max_num=img_max_num, use_thumbnail=True
             )
             pixel_values_list.append(tiles)
             num_patches_list.append(int(tiles.shape[0]))
@@ -374,7 +409,7 @@ class InternVLProcessor(BaseMultimodalProcessor):
                     tiles = self.dynamic_preprocess(
                         frame_t,
                         image_size=448,
-                        max_num=self.VIDEO_MAX_NUM,
+                        max_num=vid_max_num,
                         use_thumbnail=self.VIDEO_USE_THUMBNAIL,
                     )
                     per_video_tiles.append(tiles)
@@ -394,6 +429,7 @@ class InternVLProcessor(BaseMultimodalProcessor):
 
         input_text_mid = base_output.input_text or prompt
         input_text_mid = input_text_mid.replace(self.IMAGE_PLACEHOLDER_TOKEN, img_ph)
+        input_text_mid = input_text_mid.replace(self.IMG_CONTEXT, img_ph)
 
         if self.VIDEO_CONTEXT_TOKEN and self.video_token_id is not None:
             input_text_mid = input_text_mid.replace(
