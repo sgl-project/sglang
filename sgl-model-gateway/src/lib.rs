@@ -5,6 +5,7 @@ pub mod core;
 pub mod data_connector;
 pub mod grpc_client;
 pub mod mcp;
+pub mod mesh;
 pub mod middleware;
 pub mod multimodal;
 pub mod observability;
@@ -19,4 +20,3 @@ pub mod tool_parser;
 pub mod version;
 pub mod wasm;
 pub mod workflow;
-// fake change, to be deleted

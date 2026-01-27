@@ -249,6 +249,17 @@ def get_tbo_token_distribution_threshold() -> float:
     return TBO_TOKEN_DISTRIBUTION_THRESHOLD
 
 
+def filter_moe_weight_param_global_expert(name, x, num_local_experts):
+    """
+    Filter out for MoE expert parameters that requires global expert.
+    """
+    return (
+        not getattr(x, "_sglang_require_global_experts", False)
+        and x.data.ndim > 0
+        and x.data.shape[0] == num_local_experts
+    )
+
+
 def should_use_flashinfer_cutlass_moe_fp4_allgather():
     """
     Perform FP4 quantize before all-gather for flashinfer cutlass moe to reduce communication cost for high-throughput serving.

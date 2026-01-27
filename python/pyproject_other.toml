@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61.0", "setuptools-scm>=8.0", "wheel"]
+requires = ["setuptools>=61.0", "setuptools-scm>=8.0", "wheel", "grpcio-tools==1.75.1"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -66,6 +66,7 @@ runtime_common = [
   "grpcio==1.75.1", # keep it align with compile_proto.py
   "grpcio-tools==1.75.1", # keep it align with compile_proto.py
   "grpcio-reflection==1.75.1", # required by srt/entrypoints/grpc_server.py
+  "bidict",
 ]
 
 tracing = [
@@ -84,26 +85,7 @@ srt_hip = [
   "wave-lang==3.8.2",
 ]
 
-# https://docs.sglang.io/platforms/ascend_npu.html
-srt_npu = ["sglang[runtime_common]"]
-
-# For Intel Gaudi(device : hpu) follow the installation guide
-# https://docs.vllm.ai/en/latest/getting_started/gaudi-installation.html
-srt_hpu = ["sglang[runtime_common]"]
-
-test = [
-  "accelerate",
-  "expecttest",
-  "gguf",
-  "jsonlines",
-  "matplotlib",
-  "pandas",
-  "peft",
-  "pytest",
-  "sentence_transformers",
-  "tabulate",
-]
-diffusion = [
+diffusion_hip = [
   "diffusers @ git+https://github.com/huggingface/diffusers.git@6290fdfda40610ce7b99920146853614ba529c6e",
   "opencv-python-headless==4.10.0.84",
   "imageio==2.36.0",
@@ -117,13 +99,61 @@ diffusion = [
   "vsa==0.0.4",
   "runai_model_streamer",
 ]
+
+# https://docs.sglang.io/platforms/ascend_npu.html
+srt_npu = ["sglang[runtime_common]"]
+
+# For Intel Gaudi(device : hpu) follow the installation guide
+# https://docs.vllm.ai/en/latest/getting_started/gaudi-installation.html
+srt_hpu = ["sglang[runtime_common]"]
+
+# https://docs.sglang.io/platforms/mthreads_gpu.md
+srt_musa = [
+    "sglang[runtime_common]",
+    "torch",
+    "torch_musa",
+    "torchada>=0.1.15",
+    "mthreads-ml-py",
+    "numpy<2.0",
+]
+
+diffusion_musa = [
+  "PyYAML==6.0.1",
+  "cloudpickle",
+  "diffusers==0.36.0",
+  "imageio==2.36.0",
+  "imageio-ffmpeg==0.5.1",
+  "moviepy>=2.0.0",
+  "opencv-python-headless==4.10.0.84",
+  "remote-pdb",
+  "st_attn==0.0.7",
+  "vsa==0.0.4",
+  "runai_model_streamer",
+  "cache-dit==1.1.8"
+]
+
+test = [
+  "accelerate",
+  "expecttest",
+  "gguf",
+  "jsonlines",
+  "matplotlib",
+  "pandas",
+  "peft",
+  "pytest",
+  "sentence_transformers",
+  "tabulate",
+]
+
 all_hip = ["sglang[srt_hip]"]
 all_npu = ["sglang[srt_npu]"]
 all_hpu = ["sglang[srt_hpu]"]
+all_musa = ["sglang[srt_musa]", "sglang[diffusion_musa]"]
 
 dev_hip = ["sglang[all_hip]", "sglang[test]"]
 dev_npu = ["sglang[all_npu]", "sglang[test]"]
 dev_hpu = ["sglang[all_hpu]", "sglang[test]"]
+dev_musa = ["sglang[all_musa]", "sglang[test]"]
 
 [project.urls]
 "Homepage" = "https://github.com/sgl-project/sglang"
@@ -134,16 +164,8 @@ sglang = "sglang.cli.main:main"
 
 [tool.setuptools.package-data]
 "sglang" = [
-  "srt/layers/moe/fused_moe_triton/configs/*/*.json",
-  "srt/layers/quantization/configs/*.json",
-  "srt/mem_cache/storage/hf3fs/hf3fs_utils.cpp",
-  "srt/mem_cache/cpp_radix_tree/*.cpp",
-  "srt/mem_cache/cpp_radix_tree/*.h",
-  "srt/speculative/cpp_ngram/*.cpp",
-  "srt/speculative/cpp_ngram/*.h",
-  "jit_kernel/include/sgl_kernel/*.h",
-  "jit_kernel/include/sgl_kernel/*.cuh",
-  "jit_kernel/csrc/*.cuh"
+  "srt/**/*",
+  "jit_kernel/**/*"
 ]
 
 [tool.setuptools.packages.find]
@@ -172,7 +194,3 @@ exclude = [
 root = ".."
 version_file = "sglang/_version.py"
 git_describe_command = ["git", "describe", "--tags", "--long", "--match", "v*"]
-
-[tool.codespell]
-ignore-words-list = "ans, als, hel, boostrap, childs, te, vas, hsa, ment"
-skip = "*.json,*.jsonl,*.patch,*.txt"

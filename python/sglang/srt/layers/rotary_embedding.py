@@ -115,9 +115,10 @@ class RotaryEmbedding(MultiPlatformOp):
             cache = cache.to(dtype)
 
         if (
-            (not (_is_cuda or _is_npu) or self.head_size not in [64, 128, 256, 512])
-            and not (_is_cpu and _is_cpu_amx_available)
+            (not (_is_cuda) or self.head_size not in [64, 128, 256, 512])
+            and not (_is_cpu)
             and not (_is_xpu)
+            and not (_is_npu)
         ):
             if _is_cuda or _is_hip:
                 from sgl_kernel import rotary_embedding
@@ -294,8 +295,8 @@ class RotaryEmbedding(MultiPlatformOp):
         assert (
             fused_set_kv_buffer_arg is None
         ), "fused_set_kv_buffer_arg is not supported for npu implementation"
-
-        rotary_mode = "half"
+        if query.dtype == torch.bfloat16 and self.cos_sin_cache.dtype == torch.float:
+            return self.forward_native(positions, query, key, offsets)
         if self.is_neox_style:
             rotary_mode = "half"
         else:
