@@ -39,6 +39,11 @@ from sglang.srt.layers.communicator import (
     LayerScatterModes,
     ScatterMode,
 )
+from sglang.srt.layers.dp_attention import (
+    get_attention_tp_rank,
+    get_attention_tp_size,
+    is_dp_attention_enabled,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     QKVParallelLinear,
@@ -54,6 +59,7 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer
+from sglang.srt.layers.utils.common import get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -522,23 +528,25 @@ class MiniMaxM2Attention(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
-        tp_size = get_tensor_model_parallel_world_size()
+
+        attn_tp_rank = get_attention_tp_rank()
+        attn_tp_size = get_attention_tp_size()
 
         # Get dimensions from config
         self.total_num_heads = config.num_attention_heads
-        assert self.total_num_heads % tp_size == 0
-        self.num_heads = self.total_num_heads // tp_size
+        assert self.total_num_heads % attn_tp_size == 0
+        self.num_heads = self.total_num_heads // attn_tp_size
         self.total_num_kv_heads = config.num_key_value_heads
 
-        if self.total_num_kv_heads >= tp_size:
+        if self.total_num_kv_heads >= attn_tp_size:
             # Number of KV heads is greater than TP size, so we partition
             # the KV heads across multiple tensor parallel GPUs.
-            assert self.total_num_kv_heads % tp_size == 0
+            assert self.total_num_kv_heads % attn_tp_size == 0
         else:
             # Number of KV heads is less than TP size, so we replicate
             # the KV heads across multiple tensor parallel GPUs.
-            assert tp_size % self.total_num_kv_heads == 0
-        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
+            assert attn_tp_size % self.total_num_kv_heads == 0
+        self.num_kv_heads = max(1, self.total_num_kv_heads // attn_tp_size)
 
         # Use head_dim from config if available, otherwise calculate
         self.head_dim = getattr(
@@ -566,6 +574,8 @@ class MiniMaxM2Attention(nn.Module):
             self.total_num_kv_heads,
             bias=False,
             quant_config=quant_config,
+            tp_rank=attn_tp_rank,
+            tp_size=attn_tp_size,
             prefix=add_prefix("qkv_proj", prefix),
         )
 
@@ -575,6 +585,8 @@ class MiniMaxM2Attention(nn.Module):
             bias=False,
             reduce_results=False,
             quant_config=quant_config,
+            tp_rank=attn_tp_rank,
+            tp_size=attn_tp_size,
             prefix=add_prefix("o_proj", prefix),
         )
 
@@ -827,10 +839,15 @@ class MiniMaxM2Model(nn.Module):
         self.vocab_size = config.vocab_size
         self.pp_group = get_pp_group()
 
-        self.embed_tokens = VocabParallelEmbedding(
-            config.vocab_size,
-            config.hidden_size,
-        )
+        if self.pp_group.is_first_rank:
+            self.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+                enable_tp=not is_dp_attention_enabled(),
+                prefix=add_prefix("embed_tokens", prefix),
+            )
+        else:
+            self.embed_tokens = PPMissingLayer()
 
         def layer_fn(idx, prefix: str) -> nn.Module:
             return MiniMaxM2DecoderLayer(
@@ -929,22 +946,24 @@ class MiniMaxM2ForCausalLM(nn.Module):
 
         self.config = config
         self.quant_config = quant_config
+        self.pp_group = get_pp_group()
 
         self.model = MiniMaxM2Model(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
 
-        if get_pp_group().is_last_rank:
+        if self.pp_group.is_last_rank:
             self.lm_head = ParallelLMHead(
                 config.vocab_size,
                 config.hidden_size,
-                quant_config=None,
+                quant_config=quant_config,
                 prefix=add_prefix("lm_head", prefix),
+                use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
             )
+
+            self.logits_processor = LogitsProcessor(config)
         else:
             self.lm_head = PPMissingLayer()
-
-        self.logits_processor = LogitsProcessor(config)
 
         # For EAGLE3
         self.capture_aux_hidden_states = False
@@ -953,7 +972,7 @@ class MiniMaxM2ForCausalLM(nn.Module):
         return self.model.get_input_embeddings(input_ids)
 
     def set_eagle3_layers_to_capture(self, layer_ids: Optional[list[int]] = None):
-        if not get_pp_group().is_last_rank:
+        if not self.pp_group.is_last_rank:
             return
 
         self.capture_aux_hidden_states = True
@@ -977,17 +996,23 @@ class MiniMaxM2ForCausalLM(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
         # _print_tensor_info(input_ids, "input_ids")
-        hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
+        hidden_states = self.model(
+            input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
+        )
 
         aux_hidden_states = None
         if self.capture_aux_hidden_states:
             hidden_states, aux_hidden_states = hidden_states
 
-        return self.logits_processor(
-            input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
-        )
+        if self.pp_group.is_last_rank:
+            return self.logits_processor(
+                input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
+            )
+        else:
+            return hidden_states
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         """Load model weights with proper mapping for MiniMax architecture."""
@@ -1013,6 +1038,12 @@ class MiniMaxM2ForCausalLM(nn.Module):
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
         for name, loaded_weight in weights:
+            layer_id = get_layer_id(name)
+            if layer_id is not None and (
+                layer_id < self.model.start_layer or layer_id >= self.model.end_layer
+            ):
+                continue
+
             if "rotary_emb.inv_freq" in name:
                 continue
 
@@ -1030,11 +1061,13 @@ class MiniMaxM2ForCausalLM(nn.Module):
                 # name will be updated to mlp.experts[0].gate_up_proj, which
                 # will then be updated below in expert_params_mapping
                 # for mlp.experts[0].gate_gate_up_proj, which breaks load.
-                if ("mlp.experts." in name) and name not in params_dict:
+                if "mlp.experts." in name:
                     continue
                 name = name.replace(weight_name, param_name)
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
+                    continue
+                if name not in params_dict:
                     continue
 
                 param = params_dict[name]
@@ -1042,11 +1075,19 @@ class MiniMaxM2ForCausalLM(nn.Module):
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
+                is_expert_weight = False
+
                 for mapping in expert_params_mapping:
                     param_name, weight_name, expert_id, shard_id = mapping
                     if weight_name not in name:
                         continue
+
+                    is_expert_weight = True
+
                     name = name.replace(weight_name, param_name)
+                    if name not in params_dict:
+                        # Expert weight not on this rank, will be skipped below
+                        continue
 
                     param = params_dict[name]
                     weight_loader = param.weight_loader
@@ -1059,6 +1100,10 @@ class MiniMaxM2ForCausalLM(nn.Module):
                     )
                     break
                 else:
+                    if is_expert_weight:
+                        # This is an expert weight but not mapped to this rank, skip all remaining processing
+                        continue
+
                     # Skip loading extra bias for GPTQ models.
                     if name.endswith(".bias") and name not in params_dict:
                         continue
@@ -1068,11 +1113,14 @@ class MiniMaxM2ForCausalLM(nn.Module):
                     if name is None:
                         continue
 
-                    param = params_dict[name]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
-                    weight_loader(param, loaded_weight)
+                    if name in params_dict:
+                        param = params_dict[name]
+                        weight_loader = getattr(
+                            param, "weight_loader", default_weight_loader
+                        )
+                        weight_loader(param, loaded_weight)
+                    else:
+                        logger.warning(f"Parameter {name} not found in params_dict")
             loaded_params.add(name)
         return loaded_params
 
