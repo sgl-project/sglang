@@ -46,8 +46,6 @@ from sglang.srt.model_loader.utils import (
 )
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_common.utils import (
-    _is_cpu,
-    _is_cpu_amx_available,
     _is_cuda,
     _is_fp8_fnuz,
     _is_hip,
