@@ -934,25 +934,12 @@ class MiniCPMV4_0(MiniCPMBaseModel):
 
     def get_embed_and_head(self):
         """Get embedding and lm_head weights for EAGLE3 support."""
-        if hasattr(self.llm, "get_embed_and_head"):
-            return self.llm.get_embed_and_head()
-        # Fallback
-        return self.llm.model.embed_tokens.weight, self.llm.lm_head.weight
+        return self.llm.get_embed_and_head()
 
     def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
         """Set layers to capture for EAGLE3 speculative decoding."""
         self.capture_aux_hidden_states = True
-        if hasattr(self.llm, "set_eagle3_layers_to_capture"):
-            self.llm.set_eagle3_layers_to_capture(layer_ids)
-        else:
-            # Fallback: set default layers to capture
-            self.llm.capture_aux_hidden_states = True
-            if layer_ids is None:
-                num_layers = self.config.num_hidden_layers
-                self.llm.model.layers_to_capture = [2, num_layers // 2, num_layers - 3]
-            else:
-                # plus 1 because sglang takes the output of (i-1)th layer as aux hidden state for ith layer
-                self.llm.model.layers_to_capture = [val + 1 for val in layer_ids]
+        self.llm.set_eagle3_layers_to_capture(layer_ids)
 
 
 _SUPPORT_VERSION = {
