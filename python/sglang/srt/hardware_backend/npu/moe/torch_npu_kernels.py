@@ -142,18 +142,13 @@ class TorchNpuKernelsRunnerCore(MoeRunnerCore):
     def __init__(self, config: MoeRunnerConfig):
         super().__init__(config)
         
-        if config.quantization == "ModelSlimW4A8Int8MoE":
-            self.selected_run = output_w4a8
-        elif config.quantization == "NPUCompressedTensorsW4A8Int4DynamicMoEMethod":
-            self.selected_run = output_w4a8
-        elif config.quantization == "ModelSlimW8A8Int8MoE":
-            self.selected_run = output_w8a8
-        elif config.quantization == "NPUCompressedTensorsW4A16Int4DynamicMoEMethod":
-            self.selected_run = output_wna16
-        elif config.quantization == "AWQMoEAscendMethod":
-            self.selected_run = output_wna16
-        elif config.quantization == "UnquantizedFusedMoEMethod":
-            self.selected_run = output_unquant
+        self.selected_run = {
+            "ModelSlimW4A8Int8MoE": output_w4a8,
+            "NPUCompressedTensorsW4A8Int4DynamicMoEMethod": output_w4a8,
+            "ModelSlimW8A8Int8MoE": output_w8a8,
+            "NPUCompressedTensorsW4A16Int4DynamicMoEMethod": output_wna16,
+            "AWQMoEAscendMethod": output_wna16,
+            "UnquantizedFusedMoEMethod": output_unquant}.get(config.quantization, output_unquant)
 
     def run(
         self,
