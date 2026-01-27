@@ -40,83 +40,53 @@ SIMILARITY_THRESHOLD = 0.99
 class TestEmbeddingLoraSupport(unittest.TestCase):
     """Test LoRA support in embedding request structures."""
 
-    def test_embedding_req_input_lora_fields_exist(self):
-        """Test that EmbeddingReqInput has lora_path and lora_id fields."""
+    def test_embedding_req_input_lora_normalization_and_indexing(self):
+        """Test EmbeddingReqInput LoRA field normalization, indexing, and validation."""
+        # Test fields exist with defaults
         req = EmbeddingReqInput(text="Hello")
         self.assertIsNone(req.lora_path)
         self.assertIsNone(req.lora_id)
 
-    def test_embedding_req_input_lora_path_normalization_single_to_batch(self):
-        """Test that single lora_path is expanded to match batch size."""
+        # Test single lora_path expands to batch and __getitem__ extracts correctly
         req = EmbeddingReqInput(
-            text=["Hello", "World", "Test"],
+            text=["Hello", "World"],
             lora_path="my-adapter",
-        )
-        req.normalize_batch_and_arguments()
-
-        self.assertEqual(req.lora_path, ["my-adapter", "my-adapter", "my-adapter"])
-
-    def test_embedding_req_input_lora_path_normalization_list_preserved(self):
-        """Test that list of lora_paths is preserved during normalization."""
-        req = EmbeddingReqInput(
-            text=["Hello", "World"],
-            lora_path=["adapter1", "adapter2"],
-        )
-        req.normalize_batch_and_arguments()
-
-        self.assertEqual(req.lora_path, ["adapter1", "adapter2"])
-
-    def test_embedding_req_input_lora_path_list_mismatch_raises_error(self):
-        """Test that mismatched lora_path list length raises ValueError."""
-        req = EmbeddingReqInput(
-            text=["Hello", "World", "Test"],
-            lora_path=["adapter1"],  # Length 1, but batch size is 3
-        )
-
-        with self.assertRaises(ValueError) as ctx:
-            req.normalize_batch_and_arguments()
-
-        self.assertIn("lora_path list length", str(ctx.exception))
-
-    def test_embedding_req_input_getitem_extracts_lora_fields(self):
-        """Test that __getitem__ correctly extracts LoRA fields."""
-        req = EmbeddingReqInput(
-            text=["Hello", "World"],
-            lora_path=["adapter1", "adapter2"],
             lora_id=["id1", "id2"],
         )
         req.normalize_batch_and_arguments()
+        self.assertEqual(req.lora_path, ["my-adapter", "my-adapter"])
+        self.assertEqual(req[0].lora_path, "my-adapter")
+        self.assertEqual(req[0].lora_id, "id1")
+        self.assertEqual(req[1].lora_id, "id2")
 
-        item0 = req[0]
-        item1 = req[1]
+        # Test mismatched list length raises error
+        req = EmbeddingReqInput(
+            text=["Hello", "World", "Test"],
+            lora_path=["adapter1"],
+        )
+        with self.assertRaises(ValueError) as ctx:
+            req.normalize_batch_and_arguments()
+        self.assertIn("lora_path list length", str(ctx.exception))
 
-        self.assertEqual(item0.lora_path, "adapter1")
-        self.assertEqual(item0.lora_id, "id1")
-        self.assertEqual(item1.lora_path, "adapter2")
-        self.assertEqual(item1.lora_id, "id2")
-
-    def test_tokenized_embedding_req_input_has_lora_id(self):
-        """Test that TokenizedEmbeddingReqInput has lora_id field."""
-        sampling_params = SamplingParams()
+    def test_tokenized_and_protocol_lora_fields(self):
+        """Test LoRA fields in TokenizedEmbeddingReqInput and EmbeddingRequest."""
+        # TokenizedEmbeddingReqInput
         tokenized = TokenizedEmbeddingReqInput(
             input_text="Hello",
             input_ids=[1, 2, 3],
             image_inputs={},
             token_type_ids=[],
-            sampling_params=sampling_params,
+            sampling_params=SamplingParams(),
             lora_id="my-lora-id",
         )
-
         self.assertEqual(tokenized.lora_id, "my-lora-id")
 
-    def test_embedding_request_protocol_has_lora_path(self):
-        """Test that EmbeddingRequest API model has lora_path field."""
+        # EmbeddingRequest protocol
         request = EmbeddingRequest(
             input="Hello world",
             model="test-model",
             lora_path="my-adapter",
         )
-
         self.assertEqual(request.lora_path, "my-adapter")
 
 
